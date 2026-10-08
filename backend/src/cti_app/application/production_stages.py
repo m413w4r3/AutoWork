@@ -5,11 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID, uuid4
 
-from cti_app.application.persistence import ProductionUnitOfWorkFactory
+from cti_app.application.persistence import ProductionUnitOfWork, ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_editorial_enrichment import (
     EDITORIAL_ENRICHMENT_GENERATOR_VERSION,
@@ -56,6 +57,16 @@ from cti_app.domain.production_synthesis import (
     production_synthesis_to_json,
     synthesis_evidence_refs,
 )
+
+
+@asynccontextmanager
+async def _uow_scope(uow_factory: Any, existing_uow: Any | None) -> Any:
+    """Reuse a caller-owned transaction or open one for standalone stage writes."""
+    if existing_uow is not None:
+        yield existing_uow
+        return
+    async with uow_factory() as owned_uow:
+        yield owned_uow
 
 
 def compute_input_hash(input_data: dict[str, Any]) -> str:
@@ -388,6 +399,7 @@ class EditorialEnrichmentService(_ArtifactPayloadMixin):
         expected_current_canonical_sha256: str | None = None,
         canonical_payload: dict[str, Any] | None = None,
         resource_search_enabled: bool = False,
+        uow: ProductionUnitOfWork | None = None,
     ) -> ProductionArtifact:
         if self._artifact_store is None:
             raise ValueError("editorial_enrichment_inputs_missing")
@@ -414,7 +426,8 @@ class EditorialEnrichmentService(_ArtifactPayloadMixin):
                 raise ValueError("editorial_enrichment_revision_payload_mismatch")
         encoded = ProductionArtifactStore.canonical_json_bytes(payload)
         stage = ProductionArtifactStage.EDITORIAL_ENRICHMENT
-        async with self._uow_factory() as uow:
+        provided_uow = uow
+        async with _uow_scope(self._uow_factory, provided_uow) as uow:
             current = (
                 await uow.production_artifacts.get_current_for_revision(run_id, stage.value)
                 if expected_current_artifact_id is not None
@@ -496,7 +509,8 @@ class EditorialEnrichmentService(_ArtifactPayloadMixin):
             )
             await uow.production_artifacts.append(artifact)
             await uow.production_artifacts.mark_downstream_stale(run_id, stage.value)
-            await uow.commit()
+            if provided_uow is None:
+                await uow.commit()
             return artifact
 
 
@@ -530,6 +544,7 @@ class SynthesisService(_ArtifactPayloadMixin):
         expected_current_input_hash: str | None = None,
         expected_current_canonical_sha256: str | None = None,
         stale_stages: set[str] | None = None,
+        uow: Any | None = None,
     ) -> ProductionArtifact:
         if self._artifact_store is None:
             raise ValueError("Canonical synthesis requires an artifact store")
@@ -568,7 +583,8 @@ class SynthesisService(_ArtifactPayloadMixin):
         }
         if metadata_extra is not None:
             metadata.update(dict(metadata_extra))
-        async with self._uow_factory() as uow:
+        provided_uow = uow
+        async with _uow_scope(self._uow_factory, provided_uow) as uow:
             # Not get_current: a synthesis retry stales every prior synthesis
             # artifact first, and get_current excludes STALE rows — using it
             # here would restart numbering at 1 and collide with the
@@ -637,5 +653,6 @@ class SynthesisService(_ArtifactPayloadMixin):
             elif stale_stages:
                 await uow.production_artifacts.mark_stages_stale(run_id, stale_stages)
 
-            await uow.commit()
+            if provided_uow is None:
+                await uow.commit()
             return artifact

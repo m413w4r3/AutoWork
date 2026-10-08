@@ -44,7 +44,13 @@ from cti_app.domain.production_editorial_enrichment import (
     validate_text,
 )
 from cti_app.domain.production_editorial_enrichment import publication_json_object as json_object
-from cti_app.domain.production_references import ProductionReferenceKind, ProductionReferenceTier
+from cti_app.domain.production_references import (
+    ProductionEditorialRole,
+    ProductionReferenceKind,
+    ProductionReferenceTier,
+    ProductionSourceCriticality,
+    ProductionSourceCriticalityReason,
+)
 from cti_app.domain.production_synthesis import ExtractionEvidenceRefV1
 from cti_app.domain.publication import (
     ArtifactType,
@@ -865,6 +871,31 @@ class PublicationDocumentV4:
                     "tier": source.tier.value,
                     "kind": source.kind.value,
                     "role": source.role.value,
+                    **(
+                        {"editorial_role": source.editorial_role.value}
+                        if source.editorial_role is not None
+                        else {}
+                    ),
+                    **(
+                        {"source_criticality": source.source_criticality.value}
+                        if source.source_criticality is not None
+                        else {}
+                    ),
+                    **(
+                        {"criticality_reason": source.criticality_reason.value}
+                        if source.criticality_reason is not None
+                        else {}
+                    ),
+                    **(
+                        {"source_collection_id": str(source.source_collection_id)}
+                        if source.source_collection_id is not None
+                        else {}
+                    ),
+                    **(
+                        {"content_sha256": source.content_sha256}
+                        if source.content_sha256 is not None
+                        else {}
+                    ),
                 }
                 for source in self.sources
             ],
@@ -1013,6 +1044,43 @@ class PublicationDocumentV4:
                 tier=json_enum(ProductionReferenceTier, item["tier"], "Source tier"),
                 kind=json_enum(ProductionReferenceKind, item["kind"], "Source kind"),
                 role=json_enum(SourceRole, item["role"], "Source role"),
+                editorial_role=(
+                    json_enum(
+                        ProductionEditorialRole,
+                        item["editorial_role"],
+                        "Source editorial role",
+                    )
+                    if item.get("editorial_role") is not None
+                    else None
+                ),
+                source_criticality=(
+                    json_enum(
+                        ProductionSourceCriticality,
+                        item["source_criticality"],
+                        "Source criticality",
+                    )
+                    if item.get("source_criticality") is not None
+                    else None
+                ),
+                criticality_reason=(
+                    json_enum(
+                        ProductionSourceCriticalityReason,
+                        item["criticality_reason"],
+                        "Source criticality reason",
+                    )
+                    if item.get("criticality_reason") is not None
+                    else None
+                ),
+                source_collection_id=(
+                    json_uuid(item["source_collection_id"], "Source collection ID")
+                    if item.get("source_collection_id") is not None
+                    else None
+                ),
+                content_sha256=(
+                    json_sha256(item["content_sha256"], "Source archive hash")
+                    if item.get("content_sha256") is not None
+                    else None
+                ),
             )
             for item in (
                 json_object(
@@ -1027,6 +1095,11 @@ class PublicationDocumentV4:
                             "tier",
                             "kind",
                             "role",
+                            "editorial_role",
+                            "source_criticality",
+                            "criticality_reason",
+                            "source_collection_id",
+                            "content_sha256",
                         }
                     ),
                     "Publication source",

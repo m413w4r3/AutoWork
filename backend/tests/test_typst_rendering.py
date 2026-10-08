@@ -26,6 +26,7 @@ from cti_app.domain.production_editorial_enrichment import (
     EnrichmentPlacementKind,
     EnrichmentPlacementV1,
 )
+from cti_app.domain.production_references import ProductionEditorialRole
 from cti_app.domain.production_synthesis import EvidenceKind, ExtractionEvidenceRefV1
 from cti_app.domain.publication import (
     ArtifactType,
@@ -236,7 +237,7 @@ def test_minimal_document_has_complete_empty_sections_and_is_deterministic(tmp_p
     assert first.source_bytes == second.source_bytes
     assert first.render_data_sha256 == second.render_data_sha256
     assert first.media_refs == ()
-    assert data["schema_version"] == ("typst-publication-model-v17-synthesis-section-headings")
+    assert data["schema_version"] == "typst-publication-model-v18-context-source-label"
     references, synthesis = data["content_sections"]
     assert references["type"] == "references"
     assert references["timeline"] == []
@@ -366,6 +367,11 @@ def test_full_mapping_preserves_text_timeline_indicators_and_optional_sources(
 ) -> None:
     renderer, bundle = _renderer(tmp_path)
     document = _full_document()
+    contextual_source = replace(document.sources[1], editorial_role=ProductionEditorialRole.CONTEXT)
+    document = replace(
+        document,
+        sources=(document.sources[0], contextual_source, document.sources[2]),
+    )
     data = json.loads(renderer.render(document, bundle).render_data_bytes)
 
     assert data["language"] == "fr"
@@ -410,7 +416,7 @@ def test_full_mapping_preserves_text_timeline_indicators_and_optional_sources(
         },
         {
             "title": None,
-            "publisher": None,
+            "publisher": "Contexte · example.test",
             "date": None,
             "url": "https://example.test/two",
         },
@@ -516,7 +522,7 @@ def test_v5_projection_maps_semantic_spans_to_closed_typst_helpers(tmp_path: Pat
     styles = {span["style"] for span in paragraph["semantic_spans"]}
     semantic_cells = table["semantic_cells"]
 
-    assert data["schema_version"] == ("typst-publication-model-v17-synthesis-section-headings")
+    assert data["schema_version"] == "typst-publication-model-v18-context-source-label"
     assert table["column_weights"] == _table_column_weights(base.tables[0])
     assert all(0.8 <= weight <= 2.4 for weight in table["column_weights"])
     assert paragraph["text"] == lead_text

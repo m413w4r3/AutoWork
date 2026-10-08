@@ -10,7 +10,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -38,7 +38,7 @@ from cti_app.domain.semantic_annotation import (
     timeline_anchor,
 )
 
-_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v17-synthesis-section-headings"
+_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v18-context-source-label"
 _PUBLICATION_RENDERER_MANIFEST = "renderer-manifest.json"
 _FRENCH_MONTH_NAMES = (
     "janvier",
@@ -484,10 +484,19 @@ def project_publication_to_typst_model(
         if spans is not None:
             item["semantic_spans"] = spans
         source_references.append(item)
+
+    def publisher_label(source: Any) -> str | None:
+        if source.editorial_role is None or source.editorial_role.value != "context":
+            return cast(str | None, source.publisher)
+        publisher = (source.publisher or "").strip() or (
+            urlsplit(source.canonical_url).hostname or "source"
+        ).removeprefix("www.")
+        return f"Contexte · {publisher}"
+
     sources = [
         {
             "title": source.title,
-            "publisher": source.publisher,
+            "publisher": publisher_label(source),
             "date": source.published_at.isoformat() if source.published_at is not None else None,
             "url": source.canonical_url,
         }

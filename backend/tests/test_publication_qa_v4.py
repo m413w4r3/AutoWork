@@ -7,6 +7,7 @@ from uuid import UUID
 import pytest
 
 from cti_app.application import publication_qa
+from cti_app.application.production_extraction import references_corpus_hash
 from cti_app.application.production_relevance import build_relevance_projection
 from cti_app.application.production_synthesis import canonical_extraction_hash
 from cti_app.application.publication_builder import (
@@ -15,13 +16,26 @@ from cti_app.application.publication_builder import (
 )
 from cti_app.application.publication_qa import qa_publication_v4, qa_publication_v5
 from cti_app.application.typst_rendering import project_publication_to_typst_model
-from cti_app.domain.production import ProductionEvidenceBasis
+from cti_app.domain.collection import CollectionState
+from cti_app.domain.discovery import SourceRole
+from cti_app.domain.production import ExtractionProfile, ProductionEvidenceBasis
 from cti_app.domain.production_extraction import (
     ExtractionIndicatorStatus,
     ExtractionIndicatorV1,
     encode_indicator_section_paths,
 )
-from cti_app.domain.production_synthesis import extraction_evidence_refs_v1
+from cti_app.domain.production_references import (
+    ProductionEditorialRole,
+    ProductionReferenceKind,
+    ProductionReferenceTier,
+)
+from cti_app.domain.production_synthesis import (
+    EvidenceKind,
+    SynthesisParagraphV1,
+    SynthesisSectionKind,
+    SynthesisSectionV1,
+    extraction_evidence_refs_v1,
+)
 from cti_app.domain.publication import ArtifactType, PublicationSectionKind, PublicationSectionV1
 from cti_app.domain.publication_document import (
     PublicationDocumentV4,
@@ -153,6 +167,117 @@ def test_v5_qa_excludes_other_case_iocs_from_publication() -> None:
     assert result["checks"]["ioc_groups_separated"] is True
     assert publication.indicators == ()
     assert publication.original_indicators == ()
+
+
+def test_context_source_round_trip_qa_and_typst_projection() -> None:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    core_source = extraction.sources[0]
+    context_id = UUID(int=23)
+    content_sha256 = "d" * 64
+    indicator = ExtractionIndicatorV1(
+        value="NanoDump",
+        artifact_type=ArtifactType.OTHER,
+        indicator_status=ExtractionIndicatorStatus.CONTEXTUAL,
+        context="NanoDump is a memory dumper.",
+        evidence_quote="NanoDump is a memory dumper.",
+        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+        source_document_ids=(context_id,),
+    )
+    context_source = replace(
+        core_source,
+        source_document_id=context_id,
+        canonical_url="https://technical.example/nanodump",
+        content_sha256=content_sha256,
+        tier=ProductionReferenceTier.TECHNICAL,
+        kind=ProductionReferenceKind.TECHNICAL_RESOURCE,
+        profile=ExtractionProfile.IOC_RULES,
+        editorial_role=ProductionEditorialRole.CONTEXT,
+        profile_reason_code=None,
+        facts=(),
+        events=(),
+        indicators=(indicator,),
+        rules=(),
+        uncertainties=(),
+    )
+    context_reference = replace(
+        references.sources[0],
+        canonical_url=context_source.canonical_url,
+        tier=ProductionReferenceTier.TECHNICAL,
+        kind=ProductionReferenceKind.TECHNICAL_RESOURCE,
+        role=SourceRole.PRIMARY,
+        title="NanoDump reference",
+        publisher="Technical Feed",
+        source_collection_id=UUID(int=123),
+        source_document_id=context_id,
+        collection_state=CollectionState.ARCHIVED,
+        content_sha256=content_sha256,
+        relevance_reason="Operator-selected additive source",
+        eligible_for_extraction=True,
+        editorial_role=ProductionEditorialRole.CONTEXT,
+    )
+    references = replace(references, sources=(*references.sources, context_reference))
+    extraction = replace(
+        extraction,
+        references_corpus_hash=references_corpus_hash(references),
+        sources=(*extraction.sources, context_source),
+    )
+    context_ref = next(
+        ref
+        for ref in extraction_evidence_refs_v1(extraction)
+        if ref.source_document_id == context_id and ref.kind is EvidenceKind.INDICATOR
+    )
+    synthesis = replace(
+        synthesis,
+        extraction_hash=canonical_extraction_hash(extraction),
+        sections=(
+            SynthesisSectionV1(
+                kind=SynthesisSectionKind.TECHNICAL,
+                heading="NanoDump",
+                paragraphs=(SynthesisParagraphV1("NanoDump is a memory dumper.", (context_ref,)),),
+            ),
+        ),
+    )
+    projection = build_relevance_projection(snapshot, extraction)
+    editorial_enrichment = _enrichment_with(extraction=extraction, synthesis=synthesis)
+    publication = build_publication_document_v5(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        relevance_projection=projection,
+        synthesis=synthesis,
+        editorial_enrichment=editorial_enrichment,
+    )
+
+    source = next(item for item in publication.sources if item.source_document_id == context_id)
+    assert source.editorial_role is ProductionEditorialRole.CONTEXT
+    assert source.source_collection_id == UUID(int=123)
+    assert source.content_sha256 == content_sha256
+    assert source.source_criticality is not None
+    assert source.criticality_reason is not None
+    qa = qa_publication_v5(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        relevance_projection=projection,
+        synthesis=synthesis,
+        editorial_enrichment=editorial_enrichment,
+        publication=publication,
+    )
+    assert qa["passed"] is True
+    assert qa["checks"]["source_provenance"] is True
+
+    restored = parse_publication_document(serialize_publication_document(publication))
+    restored_source = next(
+        item for item in restored.sources if item.source_document_id == context_id
+    )
+    assert restored_source == source
+    render_model = project_publication_to_typst_model(publication)
+    source_row = next(
+        item
+        for item in render_model.content_sections[0]["sources"]
+        if item["url"] == context_source.canonical_url
+    )
+    assert source_row["publisher"] == "Contexte · Technical Feed"
 
 
 def test_table_cell_and_diagram_asset_tampering_fail() -> None:

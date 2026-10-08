@@ -1588,6 +1588,112 @@ export type TargetedEditorialRevisionOperation =
 export type TargetedEditorialRevisionMode =
   "existing_evidence_only" | "allow_source_extension";
 
+export type EvidenceUseScope = "tool_context" | "actor_activity";
+
+export type SourceAdditionOrigin = "discovery" | "operator_url" | "manual_archive";
+export type SourceAdditionState =
+  | "candidate"
+  | "selected"
+  | "archived"
+  | "extracted"
+  | "ready"
+  | "refused";
+
+export interface SourceAdditionManifestEntry {
+  addition_id: string;
+  url: string;
+  final_url: string | null;
+  encoded_sha256: string | null;
+  decoded_sha256: string | null;
+  collection_id: string | null;
+  source_document_id: string | null;
+  checkpoint_id: string | null;
+  extraction_id: string | null;
+  model_run_id: string | null;
+  evidence_handles: Array<{
+    source_document_id: string;
+    kind: string;
+    evidence_key: string;
+  }>;
+  origin: SourceAdditionOrigin;
+  title: string | null;
+  publisher: string | null;
+  published_at: string | null;
+  tier: string;
+  kind: string;
+  role: string;
+  editorial_role: string;
+  criticality: string | null;
+  criticality_reason: string | null;
+  criticality_policy_version: string;
+  selection_criterion: string | null;
+  selection_criterion_version: string | null;
+  selected_by: string | null;
+  extraction_profile: string | null;
+  profile_reason_code: string | null;
+  reuse_state: string | null;
+  extraction_profile_policy_version: string;
+  checkpoint_contract_version: string | null;
+  checkpoint_prompt_version: string | null;
+  checkpoint_parser_version: string | null;
+  checkpoint_verifier_version: string | null;
+  source_text_contract_version: string | null;
+  model_policy_version: string | null;
+  routing_policy_version: string | null;
+  collection_policy_snapshot_id: string | null;
+}
+
+export interface SourceAdditionBlocker {
+  source_url: string;
+  repair_key: string;
+  criticality: string;
+  criticality_reason: string;
+  failure_code: string | null;
+  reason: string;
+}
+
+export interface SourceAdditionCandidateRequest {
+  production_run_id: string;
+  request_id: string;
+  url: string;
+  origin?: SourceAdditionOrigin;
+  title?: string | null;
+  publisher?: string | null;
+  published_at?: string | null;
+  kind?: string;
+  role?: string;
+}
+
+export interface SourceAdditionSelectionRequest {
+  production_run_id: string;
+  request_id: string;
+  url: string;
+  criterion: string;
+  criterion_version?: string | null;
+}
+
+export interface SourceAdditionAcquireRequest {
+  production_run_id: string;
+  request_id: string;
+  url: string;
+  job_id?: string | null;
+  manual_content_base64?: string | null;
+  declared_mime_type?: string | null;
+  final_url?: string | null;
+}
+
+export interface SourceAdditionOperationResponse {
+  addition: Record<string, unknown>;
+  model_calls?: number;
+  reused_checkpoints?: number;
+  refusal?: {
+    code: string;
+    recommended_restart_stage: ProductionStage | null;
+    reason: string;
+    details: Record<string, string>;
+  } | null;
+}
+
 export type TargetedEditorialRevisionTargetKind =
   | "title"
   | "lead"
@@ -1627,6 +1733,9 @@ export interface TargetedEditorialRevisionRequest {
   operation: TargetedEditorialRevisionOperation;
   instruction: string;
   mode: TargetedEditorialRevisionMode;
+  source_addition_request_id?: string | null;
+  source_additions_hash?: string | null;
+  before_hash?: string | null;
 }
 
 export interface TargetedEditorialRevisionPreview {
@@ -1641,6 +1750,18 @@ export interface TargetedEditorialRevisionPreview {
   source_extension: boolean;
   expected_model_calls: number;
   enrichment_rebase: string;
+  before_hash: string | null;
+  source_additions: SourceAdditionManifestEntry[];
+  source_additions_hash: string | null;
+  source_addition_ready: boolean | null;
+  source_addition_blockers: SourceAdditionBlocker[];
+  expected_model_calls_by_stage: Record<
+    string,
+    { made?: number; remaining?: number; checkpoint_reuses?: number }
+  > | null;
+  stages_rebased: string[];
+  historical_artifacts_preserved: boolean;
+  refusal: TargetedEditorialRevisionRefusal | null;
 }
 
 export type TargetedEditorialRevisionRefusalCode =
@@ -1670,7 +1791,9 @@ export interface TargetedEditorialRevisionLineageEntry {
   validator_version: string;
   evidence_refs: unknown[];
   evidence_handles: string[];
-  source_additions: unknown[];
+  claim_scopes?: EvidenceUseScope[];
+  source_additions: SourceAdditionManifestEntry[];
+  source_additions_hash?: string | null;
   before_hash: string;
   after_hash: string;
   rationale: string;
@@ -1696,6 +1819,7 @@ export interface TargetedEditorialRevisionProvenance {
   origin: "initial" | "inherited" | "revision";
   artifact_id: string;
   revision_id: string | null;
+  source_document_ids?: string[];
 }
 
 export interface TargetedEditorialRevisionLineage {
@@ -1704,6 +1828,39 @@ export interface TargetedEditorialRevisionLineage {
   revisions: TargetedEditorialRevisionLineageEntry[];
   paragraph_provenance: Record<string, TargetedEditorialRevisionProvenance>;
   element_provenance: Record<string, TargetedEditorialRevisionProvenance>;
+}
+
+export async function recordSourceAdditionCandidate(
+  subjectId: string,
+  body: SourceAdditionCandidateRequest,
+): Promise<SourceAdditionOperationResponse> {
+  return request(`/api/subjects/${subjectId}/production/source-additions/candidates`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export async function selectSourceAddition(
+  subjectId: string,
+  body: SourceAdditionSelectionRequest,
+): Promise<SourceAdditionOperationResponse> {
+  return request(`/api/subjects/${subjectId}/production/source-additions/select`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export async function acquireSourceAddition(
+  subjectId: string,
+  body: SourceAdditionAcquireRequest,
+): Promise<SourceAdditionOperationResponse> {
+  return request(`/api/subjects/${subjectId}/production/source-additions/acquire`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
 }
 
 export async function previewTargetedEditorialRevision(

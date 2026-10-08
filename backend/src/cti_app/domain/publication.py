@@ -9,7 +9,13 @@ from enum import StrEnum
 from uuid import UUID
 
 from cti_app.domain.discovery import SourceRole, canonicalize_http_url
-from cti_app.domain.production_references import ProductionReferenceKind, ProductionReferenceTier
+from cti_app.domain.production_references import (
+    ProductionEditorialRole,
+    ProductionReferenceKind,
+    ProductionReferenceTier,
+    ProductionSourceCriticality,
+    ProductionSourceCriticalityReason,
+)
 
 
 class ArtifactType(StrEnum):
@@ -324,6 +330,11 @@ class PublicationSourceV1:
     tier: ProductionReferenceTier
     kind: ProductionReferenceKind
     role: SourceRole
+    editorial_role: ProductionEditorialRole | None = None
+    source_criticality: ProductionSourceCriticality | None = None
+    criticality_reason: ProductionSourceCriticalityReason | None = None
+    source_collection_id: UUID | None = None
+    content_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.source_document_id, UUID):
@@ -340,6 +351,29 @@ class PublicationSourceV1:
             raise ValueError("Publication source kind is invalid")
         if not isinstance(self.role, SourceRole):
             raise ValueError("Publication source role is invalid")
+        if self.editorial_role is not None and not isinstance(
+            self.editorial_role, ProductionEditorialRole
+        ):
+            raise ValueError("Publication source editorial role is invalid")
+        if self.source_criticality is not None and not isinstance(
+            self.source_criticality, ProductionSourceCriticality
+        ):
+            raise ValueError("Publication source criticality is invalid")
+        if self.criticality_reason is not None and not isinstance(
+            self.criticality_reason, ProductionSourceCriticalityReason
+        ):
+            raise ValueError("Publication source criticality reason is invalid")
+        if (self.source_criticality is None) != (self.criticality_reason is None):
+            raise ValueError("Publication source criticality requires its reason")
+        if self.source_collection_id is not None and not isinstance(
+            self.source_collection_id, UUID
+        ):
+            raise ValueError("Publication source collection identity is invalid")
+        if (
+            self.content_sha256 is not None
+            and _PUBLICATION_EVIDENCE_SHA256.fullmatch(self.content_sha256) is None
+        ):
+            raise ValueError("Publication source archive hash is invalid")
         if self.title is not None and not isinstance(self.title, str):
             raise ValueError("Publication source title must be text or None")
         if self.publisher is not None and not isinstance(self.publisher, str):

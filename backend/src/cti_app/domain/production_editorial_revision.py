@@ -44,6 +44,13 @@ class TargetedEditorialRevisionMode(StrEnum):
     ALLOW_SOURCE_EXTENSION = "allow_source_extension"
 
 
+class EvidenceUseScope(StrEnum):
+    """Permitted subject attribution for one claim in a revision patch."""
+
+    TOOL_CONTEXT = "tool_context"
+    ACTOR_ACTIVITY = "actor_activity"
+
+
 class TargetedEditorialRevisionTargetKind(StrEnum):
     TITLE = "title"
     LEAD = "lead"
@@ -210,6 +217,9 @@ class TargetedEditorialRevisionRequest:
     instruction: str
     mode: TargetedEditorialRevisionMode
     requester: str
+    source_addition_request_id: UUID | None = None
+    source_additions_hash: str | None = None
+    before_hash: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -283,3 +283,24 @@ Krypt3ia bloquée est à traiter à REFERENCES avant l’extension NanoDump.
 - E2a-1 n’ajoute pas l’UI/API HTTP, la révision narrative, les scopes de claim,
   l’enrichissement ou la publication. Ces changements restent dans les
   livraisons suivantes et leurs fichiers réservés.
+
+## E2a-2 : décisions d’implémentation
+
+- L’application publique compose `promote_in_uow` et
+  `ProductionSynthesisRevisionService.revise_in_uow` dans le même UoW, puis
+  commit une seule fois. La révision revérifie les fences de base et le hash
+  du manifeste, n’adopte que l’extraction promue et refuse toute différence
+  hors cible; une erreur annule les artefacts promus et la synthèse ensemble.
+- Le preview combine le plan READY de l’addition, les bloqueurs D recalculés,
+  les versions prospectives et les appels restants. La source ajoutée fournit
+  seulement `TOOL_CONTEXT`; chaque claim du patch déclare son scope et
+  `ACTOR_ACTIVITY` exige un handle subject-scoped.
+- La lineage de révision conserve le manifeste complet et chaque paragraphe
+  conserve son artifact d’origine. La publication projette rôle, criticité,
+  raison et identité archive/document/hash; le contrat de rendu est
+  versionné et les champs ajoutés restent optionnels à la lecture des anciens
+  artifacts.
+- L’API expose uniquement sélection/acquisition, preview et apply. Le rebuild
+  publication/QA reste sans modèle; l’enrichissement est rebasé uniquement
+  après revalidation des ancres et handles, sinon ses blocs dépendants sont
+  stale.

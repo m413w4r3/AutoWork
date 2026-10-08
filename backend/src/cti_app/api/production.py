@@ -4,7 +4,7 @@ import base64
 import binascii
 import hashlib
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Annotated, Any, Literal, NoReturn, cast
 from uuid import UUID
 
@@ -30,6 +30,7 @@ from cti_app.application.production_enrichment_revision import (
     EditorialEnrichmentRevisionValidationError,
     ProductionEditorialEnrichmentRevisionService,
 )
+from cti_app.application.production_extraction import ProductionExtractionService
 from cti_app.application.production_jobs import (
     PRODUCTION_STAGE_MAX_ATTEMPTS,
     ProductionBatchPausedError,
@@ -80,6 +81,11 @@ from cti_app.application.production_resume import (
     plan_production_resume,
 )
 from cti_app.application.production_review_recovery import ReviewRecoveryConflictError
+from cti_app.application.production_source_additions import (
+    SourceAdditionConflictError,
+    SourceAdditionError,
+    SourceAdditionService,
+)
 from cti_app.application.production_stage_status import (
     build_stage_statuses,
     completed_stage_count,
@@ -106,6 +112,7 @@ from cti_app.application.subject_production import (
     StaleEditionProductionBatchError,
     SubjectProductionService,
 )
+from cti_app.domain.discovery import SourceRole
 from cti_app.domain.editions import EditionStatus
 from cti_app.domain.entities import Subject
 from cti_app.domain.jobs import JobStatus
@@ -140,6 +147,11 @@ from cti_app.domain.production_editorial_revision import (
     TargetedEditorialRevisionTargetKind,
 )
 from cti_app.domain.production_pipeline import production_artifact_stages
+from cti_app.domain.production_references import ProductionReferenceKind
+from cti_app.domain.production_source_additions import (
+    SourceAdditionOrigin,
+    source_addition_to_json,
+)
 from cti_app.domain.publication import is_publication_ioc_artifact_type
 from cti_app.domain.selection import SubjectDiscoveryOrigin
 from cti_app.infrastructure.analytic_chart_renderer import AnalyticChartRenderer
@@ -212,6 +224,9 @@ class TargetedEditorialRevisionRequestBody(BaseModel):
     operation: TargetedEditorialRevisionOperation
     instruction: StrictStr = Field(min_length=1, max_length=2000)
     mode: TargetedEditorialRevisionMode = TargetedEditorialRevisionMode.EXISTING_EVIDENCE_ONLY
+    source_addition_request_id: UUID | None = None
+    source_additions_hash: _Sha256String | None = None
+    before_hash: _Sha256String | None = None
 
 
 class TargetedEditorialRevisionPreviewResponse(BaseModel):
@@ -226,6 +241,51 @@ class TargetedEditorialRevisionPreviewResponse(BaseModel):
     source_extension: bool
     expected_model_calls: int
     enrichment_rebase: str
+    before_hash: str | None = None
+    source_additions: list[dict[str, Any]] = Field(default_factory=list)
+    source_additions_hash: str | None = None
+    source_addition_ready: bool | None = None
+    source_addition_blockers: list[dict[str, Any]] = Field(default_factory=list)
+    expected_model_calls_by_stage: dict[str, dict[str, int]] | None = None
+    stages_rebased: list[str] = Field(default_factory=list)
+    historical_artifacts_preserved: bool = True
+    refusal: dict[str, Any] | None = None
+
+
+class SourceAdditionCandidateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    production_run_id: UUID
+    request_id: UUID
+    url: StrictStr
+    origin: SourceAdditionOrigin = SourceAdditionOrigin.OPERATOR_URL
+    title: StrictStr | None = None
+    publisher: StrictStr | None = None
+    published_at: date | None = None
+    kind: ProductionReferenceKind = ProductionReferenceKind.TECHNICAL_RESOURCE
+    role: SourceRole = SourceRole.UNKNOWN
+
+
+class SourceAdditionSelectionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    production_run_id: UUID
+    request_id: UUID
+    url: StrictStr
+    criterion: StrictStr = Field(min_length=1, max_length=1000)
+    criterion_version: StrictStr | None = Field(default=None, max_length=120)
+
+
+class SourceAdditionAcquireRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    production_run_id: UUID
+    request_id: UUID
+    url: StrictStr
+    job_id: UUID | None = None
+    manual_content_base64: StrictStr | None = None
+    declared_mime_type: StrictStr | None = None
+    final_url: StrictStr | None = None
 
 
 class TargetedEditorialRevisionResponse(BaseModel):
@@ -582,6 +642,33 @@ def _production_enrichment_revision_service(
     )
 
 
+def _production_source_addition_service(request: Request) -> SourceAdditionService:
+    artifact_store = getattr(request.app.state, "production_artifact_store", None)
+    collection_service = getattr(request.app.state, "collection_service", None)
+    model_gateway = getattr(request.app.state, "model_gateway", None)
+    uow_factory = getattr(request.app.state, "uow_factory", None)
+    if (
+        artifact_store is None
+        or collection_service is None
+        or model_gateway is None
+        or uow_factory is None
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "source_addition_service_unavailable"},
+        )
+    return SourceAdditionService(
+        uow_factory=uow_factory,
+        collection_service=collection_service,
+        extraction_service=ProductionExtractionService(
+            uow_factory=uow_factory,
+            model_gateway=model_gateway,
+            artifact_store=artifact_store,
+        ),
+        artifact_store=artifact_store,
+    )
+
+
 def _production_synthesis_revision_service(
     request: Request,
 ) -> ProductionSynthesisRevisionService:
@@ -603,12 +690,18 @@ def _production_synthesis_revision_service(
         model_gateway=model_gateway,
         synthesis_service=synthesis_persistence,
     )
+    source_addition_service = (
+        _production_source_addition_service(request)
+        if getattr(request.app.state, "collection_service", None) is not None
+        else None
+    )
     return ProductionSynthesisRevisionService(
         synthesis_service=synthesis_service,
         synthesis_persistence=synthesis_persistence,
         enrichment_persistence=EditorialEnrichmentService(uow_factory, artifact_store),
         publication_render_service=render_service,
         enrichment_revision_service=_production_enrichment_revision_service(request),
+        source_addition_service=source_addition_service,
         resource_search_enabled=get_settings().production_editorial_resource_search_enabled,
     )
 
@@ -2984,7 +3077,141 @@ def _targeted_revision_domain_request(
         instruction=payload.instruction,
         mode=payload.mode,
         requester=requester,
+        source_addition_request_id=payload.source_addition_request_id,
+        source_additions_hash=(
+            str(payload.source_additions_hash)
+            if payload.source_additions_hash is not None
+            else None
+        ),
+        before_hash=str(payload.before_hash) if payload.before_hash is not None else None,
     )
+
+
+async def _require_current_source_addition_run(
+    request: Request, subject_id: UUID, production_run_id: UUID
+) -> None:
+    async with request.app.state.uow_factory() as uow:
+        run = await uow.production_runs.get_current_for_subject(subject_id)
+    if run is None or run.id != production_run_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "source_addition_run_not_current"},
+        )
+
+
+@router.post("/subjects/{subject_id}/production/source-additions/candidates")
+async def record_source_addition_candidate(
+    subject_id: UUID, payload: SourceAdditionCandidateRequest, request: Request
+) -> dict[str, Any]:
+    await _require_current_source_addition_run(request, subject_id, payload.production_run_id)
+    service = _production_source_addition_service(request)
+    try:
+        addition = await service.record_candidate(
+            production_run_id=payload.production_run_id,
+            request_id=payload.request_id,
+            url=payload.url,
+            origin=payload.origin,
+            title=payload.title,
+            publisher=payload.publisher,
+            published_at=payload.published_at,
+            kind=payload.kind,
+            role=payload.role,
+        )
+    except SourceAdditionConflictError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": exc.code, "message": str(exc)},
+        ) from exc
+    except (SourceAdditionError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={"code": str(exc) or "source_addition_candidate_invalid"},
+        ) from exc
+    return {"addition": source_addition_to_json(addition)}
+
+
+@router.post("/subjects/{subject_id}/production/source-additions/select")
+async def select_source_addition(
+    subject_id: UUID, payload: SourceAdditionSelectionRequest, request: Request
+) -> dict[str, Any]:
+    await _require_current_source_addition_run(request, subject_id, payload.production_run_id)
+    service = _production_source_addition_service(request)
+    try:
+        addition = await service.select(
+            production_run_id=payload.production_run_id,
+            request_id=payload.request_id,
+            url=payload.url,
+            criterion=payload.criterion,
+            actor_id=await _actor_id(request),
+            criterion_version=payload.criterion_version,
+        )
+    except SourceAdditionConflictError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": exc.code, "message": str(exc)},
+        ) from exc
+    except (SourceAdditionError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={"code": str(exc) or "source_addition_selection_invalid"},
+        ) from exc
+    return {"addition": source_addition_to_json(addition)}
+
+
+@router.post("/subjects/{subject_id}/production/source-additions/acquire")
+async def acquire_source_addition(
+    subject_id: UUID, payload: SourceAdditionAcquireRequest, request: Request
+) -> dict[str, Any]:
+    await _require_current_source_addition_run(request, subject_id, payload.production_run_id)
+    manual_content = None
+    if payload.manual_content_base64 is not None:
+        try:
+            manual_content = base64.b64decode(payload.manual_content_base64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail={"code": "source_addition_manual_archive_base64_invalid"},
+            ) from exc
+    service = _production_source_addition_service(request)
+    try:
+        result = await service.acquire(
+            production_run_id=payload.production_run_id,
+            request_id=payload.request_id,
+            url=payload.url,
+            job_id=payload.job_id,
+            manual_content=manual_content,
+            declared_mime_type=payload.declared_mime_type,
+            final_url=payload.final_url,
+        )
+    except SourceAdditionConflictError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": exc.code, "message": str(exc)},
+        ) from exc
+    except (SourceAdditionError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={"code": str(exc) or "source_addition_acquisition_invalid"},
+        ) from exc
+    return {
+        "addition": source_addition_to_json(result.addition),
+        "model_calls": result.model_calls,
+        "reused_checkpoints": result.reused_checkpoints,
+        "refusal": (
+            {
+                "code": result.refusal.code.value,
+                "recommended_restart_stage": (
+                    result.refusal.recommended_restart_stage.value
+                    if result.refusal.recommended_restart_stage is not None
+                    else None
+                ),
+                "reason": result.refusal.reason,
+                "details": dict(result.refusal.details),
+            }
+            if result.refusal is not None
+            else None
+        ),
+    }
 
 
 @router.post(
@@ -3007,6 +3234,16 @@ async def preview_targeted_synthesis_revision(
             status_code=status.HTTP_409_CONFLICT,
             detail={"code": exc.code, "message": str(exc)},
         ) from exc
+    except SourceAdditionConflictError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": exc.code, "message": str(exc)},
+        ) from exc
+    except SourceAdditionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={"code": exc.code, "message": str(exc)},
+        ) from exc
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -3024,6 +3261,19 @@ async def preview_targeted_synthesis_revision(
         source_extension=preview.source_extension,
         expected_model_calls=preview.expected_model_calls,
         enrichment_rebase=preview.enrichment_rebase,
+        before_hash=preview.before_hash,
+        source_additions=[dict(item) for item in preview.source_additions],
+        source_additions_hash=preview.source_additions_hash,
+        source_addition_ready=preview.source_addition_ready,
+        source_addition_blockers=[dict(item) for item in preview.source_addition_blockers],
+        expected_model_calls_by_stage=(
+            {key: dict(value) for key, value in preview.expected_model_calls_by_stage.items()}
+            if preview.expected_model_calls_by_stage is not None
+            else None
+        ),
+        stages_rebased=list(preview.stages_rebased),
+        historical_artifacts_preserved=preview.historical_artifacts_preserved,
+        refusal=preview.refusal.to_json() if preview.refusal is not None else None,
     )
 
 
@@ -3043,6 +3293,11 @@ async def revise_synthesis_artifact(
     try:
         result = await service.revise(domain_request)
     except TargetedEditorialRevisionConflictError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": exc.code, "message": str(exc)},
+        ) from exc
+    except SourceAdditionConflictError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={"code": exc.code, "message": str(exc)},

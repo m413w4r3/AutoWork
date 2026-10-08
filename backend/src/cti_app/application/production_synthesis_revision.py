@@ -29,6 +29,13 @@ from cti_app.application.production_prompts import (
     SYNTHESIS_TARGETED_REVISION_PROMPT_VERSION,
 )
 from cti_app.application.production_references import production_reference_corpus_from_json
+from cti_app.application.production_source_additions import (
+    SourceAdditionConflictError,
+    SourceAdditionError,
+    SourceAdditionPromotionBlockedError,
+    SourceAdditionPromotionResult,
+    SourceAdditionService,
+)
 from cti_app.application.production_stages import EditorialEnrichmentService, SynthesisService
 from cti_app.application.production_synthesis import (
     ProductionSynthesisService,
@@ -43,6 +50,7 @@ from cti_app.application.production_synthesis import (
     parse_synthesis_proposal_wire,
     synthesis_access_policy_hash,
     synthesis_evidence_pack_hash,
+    synthesis_input_hash,
     validate_synthesis_proposal,
 )
 from cti_app.application.publication_assembly import PublicationAssemblyService
@@ -62,6 +70,7 @@ from cti_app.domain.production_editorial_enrichment import (
     editorial_enrichment_to_json,
 )
 from cti_app.domain.production_editorial_revision import (
+    EvidenceUseScope,
     TargetedEditorialRevisionConflictError,
     TargetedEditorialRevisionMode,
     TargetedEditorialRevisionOperation,
@@ -75,8 +84,10 @@ from cti_app.domain.production_extraction import (
     ProductionExtractionOmissionReason,
     ProductionExtractionV1,
     is_production_extraction_hash,
+    production_extraction_from_json,
 )
 from cti_app.domain.production_references import (
+    ProductionEditorialRole,
     ProductionReferenceCorpusV1,
     ProductionSourceCriticality,
     production_source_criticality,
@@ -93,8 +104,8 @@ from cti_app.domain.production_synthesis import (
     validate_synthesis_section_headings,
 )
 
-TARGETED_SYNTHESIS_REVISION_PARSER_VERSION = "targeted-synthesis-patch-parser-v1"
-TARGETED_SYNTHESIS_REVISION_VALIDATOR_VERSION = "targeted-synthesis-patch-validator-v1"
+TARGETED_SYNTHESIS_REVISION_PARSER_VERSION = "targeted-synthesis-patch-parser-v2-claim-scope"
+TARGETED_SYNTHESIS_REVISION_VALIDATOR_VERSION = "targeted-synthesis-patch-validator-v2-source-scope"
 MAX_TARGETED_REVISION_INSTRUCTION_LENGTH = 2000
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _OUTER_WIRE_BLOCK = re.compile(
@@ -125,6 +136,15 @@ class TargetedSynthesisRevisionPreview:
     source_extension: bool
     expected_model_calls: int
     enrichment_rebase: str
+    before_hash: str | None = None
+    source_additions: tuple[Mapping[str, Any], ...] = ()
+    source_additions_hash: str | None = None
+    source_addition_ready: bool | None = None
+    source_addition_blockers: tuple[Mapping[str, Any], ...] = ()
+    expected_model_calls_by_stage: Mapping[str, Mapping[str, int]] | None = None
+    stages_rebased: tuple[str, ...] = ()
+    historical_artifacts_preserved: bool = True
+    refusal: TargetedEditorialRevisionRefusal | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -504,6 +524,8 @@ def _parse_after_claims(
     evidence_pack: SynthesisEvidencePackV1,
     extraction: ProductionExtractionV1,
     unchanged_lead_wire: str = "",
+    source_addition_document_ids: frozenset[UUID] = frozenset(),
+    require_claim_scopes: bool = False,
 ) -> tuple[SynthesisProposalV1, tuple[SynthesisParagraphV1, ...], tuple[SynthesisSectionV1, ...]]:
     synthetic_lead = not re.search(r"(?im)^\s*@@\s*LEAD\s*@@", raw)
     parse_input = f"{unchanged_lead_wire}\n{raw}" if synthetic_lead else raw
@@ -524,6 +546,9 @@ def _parse_after_claims(
         parsed.proposal,
         evidence_pack,
         check_lead=not synthetic_lead,
+        extraction=extraction,
+        source_addition_document_ids=source_addition_document_ids,
+        require_claim_scopes=require_claim_scopes,
     )
     try:
         lead, sections = validate_synthesis_proposal(parsed.proposal, evidence_pack, extraction)
@@ -567,6 +592,9 @@ def _assert_claim_handles_and_relations_supported(
     evidence_pack: SynthesisEvidencePackV1,
     *,
     check_lead: bool = True,
+    extraction: ProductionExtractionV1 | None = None,
+    source_addition_document_ids: frozenset[UUID] = frozenset(),
+    require_claim_scopes: bool = False,
 ) -> None:
     records = {
         str(record["handle"]): record
@@ -580,9 +608,54 @@ def _assert_claim_handles_and_relations_supported(
         *(proposal.lead if check_lead else ()),
         *(claim for section in proposal.sections for claim in section.claims),
     ]
+    source_by_id = (
+        {source.source_document_id: source for source in extraction.sources}
+        if extraction is not None
+        else {}
+    )
     for claim in claims:
         if any(handle not in evidence_pack._handle_to_ref for handle in claim.evidence_handles):
             raise TargetedSynthesisRevisionValidationError("synthesis_unknown_evidence")
+        if require_claim_scopes:
+            try:
+                claim_scope = EvidenceUseScope(claim.claim_scope or "")
+            except ValueError as exc:
+                raise TargetedSynthesisRevisionValidationError(
+                    "revision_claim_scope_missing_or_invalid"
+                ) from exc
+            referenced_ids = {
+                evidence_pack.resolve_handle(handle).source_document_id
+                for handle in claim.evidence_handles
+            }
+            context_ids = {
+                source_id
+                for source_id in referenced_ids
+                if source_id in source_addition_document_ids
+                and source_by_id.get(source_id) is not None
+                and source_by_id[source_id].editorial_role is ProductionEditorialRole.CONTEXT
+            }
+            subject_scoped_ids = {
+                evidence_pack.resolve_handle(handle).source_document_id
+                for handle in claim.evidence_handles
+                if handle in evidence_pack._subject_scoped_handles
+                and evidence_pack.resolve_handle(handle).source_document_id
+                not in source_addition_document_ids
+            }
+            if claim_scope is EvidenceUseScope.TOOL_CONTEXT and (
+                not context_ids or referenced_ids != context_ids
+            ):
+                raise TargetedSynthesisRevisionValidationError(
+                    "revision_tool_context_scope_mismatch"
+                )
+            if claim_scope is EvidenceUseScope.ACTOR_ACTIVITY:
+                if context_ids:
+                    raise TargetedSynthesisRevisionValidationError(
+                        "revision_tool_context_cannot_support_actor_activity"
+                    )
+                if not subject_scoped_ids:
+                    raise TargetedSynthesisRevisionValidationError(
+                        "revision_actor_activity_requires_subject_evidence"
+                    )
         evidence_text = " ".join(
             str(value)
             for handle in claim.evidence_handles
@@ -661,12 +734,13 @@ def _assert_non_target_unchanged(
     target: TargetedEditorialRevisionTarget,
     operation: TargetedEditorialRevisionOperation,
     resolved: _ResolvedTarget,
+    *,
+    allow_extraction_hash_change: bool = False,
 ) -> None:
-    always_preserved = (
+    always_preserved: tuple[str, ...] = (
         "schema_version",
         "subject_id",
         "production_input_hash",
-        "extraction_hash",
         "publication_language",
         "synthesis_policy_version",
         "timeline",
@@ -674,6 +748,8 @@ def _assert_non_target_unchanged(
         "uncertainties",
         "warnings",
     )
+    if not allow_extraction_hash_change:
+        always_preserved = (*always_preserved[:3], "extraction_hash", *always_preserved[3:])
     if any(
         _canonical_bytes(before[key]) != _canonical_bytes(after[key]) for key in always_preserved
     ):
@@ -792,6 +868,8 @@ def _apply_wire_patch(
     evidence_pack: SynthesisEvidencePackV1,
     extraction: ProductionExtractionV1,
     snapshot: ProductionInputSnapshot,
+    source_addition_document_ids: frozenset[UUID] = frozenset(),
+    require_claim_scopes: bool = False,
 ) -> tuple[ProductionSynthesisV1, dict[str, Any], str]:
     resolved = _resolve_target(base_payload, target, operation)
     if patch.before_hash != resolved.before_hash:
@@ -855,6 +933,8 @@ def _apply_wire_patch(
             evidence_pack=evidence_pack,
             extraction=extraction,
             unchanged_lead_wire=_unchanged_lead_wire(base_synthesis, evidence_pack),
+            source_addition_document_ids=source_addition_document_ids,
+            require_claim_scopes=require_claim_scopes,
         )
         if operation is TargetedEditorialRevisionOperation.REWRITE_LEAD:
             if not parsed_lead or parsed_sections:
@@ -973,6 +1053,7 @@ class ProductionSynthesisRevisionService:
         enrichment_persistence: EditorialEnrichmentService,
         publication_render_service: PublicationRenderService,
         enrichment_revision_service: Any | None = None,
+        source_addition_service: SourceAdditionService | None = None,
         resource_search_enabled: bool = False,
     ) -> None:
         self._synthesis = synthesis_service
@@ -980,6 +1061,7 @@ class ProductionSynthesisRevisionService:
         self._enrichment_persistence = enrichment_persistence
         self._publication_render_service = publication_render_service
         self._enrichment_revision_service = enrichment_revision_service
+        self._source_addition_service = source_addition_service
         self._resource_search_enabled = resource_search_enabled
 
     async def preview(
@@ -998,7 +1080,135 @@ class ProductionSynthesisRevisionService:
         context = await self._load_context(request)
         resolved = _resolve_target(context.base_payload, request.target, request.operation)
         if request.mode is TargetedEditorialRevisionMode.ALLOW_SOURCE_EXTENSION:
-            calls = 0
+            addition_preview = None
+            preview_refusal = None
+            if self._source_addition_service is None or request.source_addition_request_id is None:
+                preview_refusal = TargetedEditorialRevisionRefusal(
+                    code=TargetedEditorialRevisionRefusalCode.REVISION_NOT_APPLICABLE,
+                    recommended_restart_stage=ProductionStage.REFERENCES,
+                    reason="A source addition request is required before extension preview.",
+                )
+            else:
+                addition_preview = await self._source_addition_service.preview(
+                    production_run_id=context.run.id,
+                    request_id=request.source_addition_request_id,
+                )
+                if request.before_hash is not None and request.before_hash != resolved.before_hash:
+                    preview_refusal = TargetedEditorialRevisionRefusal(
+                        code=TargetedEditorialRevisionRefusalCode.REVISION_NOT_APPLICABLE,
+                        recommended_restart_stage=ProductionStage.SYNTHESIS,
+                        reason="The target changed after the preview fences were captured.",
+                    )
+                elif (
+                    request.source_additions_hash is not None
+                    and request.source_additions_hash != addition_preview.source_additions_hash
+                ):
+                    preview_refusal = TargetedEditorialRevisionRefusal(
+                        code=TargetedEditorialRevisionRefusalCode.REVISION_NOT_APPLICABLE,
+                        recommended_restart_stage=ProductionStage.REFERENCES,
+                        reason="The source addition manifest changed after preview.",
+                    )
+            calls_by_stage = (
+                {key: dict(value) for key, value in addition_preview.model_calls.items()}
+                if addition_preview is not None
+                else {}
+            )
+            calls = (
+                int(calls_by_stage.get("addition_extraction", {}).get("remaining", 0))
+                if addition_preview is not None
+                else 0
+            )
+            if addition_preview is not None and addition_preview.ready and not preview_refusal:
+                effective_request = replace(
+                    request,
+                    source_additions_hash=addition_preview.source_additions_hash,
+                    before_hash=resolved.before_hash,
+                )
+                identity = _sha256(self._request_identity_payload(effective_request))
+                model_run_id = uuid5(NAMESPACE_URL, f"targeted-synthesis-model-run:{identity}")
+                existing_run = await self._synthesis._model_gateway.get_run(model_run_id)
+                revision_calls = 0 if existing_run is not None else 1
+                calls_by_stage["synthesis_revision"] = {
+                    "made": 0,
+                    "remaining": revision_calls,
+                }
+                calls += revision_calls
+            else:
+                calls_by_stage["synthesis_revision"] = {"made": 0, "remaining": 0}
+            if addition_preview is not None and addition_preview.blockers:
+                preview_refusal = TargetedEditorialRevisionRefusal(
+                    code=TargetedEditorialRevisionRefusalCode.REVISION_NOT_APPLICABLE,
+                    recommended_restart_stage=ProductionStage.REFERENCES,
+                    reason=(
+                        "Une source critique est bloquée; la promotion attend sa réparation "
+                        "ou une décision D effective."
+                    ),
+                )
+            elif (
+                addition_preview is not None and not addition_preview.ready and not preview_refusal
+            ):
+                preview_refusal = TargetedEditorialRevisionRefusal(
+                    code=TargetedEditorialRevisionRefusalCode.REVISION_NOT_APPLICABLE,
+                    recommended_restart_stage=ProductionStage.REFERENCES,
+                    reason=(
+                        "Aucune addition READY n'est disponible; terminez l'archivage "
+                        "et l'extraction."
+                    ),
+                )
+            return TargetedSynthesisRevisionPreview(
+                base_artifact_id=context.base_artifact.id,
+                base_version=context.base_artifact.version,
+                base_input_hash=context.base_artifact.input_hash,
+                base_canonical_sha256=request.base_canonical_sha256,
+                target_path=resolved.path,
+                stages_preserved=(
+                    "production_input_snapshot",
+                    "old_source_checkpoints",
+                    "historical_references_extraction_projection",
+                ),
+                stages_invalidated=(ProductionArtifactStage.PUBLICATION.value,),
+                stages_conditionally_rebased=(ProductionArtifactStage.EDITORIAL_ENRICHMENT.value,),
+                source_extension=True,
+                expected_model_calls=calls,
+                enrichment_rebase=(
+                    "revalidate_anchors_and_evidence; adopt if valid, otherwise stale"
+                ),
+                before_hash=resolved.before_hash,
+                source_additions=(
+                    addition_preview.source_additions if addition_preview is not None else ()
+                ),
+                source_additions_hash=(
+                    addition_preview.source_additions_hash if addition_preview is not None else None
+                ),
+                source_addition_ready=(
+                    addition_preview.ready if addition_preview is not None else False
+                ),
+                source_addition_blockers=(
+                    tuple(
+                        {
+                            "source_url": blocker.source_url,
+                            "repair_key": blocker.repair_key,
+                            "criticality": blocker.criticality.value,
+                            "criticality_reason": blocker.criticality_reason.value,
+                            "failure_code": blocker.failure_code,
+                            "reason": blocker.reason,
+                        }
+                        for blocker in addition_preview.blockers
+                    )
+                    if addition_preview is not None
+                    else ()
+                ),
+                expected_model_calls_by_stage=calls_by_stage,
+                stages_rebased=(
+                    ProductionArtifactStage.REFERENCES.value,
+                    ProductionArtifactStage.EXTRACTION.value,
+                    ProductionArtifactStage.RELEVANCE_PROJECTION.value,
+                )
+                if addition_preview is not None and addition_preview.projected_artifacts
+                else (),
+                historical_artifacts_preserved=True,
+                refusal=preview_refusal,
+            )
         else:
             extraction, _ = await self._synthesis._load_extraction(
                 context.run, context.snapshot, context.extraction_artifact
@@ -1029,9 +1239,10 @@ class ProductionSynthesisRevisionService:
             ),
             stages_invalidated=(ProductionArtifactStage.PUBLICATION.value,),
             stages_conditionally_rebased=(ProductionArtifactStage.EDITORIAL_ENRICHMENT.value,),
-            source_extension=(request.mode is TargetedEditorialRevisionMode.ALLOW_SOURCE_EXTENSION),
+            source_extension=False,
             expected_model_calls=calls,
             enrichment_rebase="revalidate_anchors_and_evidence; adopt if valid, otherwise stale",
+            before_hash=resolved.before_hash,
         )
 
     async def _critical_extraction_failures(
@@ -1060,24 +1271,233 @@ class ProductionSynthesisRevisionService:
         identity_payload = self._request_identity_payload(request)
         request_identity = _sha256(identity_payload)
         revision_id = uuid5(NAMESPACE_URL, f"targeted-synthesis-revision:{request_identity}")
-
         prior = await self._existing_result(request.subject_id, revision_id)
         if prior is not None:
             return prior
-        context = await self._load_context(request)
-        if request.mode is TargetedEditorialRevisionMode.ALLOW_SOURCE_EXTENSION:
+
+        promotion: SourceAdditionPromotionResult | None = None
+        if request.mode is TargetedEditorialRevisionMode.ALLOW_SOURCE_EXTENSION and (
+            self._source_addition_service is None
+            or request.source_addition_request_id is None
+            or request.source_additions_hash is None
+            or request.before_hash is None
+        ):
             return TargetedSynthesisRevisionResult(
                 artifact=None,
                 publication_artifact=None,
                 revision=None,
                 refusal=TargetedEditorialRevisionRefusal(
-                    code=TargetedEditorialRevisionRefusalCode.SOURCE_EXTENSION_NOT_AVAILABLE_YET,
-                    recommended_restart_stage=None,
-                    reason="Source extension requires the E2 archival and extraction workflow.",
+                    code=TargetedEditorialRevisionRefusalCode.REVISION_NOT_APPLICABLE,
+                    recommended_restart_stage=ProductionStage.REFERENCES,
+                    reason=(
+                        "Source extension requires a READY archived and extracted addition "
+                        "with matching preview fences."
+                    ),
                 ),
             )
 
+        async with self._synthesis._uow_factory() as uow:
+            if request.mode is TargetedEditorialRevisionMode.ALLOW_SOURCE_EXTENSION:
+                assert self._source_addition_service is not None
+                assert request.source_addition_request_id is not None
+                current_run = await uow.production_runs.get_current_for_subject(request.subject_id)
+                if current_run is None:
+                    raise TargetedEditorialRevisionConflictError(
+                        "The requested production run is no longer current"
+                    )
+                try:
+                    promotion = await self._source_addition_service.promote(
+                        uow,
+                        production_run_id=current_run.id,
+                        request_id=request.source_addition_request_id,
+                    )
+                except SourceAdditionPromotionBlockedError as exc:
+                    blocked = "; ".join(
+                        f"{item.source_url}: {item.reason}" for item in exc.blockers
+                    )
+                    return TargetedSynthesisRevisionResult(
+                        artifact=None,
+                        publication_artifact=None,
+                        revision=None,
+                        refusal=TargetedEditorialRevisionRefusal(
+                            code=TargetedEditorialRevisionRefusalCode.REVISION_NOT_APPLICABLE,
+                            recommended_restart_stage=ProductionStage.REFERENCES,
+                            reason=(
+                                "Une source critique du corpus reste bloquée; réparez-la ou "
+                                "enregistrez une décision D effective pour cette génération. "
+                                f"{blocked}"
+                            ),
+                        ),
+                    )
+                except SourceAdditionConflictError:
+                    raise
+                except SourceAdditionError as exc:
+                    return TargetedSynthesisRevisionResult(
+                        artifact=None,
+                        publication_artifact=None,
+                        revision=None,
+                        refusal=TargetedEditorialRevisionRefusal(
+                            code=TargetedEditorialRevisionRefusalCode.REVISION_NOT_APPLICABLE,
+                            recommended_restart_stage=ProductionStage.REFERENCES,
+                            reason=(
+                                "Aucune addition READY n'est disponible pour ce manifeste; "
+                                f"reprenez l'acquisition et l'extraction ({exc})."
+                            ),
+                        ),
+                    )
+            try:
+                result = await self.revise_in_uow(
+                    uow,
+                    request,
+                    source_addition_promotion=promotion,
+                )
+            except TargetedSynthesisRevisionValidationError as exc:
+                deterministic_refusals = {
+                    "revision_claim_scope_missing_or_invalid",
+                    "revision_tool_context_scope_mismatch",
+                    "revision_tool_context_cannot_support_actor_activity",
+                    "revision_actor_activity_requires_subject_evidence",
+                    "source_extension_added_evidence_not_used",
+                    "synthesis_unknown_evidence",
+                    "synthesis_relation_not_evidenced",
+                    "revision_after_claims_invalid",
+                    "revision_patch_changed_outside_target",
+                    "revision_patch_target_action_mismatch",
+                    "synthesis_extraction_lineage_invalid",
+                    "synthesis_lineage_invalid",
+                    "synthesis_section_heading_invalid",
+                    "revision_requires_one_section",
+                    "revision_requires_one_section_claim",
+                }
+                if (
+                    request.mode is not TargetedEditorialRevisionMode.ALLOW_SOURCE_EXTENSION
+                    or exc.reason_code not in deterministic_refusals
+                ):
+                    raise
+                restart_stage = (
+                    ProductionStage.EXTRACTION
+                    if "extraction" in exc.reason_code or "lineage" in exc.reason_code
+                    else ProductionStage.SYNTHESIS
+                )
+                return TargetedSynthesisRevisionResult(
+                    artifact=None,
+                    publication_artifact=None,
+                    revision=None,
+                    refusal=TargetedEditorialRevisionRefusal(
+                        code=TargetedEditorialRevisionRefusalCode.REVISION_NOT_APPLICABLE,
+                        recommended_restart_stage=restart_stage,
+                        reason=(
+                            "Le patch de révision n'est pas étayé par les preuves autorisées. "
+                            f"Détail: {exc.reason_code}."
+                        ),
+                    ),
+                )
+            if result.refusal is None:
+                await uow.commit()
+
+        if result.publication_artifact is not None:
+            await self._publication_render_service.render_preview(result.publication_artifact.id)
+        return result
+
+    async def revise_in_uow(
+        self,
+        uow: Any,
+        request: TargetedEditorialRevisionRequest,
+        *,
+        source_addition_promotion: SourceAdditionPromotionResult | None = None,
+    ) -> TargetedSynthesisRevisionResult:
+        try:
+            result = await self._revise_in_uow_impl(
+                uow,
+                request,
+                source_addition_promotion=source_addition_promotion,
+            )
+        except BaseException:
+            rollback = getattr(uow, "rollback", None)
+            if source_addition_promotion is not None and callable(rollback):
+                await rollback()
+            raise
+        if result.refusal is not None and source_addition_promotion is not None:
+            rollback = getattr(uow, "rollback", None)
+            if callable(rollback):
+                await rollback()
+        return result
+
+    async def _revise_in_uow_impl(
+        self,
+        uow: Any,
+        request: TargetedEditorialRevisionRequest,
+        *,
+        source_addition_promotion: SourceAdditionPromotionResult | None = None,
+    ) -> TargetedSynthesisRevisionResult:
+        """Revise within a caller-owned transaction, optionally after promotion."""
+        self._validate_request(request)
+        if request.target.kind is TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT:
+            raise TargetedSynthesisRevisionValidationError(
+                "targeted_enrichment_revision_requires_its_own_unit_of_work"
+            )
+        if request.mode is TargetedEditorialRevisionMode.ALLOW_SOURCE_EXTENSION:
+            if source_addition_promotion is None:
+                return TargetedSynthesisRevisionResult(
+                    artifact=None,
+                    publication_artifact=None,
+                    revision=None,
+                    refusal=TargetedEditorialRevisionRefusal(
+                        code=TargetedEditorialRevisionRefusalCode.REVISION_NOT_APPLICABLE,
+                        recommended_restart_stage=ProductionStage.REFERENCES,
+                        reason="A source addition must be promoted in this transaction first.",
+                    ),
+                )
+            if source_addition_promotion.source_additions_hash != request.source_additions_hash:
+                return TargetedSynthesisRevisionResult(
+                    artifact=None,
+                    publication_artifact=None,
+                    revision=None,
+                    refusal=TargetedEditorialRevisionRefusal(
+                        code=TargetedEditorialRevisionRefusalCode.REVISION_NOT_APPLICABLE,
+                        recommended_restart_stage=ProductionStage.REFERENCES,
+                        reason="The ready source addition manifest changed after preview.",
+                    ),
+                )
+
+        identity_payload = self._request_identity_payload(request)
+        request_identity = _sha256(identity_payload)
+        revision_id = uuid5(NAMESPACE_URL, f"targeted-synthesis-revision:{request_identity}")
+        existing_artifact = await uow.production_artifacts.get(revision_id)
+        if existing_artifact is not None:
+            if (
+                existing_artifact.subject_id != request.subject_id
+                or existing_artifact.stage is not ProductionArtifactStage.SYNTHESIS
+            ):
+                raise TargetedEditorialRevisionConflictError(
+                    "The deterministic revision identity belongs to another artifact"
+                )
+            revision = existing_artifact.metadata.get("revision")
+            if not isinstance(revision, dict):
+                raise ValueError("targeted_synthesis_revision_result_corrupt")
+            publication = next(
+                (
+                    item
+                    for item in await uow.production_artifacts.list_for_run(
+                        existing_artifact.production_run_id
+                    )
+                    if item.stage is ProductionArtifactStage.PUBLICATION
+                    and isinstance(item.metadata.get("input_artifacts"), dict)
+                    and item.metadata["input_artifacts"].get("synthesis_artifact_id")
+                    == str(existing_artifact.id)
+                ),
+                None,
+            )
+            return TargetedSynthesisRevisionResult(
+                artifact=existing_artifact,
+                publication_artifact=publication,
+                revision=revision,
+            )
+
+        context = await self._load_context(request, uow=uow)
         resolved = _resolve_target(context.base_payload, request.target, request.operation)
+        if request.before_hash is not None and request.before_hash != resolved.before_hash:
+            raise TargetedEditorialRevisionConflictError("The targeted element changed")
         base_blob_id = context.base_artifact.canonical_blob_id
         if base_blob_id is None:
             raise TargetedSynthesisRevisionValidationError("synthesis_artifact_blob_missing")
@@ -1088,14 +1508,168 @@ class ProductionSynthesisRevisionService:
                 "The synthesis revision base content hash changed"
             )
         base_synthesis = production_synthesis_from_json(context.base_payload)
+        source_addition_document_ids: frozenset[UUID] = frozenset()
+        source_additions: tuple[Mapping[str, Any], ...] = ()
+        base_projection_hash: str | None = None
+        if request.mode is TargetedEditorialRevisionMode.ALLOW_SOURCE_EXTENSION:
+            promotion = source_addition_promotion
+            if promotion is None or promotion.promotion_plan is None:
+                return TargetedSynthesisRevisionResult(
+                    artifact=None,
+                    publication_artifact=None,
+                    revision=None,
+                    refusal=TargetedEditorialRevisionRefusal(
+                        code=TargetedEditorialRevisionRefusalCode.REVISION_NOT_APPLICABLE,
+                        recommended_restart_stage=ProductionStage.REFERENCES,
+                        reason="The source addition promotion has no verifiable base plan.",
+                    ),
+                )
+            plan = promotion.promotion_plan
+            if (
+                plan.production_run_id != context.run.id
+                or plan.subject_id != context.run.subject_id
+                or plan.pipeline_generation != context.run.pipeline_generation
+                or promotion.request_id != request.source_addition_request_id
+                or promotion.source_additions_hash != request.source_additions_hash
+                or len(promotion.artifacts) != 3
+            ):
+                raise TargetedEditorialRevisionConflictError(
+                    "The source addition promotion does not match the requested run or manifest"
+                )
+            fences_by_stage = {item.stage: item for item in plan.base_artifacts}
+            if set(fences_by_stage) != {
+                ProductionArtifactStage.REFERENCES,
+                ProductionArtifactStage.EXTRACTION,
+                ProductionArtifactStage.RELEVANCE_PROJECTION,
+            }:
+                raise TargetedEditorialRevisionConflictError(
+                    "The source addition base fences are incomplete"
+                )
+            for stage, fence in fences_by_stage.items():
+                fenced_artifact = await uow.production_artifacts.get(fence.artifact_id)
+                if (
+                    fenced_artifact is None
+                    or fenced_artifact.production_run_id != context.run.id
+                    or fenced_artifact.stage is not stage
+                    or fenced_artifact.version != fence.version
+                    or fenced_artifact.input_hash != fence.input_hash
+                    or fenced_artifact.status is not ProductionArtifactStatus.VERIFIED
+                    or fenced_artifact.canonical_blob_id is None
+                ):
+                    raise TargetedEditorialRevisionConflictError(
+                        "A source addition base artifact changed"
+                    )
+                fenced_bytes = await self._synthesis._artifact_store.read_bytes(
+                    fenced_artifact.canonical_blob_id
+                )
+                if hashlib.sha256(fenced_bytes).hexdigest() != fence.canonical_sha256:
+                    raise TargetedEditorialRevisionConflictError(
+                        "A source addition base artifact hash changed"
+                    )
+                if stage is ProductionArtifactStage.EXTRACTION:
+                    base_extraction_payload = json.loads(fenced_bytes)
+                    if not isinstance(base_extraction_payload, dict):
+                        raise TargetedSynthesisRevisionValidationError(
+                            "source_addition_base_extraction_invalid"
+                        )
+                    base_extraction = production_extraction_from_json(base_extraction_payload)
+                    if not is_production_extraction_hash(
+                        base_extraction, base_synthesis.extraction_hash
+                    ):
+                        raise TargetedEditorialRevisionConflictError(
+                            "The synthesis base does not reference its fenced extraction"
+                        )
+                elif stage is ProductionArtifactStage.RELEVANCE_PROJECTION:
+                    projection_payload = json.loads(fenced_bytes)
+                    base_projection_hash = (
+                        str(projection_payload.get("projection_hash"))
+                        if isinstance(projection_payload, dict)
+                        else None
+                    )
+            if (
+                context.base_artifact.metadata.get("relevance_projection_hash")
+                != base_projection_hash
+            ):
+                raise TargetedEditorialRevisionConflictError(
+                    "The synthesis base does not reference its fenced relevance projection"
+                )
+            promoted_by_stage = {item.stage: item for item in promotion.artifacts}
+            current_by_stage = {
+                ProductionArtifactStage.REFERENCES: context.references_artifact,
+                ProductionArtifactStage.EXTRACTION: context.extraction_artifact,
+                ProductionArtifactStage.RELEVANCE_PROJECTION: context.projection_artifact,
+            }
+            projected_by_stage = {item.stage: item for item in plan.projected_artifacts}
+            for stage, current_artifact in current_by_stage.items():
+                promoted_artifact = promoted_by_stage.get(stage)
+                projected = projected_by_stage.get(stage)
+                if (
+                    current_artifact is None
+                    or promoted_artifact is None
+                    or projected is None
+                    or current_artifact.id != promoted_artifact.id
+                    or current_artifact.id != projected.artifact_id
+                    or current_artifact.version != projected.version
+                    or current_artifact.input_hash != projected.input_hash
+                    or current_artifact.canonical_blob_id is None
+                ):
+                    raise TargetedEditorialRevisionConflictError(
+                        "The promoted source addition artifacts are no longer current"
+                    )
+                current_bytes = await self._synthesis._artifact_store.read_bytes(
+                    current_artifact.canonical_blob_id
+                )
+                if hashlib.sha256(current_bytes).hexdigest() != projected.canonical_sha256:
+                    raise TargetedEditorialRevisionConflictError(
+                        "A promoted source addition artifact hash changed"
+                    )
+                if current_artifact.metadata.get("source_additions_hash") != (
+                    promotion.source_additions_hash
+                ):
+                    raise TargetedEditorialRevisionConflictError(
+                        "A promoted artifact has a different source addition manifest"
+                    )
+            raw_manifest = context.references_artifact.metadata.get("source_additions")
+            if (
+                not isinstance(raw_manifest, list)
+                or context.references_artifact.metadata.get("source_additions_hash")
+                != promotion.source_additions_hash
+            ):
+                raise TargetedEditorialRevisionConflictError(
+                    "The promoted reference manifest is missing or inconsistent"
+                )
+            source_additions = tuple(
+                dict(item) for item in raw_manifest if isinstance(item, Mapping)
+            )
+            try:
+                source_addition_document_ids = frozenset(
+                    UUID(str(item["source_document_id"])) for item in source_additions
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise TargetedSynthesisRevisionValidationError(
+                    "source_addition_manifest_invalid"
+                ) from exc
+            if not source_addition_document_ids or len(source_additions) != len(raw_manifest):
+                raise TargetedSynthesisRevisionValidationError("source_addition_manifest_invalid")
         extraction, extraction_hash = await self._synthesis._load_extraction(
             context.run, context.snapshot, context.extraction_artifact
         )
-        if not is_production_extraction_hash(extraction, base_synthesis.extraction_hash):
-            raise TargetedEditorialRevisionConflictError(
-                "The synthesis base does not reference its current extraction artifact"
+        if request.mode is TargetedEditorialRevisionMode.ALLOW_SOURCE_EXTENSION:
+            base_synthesis_for_apply = replace(
+                base_synthesis, extraction_hash=canonical_extraction_hash(extraction)
             )
-        if await self._critical_extraction_failures(context, extraction):
+            base_payload_for_apply = production_synthesis_to_json(base_synthesis_for_apply)
+        else:
+            base_synthesis_for_apply = base_synthesis
+            base_payload_for_apply = context.base_payload
+            if not is_production_extraction_hash(extraction, base_synthesis.extraction_hash):
+                raise TargetedEditorialRevisionConflictError(
+                    "The synthesis base does not reference its current extraction artifact"
+                )
+        if (
+            request.mode is not TargetedEditorialRevisionMode.ALLOW_SOURCE_EXTENSION
+            and await self._critical_extraction_failures(context, extraction)
+        ):
             return TargetedSynthesisRevisionResult(
                 artifact=None,
                 publication_artifact=None,
@@ -1124,10 +1698,20 @@ class ProductionSynthesisRevisionService:
         policy_hash = synthesis_access_policy_hash(access_policy)
         evidence_pack = build_synthesis_evidence_pack(context.snapshot, extraction, projection)
         evidence_pack_hash = synthesis_evidence_pack_hash(evidence_pack)
+        revision_input_hash = (
+            synthesis_input_hash(context.snapshot, extraction, evidence_pack, policy_hash)
+            if request.mode is TargetedEditorialRevisionMode.ALLOW_SOURCE_EXTENSION
+            else context.base_artifact.input_hash
+        )
+        expected_base_projection_hash = (
+            base_projection_hash
+            if request.mode is TargetedEditorialRevisionMode.ALLOW_SOURCE_EXTENSION
+            else (projection.projection_hash if projection is not None else None)
+        )
         if (
             base_synthesis.production_input_hash != context.snapshot.input_hash
             or context.base_artifact.metadata.get("relevance_projection_hash")
-            != (projection.projection_hash if projection is not None else None)
+            != expected_base_projection_hash
         ):
             raise TargetedEditorialRevisionConflictError(
                 "The frozen synthesis inputs no longer match their verified artifacts"
@@ -1148,7 +1732,7 @@ class ProductionSynthesisRevisionService:
             target_path=resolved.path,
             base_hash=base_hash,
             before_hash=resolved.before_hash,
-            current_payload=context.base_payload,
+            current_payload=base_payload_for_apply,
             evidence_pack=evidence_pack,
         )
         model_run_id = uuid5(NAMESPACE_URL, f"targeted-synthesis-model-run:{request_identity}")
@@ -1165,6 +1749,22 @@ class ProductionSynthesisRevisionService:
                 "targeted_revision_parser_version": TARGETED_SYNTHESIS_REVISION_PARSER_VERSION,
                 "targeted_revision_validator_version": (
                     TARGETED_SYNTHESIS_REVISION_VALIDATOR_VERSION
+                ),
+                "targeted_revision_source_additions_hash": request.source_additions_hash,
+                "targeted_revision_base_artifact_fences": (
+                    [
+                        {
+                            "stage": item.stage.value,
+                            "artifact_id": str(item.artifact_id),
+                            "version": item.version,
+                            "input_hash": item.input_hash,
+                            "canonical_sha256": item.canonical_sha256,
+                        }
+                        for item in source_addition_promotion.promotion_plan.base_artifacts
+                    ]
+                    if source_addition_promotion is not None
+                    and source_addition_promotion.promotion_plan is not None
+                    else []
                 ),
             },
             run_id=model_run_id,
@@ -1215,15 +1815,36 @@ class ProductionSynthesisRevisionService:
         if wire_patch.base_artifact_hash != base_hash:
             raise TargetedEditorialRevisionConflictError("The model patch references another base")
         revised, revised_payload, before_hash = _apply_wire_patch(
-            base_synthesis=base_synthesis,
-            base_payload=context.base_payload,
+            base_synthesis=base_synthesis_for_apply,
+            base_payload=base_payload_for_apply,
             target=request.target,
             operation=request.operation,
             patch=wire_patch,
             evidence_pack=evidence_pack,
             extraction=extraction,
             snapshot=context.snapshot,
+            source_addition_document_ids=source_addition_document_ids,
+            require_claim_scopes=(
+                request.mode is TargetedEditorialRevisionMode.ALLOW_SOURCE_EXTENSION
+            ),
         )
+        if request.mode is TargetedEditorialRevisionMode.ALLOW_SOURCE_EXTENSION:
+            _assert_non_target_unchanged(
+                context.base_payload,
+                revised_payload,
+                request.target,
+                request.operation,
+                resolved,
+                allow_extraction_hash_change=True,
+            )
+            introduced_documents = {
+                UUID(str(reference["source_document_id"]))
+                for reference in self._revision_evidence_refs(context.base_payload, revised_payload)
+            }
+            if not introduced_documents.intersection(source_addition_document_ids):
+                raise TargetedSynthesisRevisionValidationError(
+                    "source_extension_added_evidence_not_used"
+                )
         revision_data = {
             "revision_id": str(revision_id),
             "request_identity": request_identity,
@@ -1242,7 +1863,13 @@ class ProductionSynthesisRevisionService:
             "validator_version": TARGETED_SYNTHESIS_REVISION_VALIDATOR_VERSION,
             "evidence_refs": self._revision_evidence_refs(context.base_payload, revised_payload),
             "evidence_handles": sorted(evidence_pack._handle_to_ref),
-            "source_additions": [],
+            "claim_scopes": (
+                re.findall(r"(?im)^\s*CLAIM_SCOPE\s*:\s*([a-z_]+)\s*$", wire_patch.after)
+                if request.mode is TargetedEditorialRevisionMode.ALLOW_SOURCE_EXTENSION
+                else []
+            ),
+            "source_additions": [dict(item) for item in source_additions],
+            "source_additions_hash": request.source_additions_hash,
             "before_hash": before_hash,
             "after_hash": _sha256(revised_payload),
             "rationale": wire_patch.rationale,
@@ -1253,12 +1880,16 @@ class ProductionSynthesisRevisionService:
             ),
         }
         provenance = self._paragraph_provenance(
-            context.base_artifact, context.base_payload, revised_payload, revision_id
+            context.base_artifact,
+            context.base_payload,
+            revised_payload,
+            revision_id,
+            source_addition_document_ids=source_addition_document_ids,
         )
         artifact = await self._synthesis_persistence.store_synthesis_result(
             run_id=context.run.id,
             subject_id=request.subject_id,
-            input_hash=context.base_artifact.input_hash,
+            input_hash=revision_input_hash,
             synthesis=revised,
             extraction=extraction,
             raw_result=raw_text,
@@ -1281,6 +1912,7 @@ class ProductionSynthesisRevisionService:
             expected_current_input_hash=context.base_artifact.input_hash,
             expected_current_canonical_sha256=base_hash,
             stale_stages={ProductionArtifactStage.PUBLICATION.value},
+            uow=uow,
         )
 
         enrichment_artifact, enrichment = await self._rebase_enrichment_if_valid(
@@ -1290,6 +1922,7 @@ class ProductionSynthesisRevisionService:
             revised_synthesis=revised,
             synthesis_artifact=artifact,
             access_policy_hash=policy_hash,
+            uow=uow,
         )
         publication = None
         if enrichment_artifact is not None and enrichment is not None:
@@ -1301,6 +1934,7 @@ class ProductionSynthesisRevisionService:
                 synthesis_artifact=artifact,
                 enrichment_artifact=enrichment_artifact,
                 enrichment=enrichment,
+                uow=uow,
             )
         revision_data["publication_artifact_id"] = (
             str(publication.id) if publication is not None else None
@@ -1423,6 +2057,11 @@ class ProductionSynthesisRevisionService:
         if (
             _SHA256.fullmatch(request.base_input_hash) is None
             or _SHA256.fullmatch(request.base_canonical_sha256) is None
+            or (
+                request.source_additions_hash is not None
+                and _SHA256.fullmatch(request.source_additions_hash) is None
+            )
+            or (request.before_hash is not None and _SHA256.fullmatch(request.before_hash) is None)
         ):
             raise ValueError("targeted_synthesis_revision_base_hash_invalid")
 
@@ -1439,6 +2078,13 @@ class ProductionSynthesisRevisionService:
             "instruction": request.instruction.strip(),
             "mode": request.mode.value,
             "requester": request.requester,
+            "source_addition_request_id": (
+                str(request.source_addition_request_id)
+                if request.source_addition_request_id is not None
+                else None
+            ),
+            "source_additions_hash": request.source_additions_hash,
+            "before_hash": request.before_hash,
             "prompt_version": SYNTHESIS_TARGETED_REVISION_PROMPT_VERSION,
             "contract_version": SYNTHESIS_TARGETED_REVISION_CONTRACT_VERSION,
             "parser_version": TARGETED_SYNTHESIS_REVISION_PARSER_VERSION,
@@ -1481,41 +2127,43 @@ class ProductionSynthesisRevisionService:
             revision=revision,
         )
 
-    async def _load_context(self, request: TargetedEditorialRevisionRequest) -> _RevisionContext:
-        async with self._synthesis._uow_factory() as uow:
-            run = await uow.production_runs.get_current_for_subject(request.subject_id)
-            base = await uow.production_artifacts.get(request.base_artifact_id)
-            if run is None or base is None or base.production_run_id != run.id:
-                raise TargetedEditorialRevisionConflictError(
-                    "The requested synthesis base is no longer current"
-                )
-            current = await uow.production_artifacts.get_current(
-                run.id, ProductionArtifactStage.SYNTHESIS.value
+    async def _load_context(
+        self, request: TargetedEditorialRevisionRequest, *, uow: Any | None = None
+    ) -> _RevisionContext:
+        if uow is None:
+            async with self._synthesis._uow_factory() as active_uow:
+                return await self._load_context(request, uow=active_uow)
+        run = await uow.production_runs.get_current_for_subject(request.subject_id)
+        base = await uow.production_artifacts.get(request.base_artifact_id)
+        if run is None or base is None or base.production_run_id != run.id:
+            raise TargetedEditorialRevisionConflictError(
+                "The requested synthesis base is no longer current"
             )
-            if (
-                current is None
-                or current.id != base.id
-                or base.version != request.base_version
-                or base.input_hash != request.base_input_hash
-                or base.status is not ProductionArtifactStatus.VERIFIED
-                or base.canonical_blob_id is None
-            ):
-                raise TargetedEditorialRevisionConflictError(
-                    "The requested synthesis base is stale"
-                )
-            snapshot = await uow.production_input_snapshots.get_by_run(run.id)
-            references = await uow.production_artifacts.get_current(
-                run.id, ProductionArtifactStage.REFERENCES.value
-            )
-            extraction = await uow.production_artifacts.get_current(
-                run.id, ProductionArtifactStage.EXTRACTION.value
-            )
-            projection = await uow.production_artifacts.get_current(
-                run.id, ProductionArtifactStage.RELEVANCE_PROJECTION.value
-            )
-            publication = await uow.production_artifacts.get_current(
-                run.id, ProductionArtifactStage.PUBLICATION.value
-            )
+        current = await uow.production_artifacts.get_current(
+            run.id, ProductionArtifactStage.SYNTHESIS.value
+        )
+        if (
+            current is None
+            or current.id != base.id
+            or base.version != request.base_version
+            or base.input_hash != request.base_input_hash
+            or base.status is not ProductionArtifactStatus.VERIFIED
+            or base.canonical_blob_id is None
+        ):
+            raise TargetedEditorialRevisionConflictError("The requested synthesis base is stale")
+        snapshot = await uow.production_input_snapshots.get_by_run(run.id)
+        references = await uow.production_artifacts.get_current(
+            run.id, ProductionArtifactStage.REFERENCES.value
+        )
+        extraction = await uow.production_artifacts.get_current(
+            run.id, ProductionArtifactStage.EXTRACTION.value
+        )
+        projection = await uow.production_artifacts.get_current(
+            run.id, ProductionArtifactStage.RELEVANCE_PROJECTION.value
+        )
+        publication = await uow.production_artifacts.get_current(
+            run.id, ProductionArtifactStage.PUBLICATION.value
+        )
         if snapshot is None or references is None or extraction is None:
             raise ValueError("targeted_synthesis_revision_inputs_missing")
         for item in (references, extraction, base):
@@ -1591,6 +2239,16 @@ class ProductionSynthesisRevisionService:
                 ),
                 "Use only the evidence handles listed above. Do not add sources or relations.",
                 (
+                    "For allow_source_extension, label every claim with CLAIM_SCOPE: "
+                    "tool_context or actor_activity. Use the new CONTEXT source only for "
+                    "generic tool descriptions. It does not prove that the subject used the "
+                    "tool or performed any operation. Claims about subject activity require "
+                    "a CORE, subject-scoped evidence handle and must not cite a TOOL_CONTEXT "
+                    "handle. Never infer intrusion, execution, persistence, or C2."
+                    if request.mode is TargetedEditorialRevisionMode.ALLOW_SOURCE_EXTENSION
+                    else ""
+                ),
+                (
                     "For a change that needs new sources, repair of extraction, a scope change, "
                     "or "
                     "QA bypass, return REFUSAL revision_not_applicable with restart stage "
@@ -1612,7 +2270,13 @@ class ProductionSynthesisRevisionService:
                 "@@BEFORE_HASH@@",
                 before_hash,
                 "@@AFTER@@",
-                "...bounded replacement...",
+                (
+                    "SECTION: analytical\nHEADING: ...\nCLAIM C001\n"
+                    "CLAIM_SCOPE: tool_context\nEVIDENCE: E001\nTEXT: ...\nEND CLAIM\n"
+                    "END SECTION"
+                    if request.mode is TargetedEditorialRevisionMode.ALLOW_SOURCE_EXTENSION
+                    else "...bounded replacement..."
+                ),
                 "@@RATIONALE@@",
                 "Short evidence-based reason.",
                 "@@END@@",
@@ -1696,6 +2360,8 @@ class ProductionSynthesisRevisionService:
         before: Mapping[str, Any],
         after: Mapping[str, Any],
         revision_id: UUID,
+        *,
+        source_addition_document_ids: frozenset[UUID] = frozenset(),
     ) -> dict[str, Any]:
         old = base_artifact.metadata.get("paragraph_provenance")
         provenance = dict(old) if isinstance(old, dict) else {}
@@ -1728,10 +2394,25 @@ class ProductionSynthesisRevisionService:
                         "revision_id": None,
                     }
                 else:
+                    source_document_ids = sorted(
+                        {
+                            str(reference["source_document_id"])
+                            for reference in paragraph.get("evidence_refs", [])
+                            if isinstance(reference, Mapping)
+                            and reference.get("source_document_id") is not None
+                            and UUID(str(reference["source_document_id"]))
+                            in source_addition_document_ids
+                        }
+                    )
                     provenance[identity] = {
                         "origin": "revision",
                         "artifact_id": str(revision_id),
                         "revision_id": str(revision_id),
+                        **(
+                            {"source_document_ids": source_document_ids}
+                            if source_document_ids
+                            else {}
+                        ),
                     }
         return {
             key: provenance[key]
@@ -1748,11 +2429,24 @@ class ProductionSynthesisRevisionService:
         revised_synthesis: ProductionSynthesisV1,
         synthesis_artifact: ProductionArtifact,
         access_policy_hash: str,
+        uow: Any | None = None,
     ) -> tuple[ProductionArtifact | None, EditorialEnrichmentV1 | None]:
-        async with self._synthesis._uow_factory() as uow:
-            enrichment_artifact = await uow.production_artifacts.get_current(
-                context.run.id, ProductionArtifactStage.EDITORIAL_ENRICHMENT.value
-            )
+        if uow is None:
+            async with self._synthesis._uow_factory() as active_uow:
+                result = await self._rebase_enrichment_if_valid(
+                    context=context,
+                    extraction=extraction,
+                    projection=projection,
+                    revised_synthesis=revised_synthesis,
+                    synthesis_artifact=synthesis_artifact,
+                    access_policy_hash=access_policy_hash,
+                    uow=active_uow,
+                )
+                await active_uow.commit()
+                return result
+        enrichment_artifact = await uow.production_artifacts.get_current(
+            context.run.id, ProductionArtifactStage.EDITORIAL_ENRICHMENT.value
+        )
         if (
             enrichment_artifact is None
             or enrichment_artifact.status is not ProductionArtifactStatus.VERIFIED
@@ -1869,11 +2563,9 @@ class ProductionSynthesisRevisionService:
                 resource_search_enabled=self._resource_search_enabled,
             )
         except (ValueError, TypeError, KeyError):
-            async with self._synthesis._uow_factory() as uow:
-                await uow.production_artifacts.mark_stages_stale(
-                    context.run.id, {ProductionArtifactStage.EDITORIAL_ENRICHMENT.value}
-                )
-                await uow.commit()
+            await uow.production_artifacts.mark_stages_stale(
+                context.run.id, {ProductionArtifactStage.EDITORIAL_ENRICHMENT.value}
+            )
             return None, None
 
         rebased_artifact = await self._enrichment_persistence.store_editorial_enrichment_result(
@@ -1917,6 +2609,7 @@ class ProductionSynthesisRevisionService:
             expected_current_canonical_sha256=current_sha,
             canonical_payload=editorial_enrichment_to_json(rebased),
             resource_search_enabled=self._resource_search_enabled,
+            uow=uow,
         )
         return rebased_artifact, rebased
 
@@ -1930,40 +2623,38 @@ class ProductionSynthesisRevisionService:
         synthesis_artifact: ProductionArtifact,
         enrichment_artifact: ProductionArtifact,
         enrichment: EditorialEnrichmentV1,
+        uow: Any,
     ) -> ProductionArtifact:
         references_blob_id = context.references_artifact.canonical_blob_id
         if references_blob_id is None:
             raise TargetedSynthesisRevisionValidationError("references_artifact_blob_missing")
         references_payload = await self._synthesis._artifact_store.read_json(references_blob_id)
         references = production_reference_corpus_from_json(references_payload)
-        async with self._synthesis._uow_factory() as uow:
-            publication = await PublicationAssemblyService(
-                self._synthesis._artifact_store, uow.production_artifacts
-            ).assemble_publication(
-                run=context.run,
-                snapshot=context.snapshot,
-                references=references,
-                extraction=extraction,
-                relevance_projection=projection,
-                synthesis=synthesis,
-                editorial_enrichment=enrichment,
-                metadata_extra={
-                    "input_artifacts": {
-                        "references_artifact_id": str(context.references_artifact.id),
-                        "extraction_artifact_id": str(context.extraction_artifact.id),
-                        "relevance_projection_artifact_id": (
-                            str(context.projection_artifact.id)
-                            if context.projection_artifact is not None
-                            else None
-                        ),
-                        "synthesis_artifact_id": str(synthesis_artifact.id),
-                        "editorial_enrichment_artifact_id": str(enrichment_artifact.id),
-                    },
-                    "editorial_revision_artifact_id": str(synthesis_artifact.id),
+        publication = await PublicationAssemblyService(
+            self._synthesis._artifact_store, uow.production_artifacts
+        ).assemble_publication(
+            run=context.run,
+            snapshot=context.snapshot,
+            references=references,
+            extraction=extraction,
+            relevance_projection=projection,
+            synthesis=synthesis,
+            editorial_enrichment=enrichment,
+            metadata_extra={
+                "input_artifacts": {
+                    "references_artifact_id": str(context.references_artifact.id),
+                    "extraction_artifact_id": str(context.extraction_artifact.id),
+                    "relevance_projection_artifact_id": (
+                        str(context.projection_artifact.id)
+                        if context.projection_artifact is not None
+                        else None
+                    ),
+                    "synthesis_artifact_id": str(synthesis_artifact.id),
+                    "editorial_enrichment_artifact_id": str(enrichment_artifact.id),
                 },
-            )
-            await uow.commit()
-        await self._publication_render_service.render_preview(publication.id)
+                "editorial_revision_artifact_id": str(synthesis_artifact.id),
+            },
+        )
         return publication
 
 

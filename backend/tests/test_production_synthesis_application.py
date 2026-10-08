@@ -83,6 +83,7 @@ from cti_app.domain.production import (
     ProductionEvidenceBasis,
     ProductionInputSnapshot,
     ProductionRun,
+    ProductionStage,
     SynthesisMode,
 )
 from cti_app.domain.production_editorial_revision import (
@@ -4182,6 +4183,207 @@ def test_targeted_revision_rejects_unknown_evidence_and_unsupported_claim() -> N
             )
 
 
+def test_source_extension_claim_scopes_separate_tool_context_from_actor_activity() -> None:
+    world, _, _, _ = _targeted_revision_fixture()
+    added_source_id = uuid4()
+    added_source = make_source(
+        added_source_id,
+        tier=ProductionReferenceTier.TECHNICAL,
+        editorial_role=ProductionEditorialRole.CONTEXT,
+        kind=ProductionReferenceKind.TECHNICAL_RESOURCE,
+        indicators=(
+            ExtractionIndicatorV1(
+                value="NanoDump",
+                artifact_type=ArtifactType.OTHER,
+                indicator_status=ExtractionIndicatorStatus.CONTEXTUAL,
+                context="NanoDump is a memory dumper and credential recovery utility.",
+                evidence_quote=("NanoDump is a memory dumper and credential recovery utility."),
+                evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+                source_document_ids=(added_source_id,),
+            ),
+        ),
+        url_suffix="nanodump-context",
+    )
+    extraction = _matched_extraction(world.snapshot, world.extraction.sources[0], added_source)
+    projection = build_relevance_projection(world.snapshot, extraction)
+    evidence_pack = build_synthesis_evidence_pack(world.snapshot, extraction, projection)
+    assert any(
+        ref.source_document_id == added_source_id
+        for ref, _ in extraction_evidence_elements(extraction)
+    )
+    assert [
+        item.classification
+        for item in projection.classifications
+        if item.evidence_ref.source_document_id == added_source_id
+    ] == [RelevanceClassification.CONTEXT]
+    context_handle = next(
+        handle
+        for handle, ref in evidence_pack._handle_to_ref.items()
+        if ref.source_document_id == added_source_id
+    )
+    subject_handle = next(
+        handle
+        for handle, ref in evidence_pack._handle_to_ref.items()
+        if ref.source_document_id == world.source_id and ref.kind is EvidenceKind.FACT
+    )
+
+    def proposal(scope: str, handle: str) -> SynthesisProposalV1:
+        return SynthesisProposalV1(
+            lead=(),
+            sections=(
+                SynthesisSectionProposalV1(
+                    kind=SynthesisSectionKind.OVERVIEW,
+                    heading="NanoDump",
+                    claims=(
+                        SynthesisClaimProposalV1(
+                            text=(
+                                "NanoDump is a memory dumper and credential recovery utility."
+                                if handle == context_handle
+                                else "FooRAT."
+                            ),
+                            evidence_handles=(handle,),
+                            claim_scope=scope,
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+    synthesis_revision_module._assert_claim_handles_and_relations_supported(
+        proposal("tool_context", context_handle),
+        evidence_pack,
+        extraction=extraction,
+        source_addition_document_ids=frozenset({added_source_id}),
+        require_claim_scopes=True,
+    )
+    with pytest.raises(
+        synthesis_revision_module.TargetedSynthesisRevisionValidationError,
+        match="revision_tool_context_cannot_support_actor_activity",
+    ):
+        synthesis_revision_module._assert_claim_handles_and_relations_supported(
+            proposal("actor_activity", context_handle),
+            evidence_pack,
+            extraction=extraction,
+            source_addition_document_ids=frozenset({added_source_id}),
+            require_claim_scopes=True,
+        )
+    with pytest.raises(
+        synthesis_revision_module.TargetedSynthesisRevisionValidationError,
+        match="revision_actor_activity_requires_subject_evidence",
+    ):
+        synthesis_revision_module._assert_claim_handles_and_relations_supported(
+            proposal("actor_activity", context_handle),
+            evidence_pack,
+            extraction=extraction,
+            source_addition_document_ids=frozenset(),
+            require_claim_scopes=True,
+        )
+    synthesis_revision_module._assert_claim_handles_and_relations_supported(
+        proposal("actor_activity", subject_handle),
+        evidence_pack,
+        extraction=extraction,
+        source_addition_document_ids=frozenset({added_source_id}),
+        require_claim_scopes=True,
+    )
+    with pytest.raises(
+        synthesis_revision_module.TargetedSynthesisRevisionValidationError,
+        match="synthesis_unknown_evidence",
+    ):
+        synthesis_revision_module._assert_claim_handles_and_relations_supported(
+            proposal("tool_context", "E999"),
+            evidence_pack,
+            extraction=extraction,
+            source_addition_document_ids=frozenset({added_source_id}),
+            require_claim_scopes=True,
+        )
+
+
+def test_source_extension_adds_context_section_and_only_changes_extraction_hash_globally() -> None:
+    world, base, _, _ = _targeted_revision_fixture()
+    added_source_id = uuid4()
+    added_source = make_source(
+        added_source_id,
+        tier=ProductionReferenceTier.TECHNICAL,
+        editorial_role=ProductionEditorialRole.CONTEXT,
+        kind=ProductionReferenceKind.TECHNICAL_RESOURCE,
+        indicators=(
+            ExtractionIndicatorV1(
+                value="NanoDump",
+                artifact_type=ArtifactType.OTHER,
+                indicator_status=ExtractionIndicatorStatus.CONTEXTUAL,
+                context="NanoDump is a memory dumper and credential recovery utility.",
+                evidence_quote=("NanoDump is a memory dumper and credential recovery utility."),
+                evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+                source_document_ids=(added_source_id,),
+            ),
+        ),
+        url_suffix="nanodump-context",
+    )
+    extraction = _matched_extraction(world.snapshot, world.extraction.sources[0], added_source)
+    projection = build_relevance_projection(world.snapshot, extraction)
+    evidence_pack = build_synthesis_evidence_pack(world.snapshot, extraction, projection)
+    context_handle = next(
+        handle
+        for handle, ref in evidence_pack._handle_to_ref.items()
+        if ref.source_document_id == added_source_id
+    )
+    base_for_apply = replace(base, extraction_hash=canonical_extraction_hash(extraction))
+    original_payload = production_synthesis_to_json(base)
+    base_payload_for_apply = production_synthesis_to_json(base_for_apply)
+    anchor_id = synthesis_revision_module._section_id(original_payload["sections"][-1])
+    target = TargetedEditorialRevisionTarget(
+        kind=TargetedEditorialRevisionTargetKind.SECTIONS,
+        anchor_id=anchor_id,
+        insert_after=True,
+    )
+    operation = TargetedEditorialRevisionOperation.INSERT_SECTION
+    patch = _targeted_wire_patch(
+        base_payload_for_apply,
+        target,
+        operation,
+        "@@SECTION overview S001@@\n"
+        "HEADING: Description de NanoDump\n"
+        "@@CLAIM C001@@\n"
+        "CLAIM_SCOPE: tool_context\n"
+        f"EVIDENCE: {context_handle}\n"
+        "TEXT: NanoDump is a memory dumper and credential recovery utility.\n"
+        "@@END CLAIM@@\n"
+        "@@END SECTION@@",
+    )
+
+    revised, revised_payload, _ = synthesis_revision_module._apply_wire_patch(
+        base_synthesis=base_for_apply,
+        base_payload=base_payload_for_apply,
+        target=target,
+        operation=operation,
+        patch=patch,
+        evidence_pack=evidence_pack,
+        extraction=extraction,
+        snapshot=world.snapshot,
+        source_addition_document_ids=frozenset({added_source_id}),
+        require_claim_scopes=True,
+    )
+    resolved = synthesis_revision_module._resolve_target(original_payload, target, operation)
+    synthesis_revision_module._assert_non_target_unchanged(
+        original_payload,
+        revised_payload,
+        target,
+        operation,
+        resolved,
+        allow_extraction_hash_change=True,
+    )
+
+    assert revised.extraction_hash == canonical_extraction_hash(extraction)
+    assert revised_payload["sections"][:-1] == original_payload["sections"]
+    assert revised_payload["title"] == original_payload["title"]
+    assert revised_payload["lead"] == original_payload["lead"]
+    assert revised_payload["timeline"] == original_payload["timeline"]
+    assert revised_payload["source_notes"] == original_payload["source_notes"]
+    assert revised_payload["uncertainties"] == original_payload["uncertainties"]
+    added_paragraph = revised_payload["sections"][-1]["paragraphs"][0]
+    assert added_paragraph["evidence_refs"][0]["source_document_id"] == str(added_source_id)
+
+
 def test_targeted_title_revision_preserves_legacy_sections_byte_for_byte() -> None:
     world, base, evidence_pack, _ = _targeted_revision_fixture()
     payload = production_synthesis_to_json(base)
@@ -4376,6 +4578,7 @@ class _FailOnceSynthesisWriter:
         expected_current_input_hash: str | None = None,
         expected_current_canonical_sha256: str | None = None,
         stale_stages: set[str] | None = None,
+        uow: object | None = None,
     ) -> ProductionArtifact:
         self.calls += 1
         if self.calls == 1:
@@ -4399,6 +4602,7 @@ class _FailOnceSynthesisWriter:
             expected_current_input_hash=expected_current_input_hash,
             expected_current_canonical_sha256=expected_current_canonical_sha256,
             stale_stages=stale_stages,
+            uow=uow,
         )
 
 
@@ -4424,6 +4628,7 @@ class _SynthesisResultWriter(Protocol):
         expected_current_input_hash: str | None = None,
         expected_current_canonical_sha256: str | None = None,
         stale_stages: set[str] | None = None,
+        uow: object | None = None,
     ) -> ProductionArtifact: ...
 
 
@@ -4604,9 +4809,12 @@ async def test_synthesis_revision_recovers_existing_model_run_without_resubmissi
     extension_preview = await revision_service.preview(extension_request)
     assert extension_preview.source_extension is True
     assert extension_preview.expected_model_calls == 0
+    assert extension_preview.refusal is not None
+    assert extension_preview.refusal.code.value == "revision_not_applicable"
     refused = await revision_service.revise(extension_request)
     assert refused.refusal is not None
-    assert refused.refusal.code.value == "source_extension_not_available_yet"
+    assert refused.refusal.code.value == "revision_not_applicable"
+    assert refused.refusal.recommended_restart_stage is ProductionStage.REFERENCES
     assert not gateway.calls
     with pytest.raises(RuntimeError, match="simulated interruption"):
         await revision_service.revise(request)
@@ -4635,6 +4843,145 @@ async def test_synthesis_revision_recovers_existing_model_run_without_resubmissi
     conflicting_request = replace(request, instruction="A different edit from the stale base.")
     with pytest.raises(TargetedEditorialRevisionConflictError):
         await revision_service.revise(conflicting_request)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_after_write", (False, True))
+async def test_source_extension_uses_one_uow_and_rolls_back_promotion_on_revision_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    fail_after_write: bool,
+) -> None:
+    from types import MethodType
+
+    from cti_app.application.production_source_additions import SourceAdditionPromotionResult
+    from cti_app.application.production_synthesis_revision import (
+        ProductionSynthesisRevisionService,
+        TargetedSynthesisRevisionResult,
+    )
+
+    world, _, _, _ = _targeted_revision_fixture()
+    request = TargetedEditorialRevisionRequest(
+        subject_id=world.snapshot.subject_id,
+        base_artifact_id=uuid4(),
+        base_version=1,
+        base_input_hash="a" * 64,
+        base_canonical_sha256="b" * 64,
+        target=TargetedEditorialRevisionTarget(kind=TargetedEditorialRevisionTargetKind.TITLE),
+        operation=TargetedEditorialRevisionOperation.REWRITE_TITLE,
+        instruction="Add a sourced section about NanoDump.",
+        mode=TargetedEditorialRevisionMode.ALLOW_SOURCE_EXTENSION,
+        requester="test-analyst",
+        source_addition_request_id=uuid4(),
+        source_additions_hash="c" * 64,
+        before_hash="d" * 64,
+    )
+    committed: list[str] = []
+
+    class AtomicMemoryUow:
+        def __init__(self) -> None:
+            self.pending: list[str] = []
+            self.commit_calls = 0
+            self.rollback_calls = 0
+            self.production_runs = SimpleNamespace(
+                get_current_for_subject=lambda subject_id: _async_value(
+                    world.run if subject_id == world.run.subject_id else None
+                )
+            )
+            self.production_artifacts = _RevisionArtifactRepository(())
+
+        async def __aenter__(self) -> AtomicMemoryUow:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            del args
+
+        async def commit(self) -> None:
+            self.commit_calls += 1
+            committed.extend(self.pending)
+
+        async def rollback(self) -> None:
+            self.rollback_calls += 1
+            self.pending.clear()
+
+    uows: list[AtomicMemoryUow] = []
+
+    def uow_factory() -> AtomicMemoryUow:
+        uow = AtomicMemoryUow()
+        uows.append(uow)
+        return uow
+
+    class FakeSourceAdditionService:
+        promotion_uow: AtomicMemoryUow | None = None
+
+        async def promote(
+            self, uow: AtomicMemoryUow, *, production_run_id: UUID, request_id: UUID
+        ) -> SourceAdditionPromotionResult:
+            assert production_run_id == world.run.id
+            assert request_id == request.source_addition_request_id
+            self.promotion_uow = uow
+            uow.pending.extend(("REFERENCES", "EXTRACTION", "RELEVANCE_PROJECTION"))
+            return SourceAdditionPromotionResult(
+                production_run_id=production_run_id,
+                request_id=request_id,
+                artifacts=(),
+                source_additions_hash=request.source_additions_hash or "",
+                already_promoted=False,
+            )
+
+    source_addition_service = FakeSourceAdditionService()
+    revision_service = ProductionSynthesisRevisionService(
+        synthesis_service=SimpleNamespace(_uow_factory=uow_factory),  # type: ignore[arg-type]
+        synthesis_persistence=SimpleNamespace(),  # type: ignore[arg-type]
+        enrichment_persistence=SimpleNamespace(),  # type: ignore[arg-type]
+        publication_render_service=SimpleNamespace(),  # type: ignore[arg-type]
+        source_addition_service=source_addition_service,  # type: ignore[arg-type]
+    )
+
+    async def fail_after_revision_write(
+        self: ProductionSynthesisRevisionService,
+        uow: AtomicMemoryUow,
+        revision_request: TargetedEditorialRevisionRequest,
+        *,
+        source_addition_promotion: SourceAdditionPromotionResult | None = None,
+    ) -> TargetedSynthesisRevisionResult:
+        assert revision_request is request
+        assert source_addition_promotion is not None
+        uow.pending.append("SYNTHESIS")
+        if fail_after_write:
+            raise RuntimeError("simulated synthesis failure after source promotion")
+        return TargetedSynthesisRevisionResult(
+            artifact=None,
+            publication_artifact=None,
+            revision=None,
+        )
+
+    monkeypatch.setattr(
+        revision_service,
+        "_revise_in_uow_impl",
+        MethodType(fail_after_revision_write, revision_service),
+    )
+
+    if fail_after_write:
+        with pytest.raises(RuntimeError, match="after source promotion"):
+            await revision_service.revise(request)
+    else:
+        result = await revision_service.revise(request)
+        assert result.refusal is None
+
+    assert source_addition_service.promotion_uow is uows[1]
+    assert uows[1].commit_calls == (0 if fail_after_write else 1)
+    assert uows[1].rollback_calls == (1 if fail_after_write else 0)
+    assert uows[1].pending == (
+        []
+        if fail_after_write
+        else [
+            "REFERENCES",
+            "EXTRACTION",
+            "RELEVANCE_PROJECTION",
+            "SYNTHESIS",
+        ]
+    )
+    assert committed == ([] if fail_after_write else uows[1].pending)
 
 
 @pytest.mark.asyncio

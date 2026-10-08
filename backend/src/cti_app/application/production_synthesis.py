@@ -148,6 +148,7 @@ class _StrictProposalModel(BaseModel):
 class SynthesisClaimProposalV1(_StrictProposalModel):
     text: StrictStr
     evidence_handles: tuple[StrictStr, ...]
+    claim_scope: StrictStr | None = None
     _block_id: str | None = PrivateAttr(default=None)
 
     @field_validator("text")
@@ -257,6 +258,7 @@ class _WireClaim:
     group: str
     section: _WireSection | None
     evidence_handles: tuple[str, ...] | None = None
+    claim_scope: str | None = None
     text_lines: list[str] = field(default_factory=list)
     raw_lines: list[str] = field(default_factory=list)
     text_started: bool = False
@@ -283,11 +285,11 @@ _SYNTHESIS_CLAIM_HEADER = re.compile(r"^CLAIM(?:\s+([A-Za-z0-9._-]+))?\s*:?$", r
 _SYNTHESIS_SOURCE_NOTE_HEADER = re.compile(r"^SOURCE_NOTE\s+([A-Za-z0-9._-]+)\s*:?$", re.IGNORECASE)
 _SYNTHESIS_TITLE_INLINE = re.compile(r"^TITLE\s*:\s*(.*)$", re.IGNORECASE)
 _SYNTHESIS_FIELD = re.compile(
-    r"^(EVIDENCE(?:\s+HANDLES?)?|HANDLES|TEXT|HEADING)\s*:\s*(.*)$",
+    r"^(EVIDENCE(?:\s+HANDLES?)?|HANDLES|TEXT|HEADING|CLAIM_SCOPE)\s*:\s*(.*)$",
     re.IGNORECASE,
 )
 _SYNTHESIS_FIELD_BARE = re.compile(
-    r"^(EVIDENCE(?:\s+HANDLES?)?|HANDLES|TEXT|HEADING)\s+(.+)$",
+    r"^(EVIDENCE(?:\s+HANDLES?)?|HANDLES|TEXT|HEADING|CLAIM_SCOPE)\s+(.+)$",
     re.IGNORECASE,
 )
 _SYNTHESIS_HANDLE = re.compile(r"\b[ER]\d{3,}\b")
@@ -384,6 +386,7 @@ def parse_synthesis_proposal_wire(raw_text: str) -> SynthesisWireParseResult:
             parsed = SynthesisClaimProposalV1(
                 text="\n".join(claim.text_lines).strip(),
                 evidence_handles=claim.evidence_handles,
+                claim_scope=claim.claim_scope,
             )
         except ValueError:
             reject(claim.block_id, "synthesis_claim_schema_invalid", claim.raw_lines)
@@ -703,6 +706,13 @@ def parse_synthesis_proposal_wire(raw_text: str) -> SynthesisWireParseResult:
                         current_claim.evidence_handles = _wire_evidence_handles(value)
                         if current_claim.evidence_handles is None:
                             current_claim.error_code = "synthesis_claim_invalid_evidence_handles"
+                elif field_name == "claim_scope":
+                    if current_claim.claim_scope is not None:
+                        current_claim.error_code = "synthesis_claim_duplicate_scope_field"
+                    elif not value.strip():
+                        current_claim.error_code = "synthesis_claim_invalid_scope"
+                    else:
+                        current_claim.claim_scope = value.strip()
                 elif field_name == "text":
                     if current_claim.text_started:
                         current_claim.error_code = "synthesis_claim_duplicate_text_field"
@@ -895,7 +905,8 @@ class SynthesisAccessPolicyV1:
 
 _PROPOSAL_REQUIRED_KEYS = frozenset({"lead", "sections"})
 _PROPOSAL_OPTIONAL_KEYS = frozenset({"title", "source_notes"})
-_CLAIM_PROPOSAL_KEYS = frozenset({"text", "evidence_handles"})
+_CLAIM_PROPOSAL_REQUIRED_KEYS = frozenset({"text", "evidence_handles"})
+_CLAIM_PROPOSAL_OPTIONAL_KEYS = frozenset({"claim_scope"})
 _SECTION_PROPOSAL_KEYS = frozenset({"kind", "heading", "claims"})
 _SOURCE_NOTE_PROPOSAL_KEYS = frozenset({"source_alias", "evidence_handles", "text"})
 _MARKDOWN_OR_HTML = re.compile(
@@ -1298,6 +1309,7 @@ class SynthesisEvidencePackV1:
     _source_alias_handles: Mapping[str, tuple[str, ...]] = field(
         default_factory=dict, repr=False, compare=False
     )
+    _subject_scoped_handles: frozenset[str] = field(default_factory=frozenset, repr=False)
 
     def source_for_alias(self, alias: str) -> tuple[UUID, frozenset[str]] | None:
         """Resolve a transport source alias to its source and the handles it may cite."""
@@ -1536,6 +1548,19 @@ def build_synthesis_evidence_pack(
         )
         for relation in (projection.source_pair_relations if projection is not None else ())
     )
+    subject_scoped_refs = {
+        item.evidence_ref
+        for item in (projection.classifications if projection is not None else ())
+        if item.classification
+        in {RelevanceClassification.DIRECT, RelevanceClassification.CORROBORATION}
+        and source_by_id[item.evidence_ref.source_document_id].editorial_role
+        is not ProductionEditorialRole.CONTEXT
+    }
+    subject_scoped_handles = frozenset(
+        handle
+        for ref in subject_scoped_refs
+        if (handle := handle_for_ref.get(ref) or reserve_handle_for_ref.get(ref)) is not None
+    )
     return SynthesisEvidencePackV1(
         subject_title=snapshot.subject_title,
         publication_language=snapshot.publication_language,
@@ -1554,6 +1579,7 @@ def build_synthesis_evidence_pack(
         _handle_for_ref=MappingProxyType(dict(handle_for_ref)),
         _source_alias_to_id=MappingProxyType(source_alias_to_id),
         _source_alias_handles=MappingProxyType(source_alias_handles),
+        _subject_scoped_handles=subject_scoped_handles,
     )
 
 
@@ -1900,13 +1926,20 @@ def _strict_mapping(value: Any, keys: frozenset[str], label: str) -> Mapping[str
 
 
 def _claim_proposal_from_payload(value: Any) -> SynthesisClaimProposalV1:
-    payload = _strict_mapping(value, _CLAIM_PROPOSAL_KEYS, "Claim proposal")
+    if (
+        not isinstance(value, Mapping)
+        or not _CLAIM_PROPOSAL_REQUIRED_KEYS <= set(value)
+        or set(value) - _CLAIM_PROPOSAL_REQUIRED_KEYS - _CLAIM_PROPOSAL_OPTIONAL_KEYS
+    ):
+        raise ValueError("Claim proposal fields do not match the strict schema")
+    payload = value
     handles = payload["evidence_handles"]
     if not isinstance(handles, list):
         raise ValueError("Claim evidence handles must be an array")
     return SynthesisClaimProposalV1(
         text=payload["text"],
         evidence_handles=tuple(handles),
+        claim_scope=payload.get("claim_scope"),
     )
 
 

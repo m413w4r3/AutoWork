@@ -48,6 +48,7 @@ from cti_app.domain.production_references import (
     ProductionReferenceKind,
     ProductionReferenceSourceV1,
     ProductionReferenceTier,
+    production_source_criticality,
 )
 from cti_app.domain.production_relevance import (
     RelevanceClassification,
@@ -399,7 +400,7 @@ def _validate_publication_lineage(
 
 # V9 changes only PUBLICATION presentation: identical archived content now has
 # one deterministic reader-facing source entry. Upstream artifacts remain valid.
-ASSEMBLY_POLICY_VERSION: Final[str] = "9-content-identity-reference-deduplication"
+ASSEMBLY_POLICY_VERSION: Final[str] = "10-context-source-provenance"
 
 
 def _canonical_digest(payload: dict[str, Any]) -> str:
@@ -472,6 +473,9 @@ def _project_publication_sources(
                 f"{source_document_id}",
             )
         resolved_source = min(matching_sources, key=_publication_reference_source_order)
+        criticality, criticality_reason = production_source_criticality(
+            resolved_source, sources=references.sources
+        )
         publication_sources.append(
             PublicationSourceV1(
                 source_document_id=source_document_id,
@@ -482,6 +486,11 @@ def _project_publication_sources(
                 tier=resolved_source.tier,
                 kind=resolved_source.kind,
                 role=resolved_source.role,
+                editorial_role=resolved_source.editorial_role,
+                source_criticality=criticality,
+                criticality_reason=criticality_reason,
+                source_collection_id=resolved_source.source_collection_id,
+                content_sha256=resolved_source.content_sha256,
             )
         )
     return tuple(publication_sources)

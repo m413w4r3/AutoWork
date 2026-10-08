@@ -14,7 +14,10 @@ from cti_app.application.typst_rendering import project_publication_to_typst_mod
 from cti_app.domain.production import ProductionInputSnapshot
 from cti_app.domain.production_editorial_enrichment import EditorialEnrichmentV1
 from cti_app.domain.production_extraction import ProductionExtractionV1
-from cti_app.domain.production_references import ProductionReferenceCorpusV1
+from cti_app.domain.production_references import (
+    ProductionReferenceCorpusV1,
+    production_source_criticality,
+)
 from cti_app.domain.production_relevance import RelevanceProjectionV1
 from cti_app.domain.production_synthesis import (
     ProductionSynthesisV1,
@@ -176,6 +179,32 @@ def qa_publication_v5(
         ) == serialize_publication_document(expected)
         if not checks["exact_projection"]:
             errors.append("Publication differs from canonical Assembly projection")
+
+    checks["source_provenance"] = True
+    reference_sources_by_id: dict[Any, list[Any]] = {}
+    for source in references.sources:
+        if source.source_document_id is not None:
+            reference_sources_by_id.setdefault(source.source_document_id, []).append(source)
+    for publication_source in publication.sources:
+        if publication_source.editorial_role is None:
+            continue
+        matches = reference_sources_by_id.get(publication_source.source_document_id, [])
+        if not any(
+            publication_source.editorial_role is source.editorial_role
+            and publication_source.source_collection_id == source.source_collection_id
+            and publication_source.content_sha256 == source.content_sha256
+            and (
+                publication_source.source_criticality,
+                publication_source.criticality_reason,
+            )
+            == production_source_criticality(source, sources=references.sources)
+            for source in matches
+        ):
+            checks["source_provenance"] = False
+            errors.append(
+                "Publication source role, criticality, or archive provenance differs "
+                "from the canonical reference corpus"
+            )
 
     v5 = publication if isinstance(publication, PublicationDocumentV5) else None
     reference_texts = tuple(item.text for item in v5.references) if v5 else ()

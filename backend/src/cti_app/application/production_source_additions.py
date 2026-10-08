@@ -196,6 +196,7 @@ class SourceAdditionPromotionResult:
     artifacts: tuple[ProductionArtifact, ...]
     source_additions_hash: str
     already_promoted: bool
+    promotion_plan: SourceAdditionPromotionPlanV1 | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -628,6 +629,9 @@ class SourceAdditionService:
         plan = ready[0].promotion_plan
         if plan is None or any(entry.promotion_plan != plan for entry in ready):
             raise SourceAdditionConflictError("source_addition_projection_plan_mismatch")
+        ready_additions_hash = source_additions_hash(tuple(entry.addition for entry in ready))
+        if ready_additions_hash != plan.source_additions_hash:
+            raise SourceAdditionConflictError("source_addition_manifest_changed")
 
         active_items: list[ProductionArtifact | None] = []
         for item in plan.projected_artifacts:
@@ -645,6 +649,7 @@ class SourceAdditionService:
                 artifacts=tuple(item for item in active if item is not None),
                 source_additions_hash=plan.source_additions_hash,
                 already_promoted=True,
+                promotion_plan=plan,
             )
 
         if run.pipeline_generation != plan.pipeline_generation:
@@ -686,11 +691,6 @@ class SourceAdditionService:
             raise SourceAdditionPromotionBlockedError(blockers)
 
         manifest = source_addition_manifest(tuple(entry.addition for entry in ready))
-        if (
-            source_additions_hash(tuple(entry.addition for entry in ready))
-            != plan.source_additions_hash
-        ):
-            raise SourceAdditionConflictError("source_addition_manifest_changed")
         manifest_json = [dict(item) for item in manifest]
         promoted: list[ProductionArtifact] = []
         for projection in plan.projected_artifacts:
@@ -726,6 +726,7 @@ class SourceAdditionService:
             artifacts=tuple(promoted),
             source_additions_hash=plan.source_additions_hash,
             already_promoted=False,
+            promotion_plan=plan,
         )
 
     async def _archive_selected(
