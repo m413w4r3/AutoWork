@@ -380,7 +380,15 @@ class ExtractionProfile(StrEnum):
     IOC_RULES = "ioc_rules"
 
 
+class SourceAdditionExtractionIntent(StrEnum):
+    """Operator-declared extraction depth for an additive source."""
+
+    INDICATORS_ONLY = "indicators_only"
+    DESCRIPTIVE_FACTS = "descriptive_facts"
+
+
 EXTRACTION_PROFILE_POLICY_VERSION = "production-reference-tier-core-first-v5"
+SOURCE_ADDITION_EXTRACTION_PROFILE_POLICY_VERSION = "source-addition-extraction-intent-v1"
 
 
 class DetectionRuleType(StrEnum):

@@ -307,3 +307,26 @@ Krypt3ia bloquée est à traiter à REFERENCES avant l’extension NanoDump.
   publication/QA reste sans modèle; l’enrichissement est rebasé uniquement
   après revalidation des ancres et handles, sinon ses blocs dépendants sont
   stale.
+
+## E2a-2a : intention d’extraction des sources ajoutées
+
+- `SourceAdditionV1.extraction_intent` est un enum stocké dans le JSONB du
+  journal. `indicators_only` est la valeur par défaut et préserve le profil
+  historique. Un enregistrement antérieur sans ce champ se lit comme
+  `indicators_only`; aucun snapshot passé n’est réécrit.
+- L’opérateur peut choisir `descriptive_facts` pour une source ajoutée afin
+  d’en décrire le fonctionnement. La décision de profil existante reçoit cette
+  intention uniquement sur les documents ajoutés au corpus prospectif et
+  retourne `FULL` avec la raison typée `operator_descriptive_context`. La
+  politique tier/type des références du pipeline normal reste inchangée.
+- L’identité de checkpoint conserve le texte effectif, le profil et la version
+  `source-addition-extraction-intent-v1`. Ainsi, deux profils ou deux versions
+  de cette décision ne partagent pas un checkpoint; les réutilisations des
+  sources historiques gardent leur identité actuelle.
+- Le profil, la raison, l’intention et la version de politique apparaissent
+  dans le manifeste d’addition. Le preview rapporte aussi les appels faits,
+  restants et les réutilisations de checkpoints pour l’extraction.
+- Cette intention ne modifie ni le rôle éditorial `CONTEXT` ni la portée
+  `TOOL_CONTEXT`. La projection de pertinence classe les evidence ajoutées en
+  `CONTEXT`; elles peuvent appuyer une description de l’outil, jamais une claim
+  `actor_activity` ou un fait de campagne. Aucune migration SQL n’est requise.
