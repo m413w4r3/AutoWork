@@ -1386,11 +1386,54 @@ class ProductionExtractionService:
             corpus = await load_reference_corpus(
                 uow=uow, run=run, snapshot=snapshot, artifact_store=self._artifact_store
             )
+        if snapshot is None:
+            raise ProductionExtractionControlError(
+                ExtractionControlCode.REFERENCE_CORPUS_INVALID,
+                "Extraction requires the run's frozen production snapshot",
+            )
+        return await self.plan_for_corpus(run=run, snapshot=snapshot, corpus=corpus)
+
+    async def plan_for_corpus(
+        self,
+        *,
+        run: ProductionRun,
+        snapshot: ProductionInputSnapshot,
+        corpus: ProductionReferenceCorpusV1,
+        source_document_ids: frozenset[UUID] | None = None,
+    ) -> ExtractionPlan:
+        """Prepare archive-backed extraction from an explicit prospective corpus.
+
+        Source extension uses this entry point to plan against REFERENCES that
+        are persisted as prospective content-addressed blobs but are not yet
+        current artifacts. The normal planner delegates here with its current
+        canonical corpus, preserving the same archive, scope, and checkpoint
+        behavior for both paths.
+        """
+        if run.subject_id != snapshot.subject_id or corpus.subject_id != snapshot.subject_id:
+            raise ProductionExtractionControlError(
+                ExtractionControlCode.REFERENCE_CORPUS_INVALID,
+                "Extraction run, snapshot, and reference corpus subjects differ",
+            )
         seed_plan = build_extraction_plan(corpus)
-        archives = await self._load_archives(seed_plan)
+        selected_sources = (
+            tuple(seed_plan.sources)
+            if source_document_ids is None
+            else tuple(
+                source
+                for source in seed_plan.sources
+                if source.source_document_id in source_document_ids
+            )
+        )
+        if source_document_ids is not None and {
+            source.source_document_id for source in selected_sources
+        } != set(source_document_ids):
+            raise ProductionExtractionControlError(
+                ExtractionControlCode.REFERENCE_CORPUS_INVALID,
+                "A requested addition is not eligible for extraction in the projected corpus",
+            )
+        archives = await self._load_archives(replace(seed_plan, sources=selected_sources))
         evidence_documents: dict[UUID, SourceEvidenceDocument] = {}
-        assert snapshot is not None
-        for planned in seed_plan.sources:
+        for planned in selected_sources:
             archive = archives[planned.source_document_id]
             try:
                 evidence = build_source_evidence_document(
@@ -1421,6 +1464,16 @@ class ProductionExtractionService:
                 evidence, parsed_text=effective_text, scope=scope
             )
         plan = build_extraction_plan(corpus, evidence_documents=evidence_documents)
+        if source_document_ids is not None:
+            plan = replace(
+                plan,
+                sources=tuple(
+                    source
+                    for source in plan.sources
+                    if source.source_document_id in source_document_ids
+                ),
+                omitted_sources=(),
+            )
         planned_by_id = {source.source_document_id: source for source in plan.sources}
         prepared_archives = {
             source_id: replace(archive, planned=planned_by_id[source_id])
@@ -2394,6 +2447,15 @@ class _ExtractionRun:
                     checkpoint_id=computation.checkpoint_id,
                     reuse_state=reuse_state,
                 )
+            )
+        if not sources:
+            return self._stopped(
+                ExtractionExecutionStatus.BLOCKED,
+                SourceExtractionFailure(
+                    ExtractionFailureCode.MODEL_CALL_FAILED,
+                    "No requested source produced a verified extraction",
+                    details={"source_count": len(self._plan.sources)},
+                ),
             )
         extraction = build_production_extraction(
             plan=self._plan,

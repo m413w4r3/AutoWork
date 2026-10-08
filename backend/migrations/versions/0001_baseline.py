@@ -233,6 +233,12 @@ _TRIGGERS: tuple[tuple[str, str, str, str], ...] = (
         "append_only",
     ),
     (
+        "production_source_additions",
+        "trg_production_source_additions_append_only",
+        "reject_evidence_mutation",
+        "append_only",
+    ),
+    (
         "virustotal_observations",
         "trg_vt_observations_append_only",
         "reject_evidence_mutation",

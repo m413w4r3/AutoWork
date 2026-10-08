@@ -45,6 +45,7 @@ from cti_app.application.persistence import (
     ProductionRepairDecisionRepository,
     ProductionReuseInvalidationRepository,
     ProductionRunRepository,
+    ProductionSourceAdditionRepository,
     ProvenanceRepository,
     PublicationManifestEntryRepository,
     PublicationManifestExclusionRepository,
@@ -155,6 +156,9 @@ from cti_app.infrastructure.database.repositories.production import (
     SqlAlchemySampleAcquisitionAttemptRepository,
     SqlAlchemySourceExtractionRepository,
 )
+from cti_app.infrastructure.database.repositories.production_source_additions import (
+    SqlAlchemyProductionSourceAdditionRepository,
+)
 from cti_app.infrastructure.database.repositories.publication_render import (
     SqlAlchemyPublicationRenderRepository,
 )
@@ -223,6 +227,7 @@ class SqlAlchemyUnitOfWork:
     production_runs: ProductionRunRepository
     production_input_snapshots: ProductionInputSnapshotRepository
     production_artifacts: ProductionArtifactRepository
+    production_source_additions: ProductionSourceAdditionRepository
     production_reuse_invalidations: ProductionReuseInvalidationRepository
     production_repair_decisions: ProductionRepairDecisionRepository
     production_repair_corrections: ProductionRepairCorrectionRepository
@@ -305,6 +310,9 @@ class SqlAlchemyUnitOfWork:
         self.production_runs = SqlAlchemyProductionRunRepository(self._session)
         self.production_input_snapshots = SqlAlchemyProductionInputSnapshotRepository(self._session)
         self.production_artifacts = SqlAlchemyProductionArtifactRepository(self._session)
+        self.production_source_additions = SqlAlchemyProductionSourceAdditionRepository(
+            self._session
+        )
         self.production_repair_decisions = SqlAlchemyProductionRepairDecisionRepository(
             self._session
         )

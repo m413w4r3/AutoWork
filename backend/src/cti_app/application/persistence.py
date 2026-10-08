@@ -80,6 +80,7 @@ from cti_app.domain.production import (
     SampleAcquisitionAttempt,
     SourceExtraction,
 )
+from cti_app.domain.production_source_additions import SourceAdditionJournalEntryV1
 from cti_app.domain.publication_render import PublicationRender
 from cti_app.domain.publication_review import PublicationReviewDecision
 from cti_app.domain.reference_corpus import ReferenceMember, ReferenceMemberDispute
@@ -826,6 +827,7 @@ class UnitOfWork(Protocol):
     production_runs: ProductionRunRepository
     production_input_snapshots: ProductionInputSnapshotRepository
     production_artifacts: ProductionArtifactRepository
+    production_source_additions: ProductionSourceAdditionRepository
     production_reuse_invalidations: ProductionReuseInvalidationRepository
     production_repair_decisions: ProductionRepairDecisionRepository
     production_repair_corrections: ProductionRepairCorrectionRepository
@@ -1031,6 +1033,18 @@ class ProductionArtifactRepository(Protocol):
     async def mark_from_stage_stale(self, run_id: UUID, stage: str) -> list[str]: ...
 
 
+class ProductionSourceAdditionRepository(Protocol):
+    async def get_latest_for_identity(
+        self, production_run_id: UUID, request_id: UUID, source_key: str
+    ) -> SourceAdditionJournalEntryV1 | None: ...
+
+    async def list_latest_for_request(
+        self, production_run_id: UUID, request_id: UUID
+    ) -> Sequence[SourceAdditionJournalEntryV1]: ...
+
+    async def append(self, entry: SourceAdditionJournalEntryV1) -> None: ...
+
+
 class SourceExtractionRepository(Protocol):
     """Persistent, subject-independent Q2 source checkpoint catalog."""
 
@@ -1159,6 +1173,7 @@ class ProductionUnitOfWork(Protocol):
     production_runs: ProductionRunRepository
     production_input_snapshots: ProductionInputSnapshotRepository
     production_artifacts: ProductionArtifactRepository
+    production_source_additions: ProductionSourceAdditionRepository
     source_extractions: SourceExtractionRepository
     production_reuse_invalidations: ProductionReuseInvalidationRepository
     production_repair_decisions: ProductionRepairDecisionRepository
