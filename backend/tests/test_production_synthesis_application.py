@@ -4371,6 +4371,75 @@ def test_targeted_revision_rewrites_only_paragraph_in_middle_section() -> None:
     assert revised.sections[1].paragraphs[0].text == "FooRAT was identified in the report."
 
 
+def test_targeted_revision_validates_patch_when_unchanged_lead_is_not_fully_admitted() -> None:
+    world, base, _, _ = _targeted_revision_fixture()
+    context_source_id = uuid4()
+    context_source = make_source(
+        context_source_id,
+        tier=ProductionReferenceTier.SUPPORTING,
+        profile=ExtractionProfile.IOC_RULES,
+        role=SourceRole.INDEPENDENT,
+        editorial_role=ProductionEditorialRole.CORROBORATION,
+        uncertainties=("Attribution remains uncertain in the technical source.",),
+        url_suffix="technical-context",
+    )
+    extraction = _matched_extraction(world.snapshot, world.extraction.sources[0], context_source)
+    evidence_pack = build_synthesis_evidence_pack(world.snapshot, extraction)
+    admitted_ref = base.lead[0].evidence_refs[0]
+    unadmitted_ref = next(
+        ref
+        for ref in extraction_evidence_refs_v1(extraction)
+        if ref.kind is EvidenceKind.UNCERTAINTY and ref.source_document_id == context_source_id
+    )
+    handle = evidence_pack.handle_for(admitted_ref)
+    assert handle is not None
+    assert evidence_pack.handle_for(unadmitted_ref) is None
+
+    base = replace(
+        base,
+        extraction_hash=canonical_extraction_hash(extraction),
+        lead=(
+            replace(
+                base.lead[0],
+                evidence_refs=(admitted_ref, unadmitted_ref),
+            ),
+        ),
+    )
+    payload = production_synthesis_to_json(base)
+    section = payload["sections"][1]
+    target = TargetedEditorialRevisionTarget(
+        kind=TargetedEditorialRevisionTargetKind.SECTION_PARAGRAPH,
+        stable_ids=(synthesis_revision_module._paragraph_id(section["paragraphs"][0]),),
+        parent_id=synthesis_revision_module._section_id(section),
+    )
+    operation = TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH
+    patch = _targeted_wire_patch(
+        payload,
+        target,
+        operation,
+        "@@SECTION overview S001@@\n"
+        "@@CLAIM C001@@\n"
+        f"EVIDENCE: {handle}\n"
+        "TEXT: FooRAT was identified in the report.\n"
+        "@@END SECTION@@",
+    )
+
+    revised, revised_payload, _ = synthesis_revision_module._apply_wire_patch(
+        base_synthesis=base,
+        base_payload=payload,
+        target=target,
+        operation=operation,
+        patch=patch,
+        evidence_pack=evidence_pack,
+        extraction=extraction,
+        snapshot=world.snapshot,
+    )
+
+    assert revised.lead == base.lead
+    assert revised_payload["lead"] == payload["lead"]
+    assert revised.sections[1].paragraphs[0].text == "FooRAT was identified in the report."
+
+
 def test_targeted_revision_rejects_unknown_evidence_and_unsupported_claim() -> None:
     world, base, evidence_pack, handle = _targeted_revision_fixture()
     payload = production_synthesis_to_json(base)

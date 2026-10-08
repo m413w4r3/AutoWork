@@ -110,12 +110,12 @@ from cti_app.domain.production_synthesis import (
     validate_synthesis_section_headings,
 )
 
-TARGETED_SYNTHESIS_REVISION_PARSER_VERSION = "targeted-synthesis-patch-parser-v3-heading-after-text"
+TARGETED_SYNTHESIS_REVISION_PARSER_VERSION = "targeted-synthesis-patch-parser-v4-optional-lead"
 # The revision contract includes validator-owned evidence grounding behavior.
-SYNTHESIS_TARGETED_REVISION_CONTRACT_VERSION = (
-    "synthesis-targeted-patch-v4-after-formats-grounding-v3"
+SYNTHESIS_TARGETED_REVISION_CONTRACT_VERSION = "synthesis-targeted-patch-v5-no-lead-validation"
+TARGETED_SYNTHESIS_REVISION_VALIDATOR_VERSION = (
+    "targeted-synthesis-patch-validator-v5-no-lead-validation"
 )
-TARGETED_SYNTHESIS_REVISION_VALIDATOR_VERSION = "targeted-synthesis-patch-validator-v4-grounding-v3"
 MAX_TARGETED_REVISION_INSTRUCTION_LENGTH = 2000
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _OUTER_WIRE_BLOCK = re.compile(
@@ -797,15 +797,13 @@ def _parse_after_claims(
     *,
     evidence_pack: SynthesisEvidencePackV1,
     extraction: ProductionExtractionV1,
-    unchanged_lead_wire: str = "",
     source_addition_document_ids: frozenset[UUID] = frozenset(),
     require_claim_scopes: bool = False,
     base_synthesis: ProductionSynthesisV1 | None = None,
     snapshot: ProductionInputSnapshot | None = None,
 ) -> tuple[SynthesisProposalV1, tuple[SynthesisParagraphV1, ...], tuple[SynthesisSectionV1, ...]]:
-    synthetic_lead = not re.search(r"(?im)^\s*@@\s*LEAD\s*@@", raw)
-    parse_input = f"{unchanged_lead_wire}\n{raw}" if synthetic_lead else raw
-    parsed = parse_synthesis_proposal_wire(parse_input)
+    has_lead = re.search(r"(?im)^\s*@@\s*LEAD\s*@@", raw) is not None
+    parsed = parse_synthesis_proposal_wire(raw, require_lead=has_lead)
     if parsed.proposal is None or parsed.error_code is not None or parsed.rejections:
         raise TargetedSynthesisRevisionValidationError(
             "revision_after_claims_invalid",
@@ -821,7 +819,7 @@ def _parse_after_claims(
     _assert_claim_handles_and_relations_supported(
         parsed.proposal,
         evidence_pack,
-        check_lead=not synthetic_lead,
+        check_lead=has_lead,
         extraction=extraction,
         source_addition_document_ids=source_addition_document_ids,
         require_claim_scopes=require_claim_scopes,
@@ -835,7 +833,7 @@ def _parse_after_claims(
             exc.code.value,
             details={"reason": exc.reason},
         ) from exc
-    return parsed.proposal, (() if synthetic_lead else lead), sections
+    return parsed.proposal, lead, sections
 
 
 _GROUNDING_STOP_WORDS = frozenset(
@@ -1463,29 +1461,6 @@ def _assert_claim_handles_and_relations_supported(
             )
 
 
-def _unchanged_lead_wire(
-    synthesis: ProductionSynthesisV1, evidence_pack: SynthesisEvidencePackV1
-) -> str:
-    paragraph = next(
-        (
-            item
-            for item in synthesis.lead
-            if all(evidence_pack.handle_for(ref) for ref in item.evidence_refs)
-        ),
-        None,
-    )
-    if paragraph is None:
-        raise TargetedSynthesisRevisionValidationError(
-            "revision_cannot_validate_patch_without_admitted_lead"
-        )
-    handles = [evidence_pack.handle_for(ref) for ref in paragraph.evidence_refs]
-    return (
-        "@@LEAD@@\n@@CLAIM PRESERVED_LEAD@@\n"
-        f"EVIDENCE: {', '.join(item for item in handles if item is not None)}\n"
-        f"TEXT: {paragraph.text}\n"
-    )
-
-
 def _require_empty_after(raw: str) -> None:
     normalized = raw.strip().casefold()
     if normalized not in {"empty", "@@empty@@"}:
@@ -1734,7 +1709,6 @@ def _apply_wire_patch(
             raw_after,
             evidence_pack=evidence_pack,
             extraction=extraction,
-            unchanged_lead_wire=_unchanged_lead_wire(base_synthesis, evidence_pack),
             source_addition_document_ids=source_addition_document_ids,
             require_claim_scopes=require_claim_scopes,
             base_synthesis=base_synthesis,

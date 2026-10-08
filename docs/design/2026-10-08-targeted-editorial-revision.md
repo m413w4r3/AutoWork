@@ -215,3 +215,31 @@ toute proposition contre ce pack. Les IDs, hashes, politique d'accès et
 inventaire empêchent que des entrées remplacées ou modifiées profitent de
 l'exception. L'exception est limitée au marqueur écrit par le chemin de
 réparation; aucune nouvelle version de politique n'est nécessaire.
+
+## Correctif — validation d'un patch sans chapeau
+
+Un patch ciblé de section ou de paragraphe peut omettre `@@LEAD@@`, puisque le
+chapeau n'est pas sa cible. Le parseur accepte alors une proposition sans claim
+de lead uniquement dans ce mode interne (`require_lead=False`) ; son mode par
+défaut conserve l'exigence d'un lead pour les propositions complètes. La
+validation continue sur chaque claim de la cible, ses handles exacts, son
+scope, ses relations et son ancrage dans l'extraction. Aucun texte de
+remplacement ne peut être validé en contournant ces contrôles.
+
+Le chapeau de base n'est plus injecté dans la proposition servant à valider le
+patch. L'application garde le payload de base et remplace uniquement la cible,
+ce qui préserve les octets canoniques du chapeau et des autres zones hors cible.
+Les versions du parseur de révision, du contrat et du validateur sont
+incrémentées pour distinguer ce comportement lors des relectures de lineage.
+
+L'audit en lecture seule des neuf sujets réels des fichiers `fin1.json` à
+`fin9.json` trouve quatre chapeaux sans paragraphe dont toutes les références
+ont un handle admis : `fdde6348-2f3d-4466-b7e2-8be1999c35e7`,
+`bb2701a1-777c-405a-b2bd-0f097e648fd3`,
+`b17edd9f-743a-4bc9-b919-b65c904a5803` et
+`27a56be8-ed2d-4cf4-8542-ea73d744a60e` (GTG-30006). Pour ce dernier, le
+chapeau de la synthèse v9 cite un fait direct admis et une incertitude
+`context` provenant d'une source `IOC_RULES`. Les incertitudes narratives du
+pack de révision sont construites depuis les sources `FULL`, donc cette
+seconde référence n'a aucun handle dans le pack, bien que le chapeau reste
+inchangé et hors cible.
