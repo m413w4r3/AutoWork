@@ -46,6 +46,10 @@ PRODUCTION_SOURCE_CRITICALITY_REASON_VALUES_SQL = (
     "'core_tier', 'primary_role', 'counter_analysis', 'redundant_corroboration', "
     "'corroboration_uncovered', 'content_duplicate', 'coverage_unknown'"
 )
+PRODUCTION_SOURCE_ADDITION_STATE_VALUES_SQL = (
+    "'candidate', 'selected', 'archived', 'extracted', 'ready', 'refused'"
+)
+PRODUCTION_SOURCE_ADDITION_ORIGIN_VALUES_SQL = "'discovery', 'operator_url', 'manual_archive'"
 PRODUCTION_REPAIR_VERIFICATION_STATE_VALUES_SQL = "'source_verified', 'analyst_override'"
 PRODUCTION_BATCH_STATUS_VALUES_SQL = (
     "'queued', 'running', 'paused', 'completed', 'completed_with_issues', 'cancelled'"
@@ -206,6 +210,60 @@ class ProductionArtifactRow(Base):
     artifact_metadata: Mapped[dict[str, Any]] = mapped_column(
         JSONB, name="metadata", nullable=False
     )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ProductionSourceAdditionRow(Base):
+    """Append-only acquisition journal; payloads live in content-addressed blobs."""
+
+    __tablename__ = "production_source_additions"
+    __table_args__ = (
+        UniqueConstraint("addition_id", "version", name="uq_source_addition_version"),
+        UniqueConstraint(
+            "production_run_id",
+            "request_id",
+            "source_key",
+            "version",
+            name="uq_source_addition_request_source_version",
+        ),
+        CheckConstraint("version >= 1", name="ck_source_addition_version"),
+        CheckConstraint(
+            "char_length(source_key) = 64 AND source_key ~ '^[0-9a-f]{64}$'",
+            name="ck_source_addition_source_key",
+        ),
+        CheckConstraint(
+            f"state IN ({PRODUCTION_SOURCE_ADDITION_STATE_VALUES_SQL})",
+            name="ck_source_addition_state",
+        ),
+        CheckConstraint(
+            f"origin IN ({PRODUCTION_SOURCE_ADDITION_ORIGIN_VALUES_SQL})",
+            name="ck_source_addition_origin",
+        ),
+        Index(
+            "ix_production_source_additions_request_latest",
+            "production_run_id",
+            "request_id",
+            "source_key",
+            "version",
+        ),
+        Index("ix_production_source_additions_run_created", "production_run_id", "created_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    addition_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    request_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    production_run_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("production_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    subject_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("subjects.id", ondelete="RESTRICT"), nullable=False
+    )
+    source_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    version: Mapped[int] = mapped_column(nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    origin: Mapped[str] = mapped_column(String(32), nullable=False)
+    record: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    projection: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 

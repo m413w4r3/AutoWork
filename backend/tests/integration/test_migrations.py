@@ -154,6 +154,10 @@ EXPECTED_TRIGGERS: dict[tuple[str, str], str] = {
         "production_repair_corrections",
         "trg_production_repair_corrections_append_only",
     ): "reject_evidence_mutation",
+    (
+        "production_source_additions",
+        "trg_production_source_additions_append_only",
+    ): "reject_evidence_mutation",
     ("virustotal_observations", "trg_vt_observations_append_only"): "reject_evidence_mutation",
     ("virustotal_file_views", "trg_vt_file_views_append_only"): "reject_evidence_mutation",
     ("subjects", "trg_subjects_prevent_tlp_downgrade"): "prevent_tlp_downgrade",

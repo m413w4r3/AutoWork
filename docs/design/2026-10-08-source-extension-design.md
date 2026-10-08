@@ -212,3 +212,74 @@ si une recherche bornée compte séparément dans le preview. D classe aussi une
 source TECHNICAL/CONTEXT non dupliquée CRITICAL/COVERAGE_UNKNOWN: conserver
 cette règle prudente ou faire évoluer D explicitement. Pour le run observé,
 Krypt3ia bloquée est à traiter à REFERENCES avant l’extension NanoDump.
+
+## 7. E2a-1 : décisions d’implémentation
+
+- `domain/production_source_additions.py` porte les enums `StrEnum`, le
+  `SourceAdditionV1` immuable, les fences, le plan de promotion et le manifeste
+  canonique trié. Un article devient `SUPPORTING/PUBLICATION`; une ressource
+  technique devient `TECHNICAL/TECHNICAL_RESOURCE`. Toute addition conserve le
+  rôle éditorial `CONTEXT`. `source_additions_hash` couvre l’URL finale, les
+  deux SHA, la collection/document, le checkpoint/extraction/ModelRun, les
+  handles, le critère/acteur et les versions de politique.
+- `production_source_additions` est un journal append-only; les transitions
+  et les plans READY sont des snapshots versionnés. L’identité idempotente est
+  `(production_run_id, request_id, sha256(URL canonique))`. Le modèle est créé
+  dans `0001_baseline`; l’UoW expose le repository typé.
+- `SourceAdditionService.record_candidate/record_discovery_proposals` accepte
+  aussi directement les URL de `EditorialResourceProposalV1` déjà produites
+  par la recherche bornée existante; il ne relance pas cette recherche et ne
+  transforme aucune proposition en preuve. `select` journalise le critère,
+  sa version et l’acteur. `acquire` reprend la collection par URL canonique,
+  puis vérifie le reçu exact, les SHA, l’URL finale, la date et la politique
+  avant d’extraire. Un retour après crash doit retrouver les mêmes IDs et
+  empreintes; une autre archive sous la même URL donne un refus typé.
+- Le chemin standard reste `collection.py`. L’archive manuelle n’est proposée
+  qu’après `ACCESS_BLOCKED` (403/robots), uniquement avec les octets fournis
+  par l’opérateur. Une addition impossible devient `REFUSED` avec code et
+  stage de reprise; elle ne crée pas une issue de réparation du run.
+- Le corpus REFERENCES prospectif est l’ancien corpus plus les additions
+  archivées. `ProductionExtractionService.plan_for_corpus` reçoit seulement
+  les IDs des nouveaux documents; les anciennes sorties d’extraction et leurs
+  checkpoints ne sont pas recalculés. L’échec isolé d’une nouvelle source est
+  refusé. La projection de pertinence conserve ses décisions existantes et
+  classe les nouvelles evidence `CONTEXT` sans modèle.
+- Les nouveaux REFERENCES et EXTRACTION reçoivent le manifeste dans
+  `metadata.source_additions`. Les anciens artifacts ne sont ni réécrits ni
+  marqués stale. Un bloqueur critique du corpus courant (dont Krypt3ia) reste
+  un bloqueur; seule une archive ou une décision D `continue_without_source`
+  effective, raisonnée et attachée à la génération courante le lève.
+- L’interface de promotion est transactionnelle et ne commit pas:
+
+  ```python
+  promoted = await source_addition_service.promote(
+      uow,
+      production_run_id=run_id,
+      request_id=request_id,
+  )
+  await synthesis_revision_service.revise_in_uow(
+      uow,
+      production_run_id=run_id,
+      source_addition_promotion=promoted,
+      ...,
+  )
+  await uow.commit()
+  ```
+
+  La livraison 2 doit fournir `revise_in_uow` et adopter le hash effectif
+  d’EXTRACTION retourné par `promoted`, après avoir vérifié la dépendance de
+  SYNTHESIS sur l’ancien hash de base. Si l’ajout des deux étapes échoue, elle
+  rollbacke le même UoW. Un appel qui promeut REFERENCES/EXTRACTION sans la
+  nouvelle SYNTHESIS laisserait l’ancienne `ProductionSynthesisV1.extraction_hash`
+  derrière l’extraction courante; la méthode ne doit donc pas être commitée
+  seule. Les blobs prospectifs adressés par contenu peuvent rester orphelins
+  après un rollback, mais aucun nouvel artifact ne les rend courants.
+
+  Le préflight de promotion recalcule les bloqueurs et compare la génération,
+  les IDs/versions/input hashes et SHA-256 canoniques des trois artifacts de
+  base. La promotion append REFERENCES, EXTRACTION et RELEVANCE_PROJECTION
+  dans cet ordre transactionnel; elle ne touche pas à SYNTHESIS, ENRICHMENT
+  ou PUBLICATION. Le résultat renvoie les artifacts projetés à la livraison 2.
+- E2a-1 n’ajoute pas l’UI/API HTTP, la révision narrative, les scopes de claim,
+  l’enrichissement ou la publication. Ces changements restent dans les
+  livraisons suivantes et leurs fichiers réservés.

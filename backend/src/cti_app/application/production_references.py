@@ -94,6 +94,7 @@ class ProductionReferenceProposal:
     kind: ProductionReferenceKind
     relevance_reason: str
     editorial_role: ProductionEditorialRole = ProductionEditorialRole.CONTEXT
+    proposed_by_model: bool = True
 
     @property
     def tier(self) -> ProductionReferenceTier:
@@ -206,7 +207,7 @@ def build_production_reference_corpus(
                 published_at=proposal.published_at,
                 discovery_candidate_ids=(),
                 relevance_reason=proposal.relevance_reason,
-                proposed_by_model=True,
+                proposed_by_model=proposal.proposed_by_model,
             ),
         )
 
