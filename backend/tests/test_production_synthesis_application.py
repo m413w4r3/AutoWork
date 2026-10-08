@@ -5896,9 +5896,7 @@ async def test_synthesis_revision_recovers_existing_model_run_without_resubmissi
     # or corrupt persisted rows still must not authorize a source waiver.
     reasonless_decision = object.__new__(ProductionRepairDecision)
     for field_name in ProductionRepairDecision.__dataclass_fields__:
-        object.__setattr__(
-            reasonless_decision, field_name, getattr(valid_waiver, field_name)
-        )
+        object.__setattr__(reasonless_decision, field_name, getattr(valid_waiver, field_name))
     object.__setattr__(reasonless_decision, "reason", None)
     effective_repair_decisions[:] = [reasonless_decision]
     refused_without_reason = await revision_service.revise(request)
