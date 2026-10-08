@@ -910,6 +910,7 @@ def _distinctive_grounding_terms(text: str) -> tuple[str, ...]:
     to paraphrase.
     """
     terms: dict[str, str] = {}
+    current_run: list[re.Match[str]] = []
 
     def add(value: str, *, force: bool = False) -> None:
         cleaned = value.strip(".,:;!?()[]{}\"'").strip("\u201c\u201d\u2018\u2019")
@@ -919,17 +920,28 @@ def _distinctive_grounding_terms(text: str) -> tuple[str, ...]:
         if key and (force or key not in _GROUNDING_STOP_WORDS):
             terms.setdefault(key, cleaned)
 
+    def add_current_run() -> None:
+        if len(current_run) > 1:
+            add(" ".join(part.group() for part in current_run))
+        current_run.clear()
+
     for match in _DISTINCTIVE_LITERAL.finditer(text):
         add(match.group())
 
     words = list(_GROUNDING_WORD.finditer(text))
-    current_run: list[re.Match[str]] = []
     for index, match in enumerate(words):
+        if current_run:
+            separator = text[current_run[-1].end() : match.start()]
+            if any(not character.isspace() or character in "\r\n" for character in separator):
+                add_current_run()
+
         value = match.group()
         letters = [character for character in value if character.isalpha()]
         is_camel_case = any(left.islower() and right.isupper() for left, right in pairwise(value))
         is_acronym = len(letters) > 1 and value.isupper()
         is_title_case = bool(letters) and value[0].isupper() and value[1:].islower()
+        is_explicit_identifier = any(character in value for character in "._-")
+        is_sentence_initial = is_title_case and _is_sentence_initial(text, match.start())
 
         scope_marker = unicodedata.normalize("NFKC", value).casefold()
         next_word = words[index + 1].group().casefold() if index < len(words) - 1 else ""
@@ -937,31 +949,36 @@ def _distinctive_grounding_terms(text: str) -> tuple[str, ...]:
             scope_marker == "tout" and next_word == "en"
         ):
             add(value, force=True)
-        if any(character.isdigit() for character in value) or is_camel_case or is_acronym:
+        if (
+            any(character.isdigit() for character in value)
+            or is_camel_case
+            or is_acronym
+            or is_explicit_identifier
+        ):
             add(value)
 
-        if not is_title_case:
-            if len(current_run) > 1:
-                add(" ".join(part.group() for part in current_run))
-            current_run = []
-        else:
-            current_run.append(match)
-        next_is_title_case = index < len(words) - 1 and (
-            words[index + 1].group()[0].isupper() and words[index + 1].group()[1:].islower()
+        # A French editorial opener such as "Ces" or "Selon" must not become
+        # part of a named sequence just because it starts a sentence. A real
+        # capitalized sequence after it (for example, "Cobalt Strike") remains
+        # eligible for grounding.
+        initial_stop_word = (
+            is_sentence_initial and _grounding_match_token(value) in _GROUNDING_STOP_WORDS
         )
-        if current_run and not next_is_title_case:
-            if len(current_run) > 1:
-                add(" ".join(part.group() for part in current_run))
-            current_run = []
+        if is_title_case and not initial_stop_word:
+            current_run.append(match)
+        else:
+            add_current_run()
 
-        if is_title_case and not _is_sentence_initial(text, match.start()):
+        if is_title_case and not is_sentence_initial:
             add(value)
+
+    add_current_run()
 
     return tuple(terms[key] for key in sorted(terms))
 
 
 def _unsupported_distinctive_claim_terms(claim_text: str, evidence_text: str) -> tuple[str, ...]:
-    """Find claim-specific names and literals absent from its cited evidence."""
+    """Find unsupported names and literals; multiword names need sequence evidence."""
     supported = {
         _grounding_match_token(term) for term in _distinctive_grounding_terms(evidence_text)
     }
