@@ -50,7 +50,7 @@ from cti_app.domain.publication_render import (
 from cti_app.domain.typst_render import TypstRenderFormat, TypstRenderStatus
 
 PUBLICATION_RENDERER = "typst"
-PUBLICATION_RENDERER_VERSION = "publication-v7-typst-v5-chapsvision-figures-tables-cited-context-reference"
+PUBLICATION_RENDERER_VERSION = "publication-v7-typst-v5-chapsvision-cited-context"
 
 PUBLICATION_RENDER_BUCKETS = TypstRenderBuckets(
     source="publication-renders-source",
