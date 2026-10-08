@@ -5035,7 +5035,7 @@ def test_sentence_initial_editorial_words_are_not_distinctive(opener: str) -> No
 
 @pytest.mark.parametrize(
     "identifier",
-    ("API", "PssNtCaptureSnapshot", "NanoDump2", "Foo-bar", "foo_bar", "Foo.exe"),
+    ("API", "PssNtCaptureSnapshot", "NanoDump2", "Group-IB", "foo_bar", "Foo.exe"),
 )
 def test_distinctive_identifiers_remain_distinctive_at_sentence_start(identifier: str) -> None:
     terms = synthesis_revision_module._distinctive_grounding_terms(
