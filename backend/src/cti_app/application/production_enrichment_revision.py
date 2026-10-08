@@ -2915,7 +2915,7 @@ class ProductionEditorialEnrichmentRevisionService:
         from cti_app.application.publication_assembly import PublicationAssemblyService
 
         async with self._enrichment._uow_factory() as uow:
-            publication = await PublicationAssemblyService(
+            assembly = await PublicationAssemblyService(
                 self._enrichment._artifact_store, uow.production_artifacts
             ).assemble_publication(
                 run=run,
@@ -2939,6 +2939,7 @@ class ProductionEditorialEnrichmentRevisionService:
                 },
             )
             await uow.commit()
+        publication = assembly.artifact
         await self._publication_render_service.render_preview(publication.id)
         return publication
 

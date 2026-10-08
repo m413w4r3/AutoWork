@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import replace
-from typing import Any
+from typing import Any, NamedTuple
 from uuid import UUID
 
 from cti_app.application.diagram_compilation import (
@@ -44,6 +44,17 @@ from cti_app.domain.source_media import (
 )
 
 
+class PublicationAssemblyResult(NamedTuple):
+    """Publication plus its exact projection inputs.
+
+    Returning refreshed diagram asset references keeps QA aligned without
+    rewriting the fenced EDITORIAL_ENRICHMENT artifact.
+    """
+
+    artifact: ProductionArtifact
+    editorial_enrichment: EditorialEnrichmentV1
+
+
 class PublicationAssemblyService:
     """Build and persist the canonical publication for one production run."""
 
@@ -71,7 +82,7 @@ class PublicationAssemblyService:
         editorial_enrichment: EditorialEnrichmentV1,
         relevance_projection: RelevanceProjectionV1 | None = None,
         metadata_extra: Mapping[str, Any] | None = None,
-    ) -> ProductionArtifact:
+    ) -> PublicationAssemblyResult:
         if (
             snapshot.production_run_id != run.id
             or snapshot.edition_id != run.edition_id
@@ -196,7 +207,7 @@ class PublicationAssemblyService:
             try:
                 stored = await self._artifact_store.read_bytes(current.canonical_blob_id)
                 if stored == canonical_bytes:
-                    return current
+                    return PublicationAssemblyResult(current, editorial_enrichment)
             except (BlobIntegrityError, EntityNotFoundError, FileNotFoundError):
                 pass
 
@@ -229,7 +240,7 @@ class PublicationAssemblyService:
             )
             self._set_repair_result_id(artifact)
             await self._production_artifacts.append(artifact)
-            return artifact
+            return PublicationAssemblyResult(artifact, editorial_enrichment)
 
         _, canonical_blob_id, _ = await self._artifact_store.store_stage_payloads(
             canonical=canonical_document
@@ -248,7 +259,7 @@ class PublicationAssemblyService:
         )
         self._set_repair_result_id(artifact)
         await self._production_artifacts.append(artifact)
-        return artifact
+        return PublicationAssemblyResult(artifact, editorial_enrichment)
 
     async def _refresh_diagram_assets(
         self,

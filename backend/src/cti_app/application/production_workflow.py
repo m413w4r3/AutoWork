@@ -2034,7 +2034,7 @@ class ProductionWorkflowOrchestrator:
                     extraction=canonical_extraction,
                     synthesis=canonical_synthesis,
                 )
-                publication = await PublicationAssemblyService(
+                assembly = await PublicationAssemblyService(
                     self._artifact_store,
                     uow.production_artifacts,
                     media_asset_store=self._media_asset_store,
@@ -2072,6 +2072,7 @@ class ProductionWorkflowOrchestrator:
                         ),
                     },
                 )
+                publication = assembly.artifact
                 if publication.canonical_blob_id is None:
                     raise ValueError("Publication canonical body is missing")
                 document = parse_publication_document(
@@ -2083,7 +2084,7 @@ class ProductionWorkflowOrchestrator:
                     extraction=canonical_extraction,
                     relevance_projection=canonical_relevance_projection,
                     synthesis=canonical_synthesis,
-                    editorial_enrichment=canonical_enrichment,
+                    editorial_enrichment=assembly.editorial_enrichment,
                     publication=document,
                 )
             except PublicationAssemblyValidationError as exc:

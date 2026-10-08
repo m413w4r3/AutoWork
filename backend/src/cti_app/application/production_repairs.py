@@ -4741,7 +4741,7 @@ class ProductionRepairMaterializationService:
             }
             if repair_materialization is not None:
                 metadata["repair_materialization"] = dict(repair_materialization)
-            new_publication = await CanonicalAssemblyService(
+            assembly = await CanonicalAssemblyService(
                 store, uow.production_artifacts
             ).assemble_publication(
                 run=run,
@@ -4753,6 +4753,7 @@ class ProductionRepairMaterializationService:
                 editorial_enrichment=editorial_enrichment,
                 metadata_extra=metadata,
             )
+            new_publication = assembly.artifact
             if new_publication.canonical_blob_id is None:
                 raise ProductionRepairProjectionError("assembly_inputs_missing")
             document = parse_publication_document(
@@ -4764,7 +4765,7 @@ class ProductionRepairMaterializationService:
                 extraction=canonical_extraction,
                 relevance_projection=relevance_projection,
                 synthesis=synthesis,
-                editorial_enrichment=editorial_enrichment,
+                editorial_enrichment=assembly.editorial_enrichment,
                 publication=document,
             )
             await self._ensure_qa_passed(qa_result)

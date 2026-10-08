@@ -355,7 +355,7 @@ async def _seed(uow_factory: UnitOfWorkFactory, tmp_path: Path) -> _Fixture:
         await uow.commit()
 
     async with uow_factory() as uow:
-        publication = await PublicationAssemblyService(
+        assembly = await PublicationAssemblyService(
             store, uow.production_artifacts
         ).assemble_publication(
             run=run,
@@ -365,6 +365,7 @@ async def _seed(uow_factory: UnitOfWorkFactory, tmp_path: Path) -> _Fixture:
             synthesis=synthesis_value,
             editorial_enrichment=enrichment_value,
         )
+        publication = assembly.artifact
         await uow.commit()
 
     repair_key = repair_key_for_rejection(

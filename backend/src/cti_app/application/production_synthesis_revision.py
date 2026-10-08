@@ -3542,7 +3542,7 @@ class ProductionSynthesisRevisionService:
             raise TargetedSynthesisRevisionValidationError("references_artifact_blob_missing")
         references_payload = await self._synthesis._artifact_store.read_json(references_blob_id)
         references = production_reference_corpus_from_json(references_payload)
-        publication = await PublicationAssemblyService(
+        assembly = await PublicationAssemblyService(
             self._synthesis._artifact_store, uow.production_artifacts
         ).assemble_publication(
             run=context.run,
@@ -3567,7 +3567,7 @@ class ProductionSynthesisRevisionService:
                 "editorial_revision_artifact_id": str(synthesis_artifact.id),
             },
         )
-        return publication
+        return assembly.artifact
 
 
 def _target_value_for_display(

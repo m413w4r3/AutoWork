@@ -14,7 +14,10 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from cti_app.application.media_assets import MediaAssetStore
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_editorial_enrichment import validate_editorial_enrichment
-from cti_app.application.publication_assembly import PublicationAssemblyService
+from cti_app.application.publication_assembly import (
+    PublicationAssemblyResult,
+    PublicationAssemblyService,
+)
 from cti_app.domain.classification import TLP
 from cti_app.domain.editions import Edition
 from cti_app.domain.entities import Subject
@@ -51,20 +54,20 @@ async def test_editorial_enrichment_persists_grounded_structures_on_postgres(
     assembly_call_counts: list[tuple[tuple[int, int, int], tuple[int, int, int]]] = []
     assemble = PublicationAssemblyService.assemble_publication
 
-    async def instrumented_assemble(self: object, **kwargs: object) -> ProductionArtifact:
+    async def instrumented_assemble(self: object, **kwargs: object) -> PublicationAssemblyResult:
         before = (
             scenario.diagram_compiler.calls,
             len(scenario.model.provider_calls),
             len(scenario.collection_transport.requests),
         )
-        artifact = await assemble(self, **kwargs)  # type: ignore[arg-type]
+        result = await assemble(self, **kwargs)  # type: ignore[arg-type]
         after = (
             scenario.diagram_compiler.calls,
             len(scenario.model.provider_calls),
             len(scenario.collection_transport.requests),
         )
         assembly_call_counts.append((before, after))
-        return artifact
+        return result
 
     monkeypatch.setattr(PublicationAssemblyService, "assemble_publication", instrumented_assemble)
     await scenario.start()

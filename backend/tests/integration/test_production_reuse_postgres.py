@@ -1124,7 +1124,7 @@ async def _seed_reusable_article(
                 source_artifacts[ProductionArtifactStage.EDITORIAL_ENRICHMENT].canonical_blob_id
             )
         )
-        publication = await PublicationAssemblyService(
+        assembly = await PublicationAssemblyService(
             store, uow.production_artifacts
         ).assemble_publication(
             run=source_run,
@@ -1135,6 +1135,7 @@ async def _seed_reusable_article(
             editorial_enrichment=enrichment,
             relevance_projection=first_pass.projection,
         )
+        publication = assembly.artifact
         await uow.commit()
     return source_run, source_artifacts, publication
 
@@ -1591,7 +1592,7 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
         await store.read_json(source_enrichment_artifact.canonical_blob_id)
     )
     async with uow_factory() as uow:
-        publication_a = await PublicationAssemblyService(
+        assembly_a = await PublicationAssemblyService(
             store, uow.production_artifacts
         ).assemble_publication(
             run=run_a,
@@ -1602,6 +1603,7 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
             editorial_enrichment=enrichment_a,
             relevance_projection=first_pass.projection,
         )
+        publication_a = assembly_a.artifact
         await uow.commit()
 
     run_b, created_b = await production.create_run(subject.id, edition.id)

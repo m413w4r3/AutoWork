@@ -27,7 +27,7 @@ from cti_app.application.publication_builder import (
     build_publication_document_v5,
     compute_assembly_input_hash,
 )
-from cti_app.application.publication_qa import qa_publication_v4
+from cti_app.application.publication_qa import qa_publication_v4, qa_publication_v5
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.discovery import SourceRole
@@ -399,7 +399,7 @@ async def test_publication_rebuilds_stale_diagram_svg_without_model_calls() -> N
         diagrams=(diagram,),
     )
 
-    publication = await service.assemble_publication(
+    assembly = await service.assemble_publication(
         run=run,
         snapshot=snapshot,
         references=references,
@@ -407,6 +407,7 @@ async def test_publication_rebuilds_stale_diagram_svg_without_model_calls() -> N
         synthesis=synthesis,
         editorial_enrichment=enrichment,
     )
+    publication = assembly.artifact
 
     assert publication.canonical_blob_id is not None
     stored_document = parse_publication_document(
@@ -416,6 +417,34 @@ async def test_publication_rebuilds_stale_diagram_svg_without_model_calls() -> N
     assert media_asset_store.stored_sources == [f"production_run:{run.id}:diagram:{diagram.key}"]
     assert stored_document.diagrams[0].asset_id == media_asset_store.new_asset_id
     assert enrichment.diagrams[0].compiled_asset_id == media_asset_store.old_asset_id
+    assert assembly.editorial_enrichment == replace(
+        enrichment,
+        diagrams=(replace(diagram, compiled_asset_id=media_asset_store.new_asset_id),),
+    )
+
+    qa_inputs = {
+        "snapshot": snapshot,
+        "references": references,
+        "extraction": extraction,
+        "synthesis": synthesis,
+    }
+    stale_qa = qa_publication_v5(
+        **qa_inputs,
+        editorial_enrichment=enrichment,
+        publication=stored_document,
+    )
+    assert stale_qa["passed"] is False
+    assert stale_qa["checks"]["exact_projection"] is False
+    assert all(value for key, value in stale_qa["checks"].items() if key != "exact_projection")
+    assert stale_qa["errors"] == ["Publication differs from canonical Assembly projection"]
+
+    refreshed_qa = qa_publication_v5(
+        **qa_inputs,
+        editorial_enrichment=assembly.editorial_enrichment,
+        publication=stored_document,
+    )
+    assert refreshed_qa["passed"] is True
+    assert all(refreshed_qa["checks"].values())
 
 
 @pytest.mark.asyncio
@@ -432,7 +461,7 @@ async def test_assembly_persists_exact_v4_body_and_one_publication_artifact() ->
         editorial_enrichment=enrichment,
     )
 
-    artifact = await service.assemble_publication(
+    artifact, _ = await service.assemble_publication(
         run=run,
         snapshot=snapshot,
         references=references,
@@ -496,7 +525,7 @@ async def test_assembly_persists_editorial_enrichment_in_the_canonical_body() ->
     service, catalog, _artifacts = _service()
     store = ProductionArtifactStore(catalog)
 
-    artifact = await service.assemble_publication(
+    artifact, _ = await service.assemble_publication(
         run=_run(snapshot),
         snapshot=snapshot,
         references=references,
@@ -527,8 +556,8 @@ async def test_identical_inputs_in_the_same_run_return_the_current_publication()
         ),
     }
 
-    first = await service.assemble_publication(**inputs)
-    second = await service.assemble_publication(**inputs)
+    first, _ = await service.assemble_publication(**inputs)
+    second, _ = await service.assemble_publication(**inputs)
 
     assert second is first
     assert len(catalog.writes) == 1
@@ -541,7 +570,7 @@ async def test_identical_inputs_reuse_a_finished_run_publication_with_provenance
     service, catalog, artifacts = _service()
     source_run = _run(snapshot)
     enrichment = build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis)
-    source = await service.assemble_publication(
+    source, _ = await service.assemble_publication(
         run=source_run,
         snapshot=snapshot,
         references=references,
@@ -553,7 +582,7 @@ async def test_identical_inputs_reuse_a_finished_run_publication_with_provenance
     target_snapshot = replace(snapshot, production_run_id=UUID(int=30))
     target_run = _run(target_snapshot)
 
-    reused = await service.assemble_publication(
+    reused, _ = await service.assemble_publication(
         run=target_run,
         snapshot=target_snapshot,
         references=references,
@@ -600,7 +629,7 @@ async def test_publication_warnings_are_artifact_diagnostics_not_document_conten
     service, catalog, _artifacts = _service()
     store = ProductionArtifactStore(catalog)
 
-    artifact = await service.assemble_publication(
+    artifact, _ = await service.assemble_publication(
         run=_run(snapshot),
         snapshot=snapshot,
         references=references,
@@ -622,7 +651,7 @@ async def test_unreadable_reuse_candidate_falls_back_to_fresh_persistence() -> N
     snapshot, references, extraction, synthesis = _canonical_inputs()
     service, catalog, artifacts = _service()
     source_run = _run(snapshot)
-    source = await service.assemble_publication(
+    source, _ = await service.assemble_publication(
         run=source_run,
         snapshot=snapshot,
         references=references,
@@ -636,7 +665,7 @@ async def test_unreadable_reuse_candidate_falls_back_to_fresh_persistence() -> N
     catalog.blobs.clear()
     target_snapshot = replace(snapshot, production_run_id=UUID(int=30))
 
-    fresh = await service.assemble_publication(
+    fresh, _ = await service.assemble_publication(
         run=_run(target_snapshot),
         snapshot=target_snapshot,
         references=references,
@@ -658,7 +687,7 @@ async def test_changed_inputs_persist_a_fresh_body_as_the_next_revision() -> Non
     service, catalog, artifacts = _service()
     run = _run(snapshot)
     artifacts.terminal_runs[run.id] = run.edition_id
-    first = await service.assemble_publication(
+    first, _ = await service.assemble_publication(
         run=run,
         snapshot=snapshot,
         references=references,
@@ -670,7 +699,7 @@ async def test_changed_inputs_persist_a_fresh_body_as_the_next_revision() -> Non
     )
     changed_synthesis = replace(synthesis, title="[Example actor] Revised synthesis")
 
-    second = await service.assemble_publication(
+    second, _ = await service.assemble_publication(
         run=run,
         snapshot=snapshot,
         references=references,
@@ -851,7 +880,7 @@ async def test_publication_v5_review_projection_retains_figure_provenance_and_or
     assert published_figure["provenance"] == "Archived figure from the primary source, page 2"
 
     service, _catalog, _artifacts = _service()
-    artifact = await service.assemble_publication(
+    artifact, _ = await service.assemble_publication(
         run=_run(snapshot),
         snapshot=snapshot,
         references=references,
@@ -928,7 +957,7 @@ async def test_ioc_only_repair_reuses_narrative_and_reassembles_canonical_public
         1,
         editorial_enrichment_to_json(enrichment_a),
     )
-    publication_a = await service.assemble_publication(
+    publication_a, _ = await service.assemble_publication(
         run=run,
         snapshot=snapshot,
         references=references,
