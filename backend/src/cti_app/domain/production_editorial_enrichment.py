@@ -53,6 +53,7 @@ class EditorialEnrichmentRevisionAction(StrEnum):
 class EditorialEnrichmentElementKind(StrEnum):
     TABLE = "table"
     DIAGRAM = "diagram"
+    CHART = "chart"
     FIGURE = "figure"
 
 

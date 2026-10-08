@@ -26,6 +26,7 @@ from cti_app.application.production_editorial_enrichment import (
     ProductionEditorialEnrichmentService,
 )
 from cti_app.application.production_enrichment_revision import (
+    EditorialEnrichmentRevisionResult,
     EditorialEnrichmentRevisionValidationError,
     ProductionEditorialEnrichmentRevisionService,
 )
@@ -132,6 +133,8 @@ from cti_app.domain.production_editorial_revision import (
     TargetedEditorialRevisionConflictError,
     TargetedEditorialRevisionMode,
     TargetedEditorialRevisionOperation,
+    TargetedEditorialRevisionPlacement,
+    TargetedEditorialRevisionPlacementKind,
     TargetedEditorialRevisionRequest,
     TargetedEditorialRevisionTarget,
     TargetedEditorialRevisionTargetKind,
@@ -186,6 +189,16 @@ class TargetedEditorialRevisionTargetRequest(BaseModel):
     parent_id: _Sha256String | None = None
     anchor_id: _Sha256String | None = None
     insert_after: StrictBool = False
+    element_kind: EditorialEnrichmentElementKind | None = None
+    element_key: StrictStr | None = Field(default=None, max_length=128)
+    placement: TargetedEditorialRevisionPlacementRequest | None = None
+
+
+class TargetedEditorialRevisionPlacementRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: TargetedEditorialRevisionPlacementKind
+    section_id: _Sha256String | None = None
 
 
 class TargetedEditorialRevisionRequestBody(BaseModel):
@@ -231,6 +244,7 @@ class TargetedEditorialRevisionLineageResponse(BaseModel):
     production_run_id: str
     revisions: list[dict[str, Any]]
     paragraph_provenance: dict[str, Any]
+    element_provenance: dict[str, Any] = Field(default_factory=dict)
 
 
 class StartEditionProductionRequest(BaseModel):
@@ -594,6 +608,7 @@ def _production_synthesis_revision_service(
         synthesis_persistence=synthesis_persistence,
         enrichment_persistence=EditorialEnrichmentService(uow_factory, artifact_store),
         publication_render_service=render_service,
+        enrichment_revision_service=_production_enrichment_revision_service(request),
         resource_search_enabled=get_settings().production_editorial_resource_search_enabled,
     )
 
@@ -2876,16 +2891,19 @@ async def revise_editorial_enrichment_artifact(
 ) -> EditorialEnrichmentRevisionResponse:
     service = _production_enrichment_revision_service(request)
     try:
-        result = await service.revise(
-            subject_id=subject_id,
-            base_artifact_id=payload.base_artifact_id,
-            base_version=payload.base_version,
-            base_input_hash=payload.base_input_hash,
-            base_canonical_sha256=payload.base_canonical_sha256,
-            element_kind=payload.element_kind,
-            element_key=payload.element_key,
-            action=payload.action,
-            instruction=payload.instruction,
+        result = cast(
+            EditorialEnrichmentRevisionResult,
+            await service.revise(
+                subject_id=subject_id,
+                base_artifact_id=payload.base_artifact_id,
+                base_version=payload.base_version,
+                base_input_hash=payload.base_input_hash,
+                base_canonical_sha256=payload.base_canonical_sha256,
+                element_kind=payload.element_kind,
+                element_key=payload.element_key,
+                action=payload.action,
+                instruction=payload.instruction,
+            ),
         )
     except EditorialEnrichmentRevisionConflictError as exc:
         raise HTTPException(
@@ -2951,6 +2969,16 @@ def _targeted_revision_domain_request(
             parent_id=payload.target.parent_id,
             anchor_id=payload.target.anchor_id,
             insert_after=payload.target.insert_after,
+            element_kind=payload.target.element_kind,
+            element_key=payload.target.element_key,
+            placement=(
+                TargetedEditorialRevisionPlacement(
+                    kind=payload.target.placement.kind,
+                    section_id=payload.target.placement.section_id,
+                )
+                if payload.target.placement is not None
+                else None
+            ),
         ),
         operation=payload.operation,
         instruction=payload.instruction,

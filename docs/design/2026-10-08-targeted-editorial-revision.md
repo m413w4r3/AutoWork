@@ -89,3 +89,52 @@ Le service d’enrichissement reste l’implémentation de référence pour le
 ModelRun et ses garanties de reprise. E1 extrait seulement les conventions
 partagées nécessaires au contrat et au stockage synthèse ; il ne déplace pas
 son orchestration ni ne change son wire format.
+
+## E2b — révision ciblée des enrichissements
+
+Le même endpoint preview/apply/lineage route selon `target.kind` : les cibles
+`synthesis.*` restent traitées par le service E1 ; une cible
+`editorial_enrichment.<table|diagram|chart|source_figure>[key]` est déléguée au
+service d’enrichissement existant. Le contrat ajoute un discriminant
+`enrichment_element`, la famille d’élément, une clé facultative (absente à la
+création) et une position d’insertion ancrée sur le lead, une section stable de
+la synthèse ou la timeline. Les opérations de source figure exposées sont
+`replace_source_figure` et `delete_source_figure`; les anciennes révisions
+`CHOOSE_ANOTHER_FIGURE` restent lisibles.
+
+Le service conserve son orchestration ModelRun, son parseur wire et ses
+validateurs. Un create lui fournit aussi l’enrichissement courant, la synthèse
+E1 avec IDs stables, l’EvidencePack admis, le placement demandé et les
+instructions, règles analytiques et le contrat de sortie du prompt
+`EDITORIAL_ENRICHMENT` courant. Après validation du seul élément demandé, sa clé est
+`<family>_<sha256(request_identity)>` (avec suffixe déterministe en cas de
+collision). Les relations doivent être démontrées par les preuves et les
+handles doivent appartenir au pack. `NO USEFUL ENRICHMENT` devient un refus
+typé sans artifact; un pipeline non établi ou un élément trivial est refusé.
+Les rewrites qui deviennent triviaux sont refusés avec suppression recommandée.
+
+Les delete sont des opérations locales sans appel modèle. Le payload canonique
+résultant est une copie du payload de base avec uniquement l’élément ciblé
+retiré; les ancres et le placement des éléments conservés ne changent pas. Les
+annotations sémantiques dont l’ancre appartient à l’élément supprimé disparaissent
+avec lui, et toutes les autres restent identiques. Pour une figure source, sa
+trace de décision est liée à la figure et disparaît avec elle (ou est remplacée
+avec sa figure); les traces des autres figures restent identiques. Les fences,
+l’idempotence et le CAS restent identiques aux révisions E1.
+
+Les nouveaux artifacts enrichissement écrivent `metadata.revision` au format
+commun E1 (identité, base, cible, opération, requête, mode, acteur, ModelRun,
+versions de prompt/contrat, références de preuves, additions de sources vides,
+date et artifact résultat). `model_run_id` est nul pour un delete pur.
+L’historique se parcourt par `base_artifact_id`; les anciennes métadonnées
+`element_kind`/`action` gardent leur lecteur legacy et ne sont pas réécrites.
+La provenance par élément indique l’artifact initial ou la révision qui l’a
+créé/modifié; les éléments inchangés gardent leur provenance.
+
+Une révision ne change que l’artifact `EDITORIAL_ENRICHMENT` et rend
+`PUBLICATION` stale avant son rebuild par le chemin de rendu/QA existant, sans
+modèle. `SYNTHESIS`, `REFERENCES`, `EXTRACTION`, `RELEVANCE_PROJECTION` et les
+autres enrichissements restent inchangés. Le preview expose les fences de
+base, la zone visée, les stages conservés/invalidés et 0 appel modèle pour un
+delete, 1 pour un create/rewrite (0 si un ModelRun idempotent est déjà
+disponible). `allow_source_extension` conserve le refus typé E2a.

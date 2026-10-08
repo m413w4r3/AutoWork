@@ -1486,7 +1486,11 @@ export async function getEditorialEnrichmentArtifact(
   );
 }
 
-export type EditorialEnrichmentElementKind = "table" | "diagram" | "figure";
+export type EditorialEnrichmentElementKind =
+  | "table"
+  | "diagram"
+  | "chart"
+  | "figure";
 export type EditorialEnrichmentRevisionAction =
   | "improve_table"
   | "detail_diagram"
@@ -1578,6 +1582,7 @@ export type TargetedEditorialRevisionOperation =
   | "delete_chart"
   | "create_source_figure"
   | "rewrite_source_figure"
+  | "replace_source_figure"
   | "delete_source_figure";
 
 export type TargetedEditorialRevisionMode =
@@ -1589,7 +1594,18 @@ export type TargetedEditorialRevisionTargetKind =
   | "lead_paragraph"
   | "sections"
   | "section"
-  | "section_paragraph";
+  | "section_paragraph"
+  | "enrichment_element";
+
+export type TargetedEditorialRevisionPlacementKind =
+  | "after_lead"
+  | "after_section"
+  | "after_timeline";
+
+export interface TargetedEditorialRevisionPlacement {
+  kind: TargetedEditorialRevisionPlacementKind;
+  section_id?: string | null;
+}
 
 export interface TargetedEditorialRevisionTarget {
   kind: TargetedEditorialRevisionTargetKind;
@@ -1597,6 +1613,9 @@ export interface TargetedEditorialRevisionTarget {
   parent_id?: string | null;
   anchor_id?: string | null;
   insert_after?: boolean;
+  element_kind?: EditorialEnrichmentElementKind | null;
+  element_key?: string | null;
+  placement?: TargetedEditorialRevisionPlacement | null;
 }
 
 export interface TargetedEditorialRevisionRequest {
@@ -1644,7 +1663,7 @@ export interface TargetedEditorialRevisionLineageEntry {
   request: string;
   mode: TargetedEditorialRevisionMode;
   actor: string;
-  model_run_id: string;
+  model_run_id: string | null;
   prompt_version: string;
   contract_version: string;
   parser_version: string;
@@ -1684,6 +1703,7 @@ export interface TargetedEditorialRevisionLineage {
   production_run_id: string;
   revisions: TargetedEditorialRevisionLineageEntry[];
   paragraph_provenance: Record<string, TargetedEditorialRevisionProvenance>;
+  element_provenance: Record<string, TargetedEditorialRevisionProvenance>;
 }
 
 export async function previewTargetedEditorialRevision(

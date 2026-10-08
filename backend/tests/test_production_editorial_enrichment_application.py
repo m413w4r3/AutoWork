@@ -7,7 +7,7 @@ from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -77,6 +77,9 @@ from cti_app.application.production_synthesis import (
     canonical_extraction_hash,
     synthesis_access_policy_hash,
 )
+from cti_app.application.production_synthesis_revision import (
+    ProductionSynthesisRevisionService,
+)
 from cti_app.application.source_figure_inventory import (
     ArchivedFigureAsset,
     ArchivedFigureSource,
@@ -117,10 +120,22 @@ from cti_app.domain.production_editorial_enrichment import (
     ResolvedSourceFigureV1,
     SourceFigureDecision,
     SourceFigureLocatorV1,
+    TableColumnV1,
     TableRowV1,
+    TableSpecV1,
     editorial_enrichment_from_json,
     editorial_enrichment_to_json,
     source_figure_id,
+)
+from cti_app.domain.production_editorial_revision import (
+    TargetedEditorialRevisionConflictError,
+    TargetedEditorialRevisionMode,
+    TargetedEditorialRevisionOperation,
+    TargetedEditorialRevisionPlacement,
+    TargetedEditorialRevisionPlacementKind,
+    TargetedEditorialRevisionRequest,
+    TargetedEditorialRevisionTarget,
+    TargetedEditorialRevisionTargetKind,
 )
 from cti_app.domain.production_extraction import (
     EXTRACTION_PROFILE_POLICY_VERSION,
@@ -154,7 +169,7 @@ from cti_app.domain.production_synthesis import (
     production_synthesis_to_json,
 )
 from cti_app.domain.publication import ArtifactType
-from cti_app.domain.semantic_annotation import SemanticRole
+from cti_app.domain.semantic_annotation import SemanticAnnotationProposalV1, SemanticRole
 from cti_app.domain.source_media import (
     SourceFigureProvenanceDiagnostic,
     SourceFigureProvenanceStage,
@@ -4378,6 +4393,10 @@ async def _revision_harness(
     collection: SourceCollection | None = None,
     indicators: tuple[ExtractionIndicatorV1, ...] = (),
     anchor: str | None = None,
+    include_figure: bool = False,
+    include_second_figure: bool = False,
+    include_target_annotations: bool = False,
+    include_ioc_duplicate_table: bool = False,
 ) -> SimpleNamespace:
     from cti_app.application.publication_assembly import PublicationAssemblyService
 
@@ -4421,15 +4440,45 @@ async def _revision_harness(
             canonical_blob_id=world.store.put(production_synthesis_to_json(world.synthesis)),
         )
     inventory = _figure_inventory(world.extraction)
+    if include_second_figure:
+        original = inventory.figures[0]
+        alternative_locator = SourceFigureLocatorV1(
+            page=3,
+            section="Network overview",
+            figure_label="Alternative ExampleRAT process map",
+            original_asset_url="https://cdn.example.test/example-rat-alternative.png",
+        )
+        alternative = original.model_copy(
+            update={
+                "figure_id": source_figure_id(
+                    source_document_id=original.source_document_id,
+                    sha256="e" * 64,
+                    source=original.source,
+                    locator=alternative_locator,
+                ),
+                "blob_id": UUID(int=602),
+                "sha256": "e" * 64,
+                "locator": alternative_locator,
+                "provenance": "archived alternative source figure",
+            },
+        )
+        metadata = dict(inventory.catalog_metadata)
+        metadata[alternative.figure_id] = next(iter(metadata.values()))
+        inventory = replace(
+            inventory,
+            figures=(*inventory.figures, alternative),
+            catalog_metadata=metadata,
+        )
+    inventory_state = SimpleNamespace(value=inventory)
 
     async def load_inventory(**_kwargs: object) -> SourceFigureInventoryResult:
-        return inventory
+        return cast(SourceFigureInventoryResult, inventory_state.value)
 
     monkeypatch.setattr(revision_module, "load_archived_source_figure_inventory", load_inventory)
     monkeypatch.setattr(
         revision_module,
         "production_reference_corpus_from_json",
-        lambda _payload: SimpleNamespace(),
+        lambda _payload: SimpleNamespace(sources=()),
     )
 
     document = _document()
@@ -4461,6 +4510,64 @@ async def _revision_harness(
     enrichment = validate_editorial_enrichment_proposal(
         _proposal(fact_handle), evidence_pack, world.extraction, world.synthesis
     )
+    if include_ioc_duplicate_table:
+        handles = {
+            str(record["value"]): str(record["handle"])
+            for record in evidence_pack.technical_evidence
+            if record.get("kind") == EvidenceKind.INDICATOR.value
+        }
+        ioc_values = ("203.0.113.5", "198.51.100.7")
+        base_table = enrichment.tables[0]
+        ioc_table = TableSpecV1(
+            key=base_table.key,
+            kind=EnrichmentTableKind.INFRASTRUCTURE,
+            title="Projected IOC values",
+            caption=None,
+            columns=(TableColumnV1("indicator", "Indicator"), TableColumnV1("type", "Type")),
+            rows=tuple(
+                TableRowV1((value, "IP"), (evidence_pack.resolve_handle(handles[value]),))
+                for value in ioc_values
+            ),
+            placement=base_table.placement,
+            purpose=base_table.purpose,
+        )
+        enrichment = replace(enrichment, tables=(ioc_table,))
+    if include_figure:
+        figure_catalog = build_editorial_figure_catalog(world.extraction, inventory)
+        figure_wire = _figure_wire(handle=figure_catalog[0].handle)
+        parsed_figure = parse_editorial_enrichment_proposal_wire(
+            figure_wire, evidence_pack, figure_catalog=figure_catalog
+        )
+        assert parsed_figure.proposal is not None
+        selected_figure = validate_editorial_enrichment_proposal(
+            parsed_figure.proposal,
+            evidence_pack,
+            world.extraction,
+            world.synthesis,
+            figure_catalog=figure_catalog,
+        )
+        enrichment = replace(
+            enrichment,
+            source_figures=selected_figure.source_figures,
+            figure_decisions=selected_figure.figure_decisions,
+        )
+    if include_target_annotations:
+        diagram = enrichment.diagrams[0]
+        enrichment = replace(
+            enrichment,
+            annotations=(
+                SemanticAnnotationProposalV1(
+                    role=SemanticRole.MALWARE,
+                    paragraph_anchor=f"diagram:{diagram.key}:title",
+                    text=diagram.title,
+                ),
+                SemanticAnnotationProposalV1(
+                    role=SemanticRole.MALWARE,
+                    paragraph_anchor="section:0:paragraph:0001",
+                    text="ExampleRAT",
+                ),
+            ),
+        )
     base_payload = editorial_enrichment_to_json(enrichment)
     base = ProductionArtifact(
         production_run_id=world.run.id,
@@ -4562,6 +4669,7 @@ async def _revision_harness(
     return SimpleNamespace(
         world=world,
         service=service,
+        inventory_state=inventory_state,
         artifacts=artifacts,
         base=base,
         base_payload=base_payload,
@@ -5793,3 +5901,712 @@ def test_translated_diagram_labels_are_grounded_by_their_cited_english_evidence(
 
     assert result.proposal is not None
     assert len(result.proposal.diagrams) == 1
+
+
+def _common_revision_service(harness: SimpleNamespace) -> ProductionSynthesisRevisionService:
+    return ProductionSynthesisRevisionService(
+        synthesis_service=SimpleNamespace(_uow_factory=harness.service._enrichment._uow_factory),
+        synthesis_persistence=cast(Any, None),
+        enrichment_persistence=cast(Any, None),
+        publication_render_service=cast(Any, None),
+        enrichment_revision_service=harness.service,
+    )
+
+
+def _common_enrichment_request(
+    harness: SimpleNamespace,
+    *,
+    element_kind: EditorialEnrichmentElementKind,
+    operation: TargetedEditorialRevisionOperation,
+    element_key: str | None,
+    placement: TargetedEditorialRevisionPlacement | None = None,
+    instruction: str = "Make only this enrichment element more useful.",
+) -> TargetedEditorialRevisionRequest:
+    return TargetedEditorialRevisionRequest(
+        subject_id=harness.world.snapshot.subject_id,
+        base_artifact_id=harness.base.id,
+        base_version=harness.base.version,
+        base_input_hash=harness.input_hash,
+        base_canonical_sha256=harness.base_sha256,
+        target=TargetedEditorialRevisionTarget(
+            kind=TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT,
+            element_kind=element_kind,
+            element_key=element_key,
+            placement=placement,
+        ),
+        operation=operation,
+        instruction=instruction,
+        mode=TargetedEditorialRevisionMode.EXISTING_EVIDENCE_ONLY,
+        requester="test-analyst",
+    )
+
+
+def test_synthesis_revision_target_json_keeps_e1_identity_shape() -> None:
+    target = TargetedEditorialRevisionTarget(kind=TargetedEditorialRevisionTargetKind.TITLE)
+
+    assert target.to_json() == {
+        "kind": "title",
+        "stable_ids": [],
+        "parent_id": None,
+        "anchor_id": None,
+        "insert_after": False,
+    }
+
+
+@pytest.mark.parametrize(
+    ("kind", "key", "operation", "list_name"),
+    [
+        (
+            EditorialEnrichmentElementKind.TABLE,
+            "tools_table",
+            TargetedEditorialRevisionOperation.DELETE_TABLE,
+            "tables",
+        ),
+        (
+            EditorialEnrichmentElementKind.DIAGRAM,
+            "infection_chain",
+            TargetedEditorialRevisionOperation.DELETE_DIAGRAM,
+            "diagrams",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_common_delete_is_model_free_byte_local_and_rebuilds_publication(
+    monkeypatch: pytest.MonkeyPatch,
+    kind: EditorialEnrichmentElementKind,
+    key: str,
+    operation: TargetedEditorialRevisionOperation,
+    list_name: str,
+) -> None:
+    harness = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(lambda request: _succeeded_text(request, "unexpected")),
+        include_target_annotations=kind is EditorialEnrichmentElementKind.DIAGRAM,
+        indicators=(
+            (
+                _confirmed_ioc("203.0.113.5", "C2 endpoint 203.0.113.5"),
+                _confirmed_ioc("198.51.100.7", "Update server 198.51.100.7"),
+            )
+            if kind is EditorialEnrichmentElementKind.TABLE
+            else ()
+        ),
+        include_ioc_duplicate_table=kind is EditorialEnrichmentElementKind.TABLE,
+    )
+    service = _common_revision_service(harness)
+    request = _common_enrichment_request(
+        harness, element_kind=kind, operation=operation, element_key=key
+    )
+    synthesis_before_id = harness.world.synthesis_artifact.id
+    synthesis_blob_id = harness.world.synthesis_artifact.canonical_blob_id
+    assert synthesis_blob_id is not None
+    synthesis_before = await harness.world.store.read_bytes(synthesis_blob_id)
+    synthesis_before_sha256 = hashlib.sha256(synthesis_before).hexdigest()
+    preview = await service.preview(request)
+    result = await service.revise(request)
+
+    assert preview.expected_model_calls == 0
+    assert preview.stages_preserved == (
+        "references",
+        "extraction",
+        "relevance_projection",
+        "synthesis",
+    )
+    assert preview.stages_invalidated == ("publication",)
+    assert result.refusal is None and result.artifact is not None
+    assert harness.world.gateway.calls == []
+    assert result.publication_artifact is not None
+    assert len(harness.assembled) == len(harness.rendered) == 1
+    synthesis_after = next(
+        item
+        for item in harness.artifacts.artifacts
+        if item.stage is ProductionArtifactStage.SYNTHESIS
+    )
+    assert synthesis_after.id == synthesis_before_id
+    assert synthesis_after.canonical_blob_id == synthesis_blob_id
+    synthesis_after_bytes = await harness.world.store.read_bytes(synthesis_after.canonical_blob_id)
+    assert hashlib.sha256(synthesis_after_bytes).hexdigest() == synthesis_before_sha256
+    if kind is EditorialEnrichmentElementKind.TABLE:
+        assert harness.base_payload["tables"][0]["title"] == "Projected IOC values"
+        assert {row["cells"][0] for row in harness.base_payload["tables"][0]["rows"]} == {
+            "203.0.113.5",
+            "198.51.100.7",
+        }
+    expected = dict(harness.base_payload)
+    expected[list_name] = [item for item in expected[list_name] if item.get("key") != key]
+    if kind is EditorialEnrichmentElementKind.DIAGRAM:
+        expected["annotations"] = [
+            item
+            for item in expected["annotations"]
+            if not item["paragraph_anchor"].startswith(f"diagram:{key}:")
+        ]
+    result_bytes = await harness.world.store.read_bytes(result.artifact.canonical_blob_id)
+    assert result_bytes == ProductionArtifactStore.canonical_json_bytes(expected)
+    for untouched in set(expected) - {list_name}:
+        if kind is EditorialEnrichmentElementKind.DIAGRAM and untouched == "annotations":
+            continue
+        assert expected[untouched] == harness.base_payload[untouched]
+    if kind is EditorialEnrichmentElementKind.DIAGRAM:
+        assert expected["annotations"] == [harness.base_payload["annotations"][1]]
+    revision = result.artifact.metadata["revision"]
+    assert revision["operation"] == operation.value
+    assert revision["model_run_id"] is None
+    assert revision["source_additions"] == []
+
+
+@pytest.mark.asyncio
+async def test_common_create_table_uses_deterministic_key_and_adds_only_one_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def draft_table(request: ModelRequest) -> ModelExecution:
+        prompt = json.loads(request.text)
+        assert prompt["current_editorial_enrichment"]["tables"][0]["key"] == "tools_table"
+        assert "[" in prompt["stable_current_synthesis"]
+        assert prompt["target"]["placement"] == {"kind": "after_lead", "section_id": None}
+        assert prompt["editorial_contract"]["contract_version"]
+        contract_example = prompt["editorial_contract"]["output_contract"]
+        assert "column of projected IOC values" in contract_example
+        assert "at least 80%" in contract_example
+        assert prompt["editorial_contract"]["editorial_guidance"]["diagram_layout_budgets"]
+        handle = next(
+            item["handle"]
+            for item in prompt["admitted_evidence_pack"]["narrative_evidence"]
+            if item.get("value") == "ExampleRAT"
+        )
+        proposal = _proposal(handle)
+        purpose = proposal.tables[0].purpose.model_copy(
+            update={"question": "What role does the source attribute to ExampleRAT?"}
+        )
+        table = proposal.tables[0].model_copy(
+            update={"key": prompt["target"]["key"], "purpose": purpose}
+        )
+        proposal = proposal.model_copy(update={"tables": (table,), "diagrams": ()})
+        return _succeeded_text(request, _proposal_to_wire(proposal))
+
+    harness = await _revision_harness(monkeypatch, _RecordingGateway(draft_table))
+    service = _common_revision_service(harness)
+    request = _common_enrichment_request(
+        harness,
+        element_kind=EditorialEnrichmentElementKind.TABLE,
+        operation=TargetedEditorialRevisionOperation.CREATE_TABLE,
+        element_key=None,
+        placement=TargetedEditorialRevisionPlacement(
+            TargetedEditorialRevisionPlacementKind.AFTER_LEAD
+        ),
+    )
+    result = await service.revise(request)
+    replay = await service.revise(request)
+
+    assert result.refusal is None and result.artifact is not None
+    assert replay.artifact is not None and replay.artifact.id == result.artifact.id
+    payload = await harness.world.store.read_json(result.artifact.canonical_blob_id)
+    assert len(payload["tables"]) == 2
+    assert payload["tables"][0] == harness.base_payload["tables"][0]
+    created = payload["tables"][1]
+    assert created["key"].startswith("table_")
+    assert len(created["key"]) == 64
+    assert payload["diagrams"] == harness.base_payload["diagrams"]
+    assert len(harness.world.gateway.calls) == 1
+    assert result.artifact.metadata["revision"]["target"]["element_key"] == created["key"]
+
+
+@pytest.mark.asyncio
+async def test_common_rewrite_diagram_accepts_nontrivial_and_refuses_trivial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    anchor = (
+        "ExampleRAT downloads a payload; the payload installs a service, the service connects "
+        "to the command server, and the payload also reports to that server."
+    )
+
+    def draft_nontrivial(request: ModelRequest) -> ModelExecution:
+        prompt = json.loads(request.text)
+        handle = next(
+            item["handle"]
+            for item in prompt["admitted_evidence_pack"]["narrative_evidence"]
+            if item.get("value") == anchor
+        )
+        wire = _diagram_wire_for_quality(
+            (
+                ("rat", "ExampleRAT", "unknown"),
+                ("payload", "payload", "unknown"),
+                ("service", "service", "unknown"),
+                ("c2", "command server", "unknown"),
+            ),
+            (
+                ("rat", "payload", "downloads"),
+                ("payload", "service", "installs"),
+                ("service", "c2", "connects"),
+                ("payload", "c2", "reports"),
+            ),
+            evidence_handle=str(handle),
+            key="infection_chain",
+        )
+        return _succeeded_text(request, wire)
+
+    accepted = await _revision_harness(
+        monkeypatch, _RecordingGateway(draft_nontrivial), anchor=anchor
+    )
+    accepted_request = _common_enrichment_request(
+        accepted,
+        element_kind=EditorialEnrichmentElementKind.DIAGRAM,
+        operation=TargetedEditorialRevisionOperation.REWRITE_DIAGRAM,
+        element_key="infection_chain",
+    )
+    accepted_result = await _common_revision_service(accepted).revise(accepted_request)
+    assert accepted_result.refusal is None and accepted_result.artifact is not None
+    accepted_payload = await accepted.world.store.read_json(
+        accepted_result.artifact.canonical_blob_id
+    )
+    assert len(accepted_payload["diagrams"]) == 1
+    assert accepted_payload["diagrams"][0]["edges"] != accepted.base_payload["diagrams"][0]["edges"]
+
+    trivial_anchor = "ExampleRAT downloads the payload and starts execution."
+
+    def draft_trivial(request: ModelRequest) -> ModelExecution:
+        prompt = json.loads(request.text)
+        handle = next(
+            item["handle"]
+            for item in prompt["admitted_evidence_pack"]["narrative_evidence"]
+            if item.get("value") == trivial_anchor
+        )
+        wire = _diagram_wire_for_quality(
+            (
+                ("rat", "ExampleRAT", "unknown"),
+                ("payload", "Payload", "unknown"),
+                ("execution", "Execution", "unknown"),
+            ),
+            (("rat", "payload", "downloads"), ("payload", "execution", "starts")),
+            evidence_handle=str(handle),
+            key="infection_chain",
+        )
+        return _succeeded_text(request, wire)
+
+    trivial = await _revision_harness(
+        monkeypatch, _RecordingGateway(draft_trivial), anchor=trivial_anchor
+    )
+    trivial_request = _common_enrichment_request(
+        trivial,
+        element_kind=EditorialEnrichmentElementKind.DIAGRAM,
+        operation=TargetedEditorialRevisionOperation.REWRITE_DIAGRAM,
+        element_key="infection_chain",
+    )
+    refusal = await _common_revision_service(trivial).revise(trivial_request)
+    assert refusal.artifact is None
+    assert refusal.refusal is not None
+    assert refusal.refusal.code.value == "revision_not_applicable"
+    assert "trivial" in refusal.refusal.reason or "delete the element" in refusal.refusal.reason
+
+
+@pytest.mark.asyncio
+async def test_common_revision_chains_three_versions_and_preserves_lineage_and_idempotence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    anchor = (
+        "ExampleRAT downloads a payload; the payload installs a service, the service connects "
+        "to the command server, and the payload also reports to that server."
+    )
+
+    def draft(request: ModelRequest) -> ModelExecution:
+        operation = request.metadata["revision_request"]["operation"]
+        if operation == TargetedEditorialRevisionOperation.REWRITE_TABLE.value:
+            return _succeeded_text(request, _table_revision_wire())
+        prompt = json.loads(request.text)
+        handle = next(
+            item["handle"]
+            for item in prompt["admitted_evidence_pack"]["narrative_evidence"]
+            if item.get("value") == anchor
+        )
+        wire = _diagram_wire_for_quality(
+            (
+                ("rat", "ExampleRAT", "unknown"),
+                ("payload", "payload", "unknown"),
+                ("service", "service", "unknown"),
+                ("c2", "command server", "unknown"),
+            ),
+            (
+                ("rat", "payload", "downloads"),
+                ("payload", "service", "installs"),
+                ("service", "c2", "connects"),
+                ("payload", "c2", "reports"),
+            ),
+            evidence_handle=str(handle),
+            key="infection_chain",
+        )
+        return _succeeded_text(request, wire)
+
+    harness = await _revision_harness(monkeypatch, _RecordingGateway(draft), anchor=anchor)
+    service = _common_revision_service(harness)
+    first_request = _common_enrichment_request(
+        harness,
+        element_kind=EditorialEnrichmentElementKind.TABLE,
+        operation=TargetedEditorialRevisionOperation.REWRITE_TABLE,
+        element_key="tools_table",
+    )
+    first = await service.revise(first_request)
+    assert first.artifact is not None
+    second_base = await harness.world.store.read_bytes(first.artifact.canonical_blob_id)
+    second_request = replace(
+        first_request,
+        base_artifact_id=first.artifact.id,
+        base_version=first.artifact.version,
+        base_input_hash=first.artifact.input_hash,
+        base_canonical_sha256=hashlib.sha256(second_base).hexdigest(),
+        target=TargetedEditorialRevisionTarget(
+            kind=TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT,
+            element_kind=EditorialEnrichmentElementKind.DIAGRAM,
+            element_key="infection_chain",
+        ),
+        operation=TargetedEditorialRevisionOperation.REWRITE_DIAGRAM,
+    )
+    second = await service.revise(second_request)
+    assert second.artifact is not None
+    third_base = await harness.world.store.read_bytes(second.artifact.canonical_blob_id)
+    third_request = replace(
+        first_request,
+        base_artifact_id=second.artifact.id,
+        base_version=second.artifact.version,
+        base_input_hash=second.artifact.input_hash,
+        base_canonical_sha256=hashlib.sha256(third_base).hexdigest(),
+        operation=TargetedEditorialRevisionOperation.DELETE_TABLE,
+        instruction="Remove the duplicated table.",
+    )
+    third = await service.revise(third_request)
+    assert third.artifact is not None
+    replay = await service.revise(third_request)
+    assert replay.artifact is not None and replay.artifact.id == third.artifact.id
+    assert len(harness.world.gateway.calls) == 2
+
+    lineage = await service.lineage(third.artifact.id)
+    assert len(lineage["revisions"]) == 3
+    assert lineage["revisions"][0]["operation"] == "delete_table"
+    assert lineage["revisions"][1]["operation"] == "rewrite_diagram"
+    assert lineage["revisions"][2]["operation"] == "rewrite_table"
+    assert "table:tools_table" not in lineage["element_provenance"]
+    assert lineage["element_provenance"]["diagram:infection_chain"]["artifact_id"] == str(
+        second.artifact.id
+    )
+    assert harness.world.synthesis_artifact.id in [item.id for item in harness.artifacts.artifacts]
+    assert harness.world.synthesis_artifact.canonical_blob_id is not None
+
+    conflict = replace(second_request, instruction="A different rewrite from the stale base.")
+    with pytest.raises(TargetedEditorialRevisionConflictError):
+        await service.revise(conflict)
+
+
+@pytest.mark.asyncio
+async def test_common_lineage_keeps_historical_enrichment_revision_format_readable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(lambda request: _succeeded_text(request, "unexpected")),
+    )
+    harness.base.metadata["revision"] = {
+        "request_identity": "legacy-request",
+        "outcome": "revised",
+        "element_kind": "table",
+        "element_key": "tools_table",
+        "action": "improve_table",
+        "base_artifact_id": "legacy-base-id",
+    }
+    request = _common_enrichment_request(
+        harness,
+        element_kind=EditorialEnrichmentElementKind.DIAGRAM,
+        operation=TargetedEditorialRevisionOperation.DELETE_DIAGRAM,
+        element_key="infection_chain",
+    )
+    result = await _common_revision_service(harness).revise(request)
+    assert result.artifact is not None
+    lineage = await _common_revision_service(harness).lineage(result.artifact.id)
+
+    assert len(lineage["revisions"]) == 2
+    assert lineage["revisions"][1]["request_identity"] == "legacy-request"
+    assert lineage["element_provenance"]["table:tools_table"]["revision_id"] == ("legacy-request")
+
+
+@pytest.mark.asyncio
+async def test_common_create_diagram_accepts_evidenced_pipeline_and_returns_typed_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    anchor = (
+        "ExampleRAT downloads a payload; the payload installs a service, the service connects "
+        "to the command server, and the payload also reports to that server."
+    )
+
+    def draft_pipeline(request: ModelRequest) -> ModelExecution:
+        prompt = json.loads(request.text)
+        handle = next(
+            item["handle"]
+            for item in prompt["admitted_evidence_pack"]["narrative_evidence"]
+            if item.get("value") == anchor
+        )
+        wire = _diagram_wire_for_quality(
+            (
+                ("rat", "ExampleRAT", "unknown"),
+                ("payload", "payload", "unknown"),
+                ("service", "service", "unknown"),
+                ("c2", "command server", "unknown"),
+            ),
+            (
+                ("rat", "payload", "downloads"),
+                ("payload", "service", "installs"),
+                ("service", "c2", "connects"),
+                ("payload", "c2", "reports"),
+            ),
+            evidence_handle=str(handle),
+            key=str(prompt["target"]["key"]),
+        ).replace("PLACEMENT: after_section\nSECTION_INDEX: 0", "PLACEMENT: after_lead")
+        return _succeeded_text(request, wire)
+
+    harness = await _revision_harness(monkeypatch, _RecordingGateway(draft_pipeline), anchor=anchor)
+    service = _common_revision_service(harness)
+    request = _common_enrichment_request(
+        harness,
+        element_kind=EditorialEnrichmentElementKind.DIAGRAM,
+        operation=TargetedEditorialRevisionOperation.CREATE_DIAGRAM,
+        element_key=None,
+        placement=TargetedEditorialRevisionPlacement(
+            TargetedEditorialRevisionPlacementKind.AFTER_LEAD
+        ),
+    )
+    preview = await service.preview(request)
+    result = await service.revise(request)
+
+    assert preview.expected_model_calls == 1
+    assert result.refusal is None and result.artifact is not None
+    payload = await harness.world.store.read_json(result.artifact.canonical_blob_id)
+    assert len(payload["diagrams"]) == 2
+    assert payload["diagrams"][0] == harness.base_payload["diagrams"][0]
+    assert payload["diagrams"][1]["key"].startswith("diagram_")
+    assert payload["tables"] == harness.base_payload["tables"]
+
+    refused_harness = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(
+            lambda model_request: _succeeded_text(model_request, "NO USEFUL ENRICHMENT")
+        ),
+        anchor=anchor,
+    )
+    refused_request = _common_enrichment_request(
+        refused_harness,
+        element_kind=EditorialEnrichmentElementKind.DIAGRAM,
+        operation=TargetedEditorialRevisionOperation.CREATE_DIAGRAM,
+        element_key=None,
+        placement=TargetedEditorialRevisionPlacement(
+            TargetedEditorialRevisionPlacementKind.AFTER_LEAD
+        ),
+    )
+    refused = await _common_revision_service(refused_harness).revise(refused_request)
+    assert refused.artifact is None
+    assert refused.refusal is not None
+    assert refused.refusal.code.value == "revision_not_applicable"
+
+
+@pytest.mark.asyncio
+async def test_common_create_diagram_rejects_unknown_handles_and_unsupported_relations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    anchor = "ExampleRAT downloads the payload and starts execution."
+
+    def draft_invalid(request: ModelRequest) -> ModelExecution:
+        prompt = json.loads(request.text)
+        handle = (
+            "E999"
+            if prompt["instruction"].endswith("unknown handle")
+            else next(
+                item["handle"]
+                for item in prompt["admitted_evidence_pack"]["narrative_evidence"]
+                if item.get("value") == anchor
+            )
+        )
+        wire = _diagram_wire_for_quality(
+            (
+                ("rat", "ExampleRAT", "unknown"),
+                ("payload", "payload", "unknown"),
+                ("c2", "command server", "unknown"),
+            ),
+            (("rat", "payload", "downloads"), ("payload", "c2", "controls")),
+            evidence_handle=str(handle),
+            key=str(prompt["target"]["key"]),
+        ).replace("PLACEMENT: after_section\nSECTION_INDEX: 0", "PLACEMENT: after_lead")
+        return _succeeded_text(request, wire)
+
+    for instruction in ("create with unknown handle", "create unsupported relation"):
+        harness = await _revision_harness(
+            monkeypatch, _RecordingGateway(draft_invalid), anchor=anchor
+        )
+        request = _common_enrichment_request(
+            harness,
+            element_kind=EditorialEnrichmentElementKind.DIAGRAM,
+            operation=TargetedEditorialRevisionOperation.CREATE_DIAGRAM,
+            element_key=None,
+            placement=TargetedEditorialRevisionPlacement(
+                TargetedEditorialRevisionPlacementKind.AFTER_LEAD
+            ),
+            instruction=instruction,
+        )
+        result = await _common_revision_service(harness).revise(request)
+        assert result.artifact is None
+        assert result.refusal is not None
+        assert result.refusal.code.value == "revision_not_applicable"
+
+
+@pytest.mark.asyncio
+async def test_common_allow_source_extension_returns_typed_e2a_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(lambda request: _succeeded_text(request, "unexpected")),
+    )
+    request = _common_enrichment_request(
+        harness,
+        element_kind=EditorialEnrichmentElementKind.DIAGRAM,
+        operation=TargetedEditorialRevisionOperation.DELETE_DIAGRAM,
+        element_key="infection_chain",
+    )
+    request = replace(request, mode=TargetedEditorialRevisionMode.ALLOW_SOURCE_EXTENSION)
+
+    result = await _common_revision_service(harness).revise(request)
+
+    assert result.artifact is None
+    assert result.refusal is not None
+    assert result.refusal.code.value == "source_extension_not_available_yet"
+    assert harness.world.gateway.calls == []
+
+
+@pytest.mark.asyncio
+async def test_common_create_chart_adds_only_the_requested_chart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    anchor = (
+        "Registered domains alpha.example and beta.example were first registered on "
+        "2026-08-25 and 2026-08-27, respectively."
+    )
+
+    def draft_chart(request: ModelRequest) -> ModelExecution:
+        prompt = json.loads(request.text)
+        handle = next(
+            item["handle"]
+            for item in prompt["admitted_evidence_pack"]["narrative_evidence"]
+            if item.get("value") == anchor
+        )
+        wire = f"""CHART C001
+KEY: {prompt["target"]["key"]}
+KIND: timeline
+TITLE: Domain registrations over time
+CAPTION: Registration dates reported for two domains.
+PURPOSE: When were these domains first registered?
+DATA: The report gives two domain registration dates.
+GAIN: A time axis places the reported registrations in sequence.
+SCOPE: Only the two domain registration dates in the supplied evidence.
+PURPOSE_EVIDENCE: {handle}
+LIMITS: No activity between these dates is inferred.
+PLACEMENT: after_lead
+PLACEMENT_REASON: Place beside the infrastructure analysis.
+POINT P001
+DATE: 2026-08-25
+LABEL: alpha.example
+SERIES: Registered domains
+EVIDENCE: {handle}
+END POINT
+POINT P002
+DATE: 2026-08-27
+LABEL: beta.example
+SERIES: Registered domains
+EVIDENCE: {handle}
+END POINT
+END CHART"""
+        return _succeeded_text(request, wire)
+
+    harness = await _revision_harness(monkeypatch, _RecordingGateway(draft_chart), anchor=anchor)
+    request = _common_enrichment_request(
+        harness,
+        element_kind=EditorialEnrichmentElementKind.CHART,
+        operation=TargetedEditorialRevisionOperation.CREATE_CHART,
+        element_key=None,
+        placement=TargetedEditorialRevisionPlacement(
+            TargetedEditorialRevisionPlacementKind.AFTER_LEAD
+        ),
+    )
+    result = await _common_revision_service(harness).revise(request)
+
+    assert result.refusal is None and result.artifact is not None
+    payload = await harness.world.store.read_json(result.artifact.canonical_blob_id)
+    assert len(payload["charts"]) == 1
+    assert payload["charts"][0]["key"].startswith("chart_")
+    assert payload["tables"] == harness.base_payload["tables"]
+    assert payload["diagrams"] == harness.base_payload["diagrams"]
+
+
+@pytest.mark.asyncio
+async def test_common_delete_and_replace_source_figure_are_targeted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    delete_harness = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(lambda request: _succeeded_text(request, "unexpected")),
+        include_figure=True,
+    )
+    figure = delete_harness.base_payload["source_figures"][0]
+    figure_key = figure["key"]
+    figure_id = figure["resolved_figure"]["figure_id"]
+    delete_request = _common_enrichment_request(
+        delete_harness,
+        element_kind=EditorialEnrichmentElementKind.FIGURE,
+        operation=TargetedEditorialRevisionOperation.DELETE_SOURCE_FIGURE,
+        element_key=figure_key,
+    )
+    delete_result = await _common_revision_service(delete_harness).revise(delete_request)
+
+    assert delete_result.refusal is None and delete_result.artifact is not None
+    assert delete_harness.world.gateway.calls == []
+    deleted_payload = await delete_harness.world.store.read_json(
+        delete_result.artifact.canonical_blob_id
+    )
+    assert deleted_payload["source_figures"] == []
+    assert all(item["figure_id"] != figure_id for item in deleted_payload["figure_decisions"])
+    for key in set(delete_harness.base_payload) - {"source_figures", "figure_decisions"}:
+        assert deleted_payload[key] == delete_harness.base_payload[key]
+
+    def choose_alternative(request: ModelRequest) -> ModelExecution:
+        prompt = json.loads(request.text)
+        alternative = next(
+            item
+            for item in prompt["figure_catalog"]
+            if item["figure_label"] == "Alternative ExampleRAT process map"
+        )
+        return _succeeded_text(
+            request,
+            _figure_wire(
+                handle=str(alternative["handle"]),
+                caption="Alternative documented ExampleRAT architecture",
+            ),
+        )
+
+    replace_harness = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(choose_alternative),
+        include_figure=True,
+        include_second_figure=True,
+    )
+    original = replace_harness.base_payload["source_figures"][0]
+    replace_request = _common_enrichment_request(
+        replace_harness,
+        element_kind=EditorialEnrichmentElementKind.FIGURE,
+        operation=TargetedEditorialRevisionOperation.REPLACE_SOURCE_FIGURE,
+        element_key=original["key"],
+    )
+    replace_result = await _common_revision_service(replace_harness).revise(replace_request)
+
+    assert replace_result.refusal is None and replace_result.artifact is not None
+    replacement_payload = await replace_harness.world.store.read_json(
+        replace_result.artifact.canonical_blob_id
+    )
+    replacement = replacement_payload["source_figures"][0]
+    assert replacement["key"] == original["key"]
+    assert replacement["resolved_figure"]["figure_id"] != original["resolved_figure"]["figure_id"]
+    assert replacement["caption"] == "Alternative documented ExampleRAT architecture"
+    assert replacement_payload["tables"] == replace_harness.base_payload["tables"]
+    assert replacement_payload["diagrams"] == replace_harness.base_payload["diagrams"]
+    assert len(replace_harness.world.gateway.calls) == 1

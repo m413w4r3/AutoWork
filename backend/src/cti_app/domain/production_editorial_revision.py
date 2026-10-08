@@ -9,6 +9,7 @@ from typing import Any
 from uuid import UUID
 
 from cti_app.domain.production import ProductionStage
+from cti_app.domain.production_editorial_enrichment import EditorialEnrichmentElementKind
 
 
 class TargetedEditorialRevisionOperation(StrEnum):
@@ -34,6 +35,7 @@ class TargetedEditorialRevisionOperation(StrEnum):
     DELETE_CHART = "delete_chart"
     CREATE_SOURCE_FIGURE = "create_source_figure"
     REWRITE_SOURCE_FIGURE = "rewrite_source_figure"
+    REPLACE_SOURCE_FIGURE = "replace_source_figure"
     DELETE_SOURCE_FIGURE = "delete_source_figure"
 
 
@@ -49,6 +51,31 @@ class TargetedEditorialRevisionTargetKind(StrEnum):
     SECTIONS = "sections"
     SECTION = "section"
     SECTION_PARAGRAPH = "section_paragraph"
+    ENRICHMENT_ELEMENT = "enrichment_element"
+
+
+class TargetedEditorialRevisionPlacementKind(StrEnum):
+    AFTER_LEAD = "after_lead"
+    AFTER_SECTION = "after_section"
+    AFTER_TIMELINE = "after_timeline"
+
+
+@dataclass(frozen=True, slots=True)
+class TargetedEditorialRevisionPlacement:
+    kind: TargetedEditorialRevisionPlacementKind
+    section_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, TargetedEditorialRevisionPlacementKind):
+            raise ValueError("targeted_editorial_revision_placement_kind_invalid")
+        if self.kind is TargetedEditorialRevisionPlacementKind.AFTER_SECTION:
+            if self.section_id is None or _SHA256.fullmatch(self.section_id) is None:
+                raise ValueError("targeted_editorial_revision_placement_section_required")
+        elif self.section_id is not None:
+            raise ValueError("targeted_editorial_revision_placement_section_invalid")
+
+    def to_json(self) -> dict[str, Any]:
+        return {"kind": self.kind.value, "section_id": self.section_id}
 
 
 class TargetedEditorialRevisionRefusalCode(StrEnum):
@@ -72,6 +99,9 @@ class TargetedEditorialRevisionTarget:
     parent_id: str | None = None
     anchor_id: str | None = None
     insert_after: bool = False
+    element_kind: EditorialEnrichmentElementKind | None = None
+    element_key: str | None = None
+    placement: TargetedEditorialRevisionPlacement | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, TargetedEditorialRevisionTargetKind):
@@ -127,15 +157,45 @@ class TargetedEditorialRevisionTarget:
                 raise ValueError("targeted_editorial_revision_target_id_invalid")
         if type(self.insert_after) is not bool:
             raise ValueError("targeted_editorial_revision_insert_after_invalid")
+        if self.kind is TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT:
+            if (
+                not isinstance(self.element_kind, EditorialEnrichmentElementKind)
+                or self.stable_ids
+                or self.parent_id is not None
+                or self.anchor_id is not None
+                or self.insert_after
+            ):
+                raise ValueError("targeted_editorial_revision_enrichment_target_invalid")
+            if self.element_key is not None and (
+                not self.element_key.strip() or len(self.element_key) > 128
+            ):
+                raise ValueError("targeted_editorial_revision_enrichment_key_invalid")
+        elif (
+            self.element_kind is not None
+            or self.element_key is not None
+            or self.placement is not None
+        ):
+            raise ValueError("targeted_editorial_revision_enrichment_target_invalid")
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "kind": self.kind.value,
             "stable_ids": list(self.stable_ids),
             "parent_id": self.parent_id,
             "anchor_id": self.anchor_id,
             "insert_after": self.insert_after,
         }
+        if self.kind is TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT:
+            payload.update(
+                {
+                    "element_kind": (
+                        self.element_kind.value if self.element_kind is not None else None
+                    ),
+                    "element_key": self.element_key,
+                    "placement": self.placement.to_json() if self.placement is not None else None,
+                }
+            )
+        return payload
 
 
 @dataclass(frozen=True, slots=True)

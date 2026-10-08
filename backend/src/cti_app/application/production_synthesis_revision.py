@@ -8,7 +8,7 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from cti_app.application.model_gateway import (
@@ -972,18 +972,29 @@ class ProductionSynthesisRevisionService:
         synthesis_persistence: SynthesisService,
         enrichment_persistence: EditorialEnrichmentService,
         publication_render_service: PublicationRenderService,
+        enrichment_revision_service: Any | None = None,
         resource_search_enabled: bool = False,
     ) -> None:
         self._synthesis = synthesis_service
         self._synthesis_persistence = synthesis_persistence
         self._enrichment_persistence = enrichment_persistence
         self._publication_render_service = publication_render_service
+        self._enrichment_revision_service = enrichment_revision_service
         self._resource_search_enabled = resource_search_enabled
 
     async def preview(
         self, request: TargetedEditorialRevisionRequest
     ) -> TargetedSynthesisRevisionPreview:
         self._validate_request(request)
+        if request.target.kind is TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT:
+            if self._enrichment_revision_service is None:
+                raise TargetedSynthesisRevisionValidationError(
+                    "targeted_enrichment_revision_unavailable"
+                )
+            return cast(
+                TargetedSynthesisRevisionPreview,
+                await self._enrichment_revision_service.preview_targeted(request),
+            )
         context = await self._load_context(request)
         resolved = _resolve_target(context.base_payload, request.target, request.operation)
         if request.mode is TargetedEditorialRevisionMode.ALLOW_SOURCE_EXTENSION:
@@ -1037,6 +1048,15 @@ class ProductionSynthesisRevisionService:
         self, request: TargetedEditorialRevisionRequest
     ) -> TargetedSynthesisRevisionResult:
         self._validate_request(request)
+        if request.target.kind is TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT:
+            if self._enrichment_revision_service is None:
+                raise TargetedSynthesisRevisionValidationError(
+                    "targeted_enrichment_revision_unavailable"
+                )
+            return cast(
+                TargetedSynthesisRevisionResult,
+                await self._enrichment_revision_service.revise_targeted(request),
+            )
         identity_payload = self._request_identity_payload(request)
         request_identity = _sha256(identity_payload)
         revision_id = uuid5(NAMESPACE_URL, f"targeted-synthesis-revision:{request_identity}")
@@ -1297,35 +1317,48 @@ class ProductionSynthesisRevisionService:
         )
 
     async def lineage(self, artifact_id: UUID) -> dict[str, Any]:
+        enrichment = False
         async with self._synthesis._uow_factory() as uow:
             artifact = await uow.production_artifacts.get(artifact_id)
             if artifact is None:
                 raise ValueError("targeted_synthesis_revision_artifact_not_found")
-            if artifact.stage is not ProductionArtifactStage.SYNTHESIS:
+            if artifact.stage is ProductionArtifactStage.EDITORIAL_ENRICHMENT:
+                enrichment = True
+            elif artifact.stage is not ProductionArtifactStage.SYNTHESIS:
                 raise ValueError("targeted_synthesis_revision_artifact_not_synthesis")
-            run_id = artifact.production_run_id
-            chain: list[dict[str, Any]] = []
-            cursor: ProductionArtifact | None = artifact
-            visited: set[UUID] = set()
-            while cursor is not None and cursor.id not in visited:
-                visited.add(cursor.id)
-                revision = cursor.metadata.get("revision")
-                if not isinstance(revision, dict):
-                    break
-                chain.append(dict(revision))
-                base_id = revision.get("base_artifact_id")
-                try:
-                    cursor = await uow.production_artifacts.get(UUID(str(base_id)))
-                except (ValueError, TypeError, AttributeError):
-                    break
-                if cursor is None or cursor.stage is not ProductionArtifactStage.SYNTHESIS:
-                    break
-            return {
-                "artifact_id": str(artifact_id),
-                "production_run_id": str(run_id),
-                "revisions": chain,
-                "paragraph_provenance": artifact.metadata.get("paragraph_provenance", {}),
-            }
+            else:
+                run_id = artifact.production_run_id
+                chain: list[dict[str, Any]] = []
+                cursor: ProductionArtifact | None = artifact
+                visited: set[UUID] = set()
+                while cursor is not None and cursor.id not in visited:
+                    visited.add(cursor.id)
+                    revision = cursor.metadata.get("revision")
+                    if not isinstance(revision, dict):
+                        break
+                    chain.append(dict(revision))
+                    base_id = revision.get("base_artifact_id")
+                    try:
+                        cursor = await uow.production_artifacts.get(UUID(str(base_id)))
+                    except (ValueError, TypeError, AttributeError):
+                        break
+                    if cursor is None or cursor.stage is not ProductionArtifactStage.SYNTHESIS:
+                        break
+                result = {
+                    "artifact_id": str(artifact_id),
+                    "production_run_id": str(run_id),
+                    "revisions": chain,
+                    "paragraph_provenance": artifact.metadata.get("paragraph_provenance", {}),
+                    "element_provenance": {},
+                }
+        if enrichment:
+            if self._enrichment_revision_service is None:
+                raise ValueError("targeted_enrichment_revision_unavailable")
+            return cast(
+                dict[str, Any],
+                await self._enrichment_revision_service.lineage_targeted(artifact_id),
+            )
+        return result
 
     @staticmethod
     def _validate_request(request: TargetedEditorialRevisionRequest) -> None:
@@ -1335,6 +1368,51 @@ class ProductionSynthesisRevisionService:
             raise ValueError("targeted_synthesis_revision_operation_invalid")
         if not isinstance(request.mode, TargetedEditorialRevisionMode):
             raise ValueError("targeted_synthesis_revision_mode_invalid")
+        enrichment_operations = {
+            TargetedEditorialRevisionOperation.CREATE_TABLE,
+            TargetedEditorialRevisionOperation.REWRITE_TABLE,
+            TargetedEditorialRevisionOperation.DELETE_TABLE,
+            TargetedEditorialRevisionOperation.CREATE_DIAGRAM,
+            TargetedEditorialRevisionOperation.REWRITE_DIAGRAM,
+            TargetedEditorialRevisionOperation.DELETE_DIAGRAM,
+            TargetedEditorialRevisionOperation.CREATE_CHART,
+            TargetedEditorialRevisionOperation.REWRITE_CHART,
+            TargetedEditorialRevisionOperation.DELETE_CHART,
+            TargetedEditorialRevisionOperation.REPLACE_SOURCE_FIGURE,
+            TargetedEditorialRevisionOperation.REWRITE_SOURCE_FIGURE,
+            TargetedEditorialRevisionOperation.DELETE_SOURCE_FIGURE,
+        }
+        if request.target.kind is TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT:
+            kind = request.target.element_kind
+            operation = request.operation
+            operation_kind = {
+                TargetedEditorialRevisionOperation.CREATE_TABLE: "table",
+                TargetedEditorialRevisionOperation.REWRITE_TABLE: "table",
+                TargetedEditorialRevisionOperation.DELETE_TABLE: "table",
+                TargetedEditorialRevisionOperation.CREATE_DIAGRAM: "diagram",
+                TargetedEditorialRevisionOperation.REWRITE_DIAGRAM: "diagram",
+                TargetedEditorialRevisionOperation.DELETE_DIAGRAM: "diagram",
+                TargetedEditorialRevisionOperation.CREATE_CHART: "chart",
+                TargetedEditorialRevisionOperation.REWRITE_CHART: "chart",
+                TargetedEditorialRevisionOperation.DELETE_CHART: "chart",
+                TargetedEditorialRevisionOperation.REPLACE_SOURCE_FIGURE: "figure",
+                TargetedEditorialRevisionOperation.REWRITE_SOURCE_FIGURE: "figure",
+                TargetedEditorialRevisionOperation.DELETE_SOURCE_FIGURE: "figure",
+            }.get(operation)
+            if operation_kind is None or kind is None or kind.value != operation_kind:
+                raise ValueError("targeted_enrichment_revision_target_operation_mismatch")
+            is_create = operation in {
+                TargetedEditorialRevisionOperation.CREATE_TABLE,
+                TargetedEditorialRevisionOperation.CREATE_DIAGRAM,
+                TargetedEditorialRevisionOperation.CREATE_CHART,
+            }
+            if is_create:
+                if request.target.element_key is not None or request.target.placement is None:
+                    raise ValueError("targeted_enrichment_revision_create_target_invalid")
+            elif request.target.element_key is None or request.target.placement is not None:
+                raise ValueError("targeted_enrichment_revision_element_target_invalid")
+        elif request.operation in enrichment_operations:
+            raise ValueError("targeted_editorial_revision_target_operation_mismatch")
         instruction = request.instruction.strip()
         if not instruction or len(instruction) > MAX_TARGETED_REVISION_INSTRUCTION_LENGTH:
             raise ValueError("targeted_synthesis_revision_instruction_invalid")
