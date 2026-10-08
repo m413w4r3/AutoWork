@@ -48,6 +48,10 @@ from cti_app.domain.production_pipeline import (
     downstream_artifacts_from_pipeline_stage,
     production_artifact_stages,
 )
+from cti_app.domain.production_references import (
+    ProductionSourceCriticality,
+    ProductionSourceCriticalityReason,
+)
 from cti_app.infrastructure.database.models.core import SubjectRow
 from cti_app.infrastructure.database.models.jobs import JobRow
 from cti_app.infrastructure.database.models.model_execution import ModelRunRow
@@ -859,6 +863,18 @@ class SqlAlchemyProductionRepairDecisionRepository:
                 observed_pipeline_generation=decision.observed_pipeline_generation,
                 actor_id=decision.actor_id,
                 reason=decision.reason,
+                source_criticality=(
+                    decision.source_criticality.value
+                    if decision.source_criticality is not None
+                    else None
+                ),
+                criticality_reason=(
+                    decision.criticality_reason.value
+                    if decision.criticality_reason is not None
+                    else None
+                ),
+                failure_code=decision.failure_code,
+                criticality_policy_version=decision.criticality_policy_version,
                 created_at=decision.created_at,
             )
         )
@@ -1633,5 +1649,17 @@ def _production_repair_decision_from_row(
         correction_id=row.correction_id,
         actor_id=row.actor_id,
         reason=row.reason,
+        source_criticality=(
+            ProductionSourceCriticality(row.source_criticality)
+            if row.source_criticality is not None
+            else None
+        ),
+        criticality_reason=(
+            ProductionSourceCriticalityReason(row.criticality_reason)
+            if row.criticality_reason is not None
+            else None
+        ),
+        failure_code=row.failure_code,
+        criticality_policy_version=row.criticality_policy_version,
         created_at=row.created_at,
     )

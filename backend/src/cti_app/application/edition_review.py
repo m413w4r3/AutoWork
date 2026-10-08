@@ -268,6 +268,11 @@ class EditionRepairItem:
     # What the current projection really materializes, so an audit never reads
     # "the analyst decided INCLUDE" as "the deliverable contains the value".
     application_state: str = RepairDecisionApplicationState.UNRESOLVED.value
+    source_criticality: str | None = None
+    criticality_reason: str | None = None
+    failure_code: str | None = None
+    extraction_warnings: tuple[str, ...] = ()
+    criticality_policy_version: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -279,6 +284,7 @@ class EditionRepairSummary:
     rejected_other_artifacts: int
     articles_with_repairs: int
     articles_needing_rebuild: int
+    source_losses_to_review: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -431,7 +437,15 @@ class EditionRepairReadService:
             if callable(supplemental_getter)
             else ()
         )
-        return tuple([*extraction, *supplemental])
+        source_failure_getter = getattr(
+            self._issue_reader, "list_source_extraction_failure_issues", None
+        )
+        source_failures = (
+            await source_failure_getter(edition_id, subject_id)
+            if callable(source_failure_getter)
+            else ()
+        )
+        return tuple([*extraction, *supplemental, *source_failures])
 
     @staticmethod
     def _item_from_issue(issue: Any, row: EditionReviewReadItem | None) -> EditionRepairItem | None:
@@ -477,6 +491,7 @@ class EditionRepairReadService:
             preview=str(getattr(issue, "preview", "")),
             reason_code=str(
                 getattr(issue, "reason_code", None)
+                or getattr(issue, "failure_code", None)
                 or getattr(issue, "error_reason", None)
                 or "supplemental_source_unarchived"
             ),
@@ -496,6 +511,8 @@ class EditionRepairReadService:
                 if decision is not None
                 else "source_archived_pending_references"
                 if pending_references
+                else "secondary_source_loss_recorded"
+                if execution.resolved and decision is None
                 else None
             ),
             rebuild_required=execution.rebuild_required,
@@ -504,6 +521,27 @@ class EditionRepairReadService:
             is_publication_ioc=is_ioc,
             in_publication_scope=_row_in_publication_scope(row),
             application_state=execution.application_state.value,
+            source_criticality=(
+                str(getattr(getattr(issue, "source_criticality", None), "value", None))
+                if getattr(issue, "source_criticality", None) is not None
+                else None
+            ),
+            criticality_reason=(
+                str(getattr(getattr(issue, "criticality_reason", None), "value", None))
+                if getattr(issue, "criticality_reason", None) is not None
+                else None
+            ),
+            failure_code=(
+                str(getattr(issue, "failure_code", None))
+                if getattr(issue, "failure_code", None) is not None
+                else None
+            ),
+            extraction_warnings=tuple(getattr(issue, "extraction_warnings", ()) or ()),
+            criticality_policy_version=(
+                str(getattr(issue, "criticality_policy_version", None))
+                if getattr(issue, "criticality_policy_version", None) is not None
+                else None
+            ),
         )
 
 
@@ -558,6 +596,10 @@ def _repair_summary(
         unresolved_total=len(open_items),
         sources_to_supply=sum(
             item.kind == ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED.value
+            for item in open_items
+        ),
+        source_losses_to_review=sum(
+            item.kind == ProductionRepairIssueKind.SOURCE_EXTRACTION_FAILED.value
             for item in open_items
         ),
         rejected_iocs_to_review=sum(
@@ -1031,6 +1073,7 @@ def _repair_issue_is_actionable(issue: Any) -> bool:
     kind = _issue_kind(issue)
     return kind in {
         ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED.value,
+        ProductionRepairIssueKind.SOURCE_EXTRACTION_FAILED.value,
         ProductionRepairIssueKind.REJECTED_RULE.value,
     } or (
         kind == ProductionRepairIssueKind.REJECTED_INDICATOR.value
@@ -1039,11 +1082,14 @@ def _repair_issue_is_actionable(issue: Any) -> bool:
 
 
 def _repair_issue_resolved(issue: Any) -> bool:
-    # An archived source has nothing left to arbitrate; its remaining debt is
-    # counted by ``pending_rebuild_count`` instead.
-    return getattr(issue, "effective_decision", None) is not None or _issue_pending_references(
-        issue
-    )
+    # A historical continue action without a reason remains visible and cannot
+    # silently discharge the source-loss review requirement.
+    if _issue_kind(issue) in {
+        ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED.value,
+        ProductionRepairIssueKind.SOURCE_EXTRACTION_FAILED.value,
+    }:
+        return repair_issue_execution_state(issue).resolved
+    return getattr(issue, "effective_decision", None) is not None
 
 
 def _validate_document_identity(

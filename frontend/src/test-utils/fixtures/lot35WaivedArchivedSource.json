@@ -7,7 +7,8 @@
       "rejected_rules_to_review": 0,
       "rejected_other_artifacts": 0,
       "articles_with_repairs": 1,
-      "articles_needing_rebuild": 1
+      "articles_needing_rebuild": 1,
+      "source_losses_to_review": 0
     },
     "items": [
       {
@@ -69,7 +70,12 @@
         "repair_state": "archived_pending_references",
         "is_publication_ioc": false,
         "in_publication_scope": true,
-        "application_state": "already_effective"
+        "application_state": "already_effective",
+        "source_criticality": "critical",
+        "criticality_reason": "corroboration_uncovered",
+        "failure_code": null,
+        "extraction_warnings": [],
+        "criticality_policy_version": "source-criticality-v1"
       }
     ],
     "articles": [

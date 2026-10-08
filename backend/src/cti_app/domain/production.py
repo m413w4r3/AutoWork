@@ -15,6 +15,10 @@ from uuid import UUID, uuid4
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import SourceCandidate, SourceRole
 from cti_app.domain.model_runs import ModelSubmissionState
+from cti_app.domain.production_references import (
+    ProductionSourceCriticality,
+    ProductionSourceCriticalityReason,
+)
 
 
 class ProductionRunStatus(StrEnum):
@@ -42,6 +46,7 @@ class ProductionRepairIssueKind(StrEnum):
     REJECTED_INDICATOR = "rejected_indicator"
     REJECTED_RULE = "rejected_rule"
     SUPPLEMENTAL_SOURCE_UNARCHIVED = "supplemental_source_unarchived"
+    SOURCE_EXTRACTION_FAILED = "source_extraction_failed"
 
 
 class RepairApplicationStage(StrEnum):
@@ -204,6 +209,7 @@ class SupplementalSourceRepairState(StrEnum):
     UNARCHIVED = "unarchived"
     COLLECTION_MISSING = "collection_missing"
     ARCHIVED_PENDING_REFERENCES = "archived_pending_references"
+    CONTINUED_WITH_DIAGNOSTIC = "continued_with_diagnostic"
 
 
 class ProductionRepairAction(StrEnum):
@@ -1224,6 +1230,10 @@ class ProductionRepairDecision:
     action: ProductionRepairAction
     actor_id: str
     reason: str | None = None
+    source_criticality: ProductionSourceCriticality | None = None
+    criticality_reason: ProductionSourceCriticalityReason | None = None
+    failure_code: str | None = None
+    criticality_policy_version: str | None = None
     correction_id: UUID | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     id: UUID = field(default_factory=uuid4)
@@ -1236,6 +1246,28 @@ class ProductionRepairDecision:
             raise ValueError("Unknown production repair issue kind or action") from exc
         object.__setattr__(self, "issue_kind", issue_kind)
         object.__setattr__(self, "action", action)
+        if self.source_criticality is not None:
+            object.__setattr__(
+                self, "source_criticality", ProductionSourceCriticality(self.source_criticality)
+            )
+        if self.criticality_reason is not None:
+            object.__setattr__(
+                self,
+                "criticality_reason",
+                ProductionSourceCriticalityReason(self.criticality_reason),
+            )
+        for field_name in ("failure_code", "criticality_policy_version"):
+            value = getattr(self, field_name)
+            if value is not None:
+                normalized = value.strip()
+                if not normalized:
+                    raise ValueError(f"{field_name} must not be empty")
+                object.__setattr__(self, field_name, normalized)
+
+        if (self.source_criticality is None) != (self.criticality_reason is None):
+            raise ValueError("source criticality and its reason must be recorded together")
+        if self.source_criticality is not None and self.criticality_policy_version is None:
+            raise ValueError("source criticality requires its policy version")
 
         if self.observed_pipeline_generation < 0:
             raise ValueError("observed_pipeline_generation must be >= 0")
@@ -1255,21 +1287,43 @@ class ProductionRepairDecision:
             raise ValueError("reason is too long")
         object.__setattr__(self, "reason", normalized_reason)
 
+        if (
+            issue_kind is ProductionRepairIssueKind.SOURCE_EXTRACTION_FAILED
+            and action is (ProductionRepairAction.CONTINUE_WITHOUT_SOURCE)
+            and (
+                normalized_reason is None
+                or self.source_criticality is None
+                or self.criticality_reason is None
+                or self.failure_code is None
+                or self.criticality_policy_version is None
+            )
+        ):
+            raise ValueError(
+                "Source extraction failure decisions require an analyst reason and diagnostic"
+            )
+
         compatible = (
-            issue_kind
-            in {
-                ProductionRepairIssueKind.REJECTED_INDICATOR,
-                ProductionRepairIssueKind.REJECTED_RULE,
-            }
-            and action
-            in {
-                ProductionRepairAction.INCLUDE,
-                ProductionRepairAction.EXCLUDE,
-                ProductionRepairAction.REPLACE,
-            }
-        ) or (
-            issue_kind is ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED
-            and action is ProductionRepairAction.CONTINUE_WITHOUT_SOURCE
+            (
+                issue_kind
+                in {
+                    ProductionRepairIssueKind.REJECTED_INDICATOR,
+                    ProductionRepairIssueKind.REJECTED_RULE,
+                }
+                and action
+                in {
+                    ProductionRepairAction.INCLUDE,
+                    ProductionRepairAction.EXCLUDE,
+                    ProductionRepairAction.REPLACE,
+                }
+            )
+            or (
+                issue_kind is ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED
+                and action is ProductionRepairAction.CONTINUE_WITHOUT_SOURCE
+            )
+            or (
+                issue_kind is ProductionRepairIssueKind.SOURCE_EXTRACTION_FAILED
+                and action is ProductionRepairAction.CONTINUE_WITHOUT_SOURCE
+            )
         )
         if not compatible:
             raise ValueError("Production repair action is incompatible with issue kind")

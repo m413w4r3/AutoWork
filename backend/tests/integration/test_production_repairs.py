@@ -22,6 +22,10 @@ from cti_app.domain.production import (
     ProductionRepairIssueKind,
     ProductionRun,
 )
+from cti_app.domain.production_references import (
+    ProductionSourceCriticality,
+    ProductionSourceCriticalityReason,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -96,6 +100,24 @@ async def test_production_repair_decisions_are_fk_backed_append_only_and_effecti
         actor_id="reviewer",
         created_at=now,
     )
+    critical_source_decision = ProductionRepairDecision(
+        id=UUID("00000000-0000-0000-0000-000000000003"),
+        edition_id=edition.id,
+        subject_id=subject.id,
+        production_run_id=run.id,
+        observed_artifact_id=artifact.id,
+        observed_pipeline_generation=run.pipeline_generation,
+        repair_key="b" * 64,
+        issue_kind=ProductionRepairIssueKind.SOURCE_EXTRACTION_FAILED,
+        action=ProductionRepairAction.CONTINUE_WITHOUT_SOURCE,
+        actor_id="analyst",
+        reason="Analyst reviewed the missing counter-analysis and accepted the loss.",
+        source_criticality=ProductionSourceCriticality.CRITICAL,
+        criticality_reason=ProductionSourceCriticalityReason.COUNTER_ANALYSIS,
+        failure_code="access_blocked",
+        criticality_policy_version="source-criticality-v1",
+        created_at=now,
+    )
 
     try:
         async with uow_factory() as uow:
@@ -105,11 +127,12 @@ async def test_production_repair_decisions_are_fk_backed_append_only_and_effecti
             await uow.production_artifacts.append(artifact)
             await uow.production_repair_decisions.append(first)
             await uow.production_repair_decisions.append(second)
+            await uow.production_repair_decisions.append(critical_source_decision)
             await uow.commit()
 
         async with uow_factory() as uow:
             effective = await uow.production_repair_decisions.effective_decisions(edition.id)
-            assert effective == (second,)
+            assert set(effective) == {second, critical_source_decision}
 
         engine = create_postgres_engine(migrated_postgres_url)
         session_factory = create_session_factory(engine)
@@ -147,6 +170,28 @@ async def test_production_repair_decisions_are_fk_backed_append_only_and_effecti
                             "DELETE FROM production_repair_decisions WHERE edition_id = :edition_id"
                         ),
                         {"edition_id": edition.id},
+                    )
+                await session.rollback()
+                with pytest.raises(IntegrityError):
+                    await session.execute(
+                        text(
+                            "INSERT INTO production_repair_decisions "
+                            "(id, edition_id, subject_id, production_run_id, "
+                            "observed_artifact_id, repair_key, issue_kind, action, "
+                            "observed_pipeline_generation, actor_id, created_at) "
+                            "VALUES (:id, :edition_id, :subject_id, :run_id, :artifact_id, "
+                            ":repair_key, 'source_extraction_failed', "
+                            "'continue_without_source', 0, 'analyst', :created_at)"
+                        ),
+                        {
+                            "id": uuid4(),
+                            "edition_id": edition.id,
+                            "subject_id": subject.id,
+                            "run_id": run.id,
+                            "artifact_id": artifact.id,
+                            "repair_key": "c" * 64,
+                            "created_at": now,
+                        },
                     )
                 await session.rollback()
                 with pytest.raises(IntegrityError):

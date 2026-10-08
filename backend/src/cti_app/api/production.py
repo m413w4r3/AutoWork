@@ -69,9 +69,11 @@ from cti_app.application.production_repairs import (
     ProductionRepairMaterializationService,
     ProductionRepairProjectionError,
     ProductionRepairProjectionService,
+    ProductionRepairSourceDiagnosticRequiredError,
     ProductionRepairStaleError,
     ProductionRepairStatusError,
     ProductionRepairValueNotVerifiableError,
+    repair_issue_execution_state,
 )
 from cti_app.application.production_resume import (
     plan_production_resume,
@@ -587,6 +589,14 @@ def _repair_decision_view(decision: Any | None) -> dict[str, Any] | None:
         "action": decision.action.value,
         "actor_id": decision.actor_id,
         "reason": decision.reason,
+        "source_criticality": (
+            decision.source_criticality.value if decision.source_criticality is not None else None
+        ),
+        "criticality_reason": (
+            decision.criticality_reason.value if decision.criticality_reason is not None else None
+        ),
+        "failure_code": decision.failure_code,
+        "criticality_policy_version": decision.criticality_policy_version,
         "created_at": decision.created_at.isoformat(),
         "observed_artifact_id": str(decision.observed_artifact_id),
         "observed_pipeline_generation": decision.observed_pipeline_generation,
@@ -595,6 +605,7 @@ def _repair_decision_view(decision: Any | None) -> dict[str, Any] | None:
 
 
 def _supplemental_repair_issue_view(issue: Any) -> dict[str, Any]:
+    execution = repair_issue_execution_state(issue)
     return {
         "repair_key": issue.repair_key,
         "kind": issue.kind.value,
@@ -616,6 +627,42 @@ def _supplemental_repair_issue_view(issue: Any) -> dict[str, Any]:
         "observed_pipeline_generation": issue.observed_pipeline_generation,
         "effective_decision": _repair_decision_view(issue.effective_decision),
         "recommended_action": issue.recommended_action,
+        "source_criticality": issue.source_criticality.value,
+        "criticality_reason": issue.criticality_reason.value,
+        "failure_code": issue.failure_code,
+        "criticality_policy_version": issue.criticality_policy_version,
+        "resolved": execution.resolved,
+        "blocking": execution.blocking,
+        "application_state": execution.application_state.value,
+    }
+
+
+def _source_extraction_failure_issue_view(issue: Any) -> dict[str, Any]:
+    execution = repair_issue_execution_state(issue)
+    return {
+        "repair_key": issue.repair_key,
+        "kind": issue.kind.value,
+        "source_id": issue.source_id,
+        "source_title": issue.source_title,
+        "source_url": issue.source_url,
+        "publisher": issue.publisher,
+        "failure_code": issue.failure_code,
+        "extraction_warnings": list(issue.extraction_warnings),
+        "source_criticality": issue.source_criticality.value,
+        "criticality_reason": issue.criticality_reason.value,
+        "criticality_policy_version": issue.criticality_policy_version,
+        "production_run_id": str(issue.production_run_id),
+        "observed_artifact_id": str(issue.observed_artifact_id),
+        "observed_artifact_version": issue.observed_artifact_version,
+        "observed_pipeline_generation": issue.observed_pipeline_generation,
+        "effective_decision": _repair_decision_view(issue.effective_decision),
+        "resolved": execution.resolved,
+        "blocking": execution.blocking,
+        "application_state": execution.application_state.value,
+        "recommended_stage": execution.recommended_stage,
+        "recommended_action": (
+            "review_source_loss" if execution.blocking else "continue_without_source"
+        ),
     }
 
 
@@ -1911,6 +1958,12 @@ async def get_subject_production_repairs(
 
     issue_service = _production_repair_issue_service(request)
     supplemental = await issue_service.list_supplemental_source_issues(edition_id, subject_id)
+    source_failure_getter = getattr(issue_service, "list_source_extraction_failure_issues", None)
+    source_failures = (
+        await source_failure_getter(edition_id, subject_id)
+        if callable(source_failure_getter)
+        else ()
+    )
     light_getter = getattr(issue_service, "list_issue_views", None)
     extraction_issues = (
         await light_getter(edition_id, subject_id)
@@ -1919,16 +1972,23 @@ async def get_subject_production_repairs(
     )
     if kind is ProductionRepairIssueKind.REJECTED_INDICATOR:
         supplemental = ()
+        source_failures = ()
         extraction_issues = tuple(issue for issue in extraction_issues if issue.kind is kind)
     elif kind is ProductionRepairIssueKind.REJECTED_RULE:
         supplemental = ()
+        source_failures = ()
         extraction_issues = tuple(issue for issue in extraction_issues if issue.kind is kind)
     elif kind is ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED:
+        extraction_issues = ()
+        source_failures = ()
+    elif kind is ProductionRepairIssueKind.SOURCE_EXTRACTION_FAILED:
+        supplemental = ()
         extraction_issues = ()
 
     all_issues = [
         *[_repair_issue_view(issue) for issue in extraction_issues],
         *[_supplemental_repair_issue_view(issue) for issue in supplemental],
+        *[_source_extraction_failure_issue_view(issue) for issue in source_failures],
     ]
     all_issues.sort(key=lambda item: (item.get("kind", ""), item.get("repair_key", "")))
     offset = _repair_cursor_offset(cursor)
@@ -1964,6 +2024,20 @@ async def get_subject_production_repair_detail(
                 detail=f"No production run found for subject {subject_id}",
             )
         edition_id = run.edition_id
+    issue_service = _production_repair_issue_service(request)
+    source_failure_getter = getattr(issue_service, "get_source_extraction_failure_issue", None)
+    source_failure = (
+        await source_failure_getter(edition_id, repair_key, subject_id)
+        if callable(source_failure_getter)
+        else None
+    )
+    if source_failure is not None:
+        result = _source_extraction_failure_issue_view(source_failure)
+        history = await issue_service.decision_history(edition_id, repair_key, subject_id)
+        result["decision_history"] = [
+            view for view in (_repair_decision_view(item) for item in history) if view is not None
+        ]
+        return result
     detail = await _production_repair_issue_service(request).get_issue(
         edition_id, repair_key, subject_id
     )
@@ -2176,6 +2250,14 @@ def _production_repair_decision_error(exc: Exception, repair_key: str) -> NoRetu
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail={
                 "code": ProductionRepairAuditReasonRequiredError.code,
+                "repair_key": repair_key,
+            },
+        ) from exc
+    if isinstance(exc, ProductionRepairSourceDiagnosticRequiredError):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": ProductionRepairSourceDiagnosticRequiredError.code,
                 "repair_key": repair_key,
             },
         ) from exc

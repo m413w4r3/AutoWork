@@ -9,7 +9,7 @@ historical revisions or data conversions involved.
 from collections.abc import Sequence
 
 from alembic import op
-from sqlalchemy import inspect
+from sqlalchemy import CheckConstraint, inspect
 
 from cti_app.infrastructure.database.models import (  # noqa: F401
     collection,
@@ -376,6 +376,68 @@ _TRIGGERS: tuple[tuple[str, str, str, str], ...] = (
     ),
 )
 
+# These are part of the target schema contract for the mutable baseline. The
+# migration creates the schema from ORM metadata, so keep a guard here to make
+# source-extraction repair decisions an explicit baseline requirement instead
+# of relying on an unnoticed model-only change.
+_PRODUCTION_REPAIR_DECISION_BASELINE_COLUMNS = frozenset(
+    {
+        "source_criticality",
+        "criticality_reason",
+        "failure_code",
+        "criticality_policy_version",
+    }
+)
+_PRODUCTION_REPAIR_DECISION_BASELINE_CHECKS = frozenset(
+    {
+        "ck_production_repair_issue_kind",
+        "ck_production_repair_action_compatibility",
+        "ck_production_repair_source_criticality",
+        "ck_production_repair_criticality_reason",
+        "ck_production_repair_source_criticality_pair",
+        "ck_production_repair_criticality_policy_version",
+        "ck_production_repair_source_extraction_diagnostic",
+    }
+)
+
+
+def _assert_production_repair_decision_baseline_contract() -> None:
+    table = Base.metadata.tables.get("production_repair_decisions")
+    if table is None:
+        raise RuntimeError("production_repair_decisions is missing from the target schema")
+
+    missing_columns = _PRODUCTION_REPAIR_DECISION_BASELINE_COLUMNS - set(table.columns.keys())
+    checks = {
+        str(constraint.name): str(constraint.sqltext)
+        for constraint in table.constraints
+        if isinstance(constraint, CheckConstraint) and constraint.name
+    }
+    missing_checks = _PRODUCTION_REPAIR_DECISION_BASELINE_CHECKS - checks.keys()
+    compatibility = checks.get("ck_production_repair_action_compatibility", "")
+    missing_compatibility_values = {
+        value
+        for value in ("source_extraction_failed", "continue_without_source")
+        if value not in compatibility
+    }
+    source_diagnostic = checks.get("ck_production_repair_source_extraction_diagnostic", "")
+    missing_source_diagnostic_values = {
+        value
+        for value in ("source_extraction_failed", "continue_without_source", "failure_code")
+        if value not in source_diagnostic
+    }
+    if (
+        missing_columns
+        or missing_checks
+        or missing_compatibility_values
+        or missing_source_diagnostic_values
+    ):
+        raise RuntimeError(
+            "production_repair_decisions target schema contract is incomplete: "
+            f"columns={sorted(missing_columns)}, checks={sorted(missing_checks)}, "
+            f"compatibility_values={sorted(missing_compatibility_values)}, "
+            f"source_diagnostic_values={sorted(missing_source_diagnostic_values)}"
+        )
+
 
 def upgrade() -> None:
     # This is intentionally a fresh-schema operation. No revision checks,
@@ -385,6 +447,7 @@ def upgrade() -> None:
     # non-null publication_language column in the ORM metadata below.
     # The target production_runs schema keeps no synthesis conversation
     # identity: the durable ModelRun owns provider recovery.
+    _assert_production_repair_decision_baseline_contract()
     Base.metadata.create_all(bind=op.get_bind(), checkfirst=False)
     for _function_name, definition in _GUARD_FUNCTIONS:
         op.execute(definition)

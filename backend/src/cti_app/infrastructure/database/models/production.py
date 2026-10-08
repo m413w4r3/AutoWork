@@ -37,9 +37,15 @@ SOURCE_EXTRACTION_STATUS_VALUES_SQL = "'running', 'verified', 'needs_review', 'f
 TLP_VALUES_SQL = "'CLEAR', 'GREEN', 'AMBER', 'AMBER+STRICT', 'RED'"
 EXTRACTION_PROFILE_VALUES_SQL = "'full', 'ioc_rules'"
 PRODUCTION_REPAIR_ISSUE_KIND_VALUES_SQL = (
-    "'rejected_indicator', 'rejected_rule', 'supplemental_source_unarchived'"
+    "'rejected_indicator', 'rejected_rule', 'supplemental_source_unarchived', "
+    "'source_extraction_failed'"
 )
 PRODUCTION_REPAIR_ACTION_VALUES_SQL = "'include', 'exclude', 'replace', 'continue_without_source'"
+PRODUCTION_SOURCE_CRITICALITY_VALUES_SQL = "'critical', 'secondary'"
+PRODUCTION_SOURCE_CRITICALITY_REASON_VALUES_SQL = (
+    "'core_tier', 'primary_role', 'counter_analysis', 'redundant_corroboration', "
+    "'corroboration_uncovered', 'content_duplicate', 'coverage_unknown'"
+)
 PRODUCTION_REPAIR_VERIFICATION_STATE_VALUES_SQL = "'source_verified', 'analyst_override'"
 PRODUCTION_BATCH_STATUS_VALUES_SQL = (
     "'queued', 'running', 'paused', 'completed', 'completed_with_issues', 'cancelled'"
@@ -723,6 +729,8 @@ class ProductionRepairDecisionRow(Base):
             "((issue_kind IN ('rejected_indicator', 'rejected_rule') "
             "AND action IN ('include', 'exclude', 'replace')) OR "
             "(issue_kind = 'supplemental_source_unarchived' "
+            "AND action = 'continue_without_source') OR "
+            "(issue_kind = 'source_extraction_failed' "
             "AND action = 'continue_without_source'))",
             name="ck_production_repair_action_compatibility",
         ),
@@ -745,6 +753,35 @@ class ProductionRepairDecisionRow(Base):
         CheckConstraint(
             "reason IS NULL OR char_length(reason) <= 500",
             name="ck_production_repair_reason_length",
+        ),
+        CheckConstraint(
+            f"source_criticality IS NULL OR source_criticality IN "
+            f"({PRODUCTION_SOURCE_CRITICALITY_VALUES_SQL})",
+            name="ck_production_repair_source_criticality",
+        ),
+        CheckConstraint(
+            f"criticality_reason IS NULL OR criticality_reason IN "
+            f"({PRODUCTION_SOURCE_CRITICALITY_REASON_VALUES_SQL})",
+            name="ck_production_repair_criticality_reason",
+        ),
+        CheckConstraint(
+            "(source_criticality IS NULL) = (criticality_reason IS NULL)",
+            name="ck_production_repair_source_criticality_pair",
+        ),
+        CheckConstraint(
+            "source_criticality IS NULL OR (criticality_policy_version IS NOT NULL "
+            "AND char_length(btrim(criticality_policy_version)) > 0)",
+            name="ck_production_repair_criticality_policy_version",
+        ),
+        CheckConstraint(
+            "issue_kind <> 'source_extraction_failed' OR "
+            "action <> 'continue_without_source' OR ("
+            "reason IS NOT NULL AND char_length(btrim(reason)) > 0 AND "
+            "source_criticality IS NOT NULL AND criticality_reason IS NOT NULL AND "
+            "failure_code IS NOT NULL AND char_length(btrim(failure_code)) > 0 AND "
+            "criticality_policy_version IS NOT NULL AND "
+            "char_length(btrim(criticality_policy_version)) > 0)",
+            name="ck_production_repair_source_extraction_diagnostic",
         ),
         Index(
             "ix_production_repair_edition_key_created",
@@ -789,4 +826,8 @@ class ProductionRepairDecisionRow(Base):
     observed_pipeline_generation: Mapped[int] = mapped_column(nullable=False)
     actor_id: Mapped[str] = mapped_column(String(255), nullable=False)
     reason: Mapped[str | None] = mapped_column(Text)
+    source_criticality: Mapped[str | None] = mapped_column(String(32))
+    criticality_reason: Mapped[str | None] = mapped_column(String(64))
+    failure_code: Mapped[str | None] = mapped_column(String(128))
+    criticality_policy_version: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

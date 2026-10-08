@@ -15,7 +15,7 @@ This module validates, against a real (temporary) PostgreSQL database:
 5. the *behaviour* of the two guard families (TLP-downgrade prevention and
    append-only enforcement), not just their catalog presence;
 6. that a database with no tables and no Alembic history upgrades directly
-   to the sole ``0001_baseline`` head, and that repeating ``upgrade head``
+   to the current Alembic head, and that repeating ``upgrade head``
    leaves the schema and trigger definitions unchanged;
 7. a full ``upgrade head`` -> ``downgrade base`` -> ``upgrade head`` cycle,
    asserting tables/functions/triggers are completely gone after the full
@@ -694,8 +694,8 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
     assert asyncio.run(_table_names(temporary_postgres_url)) == set()
     command.upgrade(config, "head")
     command.current(config)
-    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0001_baseline"
-    assert _head_revision() == "0001_baseline"
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
+    assert _head_revision() == "0002_production_batch_pause"
 
     tables = asyncio.run(_table_names(temporary_postgres_url))
     assert _REPAIR_TABLE in tables
@@ -747,8 +747,8 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
     }
     trigger_definitions = asyncio.run(_trigger_definitions(temporary_postgres_url))
 
-    # The single mutable baseline is idempotent: repeating the upgrade is a
-    # no-op for the schema and trigger definitions.
+    # The migration chain is idempotent: repeating the upgrade is a no-op for
+    # the schema and trigger definitions.
     command.upgrade(config, "head")
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
     assert asyncio.run(_table_names(temporary_postgres_url)) == tables

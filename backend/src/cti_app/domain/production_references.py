@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date
 from enum import StrEnum
+from typing import Protocol
 from uuid import UUID
 
 from cti_app.domain.collection import CollectionState
@@ -32,6 +34,28 @@ class ProductionEditorialRole(StrEnum):
     COUNTER_ANALYSIS = "counter_analysis"
 
 
+class ProductionSourceCriticality(StrEnum):
+    """Whether losing a source can change the subject's supported analysis."""
+
+    CRITICAL = "critical"
+    SECONDARY = "secondary"
+
+
+class ProductionSourceCriticalityReason(StrEnum):
+    """Deterministic evidence behind a source criticality assessment."""
+
+    CORE_TIER = "core_tier"
+    PRIMARY_ROLE = "primary_role"
+    COUNTER_ANALYSIS = "counter_analysis"
+    REDUNDANT_CORROBORATION = "redundant_corroboration"
+    CORROBORATION_UNCOVERED = "corroboration_uncovered"
+    CONTENT_DUPLICATE = "content_duplicate"
+    COVERAGE_UNKNOWN = "coverage_unknown"
+
+
+PRODUCTION_SOURCE_CRITICALITY_POLICY_VERSION = "source-criticality-v1"
+
+
 class ProductionReferenceResearchStatus(StrEnum):
     COMPLETED = "completed"
 
@@ -42,6 +66,87 @@ _TIER_ORDER = {
     ProductionReferenceTier.SUPPORTING: 1,
     ProductionReferenceTier.TECHNICAL: 2,
 }
+
+
+class _CriticalitySource(Protocol):
+    @property
+    def tier(self) -> ProductionReferenceTier: ...
+
+    @property
+    def kind(self) -> ProductionReferenceKind: ...
+
+    @property
+    def role(self) -> SourceRole: ...
+
+    @property
+    def editorial_role(self) -> ProductionEditorialRole | None: ...
+
+    @property
+    def content_sha256(self) -> str | None: ...
+
+
+def production_source_criticality(
+    source: _CriticalitySource,
+    *,
+    sources: Sequence[_CriticalitySource],
+) -> tuple[ProductionSourceCriticality, ProductionSourceCriticalityReason]:
+    """Assess loss severity from frozen source roles and known source coverage.
+
+    CORE, PRIMARY, and COUNTER_ANALYSIS sources are always critical. A source
+    explicitly assigned CORROBORATION is secondary only while an extractable
+    primary source remains. An exact content hash shared with another
+    extractable source is also proof of redundancy. Other cases stay critical:
+    this code has no claim-level coverage contract, so unknown coverage cannot
+    be guessed away. Title or attribution provenance is represented by the
+    existing CORE/PRIMARY assignments when known.
+    """
+    if source.tier is ProductionReferenceTier.CORE:
+        return ProductionSourceCriticality.CRITICAL, ProductionSourceCriticalityReason.CORE_TIER
+    if source.editorial_role is ProductionEditorialRole.COUNTER_ANALYSIS:
+        return (
+            ProductionSourceCriticality.CRITICAL,
+            ProductionSourceCriticalityReason.COUNTER_ANALYSIS,
+        )
+    if (
+        source.role is SourceRole.PRIMARY
+        or source.editorial_role is ProductionEditorialRole.PRIMARY
+    ):
+        return ProductionSourceCriticality.CRITICAL, ProductionSourceCriticalityReason.PRIMARY_ROLE
+
+    other_sources = tuple(candidate for candidate in sources if candidate is not source)
+    primary_coverage_exists = any(
+        getattr(candidate, "eligible_for_extraction", True)
+        and (
+            candidate.tier is ProductionReferenceTier.CORE
+            or candidate.role is SourceRole.PRIMARY
+            or candidate.editorial_role is ProductionEditorialRole.PRIMARY
+        )
+        for candidate in other_sources
+    )
+    if source.editorial_role is ProductionEditorialRole.CORROBORATION and primary_coverage_exists:
+        return (
+            ProductionSourceCriticality.SECONDARY,
+            ProductionSourceCriticalityReason.REDUNDANT_CORROBORATION,
+        )
+
+    if source.content_sha256 is not None and any(
+        getattr(candidate, "eligible_for_extraction", True)
+        and candidate.content_sha256 == source.content_sha256
+        for candidate in other_sources
+    ):
+        return (
+            ProductionSourceCriticality.SECONDARY,
+            ProductionSourceCriticalityReason.CONTENT_DUPLICATE,
+        )
+
+    reason = (
+        ProductionSourceCriticalityReason.CORROBORATION_UNCOVERED
+        if source.editorial_role is ProductionEditorialRole.CORROBORATION
+        else ProductionSourceCriticalityReason.COVERAGE_UNKNOWN
+    )
+    return ProductionSourceCriticality.CRITICAL, reason
+
+
 PRODUCTION_REFERENCE_EXTRACTION_STATES = frozenset(
     {
         CollectionState.ARCHIVED,
