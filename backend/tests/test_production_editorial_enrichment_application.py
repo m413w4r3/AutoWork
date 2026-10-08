@@ -4399,7 +4399,10 @@ async def _revision_harness(
     include_ioc_duplicate_table: bool = False,
     legacy_v8_identity: bool = False,
 ) -> SimpleNamespace:
-    from cti_app.application.publication_assembly import PublicationAssemblyService
+    from cti_app.application.publication_assembly import (
+        PublicationAssemblyResult,
+        PublicationAssemblyService,
+    )
 
     world = _world(gateway)
     if indicators or anchor is not None:
@@ -4631,8 +4634,8 @@ async def _revision_harness(
         *,
         run: ProductionRun,
         metadata_extra: dict[str, Any],
-        **_kwargs: Any,
-    ) -> ProductionArtifact:
+        **kwargs: Any,
+    ) -> PublicationAssemblyResult:
         del assembly
         assembled.append(metadata_extra)
         existing = await artifacts.list_for_run(run.id)
@@ -4654,7 +4657,7 @@ async def _revision_harness(
             metadata=metadata_extra,
         )
         await artifacts.append(publication)
-        return publication
+        return PublicationAssemblyResult(publication, kwargs["editorial_enrichment"])
 
     async def render_preview(artifact_id: UUID) -> None:
         rendered.append(artifact_id)
