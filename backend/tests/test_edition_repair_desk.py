@@ -36,6 +36,7 @@ from cti_app.domain.production import (
     ProductionRun,
     ProductionRunStatus,
     ProductionStage,
+    SupplementalSourceRepairState,
 )
 from cti_app.domain.production_references import (
     ProductionReferenceCorpusV1,
@@ -417,6 +418,7 @@ def test_repair_items_expose_backend_rebuild_stages() -> None:
         row,
         kind=ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED,
     )
+    source.repair_state = SupplementalSourceRepairState.ARCHIVED_PENDING_REFERENCES
     pending_projection = _issue(
         2,
         row,

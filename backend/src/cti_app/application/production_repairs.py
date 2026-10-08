@@ -1323,6 +1323,21 @@ def _decision_action(decision: ProductionRepairDecision | None) -> Any:
     return _projection_enum_value(getattr(decision, "action", None))
 
 
+def _source_waiver_has_analyst_reason(decision: ProductionRepairDecision | None) -> bool:
+    """A reasoned legacy waiver remains explicit; a reasonless one does not.
+
+    Legacy source decisions have no criticality fields. Their actor and reason
+    remain readable and can authorize a critical loss when the observation
+    fence matches. A reasonless legacy waiver is accepted only when the
+    current source is demonstrably secondary and its loss diagnostic is shown.
+    """
+    return _decision_action(
+        decision
+    ) == ProductionRepairAction.CONTINUE_WITHOUT_SOURCE.value and bool(
+        (getattr(decision, "reason", None) or "").strip()
+    )
+
+
 def _decision_for_current_source_issue(
     decision: ProductionRepairDecision | None,
     run: Any,
@@ -1440,8 +1455,20 @@ def classify_repair_impact(
                 reuse_unknown_count=preview["reuse_unknown_count"],
             )
         if repair_state == SupplementalSourceRepairState.COLLECTION_MISSING.value:
+            if _source_waiver_has_analyst_reason(decision) or _secondary_source_loss_is_diagnosed(
+                issue
+            ):
+                return _repair_impact(
+                    ProductionRepairImpactKind.NO_DELIVERABLE_CHANGE,
+                    _NO_DELIVERABLE_OUTPUTS,
+                    model_call_required=False,
+                    reason=(
+                        "The source loss is accepted with an explicit waiver or visible diagnosis."
+                    ),
+                )
             # There is nothing to reintegrate yet: the plan describes real
-            # work but no rebuild can run before the source is prepared.
+            # work but no rebuild can run before the source is prepared. A
+            # critical loss still needs an analyst decision before sign-off.
             return _repair_impact(
                 ProductionRepairImpactKind.SOURCE_CORPUS,
                 _SOURCE_CORPUS_OUTPUTS,
@@ -1463,6 +1490,20 @@ def classify_repair_impact(
                 ),
             )
         if action == ProductionRepairAction.CONTINUE_WITHOUT_SOURCE.value:
+            if not (
+                _source_waiver_has_analyst_reason(decision)
+                or _secondary_source_loss_is_diagnosed(issue)
+            ):
+                return _repair_impact(
+                    ProductionRepairImpactKind.NO_DELIVERABLE_CHANGE,
+                    _NO_DELIVERABLE_OUTPUTS,
+                    model_call_required=False,
+                    ready_to_apply=False,
+                    reason=(
+                        "This legacy waiver has no analyst reason; a critical source loss "
+                        "needs a new decision."
+                    ),
+                )
             return _repair_impact(
                 ProductionRepairImpactKind.NO_DELIVERABLE_CHANGE,
                 _NO_DELIVERABLE_OUTPUTS,
@@ -1616,11 +1657,7 @@ def repair_issue_execution_state(
         ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED,
         ProductionRepairIssueKind.SOURCE_EXTRACTION_FAILED,
     }
-    audited_source_waiver = (
-        effective is not None
-        and _decision_action(effective) == ProductionRepairAction.CONTINUE_WITHOUT_SOURCE.value
-        and bool((getattr(effective, "reason", None) or "").strip())
-    )
+    audited_source_waiver = _source_waiver_has_analyst_reason(effective)
     pending_references = repair_issue_pending_references(issue)
     application_state = repair_issue_application_state(issue, effective)
     impact = classify_repair_impact(issue, effective)
@@ -1641,13 +1678,14 @@ def repair_issue_execution_state(
         recommended_stage: str | None = "rebuild_references"
     elif is_source:
         rebuild_required = False
-        recommended_stage = (
-            "none"
-            if resolved
-            else "review_source_loss"
-            if issue_kind is ProductionRepairIssueKind.SOURCE_EXTRACTION_FAILED
-            else "rebuild_references"
-        )
+        if resolved:
+            recommended_stage = "none"
+        elif issue_kind is ProductionRepairIssueKind.SOURCE_EXTRACTION_FAILED:
+            recommended_stage = "review_source_loss"
+        else:
+            # A critical collection failure cannot be signed off as a no-op.
+            # The decision endpoint is the actionable review path.
+            recommended_stage = "revise_decision"
     elif application_state is RepairDecisionApplicationState.UNRESOLVED:
         rebuild_required = False
         recommended_stage = None
@@ -5466,14 +5504,18 @@ def repair_decision_application_state(
     }:
         # A waived source owes a REFERENCES reconciliation, never an
         # extraction projection; the source's durable loss remains visible in
-        # its canonical artifact and its analyst reason in the decision.
+        # its canonical artifact and its analyst reason in the decision. An
+        # archived source with pending REFERENCES is already supplied; that
+        # rebuild debt is independent of an older waiver's audit reason.
+        archived_source_has_recorded_waiver = (
+            repair_issue_pending_references(issue)
+            and _decision_action(effective_decision)
+            == ProductionRepairAction.CONTINUE_WITHOUT_SOURCE.value
+        )
         return (
             RepairDecisionApplicationState.ALREADY_EFFECTIVE
-            if (
-                _decision_action(effective_decision)
-                == ProductionRepairAction.CONTINUE_WITHOUT_SOURCE.value
-                and bool((getattr(effective_decision, "reason", None) or "").strip())
-            )
+            if archived_source_has_recorded_waiver
+            or _source_waiver_has_analyst_reason(effective_decision)
             or _secondary_source_loss_is_diagnosed(issue)
             else RepairDecisionApplicationState.UNRESOLVED
         )
@@ -5555,10 +5597,7 @@ def repair_issue_blocks_signoff(
     }:
         decision = effective_decision or getattr(issue, "effective_decision", None)
         return not (
-            (
-                _decision_action(decision) == ProductionRepairAction.CONTINUE_WITHOUT_SOURCE.value
-                and bool((getattr(decision, "reason", None) or "").strip())
-            )
+            _source_waiver_has_analyst_reason(decision)
             or _secondary_source_loss_is_diagnosed(issue)
         )
     return repair_issue_application_state(issue, effective_decision) in {

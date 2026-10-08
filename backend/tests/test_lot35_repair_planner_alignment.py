@@ -33,6 +33,10 @@ from cti_app.domain.production import (
     RepairDecisionApplicationState,
     SupplementalSourceRepairState,
 )
+from cti_app.domain.production_references import (
+    ProductionSourceCriticality,
+    ProductionSourceCriticalityReason,
+)
 from cti_app.domain.publication import is_publication_ioc_artifact_type
 
 EDITION_ID = UUID("00000000-0000-0000-0000-000000000001")
@@ -68,7 +72,15 @@ def _q2_issue(
     )
 
 
-def _source_issue(state: SupplementalSourceRepairState) -> SupplementalSourceRepairIssue:
+def _source_issue(
+    state: SupplementalSourceRepairState,
+    *,
+    source_criticality: ProductionSourceCriticality = ProductionSourceCriticality.CRITICAL,
+    criticality_reason: ProductionSourceCriticalityReason = (
+        ProductionSourceCriticalityReason.COVERAGE_UNKNOWN
+    ),
+    failure_code: str | None = None,
+) -> SupplementalSourceRepairIssue:
     return SupplementalSourceRepairIssue(
         repair_key="c" * 64,
         kind=ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED,
@@ -87,10 +99,18 @@ def _source_issue(state: SupplementalSourceRepairState) -> SupplementalSourceRep
         repair_state=state,
         rebuild_required=(state is SupplementalSourceRepairState.ARCHIVED_PENDING_REFERENCES),
         subject_id=SUBJECT_ID,
+        source_criticality=source_criticality,
+        criticality_reason=criticality_reason,
+        failure_code=failure_code,
     )
 
 
-def _decision(issue: Any, action: ProductionRepairAction) -> ProductionRepairDecision:
+def _decision(
+    issue: Any,
+    action: ProductionRepairAction,
+    *,
+    reason: str | None = None,
+) -> ProductionRepairDecision:
     return ProductionRepairDecision(
         edition_id=EDITION_ID,
         subject_id=SUBJECT_ID,
@@ -101,6 +121,7 @@ def _decision(issue: Any, action: ProductionRepairAction) -> ProductionRepairDec
         issue_kind=issue.kind,
         action=action,
         actor_id="analyst",
+        reason=reason,
     )
 
 
@@ -156,10 +177,10 @@ PLANNER_MATRIX: tuple[_Row, ...] = (
         application_state=RepairDecisionApplicationState.UNRESOLVED,
         impact_kind=ProductionRepairImpactKind.SOURCE_CORPUS,
         resolved=False,
-        blocks_signoff=False,
+        blocks_signoff=True,
         rebuild_required=False,
         ready_to_apply=False,
-        recommended_stage="rebuild_references",
+        recommended_stage="revise_decision",
         desk_offers_apply=False,
     ),
     _Row(
@@ -169,16 +190,42 @@ PLANNER_MATRIX: tuple[_Row, ...] = (
         application_state=RepairDecisionApplicationState.UNRESOLVED,
         impact_kind=ProductionRepairImpactKind.SOURCE_CORPUS,
         resolved=False,
-        blocks_signoff=False,
+        blocks_signoff=True,
         rebuild_required=False,
         ready_to_apply=False,
-        recommended_stage="rebuild_references",
+        recommended_stage="revise_decision",
         desk_offers_apply=False,
     ),
     _Row(
-        label="source · unarchived · waiver",
+        label="source · unarchived · critical legacy waiver without reason",
         issue=_UNARCHIVED_WAIVED,
         decision=_decision(_UNARCHIVED_WAIVED, ProductionRepairAction.CONTINUE_WITHOUT_SOURCE),
+        application_state=RepairDecisionApplicationState.UNRESOLVED,
+        impact_kind=ProductionRepairImpactKind.NO_DELIVERABLE_CHANGE,
+        resolved=False,
+        blocks_signoff=True,
+        rebuild_required=False,
+        ready_to_apply=False,
+        recommended_stage="revise_decision",
+        desk_offers_apply=False,
+    ),
+    _Row(
+        label="source · unarchived · legacy secondary waiver",
+        issue=_source_issue(
+            SupplementalSourceRepairState.UNARCHIVED,
+            source_criticality=ProductionSourceCriticality.SECONDARY,
+            criticality_reason=ProductionSourceCriticalityReason.REDUNDANT_CORROBORATION,
+            failure_code="access_blocked",
+        ),
+        decision=_decision(
+            _source_issue(
+                SupplementalSourceRepairState.UNARCHIVED,
+                source_criticality=ProductionSourceCriticality.SECONDARY,
+                criticality_reason=ProductionSourceCriticalityReason.REDUNDANT_CORROBORATION,
+                failure_code="access_blocked",
+            ),
+            ProductionRepairAction.CONTINUE_WITHOUT_SOURCE,
+        ),
         application_state=RepairDecisionApplicationState.ALREADY_EFFECTIVE,
         impact_kind=ProductionRepairImpactKind.NO_DELIVERABLE_CHANGE,
         resolved=True,
@@ -347,18 +394,27 @@ def test_no_deliverable_change_never_owes_a_rebuild(row: _Row) -> None:
 
     if state.impact.kind is ProductionRepairImpactKind.NO_DELIVERABLE_CHANGE:
         assert not state.rebuild_required
-        assert not state.blocking
+        # Critical source loss can block analyst sign-off even when no
+        # deliverable rebuild is owed.
 
 
 def test_archiving_a_waived_source_reverses_the_planner_answer() -> None:
     """The same effective waiver, before and after the source really exists."""
     waived = repair_issue_execution_state(
         _UNARCHIVED_WAIVED,
-        _decision(_UNARCHIVED_WAIVED, ProductionRepairAction.CONTINUE_WITHOUT_SOURCE),
+        _decision(
+            _UNARCHIVED_WAIVED,
+            ProductionRepairAction.CONTINUE_WITHOUT_SOURCE,
+            reason="Analyst reviewed and explicitly accepted this source loss.",
+        ),
     )
     archived = repair_issue_execution_state(
         _ARCHIVED_WAIVED,
-        _decision(_ARCHIVED_WAIVED, ProductionRepairAction.CONTINUE_WITHOUT_SOURCE),
+        _decision(
+            _ARCHIVED_WAIVED,
+            ProductionRepairAction.CONTINUE_WITHOUT_SOURCE,
+            reason="Analyst reviewed and explicitly accepted this source loss.",
+        ),
     )
 
     assert waived.impact.kind is ProductionRepairImpactKind.NO_DELIVERABLE_CHANGE

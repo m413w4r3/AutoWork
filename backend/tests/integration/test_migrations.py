@@ -338,6 +338,20 @@ def _actual_check_constraint_names(inspector: Any, table_name: str) -> set[str]:
     return {cc["name"] for cc in inspector.get_check_constraints(table_name)}
 
 
+async def _check_constraint_definitions(database_url: str, table_name: str) -> dict[str, str]:
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.connect() as connection:
+            return await connection.run_sync(
+                lambda sync: {
+                    str(check["name"]): str(check["sqltext"])
+                    for check in inspect(sync).get_check_constraints(table_name)
+                }
+            )
+    finally:
+        await engine.dispose()
+
+
 def _actual_indexes(inspector: Any, table_name: str) -> set[IndexShape]:
     shapes: set[IndexShape] = set()
     for idx in inspector.get_indexes(table_name):
@@ -521,6 +535,36 @@ def test_orm_table_matches_migrated_schema(
     assert actual["checks"] == _expected_check_constraint_names(table)
 
     assert actual["indexes"] == _expected_indexes(table)
+
+
+def test_production_repair_decision_source_loss_contract_is_in_fresh_schema(
+    migrated_postgres_url: str,
+    schema_snapshot: dict[str, dict[str, Any]],
+) -> None:
+    decision_schema = schema_snapshot[_REPAIR_TABLE]
+    assert {
+        "source_criticality",
+        "criticality_reason",
+        "failure_code",
+        "criticality_policy_version",
+    } <= set(decision_schema["columns"])
+    assert {
+        "ck_production_repair_issue_kind",
+        "ck_production_repair_action_compatibility",
+        "ck_production_repair_source_criticality",
+        "ck_production_repair_criticality_reason",
+        "ck_production_repair_source_criticality_pair",
+        "ck_production_repair_criticality_policy_version",
+        "ck_production_repair_source_extraction_diagnostic",
+    } <= decision_schema["checks"]
+
+    checks = asyncio.run(_check_constraint_definitions(migrated_postgres_url, _REPAIR_TABLE))
+    assert "source_extraction_failed" in checks["ck_production_repair_issue_kind"].lower()
+    assert "continue_without_source" in checks["ck_production_repair_action_compatibility"].lower()
+    assert (
+        "failure_code is not null"
+        in checks["ck_production_repair_source_extraction_diagnostic"].lower()
+    )
 
 
 def test_fusion_schema_uses_canonical_candidate_identity(
