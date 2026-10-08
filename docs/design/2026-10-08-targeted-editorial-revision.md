@@ -77,6 +77,27 @@ les changements de scope, la réparation d’extraction, le changement d’acteu
 sans preuve, la source critique absente, le contournement QA, les faits sans
 preuve ou la refonte complète. Les refus du modèle passent par le même type.
 
+## Ancrage v3 des claims de révision
+
+Un terme distinctif d’un claim est ancré s’il apparaît dans un handle cité ou
+dans toute autre preuve d’extraction du même document source qu’un handle cité,
+même si cette preuve n’a pas son propre handle dans le pack de prompt. Les
+preuves d’un document différent ne sont pas ajoutées au support du claim. Le contexte
+du sujet — titre, acteur ou campagne du snapshot, puis titre et paragraphes de
+la synthèse de base — peut établir les noms d’entités déjà connus, jamais une
+valeur technique. Les labels de source du pack, les URL de toutes les sources extraites et
+les éditeurs du snapshot peuvent établir le nom de l’émetteur, sans apporter
+de fait technique.
+
+Les nombres, IOC, domaines, URL, chemins, commandes, options, fonctions API,
+versions, mutex et clés restent ancrés dans les preuves des documents cités.
+Les mots courants, y compris les débuts de phrase et les formes françaises
+usuelles à trait d’union (`chaque`, `celles-ci`, `peut-être`), ne sont pas des
+termes distinctifs. Les noms propres au milieu d’une phrase, y compris les
+noms avec acronymes après un tiret (`Group-IB`), restent contrôlés.
+Les handles inconnus et les scopes `tool_context` / `actor_activity` gardent
+leurs validations dédiées.
+
 ## Découpage
 
 - **E1** : contrat de domaine générique, patch de synthèse, lineage, fences,

@@ -7,7 +7,7 @@ import json
 import re
 import unicodedata
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from itertools import pairwise
@@ -29,7 +29,6 @@ from cti_app.application.production_editorial_enrichment import (
 )
 from cti_app.application.production_prompts import (
     SYNTHESIS_EDITORIAL_CONTRACT_V5,
-    SYNTHESIS_TARGETED_REVISION_CONTRACT_VERSION,
     SYNTHESIS_TARGETED_REVISION_PROMPT_VERSION,
 )
 from cti_app.application.production_references import production_reference_corpus_from_json
@@ -103,6 +102,7 @@ from cti_app.domain.production_synthesis import (
     SynthesisParagraphV1,
     SynthesisSectionKind,
     SynthesisSectionV1,
+    extraction_evidence_elements,
     is_valid_editorial_title,
     production_synthesis_from_json,
     production_synthesis_to_json,
@@ -111,7 +111,11 @@ from cti_app.domain.production_synthesis import (
 )
 
 TARGETED_SYNTHESIS_REVISION_PARSER_VERSION = "targeted-synthesis-patch-parser-v3-heading-after-text"
-TARGETED_SYNTHESIS_REVISION_VALIDATOR_VERSION = "targeted-synthesis-patch-validator-v3-no-change"
+# The revision contract includes validator-owned evidence grounding behavior.
+SYNTHESIS_TARGETED_REVISION_CONTRACT_VERSION = (
+    "synthesis-targeted-patch-v4-after-formats-grounding-v3"
+)
+TARGETED_SYNTHESIS_REVISION_VALIDATOR_VERSION = "targeted-synthesis-patch-validator-v4-grounding-v3"
 MAX_TARGETED_REVISION_INSTRUCTION_LENGTH = 2000
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _OUTER_WIRE_BLOCK = re.compile(
@@ -796,6 +800,8 @@ def _parse_after_claims(
     unchanged_lead_wire: str = "",
     source_addition_document_ids: frozenset[UUID] = frozenset(),
     require_claim_scopes: bool = False,
+    base_synthesis: ProductionSynthesisV1 | None = None,
+    snapshot: ProductionInputSnapshot | None = None,
 ) -> tuple[SynthesisProposalV1, tuple[SynthesisParagraphV1, ...], tuple[SynthesisSectionV1, ...]]:
     synthetic_lead = not re.search(r"(?im)^\s*@@\s*LEAD\s*@@", raw)
     parse_input = f"{unchanged_lead_wire}\n{raw}" if synthetic_lead else raw
@@ -819,6 +825,8 @@ def _parse_after_claims(
         extraction=extraction,
         source_addition_document_ids=source_addition_document_ids,
         require_claim_scopes=require_claim_scopes,
+        base_synthesis=base_synthesis,
+        snapshot=snapshot,
     )
     try:
         lead, sections = validate_synthesis_proposal(parsed.proposal, evidence_pack, extraction)
@@ -840,6 +848,25 @@ _GROUNDING_STOP_WORDS = frozenset(
         "que aux au en comme leur leurs chaque selon"
     ).split()
 )
+_GROUNDING_SENTENCE_INITIAL_STOP_WORDS = frozenset(
+    "a according alors alors ainsi also although an and apres avant aucun aucune aussi autre "
+    "autres "
+    "because but "
+    "car cela celle celles celui ceux cependant comme comment dans de depuis donc elle elles en "
+    "encore ensuite est et every each even finally for from here however if il ils in it leur mais "
+    "me meme meanwhile moins ne ni non nous on or ou parce parmi pas pendant plusieurs plus puis "
+    "pour pourquoi quand que quel quelle quelles qui quoi sans selon since so some then therefore "
+    "this those thus toutefois tout toute tous toutes un une voici voilà "
+    "when where while with yet".split()
+)
+_GROUNDING_COMMON_HYPHENATED_WORDS = frozenset(
+    "celui-ci celle-ci ceux-ci celles-ci celui-là celle-là ceux-là celles-là "
+    "peut-être peut-etre".split()
+)
+_GROUNDING_SCOPE_ASSERTIONS = frozenset(
+    "all every entire whole only worldwide globally tout toute tous toutes jamais toujours "
+    "seulement uniquement mondialement partout".split()
+)
 
 
 def _grounding_token(value: str) -> str:
@@ -858,12 +885,6 @@ def _grounding_token(value: str) -> str:
 
 
 _GROUNDING_WORD = re.compile(r"[\w-]+", flags=re.UNICODE)
-_GROUNDING_SCOPE_MARKERS = frozenset(
-    """
-    all every each entire whole only worldwide globally tout toute tous toutes chaque jamais
-    toujours seulement uniquement mondialement partout
-    """.split()
-)
 _DISTINCTIVE_LITERAL = re.compile(
     r"(?<![\w])(?:"
     r"--[A-Za-z0-9][A-Za-z0-9_-]*|"
@@ -877,6 +898,18 @@ _DISTINCTIVE_LITERAL = re.compile(
     r"[A-Za-z0-9_-]*\d[A-Za-z0-9_-]*"
     r")(?![\w])",
     flags=re.IGNORECASE | re.UNICODE,
+)
+_API_FUNCTION_LITERAL = re.compile(
+    r"(?<![\w])(?:Pss|Nt|Zw|Rtl|Ke|Ex|Io|Ob|Mm|Ps|Flt|Get|Set|Open|Close|Create|"
+    r"Read|Write|Query|Virtual|Load|Free|Map|Flush|Copy|Move|Delete|Reg|Crypt|Http|"
+    r"Internet)[A-Z][A-Za-z0-9]*(?![\w])"
+)
+_SHELL_COMMAND_LITERAL = re.compile(
+    r"(?<![\w])(?:Add|Get|Set|New|Remove|Enable|Disable|Clear|Start|Stop|Invoke|Register|"
+    r"Unregister|Test|Update|Write|Read|Export|Import|Copy|Move|Connect|Disconnect|Convert|"
+    r"Find|Search|Resolve|Mount|Dismount|Grant|Revoke|Open|Close|Restart|Reset|Install|"
+    r"Uninstall)-[A-Z][A-Za-z0-9]*(?:-[A-Z][A-Za-z0-9]*)*(?![\w])",
+    flags=re.IGNORECASE,
 )
 
 
@@ -904,20 +937,19 @@ def _distinctive_grounding_terms(text: str) -> tuple[str, ...]:
     """Return only claim tokens that can introduce a specific, verifiable fact.
 
     Numbers, identifiers, technical literals, IOC-like values, CamelCase names,
-    acronyms, and non-initial capitalized names are checked against cited
-    evidence. Absolute quantifiers and scope modifiers are checked because they
-    change the factual reach of a claim. Ordinary editorial prose remains free
-    to paraphrase.
+    acronyms, and non-initial capitalized names are checked against authorized
+    grounding. Ordinary lowercase prose, sentence openers, and common French
+    hyphenated forms are not distinctive facts.
     """
     terms: dict[str, str] = {}
     current_run: list[re.Match[str]] = []
 
-    def add(value: str, *, force: bool = False) -> None:
+    def add(value: str) -> None:
         cleaned = value.strip(".,:;!?()[]{}\"'").strip("\u201c\u201d\u2018\u2019")
         if not cleaned:
             return
         key = _grounding_match_token(cleaned)
-        if key and (force or key not in _GROUNDING_STOP_WORDS):
+        if key and key not in _GROUNDING_STOP_WORDS:
             terms.setdefault(key, cleaned)
 
     def add_current_run() -> None:
@@ -929,7 +961,11 @@ def _distinctive_grounding_terms(text: str) -> tuple[str, ...]:
         add(match.group())
 
     words = list(_GROUNDING_WORD.finditer(text))
-    for index, match in enumerate(words):
+    for match in words:
+        normalized_value = unicodedata.normalize("NFKC", match.group()).casefold()
+        if normalized_value in _GROUNDING_COMMON_HYPHENATED_WORDS:
+            add_current_run()
+            continue
         if current_run:
             separator = text[current_run[-1].end() : match.start()]
             if any(not character.isspace() or character in "\r\n" for character in separator):
@@ -940,19 +976,19 @@ def _distinctive_grounding_terms(text: str) -> tuple[str, ...]:
         is_camel_case = any(left.islower() and right.isupper() for left, right in pairwise(value))
         is_acronym = len(letters) > 1 and value.isupper()
         is_title_case = bool(letters) and value[0].isupper() and value[1:].islower()
-        is_explicit_identifier = any(character in value for character in "._-")
+        is_hyphenated_proper_name = (
+            "-" in value
+            and value[0].isupper()
+            and any(character.isupper() for character in value[1:])
+        )
+        is_explicit_identifier = any(character in value for character in "._/\\")
         is_sentence_initial = is_title_case and _is_sentence_initial(text, match.start())
 
-        scope_marker = unicodedata.normalize("NFKC", value).casefold()
-        next_word = words[index + 1].group().casefold() if index < len(words) - 1 else ""
-        if scope_marker in _GROUNDING_SCOPE_MARKERS and not (
-            scope_marker == "tout" and next_word == "en"
-        ):
-            add(value, force=True)
         if (
             any(character.isdigit() for character in value)
             or is_camel_case
             or is_acronym
+            or is_hyphenated_proper_name
             or is_explicit_identifier
         ):
             add(value)
@@ -961,8 +997,8 @@ def _distinctive_grounding_terms(text: str) -> tuple[str, ...]:
         # part of a named sequence just because it starts a sentence. A real
         # capitalized sequence after it (for example, "Cobalt Strike") remains
         # eligible for grounding.
-        initial_stop_word = (
-            is_sentence_initial and _grounding_match_token(value) in _GROUNDING_STOP_WORDS
+        initial_stop_word = is_sentence_initial and _grounding_match_token(value) in (
+            _GROUNDING_STOP_WORDS | _GROUNDING_SENTENCE_INITIAL_STOP_WORDS
         )
         if is_title_case and not initial_stop_word:
             current_run.append(match)
@@ -977,17 +1013,158 @@ def _distinctive_grounding_terms(text: str) -> tuple[str, ...]:
     return tuple(terms[key] for key in sorted(terms))
 
 
-def _unsupported_distinctive_claim_terms(claim_text: str, evidence_text: str) -> tuple[str, ...]:
-    """Find unsupported names and literals; multiword names need sequence evidence."""
+def _unsupported_distinctive_claim_terms(
+    claim_text: str,
+    evidence_text: str,
+    *,
+    context_texts: Sequence[str] = (),
+    source_label_terms: Iterable[str] = (),
+) -> tuple[str, ...]:
+    """Compare claim facts with evidence and optional non-technical context.
+
+    Multiword names need sequence evidence. Context may establish names and
+    ordinary entities, while technical literals stay anchored in source text.
+    """
     supported = {
         _grounding_match_token(term) for term in _distinctive_grounding_terms(evidence_text)
     }
+    context_text = " ".join(context_texts)
+    supported.update(_nontechnical_distinctive_grounding_keys(context_text))
+    supported.update(_grounding_match_token(term) for term in source_label_terms)
     unsupported: dict[str, str] = {}
     for term in _distinctive_grounding_terms(claim_text):
         key = _grounding_match_token(term)
         if key not in supported:
             unsupported.setdefault(key, term)
     return tuple(unsupported[key] for key in sorted(unsupported))
+
+
+def _unsupported_claim_scope_assertions(claim_text: str, evidence_text: str) -> tuple[str, ...]:
+    """Keep absolute scope assertions tied to evidence without classifying prose."""
+    supported = {
+        unicodedata.normalize("NFKC", match.group()).casefold()
+        for match in _GROUNDING_WORD.finditer(evidence_text)
+    }
+    claim_words = list(_GROUNDING_WORD.finditer(claim_text))
+    return tuple(
+        sorted(
+            {
+                match.group()
+                for index, match in enumerate(claim_words)
+                if (marker := unicodedata.normalize("NFKC", match.group()).casefold())
+                in _GROUNDING_SCOPE_ASSERTIONS
+                and marker not in supported
+                and not (
+                    marker == "tout"
+                    and index + 1 < len(claim_words)
+                    and claim_words[index + 1].group().casefold() == "en"
+                )
+            },
+            key=str.casefold,
+        )
+    )
+
+
+def _technical_grounding_keys(text: str) -> frozenset[str]:
+    """Return literal and API/command identifiers that context cannot anchor."""
+    keys: set[str] = set()
+    for pattern in (_DISTINCTIVE_LITERAL, _API_FUNCTION_LITERAL, _SHELL_COMMAND_LITERAL):
+        for match in pattern.finditer(text):
+            literal = match.group().strip(".,:;!?()[]{}\"'").strip("\u201c\u201d\u2018\u2019")
+            keys.add(_grounding_match_token(literal))
+            keys.update(
+                _grounding_match_token(token.group()) for token in _GROUNDING_WORD.finditer(literal)
+            )
+    return frozenset(keys)
+
+
+def _nontechnical_distinctive_grounding_keys(text: str) -> frozenset[str]:
+    """Extract entity names while excluding technical values from context."""
+    technical_keys = _technical_grounding_keys(text)
+    return frozenset(
+        _grounding_match_token(term)
+        for term in _distinctive_grounding_terms(text)
+        if _grounding_match_token(term) not in technical_keys
+    )
+
+
+_COMMON_MULTI_PART_PUBLIC_SUFFIXES = frozenset(
+    {"co.uk", "gov.uk", "ac.uk", "org.uk", "com.au", "co.nz", "co.jp", "com.br", "com.cn"}
+)
+
+
+def _source_emitter_alias(source_label: str) -> str | None:
+    """Reduce a source hostname to its issuer-like registered name."""
+    candidate = source_label.strip()
+    parsed = urlsplit(candidate if "://" in candidate else f"//{candidate}")
+    hostname = (parsed.hostname or "").casefold().removeprefix("www.")
+    if not hostname:
+        return None
+    parts = hostname.split(".")
+    if len(parts) > 2 and ".".join(parts[-2:]) in _COMMON_MULTI_PART_PUBLIC_SUFFIXES:
+        root = parts[-3]
+    elif len(parts) > 1:
+        root = parts[-2]
+    else:
+        root = parts[0]
+    if re.fullmatch(r"[a-z]+(?:-[a-z]+)*", root) is None:
+        return None
+    return root
+
+
+def _source_emitter_grounding_keys(
+    evidence_pack: SynthesisEvidencePackV1,
+    extraction: ProductionExtractionV1 | None,
+    snapshot: ProductionInputSnapshot | None,
+) -> frozenset[str]:
+    """Collect source issuer names without allowing technical labels as facts."""
+    labels = [
+        str(record["source_label"])
+        for record in (
+            *evidence_pack.narrative_evidence,
+            *evidence_pack.technical_evidence,
+            *evidence_pack.reserve_evidence,
+        )
+        if isinstance(record.get("source_label"), str)
+    ]
+    if extraction is not None:
+        labels.extend(source.canonical_url for source in extraction.sources)
+    keys: set[str] = set()
+    for label in labels:
+        alias = _source_emitter_alias(label)
+        if alias is not None:
+            keys.add(_grounding_match_token(alias))
+    if snapshot is not None:
+        for source in snapshot.core_sources:
+            publisher = source.publisher.strip()
+            if publisher:
+                keys.update(_nontechnical_distinctive_grounding_keys(publisher))
+                publisher_words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", publisher)
+                if len(publisher_words) > 1 and all(word[0].isupper() for word in publisher_words):
+                    initialism = "".join(word[0] for word in publisher_words).upper()
+                    if re.fullmatch(r"[A-Z]{2,}", initialism):
+                        keys.add(_grounding_match_token(initialism))
+    return frozenset(keys)
+
+
+def _claim_grounding_context(
+    evidence_pack: SynthesisEvidencePackV1,
+    base_synthesis: ProductionSynthesisV1 | None,
+    snapshot: ProductionInputSnapshot | None,
+) -> tuple[str, ...]:
+    """Return only established subject and base-synthesis editorial context."""
+    context = [evidence_pack.subject_title, evidence_pack.actor_or_campaign]
+    if snapshot is not None:
+        context.extend((snapshot.subject_title, snapshot.actor_or_campaign))
+    if base_synthesis is not None:
+        context.append(base_synthesis.title)
+        context.extend(paragraph.text for paragraph in base_synthesis.lead)
+        context.extend(
+            paragraph.text
+            for section in base_synthesis.sections
+            for paragraph in section.paragraphs
+        )
+    return tuple(value for value in context if isinstance(value, str) and value.strip())
 
 
 def _bounded_claim_grounding_details(details: Mapping[str, Any]) -> dict[str, Any]:
@@ -1172,7 +1349,16 @@ def _assert_claim_handles_and_relations_supported(
     extraction: ProductionExtractionV1 | None = None,
     source_addition_document_ids: frozenset[UUID] = frozenset(),
     require_claim_scopes: bool = False,
+    base_synthesis: ProductionSynthesisV1 | None = None,
+    snapshot: ProductionInputSnapshot | None = None,
 ) -> None:
+    """Enforce grounding v3 without widening the dedicated scope checks.
+
+    A claim may use any extracted evidence from a document it cites, plus
+    non-technical names already present in the subject/base synthesis or
+    issuer labels from the evidence pack. Technical literals remain supported
+    only by evidence from a cited source document.
+    """
     records = {
         str(record["handle"]): record
         for record in (
@@ -1190,6 +1376,12 @@ def _assert_claim_handles_and_relations_supported(
         if extraction is not None
         else {}
     )
+    extraction_evidence_text_by_document: dict[UUID, list[str]] = {}
+    if extraction is not None:
+        for ref, payload in extraction_evidence_elements(extraction):
+            extraction_evidence_text_by_document.setdefault(ref.source_document_id, []).extend(
+                str(value) for value in payload.values() if isinstance(value, str)
+            )
     for claim_index, claim in enumerate(claims, start=1):
         if any(handle not in evidence_pack._handle_to_ref for handle in claim.evidence_handles):
             raise TargetedSynthesisRevisionValidationError("synthesis_unknown_evidence")
@@ -1233,14 +1425,33 @@ def _assert_claim_handles_and_relations_supported(
                     raise TargetedSynthesisRevisionValidationError(
                         "revision_actor_activity_requires_subject_evidence"
                     )
-        evidence_text = " ".join(
-            str(value)
+        cited_document_ids = {
+            evidence_pack.resolve_handle(handle).source_document_id
             for handle in claim.evidence_handles
-            for key, value in records[handle].items()
+        }
+        evidence_values = [
+            str(value)
+            for handle, record in records.items()
+            if (record_ref := evidence_pack._handle_to_ref.get(handle)) is not None
+            and record_ref.source_document_id in cited_document_ids
+            for key, value in record.items()
             if key not in {"handle", "source_label", "source_role", "editorial_role"}
             and isinstance(value, str)
+        ]
+        evidence_values.extend(
+            value
+            for document_id in cited_document_ids
+            for value in extraction_evidence_text_by_document.get(document_id, ())
         )
-        unsupported = _unsupported_distinctive_claim_terms(claim.text, evidence_text)
+        evidence_text = " ".join(evidence_values)
+        unsupported_distinctive = _unsupported_distinctive_claim_terms(
+            claim.text,
+            evidence_text,
+            context_texts=_claim_grounding_context(evidence_pack, base_synthesis, snapshot),
+            source_label_terms=_source_emitter_grounding_keys(evidence_pack, extraction, snapshot),
+        )
+        unsupported_scope = _unsupported_claim_scope_assertions(claim.text, evidence_text)
+        unsupported = tuple(dict.fromkeys((*unsupported_distinctive, *unsupported_scope)))
         if unsupported:
             claim_code = claim._block_id or f"C{claim_index:03d}"
             raise TargetedSynthesisRevisionValidationError(
@@ -1526,6 +1737,8 @@ def _apply_wire_patch(
             unchanged_lead_wire=_unchanged_lead_wire(base_synthesis, evidence_pack),
             source_addition_document_ids=source_addition_document_ids,
             require_claim_scopes=require_claim_scopes,
+            base_synthesis=base_synthesis,
+            snapshot=snapshot,
         )
         if operation is TargetedEditorialRevisionOperation.REWRITE_LEAD:
             if not parsed_lead or parsed_sections:

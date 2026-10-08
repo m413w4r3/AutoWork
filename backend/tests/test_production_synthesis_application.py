@@ -4619,6 +4619,315 @@ def test_nano_dump_claims_reject_invented_distinctive_terms(
     assert len(error.value.details["unsupported_terms"]) <= 12
 
 
+def _grounding_revision_case(
+    claim_text: str,
+    *,
+    cited_handles: tuple[str, ...],
+    evidence: tuple[tuple[str, str, str, str], ...],
+    subject_title: str = "",
+    actor_or_campaign: str = "",
+    base_text: str = "",
+) -> tuple[
+    SimpleNamespace,
+    SynthesisEvidencePackV1,
+    SynthesisProposalV1,
+    ProductionSynthesisV1,
+]:
+    world, base_synthesis, base_pack, _ = _targeted_revision_fixture()
+    document_ids: dict[str, UUID] = {}
+    refs: dict[str, ExtractionEvidenceRefV1] = {}
+    records: list[dict[str, Any]] = []
+    for handle, document_key, source_label, text in evidence:
+        document_id = document_ids.setdefault(document_key, uuid4())
+        ref = ExtractionEvidenceRefV1(
+            source_document_id=document_id,
+            kind=EvidenceKind.FACT,
+            evidence_key=hashlib.sha256(handle.encode("utf-8")).hexdigest(),
+        )
+        refs[handle] = ref
+        records.append(
+            {
+                "handle": handle,
+                "kind": EvidenceKind.FACT.value,
+                "source_label": source_label,
+                "source_role": "technical",
+                "editorial_role": "context",
+                "type": EvidenceKind.FACT.value,
+                "name": "Document fact",
+                "context": text,
+                "evidence": text,
+            }
+        )
+    evidence_pack = replace(
+        base_pack,
+        subject_title=subject_title or base_pack.subject_title,
+        actor_or_campaign=actor_or_campaign or base_pack.actor_or_campaign,
+        narrative_evidence=tuple(records),
+        technical_evidence=(),
+        reserve_evidence=(),
+        _handle_to_ref=refs,
+        _handle_for_ref={ref: handle for handle, ref in refs.items()},
+    )
+    assert isinstance(evidence_pack, SynthesisEvidencePackV1)
+    claim = SynthesisClaimProposalV1(
+        text=claim_text,
+        evidence_handles=cited_handles,
+        claim_scope="tool_context",
+    )
+    claim._block_id = "C001"
+    proposal = SynthesisProposalV1(
+        lead=(),
+        sections=(
+            SynthesisSectionProposalV1(
+                kind=SynthesisSectionKind.OVERVIEW,
+                heading="",
+                claims=(claim,),
+            ),
+        ),
+    )
+    if base_text:
+        base_synthesis = replace(
+            base_synthesis,
+            lead=(replace(base_synthesis.lead[0], text=base_text),),
+        )
+    return world, evidence_pack, proposal, base_synthesis
+
+
+def _assert_grounding_revision_accepted(
+    case: tuple[
+        SimpleNamespace,
+        SynthesisEvidencePackV1,
+        SynthesisProposalV1,
+        ProductionSynthesisV1,
+    ],
+) -> None:
+    world, evidence_pack, proposal, base_synthesis = case
+    synthesis_revision_module._assert_claim_handles_and_relations_supported(
+        proposal,
+        evidence_pack,
+        extraction=world.extraction,
+        snapshot=world.snapshot,
+        base_synthesis=base_synthesis,
+    )
+
+
+def _assert_grounding_revision_rejected(
+    case: tuple[
+        SimpleNamespace,
+        SynthesisEvidencePackV1,
+        SynthesisProposalV1,
+        ProductionSynthesisV1,
+    ],
+    unsupported_term: str,
+) -> None:
+    world, evidence_pack, proposal, base_synthesis = case
+    with pytest.raises(
+        synthesis_revision_module.TargetedSynthesisRevisionValidationError,
+        match="synthesis_relation_not_evidenced",
+    ) as error:
+        synthesis_revision_module._assert_claim_handles_and_relations_supported(
+            proposal,
+            evidence_pack,
+            extraction=world.extraction,
+            snapshot=world.snapshot,
+            base_synthesis=base_synthesis,
+        )
+    assert error.value.details["claim_code"] == "C001"
+    assert unsupported_term in error.value.details["unsupported_terms"]
+
+
+def test_grounding_v3_accepts_source_issuer_names_from_evidence_pack_labels() -> None:
+    assert "Group-IB" in synthesis_revision_module._distinctive_grounding_terms(
+        "Selon Group-IB, une activité est observée."
+    )
+    case = _grounding_revision_case(
+        "Selon le FBI, l'AIVD, le NCSC et Group-IB, une activité est observée.",
+        cited_handles=("E1",),
+        evidence=(
+            ("E1", "flash", "fbi.gov", "Le rapport décrit une activité observée."),
+            ("E2", "advisory", "aivd.nl", "Le bulletin signale une activité observée."),
+            ("E3", "advisory", "ncsc.gov.uk", "L'avis signale une activité observée."),
+            ("E4", "report", "group-ib.com", "Le rapport décrit une activité observée."),
+        ),
+    )
+
+    _assert_grounding_revision_accepted(case)
+
+
+def test_grounding_v3_accepts_subject_name_from_snapshot_context() -> None:
+    world, evidence_pack, proposal, base_synthesis = _grounding_revision_case(
+        "HEAVYGRAM a lancé une activité décrite dans le rapport.",
+        cited_handles=("E1",),
+        evidence=(("E1", "flash", "report.example", "Le rapport décrit une activité."),),
+        subject_title="HEAVYGRAM — activité de campagne",
+        actor_or_campaign="HEAVYGRAM",
+    )
+    snapshot = replace(
+        world.snapshot,
+        subject_title="HEAVYGRAM — activité de campagne",
+        actor_or_campaign="HEAVYGRAM",
+        input_hash="",
+        reuse_basis_hash="",
+    )
+    world.snapshot = snapshot
+
+    _assert_grounding_revision_accepted((world, evidence_pack, proposal, base_synthesis))
+
+
+def test_grounding_v3_accepts_a_name_from_another_handle_in_the_cited_document() -> None:
+    case = _grounding_revision_case(
+        "Le FBI identifie winappx.exe et décrit aussi PowerShell.",
+        cited_handles=("E1",),
+        evidence=(
+            (
+                "E1",
+                "fbi-flash",
+                "fbi.gov",
+                "Le rapport identifie winappx.exe comme implant.",
+            ),
+            (
+                "E2",
+                "fbi-flash",
+                "fbi.gov",
+                "Le même rapport indique que PowerShell écrit le fichier de staging.",
+            ),
+        ),
+    )
+
+    _assert_grounding_revision_accepted(case)
+
+
+def test_grounding_v3_uses_unlisted_extraction_evidence_from_a_cited_document() -> None:
+    case = _grounding_revision_case(
+        "PowerShell apparaît dans le document cité.",
+        cited_handles=("E1",),
+        evidence=(("E1", "fbi-flash", "fbi.gov", "Le rapport décrit un implant."),),
+    )
+    world, evidence_pack, proposal, base_synthesis = case
+    source = world.extraction.sources[0]
+    extra_fact = make_fact(
+        source.source_document_id,
+        "PowerShell",
+        context="Le rapport indique que PowerShell écrit le fichier de staging.",
+    )
+    world.extraction = replace(
+        world.extraction,
+        sources=tuple(
+            replace(item, facts=(*item.facts, extra_fact))
+            if item.source_document_id == source.source_document_id
+            else item
+            for item in world.extraction.sources
+        ),
+    )
+    extraction_ref = ExtractionEvidenceRefV1(
+        source_document_id=source.source_document_id,
+        kind=EvidenceKind.FACT,
+        evidence_key=hashlib.sha256(b"cited-document-evidence").hexdigest(),
+    )
+    evidence_pack = replace(
+        evidence_pack,
+        _handle_to_ref={"E1": extraction_ref},
+        _handle_for_ref={extraction_ref: "E1"},
+    )
+    assert "PowerShell" not in " ".join(
+        str(value) for record in evidence_pack.narrative_evidence for value in record.values()
+    )
+    _assert_grounding_revision_accepted((world, evidence_pack, proposal, base_synthesis))
+
+
+def test_grounding_v3_ignores_common_french_sentence_openers_and_hyphen_forms() -> None:
+    case = _grounding_revision_case(
+        "Chaque artefact est examiné ; celles-ci sont regroupées ensuite.",
+        cited_handles=("E1",),
+        evidence=(("E1", "flash", "report.example", "Le rapport décrit plusieurs artefacts."),),
+    )
+
+    assert "Chaque" not in synthesis_revision_module._distinctive_grounding_terms(
+        "Chaque artefact est observé."
+    )
+    assert "Celles-ci" not in synthesis_revision_module._distinctive_grounding_terms(
+        "Celles-ci sont observées."
+    )
+    _assert_grounding_revision_accepted(case)
+
+
+@pytest.mark.parametrize(
+    ("claim", "unsupported_term"),
+    (
+        ("GhostKernel lance l'implant observé.", "GhostKernel"),
+        ("Ghost-Tool lance l'implant observé.", "Ghost-Tool"),
+        ("PowerShell lance l'implant observé.", "PowerShell"),
+        ("L'outil active l'option --disable-telemetry.", "--disable-telemetry"),
+        (r"Le binaire écrit C:\Temp\staging\new.bin.", r"C:\Temp\staging\new.bin"),
+        ("Le rapport compte 76543 fichiers.", "76543"),
+    ),
+)
+def test_grounding_v3_rejects_names_and_values_outside_cited_documents(
+    claim: str, unsupported_term: str
+) -> None:
+    evidence = (
+        ("E1", "cited", "report-a.example", "Le rapport identifie l'implant."),
+        ("E2", "uncited", "report-b.example", "PowerShell est présent dans ce document."),
+    )
+    case = _grounding_revision_case(claim, cited_handles=("E1",), evidence=evidence)
+
+    _assert_grounding_revision_rejected(case, unsupported_term)
+
+
+def test_grounding_v3_does_not_use_editorial_context_to_anchor_api_functions() -> None:
+    case = _grounding_revision_case(
+        "PssNtCaptureSnapshot clone le processus décrit.",
+        cited_handles=("E1",),
+        evidence=(("E1", "flash", "report.example", "Le rapport décrit un processus."),),
+        base_text="La synthèse précédente mentionnait PssNtCaptureSnapshot.",
+    )
+
+    _assert_grounding_revision_rejected(case, "PssNtCaptureSnapshot")
+
+
+@pytest.mark.parametrize(
+    ("claim", "context", "unsupported_term"),
+    (
+        (
+            r"L'implant écrit C:\Temp\staging\new.bin.",
+            r"Le chemin historique était C:\Temp\staging\new.bin.",
+            r"C:\Temp\staging\new.bin",
+        ),
+        (
+            "L'outil active l'option --disable-telemetry.",
+            "La synthèse précédente mentionnait --disable-telemetry.",
+            "--disable-telemetry",
+        ),
+        (
+            "Le rapport compte 76543 fichiers.",
+            "La version initiale indique 76543 fichiers.",
+            "76543",
+        ),
+    ),
+)
+def test_grounding_v3_keeps_technical_literals_out_of_subject_and_base_context(
+    claim: str, context: str, unsupported_term: str
+) -> None:
+    case = _grounding_revision_case(
+        claim,
+        cited_handles=("E1",),
+        evidence=(("E1", "flash", "fbi.gov", "Le rapport décrit l'implant."),),
+        base_text=context,
+    )
+
+    _assert_grounding_revision_rejected(case, unsupported_term)
+
+
+def test_grounding_v3_source_label_anchors_issuer_name_but_not_its_domain() -> None:
+    case = _grounding_revision_case(
+        "Le FBI rapporte une activité sur fbi.gov.",
+        cited_handles=("E1",),
+        evidence=(("E1", "flash", "fbi.gov", "Le rapport décrit une activité."),),
+    )
+
+    _assert_grounding_revision_rejected(case, "fbi.gov")
+
+
 def test_distinctive_grounding_normalizes_accents_and_plurals_without_matching_prose() -> None:
     assert "CaféRATs" in synthesis_revision_module._distinctive_grounding_terms(
         "L'outil CaféRATs appelle PROCESS_VM_READ."
