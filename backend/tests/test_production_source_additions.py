@@ -50,6 +50,7 @@ from cti_app.domain.production import (
     ProductionRun,
     ProductionRunStatus,
     ProductionStage,
+    SourceAdditionExtractionIntent,
 )
 from cti_app.domain.production_extraction import (
     ExtractionProfileReasonCode,
@@ -75,6 +76,7 @@ from cti_app.domain.production_source_additions import (
     SourceAdditionPromotionPlanV1,
     SourceAdditionState,
     SourceAdditionV1,
+    source_addition_from_json,
     source_addition_manifest,
     source_addition_source_key,
     source_addition_to_json,
@@ -892,6 +894,17 @@ def test_manifest_hash_is_order_independent_and_contains_durable_lineage() -> No
     assert manifest[0]["model_run_id"] == str(first.model_run_id)
     assert manifest[0]["selection_criterion_version"] == "criterion-v1"
     assert source_addition_to_json(first)["state"] == "ready"
+
+
+def test_legacy_source_addition_record_defaults_to_indicators_only() -> None:
+    run_id, subject_id, request_id = uuid4(), uuid4(), uuid4()
+    addition = _ready_addition(run_id=run_id, subject_id=subject_id, request_id=request_id)
+    payload = source_addition_to_json(addition)
+    payload.pop("extraction_intent")
+
+    restored = source_addition_from_json(payload)
+
+    assert restored.extraction_intent is SourceAdditionExtractionIntent.INDICATORS_ONLY
 
 
 def test_extraction_rebase_preserves_old_bytes_and_marks_addition_context_only() -> None:

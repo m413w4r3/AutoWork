@@ -9,6 +9,7 @@ import {
   recordSourceAdditionCandidate,
   selectSourceAddition,
   type ArtifactResponse,
+  type SourceAdditionExtractionIntent,
   type TargetedEditorialRevisionLineage,
   type TargetedEditorialRevisionMode,
   type TargetedEditorialRevisionOperation,
@@ -222,6 +223,8 @@ export function TargetedEditorialRevisionPanel({
     "existing_evidence_only",
   );
   const [sourceUrl, setSourceUrl] = useState("");
+  const [sourceExtractionIntent, setSourceExtractionIntent] =
+    useState<SourceAdditionExtractionIntent>("indicators_only");
   const [sourceCriterion, setSourceCriterion] = useState(
     "Source fournie par l’opérateur",
   );
@@ -255,6 +258,7 @@ export function TargetedEditorialRevisionPanel({
         production_run_id: artifact.production_run_id,
         request_id: requestId,
         url: sourceUrl.trim(),
+        extraction_intent: sourceExtractionIntent,
       };
       await recordSourceAdditionCandidate(subjectId, {
         ...body,
@@ -458,6 +462,24 @@ export function TargetedEditorialRevisionPanel({
                   clearPreview();
                 }}
               />
+            </label>
+            <label>
+              Intention d’extraction
+              <select
+                aria-label="Intention d’extraction de la source"
+                value={sourceExtractionIntent}
+                onChange={(event) => {
+                  setSourceExtractionIntent(
+                    event.target.value as SourceAdditionExtractionIntent,
+                  );
+                  setSourceRequestId(null);
+                  sourceMutation.reset();
+                  clearPreview();
+                }}
+              >
+                <option value="indicators_only">Indicateurs uniquement</option>
+                <option value="descriptive_facts">Faits descriptifs</option>
+              </select>
             </label>
             <label>
               Motif de sélection

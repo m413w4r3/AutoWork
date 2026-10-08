@@ -132,6 +132,7 @@ from cti_app.domain.production import (
     ProductionRunStatus,
     ProductionStage,
     ProductionSubmissionReconciliation,
+    SourceAdditionExtractionIntent,
 )
 from cti_app.domain.production_editorial_enrichment import (
     EditorialEnrichmentElementKind,
@@ -294,6 +295,9 @@ class SourceAdditionCandidateRequest(BaseModel):
     published_at: date | None = None
     kind: ProductionReferenceKind = ProductionReferenceKind.TECHNICAL_RESOURCE
     role: SourceRole = SourceRole.UNKNOWN
+    extraction_intent: SourceAdditionExtractionIntent = (
+        SourceAdditionExtractionIntent.INDICATORS_ONLY
+    )
 
 
 class SourceAdditionSelectionRequest(BaseModel):
@@ -3249,6 +3253,7 @@ async def record_source_addition_candidate(
             published_at=payload.published_at,
             kind=payload.kind,
             role=payload.role,
+            extraction_intent=payload.extraction_intent,
         )
     except SourceAdditionConflictError as exc:
         raise HTTPException(

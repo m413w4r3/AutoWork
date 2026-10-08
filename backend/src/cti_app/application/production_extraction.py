@@ -104,6 +104,7 @@ from cti_app.domain.model_runs import ModelRunStatus
 from cti_app.domain.production import (
     EXTRACTION_PROFILE_POLICY_VERSION,
     PRODUCTION_RECONCILIATION_ERROR_CODE,
+    SOURCE_ADDITION_EXTRACTION_PROFILE_POLICY_VERSION,
     DetectionRule,
     ExtractionProfile,
     ProductionArtifact,
@@ -112,6 +113,7 @@ from cti_app.domain.production import (
     ProductionEvidenceBasis,
     ProductionInputSnapshot,
     ProductionRun,
+    SourceAdditionExtractionIntent,
     SourceExtraction,
     SourceExtractionStatus,
     model_run_awaits_reconciliation,
@@ -288,6 +290,7 @@ class PlannedExtractionSource:
     editorial_role: ProductionEditorialRole
     profile: ExtractionProfile
     profile_reason_code: ExtractionProfileReasonCode
+    profile_policy_version: str
     title: str | None
     collection_state: CollectionState
     effective_evidence_sha256: str | None = None
@@ -414,6 +417,7 @@ def build_extraction_plan(
     corpus: ProductionReferenceCorpusV1,
     *,
     evidence_documents: Mapping[UUID, SourceEvidenceDocument] | None = None,
+    source_profile_intents: Mapping[UUID, SourceAdditionExtractionIntent] | None = None,
 ) -> ExtractionPlan:
     """Plan one extraction run exclusively from the canonical REFERENCES corpus.
 
@@ -471,7 +475,14 @@ def build_extraction_plan(
                 tier=source.tier,
                 kind=source.kind,
                 editorial_role=source.editorial_role,
+                extraction_intent=(source_profile_intents or {}).get(source.source_document_id),
             )
+        )
+        intent = (source_profile_intents or {}).get(source.source_document_id)
+        profile_policy_version = (
+            SOURCE_ADDITION_EXTRACTION_PROFILE_POLICY_VERSION
+            if intent is SourceAdditionExtractionIntent.DESCRIPTIVE_FACTS
+            else EXTRACTION_PROFILE_POLICY_VERSION
         )
         evidence = (evidence_documents or {}).get(source.source_document_id)
         effective_hash = (
@@ -494,6 +505,7 @@ def build_extraction_plan(
                 editorial_role=source.editorial_role,
                 profile=profile,
                 profile_reason_code=profile_reason_code,
+                profile_policy_version=profile_policy_version,
                 title=source.title,
                 collection_state=source.collection_state,
                 effective_evidence_sha256=effective_hash,
@@ -511,12 +523,25 @@ def build_extraction_plan(
     )
     sources = tuple(replace(source, position=index) for index, source in enumerate(ordered))
     corpus_hash = references_corpus_hash(corpus)
+    source_profile_decisions = tuple(
+        {
+            "source_document_id": str(source.source_document_id),
+            "profile": source.profile.value,
+            "profile_reason_code": source.profile_reason_code.value,
+            "profile_policy_version": source.profile_policy_version,
+        }
+        for source in sources
+        if source.profile_policy_version == SOURCE_ADDITION_EXTRACTION_PROFILE_POLICY_VERSION
+    )
     return ExtractionPlan(
         subject_id=corpus.subject_id,
         production_input_hash=corpus.production_input_hash,
         references_corpus_hash=corpus_hash,
         profile_policy_version=EXTRACTION_PROFILE_POLICY_VERSION,
-        input_hash=extraction_input_hash(references_corpus_hash=corpus_hash),
+        input_hash=extraction_input_hash(
+            references_corpus_hash=corpus_hash,
+            source_profile_decisions=source_profile_decisions or None,
+        ),
         sources=sources,
         omitted_sources=tuple(
             sorted(
@@ -532,7 +557,11 @@ def build_extraction_plan(
     )
 
 
-def extraction_input_hash(*, references_corpus_hash: str) -> str:
+def extraction_input_hash(
+    *,
+    references_corpus_hash: str,
+    source_profile_decisions: Sequence[Mapping[str, str]] | None = None,
+) -> str:
     """Return the deterministic functional identity of one extraction run.
 
     The corpus hash already covers every planned source (document, bytes, tier);
@@ -542,27 +571,28 @@ def extraction_input_hash(*, references_corpus_hash: str) -> str:
     same hash.
     """
 
-    return _canonical_hash(
-        {
-            "stage": "extraction",
-            "service_version": PRODUCTION_EXTRACTION_SERVICE_VERSION,
-            "references_corpus_hash": references_corpus_hash,
-            "profile_policy_version": EXTRACTION_PROFILE_POLICY_VERSION,
-            "extraction_contract_version": Q2_EXTRACTION_CONTRACT_VERSION,
-            "source_text_contract_version": source_text_contract_version(),
-            "prompt_versions": {
-                **{
-                    profile.value: version
-                    for profile, version in CANONICAL_EXTRACTION_PROMPT_VERSION_BY_PROFILE.items()
-                },
-                "ioc_rules_batch": CANONICAL_IOC_RULES_BATCH_PROMPT_VERSION,
+    payload: dict[str, Any] = {
+        "stage": "extraction",
+        "service_version": PRODUCTION_EXTRACTION_SERVICE_VERSION,
+        "references_corpus_hash": references_corpus_hash,
+        "profile_policy_version": EXTRACTION_PROFILE_POLICY_VERSION,
+        "extraction_contract_version": Q2_EXTRACTION_CONTRACT_VERSION,
+        "source_text_contract_version": source_text_contract_version(),
+        "prompt_versions": {
+            **{
+                profile.value: version
+                for profile, version in CANONICAL_EXTRACTION_PROMPT_VERSION_BY_PROFILE.items()
             },
-            "response_parser_version": EXTRACTION_RESPONSE_PARSER_VERSION,
-            "verifier_version": ARTIFACT_VERIFIER_VERSION,
-            "model_policy_version": EXTRACTION_MODEL_POLICY_VERSION,
-            "routing_policy_version": EXTRACTION_ROUTING_POLICY_VERSION,
-        }
-    )
+            "ioc_rules_batch": CANONICAL_IOC_RULES_BATCH_PROMPT_VERSION,
+        },
+        "response_parser_version": EXTRACTION_RESPONSE_PARSER_VERSION,
+        "verifier_version": ARTIFACT_VERIFIER_VERSION,
+        "model_policy_version": EXTRACTION_MODEL_POLICY_VERSION,
+        "routing_policy_version": EXTRACTION_ROUTING_POLICY_VERSION,
+    }
+    if source_profile_decisions is not None:
+        payload["source_profile_decisions"] = list(source_profile_decisions)
+    return _canonical_hash(payload)
 
 
 def _canonical_hash(payload: Any) -> str:
@@ -586,15 +616,17 @@ def source_checkpoint_identity(
     effective_evidence_sha256: str,
     profile: ExtractionProfile,
     prompt_version: str,
+    profile_policy_version: str | None = None,
 ) -> dict[str, str]:
     """The durable functional identity of one subject-independent checkpoint."""
 
+    selected_policy_version = profile_policy_version or EXTRACTION_PROFILE_POLICY_VERSION
     return {
         # The existing durable column is retained, but its identity semantics
         # are now the exact normalized text sent to extraction.
         "source_content_sha256": effective_evidence_sha256,
         "profile": profile.value,
-        "profile_policy_version": EXTRACTION_PROFILE_POLICY_VERSION,
+        "profile_policy_version": selected_policy_version,
         "contract_version": Q2_EXTRACTION_CONTRACT_VERSION,
         "prompt_version": prompt_version,
         "parser_version": EXTRACTION_RESPONSE_PARSER_VERSION,
@@ -630,6 +662,7 @@ def is_current_source_checkpoint(
     profile: ExtractionProfile,
     effective_evidence_sha256: str | None = None,
     content_sha256: str | None = None,
+    profile_policy_version: str | None = None,
 ) -> bool:
     """Whether a durable checkpoint row would satisfy ``profile`` today."""
 
@@ -646,6 +679,7 @@ def is_current_source_checkpoint(
             effective_evidence_sha256=effective_digest,
             profile=candidate_profile,
             prompt_version=prompt_version,
+            profile_policy_version=profile_policy_version,
         )
         if all(
             getattr(row, key).value == value if key == "profile" else getattr(row, key) == value
@@ -1400,6 +1434,7 @@ class ProductionExtractionService:
         snapshot: ProductionInputSnapshot,
         corpus: ProductionReferenceCorpusV1,
         source_document_ids: frozenset[UUID] | None = None,
+        source_profile_intents: Mapping[UUID, SourceAdditionExtractionIntent] | None = None,
     ) -> ExtractionPlan:
         """Prepare archive-backed extraction from an explicit prospective corpus.
 
@@ -1414,7 +1449,7 @@ class ProductionExtractionService:
                 ExtractionControlCode.REFERENCE_CORPUS_INVALID,
                 "Extraction run, snapshot, and reference corpus subjects differ",
             )
-        seed_plan = build_extraction_plan(corpus)
+        seed_plan = build_extraction_plan(corpus, source_profile_intents=source_profile_intents)
         selected_sources = (
             tuple(seed_plan.sources)
             if source_document_ids is None
@@ -1463,7 +1498,11 @@ class ProductionExtractionService:
             evidence_documents[planned.source_document_id] = replace(
                 evidence, parsed_text=effective_text, scope=scope
             )
-        plan = build_extraction_plan(corpus, evidence_documents=evidence_documents)
+        plan = build_extraction_plan(
+            corpus,
+            evidence_documents=evidence_documents,
+            source_profile_intents=source_profile_intents,
+        )
         if source_document_ids is not None:
             plan = replace(
                 plan,
@@ -1547,6 +1586,7 @@ class ProductionExtractionService:
                 ),
                 profile=profile,
                 prompt_version=prompt_version,
+                profile_policy_version=planned.profile_policy_version,
             )
             async with self._uow_factory() as uow:
                 row = await uow.source_extractions.get_by_identity(**identity)
@@ -1589,6 +1629,7 @@ class ProductionExtractionService:
             effective_evidence_sha256=planned.effective_evidence_sha256 or planned.content_sha256,
             profile=planned.profile,
             prompt_version=prompt_version,
+            profile_policy_version=planned.profile_policy_version,
         )
         (
             raw_blob_id,
@@ -2172,7 +2213,7 @@ class _ExtractionRun:
                         "kind": "source",
                         "effective_evidence_sha256": planned.effective_evidence_sha256,
                         "profile": planned.profile.value,
-                        "profile_policy_version": EXTRACTION_PROFILE_POLICY_VERSION,
+                        "profile_policy_version": planned.profile_policy_version,
                         "prompt_version": prompt_version,
                         "source_text_contract_version": source_text_contract_version(),
                         "chunk_index": index,
@@ -2182,6 +2223,7 @@ class _ExtractionRun:
                         "tier": planned.tier.value,
                         "source_content_sha256": planned.content_sha256,
                         "effective_evidence_sha256": planned.effective_evidence_sha256,
+                        "profile_policy_version": planned.profile_policy_version,
                         "chunk_index": index,
                         "chunk_count": len(chunks),
                     },

@@ -1662,6 +1662,8 @@ export type EvidenceUseScope = "tool_context" | "actor_activity";
 
 export type SourceAdditionOrigin =
   "discovery" | "operator_url" | "manual_archive";
+export type SourceAdditionExtractionIntent =
+  "indicators_only" | "descriptive_facts";
 export type SourceAdditionState =
   "candidate" | "selected" | "archived" | "extracted" | "ready" | "refused";
 
@@ -1688,6 +1690,7 @@ export interface SourceAdditionManifestEntry {
   tier: string;
   kind: string;
   role: string;
+  extraction_intent: SourceAdditionExtractionIntent;
   editorial_role: string;
   criticality: string | null;
   criticality_reason: string | null;
@@ -1728,6 +1731,7 @@ export interface SourceAdditionCandidateRequest {
   published_at?: string | null;
   kind?: string;
   role?: string;
+  extraction_intent?: SourceAdditionExtractionIntent;
 }
 
 export interface SourceAdditionSelectionRequest {
