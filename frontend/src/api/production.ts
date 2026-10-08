@@ -1555,6 +1555,171 @@ export async function reviseEditorialEnrichment(
   );
 }
 
+export type TargetedEditorialRevisionOperation =
+  | "rewrite_title"
+  | "rewrite_lead"
+  | "rewrite_paragraph"
+  | "insert_paragraph"
+  | "delete_paragraph"
+  | "rewrite_section"
+  | "insert_section"
+  | "delete_section"
+  | "merge_sections"
+  | "split_section"
+  | "rename_section"
+  | "create_table"
+  | "rewrite_table"
+  | "delete_table"
+  | "create_diagram"
+  | "rewrite_diagram"
+  | "delete_diagram"
+  | "create_chart"
+  | "rewrite_chart"
+  | "delete_chart"
+  | "create_source_figure"
+  | "rewrite_source_figure"
+  | "delete_source_figure";
+
+export type TargetedEditorialRevisionMode =
+  "existing_evidence_only" | "allow_source_extension";
+
+export type TargetedEditorialRevisionTargetKind =
+  | "title"
+  | "lead"
+  | "lead_paragraph"
+  | "sections"
+  | "section"
+  | "section_paragraph";
+
+export interface TargetedEditorialRevisionTarget {
+  kind: TargetedEditorialRevisionTargetKind;
+  stable_ids: string[];
+  parent_id?: string | null;
+  anchor_id?: string | null;
+  insert_after?: boolean;
+}
+
+export interface TargetedEditorialRevisionRequest {
+  base_artifact_id: string;
+  base_version: number;
+  base_input_hash: string;
+  base_canonical_sha256: string;
+  target: TargetedEditorialRevisionTarget;
+  operation: TargetedEditorialRevisionOperation;
+  instruction: string;
+  mode: TargetedEditorialRevisionMode;
+}
+
+export interface TargetedEditorialRevisionPreview {
+  base_artifact_id: string;
+  base_version: number;
+  base_input_hash: string;
+  base_canonical_sha256: string;
+  target_path: string;
+  stages_preserved: string[];
+  stages_invalidated: string[];
+  stages_conditionally_rebased: string[];
+  source_extension: boolean;
+  expected_model_calls: number;
+  enrichment_rebase: string;
+}
+
+export type TargetedEditorialRevisionRefusalCode =
+  "revision_not_applicable" | "source_extension_not_available_yet";
+
+export interface TargetedEditorialRevisionRefusal {
+  code: TargetedEditorialRevisionRefusalCode;
+  recommended_restart_stage: ProductionStage | null;
+  reason: string;
+}
+
+export interface TargetedEditorialRevisionLineageEntry {
+  revision_id: string;
+  request_identity: string;
+  base_artifact_id: string;
+  base_artifact_hash: string;
+  target: TargetedEditorialRevisionTarget;
+  target_path: string;
+  operation: TargetedEditorialRevisionOperation;
+  request: string;
+  mode: TargetedEditorialRevisionMode;
+  actor: string;
+  model_run_id: string;
+  prompt_version: string;
+  contract_version: string;
+  parser_version: string;
+  validator_version: string;
+  evidence_refs: unknown[];
+  evidence_handles: string[];
+  source_additions: unknown[];
+  before_hash: string;
+  after_hash: string;
+  rationale: string;
+  created_at: string;
+  result_artifact_id: string;
+  previous_publication_artifact_id: string | null;
+  publication_artifact_id?: string | null;
+  enrichment_artifact_id?: string | null;
+}
+
+export interface TargetedEditorialRevisionResponse {
+  request_identity: string | null;
+  artifact_id: string | null;
+  artifact_version: number | null;
+  artifact_input_hash: string | null;
+  artifact_canonical_sha256: string | null;
+  publication_artifact_id: string | null;
+  revision: TargetedEditorialRevisionLineageEntry | null;
+  refusal: TargetedEditorialRevisionRefusal | null;
+}
+
+export interface TargetedEditorialRevisionProvenance {
+  origin: "initial" | "inherited" | "revision";
+  artifact_id: string;
+  revision_id: string | null;
+}
+
+export interface TargetedEditorialRevisionLineage {
+  artifact_id: string;
+  production_run_id: string;
+  revisions: TargetedEditorialRevisionLineageEntry[];
+  paragraph_provenance: Record<string, TargetedEditorialRevisionProvenance>;
+}
+
+export async function previewTargetedEditorialRevision(
+  subjectId: string,
+  requestBody: TargetedEditorialRevisionRequest,
+): Promise<TargetedEditorialRevisionPreview> {
+  return request(
+    `/api/subjects/${subjectId}/production/artifacts/synthesis/revisions/preview`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(requestBody),
+    },
+  );
+}
+
+export async function applyTargetedEditorialRevision(
+  subjectId: string,
+  requestBody: TargetedEditorialRevisionRequest,
+): Promise<TargetedEditorialRevisionResponse> {
+  return request(
+    `/api/subjects/${subjectId}/production/artifacts/synthesis/revisions`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(requestBody),
+    },
+  );
+}
+
+export async function getTargetedEditorialRevisionLineage(
+  artifactId: string,
+): Promise<TargetedEditorialRevisionLineage> {
+  return request(`/api/production/artifacts/${artifactId}/revision-lineage`);
+}
+
 export async function getEditorialEnrichmentArtifactVersion(
   subjectId: string,
   artifactId: string,
