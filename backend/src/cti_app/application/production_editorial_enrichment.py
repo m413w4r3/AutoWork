@@ -233,6 +233,7 @@ MAX_ENRICHMENT_RESOURCE_NEEDS = 4
 MAX_ENRICHMENT_RESOURCE_PROPOSALS = 12
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_DIAGRAM_STORAGE_S3_ALIAS = re.compile(r"(\bstorage)\s+\(s3\)$", re.IGNORECASE)
 _RENDERER_SYNTAX = re.compile(
     r"(?im)(?:```|~~~|<\s*/?\s*[a-z][^>]*>|^\s*(?:graph\s+|digraph\b|subgraph\b|flowchart\b|sequenceDiagram\b|classDiagram\b|stateDiagram\b|erDiagram\b|mindmap\b|architecture-beta\b)|^\s*(?:direction\s*:\s*(?:right|down|left|up)|[\w.-]+\s*(?:->|<-|<->|-->|\.\.>|--|\|>))|\\begin\s*\{|\\(?:tikz|node|draw|path)\b|#(?:set|let|show|import)\b|<svg\b|^\s*\|.*\|\s*$)"
 )
@@ -4125,9 +4126,27 @@ class EditorialEnrichmentStageErrorCode(StrEnum):
     RECONCILIATION_REQUIRED = PRODUCTION_RECONCILIATION_ERROR_CODE
 
 
+def _editorial_enrichment_diagnostic_code(message: str | None, *, fallback: str) -> str:
+    if message:
+        tail = message.rsplit(":", 1)[-1].strip().rstrip(".,;)")
+        match = re.fullmatch(r"[a-z][a-z0-9_]{2,}", tail, re.IGNORECASE)
+        if match is not None:
+            return match.group()
+    return fallback
+
+
 class EditorialEnrichmentProposalControlError(RuntimeError):
-    def __init__(self, code: EditorialEnrichmentStageErrorCode, message: str | None = None) -> None:
+    def __init__(
+        self,
+        code: EditorialEnrichmentStageErrorCode,
+        message: str | None = None,
+        *,
+        diagnostic_code: str | None = None,
+    ) -> None:
         self.code = code
+        self.diagnostic_code = diagnostic_code or _editorial_enrichment_diagnostic_code(
+            message, fallback=code.value
+        )
         detail = " ".join(message.split())[:300] if message else code.value
         super().__init__(detail)
 
@@ -5457,12 +5476,25 @@ def _editorial_text_diagnostic(context: str | None, reason: str) -> str:
 
 
 def _validate_plain_editorial_text(value: str, *, context: str | None = None) -> None:
+    plain_text_value = value
+    if (
+        context is not None
+        and context.startswith("diagram:")
+        and ":node." in context
+        and context.endswith(".label")
+    ):
+        # The synthesis validator treats every ``(S<number>)`` as an inline
+        # source citation. In a grounded diagram node, ``Storage (S3)`` is a
+        # standard service qualifier; the diagram endpoint filter has already
+        # checked its evidence handles and lexical coverage.
+        plain_text_value = _DIAGRAM_STORAGE_S3_ALIAS.sub(r"\1 S3", value, count=1)
     try:
-        _validate_plain_text(value)
+        _validate_plain_text(plain_text_value)
     except (TypeError, ValueError, RuntimeError) as exc:
         raise EditorialEnrichmentProposalControlError(
             EditorialEnrichmentStageErrorCode.OUTPUT_INVALID,
             message=_editorial_text_diagnostic(context, f"plain_text_validation_failed:{exc}"),
+            diagnostic_code="plain_text_violation",
         ) from exc
     if _RENDERER_SYNTAX.search(mask_technical_literal_markup_exceptions(value)):
         raise EditorialEnrichmentProposalControlError(
@@ -5470,6 +5502,7 @@ def _validate_plain_editorial_text(value: str, *, context: str | None = None) ->
             message=_editorial_text_diagnostic(
                 context, "renderer_syntax_not_allowed_in_plain_editorial_text"
             ),
+            diagnostic_code="renderer_syntax_not_allowed_in_plain_editorial_text",
         )
 
 
@@ -6718,6 +6751,7 @@ class ProductionEditorialEnrichmentService:
                 details={
                     **wire_details,
                     "validation_error_code": exc.code.value,
+                    "validation_diagnostic_code": exc.diagnostic_code,
                     "validation_error_message": str(exc),
                     **({"validation_rejections": validation_details} if validation_details else {}),
                 },
@@ -7666,7 +7700,12 @@ class ProductionEditorialEnrichmentService:
             warnings = diagnostic_details.get("warnings", ())
             if not isinstance(warnings, (list, tuple)):
                 warnings = ()
-            diagnostic = f"editorial_enrichment_output_invalid:{error_code.value}"
+            diagnostic_code = diagnostic_details.get("validation_diagnostic_code")
+            if not isinstance(diagnostic_code, str) or not diagnostic_code:
+                diagnostic_code = diagnostic_details.get("wire_error_code")
+            if not isinstance(diagnostic_code, str) or not diagnostic_code:
+                diagnostic_code = error_code.value
+            diagnostic = f"editorial_enrichment_output_invalid:{diagnostic_code}"
             diagnostic_details["warnings"] = list(dict.fromkeys((*warnings, diagnostic)))
             details = diagnostic_details
         return ProductionEditorialEnrichmentExecution(

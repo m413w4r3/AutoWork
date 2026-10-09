@@ -7965,3 +7965,166 @@ async def test_common_delete_and_replace_source_figure_are_targeted(
     assert replacement_payload["tables"] == replace_harness.base_payload["tables"]
     assert replacement_payload["diagrams"] == replace_harness.base_payload["diagrams"]
     assert len(replace_harness.world.gateway.calls) == 1
+
+
+def test_archived_vultr_s3_diagram_passes_plain_text_validation() -> None:
+    snapshot = _snapshot()
+    facts = (
+        ExtractionFactV1(
+            category="infrastructure",
+            value="winappx.exe téléverse des fichiers vers Vultr.",
+            attack_id=None,
+            context="",
+            evidence_quote="winappx.exe uploads unique files to Vultr.",
+            evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+            source_document_ids=(_DOCUMENT_ID,),
+        ),
+        ExtractionFactV1(
+            category="infrastructure",
+            value=(
+                "S3Vultr.py implémente un client S3 personnalisé configuré pour "
+                "ams1.vultrobjects.com."
+            ),
+            attack_id=None,
+            context="",
+            evidence_quote=(
+                "S3Vultr.py contained a custom S3Client using the AWS S3 API, "
+                "configured for ams1.vultrobjects.com."
+            ),
+            evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+            source_document_ids=(_DOCUMENT_ID,),
+        ),
+    )
+    extraction = _extraction(facts=facts, input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    handles_by_value = {str(item["value"]): str(item["handle"]) for item in pack.narrative_evidence}
+    upload_handle = handles_by_value["winappx.exe téléverse des fichiers vers Vultr."]
+    storage_handle = handles_by_value[
+        "S3Vultr.py implémente un client S3 personnalisé configuré pour ams1.vultrobjects.com."
+    ]
+    handles = f"{upload_handle}, {storage_handle}"
+    wire = f"""DIAGRAM D001
+KEY: vultr_upload
+KIND: infrastructure
+PROFILE: architecture
+TITLE: Téléversement vers Vultr
+CAPTION: winappx.exe transmet des fichiers à Vultr.
+PURPOSE: Quel composant téléverse les fichiers vers Vultr ?
+DATA: Les preuves décrivent winappx.exe et le stockage Vultr.
+GAIN: Le schéma relie le programme à sa destination.
+SCOPE: Flux documenté entre winappx.exe et Vultr.
+PURPOSE_EVIDENCE: {handles}
+LIMITS: Aucun autre service de stockage n'est établi.
+PLACEMENT_REASON: À placer auprès du passage sur le téléversement.
+DIRECTION: top_to_bottom
+PLACEMENT: after_section
+SECTION_INDEX: 0
+NODE N001
+ID: winappx
+LABEL: winappx.exe
+ROLE: malware_tool
+EVIDENCE: {handles}
+END NODE
+NODE N002
+ID: vultr_s3
+LABEL: Vultr Object Storage (S3)
+ROLE: infrastructure
+EVIDENCE: {handles}
+END NODE
+RELATION L001
+FROM: winappx
+TO: vultr_s3
+RELATION_TYPE: factual
+DIRECTION: directed
+LABEL: téléverse des fichiers vers Vultr
+EVIDENCE: {handles}
+END RELATION
+END DIAGRAM"""
+
+    parsed = parse_editorial_enrichment_proposal_wire(wire, pack)
+
+    assert parsed.proposal is not None, parsed.rejections
+    assert parsed.rejections == ()
+    enrichment = validate_editorial_enrichment_proposal(
+        parsed.proposal,
+        pack,
+        extraction,
+        synthesis,
+        accepted_blocks=parsed.accepted_blocks,
+        _drop_invalid_blocks=False,
+    )
+
+    assert len(enrichment.diagrams) == 1
+    assert enrichment.diagrams[0].nodes[1].label == "Vultr Object Storage (S3)"
+
+    unsupported = parse_editorial_enrichment_proposal_wire(
+        wire.replace("Vultr Object Storage (S3)", "Unlisted Cloud Service", 1), pack
+    )
+    assert unsupported.proposal is None
+    assert any(
+        item.reason_code == "editorial_enrichment_diagram_relation_endpoint_unsupported"
+        for item in unsupported.rejections
+    )
+
+
+@pytest.mark.asyncio
+async def test_targeted_output_invalid_includes_validation_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    anchor = "ExampleRAT downloads the payload and starts execution."
+
+    def draft_with_markdown_title(request: ModelRequest) -> ModelExecution:
+        prompt = json.loads(request.text)
+        handle = next(
+            item["handle"]
+            for item in prompt["admitted_evidence_pack"]["narrative_evidence"]
+            if item.get("value") == anchor
+        )
+        wire = _diagram_wire_for_quality(
+            (("malware", "ExampleRAT", "unknown"), ("payload", "payload", "unknown")),
+            (("malware", "payload", "downloads"),),
+            evidence_handle=str(handle),
+            key=str(prompt["target"]["key"]),
+        ).replace("PLACEMENT: after_section\nSECTION_INDEX: 0", "PLACEMENT: after_lead")
+        lines = wire.splitlines()
+        title_index = next(index for index, line in enumerate(lines) if line.startswith("TITLE:"))
+        lines[title_index] = "TITLE: **Observed sequence**"
+        return _succeeded_text(request, "\n".join(lines))
+
+    harness = await _revision_harness(
+        monkeypatch, _RecordingGateway(draft_with_markdown_title), anchor=anchor
+    )
+    request = _common_enrichment_request(
+        harness,
+        element_kind=EditorialEnrichmentElementKind.DIAGRAM,
+        operation=TargetedEditorialRevisionOperation.CREATE_DIAGRAM,
+        element_key=None,
+        placement=TargetedEditorialRevisionPlacement(
+            TargetedEditorialRevisionPlacementKind.AFTER_LEAD
+        ),
+    )
+
+    result = await _common_revision_service(harness).revise(request)
+
+    assert result.refusal is not None
+    assert result.refusal.details["validator_rejections"][0]["diagnostic_code"] == (
+        "plain_text_violation"
+    )
+    assert (
+        "plain_text_validation_failed"
+        in result.refusal.details["validator_rejections"][0]["diagnostic"]
+    )
+
+
+def test_output_invalid_warning_uses_validation_diagnostic_subcode() -> None:
+    result = ProductionEditorialEnrichmentService._needs_review(
+        input_hash=_INPUT_HASH,
+        model_run_id=None,
+        error_code=EditorialEnrichmentStageErrorCode.OUTPUT_INVALID,
+        error_message="The proposal failed plain text validation.",
+        details={"validation_diagnostic_code": "plain_text_violation"},
+    )
+
+    assert result.details is not None
+    assert "editorial_enrichment_output_invalid:plain_text_violation" in result.details["warnings"]

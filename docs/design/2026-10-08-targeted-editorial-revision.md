@@ -255,6 +255,17 @@ endpoint. Les relations d'infection gardent leur exigence de séquence
 documentée; les indications de contre-preuve et les relations de projection
 inter-sources restent bloquantes.
 
+La validation de texte brut partage le détecteur de marqueurs de source de la
+synthèse, qui interprète aussi `(S3)` comme une citation. Dans un libellé de
+nœud diagramme terminé par `Storage (S3)`, cette forme désigne le protocole S3,
+pas une référence éditoriale. Le contrôle de texte masque ce seul suffixe
+pendant le test de citation; le libellé original reste soumis au filtre de
+relations et à la vérification des handles du pack. Les autres marqueurs de
+source, les handles inconnus et les endpoints sans preuve restent refusés.
+Les refus de validation exposent maintenant `diagnostic_code` et le message
+complet dans les détails de la révision, et ajoutent le sous-code aux warnings
+`editorial_enrichment_output_invalid`.
+
 Cette règle assouplit seulement le rejet (elle accepte un sur-ensemble de ce que
 le validateur acceptait) : aucune sortie précédemment valide ne devient invalide.
 Elle n'incrémente donc NI la version de politique du schéma

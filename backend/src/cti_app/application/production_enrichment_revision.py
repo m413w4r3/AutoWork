@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any, cast
@@ -1748,9 +1748,14 @@ class ProductionEditorialEnrichmentRevisionService:
                         reason_code = (
                             str(getattr(code, "value", code)) if code is not None else reason_code
                         )
-                    validator_rejections.append(
-                        {"block_id": element_key, "reason_code": reason_code}
-                    )
+                        rejection = {"block_id": element_key, "reason_code": reason_code}
+                        if exc.diagnostic_code:
+                            rejection["diagnostic_code"] = exc.diagnostic_code
+                        if str(exc):
+                            rejection["diagnostic"] = str(exc)
+                    else:
+                        rejection = {"block_id": element_key, "reason_code": reason_code}
+                    validator_rejections.append(rejection)
                     raise EditorialEnrichmentRevisionValidationError(validator_rejections)
                 if is_create:
                     self._assert_requested_placement(
@@ -1833,6 +1838,7 @@ class ProductionEditorialEnrichmentRevisionService:
                     return self._targeted_refusal(
                         reason,
                         ProductionStage.EXTRACTION,
+                        details={"validator_rejections": exc.rejections},
                     )
                 raise
             except ValueError as exc:
@@ -2459,8 +2465,13 @@ class ProductionEditorialEnrichmentRevisionService:
             )
         except (EditorialEnrichmentProposalControlError, ValueError) as exc:
             code = getattr(exc, "code", "editorial_enrichment_revision_validation_failed")
+            rejection = {"block_id": element_key, "reason_code": str(code)}
+            if isinstance(exc, EditorialEnrichmentProposalControlError):
+                rejection["reason_code"] = exc.code.value
+                rejection["diagnostic_code"] = exc.diagnostic_code
+                rejection["diagnostic"] = str(exc)
             raise EditorialEnrichmentRevisionValidationError(
-                [*validator_rejections, {"block_id": element_key, "reason_code": str(code)}]
+                [*validator_rejections, rejection]
             ) from exc
 
     async def _replace_target(
@@ -2725,7 +2736,10 @@ class ProductionEditorialEnrichmentRevisionService:
 
     @staticmethod
     def _targeted_refusal(
-        reason: str, restart_stage: ProductionStage | None
+        reason: str,
+        restart_stage: ProductionStage | None,
+        *,
+        details: Mapping[str, Any] | None = None,
     ) -> TargetedSynthesisRevisionResult:
         return TargetedSynthesisRevisionResult(
             artifact=None,
@@ -2735,6 +2749,7 @@ class ProductionEditorialEnrichmentRevisionService:
                 code=TargetedEditorialRevisionRefusalCode.REVISION_NOT_APPLICABLE,
                 recommended_restart_stage=restart_stage,
                 reason=reason,
+                details=dict(details or {}),
             ),
         )
 
