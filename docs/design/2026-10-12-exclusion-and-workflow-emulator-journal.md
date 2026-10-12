@@ -1,23 +1,30 @@
 # Journal — exclusion de composition et émulateur de workflow
 
-Date : 2026-10-12. Ce journal sépare l’état du défaut initial, les correctifs
-successifs et l’état du dépôt pendant le Lot D.
+Date d’origine : 2026-10-12. Mise à jour de clôture : 2026-10-13.
+Ce journal sépare l’état du défaut initial, les correctifs successifs et les
+preuves finales du Lot D.
 
 ## 1. État de départ
 
 - Le défaut d’exclusion est observé sur `8647207` (`feat: compose multi-batch
   editions from versioned composition`). C’est l’état avant le correctif.
-- `4a1fa71` corrige l’exclusion auditable ; `374f1ce` restaure
+- `4a1fa71` corrige l’exclusion (Lot B) ; `374f1ce` restaure
   `exclusions=tuple(exclusions)`, capturé à tort comme `exclusions=()` pendant
-  les preuves de mutation du Lot C. `9702c70` ajoute l’émulateur W1/W2 et ses
-  marqueurs. `0a62337` corrige Review pour qu’un sujet différé bloque
-  `can_accept`. `5effbfd` ajoute W3, W4, W6 et W8. Les fichiers du Lot D sont
-  **à committer** ; ils n’ont pas de hash de commit.
-- Le HEAD de départ de cette finalisation est `5effbfd`.
+  les preuves de mutation du Lot C.
+- `9702c70` ajoute l’émulateur W1/W2 et ses marqueurs ; `0a62337` corrige Review
+  afin qu’un sujet différé bloque `can_accept` ; `5effbfd` ajoute W3, W4, W6 et
+  W8.
+- `86657f3` ajoute le Makefile, les gates CI, les scripts et ce journal ;
+  `000c658` ajoute W5/W7/W9 et Discovery réelle dans W1 ; `71068be` conserve le
+  code `subject_deferred` à côté de son libellé ; `73380c4` ajoute W10 et le job
+  CI navigateur ; `df857f9` durcit W5 après l’audit par mutation.
+- Le HEAD de départ de cette clôture est `df857f9`, arbre propre. Les commits
+  listés sont locaux et rien n’a été poussé. Les changements de ce journal sont
+  **à committer**.
 - La pièce jointe de mission n’était pas lisible depuis les sessions
-  déléguées. Les exigences reproduites dans le brief utilisateur sont
-  vérifiées ci-dessous ; seuls les détails dépendant du texte complet qui ne
-  sont pas autrement vérifiables restent marqués **À CONFIRMER**.
+  déléguées. Les faits recopiés dans le brief et vérifiables dans le dépôt sont
+  rapportés ci-dessous ; les exigences qui dépendraient uniquement du texte
+  complet restent marquées **À CONFIRMER**.
 
 ## 2. Cause racine
 
@@ -53,12 +60,11 @@ directement des `EditionReviewReadItem` exclus, sans employer le read model
 PostgreSQL qui sépare les scopes. Le test
 `test_review_acceptance_requires_an_included_item()` dans
 `backend/tests/test_publication_review.py` vérifie ces objets fabriqués. Les
-parcours Playwright concernés simulaient les routes avec `route.fulfill()` et
-un statut HTTP réussi ; ils ne validaient pas l’écriture PostgreSQL et le gel
-du manifeste pour A inclus, B exclu, C inclus. L’emplacement exact du test
-Playwright de cette simulation est **À CONFIRMER** : le fichier de mission
-mentionne le comportement, mais la recherche locale n’a pas identifié de
-scénario Playwright nommé explicitement « exclusion ».
+parcours Playwright mockés simulaient les routes avec `route.fulfill()` et un
+statut HTTP réussi ; ils ne validaient pas l’écriture PostgreSQL et le gel du
+manifeste pour A inclus, B exclu, C inclus. W10 apporte maintenant un test
+navigateur séparé qui exerce le vrai backend PostgreSQL, dans
+`frontend/e2e-real/exclusion-real-backend.spec.ts`.
 
 ## 3. Preuve rouge → verte
 
@@ -83,14 +89,22 @@ couvrent notamment :
 - `test_reinclusion_keeps_exclusion_history_and_does_not_change_frozen_manifest`
 - `test_excluded_b_pinned_to_its_decided_document_is_accepted_and_published`
 
-L’orchestrateur a exécuté les cinq fichiers
-`tests/test_publication_review.py`,
+L’orchestrateur a exécuté cinq fichiers via `make test-integration` :
+`tests/integration/test_publication_review.py`,
 `tests/integration/test_edition_exclusion_publication_postgres.py`,
 `tests/integration/test_edition_composition_postgres.py`,
 `tests/integration/test_edition_multibatch_publication_postgres.py` et
-`tests/integration/test_publication_freeze_retry.py` via
-`make test-integration` : **20 passed**. Le fichier d’exclusion seul contient
-neuf tests et son exécution isolée avait donné `9 passed in 2.87s`.
+`tests/integration/test_publication_freeze_retry.py` : **20 passed**. Le fichier
+d’exclusion seul contient neuf tests. Les noms exacts incluent
+`test_two_step_exclusion_without_identity_pin_is_rejected`,
+`test_exclude_subject_atomically_publishes_a_c_and_exclusion_b`,
+`test_exclude_selected_b_without_a_run_is_publishable`,
+`test_deferred_subject_blocks_publication_as_incomplete`,
+`test_exclusion_is_blocked_after_run_retry_until_a_new_decision`,
+`test_stale_expected_version_does_not_append_an_exclusion_decision`,
+`test_exclusion_idempotency_reuses_one_decision_and_rejects_changed_payload`,
+`test_reinclusion_keeps_exclusion_history_and_does_not_change_frozen_manifest`
+et `test_excluded_b_pinned_to_its_decided_document_is_accepted_and_published`.
 
 Un second défaut, révélé par W3, concernait un sujet `deferred` :
 `Review.can_accept` valait `True`, alors que le gel renvoyait HTTP 409
@@ -110,9 +124,8 @@ l’état antérieur de LOT 21 mais laisserait la console proposer une action qu
 
 ## 4. Contrat corrigé C1–C7 et DDL live
 
-Le découpage ci-dessous nomme les sept responsabilités du correctif ; les
-libellés littéraux de C1–C7 dans la pièce jointe non lisible depuis les
-sessions déléguées sont **À CONFIRMER**.
+Les sept responsabilités C1–C7 ci-dessous sont des descriptions fonctionnelles
+vérifiées contre le modèle, le service, la route et le correctif.
 
 1. **C1 — Identité nullable** : run et génération peuvent être absents pour
    une exclusion d’un sujet jamais produit.
@@ -159,139 +172,249 @@ Le schéma de test utilisé par les tests d’intégration est créé à neuf de
 ## 5. Émulateur et niveau de preuve
 
 `WorkflowDriver.build_emulator_app()` construit une app FastAPI de test avec
-les routers officiels, et son client utilise `ASGITransport`. Les services et
-repositories concernés sont réels et écrivent dans PostgreSQL. L’app n’est
-pas `main.app`.
+les routers officiels et `ASGITransport`. L’app est recomposée, pas
+`main.app`. Les services et repositories PostgreSQL sont réels là où le tableau
+le précise ; les fixtures SQL et doubles restent visibles ci-dessous.
 
-| Scénario | Niveau démontré | Doubles / limites |
+| Scénario | Niveau et chemin exercé | État préparé, doubles et limites |
 |---|---|---|
-| `test_network_guard` | Unitaire : interdiction des sockets, DNS et HTTP externes ; pas de DB | Ne prouve pas les chemins natifs ni les sous-processus. |
-| W1 `workflow_full` | Émulation workflow : Fusion réelle, route de sélection, transitions et jobs réels, Review, composition et release | Discovery est fixturée et persistée par repositories ; planner de Fusion, transport source, gateway modèle et compilateur D2 sont déterministes/factices. Pas de compilation PDF/Typst. |
-| W2 `workflow_fast` | Émulation workflow : Composition, exclusion API, Review, manifeste et release réels | Runs `READY` et artefacts `VERIFIED` insérés directement par fixture ; pas de transitions de production. |
-| W3 — test principal `workflow_fast` | Émulation workflow : Review indique `subject_deferred`, `can_accept=false` et le gel refuse avec `composition_incomplete` ; une décision explicite exclut ensuite B sans run | Discovery fixturée ; Fusion, Selection et production de A réelles. Vérifie aussi avec `checked>0` que la release historique reste inchangée, que B n’a pas de run/job/model run et n’entre pas dans le blob assemblé. |
-| W3 — `test_w3_deferred_subject_review_does_not_offer_acceptance` | Émulation workflow : vérifie séparément que Review ne propose pas l’acceptation tant que B est différé | Le sujet reste différé ; ce n’est pas une exclusion. |
-| W4 `workflow_fast` | Émulation workflow : D2, nouvelle Fusion cumulative et `discovery_update_available=true` après épinglage de la composition | Les lots Discovery sont fixturés ; la réconciliation cumulative et le merge sont réels. L’identité sélectionnée, le run, l’artefact et l’épingle restent vérifiés. |
-| W6 `workflow_fast` | Émulation workflow : concurrence, reprise, acceptation et release ; vérifie `checked>0` et les hashes des manifestes historiques | Runs `READY` et artefacts `VERIFIED` préparés par fixture ; reprise d’écriture de blob simulée dans le test. |
-| W8 `workflow_fast` | Émulation workflow : conflit de version d’acceptation, puis publication avec exclusion explicite | Seeds READY directs ; pas de transition de génération/retry réelle. |
+| Garde réseau (`test_network_guard.py`) | Unitaire, sans DB : bloque sockets, DNS et HTTP externes. | Ne couvre pas les sous-processus, le code natif ni des sockets déjà ouvertes. |
+| W1 (`workflow_full`) | DiscoveryService réel piloté par réponses locales via ScriptedModelGateway ; Fusion cumulative réelle avec planner déterministe ; Selection par route, jobs de production, Composition, Review, Accept et Assembly réels. | Les réponses de modèle/source sont déterministes ; modèle Bridge/distant absent, compilateur D2 factice. Typst/PDF non exercés par W1. |
+| W2 (`workflow_fast`) | Routes de composition et d’exclusion, Review, manifeste V2 et release réels. | Helper SQL insère directement les runs `READY` et artefacts `VERIFIED` ; pas de transition de production. |
+| W3 — exclusion sans run (`workflow_fast`) | Discovery préparée, Fusion et Selection réelles ; A passe par les jobs déterministes réels ; Review et gel refusent le report B, puis la route persiste l’exclusion sans `production_run_id`. Assembly réel exclut B. | B n’a pas de run/job/model run. Vérifie `checked>0` pour l’historique et le blob assemblé. Discovery est fixturée. |
+| W3 — Review différé (`workflow_fast`) | Test séparé `test_w3_deferred_subject_review_does_not_offer_acceptance` : la route Review ne propose pas l’acceptation pendant le report. | B reste `deferred`, pas exclu. |
+| W4 (`workflow_fast`) | Après production épinglée, vraie réconciliation Fusion cumulative rend `discovery_update_available=true`, sans changer l’identité produite ni la Composition épinglée. | Entrées Discovery D1/D2 fixturées ; production de départ `READY` préparée dans PostgreSQL. |
+| W5 (`workflow_full`) | A et B sont produits par les vrais jobs déterministes ; la correction d’enrichissement crée une nouvelle PUBLICATION. Le vrai Review vérifie pin, diagnostics, décisions et codes d’acceptation. | Décisions de test insérées par le repository réel ; un état Review temporaire est fixturé pour isoler le garde. Preview remplacée par un double ; aucune preuve Typst/PDF. |
+| W6 (`workflow_fast`) | Composition, Review, acceptation, Assembly, concurrence et reprise réels ; relit les hashes historiques avec `checked>0`. | Runs `READY`/artefacts `VERIFIED` insérés ; interruption de l’écriture blob simulée. |
+| W7 (`workflow_full`) | Vraie Fusion cumulative met une proposition conflictuelle en revue ; la résolution `SEPARATE` passe par `FusionService.resolve_review`. Relit Composition, runs et artefacts inchangés. | A/B et production préparés ; la revue Fusion n’a pas de route HTTP et est donc prouvée au niveau service. |
+| W8 (`workflow_fast`) | Routes Composition/acceptation et Assembly réelles : conflit de version, puis release avec B exclu. | Runs `READY` et artefacts `VERIFIED` insérés directement. |
+| W9 (`workflow_full`) | Composition, Review, acceptation, Assembly puis vrai rendu Typst, inspection Poppler et relecture SQL des liens release/manifeste/document/rendu. | Trois publications synthétiques minimales insérées. Typst, templates, polices et Poppler manquants font échouer explicitement le test. La qualité visuelle n’est pas évaluée. |
+| W10 (job `workflow-browser`) | Playwright visite la console avec serveur/backend réels : GET composition, POST exclusion de B, Review, puis acceptation A/C ; vérification SQL du manifeste et de la décision. | PostgreSQL de service isolé. La page montre « Exclu », le motif, l’acteur, l’UUID de décision et la version de composition. Job séparé de l’émulateur. |
 
-La collecte pytest réelle a relevé **7 node IDs `workflow_fast`** et **8 au
-total** avec `workflow_full` : garde réseau, W2, deux tests W3, W4, W6, W8 et
-W1. Les planchers Make sont 7 et 8. W5, W7, W9 (Typst réel) et W10
-(navigateur) ne sont pas couverts. Aucun scénario ne compile ni n’inspecte un
-PDF/Typst réel. `WorkflowDriver.build_emulator_app()` utilise les routers
-officiels via ASGI, mais cette app recomposée n’est pas `main.app`.
+La collecte réelle trouve **7 tests `workflow_fast`**, **4 tests
+`workflow_full`**, soit **11** dans `workflow_fast or workflow_full`. Les 7 FAST
+sont le garde réseau, W2, les deux tests W3, W4, W6 et W8. Les quatre FULL-only
+sont W1, W5, W7 et W9. Make impose `WORKFLOW_FAST_MIN=7` et
+`WORKFLOW_FULL_MIN=11` ; la CI impose `--min-count 4` à son étape FULL-only.
+W10 est collecté séparément dans le job navigateur.
 
-Node IDs retournés par `pytest --collect-only -q` :
+Les node IDs mesurés sont :
 
 ```text
-workflow_fast
 tests/workflow_emulator/test_network_guard.py::test_network_guard_blocks_external_socket_dns_and_httpx
+tests/workflow_emulator/test_w1_progressive_abc.py::test_w1_progressive_abc_uses_real_selection_and_production_transitions
 tests/workflow_emulator/test_w2_inclusion_exclusion.py::test_w2_inclusion_exclusion_is_persisted_through_release
 tests/workflow_emulator/test_w3_unproduced_subject_excluded.py::test_w3_unproduced_subject_is_explicitly_excluded
 tests/workflow_emulator/test_w3_unproduced_subject_excluded.py::test_w3_deferred_subject_review_does_not_offer_acceptance
 tests/workflow_emulator/test_w4_discovery_after_production.py::test_w4_discovery_after_production_keeps_pinned_inputs_publishable
+tests/workflow_emulator/test_w5_late_correction.py::test_w5_late_correction_requires_explicit_repin
 tests/workflow_emulator/test_w6_concurrency_and_resume.py::test_w6_concurrency_and_resume
+tests/workflow_emulator/test_w7_discovery_fusion_conflicts.py::test_w7_selected_discovery_fusion_requires_human_resolution
 tests/workflow_emulator/test_w8_stale_composition_version.py::test_w8_accept_rejects_stale_composition_version
-
-workflow_full
-tests/workflow_emulator/test_w1_progressive_abc.py::test_w1_progressive_abc_uses_real_selection_and_production_transitions
+tests/workflow_emulator/test_w9_real_typst_render.py::test_w9_real_typst_render_contains_frozen_article_titles
 ```
 
-## 6. Audit anti-faux-positifs M1–M7
+Limites de fidélité : ASGI recomposé, pas `main.app` ; aucun appel à Bridge ni
+modèle distant ; D2 est factice. W2, le départ de W3, W4, W6 et W8 partent de
+runs `READY` insérés plutôt que d’exercer une génération complète. W3 produit
+A par vrais jobs mais B n’est pas produit. Discovery est fixturée dans W3/W4 ;
+W1 exécute le vrai service Discovery avec réponses déterministes locales. W7
+prouve la revue Fusion au niveau service, sans route HTTP. Le garde réseau ne
+prouve pas les sockets en processus enfant ou en code natif.
 
-`/tmp/lotc-audit-report.md` conclut : **0 bloquant**, **3 majeurs corrigés
-avant `9702c70`**, et les sept mutations détectées puis restaurées. Les majeurs
-étaient F1, docstring W1 surévaluant Discovery ; F2, garde réseau incomplet et
-DSN non limité au local ; F3, skips silencieux si le DSN manque.
+## 6. Audits indépendants par mutation
 
-| Mutation | Résultat relevé |
-|---|---|
-| M1 — Review retourne `exclusions=()` | W2 échoue : audit d’exclusion absent/inapplicable dans Review. |
-| M2 — Exclusion omise du manifeste | W2 échoue : ligne d’exclusion PostgreSQL de B absente. |
-| M3 — Décision non persistée | W2 échoue : route d’exclusion HTTP 409. |
-| M4 — B inclus et exclu | W2 échoue : un sujet ne peut être inclus et exclu. |
-| M5 — Motif modifié à l’écriture | W2 échoue : décision exacte absente en PostgreSQL. |
-| M6 — Fusion invalide l’artefact A | W1 échoue en relisant l’artefact après D2/F2 et production de C. |
-| M7 — Composition crée un job | W2 et W1 échouent sur le compteur jobs/model_runs. |
+`/tmp/lotc-audit-report.md` relève **0 bloquant** et **3 majeurs** corrigés avant
+`9702c70` : F1, docstring W1 qui surévaluait Discovery ; F2, garde réseau/DSN
+local insuffisants ; F3, skip silencieux. Les mutations M1–M7 sur W1/W2 ont
+toutes été détectées : Review sans exclusion, exclusion absente du manifeste,
+décision non persistée, B à la fois inclus et exclu, motif altéré, artefact A
+invalidé par Fusion, ou job créé par Composition. Elles ont été restaurées.
 
-M1–M7 ne mutaient que le code couvert par W1/W2. W3, W4, W6 et W8 n’ont pas
-encore été éprouvés par des mutations de `backend/src/` ; ces tests de mutation
-restent à faire.
+`/tmp/c3-mutation-report.md` : **15/15 mutations réalisables tuées** pour
+W3/W4/W6/W8. X-b n’est pas une mutation survivante : le trigger append-only de
+PostgreSQL rejette l’UPDATE de `publication_manifests` avant l’assertion
+applicative.
+
+`/tmp/c4-mutation-report.md` : audit W5/W7/W9/W1-Discovery/W10, initialement
+**15 tuées sur 18**. Les trois survivantes W5-b/W5-c/W5-d ont été traitées dans
+`df857f9`. W5-d est une mutation équivalente : la PUBLICATION v1 est déjà
+`STALE` après la correction officielle. Les mutations non équivalentes qui
+annulent le blob historique ou altèrent `input_hash` sont tuées. L’auteur a
+rejoué les mutations W5 selon la procédure de sauvegarde/restauration ;
+`git diff HEAD --stat -- backend/src` est vide.
 
 ## 7. Incidents
 
-- `4a1fa71` a capturé `exclusions=()` pendant une preuve de mutation du Lot C ;
-  `374f1ce` a restauré `exclusions=tuple(exclusions)`.
-- La collision pytest venait de `pytest_plugins = ["tests.integration.conftest"]`
-  dans le `conftest.py` du dossier workflow_emulator. Collecter ensemble
-  `tests/integration` et `tests/workflow_emulator` provoquait
-  `ValueError: Plugin already registered under a different name:
-  tests.integration.conftest` et cassait `uv run pytest` en CI. Elle a été
-  corrigée avant `9702c70` en important les fixtures par nom. Ce n’était pas
-  une collision dans les modules Typst.
-- Trois processus pytest orphelins sont restés bloqués 7–10 minutes sur
+- `4a1fa71` a capturé une mutation temporaire `exclusions=()` ; `374f1ce` a
+  restauré `exclusions=tuple(exclusions)`.
+- Collision de plugin : `pytest_plugins = ["tests.integration.conftest"]` dans
+  le `conftest.py` workflow provoquait `ValueError: Plugin already registered
+  under a different name: tests.integration.conftest` quand les deux dossiers
+  étaient collectés ensemble. Corrigé avant `9702c70` en important les fixtures
+  par nom ; ce n’était pas une collision des modules Typst.
+- Trois processus pytest orphelins ont bloqué 7–10 minutes sur
   `test_goodware.py::test_measurement_prepares_once_and_reuses_uuid_and_fingerprint` ;
-  l’incident ne s’est pas reproduit ensuite.
-- `test_analysis_subprocess.py` a été bloqué dans les sessions Luna sandboxées,
-  mais pas hors sandbox. Des tests Typst locaux dépendent de `/snap/bin/typst`
-  et d’un `TMPDIR` sous `$HOME` ; leurs échecs observés sont des problèmes
-  d’environnement, pas des défauts de code.
-- Une première relance des mesures a reçu un DSN synchrone (`postgresql://`)
-  au lieu du DSN async requis (`postgresql+asyncpg://`) et a échoué avant les
-  scénarios sur l’import de `psycopg2`. Les résultats ci-dessous proviennent
-  d’une série relancée avec le DSN local correct.
+  non reproduit ensuite.
+- `test_analysis_subprocess.py` et Playwright (`connect EPERM 127.0.0.1`) ont
+  bloqué dans des sessions déléguées sandboxées et passé hors sandbox. Lors de
+  cette clôture, une première exécution backend sandboxée a aussi échoué sur le
+  subprocess puis cessé d’avancer dans `test_goodware`; relancée hors sandbox,
+  la suite a passé.
+- `0a62337` a remplacé le code visible `subject_deferred` par un libellé seul,
+  cassant le test E2E mocké `frontend/e2e/multibatch-composition.spec.ts:514`.
+  Vitest ne l’avait pas détecté. `71068be` affiche de nouveau le code à côté du
+  libellé. Leçon : lancer aussi `pnpm test:e2e` après un changement frontend.
+- Le spec W10 cassait `pnpm lint` (TypeScript/ESLint) et `pnpm test` (Vitest
+  collectait le spec Playwright). `73380c4` a corrigé `tsconfig.node.json` et
+  `vite.config.ts`.
+- Un programme étranger occupait le port `8765`; W10 utilise maintenant
+  `18765`. Les trois exécutions de cette clôture ont gardé ce port par défaut et
+  n’ont pas touché `8765`.
+- Des bases `cti_browser_*` étaient restées après un arrêt par signal. Le
+  serveur s’arrête maintenant via son endpoint de contrôle ; aucune base de
+  test résiduelle n’a été observée après le nettoyage.
+- Sans `TMPDIR` sous `$HOME`, 23 tests Typst/rendu hors workflow échouaient avec
+  le Typst snap (`/snap/bin/typst`). Cette clôture a utilisé
+  `TMPDIR=$HOME/typst-tmp` ; le backend complet a passé.
+- Le premier appel de mesure de cette clôture a échoué avant les tests, car le
+  cache UV par défaut était en lecture seule ; les tentatives sandboxées ne
+  pouvaient pas ouvrir le socket PostgreSQL local. Les six profils ont passé
+  avec `UV_CACHE_DIR=/tmp/lotd-uv-cache` et l’accès autorisé au seul DSN local
+  de test.
 
 ## 8. Mesures et arbitrages
 
-La commande reproductible est `make measure-workflow`, avec
-`TEST_POSTGRES_ADMIN_DSN` pointant vers le PostgreSQL local de test. Elle lance
-trois fois chaque profil, conserve les sorties pytest `--durations=0`, les
-rapports JUnit, les traces JSONL, le RSS mesuré autour de pytest et le temps
-total de Make. Elle n’arrête ni ne démarre le conteneur PostgreSQL.
+Commande reproductible, avec le conteneur de test déjà actif :
 
-| Mesure | Résultat |
+```sh
+export TEST_POSTGRES_ADMIN_DSN=postgresql+asyncpg://postgres:postgres@127.0.0.1:55432/postgres
+UV_CACHE_DIR=/tmp/lotd-uv-cache TMPDIR="$HOME/typst-tmp" make measure-workflow
+```
+
+`measure-workflow` fait trois exécutions de chaque profil, garde les sorties
+`--durations=0`, JUnit, traces JSONL, temps Make et RSS pytest. Il ne démarre ni
+n’arrête PostgreSQL. Les durées ci-dessous sont secondes, min / médiane / max.
+Un scénario partagé apparaît six fois (trois FAST et trois FULL) ; FULL-only,
+trois fois.
+
+| Node ID / mesure | Runs | Min / médiane / max |
+|---|---:|---:|
+| Garde réseau | 6 | 0,08 / 0,08 / 0,09 |
+| W1 — Discovery/Selection/jobs réels | 3 | 3,04 / 3,18 / 3,41 |
+| W2 — inclusion/exclusion | 6 | 0,59 / 0,63 / 0,67 |
+| W3 — Review différé | 6 | 1,08 / 1,15 / 1,23 |
+| W3 — exclusion sans run | 6 | 1,38 / 1,57 / 1,62 |
+| W4 — Discovery après production | 6 | 1,29 / 1,38 / 1,51 |
+| W5 — correction tardive | 3 | 2,41 / 2,64 / 2,66 |
+| W6 — concurrence et reprise | 6 | 1,36 / 1,43 / 1,75 |
+| W7 — conflits Fusion | 3 | 1,07 / 1,19 / 1,45 |
+| W8 — version obsolète | 6 | 0,58 / 0,66 / 0,85 |
+| W9 — rendu Typst réel | 3 | 1,64 / 1,66 / 1,73 |
+| Setup première fixture DB + Alembic | 6 | 0,50 / 0,55 / 0,65 |
+| Make FAST — 7 tests, code 0/0/0 | 3 | 11,70 / 12,01 / 12,01 |
+| RSS maximal pytest FAST | 3 | 164 696 KiB |
+| Make FULL — 11 tests, code 0/0/0 | 3 | 20,22 / 21,13 / 21,22 |
+| RSS maximal pytest FULL | 3 | 363 776 KiB |
+
+Le setup affiché est le `setup` pytest du premier test DB (W2 en FAST, W1 en
+FULL) et comprend les autres fixtures de setup. La variation FAST est de 0,31 s
+(2,6 % de la médiane) ; FULL varie de 1,00 s (4,7 %). Le setup varie de 0,15 s.
+W1 et W7 ont les plus grands écarts individuels (0,37 et 0,38 s). Les runs sont
+séquentiels avec PostgreSQL déjà actif ; aucune cause précise de variation n’a
+été isolée.
+
+| W10 / mesure navigateur | Résultat |
 |---|---|
-| Préparation DB + `alembic upgrade head` (setup session pytest) | `setup` de W2 (premier test DB du FAST) ou W1 (premier test DB du FULL) : 0,46 / 0,55 / 0,65 s min / médiane / max. Il s’agit de l’attribution pytest du setup de session, avec ses autres fixtures de setup. |
-| Durée par scénario (min / médiane / max, secondes) | Garde réseau 0,08 / 0,08 / 0,09 ; W1 2,76 / 3,01 / 3,11 ; W2 0,57 / 0,61 / 0,82 ; W3 principal 1,48 / 1,55 / 1,74 ; W3 Review 0,98 / 1,11 / 1,35 ; W4 1,32 / 1,39 / 1,54 ; W6 1,35 / 1,44 / 1,56 ; W8 0,58 / 0,68 / 0,80. W1 figure dans les trois runs FULL agrégés ; les autres valeurs couvrent six runs. |
-| FAST, 3 exécutions | Toutes passent. Temps total Make min / médiane / max : 11,81 / 11,85 / 11,94 s ; codes de sortie 0, 0, 0. |
-| FULL (`workflow_fast or workflow_full`), 3 exécutions | Toutes passent. Temps total Make min / médiane / max : 14,77 / 14,86 / 15,20 s ; codes de sortie 0, 0, 0. |
-| Étape CI FULL-only locale (`workflow_full`) | `1 passed, 7 deselected in 3.72s` ; garde OK pour 1 scénario ; temps mur `/usr/bin/time -v` 7,90 s, RSS maximal 152 124 KiB. |
-| RSS maximal du processus pytest | `/usr/bin/time -v` : 162 476 KiB max sur FAST et 166 444 KiB max sur FULL agrégé. |
-| `make backend-sync` à chaud | `uv sync --locked --python 3.12 --group dev --group analysis` : 0,03 s mur, 0,01 s utilisateur, 0,02 s système, RSS 22 560 KiB. |
-| Démarrage d’un conteneur PostgreSQL sous projet Compose distinct | `docker compose up -d --wait postgres-test` : 5,91 s, 0,09 s utilisateur + 0,03 s système, 2 % CPU du client Compose, RSS client 29 120 KiB. Image `postgres:16-alpine` déjà présente ; aucune image téléchargée. Le conteneur et le réseau du projet éphémère ont été retirés. |
-| Variabilité observée | FAST varie de 0,13 s (1,1 % de la médiane), FULL de 0,43 s (2,9 %). Les scénarios W2–W8 varient selon le cas de 0,10 à 0,37 s ; W1 de 0,35 s. Aucune cause n’a été isolée ; les six runs sont séquentiels avec PostgreSQL déjà démarré. |
+| Exécution 1 | Make 7,88 s ; Playwright `1 passed (2.8s)`, test 1,4 s ; SQL verification passed. |
+| Exécution 2 | Make 7,79 s ; Playwright `1 passed (2.8s)`, test 1,4 s ; SQL verification passed. |
+| Exécution 3 | Make 8,05 s ; Playwright `1 passed (2.9s)`, test 1,5 s ; SQL verification passed. |
+| Total des trois exécutions | 23,72 s Make ; 8,5 s cumulés pour les invocations Playwright. |
 
-L’objectif du brief est FAST sous une minute supplémentaire et FULL en
-quelques minutes. Le profil FAST complet mesure 11,85 s médiane et le profil
-FULL agrégé 14,86 s médiane ; les deux restent sous ces budgets.
+Coûts de référence mesurés à chaud : `make backend-sync` **0,02 s** ;
+`make test-backend` **52,59 s** au total (**50,88 s pytest**, 3 074 passés,
+10 désélectionnés, RSS maximal 398 716 KiB) ; `make test-integration
+INTEGRATION_TEST_PATH=tests/integration` **88,89 s** (**85,56 s pytest**,
+274 passés, RSS maximal 609 560 KiB). Le DSN fourni a empêché `test-integration`
+de posséder ou supprimer le conteneur actif.
 
-Pour la CI, FAST mesure 11,85 s médiane et le replay local de l’étape FULL-only
-mesure 7,90 s. Le pytest principal exécutait auparavant les huit scénarios dans
-une session : la somme des médianes d’appels (9,87 s) et du setup DB (0,55 s)
-est environ 10,42 s. Le surcoût net est donc estimé à **environ 9 s** à chaud
-(11,85 + 7,90 − 10,42), sans comparaison A/B du job GitHub. `make
-test-integration`, utilisé par les deux gates, dépend de `backend-sync` et
-exécute `uv sync --locked --python 3.12 --group dev --group analysis` ; à chaud
-ce sync prend 0,03 s. Le temps d’installation à froid des dépendances, surtout
-du groupe `analysis` sur un runner GitHub, n’a pas été mesuré et peut allonger
-le job.
+L’étape CI FULL-only a aussi été rejouée localement : 4 passés, 7 désélectionnés,
+pytest en 9,18 s ; Make `test-integration` en 11,42 s, puis le garde a affiché
+`Garde workflow OK: 4 scénario(s) collecté(s), tous présents et passed dans le JUnit.`
+Le garde a pris 3,1 s avec `uv run`. À chaud, les deux étapes workflow du job
+`backend` représentent donc environ **26,5 s** (FAST Make 12,01 + FULL-only Make
+11,42 + garde FULL-only 3,1). Dans l’ancien pytest principal, les médianes
+d’appels des 11 tests totalisent environ 15,57 s, plus un setup DB de 0,55 s.
+Le coût net estimé du découpage en deux gates est donc **environ 10 s** au-delà
+de cette exécution unique, principalement pour un second démarrage de session,
+setup DB et garde. C’est une estimation locale, pas une mesure du job GitHub.
 
-La cible doit être rejouée quand W5/W7/W9/W10 seront ajoutés ou que leur code
-évoluera. Les mesures de cette section proviennent du profil vert à huit tests.
+Le job `workflow-browser` est à environ 8 s localement avec les dépendances déjà
+installées. Le coût froid de `pnpm install` et de `playwright install --with-deps
+chromium` sur GitHub n’a pas été mesuré. Le `backend-sync` chaud à 0,02 s ne
+permet pas d’estimer le `uv sync` à froid du groupe `analysis` sur un runner.
 
-## 9. Risques résiduels et non-vérifié
+L’objectif §23 est FAST à moins d’une minute supplémentaire et FULL en quelques
+minutes. Les médianes mesurées sont 12,01 s pour FAST et 21,13 s pour le FULL
+agrégé : FAST reste environ 48 s sous sa limite et FULL est sous le budget de
+quelques minutes. Les résultats reflètent le jeu vert actuel de 11 tests et
+doivent être rejoués à l’ajout ou au changement d’un scénario.
 
-- Actions GitHub n’a pas été exécutée depuis cette session ; l’étape FULL-only
-  a été rejouée localement. Parse YAML réussi ; `actionlint` indisponible.
-- `make lint-backend` et `make typecheck-backend` passent sur le HEAD courant.
-  L’orchestrateur rapporte 3 074 tests backend et 27 tests workflow/intégration
-  verts ; ces deux comptes viennent de son exécution, pas de cette session.
-- W5, W7, W9 et W10 restent absents. Discovery reste fixturée dans W1/W3/W4 ;
-  aucun scénario ne compile un PDF/Typst réel. L’application du DDL live et le
-  restamp n’ont pas été faits.
-- Les mutations M1–M7 ne couvrent que W1/W2. Les mutations de code source qui
-  éprouveraient W3/W4/W6/W8 restent à faire.
-- La pièce jointe de mission n’était pas lisible depuis les sessions
-  déléguées. Les exigences chiffrées du brief fourni ont été vérifiées ; les
-  seuls points encore **À CONFIRMER** concernent des formulations ou détails
-  accessibles uniquement dans la pièce jointe complète.
+## 9. Risques résiduels et non vérifié
+
+- GitHub Actions n’a pas été exécuté. Les suites locales backend et intégration
+  ont passé ; le job `frontend` et les jobs GitHub `backend`/`workflow-browser`
+  restent à observer sur runner.
+- Le pytest principal du job `backend` exclut `workflow_fast` et `workflow_full` ;
+  FAST puis FULL-only ont des étapes séparées `if: always()` et une publication
+  d’artefacts à l’échec. W10 est un job séparé, avec PostgreSQL et installation
+  navigateur propres.
+- Le commentaire de `.github/workflows/ci.yml` au-dessus de l’étape FULL-only
+  annonçait « only W1 » et « floor is 1 » alors que le code applique
+  `--min-count 4` ; il a été aligné sur le code après la clôture du Lot D.
+- Les installations froides UV/Playwright du runner ne sont pas mesurées. Les
+  sessions déléguées sandboxées ne reproduisent pas l’environnement utilisateur.
+- Discovery est fixturée dans W3/W4 ; une partie de FAST (W2, départ W3, W4,
+  W6, W8) commence sur des runs `READY` insérés. W7 exerce la résolution Fusion
+  au niveau service, sans route HTTP.
+- Le DDL de la section 4 et tout restamp live restent **NON APPLIQUÉS**. Aucune
+  base live ni donnée réelle n’a été utilisée. Les lectures d’historiques sont
+  testées sur PostgreSQL de test, pas sur les releases d’une base live.
+- La qualité visuelle/éditoriale du PDF W9, toutes les permutations de Review /
+  Fusion et la décision produit sur les sujets reportés restent à confirmer.
+  Le test LOT 21 a été ajusté : un report bloque maintenant `can_accept` ;
+  l’alternative est que Review ignore les reports et que seul le gel refuse.
+- L’absence de première exécution GitHub et le coût froid des dépendances sont
+  les points opérationnels restants. Les scénarios
+  W5/W7/W9 et W10 sont présents et ont passé localement.
+
+## 10. Critères d’acceptation §31
+
+| # | Critère | État | Preuve / limite |
+|---:|---|---|---|
+| 1 | Défaut reproduit par un test PostgreSQL réel | OUI | `test_edition_exclusion_publication_postgres.py`, rouge sur `8647207` : `review_decision_identity_mismatch` et `excluded_item_has_no_decision`. |
+| 2 | Rouge avant, vert après | OUI | Échecs initiaux ci-dessus ; après `4a1fa71` et réparation `374f1ce`, les cas ciblés passent. |
+| 3 | A inclus / B exclu / C inclus, manifeste V2 correct | OUI | Tests PostgreSQL Lot B, W2 et W10 ; W10 relit le manifeste en base. |
+| 4 | Exclusion sans run est canonique | OUI | `EditionCompositionService.exclude_subject`, test d’intégration et W3 ; `production_run_id IS NULL`. |
+| 5 | Décisions et motifs auditables | OUI | PostgreSQL conserve la décision ; W10 vérifie et affiche motif, acteur et UUID. |
+| 6 | Review lit les exclusions hors de `Review.items` | OUI | `EditionReview.exclusions` et tests de lecture/gel ; `items` contient les inclus. |
+| 7 | Frontend exclut et montre le résultat exact | OUI | W10 affiche `Exclu`, motif, acteur, UUID, version de composition et état acceptable ; `subject_deferred` reste affiché avec son libellé. |
+| 8 | Conflits de version sûrs et idempotents | OUI | Tests Lot B, W6 et W8 ; conflits typés et rejeu idempotent. |
+| 9 | Émulateur exécute de vraies transitions | PARTIEL | W1/W5 exécutent Selection/jobs et corrections réelles ; plusieurs FAST partent de runs `READY` insérés. |
+| 10 | Fournisseurs simulés sans réseau | OUI | Garde réseau et providers déterministes ; limites des sous-processus et code natif documentées. |
+| 11 | FAST local et CI | PARTIEL | FAST local 7/7 avec garde JUnit ; CI GitHub non exécutée. |
+| 12 | FULL Typst réel et navigateur/backend réel | PARTIEL | W9 et W10 passent localement ; exécution CI GitHub non vérifiée. |
+| 13 | Coûts mesurés | OUI | Six profils, trois W10, sync chaud et suites backend/intégration mesurés §8. |
+| 14 | Aucun scénario requis sauté ou absent | OUI | `WORKFLOW_EMULATOR_REQUIRED=1`, garde JUnit et planchers Make 7/11 ; CI FULL-only `--min-count 4`. |
+| 15 | CI entière verte | NON VÉRIFIÉ | Local : backend 3 074 passés + 10 désélectionnés, intégration 274 passés ; frontend rapporté par l’orchestrateur : 267 Vitest, 12 E2E mockés et W10. GitHub Actions non exécuté. |
+| 16 | Aucune base/donnée réelle modifiée | OUI | Seulement PostgreSQL de test local ; DDL live non appliqué. |
+| 17 | Manifests/releases historiques lisibles | PARTIEL | Hash historiques avec `checked>0` dans W6 et tests Lot B ; base live non testée. Les colonnes de run/génération deviennent nullable, lecture historique conservée. |
+
+### À faire par le responsable
+
+- Appliquer le DDL live après vérification finale contre le modèle de la section 4.
+- Confirmer la décision produit sur le blocage Review d’un sujet reporté.
+- Pousser les commits puis observer la première CI GitHub (`backend`, `frontend`,
+  `workflow-browser`).
+- Relever `WORKFLOW_FAST_MIN`, `WORKFLOW_FULL_MIN` et le `--min-count` FULL-only
+  à chaque ajout de scénario.

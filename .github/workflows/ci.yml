@@ -65,7 +65,7 @@ jobs:
         if: always()
         run: make -C .. test-workflow
       # Run only workflow_full here; FAST already ran above, avoiding duplicates.
-      # This marker currently collects only W1, so the FULL-only floor is 1.
+      # workflow_full currently collects W1, W5, W7 and W9, so the FULL-only floor is 4.
       # Keep FULL in this job so it reuses Typst, fonts, D2, PostgreSQL and uv.
       # A separate job would reinstall those tools; this trades a longer backend
       # job for avoiding duplicate setup and keeps FAST and FULL independently visible.
