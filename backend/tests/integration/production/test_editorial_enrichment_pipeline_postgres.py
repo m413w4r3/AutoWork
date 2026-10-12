@@ -37,7 +37,10 @@ from cti_app.infrastructure.database.models.production import ProductionArtifact
 from tests.integration.production.support import ProductionScenario, grounded_editorial_proposal
 
 from ..edition_codes import reserve_edition_code
-from .test_pipeline_happy_path import _configured_scenario, _install_canonical_synthesis
+from .test_pipeline_happy_path import (
+    _configured_editorial_scenario,
+    _install_canonical_synthesis,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -47,7 +50,9 @@ async def test_editorial_enrichment_persists_grounded_structures_on_postgres(
     production_scenario_factory: Callable[[Mapping[str, Mapping[str, object]]], ProductionScenario],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    scenario = await _configured_scenario(production_scenario_factory)
+    scenario = await _configured_editorial_scenario(
+        production_scenario_factory, capture_tag="editorial-enrichment"
+    )
     _install_canonical_synthesis(scenario)
     scenario.model.script.editorial_enrichment(grounded_editorial_proposal)
 
@@ -72,7 +77,11 @@ async def test_editorial_enrichment_persists_grounded_structures_on_postgres(
     monkeypatch.setattr(PublicationAssemblyService, "assemble_publication", instrumented_assemble)
     await scenario.start()
     run = await scenario.run_until_terminal()
-    assert run.status is ProductionRunStatus.READY, (run.error_code, run.error_message)
+    assert run.status is ProductionRunStatus.READY, (
+        run.error_code,
+        run.error_message,
+        run.current_stage,
+    )
 
     async with scenario.uow_factory() as uow:
         artifacts = {
@@ -101,7 +110,7 @@ async def test_editorial_enrichment_persists_grounded_structures_on_postgres(
     enrichment = editorial_enrichment_from_json(
         await scenario.artifact_store.read_json(enrichment_artifact.canonical_blob_id)
     )
-    assert len(enrichment.tables) == len(enrichment.diagrams) == 1
+    assert len(enrichment.tables) == len(enrichment.diagrams) == 1, enrichment.warnings
     assert enrichment.source_figures == ()
     validate_editorial_enrichment(enrichment, extraction=extraction, synthesis=synthesis)
     assert enrichment.tables[0].rows[0].evidence_refs

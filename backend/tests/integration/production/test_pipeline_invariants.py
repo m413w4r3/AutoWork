@@ -228,6 +228,10 @@ def _configure(
     unavailable: frozenset[str] = frozenset(),
     body_salt: str = "",
 ) -> tuple[ProductionScenario, CanonicalExtractionScript]:
+    # This fixture's PostgreSQL database is shared within a test session, and
+    # source_extractions are keyed by normalized capture bytes. Salt every run
+    # so a prior scenario cannot supply a stale checkpoint.
+    body_salt = body_salt or f"scenario:{urls[0]}:{uuid4().hex}\n"
     specs = {
         url: {
             "status": 404 if url in unavailable else 200,
@@ -459,7 +463,7 @@ async def test_two_providers_produce_the_same_canonical_contract(
         production_scenario_factory,
         second_urls,
         core_urls=second_urls,
-        body_salt="Second provider capture. ",
+        body_salt=f"Second provider capture {uuid4().hex}. ",
     )
     second.model.use_chatgpt_bridge_identity()
 
@@ -496,8 +500,11 @@ async def test_duplicate_content_keeps_two_sources_and_calls_the_model_once(
     production_scenario_factory: ScenarioFactory,
 ) -> None:
     urls = _urls(2, namespace="duplicate")
-    scenario, script = _configure(production_scenario_factory, urls, core_urls=urls)
-    shared_body = _source_body(1)
+    body_salt = f"scenario:{urls[0]}:{uuid4().hex}\n"
+    scenario, script = _configure(
+        production_scenario_factory, urls, core_urls=urls, body_salt=body_salt
+    )
+    shared_body = _source_body(1, salt=body_salt)
     shared_spec = {"status": 200, "mime": "text/plain", "body": shared_body}
     scenario.collection_transport._sources = dict.fromkeys(urls, shared_spec)
 
@@ -513,7 +520,8 @@ async def test_duplicate_content_keeps_two_sources_and_calls_the_model_once(
     assert extraction.sources[0].reuse_state is ExtractionReuseState.FRESH
     assert extraction.sources[1].reuse_state is ExtractionReuseState.CONTENT_DUPLICATE
     assert extraction.sources[1].checkpoint_id == extraction.sources[0].checkpoint_id
-    assert [indicator.value for indicator in extraction.sources[1].indicators] == [_marker(1)]
+    assert [indicator.value for indicator in extraction.sources[0].indicators] == [_marker(1)]
+    assert extraction.sources[1].indicators == ()
 
 
 @pytest.mark.asyncio
@@ -521,13 +529,20 @@ async def test_cross_subject_checkpoints_reuse_the_extraction_without_a_call(
     production_scenario_factory: ScenarioFactory,
 ) -> None:
     urls = _urls(2, namespace="cross-subject")
-    first, first_script = _configure(production_scenario_factory, urls, core_urls=urls)
+    # This is the one scenario that intentionally shares exact capture bytes
+    # across two subjects to verify cross-subject checkpoint reuse.
+    shared_body_salt = f"cross-subject:{uuid4().hex}\n"
+    first, first_script = _configure(
+        production_scenario_factory, urls, core_urls=urls, body_salt=shared_body_salt
+    )
     await first.start()
     first_run = await first.run_until_terminal()
     assert first_run.status is ProductionRunStatus.READY
     assert len(first_script.calls) == 2
 
-    second, second_script = _configure(production_scenario_factory, urls, core_urls=urls)
+    second, second_script = _configure(
+        production_scenario_factory, urls, core_urls=urls, body_salt=shared_body_salt
+    )
     await second.start()
     second_run = await second.run_until_terminal()
     assert second_run.status is ProductionRunStatus.READY

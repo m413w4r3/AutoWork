@@ -689,7 +689,7 @@ def _canonical_synthesis(
         extraction_hash=canonical_extraction_hash(extraction),
         publication_language=snapshot.publication_language,
         synthesis_policy_version=SYNTHESIS_POLICY_VERSION,
-        title=snapshot.subject_title,
+        title=f"[Example publisher] {snapshot.subject_title}",
         lead=(paragraph,),
         sections=(
             SynthesisSectionV1(
@@ -718,13 +718,13 @@ async def _ensure_synthesis_source_document(
     subject: Subject,
     source: SourceCandidate,
     extraction: ProductionExtractionV1,
+    content: bytes,
 ) -> None:
     """Persist the exact archived-source metadata the access policy folds."""
     document_id = extraction.sources[0].source_document_id
     async with uow_factory() as uow:
         if await uow.source_documents.get(document_id) is not None:
             return
-        content = f"Canonical synthesis source {document_id}".encode()
         content_sha256 = hashlib.sha256(content).hexdigest()
         blob_id = await store.put_bytes(
             content, bucket="integration-synthesis-source", mime_type="text/plain"
@@ -764,7 +764,7 @@ async def _store_canonical_first_pass(
     source: SourceCandidate,
     event_text: str,
     document_id: UUID | None = None,
-    content_sha256: str = "d" * 64,
+    content_sha256: str | None = None,
 ) -> SimpleNamespace:
     """Persist the REFERENCES and EXTRACTION payloads of one canonical first pass.
 
@@ -772,6 +772,9 @@ async def _store_canonical_first_pass(
     ``ProductionExtractionV1``.  The returned hashes are the exact functional
     identities the orchestrator recomputes for a second run.
     """
+    document_id = document_id or uuid4()
+    source_content = f"Canonical synthesis source {document_id}\n{event_text}\n".encode()
+    content_sha256 = content_sha256 or hashlib.sha256(source_content).hexdigest()
     published_at = source.published_at or date(2026, 8, 5)
     raw = "\n".join(
         (
@@ -792,7 +795,6 @@ async def _store_canonical_first_pass(
             f"text: {event_text}",
         )
     )
-    document_id = document_id or uuid4()
     corpus = ProductionReferenceCorpusV1(
         schema_version=1,
         subject_id=subject.id,
@@ -865,7 +867,12 @@ async def _store_canonical_first_pass(
         canonical=production_extraction_to_json(extraction)
     )
     await _ensure_synthesis_source_document(
-        uow_factory, store, subject=subject, source=source, extraction=extraction
+        uow_factory,
+        store,
+        subject=subject,
+        source=source,
+        extraction=extraction,
+        content=source_content,
     )
     # The canonical synthesis identity is the frozen snapshot, the canonical
     # extraction and the exact source access policy; no legacy report hash
@@ -1953,7 +1960,7 @@ async def test_two_article_cached_edition_is_sequential_and_uses_new_publication
         ):
             result = await orchestrator.execute_stage(run_id, stage)
             cached_results.append(result)
-            assert result["status"] == "reused"
+            assert result["status"] == "reused", (stage, result)
             if stage is not ProductionStage.SYNTHESIS:
                 await SubjectProductionService(uow_factory).advance_stage(run_id)
         await SubjectProductionService(uow_factory).advance_stage(run_id)
@@ -2030,6 +2037,6 @@ async def test_two_article_cached_edition_is_sequential_and_uses_new_publication
     edition_json = await store.read_json(release.edition_document_blob_id)
     assert all(item["document"]["schema_version"] == "5" for item in edition_json["publications"])
     assert [item["document"]["title"] for item in edition_json["publications"]] == [
-        "Article A",
-        "Article B",
+        "[Example publisher] Article A",
+        "[Example publisher] Article B",
     ]

@@ -77,6 +77,7 @@ from cti_app.domain.production_extraction import (
     production_extraction_to_json,
 )
 from cti_app.domain.production_synthesis import (
+    PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
     EvidenceKind,
     ExtractionEvidenceRefV1,
     ProductionSynthesisV1,
@@ -507,7 +508,7 @@ async def test_canonical_synthesis_pipeline_persists_reloads_and_assembles(
     # Canonical lineage: frozen snapshot identity plus the canonical extraction hash.
     assert snapshot.publication_language == "fr"
     assert synthesis.publication_language == snapshot.publication_language == "fr"
-    assert synthesis.title == snapshot.subject_title
+    assert synthesis.title == f"[Example publisher 1] {snapshot.subject_title}"
     assert synthesis.subject_id == snapshot.subject_id
     assert synthesis.production_input_hash == snapshot.input_hash
     assert synthesis.extraction_hash == canonical_extraction_hash(extraction)
@@ -551,7 +552,7 @@ async def test_canonical_synthesis_pipeline_persists_reloads_and_assembles(
         assert str(source.source_document_id) not in request.text
     assert "[S1]" not in request.text
 
-    assert synthesis_artifact.metadata["schema_version"] == 1
+    assert synthesis_artifact.metadata["schema_version"] == PRODUCTION_SYNTHESIS_SCHEMA_VERSION
     assert synthesis_artifact.metadata["language"] == "fr"
     assert synthesis_artifact.metadata["mode"] == "fresh"
     assert synthesis_artifact.conversation_turn_id is None

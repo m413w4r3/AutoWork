@@ -6,6 +6,7 @@ import hashlib
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from typing import Any
+from uuid import uuid4
 
 import pytest
 
@@ -38,6 +39,7 @@ from cti_app.domain.production_extraction import (
     production_extraction_from_json,
     production_extraction_to_json,
 )
+from cti_app.domain.production_synthesis import PRODUCTION_SYNTHESIS_SCHEMA_VERSION
 from cti_app.domain.publication import ArtifactType
 from cti_app.domain.publication_document import parse_publication_document
 
@@ -93,6 +95,16 @@ IOC confirmed domain
     - core-c2.security-lab.io :: Command-and-control domain in the report.
 """
 
+Q2_EDITORIAL_CORE_RESPONSE = """FACT malware
+- ExampleRAT :: ExampleRAT uses core-c2.security-lab.io for command and control.
+
+FACT persistence
+- The loader persisted in memory after execution. :: Loader persistence.
+
+IOC confirmed domain
+    - core-c2.security-lab.io :: ExampleRAT uses core-c2.security-lab.io for command and control.
+"""
+
 Q2_SECONDARY_RESPONSE = """IOC contextual domain
 - secondary-c2.security-lab.io :: A related infrastructure domain is discussed.
 """
@@ -124,9 +136,35 @@ def _sources() -> dict[str, dict[str, object]]:
 async def _configured_scenario(
     factory: Callable[[Mapping[str, Mapping[str, object]]], ProductionScenario],
 ) -> ProductionScenario:
-    scenario = factory(_sources())
+    sources = _sources()
+    capture_tag = uuid4().hex
+    for source in sources.values():
+        source["body"] = f"{source['body']} Capture scenario: {capture_tag}."
+    scenario = factory(sources)
     scenario.model.script.references(Q1_RESPONSE)
     scenario.model.script.q2(source_url=SOURCE_URLS[0], response=Q2_CORE_RESPONSE)
+    scenario.model.script.q2(source_url=SOURCE_URLS[1], response=Q2_SECONDARY_RESPONSE)
+    return scenario
+
+
+async def _configured_editorial_scenario(
+    factory: Callable[[Mapping[str, Mapping[str, object]]], ProductionScenario],
+    *,
+    capture_tag: str,
+) -> ProductionScenario:
+    """Give editorial scenarios distinct captures and two grounded table rows."""
+    capture_tag = f"{capture_tag}:{uuid4().hex}"
+    sources = _sources()
+    core = sources[SOURCE_URLS[0]]
+    core["body"] = (
+        f"{core['body']} Capture scenario: {capture_tag}. "
+        "The report states the loader persisted in memory after execution."
+    )
+    secondary = sources[SOURCE_URLS[1]]
+    secondary["body"] = f"{secondary['body']} Capture scenario: {capture_tag}."
+    scenario = factory(sources)
+    scenario.model.script.references(Q1_RESPONSE)
+    scenario.model.script.q2(source_url=SOURCE_URLS[0], response=Q2_EDITORIAL_CORE_RESPONSE)
     scenario.model.script.q2(source_url=SOURCE_URLS[1], response=Q2_SECONDARY_RESPONSE)
     return scenario
 
@@ -263,7 +301,7 @@ async def test_complete_production_pipeline_reaches_ready(
     assert synthesis_artifact.canonical_blob_id is not None
     assert synthesis_artifact.rendered_blob_id is not None
     assert synthesis_artifact.conversation_turn_id is None
-    assert synthesis_artifact.metadata["schema_version"] == 1
+    assert synthesis_artifact.metadata["schema_version"] == PRODUCTION_SYNTHESIS_SCHEMA_VERSION
     assert synthesis_artifact.metadata["language"] == "fr"
     assert synthesis_artifact.metadata["mode"] == "fresh"
     extraction_metadata = by_stage[ProductionArtifactStage.EXTRACTION].metadata
@@ -430,7 +468,7 @@ async def test_complete_production_pipeline_reaches_ready(
     assert publication_indicator_values == extraction_indicator_values
     synthesis = production_synthesis_from_json(synthesis_payload)
     extraction = production_extraction_from_json(extraction_payload)
-    assert synthesis.title == snapshot.subject_title
+    assert synthesis.title == f"[Example publisher 1] {snapshot.subject_title}"
     assert synthesis.publication_language == snapshot.publication_language == "fr"
     assert synthesis.production_input_hash == snapshot.input_hash
     assert synthesis.extraction_hash == canonical_extraction_hash(extraction)

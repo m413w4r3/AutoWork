@@ -25,7 +25,10 @@ from pydantic import BaseModel
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.collection import SubjectCollectionService
 from cti_app.application.diagnostics import DiagnosticsLog
-from cti_app.application.diagram_compilation import CompiledDiagram
+from cti_app.application.diagram_compilation import (
+    DIAGRAM_COMPILATION_POLICY_VERSION,
+    CompiledDiagram,
+)
 from cti_app.application.http_collection import (
     CollectionPolicy,
     HttpTransport,
@@ -57,6 +60,7 @@ from cti_app.application.model_gateway import (
 )
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_extraction import effective_evidence_sha256
 from cti_app.application.production_jobs import (
     PRODUCTION_STAGE_MAX_ATTEMPTS,
     ProductionStageChain,
@@ -175,7 +179,7 @@ class _DeterministicDiagramCompiler:
             media_sha256=sha256(media_bytes).hexdigest(),
             compiler="d2-test",
             compiler_version="0.9.0-test",
-            compiler_policy_version="diagram-test-v1",
+            compiler_policy_version=DIAGRAM_COMPILATION_POLICY_VERSION,
         )
 
 
@@ -247,7 +251,12 @@ class ScriptedModelScript:
         for url, spec in sources.items():
             body = spec["body"]
             encoded = body if isinstance(body, bytes) else str(body).encode("utf-8")
-            self._url_by_sha256[sha256(encoded).hexdigest()] = url
+            self._url_by_sha256.setdefault(sha256(encoded).hexdigest(), url)
+            try:
+                effective_text = body.decode("utf-8") if isinstance(body, bytes) else str(body)
+            except UnicodeDecodeError:
+                continue
+            self._url_by_sha256.setdefault(effective_evidence_sha256(effective_text), url)
 
     def references(self, response: str) -> None:
         self._references = response
@@ -275,7 +284,10 @@ class ScriptedModelScript:
                 raise AssertionError("Extraction batch request has no handle mapping")
             outputs: list[str] = []
             for entry in entries:
-                output = self._q2_output(entry["source_content_sha256"])
+                content_sha256 = entry.get(
+                    "effective_evidence_sha256", entry.get("source_content_sha256")
+                )
+                output = self._q2_output(content_sha256)
                 if isinstance(output, _UnstructuredAnswer):
                     return output.text
                 if isinstance(output, Exception):
@@ -487,7 +499,10 @@ class ScriptedModelGateway(ModelGateway):
         """The scripted URLs behind the captures of one extraction request."""
         batch = request.metadata.get("batch_sources")
         hashes = (
-            [entry["source_content_sha256"] for entry in batch]
+            [
+                entry.get("effective_evidence_sha256", entry.get("source_content_sha256"))
+                for entry in batch
+            ]
             if isinstance(batch, list)
             else [request.metadata.get("source_content_sha256")]
         )
@@ -971,25 +986,59 @@ def _grounded_synthesis_proposal(prompt_text: str) -> str:
 
 
 def grounded_editorial_proposal(prompt_text: str) -> str:
-    """Return a table and a diagram as Editorial Enrichment text blocks."""
+    """Return grounded multirow editorial content under the current policy."""
     pack = json.loads(prompt_text)["current_evidence_pack"]
-    evidence = pack["technical_evidence"] or pack["narrative_evidence"]
-    if not evidence:
-        raise AssertionError("Editorial enrichment requires extraction evidence")
-    first = evidence[0]
+    evidence: list[Mapping[str, Any]] = []
+    seen_handles: set[str] = set()
+    for record in (*pack["narrative_evidence"], *pack["technical_evidence"]):
+        handle = record.get("handle")
+        context = record.get("context") or record.get("evidence")
+        value = record.get("value") or record.get("text") or record.get("name")
+        if (
+            isinstance(handle, str)
+            and handle not in seen_handles
+            and isinstance(context, str)
+            and context.strip()
+            and isinstance(value, str)
+            and value.strip()
+        ):
+            evidence.append({**record, "fixture_context": context})
+            seen_handles.add(handle)
+    if len(evidence) < 2:
+        raise AssertionError("Editorial table requires two contextualized evidence records")
+    first, second = evidence[:2]
     handle = first["handle"]
-    value = first.get("value") or first.get("text")
-    if not isinstance(value, str) or not value:
-        raise AssertionError("Editorial evidence has no readable value")
+    second_handle = second["handle"]
+    first_value = first.get("value") or first.get("text") or first.get("name")
+    second_value = second.get("value") or second.get("text") or second.get("name")
+    diagram_record = next(
+        (
+            record
+            for record in pack["technical_evidence"]
+            if record.get("kind") == "indicator"
+            and isinstance(record.get("value"), str)
+            and "examplerat" in str(record.get("evidence", "")).casefold()
+        ),
+        None,
+    )
+    if diagram_record is None:
+        raise AssertionError("Editorial diagram requires a grounded infrastructure indicator")
+    diagram_handle = diagram_record["handle"]
+    diagram_value = diagram_record["value"]
 
-    def purpose(question: str, gain: str) -> tuple[str, ...]:
+    def purpose(
+        question: str,
+        gain: str,
+        data: str,
+        evidence_handles: tuple[str, ...] = (handle,),
+    ) -> tuple[str, ...]:
         return (
             f"PURPOSE: {question}",
-            "DATA: La source rapporte cet élément.",
+            f"DATA: {data}",
             f"GAIN: {gain}",
-            "SCOPE: Un seul élément de preuve.",
-            f"PURPOSE_EVIDENCE: {handle}",
-            "LIMITS: Aucun contexte supplémentaire n'est documenté.",
+            "SCOPE: Les éléments extraits et leurs extraits de source validés.",
+            f"PURPOSE_EVIDENCE: {' '.join(evidence_handles)}",
+            "LIMITS: Aucun élément au-delà des preuves validées n'est documenté.",
             "PLACEMENT_REASON: Placé après le paragraphe d'introduction.",
         )
 
@@ -998,52 +1047,77 @@ def grounded_editorial_proposal(prompt_text: str) -> str:
             "TABLE T001",
             "KEY: observations",
             "KIND: custom",
-            "TITLE: Observations rapportées",
+            "TITLE: Éléments documentés selon leur rôle éditorial",
             *purpose(
-                "Quelle valeur la source rapporte-t-elle ?",
-                "Un tableau isole la valeur rapportée sans la répéter dans le texte.",
+                "Quel extrait de source étaye chaque élément extrait ?",
+                "La présentation distingue les éléments par type et rôle éditorial sans "
+                "fusionner leurs sources.",
+                "Chaque ligne associe un élément à son extrait de source validé, son type et "
+                "le rôle éditorial de sa source.",
+                (handle, second_handle),
             ),
             "PLACEMENT: after_lead",
             "COLUMN C001_001",
-            "KEY: type",
-            "LABEL: Type",
+            "KEY: editorial_role",
+            "LABEL: Rôle éditorial",
             "END COLUMN",
             "COLUMN C001_002",
+            "KEY: evidence_kind",
+            "LABEL: Type de preuve",
+            "END COLUMN",
+            "COLUMN C001_003",
+            "KEY: source_excerpt",
+            "LABEL: Extrait de source",
+            "END COLUMN",
+            "COLUMN C001_004",
             "KEY: value",
-            "LABEL: Valeur",
+            "LABEL: Élément",
             "END COLUMN",
             "ROW R001_001",
-            "CELL: Élément",
-            f"CELL: {value}",
+            f"CELL: {first['editorial_role']}",
+            f"CELL: {first['kind']}",
+            f"CELL: {first['fixture_context']}",
+            f"CELL: {first_value}",
             f"EVIDENCE: {handle}",
+            "END ROW",
+            "ROW R001_002",
+            f"CELL: {second['editorial_role']}",
+            f"CELL: {second['kind']}",
+            f"CELL: {second['fixture_context']}",
+            f"CELL: {second_value}",
+            f"EVIDENCE: {second_handle}",
             "END ROW",
             "END TABLE",
             "DIAGRAM D001",
             "KEY: reported_activity",
             "KIND: custom",
-            "TITLE: Éléments documentés",
+            "TITLE: Infrastructure de commande et de contrôle documentée",
             *purpose(
-                "Comment la valeur se rattache-t-elle à son type documenté ?",
-                "Un schéma relie le type à la valeur pour situer l'élément.",
+                "Comment la source relie-t-elle ExampleRAT à son infrastructure ?",
+                "Le lien explicite entre le logiciel et le domaine clarifie leur relation.",
+                "La source décrit ExampleRAT utilisant le domaine cité pour le contrôle.",
+                (diagram_handle,),
             ),
             "DIRECTION: left_to_right",
             "PLACEMENT: after_lead",
             "NODE N001_001",
-            "ID: report",
-            f"LABEL: {first['kind']}",
-            f"EVIDENCE: {handle}",
+            "ID: malware",
+            "LABEL: ExampleRAT",
+            "ROLE: malware_tool",
+            f"EVIDENCE: {diagram_handle}",
             "END NODE",
             "NODE N001_002",
             "ID: observation",
-            f"LABEL: {value}",
-            f"EVIDENCE: {handle}",
+            f"LABEL: {diagram_value}",
+            "ROLE: infrastructure",
+            f"EVIDENCE: {diagram_handle}",
             "END NODE",
             "RELATION L001_001",
-            "FROM: report",
+            "FROM: malware",
             "TO: observation",
-            "RELATION_TYPE: inference",
-            "LABEL: documente",
-            f"EVIDENCE: {handle}",
+            "RELATION_TYPE: factual",
+            "LABEL: uses",
+            f"EVIDENCE: {diagram_handle}",
             "END RELATION",
             "END DIAGRAM",
         )

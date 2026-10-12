@@ -25,7 +25,10 @@ from cti_app.infrastructure.database.models.model_execution import ModelRunRow
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
 from tests.integration.production.support import ProductionScenario, grounded_editorial_proposal
 
-from .test_pipeline_happy_path import _configured_scenario, _install_canonical_synthesis
+from .test_pipeline_happy_path import (
+    _configured_editorial_scenario,
+    _install_canonical_synthesis,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -42,7 +45,9 @@ async def _model_run_ids(scenario: ProductionScenario) -> set[UUID]:
 async def test_imported_v5_state_is_directly_assemblable(
     production_scenario_factory: Callable[[Mapping[str, Mapping[str, object]]], ProductionScenario],
 ) -> None:
-    scenario = await _configured_scenario(production_scenario_factory)
+    scenario = await _configured_editorial_scenario(
+        production_scenario_factory, capture_tag="production-state-v5"
+    )
     scenario.model.script.editorial_enrichment(grounded_editorial_proposal)
     _install_canonical_synthesis(scenario)
     initial = await scenario.start()
