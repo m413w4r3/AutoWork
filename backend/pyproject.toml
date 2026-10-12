@@ -51,7 +51,11 @@ addopts = "-ra --strict-config --strict-markers"
 asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["src"]
-markers = ["integration: requires a temporary PostgreSQL database"]
+markers = [
+  "integration: requires a temporary PostgreSQL database",
+  "workflow_fast: deterministic workflow emulation with READY production runs inserted",
+  "workflow_full: deterministic workflow emulation through real production jobs",
+]
 
 [tool.ruff]
 line-length = 100
