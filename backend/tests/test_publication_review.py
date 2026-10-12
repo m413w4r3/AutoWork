@@ -14,7 +14,10 @@ from cti_app.application.edition_release_materialization import (
     EditionReleaseMaterializationError,
 )
 from cti_app.application.edition_review import (
+    EditionReviewDiagnostic,
+    EditionReviewDiagnosticCode,
     EditionReviewReadItem,
+    EditionReviewReadScope,
     EditionReviewService,
     ReviewItemStaleError,
 )
@@ -179,6 +182,11 @@ class _Artifacts:
     async def get_current(self, run_id: UUID, stage: str) -> ProductionArtifact | None:
         return self.artifact if run_id == RUN_ID and stage == "publication" else None
 
+    async def get(self, artifact_id: UUID) -> ProductionArtifact | None:
+        return (
+            self.artifact if self.artifact is not None and artifact_id == self.artifact.id else None
+        )
+
 
 class _Decisions:
     def __init__(self) -> None:
@@ -263,6 +271,24 @@ async def test_review_rules_and_exact_acceptance() -> None:
     for status in (ProductionRunStatus.QUEUED, ProductionRunStatus.RUNNING):
         item, _ = await _review(status, artifact_status=None)
         assert item.blocking is True
+
+
+def test_review_without_composition_is_empty_and_explicitly_blocked() -> None:
+    review = EditionReviewService.from_rows(
+        EDITION_ID,
+        EditionReviewReadScope(
+            items=(),
+            composition_version=None,
+            diagnostics=(EditionReviewDiagnostic(EditionReviewDiagnosticCode.COMPOSITION_MISSING),),
+        ),
+    )
+
+    assert review.items == ()
+    assert review.can_accept is False
+    assert review.composition_version is None
+    assert [diagnostic.code for diagnostic in review.diagnostics] == [
+        EditionReviewDiagnosticCode.COMPOSITION_MISSING
+    ]
 
 
 def test_loss_counters_are_editorial_signals_only() -> None:

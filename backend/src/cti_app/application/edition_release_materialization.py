@@ -84,7 +84,7 @@ class EditionReleaseRematerializationService:
                 manifest = (
                     await uow.publication_manifests.get(manifest_id)
                     if manifest_id is not None
-                    else await uow.publication_manifests.get_latest_for_edition(edition_id)
+                    else await uow.publication_manifests.get_latest_manifest_for_edition(edition_id)
                 )
                 if manifest is None or manifest.edition_id != edition_id:
                     raise EditionReleaseMaterializationError("manifest_not_found")

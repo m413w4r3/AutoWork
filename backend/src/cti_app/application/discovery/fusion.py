@@ -77,6 +77,12 @@ class FusionEditionArchivedError(ValueError):
 class FusionSelectedSubjectConflictError(ValueError):
     code = "fusion_selected_subject_conflict"
 
+    def __init__(self, subject_ids: Sequence[UUID]) -> None:
+        self.subject_ids = tuple(sorted(set(subject_ids), key=str))
+        super().__init__(
+            "Fusion would assign distinct editorial subjects to one Discovery identity"
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class FusionPublication:
@@ -552,10 +558,14 @@ class FusionService:
         for origin in origins:
             canonical_id = canonical(origin.discovery_subject_id)
             origins_by_canonical.setdefault(canonical_id, set()).add(origin.subject_id)
-        if any(len(subject_ids) > 1 for subject_ids in origins_by_canonical.values()):
-            raise FusionSelectedSubjectConflictError(
-                "A fusion operation cannot merge discovery subjects selected into distinct Subjects"
-            )
+        conflicting_subject_ids = {
+            subject_id
+            for subject_ids in origins_by_canonical.values()
+            if len(subject_ids) > 1
+            for subject_id in subject_ids
+        }
+        if conflicting_subject_ids:
+            raise FusionSelectedSubjectConflictError(tuple(conflicting_subject_ids))
 
     @staticmethod
     def _validate_decisions(

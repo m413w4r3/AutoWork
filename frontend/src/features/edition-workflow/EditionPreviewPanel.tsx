@@ -1,20 +1,63 @@
-import { useQuery } from "@tanstack/react-query";
-import { useRef } from "react";
+import { useMutation, useQuery } from "@tanstack/react-query";
+import { useEffect, useRef, useState } from "react";
 
-import { editionPreviewPdfUrl, getEditionPreview } from "../../api/publication";
+import {
+  editionPreviewPdfUrl,
+  fetchEditionPreviewPdf,
+  getEditionCompositionPreview,
+  getEditionPreview,
+  pdfInspectionUrl,
+  renderInputInspectionUrl,
+} from "../../api/publication";
 import { PublicationDocumentView } from "../../components/ProductionArtifactView";
 
-export function EditionPreviewPanel({ editionId }: { editionId: string }) {
+export function EditionPreviewPanel({
+  editionId,
+  compositionPreview = false,
+}: {
+  editionId: string;
+  compositionPreview?: boolean;
+}) {
   const previousHash = useRef<string | null>(null);
+  const [inspectionLinks, setInspectionLinks] = useState<{
+    pdfUrl: string;
+    inspectionId: string | null;
+    pdfSha256: string | null;
+  } | null>(null);
   const preview = useQuery({
-    queryKey: ["edition-preview", editionId],
+    queryKey: [
+      compositionPreview ? "edition-composition-preview" : "edition-preview",
+      editionId,
+    ],
     queryFn: async () => {
-      const result = await getEditionPreview(editionId, previousHash.current);
+      const result = compositionPreview
+        ? await getEditionCompositionPreview(editionId, previousHash.current)
+        : await getEditionPreview(editionId, previousHash.current);
       previousHash.current = result.preview_input_hash;
       return result;
     },
     retry: false,
   });
+  const inspectPdf = useMutation({
+    mutationFn: (previewInputHash: string) =>
+      fetchEditionPreviewPdf(editionId, previewInputHash),
+    retry: false,
+    onSuccess: (result) => {
+      if (inspectionLinks) URL.revokeObjectURL(inspectionLinks.pdfUrl);
+      setInspectionLinks({
+        pdfUrl: URL.createObjectURL(result.content),
+        inspectionId: result.inspectionId,
+        pdfSha256: result.pdfSha256,
+      });
+    },
+  });
+
+  useEffect(
+    () => () => {
+      if (inspectionLinks) URL.revokeObjectURL(inspectionLinks.pdfUrl);
+    },
+    [inspectionLinks],
+  );
 
   if (preview.isPending)
     return <p role="status">Chargement de la prévisualisation…</p>;
@@ -51,6 +94,18 @@ export function EditionPreviewPanel({ editionId }: { editionId: string }) {
           Cette prévisualisation est obsolète : l’édition ou un article a
           changé. Actualisez-la avant téléchargement.
         </p>
+      ) : null}
+      {current.partial ? (
+        <aside className="composition-console__warning" role="status">
+          Aperçu partiel : des sujets manquent ou sont reportés. Cet aperçu ne
+          vaut pas acceptation finale.
+          {current.missing_subject_ids.length > 0 ? (
+            <p>Sujets manquants : {current.missing_subject_ids.join(", ")}</p>
+          ) : null}
+          {current.deferred_subject_ids.length > 0 ? (
+            <p>Sujets reportés : {current.deferred_subject_ids.join(", ")}</p>
+          ) : null}
+        </aside>
       ) : null}
       <div className="edition-preview__document">
         <section aria-label="Métadonnées du bulletin">
@@ -101,6 +156,51 @@ export function EditionPreviewPanel({ editionId }: { editionId: string }) {
           </a>
         )}
       </p>
+      {!current.stale ? (
+        <div className="edition-preview__inspection-actions">
+          <button
+            type="button"
+            className="button button--secondary"
+            disabled={inspectPdf.isPending}
+            onClick={() => inspectPdf.mutate(current.preview_input_hash)}
+          >
+            {inspectPdf.isPending
+              ? "Chargement du PDF…"
+              : "Préparer l’inspection Typst et PDF"}
+          </button>
+          {inspectPdf.error ? (
+            <p role="alert" className="error-message">
+              Le PDF de prévisualisation n’a pas pu être chargé :{" "}
+              {String(inspectPdf.error)}
+            </p>
+          ) : null}
+          {inspectionLinks ? (
+            <nav aria-label="Inspections du PDF de prévisualisation">
+              <a
+                href={inspectionLinks.pdfUrl}
+                download={`edition-${editionId}-preview.pdf`}
+              >
+                Télécharger le PDF chargé
+              </a>
+              {inspectionLinks.inspectionId ? (
+                <a
+                  href={renderInputInspectionUrl(
+                    inspectionLinks.inspectionId,
+                    true,
+                  )}
+                >
+                  Inspecter les entrées Typst
+                </a>
+              ) : null}
+              {inspectionLinks.pdfSha256 ? (
+                <a href={pdfInspectionUrl(inspectionLinks.pdfSha256)}>
+                  Inspecter le PDF
+                </a>
+              ) : null}
+            </nav>
+          ) : null}
+        </div>
+      ) : null}
       <p className="edition-preview__provenance">
         Hash d’entrée : <code>{current.preview_input_hash.slice(0, 12)}…</code>{" "}
         · {current.artifacts.length} article

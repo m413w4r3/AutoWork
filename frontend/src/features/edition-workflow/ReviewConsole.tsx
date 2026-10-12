@@ -1,12 +1,10 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import { useCallback, useState } from "react";
 
 import {
-  acceptEditionPublication,
   getEditionReview,
   type EditionRepairSummary,
 } from "../../api/publication";
-import { ApiError } from "../../api/editions";
 import { RepairDesk } from "./RepairDesk";
 import { EditionPreviewPanel } from "./EditionPreviewPanel";
 import { reviewPollingInterval } from "./reviewPolling";
@@ -28,7 +26,6 @@ export function ReviewConsole({
   editionId: string;
   readOnly?: boolean;
 }) {
-  const queryClient = useQueryClient();
   const [repairSummary, setRepairSummary] = useState(EMPTY_REPAIR_SUMMARY);
   const [repairSummaryLoaded, setRepairSummaryLoaded] = useState(readOnly);
   const [tab, setTab] = useState<"review" | "preview">("review");
@@ -44,28 +41,6 @@ export function ReviewConsole({
     queryFn: () => getEditionReview(editionId),
     refetchInterval: (query) => reviewPollingInterval(query.state.data),
   });
-  const accept = useMutation({
-    mutationFn: () => acceptEditionPublication(editionId),
-    retry: false,
-    onSuccess: () => {
-      void queryClient.invalidateQueries({
-        queryKey: ["edition-release", editionId],
-      });
-      void queryClient.invalidateQueries({ queryKey: ["edition", editionId] });
-      void queryClient.invalidateQueries({ queryKey: ["editions"] });
-    },
-    onError: (error) => {
-      if (
-        error instanceof ApiError &&
-        error.code === "review_cannot_be_accepted"
-      ) {
-        void queryClient.invalidateQueries({
-          queryKey: ["edition-review", editionId],
-        });
-      }
-    },
-  });
-
   if (review.isPending) return <p role="status">Chargement de la revue…</p>;
   if (review.isError) {
     return (
@@ -102,12 +77,6 @@ export function ReviewConsole({
     repairSummaryParts.length > 0
       ? `${repairSummaryParts.join(", ")} restent à arbitrer.`
       : `${unresolvedRepairCount} élément${unresolvedRepairCount > 1 ? "s" : ""} reste${unresolvedRepairCount > 1 ? "nt" : ""} à arbitrer.`;
-  const canAccept =
-    (readOnly || repairSummaryLoaded) &&
-    currentReview.can_accept &&
-    unresolvedRepairCount === 0 &&
-    pendingRebuildCount === 0;
-
   return (
     <section
       className="review-console"
@@ -154,7 +123,7 @@ export function ReviewConsole({
           >
             <div>
               <h3 id="accept-heading">
-                {readOnly ? "État final de la revue" : "Accepter la production"}
+                {readOnly ? "État de la revue" : "Validation éditoriale"}
               </h3>
               <p>
                 {readOnly
@@ -164,31 +133,16 @@ export function ReviewConsole({
                     : unresolvedRepairCount > 0
                       ? `La revue technique n’est pas terminée : ${unresolvedMessage}`
                       : pendingRebuildCount > 0
-                        ? `${pendingRebuildCount} article${pendingRebuildCount > 1 ? "s" : ""} ${pendingRebuildCount > 1 ? "doivent" : "doit"} être reconstruit${pendingRebuildCount > 1 ? "s" : ""} avant finalisation.`
-                        : canAccept
-                          ? "L’assemblage final sera lancé après acceptation et suivi depuis Publication."
-                          : "Résolvez ou excluez les articles bloquants."}
+                        ? `${pendingRebuildCount} article${pendingRebuildCount > 1 ? "s" : ""} ${pendingRebuildCount > 1 ? "doivent" : "doit"} être reconstruit${pendingRebuildCount > 1 ? "s" : ""} avant l’acceptation.`
+                        : currentReview.can_accept
+                          ? "La validation technique est prête. L’acceptation finale se fait depuis Composition avec confirmation de version."
+                          : "Résolvez les diagnostics bloquants avant l’acceptation."}
               </p>
             </div>
-            {!readOnly && accept.error ? (
-              <p className="error-message" role="alert">
-                {accept.error instanceof ApiError &&
-                accept.error.code === "review_cannot_be_accepted"
-                  ? "La revue ne peut plus être acceptée. Rechargez la revue."
-                  : accept.error instanceof Error
-                    ? accept.error.message
-                    : "La publication n’a pas pu être acceptée."}
-              </p>
-            ) : null}
             {!readOnly ? (
-              <button
-                className="button"
-                type="button"
-                disabled={!canAccept || accept.isPending}
-                onClick={() => accept.mutate()}
-              >
-                {accept.isPending ? "Acceptation…" : "Accepter la production"}
-              </button>
+              <a className="button" href={`/editions/${editionId}/composition`}>
+                Ouvrir la composition
+              </a>
             ) : null}
           </section>
         </>

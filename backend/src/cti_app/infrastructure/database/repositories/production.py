@@ -505,6 +505,14 @@ class SqlAlchemyProductionArtifactRepository:
         row = await self._session.get(ProductionArtifactRow, artifact_id)
         return _production_artifact_from_row(row) if row else None
 
+    async def get_for_update(self, artifact_id: UUID) -> ProductionArtifact | None:
+        row = await self._session.scalar(
+            select(ProductionArtifactRow)
+            .where(ProductionArtifactRow.id == artifact_id)
+            .with_for_update()
+        )
+        return _production_artifact_from_row(row) if row else None
+
     async def get_current(self, run_id: UUID, stage: str) -> ProductionArtifact | None:
         query = (
             select(ProductionArtifactRow)

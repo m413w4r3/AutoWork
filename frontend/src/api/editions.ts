@@ -37,6 +37,74 @@ export interface EditionPage {
   page_size: number;
 }
 
+export type CompositionDisposition = "included" | "deferred" | "excluded";
+
+export type CompositionPreparationStatus = "unassessed" | "ready" | "blocked";
+
+export interface EditionCompositionEntry {
+  id: string;
+  subject_id: string;
+  disposition: CompositionDisposition;
+  position: number | null;
+  production_run_id: string | null;
+  pipeline_generation: number | null;
+  artifact_id: string | null;
+  artifact_version: number | null;
+  artifact_input_hash: string | null;
+  provenance_batch_id: string | null;
+  review_decision_id: string | null;
+  document_sha256: string | null;
+  preparation_status: CompositionPreparationStatus;
+}
+
+export interface EditionComposition {
+  id: string;
+  edition_id: string;
+  version: number;
+  actor_id: string;
+  preparation_status: CompositionPreparationStatus;
+  created_at: string;
+  updated_at: string;
+  entries: EditionCompositionEntry[];
+}
+
+export interface CompositionReason {
+  code: string;
+  message: string;
+  subject_id: string | null;
+  details: Record<string, unknown> | null;
+}
+
+export interface EditionCompositionRead {
+  edition_id: string;
+  composition: EditionComposition | null;
+  reasons: CompositionReason[];
+  axes: {
+    production_validity: boolean | null;
+    discovery_update_available: boolean | null;
+    composition_eligibility: boolean;
+  };
+}
+
+export interface EditionCompositionEntryInput {
+  subject_id: string;
+  disposition: CompositionDisposition;
+  position: number | null;
+  production_run_id?: string | null;
+  pipeline_generation?: number | null;
+  artifact_id?: string | null;
+  artifact_version?: number | null;
+  artifact_input_hash?: string | null;
+  provenance_batch_id?: string | null;
+  review_decision_id?: string | null;
+  document_sha256?: string | null;
+}
+
+export interface EditionCompositionPut {
+  expected_version: number;
+  entries: EditionCompositionEntryInput[];
+}
+
 export class ApiError extends Error {
   constructor(
     message: string,
@@ -68,6 +136,27 @@ export function listSubjects(editionId: string): Promise<Subject[]> {
   return request<Subject[]>(
     `/api/editions/${encodeURIComponent(editionId)}/subjects`,
   );
+}
+
+export function getEditionComposition(
+  editionId: string,
+): Promise<EditionCompositionRead> {
+  return request(`/api/editions/${encodeURIComponent(editionId)}/composition`);
+}
+
+export function putEditionComposition(
+  editionId: string,
+  payload: EditionCompositionPut,
+  idempotencyKey: string,
+): Promise<EditionComposition> {
+  return request(`/api/editions/${encodeURIComponent(editionId)}/composition`, {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+      "Idempotency-Key": idempotencyKey,
+    },
+    body: JSON.stringify(payload),
+  });
 }
 
 export function getSubject(subjectId: string): Promise<Subject> {
@@ -111,14 +200,21 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
     return (await response.json()) as T;
   }
   const body = (await response.json().catch(() => null)) as {
-    detail?: { code?: string; message?: string } | string;
+    detail?: Record<string, unknown> | string;
   } | null;
   const detail = body?.detail;
   const message =
-    typeof detail === "object" && detail?.message
+    typeof detail === "object" && typeof detail.message === "string"
       ? detail.message
       : "L’opération n’a pas pu être effectuée.";
   const code =
-    typeof detail === "object" && detail?.code ? detail.code : "api_error";
-  throw new ApiError(message, code, response.status);
+    typeof detail === "object" && typeof detail.code === "string"
+      ? detail.code
+      : "api_error";
+  throw new ApiError(
+    message,
+    code,
+    response.status,
+    typeof detail === "object" ? detail : null,
+  );
 }

@@ -64,8 +64,9 @@ async def build_edition_document(
 ) -> EditionDocumentV2:
     """Read verified publication artifacts and build the one canonical model.
 
-    Preview passes ``require_current=True``. Final assembly passes ``False``
-    because its manifest already pins the immutable artifact identities.
+    Both preview and final assembly pass ``False`` because their composition
+    or manifest already pins the intended artifact identities. A preview can
+    be partial; a final manifest cannot be frozen until review is complete.
     Both paths use this same constructor and ordering contract.
     """
     publications: list[EditionPublicationV2] = []

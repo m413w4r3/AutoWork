@@ -250,7 +250,11 @@ def _raise_fusion_error(exc: Exception) -> NoReturn:
     if isinstance(exc, FusionSelectedSubjectConflictError):
         raise HTTPException(
             status_code=409,
-            detail={"code": exc.code, "message": str(exc)},
+            detail={
+                "code": exc.code,
+                "message": str(exc),
+                "subject_ids": [str(subject_id) for subject_id in exc.subject_ids],
+            },
         ) from exc
     if isinstance(exc, LookupError):
         raise HTTPException(

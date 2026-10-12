@@ -96,8 +96,8 @@ describe("Repair Desk — source waivée puis archivée", () => {
     ).toBeInTheDocument();
     // The rebuild debt is what refuses the sign-off.
     expect(
-      screen.getByRole("button", { name: "Accepter la production" }),
-    ).toBeDisabled();
+      screen.getByRole("link", { name: "Ouvrir la composition" }),
+    ).toHaveAttribute("href", `/editions/${EDITION_ID}/composition`);
 
     // F5: everything React held in memory is gone.
     cleanup();
@@ -107,7 +107,7 @@ describe("Repair Desk — source waivée puis archivée", () => {
       await screen.findByRole("button", { name: "Réintégrer la source" }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Accepter la production" }),
-    ).toBeDisabled();
+      screen.getByRole("link", { name: "Ouvrir la composition" }),
+    ).toHaveAttribute("href", `/editions/${EDITION_ID}/composition`);
   });
 });

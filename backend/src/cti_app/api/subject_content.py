@@ -233,7 +233,9 @@ async def _publication_preview(
                 detail={"code": "publication_artifact_not_found"},
             )
 
-        manifest = await uow.publication_manifests.get_latest_for_edition(current.run.edition_id)
+        manifest = await uow.publication_manifests.get_latest_manifest_for_edition(
+            current.run.edition_id
+        )
         release = (
             await uow.edition_releases.get_by_manifest(manifest.id)
             if manifest is not None

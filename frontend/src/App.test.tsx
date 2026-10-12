@@ -881,6 +881,7 @@ describe("routage d’une Edition", () => {
       ["Fusion", "/fusion"],
       ["Sélection", "/selection"],
       ["Productions", "/production"],
+      ["Composition", "/composition"],
       ["Revue", "/review"],
       ["Publication", "/publication"],
     ] as const) {

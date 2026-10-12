@@ -25,6 +25,7 @@ from cti_app.application.production_enrichment_revision import (
 from cti_app.application.production_stages import EditorialEnrichmentService
 from cti_app.application.publication_rendering import PublicationRenderService
 from cti_app.application.typst_compilation import TypstCompileRequest
+from cti_app.application.typst_input_inspection import RenderInputInspectionService
 from cti_app.application.typst_paths import typst_bundle_paths
 from cti_app.application.typst_rendering import TypstRenderer
 from cti_app.domain.pdf_inspection import PdfInspectionProfile
@@ -175,6 +176,11 @@ async def test_postgres_localized_diagram_correction_and_rerender_loop(
     assert len(canonical_enrichment_before.diagrams) == 1
     assert len(canonical_enrichment_before.tables) == 1
     diagram_key = canonical_enrichment_before.diagrams[0].key
+    canonical_document_before = await scenario.artifact_store.read_json(
+        publication_before.canonical_blob_id  # type: ignore[arg-type]
+    )
+    assert canonical_document_before["subject_id"] == str(run.subject_id)
+    assert diagram_key in json.dumps(canonical_document_before)
     table_before = next(
         item
         for item in enrichment_payload_before["tables"]
@@ -204,15 +210,42 @@ async def test_postgres_localized_diagram_correction_and_rerender_loop(
         assert initial_render.output_sha256 is not None
         assert compiler.compile_calls == 1
         assert compiler.query_calls == 1
+        inspection_repository = SqlAlchemyPdfInspectionSourceRepository(
+            create_session_factory(engine)
+        )
         inspection = PdfInspectionService(
-            SqlAlchemyPdfInspectionSourceRepository(create_session_factory(engine)),
+            inspection_repository,
             scenario.artifact_store,
             PopplerSubprocess(temp_root=tmp_path / "poppler"),
+            cache,
+        )
+        input_inspection = RenderInputInspectionService(
+            inspection_repository,
+            scenario.artifact_store,
+            inspection,
             cache,
         )
         before_inspection = await inspection.metadata(initial_render.output_sha256)
         initial_render_ids = await _publication_render_ids(scenario)
         assert len(initial_render_ids) == 1
+        initial_render_id = str(next(iter(initial_render_ids)))
+        inspected_inputs = await input_inspection.metadata(initial_render_id)
+        source_inventory = await input_inspection.files(initial_render_id)
+        entrypoint = next(
+            item for item in source_inventory["files"] if item["path"].endswith("publication.typ")
+        )
+        inspected_entrypoint = await input_inspection.file(initial_render_id, entrypoint["file_id"])
+        inspected_render_data = await input_inspection.render_data(initial_render_id)
+        inspected_input_diagnostics = await input_inspection.diagnostics(initial_render_id)
+        assert inspected_inputs["source"]["availability"] == "ready"
+        assert source_inventory["availability"] == "ready"
+        assert inspected_entrypoint["path"] == entrypoint["path"]
+        assert inspected_entrypoint["sha256"] == entrypoint["sha256"]
+        assert isinstance(inspected_entrypoint["content"], str)
+        assert inspected_render_data["availability"] == "ready"
+        assert diagram_key in json.dumps(inspected_render_data["json"])
+        assert inspected_input_diagnostics["render_id"] == initial_render_id
+        assert inspected_input_diagnostics["pdf"]["sha256"] == initial_render.output_sha256
         assert len(scenario.model.provider_calls) == pipeline_model_calls
         assert await _model_run_ids(scenario) == pipeline_model_run_ids
         old_hash = before_inspection["pdf"]["sha256"]
@@ -362,6 +395,19 @@ async def test_postgres_localized_diagram_correction_and_rerender_loop(
         assert await _model_run_ids(scenario) == model_runs_before_apply
         assert new_render.output_sha256 is not None
         assert new_render.output_sha256 != old_hash
+        render_ids_after = await _publication_render_ids(scenario)
+        new_render_id = str(next(iter(render_ids_after - initial_render_ids)))
+        inspected_after_render_data = await input_inspection.render_data(new_render_id)
+        assert inspected_after_render_data["availability"] == "ready"
+        assert diagram_key not in json.dumps(inspected_after_render_data["json"])
+        assert canonical_enrichment_before.tables[0].key in json.dumps(
+            inspected_after_render_data["json"]
+        )
+        canonical_document_after = await scenario.artifact_store.read_json(
+            publication_after.canonical_blob_id  # type: ignore[arg-type]
+        )
+        assert diagram_key not in json.dumps(canonical_document_after)
+        assert canonical_enrichment_before.tables[0].key in json.dumps(canonical_document_after)
         after_inspection = await inspection.metadata(new_render.output_sha256)
         assert after_inspection["pdf"]["sha256"] == new_render.output_sha256
         assert after_inspection["pdf"]["page_count"] >= 1

@@ -897,11 +897,11 @@ describe("Repair Desk", () => {
       screen.getByRole("button", { name: "Régénérer la synthèse" }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Accepter la production" }),
-    ).toBeDisabled();
+      screen.getByRole("link", { name: "Ouvrir la composition" }),
+    ).toHaveAttribute("href", `/editions/${EDITION_ID}/composition`);
     expect(
       screen.getByText(
-        "2 articles doivent être reconstruits avant finalisation.",
+        "2 articles doivent être reconstruits avant l’acceptation.",
       ),
     ).toBeInTheDocument();
     await user.click(
@@ -940,16 +940,15 @@ describe("Repair Desk", () => {
     );
   });
 
-  it("explique pourquoi l’acceptation reste désactivée", async () => {
+  it("oriente vers Composition quand la validation technique reste bloquée", async () => {
     const unresolved = repairItem();
     renderReview(page([unresolved], { unresolved_total: 1 }));
-    const acceptButton = await screen.findByRole("button", {
-      name: "Accepter la production",
-    });
-    await waitFor(() => expect(acceptButton).toBeDisabled());
     expect(
-      screen.getByText(/La revue technique n’est pas terminée/),
-    ).toBeInTheDocument();
+      await screen.findByRole("link", { name: "Ouvrir la composition" }),
+    ).toHaveAttribute("href", `/editions/${EDITION_ID}/composition`);
+    expect(
+      screen.queryByRole("button", { name: "Accepter la production" }),
+    ).not.toBeInTheDocument();
   });
 
   it("affiche la valeur historique récupérée et autorise l’inclusion", async () => {

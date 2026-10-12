@@ -41,6 +41,8 @@ function editionPreview(stale = false): EditionPreviewResponse {
   return {
     edition_id: EDITION_ID,
     edition_version: 4,
+    composition_id: "composition-1",
+    composition_version: 2,
     preview_input_hash: HASH,
     artifacts: [
       {
@@ -86,6 +88,9 @@ function editionPreview(stale = false): EditionPreviewResponse {
         },
       ],
     },
+    partial: false,
+    missing_subject_ids: [],
+    deferred_subject_ids: [],
     stale,
   };
 }
@@ -749,11 +754,13 @@ describe("ReviewConsole", () => {
       screen.getByRole("button", { name: /Sources à fournir/ }),
     ).toHaveTextContent("0");
     expect(
-      screen.getByText("Résolvez ou excluez les articles bloquants."),
+      screen.getByText(
+        "Résolvez les diagnostics bloquants avant l’acceptation.",
+      ),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Accepter la production" }),
-    ).toBeDisabled();
+      screen.getByRole("link", { name: "Ouvrir la composition" }),
+    ).toHaveAttribute("href", `/editions/${EDITION_ID}/composition`);
   });
 
   it("signale les pertes par des filtres locaux dans le Repair Desk", async () => {
@@ -819,64 +826,20 @@ describe("ReviewConsole", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("active Accept sans body métier et invalide la publication et l’édition", async () => {
-    const { client, fetchMock } = renderReview(makeReview());
-    const invalidate = vi.spyOn(client, "invalidateQueries");
-    const user = userEvent.setup();
-
-    const acceptButton = await screen.findByRole("button", {
-      name: "Accepter la production",
-    });
-    await waitFor(() => expect(acceptButton).toBeEnabled());
+  it("laisse la confirmation finale à la Composition versionnée", async () => {
+    const { fetchMock } = renderReview(makeReview());
     expect(
-      screen.getByText(
-        "L’assemblage final sera lancé après acceptation et suivi depuis Publication.",
-      ),
+      await screen.findByText("Validation éditoriale"),
     ).toBeInTheDocument();
-    expect(screen.queryByText(/étape de publication/)).not.toBeInTheDocument();
-    await user.click(acceptButton);
-
-    await waitFor(() =>
-      expect(
-        fetchMock.mock.calls.some(([, init]) => init?.method === "POST"),
-      ).toBe(true),
-    );
-    const [url, init] = postCall(fetchMock);
-    expect(url).toBe("/api/editions/edition-1/publication/accept");
-    expect(init.body).toBeUndefined();
-    expect(invalidate).toHaveBeenCalledWith({
-      queryKey: ["edition-release", EDITION_ID],
-    });
-    expect(invalidate).toHaveBeenCalledWith({
-      queryKey: ["edition", EDITION_ID],
-    });
-    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["editions"] });
-  });
-
-  it("recharge la revue quand le backend refuse l’acceptation", async () => {
-    const { client } = renderReview(makeReview(), () =>
-      Response.json(
-        { detail: { code: "review_cannot_be_accepted" } },
-        { status: 409 },
-      ),
-    );
-    const invalidate = vi.spyOn(client, "invalidateQueries");
-    const user = userEvent.setup();
-
-    const acceptButton = await screen.findByRole("button", {
-      name: "Accepter la production",
-    });
-    await waitFor(() => expect(acceptButton).toBeEnabled());
-    await user.click(acceptButton);
-
     expect(
-      await screen.findByText(
-        "La revue ne peut plus être acceptée. Rechargez la revue.",
-      ),
-    ).toBeInTheDocument();
-    expect(invalidate).toHaveBeenCalledWith({
-      queryKey: ["edition-review", EDITION_ID],
-    });
+      await screen.findByRole("link", { name: "Ouvrir la composition" }),
+    ).toHaveAttribute("href", `/editions/${EDITION_ID}/composition`);
+    expect(
+      screen.queryByRole("button", { name: "Accepter la production" }),
+    ).not.toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.some(([, init]) => init?.method === "POST"),
+    ).toBe(false);
   });
 
   it("ne demande aucun artifact lourd depuis la revue", async () => {

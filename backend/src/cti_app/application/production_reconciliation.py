@@ -18,11 +18,12 @@ from cti_app.application.production_jobs import (
     production_reconciliation_resume_job_kind,
 )
 from cti_app.application.production_review_recovery import (
+    ACTIVE_BATCH,
     ACTIVE_SIBLING,
+    ACTIVE_SUBJECT_RUN,
     BATCH_CANCELLED,
     BATCH_MISSING,
     BATCH_PAUSED,
-    BATCH_SUPERSEDED,
     ReviewRecoveryConflictError,
     prepare_batch_for_recovery,
 )
@@ -51,9 +52,13 @@ _RECOVERY_CONFLICTS = {
         "production_batch_paused",
         "Le lot de production est en pause. Reprenez-le avant cette action.",
     ),
-    BATCH_SUPERSEDED: (
-        "production_reconciliation_batch_superseded",
-        "Un lot de production plus récent est actif ; cette reprise est obsolète.",
+    ACTIVE_BATCH: (
+        "production_reconciliation_batch_active",
+        "Un autre lot de cette édition est actif ; terminez-le avant cette reprise.",
+    ),
+    ACTIVE_SUBJECT_RUN: (
+        "production_subject_active",
+        "Un autre run actif existe pour ce sujet.",
     ),
     ACTIVE_SIBLING: (
         "production_reconciliation_active_sibling",

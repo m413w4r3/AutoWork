@@ -111,7 +111,9 @@ class _Manifests:
     def __init__(self, manifest: PublicationManifestV1 | None) -> None:
         self.manifest = manifest
 
-    async def get_latest_for_edition(self, edition_id: UUID) -> PublicationManifestV1 | None:
+    async def get_latest_manifest_for_edition(
+        self, edition_id: UUID
+    ) -> PublicationManifestV1 | None:
         if self.manifest is None or self.manifest.edition_id != edition_id:
             return None
         return self.manifest

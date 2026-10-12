@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import os
@@ -613,7 +614,18 @@ async def test_publication_render_service_happy_path_persists_content_and_hashes
     assert render.output_blob_id is not None
     assert render.output_sha256 == hashlib.sha256(compiler.content).hexdigest()
     assert render.output_byte_size == len(compiler.content)
-    assert store.blobs[render.source_blob_id] == b'#let publication = json("render-data.json")\n'
+    source_snapshot = json.loads(store.blobs[render.source_blob_id])
+    assert source_snapshot["schema_version"] == "typst-render-input-snapshot-v1"
+    template_files = {item["relative_path"]: item for item in source_snapshot["files"]}
+    assert set(template_files) == {"RENDERER/publication.typ", "UTILS/helpers.typ"}
+    publication_entrypoint = template_files["RENDERER/publication.typ"]
+    assert base64.b64decode(publication_entrypoint["content_base64"]) == (
+        b'#let publication = json("render-data.json")\n'
+    )
+    assert (
+        publication_entrypoint["sha256"]
+        == hashlib.sha256(b'#let publication = json("render-data.json")\n').hexdigest()
+    )
     assert set(compiler.workspace_snapshots[0]) == {
         "RENDERER/publication.typ",
         "RENDERER/render-data.json",

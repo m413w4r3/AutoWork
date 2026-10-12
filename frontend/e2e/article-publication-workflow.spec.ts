@@ -5,6 +5,7 @@ import {
   selectionWireItem,
   selectionWireLastDecision,
 } from "./support/selectionWire";
+import { createCompositionApi } from "./support/compositionApi";
 import type { PublicationDocumentV4 } from "../src/api/production";
 
 test("Sujet : sélection, production, revue et publication PDF", async ({
@@ -131,6 +132,19 @@ test("Sujet : sélection, production, revue et publication PDF", async ({
   let productionSurfaceVisited = false;
   let productionPostBody: unknown = null;
   const seenPaths: string[] = [];
+  const compositionApi = createCompositionApi(editionId, [
+    {
+      subject_id: subjectId,
+      title: "Campagne Iranian Proxy",
+      production_run_id: runId,
+      pipeline_generation: 1,
+      artifact_id: artifactId,
+      artifact_version: 1,
+      artifact_input_hash: hash,
+      provenance_batch_id: batchId,
+      document_sha256: hash,
+    },
+  ]);
 
   const edition = () => ({
     id: editionId,
@@ -343,20 +357,57 @@ test("Sujet : sélection, production, revue et publication PDF", async ({
       await route.fulfill({ json: review });
       return;
     }
-    if (path === `/api/editions/${editionId}/publication/accept`) {
+    if (path === `/api/editions/${editionId}/subjects`) {
+      await route.fulfill({
+        json: [
+          {
+            id: subjectId,
+            edition_id: editionId,
+            title: "Campagne Iranian Proxy",
+            slug: "campagne-iranian-proxy",
+            tlp: "AMBER",
+            version: 1,
+            created_at: "2026-08-29T00:00:00Z",
+            updated_at: "2026-08-29T00:00:00Z",
+          },
+        ],
+      });
+      return;
+    }
+    if (path === `/api/editions/${editionId}/composition/validation`) {
+      await route.fulfill({ json: compositionApi.validation() });
+      return;
+    }
+    if (path === `/api/editions/${editionId}/composition`) {
+      if (request.method() === "PUT") {
+        expect(request.headers()["idempotency-key"]).toBeTruthy();
+        const body = request.postDataJSON() as {
+          expected_version: number;
+          entries: Array<Record<string, unknown>>;
+        };
+        await route.fulfill({
+          json: compositionApi.put(body.expected_version, body.entries),
+        });
+      } else {
+        await route.fulfill({ json: compositionApi.read() });
+      }
+      return;
+    }
+    if (
+      path === `/api/editions/${editionId}/composition/accept` &&
+      request.method() === "POST"
+    ) {
+      const body = request.postDataJSON() as {
+        expected_composition_version: number;
+      };
       publicationAccepted = true;
       await route.fulfill({
         status: 202,
-        json: {
-          edition_id: editionId,
-          edition_state: "open",
-          manifest_id: manifestId,
-          manifest_sha256: hash,
-          edition_version: 4,
-          batch_id: batchId,
-          job_id: "assembly-job-1",
-          job_dispatched: true,
-        },
+        json: compositionApi.accept(
+          body.expected_composition_version,
+          manifestId,
+          hash,
+        ),
       });
       return;
     }
@@ -393,6 +444,28 @@ test("Sujet : sélection, production, revue et publication PDF", async ({
           schema_version: "4",
           canonical_content: publicationV4,
         },
+      });
+      return;
+    }
+    if (path === `/api/subjects/${subjectId}/production/runs`) {
+      await route.fulfill({
+        json: [
+          {
+            run_id: runId,
+            edition_id: editionId,
+            subject_id: subjectId,
+            run_number: 1,
+            status: "ready",
+            current_stage: "assembly",
+            pipeline_generation: 1,
+            research_date: "2026-08-29",
+            created_at: "2026-08-29T00:01:00Z",
+            started_at: "2026-08-29T00:02:00Z",
+            finished_at: "2026-08-29T00:10:00Z",
+            error_code: null,
+            error_message: null,
+          },
+        ],
       });
       return;
     }
@@ -603,8 +676,11 @@ test("Sujet : sélection, production, revue et publication PDF", async ({
       await route.fulfill({
         json: {
           artifact_id: artifactId,
+          production_run_id: runId,
           stage: "publication",
           version: 1,
+          input_hash: hash,
+          canonical_sha256: hash,
           status: "verified",
           metadata: {},
           canonical_content: publicationV4,
@@ -661,7 +737,7 @@ test("Sujet : sélection, production, revue et publication PDF", async ({
   await expect(
     page.getByRole("heading", { name: "Revue de publication" }),
   ).toBeVisible();
-  await page.getByRole("link", { name: "Ouvrir" }).click();
+  await page.getByRole("link", { name: "Ouvrir", exact: true }).click();
   await expect(
     page.getByRole("heading", { name: "Campagne Iranian Proxy", exact: true }),
   ).toBeVisible();
@@ -815,13 +891,18 @@ test("Sujet : sélection, production, revue et publication PDF", async ({
 
   // 5. Assembly stays reachable and operational after the canonical view.
   await page.goto(`/editions/${editionId}/review`);
+  await page.getByRole("link", { name: "Composition", exact: true }).click();
+  await expect(page).toHaveURL(`/editions/${editionId}/composition`);
   await expect(
-    page.getByRole("heading", { name: "Revue de publication" }),
+    page.getByRole("heading", { name: "Sujets et ordre de publication" }),
   ).toBeVisible();
-  await expect(
-    page.getByRole("button", { name: "Accepter la production" }),
-  ).toBeEnabled();
-  await page.getByRole("button", { name: "Accepter la production" }).click();
+  const compositionCard = page.locator(".composition-console__subject").filter({
+    has: page.getByRole("heading", { name: "Campagne Iranian Proxy" }),
+  });
+  await compositionCard.getByRole("button", { name: "Inclure" }).click();
+  await expect(compositionCard.getByText("Inclus · position 1")).toBeVisible();
+  await page.getByRole("checkbox").check();
+  await page.getByRole("button", { name: "Accepter la composition" }).click();
   await page.getByRole("link", { name: "Publication" }).click();
   await expect(page).toHaveURL(`/editions/${editionId}/publication`);
   await expect(
@@ -838,7 +919,8 @@ test("Sujet : sélection, production, revue et publication PDF", async ({
       `POST /api/editions/${editionId}/production/batches`,
       `GET /api/editions/${editionId}/production`,
       `GET /api/editions/${editionId}/review`,
-      `POST /api/editions/${editionId}/publication/accept`,
+      `PUT /api/editions/${editionId}/composition`,
+      `POST /api/editions/${editionId}/composition/accept`,
       `GET /api/editions/${editionId}/release`,
       `GET /api/subjects/${subjectId}/content`,
       `GET /api/subjects/${subjectId}/production/artifacts/extraction`,

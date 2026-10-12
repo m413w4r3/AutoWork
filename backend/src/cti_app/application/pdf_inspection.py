@@ -51,10 +51,17 @@ class PdfRenderReference:
     template_sha256: str
     compiler_version: str
     font_bundle_version: str
-    output_blob_id: UUID
-    output_sha256: str
-    output_byte_size: int
+    output_blob_id: UUID | None
+    output_sha256: str | None
+    output_byte_size: int | None
     source: dict[str, Any]
+    renderer: str = "typst"
+    template_version: str = "unknown"
+    compiler: str = "typst"
+    source_blob_id: UUID | None = None
+    render_data_blob_id: UUID | None = None
+    error_code: str | None = None
+    error_message: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +101,8 @@ class PdfRasterizedPage:
 
 class PdfInspectionSourceReader(Protocol):
     async def find_by_output_sha256(self, pdf_sha256: str) -> tuple[PdfRenderReference, ...]: ...
+
+    async def find_by_render_id(self, render_id: UUID) -> PdfRenderReference | None: ...
 
 
 class PdfInspectionBlobReader(Protocol):
@@ -573,6 +582,12 @@ class PdfInspectionService:
         content: bytes | None = None
         for reference in references:
             if reference.status != "succeeded":
+                continue
+            if (
+                reference.output_blob_id is None
+                or reference.output_byte_size is None
+                or reference.output_sha256 is None
+            ):
                 continue
             if reference.output_byte_size > MAX_PDF_BYTES:
                 raise PdfInspectionError(PdfInspectionErrorCode.LIMIT_EXCEEDED)

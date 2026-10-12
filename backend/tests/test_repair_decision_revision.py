@@ -222,7 +222,9 @@ class _Uow:
             list_for_edition=self._runs_for_edition,
         )
         self.editions = SimpleNamespace(get=self._edition, get_for_update=self._edition)
-        self.publication_manifests = SimpleNamespace(get_latest_for_edition=self._no_manifest)
+        self.publication_manifests = SimpleNamespace(
+            get_latest_manifest_for_edition=self._no_manifest
+        )
         self.edition_review_read_model = SimpleNamespace(
             list_for_edition=self._rows,
         )

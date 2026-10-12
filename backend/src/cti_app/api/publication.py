@@ -79,6 +79,7 @@ from cti_app.application.production_repairs import (
     repair_application_diagnostic,
     repair_issue_execution_state,
 )
+from cti_app.application.typst_input_snapshot import preview_inspection_id
 from cti_app.domain.edition_render import EditionRenderDisplayStatus
 from cti_app.domain.editions import EditionStatus
 from cti_app.domain.jobs import JobStatus
@@ -177,6 +178,23 @@ class ReviewItemView(BaseModel):
     can_resume: bool = False
     requires_reconciliation: bool = False
     reconciliation: ProductionReconciliationView | None = None
+    composition_version: int | None = None
+    superseded_artifact_available: bool = False
+    pinned_generation_current: bool = True
+    latest_artifact_run_id: UUID | None = None
+    latest_artifact_id: UUID | None = None
+    latest_artifact_version: int | None = None
+
+
+class ReviewDiagnosticView(BaseModel):
+    code: str
+    subject_id: UUID | None
+    disposition: str | None
+    run_id: UUID | None
+    details: dict[str, object] | None
+    active_repair_count: int
+    unresolved_repair_count: int
+    pending_rebuild_count: int
 
 
 class EditionReviewView(BaseModel):
@@ -186,6 +204,8 @@ class EditionReviewView(BaseModel):
     unresolved_repair_count: int = 0
     repair_review_complete: bool = True
     pending_rebuild_count: int = 0
+    composition_version: int | None = None
+    diagnostics: list[ReviewDiagnosticView]
 
 
 class EditionRepairDecisionRequest(BaseModel):
@@ -340,10 +360,18 @@ class PublicationAcceptView(BaseModel):
     edition_state: str
     manifest_id: UUID
     manifest_sha256: str
+    manifest_schema_version: str
     edition_version: int
-    batch_id: UUID
+    composition_id: UUID
+    composition_version: int
     job_id: UUID | None
     job_dispatched: bool
+
+
+class PublicationAcceptRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_composition_version: int = Field(ge=1)
 
 
 class EditionReleaseView(BaseModel):
@@ -383,9 +411,14 @@ class EditionPreviewArtifactView(BaseModel):
 class EditionPreviewView(BaseModel):
     edition_id: UUID
     edition_version: int
+    composition_id: UUID
+    composition_version: int
     preview_input_hash: str
     artifacts: list[EditionPreviewArtifactView]
     document: dict[str, Any]
+    partial: bool
+    missing_subject_ids: list[UUID]
+    deferred_subject_ids: list[UUID]
     stale: bool
 
 
@@ -461,6 +494,7 @@ async def _actor_id(request: Request) -> str:
     return (await provider.current()).actor_id
 
 
+@router.get("/editions/{edition_id}/composition/validation", response_model=EditionReviewView)
 @router.get("/editions/{edition_id}/review", response_model=EditionReviewView)
 async def get_edition_review(edition_id: UUID, request: Request) -> EditionReviewView:
     try:
@@ -1426,15 +1460,25 @@ async def exclude_review_item(
 
 
 @router.post(
+    "/editions/{edition_id}/composition/accept",
+    response_model=PublicationAcceptView,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+@router.post(
     "/editions/{edition_id}/publication/accept",
     response_model=PublicationAcceptView,
     status_code=status.HTTP_202_ACCEPTED,
 )
-async def accept_edition_publication(edition_id: UUID, request: Request) -> PublicationAcceptView:
+async def accept_edition_publication(
+    edition_id: UUID,
+    payload: PublicationAcceptRequest,
+    request: Request,
+) -> PublicationAcceptView:
     try:
         result = await _publication_service(request).accept(
             edition_id,
             actor_id=await _actor_id(request),
+            expected_composition_version=payload.expected_composition_version,
             correlation_id=get_correlation_id(),
         )
         return PublicationAcceptView(
@@ -1442,8 +1486,10 @@ async def accept_edition_publication(edition_id: UUID, request: Request) -> Publ
             edition_state=result.edition_state.value,
             manifest_id=result.manifest.id,
             manifest_sha256=result.manifest.content_sha256,
+            manifest_schema_version=result.manifest.schema_version,
             edition_version=result.manifest.edition_version,
-            batch_id=result.manifest.batch_id,
+            composition_id=result.manifest.composition_id,
+            composition_version=result.manifest.composition_version,
             job_id=result.job_id,
             job_dispatched=result.job_dispatched,
         )
@@ -1476,6 +1522,7 @@ async def retry_edition_render(edition_id: UUID, request: Request) -> EditionRel
         _raise_publication_error(exc)
 
 
+@router.get("/editions/{edition_id}/composition/preview", response_model=EditionPreviewView)
 @router.get("/editions/{edition_id}/preview", response_model=EditionPreviewView)
 async def get_edition_preview(
     edition_id: UUID,
@@ -1492,6 +1539,8 @@ async def get_edition_preview(
     return EditionPreviewView(
         edition_id=preview.edition_id,
         edition_version=preview.edition_version,
+        composition_id=preview.composition_id,
+        composition_version=preview.composition_version,
         preview_input_hash=preview.preview_input_hash,
         artifacts=[
             EditionPreviewArtifactView(
@@ -1504,6 +1553,9 @@ async def get_edition_preview(
             for artifact in preview.artifacts
         ],
         document=preview.document.to_json(),
+        partial=preview.partial,
+        missing_subject_ids=list(preview.missing_subject_ids),
+        deferred_subject_ids=list(preview.deferred_subject_ids),
         stale=preview.stale,
     )
 
@@ -1605,6 +1657,7 @@ async def download_edition_preview_pdf(
     except Exception as exc:
         _raise_publication_error(exc)
     pdf_sha256 = hashlib.sha256(preview_pdf.content).hexdigest()
+    render_inspection_id = preview_inspection_id(preview_input_hash, pdf_sha256)
     inspection_service = getattr(request.app.state, "pdf_inspection_service", None)
     if inspection_service is not None:
         try:
@@ -1621,6 +1674,7 @@ async def download_edition_preview_pdf(
         headers={
             "Content-Disposition": f'attachment; filename="{preview_pdf.filename}"',
             "X-PDF-SHA256": pdf_sha256,
+            "X-Render-Inspection-ID": render_inspection_id,
         },
     )
 
@@ -1689,6 +1743,12 @@ def _review_view(review: EditionReview) -> EditionReviewView:
                     item.reconciliation,
                     pipeline_generation=item.pipeline_generation,
                 ),
+                composition_version=item.composition_version,
+                superseded_artifact_available=item.superseded_artifact_available,
+                pinned_generation_current=item.pinned_generation_current,
+                latest_artifact_run_id=item.latest_artifact_run_id,
+                latest_artifact_id=item.latest_artifact_id,
+                latest_artifact_version=item.latest_artifact_version,
             )
             for item in review.items
         ],
@@ -1696,6 +1756,20 @@ def _review_view(review: EditionReview) -> EditionReviewView:
         unresolved_repair_count=review.unresolved_repair_count,
         repair_review_complete=review.repair_review_complete,
         pending_rebuild_count=review.pending_rebuild_count,
+        composition_version=review.composition_version,
+        diagnostics=[
+            ReviewDiagnosticView(
+                code=diagnostic.code.value,
+                subject_id=diagnostic.subject_id,
+                disposition=(diagnostic.disposition.value if diagnostic.disposition else None),
+                run_id=diagnostic.run_id,
+                details=diagnostic.details,
+                active_repair_count=diagnostic.active_repair_count,
+                unresolved_repair_count=diagnostic.unresolved_repair_count,
+                pending_rebuild_count=diagnostic.pending_rebuild_count,
+            )
+            for diagnostic in review.diagnostics
+        ],
     )
 
 

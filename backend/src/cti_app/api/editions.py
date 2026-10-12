@@ -4,9 +4,16 @@ from datetime import date, datetime
 from typing import Annotated, NoReturn, TypedDict
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Query, Request, status
+from fastapi import APIRouter, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 
+from cti_app.application.edition_composition import (
+    CompositionRead,
+    CompositionReferenceError,
+    CompositionVersionConflict,
+    EditionCompositionError,
+    EditionCompositionService,
+)
 from cti_app.application.editions import (
     DuplicateEditionError,
     EditionConcurrencyError,
@@ -16,6 +23,12 @@ from cti_app.application.editions import (
 )
 from cti_app.application.identity import Identity, IdentityProvider
 from cti_app.domain.classification import TLP
+from cti_app.domain.edition_composition import (
+    CompositionDisposition,
+    CompositionPreparationStatus,
+    EditionComposition,
+    EditionCompositionEntry,
+)
 from cti_app.domain.editions import (
     Edition,
     EditionAuditEvent,
@@ -78,6 +91,91 @@ class EditionAuditView(BaseModel):
     after: dict[str, object]
     correlation_id: str
     occurred_at: datetime
+
+
+class EditionCompositionEntryPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    subject_id: UUID
+    disposition: CompositionDisposition
+    position: int | None = Field(default=None, ge=1)
+    production_run_id: UUID | None = None
+    pipeline_generation: int | None = Field(default=None, ge=0)
+    artifact_id: UUID | None = None
+    artifact_version: int | None = Field(default=None, ge=1)
+    artifact_input_hash: str | None = Field(default=None, min_length=64, max_length=128)
+    provenance_batch_id: UUID | None = None
+    review_decision_id: UUID | None = None
+    document_sha256: str | None = Field(default=None, min_length=64, max_length=64)
+
+    def to_domain(self) -> EditionCompositionEntry:
+        return EditionCompositionEntry(
+            subject_id=self.subject_id,
+            disposition=self.disposition,
+            position=self.position,
+            production_run_id=self.production_run_id,
+            pipeline_generation=self.pipeline_generation,
+            artifact_id=self.artifact_id,
+            artifact_version=self.artifact_version,
+            artifact_input_hash=self.artifact_input_hash,
+            provenance_batch_id=self.provenance_batch_id,
+            review_decision_id=self.review_decision_id,
+            document_sha256=self.document_sha256,
+        )
+
+
+class EditionCompositionPut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_version: int = Field(ge=0)
+    entries: list[EditionCompositionEntryPayload] = Field(max_length=500)
+
+
+class EditionCompositionEntryView(BaseModel):
+    id: UUID
+    subject_id: UUID
+    disposition: CompositionDisposition
+    position: int | None
+    production_run_id: UUID | None
+    pipeline_generation: int | None
+    artifact_id: UUID | None
+    artifact_version: int | None
+    artifact_input_hash: str | None
+    provenance_batch_id: UUID | None
+    review_decision_id: UUID | None
+    document_sha256: str | None
+    preparation_status: CompositionPreparationStatus
+
+
+class EditionCompositionView(BaseModel):
+    id: UUID
+    edition_id: UUID
+    version: int
+    actor_id: str
+    preparation_status: CompositionPreparationStatus
+    created_at: datetime
+    updated_at: datetime
+    entries: list[EditionCompositionEntryView]
+
+
+class CompositionReasonView(BaseModel):
+    code: str
+    message: str
+    subject_id: UUID | None
+    details: dict[str, object] | None
+
+
+class CompositionAxesView(BaseModel):
+    production_validity: bool | None
+    discovery_update_available: bool | None
+    composition_eligibility: bool
+
+
+class EditionCompositionReadView(BaseModel):
+    edition_id: UUID
+    composition: EditionCompositionView | None
+    reasons: list[CompositionReasonView]
+    axes: CompositionAxesView
 
 
 @router.post("", response_model=EditionView, status_code=status.HTTP_201_CREATED)
@@ -167,6 +265,39 @@ async def edition_audit(edition_id: UUID, request: Request) -> list[EditionAudit
         _raise_api_error(exc)
 
 
+@router.get("/{edition_id}/composition", response_model=EditionCompositionReadView)
+async def get_edition_composition(edition_id: UUID, request: Request) -> EditionCompositionReadView:
+    service: EditionCompositionService = request.app.state.edition_composition_service
+    try:
+        return _composition_read_view(await service.get(edition_id))
+    except Exception as exc:
+        _raise_composition_api_error(exc)
+
+
+@router.put("/{edition_id}/composition", response_model=EditionCompositionView)
+async def put_edition_composition(
+    edition_id: UUID,
+    payload: EditionCompositionPut,
+    request: Request,
+    idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=1, max_length=255)],
+) -> EditionCompositionView:
+    service: EditionCompositionService = request.app.state.edition_composition_service
+    provider: IdentityProvider = request.app.state.identity_provider
+    identity = await provider.current()
+    try:
+        composition = await service.replace_entries(
+            edition_id,
+            tuple(entry.to_domain() for entry in payload.entries),
+            expected_version=payload.expected_version,
+            idempotency_key=idempotency_key,
+            actor_id=identity.actor_id,
+            correlation_id=get_correlation_id(),
+        )
+        return _composition_view(composition)
+    except Exception as exc:
+        _raise_composition_api_error(exc)
+
+
 async def _runtime(request: Request) -> tuple[EditionService, Identity]:
     service: EditionService = request.app.state.edition_service
     provider: IdentityProvider = request.app.state.identity_provider
@@ -229,6 +360,79 @@ def _audit_view(event: EditionAuditEvent) -> EditionAuditView:
         correlation_id=event.correlation_id,
         occurred_at=event.occurred_at,
     )
+
+
+def _composition_view(composition: EditionComposition) -> EditionCompositionView:
+    return EditionCompositionView(
+        id=composition.id,
+        edition_id=composition.edition_id,
+        version=composition.version,
+        actor_id=composition.actor_id,
+        preparation_status=composition.preparation_status,
+        created_at=composition.created_at,
+        updated_at=composition.updated_at,
+        entries=[
+            EditionCompositionEntryView(
+                id=entry.id,
+                subject_id=entry.subject_id,
+                disposition=entry.disposition,
+                position=entry.position,
+                production_run_id=entry.production_run_id,
+                pipeline_generation=entry.pipeline_generation,
+                artifact_id=entry.artifact_id,
+                artifact_version=entry.artifact_version,
+                artifact_input_hash=entry.artifact_input_hash,
+                provenance_batch_id=entry.provenance_batch_id,
+                review_decision_id=entry.review_decision_id,
+                document_sha256=entry.document_sha256,
+                preparation_status=entry.preparation_status,
+            )
+            for entry in composition.entries
+        ],
+    )
+
+
+def _composition_read_view(read: CompositionRead) -> EditionCompositionReadView:
+    return EditionCompositionReadView(
+        edition_id=read.edition_id,
+        composition=_composition_view(read.composition) if read.composition else None,
+        reasons=[
+            CompositionReasonView(
+                code=reason.code.value,
+                message=reason.message,
+                subject_id=reason.subject_id,
+                details=dict(reason.details) if reason.details else None,
+            )
+            for reason in read.reasons
+        ],
+        axes=CompositionAxesView(
+            production_validity=read.axes.production_validity,
+            discovery_update_available=read.axes.discovery_update_available,
+            composition_eligibility=read.axes.composition_eligibility,
+        ),
+    )
+
+
+def _raise_composition_api_error(exc: Exception) -> NoReturn:
+    if isinstance(exc, EditionCompositionError):
+        detail: dict[str, object] = {"code": exc.code, "message": str(exc)}
+        if isinstance(exc, CompositionVersionConflict):
+            detail.update(
+                expected_version=exc.expected_version,
+                actual_version=exc.actual_version,
+            )
+        elif isinstance(exc, CompositionReferenceError):
+            detail.update(
+                reason=exc.reason,
+                subject_id=str(exc.subject_id) if exc.subject_id else None,
+            )
+        raise HTTPException(status_code=exc.status_code, detail=detail) from exc
+    if isinstance(exc, (ValueError, TypeError)):
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "composition_invariant_violation", "message": str(exc)},
+        ) from exc
+    raise exc
 
 
 def _parse_month(value: str) -> tuple[date, date]:

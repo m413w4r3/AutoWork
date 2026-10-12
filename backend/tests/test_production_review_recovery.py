@@ -59,11 +59,18 @@ class _Runs:
     def __init__(self) -> None:
         self.items: dict[UUID, ProductionRun] = {}
 
+    async def lock_creation_for_subject(self, subject_id: UUID) -> None:
+        return None
+
     async def get(self, run_id: UUID) -> ProductionRun | None:
         return self.items.get(run_id)
 
     async def get_for_update(self, run_id: UUID) -> ProductionRun | None:
         return self.items.get(run_id)
+
+    async def get_current_for_subject(self, subject_id: UUID) -> ProductionRun | None:
+        matches = [run for run in self.items.values() if run.subject_id == subject_id]
+        return max(matches, key=lambda run: (run.run_number, str(run.id))) if matches else None
 
     async def save(self, run: ProductionRun) -> None:
         self.items[run.id] = run
@@ -552,7 +559,7 @@ async def test_a_cancelled_run_is_never_retried_from_review(
     assert world.batch.status is ProductionBatchStatus.COMPLETED_WITH_ISSUES
 
 
-async def test_an_old_batch_is_never_reopened_behind_a_newer_one(
+async def test_an_active_newer_batch_blocks_reopening_an_old_batch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     world = _World()
@@ -568,7 +575,7 @@ async def test_an_old_batch_is_never_reopened_behind_a_newer_one(
     with pytest.raises(ValueError) as error:
         await _retry(world, ProductionStage.EXTRACTION)
 
-    assert str(error.value) == "production_batch_superseded"
+    assert str(error.value) == "production_active_batch"
     assert world.batch.status is ProductionBatchStatus.COMPLETED_WITH_ISSUES
     assert newer.status is ProductionBatchStatus.RUNNING
     assert newer.phase is ProductionBatchPhase.INITIAL
@@ -709,16 +716,12 @@ async def test_the_domain_itself_refuses_a_retry_awaiting_reconciliation() -> No
 
 @pytest.mark.parametrize(
     "newer_status",
-    (
-        ProductionBatchStatus.RUNNING,
-        ProductionBatchStatus.COMPLETED,
-        ProductionBatchStatus.COMPLETED_WITH_ISSUES,
-    ),
+    (ProductionBatchStatus.COMPLETED, ProductionBatchStatus.COMPLETED_WITH_ISSUES),
 )
-async def test_only_the_latest_batch_of_an_edition_may_be_reopened(
+async def test_a_terminal_newer_batch_does_not_supersede_the_reviewed_run(
     monkeypatch: pytest.MonkeyPatch, newer_status: ProductionBatchStatus
 ) -> None:
-    """A finished newer batch supersedes just as much as a running one."""
+    """Batch chronology does not replace the exact run's recovery identity."""
     world = _World()
     _register(world, monkeypatch)
     newer = world.uow.edition_production_batches.add(
@@ -730,18 +733,55 @@ async def test_only_the_latest_batch_of_an_edition_may_be_reopened(
     )
     newer_version = newer.version
 
-    with pytest.raises(ValueError) as error:
-        await _retry(world, ProductionStage.EXTRACTION)
+    result = await _retry(world, ProductionStage.EXTRACTION)
 
-    assert str(error.value) == "production_batch_superseded"
-    # Neither batch is mutated by the refusal.
-    assert world.batch.status is ProductionBatchStatus.COMPLETED_WITH_ISSUES
+    assert result.run.pipeline_generation == 2
+    assert world.batch.status is ProductionBatchStatus.RUNNING
     assert world.batch.phase is ProductionBatchPhase.REVIEW
     assert newer.status is newer_status
     assert newer.phase is ProductionBatchPhase.INITIAL
     assert newer.version == newer_version
+    assert world.run.status is ProductionRunStatus.RUNNING
+
+
+async def test_a_concurrent_active_run_for_the_same_subject_blocks_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world = _World()
+    _register(world, monkeypatch)
+    active_batch = world.uow.edition_production_batches.add(
+        EditionProductionBatch(
+            edition_id=world.edition.id,
+            status=ProductionBatchStatus.RUNNING,
+            phase=ProductionBatchPhase.INITIAL,
+        )
+    )
+    active_run = ProductionRun(
+        subject_id=world.run.subject_id,
+        edition_id=world.edition.id,
+        status=ProductionRunStatus.RUNNING,
+        current_stage=ProductionStage.SYNTHESIS,
+        run_number=2,
+        pipeline_generation=3,
+    )
+    world.uow.production_runs.items[active_run.id] = active_run
+    world.uow.edition_production_batch_items.items.append(
+        EditionProductionBatchItem(
+            batch_id=active_batch.id,
+            subject_id=active_run.subject_id,
+            production_run_id=active_run.id,
+            position=1,
+        )
+    )
+
+    with pytest.raises(ReviewRecoveryConflictError) as error:
+        await _retry(world, ProductionStage.EXTRACTION)
+
+    assert error.value.reason == "active_subject_run"
+    assert world.batch.status is ProductionBatchStatus.COMPLETED_WITH_ISSUES
+    assert active_batch.status is ProductionBatchStatus.RUNNING
+    assert active_run.status is ProductionRunStatus.RUNNING
     assert world.run.pipeline_generation == 1
-    assert world.run.status is ProductionRunStatus.NEEDS_REVIEW
 
 
 async def test_the_exact_latest_terminal_batch_still_reopens(
@@ -757,7 +797,7 @@ async def test_the_exact_latest_terminal_batch_still_reopens(
     assert result.run.pipeline_generation == 2
 
 
-async def test_a_running_sibling_blocks_a_retry_inside_a_running_batch(
+async def test_an_active_sibling_blocks_a_retry_inside_a_running_batch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """One subject at a time, including during the batch's initial pass."""

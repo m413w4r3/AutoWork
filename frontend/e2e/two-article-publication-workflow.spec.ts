@@ -6,6 +6,7 @@ import {
   selectionWireItem,
   selectionWireLastDecision,
 } from "./support/selectionWire";
+import { createCompositionApi } from "./support/compositionApi";
 
 test("Édition : production séquentielle de deux sujets, revue et PDF", async ({
   page,
@@ -36,6 +37,30 @@ test("Édition : production séquentielle de deux sujets, revue et PDF", async (
   const seenPaths: string[] = [];
   let productionPostBody: unknown = null;
   let productionSurfaceVisited = false;
+  const compositionApi = createCompositionApi(editionId, [
+    {
+      subject_id: subjectA,
+      title: "Article A",
+      production_run_id: runA,
+      pipeline_generation: 2,
+      artifact_id: artifactA,
+      artifact_version: 1,
+      artifact_input_hash: hash,
+      provenance_batch_id: batchId,
+      document_sha256: hash,
+    },
+    {
+      subject_id: subjectB,
+      title: "Article B",
+      production_run_id: runB,
+      pipeline_generation: 2,
+      artifact_id: artifactB,
+      artifact_version: 1,
+      artifact_input_hash: hash,
+      provenance_batch_id: batchId,
+      document_sha256: hash,
+    },
+  ]);
 
   const edition = () => ({
     id: editionId,
@@ -368,26 +393,69 @@ test("Édition : production séquentielle de deux sujets, revue et PDF", async (
       await route.fulfill({ json: review });
       return;
     }
+    if (path === `/api/editions/${editionId}/subjects`) {
+      await route.fulfill({
+        json: [
+          {
+            id: subjectA,
+            edition_id: editionId,
+            title: "Article A",
+            slug: "article-a",
+            tlp: "AMBER",
+            version: 1,
+            created_at: "2026-08-29T00:00:00Z",
+            updated_at: "2026-08-29T00:00:00Z",
+          },
+          {
+            id: subjectB,
+            edition_id: editionId,
+            title: "Article B",
+            slug: "article-b",
+            tlp: "AMBER",
+            version: 1,
+            created_at: "2026-08-29T00:00:00Z",
+            updated_at: "2026-08-29T00:00:00Z",
+          },
+        ],
+      });
+      return;
+    }
+    if (path === `/api/editions/${editionId}/composition/validation`) {
+      await route.fulfill({ json: compositionApi.validation() });
+      return;
+    }
+    if (path === `/api/editions/${editionId}/composition`) {
+      if (request.method() === "PUT") {
+        expect(request.headers()["idempotency-key"]).toBeTruthy();
+        const body = request.postDataJSON() as {
+          expected_version: number;
+          entries: Array<Record<string, unknown>>;
+        };
+        await route.fulfill({
+          json: compositionApi.put(body.expected_version, body.entries),
+        });
+      } else {
+        await route.fulfill({ json: compositionApi.read() });
+      }
+      return;
+    }
     if (
-      path === `/api/editions/${editionId}/publication/accept` &&
+      path === `/api/editions/${editionId}/composition/accept` &&
       request.method() === "POST"
     ) {
+      const body = request.postDataJSON() as {
+        expected_composition_version: number;
+      };
       publicationAccepted = true;
       expect(manifestEntries).toHaveLength(2);
       expect(manifestEntries.map((entry) => entry.position)).toEqual([1, 2]);
       await route.fulfill({
         status: 202,
-        json: {
-          edition_id: editionId,
-          edition_state: "open",
-          manifest_id: manifestId,
-          manifest_sha256: hash,
-          edition_version: 4,
-          batch_id: batchId,
-          job_id: "assembly-job-1",
-          job_dispatched: true,
-          manifest_entries: manifestEntries,
-        },
+        json: compositionApi.accept(
+          body.expected_composition_version,
+          manifestId,
+          hash,
+        ),
       });
       return;
     }
@@ -450,6 +518,54 @@ test("Édition : production séquentielle de deux sujets, revue et PDF", async (
     if (subjectMatch) {
       openedSubjects.push(subjectMatch[1]);
       await route.fulfill({ json: content(subjectMatch[1]) });
+      return;
+    }
+    const productionRunsMatch = path.match(
+      /^\/api\/subjects\/([^/]+)\/production\/runs$/,
+    );
+    if (productionRunsMatch) {
+      const subjectId = productionRunsMatch[1];
+      const isA = subjectId === subjectA;
+      await route.fulfill({
+        json: [
+          {
+            run_id: isA ? runA : runB,
+            edition_id: editionId,
+            subject_id: subjectId,
+            run_number: 1,
+            status: "ready",
+            current_stage: "assembly",
+            pipeline_generation: 2,
+            research_date: "2026-08-29",
+            created_at: "2026-08-29T00:02:00Z",
+            started_at: "2026-08-29T00:02:00Z",
+            finished_at: "2026-08-29T00:10:00Z",
+            error_code: null,
+            error_message: null,
+          },
+        ],
+      });
+      return;
+    }
+    const publicationArtifactMatch = path.match(
+      /^\/api\/subjects\/([^/]+)\/production\/artifacts\/publication$/,
+    );
+    if (publicationArtifactMatch) {
+      const subjectId = publicationArtifactMatch[1];
+      const isA = subjectId === subjectA;
+      await route.fulfill({
+        json: {
+          artifact_id: isA ? artifactA : artifactB,
+          production_run_id: isA ? runA : runB,
+          stage: "publication",
+          version: 1,
+          input_hash: hash,
+          canonical_sha256: hash,
+          status: "verified",
+          metadata: {},
+          canonical_content: content(subjectId).canonical_content,
+        },
+      });
       return;
     }
     const productionMatch = path.match(
@@ -536,9 +652,11 @@ test("Édition : production séquentielle de deux sujets, revue et PDF", async (
   await expect(
     page.getByRole("heading", { name: "Revue de publication" }),
   ).toBeVisible();
-  await expect(page.getByRole("link", { name: "Ouvrir" })).toHaveCount(2);
+  await expect(
+    page.getByRole("link", { name: "Ouvrir", exact: true }),
+  ).toHaveCount(2);
 
-  await page.getByRole("link", { name: "Ouvrir" }).nth(0).click();
+  await page.getByRole("link", { name: "Ouvrir", exact: true }).nth(0).click();
   await expect(
     page.getByRole("heading", { name: "Article A", level: 1 }),
   ).toBeVisible();
@@ -555,7 +673,7 @@ test("Édition : production séquentielle de deux sujets, revue et PDF", async (
   ).toBeVisible();
   await page.goBack();
 
-  await page.getByRole("link", { name: "Ouvrir" }).nth(1).click();
+  await page.getByRole("link", { name: "Ouvrir", exact: true }).nth(1).click();
   await expect(
     page.getByRole("heading", { name: "Article B", level: 1 }),
   ).toBeVisible();
@@ -571,7 +689,23 @@ test("Édition : production séquentielle de deux sujets, revue et PDF", async (
   ).toBeVisible();
   expect(openedSubjects).toEqual([subjectA, subjectB]);
 
-  await page.getByRole("button", { name: "Accepter la production" }).click();
+  await page.getByRole("link", { name: "Composition", exact: true }).click();
+  await expect(page).toHaveURL(`/editions/${editionId}/composition`);
+  await expect(
+    page.getByRole("heading", { name: "Sujets et ordre de publication" }),
+  ).toBeVisible();
+  for (const subjectId of [subjectA, subjectB]) {
+    const compositionCard = page
+      .locator(".composition-console__subject")
+      .filter({
+        has: page.getByRole("heading", {
+          name: subjectId === subjectA ? "Article A" : "Article B",
+        }),
+      });
+    await compositionCard.getByRole("button", { name: "Inclure" }).click();
+  }
+  await page.getByRole("checkbox").check();
+  await page.getByRole("button", { name: "Accepter la composition" }).click();
   await page.getByRole("link", { name: "Publication" }).click();
   await expect(page).toHaveURL(`/editions/${editionId}/publication`);
   await expect(
@@ -588,7 +722,8 @@ test("Édition : production séquentielle de deux sujets, revue et PDF", async (
       `POST /api/editions/${editionId}/production/batches`,
       `GET /api/editions/${editionId}/production`,
       `GET /api/editions/${editionId}/review`,
-      `POST /api/editions/${editionId}/publication/accept`,
+      `PUT /api/editions/${editionId}/composition`,
+      `POST /api/editions/${editionId}/composition/accept`,
       `GET /api/editions/${editionId}/release`,
       `GET /api/subjects/${subjectA}/content`,
       `GET /api/subjects/${subjectB}/content`,

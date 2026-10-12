@@ -241,6 +241,7 @@ async def test_lot35_waived_source_archived_later_blocks_signoff_until_rebuild(
         (ProductionArtifactStage.PUBLICATION, "d"),
     ):
         await world.artifacts.append(_stage_artifact(run, stage, 1, input_hash=digest * 64))
+    await world.pin_current_publication()
 
     # --- 1. The unarchived source is an open arbitration. -------------------
     async with _client(_application(world, collection_service)) as client:
@@ -335,7 +336,10 @@ async def test_lot35_waived_source_archived_later_blocks_signoff_until_rebuild(
     assert review.json()["can_accept"] is False
     assert review.json()["pending_rebuild_count"] == 1
     async with _client(fresh) as client:
-        refused = await client.post(f"/api/editions/{edition.id}/publication/accept")
+        refused = await client.post(
+            f"/api/editions/{edition.id}/publication/accept",
+            json={"expected_composition_version": 1},
+        )
     assert refused.status_code == 409
     assert refused.json()["detail"]["code"] == "review_cannot_be_accepted"
     assert world.manifests.items == []
@@ -354,7 +358,27 @@ async def test_lot35_waived_source_archived_later_blocks_signoff_until_rebuild(
         decision_id: "decision-waive",
     }
     _assert_fixture("repair_page", _normalized(page, replacements))
-    _assert_fixture("review", _normalized(review.json(), replacements))
+    review_payload = review.json()
+    # LOT C adds the canonical composition version and diagnostics to this
+    # Review response. Keep the old cross-frontend golden fields comparable;
+    # LOT E can add these two fields to the shared fixture with the UI work.
+    assert review_payload["composition_version"] == 1
+    assert review_payload["diagnostics"] == []
+    review_payload.pop("composition_version")
+    review_payload.pop("diagnostics")
+    for item in review_payload["items"]:
+        assert item["composition_version"] == 1
+        assert item["pinned_generation_current"] is True
+        for field in (
+            "composition_version",
+            "superseded_artifact_available",
+            "pinned_generation_current",
+            "latest_artifact_run_id",
+            "latest_artifact_id",
+            "latest_artifact_version",
+        ):
+            item.pop(field)
+    _assert_fixture("review", _normalized(review_payload, replacements))
 
     # --- 6. The deterministic REFERENCES rebuild clears the debt. -----------
     async with _client(fresh) as client:
@@ -384,6 +408,7 @@ async def test_lot35_waived_source_archived_later_blocks_signoff_until_rebuild(
     ):
         await world.artifacts.append(_stage_artifact(replayed, stage, 2, input_hash=digest * 64))
     replayed.mark_ready()
+    await world.pin_current_publication()
 
     # --- 7. The issue and the sign-off debt are gone. -----------------------
     final = _application(world, collection_service)
@@ -396,7 +421,10 @@ async def test_lot35_waived_source_archived_later_blocks_signoff_until_rebuild(
     assert review.json()["can_accept"] is True
 
     async with _client(final) as client:
-        accepted = await client.post(f"/api/editions/{edition.id}/publication/accept")
+        accepted = await client.post(
+            f"/api/editions/{edition.id}/publication/accept",
+            json={"expected_composition_version": 2},
+        )
     assert accepted.status_code == 202, accepted.text
     assert len(world.manifests.items) == 1
     # The whole waive/archive/rebuild cycle ran without a single model call.

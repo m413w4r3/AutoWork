@@ -4,15 +4,20 @@ from collections.abc import Sequence
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import String, and_, case, cast, func, or_, select
+from sqlalchemy import String, and_, case, cast, exists, func, literal, or_, select, true, union_all
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from cti_app.application.edition_review import (
+    EditionReviewDiagnostic,
+    EditionReviewDiagnosticCode,
     EditionReviewReadItem,
+    EditionReviewReadScope,
     requires_reconciliation,
     review_item_can_retry,
 )
 from cti_app.application.production_resume import resolve_retry_stage
+from cti_app.domain.edition_composition import CompositionDisposition
 from cti_app.domain.model_runs import ModelSubmissionState
 from cti_app.domain.production import (
     ProductionArtifactStage,
@@ -23,9 +28,11 @@ from cti_app.domain.production import (
 )
 from cti_app.domain.publication_review import PublicationDecision, PublicationReviewDecision
 from cti_app.infrastructure.database.models.core import SubjectRow
+from cti_app.infrastructure.database.models.edition_composition import (
+    EditionCompositionEntryRow,
+    EditionCompositionRow,
+)
 from cti_app.infrastructure.database.models.production import (
-    EditionProductionBatchItemRow,
-    EditionProductionBatchRow,
     ProductionArtifactRow,
     ProductionInputSnapshotRow,
     ProductionRunRow,
@@ -76,44 +83,16 @@ class SqlAlchemyEditionReviewReadRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
-    async def list_for_edition(self, edition_id: UUID) -> Sequence[EditionReviewReadItem]:
-        latest_batch_id = (
-            select(EditionProductionBatchRow.id)
-            .where(EditionProductionBatchRow.edition_id == edition_id)
-            .order_by(
-                EditionProductionBatchRow.created_at.desc(),
-                EditionProductionBatchRow.id.desc(),
-            )
-            .limit(1)
-            .scalar_subquery()
-        )
-        current_artifacts = (
+    async def list_for_edition(self, edition_id: UUID) -> EditionReviewReadScope:
+        composition = (
             select(
-                ProductionArtifactRow.production_run_id.label("run_id"),
-                ProductionArtifactRow.id.label("artifact_id"),
-                ProductionArtifactRow.version.label("artifact_version"),
-                ProductionArtifactRow.input_hash.label("artifact_hash"),
-                ProductionArtifactRow.status.label("artifact_status"),
-                func.row_number()
-                .over(
-                    partition_by=ProductionArtifactRow.production_run_id,
-                    order_by=(
-                        case(
-                            (ProductionArtifactRow.stage == "publication", 1),
-                            else_=0,
-                        ).desc(),
-                        ProductionArtifactRow.version.desc(),
-                        ProductionArtifactRow.id.desc(),
-                    ),
-                )
-                .label("artifact_rank"),
+                EditionCompositionRow.id.label("id"),
+                EditionCompositionRow.version.label("version"),
             )
-            .where(
-                ProductionArtifactRow.stage == ProductionArtifactStage.PUBLICATION.value,
-                ProductionArtifactRow.status != ProductionArtifactStatus.STALE.value,
-            )
-            .subquery("current_review_artifacts")
+            .where(EditionCompositionRow.edition_id == edition_id)
+            .cte("current_review_composition")
         )
+
         current_extraction = (
             select(
                 ProductionArtifactRow.production_run_id.label("run_id"),
@@ -195,30 +174,65 @@ class SqlAlchemyEditionReviewReadRepository:
             .group_by(ProductionArtifactRow.production_run_id)
             .subquery("current_review_live_stages")
         )
+        latest_publications = (
+            select(
+                ProductionRunRow.subject_id.label("subject_id"),
+                ProductionRunRow.id.label("run_id"),
+                ProductionArtifactRow.id.label("artifact_id"),
+                ProductionArtifactRow.version.label("artifact_version"),
+                func.row_number()
+                .over(
+                    partition_by=(ProductionRunRow.subject_id, ProductionRunRow.id),
+                    order_by=(
+                        ProductionRunRow.run_number.desc(),
+                        ProductionArtifactRow.version.desc(),
+                        ProductionArtifactRow.id.desc(),
+                    ),
+                )
+                .label("artifact_rank"),
+            )
+            .join(
+                ProductionArtifactRow,
+                ProductionArtifactRow.production_run_id == ProductionRunRow.id,
+            )
+            .where(
+                ProductionRunRow.edition_id == edition_id,
+                ProductionRunRow.status == ProductionRunStatus.READY.value,
+                ProductionArtifactRow.stage == ProductionArtifactStage.PUBLICATION.value,
+                ProductionArtifactRow.status == ProductionArtifactStatus.VERIFIED.value,
+            )
+            .subquery("latest_review_publications")
+        )
+        pinned_artifact = aliased(ProductionArtifactRow, name="pinned_review_artifact")
         subject_title = (
             select(SubjectRow.title)
-            .where(SubjectRow.id == EditionProductionBatchItemRow.subject_id)
-            .correlate(EditionProductionBatchItemRow)
+            .where(SubjectRow.id == EditionCompositionEntryRow.subject_id)
+            .correlate(EditionCompositionEntryRow)
             .scalar_subquery()
         )
 
         ranked = (
             select(
-                EditionProductionBatchItemRow.position.label("position"),
-                EditionProductionBatchItemRow.subject_id.label("subject_id"),
+                composition.c.version.label("composition_version"),
+                EditionCompositionEntryRow.position.label("position"),
+                EditionCompositionEntryRow.subject_id.label("subject_id"),
                 func.coalesce(
                     ProductionInputSnapshotRow.subject_title,
                     subject_title,
-                    cast(EditionProductionBatchItemRow.subject_id, String),
+                    cast(EditionCompositionEntryRow.subject_id, String),
                 ).label("title"),
-                ProductionRunRow.id.label("run_id"),
-                ProductionRunRow.pipeline_generation.label("pipeline_generation"),
+                EditionCompositionEntryRow.production_run_id.label("run_id"),
+                EditionCompositionEntryRow.pipeline_generation.label("pipeline_generation"),
+                ProductionRunRow.pipeline_generation.label("current_pipeline_generation"),
                 ProductionRunRow.status.label("run_status"),
                 ProductionRunRow.current_stage.label("current_stage"),
-                current_artifacts.c.artifact_id,
-                current_artifacts.c.artifact_version,
-                current_artifacts.c.artifact_hash,
-                current_artifacts.c.artifact_status,
+                EditionCompositionEntryRow.artifact_id.label("artifact_id"),
+                EditionCompositionEntryRow.artifact_version.label("artifact_version"),
+                EditionCompositionEntryRow.artifact_input_hash.label("artifact_hash"),
+                pinned_artifact.status.label("artifact_status"),
+                latest_publications.c.run_id.label("latest_artifact_run_id"),
+                latest_publications.c.artifact_id.label("latest_artifact_id"),
+                latest_publications.c.artifact_version.label("latest_artifact_version"),
                 live_stages.c.stages.label("live_artifact_stages"),
                 func.coalesce(current_extraction.c.rejected_indicator_count, 0).label(
                     "rejected_indicator_count"
@@ -255,7 +269,7 @@ class SqlAlchemyEditionReviewReadRepository:
                 PublicationReviewDecisionRow.decision.label("decision"),
                 func.row_number()
                 .over(
-                    partition_by=EditionProductionBatchItemRow.id,
+                    partition_by=EditionCompositionEntryRow.id,
                     order_by=(
                         PublicationReviewDecisionRow.occurred_at.desc().nullslast(),
                         PublicationReviewDecisionRow.id.desc().nullslast(),
@@ -263,67 +277,256 @@ class SqlAlchemyEditionReviewReadRepository:
                 )
                 .label("decision_rank"),
             )
-            .select_from(EditionProductionBatchItemRow)
+            .select_from(EditionCompositionEntryRow)
+            .join(composition, composition.c.id == EditionCompositionEntryRow.composition_id)
             .join(
                 ProductionRunRow,
-                ProductionRunRow.id == EditionProductionBatchItemRow.production_run_id,
+                ProductionRunRow.id == EditionCompositionEntryRow.production_run_id,
             )
             .outerjoin(
                 ProductionInputSnapshotRow,
                 ProductionInputSnapshotRow.production_run_id
-                == EditionProductionBatchItemRow.production_run_id,
+                == EditionCompositionEntryRow.production_run_id,
             )
             .outerjoin(
-                current_artifacts,
+                pinned_artifact,
                 and_(
-                    current_artifacts.c.run_id == EditionProductionBatchItemRow.production_run_id,
-                    current_artifacts.c.artifact_rank == 1,
+                    pinned_artifact.id == EditionCompositionEntryRow.artifact_id,
+                    pinned_artifact.production_run_id
+                    == EditionCompositionEntryRow.production_run_id,
+                    pinned_artifact.version == EditionCompositionEntryRow.artifact_version,
+                    pinned_artifact.input_hash == EditionCompositionEntryRow.artifact_input_hash,
+                    pinned_artifact.stage == ProductionArtifactStage.PUBLICATION.value,
                 ),
             )
             .outerjoin(
                 current_extraction,
                 and_(
-                    current_extraction.c.run_id == EditionProductionBatchItemRow.production_run_id,
+                    current_extraction.c.run_id == EditionCompositionEntryRow.production_run_id,
                     current_extraction.c.artifact_rank == 1,
                 ),
             )
             .outerjoin(
                 live_stages,
-                live_stages.c.run_id == EditionProductionBatchItemRow.production_run_id,
+                live_stages.c.run_id == EditionCompositionEntryRow.production_run_id,
+            )
+            .outerjoin(
+                latest_publications,
+                and_(
+                    latest_publications.c.subject_id == EditionCompositionEntryRow.subject_id,
+                    latest_publications.c.run_id == EditionCompositionEntryRow.production_run_id,
+                    latest_publications.c.artifact_rank == 1,
+                ),
             )
             .outerjoin(
                 PublicationReviewDecisionRow,
                 and_(
                     PublicationReviewDecisionRow.edition_id == edition_id,
                     PublicationReviewDecisionRow.subject_id
-                    == EditionProductionBatchItemRow.subject_id,
-                    PublicationReviewDecisionRow.production_run_id == ProductionRunRow.id,
+                    == EditionCompositionEntryRow.subject_id,
+                    PublicationReviewDecisionRow.production_run_id
+                    == EditionCompositionEntryRow.production_run_id,
                     PublicationReviewDecisionRow.pipeline_generation
-                    == ProductionRunRow.pipeline_generation,
+                    == EditionCompositionEntryRow.pipeline_generation,
+                    PublicationReviewDecisionRow.document_artifact_id
+                    == EditionCompositionEntryRow.artifact_id,
+                    PublicationReviewDecisionRow.document_artifact_version
+                    == EditionCompositionEntryRow.artifact_version,
+                    PublicationReviewDecisionRow.document_input_hash
+                    == EditionCompositionEntryRow.artifact_input_hash,
+                ),
+            )
+            .where(
+                EditionCompositionEntryRow.disposition == "included",
+            )
+            .subquery("ranked_review_items")
+        )
+        item_columns = (
+            "position",
+            "subject_id",
+            "title",
+            "run_id",
+            "pipeline_generation",
+            "current_pipeline_generation",
+            "run_status",
+            "current_stage",
+            "artifact_id",
+            "artifact_version",
+            "artifact_hash",
+            "artifact_status",
+            "latest_artifact_run_id",
+            "latest_artifact_id",
+            "latest_artifact_version",
+            "live_artifact_stages",
+            "rejected_indicator_count",
+            "rejected_ioc_count",
+            "rejected_other_artifact_count",
+            "rejected_rule_count",
+            "published_rule_count",
+            "error_code",
+            "error_message",
+            "reconciliation_model_run_id",
+            "reconciliation_stage",
+            "reconciliation_bridge_response_id",
+            "reconciliation_bridge_request_id",
+            "reconciliation_submission_state",
+            "reconciliation_phase",
+            "reconciliation_output_sha256",
+            "reconciliation_provenance",
+            "decision_id",
+            "decision",
+            "decision_rank",
+        )
+        diagnostic_columns = (
+            "diagnostic_code",
+            "diagnostic_subject_id",
+            "diagnostic_disposition",
+            "diagnostic_run_id",
+            "diagnostic_title",
+            "diagnostic_decision_id",
+        )
+        item_query = select(
+            literal("item").label("row_kind"),
+            ranked.c.composition_version.label("composition_version"),
+            *(ranked.c[column].label(column) for column in item_columns),
+            *(literal(None).label(column) for column in diagnostic_columns),
+        ).where(ranked.c.decision_rank == 1)
+
+        diagnostic_decision = aliased(PublicationReviewDecisionRow, name="excluded_review_decision")
+        diagnostic_query = (
+            select(
+                literal("diagnostic").label("row_kind"),
+                composition.c.version.label("composition_version"),
+                *(literal(None).label(column) for column in item_columns),
+                case(
+                    (EditionCompositionEntryRow.id.is_(None), "subject_unaddressed"),
+                    (EditionCompositionEntryRow.disposition == "deferred", "subject_deferred"),
+                    else_="subject_excluded",
+                ).label("diagnostic_code"),
+                SubjectRow.id.label("subject_id"),
+                EditionCompositionEntryRow.disposition.label("diagnostic_disposition"),
+                EditionCompositionEntryRow.production_run_id.label("diagnostic_run_id"),
+                SubjectRow.title.label("diagnostic_title"),
+                diagnostic_decision.id.label("diagnostic_decision_id"),
+            )
+            .select_from(SubjectRow)
+            .join(composition, true())
+            .outerjoin(
+                EditionCompositionEntryRow,
+                and_(
+                    EditionCompositionEntryRow.composition_id == composition.c.id,
+                    EditionCompositionEntryRow.subject_id == SubjectRow.id,
+                ),
+            )
+            .outerjoin(
+                diagnostic_decision,
+                and_(
+                    diagnostic_decision.id == EditionCompositionEntryRow.review_decision_id,
+                    diagnostic_decision.edition_id == edition_id,
+                    diagnostic_decision.subject_id == SubjectRow.id,
+                    diagnostic_decision.decision == "exclude",
                     or_(
                         and_(
-                            current_artifacts.c.artifact_id.is_(None),
-                            PublicationReviewDecisionRow.document_artifact_id.is_(None),
-                            PublicationReviewDecisionRow.document_artifact_version.is_(None),
-                            PublicationReviewDecisionRow.document_input_hash.is_(None),
+                            EditionCompositionEntryRow.artifact_id.is_(None),
+                            diagnostic_decision.document_artifact_id.is_(None),
+                            diagnostic_decision.document_artifact_version.is_(None),
+                            diagnostic_decision.document_input_hash.is_(None),
                         ),
                         and_(
-                            PublicationReviewDecisionRow.document_artifact_id
-                            == current_artifacts.c.artifact_id,
-                            PublicationReviewDecisionRow.document_artifact_version
-                            == current_artifacts.c.artifact_version,
-                            PublicationReviewDecisionRow.document_input_hash
-                            == current_artifacts.c.artifact_hash,
+                            EditionCompositionEntryRow.artifact_id.is_not(None),
+                            diagnostic_decision.production_run_id
+                            == EditionCompositionEntryRow.production_run_id,
+                            diagnostic_decision.pipeline_generation
+                            == EditionCompositionEntryRow.pipeline_generation,
+                            diagnostic_decision.document_artifact_id
+                            == EditionCompositionEntryRow.artifact_id,
+                            diagnostic_decision.document_artifact_version
+                            == EditionCompositionEntryRow.artifact_version,
+                            diagnostic_decision.document_input_hash
+                            == EditionCompositionEntryRow.artifact_input_hash,
                         ),
                     ),
                 ),
             )
-            .where(EditionProductionBatchItemRow.batch_id == latest_batch_id)
-            .subquery("ranked_review_items")
+            .where(
+                SubjectRow.edition_id == edition_id,
+                or_(
+                    EditionCompositionEntryRow.id.is_(None),
+                    EditionCompositionEntryRow.disposition.in_(
+                        (
+                            CompositionDisposition.DEFERRED.value,
+                            CompositionDisposition.EXCLUDED.value,
+                        )
+                    ),
+                ),
+            )
         )
-        query = select(ranked).where(ranked.c.decision_rank == 1).order_by(ranked.c.position)
-        rows = (await self._session.execute(query)).mappings()
-        return [_read_item_from_row(row) for row in rows]
+        metadata_query = select(
+            literal("metadata").label("row_kind"),
+            composition.c.version.label("composition_version"),
+            *(literal(None).label(column) for column in item_columns),
+            *(literal(None).label(column) for column in diagnostic_columns),
+        ).select_from(composition)
+        missing_query = select(
+            literal("diagnostic").label("row_kind"),
+            literal(None).label("composition_version"),
+            *(literal(None).label(column) for column in item_columns),
+            literal("composition_missing").label("diagnostic_code"),
+            *(literal(None).label(column) for column in diagnostic_columns[1:]),
+        ).where(~exists(select(composition.c.id)))
+        combined = union_all(item_query, diagnostic_query, metadata_query, missing_query)
+        combined_rows = combined.subquery()
+        result_query = select(combined_rows).order_by(
+            combined_rows.c.row_kind,
+            combined_rows.c.position.nullslast(),
+            combined_rows.c.diagnostic_subject_id,
+        )
+        rows = (await self._session.execute(result_query)).mappings()
+        items: list[EditionReviewReadItem] = []
+        diagnostics: list[EditionReviewDiagnostic] = []
+        composition_version: int | None = None
+        for row in rows:
+            if row["composition_version"] is not None:
+                composition_version = row["composition_version"]
+            if row["row_kind"] == "item":
+                items.append(
+                    _read_item_from_row(row, composition_version=row["composition_version"])
+                )
+                continue
+            code = row["diagnostic_code"]
+            if code is None:
+                continue
+            diagnostic_code = EditionReviewDiagnosticCode(code)
+            subject_id = row["diagnostic_subject_id"]
+            disposition = row["diagnostic_disposition"]
+            diagnostics.append(
+                EditionReviewDiagnostic(
+                    code=diagnostic_code,
+                    subject_id=subject_id,
+                    disposition=CompositionDisposition(disposition) if disposition else None,
+                    run_id=row["diagnostic_run_id"],
+                    details={"title": row["diagnostic_title"]} if row["diagnostic_title"] else None,
+                )
+            )
+            if (
+                diagnostic_code is EditionReviewDiagnosticCode.SUBJECT_EXCLUDED
+                and row["diagnostic_decision_id"] is None
+            ):
+                diagnostics.append(
+                    EditionReviewDiagnostic(
+                        code=EditionReviewDiagnosticCode.EXCLUSION_DECISION_MISSING,
+                        subject_id=subject_id,
+                        disposition=CompositionDisposition.EXCLUDED,
+                        run_id=row["diagnostic_run_id"],
+                        details={"title": row["diagnostic_title"]},
+                    )
+                )
+
+        return EditionReviewReadScope(
+            items=tuple(items),
+            composition_version=composition_version,
+            diagnostics=tuple(diagnostics),
+        )
 
 
 def _decision_from_row(row: PublicationReviewDecisionRow) -> PublicationReviewDecision:
@@ -364,7 +567,7 @@ def _reconciliation_from_row(row: Any, run_id: UUID) -> ProductionSubmissionReco
     )
 
 
-def _read_item_from_row(row: Any) -> EditionReviewReadItem:
+def _read_item_from_row(row: Any, *, composition_version: int) -> EditionReviewReadItem:
     run_status = ProductionRunStatus(row["run_status"])
     live_artifact_stages = frozenset(row["live_artifact_stages"] or ())
     artifact_status = (
@@ -413,4 +616,18 @@ def _read_item_from_row(row: Any) -> EditionReviewReadItem:
         rejected_other_artifact_count=row["rejected_other_artifact_count"] or 0,
         rejected_rule_count=row["rejected_rule_count"] or 0,
         published_rule_count=row["published_rule_count"] or 0,
+        composition_version=composition_version,
+        pinned_generation_current=(
+            row["current_pipeline_generation"] == row["pipeline_generation"]
+        ),
+        superseded_artifact_available=(
+            row["latest_artifact_id"] is not None
+            and (
+                row["latest_artifact_id"] != row["artifact_id"]
+                or row["latest_artifact_run_id"] != row["run_id"]
+            )
+        ),
+        latest_artifact_run_id=row["latest_artifact_run_id"],
+        latest_artifact_id=row["latest_artifact_id"],
+        latest_artifact_version=row["latest_artifact_version"],
     )

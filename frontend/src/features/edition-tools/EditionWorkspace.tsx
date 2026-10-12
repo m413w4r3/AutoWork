@@ -11,6 +11,7 @@ import { DiscoveryPanel } from "../discovery/DiscoveryPanel";
 import { EditionDashboard } from "../edition-dashboard/EditionDashboard";
 import { ProductionBatchSelector } from "../edition-workflow/ProductionBatchSelector";
 import { ProductionConsole } from "../edition-workflow/ProductionConsole";
+import { CompositionConsole } from "../edition-workflow/CompositionConsole";
 import {
   productionErrorMessage,
   retryTransientProductionFailure,
@@ -29,6 +30,7 @@ export type EditionTool =
   | "fusion"
   | "selection"
   | "production"
+  | "composition"
   | "review"
   | "publication";
 
@@ -43,6 +45,7 @@ const EDITION_NAVIGATION: ReadonlyArray<{
   { surface: "fusion", label: "Fusion" },
   { surface: "selection", label: "Sélection" },
   { surface: "production", label: "Productions" },
+  { surface: "composition", label: "Composition" },
   { surface: "review", label: "Revue" },
   { surface: "publication", label: "Publication" },
 ];
@@ -249,6 +252,8 @@ export function EditionToolSurface({
       return <SelectionTool edition={edition} readOnly={readOnly} />;
     case "production":
       return <ProductionTool edition={edition} readOnly={readOnly} />;
+    case "composition":
+      return <CompositionConsole editionId={edition.id} readOnly={readOnly} />;
     case "review":
       return <ReviewConsole editionId={edition.id} readOnly={readOnly} />;
     case "publication":

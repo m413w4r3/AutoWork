@@ -129,6 +129,7 @@ CLEAN_PATHS := \
 	test-all \
 	test-backend \
 	test-frontend \
+	test-frontend-e2e \
 	test-integration \
 	integration-db-up \
 	integration-db-down \
@@ -300,6 +301,9 @@ test-backend: backend-sync ## Lance les tests backend hors intégration
 
 test-frontend: frontend-sync ## Lance les tests frontend
 	cd $(FRONTEND_DIR) && $(PNPM) test --run
+
+test-frontend-e2e: frontend-sync ## Lance les tests Playwright frontend
+	cd $(FRONTEND_DIR) && $(PNPM) exec playwright test
 
 test: test-backend test-frontend ## Lance les tests rapides backend + frontend
 

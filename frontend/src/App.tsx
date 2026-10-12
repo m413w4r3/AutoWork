@@ -10,7 +10,7 @@ import { usePathname } from "./navigation";
 export function App() {
   const pathname = usePathname();
   const detail = pathname.match(
-    /^\/editions\/([^/]+)(?:\/(discovery|fusion|selection|production|review|publication))?$/,
+    /^\/editions\/([^/]+)(?:\/(discovery|fusion|selection|production|composition|review|publication))?$/,
   );
   const subject = pathname.match(/^\/subjects\/([^/]+)$/);
   const artifact = pathname.match(

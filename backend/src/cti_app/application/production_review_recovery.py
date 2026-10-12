@@ -27,7 +27,8 @@ from cti_app.domain.production import (
 BATCH_MISSING = "batch_missing"
 BATCH_CANCELLED = "batch_cancelled"
 BATCH_PAUSED = "batch_paused"
-BATCH_SUPERSEDED = "batch_superseded"
+ACTIVE_BATCH = "active_batch"
+ACTIVE_SUBJECT_RUN = "active_subject_run"
 ACTIVE_SIBLING = "active_sibling"
 
 
@@ -72,15 +73,14 @@ async def prepare_batch_for_recovery(
     if batch.status is ProductionBatchStatus.PAUSED:
         raise ReviewRecoveryConflictError(BATCH_PAUSED)
 
+    await _ensure_no_active_subject_run(uow, run)
+
     needs_reopening = batch.status not in {
         ProductionBatchStatus.QUEUED,
         ProductionBatchStatus.RUNNING,
     }
     if needs_reopening:
-        # A finished batch is only ever reopened while it is still the one the
-        # edition is reviewing.  An operator acting on a stale Review view must
-        # never resurrect an old batch behind a newer production.
-        await _ensure_not_superseded(batches, batch)
+        await _ensure_no_active_batch(batches, batch)
 
     # One subject of a batch runs at a time, whatever gesture asks for the
     # resume: a running sibling must reach a terminal state first.
@@ -109,27 +109,33 @@ async def _get_batch(
     return plain
 
 
-async def _ensure_not_superseded(batches: Any, batch: EditionProductionBatch) -> None:
-    """Only the edition's newest batch may be reopened.
-
-    Activity is not the criterion: a newer batch that already finished — as
-    ``completed`` or ``completed_with_issues`` — is just as much the edition's
-    current production, and resurrecting the batch behind it would reopen a
-    superseded Review.  ``get_latest_for_edition`` is the authority; the
-    active-batch check stays as the cheaper, narrower fence.
-    """
+async def _ensure_no_active_batch(batches: Any, batch: EditionProductionBatch) -> None:
+    """A finished batch can reopen only when no other edition batch is active."""
     get_active = getattr(batches, "get_active_for_edition", None)
     if get_active is not None:
         active = await get_active(batch.edition_id)
         if active is not None and active.id != batch.id:
-            raise ReviewRecoveryConflictError(BATCH_SUPERSEDED)
+            raise ReviewRecoveryConflictError(ACTIVE_BATCH)
 
-    get_latest = getattr(batches, "get_latest_for_edition", None)
-    if get_latest is None:
+
+async def _ensure_no_active_subject_run(uow: Any, run: ProductionRun) -> None:
+    """A later active run for the same subject is incompatible with this retry."""
+    runs = getattr(uow, "production_runs", None)
+    lock_creation = getattr(runs, "lock_creation_for_subject", None)
+    if lock_creation is not None:
+        # Use the same subject serialization fence as new-run creation. The
+        # Edition lock is already held by every recovery caller.
+        await lock_creation(run.subject_id)
+    get_current = getattr(runs, "get_current_for_subject", None)
+    if get_current is None:
         return
-    latest = await get_latest(batch.edition_id)
-    if latest is not None and latest.id != batch.id:
-        raise ReviewRecoveryConflictError(BATCH_SUPERSEDED)
+    current = await get_current(run.subject_id)
+    if (
+        current is not None
+        and current.id != run.id
+        and current.status in {ProductionRunStatus.QUEUED, ProductionRunStatus.RUNNING}
+    ):
+        raise ReviewRecoveryConflictError(ACTIVE_SUBJECT_RUN)
 
 
 async def _ensure_no_active_sibling(uow: Any, items: Any, batch_id: UUID, run_id: UUID) -> None:
@@ -145,11 +151,12 @@ async def _ensure_no_active_sibling(uow: Any, items: Any, batch_id: UUID, run_id
 
 
 __all__ = [
+    "ACTIVE_BATCH",
     "ACTIVE_SIBLING",
+    "ACTIVE_SUBJECT_RUN",
     "BATCH_CANCELLED",
     "BATCH_MISSING",
     "BATCH_PAUSED",
-    "BATCH_SUPERSEDED",
     "ProductionBatchRecoveryConflictError",
     "ReviewRecoveryConflictError",
     "prepare_batch_for_recovery",

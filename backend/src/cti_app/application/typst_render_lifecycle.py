@@ -26,11 +26,13 @@ from cti_app.application.typst_compilation import (
     TypstCompilationError,
     TypstCompiler,
 )
+from cti_app.application.typst_input_snapshot import build_typst_input_snapshot
 from cti_app.application.typst_render_execution import (
     ExecutedTypstRender,
     TypstRenderExecutionError,
     TypstRenderExecutionErrorTypes,
     TypstRenderExecutor,
+    TypstRenderMediaMissingError,
     translate_execution_error,
 )
 from cti_app.application.typst_render_output import (
@@ -177,13 +179,27 @@ class TypstRenderRunner[RecordT: TypstRenderRecord]:
         source_blob_id: UUID | None = None
         render_data_blob_id: UUID | None = None
 
-        async def persist_render_inputs(render_source: TypstRenderSource) -> None:
+        async def persist_render_inputs(
+            render_source: TypstRenderSource,
+            template_bundle: TypstTemplateBundle,
+            resolved_media: dict[UUID, bytes],
+        ) -> None:
             nonlocal source_blob_id, render_data_blob_id
             try:
+                input_snapshot = build_typst_input_snapshot(
+                    template_bundle=template_bundle,
+                    render_source=render_source,
+                    resolved_media=resolved_media,
+                    render_id=str(render_id),
+                )
                 source_blob_id = await self._artifact_store.put_bytes(
-                    render_source.source_bytes,
+                    input_snapshot if input_snapshot is not None else render_source.source_bytes,
                     bucket=self._buckets.source,
-                    mime_type="text/plain; charset=utf-8",
+                    mime_type=(
+                        "application/vnd.autowork.typst-input-snapshot+json"
+                        if input_snapshot is not None
+                        else "text/plain; charset=utf-8"
+                    ),
                 )
                 render_data_blob_id = await self._artifact_store.put_bytes(
                     render_source.render_data_bytes,
@@ -283,16 +299,27 @@ class TypstRenderRunner[RecordT: TypstRenderRecord]:
         render_source: TypstRenderSource,
         template_bundle: TypstTemplateBundle,
         font_bundle: FontBundleSnapshot,
-        persist_render_inputs: Callable[[TypstRenderSource], Awaitable[None]],
+        persist_render_inputs: Callable[
+            [TypstRenderSource, TypstTemplateBundle, dict[UUID, bytes]], Awaitable[None]
+        ],
     ) -> ExecutedTypstRender:
         try:
-            resolved_media = await self._executor.resolve_media(render_source)
+            try:
+                resolved_media = await self._executor.resolve_media(render_source)
+            except TypstRenderExecutionError as media_error:
+                # A failed asset lookup still leaves the exact template and JSON
+                # inputs inspectable, with the unresolved media reference marked.
+                if isinstance(media_error, TypstRenderMediaMissingError):
+                    await persist_render_inputs(render_source, template_bundle, {})
+                raise
             return await self._executor.execute(
                 render_source=render_source,
                 template_bundle=template_bundle,
                 font_bundle=font_bundle,
                 resolved_media=resolved_media,
-                on_workspace_ready=lambda: persist_render_inputs(render_source),
+                on_workspace_ready=lambda: persist_render_inputs(
+                    render_source, template_bundle, resolved_media
+                ),
             )
         except TypstRenderExecutionError as exc:
             raise translate_execution_error(exc, self._errors.execution) from exc

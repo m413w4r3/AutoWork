@@ -23,6 +23,7 @@ from cti_app.api.publication import router as publication_router
 from cti_app.api.selection import selection_router
 from cti_app.api.subject_content import router as subject_content_router
 from cti_app.api.subjects import router as subjects_router
+from cti_app.api.typst_input_inspection import router as typst_input_inspection_router
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.collection import SubjectCollectionService
 from cti_app.application.collection_review import CollectionReviewService
@@ -38,6 +39,7 @@ from cti_app.application.discovery.fusion import FusionService
 from cti_app.application.discovery.manual_source_edits import ManualSourceEditService
 from cti_app.application.discovery.runs import DiscoveryRunService
 from cti_app.application.discovery.service import DiscoveryService
+from cti_app.application.edition_composition import EditionCompositionService
 from cti_app.application.edition_preview import EditionPreviewPdfRenderer, EditionPreviewService
 from cti_app.application.edition_publication import (
     EditionAssemblyService,
@@ -84,6 +86,7 @@ from cti_app.application.publication_rendering import PublicationRenderService
 from cti_app.application.selection import SelectionService
 from cti_app.application.subject_content import SubjectContentService
 from cti_app.application.subjects import SubjectService
+from cti_app.application.typst_input_inspection import RenderInputInspectionService
 from cti_app.application.typst_paths import typst_bundle_paths
 from cti_app.application.typst_rendering import TypstRenderer
 from cti_app.application.workspace import SubjectWorkspaceMaterializer
@@ -246,10 +249,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     production_artifact_store = ProductionArtifactStore(BlobCatalogService(blob_store, uow_factory))
     pdf_inspection_cache = PdfInspectionCache(settings.pdf_inspection_cache_root)
+    pdf_inspection_source_repository = SqlAlchemyPdfInspectionSourceRepository(session_factory)
     pdf_inspection_service = PdfInspectionService(
-        SqlAlchemyPdfInspectionSourceRepository(session_factory),
+        pdf_inspection_source_repository,
         production_artifact_store,
         PopplerSubprocess(),
+        pdf_inspection_cache,
+    )
+    render_input_inspection_service = RenderInputInspectionService(
+        pdf_inspection_source_repository,
+        production_artifact_store,
+        pdf_inspection_service,
         pdf_inspection_cache,
     )
     production_checkpoint = EditionProductionCheckpointService(
@@ -328,6 +338,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.uow_factory = uow_factory
     app.state.production_artifact_store = production_artifact_store
     app.state.pdf_inspection_service = pdf_inspection_service
+    app.state.render_input_inspection_service = render_input_inspection_service
     app.state.media_asset_store = media_asset_store
     app.state.subject_content_service = subject_content_service
     app.state.publication_render_service = publication_render_service
@@ -361,6 +372,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         uow_factory, production_artifact_store, repair_payload_resolver
     )
     app.state.production_repair_issue_service = production_repair_issue_service
+    app.state.edition_composition_service = EditionCompositionService(
+        uow_factory, repair_issue_reader=production_repair_issue_service
+    )
     app.state.edition_review_service = EditionReviewService(
         uow_factory, production_repair_issue_service
     )
@@ -451,6 +465,7 @@ def create_app() -> FastAPI:
     application.include_router(production_control_router)
     application.include_router(publication_router)
     application.include_router(pdf_inspection_router)
+    application.include_router(typst_input_inspection_router)
     application.include_router(selection_router)
     application.include_router(subjects_router)
     application.include_router(subject_content_router)

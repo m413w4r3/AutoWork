@@ -19,6 +19,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from cti_app.application.blobs import BlobCatalogService
+from cti_app.application.edition_composition import EditionCompositionService
 from cti_app.application.edition_publication import (
     EditionPublicationService,
     PublicationAcceptanceError,
@@ -44,6 +45,7 @@ from cti_app.domain.discovery_cumulative import (
     DiscoverySubjectIdentity,
     MergeValidationStatus,
 )
+from cti_app.domain.edition_composition import CompositionDisposition, EditionCompositionEntry
 from cti_app.domain.editions import Edition, EditionStatus
 from cti_app.domain.entities import Subject
 from cti_app.domain.production import (
@@ -368,6 +370,27 @@ async def _seed(uow_factory: UnitOfWorkFactory, tmp_path: Path) -> _Fixture:
         publication = assembly.artifact
         await uow.commit()
 
+    await EditionCompositionService(uow_factory).replace_entries(
+        edition.id,
+        (
+            EditionCompositionEntry(
+                subject_id=subject.id,
+                disposition=CompositionDisposition.INCLUDED,
+                position=1,
+                production_run_id=run.id,
+                pipeline_generation=run.pipeline_generation,
+                artifact_id=publication.id,
+                artifact_version=publication.version,
+                artifact_input_hash=publication.input_hash,
+                provenance_batch_id=batch.id,
+            ),
+        ),
+        expected_version=0,
+        idempotency_key=f"lot34-seed-composition:{edition.id}",
+        actor_id="lot34",
+        correlation_id=f"lot34-seed-composition:{edition.id}",
+    )
+
     repair_key = repair_key_for_rejection(
         edition_id=edition.id,
         subject_id=subject.id,
@@ -508,7 +531,12 @@ async def test_concurrent_accept_can_only_freeze_the_repaired_publication(
     async def accept() -> tuple[Any, float]:
         await reached.wait()
         started = monotonic()
-        accepted = await publication_service.accept(fixture.edition.id, actor_id="analyst")
+        try:
+            accepted = await publication_service.accept(
+                fixture.edition.id, actor_id="analyst", expected_composition_version=1
+            )
+        except PublicationAcceptanceError as exc:
+            accepted = exc
         return accepted, monotonic() - started
 
     materialize_task = asyncio.create_task(materialize())
@@ -518,13 +546,44 @@ async def test_concurrent_accept_can_only_freeze_the_repaired_publication(
     await asyncio.sleep(0.3)
     release.set()
     result = await materialize_task
-    accepted, waited = await accept_task
+    first_accept, waited = await accept_task
 
     assert result.publication_artifact is not None
     new_publication_id = result.publication_artifact.id
     assert new_publication_id != fixture.publication.id
     # The accept could not proceed while the repair held its fence.
     assert waited >= 0.2
+    assert isinstance(first_accept, PublicationAcceptanceError)
+    assert first_accept.code == "publication_artifact_changed_during_freeze"
+    async with uow_factory() as uow:
+        assert (
+            await uow.publication_manifests.get_latest_manifest_for_edition(fixture.edition.id)
+            is None
+        )
+
+    await EditionCompositionService(uow_factory).replace_entries(
+        fixture.edition.id,
+        (
+            EditionCompositionEntry(
+                subject_id=fixture.subject.id,
+                disposition=CompositionDisposition.INCLUDED,
+                position=1,
+                production_run_id=fixture.run.id,
+                pipeline_generation=fixture.run.pipeline_generation,
+                artifact_id=result.publication_artifact.id,
+                artifact_version=result.publication_artifact.version,
+                artifact_input_hash=result.publication_artifact.input_hash,
+                provenance_batch_id=fixture.batch.id,
+            ),
+        ),
+        expected_version=1,
+        idempotency_key=f"lot34-repaired-composition:{fixture.edition.id}",
+        actor_id="analyst",
+        correlation_id=f"lot34-repaired-composition:{fixture.edition.id}",
+    )
+    accepted = await publication_service.accept(
+        fixture.edition.id, actor_id="analyst", expected_composition_version=2
+    )
     assert len(accepted.manifest.entries) == 1
     assert accepted.manifest.entries[0].document_artifact_id == new_publication_id
     assert accepted.manifest.entries[0].document_artifact_version == 2
@@ -559,7 +618,9 @@ async def test_a_failed_repair_leaves_the_pre_repair_article_freezable(
 
     async def accept() -> Any:
         await reached.wait()
-        return await publication_service.accept(fixture.edition.id, actor_id="analyst")
+        return await publication_service.accept(
+            fixture.edition.id, actor_id="analyst", expected_composition_version=1
+        )
 
     materialize_task = asyncio.create_task(materialize())
     accept_task = asyncio.create_task(accept())
@@ -635,7 +696,7 @@ async def test_freeze_refuses_a_document_older_than_the_effective_extraction(
 
     with pytest.raises(PublicationAcceptanceError, match="repair_materialization_incomplete"):
         await EditionPublicationService(uow_factory, fixture.store).accept(
-            fixture.edition.id, actor_id="analyst"
+            fixture.edition.id, actor_id="analyst", expected_composition_version=1
         )
 
 

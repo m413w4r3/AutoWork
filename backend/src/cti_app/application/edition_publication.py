@@ -55,17 +55,21 @@ from cti_app.application.typst_render_output import (
     TypstRenderOutputStorageError,
     read_verified_render_pdf,
 )
+from cti_app.domain.edition_composition import CompositionDisposition
 from cti_app.domain.edition_publication import (
     EditionDocumentV2,
     EditionRelease,
-    PublicationManifestEntryV1,
+    PublicationManifest,
+    PublicationManifestEntryV2,
     PublicationManifestExclusionV1,
     PublicationManifestV1,
+    PublicationManifestV2,
 )
 from cti_app.domain.edition_render import EditionRender, EditionRenderDisplayStatus
 from cti_app.domain.editions import Edition, EditionStatus
 from cti_app.domain.jobs import InvalidJobTransitionError, Job, JobStatus
 from cti_app.domain.production import ProductionArtifactStage, ProductionArtifactStatus
+from cti_app.domain.publication_review import PublicationDecision
 from cti_app.domain.typst_render import TypstRenderStatus
 
 logger = logging.getLogger(__name__)
@@ -80,7 +84,28 @@ class PublicationError(ValueError):
 
 
 class PublicationAcceptanceError(PublicationError):
-    pass
+    code = "publication_acceptance_rejected"
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
+class PublicationCompositionVersionConflict(PublicationAcceptanceError):
+    def __init__(self, expected_version: int, actual_version: int) -> None:
+        self.expected_version = expected_version
+        self.actual_version = actual_version
+        super().__init__("composition_version_conflict")
+
+
+class PublicationCompositionChangedDuringFreeze(PublicationAcceptanceError):
+    def __init__(self) -> None:
+        super().__init__("composition_changed_during_freeze")
+
+
+class PublicationArtifactChangedDuringFreeze(PublicationAcceptanceError):
+    def __init__(self) -> None:
+        super().__init__("publication_artifact_changed_during_freeze")
 
 
 class PublicationAssemblyError(PublicationError):
@@ -119,7 +144,7 @@ class EditionReleasePdf:
 
 @dataclass(frozen=True, slots=True)
 class PublicationAcceptResult:
-    manifest: PublicationManifestV1
+    manifest: PublicationManifestV2
     job_id: UUID | None
     job_dispatched: bool
     edition_state: EditionStatus
@@ -212,8 +237,9 @@ class EditionReleaseStatus:
 @dataclass(frozen=True, slots=True)
 class _ResolvedPublicationInputs:
     edition_version: int
-    batch_id: UUID
-    entries: tuple[PublicationManifestEntryV1, ...]
+    composition_id: UUID
+    composition_version: int
+    entries: tuple[PublicationManifestEntryV2, ...]
     exclusions: tuple[PublicationManifestExclusionV1, ...]
 
 
@@ -240,6 +266,7 @@ class EditionPublicationService:
         edition_id: UUID,
         *,
         actor_id: str,
+        expected_composition_version: int,
         correlation_id: str = "-",
     ) -> PublicationAcceptResult:
         """Freeze once, then re-assure the same assembly job on every retry."""
@@ -255,14 +282,15 @@ class EditionPublicationService:
                 edition,
                 repair_issue_reader=self._repair_issue_reader,
                 validate_review=True,
+                expected_composition_version=expected_composition_version,
             )
-            manifest = await uow.publication_manifests.get_latest_for_edition(edition_id)
+            manifest = await uow.publication_manifests.get_latest_manifest_for_edition(edition_id)
             if manifest is not None:
                 release = await uow.edition_releases.get_by_manifest(manifest.id)
             else:
                 release = None
             if (
-                manifest is not None
+                isinstance(manifest, PublicationManifestV2)
                 and release is None
                 and _publication_inputs_match(manifest, current_inputs)
             ):
@@ -284,10 +312,18 @@ class EditionPublicationService:
         actor_id: str,
         inputs: _ResolvedPublicationInputs,
     ) -> PublicationAcceptResult:
-        manifest = PublicationManifestV1.create(
+        current_composition = await uow.edition_compositions.get_for_edition(edition.id)
+        if (
+            current_composition is None
+            or current_composition.id != inputs.composition_id
+            or current_composition.version != inputs.composition_version
+        ):
+            raise PublicationCompositionChangedDuringFreeze()
+        manifest = PublicationManifestV2.create(
             edition_id=edition.id,
             edition_version=edition.version,
-            batch_id=inputs.batch_id,
+            composition_id=inputs.composition_id,
+            composition_version=inputs.composition_version,
             created_by=actor_id,
             entries=inputs.entries,
             exclusions=inputs.exclusions,
@@ -303,7 +339,7 @@ class EditionPublicationService:
 
     async def _ensure_assembly_job(
         self,
-        manifest: PublicationManifestV1,
+        manifest: PublicationManifest,
         *,
         correlation_id: str,
         actor_id: str,
@@ -327,7 +363,7 @@ class EditionPublicationService:
             edition = await uow.editions.get(edition_id)
             if edition is None:
                 raise PublicationManifestNotFoundError(str(edition_id))
-            manifest = await uow.publication_manifests.get_latest_for_edition(edition_id)
+            manifest = await uow.publication_manifests.get_latest_manifest_for_edition(edition_id)
             release = (
                 await uow.edition_releases.get_by_manifest(manifest.id)
                 if manifest is not None
@@ -353,18 +389,21 @@ class EditionPublicationService:
                 render_job = _latest_render_job(render_jobs, release.id)
             current_inputs_match = False
             if manifest is not None and release is None:
-                try:
-                    current_inputs = await _resolve_current_publication_inputs(
-                        uow,
-                        edition,
-                        repair_issue_reader=None,
-                        validate_review=False,
+                if isinstance(manifest, PublicationManifestV1):
+                    current_inputs_match = edition.version == manifest.edition_version
+                else:
+                    try:
+                        current_inputs = await _resolve_current_publication_inputs(
+                            uow,
+                            edition,
+                            repair_issue_reader=None,
+                            validate_review=False,
+                        )
+                    except PublicationError:
+                        current_inputs = None
+                    current_inputs_match = current_inputs is not None and _publication_inputs_match(
+                        manifest, current_inputs
                     )
-                except PublicationError:
-                    current_inputs = None
-                current_inputs_match = current_inputs is not None and _publication_inputs_match(
-                    manifest, current_inputs
-                )
             can_retry_assembly = (
                 edition.state is EditionStatus.OPEN
                 and manifest is not None
@@ -401,7 +440,7 @@ class EditionPublicationService:
         """Return the verified PDF of the latest release's most recent successful render."""
         async with self._uow_factory() as uow:
             edition = await uow.editions.get(edition_id)
-            manifest = await uow.publication_manifests.get_latest_for_edition(edition_id)
+            manifest = await uow.publication_manifests.get_latest_manifest_for_edition(edition_id)
             release = (
                 await uow.edition_releases.get_by_manifest(manifest.id)
                 if manifest is not None
@@ -428,7 +467,7 @@ class EditionPublicationService:
     async def read_release_ioc_archive(self, edition_id: UUID) -> EditionIOCArchive:
         """Export IOC values only from the document pinned by the latest release."""
         async with self._uow_factory() as uow:
-            manifest = await uow.publication_manifests.get_latest_for_edition(edition_id)
+            manifest = await uow.publication_manifests.get_latest_manifest_for_edition(edition_id)
             release = (
                 await uow.edition_releases.get_by_manifest(manifest.id)
                 if manifest is not None
@@ -474,7 +513,7 @@ class EditionPublicationService:
         """Ensure the render job for the current release without changing its inputs."""
         async with self._uow_factory() as uow:
             edition = await uow.editions.get(edition_id)
-            manifest = await uow.publication_manifests.get_latest_for_edition(edition_id)
+            manifest = await uow.publication_manifests.get_latest_manifest_for_edition(edition_id)
             release = (
                 await uow.edition_releases.get_by_manifest(manifest.id)
                 if manifest is not None
@@ -527,11 +566,20 @@ class EditionAssemblyService:
             edition = await uow.editions.get(manifest.edition_id)
             if edition is None:
                 raise PublicationAssemblyError("edition_not_found")
-            if existing is None:
+            if existing is None and isinstance(manifest, PublicationManifestV2):
                 if edition.state is not EditionStatus.OPEN:
                     raise PublicationAssemblyError("edition_must_be_open")
                 if edition.version != manifest.edition_version:
                     raise PublicationAssemblyError("edition_changed_after_publication_freeze")
+                _assert_manifest_inputs_current = True
+            else:
+                _assert_manifest_inputs_current = False
+            if existing is None and isinstance(manifest, PublicationManifestV1):
+                if edition.state is not EditionStatus.OPEN:
+                    raise PublicationAssemblyError("edition_must_be_open")
+                if edition.version != manifest.edition_version:
+                    raise PublicationAssemblyError("edition_changed_after_publication_freeze")
+            if _assert_manifest_inputs_current:
                 try:
                     current_inputs = await _resolve_current_publication_inputs(
                         uow,
@@ -612,19 +660,20 @@ class EditionAssemblyService:
                     raise PublicationAssemblyError("edition_must_be_open")
                 if edition.version != manifest.edition_version:
                     raise PublicationAssemblyError("edition_changed_after_publication_freeze")
-                try:
-                    current_inputs = await _resolve_current_publication_inputs(
-                        uow,
-                        edition,
-                        repair_issue_reader=None,
-                        validate_review=False,
-                    )
-                except PublicationError as exc:
-                    raise PublicationAssemblyError(
-                        "publication_inputs_changed_after_freeze"
-                    ) from exc
-                if not _publication_inputs_match(manifest, current_inputs):
-                    raise PublicationAssemblyError("publication_inputs_changed_after_freeze")
+                if isinstance(manifest, PublicationManifestV2):
+                    try:
+                        current_inputs = await _resolve_current_publication_inputs(
+                            uow,
+                            edition,
+                            repair_issue_reader=None,
+                            validate_review=False,
+                        )
+                    except PublicationError as exc:
+                        raise PublicationAssemblyError(
+                            "publication_inputs_changed_after_freeze"
+                        ) from exc
+                    if not _publication_inputs_match(manifest, current_inputs):
+                        raise PublicationAssemblyError("publication_inputs_changed_after_freeze")
                 if candidate_release is None:
                     raise PublicationAssemblyError("release_candidate_missing")
                 release = candidate_release
@@ -711,10 +760,18 @@ async def _resolve_current_publication_inputs(
     *,
     repair_issue_reader: ProductionRepairIssueReader | None,
     validate_review: bool,
+    expected_composition_version: int | None = None,
 ) -> _ResolvedPublicationInputs:
-    batch = await uow.edition_production_batches.get_latest_for_edition(edition.id)
-    if batch is None:
-        raise PublicationAcceptanceError("edition_has_no_production_batch")
+    composition = await uow.edition_compositions.get_for_edition(edition.id)
+    if composition is None:
+        raise PublicationAcceptanceError("edition_has_no_composition")
+    if (
+        expected_composition_version is not None
+        and composition.version != expected_composition_version
+    ):
+        raise PublicationCompositionVersionConflict(
+            expected_composition_version, composition.version
+        )
 
     rows = await uow.edition_review_read_model.list_for_edition(edition.id)
     repairs: tuple[Any, ...] = ()
@@ -728,17 +785,41 @@ async def _resolve_current_publication_inputs(
         supplemental = await repair_issue_reader.list_supplemental_source_issues(edition.id)
         repairs = tuple([*extraction, *supplemental])
     review = EditionReviewService.from_rows(edition.id, rows, repair_issues=repairs)
-    if validate_review and not review.can_accept:
-        raise PublicationAcceptanceError("review_cannot_be_accepted")
+    if review.composition_version != composition.version:
+        raise PublicationCompositionChangedDuringFreeze()
+    if validate_review:
+        if any(
+            entry.disposition is CompositionDisposition.DEFERRED for entry in composition.entries
+        ) or any(
+            diagnostic.code.value == "subject_unaddressed" for diagnostic in review.diagnostics
+        ):
+            raise PublicationAcceptanceError("composition_incomplete")
 
-    entries: list[PublicationManifestEntryV1] = []
+    review_by_subject = {item.subject_id: item for item in review.items}
+    entries: list[PublicationManifestEntryV2] = []
     exclusions: list[PublicationManifestExclusionV1] = []
-    for item in review.items:
-        if item.included:
-            if item.document_artifact_id is None:
-                raise PublicationAcceptanceError("included_item_has_no_document")
+    for composition_entry in composition.entries:
+        if composition_entry.disposition is CompositionDisposition.INCLUDED:
+            item = review_by_subject.get(composition_entry.subject_id)
+            if item is None or item.document_artifact_id is None:
+                raise PublicationArtifactChangedDuringFreeze()
+            if (
+                composition_entry.position != item.position
+                or composition_entry.production_run_id != item.run_id
+                or composition_entry.pipeline_generation != item.pipeline_generation
+                or composition_entry.artifact_id != item.document_artifact_id
+                or composition_entry.artifact_version != item.document_artifact_version
+                or composition_entry.artifact_input_hash != item.document_input_hash
+            ):
+                raise PublicationArtifactChangedDuringFreeze()
             run = await _get_run_for_update(uow, item.run_id)
-            artifact = await uow.production_artifacts.get(item.document_artifact_id)
+            artifact_repository = uow.production_artifacts
+            artifact_getter = getattr(artifact_repository, "get_for_update", None)
+            artifact = await (
+                artifact_getter(item.document_artifact_id)
+                if artifact_getter is not None
+                else artifact_repository.get(item.document_artifact_id)
+            )
             if (
                 run is None
                 or artifact is None
@@ -754,7 +835,23 @@ async def _resolve_current_publication_inputs(
                 or artifact.status is not ProductionArtifactStatus.VERIFIED
                 or artifact.canonical_blob_id is None
             ):
-                raise PublicationAcceptanceError("included_artifact_mismatch")
+                raise PublicationArtifactChangedDuringFreeze()
+            if validate_review and (not item.included or not review.can_accept):
+                raise PublicationAcceptanceError("review_cannot_be_accepted")
+            blob_repository = getattr(uow, "blobs", None)
+            blob = (
+                await blob_repository.get(artifact.canonical_blob_id)
+                if blob_repository is not None
+                else None
+            )
+            document_sha256 = (
+                blob.descriptor.sha256 if blob is not None else composition_entry.document_sha256
+            )
+            if (
+                composition_entry.document_sha256 is not None
+                and document_sha256 != composition_entry.document_sha256
+            ):
+                raise PublicationArtifactChangedDuringFreeze()
             if validate_review:
                 # Defence in depth: the manifest must never freeze a document
                 # older than the repair already applied to its Extraction.
@@ -775,7 +872,7 @@ async def _resolve_current_publication_inputs(
                 ):
                     raise PublicationAcceptanceError("repair_materialization_incomplete")
             entries.append(
-                PublicationManifestEntryV1(
+                PublicationManifestEntryV2(
                     position=item.position,
                     subject_id=item.subject_id,
                     production_run_id=item.run_id,
@@ -783,38 +880,55 @@ async def _resolve_current_publication_inputs(
                     document_artifact_id=artifact.id,
                     document_artifact_version=artifact.version,
                     document_input_hash=artifact.input_hash,
-                )
-            )
-        elif item.effective_decision is not None:
-            if item.effective_decision_id is None:
-                raise PublicationAcceptanceError("excluded_item_has_no_decision")
-            if item.effective_decision.value != "exclude":
-                raise PublicationAcceptanceError("non_publishable_item_is_not_excluded")
-            exclusions.append(
-                PublicationManifestExclusionV1(
-                    subject_id=item.subject_id,
+                    document_sha256=document_sha256,
+                    provenance_batch_id=composition_entry.provenance_batch_id,
                     review_decision_id=item.effective_decision_id,
                 )
             )
-        else:
-            raise PublicationAcceptanceError("review_item_has_no_effective_decision")
+        elif composition_entry.disposition is CompositionDisposition.EXCLUDED:
+            if composition_entry.review_decision_id is None:
+                raise PublicationAcceptanceError("excluded_item_has_no_decision")
+            exclusion_item = review_by_subject.get(composition_entry.subject_id)
+            if (
+                exclusion_item is None
+                or exclusion_item.effective_decision is not PublicationDecision.EXCLUDE
+                or exclusion_item.effective_decision_id != composition_entry.review_decision_id
+            ):
+                raise PublicationAcceptanceError("excluded_item_has_no_decision")
+            exclusions.append(
+                PublicationManifestExclusionV1(
+                    subject_id=composition_entry.subject_id,
+                    review_decision_id=composition_entry.review_decision_id,
+                )
+            )
 
     if not entries:
         raise PublicationAcceptanceError("review_must_include_at_least_one_item")
+    latest_composition = await uow.edition_compositions.get_for_edition(edition.id)
+    if (
+        latest_composition is None
+        or latest_composition.id != composition.id
+        or latest_composition.version != composition.version
+    ):
+        raise PublicationCompositionChangedDuringFreeze()
     return _ResolvedPublicationInputs(
         edition_version=edition.version,
-        batch_id=batch.id,
+        composition_id=composition.id,
+        composition_version=composition.version,
         entries=tuple(sorted(entries, key=lambda item: item.position)),
         exclusions=tuple(sorted(exclusions, key=lambda item: str(item.subject_id))),
     )
 
 
 def _publication_inputs_match(
-    manifest: PublicationManifestV1, inputs: _ResolvedPublicationInputs
+    manifest: PublicationManifest, inputs: _ResolvedPublicationInputs
 ) -> bool:
+    if not isinstance(manifest, PublicationManifestV2):
+        return False
     return (
         manifest.edition_version == inputs.edition_version
-        and manifest.batch_id == inputs.batch_id
+        and manifest.composition_id == inputs.composition_id
+        and manifest.composition_version == inputs.composition_version
         and manifest.entries == inputs.entries
         and manifest.exclusions == inputs.exclusions
     )

@@ -69,13 +69,15 @@ export type AssemblyJobStatus =
 export type EditionRenderDisplayStatus =
   "none" | "not_started" | "queued" | "running" | "failed" | "succeeded";
 
-export interface PublicationAcceptResponse {
+export interface CompositionAcceptResponse {
   edition_id: string;
   edition_state: EditionStatus;
   manifest_id: string;
   manifest_sha256: string;
+  manifest_schema_version: string;
   edition_version: number;
-  batch_id: string;
+  composition_id: string;
+  composition_version: number;
   job_id: string | null;
   job_dispatched: boolean;
 }
@@ -134,10 +136,26 @@ export interface EditionDocumentV2 {
 export interface EditionPreviewResponse {
   edition_id: string;
   edition_version: number;
+  composition_id: string;
+  composition_version: number;
   preview_input_hash: string;
   artifacts: EditionPreviewArtifact[];
   document: EditionDocumentV2;
+  partial: boolean;
+  missing_subject_ids: string[];
+  deferred_subject_ids: string[];
   stale: boolean;
+}
+
+export interface EditionReviewDiagnostic {
+  code: string;
+  subject_id: string | null;
+  disposition: string | null;
+  run_id: string | null;
+  details: Record<string, unknown> | null;
+  active_repair_count: number;
+  unresolved_repair_count: number;
+  pending_rebuild_count: number;
 }
 
 export interface ReviewItem {
@@ -182,6 +200,12 @@ export interface ReviewItem {
   can_resume?: boolean;
   requires_reconciliation: boolean;
   reconciliation: ProductionReconciliation | null;
+  composition_version?: number | null;
+  superseded_artifact_available?: boolean;
+  pinned_generation_current?: boolean;
+  latest_artifact_run_id?: string | null;
+  latest_artifact_id?: string | null;
+  latest_artifact_version?: number | null;
   error_code: string | null;
   error_message: string | null;
 }
@@ -192,6 +216,8 @@ export interface EditionReview {
   edition_id: string;
   items: ReviewItem[];
   can_accept: boolean;
+  composition_version?: number | null;
+  diagnostics?: EditionReviewDiagnostic[];
   unresolved_repair_count?: number;
   repair_review_complete?: boolean;
   pending_rebuild_count?: number;
@@ -435,6 +461,14 @@ export async function getEditionReview(
   return request(`/api/editions/${editionId}/review`);
 }
 
+export async function getEditionCompositionValidation(
+  editionId: string,
+): Promise<EditionReview> {
+  return request(
+    `/api/editions/${encodeURIComponent(editionId)}/composition/validation`,
+  );
+}
+
 export async function getEditionRepairPage(
   editionId: string,
   options: {
@@ -593,13 +627,18 @@ export function rebuildEditionReviewItem(
   );
 }
 
-export function acceptEditionPublication(
+export function acceptEditionComposition(
   editionId: string,
-): Promise<PublicationAcceptResponse> {
+  expectedCompositionVersion: number,
+): Promise<CompositionAcceptResponse> {
   return request(
-    `/api/editions/${encodeURIComponent(editionId)}/publication/accept`,
+    `/api/editions/${encodeURIComponent(editionId)}/composition/accept`,
     {
       method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        expected_composition_version: expectedCompositionVersion,
+      }),
     },
   );
 }
@@ -644,6 +683,73 @@ export function getEditionPreview(
   return request(
     `/api/editions/${encodeURIComponent(editionId)}/preview${query}`,
   );
+}
+
+export function getEditionCompositionPreview(
+  editionId: string,
+  previousPreviewInputHash?: string | null,
+): Promise<EditionPreviewResponse> {
+  const query = previousPreviewInputHash
+    ? `?preview_input_hash=${encodeURIComponent(previousPreviewInputHash)}`
+    : "";
+  return request(
+    `/api/editions/${encodeURIComponent(editionId)}/composition/preview${query}`,
+  );
+}
+
+export async function fetchEditionPreviewPdf(
+  editionId: string,
+  previewInputHash: string,
+): Promise<{
+  content: Blob;
+  inspectionId: string | null;
+  pdfSha256: string | null;
+}> {
+  const response = await fetch(
+    editionPreviewPdfUrl(editionId, previewInputHash),
+  );
+  if (!response.ok) throw await apiError(response);
+  return {
+    content: await response.blob(),
+    inspectionId: response.headers.get("X-Render-Inspection-ID"),
+    pdfSha256: response.headers.get("X-PDF-SHA256"),
+  };
+}
+
+export interface RenderInputInspectionResponse {
+  render: {
+    id: string;
+    type: string;
+    status: string;
+  };
+  hashes: {
+    pdf_sha256: string | null;
+  };
+  pdf: {
+    sha256: string | null;
+    href: string | null;
+    availability: string;
+  };
+}
+
+export function getRenderInputInspection(
+  renderId: string,
+): Promise<RenderInputInspectionResponse> {
+  return request(`/api/render-inspections/${encodeURIComponent(renderId)}`);
+}
+
+export function renderInputInspectionUrl(
+  renderId: string,
+  preview = false,
+): string {
+  const root = preview
+    ? "/api/render-inspections/previews"
+    : "/api/render-inspections";
+  return `${root}/${encodeURIComponent(renderId)}`;
+}
+
+export function pdfInspectionUrl(pdfSha256: string): string {
+  return `/api/pdf-inspections/${encodeURIComponent(pdfSha256)}`;
 }
 
 export function editionPreviewPdfUrl(
@@ -692,6 +798,39 @@ export async function excludeReviewItem(
         document_artifact_version: item.document_artifact_version,
         document_input_hash: item.document_input_hash,
         reason: reason.trim(),
+      }),
+    },
+  );
+}
+
+export async function excludeCompositionArtifact(
+  editionId: string,
+  identity: {
+    subjectId: string;
+    productionRunId: string;
+    pipelineGeneration: number;
+    artifactId: string;
+    artifactVersion: number;
+    inputHash: string;
+  },
+  reason: string,
+): Promise<ReviewDecision> {
+  const normalizedReason = reason.trim();
+  if (!normalizedReason) {
+    throw new Error("Un motif est obligatoire pour exclure un sujet.");
+  }
+  return request(
+    `/api/editions/${encodeURIComponent(editionId)}/review/items/${encodeURIComponent(identity.subjectId)}/exclude`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        production_run_id: identity.productionRunId,
+        pipeline_generation: identity.pipelineGeneration,
+        document_artifact_id: identity.artifactId,
+        document_artifact_version: identity.artifactVersion,
+        document_input_hash: identity.inputHash,
+        reason: normalizedReason,
       }),
     },
   );

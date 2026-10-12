@@ -36,9 +36,10 @@ from cti_app.domain.discovery_cumulative import (
 )
 from cti_app.domain.edition_publication import (
     EditionRelease,
+    PublicationManifest,
     PublicationManifestEntryV1,
+    PublicationManifestEntryV2,
     PublicationManifestExclusionV1,
-    PublicationManifestV1,
 )
 from cti_app.domain.edition_render import EditionRender
 from cti_app.domain.editions import Edition, EditionAuditEvent, EditionStatus
@@ -99,6 +100,10 @@ class ActiveSubjectProductionRunConflictError(RuntimeError):
 
 
 if TYPE_CHECKING:
+    from cti_app.application.edition_composition import (
+        EditionCompositionEventRepository,
+        EditionCompositionRepository,
+    )
     from cti_app.application.edition_review import EditionReviewReadRepository
 
 
@@ -846,6 +851,8 @@ class UnitOfWork(Protocol):
     source_extractions: SourceExtractionRepository
     edition_production_batches: EditionProductionBatchRepository
     edition_production_batch_items: EditionProductionBatchItemRepository
+    edition_compositions: EditionCompositionRepository
+    edition_composition_events: EditionCompositionEventRepository
     batch_status_read_model: BatchStatusReadRepository
     edition_review_read_model: EditionReviewReadRepository
     publication_review_decisions: PublicationReviewDecisionRepository
@@ -1017,6 +1024,8 @@ class ProductionArtifactRepository(Protocol):
     async def append(self, artifact: ProductionArtifact) -> None: ...
 
     async def get(self, artifact_id: UUID) -> ProductionArtifact | None: ...
+
+    async def get_for_update(self, artifact_id: UUID) -> ProductionArtifact | None: ...
 
     async def get_current(self, run_id: UUID, stage: str) -> ProductionArtifact | None: ...
 
@@ -1201,6 +1210,7 @@ class ProductionUnitOfWork(Protocol):
     source_collections: SourceCollectionRepository
     edition_production_batches: EditionProductionBatchRepository
     edition_production_batch_items: EditionProductionBatchItemRepository
+    edition_compositions: EditionCompositionRepository
     edition_review_read_model: EditionReviewReadRepository
     publication_review_decisions: PublicationReviewDecisionRepository
     publication_manifests: PublicationManifestRepository
@@ -1241,27 +1251,31 @@ class PublicationReviewDecisionRepository(Protocol):
 
 
 class PublicationManifestRepository(Protocol):
-    async def add(self, manifest: PublicationManifestV1, manifest_blob_id: UUID) -> None: ...
+    async def add(self, manifest: PublicationManifest, manifest_blob_id: UUID) -> None: ...
 
-    async def get(self, manifest_id: UUID) -> PublicationManifestV1 | None: ...
+    async def get(self, manifest_id: UUID) -> PublicationManifest | None: ...
 
     async def get_blob_id(self, manifest_id: UUID) -> UUID | None: ...
 
     async def get_for_edition_version(
         self, edition_id: UUID, edition_version: int
-    ) -> PublicationManifestV1 | None: ...
+    ) -> PublicationManifest | None: ...
 
-    async def get_latest_for_edition(self, edition_id: UUID) -> PublicationManifestV1 | None: ...
+    async def get_latest_manifest_for_edition(
+        self, edition_id: UUID
+    ) -> PublicationManifest | None: ...
 
 
 class PublicationManifestEntryRepository(Protocol):
     async def append_many(
-        self, manifest_id: UUID, entries: Sequence[PublicationManifestEntryV1]
+        self,
+        manifest_id: UUID,
+        entries: Sequence[PublicationManifestEntryV1 | PublicationManifestEntryV2],
     ) -> None: ...
 
     async def list_for_manifest(
         self, manifest_id: UUID
-    ) -> Sequence[PublicationManifestEntryV1]: ...
+    ) -> Sequence[PublicationManifestEntryV1 | PublicationManifestEntryV2]: ...
 
 
 class PublicationManifestExclusionRepository(Protocol):

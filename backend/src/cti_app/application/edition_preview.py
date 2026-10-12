@@ -15,7 +15,6 @@ from cti_app.application.edition_document import (
     build_edition_document,
 )
 from cti_app.application.edition_review import (
-    EditionReview,
     EditionReviewService,
     ProductionRepairIssueReader,
 )
@@ -32,6 +31,11 @@ from cti_app.application.typst_compilation import (
     TypstCompilationError,
     TypstCompiler,
 )
+from cti_app.application.typst_input_snapshot import (
+    build_typst_input_snapshot,
+    preview_inspection_id,
+    preview_snapshot_cache_key,
+)
 from cti_app.application.typst_render_execution import (
     TypstRenderExecutionError,
     TypstRenderExecutionErrorTypes,
@@ -41,6 +45,7 @@ from cti_app.application.typst_render_execution import (
 )
 from cti_app.application.typst_render_lifecycle import TypstMappingSidecarCache
 from cti_app.application.typst_rendering import TemplateBundleInvalidError
+from cti_app.domain.edition_composition import CompositionDisposition
 from cti_app.domain.edition_publication import EditionDocumentV2
 from cti_app.domain.edition_render import EDITION_RENDERER_VERSION
 from cti_app.domain.editions import Edition
@@ -112,9 +117,14 @@ class EditionPreviewArtifact:
 class EditionPreview:
     edition_id: UUID
     edition_version: int
+    composition_id: UUID
+    composition_version: int
     preview_input_hash: str
     artifacts: tuple[EditionPreviewArtifact, ...]
     document: EditionDocumentV2
+    partial: bool
+    missing_subject_ids: tuple[UUID, ...]
+    deferred_subject_ids: tuple[UUID, ...]
     stale: bool
 
 
@@ -192,6 +202,26 @@ class EditionPreviewPdfRenderer:
                 font_bundle=font_bundle,
                 resolved_media=resolved_media,
             )
+            if self._mapping_cache is not None and preview_input_hash is not None:
+                try:
+                    inspection_id = preview_inspection_id(
+                        preview_input_hash, executed.compiled_document.sha256
+                    )
+                    snapshot = build_typst_input_snapshot(
+                        template_bundle=template_bundle,
+                        render_source=render_source,
+                        resolved_media=executed.resolved_media,
+                        render_id=inspection_id,
+                        preview_input_hash=preview_input_hash,
+                        pdf_sha256=executed.compiled_document.sha256,
+                    )
+                    if snapshot is not None:
+                        self._mapping_cache.put_derived(
+                            preview_snapshot_cache_key(inspection_id), snapshot
+                        )
+                except Exception:
+                    # Disposable source inspection never changes preview success.
+                    pass
             if (
                 self._mapping_cache is not None
                 and preview_input_hash is not None
@@ -271,40 +301,75 @@ class EditionPreviewService:
         previous_preview_input_hash: str | None = None,
     ) -> tuple[Edition, EditionPreview]:
         review = await self._review_service.get(edition_id)
-        if not review.can_accept:
+        if review.composition_version is None:
             raise EditionPreviewError("edition_preview_unavailable")
-
-        refs = tuple(
-            EditionDocumentArtifactRef(
-                position=item.position,
-                subject_id=item.subject_id,
-                production_run_id=item.run_id,
-                pipeline_generation=item.pipeline_generation,
-                artifact_id=item.document_artifact_id,
-                artifact_version=item.document_artifact_version,
-                input_hash=item.document_input_hash,
-            )
-            for item in review.items
-            if item.included
-            and item.document_artifact_id is not None
-            and item.document_artifact_version is not None
-            and item.document_input_hash is not None
-        )
-        if not refs:
-            raise EditionPreviewError("edition_preview_has_no_publications")
 
         async with self._uow_factory() as uow:
             edition = await uow.editions.get(edition_id)
             if edition is None:
                 raise EditionPreviewError("edition_not_found")
-            fingerprint = _preview_fingerprint(edition, review, refs)
+            composition = await uow.edition_compositions.get_for_edition(edition_id)
+            if composition is None or composition.version != review.composition_version:
+                raise EditionPreviewStaleError("edition_preview_stale")
+            review_by_subject = {item.subject_id: item for item in review.items}
+            refs_list: list[EditionDocumentArtifactRef] = []
+            missing: set[UUID] = set()
+            deferred: set[UUID] = set()
+            for entry in composition.entries:
+                if entry.disposition is CompositionDisposition.DEFERRED:
+                    deferred.add(entry.subject_id)
+                    missing.add(entry.subject_id)
+                    continue
+                if entry.disposition is CompositionDisposition.EXCLUDED:
+                    continue
+                item = review_by_subject.get(entry.subject_id)
+                if (
+                    item is None
+                    or item.document_artifact_id != entry.artifact_id
+                    or item.document_artifact_version != entry.artifact_version
+                    or item.document_input_hash != entry.artifact_input_hash
+                ):
+                    missing.add(entry.subject_id)
+                    continue
+                if (
+                    entry.production_run_id is None
+                    or entry.pipeline_generation is None
+                    or entry.artifact_id is None
+                    or entry.artifact_version is None
+                    or entry.artifact_input_hash is None
+                ):
+                    missing.add(entry.subject_id)
+                    continue
+                refs_list.append(
+                    EditionDocumentArtifactRef(
+                        position=entry.position or item.position,
+                        subject_id=entry.subject_id,
+                        production_run_id=entry.production_run_id,
+                        pipeline_generation=entry.pipeline_generation,
+                        artifact_id=entry.artifact_id,
+                        artifact_version=entry.artifact_version,
+                        input_hash=entry.artifact_input_hash,
+                    )
+                )
+            for diagnostic in review.diagnostics:
+                if diagnostic.code.value == "subject_unaddressed" and diagnostic.subject_id:
+                    missing.add(diagnostic.subject_id)
+            refs = tuple(sorted(refs_list, key=lambda ref: ref.position))
+            if not refs:
+                raise EditionPreviewError("edition_preview_has_no_publications")
+            fingerprint = _preview_fingerprint(
+                edition.id,
+                edition.version,
+                composition.id,
+                composition.version,
+            )
             try:
                 document = await build_edition_document(
                     uow,
                     self._artifact_store,
                     edition,
                     refs,
-                    require_current=True,
+                    require_current=False,
                 )
             except EditionDocumentBuildError as exc:
                 raise EditionPreviewError(exc.code) from exc
@@ -314,6 +379,8 @@ class EditionPreviewService:
         return edition, EditionPreview(
             edition_id=edition_id,
             edition_version=edition.version,
+            composition_id=composition.id,
+            composition_version=composition.version,
             preview_input_hash=fingerprint,
             artifacts=tuple(
                 EditionPreviewArtifact(
@@ -326,6 +393,9 @@ class EditionPreviewService:
                 for ref in refs
             ),
             document=document,
+            partial=bool(missing),
+            missing_subject_ids=tuple(sorted(missing, key=str)),
+            deferred_subject_ids=tuple(sorted(deferred, key=str)),
             stale=observed_hash is not None and observed_hash != fingerprint,
         )
 
@@ -369,33 +439,16 @@ class EditionPreviewService:
 
 
 def _preview_fingerprint(
-    edition: Edition, review: EditionReview, refs: tuple[EditionDocumentArtifactRef, ...]
+    edition_id: UUID,
+    edition_version: int,
+    composition_id: UUID,
+    composition_version: int,
 ) -> str:
     payload = {
-        "edition_id": str(edition.id),
-        "edition_version": edition.version,
-        "scope": [
-            {
-                "subject_id": str(item.subject_id),
-                "position": item.position,
-                "included": item.included,
-                "decision": item.effective_decision.value if item.effective_decision else None,
-                "decision_id": str(item.effective_decision_id)
-                if item.effective_decision_id
-                else None,
-            }
-            for item in review.items
-        ],
-        "artifacts": [
-            {
-                "position": ref.position,
-                "subject_id": str(ref.subject_id),
-                "artifact_id": str(ref.artifact_id),
-                "artifact_version": ref.artifact_version,
-                "input_hash": ref.input_hash,
-            }
-            for ref in refs
-        ],
+        "edition_id": str(edition_id),
+        "edition_version": edition_version,
+        "composition_id": str(composition_id),
+        "composition_version": composition_version,
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()

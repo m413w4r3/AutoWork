@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from enum import StrEnum
 from typing import Any, Protocol
 from uuid import UUID
 
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
-from cti_app.application.production_artifact_resolver import current_publication_artifact
 from cti_app.application.production_repairs import (
     merge_repair_impacts,
     repair_issue_application_state,
@@ -17,6 +17,7 @@ from cti_app.application.production_repairs import (
     repair_issue_pending_references,
 )
 from cti_app.application.production_resume import resolve_retry_stage
+from cti_app.domain.edition_composition import CompositionDisposition
 from cti_app.domain.editions import EditionStatus
 from cti_app.domain.production import (
     ProductionArtifactStage,
@@ -64,6 +65,12 @@ class EditionReviewReadItem:
     rejected_other_artifact_count: int = 0
     rejected_rule_count: int = 0
     published_rule_count: int = 0
+    composition_version: int | None = None
+    superseded_artifact_available: bool = False
+    pinned_generation_current: bool = True
+    latest_artifact_run_id: UUID | None = None
+    latest_artifact_id: UUID | None = None
+    latest_artifact_version: int | None = None
     #: ``ProductionArtifactStage`` values whose artifact is not STALE.
     #: ``None`` means the caller did not supply the artifact inventory, which
     #: is not the same fact as "nothing is current"; the distinction decides
@@ -117,8 +124,43 @@ class EditionReviewReadItem:
         )
 
 
+class EditionReviewDiagnosticCode(StrEnum):
+    COMPOSITION_MISSING = "composition_missing"
+    SUBJECT_UNADDRESSED = "subject_unaddressed"
+    SUBJECT_DEFERRED = "subject_deferred"
+    SUBJECT_EXCLUDED = "subject_excluded"
+    EXCLUSION_DECISION_MISSING = "exclusion_decision_missing"
+    PINNED_ARTIFACT_SUPERSEDED = "pinned_artifact_superseded"
+    PINNED_RUN_GENERATION_STALE = "pinned_run_generation_stale"
+
+
+@dataclass(frozen=True, slots=True)
+class EditionReviewDiagnostic:
+    code: EditionReviewDiagnosticCode
+    subject_id: UUID | None = None
+    disposition: CompositionDisposition | None = None
+    run_id: UUID | None = None
+    details: dict[str, Any] | None = None
+    active_repair_count: int = 0
+    unresolved_repair_count: int = 0
+    pending_rebuild_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class EditionReviewReadScope:
+    """One composition-scoped database read, including non-included signals."""
+
+    items: tuple[EditionReviewReadItem, ...]
+    composition_version: int | None
+    diagnostics: tuple[EditionReviewDiagnostic, ...] = ()
+
+    @property
+    def composition_missing(self) -> bool:
+        return self.composition_version is None
+
+
 class EditionReviewReadRepository(Protocol):
-    async def list_for_edition(self, edition_id: UUID) -> Sequence[EditionReviewReadItem]: ...
+    async def list_for_edition(self, edition_id: UUID) -> EditionReviewReadScope: ...
 
 
 def requires_reconciliation(
@@ -210,6 +252,12 @@ class EditionReviewItem:
     #: The article has no current deliverable and owes a rebuild. Derived from
     #: the artifacts, so it is true whether or not a repair issue is open.
     rebuild_required: bool = False
+    composition_version: int | None = None
+    superseded_artifact_available: bool = False
+    pinned_generation_current: bool = True
+    latest_artifact_run_id: UUID | None = None
+    latest_artifact_id: UUID | None = None
+    latest_artifact_version: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,6 +271,8 @@ class EditionReview:
     # Sign-off is refused while this is non-zero, so no manifest can be frozen
     # between a manual archive and the REFERENCES version that reintegrates it.
     pending_rebuild_count: int = 0
+    composition_version: int | None = None
+    diagnostics: tuple[EditionReviewDiagnostic, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -369,7 +419,11 @@ class EditionRepairReadService:
         async with self._uow_factory() as uow:
             edition = await uow.editions.get(edition_id)
             EditionReviewService._require_readable(edition, edition_id)
-            rows = await uow.edition_review_read_model.list_for_edition(edition_id)
+            read_scope = await uow.edition_review_read_model.list_for_edition(edition_id)
+            if isinstance(read_scope, EditionReviewReadScope):
+                rows = read_scope.items
+            else:
+                rows = read_scope
 
         rows_by_subject = {row.subject_id: row for row in rows}
         rows_by_run = {row.run_id: row for row in rows}
@@ -812,29 +866,111 @@ class EditionReviewService:
         async with self._uow_factory() as uow:
             edition = await uow.editions.get(edition_id)
             self._require_readable(edition, edition_id)
-            rows = await uow.edition_review_read_model.list_for_edition(edition_id)
+            scope = await uow.edition_review_read_model.list_for_edition(edition_id)
         repairs = await self._repair_issues(edition_id) if self._repair_issue_reader else ()
-        return self.from_rows(edition_id, rows, repair_issues=repairs)
+        return self.from_rows(edition_id, scope, repair_issues=repairs)
 
     @staticmethod
     def from_rows(
         edition_id: UUID,
-        rows: Sequence[EditionReviewReadItem],
+        rows: Sequence[EditionReviewReadItem] | EditionReviewReadScope,
         *,
         repair_issues: Sequence[Any] = (),
     ) -> EditionReview:
         """Evaluate the same review rules inside an already open transaction."""
-        rows_by_run = {row.run_id: row for row in rows}
+        scope: EditionReviewReadScope | None = None
+        if isinstance(rows, EditionReviewReadScope):
+            scope = rows
+            read_rows: Sequence[EditionReviewReadItem] = rows.items
+            diagnostics = list(rows.diagnostics)
+        else:
+            read_rows = rows
+            diagnostics = []
+        if (
+            scope is not None
+            and scope.composition_missing
+            and not any(
+                diagnostic.code is EditionReviewDiagnosticCode.COMPOSITION_MISSING
+                for diagnostic in diagnostics
+            )
+        ):
+            diagnostics.append(
+                EditionReviewDiagnostic(EditionReviewDiagnosticCode.COMPOSITION_MISSING)
+            )
+
+        run_subjects = {row.run_id: row.subject_id for row in read_rows}
+        run_subjects.update(
+            {
+                diagnostic.run_id: diagnostic.subject_id
+                for diagnostic in diagnostics
+                if diagnostic.run_id is not None and diagnostic.subject_id is not None
+            }
+        )
         repair_by_subject: dict[UUID, list[Any]] = {}
         for issue in repair_issues:
             subject_id = _issue_subject(issue)
             if subject_id is None:
                 run_id = getattr(issue, "production_run_id", None)
-                row = rows_by_run.get(run_id) if isinstance(run_id, UUID) else None
-                subject_id = row.subject_id if row is not None else None
+                subject_id = run_subjects.get(run_id) if isinstance(run_id, UUID) else None
             if subject_id is not None:
                 repair_by_subject.setdefault(subject_id, []).append(issue)
-        items = tuple(_build_item(row, repair_by_subject.get(row.subject_id, ())) for row in rows)
+        items = tuple(
+            _build_item(row, repair_by_subject.get(row.subject_id, ())) for row in read_rows
+        )
+        for item in items:
+            if not item.pinned_generation_current:
+                diagnostics.append(
+                    EditionReviewDiagnostic(
+                        code=EditionReviewDiagnosticCode.PINNED_RUN_GENERATION_STALE,
+                        subject_id=item.subject_id,
+                        disposition=CompositionDisposition.INCLUDED,
+                        run_id=item.run_id,
+                        details={
+                            "pinned_generation": item.pipeline_generation,
+                        },
+                    )
+                )
+            if item.superseded_artifact_available:
+                diagnostics.append(
+                    EditionReviewDiagnostic(
+                        code=EditionReviewDiagnosticCode.PINNED_ARTIFACT_SUPERSEDED,
+                        subject_id=item.subject_id,
+                        disposition=CompositionDisposition.INCLUDED,
+                        run_id=item.run_id,
+                        details={
+                            "pinned_artifact_id": str(item.document_artifact_id),
+                            "pinned_artifact_version": item.document_artifact_version,
+                            "available_run_id": (
+                                str(item.latest_artifact_run_id)
+                                if item.latest_artifact_run_id is not None
+                                else None
+                            ),
+                            "available_artifact_id": (
+                                str(item.latest_artifact_id)
+                                if item.latest_artifact_id is not None
+                                else None
+                            ),
+                            "available_artifact_version": item.latest_artifact_version,
+                        },
+                    )
+                )
+        diagnostics = [
+            replace(
+                diagnostic,
+                active_repair_count=len(repair_by_subject.get(diagnostic.subject_id, ())),
+                unresolved_repair_count=sum(
+                    _repair_issue_is_actionable(issue) and not _repair_issue_resolved(issue)
+                    for issue in repair_by_subject.get(diagnostic.subject_id, ())
+                ),
+                pending_rebuild_count=sum(
+                    repair_issue_blocks_signoff(issue)
+                    for issue in repair_by_subject.get(diagnostic.subject_id, ())
+                ),
+            )
+            if diagnostic.subject_id is not None
+            else diagnostic
+            for diagnostic in diagnostics
+        ]
         # LOT 21 business rule: the publication scope is what will be delivered.
         # An article the analyst deliberately excluded carries no loss for that
         # scope, so its open repairs must not hold the whole edition hostage.
@@ -849,6 +985,12 @@ class EditionReviewService:
             for item in items
             if item.effective_decision is not PublicationDecision.EXCLUDE
         )
+        blocking_scope_diagnostics = {
+            EditionReviewDiagnosticCode.COMPOSITION_MISSING,
+            EditionReviewDiagnosticCode.SUBJECT_UNADDRESSED,
+            EditionReviewDiagnosticCode.EXCLUSION_DECISION_MISSING,
+            EditionReviewDiagnosticCode.PINNED_RUN_GENERATION_STALE,
+        }
         return EditionReview(
             edition_id=edition_id,
             items=items,
@@ -856,10 +998,15 @@ class EditionReviewService:
             and any(item.included for item in items)
             and all(not item.blocking for item in items)
             and unresolved_repair_count == 0
-            and pending_rebuild_count == 0,
+            and pending_rebuild_count == 0
+            and not any(
+                diagnostic.code in blocking_scope_diagnostics for diagnostic in diagnostics
+            ),
             unresolved_repair_count=unresolved_repair_count,
             repair_review_complete=unresolved_repair_count == 0,
             pending_rebuild_count=pending_rebuild_count,
+            composition_version=scope.composition_version if scope is not None else None,
+            diagnostics=tuple(diagnostics),
         )
 
     async def _repair_issues(self, edition_id: UUID) -> tuple[Any, ...]:
@@ -902,7 +1049,8 @@ class EditionReviewService:
         async with self._uow_factory() as uow:
             edition = await _get_edition_for_update(uow, edition_id)
             self._require_review(edition, edition_id)
-            rows = await uow.edition_review_read_model.list_for_edition(edition_id)
+            scope = await uow.edition_review_read_model.list_for_edition(edition_id)
+            rows = scope.items if isinstance(scope, EditionReviewReadScope) else scope
             row = next(
                 (candidate for candidate in rows if candidate.subject_id == subject_id),
                 None,
@@ -919,7 +1067,11 @@ class EditionReviewService:
                 if get_run_for_update is not None
                 else await runs_repository.get(row.run_id)
             )
-            artifact = await current_publication_artifact(uow.production_artifacts, row.run_id)
+            artifact = (
+                await uow.production_artifacts.get(row.document_artifact_id)
+                if row.document_artifact_id is not None
+                else None
+            )
             if (
                 run is None
                 or row.run_id != production_run_id
@@ -948,7 +1100,10 @@ class EditionReviewService:
                 ):
                     raise ReviewItemStaleError("review item does not refer to the current document")
             elif (
-                artifact.id != document_artifact_id
+                artifact.production_run_id != row.run_id
+                or artifact.stage is not ProductionArtifactStage.PUBLICATION
+                or artifact.status is ProductionArtifactStatus.STALE
+                or artifact.id != document_artifact_id
                 or artifact.version != document_artifact_version
                 or artifact.input_hash != document_input_hash
             ):
@@ -996,13 +1151,16 @@ def _build_item(row: EditionReviewReadItem, repair_issues: Sequence[Any] = ()) -
     artifact_verified = (
         row.document_artifact_id is not None
         and row.document_artifact_status is ProductionArtifactStatus.VERIFIED
+        and row.pinned_generation_current
     )
     decision = row.effective_decision
     if decision is None and row.run_status is ProductionRunStatus.READY:
         decision = PublicationDecision.INCLUDE
 
     if row.run_status is ProductionRunStatus.READY:
-        blocking = decision is not PublicationDecision.EXCLUDE and not artifact_verified
+        blocking = decision is not PublicationDecision.EXCLUDE and (
+            not artifact_verified or row.superseded_artifact_available
+        )
     elif row.run_status in {
         ProductionRunStatus.FAILED,
         ProductionRunStatus.NEEDS_REVIEW,
@@ -1066,6 +1224,12 @@ def _build_item(row: EditionReviewReadItem, repair_issues: Sequence[Any] = ()) -
         unresolved_repair_count=unresolved_repair_count,
         pending_rebuild_count=pending_rebuild_count,
         rebuild_required=row.rebuild_required,
+        composition_version=row.composition_version,
+        superseded_artifact_available=row.superseded_artifact_available,
+        pinned_generation_current=row.pinned_generation_current,
+        latest_artifact_run_id=row.latest_artifact_run_id,
+        latest_artifact_id=row.latest_artifact_id,
+        latest_artifact_version=row.latest_artifact_version,
     )
 
 

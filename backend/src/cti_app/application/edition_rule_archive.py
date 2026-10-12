@@ -88,7 +88,7 @@ class EditionRuleArchiveService:
             edition = await uow.editions.get(edition_id)
             if edition is None:
                 raise EditionRuleArchiveError("edition_not_found")
-            manifest = await uow.publication_manifests.get_latest_for_edition(edition_id)
+            manifest = await uow.publication_manifests.get_latest_manifest_for_edition(edition_id)
             if manifest is None:
                 raise EditionRuleArchiveError("publication_manifest_not_found")
             articles = [

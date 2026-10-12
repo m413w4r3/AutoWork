@@ -1,4 +1,5 @@
 from types import TracebackType
+from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -107,6 +108,10 @@ from cti_app.infrastructure.database.repositories.discovery_cumulative import (
     SqlAlchemyDiscoverySubjectIdentityRepository,
     SqlAlchemySubjectContributionRepository,
     SqlAlchemySubjectMergeEventRepository,
+)
+from cti_app.infrastructure.database.repositories.edition_composition import (
+    SqlAlchemyEditionCompositionEventRepository,
+    SqlAlchemyEditionCompositionRepository,
 )
 from cti_app.infrastructure.database.repositories.edition_publication import (
     SqlAlchemyEditionReleaseRepository,
@@ -237,6 +242,8 @@ class SqlAlchemyUnitOfWork:
     analyst_input_packs: AnalystInputPackRepository
     edition_production_batches: EditionProductionBatchRepository
     edition_production_batch_items: EditionProductionBatchItemRepository
+    edition_compositions: Any
+    edition_composition_events: Any
     batch_status_read_model: BatchStatusReadRepository
     edition_review_read_model: EditionReviewReadRepository
     publication_review_decisions: PublicationReviewDecisionRepository
@@ -330,6 +337,8 @@ class SqlAlchemyUnitOfWork:
         self.edition_production_batch_items = SqlAlchemyEditionProductionBatchItemRepository(
             self._session
         )
+        self.edition_compositions = SqlAlchemyEditionCompositionRepository(self._session)
+        self.edition_composition_events = SqlAlchemyEditionCompositionEventRepository(self._session)
         self.batch_status_read_model = SqlAlchemyBatchStatusReadRepository(self._session)
         self.edition_review_read_model = SqlAlchemyEditionReviewReadRepository(self._session)
         self.publication_review_decisions = SqlAlchemyPublicationReviewDecisionRepository(

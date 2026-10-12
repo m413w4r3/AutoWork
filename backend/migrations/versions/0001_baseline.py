@@ -15,6 +15,9 @@ from cti_app.infrastructure.database.models import (  # noqa: F401
     collection,
     core,
     discovery,
+    edition_composition,
+    # The publication manifest tables include schema-versioned V1 (batch)
+    # and V2 (composition) snapshots in this mutable baseline.
     edition_publication,
     edition_render,
     editions,
@@ -178,6 +181,12 @@ _GUARD_FUNCTIONS: tuple[tuple[str, str], ...] = (
 # ``kind`` is ``tlp`` for the four monotonic classification guards and
 # ``append_only`` for all immutable evidence/audit tables.
 _TRIGGERS: tuple[tuple[str, str, str, str], ...] = (
+    (
+        "edition_composition_events",
+        "trg_edition_composition_events_append_only",
+        "reject_evidence_mutation",
+        "append_only",
+    ),
     (
         "publication_review_decisions",
         "trg_publication_review_decisions_append_only",

@@ -115,7 +115,7 @@ async def test_fusion_mutations_transmit_business_uuids_and_snapshot_version() -
         (FusionSnapshotStaleError("stale"), 409, "fusion_snapshot_stale"),
         (FusionEditionArchivedError("Archived"), 409, "fusion_edition_archived"),
         (
-            FusionSelectedSubjectConflictError("selected subjects conflict"),
+            FusionSelectedSubjectConflictError((UUID("00000000-0000-4000-8000-000000000001"),)),
             409,
             "fusion_selected_subject_conflict",
         ),
@@ -134,3 +134,7 @@ async def test_fusion_mutation_errors_are_explicit(
         )
     assert response.status_code == status
     assert response.json()["detail"]["code"] == code
+    if isinstance(error, FusionSelectedSubjectConflictError):
+        assert response.json()["detail"]["subject_ids"] == [
+            str(subject_id) for subject_id in error.subject_ids
+        ]

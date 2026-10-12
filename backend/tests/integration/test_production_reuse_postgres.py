@@ -13,6 +13,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from cti_app.application.blobs import BlobCatalogService
+from cti_app.application.edition_composition import EditionCompositionService
 from cti_app.application.edition_publication import (
     EditionAssemblyService,
     EditionPublicationService,
@@ -84,6 +85,7 @@ from cti_app.domain.discovery_cumulative import (
     DiscoverySubjectIdentity,
     MergeValidationStatus,
 )
+from cti_app.domain.edition_composition import CompositionDisposition, EditionCompositionEntry
 from cti_app.domain.editions import Edition, EditionStatus
 from cti_app.domain.entities import SourceDocument, Subject
 from cti_app.domain.model_runs import (
@@ -1832,15 +1834,44 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
         await uow.edition_production_batch_items.append_many((review_item,))
         await uow.commit()
 
+    assert publication_b.canonical_blob_id is not None
+    async with uow_factory() as uow:
+        document_blob = await uow.blobs.get(publication_b.canonical_blob_id)
+    assert document_blob is not None
+    await EditionCompositionService(uow_factory).replace_entries(
+        edition.id,
+        (
+            EditionCompositionEntry(
+                subject_id=subject.id,
+                disposition=CompositionDisposition.INCLUDED,
+                position=1,
+                production_run_id=run_b.id,
+                pipeline_generation=persisted_b.pipeline_generation,
+                artifact_id=publication_b.id,
+                artifact_version=publication_b.version,
+                artifact_input_hash=publication_b.input_hash,
+                document_sha256=document_blob.descriptor.sha256,
+                provenance_batch_id=review_batch.id,
+            ),
+        ),
+        expected_version=0,
+        idempotency_key="reuse-publication-composition",
+        actor_id="reviewer",
+        correlation_id="reuse-integration",
+    )
+
     async with uow_factory() as uow:
         review_rows = await uow.edition_review_read_model.list_for_edition(edition.id)
-    assert len(review_rows) == 1
-    assert review_rows[0].run_id == run_b.id
-    assert review_rows[0].pipeline_generation == persisted_b.pipeline_generation
-    assert review_rows[0].document_artifact_id == publication_b.id
+    assert len(review_rows.items) == 1
+    assert review_rows.items[0].run_id == run_b.id
+    assert review_rows.items[0].pipeline_generation == persisted_b.pipeline_generation
+    assert review_rows.items[0].document_artifact_id == publication_b.id
 
     accepted = await EditionPublicationService(uow_factory, store).accept(
-        edition.id, actor_id="reviewer", correlation_id="reuse-integration"
+        edition.id,
+        actor_id="reviewer",
+        expected_composition_version=1,
+        correlation_id="reuse-integration",
     )
     assert accepted.manifest.entries[0].production_run_id == run_b.id
     assert accepted.manifest.entries[0].pipeline_generation == persisted_b.pipeline_generation
@@ -1984,26 +2015,49 @@ async def test_two_article_cached_edition_is_sequential_and_uses_new_publication
     assert len(enrichment_results) == 2
     assert sentinel.calls == 0
 
+    target_publications = []
+    target_artifact_sets = []
+    composition_entries = []
     async with uow_factory() as uow:
         persisted_edition = await uow.editions.get(edition.id)
-        review_rows = await uow.edition_review_read_model.list_for_edition(edition.id)
-        target_publications = []
-        target_artifact_sets = []
-        for row in review_rows:
-            artifacts = await uow.production_artifacts.list_for_run(row.run_id)
-            target_artifact_sets.append({artifact.stage: artifact for artifact in artifacts})
-            target_publications.append(
-                next(
-                    artifact
-                    for artifact in artifacts
-                    if artifact.stage is ProductionArtifactStage.PUBLICATION
-                    and artifact.status is ProductionArtifactStatus.VERIFIED
+        for position, run in enumerate((first, second), start=1):
+            artifacts = await uow.production_artifacts.list_for_run(run.id)
+            by_stage = {artifact.stage: artifact for artifact in artifacts}
+            publication = by_stage[ProductionArtifactStage.PUBLICATION]
+            assert publication.status is ProductionArtifactStatus.VERIFIED
+            assert publication.canonical_blob_id is not None
+            blob = await uow.blobs.get(publication.canonical_blob_id)
+            assert blob is not None
+            target_artifact_sets.append(by_stage)
+            target_publications.append(publication)
+            composition_entries.append(
+                EditionCompositionEntry(
+                    subject_id=run.subject_id,
+                    disposition=CompositionDisposition.INCLUDED,
+                    position=position,
+                    production_run_id=run.id,
+                    pipeline_generation=run.pipeline_generation,
+                    artifact_id=publication.id,
+                    artifact_version=publication.version,
+                    artifact_input_hash=publication.input_hash,
+                    document_sha256=blob.descriptor.sha256,
+                    provenance_batch_id=batch.id,
                 )
             )
+    await EditionCompositionService(uow_factory).replace_entries(
+        edition.id,
+        tuple(composition_entries),
+        expected_version=0,
+        idempotency_key="two-article-cached-composition",
+        actor_id="reviewer",
+        correlation_id="two-article-cached-smoke",
+    )
+    async with uow_factory() as uow:
+        review_rows = await uow.edition_review_read_model.list_for_edition(edition.id)
     assert persisted_edition is not None
     assert persisted_edition.state is EditionStatus.OPEN
-    assert [row.position for row in review_rows] == [1, 2]
-    assert [row.run_id for row in review_rows] == [first.id, second.id]
+    assert [row.position for row in review_rows.items] == [1, 2]
+    assert [row.run_id for row in review_rows.items] == [first.id, second.id]
     assert [artifact.id for artifact in target_publications] != [
         publication.id for publication in source_publications
     ]
@@ -2023,7 +2077,10 @@ async def test_two_article_cached_edition_is_sequential_and_uses_new_publication
         )
 
     accepted = await EditionPublicationService(uow_factory, store).accept(
-        edition.id, actor_id="reviewer", correlation_id="two-article-cached-smoke"
+        edition.id,
+        actor_id="reviewer",
+        expected_composition_version=1,
+        correlation_id="two-article-cached-smoke",
     )
     assert [entry.production_run_id for entry in accepted.manifest.entries] == [
         first.id,

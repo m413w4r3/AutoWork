@@ -100,7 +100,7 @@ class _PublicationManifests:
     def __init__(self) -> None:
         self.manifest: object | None = None
 
-    async def get_latest_for_edition(self, edition_id: UUID) -> object | None:
+    async def get_latest_manifest_for_edition(self, edition_id: UUID) -> object | None:
         del edition_id
         return self.manifest
 

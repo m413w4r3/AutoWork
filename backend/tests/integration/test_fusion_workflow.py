@@ -19,6 +19,7 @@ from cti_app.application.discovery.fusion import (
     FusionSnapshotStaleError,
 )
 from cti_app.application.discovery.manual_source_edits import ManualSourceEditService
+from cti_app.application.edition_composition import EditionCompositionService
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import (
     CandidateTopic,
@@ -38,9 +39,18 @@ from cti_app.domain.discovery_cumulative import (
     MergeDisposition,
     MergeValidationStatus,
 )
+from cti_app.domain.edition_composition import CompositionDisposition, EditionCompositionEntry
 from cti_app.domain.editions import Edition, EditionStatus
 from cti_app.domain.entities import Subject
 from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRun
+from cti_app.domain.production import (
+    ProductionArtifact,
+    ProductionArtifactStage,
+    ProductionArtifactStatus,
+    ProductionRun,
+    ProductionRunStatus,
+    ProductionStage,
+)
 from cti_app.domain.selection import (
     SelectionAction,
     SelectionDecision,
@@ -337,23 +347,93 @@ async def test_selected_subject_conflict_leaves_active_snapshot_unchanged(
             second, input_mode=DiscoveryInputMode.BRIDGE_RESEARCH, actor_id="analyst"
         )
         subject_ids = tuple(subject.subject_id for subject in snapshot.subjects)
-        await _add_selected_origin(uow_factory, edition, snapshot, subject_ids[0])
-        await _add_selected_origin(uow_factory, edition, snapshot, subject_ids[1])
+        selected_origins = [
+            await _add_selected_origin(uow_factory, edition, snapshot, discovery_subject_id)
+            for discovery_subject_id in subject_ids
+        ]
+        production = []
+        for selected_subject, _ in selected_origins:
+            run = ProductionRun(
+                subject_id=selected_subject.id,
+                edition_id=edition.id,
+                status=ProductionRunStatus.READY,
+                current_stage=ProductionStage.ASSEMBLY,
+                run_number=1,
+                pipeline_generation=1,
+            )
+            artifact = ProductionArtifact(
+                production_run_id=run.id,
+                subject_id=selected_subject.id,
+                stage=ProductionArtifactStage.PUBLICATION,
+                version=1,
+                input_hash=hashlib.sha256(str(selected_subject.id).encode()).hexdigest(),
+                status=ProductionArtifactStatus.VERIFIED,
+            )
+            production.append((run, artifact))
+        async with uow_factory() as uow:
+            for run, artifact in production:
+                await uow.production_runs.add(run)
+                await uow.production_artifacts.append(artifact)
+            await uow.commit()
         before = await _active_snapshot(uow_factory, edition.id)
         runs_before = await _merge_runs(uow_factory, edition.id)
 
-        with pytest.raises(FusionSelectedSubjectConflictError):
+        with pytest.raises(FusionSelectedSubjectConflictError) as conflict:
             await FusionService(uow_factory).merge(
                 edition.id,
                 snapshot_version=snapshot.version,
                 discovery_subject_ids=subject_ids,
                 actor_id="analyst",
             )
+        assert conflict.value.subject_ids == tuple(
+            sorted((subject.id for subject, _ in selected_origins), key=str)
+        )
 
         after = await _active_snapshot(uow_factory, edition.id)
         assert before is not None and after is not None
         assert (after.id, after.version) == (before.id, before.version)
         assert await _merge_runs(uow_factory, edition.id) == runs_before
+
+        explicit_entries = tuple(
+            EditionCompositionEntry(
+                subject_id=subject.id,
+                disposition=CompositionDisposition.INCLUDED,
+                position=position,
+                production_run_id=run.id,
+                pipeline_generation=run.pipeline_generation,
+                artifact_id=artifact.id,
+                artifact_version=artifact.version,
+                artifact_input_hash=artifact.input_hash,
+            )
+            for position, ((subject, _origin), (run, artifact)) in enumerate(
+                zip(selected_origins, production, strict=True), start=1
+            )
+        )
+        compositions = EditionCompositionService(uow_factory)
+        await compositions.replace_entries(
+            edition.id,
+            explicit_entries,
+            expected_version=0,
+            idempotency_key="resolve-selected-fusion-conflict",
+            actor_id="editor",
+            correlation_id="resolve-selected-fusion-conflict",
+        )
+        resolved = await compositions.get(edition.id)
+        assert resolved.axes.production_validity is True
+        assert resolved.axes.composition_eligibility is True
+        assert resolved.composition is not None
+        assert tuple(entry.subject_id for entry in resolved.composition.entries) == tuple(
+            subject.id for subject, _origin in selected_origins
+        )
+        async with uow_factory() as uow:
+            for run, artifact in production:
+                assert await uow.production_runs.get(run.id) == run
+                assert (
+                    await uow.production_artifacts.get_current(
+                        run.id, ProductionArtifactStage.PUBLICATION.value
+                    )
+                    == artifact
+                )
     finally:
         await engine.dispose()
 
@@ -463,7 +543,7 @@ async def test_manual_replacement_keeps_history_and_only_new_candidate_active(
         await engine.dispose()
 
 
-async def test_manual_merge_and_split_are_versioned_and_non_destructive(
+async def test_manual_merge_and_split_after_production_preserve_historical_run_identity(
     migrated_postgres_url: str,
 ) -> None:
     engine, uow_factory = _database(migrated_postgres_url)
@@ -497,6 +577,26 @@ async def test_manual_merge_and_split_are_versioned_and_non_destructive(
         selected_subject, origin = await _add_selected_origin(
             uow_factory, edition, second_snapshot, first_identity
         )
+        historical_run = ProductionRun(
+            subject_id=selected_subject.id,
+            edition_id=edition.id,
+            status=ProductionRunStatus.READY,
+            current_stage=ProductionStage.ASSEMBLY,
+            run_number=1,
+            pipeline_generation=1,
+        )
+        historical_artifact = ProductionArtifact(
+            production_run_id=historical_run.id,
+            subject_id=selected_subject.id,
+            stage=ProductionArtifactStage.PUBLICATION,
+            version=1,
+            input_hash=hashlib.sha256(b"fusion-history").hexdigest(),
+            status=ProductionArtifactStatus.VERIFIED,
+        )
+        async with uow_factory() as uow:
+            await uow.production_runs.add(historical_run)
+            await uow.production_artifacts.append(historical_artifact)
+            await uow.commit()
         fusion = FusionService(uow_factory)
         merged = await fusion.merge(
             edition.id,
@@ -542,6 +642,10 @@ async def test_manual_merge_and_split_are_versioned_and_non_destructive(
             runs = await uow.discovery_merge_runs.list_for_edition(edition.id)
             origins = await uow.subject_discovery_origins.list_for_edition(edition.id)
             identities = await uow.discovery_subject_identities.list_for_edition(edition.id)
+            run_after_split = await uow.production_runs.get(historical_run.id)
+            artifact_after_split = await uow.production_artifacts.get_current(
+                historical_run.id, ProductionArtifactStage.PUBLICATION.value
+            )
         assert historical_merge is not None
         assert len(runs) >= 2
         assert first_snapshot.id != split.snapshot_id
@@ -552,6 +656,8 @@ async def test_manual_merge_and_split_are_versioned_and_non_destructive(
         assert origins[0].subject_id == selected_subject.id
         assert origins[0].discovery_subject_id == first_identity
         assert origins[0].discovery_subject_id != split_identity.id
+        assert run_after_split == historical_run
+        assert artifact_after_split == historical_artifact
     finally:
         await engine.dispose()
 

@@ -90,6 +90,20 @@ vi.mock("../edition-workflow/ReviewConsole", () => ({
   ),
 }));
 
+vi.mock("../edition-workflow/CompositionConsole", () => ({
+  CompositionConsole: ({
+    editionId,
+    readOnly,
+  }: {
+    editionId: string;
+    readOnly?: boolean;
+  }) => (
+    <div data-testid="tool-composition" data-read-only={String(readOnly)}>
+      Composition {editionId}
+    </div>
+  ),
+}));
+
 vi.mock("../edition-workflow/PublicationConsole", () => ({
   PublicationConsole: ({
     editionId,
@@ -210,6 +224,10 @@ describe("EditionNavigation", () => {
       "href",
       `/editions/${EDITION_ID}/production`,
     );
+    expect(screen.getByRole("link", { name: "Composition" })).toHaveAttribute(
+      "href",
+      `/editions/${EDITION_ID}/composition`,
+    );
     expect(screen.getByRole("link", { name: "Revue" })).toHaveAttribute(
       "href",
       `/editions/${EDITION_ID}/review`,
@@ -253,6 +271,7 @@ describe("EditionToolSurface", () => {
     ["fusion", "tool-fusion"],
     ["selection", "tool-selection"],
     ["production", "tool-production"],
+    ["composition", "tool-composition"],
     ["review", "tool-review"],
     ["publication", "tool-publication"],
   ] as const)("rend directement l’outil %s", (tool, testId) => {

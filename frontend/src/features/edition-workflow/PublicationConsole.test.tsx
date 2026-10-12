@@ -41,9 +41,33 @@ function renderConsole(
   readOnly = false,
 ) {
   const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+    const url = urlOf(_input);
     if (init?.method === "POST") {
       return Promise.resolve(
         Response.json({ edition_id: EDITION_ID, edition_state: "open" }),
+      );
+    }
+    if (url.endsWith("/composition")) {
+      return Promise.resolve(
+        Response.json({
+          edition_id: EDITION_ID,
+          composition: { version: 3 },
+          reasons: [],
+          axes: {
+            production_validity: true,
+            discovery_update_available: false,
+            composition_eligibility: true,
+          },
+        }),
+      );
+    }
+    if (url.startsWith("/api/render-inspections/")) {
+      return Promise.resolve(
+        Response.json({
+          render: { id: "render-1", type: "edition", status: "succeeded" },
+          hashes: { pdf_sha256: "b".repeat(64) },
+          pdf: { sha256: "b".repeat(64), href: null, availability: "ready" },
+        }),
       );
     }
     if (release === null) {
@@ -178,22 +202,22 @@ describe("PublicationConsole", () => {
     expect(
       await screen.findByText("L'assemblage n'a pas pu être démarré."),
     ).toBeInTheDocument();
-    await user.click(
-      screen.getByRole("button", { name: "Relancer l'assemblage" }),
-    );
+    const retry = screen.getByRole("button", { name: "Relancer l'assemblage" });
+    await waitFor(() => expect(retry).toBeEnabled());
+    await user.click(retry);
     await waitFor(() =>
       expect(
         fetchMock.mock.calls.some(
           ([input, init]) =>
             init?.method === "POST" &&
-            urlOf(input) === "/api/editions/edition-1/publication/accept",
+            urlOf(input) === "/api/editions/edition-1/composition/accept",
         ),
       ).toBe(true),
     );
     expect(
       fetchMock.mock.calls.find(([, init]) => init?.method === "POST")?.[1]
         ?.body,
-    ).toBeUndefined();
+    ).toBe(JSON.stringify({ expected_composition_version: 3 }));
   });
 
   it("affiche le retry pour un assemblage annulé", async () => {
@@ -243,22 +267,22 @@ describe("PublicationConsole", () => {
       screen.getByText("Le document n’a pas pu être assemblé."),
     ).toBeInTheDocument();
     expect(screen.getByText("edition_assembly_failed")).not.toBeVisible();
-    await user.click(
-      screen.getByRole("button", { name: "Relancer l'assemblage" }),
-    );
+    const retry = screen.getByRole("button", { name: "Relancer l'assemblage" });
+    await waitFor(() => expect(retry).toBeEnabled());
+    await user.click(retry);
     await waitFor(() =>
       expect(
         fetchMock.mock.calls.some(
           ([input, init]) =>
             init?.method === "POST" &&
-            urlOf(input) === "/api/editions/edition-1/publication/accept",
+            urlOf(input) === "/api/editions/edition-1/composition/accept",
         ),
       ).toBe(true),
     );
     expect(
       fetchMock.mock.calls.find(([, init]) => init?.method === "POST")?.[1]
         ?.body,
-    ).toBeUndefined();
+    ).toBe(JSON.stringify({ expected_composition_version: 3 }));
   });
 
   it("affiche le lien PDF et sépare assemblage canonique et rendu", async () => {
@@ -322,7 +346,7 @@ describe("PublicationConsole", () => {
       fetchMock.mock.calls.some(
         ([input, init]) =>
           init?.method === "POST" &&
-          urlOf(input) === "/api/editions/edition-1/publication/accept",
+          urlOf(input) === "/api/editions/edition-1/composition/accept",
       ),
     ).toBe(false);
   });

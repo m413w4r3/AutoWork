@@ -30,6 +30,7 @@ from cti_app.application.edition_publication import EditionPublicationService
 from cti_app.application.edition_review import (
     EditionRepairReadService,
     EditionReviewReadItem,
+    EditionReviewReadScope,
     EditionReviewService,
 )
 from cti_app.application.http_collection import (
@@ -61,6 +62,11 @@ from cti_app.domain.discovery_cumulative import (
     DiscoveryPlannerKind,
     DiscoverySnapshot,
     DiscoverySubject,
+)
+from cti_app.domain.edition_composition import (
+    CompositionDisposition,
+    EditionComposition,
+    EditionCompositionEntry,
 )
 from cti_app.domain.editions import Edition, EditionStatus
 from cti_app.domain.entities import Subject
@@ -316,7 +322,7 @@ class _Manifests:
     def __init__(self) -> None:
         self.items: list[Any] = []
 
-    async def get_latest_for_edition(self, _edition_id: UUID) -> Any | None:
+    async def get_latest_manifest_for_edition(self, _edition_id: UUID) -> Any | None:
         return self.items[-1] if self.items else None
 
     async def add(self, manifest: Any, _blob_id: UUID) -> None:
@@ -343,6 +349,7 @@ class _ProductionUow:
             update=world.update_edition,
         )
         self.edition_review_read_model = SimpleNamespace(list_for_edition=world.review_rows)
+        self.edition_compositions = SimpleNamespace(get_for_edition=world.get_composition)
         self.edition_production_batches = SimpleNamespace(
             get_latest_for_edition=world.get_batch,
             get=world.get_batch_by_id,
@@ -429,6 +436,7 @@ class _World:
         self.manifests = _Manifests()
         self._collections = collections
         self._documents = documents
+        self.composition: EditionComposition | None = None
         self.batch = EditionProductionBatch(
             edition_id=edition.id, status=ProductionBatchStatus.COMPLETED
         )
@@ -482,29 +490,64 @@ class _World:
     async def list_batch_items(self, batch_id: UUID) -> list[Any]:
         return [self.batch_item] if batch_id == self.batch.id else []
 
-    async def review_rows(self, edition_id: UUID) -> list[EditionReviewReadItem]:
+    async def review_rows(self, edition_id: UUID) -> EditionReviewReadScope:
         del edition_id
         run = next(iter(self.runs.items.values()))
+        composition_version = self.composition.version if self.composition is not None else None
         document = await self.artifacts.get_current(
             run.id, ProductionArtifactStage.PUBLICATION.value
         )
-        return [
-            EditionReviewReadItem(
-                position=1,
-                subject_id=self.subject_id,
-                title="Article LOT 24",
-                run_id=run.id,
-                pipeline_generation=run.pipeline_generation,
-                run_status=run.status,
-                document_artifact_id=getattr(document, "id", None),
-                document_artifact_version=getattr(document, "version", None),
-                document_input_hash=getattr(document, "input_hash", None),
-                document_artifact_status=getattr(document, "status", None),
-                error_code=None,
-                error_message=None,
-                effective_decision=None,
-            )
-        ]
+        return EditionReviewReadScope(
+            items=(
+                EditionReviewReadItem(
+                    position=1,
+                    subject_id=self.subject_id,
+                    title="Article LOT 24",
+                    run_id=run.id,
+                    pipeline_generation=run.pipeline_generation,
+                    run_status=run.status,
+                    document_artifact_id=getattr(document, "id", None),
+                    document_artifact_version=getattr(document, "version", None),
+                    document_input_hash=getattr(document, "input_hash", None),
+                    document_artifact_status=getattr(document, "status", None),
+                    error_code=None,
+                    error_message=None,
+                    effective_decision=None,
+                    composition_version=composition_version,
+                ),
+            ),
+            composition_version=composition_version,
+        )
+
+    async def get_composition(self, edition_id: UUID) -> EditionComposition | None:
+        return self.composition if edition_id == self.edition.id else None
+
+    async def pin_current_publication(self) -> EditionComposition:
+        run = next(iter(self.runs.items.values()))
+        artifact = await self.artifacts.get_current(
+            run.id, ProductionArtifactStage.PUBLICATION.value
+        )
+        assert artifact is not None
+        version = self.composition.version + 1 if self.composition is not None else 1
+        self.composition = EditionComposition(
+            edition_id=self.edition.id,
+            version=version,
+            actor_id="test-editor",
+            entries=(
+                EditionCompositionEntry(
+                    subject_id=self.subject_id,
+                    disposition=CompositionDisposition.INCLUDED,
+                    position=1,
+                    production_run_id=run.id,
+                    pipeline_generation=run.pipeline_generation,
+                    artifact_id=artifact.id,
+                    artifact_version=artifact.version,
+                    artifact_input_hash=artifact.input_hash,
+                    provenance_batch_id=self.batch.id,
+                ),
+            ),
+        )
+        return self.composition
 
 
 def _selected_subject(
@@ -758,6 +801,7 @@ async def test_audit4_supplied_source_blocks_publication_until_references_rebuil
         (ProductionArtifactStage.PUBLICATION, "d"),
     ):
         await world.artifacts.append(_stage_artifact(run, stage, 1, input_hash=digest * 64))
+    await world.pin_current_publication()
 
     # --- 1. The desk shows S2 as a corpus source it cannot extract yet. -----
     application = _application(world, collection_service)
@@ -810,7 +854,10 @@ async def test_audit4_supplied_source_blocks_publication_until_references_rebuil
     assert review.json()["pending_rebuild_count"] == 1
 
     async with _client(fresh) as client:
-        refused = await client.post(f"/api/editions/{edition.id}/publication/accept")
+        refused = await client.post(
+            f"/api/editions/{edition.id}/publication/accept",
+            json={"expected_composition_version": 1},
+        )
     assert refused.status_code == 409
     assert refused.json()["detail"]["code"] == "review_cannot_be_accepted"
     assert world.manifests.items == []
@@ -865,6 +912,7 @@ async def test_audit4_supplied_source_blocks_publication_until_references_rebuil
         await world.artifacts.append(_stage_artifact(replayed, stage, 2, input_hash=digest * 64))
     assert replayed.status is ProductionRunStatus.RUNNING
     replayed.mark_ready()
+    await world.pin_current_publication()
 
     # --- 8/9. The issue is gone and the edition can be accepted again. ------
     final = _application(world, collection_service)
@@ -877,7 +925,10 @@ async def test_audit4_supplied_source_blocks_publication_until_references_rebuil
     assert review.json()["can_accept"] is True
 
     async with _client(final) as client:
-        accepted = await client.post(f"/api/editions/{edition.id}/publication/accept")
+        accepted = await client.post(
+            f"/api/editions/{edition.id}/publication/accept",
+            json={"expected_composition_version": 2},
+        )
     assert accepted.status_code == 202, accepted.text
     assert len(world.manifests.items) == 1
     # The whole scenario ran without a single model call.

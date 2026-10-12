@@ -503,10 +503,70 @@ et laisse l’édition ouverte. Une nouvelle commande, avec une nouvelle clé, p
 
 ## Review et publication
 
-La review examine le run, sa génération et l’artifact exact du document. L’acceptation crée un
-manifeste de publication immutable contenant l’ordre, les `subject_id`, les runs, les artifacts,
-les versions et les hashes retenus. L’assemblage et les rendus lisent uniquement ce manifeste.
+La composition éditoriale versionnée est le périmètre canonique de Review ; un batch garde son rôle
+d’unité d’exécution et de provenance. `GET /api/editions/{edition_id}/composition` expose la
+composition et ses raisons de validation. `GET /api/editions/{edition_id}/review` ne renvoie comme
+items que ses entrées `included`, épinglées sur le run, la génération, l’artifact, sa version et son
+hash exacts. Le read model lit ces entrées et les décisions applicables dans un statement SQL
+set-based.
+
+Une décision de Review ne s’applique qu’à cette identité complète. Une décision d’une ancienne
+version reste auditée, mais ne devient pas effective après un changement explicite de pin. Une
+nouvelle version vérifiée du même run est signalée comme disponible ; un run ultérieur P2/P3 ne
+remplace pas le run P1 épinglé par la composition.
+
+Une édition sans composition renvoie une Review vide avec `composition_version: null`, le diagnostic
+`composition_missing` et `can_accept: false`. Les sujets sans entrée, reportés ou exclus sont
+signalés respectivement par `subject_unaddressed`, `subject_deferred` ou `subject_excluded`. Une
+exclusion sans décision exacte ajoute `exclusion_decision_missing`. Les compteurs de réparation des
+sujets reportés ou exclus restent dans ces diagnostics ; ils ne bloquent pas `can_accept`. Les
+réparations bloquantes des seuls sujets inclus, une entrée incluse non publiable, une composition
+absente ou un sujet non adressé bloquent l’acceptation.
+
+`can_accept` est le contrat de Review pour l’acceptation : au moins une entrée incluse, chaque
+document épinglé vérifié et compatible avec sa génération, aucun pin dépassé par une version plus
+récente du même run, aucun blocage de réparation dans le périmètre, et aucun diagnostic bloquant.
+Les consommateurs de la composition doivent utiliser les entrées vérifiées renvoyées par son service
+de validation, sans reconstruire le périmètre depuis les derniers batches ou runs.
+
+L’acceptation crée un manifeste de publication immutable contenant l’ordre, les `subject_id`, les
+runs, les artifacts, les versions et les hashes retenus. L’assemblage et les rendus lisent
+uniquement ce manifeste.
 
 Une nouvelle production ne modifie donc pas les snapshots, artifacts ou manifestes historiques.
 Les nouvelles productions utilisent toujours la policy sémantique courante ; un ensemble explicite
 de versions historiques garde les documents déjà émis lisibles après un changement de policy.
+
+## Discovery additive et actualisation explicite
+
+Une nouvelle Discovery/Fusion peut apporter des candidats ou modifier les membres et le résumé
+d'une identité déjà sélectionnée. Elle ne déclasse pas automatiquement un ancien `ProductionRun`
+et ne réécrit pas son `ProductionInputSnapshot`, ses artifacts, leurs hashes ni la composition qui
+les épingle. La composition expose le signal orthogonal `discovery_update_available`; il ne remplace
+ni `production_validity` ni `composition_eligibility`.
+
+L'indicateur est calculé en lecture seule en suivant l'identité Fusion exacte et les UUID des
+candidats. Il ne rapproche pas les sujets par titre ou similarité. Un opérateur peut garder le pin
+publié ou lancer explicitement un nouveau batch pour le `subject_id`; seul ce nouveau run capture
+le snapshot Discovery actif. Le pin de composition ne change qu'après une commande explicite de
+composition portant les nouvelles références exactes.
+
+```http
+GET /api/editions/{edition_id}/composition/validation
+```
+
+Extrait de réponse pour un run qui reste valide et publiable malgré la nouvelle preuve :
+
+```json
+{
+  "axes": {
+    "production_validity": true,
+    "discovery_update_available": true,
+    "composition_eligibility": true
+  }
+}
+```
+
+Un conflit Fusion où plusieurs `Subject` canoniques aboutiraient à une identité commune est refusé
+avec `fusion_selected_subject_conflict` et les `subject_ids` exacts. La résolution est éditoriale ;
+Fusion ne déplace aucun run historique et ne choisit pas une identité par nom.

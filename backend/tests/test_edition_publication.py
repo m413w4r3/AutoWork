@@ -27,7 +27,9 @@ from cti_app.application.edition_publication import (
     EditionPublicationService,
     EditionReleaseStatus,
     PublicationAcceptanceError,
+    PublicationArtifactChangedDuringFreeze,
     PublicationAssemblyError,
+    PublicationCompositionChangedDuringFreeze,
     register_publication_jobs,
 )
 from cti_app.application.edition_release_materialization import (
@@ -35,27 +37,36 @@ from cti_app.application.edition_release_materialization import (
     EditionReleaseRematerializationService,
 )
 from cti_app.application.edition_rendering import EditionRenderParameters, EditionRenderService
-from cti_app.application.edition_review import EditionReviewReadItem, EditionReviewService
+from cti_app.application.edition_review import (
+    EditionReviewReadItem,
+    EditionReviewReadScope,
+    EditionReviewService,
+)
 from cti_app.application.edition_workspace import EditionWorkspaceMaterializer
 from cti_app.application.identity import LocalIdentityProvider
 from cti_app.application.jobs import DuplicateJobError, JobRegistry
 from cti_app.domain.classification import TLP
+from cti_app.domain.edition_composition import (
+    CompositionDisposition,
+    EditionComposition,
+    EditionCompositionEntry,
+)
 from cti_app.domain.edition_publication import (
     EditionDocumentV2,
     EditionPublicationV2,
     EditionRelease,
     PublicationManifestEntryV1,
+    PublicationManifestEntryV2,
     PublicationManifestV1,
+    PublicationManifestV2,
 )
 from cti_app.domain.edition_render import EditionRender, EditionRenderDisplayStatus
 from cti_app.domain.editions import Edition, EditionStatus
 from cti_app.domain.jobs import Job, JobStatus
 from cti_app.domain.production import (
-    EditionProductionBatch,
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
-    ProductionBatchPhase,
     ProductionRepairAction,
     ProductionRepairIssueKind,
     ProductionRun,
@@ -81,6 +92,44 @@ def test_edition_release_only_stores_canonical_edition_document() -> None:
         "edition_document_sha256",
         "created_at",
     ]
+
+
+def test_manifest_v2_has_composition_root_and_schema_versioned_round_trip() -> None:
+    composition_id = uuid4()
+    manifest = PublicationManifestV2.create(
+        edition_id=EDITION_ID,
+        edition_version=4,
+        composition_id=composition_id,
+        composition_version=7,
+        created_by="analyst",
+        entries=(
+            PublicationManifestEntryV2(
+                position=1,
+                subject_id=SUBJECT_A,
+                production_run_id=RUN_A,
+                pipeline_generation=2,
+                document_artifact_id=ARTIFACT_A,
+                document_artifact_version=1,
+                document_input_hash="a" * 64,
+                document_sha256="b" * 64,
+                provenance_batch_id=None,
+                review_decision_id=DECISION_B,
+            ),
+        ),
+        exclusions=(),
+    )
+
+    payload = manifest.to_json()
+
+    assert payload["schema_version"] == "2"
+    assert "batch_id" not in payload
+    assert payload["composition_id"] == str(composition_id)
+    assert payload["composition_version"] == 7
+    assert payload["entries"][0]["provenance_batch_id"] is None
+    assert payload["content_sha256"] == manifest.computed_content_sha256
+    assert PublicationManifestV1.from_json(payload) == manifest
+    with pytest.raises(ValueError, match="root batch_id"):
+        PublicationManifestV2.from_json({**payload, "batch_id": str(uuid4())})
 
 
 EDITION_ID = UUID("11111111-1111-4111-8111-111111111111")
@@ -362,7 +411,7 @@ class _ManifestRepo:
     async def get_blob_id(self, manifest_id: UUID) -> UUID | None:
         return self.manifest_blobs.get(manifest_id)
 
-    async def get_latest_for_edition(self, edition_id: UUID) -> Any:
+    async def get_latest_manifest_for_edition(self, edition_id: UUID) -> Any:
         return next(
             (
                 manifest
@@ -460,9 +509,16 @@ class _Artifacts:
     def __init__(self, artifacts: dict[UUID, ProductionArtifact]) -> None:
         self.artifacts = artifacts
         self.current_calls: list[tuple[UUID, str]] = []
+        self.artifact_after_lock: ProductionArtifact | None = None
 
     async def get(self, artifact_id: UUID) -> ProductionArtifact | None:
         return self.artifacts.get(artifact_id)
+
+    async def get_for_update(self, artifact_id: UUID) -> ProductionArtifact | None:
+        if self.artifact_after_lock is not None:
+            self.artifacts[artifact_id] = self.artifact_after_lock
+            self.artifact_after_lock = None
+        return await self.get(artifact_id)
 
     async def get_current(self, run_id: UUID, stage: str) -> ProductionArtifact | None:
         # The freeze resolves the current EXTRACTION/REFERENCES to prove that
@@ -489,9 +545,23 @@ class _ReadModel:
     def __init__(self, rows: list[EditionReviewReadItem]) -> None:
         self.rows = rows
 
-    async def list_for_edition(self, edition_id: UUID) -> list[EditionReviewReadItem]:
+    async def list_for_edition(self, edition_id: UUID) -> EditionReviewReadScope:
         del edition_id
-        return self.rows
+        version = self.rows[0].composition_version if self.rows else 1
+        return EditionReviewReadScope(items=tuple(self.rows), composition_version=version)
+
+
+class _Compositions:
+    def __init__(self, composition: EditionComposition) -> None:
+        self.composition = composition
+        self.reads = 0
+        self.composition_after_freeze_read: EditionComposition | None = None
+
+    async def get_for_edition(self, edition_id: UUID) -> EditionComposition | None:
+        self.reads += 1
+        if self.reads == 3 and self.composition_after_freeze_read is not None:
+            self.composition = self.composition_after_freeze_read
+        return self.composition if self.composition.edition_id == edition_id else None
 
 
 class _RepairIssueReader:
@@ -551,6 +621,10 @@ class _Uow:
         rows: list[EditionReviewReadItem],
         blobs: _BlobStore,
     ) -> None:
+        rows = [
+            row if row.composition_version is not None else replace(row, composition_version=1)
+            for row in rows
+        ]
         blob_a = uuid4()
         blob_b = uuid4()
         blob_c = uuid4()
@@ -564,13 +638,50 @@ class _Uow:
             publication_document_v4_to_json(_document("Charlie"))
         ).encode()
         self.editions = _Editions(edition)
-        self.edition_production_batches = type(
-            "Batches", (), {"get_latest_for_edition": self._get_batch}
-        )()
-        self.batch = EditionProductionBatch(
-            edition_id=EDITION_ID,
-            status="running",
-            phase=ProductionBatchPhase.REVIEW,
+        composition_entries: list[EditionCompositionEntry] = []
+        for row in rows:
+            if row.effective_decision is PublicationDecision.EXCLUDE:
+                if row.effective_decision_id is None:
+                    continue
+                composition_entries.append(
+                    EditionCompositionEntry(
+                        subject_id=row.subject_id,
+                        disposition=CompositionDisposition.EXCLUDED,
+                        review_decision_id=row.effective_decision_id,
+                    )
+                )
+            elif (
+                row.document_artifact_id is not None
+                and row.document_artifact_version is not None
+                and row.document_input_hash is not None
+            ):
+                composition_entries.append(
+                    EditionCompositionEntry(
+                        subject_id=row.subject_id,
+                        disposition=CompositionDisposition.INCLUDED,
+                        position=row.position,
+                        production_run_id=row.run_id,
+                        pipeline_generation=row.pipeline_generation,
+                        artifact_id=row.document_artifact_id,
+                        artifact_version=row.document_artifact_version,
+                        artifact_input_hash=row.document_input_hash,
+                    )
+                )
+            else:
+                composition_entries.append(
+                    EditionCompositionEntry(
+                        subject_id=row.subject_id,
+                        disposition=CompositionDisposition.DEFERRED,
+                    )
+                )
+        self.edition_compositions = _Compositions(
+            EditionComposition(
+                id=uuid4(),
+                edition_id=edition.id,
+                version=1,
+                actor_id="analyst",
+                entries=tuple(composition_entries),
+            )
         )
         self.production_runs = _Runs(
             {
@@ -595,9 +706,6 @@ class _Uow:
         self.edition_audit = _Audit()
         self.job_events = _Audit()
         self.jobs = _Jobs()
-
-    async def _get_batch(self, edition_id: UUID) -> EditionProductionBatch | None:
-        return self.batch if edition_id == EDITION_ID else None
 
     async def __aenter__(self) -> _Uow:
         return self
@@ -790,7 +898,7 @@ async def test_assembly_handler_persists_release_then_queues_pdf_render(
         lambda: uow,
         blobs,
         job_service=uow.jobs,
-    ).accept(EDITION_ID, actor_id="analyst")  # type: ignore[arg-type]
+    ).accept(EDITION_ID, actor_id="analyst", expected_composition_version=1)  # type: ignore[arg-type]
     assembly = EditionAssemblyService(lambda: uow, blobs)  # type: ignore[arg-type]
     registry = JobRegistry()
     register_publication_jobs(
@@ -904,8 +1012,8 @@ async def test_accept_freezes_order_exclusion_and_same_manifest_on_retry() -> No
         lambda: uow, blobs, job_service=jobs, job_dispatcher=dispatcher
     )  # type: ignore[arg-type]
 
-    first = await service.accept(EDITION_ID, actor_id="analyst")
-    second = await service.accept(EDITION_ID, actor_id="analyst")
+    first = await service.accept(EDITION_ID, actor_id="analyst", expected_composition_version=1)
+    second = await service.accept(EDITION_ID, actor_id="analyst", expected_composition_version=1)
 
     assert first.manifest_id == second.manifest_id
     assert [entry.subject_id for entry in first.manifest.entries] == [SUBJECT_A]
@@ -915,6 +1023,110 @@ async def test_accept_freezes_order_exclusion_and_same_manifest_on_retry() -> No
     assert uow.editions.edition.version == first.manifest.edition_version
     assert len(jobs.jobs) == 1
     assert len(dispatcher.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_accept_rejects_a_composition_with_deferred_subjects() -> None:
+    row = EditionReviewReadItem(
+        position=1,
+        subject_id=SUBJECT_A,
+        title="Alpha",
+        run_id=RUN_A,
+        pipeline_generation=2,
+        run_status=ProductionRunStatus.READY,
+        document_artifact_id=ARTIFACT_A,
+        document_artifact_version=1,
+        document_input_hash="a" * 64,
+        document_artifact_status=ProductionArtifactStatus.VERIFIED,
+        error_code=None,
+        error_message=None,
+        effective_decision=PublicationDecision.INCLUDE,
+    )
+    blobs = _BlobStore()
+    uow = _Uow(_edition(), [row], blobs)
+    composition = uow.edition_compositions.composition
+    uow.edition_compositions.composition = replace(
+        composition,
+        version=2,
+        entries=(
+            composition.entries[0],
+            EditionCompositionEntry(
+                subject_id=SUBJECT_B,
+                disposition=CompositionDisposition.DEFERRED,
+            ),
+        ),
+    )
+    uow.edition_review_read_model.rows[0] = replace(
+        uow.edition_review_read_model.rows[0], composition_version=2
+    )
+
+    with pytest.raises(PublicationAcceptanceError, match="composition_incomplete"):
+        await EditionPublicationService(lambda: uow, blobs).accept(
+            EDITION_ID, actor_id="analyst", expected_composition_version=2
+        )  # type: ignore[arg-type]
+
+    assert uow.publication_manifests.manifests == {}
+
+
+@pytest.mark.asyncio
+async def test_composition_change_at_freeze_boundary_writes_no_manifest() -> None:
+    row = EditionReviewReadItem(
+        position=1,
+        subject_id=SUBJECT_A,
+        title="Alpha",
+        run_id=RUN_A,
+        pipeline_generation=2,
+        run_status=ProductionRunStatus.READY,
+        document_artifact_id=ARTIFACT_A,
+        document_artifact_version=1,
+        document_input_hash="a" * 64,
+        document_artifact_status=ProductionArtifactStatus.VERIFIED,
+        error_code=None,
+        error_message=None,
+        effective_decision=PublicationDecision.INCLUDE,
+    )
+    blobs = _BlobStore()
+    uow = _Uow(_edition(), [row], blobs)
+    current = uow.edition_compositions.composition
+    uow.edition_compositions.composition_after_freeze_read = replace(current, version=2)
+
+    with pytest.raises(PublicationCompositionChangedDuringFreeze):
+        await EditionPublicationService(lambda: uow, blobs).accept(
+            EDITION_ID, actor_id="analyst", expected_composition_version=1
+        )  # type: ignore[arg-type]
+
+    assert uow.publication_manifests.manifests == {}
+
+
+@pytest.mark.asyncio
+async def test_artifact_change_under_freeze_lock_writes_no_manifest() -> None:
+    row = EditionReviewReadItem(
+        position=1,
+        subject_id=SUBJECT_A,
+        title="Alpha",
+        run_id=RUN_A,
+        pipeline_generation=2,
+        run_status=ProductionRunStatus.READY,
+        document_artifact_id=ARTIFACT_A,
+        document_artifact_version=1,
+        document_input_hash="a" * 64,
+        document_artifact_status=ProductionArtifactStatus.VERIFIED,
+        error_code=None,
+        error_message=None,
+        effective_decision=PublicationDecision.INCLUDE,
+    )
+    blobs = _BlobStore()
+    uow = _Uow(_edition(), [row], blobs)
+    uow.production_artifacts.artifact_after_lock = replace(
+        uow.production_artifacts.artifacts[ARTIFACT_A], input_hash="b" * 64
+    )
+
+    with pytest.raises(PublicationArtifactChangedDuringFreeze):
+        await EditionPublicationService(lambda: uow, blobs).accept(
+            EDITION_ID, actor_id="analyst", expected_composition_version=1
+        )  # type: ignore[arg-type]
+
+    assert uow.publication_manifests.manifests == {}
 
 
 @pytest.mark.asyncio
@@ -939,19 +1151,26 @@ async def test_completed_release_allows_a_new_snapshot_on_the_same_open_edition(
     publication = EditionPublicationService(lambda: uow, blobs)  # type: ignore[arg-type]
     assembly = EditionAssemblyService(lambda: uow, blobs)  # type: ignore[arg-type]
 
-    first = await publication.accept(EDITION_ID, actor_id="analyst")
+    first = await publication.accept(EDITION_ID, actor_id="analyst", expected_composition_version=1)
     await assembly.assemble(first.manifest_id)
+    first_release = await uow.edition_releases.get_by_manifest(first.manifest_id)
+    assert first_release is not None
+    first_document_bytes = blobs.blobs[first_release.edition_document_blob_id]
     assert uow.editions.edition.state is EditionStatus.OPEN
     assert uow.editions.edition.version == first.manifest.edition_version
 
     # A released snapshot is immutable, so an explicit accept creates a new
     # snapshot even though the Edition metadata version is unchanged.
-    replay = await publication.accept(EDITION_ID, actor_id="analyst")
+    replay = await publication.accept(
+        EDITION_ID, actor_id="analyst", expected_composition_version=1
+    )
     await assembly.assemble(replay.manifest_id)
     assert replay.manifest_id != first.manifest_id
     assert replay.manifest.edition_version == first.manifest.edition_version
     assert len(uow.publication_manifests.manifests) == 2
     assert len(uow.edition_releases.releases) == 2
+    assert await uow.edition_releases.get_by_manifest(first.manifest_id) == first_release
+    assert blobs.blobs[first_release.edition_document_blob_id] == first_document_bytes
 
     uow.editions.edition.update_metadata(
         country="France",
@@ -961,7 +1180,9 @@ async def test_completed_release_allows_a_new_snapshot_on_the_same_open_edition(
         tlp=TLP.GREEN,
         languages=("fr",),
     )
-    second = await publication.accept(EDITION_ID, actor_id="analyst")
+    second = await publication.accept(
+        EDITION_ID, actor_id="analyst", expected_composition_version=1
+    )
     await assembly.assemble(second.manifest_id)
 
     assert second.manifest_id != replay.manifest_id
@@ -992,7 +1213,7 @@ async def test_metadata_change_makes_pending_snapshot_stale_and_creates_current_
     uow = _Uow(_edition(), [row], blobs)
     publication = EditionPublicationService(lambda: uow, blobs)  # type: ignore[arg-type]
 
-    first = await publication.accept(EDITION_ID, actor_id="analyst")
+    first = await publication.accept(EDITION_ID, actor_id="analyst", expected_composition_version=1)
     uow.editions.edition.update_metadata(
         country="Belgium",
         country_code="BE",
@@ -1001,7 +1222,9 @@ async def test_metadata_change_makes_pending_snapshot_stale_and_creates_current_
         tlp=TLP.GREEN,
         languages=("fr",),
     )
-    second = await publication.accept(EDITION_ID, actor_id="analyst")
+    second = await publication.accept(
+        EDITION_ID, actor_id="analyst", expected_composition_version=1
+    )
 
     assert second.manifest_id != first.manifest_id
     assert first.manifest.edition_version != uow.editions.edition.version
@@ -1010,7 +1233,7 @@ async def test_metadata_change_makes_pending_snapshot_stale_and_creates_current_
 
 
 @pytest.mark.asyncio
-async def test_changed_review_input_supersedes_pending_snapshot_without_version_bump() -> None:
+async def test_changed_composition_supersedes_pending_snapshot() -> None:
     row = EditionReviewReadItem(
         position=1,
         subject_id=SUBJECT_A,
@@ -1031,12 +1254,29 @@ async def test_changed_review_input_supersedes_pending_snapshot_without_version_
     publication = EditionPublicationService(lambda: uow, blobs)  # type: ignore[arg-type]
     assembly = EditionAssemblyService(lambda: uow, blobs)  # type: ignore[arg-type]
 
-    first = await publication.accept(EDITION_ID, actor_id="analyst")
+    first = await publication.accept(EDITION_ID, actor_id="analyst", expected_composition_version=1)
+    uow.edition_compositions.composition = replace(
+        uow.edition_compositions.composition,
+        version=2,
+        entries=(
+            EditionCompositionEntry(
+                subject_id=SUBJECT_B,
+                disposition=CompositionDisposition.INCLUDED,
+                position=1,
+                production_run_id=RUN_B,
+                pipeline_generation=2,
+                artifact_id=ARTIFACT_B,
+                artifact_version=1,
+                artifact_input_hash="a" * 64,
+            ),
+        ),
+    )
     uow.edition_review_read_model.rows[0] = replace(
         row,
         subject_id=SUBJECT_B,
         run_id=RUN_B,
         document_artifact_id=ARTIFACT_B,
+        composition_version=2,
     )
 
     with pytest.raises(PublicationAssemblyError, match="publication_inputs_changed_after_freeze"):
@@ -1044,7 +1284,9 @@ async def test_changed_review_input_supersedes_pending_snapshot_without_version_
     assert uow.edition_releases.release is None
     assert (await publication.release_status(EDITION_ID)).can_retry_assembly is False
 
-    second = await publication.accept(EDITION_ID, actor_id="analyst")
+    second = await publication.accept(
+        EDITION_ID, actor_id="analyst", expected_composition_version=2
+    )
 
     assert second.manifest_id != first.manifest_id
     assert second.manifest.edition_version == first.manifest.edition_version
@@ -1071,11 +1313,13 @@ async def test_archived_edition_blocks_accept_and_pending_snapshot_retry() -> No
     blobs = _BlobStore()
     uow = _Uow(_edition(), [row], blobs)
     publication = EditionPublicationService(lambda: uow, blobs)  # type: ignore[arg-type]
-    accepted = await publication.accept(EDITION_ID, actor_id="analyst")
+    accepted = await publication.accept(
+        EDITION_ID, actor_id="analyst", expected_composition_version=1
+    )
     uow.editions.edition.archive()
 
     with pytest.raises(PublicationAcceptanceError, match="edition_must_be_open"):
-        await publication.accept(EDITION_ID, actor_id="analyst")
+        await publication.accept(EDITION_ID, actor_id="analyst", expected_composition_version=1)
     release_status = await publication.release_status(EDITION_ID)
 
     assert release_status.edition_state is EditionStatus.ARCHIVED
@@ -1126,12 +1370,32 @@ async def test_accept_refuses_an_include_until_its_projection_is_materialized() 
     application = FastAPI()
     application.include_router(publication_router)
     application.state.edition_publication_service = service
+    application.state.edition_review_service = EditionReviewService(
+        lambda: uow, repair_issue_reader=_RepairIssueReader(issue)
+    )
     application.state.identity_provider = LocalIdentityProvider("analyst")
     async with AsyncClient(
         transport=ASGITransport(app=application), base_url="http://test"
     ) as client:
-        response = await client.post(f"/api/editions/{EDITION_ID}/publication/accept")
+        validation_response = await client.get(f"/api/editions/{EDITION_ID}/composition/validation")
+        missing_version_response = await client.post(
+            f"/api/editions/{EDITION_ID}/composition/accept"
+        )
+        composition_accept_response = await client.post(
+            f"/api/editions/{EDITION_ID}/composition/accept",
+            json={"expected_composition_version": 1},
+        )
+        response = await client.post(
+            f"/api/editions/{EDITION_ID}/publication/accept",
+            json={"expected_composition_version": 1},
+        )
 
+    assert validation_response.status_code == 200
+    assert validation_response.json()["composition_version"] == 1
+    assert validation_response.json()["can_accept"] is False
+    assert missing_version_response.status_code == 422
+    assert composition_accept_response.status_code == 409
+    assert composition_accept_response.json()["detail"]["code"] == "review_cannot_be_accepted"
     assert response.status_code == 409
     assert response.json()["detail"]["code"] == "review_cannot_be_accepted"
     assert uow.publication_manifests.manifest is None
@@ -1183,7 +1447,9 @@ async def test_accept_preserves_editorial_positions_with_exclusions(
     blobs = _BlobStore()
     uow = _Uow(_edition(), rows, blobs)
     publication = EditionPublicationService(lambda: uow, blobs)  # type: ignore[arg-type]
-    accepted = await publication.accept(EDITION_ID, actor_id="analyst")
+    accepted = await publication.accept(
+        EDITION_ID, actor_id="analyst", expected_composition_version=1
+    )
 
     assert [entry.position for entry in accepted.manifest.entries] == expected_positions
     assembly = EditionAssemblyService(lambda: uow, blobs)  # type: ignore[arg-type]
@@ -1261,7 +1527,7 @@ async def test_dispatch_failure_keeps_freeze_and_retry_reuses_job() -> None:
         lambda: uow, blobs, job_service=jobs, job_dispatcher=dispatcher
     )  # type: ignore[arg-type]
 
-    result = await service.accept(EDITION_ID, actor_id="analyst")
+    result = await service.accept(EDITION_ID, actor_id="analyst", expected_composition_version=1)
 
     assert result.manifest_id == uow.publication_manifests.manifest.id
     assert uow.editions.edition.state is EditionStatus.OPEN
@@ -1296,11 +1562,11 @@ async def test_accept_in_assembling_repairs_failed_job_without_new_manifest() ->
         job_dispatcher=dispatcher,
     )  # type: ignore[arg-type]
 
-    first = await service.accept(EDITION_ID, actor_id="analyst")
+    first = await service.accept(EDITION_ID, actor_id="analyst", expected_composition_version=1)
     job = jobs.jobs[first.job_id]
     job.start()
     job.fail("edition_assembly_failed", "Assembly failed")
-    second = await service.accept(EDITION_ID, actor_id="analyst")
+    second = await service.accept(EDITION_ID, actor_id="analyst", expected_composition_version=1)
 
     assert second.manifest_id == first.manifest_id
     assert second.job_id == job.id
@@ -1334,7 +1600,7 @@ async def test_job_creation_failure_keeps_freeze_for_a_later_retry() -> None:
         job_dispatcher=_Dispatcher(),
     )  # type: ignore[arg-type]
 
-    result = await service.accept(EDITION_ID, actor_id="analyst")
+    result = await service.accept(EDITION_ID, actor_id="analyst", expected_composition_version=1)
 
     assert result.job_id is None
     assert not result.job_dispatched
@@ -1349,7 +1615,7 @@ async def test_empty_review_is_rejected_without_freeze() -> None:
     service = EditionPublicationService(lambda: uow, blobs)  # type: ignore[arg-type]
 
     with pytest.raises(PublicationAcceptanceError):
-        await service.accept(EDITION_ID, actor_id="analyst")
+        await service.accept(EDITION_ID, actor_id="analyst", expected_composition_version=1)
     assert uow.editions.edition.state is EditionStatus.OPEN
 
 
@@ -1375,7 +1641,9 @@ async def test_assembly_reads_manifest_artifact_id_and_persists_canonical_docume
     blobs = _BlobStore()
     uow = _Uow(_edition(), [row], blobs)
     publication = EditionPublicationService(lambda: uow, blobs)  # type: ignore[arg-type]
-    accepted = await publication.accept(EDITION_ID, actor_id="analyst")
+    accepted = await publication.accept(
+        EDITION_ID, actor_id="analyst", expected_composition_version=1
+    )
     assembly = EditionAssemblyService(lambda: uow, blobs)  # type: ignore[arg-type]
 
     release = await assembly.assemble(accepted.manifest_id)
@@ -1388,6 +1656,55 @@ async def test_assembly_reads_manifest_artifact_id_and_persists_canonical_docume
     assert not release_path.exists()
     await assembly.assemble(accepted.manifest_id)
     assert uow.edition_releases.add_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_assembly_retry_after_blob_write_interruption_uses_same_frozen_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = EditionReviewReadItem(
+        position=1,
+        subject_id=SUBJECT_A,
+        title="Alpha",
+        run_id=RUN_A,
+        pipeline_generation=2,
+        run_status=ProductionRunStatus.READY,
+        document_artifact_id=ARTIFACT_A,
+        document_artifact_version=1,
+        document_input_hash="a" * 64,
+        document_artifact_status=ProductionArtifactStatus.VERIFIED,
+        error_code=None,
+        error_message=None,
+        effective_decision=None,
+    )
+    blobs = _BlobStore()
+    uow = _Uow(_edition(), [row], blobs)
+    accepted = await EditionPublicationService(lambda: uow, blobs).accept(
+        EDITION_ID, actor_id="analyst", expected_composition_version=1
+    )
+    assembly = EditionAssemblyService(lambda: uow, blobs)  # type: ignore[arg-type]
+    original_put = blobs.put_canonical_json
+    interrupted = False
+
+    async def persist_then_interrupt(payload: dict[str, Any], *, bucket: str) -> tuple[UUID, str]:
+        nonlocal interrupted
+        result = await original_put(payload, bucket=bucket)
+        if bucket == "edition-documents" and not interrupted:
+            interrupted = True
+            raise RuntimeError("simulated worker interruption after durable blob write")
+        return result
+
+    monkeypatch.setattr(blobs, "put_canonical_json", persist_then_interrupt)
+    with pytest.raises(RuntimeError, match="simulated worker interruption"):
+        await assembly.assemble(accepted.manifest_id)
+    assert await uow.edition_releases.get_by_manifest(accepted.manifest_id) is None
+
+    monkeypatch.setattr(blobs, "put_canonical_json", original_put)
+    release = await assembly.assemble(accepted.manifest_id)
+
+    assert release.manifest_id == accepted.manifest_id
+    assert uow.edition_releases.add_calls == 1
+    assert await uow.publication_manifests.get(accepted.manifest_id) == accepted.manifest
 
 
 @pytest.mark.asyncio
@@ -1432,7 +1749,7 @@ async def test_manual_target_two_articles_is_frozen_and_rematerializable(
             publication_document_v4_to_json(_document(title))
         ).encode()
     accepted = await EditionPublicationService(lambda: uow, blobs).accept(
-        EDITION_ID, actor_id="analyst"
+        EDITION_ID, actor_id="analyst", expected_composition_version=1
     )  # type: ignore[arg-type]
     assembly = EditionAssemblyService(lambda: uow, blobs)  # type: ignore[arg-type]
 
@@ -1536,7 +1853,9 @@ async def test_assembly_does_not_write_release_workspace(tmp_path: Path) -> None
     blobs = _BlobStore()
     uow = _Uow(_edition(), [row], blobs)
     publication = EditionPublicationService(lambda: uow, blobs)  # type: ignore[arg-type]
-    accepted = await publication.accept(EDITION_ID, actor_id="analyst")
+    accepted = await publication.accept(
+        EDITION_ID, actor_id="analyst", expected_composition_version=1
+    )
     assembly = EditionAssemblyService(lambda: uow, blobs)  # type: ignore[arg-type]
 
     release = await assembly.assemble(accepted.manifest_id)
@@ -1567,7 +1886,9 @@ async def test_assembly_rejects_an_edition_changed_after_freeze() -> None:
     blobs = _BlobStore()
     uow = _Uow(_edition(), [row], blobs)
     publication = EditionPublicationService(lambda: uow, blobs)  # type: ignore[arg-type]
-    accepted = await publication.accept(EDITION_ID, actor_id="analyst")
+    accepted = await publication.accept(
+        EDITION_ID, actor_id="analyst", expected_composition_version=1
+    )
     uow.editions.edition.version += 1
     assembly = EditionAssemblyService(lambda: uow, blobs)  # type: ignore[arg-type]
 
@@ -1716,7 +2037,7 @@ async def test_release_endpoint_exposes_public_assembly_failure_state() -> None:
         job_service=jobs,
         job_dispatcher=_Dispatcher(),
     )  # type: ignore[arg-type]
-    accepted = await service.accept(EDITION_ID, actor_id="analyst")
+    accepted = await service.accept(EDITION_ID, actor_id="analyst", expected_composition_version=1)
     job = jobs.jobs[next(iter(jobs.jobs))]
     job.start()
     job.fail("edition_assembly_failed", "Public assembly failure", details={"secret": "not public"})
@@ -1796,7 +2117,9 @@ async def test_release_pdf_route_returns_404_409_and_verified_pdf() -> None:
     ) as client:
         assert (await client.get(url)).status_code == 404
 
-        accepted = await publication.accept(EDITION_ID, actor_id="analyst")
+        accepted = await publication.accept(
+            EDITION_ID, actor_id="analyst", expected_composition_version=1
+        )
         assert (await client.get(url)).status_code == 404
 
         release = await EditionAssemblyService(lambda: uow, blobs).assemble(  # type: ignore[arg-type]
@@ -1840,7 +2163,9 @@ async def test_release_ioc_zip_reads_only_the_immutable_edition_document() -> No
         transport=ASGITransport(app=application), base_url="http://test"
     ) as client:
         assert (await client.get(url)).status_code == 404
-        accepted = await publication.accept(EDITION_ID, actor_id="analyst")
+        accepted = await publication.accept(
+            EDITION_ID, actor_id="analyst", expected_composition_version=1
+        )
         release = await EditionAssemblyService(lambda: uow, blobs).assemble(  # type: ignore[arg-type]
             accepted.manifest.id
         )
@@ -1894,7 +2219,9 @@ async def test_retry_render_is_idempotent_and_published_at_comes_from_render() -
         job_service=jobs,
         job_dispatcher=dispatcher,
     )  # type: ignore[arg-type]
-    accepted = await publication.accept(EDITION_ID, actor_id="analyst")
+    accepted = await publication.accept(
+        EDITION_ID, actor_id="analyst", expected_composition_version=1
+    )
     release = await EditionAssemblyService(lambda: uow, blobs).assemble(  # type: ignore[arg-type]
         accepted.manifest.id
     )

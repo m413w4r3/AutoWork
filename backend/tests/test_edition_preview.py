@@ -19,7 +19,7 @@ from cti_app.application.edition_preview import (
     EditionPreviewService,
     EditionPreviewStaleError,
 )
-from cti_app.application.edition_review import EditionReviewReadItem
+from cti_app.application.edition_review import EditionReviewReadItem, EditionReviewReadScope
 from cti_app.application.edition_typst_rendering import EditionTypstRenderer
 from cti_app.application.media_assets import MediaAssetStore
 from cti_app.application.typst_compilation import (
@@ -28,6 +28,11 @@ from cti_app.application.typst_compilation import (
 )
 from cti_app.application.typst_rendering import load_template_bundle
 from cti_app.domain.classification import TLP
+from cti_app.domain.edition_composition import (
+    CompositionDisposition,
+    EditionComposition,
+    EditionCompositionEntry,
+)
 from cti_app.domain.edition_publication import EditionDocumentV2
 from cti_app.domain.editions import Edition, EditionStatus
 from cti_app.domain.production import (
@@ -113,9 +118,18 @@ class _ReadModel:
     def __init__(self, rows: list[EditionReviewReadItem]) -> None:
         self.rows = rows
 
-    async def list_for_edition(self, edition_id: UUID) -> list[EditionReviewReadItem]:
+    async def list_for_edition(self, edition_id: UUID) -> EditionReviewReadScope:
         del edition_id
-        return self.rows
+        version = self.rows[0].composition_version if self.rows else 1
+        return EditionReviewReadScope(items=tuple(self.rows), composition_version=version)
+
+
+class _Compositions:
+    def __init__(self, composition: EditionComposition) -> None:
+        self.composition = composition
+
+    async def get_for_edition(self, edition_id: UUID) -> EditionComposition | None:
+        return self.composition if edition_id == self.composition.edition_id else None
 
 
 class _Runs:
@@ -153,6 +167,10 @@ class _Uow:
         artifact_store: _ArtifactStore,
     ) -> None:
         self.editions = _Editions(edition)
+        rows = [
+            row if row.composition_version is not None else replace(row, composition_version=1)
+            for row in rows
+        ]
         self.edition_review_read_model = _ReadModel(rows)
         runs: dict[UUID, ProductionRun] = {}
         artifacts: dict[UUID, ProductionArtifact] = {}
@@ -187,6 +205,28 @@ class _Uow:
             assert rows[position - 1].position == position
         self.production_runs = _Runs(runs)
         self.production_artifacts = _Artifacts(artifacts)
+        self.edition_compositions = _Compositions(
+            EditionComposition(
+                edition_id=EDITION_ID,
+                version=1,
+                actor_id="analyst",
+                entries=tuple(
+                    EditionCompositionEntry(
+                        subject_id=subject_id,
+                        disposition=CompositionDisposition.INCLUDED,
+                        position=position,
+                        production_run_id=run_id,
+                        pipeline_generation=2,
+                        artifact_id=artifact_id,
+                        artifact_version=1,
+                        artifact_input_hash=PREVIEW_HASH_A,
+                    )
+                    for position, (subject_id, run_id, artifact_id) in enumerate(
+                        zip(SUBJECT_IDS, RUN_IDS, ARTIFACT_IDS, strict=True), start=1
+                    )
+                ),
+            )
+        )
         self.publication_manifests: list[object] = []
         self.edition_releases: list[object] = []
         self.edition_renders: list[object] = []
@@ -245,9 +285,14 @@ def test_preview_contract_is_document_only() -> None:
     assert tuple(edition_preview.EditionPreview.__dataclass_fields__) == (
         "edition_id",
         "edition_version",
+        "composition_id",
+        "composition_version",
         "preview_input_hash",
         "artifacts",
         "document",
+        "partial",
+        "missing_subject_ids",
+        "deferred_subject_ids",
         "stale",
     )
 
@@ -271,7 +316,66 @@ async def test_preview_returns_edition_document_and_hash_is_stable() -> None:
 
 
 @pytest.mark.asyncio
-async def test_preview_hash_changes_and_stale_is_reported_after_article_changes() -> None:
+async def test_partial_preview_lists_deferred_subjects() -> None:
+    service, uow, _ = _service()
+    composition = uow.edition_compositions.composition
+    first = composition.entries[0]
+    original_second = composition.entries[1]
+    deferred = EditionCompositionEntry(
+        subject_id=SUBJECT_IDS[1],
+        disposition=CompositionDisposition.DEFERRED,
+    )
+    uow.edition_compositions.composition = replace(
+        composition, version=2, entries=(first, deferred)
+    )
+    uow.edition_review_read_model.rows = [
+        replace(uow.edition_review_read_model.rows[0], composition_version=2)
+    ]
+
+    preview = await service.preview(EDITION_ID)
+
+    assert preview.partial is True
+    assert preview.missing_subject_ids == (SUBJECT_IDS[1],)
+    assert preview.deferred_subject_ids == (SUBJECT_IDS[1],)
+    assert [article.subject_id for article in preview.document.publications] == [SUBJECT_IDS[0]]
+
+    # Completing the deferred item reuses its existing pinned run and artifact.
+    uow.edition_compositions.composition = replace(
+        uow.edition_compositions.composition,
+        version=3,
+        entries=(first, original_second),
+    )
+    uow.edition_review_read_model.rows = [
+        replace(row, composition_version=3) for row in _review_rows()
+    ]
+    final = await service.preview(EDITION_ID)
+    assert final.partial is False
+    assert [article.subject_id for article in final.document.publications] == list(SUBJECT_IDS)
+    assert final.artifacts[0].artifact_id == ARTIFACT_IDS[0]
+    assert final.artifacts[1].artifact_id == ARTIFACT_IDS[1]
+
+
+@pytest.mark.asyncio
+async def test_composition_version_change_invalidates_preview_hash() -> None:
+    service, uow, _ = _service()
+    previous = await service.preview(EDITION_ID)
+    composition = uow.edition_compositions.composition
+    uow.edition_compositions.composition = replace(composition, version=2)
+    uow.edition_review_read_model.rows = [
+        replace(row, composition_version=2) for row in uow.edition_review_read_model.rows
+    ]
+
+    updated = await service.preview(
+        EDITION_ID,
+        previous_preview_input_hash=previous.preview_input_hash,
+    )
+
+    assert updated.preview_input_hash != previous.preview_input_hash
+    assert updated.stale is True
+
+
+@pytest.mark.asyncio
+async def test_new_cti_artifact_does_not_invalidate_composition_preview() -> None:
     service, uow, artifacts = _service()
     previous = await service.preview(EDITION_ID)
     old_row = uow.edition_review_read_model.rows[0]
@@ -288,21 +392,16 @@ async def test_preview_hash_changes_and_stale_is_reported_after_article_changes(
         canonical_blob_id=new_blob_id,
     )
     uow.production_artifacts.artifacts[new_artifact_id] = new_artifact
-    del uow.production_artifacts.artifacts[ARTIFACT_IDS[0]]
-    uow.edition_review_read_model.rows[0] = replace(
-        old_row,
-        document_artifact_id=new_artifact_id,
-        document_input_hash="b" * 64,
-    )
 
     current = await service.preview(
         EDITION_ID,
         previous_preview_input_hash=previous.preview_input_hash,
     )
 
-    assert current.preview_input_hash != previous.preview_input_hash
-    assert current.stale is True
-    assert current.document.publications[0].document.title == "Replacement article"
+    assert current.preview_input_hash == previous.preview_input_hash
+    assert current.stale is False
+    assert current.document.publications[0].document.title == "Alpha"
+    assert old_row.document_artifact_id == ARTIFACT_IDS[0]
 
 
 class _MediaAssetStore:
@@ -451,6 +550,9 @@ async def test_preview_api_serializes_document_and_pdf_route_fences_staleness(
         base_url="http://test",
     ) as client:
         preview_response = await client.get(f"/api/editions/{EDITION_ID}/preview")
+        composition_preview_response = await client.get(
+            f"/api/editions/{EDITION_ID}/composition/preview"
+        )
         preview_hash = preview_response.json()["preview_input_hash"]
         pdf_response = await client.get(
             f"/api/editions/{EDITION_ID}/preview/pdf",
@@ -462,6 +564,9 @@ async def test_preview_api_serializes_document_and_pdf_route_fences_staleness(
         )
 
     assert preview_response.status_code == 200
+    assert composition_preview_response.status_code == 200
+    assert composition_preview_response.json()["composition_version"] == 1
+    assert composition_preview_response.json()["partial"] is False
     preview_body = preview_response.json()
     assert "document" in preview_body
     assert "canonical_markdown" not in preview_body

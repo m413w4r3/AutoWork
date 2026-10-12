@@ -10,6 +10,7 @@ from uuid import uuid4
 
 import pytest
 
+from cti_app.application.edition_composition import EditionCompositionService
 from cti_app.application.edition_publication import (
     EditionAssemblyService,
     EditionPublicationService,
@@ -19,6 +20,7 @@ from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.domain.blobs import BlobDescriptor, BlobRecord
 from cti_app.domain.classification import TLP
+from cti_app.domain.edition_composition import CompositionDisposition, EditionCompositionEntry
 from cti_app.domain.edition_publication import PublicationManifestEntryV1, PublicationManifestV1
 from cti_app.domain.editions import Edition, EditionStatus
 from cti_app.domain.entities import Subject
@@ -70,7 +72,7 @@ async def _seed_review_snapshot(
         diagrams=(),
         figures=(),
     )
-    document_blob_id, _ = await store.put_canonical_json(
+    document_blob_id, document_sha256 = await store.put_canonical_json(
         serialize_publication_document(document), bucket="test-publication"
     )
     run = ProductionRun(
@@ -120,6 +122,29 @@ async def _seed_review_snapshot(
         await uow.commit()
         await uow.edition_production_batch_items.append_many((item,))
         await uow.commit()
+    current = await EditionCompositionService(uow_factory).get(scenario.edition.id)
+    expected_version = current.composition.version if current.composition else 0
+    await EditionCompositionService(uow_factory).replace_entries(
+        scenario.edition.id,
+        (
+            EditionCompositionEntry(
+                subject_id=scenario.subject.id,
+                disposition=CompositionDisposition.INCLUDED,
+                position=1,
+                production_run_id=run.id,
+                pipeline_generation=run.pipeline_generation,
+                artifact_id=artifact.id,
+                artifact_version=artifact.version,
+                artifact_input_hash=artifact.input_hash,
+                document_sha256=document_sha256,
+                provenance_batch_id=batch.id,
+            ),
+        ),
+        expected_version=expected_version,
+        idempotency_key=f"publication-freeze-composition:{run_number}",
+        actor_id="publication-freeze-test",
+        correlation_id=f"publication-freeze-composition:{run_number}",
+    )
     return batch, run, artifact
 
 
@@ -154,7 +179,9 @@ async def test_same_version_publication_snapshots_and_releases_are_chronological
     publication = EditionPublicationService(uow_factory, store)
     assembly = EditionAssemblyService(uow_factory, store)
 
-    accepted_a = await publication.accept(scenario.edition.id, actor_id="reviewer")
+    accepted_a = await publication.accept(
+        scenario.edition.id, actor_id="reviewer", expected_composition_version=1
+    )
     release_a = await assembly.assemble(accepted_a.manifest.id)
 
     await _seed_review_snapshot(
@@ -166,11 +193,15 @@ async def test_same_version_publication_snapshots_and_releases_are_chronological
         input_hash="b" * 64,
         run_number=2,
     )
-    accepted_b = await publication.accept(scenario.edition.id, actor_id="reviewer")
+    accepted_b = await publication.accept(
+        scenario.edition.id, actor_id="reviewer", expected_composition_version=2
+    )
     release_b = await assembly.assemble(accepted_b.manifest.id)
 
     async with uow_factory() as uow:
-        latest = await uow.publication_manifests.get_latest_for_edition(scenario.edition.id)
+        latest = await uow.publication_manifests.get_latest_manifest_for_edition(
+            scenario.edition.id
+        )
         persisted_a = await uow.publication_manifests.get(accepted_a.manifest.id)
         persisted_b = await uow.publication_manifests.get(accepted_b.manifest.id)
         release_for_a = await uow.edition_releases.get_by_manifest(accepted_a.manifest.id)
@@ -204,7 +235,9 @@ async def test_same_version_pending_snapshot_rejects_changed_production_review_i
     )
     publication = EditionPublicationService(uow_factory, store)
     assembly = EditionAssemblyService(uow_factory, store)
-    accepted_a = await publication.accept(scenario.edition.id, actor_id="reviewer")
+    accepted_a = await publication.accept(
+        scenario.edition.id, actor_id="reviewer", expected_composition_version=1
+    )
     version = accepted_a.manifest.edition_version
 
     await _seed_review_snapshot(
@@ -226,6 +259,56 @@ async def test_same_version_pending_snapshot_rejects_changed_production_review_i
 
     assert release is None
     assert edition is not None and edition.version == version
+
+
+@pytest.mark.asyncio
+async def test_assembly_retry_after_blob_write_interruption_keeps_one_frozen_release(
+    uow_factory: UnitOfWorkFactory,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = await _publication_scenario(uow_factory, tmp_path)
+    await _seed_review_snapshot(
+        uow_factory,
+        scenario,
+        scenario.artifact_store,
+        created_at=datetime.now(UTC),
+        title="Interrupted assembly",
+        input_hash="f" * 64,
+        run_number=1,
+    )
+    accepted = await EditionPublicationService(uow_factory, scenario.artifact_store).accept(
+        scenario.edition.id, actor_id="reviewer", expected_composition_version=1
+    )
+    assembly = EditionAssemblyService(uow_factory, scenario.artifact_store)
+    original_put = scenario.artifact_store.put_canonical_json
+    interrupted = False
+
+    async def persist_then_interrupt(payload: dict[str, object], *, bucket: str):
+        nonlocal interrupted
+        result = await original_put(payload, bucket=bucket)
+        if bucket == "edition-documents" and not interrupted:
+            interrupted = True
+            raise RuntimeError("simulated interruption after durable assembly blob")
+        return result
+
+    monkeypatch.setattr(scenario.artifact_store, "put_canonical_json", persist_then_interrupt)
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        await assembly.assemble(accepted.manifest.id)
+    async with uow_factory() as uow:
+        assert await uow.edition_releases.get_by_manifest(accepted.manifest.id) is None
+
+    monkeypatch.setattr(scenario.artifact_store, "put_canonical_json", original_put)
+    release = await assembly.assemble(accepted.manifest.id)
+    replay = await assembly.assemble(accepted.manifest.id)
+
+    assert replay == release
+    assert release.manifest_id == accepted.manifest.id
+    async with uow_factory() as uow:
+        persisted_release = await uow.edition_releases.get_by_manifest(accepted.manifest.id)
+        persisted_manifest = await uow.publication_manifests.get(accepted.manifest.id)
+    assert persisted_release == release
+    assert persisted_manifest == accepted.manifest
 
 
 @pytest.mark.asyncio

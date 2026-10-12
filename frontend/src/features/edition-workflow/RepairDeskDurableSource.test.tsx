@@ -245,10 +245,10 @@ describe("Repair Desk — dette de reconstruction durable", () => {
       await screen.findByRole("button", { name: "Réintégrer la source" }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Accepter la production" }),
-    ).toBeDisabled();
+      screen.getByRole("link", { name: "Ouvrir la composition" }),
+    ).toHaveAttribute("href", `/editions/${EDITION_ID}/composition`);
     expect(
-      screen.getByText(/doit être reconstruit avant finalisation/),
+      screen.getByText(/doit être reconstruit avant l’acceptation/),
     ).toBeInTheDocument();
 
     // F5: everything React held in memory is gone.
@@ -259,8 +259,8 @@ describe("Repair Desk — dette de reconstruction durable", () => {
       await screen.findByRole("button", { name: "Réintégrer la source" }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Accepter la production" }),
-    ).toBeDisabled();
+      screen.getByRole("link", { name: "Ouvrir la composition" }),
+    ).toHaveAttribute("href", `/editions/${EDITION_ID}/composition`);
   });
 
   it("propose de préparer une source Q1 qui n’a aucune collection", async () => {

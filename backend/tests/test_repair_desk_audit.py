@@ -20,7 +20,10 @@ import pytest
 
 from cti_app.application.edition_review import (
     EditionRepairReadService,
+    EditionReviewDiagnostic,
+    EditionReviewDiagnosticCode,
     EditionReviewReadItem,
+    EditionReviewReadScope,
     EditionReviewService,
 )
 from cti_app.application.edition_workspace import EditionWorkspaceMaterializer
@@ -54,6 +57,7 @@ from cti_app.application.production_synthesis import canonical_extraction_hash
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.discovery import SourceRole
+from cti_app.domain.edition_composition import CompositionDisposition
 from cti_app.domain.editions import Edition
 from cti_app.domain.production import (
     ProductionArtifact,
@@ -1410,6 +1414,74 @@ def test_audit10_indicator_counters_ignore_non_ioc_artifact_types() -> None:
     assert review.items[0].unresolved_repair_count == 1
     assert review.unresolved_repair_count == 1
     assert not review.can_accept
+
+
+def test_composition_review_scopes_repairs_and_reports_nonincluded_subjects() -> None:
+    included = _row(SUBJECT_A, RUN_A, position=1, decision=PublicationDecision.INCLUDE)
+    deferred_run = uuid4()
+    excluded_run = uuid4()
+    deferred = _row(SUBJECT_B, deferred_run, position=2)
+    excluded = _row(uuid4(), excluded_run, position=3)
+    scope = EditionReviewReadScope(
+        items=(included,),
+        composition_version=4,
+        diagnostics=(
+            EditionReviewDiagnostic(
+                code=EditionReviewDiagnosticCode.SUBJECT_DEFERRED,
+                subject_id=deferred.subject_id,
+                disposition=CompositionDisposition.DEFERRED,
+                run_id=deferred.run_id,
+            ),
+            EditionReviewDiagnostic(
+                code=EditionReviewDiagnosticCode.SUBJECT_EXCLUDED,
+                subject_id=excluded.subject_id,
+                disposition=CompositionDisposition.EXCLUDED,
+                run_id=excluded.run_id,
+            ),
+        ),
+    )
+    out_of_scope_repairs = [
+        _issue("6" * 64, deferred),
+        _issue("7" * 64, excluded),
+    ]
+
+    review = EditionReviewService.from_rows(
+        EDITION_ID,
+        scope,
+        repair_issues=out_of_scope_repairs,
+    )
+
+    assert review.can_accept
+    assert review.unresolved_repair_count == 0
+    assert review.pending_rebuild_count == 0
+    diagnostics = {item.subject_id: item for item in review.diagnostics}
+    assert diagnostics[deferred.subject_id].code is EditionReviewDiagnosticCode.SUBJECT_DEFERRED
+    assert diagnostics[deferred.subject_id].active_repair_count == 1
+    assert diagnostics[deferred.subject_id].unresolved_repair_count == 1
+    assert diagnostics[excluded.subject_id].code is EditionReviewDiagnosticCode.SUBJECT_EXCLUDED
+    assert diagnostics[excluded.subject_id].active_repair_count == 1
+    assert diagnostics[excluded.subject_id].unresolved_repair_count == 1
+
+    unaddressed = replace(
+        scope,
+        diagnostics=(
+            *scope.diagnostics,
+            EditionReviewDiagnostic(
+                code=EditionReviewDiagnosticCode.SUBJECT_UNADDRESSED,
+                subject_id=uuid4(),
+            ),
+        ),
+    )
+    assert not EditionReviewService.from_rows(EDITION_ID, unaddressed).can_accept
+
+    included_repair = _issue("8" * 64, included)
+    blocked = EditionReviewService.from_rows(
+        EDITION_ID,
+        scope,
+        repair_issues=[*out_of_scope_repairs, included_repair],
+    )
+    assert not blocked.can_accept
+    assert blocked.unresolved_repair_count == 1
 
 
 @pytest.mark.asyncio

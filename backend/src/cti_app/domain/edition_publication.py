@@ -17,6 +17,7 @@ from cti_app.domain.publication_document import (
 )
 
 PUBLICATION_MANIFEST_SCHEMA_VERSION = "1"
+PUBLICATION_MANIFEST_V2_SCHEMA_VERSION = "2"
 EDITION_DOCUMENT_V2_SCHEMA_VERSION = "2"
 
 
@@ -214,7 +215,11 @@ class PublicationManifestV1:
         return payload
 
     @classmethod
-    def from_json(cls, payload: Mapping[str, Any]) -> PublicationManifestV1:
+    def from_json(cls, payload: Mapping[str, Any]) -> PublicationManifestV1 | PublicationManifestV2:
+        if str(payload.get("schema_version", PUBLICATION_MANIFEST_SCHEMA_VERSION)) == (
+            PUBLICATION_MANIFEST_V2_SCHEMA_VERSION
+        ):
+            return PublicationManifestV2.from_json(payload)
         content_sha256 = str(payload["content_sha256"])
         return cls(
             schema_version=str(payload["schema_version"]),
@@ -233,6 +238,217 @@ class PublicationManifestV1:
             ),
             content_sha256=content_sha256,
         )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PublicationManifestEntryV2:
+    position: int
+    subject_id: UUID
+    production_run_id: UUID
+    pipeline_generation: int
+    document_artifact_id: UUID
+    document_artifact_version: int
+    document_input_hash: str
+    document_sha256: str | None = None
+    provenance_batch_id: UUID | None = None
+    review_decision_id: UUID | None = None
+
+    def __post_init__(self) -> None:
+        if self.position < 1:
+            raise ValueError("manifest entry position must be >= 1")
+        if self.pipeline_generation < 0:
+            raise ValueError("pipeline_generation must be >= 0")
+        if self.document_artifact_version < 1:
+            raise ValueError("document_artifact_version must be >= 1")
+        for name, value in (
+            ("document_input_hash", self.document_input_hash),
+            ("document_sha256", self.document_sha256),
+        ):
+            if value is not None and (
+                len(value) != 64 or any(char not in "0123456789abcdef" for char in value)
+            ):
+                raise ValueError(f"{name} must be lowercase SHA-256")
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "position": self.position,
+            "subject_id": str(self.subject_id),
+            "production_run_id": str(self.production_run_id),
+            "pipeline_generation": self.pipeline_generation,
+            "document_artifact_id": str(self.document_artifact_id),
+            "document_artifact_version": self.document_artifact_version,
+            "document_input_hash": self.document_input_hash,
+            "document_sha256": self.document_sha256,
+            "provenance_batch_id": (
+                str(self.provenance_batch_id) if self.provenance_batch_id is not None else None
+            ),
+            "review_decision_id": (
+                str(self.review_decision_id) if self.review_decision_id is not None else None
+            ),
+        }
+
+    @classmethod
+    def from_json(cls, payload: Mapping[str, Any]) -> PublicationManifestEntryV2:
+        return cls(
+            position=int(payload["position"]),
+            subject_id=UUID(str(payload["subject_id"])),
+            production_run_id=UUID(str(payload["production_run_id"])),
+            pipeline_generation=int(payload["pipeline_generation"]),
+            document_artifact_id=UUID(str(payload["document_artifact_id"])),
+            document_artifact_version=int(payload["document_artifact_version"]),
+            document_input_hash=str(payload["document_input_hash"]),
+            document_sha256=(
+                str(payload["document_sha256"])
+                if payload.get("document_sha256") is not None
+                else None
+            ),
+            provenance_batch_id=(
+                UUID(str(payload["provenance_batch_id"]))
+                if payload.get("provenance_batch_id") is not None
+                else None
+            ),
+            review_decision_id=(
+                UUID(str(payload["review_decision_id"]))
+                if payload.get("review_decision_id") is not None
+                else None
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PublicationManifestV2:
+    edition_id: UUID
+    edition_version: int
+    composition_id: UUID
+    composition_version: int
+    created_by: str
+    entries: tuple[PublicationManifestEntryV2, ...]
+    exclusions: tuple[PublicationManifestExclusionV1, ...]
+    content_sha256: str
+    id: UUID = field(default_factory=uuid4)
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    schema_version: str = PUBLICATION_MANIFEST_V2_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if self.schema_version != PUBLICATION_MANIFEST_V2_SCHEMA_VERSION:
+            raise ValueError(f"unsupported publication manifest schema: {self.schema_version}")
+        if self.edition_version < 1 or self.composition_version < 1:
+            raise ValueError("manifest versions must be >= 1")
+        if not self.created_by.strip():
+            raise ValueError("created_by must not be empty")
+        if self.created_at.tzinfo is None or self.created_at.utcoffset() is None:
+            raise ValueError("created_at must be timezone-aware")
+        object.__setattr__(self, "created_at", self.created_at.astimezone(UTC))
+        entries = tuple(sorted(self.entries, key=lambda item: item.position))
+        if len({item.position for item in entries}) != len(entries):
+            raise ValueError("manifest entry positions must be unique")
+        if len({item.subject_id for item in entries}) != len(entries):
+            raise ValueError("manifest entries must contain unique subjects")
+        exclusions = tuple(sorted(self.exclusions, key=lambda item: str(item.subject_id)))
+        included_subjects = {item.subject_id for item in entries}
+        excluded_subjects = {item.subject_id for item in exclusions}
+        if included_subjects & excluded_subjects:
+            raise ValueError("a subject cannot be included and excluded")
+        if len(excluded_subjects) != len(exclusions):
+            raise ValueError("manifest exclusions must contain unique subjects")
+        object.__setattr__(self, "entries", entries)
+        object.__setattr__(self, "exclusions", exclusions)
+        if len(self.content_sha256) != 64 or any(
+            char not in "0123456789abcdef" for char in self.content_sha256
+        ):
+            raise ValueError("content_sha256 must be lowercase SHA-256")
+        if self.content_sha256 != self.computed_content_sha256:
+            raise ValueError("publication manifest content_sha256 does not match its content")
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        edition_id: UUID,
+        edition_version: int,
+        composition_id: UUID,
+        composition_version: int,
+        created_by: str,
+        entries: tuple[PublicationManifestEntryV2, ...],
+        exclusions: tuple[PublicationManifestExclusionV1, ...],
+        id: UUID | None = None,
+        created_at: datetime | None = None,
+    ) -> PublicationManifestV2:
+        manifest_id = id or uuid4()
+        manifest_created_at = (created_at or datetime.now(UTC)).astimezone(UTC)
+        draft = {
+            "schema_version": PUBLICATION_MANIFEST_V2_SCHEMA_VERSION,
+            "id": str(manifest_id),
+            "edition_id": str(edition_id),
+            "edition_version": edition_version,
+            "composition_id": str(composition_id),
+            "composition_version": composition_version,
+            "created_at": manifest_created_at.isoformat(),
+            "created_by": created_by,
+            "entries": [item.to_json() for item in sorted(entries, key=lambda item: item.position)],
+            "exclusions": [
+                item.to_json() for item in sorted(exclusions, key=lambda item: str(item.subject_id))
+            ],
+        }
+        return cls(
+            id=manifest_id,
+            edition_id=edition_id,
+            edition_version=edition_version,
+            composition_id=composition_id,
+            composition_version=composition_version,
+            created_at=manifest_created_at,
+            created_by=created_by,
+            entries=entries,
+            exclusions=exclusions,
+            content_sha256=_sha256(draft),
+        )
+
+    @property
+    def computed_content_sha256(self) -> str:
+        return _sha256(self.to_json(include_content_sha256=False))
+
+    def to_json(self, *, include_content_sha256: bool = True) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "schema_version": self.schema_version,
+            "id": str(self.id),
+            "edition_id": str(self.edition_id),
+            "edition_version": self.edition_version,
+            "composition_id": str(self.composition_id),
+            "composition_version": self.composition_version,
+            "created_at": self.created_at.isoformat(),
+            "created_by": self.created_by,
+            "entries": [entry.to_json() for entry in self.entries],
+            "exclusions": [exclusion.to_json() for exclusion in self.exclusions],
+        }
+        if include_content_sha256:
+            payload["content_sha256"] = self.content_sha256
+        return payload
+
+    @classmethod
+    def from_json(cls, payload: Mapping[str, Any]) -> PublicationManifestV2:
+        if "batch_id" in payload:
+            raise ValueError("V2 publication manifests must not contain a root batch_id")
+        return cls(
+            schema_version=str(payload["schema_version"]),
+            id=UUID(str(payload["id"])),
+            edition_id=UUID(str(payload["edition_id"])),
+            edition_version=int(payload["edition_version"]),
+            composition_id=UUID(str(payload["composition_id"])),
+            composition_version=int(payload["composition_version"]),
+            created_at=_datetime_from_json(payload["created_at"], "created_at"),
+            created_by=str(payload["created_by"]),
+            entries=tuple(
+                PublicationManifestEntryV2.from_json(item) for item in payload.get("entries", [])
+            ),
+            exclusions=tuple(
+                PublicationManifestExclusionV1.from_json(item)
+                for item in payload.get("exclusions", [])
+            ),
+            content_sha256=str(payload["content_sha256"]),
+        )
+
+
+PublicationManifest = PublicationManifestV1 | PublicationManifestV2
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

@@ -22,6 +22,7 @@ from cti_app.api.production import router as production_router
 from cti_app.api.selection import selection_router
 from cti_app.application.discovery.cumulative.service import CumulativeDiscoveryService
 from cti_app.application.discovery.fusion import FusionService
+from cti_app.application.edition_composition import EditionCompositionService
 from cti_app.application.editions import EditionService
 from cti_app.application.identity import LocalIdentityProvider
 from cti_app.application.jobs import JobExecutionContext, JobRegistry, JobService
@@ -30,9 +31,13 @@ from cti_app.application.selection import SelectionService
 from cti_app.application.subjects import SubjectService
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery_cumulative import DiscoveryInputMode
+from cti_app.domain.edition_composition import CompositionDisposition, EditionCompositionEntry
 from cti_app.domain.editions import Edition
 from cti_app.domain.model_runs import ModelRun
 from cti_app.domain.production import (
+    ProductionArtifact,
+    ProductionArtifactStage,
+    ProductionArtifactStatus,
     ProductionBatchStatus,
     ProductionInputSnapshot,
     ProductionRun,
@@ -267,7 +272,72 @@ async def test_later_discovery_and_rename_never_rewrite_an_existing_run(
         frozen = await _snapshot(uow_factory, run_1.id)
         await _finish_active_batch(uow_factory, edition.id)
 
+        publication = ProductionArtifact(
+            production_run_id=run_1.id,
+            subject_id=subject_id,
+            stage=ProductionArtifactStage.PUBLICATION,
+            version=1,
+            input_hash="a" * 64,
+            status=ProductionArtifactStatus.VERIFIED,
+        )
+        async with uow_factory() as uow:
+            await uow.production_artifacts.append(publication)
+            await uow.commit()
+        composition_service = EditionCompositionService(uow_factory)
+        pin = EditionCompositionEntry(
+            subject_id=subject_id,
+            disposition=CompositionDisposition.INCLUDED,
+            position=1,
+            production_run_id=run_1.id,
+            pipeline_generation=run_1.pipeline_generation,
+            artifact_id=publication.id,
+            artifact_version=publication.version,
+            artifact_input_hash=publication.input_hash,
+        )
+        await composition_service.replace_entries(
+            edition.id,
+            (pin,),
+            expected_version=0,
+            idempotency_key="s3-compose-a",
+            actor_id="production-analyst",
+            correlation_id="s3-compose-a",
+        )
+        before_read = await composition_service.get(edition.id)
+        assert before_read.axes.production_validity is True
+        assert before_read.axes.discovery_update_available is False
+        assert before_read.axes.composition_eligibility is True
+        assert before_read.composition is not None
+        pinned_entries = before_read.composition.entries
+
+        async with uow_factory() as uow:
+            session = uow._require_session()  # type: ignore[attr-defined]
+            jobs_before = await session.scalar(text("SELECT count(*) FROM jobs"))
+            model_runs_before = await session.scalar(text("SELECT count(*) FROM model_runs"))
+        production_counts_before = await _counts(uow_factory, edition.id)
+        dispatch_count_before = len(application.state.job_dispatcher.dispatched)
+
         new_candidate = await _enrich_and_merge(uow_factory, edition, model_run, origin_identity)
+        after_read = await composition_service.get(edition.id)
+        assert after_read.axes.production_validity is True
+        assert after_read.axes.discovery_update_available is True
+        assert after_read.axes.composition_eligibility is True
+        assert after_read.composition is not None
+        assert after_read.composition.entries == pinned_entries
+        assert await _counts(uow_factory, edition.id) == production_counts_before
+        assert len(application.state.job_dispatcher.dispatched) == dispatch_count_before
+        async with uow_factory() as uow:
+            session = uow._require_session()  # type: ignore[attr-defined]
+            assert await session.scalar(text("SELECT count(*) FROM jobs")) == jobs_before
+            model_run_count = await session.scalar(text("SELECT count(*) FROM model_runs"))
+            assert model_run_count == model_runs_before
+            unchanged_artifact = await uow.production_artifacts.get_current(
+                run_1.id, ProductionArtifactStage.PUBLICATION.value
+            )
+        assert unchanged_artifact == publication
+        unchanged_after_discovery = await _snapshot(uow_factory, run_1.id)
+        assert unchanged_after_discovery == frozen
+        assert (await _runs(uow_factory, subject_id))[0].status is ProductionRunStatus.READY
+
         subject = await SubjectService(uow_factory).get(subject_id)
         await SubjectService(uow_factory).update_metadata(
             subject_id,

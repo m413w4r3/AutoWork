@@ -1,10 +1,14 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
+import { getEditionComposition } from "../../api/editions";
 import {
-  acceptEditionPublication,
+  acceptEditionComposition,
   editionRulesUrl,
+  getRenderInputInspection,
   getEditionRelease,
+  pdfInspectionUrl,
   releasePdfUrl,
+  renderInputInspectionUrl,
   retryEditionRender,
   type EditionReleaseResponse,
 } from "../../api/publication";
@@ -31,6 +35,32 @@ function invalidatePublication(
   });
   void queryClient.invalidateQueries({ queryKey: ["edition", editionId] });
   void queryClient.invalidateQueries({ queryKey: ["editions"] });
+  void queryClient.invalidateQueries({
+    queryKey: ["edition-composition", editionId],
+  });
+}
+
+function RenderInspectionLinks({ renderId }: { renderId: string }) {
+  const inspection = useQuery({
+    queryKey: ["render-input-inspection", renderId],
+    queryFn: () => getRenderInputInspection(renderId),
+    retry: false,
+  });
+  const pdfSha256 =
+    inspection.data?.hashes.pdf_sha256 ?? inspection.data?.pdf.sha256 ?? null;
+  return (
+    <nav aria-label="Inspections du rendu publié">
+      <a href={renderInputInspectionUrl(renderId)}>
+        Inspecter les entrées Typst
+      </a>
+      {inspection.isPending ? <span> · Lecture du hash PDF…</span> : null}
+      {pdfSha256 ? (
+        <a href={pdfInspectionUrl(pdfSha256)}>Inspecter le PDF</a>
+      ) : inspection.isError ? (
+        <span> · Hash PDF indisponible pour l’inspection</span>
+      ) : null}
+    </nav>
+  );
 }
 
 function DownloadActions({
@@ -122,6 +152,9 @@ function ArchivedPublication({
             editionId={editionId}
             pdfAvailable={release.pdf_available}
           />
+          {release.render_id ? (
+            <RenderInspectionLinks renderId={release.render_id} />
+          ) : null}
         </>
       ) : null}
     </section>
@@ -141,10 +174,28 @@ export function PublicationConsole({
     queryFn: () => getEditionRelease(editionId),
     refetchInterval: (query) => publicationPollingInterval(query.state.data),
   });
-  const accept = useMutation({
-    mutationFn: () => acceptEditionPublication(editionId),
+  const composition = useQuery({
+    queryKey: ["edition-composition", editionId],
+    queryFn: () => getEditionComposition(editionId),
+    enabled: release.data?.can_retry_assembly ?? false,
+  });
+  const retryAssembly = useMutation({
+    mutationFn: () => {
+      const version = composition.data?.composition?.version;
+      if (version === undefined || version === null) {
+        throw new Error("La composition courante est indisponible.");
+      }
+      return acceptEditionComposition(editionId, version);
+    },
     retry: false,
     onSuccess: () => invalidatePublication(queryClient, editionId),
+    onError: (error) => {
+      if (error instanceof ApiError && error.status === 409) {
+        void queryClient.invalidateQueries({
+          queryKey: ["edition-composition", editionId],
+        });
+      }
+    },
   });
   const retryRender = useMutation({
     mutationFn: () => retryEditionRender(editionId),
@@ -205,6 +256,9 @@ export function PublicationConsole({
           editionId={editionId}
           pdfAvailable={current.pdf_available}
         />
+        {current.render_id ? (
+          <RenderInspectionLinks renderId={current.render_id} />
+        ) : null}
       </section>
     );
   }
@@ -241,16 +295,20 @@ export function PublicationConsole({
         <button
           className="button"
           type="button"
-          disabled={accept.isPending}
-          onClick={() => accept.mutate()}
+          disabled={
+            retryAssembly.isPending ||
+            composition.isPending ||
+            !composition.data?.composition
+          }
+          onClick={() => retryAssembly.mutate()}
         >
-          {accept.isPending ? "Relancement…" : "Relancer l'assemblage"}
+          {retryAssembly.isPending ? "Relancement…" : "Relancer l'assemblage"}
         </button>
       ) : null}
-      {!readOnly && accept.error ? (
+      {!readOnly && retryAssembly.error ? (
         <p className="error-message" role="alert">
-          {accept.error instanceof Error
-            ? accept.error.message
+          {retryAssembly.error instanceof Error
+            ? retryAssembly.error.message
             : "L’assemblage n’a pas pu être relancé."}
         </p>
       ) : null}

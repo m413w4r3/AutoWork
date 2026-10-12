@@ -113,15 +113,19 @@ de regroupement éditorial et n’ajoute aucun statut de production à l’édit
 
 ## Review et publication
 
-La review est distincte de la production. Elle travaille sur le `ProductionRun`, sa génération,
-l’artifact de document et son hash d’entrée. L’acceptation crée un manifeste de publication
-append-only qui fige l’ordre et les références exactes. L’assemblage lit uniquement ce manifeste
-et crée les JSON canoniques `EditionDocumentV2` et `EditionRelease`.
+La review est distincte de la production. Elle travaille sur la composition éditoriale courante,
+les `ProductionRun`, leurs générations et les références exactes des documents. L’acceptation
+requiert `expected_composition_version`, vérifie la composition et ses artifacts sous verrou, puis
+crée un manifeste append-only V2 avec l’ordre, les exclusions décidées et les références exactes.
+Le manifeste V2 porte `composition_id` et `composition_version`; les batches sont une provenance
+nullable par entrée, jamais un batch racine. Les manifestes V1 historiques gardent leur schéma
+avec batch racine et restent lisibles. L’assemblage utilise les références gelées et crée les JSON
+canoniques `EditionDocumentV2` et `EditionRelease`.
 
 La frontière d'article est `PublicationDocumentV5 → PublicationRender → Typst PDF`. Le preview
 Subject projette le V5 côté frontend ; le wrapper V5 conserve les champs V4 et ajoute `rich_text`.
 `GET /api/subjects/{id}/publication/pdf` sert le PDF AW-019. Le rendu d'édition accepte les
-documents de schéma `4` et `5`. Pour l'édition, `PublicationManifestV1 → EditionDocumentV2 → EditionRelease →
+documents de schéma `4` et `5`. Pour l'édition, `PublicationManifestV1|PublicationManifestV2 → EditionDocumentV2 → EditionRelease →
 EditionRender → Typst PDF` rend un seul document Typst à partir des articles ordonnés du manifeste.
 `EditionRelease` reste JSON uniquement et ne contient pas le PDF.
 
@@ -131,7 +135,14 @@ sur le release/document, les versions du renderer, du template, du compilateur, 
 polices, la policy de rendu et le format. Un retry du rendu réutilise le release et ne rejoue pas
 Assembly ni Production.
 
-Le preview édition affiche `EditionDocumentV2` côté frontend ; son PDF est servi par
+`GET /api/editions/{id}/composition/validation` expose la Review appliquée à la version courante.
+`GET /api/editions/{id}/composition/preview` construit l’aperçu à partir des pins éditoriaux ; il
+peut répondre `partial: true` avec les sujets `missing_subject_ids` et `deferred_subject_ids`.
+Son `preview_input_hash` dépend de la version de composition, pas de l’arrivée d’un nouvel artifact
+CTI. L’acceptation finale passe par
+`POST /api/editions/{id}/composition/accept` avec
+`{"expected_composition_version": 3}` ; une Review incomplète est refusée. Le preview édition
+affiche `EditionDocumentV2` côté frontend ; son PDF est servi par
 `GET /api/editions/{id}/preview/pdf?preview_input_hash=<sha256>`. Le PDF final est servi par
 `GET /api/editions/{id}/release/pdf`, et `POST /api/editions/{id}/release/render` lance ou relance
 le rendu. Les routes de téléchargement DOCX ont été supprimées.
@@ -143,6 +154,104 @@ et références SHA-256.
 Le workspace d'édition matérialise la release sous
 `release/{publication-manifest.json,edition.json,bulletin.pdf}`. Il reste une projection
 reconstructible du release JSON et de l'`EditionRender` PDF.
+
+## Mode opératoire multibatch
+
+La production est progressive et éditorialement indépendante de son ordre. Après une première
+Discovery, sélectionner A et lancer explicitement un batch `[A]`. Attendre que son run soit
+`READY` et que son artifact `PUBLICATION` soit `VERIFIED`. Une nouvelle Discovery peut ensuite
+ajouter C ou apporter des candidats à A. Elle ne modifie pas le `ProductionInputSnapshot`, les
+artifacts ni les hashes de A et ne lance aucune tâche de production. L'API de composition peut
+alors indiquer :
+
+```json
+{
+  "axes": {
+    "production_validity": true,
+    "discovery_update_available": true,
+    "composition_eligibility": true
+  }
+}
+```
+
+L'analyste peut conserver le pin actuel de A ou créer explicitement un nouveau batch pour A. Le
+nouveau run capture alors le snapshot Discovery actif; la composition ne suit jamais ce run
+implicitement.
+
+Après avoir sélectionné et produit les autres sujets, lire la composition et sa validation :
+
+```http
+GET /api/editions/{edition_id}/composition
+GET /api/editions/{edition_id}/composition/validation
+```
+
+`PUT /api/editions/{edition_id}/composition` remplace la composition entière. La commande porte
+`Idempotency-Key`, `expected_version`, des positions uniques et, pour chaque entrée incluse, le
+pin complet d'un run et d'un artifact appartenant à cette édition :
+
+```http
+PUT /api/editions/{edition_id}/composition
+Idempotency-Key: compose-edition-v4
+Content-Type: application/json
+
+{
+  "expected_version": 3,
+  "entries": [
+    {
+      "subject_id": "<subject-a>", "disposition": "included", "position": 1,
+      "production_run_id": "<run-a>", "pipeline_generation": 2,
+      "artifact_id": "<publication-a>", "artifact_version": 3,
+      "artifact_input_hash": "<sha256-a>", "provenance_batch_id": "<batch-a>"
+    },
+    {"subject_id": "<subject-b>", "disposition": "deferred"},
+    {
+      "subject_id": "<subject-c>", "disposition": "excluded",
+      "review_decision_id": "<exclude-decision-c>"
+    }
+  ]
+}
+```
+
+Un `deferred` n'a pas de pin; un `excluded` exige une décision de Review exacte. Un sujet sans
+entrée est signalé `subject_unaddressed`. Les sujets différés ou exclus ne bloquent pas les
+réparations des sujets inclus, mais leur intention éditoriale reste visible. Un doublon de sujet,
+un artifact d'une autre édition, un pin modifié ou une version de composition périmée est refusé.
+
+Prévisualiser le document assemblé, y compris s'il est partiel, puis geler uniquement quand la
+validation ne contient aucun blocage :
+
+```http
+GET /api/editions/{edition_id}/composition/preview
+POST /api/editions/{edition_id}/composition/accept
+Content-Type: application/json
+
+{"expected_composition_version": 4}
+```
+
+Le manifeste V2 conserve l'ordre, les IDs exacts et les hashes; il n'a pas de batch racine. Après
+acceptation, le job `publication.edition.assemble` produit le release JSON à partir des pins. Son
+retry réutilise le même manifeste et le release associé; il ne relance pas Production. Le rendu
+PDF est distinct et peut être redemandé par `POST /api/editions/{edition_id}/release/render`.
+
+Un merge Fusion qui ferait converger deux `Subject` matérialisés est refusé avec le code
+`fusion_selected_subject_conflict` et leurs `subject_ids`. L'opérateur doit choisir explicitement
+de garder les deux entrées distinctes dans la composition ou de corriger le périmètre; aucun titre
+ni score de similarité ne tranche l'identité.
+
+## Inspection Typst et correction ciblée
+
+Pour un rendu publié, suivre `render.id`; pour un PDF de preview, suivre l'ID opaque renvoyé par
+`X-Render-Inspection-ID`. Les routes `GET /api/render-inspections/{render_id}`, `/files`,
+`/render-data` et `/diagnostics` exposent le snapshot exact et des lectures bornées. Les variantes
+preview utilisent `/api/render-inspections/previews/{inspection_id}`. `file_id`, `subject_id`,
+`block_key` et JSON Pointer sont des sélecteurs stricts; aucun chemin libre n'est accepté.
+
+L'inspection est en lecture seule. Un défaut de contenu ou d'enrichissement doit être résolu via
+la révision ciblée existante, avec son artifact/version/hash cible et son preview, puis appliqué
+avec les mêmes fences. Un problème de composition passe par une nouvelle version de composition;
+un problème de template passe par une modification versionnée et testée du dépôt. Aucun agent ne
+modifie directement un `.typ` historique ou un workspace pour faire passer cette modification
+pour canonique. Typst query et l'inspection PDF restent requis pour juger la mise en page.
 
 ## Écrans principaux
 

@@ -120,6 +120,10 @@ IndexShape = tuple[str, tuple[str, ...], bool, bool]
 # by the current baseline.
 EXPECTED_TRIGGERS: dict[tuple[str, str], str] = {
     (
+        "edition_composition_events",
+        "trg_edition_composition_events_append_only",
+    ): "reject_evidence_mutation",
+    (
         "publication_review_decisions",
         "trg_publication_review_decisions_append_only",
     ): "reject_evidence_mutation",

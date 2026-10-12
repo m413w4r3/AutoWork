@@ -225,6 +225,8 @@ async def test_pdf_inspection_source_repository_returns_publication_and_release_
     try:
         repository = SqlAlchemyPdfInspectionSourceRepository(create_session_factory(engine))
         references = await repository.find_by_output_sha256(pdf_sha256)
+        publication_by_id = await repository.find_by_render_id(publication_render.id)
+        edition_by_id = await repository.find_by_render_id(edition_render.id)
     finally:
         await engine.dispose()
 
@@ -241,6 +243,12 @@ async def test_pdf_inspection_source_repository_returns_publication_and_release_
         reference.source for reference in references if reference.kind == "edition_render"
     )
     assert edition_source["manifest_id"] == str(release.manifest_id)
+    assert publication_by_id is not None
+    assert publication_by_id.source_blob_id is None
+    assert publication_by_id.source["subject_id"] == str(subject.id)
+    assert edition_by_id is not None
+    assert edition_by_id.source["manifest_schema_version"] == "1"
+    assert edition_by_id.source["manifest_sha256"] == edition_source["manifest_sha256"]
 
 
 async def test_edition_render_blob_reachability_and_restrict_foreign_keys(

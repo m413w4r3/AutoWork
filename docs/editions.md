@@ -58,3 +58,35 @@ Work que la modification.
 
 Le repository d'audit est append-only et un trigger PostgreSQL rejette `UPDATE` et `DELETE`.
 Un trigger distinct empêche également un déclassement TLP par SQL direct.
+
+## Composition éditoriale multibatch
+
+La composition est l'autorité versionnée du bulletin. Elle comprend une ligne
+`edition_compositions`, ses `edition_composition_entries` ordonnées et le journal append-only
+`edition_composition_events`. Une entrée `included` épingle exactement le `ProductionRun`, sa
+génération, l'artifact `PUBLICATION`, sa version, son `input_hash` et sa provenance batch
+éventuelle. Une entrée `deferred` n'a pas de pin. Une entrée `excluded` porte l'ID d'une décision
+de Review. Un sujet ne peut apparaître qu'une fois dans une version.
+
+Review lit les entrées `included` et leurs pins; elle ne choisit pas le dernier batch ni le dernier
+run d'un sujet. `GET /api/editions/{id}/composition/validation` retourne des raisons métier et
+trois axes indépendants :
+
+- `production_validity` décrit les runs et artifacts épinglés;
+- `discovery_update_available` indique qu'un snapshot Discovery plus récent change les données
+  de l'identité canonique d'un pin;
+- `composition_eligibility` décrit si la composition peut être modifiée/acceptée selon ses
+  références et diagnostics.
+
+`discovery_update_available` est calculé depuis les UUID d'identité, les membres candidats et le
+résumé du snapshot; il n'utilise pas les titres comme clé. `true` ne signifie ni `STALE` ni
+invalidation : l'édition garde son run et son pin. Pour actualiser, l'opérateur déclenche un
+nouveau batch explicitement.
+
+La composition se lit avec `GET /api/editions/{id}/composition` et se remplace avec
+`PUT /api/editions/{id}/composition`, `Idempotency-Key` et `expected_version`. Les entrées
+incluses requièrent le pin complet. Le preview peut être partiel; l'acceptation finale utilise
+`POST /api/editions/{id}/composition/accept` avec la version attendue. Le manifeste V2 est
+append-only, référence `composition_id`/`composition_version` et n'a pas de `batch_id` racine.
+La provenance batch est nullable par entrée; les manifestes V1 historiques gardent leur schéma
+et leurs releases restent lisibles.
