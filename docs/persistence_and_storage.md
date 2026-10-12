@@ -171,4 +171,4 @@ d’idempotence et triggers d’immutabilité de cette baseline.
 Cette baseline reste mutable jusqu'au gate de stabilisation pré-première édition prévu après
 AW-024. Tant que la stabilisation n'est pas explicitement déclarée, tout changement du schéma
 cible modifie `0001_baseline` ; aucune migration de compatibilité avec une ancienne base AutoWork
-ni migration `0002` pour la nouvelle baseline n'est requise.
+ni migration différée pour la nouvelle baseline n'est requise.

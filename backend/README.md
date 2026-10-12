@@ -33,7 +33,7 @@ PostgreSQL est la base principale. La migration initiale est appliquée automati
 pré-première édition prévu après AW-024. Tant que cette stabilisation n'est pas
 explicitement déclarée, toute évolution du schéma cible modifie cette baseline ;
 aucune migration de compatibilité avec une ancienne base AutoWork n'est requise
-et aucune migration `0002` ne doit porter un changement de la nouvelle baseline.
+et aucune migration différée ne doit porter un changement de la nouvelle baseline.
 
 La baseline mutable doit décrire directement le schéma cible. Il ne faut pas
 ajouter de détection des anciennes bases, de backfills de compatibilité, de

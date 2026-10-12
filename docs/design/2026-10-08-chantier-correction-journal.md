@@ -134,7 +134,7 @@ Safe to parallelize: yes (worktrees séparés, base = commit A)
 - Branche locale fusionnable en fast-forward dans `main` ; rien n'est encore dans `main`, rien n'est déployé, aucun stage relancé, aucune écriture dans la DB du run réel, aucun appel Bridge réel pendant tout le chantier.
 
 ## Verrous avant toute démonstration réelle / recompute
-1. **Schéma** : la baseline `0001` a été modifiée (table `production_source_additions`, colonnes de criticité sur `production_repair_decisions`, CHECK du type d'issue `source_extraction_failed`). Conformément à backend/AGENTS.md, aucun `0002`/compat : la DB du run réel (documents des 9 sujets = jeu de régression) ne reçoit PAS ces changements sans DDL manuel additif ou recréation de la base (destructif).
+1. **Schéma** : la baseline `0001` a été modifiée (table `production_source_additions`, colonnes de criticité sur `production_repair_decisions`, CHECK du type d'issue `source_extraction_failed`). Conformément à backend/AGENTS.md, aucune migration historique n'est prévue : la DB du run réel (documents des 9 sujets = jeu de régression) ne reçoit PAS ces changements sans DDL manuel additif ou recréation de la base (destructif).
 2. **Décision analyste Krypt3ia (sujet 4)** : contre-analyse critique non archivée, décision de dérogation périmée (génération 0 vs 2) → toute extension de sources est refusée tant qu'une décision analyste à la génération courante n'existe pas (ou archivage manuel).
 3. Recompute minimal nécessaire pour bénéficier de A/B/C (titres, enrichissement) sur les 9 sujets : SYNTHESIS (titres) → ENRICHMENT → PUBLICATION ; ou révisions ciblées (titre, diagramme) ; aucun REFERENCES/EXTRACTION/RELEVANCE.
 
@@ -151,6 +151,15 @@ Safe to parallelize: yes (worktrees séparés, base = commit A)
 - **Défauts trouvés en conditions réelles lors du premier apply (les simulations ne pouvaient pas les voir)** :
   1. `rewrite_title` : le validateur de la révision imposait `[publisher]` comme groupe (`_editorial_title_group`, repli du pipeline d'origine) → rejette le titre correct `[GTG-30004] …` proposé par le modèle (`synthesis_title_actor_ungrounded`). Worker de correction lancé (steep-cloud).
   2. `rewrite_diagram` : conflit `figure catalog no longer matches` : le hash d'inventaire de figures stocké (7447c159…, 0 figure) ≠ inventaire actuel (112 figures archivées pendant l'étape d'enrichissement, hash cfab55f8…) ; la fence est structurellement instable pour tout sujet avec médias. Worker de correction lancé (copper-gate).
+
+### Annotation 2026-10-12 — baseline unique
+
+Les mentions de la révision `0002_production_batch_pause` ci-dessus consignent l'état et
+l'estampille de la base au moment de la mise en service du 8 octobre. La réduction de la chaîne
+Alembic ne modifie pas cette base. La pré-vérification et le restamp éventuel sont décrits dans
+`docs/design/2026-10-12-baseline-collapse-live-db-note.md` ; ils ne sont pas appliqués et
+requièrent l'accord explicite de l'utilisateur. Le DDL additif du 8 octobre est déjà représenté
+dans la baseline actuelle et ne doit pas être rejoué.
 
 ## Phase 2 — Plan de mise à niveau du livrable par TARGETED REVISION (état réel du run, 2026-10-08)
 Aucune relance de pipeline ; chaque correction = révision ciblée (artifacts REFERENCES/EXTRACTION/RELEVANCE conservés). Prérequis : correctifs steep-cloud (règle de titre) et copper-gate (fence inventaire de figures), puis `make up`.

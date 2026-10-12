@@ -17,7 +17,7 @@ La baseline `0001_baseline` reste mutable jusqu'au gate de stabilisation
 pré-première édition prévu après AW-024. Tant que cette stabilisation n'est pas
 explicitement déclarée, les évolutions du schéma cible modifient cette baseline ;
 aucune migration de compatibilité avec les anciennes bases AutoWork ni migration
-`0002` pour un changement de la nouvelle baseline n'est requise.
+différée pour un changement de la nouvelle baseline n'est requise.
 Les règles historiques d'immutabilité des migrations 0001 à 0004 ne sont plus
 actives.
 

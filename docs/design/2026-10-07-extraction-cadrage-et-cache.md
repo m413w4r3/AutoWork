@@ -34,9 +34,9 @@ déclenchent qu'une extraction.
   HTML brut. Toutes les autres composantes de l'identité (contrat, prompt, parseur, vérificateur,
   contrat de texte, politiques modèle/routage/profil) restent inchangées.
 - Si un changement de schéma est nécessaire (nouvelle colonne, nouvel index unique), fournir une
-  migration Alembic minimale et réversible (dernière migration : `0002_production_batch_pause`) ;
-  sinon réutiliser la colonne existante en documentant le changement de sémantique. Les anciennes
-  lignes restent lisibles mais ne sont plus réutilisées (versionner).
+  évolution de la baseline Alembic minimale et réversible ; sinon réutiliser la colonne existante
+  en documentant le changement de sémantique. Les anciennes lignes restent lisibles mais ne sont
+  plus réutilisées (versionner).
 - Vérifier empiriquement sur les quatre états réels du rapport (hashes HTML `74edd474`, `e82a4067`,
   `17e79a15`, `1aa8d48b`, blobs `source-decoded/…` dans MinIO) quels couples produisent le même
   texte d'évidence ; documenter le résultat. Si le texte effectif diffère encore à cause d'éléments

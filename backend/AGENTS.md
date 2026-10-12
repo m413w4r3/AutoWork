@@ -20,7 +20,8 @@ Code lives under `src/cti_app/`.
 - `0001_baseline` remains intentionally mutable until the pre-first-edition
   stabilization gate after AW-024. Until that gate is explicitly declared,
   target schema changes update `0001_baseline`; no compatibility migration for
-  an older AutoWork database or `0002` for a baseline change is required.
+  an older AutoWork database or deferred migration for a baseline change is
+  required.
 - The mutable baseline must describe the target schema directly. Do not add
   legacy database detection, compatibility backfills, repair branches, or
   old-database upgrade support.

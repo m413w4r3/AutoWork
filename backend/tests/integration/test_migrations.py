@@ -729,9 +729,95 @@ def test_discovery_run_append_only_guard_rejects_update(migrated_postgres_url: s
     assert asyncio.run(_run()) == "55000"
 
 
+def test_batch_pause_requires_timestamp_and_actor_identity(
+    migrated_postgres_url: str,
+) -> None:
+    async def _run() -> tuple[str, str]:
+        engine = create_async_engine(migrated_postgres_url)
+        try:
+            async with engine.begin() as connection:
+                edition_id = (
+                    await connection.execute(
+                        text(
+                            "INSERT INTO editions ("
+                            "id, country, country_code, period_start, period_end, tlp, languages, "
+                            "state, version, created_at, updated_at"
+                            ") VALUES (gen_random_uuid(), 'Pause Test', 'PB', DATE '2026-04-01', "
+                            "DATE '2026-04-30', 'AMBER', '[\"fr\"]'::jsonb, "
+                            "'open', 1, now(), now()) "
+                            "RETURNING id"
+                        )
+                    )
+                ).scalar_one()
+                await connection.execute(
+                    text(
+                        "INSERT INTO edition_production_batches ("
+                        "id, edition_id, idempotency_key, request_fingerprint, actor_id, "
+                        "correlation_id, status, phase, created_at, paused_at, paused_by, version"
+                        ") VALUES (gen_random_uuid(), :edition_id, 'pause-valid', repeat('a', 64), "
+                        "'migration-test', 'pause-valid', 'paused', 'initial', now(), now(), "
+                        "'analyst-1', 1)"
+                    ),
+                    {"edition_id": edition_id},
+                )
+
+            async def _expect_rejection(
+                idempotency_key: str, paused_at: str, paused_by: str
+            ) -> str:
+                try:
+                    async with engine.begin() as connection:
+                        await connection.execute(
+                            text(
+                                "INSERT INTO edition_production_batches ("
+                                "id, edition_id, idempotency_key, request_fingerprint, actor_id, "
+                                "correlation_id, status, phase, created_at, paused_at, paused_by, "
+                                "version"
+                                f") VALUES (gen_random_uuid(), :edition_id, :idempotency_key, "
+                                f"repeat('b', 64), 'migration-test', :idempotency_key, 'paused', "
+                                f"'initial', now(), {paused_at}, {paused_by}, 1)"
+                            ),
+                            {
+                                "edition_id": edition_id,
+                                "idempotency_key": idempotency_key,
+                            },
+                        )
+                except DBAPIError as exc:
+                    return _sqlstate(exc)
+                return ""
+
+            missing_actor = await _expect_rejection("pause-missing-actor", "now()", "NULL")
+            missing_timestamp = await _expect_rejection(
+                "pause-missing-timestamp", "NULL", "'analyst-1'"
+            )
+            return missing_actor, missing_timestamp
+        finally:
+            await engine.dispose()
+
+    assert asyncio.run(_run()) == ("23514", "23514")
+
+
 # ---------------------------------------------------------------------------
 # 6: fresh install and repeated upgrade
 # ---------------------------------------------------------------------------
+
+
+def test_fresh_install_rejects_an_incompatible_existing_schema(
+    temporary_postgres_url: str,
+) -> None:
+    async def _create_conflicting_table() -> None:
+        engine = create_async_engine(temporary_postgres_url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(text("CREATE TABLE editions (id uuid PRIMARY KEY)"))
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_create_conflicting_table())
+    with pytest.raises(DBAPIError) as exc_info:
+        command.upgrade(_alembic_config(temporary_postgres_url), "head")
+
+    assert _sqlstate(exc_info.value) == "42P07"
+    assert "editions" in str(exc_info.value).lower()
 
 
 def test_fresh_install_and_repeated_upgrade_are_conflict_free(
@@ -743,7 +829,7 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
     command.upgrade(config, "head")
     command.current(config)
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
-    assert _head_revision() == "0002_production_batch_pause"
+    assert _head_revision() == "0001_baseline"
 
     tables = asyncio.run(_table_names(temporary_postgres_url))
     assert _REPAIR_TABLE in tables

@@ -85,14 +85,14 @@ def test_production_frontend_never_reads_the_selection_api() -> None:
         assert "/selection" not in source, path
 
 
-def test_production_pause_migration_follows_baseline() -> None:
+def test_production_schema_uses_only_the_mutable_baseline() -> None:
     revisions = sorted(
         path.name
         for path in (_BACKEND / "migrations" / "versions").glob("*.py")
         if path.name != "__init__.py"
     )
 
-    assert revisions == ["0001_baseline.py", "0002_production_batch_pause.py"]
+    assert revisions == ["0001_baseline.py"]
 
 
 def test_production_reference_modules_do_not_import_malware_reference_corpus() -> None:
