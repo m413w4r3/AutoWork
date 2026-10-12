@@ -1161,6 +1161,7 @@ function ProductionSynthesisView({
 
       {document.sections.map((section, index) => (
         <section className="synthesis-section" key={`${section.kind}-${index}`}>
+          {section.heading.trim() === "" ? null : <h4>{section.heading}</h4>}
           {section.paragraphs.map((paragraph, paragraphIndex) => (
             <SynthesisParagraph
               key={`${section.kind}-${index}-${paragraphIndex}`}
@@ -1501,6 +1502,9 @@ export function PublicationDocumentView({
           {enrichmentsAt("after_lead", null)}
           {document.sections.map((section, index) => (
             <div key={`${section.kind}-${index}`}>
+              {section.heading.trim() === "" ? null : (
+                <h5>{section.heading}</h5>
+              )}
               {section.paragraphs.map((item, paragraphIndex) =>
                 leadFingerprints.has(publicationParagraphFingerprint(item.text))
                   ? null
