@@ -1116,6 +1116,23 @@ class SqlAlchemySubjectRepository:
         )
         return [_subject_from_row(row) for row in rows]
 
+    async def list_page_for_edition(
+        self, edition_id: UUID, *, after_id: UUID | None, limit: int
+    ) -> tuple[Sequence[Subject], int]:
+        total = int(
+            await self._session.scalar(
+                select(func.count())
+                .select_from(SubjectRow)
+                .where(SubjectRow.edition_id == edition_id)
+            )
+            or 0
+        )
+        statement = select(SubjectRow).where(SubjectRow.edition_id == edition_id)
+        if after_id is not None:
+            statement = statement.where(SubjectRow.id > after_id)
+        rows = await self._session.scalars(statement.order_by(SubjectRow.id).limit(limit))
+        return [_subject_from_row(row) for row in rows], total
+
     async def update(self, subject: Subject, *, expected_version: int) -> bool:
         result = await self._session.execute(
             update(SubjectRow)

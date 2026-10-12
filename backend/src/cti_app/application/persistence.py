@@ -129,6 +129,10 @@ class PublicationRenderRepository(Protocol):
 
     async def get_latest_for_artifact(self, artifact_id: UUID) -> PublicationRender | None: ...
 
+    async def list_latest_for_artifacts(
+        self, artifact_ids: Sequence[UUID]
+    ) -> Sequence[PublicationRender]: ...
+
     async def acquire_for_render(
         self, proposed: PublicationRender, *, stale_running_before: datetime
     ) -> TypstRenderAcquisition[PublicationRender]: ...
@@ -369,6 +373,10 @@ class SubjectRepository(Protocol):
 
     async def list_for_edition(self, edition_id: UUID) -> Sequence[Subject]: ...
 
+    async def list_page_for_edition(
+        self, edition_id: UUID, *, after_id: UUID | None, limit: int
+    ) -> tuple[Sequence[Subject], int]: ...
+
     async def update(self, subject: Subject, *, expected_version: int) -> bool: ...
 
 
@@ -486,6 +494,10 @@ class JobRepository(Protocol):
 
     async def list_for_aggregate(
         self, aggregate_type: str, aggregate_id: UUID, *, kind: str | None = None
+    ) -> Sequence[Job]: ...
+
+    async def list_for_aggregates(
+        self, aggregate_type: str, aggregate_ids: Sequence[UUID], *, kind: str | None = None
     ) -> Sequence[Job]: ...
 
     async def operational_metrics(self) -> JobOperationalMetrics: ...
@@ -996,6 +1008,8 @@ class ProductionRunRepository(Protocol):
 
     async def list_for_subject(self, subject_id: UUID) -> Sequence[ProductionRun]: ...
 
+    async def list_for_subjects(self, subject_ids: Sequence[UUID]) -> Sequence[ProductionRun]: ...
+
     async def allocate_next_run_number(self, subject_id: UUID) -> int: ...
 
 
@@ -1025,6 +1039,8 @@ class ProductionArtifactRepository(Protocol):
     ) -> ProductionArtifact | None: ...
 
     async def list_for_run(self, run_id: UUID) -> Sequence[ProductionArtifact]: ...
+
+    async def list_for_runs(self, run_ids: Sequence[UUID]) -> Sequence[ProductionArtifact]: ...
 
     async def mark_downstream_stale(self, run_id: UUID, stage: str) -> None: ...
 
@@ -1159,6 +1175,7 @@ class EditionProductionBatchItemRepository(Protocol):
 
 class ProductionUnitOfWork(Protocol):
     jobs: JobRepository
+    publication_renders: PublicationRenderRepository
     model_runs: ModelRunRepository
     editions: EditionRepository
     subjects: SubjectRepository

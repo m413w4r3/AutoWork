@@ -17,6 +17,7 @@ from cti_app.api.health import router as health_router
 from cti_app.api.jobs import router as jobs_router
 from cti_app.api.model_conversations import router as model_conversations_router
 from cti_app.api.production import router as production_router
+from cti_app.api.production_control import router as production_control_router
 from cti_app.api.publication import router as publication_router
 from cti_app.api.selection import selection_router
 from cti_app.api.subject_content import router as subject_content_router
@@ -65,6 +66,7 @@ from cti_app.application.media_assets import MediaAssetStore
 from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.persistence import UnitOfWork
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_control_view import ProductionControlViewService
 from cti_app.application.production_jobs import ProductionStageChain
 from cti_app.application.production_pacing import ProductionPacingPolicy
 from cti_app.application.production_repair_payloads import ProductionRepairPayloadResolver
@@ -376,6 +378,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         job_dispatcher=job_dispatcher,
         repair_issue_reader=production_repair_issue_service,
     )
+    app.state.production_control_view_service = ProductionControlViewService(
+        uow_factory,
+        repair_issue_service=production_repair_issue_service,
+        review_service=app.state.edition_review_service,
+        publication_service=app.state.edition_publication_service,
+    )
     app.state.edition_preview_service = EditionPreviewService(
         uow_factory,
         production_artifact_store,
@@ -423,6 +431,7 @@ def create_app() -> FastAPI:
     application.include_router(collection_router)
     application.include_router(model_conversations_router)
     application.include_router(production_router)
+    application.include_router(production_control_router)
     application.include_router(publication_router)
     application.include_router(selection_router)
     application.include_router(subjects_router)

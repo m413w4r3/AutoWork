@@ -78,6 +78,24 @@ class SqlAlchemyJobRepository:
         rows = await self._session.scalars(statement)
         return [_job_from_row(row) for row in rows]
 
+    async def list_for_aggregates(
+        self, aggregate_type: str, aggregate_ids: Sequence[UUID], *, kind: str | None = None
+    ) -> Sequence[Job]:
+        if not aggregate_ids:
+            return ()
+        statement = (
+            select(JobRow)
+            .where(
+                JobRow.aggregate_type == aggregate_type,
+                JobRow.aggregate_id.in_(aggregate_ids),
+            )
+            .order_by(JobRow.created_at.desc(), JobRow.id)
+        )
+        if kind is not None:
+            statement = statement.where(JobRow.kind == kind)
+        rows = await self._session.scalars(statement)
+        return [_job_from_row(row) for row in rows]
+
     async def operational_metrics(self) -> JobOperationalMetrics:
         status_rows = await self._session.execute(
             select(JobRow.status, func.count()).group_by(JobRow.status)

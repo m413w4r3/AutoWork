@@ -1,8 +1,9 @@
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -41,6 +42,34 @@ class SqlAlchemyPublicationRenderRepository:
             .limit(1)
         )
         return _publication_render_from_row(row) if row is not None else None
+
+    async def list_latest_for_artifacts(
+        self, artifact_ids: Sequence[UUID]
+    ) -> Sequence[PublicationRender]:
+        if not artifact_ids:
+            return ()
+        latest = (
+            select(
+                PublicationRenderRow.id.label("render_id"),
+                func.row_number()
+                .over(
+                    partition_by=PublicationRenderRow.publication_artifact_id,
+                    order_by=(
+                        PublicationRenderRow.created_at.desc(),
+                        PublicationRenderRow.id.desc(),
+                    ),
+                )
+                .label("render_rank"),
+            )
+            .where(PublicationRenderRow.publication_artifact_id.in_(artifact_ids))
+            .subquery("latest_publication_renders")
+        )
+        rows = await self._session.scalars(
+            select(PublicationRenderRow)
+            .join(latest, latest.c.render_id == PublicationRenderRow.id)
+            .where(latest.c.render_rank == 1)
+        )
+        return [_publication_render_from_row(row) for row in rows]
 
     async def acquire_for_render(
         self, proposed: PublicationRender, *, stale_running_before: datetime

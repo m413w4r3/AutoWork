@@ -395,6 +395,20 @@ class SqlAlchemyProductionRunRepository:
         result = await self._session.execute(query)
         return [_production_run_from_row(row) for row in result.scalars()]
 
+    async def list_for_subjects(self, subject_ids: Sequence[UUID]) -> Sequence[ProductionRun]:
+        if not subject_ids:
+            return ()
+        result = await self._session.scalars(
+            select(ProductionRunRow)
+            .where(ProductionRunRow.subject_id.in_(subject_ids))
+            .order_by(
+                ProductionRunRow.subject_id,
+                ProductionRunRow.run_number.desc(),
+                ProductionRunRow.id.desc(),
+            )
+        )
+        return [_production_run_from_row(row) for row in result]
+
     async def lock_creation_for_subject(self, subject_id: UUID) -> None:
         """Serialize run creation for one subject until this transaction ends."""
         await self._session.execute(
@@ -602,6 +616,20 @@ class SqlAlchemyProductionArtifactRepository:
         )
         result = await self._session.execute(query)
         return [_production_artifact_from_row(row) for row in result.scalars()]
+
+    async def list_for_runs(self, run_ids: Sequence[UUID]) -> Sequence[ProductionArtifact]:
+        if not run_ids:
+            return ()
+        result = await self._session.scalars(
+            select(ProductionArtifactRow)
+            .where(ProductionArtifactRow.production_run_id.in_(run_ids))
+            .order_by(
+                ProductionArtifactRow.production_run_id,
+                ProductionArtifactRow.stage,
+                ProductionArtifactRow.version,
+            )
+        )
+        return [_production_artifact_from_row(row) for row in result]
 
     async def mark_downstream_stale(self, run_id: UUID, stage: str) -> None:
         try:
