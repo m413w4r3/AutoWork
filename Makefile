@@ -92,6 +92,16 @@ PYTEST_ARGS ?=
 INTEGRATION_TEST_PATH ?= tests/integration
 INTEGRATION_PYTEST_ARGS ?=
 
+# Workflow emulator gate floors are based on the scenarios present today.
+# Raise these when adding a scenario with the matching marker.
+WORKFLOW_FAST_MIN ?= 7
+WORKFLOW_FULL_MIN ?= 8
+WORKFLOW_RESULTS_DIR ?= $(CURDIR)/var/workflow-results
+
+# Optional command prefix used to measure the pytest process (for example,
+# WORKFLOW_PYTEST_TIME_CMD="/usr/bin/time -v -o /tmp/pytest-time.txt").
+WORKFLOW_PYTEST_TIME_CMD ?=
+
 
 # ==============================================================================
 # Application data
@@ -131,6 +141,10 @@ CLEAN_PATHS := \
 	test-frontend \
 	test-frontend-e2e \
 	test-integration \
+	test-workflow \
+	test-workflow-full \
+	test-ci-scripts \
+	measure-workflow \
 	integration-db-up \
 	integration-db-down \
 	integration-db-logs \
@@ -370,10 +384,73 @@ test-integration: backend-sync ## Lance uniquement les tests PostgreSQL d'intég
 	echo "Integration tests: $(INTEGRATION_TEST_PATH)"; \
 	cd $(BACKEND_DIR); \
 	TEST_POSTGRES_ADMIN_DSN="$$test_dsn" \
-		$(UV_RUN) pytest \
+		$(UV_RUN) $(WORKFLOW_PYTEST_TIME_CMD) pytest \
 			-m integration \
 			$(INTEGRATION_TEST_PATH) \
 			$(INTEGRATION_PYTEST_ARGS)
+
+test-workflow: ## Émule les scénarios workflow_fast et vérifie JUnit + traces
+	@set -u; \
+	results="$(abspath $(WORKFLOW_RESULTS_DIR))/fast"; \
+	rm -rf -- "$$results"; \
+	mkdir -p "$$results/traces"; \
+	if WORKFLOW_EMULATOR_REQUIRED=1 \
+		WORKFLOW_TRACE_DIR="$$results/traces" \
+		WORKFLOW_PYTEST_TIME_CMD="$(WORKFLOW_PYTEST_TIME_CMD)" \
+		$(MAKE) test-integration \
+			INTEGRATION_TEST_PATH=tests/workflow_emulator \
+			INTEGRATION_PYTEST_ARGS="-m workflow_fast --durations=0 -o xfail_strict=true --junitxml=$$results/junit.xml"; then \
+		pytest_status=0; \
+	else \
+		pytest_status=$$?; \
+	fi; \
+	if cd backend && $(UV_ENV) $(UV) run --no-sync --python $(PYTHON_VERSION) -- python -I \
+		../scripts/ci/check_workflow_results.py \
+			--junitxml "$$results/junit.xml" \
+			--expression "workflow_fast" \
+			--min-count "$(WORKFLOW_FAST_MIN)" \
+			--uv "$(UV)"; then \
+		guard_status=0; \
+	else \
+		guard_status=$$?; \
+	fi; \
+	if [ "$$pytest_status" -ne 0 ]; then exit "$$pytest_status"; fi; \
+	exit "$$guard_status"
+
+test-workflow-full: ## Émule workflow_fast + workflow_full et vérifie JUnit + traces
+	@set -u; \
+	results="$(abspath $(WORKFLOW_RESULTS_DIR))/full"; \
+	rm -rf -- "$$results"; \
+	mkdir -p "$$results/traces"; \
+	if WORKFLOW_EMULATOR_REQUIRED=1 \
+		WORKFLOW_TRACE_DIR="$$results/traces" \
+		WORKFLOW_PYTEST_TIME_CMD="$(WORKFLOW_PYTEST_TIME_CMD)" \
+		$(MAKE) test-integration \
+			INTEGRATION_TEST_PATH=tests/workflow_emulator \
+			INTEGRATION_PYTEST_ARGS="-m 'workflow_fast or workflow_full' --durations=0 -o xfail_strict=true --junitxml=$$results/junit.xml"; then \
+		pytest_status=0; \
+	else \
+		pytest_status=$$?; \
+	fi; \
+	if cd backend && $(UV_ENV) $(UV) run --no-sync --python $(PYTHON_VERSION) -- python -I \
+		../scripts/ci/check_workflow_results.py \
+			--junitxml "$$results/junit.xml" \
+			--expression "workflow_fast or workflow_full" \
+			--min-count "$(WORKFLOW_FULL_MIN)" \
+			--uv "$(UV)"; then \
+		guard_status=0; \
+	else \
+		guard_status=$$?; \
+	fi; \
+	if [ "$$pytest_status" -ne 0 ]; then exit "$$pytest_status"; fi; \
+	exit "$$guard_status"
+
+test-ci-scripts: ## Teste sans base les scripts de garde CI
+	cd backend && $(UV_ENV) $(UV) run --no-sync --python $(PYTHON_VERSION) -- python -I \
+		../scripts/ci/test_check_workflow_results.py
+
+measure-workflow: ## Mesure trois exécutions de chaque profil workflow
+	./scripts/ci/measure_workflow_profiles.sh
 
 test-all: test test-integration ## Lance tests rapides puis tests d'intégration
 

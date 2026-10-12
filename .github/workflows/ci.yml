@@ -60,7 +60,51 @@ jobs:
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run mypy src tests
-      - run: uv run pytest
+      - run: uv run pytest -m "not workflow_fast and not workflow_full"
+      # W10 will add a separate workflow-browser job when the browser scenario exists.
+      - name: Workflow emulator — FAST gate
+        if: always()
+        run: make -C .. test-workflow
+      # Run only workflow_full here; FAST already ran above, avoiding duplicates.
+      # This marker currently collects only W1, so the FULL-only floor is 1.
+      # Keep FULL in this job so it reuses Typst, fonts, D2, PostgreSQL and uv.
+      # A separate job would reinstall those tools; this trades a longer backend
+      # job for avoiding duplicate setup and keeps FAST and FULL independently visible.
+      - name: Workflow emulator — FULL gate
+        if: always()
+        run: |
+          results="$GITHUB_WORKSPACE/var/workflow-results/full-only"
+          rm -rf -- "$results"
+          mkdir -p "$results/traces"
+          if WORKFLOW_EMULATOR_REQUIRED=1 \
+            WORKFLOW_TRACE_DIR="$results/traces" \
+            make -C .. test-integration \
+              INTEGRATION_TEST_PATH=tests/workflow_emulator \
+              INTEGRATION_PYTEST_ARGS="-m workflow_full --durations=0 -o xfail_strict=true --junitxml=../var/workflow-results/full-only/junit.xml"; then
+            pytest_status=0
+          else
+            pytest_status=$?
+          fi
+          if cd .. && cd backend && env -u UV_NO_SYNC -u UV_NO_DEFAULT_GROUPS -u UV_NO_DEV -u UV_NO_GROUP -u UV_FROZEN \
+            uv run --no-sync --python 3.12 -- python -I ../scripts/ci/check_workflow_results.py \
+              --junitxml "$results/junit.xml" \
+              --expression workflow_full \
+              --min-count 1 \
+              --uv uv; then
+            guard_status=0
+          else
+            guard_status=$?
+          fi
+          if [ "$pytest_status" -ne 0 ]; then exit "$pytest_status"; fi
+          exit "$guard_status"
+      - name: Upload workflow emulator evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: workflow-emulator-evidence
+          path: var/workflow-results/
+          if-no-files-found: warn
+          retention-days: 3
 
   typst-renderer-smoke:
     runs-on: ubuntu-latest

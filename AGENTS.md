@@ -53,6 +53,8 @@ The index is a locator, not a source of truth: inspect real code before edits.
 
     make test | test-backend | test-frontend
     make test-integration | test-all
+    make test-workflow
+    make test-workflow-full
 
     make lint | lint-backend | lint-frontend
     make typecheck | typecheck-backend | typecheck-frontend
