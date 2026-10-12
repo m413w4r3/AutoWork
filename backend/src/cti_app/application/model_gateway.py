@@ -87,13 +87,6 @@ class StructuredOutputError(ModelGatewayError):
     pass
 
 
-class StructuredModelUnavailableError(ModelGatewayError):
-    code = "structured_model_unavailable"
-    retryable = True
-    provider = "qwen"
-    phase = "structuring"
-
-
 class ModelCapabilityError(ModelGatewayError):
     code = "model_capability_unsupported"
 
