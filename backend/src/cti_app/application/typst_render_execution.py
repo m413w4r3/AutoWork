@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import tempfile
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -75,6 +76,9 @@ def translate_execution_error[ErrorT: Exception](
     if isinstance(error, TypstRenderMediaIntegrityMismatchError):
         return types.media_integrity_mismatch(str(error))
     return types.storage_failed(str(error))
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,7 +214,10 @@ class TypstRenderExecutor:
                         except Exception:
                             # Mapping is an ephemeral projection. A query failure
                             # must not invalidate the already verified PDF.
-                            pass
+                            logger.warning(
+                                "Typst block-location query failed; the PDF is unaffected",
+                                exc_info=True,
+                            )
         except OSError as exc:
             raise TypstRenderWorkspaceError(
                 f"Unable to materialize Typst render inputs: {exc}"
