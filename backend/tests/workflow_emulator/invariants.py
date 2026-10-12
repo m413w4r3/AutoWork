@@ -173,23 +173,36 @@ async def production_state(
         state: list[tuple[str, ...]] = []
         for run in runs:
             artifacts = await uow.production_artifacts.list_for_run(run.id)
+            artifact_identities: list[str] = []
+            for artifact in artifacts:
+                blob = (
+                    await uow.blobs.get(artifact.canonical_blob_id)
+                    if artifact.canonical_blob_id is not None
+                    else None
+                )
+                artifact_identities.append(
+                    ":".join(
+                        (
+                            str(artifact.id),
+                            artifact.stage.value,
+                            str(artifact.version),
+                            artifact.status.value,
+                            artifact.input_hash,
+                            str(artifact.canonical_blob_id or ""),
+                            (
+                                blob.descriptor.sha256
+                                if blob is not None
+                                else "missing-canonical-blob"
+                            ),
+                        )
+                    )
+                )
             state.append(
                 (
                     str(run.id),
                     run.status.value,
                     str(run.pipeline_generation),
-                    *sorted(
-                        ":".join(
-                            (
-                                str(artifact.id),
-                                artifact.stage.value,
-                                str(artifact.version),
-                                artifact.status.value,
-                                artifact.input_hash,
-                            )
-                        )
-                        for artifact in artifacts
-                    ),
+                    *sorted(artifact_identities),
                 )
             )
         return tuple(sorted(state))

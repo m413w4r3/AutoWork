@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 from hashlib import sha256
+from types import MethodType
+from typing import Any
 from uuid import UUID, uuid4
 
 from cti_app.application.discovery.cumulative.types import (
@@ -12,6 +15,7 @@ from cti_app.application.discovery.cumulative.types import (
     PlannedDiscoveryMerge,
     ResolvedMergeHandles,
 )
+from cti_app.application.model_gateway import SafeModelRequest
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import CandidateTopic, SourceCandidate, SourceRole
 from cti_app.domain.discovery_cumulative import (
@@ -30,6 +34,7 @@ REFERENCES_FIXTURE_VERSION = "workflow-references-v1"
 EXTRACTION_FIXTURE_VERSION = "workflow-extraction-v1"
 SYNTHESIS_FIXTURE_VERSION = "workflow-synthesis-v1"
 BRIDGE_FIXTURE_VERSION = "workflow-bridge-v1"
+DISCOVERY_REPORT_FIXTURE_VERSION = "workflow-discovery-report-v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +115,64 @@ text: The reports describe related {malware_name} infrastructure.
     )
 
 
+def discovery_report_for_candidates(
+    subject_labels: Sequence[str], bundles: Mapping[str, CaptureBundle]
+) -> str:
+    """Return a versioned response in the current Discovery SUBJECT/PUBLICATION schema."""
+    lines = [f"# {DISCOVERY_REPORT_FIXTURE_VERSION}", "", "# SUJETS CANDIDATS"]
+    for subject_index, label in enumerate(subject_labels, start=1):
+        bundle = bundles[label]
+        urls = tuple(bundle.sources)
+        if len(urls) < 2:
+            raise ValueError(f"Discovery fixture {label} needs at least two publications")
+        lines.extend(
+            (
+                "",
+                f"## SUBJECT S{subject_index}",
+                f"title: ExampleMalware-{label} campaign {label}",
+                f"presentation: Les publications documentent la campagne {label}.",
+                f"actor_or_campaign: Example campaign {label}",
+                "technical_potential: 3",
+                "technical_potential_reason: Les publications décrivent une activité technique.",
+                "artifacts: ioc",
+                "uncertainties: Attribution à confirmer",
+            )
+        )
+        for publication_index, url in enumerate(urls, start=1):
+            role = "primary" if publication_index == 1 else "independent"
+            published_day = 10 + publication_index
+            lines.extend(
+                (
+                    "",
+                    f"### PUBLICATION P{publication_index}",
+                    f"title: ExampleMalware-{label} report {publication_index}",
+                    f"url: {url}",
+                    "publisher: CTI Emulator",
+                    f"published_at: 2026-08-{published_day:02d}",
+                    "period_relation: in_period",
+                    f"source_role: {role}",
+                    "ioc_presence: unknown",
+                    "ioc_declared_count: unknown",
+                    "ioc_visible_count: unknown",
+                )
+            )
+    lines.extend(("", "# LIMITES", "Sortie synthétique locale pour le workflow emulator."))
+    return "\n".join(lines) + "\n"
+
+
+def script_discovery_report(gateway: Any, report: str) -> None:
+    """Route only the real Discovery prompt to a local response on ScriptedModelGateway."""
+    script = gateway.script
+    original_response_for: Callable[[SafeModelRequest], str | Exception] = script.response_for
+
+    def response_for(_script: object, request: SafeModelRequest) -> str | Exception:
+        if request.prompt_template_id == "monthly-cti-discovery":
+            return report
+        return original_response_for(request)
+
+    script.__dict__["response_for"] = MethodType(response_for, script)
+
+
 def discovery_candidate(label: str, bundle: CaptureBundle) -> CandidateTopic:
     sources = [
         SourceCandidate(
@@ -176,6 +239,55 @@ class DeterministicFusionPlanner:
                         rationale=f"Deterministic fixture plan ({FUSION_POLICY_VERSION}).",
                     )
                     for handle in sorted(handles.incoming)
+                ]
+            )
+        )
+
+
+class SelectedIdentityReviewPlanner:
+    """Park an incoming identity proposed for a selected Discovery identity."""
+
+    kind = DiscoveryPlannerKind.CHATGPT
+    policy_version = "workflow-selected-identity-review-v1"
+
+    def __init__(self, selected_discovery_subject_id: UUID) -> None:
+        self.selected_discovery_subject_id = selected_discovery_subject_id
+
+    async def plan(
+        self,
+        parent_snapshot: DiscoverySnapshot | None,
+        delta: DiscoveryDelta,
+        handles: ResolvedMergeHandles,
+        *,
+        edition_id: UUID,
+        external_llm_allowed: bool,
+        sensitivity: str,
+    ) -> PlannedDiscoveryMerge:
+        del parent_snapshot, delta, edition_id, external_llm_allowed, sensitivity
+        selected_handles = [
+            handle
+            for handle, subject_id in handles.existing.items()
+            if subject_id == self.selected_discovery_subject_id
+        ]
+        if len(selected_handles) != 1 or len(handles.incoming) != 1:
+            raise AssertionError(
+                "W7 / planner: expected one selected identity and one incoming candidate"
+            )
+        existing_handle = selected_handles[0]
+        incoming_handle = next(iter(handles.incoming))
+        return PlannedDiscoveryMerge(
+            DiscoveryMergePlanV1(
+                groups=[
+                    DiscoveryMergeGroup(
+                        existing_subject_handles=[existing_handle],
+                        incoming_candidate_handles=[incoming_handle],
+                        confidence=MergeConfidence.MEDIUM,
+                        disposition=MergeDisposition.REVIEW,
+                        rationale=(
+                            f"Synthetic identity-link proposal ({self.policy_version}); "
+                            "human review is required."
+                        ),
+                    )
                 ]
             )
         )

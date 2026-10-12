@@ -1,9 +1,8 @@
-"""Émulation workflow :
-
-Discovery fixturée (sorties persistées via les repositories, ni route, ni parseur, ni service
-Discovery) ; Fusion cumulative via le vrai CumulativeDiscoveryService.reconcile_batch avec planner
-déterministe ; Selection via route officielle ; Production via vrais jobs ; Composition, Review,
-Acceptation et Assembly réels. PostgreSQL réel ; compilateur PDF absent.
+"""FULL proof: real Discovery service/parser with a versioned scripted model response;
+cumulative Fusion with a deterministic planner; official Selection route; real production
+jobs, Composition, Review, Acceptance and Assembly; canonical state is PostgreSQL-backed.
+The provider, source transport and diagram compiler are deterministic doubles; no external
+network or Typst compilation is used.
 """
 
 from __future__ import annotations
@@ -55,56 +54,56 @@ async def test_w1_progressive_abc_uses_real_selection_and_production_transitions
     workflow_driver: WorkflowDriver,
     uow_factory: UnitOfWorkFactory,
 ) -> None:
-    """Discovery input is fixtured; Fusion, Selection, production and release are real."""
+    """Discovery is model-scripted through its real service; later workflow stages are real."""
     driver = workflow_driver
     driver.begin("W1-progressive-ABC")
     async with driver:
         edition_id = await driver.create_edition()
 
-        await driver.run_discovery("D1", ("A", "B"))
+        await driver.run_discovery_with_scripted_model("D1", ("A", "B"))
         snapshot_d1 = await driver.apply_fusion("D1")
-        assert len(snapshot_d1.subjects) == 2
+        assert len(snapshot_d1.subjects) == 2, "W1 / D1.fusion: expected candidates A and B"
         selected_d1 = await driver.select_subjects("D1", ("A", "B"))
         await driver.start_production("A", selected_d1["A"])
         run_a = await driver.advance_jobs_until_terminal("A")
         identity_a = await _assert_ready_identity(
             driver, uow_factory, "A", selected_d1["A"], "after production of A"
         )
-        assert run_a == identity_a[0]
+        assert run_a == identity_a[0], "W1 / P1.A: runner returned another production run"
 
-        await driver.run_discovery("D2", ("C",))
+        await driver.run_discovery_with_scripted_model("D2", ("C",))
         snapshot_d2 = await driver.apply_fusion("D2")
-        assert len(snapshot_d2.subjects) == 3
+        assert len(snapshot_d2.subjects) == 3, "W1 / D2.fusion: expected cumulative A, B, C"
         selected_c = await driver.select_subjects("D2", ("C",))
         await driver.start_production("C", selected_c["C"])
         run_c = await driver.advance_jobs_until_terminal("C")
         identity_c = await _assert_ready_identity(
             driver, uow_factory, "C", selected_c["C"], "after production of C"
         )
-        assert run_c == identity_c[0]
+        assert run_c == identity_c[0], "W1 / P2.C: runner returned another production run"
         assert identity_a == await _assert_ready_identity(
             driver, uow_factory, "A", selected_d1["A"], "after production of C"
-        )
+        ), "W1 / P2.C: producing C changed A's READY run or PUBLICATION identity"
 
-        await driver.run_discovery("D3", ("D",))
+        await driver.run_discovery_with_scripted_model("D3", ("D",))
         snapshot_d3 = await driver.apply_fusion("D3")
-        assert len(snapshot_d3.subjects) == 4
+        assert len(snapshot_d3.subjects) == 4, "W1 / D3.fusion: expected cumulative A, B, C, D"
         await driver.start_production("B", selected_d1["B"])
         run_b = await driver.advance_jobs_until_terminal("B")
         identity_b = await _assert_ready_identity(
             driver, uow_factory, "B", selected_d1["B"], "after production of B"
         )
-        assert run_b == identity_b[0]
+        assert run_b == identity_b[0], "W1 / P3.B: runner returned another production run"
         assert identity_a == await _assert_ready_identity(
             driver, uow_factory, "A", selected_d1["A"], "after production of B"
-        )
+        ), "W1 / P3.B: producing B changed A's READY run or PUBLICATION identity"
         assert identity_c == await _assert_ready_identity(
             driver, uow_factory, "C", selected_c["C"], "after production of B"
-        )
+        ), "W1 / P3.B: producing B changed C's READY run or PUBLICATION identity"
 
         await driver.compose((selected_d1["A"], selected_d1["B"], selected_c["C"]))
         review = await driver.review()
-        assert review["can_accept"] is True
+        assert review["can_accept"] is True, "W1 / review: complete A/B/C composition must be ready"
         await driver.validate()
         accepted = await driver.accept()
         manifest = accepted.manifest
@@ -113,9 +112,9 @@ async def test_w1_progressive_abc_uses_real_selection_and_production_transitions
             selected_d1["B"]: identity_b,
             selected_c["C"]: identity_c,
         }
-        assert manifest.schema_version == "2"
-        assert len(manifest.entries) == 3
-        assert not manifest.exclusions
+        assert manifest.schema_version == "2", "W1 / accept: expected manifest schema v2"
+        assert len(manifest.entries) == 3, "W1 / accept: manifest must contain A, B, and C"
+        assert not manifest.exclusions, "W1 / accept: inclusion-only manifest has exclusions"
         for entry in manifest.entries:
             run_id, artifact_id, version, input_hash, document_hash = expected[entry.subject_id]
             assert entry.production_run_id == run_id
@@ -131,8 +130,10 @@ async def test_w1_progressive_abc_uses_real_selection_and_production_transitions
         assert all(decision.decision is not PublicationDecision.EXCLUDE for decision in decisions)
 
         release = await driver.assemble()
-        assert release.edition_id == edition_id
-        assert release.manifest_id == manifest.id
+        assert release.edition_id == edition_id, "W1 / assembly: release edition identity changed"
+        assert release.manifest_id == manifest.id, (
+            "W1 / assembly: release manifest identity changed"
+        )
 
 
 async def _decisions(uow_factory: UnitOfWorkFactory, edition_id: UUID):

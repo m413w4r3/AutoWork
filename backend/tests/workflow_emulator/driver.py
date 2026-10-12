@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import replace
 from datetime import date
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, TypeVar, cast
 from uuid import UUID, uuid4
@@ -15,8 +16,14 @@ from httpx import ASGITransport, AsyncClient
 from cti_app.api.editions import router as editions_router
 from cti_app.api.publication import router as publication_router
 from cti_app.api.selection import selection_router
+from cti_app.application.discovery.contracts import (
+    discover_parameters_from_run,
+    discovery_job_idempotency_key,
+)
 from cti_app.application.discovery.cumulative.service import CumulativeDiscoveryService
 from cti_app.application.discovery.fusion import FusionService
+from cti_app.application.discovery.jobs import DISCOVERY_JOB_KIND
+from cti_app.application.discovery.service import DiscoveryService
 from cti_app.application.edition_composition import EditionCompositionService
 from cti_app.application.edition_publication import (
     EditionAssemblyService,
@@ -25,6 +32,7 @@ from cti_app.application.edition_publication import (
 from cti_app.application.edition_review import EditionReviewService
 from cti_app.application.editions import EditionService
 from cti_app.application.identity import LocalIdentityProvider
+from cti_app.application.jobs import JobExecutor, JobService, create_job_registry
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.selection import SelectionService
@@ -37,8 +45,10 @@ from cti_app.domain.edition_composition import (
 )
 from cti_app.domain.editions import Edition
 from cti_app.domain.entities import Subject
+from cti_app.domain.jobs import JobStatus
 from cti_app.domain.production import ProductionArtifactStage, ProductionArtifactStatus
 from cti_app.domain.publication_review import PublicationDecision
+from tests.discovery_support import make_discovery_run_for_edition
 from tests.integration.edition_codes import reserve_edition_code
 from tests.integration.production.support import ProductionScenario
 
@@ -48,6 +58,8 @@ from .providers import (
     CaptureBundle,
     DeterministicFusionPlanner,
     capture_bundle,
+    discovery_report_for_candidates,
+    script_discovery_report,
 )
 from .trace import TraceEvent, TraceVia, TraceWriter, short_identity
 
@@ -268,6 +280,141 @@ class WorkflowDriver:
             after=verify,
         )
 
+    async def run_discovery_with_scripted_model(
+        self, batch_label: str, subject_labels: Sequence[str]
+    ) -> DiscoveryBatch:
+        """Run the real Discovery service/parser with one local scripted model response."""
+        edition = await self._edition()
+        before = await invariants.production_state(self.uow_factory, edition.id)
+        for label in subject_labels:
+            self.discovery_bundles[label] = capture_bundle(label)
+        report = discovery_report_for_candidates(subject_labels, self.discovery_bundles)
+        model_scenario = self.production_scenario_factory(
+            self.discovery_bundles[subject_labels[0]].sources
+        )
+        script_discovery_report(model_scenario.model, report)
+
+        async def action() -> DiscoveryBatch:
+            run = await make_discovery_run_for_edition(
+                self.uow_factory,
+                edition,
+                source_profile="workflow-emulator",
+                complementary_axis=f"workflow-{batch_label}",
+                actor_id="workflow-analyst",
+            )
+            parameters = discover_parameters_from_run(run)
+            discovery = DiscoveryService(
+                self.uow_factory,
+                model_scenario.model,
+                archive=model_scenario.model,
+            )
+            registry = create_job_registry(
+                model_gateway=model_scenario.model,
+                discovery_service=discovery,
+            )
+            jobs = JobService(self.uow_factory, registry)
+            executor = JobExecutor(self.uow_factory, registry)
+            job = await jobs.submit(
+                kind=DISCOVERY_JOB_KIND,
+                aggregate_type="discovery_run",
+                aggregate_id=run.id,
+                idempotency_key=discovery_job_idempotency_key(run.id),
+                correlation_id=f"workflow-discovery-{batch_label}-{uuid4()}",
+                input_parameters=parameters.model_dump(mode="json"),
+                max_attempts=1,
+            )
+            completed = await executor.execute(job.id)
+            if completed.status is not JobStatus.SUCCEEDED:
+                raise AssertionError(
+                    f"Discovery job ended {completed.status.value}: "
+                    f"{completed.error_code} {completed.error_message}"
+                )
+            batches = await discovery.list_batches(edition.id)
+            matching = [item for item in batches if item.discovery_run_id == run.id]
+            if len(matching) != 1:
+                raise AssertionError(
+                    f"expected one persisted Discovery batch for run {run.id}, "
+                    f"found {len(matching)}"
+                )
+            batch = matching[0]
+            self.discovery_batches[batch_label] = batch
+            return batch
+
+        async def verify(batch: DiscoveryBatch) -> tuple[str, ...]:
+            async with self.uow_factory() as uow:
+                persisted = await uow.discovery_batches.get(batch.id)
+                candidates = await uow.discovery_candidates.list_for_batch(batch.id)
+                model_run = await uow.model_runs.get(batch.discovery_model_run_id)
+            invariants.require(
+                persisted is not None and len(candidates) == len(subject_labels),
+                self.scenario,
+                f"{batch_label}.discovery",
+                "real Discovery batch or candidate rows are missing from PostgreSQL",
+            )
+            invariants.require(
+                persisted is not None
+                and persisted.parser_version == "chatgpt-markdown-v3-structured"
+                and persisted.report_sha256 == sha256(report.encode("utf-8")).hexdigest(),
+                self.scenario,
+                f"{batch_label}.discovery",
+                "persisted Discovery parser version or report hash differs from the script",
+            )
+            invariants.require(
+                model_run is not None
+                and model_run.prompt_template_id == "monthly-cti-discovery"
+                and model_run.status.value == "succeeded"
+                and bool(model_run.output_references),
+                self.scenario,
+                f"{batch_label}.discovery",
+                "Discovery model run is absent, unsuccessful, or does not archive its response",
+            )
+            assert model_run is not None
+            archived = await model_scenario.model.read_output(
+                model_run.output_references[0], max_bytes=10_000_000
+            )
+            invariants.require(
+                archived.decode("utf-8") == report,
+                self.scenario,
+                f"{batch_label}.discovery",
+                "model-run archive does not contain the versioned scripted Discovery response",
+            )
+            expected_titles = tuple(
+                f"ExampleMalware-{label} campaign {label}" for label in subject_labels
+            )
+            invariants.require(
+                tuple(candidate.title for candidate in candidates) == expected_titles
+                and all(len(candidate.evidence.sources) == 2 for candidate in candidates),
+                self.scenario,
+                f"{batch_label}.discovery",
+                "the real Discovery parser did not persist the expected candidates and sources",
+            )
+            unchanged = await invariants.assert_production_state_unchanged(
+                self.uow_factory,
+                edition.id,
+                before,
+                scenario=self.scenario,
+                step=f"{batch_label}.discovery",
+            )
+            return (
+                "discovery-service-job-and-parser-ran",
+                "scripted-response-read-from-model-run-archive",
+                "candidate-rows-read-from-postgresql",
+                *unchanged,
+            )
+
+        return await self._perform(
+            f"{batch_label}.discovery",
+            action,
+            via="service",
+            action_name="DiscoveryService.discover_edition via JobExecutor",
+            identities={"edition": edition.id, "batch": batch_label},
+            assertions=(
+                "local-versioned-scripted-model-response",
+                "real-discovery-parser-and-persistence",
+            ),
+            after=verify,
+        )
+
     async def record_seed(self, subjects: Mapping[str, UUID], *, mechanism: str) -> None:
         """Record fixture-created READY runs after confirming their canonical DB state."""
         edition_id = self._edition_id()
@@ -441,7 +588,13 @@ class WorkflowDriver:
             after=verify,
         )
 
-    async def start_production(self, label: str, subject_id: UUID) -> UUID:
+    async def start_production(
+        self,
+        label: str,
+        subject_id: UUID,
+        *,
+        editorial_enrichment_response: str | Callable[[str], str] | None = None,
+    ) -> UUID:
         edition_id = self._edition_id()
         bundle = self.discovery_bundles[label]
         subject: Subject | None
@@ -456,6 +609,8 @@ class WorkflowDriver:
         production.model.script.references(bundle.references_response)
         for source_url, response in bundle.extraction_responses.items():
             production.model.script.q2(source_url=source_url, response=response)
+        if editorial_enrichment_response is not None:
+            production.model.script.editorial_enrichment(editorial_enrichment_response)
         self.production_scenarios[label] = production
         self.production_subjects[label] = subject_id
 
@@ -525,6 +680,9 @@ class WorkflowDriver:
                 if model_run is not None
                 else "no-model-run"
             )
+            model_details = (
+                repr(model_run.error_details) if model_run is not None else "no-model-run"
+            )
             invariants.require(
                 run is not None and run.status.value == "ready",
                 self.scenario,
@@ -534,7 +692,8 @@ class WorkflowDriver:
                     f"status={run.status.value}, "
                     f"stage={run.current_stage.value}, "
                     f"error_code={run.error_code}, "
-                    f"model_diagnostic={diagnostic_code}, calls={recent_calls}"
+                    f"model_diagnostic={diagnostic_code}, details={model_details}, "
+                    f"calls={recent_calls}"
                     if run is not None
                     else "production run is absent from PostgreSQL"
                 ),
@@ -833,6 +992,10 @@ class WorkflowDriver:
         required_exclusions: Mapping[UUID, tuple[str, str]] | None = None,
         expect_can_accept: bool | None = None,
         expected_deferred_subject_id: UUID | None = None,
+        expected_superseded_artifacts: (
+            Mapping[UUID, tuple[UUID, int, UUID, UUID, int]] | None
+        ) = None,
+        expected_inapplicable_exclusions: Mapping[UUID, UUID] | None = None,
     ) -> dict[str, Any]:
         edition_id = self._edition_id()
 
@@ -872,6 +1035,64 @@ class WorkflowDriver:
                     "Review must expose exactly one subject_deferred diagnostic for "
                     f"{expected_deferred_subject_id}; diagnostics={body['diagnostics']!r}",
                 )
+            for subject_id, expected in (expected_superseded_artifacts or {}).items():
+                diagnostics = [
+                    item
+                    for item in body["diagnostics"]
+                    if item["code"] == "pinned_artifact_superseded"
+                    and item["subject_id"] == str(subject_id)
+                ]
+                pinned_id, pinned_version, available_run_id, available_id, available_version = (
+                    expected
+                )
+                invariants.require(
+                    len(diagnostics) == 1,
+                    self.scenario,
+                    "review",
+                    "Review must expose exactly one pinned_artifact_superseded diagnostic for "
+                    f"{subject_id}; diagnostics={body['diagnostics']!r}",
+                )
+                details = diagnostics[0].get("details") or {}
+                invariants.require(
+                    details.get("pinned_artifact_id") == str(pinned_id)
+                    and details.get("pinned_artifact_version") == pinned_version
+                    and details.get("available_run_id") == str(available_run_id)
+                    and details.get("available_artifact_id") == str(available_id)
+                    and details.get("available_artifact_version") == available_version,
+                    self.scenario,
+                    "review",
+                    "pinned_artifact_superseded omits or changes pinned/current "
+                    "artifact identities",
+                )
+            for subject_id, decision_id in (expected_inapplicable_exclusions or {}).items():
+                exclusion = next(
+                    (item for item in review.exclusions if item.subject_id == subject_id), None
+                )
+                api_exclusion = next(
+                    (item for item in body["exclusions"] if item["subject_id"] == str(subject_id)),
+                    None,
+                )
+                diagnostic = next(
+                    (
+                        item
+                        for item in body["diagnostics"]
+                        if item["code"] == "exclusion_decision_missing"
+                        and item["subject_id"] == str(subject_id)
+                    ),
+                    None,
+                )
+                invariants.require(
+                    exclusion is not None
+                    and exclusion.decision_id == decision_id
+                    and not exclusion.applicable
+                    and api_exclusion is not None
+                    and api_exclusion["decision_id"] == str(decision_id)
+                    and api_exclusion["applicable"] is False
+                    and diagnostic is not None,
+                    self.scenario,
+                    "review",
+                    "the v1 exclusion decision is not applicable to the corrected artifact",
+                )
             required = required_exclusions or {}
             for subject_id, (actor_id, reason) in required.items():
                 exclusion = next(
@@ -908,6 +1129,16 @@ class WorkflowDriver:
                     if expected_deferred_subject_id is not None
                     else ()
                 ),
+                *(
+                    ("pinned-artifact-superseded-identities-exposed",)
+                    if expected_superseded_artifacts
+                    else ()
+                ),
+                *(
+                    ("v1-exclusion-decision-not-applicable-to-current-artifact",)
+                    if expected_inapplicable_exclusions
+                    else ()
+                ),
             )
 
         return await self._perform(
@@ -921,6 +1152,16 @@ class WorkflowDriver:
                 *(
                     ("review-exposes-subject-deferred-for-subject",)
                     if expected_deferred_subject_id is not None
+                    else ()
+                ),
+                *(
+                    ("review-exposes-pinned-artifact-superseded-identities",)
+                    if expected_superseded_artifacts
+                    else ()
+                ),
+                *(
+                    ("review-exposes-inapplicable-v1-exclusion",)
+                    if expected_inapplicable_exclusions
                     else ()
                 ),
             ),
