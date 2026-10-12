@@ -13,17 +13,19 @@ from cti_app.application.edition_ioc_export import (
     edition_identifier,
     project_publication_iocs,
 )
+from cti_app.application.pdf_mapping import MAPPING_RENDERER_VERSION
 from cti_app.application.typst_rendering import (
     TemplateBundleInvalidError,
     TypstMediaRef,
     TypstRenderSource,
     TypstTemplateBundle,
+    instrument_publication_targets,
     project_publication_to_typst_model,
 )
 from cti_app.domain.edition_publication import EditionDocumentV2
 from cti_app.domain.publication_document import PublicationDocumentV4, PublicationDocumentV5
 
-_EDITION_RENDER_DATA_SCHEMA_VERSION = "typst-edition-model-v18-cover-index-ioc-briefs"
+_EDITION_RENDER_DATA_SCHEMA_VERSION = "typst-edition-model-v19-block-location"
 _FRENCH_MONTH_NAMES = (
     "janvier",
     "février",
@@ -71,6 +73,8 @@ class EditionTypstRenderer:
         self,
         document: EditionDocumentV2,
         template_bundle: TypstTemplateBundle,
+        *,
+        artifact_identities: dict[str, dict[str, Any]] | None = None,
     ) -> TypstRenderSource:
         entrypoint = next(
             (
@@ -115,10 +119,22 @@ class EditionTypstRenderer:
                 "Edition Typst rendering requires every publication to use a supported schema"
             )
         publications: list[dict[str, Any]] = []
+        mapping_targets: list[dict[str, Any]] = []
+        mapping_unmapped: list[dict[str, Any]] = []
         media_refs_by_id: dict[UUID, TypstMediaRef] = {}
         for classified in classify_edition_publications(document.publications):
             publication = classified.publication
             model = project_publication_to_typst_model(publication.document)
+            article_title_target_id = None
+            target_identities = (artifact_identities or {}).get(str(publication.subject_id))
+            if target_identities is not None:
+                targets, unmapped, article_title_target_id = instrument_publication_targets(
+                    model,
+                    article_title_identity=target_identities.get("article_title"),
+                    enrichment_identity=target_identities.get("enrichment"),
+                )
+                mapping_targets.extend(targets)
+                mapping_unmapped.extend(unmapped)
             for media_ref in model.media_refs:
                 existing = media_refs_by_id.get(media_ref.asset_id)
                 if existing is not None and existing != media_ref:
@@ -136,6 +152,8 @@ class EditionTypstRenderer:
                 "file_ioc_count": project_publication_iocs(publication.document).counts["file"],
                 "content_sections": model.content_sections,
             }
+            if article_title_target_id is not None:
+                item["article_title_target_id"] = article_title_target_id
             publications.append(item)
 
         render_data = {
@@ -144,6 +162,8 @@ class EditionTypstRenderer:
             "publications": publications,
             "file_ioc_count": sum(item["file_ioc_count"] for item in publications),
         }
+        if mapping_targets or mapping_unmapped:
+            render_data["mapping_instrumentation_version"] = MAPPING_RENDERER_VERSION
         render_data_bytes = json.dumps(
             render_data,
             ensure_ascii=False,
@@ -159,4 +179,6 @@ class EditionTypstRenderer:
             media_refs=tuple(media_refs_by_id.values()),
             entrypoint_relative_path="RENDERER/edition.typ",
             render_data_relative_path="RENDERER/edition-render-data.json",
+            mapping_targets=tuple(mapping_targets),
+            mapping_unmapped=tuple(mapping_unmapped),
         )

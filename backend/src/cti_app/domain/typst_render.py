@@ -38,6 +38,9 @@ class TypstRenderRecord(Protocol):
     def input_hash(self) -> str: ...
 
     @property
+    def renderer_version(self) -> str: ...
+
+    @property
     def status(self) -> TypstRenderStatus: ...
 
     @property

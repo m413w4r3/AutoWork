@@ -14,6 +14,7 @@ from typing import Any, cast
 from urllib.parse import urlsplit
 from uuid import UUID
 
+from cti_app.application.pdf_mapping import MAPPING_RENDERER_VERSION, target_descriptor
 from cti_app.application.typst_bundle import hash_bundle_contents, resolve_bundle_files
 from cti_app.domain.media_assets import MediaAssetKind
 from cti_app.domain.production_editorial_enrichment import EnrichmentPlacementKind
@@ -38,7 +39,7 @@ from cti_app.domain.semantic_annotation import (
     timeline_anchor,
 )
 
-_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v19-cited-technical-context-reference"
+_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v20-block-location"
 _PUBLICATION_RENDERER_MANIFEST = "renderer-manifest.json"
 _FRENCH_MONTH_NAMES = (
     "janvier",
@@ -192,6 +193,8 @@ class TypstRenderSource:
     media_refs: tuple[TypstMediaRef, ...]
     entrypoint_relative_path: str = "RENDERER/publication.typ"
     render_data_relative_path: str = "RENDERER/render-data.json"
+    mapping_targets: tuple[dict[str, Any], ...] = ()
+    mapping_unmapped: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,7 +221,11 @@ class TypstRenderer:
     """Build deterministic data and return the fixed production entrypoint."""
 
     def render(
-        self, document: CanonicalPublicationDocument, template_bundle: TypstTemplateBundle
+        self,
+        document: CanonicalPublicationDocument,
+        template_bundle: TypstTemplateBundle,
+        *,
+        target_artifact_identities: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> TypstRenderSource:
         entrypoint = next(
             (
@@ -234,6 +241,15 @@ class TypstRenderer:
             )
         source_bytes = entrypoint.content
         model = project_publication_to_typst_model(document)
+        target_descriptors: tuple[dict[str, Any], ...] = ()
+        unmapped: tuple[dict[str, Any], ...] = ()
+        article_title_target_id: str | None = None
+        if target_artifact_identities is not None:
+            target_descriptors, unmapped, article_title_target_id = instrument_publication_targets(
+                model,
+                article_title_identity=target_artifact_identities.get("article_title"),
+                enrichment_identity=target_artifact_identities.get("enrichment"),
+            )
 
         render_data: dict[str, Any] = {
             "schema_version": _RENDER_DATA_SCHEMA_VERSION,
@@ -241,6 +257,10 @@ class TypstRenderer:
             "title": model.title,
             "content_sections": model.content_sections,
         }
+        if article_title_target_id is not None:
+            render_data["article_title_target_id"] = article_title_target_id
+        if target_descriptors or unmapped:
+            render_data["mapping_instrumentation_version"] = MAPPING_RENDERER_VERSION
         render_data_bytes = json.dumps(
             render_data,
             ensure_ascii=False,
@@ -253,7 +273,99 @@ class TypstRenderer:
             render_data_bytes=render_data_bytes,
             render_data_sha256=hashlib.sha256(render_data_bytes).hexdigest(),
             media_refs=model.media_refs,
+            mapping_targets=target_descriptors,
+            mapping_unmapped=unmapped,
         )
+
+
+def instrument_publication_targets(
+    model: TypstPublicationModelV2,
+    *,
+    article_title_identity: Mapping[str, Any] | None,
+    enrichment_identity: Mapping[str, Any] | None,
+) -> tuple[tuple[dict[str, Any], ...], tuple[dict[str, Any], ...], str | None]:
+    """Attach target IDs using the canonical artifact that owns each element."""
+    descriptors: list[dict[str, Any]] = []
+    unmapped_counts: dict[tuple[str, str], int] = {}
+
+    def record_unmapped(block_type: str, reason: str, count: int = 1) -> None:
+        key = (block_type, reason)
+        unmapped_counts[key] = unmapped_counts.get(key, 0) + count
+
+    def descriptor_for(
+        identity: Mapping[str, Any] | None, block_type: str, block_key: str
+    ) -> dict[str, Any] | None:
+        if identity is None:
+            return None
+        subject_id = identity.get("subject_id")
+        artifact_id = identity.get("artifact_id")
+        artifact_version = identity.get("artifact_version")
+        artifact_input_hash = identity.get("artifact_input_hash")
+        if (
+            not isinstance(subject_id, str)
+            or not isinstance(artifact_id, str)
+            or not isinstance(artifact_version, int)
+            or not isinstance(artifact_input_hash, str)
+        ):
+            return None
+        return target_descriptor(
+            subject_id=subject_id,
+            artifact_id=artifact_id,
+            artifact_version=artifact_version,
+            artifact_input_hash=artifact_input_hash,
+            block_type=block_type,
+            block_key=block_key,
+        )
+
+    title = descriptor_for(article_title_identity, "article_title", "title")
+    if title is None:
+        article_title_target_id = None
+        record_unmapped("article_title", "canonical_owner_unavailable")
+    else:
+        descriptors.append(title)
+        article_title_target_id = str(title["target_id"])
+
+    for section in model.content_sections:
+        blocks = section.get("blocks", [])
+        if not isinstance(blocks, list):
+            continue
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            if block_type in {"table", "diagram", "figure", "chart"}:
+                key = block.get("key")
+                canonical_type = "source_figure" if block_type == "figure" else block_type
+                if isinstance(key, str) and key:
+                    descriptor = descriptor_for(enrichment_identity, canonical_type, key)
+                    if descriptor is None:
+                        record_unmapped(canonical_type, "canonical_owner_unavailable")
+                    else:
+                        block["target_id"] = descriptor["target_id"]
+                        descriptors.append(descriptor)
+                    if block_type == "table":
+                        rows = block.get("rows", [])
+                        columns = block.get("columns", [])
+                        cell_count = len(columns) if isinstance(columns, list) else 0
+                        if isinstance(rows, list):
+                            cell_count += sum(len(row) for row in rows if isinstance(row, list))
+                        record_unmapped("table_cell", "no_stable_identity", cell_count)
+                else:
+                    record_unmapped("enrichment_block", "no_stable_identity")
+            elif block_type == "paragraph":
+                record_unmapped("paragraph", "no_stable_identity")
+            elif block_type == "section_heading":
+                record_unmapped("section", "no_stable_identity")
+    unmapped = tuple(
+        {
+            "block_type": block_type,
+            "reason": reason,
+            "count": count,
+        }
+        for (block_type, reason), count in sorted(unmapped_counts.items())
+        if count > 0
+    )
+    return tuple(descriptors), unmapped, article_title_target_id
 
 
 def project_publication_to_typst_model(

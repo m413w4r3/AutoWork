@@ -70,6 +70,7 @@ from cti_app.infrastructure.database.session import create_postgres_engine, crea
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
 from cti_app.infrastructure.http import AsyncioPinnedHttpTransport
 from cti_app.infrastructure.jobs import DramatiqJobDispatcher
+from cti_app.infrastructure.pdf_inspection import PdfInspectionCache
 from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
 from cti_app.infrastructure.virustotal import (
     VirusTotalHttpAdapter,
@@ -273,6 +274,7 @@ async def _execute_job(job_id: UUID) -> int | None:
         chp_typst_root, font_bundle_root, typst_fonts_lock_path = typst_bundle_paths()
         typst_compiler = TypstSubprocessCompiler()
         media_asset_store = MediaAssetStore(production_artifact_store, uow_factory)
+        pdf_inspection_cache = PdfInspectionCache()
         edition_render_service = EditionRenderService(
             uow_factory=uow_factory,
             artifact_store=production_artifact_store,
@@ -282,6 +284,7 @@ async def _execute_job(job_id: UUID) -> int | None:
             chp_typst_root=chp_typst_root,
             font_bundle_root=font_bundle_root,
             typst_fonts_lock_path=typst_fonts_lock_path,
+            mapping_cache=pdf_inspection_cache,
         )
         edition_workspace_materializer = EditionWorkspaceMaterializer(
             settings.edition_workspace_root

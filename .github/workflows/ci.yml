@@ -85,7 +85,7 @@ jobs:
             cp -R /app/chpTypst/UTILS/. "$workspace/UTILS/"
             test -s "$workspace/UTILS/chap.png"
             cat > "$workspace/RENDERER/render-data.json" <<EOF
-          {"schema_version":"typst-publication-model-v19-cited-technical-context-reference","language":"fr","title":"Font bundle smoke","content_sections":[{"type":"references","timeline":[],"blocks":[],"sources":[]},{"type":"synthesis","blocks":[{"type":"paragraph","text":"Bundled font compile smoke."}]}]}
+          {"schema_version":"typst-publication-model-v20-block-location","language":"fr","title":"Font bundle smoke","content_sections":[{"type":"references","timeline":[],"blocks":[],"sources":[]},{"type":"synthesis","blocks":[{"type":"paragraph","text":"Bundled font compile smoke."}]}]}
           EOF
             typst compile --root "$workspace" \
               --font-path /usr/local/share/autowork/typst-fonts/HankenGrotesk \

@@ -487,8 +487,14 @@ class _FailingPdfRenderer:
     def __init__(self, error: Exception) -> None:
         self._error = error
 
-    async def render(self, document: EditionDocumentV2) -> bytes:
-        del document
+    async def render(
+        self,
+        document: EditionDocumentV2,
+        *,
+        artifact_identities: dict[str, dict[str, object]] | None = None,
+        preview_input_hash: str | None = None,
+    ) -> bytes:
+        del document, artifact_identities, preview_input_hash
         raise self._error
 
 

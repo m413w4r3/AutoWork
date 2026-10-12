@@ -378,6 +378,7 @@ class _RenderUnitOfWork:
         self.edition_releases = _ReleaseRepository(releases)
         self.edition_renders = renders
         self.unexpected_accesses = unexpected_accesses
+        self.publication_manifests = _PublicationManifestRepository()
 
     async def __aenter__(self) -> _RenderUnitOfWork:
         return self
@@ -393,6 +394,12 @@ class _RenderUnitOfWork:
         if name in {"production_artifacts", "subjects", "production_runs"}:
             raise AssertionError(f"EditionRenderService must not look up {name}")
         raise AssertionError(f"Unexpected unit-of-work access: {name}")
+
+
+class _PublicationManifestRepository:
+    async def get_blob_id(self, manifest_id: Any) -> None:
+        del manifest_id
+        return None
 
 
 class _RenderUnitOfWorkFactory:
@@ -419,8 +426,13 @@ class _CapturingEditionTypstRenderer:
         self.templates: list[TypstTemplateBundle] = []
 
     def render(
-        self, document: EditionDocumentV2, template_bundle: TypstTemplateBundle
+        self,
+        document: EditionDocumentV2,
+        template_bundle: TypstTemplateBundle,
+        *,
+        artifact_identities: dict[str, dict[str, Any]] | None = None,
     ) -> TypstRenderSource:
+        del artifact_identities
         self.documents.append(document)
         self.templates.append(template_bundle)
         source = next(

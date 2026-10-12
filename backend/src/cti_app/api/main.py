@@ -245,11 +245,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
 
     production_artifact_store = ProductionArtifactStore(BlobCatalogService(blob_store, uow_factory))
+    pdf_inspection_cache = PdfInspectionCache()
     pdf_inspection_service = PdfInspectionService(
         SqlAlchemyPdfInspectionSourceRepository(session_factory),
         production_artifact_store,
         PopplerSubprocess(),
-        PdfInspectionCache(),
+        pdf_inspection_cache,
     )
     production_checkpoint = EditionProductionCheckpointService(
         uow_factory,
@@ -280,6 +281,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         chp_typst_root=chp_typst_root,
         font_bundle_root=font_bundle_root,
         typst_fonts_lock_path=typst_fonts_lock_path,
+        mapping_cache=pdf_inspection_cache,
     )
     edition_preview_pdf_renderer = EditionPreviewPdfRenderer(
         renderer=edition_typst_renderer,
@@ -288,6 +290,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         chp_typst_root=chp_typst_root,
         font_bundle_root=font_bundle_root,
         typst_fonts_lock_path=typst_fonts_lock_path,
+        mapping_cache=pdf_inspection_cache,
     )
     publication_render_service = PublicationRenderService(
         uow_factory=uow_factory,
@@ -298,6 +301,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         chp_typst_root=chp_typst_root,
         font_bundle_root=font_bundle_root,
         typst_fonts_lock_path=typst_fonts_lock_path,
+        mapping_cache=pdf_inspection_cache,
     )
     subject_content_service = SubjectContentService(uow_factory, production_artifact_store)
     production_chain = ProductionStageChain(production_pacing)

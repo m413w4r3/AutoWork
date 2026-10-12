@@ -81,6 +81,7 @@ def translate_execution_error[ErrorT: Exception](
 class ExecutedTypstRender:
     compiled_document: CompiledTypstDocument
     resolved_media: Mapping[UUID, bytes]
+    location_metadata: bytes | None = None
 
 
 def load_typst_render_bundle_snapshots(
@@ -195,11 +196,30 @@ class TypstRenderExecutor:
                         )
                     )
                     self._validate_pdf(compiled)
+                    location_metadata = b"[]" if render_source.mapping_unmapped else None
+                    query_metadata = getattr(self._compiler, "query_metadata", None)
+                    if render_source.mapping_targets and callable(query_metadata):
+                        try:
+                            location_metadata = await query_metadata(
+                                TypstCompileRequest(
+                                    workspace_root=workspace_root,
+                                    entrypoint_relative_path=render_source.entrypoint_relative_path,
+                                    font_paths=font_paths,
+                                )
+                            )
+                        except Exception:
+                            # Mapping is an ephemeral projection. A query failure
+                            # must not invalidate the already verified PDF.
+                            pass
         except OSError as exc:
             raise TypstRenderWorkspaceError(
                 f"Unable to materialize Typst render inputs: {exc}"
             ) from exc
-        return ExecutedTypstRender(compiled_document=compiled, resolved_media=media)
+        return ExecutedTypstRender(
+            compiled_document=compiled,
+            resolved_media=media,
+            location_metadata=location_metadata,
+        )
 
     @staticmethod
     def _validate_pdf(compiled: CompiledTypstDocument) -> None:

@@ -4,6 +4,7 @@ import asyncio
 import binascii
 import hashlib
 import io
+import json
 import os
 import struct
 import zlib
@@ -23,6 +24,7 @@ from cti_app.application.pdf_inspection import (
     PdfInspectionService,
     PdfRenderReference,
 )
+from cti_app.application.pdf_mapping import mapping_cache_key, target_descriptor
 from cti_app.domain.pdf_inspection import PdfInspectionErrorCode, PdfInspectionProfile
 from cti_app.infrastructure.pdf_inspection import PdfInspectionCache, PopplerSubprocess
 
@@ -156,7 +158,12 @@ async def test_metadata_exposes_integrity_parser_warnings_and_heuristic_measurem
     assert body["pdf"]["parser_warnings"] == [
         "Syntax Error: Suspects object is wrong type (boolean)"
     ]
-    assert body["mapping"] == {"status": "not_available", "items": []}
+    assert body["mapping"] == {
+        "status": "not_available",
+        "reason": "location_sidecar_unavailable",
+        "items": [],
+        "unmapped": [],
+    }
     assert body["source"][0]["kind"] == "subject_publication"
     assert body["source"][0]["render_id"] == str(RENDER_ID)
     assert body["diagnostics"]["counts"] == {"deterministic": 2, "heuristic": 1}
@@ -253,7 +260,8 @@ async def test_local_typst_fixture_is_parsed_and_rasterizes_reproducibly(tmp_pat
     assert metadata["pdf"]["sha256"] == pdf_sha256
     assert metadata["pdf"]["byte_size"] == len(content)
     assert metadata["pdf"]["page_count"] == 2
-    assert metadata["mapping"] == {"status": "not_available", "items": []}
+    assert metadata["mapping"]["status"] == "not_available"
+    assert metadata["mapping"]["reason"] == "location_sidecar_unavailable"
 
 
 @pytest.mark.asyncio
@@ -348,6 +356,93 @@ async def test_one_pdf_hash_returns_every_persisted_provenance(tmp_path: Path) -
         str(publication.id),
         str(edition.id),
     }
+
+
+@pytest.mark.asyncio
+async def test_verified_typst_sidecar_maps_canonical_diagram_and_localizes_diagnostic(
+    tmp_path: Path,
+) -> None:
+    cache = PdfInspectionCache(tmp_path / "cache")
+    reference = _reference()
+    descriptor = target_descriptor(
+        subject_id="00000000-0000-0000-0000-000000000010",
+        artifact_id="00000000-0000-0000-0000-000000000011",
+        artifact_version=3,
+        artifact_input_hash="d" * 64,
+        block_type="diagram",
+        block_key="overview",
+    )
+    sidecar = {
+        "pdf_sha256": PDF_SHA256,
+        "renderer_version": reference.renderer_version,
+        "render_id": str(reference.id),
+        "targets": [descriptor],
+        "unmapped": [{"block_type": "paragraph", "reason": "no_stable_identity", "count": 1}],
+        "query": [
+            {
+                "func": "metadata",
+                "value": {
+                    "target_id": descriptor["target_id"],
+                    "boundary": "location_start",
+                    "page": 1,
+                    "x": "62.36pt",
+                    "y": "180pt",
+                    "width": "470.55pt",
+                    "height": "50pt",
+                },
+            },
+            {
+                "func": "metadata",
+                "value": {
+                    "target_id": descriptor["target_id"],
+                    "boundary": "location_end",
+                    "page": 1,
+                    "x": "62.36pt",
+                    "y": "230pt",
+                },
+            },
+        ],
+    }
+    cache.put_derived(
+        mapping_cache_key(PDF_SHA256, reference.renderer_version, str(reference.id)),
+        json.dumps(sidecar).encode(),
+    )
+    service = _service(tmp_path, cache=cache, references=(reference,))
+
+    body = await service.metadata(PDF_SHA256)
+
+    mapped = body["mapping"]["items"][0]
+    assert body["mapping"]["status"] == "partial"
+    assert mapped["target_id"] == descriptor["target_id"]
+    assert mapped["target"]["block_key"] == "overview"
+    assert mapped["target"]["revision_channel"] == {
+        "family": "editorial_enrichment",
+        "operations": ["rewrite_diagram", "delete_diagram"],
+    }
+    assert mapped["mapping_quality"] == "canonical_block_key"
+    assert mapped["locations"] == [
+        {"page": 1, "bbox_points": {"x": 62.36, "y": 180.0, "width": 470.55, "height": 50.0}}
+    ]
+    assert body["mapping"]["unmapped"] == [
+        {"block_type": "paragraph", "reason": "no_stable_identity", "count": 1}
+    ]
+    finding = next(
+        item for item in body["diagnostics"]["items"] if item["code"] == "block_too_small"
+    )
+    assert finding["class"] == "deterministic"
+    assert finding["target"]["target_id"] == descriptor["target_id"]
+
+    sidecar["query"][0]["value"].update(page=2, y="100pt")
+    sidecar["query"][1]["value"].update(page=2, y="160pt")
+    cache.put_derived(
+        mapping_cache_key(PDF_SHA256, reference.renderer_version, str(reference.id)),
+        json.dumps(sidecar).encode(),
+    )
+    reflowed = await service.metadata(PDF_SHA256)
+    moved = reflowed["mapping"]["items"][0]
+    assert moved["target_id"] == mapped["target_id"]
+    assert moved["locations"][0]["page"] == 2
+    assert moved["locations"][0]["bbox_points"]["y"] == 100.0
 
 
 @pytest.mark.asyncio
@@ -490,7 +585,12 @@ async def test_api_routes_return_typed_errors_and_png_headers(tmp_path: Path) ->
         expired = await client.get(f"/api/pdf-inspections/{PDF_SHA256}")
 
     assert metadata.status_code == 200
-    assert metadata.json()["mapping"] == {"status": "not_available", "items": []}
+    assert metadata.json()["mapping"] == {
+        "status": "not_available",
+        "reason": "location_sidecar_unavailable",
+        "items": [],
+        "unmapped": [],
+    }
     for response, expected_profile in ((page, "preview"), (thumbnail, "thumbnail")):
         assert response.status_code == 200
         assert response.headers["content-type"] == "image/png"

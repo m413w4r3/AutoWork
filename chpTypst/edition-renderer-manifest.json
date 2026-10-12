@@ -1,5 +1,5 @@
 {
-  "template_version": "chp-edition-v15-cover-ioc-index-briefs",
+  "template_version": "chp-edition-v16-block-location",
   "files": [
     "RENDERER/edition.typ",
     "RENDERER/edition_helpers.typ",

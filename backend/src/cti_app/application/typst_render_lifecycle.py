@@ -9,6 +9,7 @@ here once and are driven by a small per-service ``TypstRenderErrors`` table.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
@@ -18,6 +19,7 @@ from typing import Any, Protocol
 from uuid import UUID
 
 from cti_app.application.media_assets import MediaAssetStore
+from cti_app.application.pdf_mapping import mapping_cache_key
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.typst_compilation import (
     FontBundleSnapshot,
@@ -115,6 +117,10 @@ class TypstRenderBuckets:
     output: str
 
 
+class TypstMappingSidecarCache(Protocol):
+    def put_derived(self, key: str, content: bytes) -> None: ...
+
+
 class TypstRenderRunner[RecordT: TypstRenderRecord]:
     """Acquire one render atomically, execute Typst once, and record the outcome."""
 
@@ -128,6 +134,7 @@ class TypstRenderRunner[RecordT: TypstRenderRecord]:
         compiler: TypstCompiler,
         buckets: TypstRenderBuckets,
         errors: TypstRenderErrors,
+        mapping_cache: TypstMappingSidecarCache | None = None,
         wait_poll_interval_seconds: float = 0.1,
         wait_timeout_seconds: float = 60.0,
         running_lease_seconds: float = 300.0,
@@ -144,6 +151,7 @@ class TypstRenderRunner[RecordT: TypstRenderRecord]:
         self._executor = TypstRenderExecutor(media_asset_store=media_asset_store, compiler=compiler)
         self._buckets = buckets
         self._errors = errors
+        self._mapping_cache = mapping_cache
         self._wait_poll_interval_seconds = wait_poll_interval_seconds
         self._wait_timeout_seconds = wait_timeout_seconds
         self._running_lease_seconds = running_lease_seconds
@@ -193,6 +201,36 @@ class TypstRenderRunner[RecordT: TypstRenderRecord]:
                 render_source, template_bundle, font_bundle, persist_render_inputs
             )
             compiled = executed.compiled_document
+            if (
+                self._mapping_cache is not None
+                and (render_source.mapping_targets or render_source.mapping_unmapped)
+                and executed.location_metadata is not None
+            ):
+                try:
+                    query_result = json.loads(executed.location_metadata)
+                    if isinstance(query_result, list):
+                        sidecar = json.dumps(
+                            {
+                                "pdf_sha256": compiled.sha256,
+                                "renderer_version": proposed.renderer_version,
+                                "render_id": str(render_id),
+                                "targets": render_source.mapping_targets,
+                                "unmapped": render_source.mapping_unmapped,
+                                "query": query_result,
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                        self._mapping_cache.put_derived(
+                            mapping_cache_key(
+                                compiled.sha256, proposed.renderer_version, str(render_id)
+                            ),
+                            sidecar,
+                        )
+                except Exception:
+                    # Malformed derived coordinates never make a verified PDF fail.
+                    pass
             try:
                 output_blob_id = await self._artifact_store.put_bytes(
                     compiled.content,

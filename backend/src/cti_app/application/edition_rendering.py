@@ -22,6 +22,9 @@ from cti_app.application.production_artifact_store import (
     MAX_ARTIFACT_BYTES,
     ProductionArtifactStore,
 )
+from cti_app.application.render_target_identities import (
+    publication_target_artifact_identities,
+)
 from cti_app.application.typst_compilation import (
     TYPST_COMPILER,
     TYPST_COMPILER_VERSION,
@@ -33,13 +36,18 @@ from cti_app.application.typst_render_execution import (
     load_typst_render_bundle_snapshots,
 )
 from cti_app.application.typst_render_lifecycle import (
+    TypstMappingSidecarCache,
     TypstRenderBuckets,
     TypstRenderError,
     TypstRenderErrors,
     TypstRenderRunner,
 )
 from cti_app.application.typst_rendering import TemplateBundleInvalidError, TypstRenderSource
-from cti_app.domain.edition_publication import EditionDocumentV2, EditionRelease
+from cti_app.domain.edition_publication import (
+    EditionDocumentV2,
+    EditionRelease,
+    PublicationManifestV1,
+)
 from cti_app.domain.edition_render import (
     EDITION_RENDER_POLICY_VERSION,
     EDITION_RENDERER,
@@ -145,6 +153,7 @@ class EditionRenderService:
         chp_typst_root: Path,
         font_bundle_root: Path,
         typst_fonts_lock_path: Path,
+        mapping_cache: TypstMappingSidecarCache | None = None,
         wait_poll_interval_seconds: float = 0.1,
         wait_timeout_seconds: float = 60.0,
         running_lease_seconds: float = 300.0,
@@ -163,6 +172,7 @@ class EditionRenderService:
             compiler=compiler,
             buckets=EDITION_RENDER_BUCKETS,
             errors=_EDITION_RENDER_ERRORS,
+            mapping_cache=mapping_cache,
             wait_poll_interval_seconds=wait_poll_interval_seconds,
             wait_timeout_seconds=wait_timeout_seconds,
             running_lease_seconds=running_lease_seconds,
@@ -178,6 +188,7 @@ class EditionRenderService:
             await uow.commit()
 
         document = await self._read_edition_document(release)
+        artifact_identities = await self._read_manifest_artifact_identities(release)
         try:
             template_bundle, font_bundle = load_typst_render_bundle_snapshots(
                 chp_typst_root=self._chp_typst_root,
@@ -233,7 +244,11 @@ class EditionRenderService:
 
         def build_source() -> TypstRenderSource:
             try:
-                return self._renderer.render(document, template_bundle)
+                return self._renderer.render(
+                    document,
+                    template_bundle,
+                    artifact_identities=artifact_identities,
+                )
             except RendererSchemaUnsupportedError as exc:
                 raise EditionRenderPublicationSchemaUnsupportedError(str(exc)) from exc
             except TemplateBundleInvalidError as exc:
@@ -274,6 +289,43 @@ class EditionRenderService:
             raise EditionRenderDocumentInvalidError(
                 "Edition release does not contain a valid EditionDocumentV2"
             ) from exc
+
+    async def _read_manifest_artifact_identities(
+        self, release: EditionRelease
+    ) -> dict[str, dict[str, Any]]:
+        """Resolve canonical block owners from each publication in the frozen manifest."""
+        try:
+            async with self._uow_factory() as uow:
+                manifest_blob_id = await uow.publication_manifests.get_blob_id(release.manifest_id)
+                await uow.commit()
+            if manifest_blob_id is None:
+                return {}
+            payload = await self._artifact_store.read_json(manifest_blob_id)
+            if not isinstance(payload, dict):
+                return {}
+            manifest = PublicationManifestV1.from_json(payload)
+            if manifest.id != release.manifest_id or manifest.edition_id != release.edition_id:
+                return {}
+            identities: dict[str, dict[str, Any]] = {}
+            async with self._uow_factory() as uow:
+                for entry in manifest.entries:
+                    publication_artifact = await uow.production_artifacts.get(
+                        entry.document_artifact_id
+                    )
+                    identities[str(entry.subject_id)] = (
+                        await publication_target_artifact_identities(
+                            uow.production_artifacts,
+                            publication_artifact,
+                            expected_publication_version=entry.document_artifact_version,
+                            expected_publication_input_hash=entry.document_input_hash,
+                        )
+                        if publication_artifact is not None
+                        else {}
+                    )
+            return identities
+        except Exception:
+            # Missing optional location provenance cannot block an immutable PDF render.
+            return {}
 
 
 def _ensure_edition_publications_are_v4(payload: dict[str, Any]) -> None:

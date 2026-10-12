@@ -19,6 +19,7 @@ from cti_app.application.typst_compilation import (
     TYPST_COMPILER,
     TYPST_COMPILER_VERSION,
     TYPST_MAX_PDF_BYTES,
+    TYPST_MAX_QUERY_STDOUT_BYTES,
     TYPST_MAX_STDERR_BYTES,
     TYPST_MAX_STDOUT_BYTES,
     CompiledTypstDocument,
@@ -321,13 +322,43 @@ class TypstSubprocessCompiler:
             compiler_version=TYPST_COMPILER_VERSION,
         )
 
-    async def _run(self, argv: Sequence[str]) -> TypstProcessResult:
+    async def query_metadata(self, request: TypstCompileRequest) -> bytes:
+        """Read render target coordinates from this exact compiled workspace."""
+        workspace_root = request.workspace_root.resolve(strict=True)
+        relative_entrypoint = PurePosixPath(request.entrypoint_relative_path)
+        if (
+            relative_entrypoint.is_absolute()
+            or "\\" in request.entrypoint_relative_path
+            or ".." in relative_entrypoint.parts
+        ):
+            raise TypstCompileFailedError("Typst entrypoint must be a path inside its workspace")
+        entrypoint = workspace_root.joinpath(*relative_entrypoint.parts)
+        argv: list[str] = [self._binary, "query", "--root", str(workspace_root)]
+        for font_path in request.font_paths:
+            argv.extend(("--font-path", str(font_path)))
+        argv.extend(
+            (
+                "--ignore-system-fonts",
+                str(entrypoint),
+                "metadata",
+                "--format",
+                "json",
+            )
+        )
+        await self._verify_version()
+        result = await self._run(argv, stdout_limit=TYPST_MAX_QUERY_STDOUT_BYTES)
+        _raise_process_failure(result)
+        return result.stdout
+
+    async def _run(
+        self, argv: Sequence[str], *, stdout_limit: int = TYPST_MAX_STDOUT_BYTES
+    ) -> TypstProcessResult:
         try:
             return await self._runner.run(
                 argv,
                 environment=typst_process_environment(),
                 timeout_seconds=float(TYPST_COMPILATION_TIMEOUT_SECONDS),
-                stdout_limit=TYPST_MAX_STDOUT_BYTES,
+                stdout_limit=stdout_limit,
                 stderr_limit=TYPST_MAX_STDERR_BYTES,
             )
         except OSError as exc:

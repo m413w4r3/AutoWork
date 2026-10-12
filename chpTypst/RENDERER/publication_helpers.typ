@@ -3,6 +3,44 @@
 
 #let has-text(value) = value != none and value != ""
 
+// The surrounding A4 renderer reserves 2.2cm on each horizontal edge. These
+// context markers and their metadata occupy no layout space and are queried in
+// the very workspace that produced the PDF.
+#let render-target(target-id, body) = {
+  if target-id == none {
+    body
+  } else {
+    metadata((target_id: target-id, boundary: "start"))
+    context {
+      let location = here()
+      let position = location.position()
+      let size = measure(body, width: 470.55pt)
+      metadata((
+        target_id: target-id,
+        boundary: "location_start",
+        page: location.page(),
+        x: position.x,
+        y: position.y,
+        width: size.width,
+        height: size.height,
+      ))
+    }
+    body
+    context {
+      let location = here()
+      let position = location.position()
+      metadata((
+        target_id: target-id,
+        boundary: "location_end",
+        page: location.page(),
+        x: position.x,
+        y: position.y,
+      ))
+    }
+    metadata((target_id: target-id, boundary: "end"))
+  }
+}
+
 #let unique-urls(urls) = urls.fold((), (result, url) => {
   if url in result { result } else { result + (url,) }
 })
@@ -205,7 +243,7 @@
 }
 
 #let render-body-block(item) = {
-  if item.type == "section_heading" {
+  let body = if item.type == "section_heading" {
     heading(level: 3)[#item.text]
   } else if item.type == "paragraph" {
     [#semantic-or-plain(item.text, item.at("semantic_spans", default: none)) #parbreak()]
@@ -220,6 +258,7 @@
   } else {
     panic("unsupported publication body block type: " + item.type)
   }
+  render-target(item.at("target_id", default: none), body)
 }
 
 #let render-publication-body(publication) = {
@@ -271,6 +310,9 @@
 }
 
 #let render-publication(publication) = {
-  heading(level: 1)[#publication.title]
+  render-target(
+    publication.at("article_title_target_id", default: none),
+    heading(level: 1)[#publication.title],
+  )
   render-publication-body(publication)
 }

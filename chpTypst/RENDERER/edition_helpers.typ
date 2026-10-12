@@ -1,6 +1,6 @@
 #import "../UTILS/colors.typ": purple
 #import "../UTILS/helpers.typ": article-indexing, better-link, styled-table, tag
-#import "publication_helpers.typ": render-publication-body
+#import "publication_helpers.typ": render-publication-body, render-target
 
 #let has-text(value) = value != none and value != ""
 
@@ -11,7 +11,10 @@
 
 #let render-article(publication) = [
   #pagebreak()
-  #heading(level: 1, numbering: none)[#publication.title] #label(publication.anchor)
+  #render-target(
+    publication.at("article_title_target_id", default: none),
+    [#heading(level: 1, numbering: none)[#publication.title] #label(publication.anchor)],
+  )
   #grid(
     columns: (1fr, auto),
     align: (left, right),
@@ -24,7 +27,10 @@
 
 #let render-brief(publication) = [
   #pagebreak()
-  #heading(level: 2, numbering: none)[#publication.title] #label(publication.anchor)
+  #render-target(
+    publication.at("article_title_target_id", default: none),
+    [#heading(level: 2, numbering: none)[#publication.title] #label(publication.anchor)],
+  )
   #grid(
     columns: (1fr, auto),
     align: (left, right),

@@ -6,6 +6,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 from cti_app.application.edition_document import (
@@ -20,8 +21,12 @@ from cti_app.application.edition_review import (
 )
 from cti_app.application.edition_typst_rendering import EditionTypstRenderer
 from cti_app.application.media_assets import MediaAssetStore
+from cti_app.application.pdf_mapping import mapping_cache_key
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.render_target_identities import (
+    publication_target_artifact_identities,
+)
 from cti_app.application.typst_compilation import (
     FontBundleInvalidError,
     TypstCompilationError,
@@ -34,8 +39,10 @@ from cti_app.application.typst_render_execution import (
     load_typst_render_bundle_snapshots,
     translate_execution_error,
 )
+from cti_app.application.typst_render_lifecycle import TypstMappingSidecarCache
 from cti_app.application.typst_rendering import TemplateBundleInvalidError
 from cti_app.domain.edition_publication import EditionDocumentV2
+from cti_app.domain.edition_render import EDITION_RENDERER_VERSION
 from cti_app.domain.editions import Edition
 
 EDITION_RENDERER_MANIFEST = "edition-renderer-manifest.json"
@@ -129,6 +136,7 @@ class EditionPreviewPdfRenderer:
         chp_typst_root: Path,
         font_bundle_root: Path,
         typst_fonts_lock_path: Path,
+        mapping_cache: TypstMappingSidecarCache | None = None,
     ) -> None:
         self._renderer = renderer
         self._executor = TypstRenderExecutor(
@@ -138,8 +146,15 @@ class EditionPreviewPdfRenderer:
         self._chp_typst_root = chp_typst_root
         self._font_bundle_root = font_bundle_root
         self._typst_fonts_lock_path = typst_fonts_lock_path
+        self._mapping_cache = mapping_cache
 
-    async def render(self, document: EditionDocumentV2) -> bytes:
+    async def render(
+        self,
+        document: EditionDocumentV2,
+        *,
+        artifact_identities: dict[str, dict[str, object]] | None = None,
+        preview_input_hash: str | None = None,
+    ) -> bytes:
         try:
             template_bundle, font_bundle = load_typst_render_bundle_snapshots(
                 chp_typst_root=self._chp_typst_root,
@@ -155,7 +170,11 @@ class EditionPreviewPdfRenderer:
             ) from exc
 
         try:
-            render_source = self._renderer.render(document, template_bundle)
+            render_source = self._renderer.render(
+                document,
+                template_bundle,
+                artifact_identities=artifact_identities,
+            )
         except TemplateBundleInvalidError as exc:
             raise EditionPreviewTemplateInvalidError(str(exc)) from exc
         except ValueError as exc:
@@ -173,6 +192,38 @@ class EditionPreviewPdfRenderer:
                 font_bundle=font_bundle,
                 resolved_media=resolved_media,
             )
+            if (
+                self._mapping_cache is not None
+                and preview_input_hash is not None
+                and (render_source.mapping_targets or render_source.mapping_unmapped)
+                and executed.location_metadata is not None
+            ):
+                try:
+                    query_result = json.loads(executed.location_metadata)
+                    if isinstance(query_result, list):
+                        sidecar = json.dumps(
+                            {
+                                "pdf_sha256": executed.compiled_document.sha256,
+                                "renderer_version": EDITION_RENDERER_VERSION,
+                                "render_id": preview_input_hash,
+                                "targets": render_source.mapping_targets,
+                                "unmapped": render_source.mapping_unmapped,
+                                "query": query_result,
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                        self._mapping_cache.put_derived(
+                            mapping_cache_key(
+                                executed.compiled_document.sha256,
+                                EDITION_RENDERER_VERSION,
+                                preview_input_hash,
+                            ),
+                            sidecar,
+                        )
+                except Exception:
+                    pass
         except TypstRenderExecutionError as exc:
             raise translate_execution_error(exc, _PREVIEW_EXECUTION_ERRORS) from exc
         except TypstCompilationError as exc:
@@ -292,7 +343,25 @@ class EditionPreviewService:
                 "Typst PDF preview is not configured",
                 code="edition_preview_pdf_unavailable",
             )
-        content = await self._pdf_renderer.render(preview.document)
+        artifact_identities: dict[str, dict[str, Any]] = {}
+        async with self._uow_factory() as uow:
+            for item in preview.artifacts:
+                publication_artifact = await uow.production_artifacts.get(item.artifact_id)
+                artifact_identities[str(item.subject_id)] = (
+                    await publication_target_artifact_identities(
+                        uow.production_artifacts,
+                        publication_artifact,
+                        expected_publication_version=item.artifact_version,
+                        expected_publication_input_hash=item.input_hash,
+                    )
+                    if publication_artifact is not None
+                    else {}
+                )
+        content = await self._pdf_renderer.render(
+            preview.document,
+            artifact_identities=artifact_identities,
+            preview_input_hash=preview.preview_input_hash,
+        )
         return EditionPreviewPdf(
             content=content,
             filename=edition.bulletin_pdf_filename(preview=True),

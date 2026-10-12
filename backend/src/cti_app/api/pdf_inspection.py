@@ -108,7 +108,7 @@ class PdfDiagnostic(BaseModel):
     class_: PdfDiagnosticClass = Field(alias="class")
     page: int | None
     measurement: dict[str, Any]
-    target: None = None
+    target: dict[str, Any] | None = None
 
 
 class PdfDiagnosticCounts(BaseModel):
@@ -127,11 +127,65 @@ class PdfDiagnostics(BaseModel):
     items: list[PdfDiagnostic]
 
 
+class PdfMappingRevisionChannel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    family: str
+    operations: list[str]
+
+
+class PdfMappingTarget(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    subject_id: UUID
+    artifact_id: UUID
+    artifact_version: int
+    artifact_input_hash: str
+    block_type: str
+    block_key: str
+    revision_channel: PdfMappingRevisionChannel | None = None
+
+
+class PdfMappingBox(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    x: float
+    y: float
+    width: float
+    height: float
+
+
+class PdfMappingLocation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    page: int
+    bbox_points: PdfMappingBox
+
+
+class PdfMappingItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    target_id: str
+    target: PdfMappingTarget
+    locations: list[PdfMappingLocation]
+    mapping_quality: Literal["canonical_block_key"]
+
+
+class PdfMappingUnmapped(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    block_type: str
+    reason: str
+    count: int
+
+
 class PdfMapping(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     status: PdfMappingStatus
-    items: list[Any] = Field(default_factory=list, max_length=0)
+    reason: str | None = None
+    items: list[PdfMappingItem] = Field(default_factory=list)
+    unmapped: list[PdfMappingUnmapped] = Field(default_factory=list)
 
 
 class PdfInspectionResponse(BaseModel):

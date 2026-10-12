@@ -319,9 +319,13 @@ class FakeRenderer:
         self.call_count = 0
 
     def render(
-        self, document: PublicationDocumentV4, template_bundle: TypstTemplateBundle
+        self,
+        document: PublicationDocumentV4,
+        template_bundle: TypstTemplateBundle,
+        *,
+        target_artifact_identities: dict[str, dict[str, Any]] | None = None,
     ) -> TypstRenderSource:
-        del document
+        del document, target_artifact_identities
         self.call_count += 1
         source_bytes = next(
             file.content
@@ -767,7 +771,7 @@ async def test_render_uses_the_loaded_template_and_font_snapshots(
     assert PUBLICATION_RENDER_POLICY_VERSION == "typst-publication-v7-chapsvision-cited-context"
     assert (
         publication_rendering.PUBLICATION_RENDERER_VERSION
-        == "publication-v7-typst-v5-chapsvision-cited-context"
+        == "publication-v8-typst-v5-block-location"
     )
     expected_templates = {file.relative_path: file.content for file in template_bundle.files}
     observed_templates = {

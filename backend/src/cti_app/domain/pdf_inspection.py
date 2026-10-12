@@ -33,3 +33,5 @@ class PdfRasterStatus(StrEnum):
 
 class PdfMappingStatus(StrEnum):
     NOT_AVAILABLE = "not_available"
+    PARTIAL = "partial"
+    UNVERIFIED = "unverified"

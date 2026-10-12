@@ -14,6 +14,9 @@ from cti_app.application.persistence import PublicationRenderUnitOfWorkFactory
 from cti_app.application.production_artifact_store import (
     ProductionArtifactStore,
 )
+from cti_app.application.render_target_identities import (
+    publication_target_artifact_identities,
+)
 from cti_app.application.typst_compilation import (
     TYPST_COMPILER,
     TYPST_COMPILER_VERSION,
@@ -25,6 +28,7 @@ from cti_app.application.typst_compilation import (
 )
 from cti_app.application.typst_render_execution import TypstRenderExecutionErrorTypes
 from cti_app.application.typst_render_lifecycle import (
+    TypstMappingSidecarCache,
     TypstRenderBuckets,
     TypstRenderError,
     TypstRenderErrors,
@@ -50,7 +54,7 @@ from cti_app.domain.publication_render import (
 from cti_app.domain.typst_render import TypstRenderFormat, TypstRenderStatus
 
 PUBLICATION_RENDERER = "typst"
-PUBLICATION_RENDERER_VERSION = "publication-v7-typst-v5-chapsvision-cited-context"
+PUBLICATION_RENDERER_VERSION = "publication-v8-typst-v5-block-location"
 
 PUBLICATION_RENDER_BUCKETS = TypstRenderBuckets(
     source="publication-renders-source",
@@ -148,6 +152,7 @@ class PublicationRenderService:
         chp_typst_root: Path,
         font_bundle_root: Path,
         typst_fonts_lock_path: Path,
+        mapping_cache: TypstMappingSidecarCache | None = None,
         wait_poll_interval_seconds: float = 0.1,
         wait_timeout_seconds: float = 60.0,
         running_lease_seconds: float = 300.0,
@@ -166,6 +171,7 @@ class PublicationRenderService:
             compiler=compiler,
             buckets=PUBLICATION_RENDER_BUCKETS,
             errors=_PUBLICATION_RENDER_ERRORS,
+            mapping_cache=mapping_cache,
             wait_poll_interval_seconds=wait_poll_interval_seconds,
             wait_timeout_seconds=wait_timeout_seconds,
             running_lease_seconds=running_lease_seconds,
@@ -233,6 +239,9 @@ class PublicationRenderService:
                     "Publication render requires a verified PUBLICATION artifact "
                     "with a canonical blob"
                 )
+            target_artifact_identities = await publication_target_artifact_identities(
+                uow.production_artifacts, artifact
+            )
             await uow.commit()
 
         try:
@@ -307,7 +316,11 @@ class PublicationRenderService:
 
         def build_source() -> TypstRenderSource:
             try:
-                return self._renderer.render(document, template_bundle)
+                return self._renderer.render(
+                    document,
+                    template_bundle,
+                    target_artifact_identities=target_artifact_identities,
+                )
             except TemplateBundleInvalidError as exc:
                 raise PublicationRenderTemplateInvalidError(str(exc)) from exc
             except ValueError as exc:

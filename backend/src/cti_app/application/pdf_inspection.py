@@ -8,6 +8,8 @@ from dataclasses import asdict, dataclass
 from typing import Any, Protocol
 from uuid import UUID
 
+from cti_app.application.pdf_mapping import build_mapping_projection, mapping_cache_key
+from cti_app.domain.edition_render import EDITION_RENDERER_VERSION
 from cti_app.domain.pdf_inspection import (
     PdfDiagnosticClass,
     PdfInspectionAvailability,
@@ -26,7 +28,9 @@ PREVIEW_MAX_EDGE_PX = 1600
 THUMBNAIL_MAX_EDGE_PX = 480
 LOW_OCCUPANCY_THRESHOLD = 0.35
 INSPECTION_POLICY_VERSION = "pdf-inspection-policy-v1"
-DIAGNOSTICS_VERSION = "pdf-diagnostics-v1"
+DIAGNOSTICS_VERSION = "pdf-diagnostics-v2"
+BLOCK_TOO_SMALL_MIN_WIDTH_POINTS = 120.0
+BLOCK_TOO_SMALL_MIN_HEIGHT_POINTS = 72.0
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _PAGE_REQUEST_SEMAPHORE = asyncio.Semaphore(2)
 
@@ -162,6 +166,7 @@ class PdfInspectionService:
     async def metadata(self, pdf_sha256: str) -> dict[str, Any]:
         source = await self._resolve(pdf_sha256)
         inspection = await self._inspection(source.content, pdf_sha256)
+        mapping = await self._mapping(source, pdf_sha256)
         size_points = (
             [inspection.page_width_points, inspection.page_height_points]
             if inspection.page_width_points is not None
@@ -278,6 +283,8 @@ class PdfInspectionService:
                         }
                     )
 
+        diagnostics.extend(self._localized_block_diagnostics(mapping))
+
         dimensions_extreme = size_points is not None and self._extreme_dimensions(
             float(size_points[0]), float(size_points[1])
         )
@@ -354,8 +361,154 @@ class PdfInspectionService:
                 },
                 "items": diagnostics,
             },
-            "mapping": {"status": PdfMappingStatus.NOT_AVAILABLE, "items": []},
+            "mapping": mapping,
         }
+
+    async def _mapping(
+        self,
+        source: PdfInspectionSource,
+        requested_pdf_sha256: str,
+    ) -> dict[str, Any]:
+        sidecars: list[dict[str, Any]] = []
+        for provenance in source.provenances:
+            render = provenance.render
+            if render is None and provenance.source.get("kind") == "edition_preview":
+                renderer_version = EDITION_RENDERER_VERSION
+                render_id = str(provenance.source.get("preview_input_hash", ""))
+            elif render is not None:
+                renderer_version = render.renderer_version
+                render_id = str(render.id)
+            else:
+                continue
+            if not render_id:
+                continue
+            raw = self._cache.get_derived(
+                mapping_cache_key(requested_pdf_sha256, renderer_version, render_id)
+            )
+            if raw is None:
+                continue
+            try:
+                payload = json.loads(raw)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if (
+                payload.get("pdf_sha256") != requested_pdf_sha256
+                or payload.get("renderer_version") != renderer_version
+                or payload.get("render_id") != render_id
+            ):
+                return {
+                    "status": PdfMappingStatus.UNVERIFIED,
+                    "reason": "mapping_sidecar_provenance_mismatch",
+                    "items": [],
+                    "unmapped": [],
+                }
+            sidecars.append(payload)
+
+        if not sidecars:
+            return {
+                "status": PdfMappingStatus.NOT_AVAILABLE,
+                "reason": "location_sidecar_unavailable",
+                "items": [],
+                "unmapped": [],
+            }
+
+        projections: list[dict[str, Any]] = []
+        for sidecar in sidecars:
+            descriptors = sidecar.get("targets")
+            unmapped = sidecar.get("unmapped")
+            query_result = sidecar.get("query")
+            if not isinstance(descriptors, list):
+                continue
+            pages: set[int] = set()
+            if isinstance(query_result, list):
+                for row in query_result:
+                    if not isinstance(row, dict) or not isinstance(row.get("value"), dict):
+                        continue
+                    value = row["value"]
+                    if isinstance(value.get("page"), int) and value["page"] > 0:
+                        pages.add(value["page"])
+            page_sizes: dict[int, tuple[float, float]] = {}
+            for page in sorted(pages):
+                try:
+                    size = await self._processor.page_size(source.content, page)
+                except Exception:
+                    size = None
+                if size is not None:
+                    page_sizes[page] = size
+            projections.append(
+                build_mapping_projection(
+                    pdf_sha256=str(sidecar.get("pdf_sha256", "")),
+                    requested_pdf_sha256=requested_pdf_sha256,
+                    descriptors=descriptors,
+                    unmapped=unmapped if isinstance(unmapped, list) else [],
+                    query_result=query_result,
+                    page_sizes=page_sizes,
+                )
+            )
+
+        if not projections:
+            return {
+                "status": PdfMappingStatus.NOT_AVAILABLE,
+                "reason": "location_sidecar_invalid",
+                "items": [],
+                "unmapped": [],
+            }
+        items = [item for projection in projections for item in projection["items"]]
+        unmapped_items = [item for projection in projections for item in projection["unmapped"]]
+        if not items:
+            return {
+                "status": PdfMappingStatus.NOT_AVAILABLE,
+                "reason": "layout_location_unavailable",
+                "items": [],
+                "unmapped": unmapped_items,
+            }
+        return {
+            "status": PdfMappingStatus.PARTIAL,
+            "reason": None,
+            "items": items,
+            "unmapped": unmapped_items,
+        }
+
+    @staticmethod
+    def _localized_block_diagnostics(mapping: dict[str, Any]) -> list[dict[str, Any]]:
+        findings: list[dict[str, Any]] = []
+        for item in mapping.get("items", []):
+            target = item.get("target", {})
+            block_type = target.get("block_type")
+            if block_type not in {"diagram", "chart", "source_figure"}:
+                continue
+            for location in item.get("locations", []):
+                bbox = location.get("bbox_points", {})
+                width = bbox.get("width")
+                height = bbox.get("height")
+                if not isinstance(width, (int, float)) or not isinstance(height, (int, float)):
+                    continue
+                if (
+                    width >= BLOCK_TOO_SMALL_MIN_WIDTH_POINTS
+                    and height >= BLOCK_TOO_SMALL_MIN_HEIGHT_POINTS
+                ):
+                    continue
+                findings.append(
+                    {
+                        "code": "block_too_small",
+                        "class": PdfDiagnosticClass.DETERMINISTIC,
+                        "page": location.get("page"),
+                        "measurement": {
+                            "width_points": width,
+                            "height_points": height,
+                            "minimum_width_points": BLOCK_TOO_SMALL_MIN_WIDTH_POINTS,
+                            "minimum_height_points": BLOCK_TOO_SMALL_MIN_HEIGHT_POINTS,
+                            "basis": "Typst measured layout slot for a canonical figure block",
+                        },
+                        "target": {
+                            "target_id": item.get("target_id"),
+                            **dict(target),
+                        },
+                    }
+                )
+        return findings
 
     async def page_png(
         self,
