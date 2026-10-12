@@ -20,7 +20,6 @@ from cti_app.application.model_gateway import (
     AdapterResult,
     AdapterResultStatus,
     ConversationResult,
-    ModelAdapter,
     ModelCapabilities,
     ModelCapabilityError,
     ModelGatewayError,
@@ -1562,8 +1561,3 @@ def _bridge_extensions(request: SafeModelRequest) -> dict[str, Any]:
 
 def _allowed_parameters(parameters: dict[str, Any], allowed: frozenset[str]) -> dict[str, Any]:
     return {key: value for key, value in parameters.items() if key in allowed}
-
-
-def assert_adapter_contract(adapter: ModelAdapter) -> None:
-    if not adapter.requested_model or not isinstance(adapter.is_external, bool):
-        raise TypeError("Model adapter contract is incomplete")
