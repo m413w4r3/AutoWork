@@ -61,7 +61,6 @@ jobs:
       - run: uv run ruff format --check .
       - run: uv run mypy src tests
       - run: uv run pytest -m "not workflow_fast and not workflow_full"
-      # W10 will add a separate workflow-browser job when the browser scenario exists.
       - name: Workflow emulator — FAST gate
         if: always()
         run: make -C .. test-workflow
@@ -89,7 +88,7 @@ jobs:
             uv run --no-sync --python 3.12 -- python -I ../scripts/ci/check_workflow_results.py \
               --junitxml "$results/junit.xml" \
               --expression workflow_full \
-              --min-count 1 \
+              --min-count 4 \
               --uv uv; then
             guard_status=0
           else
@@ -163,6 +162,57 @@ jobs:
       - run: pnpm build
       - run: pnpm exec playwright install --with-deps chromium
       - run: pnpm test:e2e
+
+  workflow-browser:
+    name: Workflow W10 — browser with real PostgreSQL backend
+    runs-on: ubuntu-latest
+    env:
+      TEST_POSTGRES_ADMIN_DSN: postgresql+asyncpg://postgres:postgres@localhost:5432/postgres
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.15.0
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+      - name: Install Playwright Chromium
+        working-directory: frontend
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Workflow W10 — real-backend browser exclusion
+        run: make test-workflow-browser
+      - name: Upload W10 browser report and trace
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: workflow-browser-evidence
+          path: var/workflow-results/browser/
+          if-no-files-found: warn
+          retention-days: 3
 
   compose:
     runs-on: ubuntu-latest

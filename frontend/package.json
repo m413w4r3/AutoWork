@@ -11,7 +11,8 @@
     "typecheck": "tsc -b --pretty false",
     "format": "prettier --write .",
     "test": "vitest",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "test:e2e:real": "playwright test -c playwright.real.config.ts"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.85.5",

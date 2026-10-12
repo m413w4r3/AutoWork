@@ -18,6 +18,8 @@
     "vite.config.ts",
     "eslint.config.js",
     "playwright.config.ts",
-    "e2e"
+    "playwright.real.config.ts",
+    "e2e",
+    "e2e-real"
   ]
 }

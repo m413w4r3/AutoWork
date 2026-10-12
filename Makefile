@@ -95,7 +95,7 @@ INTEGRATION_PYTEST_ARGS ?=
 # Workflow emulator gate floors are based on the scenarios present today.
 # Raise these when adding a scenario with the matching marker.
 WORKFLOW_FAST_MIN ?= 7
-WORKFLOW_FULL_MIN ?= 8
+WORKFLOW_FULL_MIN ?= 11
 WORKFLOW_RESULTS_DIR ?= $(CURDIR)/var/workflow-results
 
 # Optional command prefix used to measure the pytest process (for example,
@@ -143,6 +143,7 @@ CLEAN_PATHS := \
 	test-integration \
 	test-workflow \
 	test-workflow-full \
+	test-workflow-browser \
 	test-ci-scripts \
 	measure-workflow \
 	integration-db-up \
@@ -318,6 +319,72 @@ test-frontend: frontend-sync ## Lance les tests frontend
 
 test-frontend-e2e: frontend-sync ## Lance les tests Playwright frontend
 	cd $(FRONTEND_DIR) && $(PNPM) exec playwright test
+
+test-workflow-browser: backend-sync frontend-sync ## Vérifie W10 au navigateur avec PostgreSQL réel jetable
+	@set -eu; \
+	if [ -z "$${TEST_POSTGRES_ADMIN_DSN:-}" ]; then \
+		echo "ERREUR: TEST_POSTGRES_ADMIN_DSN est requis pour test-workflow-browser." >&2; \
+		exit 2; \
+	fi; \
+	results="$(abspath $(WORKFLOW_RESULTS_DIR))/browser"; \
+	api_port="$${WORKFLOW_BROWSER_API_PORT:-18765}"; \
+	state="$$results/state.json"; \
+	server_log="$$results/server.log"; \
+	mkdir -p "$$results"; \
+	rm -f -- "$$state"; \
+	export WORKFLOW_BROWSER_STATE="$$state"; \
+	export WORKFLOW_BROWSER_API_PORT="$$api_port"; \
+	export VITE_API_PROXY_TARGET="http://127.0.0.1:$$api_port"; \
+	export WORKFLOW_BROWSER_OUTPUT_DIR="$$results/playwright-results"; \
+	started_at="$$(date +%s)"; \
+	(cd $(BACKEND_DIR) && exec $(UV_RUN) python -m tests.workflow_emulator.browser_server) >"$$server_log" 2>&1 & \
+	server_pid=$$!; \
+	status=0; \
+	cleanup() { \
+		result=$$?; \
+		stop_requested=0; \
+		trap - EXIT; \
+		if kill -0 "$$server_pid" 2>/dev/null; then \
+			if curl --silent --fail --request POST "http://127.0.0.1:$$api_port/__workflow_browser/shutdown" >/dev/null; then \
+				stop_requested=1; \
+			else \
+				if ! kill -TERM "$$server_pid"; then \
+					echo "ERREUR: impossible d'arrêter le serveur W10." >&2; \
+					if [ "$$result" -eq 0 ]; then result=1; fi; \
+				else \
+					stop_requested=1; \
+				fi; \
+			fi; \
+		fi; \
+		if wait "$$server_pid"; then :; else \
+			server_status=$$?; \
+			if [ "$$result" -eq 0 ] && [ "$$stop_requested" -eq 0 ]; then result=$$server_status; fi; \
+		fi; \
+		exit "$$result"; \
+	}; \
+	trap cleanup EXIT; \
+	trap 'exit 130' INT; \
+	trap 'exit 143' TERM; \
+	ready=0; \
+	attempt=0; \
+	while [ "$$attempt" -lt 90 ]; do \
+		if curl --silent --fail "http://127.0.0.1:$$api_port/api/health" >/dev/null; then ready=1; break; fi; \
+		if ! kill -0 "$$server_pid" 2>/dev/null; then break; fi; \
+		sleep 1; \
+		attempt=$$((attempt + 1)); \
+	done; \
+	if [ "$$ready" -ne 1 ]; then \
+		echo "ERREUR: serveur W10 indisponible sur le port $$api_port; journal:" >&2; \
+		sed -n '1,240p' "$$server_log" >&2; \
+		exit 1; \
+	fi; \
+	if (cd $(FRONTEND_DIR) && $(PNPM) exec playwright test -c playwright.real.config.ts); then :; else status=$$?; fi; \
+	if [ "$$status" -eq 0 ]; then \
+		if (cd $(BACKEND_DIR) && $(UV_RUN) python -m tests.workflow_emulator.browser_verify); then :; else status=$$?; fi; \
+	fi; \
+	finished_at="$$(date +%s)"; \
+	echo "W10-browser-exclusion / elapsed_seconds=$$((finished_at - started_at))"; \
+	exit "$$status"
 
 test: test-backend test-frontend ## Lance les tests rapides backend + frontend
 
