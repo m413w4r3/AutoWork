@@ -145,7 +145,7 @@ async def _seed(uow_factory: UnitOfWorkFactory, tmp_path: Path) -> _Fixture:
     )
     subject = Subject(
         edition_id=edition.id,
-        title="LOT 34",
+        title="[Groupe] LOT 34",
         slug=f"lot34-{uuid4().hex}",
         tlp=TLP.AMBER,
     )
