@@ -8,7 +8,6 @@ import hashlib
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from html.parser import HTMLParser
 from typing import Protocol
 from urllib.parse import unquote_to_bytes
 from uuid import UUID
@@ -165,21 +164,6 @@ class SourceFigureInventoryResult:
         if not self.figures and not self.truncated and not self.warnings:
             return None
         return self.content_hash()
-
-
-class _ImageElementParser(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.images: list[tuple[str | None, str | None]] = []
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag.casefold() != "img":
-            return
-        values = {name.casefold(): value for name, value in attrs}
-        self.images.append((values.get("src"), values.get("alt") or values.get("title")))
-
-    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        self.handle_starttag(tag, attrs)
 
 
 class SourceFigureInventory:
