@@ -1,5 +1,8 @@
 # Run réel CTI — audit et plan de correction de la qualité
 
+**HISTORIQUE — 2026-10-02.** Audit ponctuel de l’état `08c89f0` ; ses constats
+ne décrivent pas nécessairement le code courant.
+
 Date : 2 octobre 2026. État examiné : HEAD `08c89f0`, avec les modifications non commitées présentes. Livrable : analyse et plan ; aucune correction applicative, aucun commit, aucune relance de production effectuée dans cet audit.
 
 ## 1. Conclusion et ordre de priorité
@@ -16,7 +19,7 @@ L'ordre recommandé est :
 
 L'accès Internet est utile pour rechercher une preuve ou une figure manquante. Il doit alimenter une collecte archivée, puis les étapes canoniques concernées. Activer uniquement `web_search=True` dans l'enrichissement ne résout ni la collecte des images, ni la contradiction entre sources, ni la pauvreté du corpus.
 
-Les numéros L0 à L9 ci-dessous désignent les lots de ce document, sans créer de nouveaux tickets AW. Le [plan architectural historique](../references/plan.md) reste une référence de contexte ; plusieurs de ses constats décrivent désormais un état antérieur au code audité.
+Les numéros L0 à L9 ci-dessous désignent les lots de ce document, sans créer de nouveaux tickets AW. Les constats sont ceux de l’état examiné et doivent être revérifiés contre le code courant avant toute reprise.
 
 ## 2. Preuves et limites de l'audit
 
