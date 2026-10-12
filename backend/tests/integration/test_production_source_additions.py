@@ -119,13 +119,18 @@ from tests.test_production_extraction_service import _StructuredGateway
 pytestmark = pytest.mark.integration
 
 
+def _country_code_from_uuid(unique: UUID) -> str:
+    return "".join(chr(ord("A") + ((unique.int >> shift) % 26)) for shift in (0, 8))
+
+
 @pytest.mark.asyncio
 async def test_source_addition_repository_round_trips_immutable_versions(
     uow_factory: UnitOfWorkFactory,
 ) -> None:
+    country_code = _country_code_from_uuid(uuid4())
     edition = Edition(
-        country="France",
-        country_code="FR",
+        country=f"Additionland {country_code}",
+        country_code=country_code,
         period_start=date(2026, 8, 1),
         period_end=date(2026, 8, 31),
         tlp=TLP.AMBER,
@@ -144,7 +149,7 @@ async def test_source_addition_repository_round_trips_immutable_versions(
         current_stage=ProductionStage.ASSEMBLY,
     )
     async with uow_factory() as uow:
-        await uow.editions.add_if_absent(edition)
+        assert await uow.editions.add_if_absent(edition)
         await uow.subjects.add(subject)
         await uow.production_runs.add(run)
         await uow.commit()
@@ -191,9 +196,10 @@ async def test_source_addition_repository_round_trips_immutable_versions(
 async def test_source_addition_and_promotion_artifact_rollback_in_one_postgres_uow(
     uow_factory: UnitOfWorkFactory,
 ) -> None:
+    country_code = _country_code_from_uuid(uuid4())
     edition = Edition(
-        country="France",
-        country_code="FR",
+        country=f"Additionland {country_code}",
+        country_code=country_code,
         period_start=date(2026, 9, 1),
         period_end=date(2026, 9, 30),
         tlp=TLP.AMBER,
@@ -212,7 +218,7 @@ async def test_source_addition_and_promotion_artifact_rollback_in_one_postgres_u
         current_stage=ProductionStage.ASSEMBLY,
     )
     async with uow_factory() as uow:
-        await uow.editions.add_if_absent(edition)
+        assert await uow.editions.add_if_absent(edition)
         await uow.commit()
     async with uow_factory() as uow:
         await uow.subjects.add(subject)
@@ -310,7 +316,7 @@ async def _seed_real_source_addition_service(
     tmp_path,
 ) -> SimpleNamespace:
     unique = uuid4()
-    country_code = "".join(chr(ord("A") + ((unique.int >> shift) % 26)) for shift in (0, 8))
+    country_code = _country_code_from_uuid(unique)
     edition = Edition(
         country=f"Additionland {country_code}",
         country_code=country_code,
