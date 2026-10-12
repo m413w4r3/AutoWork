@@ -212,12 +212,28 @@ export interface ReviewItem {
 
 export type EditionReviewItem = ReviewItem;
 
+export interface EditionReviewExclusion {
+  subject_id: string;
+  title: string;
+  decision_id: string | null;
+  applicable: boolean;
+  actor_id: string | null;
+  reason: string | null;
+  occurred_at: string | null;
+  run_id: string | null;
+  document_artifact_id: string | null;
+  document_artifact_version: number | null;
+  document_input_hash: string | null;
+  pipeline_generation: number | null;
+}
+
 export interface EditionReview {
   edition_id: string;
   items: ReviewItem[];
   can_accept: boolean;
   composition_version?: number | null;
   diagnostics?: EditionReviewDiagnostic[];
+  exclusions?: EditionReviewExclusion[];
   unresolved_repair_count?: number;
   repair_review_complete?: boolean;
   pending_rebuild_count?: number;
@@ -410,8 +426,8 @@ export interface ReviewDecision {
   id: string;
   edition_id: string;
   subject_id: string;
-  production_run_id: string;
-  pipeline_generation: number;
+  production_run_id: string | null;
+  pipeline_generation: number | null;
   document_artifact_id: string | null;
   document_artifact_version: number | null;
   document_input_hash: string | null;
@@ -798,39 +814,6 @@ export async function excludeReviewItem(
         document_artifact_version: item.document_artifact_version,
         document_input_hash: item.document_input_hash,
         reason: reason.trim(),
-      }),
-    },
-  );
-}
-
-export async function excludeCompositionArtifact(
-  editionId: string,
-  identity: {
-    subjectId: string;
-    productionRunId: string;
-    pipelineGeneration: number;
-    artifactId: string;
-    artifactVersion: number;
-    inputHash: string;
-  },
-  reason: string,
-): Promise<ReviewDecision> {
-  const normalizedReason = reason.trim();
-  if (!normalizedReason) {
-    throw new Error("Un motif est obligatoire pour exclure un sujet.");
-  }
-  return request(
-    `/api/editions/${encodeURIComponent(editionId)}/review/items/${encodeURIComponent(identity.subjectId)}/exclude`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        production_run_id: identity.productionRunId,
-        pipeline_generation: identity.pipelineGeneration,
-        document_artifact_id: identity.artifactId,
-        document_artifact_version: identity.artifactVersion,
-        document_input_hash: identity.inputHash,
-        reason: normalizedReason,
       }),
     },
   );

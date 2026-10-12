@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -24,7 +24,12 @@ from cti_app.domain.edition_composition import (
     composition_snapshot,
 )
 from cti_app.domain.editions import Edition, EditionStatus
-from cti_app.domain.production import ProductionArtifactStatus, ProductionRunStatus
+from cti_app.domain.production import (
+    ProductionArtifactStage,
+    ProductionArtifactStatus,
+    ProductionRunStatus,
+)
+from cti_app.domain.publication_review import PublicationDecision, PublicationReviewDecision
 
 
 class EditionCompositionError(Exception):
@@ -34,6 +39,11 @@ class EditionCompositionError(Exception):
 
 class CompositionNotFound(EditionCompositionError):
     code = "edition_not_found"
+    status_code = 404
+
+
+class CompositionSubjectNotFound(EditionCompositionError):
+    code = "subject_not_found"
     status_code = 404
 
 
@@ -56,6 +66,16 @@ class CompositionIdempotencyConflict(EditionCompositionError):
     status_code = 409
 
 
+class CompositionExclusionReasonRequired(EditionCompositionError):
+    code = "exclusion_reason_required"
+    status_code = 422
+
+
+class CompositionExclusionReasonTooLong(EditionCompositionError):
+    code = "exclusion_reason_too_long"
+    status_code = 422
+
+
 class CompositionEditionArchived(EditionCompositionError):
     code = "composition_edition_archived"
     status_code = 409
@@ -68,6 +88,8 @@ class CompositionReferenceError(EditionCompositionError):
     def __init__(self, reason: str, subject_id: UUID | None = None) -> None:
         self.reason = reason
         self.subject_id = subject_id
+        if reason == "review_decision_identity_mismatch":
+            self.code = reason
         super().__init__(reason)
 
 
@@ -177,6 +199,9 @@ class CompositionUnitOfWork(Protocol):
     editions: Any
     edition_compositions: EditionCompositionRepository
     edition_composition_events: EditionCompositionEventRepository
+    production_runs: Any
+    production_artifacts: Any
+    publication_review_decisions: Any
 
     async def __aenter__(self) -> CompositionUnitOfWork: ...
 
@@ -404,6 +429,95 @@ class EditionCompositionService:
             correlation_id=correlation_id,
         )
 
+    async def exclude_subject(
+        self,
+        edition_id: UUID,
+        subject_id: UUID,
+        *,
+        reason: str,
+        expected_version: int,
+        idempotency_key: str,
+        actor_id: str,
+        correlation_id: str,
+    ) -> tuple[EditionComposition, UUID]:
+        normalized_reason = reason.strip()
+        if not normalized_reason:
+            raise CompositionExclusionReasonRequired("an exclusion reason is required")
+        if len(normalized_reason) > 500:
+            raise CompositionExclusionReasonTooLong("exclusion reason must be at most 500 chars")
+
+        prepared_entry: EditionCompositionEntry | None = None
+
+        async def append_decision(
+            uow: Any, current_entries: tuple[EditionCompositionEntry, ...]
+        ) -> None:
+            nonlocal prepared_entry
+            selected_subjects = await uow.edition_compositions.list_subject_ids(edition_id)
+            if subject_id not in selected_subjects:
+                raise CompositionSubjectNotFound("subject does not belong to the edition")
+
+            identity = await _resolve_exclusion_identity(
+                uow,
+                edition_id,
+                subject_id,
+                current_entries,
+            )
+            decision = PublicationReviewDecision(
+                edition_id=edition_id,
+                subject_id=subject_id,
+                production_run_id=identity[0],
+                pipeline_generation=identity[1],
+                document_artifact_id=identity[2],
+                document_artifact_version=identity[3],
+                document_input_hash=identity[4],
+                decision=PublicationDecision.EXCLUDE,
+                actor_id=actor_id,
+                reason=normalized_reason,
+            )
+            await uow.publication_review_decisions.append(decision)
+            prepared_entry = EditionCompositionEntry(
+                subject_id=subject_id,
+                disposition=CompositionDisposition.EXCLUDED,
+                production_run_id=identity[0],
+                pipeline_generation=identity[1],
+                artifact_id=identity[2],
+                artifact_version=identity[3],
+                artifact_input_hash=identity[4],
+                review_decision_id=decision.id,
+            )
+
+        def replace_with_exclusion(
+            current_entries: tuple[EditionCompositionEntry, ...],
+        ) -> tuple[EditionCompositionEntry, ...]:
+            if prepared_entry is None:
+                raise RuntimeError("exclusion decision was not prepared")
+            remaining = tuple(entry for entry in current_entries if entry.subject_id != subject_id)
+            next_position = 1
+            normalized_entries: list[EditionCompositionEntry] = []
+            for entry in remaining:
+                if entry.disposition is CompositionDisposition.INCLUDED:
+                    entry = replace(entry, position=next_position)
+                    next_position += 1
+                normalized_entries.append(entry)
+            normalized_entries.append(prepared_entry)
+            return tuple(normalized_entries)
+
+        composition = await self._mutate(
+            edition_id,
+            CompositionMutationKind.EXCLUDE,
+            {"subject_id": str(subject_id), "reason": normalized_reason},
+            expected_version=expected_version,
+            idempotency_key=idempotency_key,
+            actor_id=actor_id,
+            correlation_id=correlation_id,
+            transform=replace_with_exclusion,
+            before_transform=append_decision,
+        )
+        excluded = next(entry for entry in composition.entries if entry.subject_id == subject_id)
+        if excluded.review_decision_id is None:
+            raise RuntimeError("excluded composition entry has no review decision")
+        return composition, excluded.review_decision_id
+
     async def reorder(
         self,
         edition_id: UUID,
@@ -494,6 +608,8 @@ class EditionCompositionService:
         transform: Callable[
             [tuple[EditionCompositionEntry, ...]], tuple[EditionCompositionEntry, ...]
         ],
+        before_transform: Callable[[Any, tuple[EditionCompositionEntry, ...]], Awaitable[None]]
+        | None = None,
     ) -> EditionComposition:
         _validate_command_identity(idempotency_key, actor_id, correlation_id)
         if expected_version < 0:
@@ -524,6 +640,8 @@ class EditionCompositionService:
                 raise CompositionVersionConflict(expected_version, current_version)
 
             current_entries = current.entries if current else ()
+            if before_transform is not None:
+                await before_transform(uow, current_entries)
             requested = tuple(transform(current_entries))
             _assert_unique_subjects(requested)
             references = await repository.validate_references(edition_id, requested, lock=True)
@@ -568,6 +686,148 @@ class EditionCompositionService:
             await event_repository.append(event)
             await uow.commit()
             return composition
+
+
+async def _resolve_exclusion_identity(
+    uow: Any,
+    edition_id: UUID,
+    subject_id: UUID,
+    current_entries: tuple[EditionCompositionEntry, ...],
+) -> tuple[UUID | None, int | None, UUID | None, int | None, str | None]:
+    included_entry = next(
+        (
+            entry
+            for entry in current_entries
+            if entry.subject_id == subject_id
+            and entry.disposition is CompositionDisposition.INCLUDED
+        ),
+        None,
+    )
+    run_repository = uow.production_runs
+    artifact_repository = uow.production_artifacts
+
+    async def lock_run(run_id: UUID) -> Any:
+        getter = getattr(run_repository, "get_for_update", None)
+        return await (getter(run_id) if callable(getter) else run_repository.get(run_id))
+
+    async def verified_publication(run_id: UUID) -> Any | None:
+        artifacts = await artifact_repository.list_for_run(run_id)
+        candidates = sorted(
+            (
+                artifact
+                for artifact in artifacts
+                if artifact.stage is ProductionArtifactStage.PUBLICATION
+                and artifact.status is ProductionArtifactStatus.VERIFIED
+            ),
+            key=lambda artifact: (artifact.version, str(artifact.id)),
+            reverse=True,
+        )
+        getter = getattr(artifact_repository, "get_for_update", None)
+        for candidate in candidates:
+            artifact = await (
+                getter(candidate.id) if callable(getter) else artifact_repository.get(candidate.id)
+            )
+            if (
+                artifact is not None
+                and artifact.production_run_id == run_id
+                and artifact.subject_id == subject_id
+                and artifact.stage is ProductionArtifactStage.PUBLICATION
+                and artifact.status is ProductionArtifactStatus.VERIFIED
+            ):
+                return artifact
+        return None
+
+    if included_entry is not None:
+        assert included_entry.production_run_id is not None
+        assert included_entry.pipeline_generation is not None
+        assert included_entry.artifact_id is not None
+        assert included_entry.artifact_version is not None
+        assert included_entry.artifact_input_hash is not None
+        run = await lock_run(included_entry.production_run_id)
+        artifact_getter = getattr(artifact_repository, "get_for_update", None)
+        artifact = await (
+            artifact_getter(included_entry.artifact_id)
+            if callable(artifact_getter)
+            else artifact_repository.get(included_entry.artifact_id)
+        )
+        if (
+            run is None
+            or run.edition_id != edition_id
+            or run.subject_id != subject_id
+            or run.pipeline_generation != included_entry.pipeline_generation
+            or artifact is None
+            or artifact.production_run_id != run.id
+            or artifact.subject_id != subject_id
+            or artifact.stage is not ProductionArtifactStage.PUBLICATION
+            or artifact.status is not ProductionArtifactStatus.VERIFIED
+            or artifact.version != included_entry.artifact_version
+            or artifact.input_hash != included_entry.artifact_input_hash
+        ):
+            raise CompositionReferenceError("publication_artifact_pin_mismatch", subject_id)
+        return (
+            run.id,
+            run.pipeline_generation,
+            artifact.id,
+            artifact.version,
+            artifact.input_hash,
+        )
+
+    creation_lock = getattr(run_repository, "lock_creation_for_subject", None)
+    if callable(creation_lock):
+        await creation_lock(subject_id)
+    runs = sorted(
+        (
+            run
+            for run in await run_repository.list_for_subject(subject_id)
+            if run.edition_id == edition_id
+        ),
+        key=lambda run: (run.run_number, str(run.id)),
+        reverse=True,
+    )
+
+    for candidate in runs:
+        if candidate.status is not ProductionRunStatus.READY:
+            continue
+        run = await lock_run(candidate.id)
+        if (
+            run is None
+            or run.edition_id != edition_id
+            or run.subject_id != subject_id
+            or run.status is not ProductionRunStatus.READY
+        ):
+            continue
+        artifact = await verified_publication(run.id)
+        if artifact is not None:
+            return (
+                run.id,
+                run.pipeline_generation,
+                artifact.id,
+                artifact.version,
+                artifact.input_hash,
+            )
+
+    eligible_without_document = {
+        ProductionRunStatus.FAILED,
+        ProductionRunStatus.NEEDS_REVIEW,
+        ProductionRunStatus.CANCELLED,
+    }
+    for candidate in runs:
+        if candidate.status not in eligible_without_document:
+            continue
+        run = await lock_run(candidate.id)
+        if (
+            run is None
+            or run.edition_id != edition_id
+            or run.subject_id != subject_id
+            or run.status not in eligible_without_document
+        ):
+            continue
+        if await verified_publication(run.id) is None:
+            return run.id, run.pipeline_generation, None, None, None
+
+    if runs:
+        raise CompositionReferenceError("production_run_not_exclusion_eligible", subject_id)
+    return None, None, None, None, None
 
 
 def _validate_command_identity(idempotency_key: str, actor_id: str, correlation_id: str) -> None:
@@ -622,23 +882,34 @@ def _validate_mutation_references(
                 or not state.run_subject_matches
             ):
                 raise CompositionReferenceError("production_run_not_in_edition", entry.subject_id)
-            if not state.artifact_exists:
-                raise CompositionReferenceError("publication_artifact_not_found", entry.subject_id)
-            if (
-                not state.artifact_run_matches
-                or not state.artifact_subject_matches
-                or state.artifact_stage != "publication"
-                or state.artifact_version != entry.artifact_version
-                or state.artifact_input_hash != entry.artifact_input_hash
-                or state.run_pipeline_generation != entry.pipeline_generation
-            ):
+            if state.run_pipeline_generation != entry.pipeline_generation:
                 raise CompositionReferenceError(
                     "publication_artifact_pin_mismatch", entry.subject_id
                 )
-            if state.artifact_status is not ProductionArtifactStatus.VERIFIED:
-                raise CompositionReferenceError(
-                    "publication_artifact_not_verified", entry.subject_id
-                )
+            if entry.artifact_id is None:
+                if entry.disposition is not CompositionDisposition.EXCLUDED:
+                    raise CompositionReferenceError(
+                        "publication_artifact_not_found", entry.subject_id
+                    )
+            else:
+                if not state.artifact_exists:
+                    raise CompositionReferenceError(
+                        "publication_artifact_not_found", entry.subject_id
+                    )
+                if (
+                    not state.artifact_run_matches
+                    or not state.artifact_subject_matches
+                    or state.artifact_stage != "publication"
+                    or state.artifact_version != entry.artifact_version
+                    or state.artifact_input_hash != entry.artifact_input_hash
+                ):
+                    raise CompositionReferenceError(
+                        "publication_artifact_pin_mismatch", entry.subject_id
+                    )
+                if state.artifact_status is not ProductionArtifactStatus.VERIFIED:
+                    raise CompositionReferenceError(
+                        "publication_artifact_not_verified", entry.subject_id
+                    )
         elif entry.disposition is CompositionDisposition.INCLUDED:
             raise CompositionReferenceError("production_run_not_in_edition", entry.subject_id)
         if entry.provenance_batch_id is not None:

@@ -69,7 +69,6 @@ from cti_app.domain.edition_render import EditionRender, EditionRenderDisplaySta
 from cti_app.domain.editions import Edition, EditionStatus
 from cti_app.domain.jobs import InvalidJobTransitionError, Job, JobStatus
 from cti_app.domain.production import ProductionArtifactStage, ProductionArtifactStatus
-from cti_app.domain.publication_review import PublicationDecision
 from cti_app.domain.typst_render import TypstRenderStatus
 
 logger = logging.getLogger(__name__)
@@ -796,6 +795,7 @@ async def _resolve_current_publication_inputs(
             raise PublicationAcceptanceError("composition_incomplete")
 
     review_by_subject = {item.subject_id: item for item in review.items}
+    exclusion_by_subject = {item.subject_id: item for item in review.exclusions}
     entries: list[PublicationManifestEntryV2] = []
     exclusions: list[PublicationManifestExclusionV1] = []
     for composition_entry in composition.entries:
@@ -836,7 +836,7 @@ async def _resolve_current_publication_inputs(
                 or artifact.canonical_blob_id is None
             ):
                 raise PublicationArtifactChangedDuringFreeze()
-            if validate_review and (not item.included or not review.can_accept):
+            if validate_review and (not item.included or item.blocking):
                 raise PublicationAcceptanceError("review_cannot_be_accepted")
             blob_repository = getattr(uow, "blobs", None)
             blob = (
@@ -886,13 +886,12 @@ async def _resolve_current_publication_inputs(
                 )
             )
         elif composition_entry.disposition is CompositionDisposition.EXCLUDED:
-            if composition_entry.review_decision_id is None:
-                raise PublicationAcceptanceError("excluded_item_has_no_decision")
-            exclusion_item = review_by_subject.get(composition_entry.subject_id)
+            exclusion = exclusion_by_subject.get(composition_entry.subject_id)
             if (
-                exclusion_item is None
-                or exclusion_item.effective_decision is not PublicationDecision.EXCLUDE
-                or exclusion_item.effective_decision_id != composition_entry.review_decision_id
+                composition_entry.review_decision_id is None
+                or exclusion is None
+                or not exclusion.applicable
+                or exclusion.decision_id != composition_entry.review_decision_id
             ):
                 raise PublicationAcceptanceError("excluded_item_has_no_decision")
             exclusions.append(
@@ -902,6 +901,8 @@ async def _resolve_current_publication_inputs(
                 )
             )
 
+    if validate_review and not review.can_accept:
+        raise PublicationAcceptanceError("review_cannot_be_accepted")
     if not entries:
         raise PublicationAcceptanceError("review_must_include_at_least_one_item")
     latest_composition = await uow.edition_compositions.get_for_edition(edition.id)

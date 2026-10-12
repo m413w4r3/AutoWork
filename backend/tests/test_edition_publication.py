@@ -38,6 +38,7 @@ from cti_app.application.edition_release_materialization import (
 )
 from cti_app.application.edition_rendering import EditionRenderParameters, EditionRenderService
 from cti_app.application.edition_review import (
+    EditionReviewExclusion,
     EditionReviewReadItem,
     EditionReviewReadScope,
     EditionReviewService,
@@ -548,7 +549,33 @@ class _ReadModel:
     async def list_for_edition(self, edition_id: UUID) -> EditionReviewReadScope:
         del edition_id
         version = self.rows[0].composition_version if self.rows else 1
-        return EditionReviewReadScope(items=tuple(self.rows), composition_version=version)
+        exclusions = tuple(
+            EditionReviewExclusion(
+                subject_id=row.subject_id,
+                title=row.title,
+                decision_id=row.effective_decision_id,
+                applicable=True,
+                actor_id="analyst",
+                reason="fixture exclusion reason",
+                occurred_at=datetime(2026, 1, 1, tzinfo=UTC),
+                run_id=row.run_id,
+                document_artifact_id=row.document_artifact_id,
+                document_artifact_version=row.document_artifact_version,
+                document_input_hash=row.document_input_hash,
+                pipeline_generation=row.pipeline_generation,
+            )
+            for row in self.rows
+            if row.effective_decision is PublicationDecision.EXCLUDE
+            and row.effective_decision_id is not None
+        )
+        items = tuple(
+            row for row in self.rows if row.effective_decision is not PublicationDecision.EXCLUDE
+        )
+        return EditionReviewReadScope(
+            items=items,
+            composition_version=version,
+            exclusions=exclusions,
+        )
 
 
 class _Compositions:
@@ -647,6 +674,11 @@ class _Uow:
                     EditionCompositionEntry(
                         subject_id=row.subject_id,
                         disposition=CompositionDisposition.EXCLUDED,
+                        production_run_id=row.run_id,
+                        pipeline_generation=row.pipeline_generation,
+                        artifact_id=row.document_artifact_id,
+                        artifact_version=row.document_artifact_version,
+                        artifact_input_hash=row.document_input_hash,
                         review_decision_id=row.effective_decision_id,
                     )
                 )

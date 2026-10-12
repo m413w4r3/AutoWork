@@ -197,6 +197,21 @@ class ReviewDiagnosticView(BaseModel):
     pending_rebuild_count: int
 
 
+class ReviewExclusionView(BaseModel):
+    subject_id: UUID
+    title: str
+    decision_id: UUID | None
+    applicable: bool
+    actor_id: str | None
+    reason: str | None
+    occurred_at: str | None
+    run_id: UUID | None
+    document_artifact_id: UUID | None
+    document_artifact_version: int | None
+    document_input_hash: str | None
+    pipeline_generation: int | None
+
+
 class EditionReviewView(BaseModel):
     edition_id: UUID
     items: list[ReviewItemView]
@@ -206,6 +221,7 @@ class EditionReviewView(BaseModel):
     pending_rebuild_count: int = 0
     composition_version: int | None = None
     diagnostics: list[ReviewDiagnosticView]
+    exclusions: list[ReviewExclusionView] = Field(default_factory=list)
 
 
 class EditionRepairDecisionRequest(BaseModel):
@@ -344,8 +360,8 @@ class ReviewDecisionView(BaseModel):
     id: UUID
     edition_id: UUID
     subject_id: UUID
-    production_run_id: UUID
-    pipeline_generation: int
+    production_run_id: UUID | None
+    pipeline_generation: int | None
     document_artifact_id: UUID | None
     document_artifact_version: int | None
     document_input_hash: str | None
@@ -1769,6 +1785,25 @@ def _review_view(review: EditionReview) -> EditionReviewView:
                 pending_rebuild_count=diagnostic.pending_rebuild_count,
             )
             for diagnostic in review.diagnostics
+        ],
+        exclusions=[
+            ReviewExclusionView(
+                subject_id=exclusion.subject_id,
+                title=exclusion.title,
+                decision_id=exclusion.decision_id,
+                applicable=exclusion.applicable,
+                actor_id=exclusion.actor_id,
+                reason=exclusion.reason,
+                occurred_at=(
+                    exclusion.occurred_at.isoformat() if exclusion.occurred_at is not None else None
+                ),
+                run_id=exclusion.run_id,
+                document_artifact_id=exclusion.document_artifact_id,
+                document_artifact_version=exclusion.document_artifact_version,
+                document_input_hash=exclusion.document_input_hash,
+                pipeline_generation=exclusion.pipeline_generation,
+            )
+            for exclusion in review.exclusions
         ],
     )
 

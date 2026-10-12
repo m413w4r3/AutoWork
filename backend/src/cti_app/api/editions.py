@@ -131,6 +131,13 @@ class EditionCompositionPut(BaseModel):
     entries: list[EditionCompositionEntryPayload] = Field(max_length=500)
 
 
+class EditionCompositionExclusionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str | None = None
+    expected_version: int = Field(ge=0)
+
+
 class EditionCompositionEntryView(BaseModel):
     id: UUID
     subject_id: UUID
@@ -156,6 +163,11 @@ class EditionCompositionView(BaseModel):
     created_at: datetime
     updated_at: datetime
     entries: list[EditionCompositionEntryView]
+
+
+class EditionCompositionExclusionResponse(BaseModel):
+    composition: EditionCompositionView
+    decision_id: UUID
 
 
 class CompositionReasonView(BaseModel):
@@ -294,6 +306,38 @@ async def put_edition_composition(
             correlation_id=get_correlation_id(),
         )
         return _composition_view(composition)
+    except Exception as exc:
+        _raise_composition_api_error(exc)
+
+
+@router.post(
+    "/{edition_id}/composition/exclusions/{subject_id}",
+    response_model=EditionCompositionExclusionResponse,
+)
+async def exclude_edition_subject(
+    edition_id: UUID,
+    subject_id: UUID,
+    payload: EditionCompositionExclusionRequest,
+    request: Request,
+    idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=1, max_length=255)],
+) -> EditionCompositionExclusionResponse:
+    service: EditionCompositionService = request.app.state.edition_composition_service
+    provider: IdentityProvider = request.app.state.identity_provider
+    identity = await provider.current()
+    try:
+        composition, decision_id = await service.exclude_subject(
+            edition_id,
+            subject_id,
+            reason=payload.reason or "",
+            expected_version=payload.expected_version,
+            idempotency_key=idempotency_key,
+            actor_id=identity.actor_id,
+            correlation_id=get_correlation_id(),
+        )
+        return EditionCompositionExclusionResponse(
+            composition=_composition_view(composition),
+            decision_id=decision_id,
+        )
     except Exception as exc:
         _raise_composition_api_error(exc)
 

@@ -105,6 +105,11 @@ export interface EditionCompositionPut {
   entries: EditionCompositionEntryInput[];
 }
 
+export interface EditionCompositionExclusionResponse {
+  composition: EditionComposition;
+  decision_id: string;
+}
+
 export class ApiError extends Error {
   constructor(
     message: string,
@@ -157,6 +162,25 @@ export function putEditionComposition(
     },
     body: JSON.stringify(payload),
   });
+}
+
+export function excludeEditionCompositionSubject(
+  editionId: string,
+  subjectId: string,
+  payload: { reason: string; expected_version: number },
+  idempotencyKey: string,
+): Promise<EditionCompositionExclusionResponse> {
+  return request(
+    `/api/editions/${encodeURIComponent(editionId)}/composition/exclusions/${encodeURIComponent(subjectId)}`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Idempotency-Key": idempotencyKey,
+      },
+      body: JSON.stringify(payload),
+    },
+  );
 }
 
 export function getSubject(subjectId: string): Promise<Subject> {

@@ -366,6 +366,9 @@ async def test_lot35_waived_source_archived_later_blocks_signoff_until_rebuild(
     assert review_payload["diagnostics"] == []
     review_payload.pop("composition_version")
     review_payload.pop("diagnostics")
+    # The shared frontend golden predates this additive Review field.
+    assert review_payload["exclusions"] == []
+    review_payload.pop("exclusions")
     for item in review_payload["items"]:
         assert item["composition_version"] == 1
         assert item["pinned_generation_current"] is True

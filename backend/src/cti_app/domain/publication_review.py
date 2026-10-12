@@ -28,8 +28,8 @@ class PublicationReviewDecision:
 
     edition_id: UUID
     subject_id: UUID
-    production_run_id: UUID
-    pipeline_generation: int
+    production_run_id: UUID | None
+    pipeline_generation: int | None
     document_artifact_id: UUID | None
     document_artifact_version: int | None
     document_input_hash: str | None
@@ -40,7 +40,7 @@ class PublicationReviewDecision:
     id: UUID = field(default_factory=uuid4)
 
     def __post_init__(self) -> None:
-        if self.pipeline_generation < 0:
+        if self.pipeline_generation is not None and self.pipeline_generation < 0:
             raise ValueError("pipeline_generation must be >= 0")
         document_identity = (
             self.document_artifact_id,
@@ -51,6 +51,15 @@ class PublicationReviewDecision:
             value is not None for value in document_identity
         ):
             raise ValueError("document identity must be complete or empty")
+        if self.production_run_id is None:
+            if self.pipeline_generation is not None or any(
+                value is not None for value in document_identity
+            ):
+                raise ValueError("runless decisions cannot carry generation or document identity")
+            if self.decision is not PublicationDecision.EXCLUDE:
+                raise ValueError("runless decisions must exclude a subject")
+        elif self.pipeline_generation is None:
+            raise ValueError("production_run_id requires pipeline_generation")
         if self.document_artifact_version is not None and self.document_artifact_version < 1:
             raise ValueError("document_artifact_version must be >= 1")
         if self.document_input_hash is not None and not _SHA256_RE.fullmatch(

@@ -67,21 +67,36 @@ class EditionCompositionEntry:
         if self.disposition is CompositionDisposition.INCLUDED and self.position is None:
             raise CompositionInvariantError("included entries require a position")
 
-        pin = (
-            self.production_run_id,
-            self.pipeline_generation,
+        document_identity = (
             self.artifact_id,
             self.artifact_version,
             self.artifact_input_hash,
         )
-        if any(value is None for value in pin) and any(value is not None for value in pin):
-            raise CompositionInvariantError("artifact pin must be complete or empty")
-        if self.disposition is CompositionDisposition.INCLUDED and any(
-            value is None for value in pin
+        if any(value is None for value in document_identity) and any(
+            value is not None for value in document_identity
+        ):
+            raise CompositionInvariantError("document identity must be complete or empty")
+        if self.production_run_id is None:
+            if self.pipeline_generation is not None or any(
+                value is not None for value in document_identity
+            ):
+                raise CompositionInvariantError(
+                    "runless entries cannot carry generation or document"
+                )
+        elif self.pipeline_generation is None:
+            raise CompositionInvariantError("production_run_id requires pipeline_generation")
+        if any(value is not None for value in document_identity) and self.production_run_id is None:
+            raise CompositionInvariantError("document identity requires a production run")
+        if self.disposition is CompositionDisposition.INCLUDED and (
+            self.production_run_id is None
+            or self.pipeline_generation is None
+            or any(value is None for value in document_identity)
         ):
             raise CompositionInvariantError("included entries require a complete artifact pin")
-        if self.disposition is CompositionDisposition.DEFERRED and any(
-            value is not None for value in pin
+        if self.disposition is CompositionDisposition.DEFERRED and (
+            self.production_run_id is not None
+            or self.pipeline_generation is not None
+            or any(value is not None for value in document_identity)
         ):
             raise CompositionInvariantError("deferred entries cannot carry artifacts")
         if self.disposition is CompositionDisposition.EXCLUDED and self.review_decision_id is None:

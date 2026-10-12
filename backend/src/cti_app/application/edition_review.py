@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
+from datetime import datetime
 from enum import StrEnum
 from typing import Any, Protocol
 from uuid import UUID
@@ -147,12 +148,29 @@ class EditionReviewDiagnostic:
 
 
 @dataclass(frozen=True, slots=True)
+class EditionReviewExclusion:
+    subject_id: UUID
+    title: str
+    decision_id: UUID | None
+    applicable: bool
+    actor_id: str | None
+    reason: str | None
+    occurred_at: datetime | None
+    run_id: UUID | None
+    document_artifact_id: UUID | None
+    document_artifact_version: int | None
+    document_input_hash: str | None
+    pipeline_generation: int | None
+
+
+@dataclass(frozen=True, slots=True)
 class EditionReviewReadScope:
     """One composition-scoped database read, including non-included signals."""
 
     items: tuple[EditionReviewReadItem, ...]
     composition_version: int | None
     diagnostics: tuple[EditionReviewDiagnostic, ...] = ()
+    exclusions: tuple[EditionReviewExclusion, ...] = ()
 
     @property
     def composition_missing(self) -> bool:
@@ -273,6 +291,7 @@ class EditionReview:
     pending_rebuild_count: int = 0
     composition_version: int | None = None
     diagnostics: tuple[EditionReviewDiagnostic, ...] = ()
+    exclusions: tuple[EditionReviewExclusion, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -883,9 +902,11 @@ class EditionReviewService:
             scope = rows
             read_rows: Sequence[EditionReviewReadItem] = rows.items
             diagnostics = list(rows.diagnostics)
+            exclusions = rows.exclusions
         else:
             read_rows = rows
             diagnostics = []
+            exclusions = ()
         if (
             scope is not None
             and scope.composition_missing
@@ -897,6 +918,30 @@ class EditionReviewService:
             diagnostics.append(
                 EditionReviewDiagnostic(EditionReviewDiagnosticCode.COMPOSITION_MISSING)
             )
+
+        diagnosed_exclusions = {
+            diagnostic.subject_id
+            for diagnostic in diagnostics
+            if diagnostic.code is EditionReviewDiagnosticCode.EXCLUSION_DECISION_MISSING
+        }
+        for exclusion in exclusions:
+            if not exclusion.applicable and exclusion.subject_id not in diagnosed_exclusions:
+                diagnostics.append(
+                    EditionReviewDiagnostic(
+                        code=EditionReviewDiagnosticCode.EXCLUSION_DECISION_MISSING,
+                        subject_id=exclusion.subject_id,
+                        disposition=CompositionDisposition.EXCLUDED,
+                        run_id=exclusion.run_id,
+                        details={
+                            "title": exclusion.title,
+                            "decision_id": (
+                                str(exclusion.decision_id)
+                                if exclusion.decision_id is not None
+                                else None
+                            ),
+                        },
+                    )
+                )
 
         run_subjects = {row.run_id: row.subject_id for row in read_rows}
         run_subjects.update(
@@ -1007,6 +1052,7 @@ class EditionReviewService:
             pending_rebuild_count=pending_rebuild_count,
             composition_version=scope.composition_version if scope is not None else None,
             diagnostics=tuple(diagnostics),
+            exclusions=exclusions,
         )
 
     async def _repair_issues(self, edition_id: UUID) -> tuple[Any, ...]:

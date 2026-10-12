@@ -74,9 +74,11 @@ class EditionCompositionEntryRow(Base):
         CheckConstraint(
             "(production_run_id IS NULL AND pipeline_generation IS NULL AND artifact_id IS NULL "
             "AND artifact_version IS NULL AND artifact_input_hash IS NULL) OR "
-            "(production_run_id IS NOT NULL AND pipeline_generation IS NOT NULL "
-            "AND artifact_id IS NOT NULL AND artifact_version IS NOT NULL "
-            "AND artifact_input_hash IS NOT NULL)",
+            "(production_run_id IS NOT NULL AND pipeline_generation IS NOT NULL AND "
+            "((artifact_id IS NOT NULL AND artifact_version IS NOT NULL "
+            "AND artifact_input_hash IS NOT NULL) OR "
+            "(disposition = 'excluded' AND artifact_id IS NULL AND artifact_version IS NULL "
+            "AND artifact_input_hash IS NULL)))",
             name="ck_edition_composition_artifact_pin_complete",
         ),
         CheckConstraint(

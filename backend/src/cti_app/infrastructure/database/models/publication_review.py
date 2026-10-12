@@ -21,6 +21,13 @@ class PublicationReviewDecisionRow(Base):
             name="ck_publication_review_generation",
         ),
         CheckConstraint(
+            "(production_run_id IS NULL AND pipeline_generation IS NULL "
+            "AND document_artifact_id IS NULL AND document_artifact_version IS NULL "
+            "AND document_input_hash IS NULL AND decision = 'exclude') OR "
+            "(production_run_id IS NOT NULL AND pipeline_generation IS NOT NULL)",
+            name="ck_publication_review_run_identity",
+        ),
+        CheckConstraint(
             "document_artifact_version >= 1",
             name="ck_publication_review_artifact_version",
         ),
@@ -81,12 +88,12 @@ class PublicationReviewDecisionRow(Base):
     subject_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("subjects.id", ondelete="RESTRICT"), nullable=False
     )
-    production_run_id: Mapped[UUID] = mapped_column(
+    production_run_id: Mapped[UUID | None] = mapped_column(
         Uuid(as_uuid=True),
         ForeignKey("production_runs.id", ondelete="RESTRICT"),
-        nullable=False,
+        nullable=True,
     )
-    pipeline_generation: Mapped[int] = mapped_column(nullable=False)
+    pipeline_generation: Mapped[int | None] = mapped_column(nullable=True)
     document_artifact_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True),
         ForeignKey("production_artifacts.id", ondelete="RESTRICT"),

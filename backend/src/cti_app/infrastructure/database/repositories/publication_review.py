@@ -11,6 +11,7 @@ from sqlalchemy.orm import aliased
 from cti_app.application.edition_review import (
     EditionReviewDiagnostic,
     EditionReviewDiagnosticCode,
+    EditionReviewExclusion,
     EditionReviewReadItem,
     EditionReviewReadScope,
     requires_reconciliation,
@@ -384,6 +385,22 @@ class SqlAlchemyEditionReviewReadRepository:
             "diagnostic_run_id",
             "diagnostic_title",
             "diagnostic_decision_id",
+            "diagnostic_entry_decision_id",
+            "diagnostic_entry_generation",
+            "diagnostic_entry_artifact_id",
+            "diagnostic_entry_artifact_version",
+            "diagnostic_entry_artifact_hash",
+            "diagnostic_decision_kind",
+            "diagnostic_decision_run_id",
+            "diagnostic_decision_generation",
+            "diagnostic_decision_artifact_id",
+            "diagnostic_decision_artifact_version",
+            "diagnostic_decision_artifact_hash",
+            "diagnostic_decision_actor_id",
+            "diagnostic_decision_reason",
+            "diagnostic_decision_occurred_at",
+            "diagnostic_current_generation",
+            "diagnostic_artifact_status",
         )
         item_query = select(
             literal("item").label("row_kind"),
@@ -393,6 +410,8 @@ class SqlAlchemyEditionReviewReadRepository:
         ).where(ranked.c.decision_rank == 1)
 
         diagnostic_decision = aliased(PublicationReviewDecisionRow, name="excluded_review_decision")
+        pinned_exclusion_run = aliased(ProductionRunRow, name="pinned_exclusion_run")
+        pinned_exclusion_artifact = aliased(ProductionArtifactRow, name="pinned_exclusion_artifact")
         diagnostic_query = (
             select(
                 literal("diagnostic").label("row_kind"),
@@ -408,6 +427,28 @@ class SqlAlchemyEditionReviewReadRepository:
                 EditionCompositionEntryRow.production_run_id.label("diagnostic_run_id"),
                 SubjectRow.title.label("diagnostic_title"),
                 diagnostic_decision.id.label("diagnostic_decision_id"),
+                EditionCompositionEntryRow.review_decision_id.label("diagnostic_entry_decision_id"),
+                EditionCompositionEntryRow.pipeline_generation.label("diagnostic_entry_generation"),
+                EditionCompositionEntryRow.artifact_id.label("diagnostic_entry_artifact_id"),
+                EditionCompositionEntryRow.artifact_version.label(
+                    "diagnostic_entry_artifact_version"
+                ),
+                EditionCompositionEntryRow.artifact_input_hash.label(
+                    "diagnostic_entry_artifact_hash"
+                ),
+                diagnostic_decision.decision.label("diagnostic_decision_kind"),
+                diagnostic_decision.production_run_id.label("diagnostic_decision_run_id"),
+                diagnostic_decision.pipeline_generation.label("diagnostic_decision_generation"),
+                diagnostic_decision.document_artifact_id.label("diagnostic_decision_artifact_id"),
+                diagnostic_decision.document_artifact_version.label(
+                    "diagnostic_decision_artifact_version"
+                ),
+                diagnostic_decision.document_input_hash.label("diagnostic_decision_artifact_hash"),
+                diagnostic_decision.actor_id.label("diagnostic_decision_actor_id"),
+                diagnostic_decision.reason.label("diagnostic_decision_reason"),
+                diagnostic_decision.occurred_at.label("diagnostic_decision_occurred_at"),
+                pinned_exclusion_run.pipeline_generation.label("diagnostic_current_generation"),
+                pinned_exclusion_artifact.status.label("diagnostic_artifact_status"),
             )
             .select_from(SubjectRow)
             .join(composition, true())
@@ -424,29 +465,15 @@ class SqlAlchemyEditionReviewReadRepository:
                     diagnostic_decision.id == EditionCompositionEntryRow.review_decision_id,
                     diagnostic_decision.edition_id == edition_id,
                     diagnostic_decision.subject_id == SubjectRow.id,
-                    diagnostic_decision.decision == "exclude",
-                    or_(
-                        and_(
-                            EditionCompositionEntryRow.artifact_id.is_(None),
-                            diagnostic_decision.document_artifact_id.is_(None),
-                            diagnostic_decision.document_artifact_version.is_(None),
-                            diagnostic_decision.document_input_hash.is_(None),
-                        ),
-                        and_(
-                            EditionCompositionEntryRow.artifact_id.is_not(None),
-                            diagnostic_decision.production_run_id
-                            == EditionCompositionEntryRow.production_run_id,
-                            diagnostic_decision.pipeline_generation
-                            == EditionCompositionEntryRow.pipeline_generation,
-                            diagnostic_decision.document_artifact_id
-                            == EditionCompositionEntryRow.artifact_id,
-                            diagnostic_decision.document_artifact_version
-                            == EditionCompositionEntryRow.artifact_version,
-                            diagnostic_decision.document_input_hash
-                            == EditionCompositionEntryRow.artifact_input_hash,
-                        ),
-                    ),
                 ),
+            )
+            .outerjoin(
+                pinned_exclusion_run,
+                pinned_exclusion_run.id == EditionCompositionEntryRow.production_run_id,
+            )
+            .outerjoin(
+                pinned_exclusion_artifact,
+                pinned_exclusion_artifact.id == EditionCompositionEntryRow.artifact_id,
             )
             .where(
                 SubjectRow.edition_id == edition_id,
@@ -484,6 +511,7 @@ class SqlAlchemyEditionReviewReadRepository:
         rows = (await self._session.execute(result_query)).mappings()
         items: list[EditionReviewReadItem] = []
         diagnostics: list[EditionReviewDiagnostic] = []
+        exclusions: list[EditionReviewExclusion] = []
         composition_version: int | None = None
         for row in rows:
             if row["composition_version"] is not None:
@@ -508,6 +536,8 @@ class SqlAlchemyEditionReviewReadRepository:
                     details={"title": row["diagnostic_title"]} if row["diagnostic_title"] else None,
                 )
             )
+            if diagnostic_code is EditionReviewDiagnosticCode.SUBJECT_EXCLUDED:
+                exclusions.append(_exclusion_from_row(row))
             if (
                 diagnostic_code is EditionReviewDiagnosticCode.SUBJECT_EXCLUDED
                 and row["diagnostic_decision_id"] is None
@@ -526,7 +556,68 @@ class SqlAlchemyEditionReviewReadRepository:
             items=tuple(items),
             composition_version=composition_version,
             diagnostics=tuple(diagnostics),
+            exclusions=(),
         )
+
+
+def _exclusion_from_row(row: Any) -> EditionReviewExclusion:
+    entry_run_id = row["diagnostic_run_id"]
+    entry_generation = row["diagnostic_entry_generation"]
+    entry_artifact_id = row["diagnostic_entry_artifact_id"]
+    entry_artifact_version = row["diagnostic_entry_artifact_version"]
+    entry_artifact_hash = row["diagnostic_entry_artifact_hash"]
+    decision_run_id = row["diagnostic_decision_run_id"]
+    decision_generation = row["diagnostic_decision_generation"]
+    decision_artifact_id = row["diagnostic_decision_artifact_id"]
+    decision_artifact_version = row["diagnostic_decision_artifact_version"]
+    decision_artifact_hash = row["diagnostic_decision_artifact_hash"]
+    document_identity_matches = (
+        decision_artifact_id == entry_artifact_id
+        and decision_artifact_version == entry_artifact_version
+        and decision_artifact_hash == entry_artifact_hash
+    )
+    run_identity_matches = (
+        decision_run_id == entry_run_id
+        and decision_generation == entry_generation
+        and (decision_run_id is None or row["diagnostic_current_generation"] == decision_generation)
+    )
+    artifact_is_current = entry_artifact_id is None or (
+        row["diagnostic_artifact_status"] is not None
+        and row["diagnostic_artifact_status"] != ProductionArtifactStatus.STALE.value
+    )
+    applicable = (
+        row["diagnostic_decision_id"] is not None
+        and row["diagnostic_decision_kind"] == PublicationDecision.EXCLUDE.value
+        and run_identity_matches
+        and document_identity_matches
+        and artifact_is_current
+    )
+    return EditionReviewExclusion(
+        subject_id=row["diagnostic_subject_id"],
+        title=row["diagnostic_title"],
+        decision_id=row["diagnostic_entry_decision_id"],
+        applicable=applicable,
+        actor_id=row["diagnostic_decision_actor_id"],
+        reason=row["diagnostic_decision_reason"],
+        occurred_at=row["diagnostic_decision_occurred_at"],
+        run_id=decision_run_id if row["diagnostic_decision_id"] is not None else entry_run_id,
+        document_artifact_id=(
+            decision_artifact_id if row["diagnostic_decision_id"] is not None else entry_artifact_id
+        ),
+        document_artifact_version=(
+            decision_artifact_version
+            if row["diagnostic_decision_id"] is not None
+            else entry_artifact_version
+        ),
+        document_input_hash=(
+            decision_artifact_hash
+            if row["diagnostic_decision_id"] is not None
+            else entry_artifact_hash
+        ),
+        pipeline_generation=(
+            decision_generation if row["diagnostic_decision_id"] is not None else entry_generation
+        ),
+    )
 
 
 def _decision_from_row(row: PublicationReviewDecisionRow) -> PublicationReviewDecision:

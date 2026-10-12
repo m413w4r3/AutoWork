@@ -7,6 +7,7 @@ import {
 import { useMemo, useState } from "react";
 
 import {
+  excludeEditionCompositionSubject,
   getEditionComposition,
   listSubjects,
   putEditionComposition,
@@ -18,8 +19,8 @@ import {
 } from "../../api/editions";
 import {
   acceptEditionComposition,
-  excludeCompositionArtifact,
   getEditionCompositionValidation,
+  getEditionReview,
 } from "../../api/publication";
 import { ApiError } from "../../api/editions";
 import {
@@ -123,6 +124,9 @@ function batchForRun(
 
 function apiErrorText(error: unknown): string {
   if (error instanceof ApiError && error.status === 409) {
+    if (error.code === "composition_idempotency_conflict") {
+      return "Cette clé d’idempotence a déjà servi pour une autre exclusion. La composition a été rechargée ; relancez l’action avec son motif actuel.";
+    }
     const actualVersion = error.details?.actual_version;
     const versionDetail =
       typeof actualVersion === "number"
@@ -165,9 +169,6 @@ export function CompositionConsole({
   const [excludingSubjectId, setExcludingSubjectId] = useState<string | null>(
     null,
   );
-  const [pendingDecisionIds, setPendingDecisionIds] = useState<
-    Record<string, string>
-  >({});
   const [isExclusionPending, setIsExclusionPending] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [confirmedVersion, setConfirmedVersion] = useState<number | null>(null);
@@ -184,6 +185,10 @@ export function CompositionConsole({
   const validationQuery = useQuery({
     queryKey: ["edition-composition-validation", editionId],
     queryFn: () => getEditionCompositionValidation(editionId),
+  });
+  const reviewQuery = useQuery({
+    queryKey: ["edition-review", editionId],
+    queryFn: () => getEditionReview(editionId),
   });
   const productionBoardQuery = useQuery({
     queryKey: ["production-board", editionId],
@@ -280,6 +285,9 @@ export function CompositionConsole({
     });
     void queryClient.invalidateQueries({
       queryKey: ["edition-release", editionId],
+    });
+    void queryClient.invalidateQueries({
+      queryKey: ["edition-review", editionId],
     });
   };
 
@@ -443,80 +451,18 @@ export function CompositionConsole({
   const handleExclude = async (candidate: CompositionCandidate) => {
     const reason = exclusionReasons[candidate.subject.id]?.trim() ?? "";
     if (!reason) return;
-    const currentEntry = entryBySubject.get(candidate.subject.id);
-    const pinnedIdentity =
-      currentEntry?.disposition === "included" &&
-      currentEntry.production_run_id &&
-      currentEntry.pipeline_generation !== null &&
-      currentEntry.artifact_id &&
-      currentEntry.artifact_version &&
-      currentEntry.artifact_input_hash
-        ? {
-            productionRunId: currentEntry.production_run_id,
-            pipelineGeneration: currentEntry.pipeline_generation,
-            artifactId: currentEntry.artifact_id,
-            artifactVersion: currentEntry.artifact_version,
-            inputHash: currentEntry.artifact_input_hash,
-          }
-        : null;
-    const artifact = candidate.artifact;
-    const run = candidate.artifactRun;
-    if (
-      !pinnedIdentity &&
-      (!artifact ||
-        !run ||
-        !artifact.production_run_id ||
-        !artifact.canonical_sha256)
-    ) {
-      setActionError(
-        "Aucun artifact exact et vérifié ne peut porter cette décision.",
-      );
-      return;
-    }
     setActionError(null);
     setIsExclusionPending(true);
     try {
-      let decisionId = pendingDecisionIds[candidate.subject.id];
-      if (!decisionId) {
-        const decision = await excludeCompositionArtifact(
-          editionId,
-          {
-            subjectId: candidate.subject.id,
-            productionRunId:
-              pinnedIdentity?.productionRunId ?? artifact!.production_run_id!,
-            pipelineGeneration:
-              pinnedIdentity?.pipelineGeneration ?? run!.pipeline_generation,
-            artifactId: pinnedIdentity?.artifactId ?? artifact!.artifact_id,
-            artifactVersion:
-              pinnedIdentity?.artifactVersion ?? artifact!.version,
-            inputHash: pinnedIdentity?.inputHash ?? artifact!.input_hash,
-          },
-          reason,
-        );
-        decisionId = decision.id;
-        setPendingDecisionIds((current) => ({
-          ...current,
-          [candidate.subject.id]: decision.id,
-        }));
-      }
-      const next = existingEntries.filter(
-        (entry) => entry.subject_id !== candidate.subject.id,
+      await excludeEditionCompositionSubject(
+        editionId,
+        candidate.subject.id,
+        { reason, expected_version: currentVersion },
+        crypto.randomUUID(),
       );
-      next.push({
-        subject_id: candidate.subject.id,
-        disposition: "excluded",
-        position: null,
-        review_decision_id: decisionId,
-      });
-      await updateComposition.mutateAsync({
-        entries: orderedEntries(next),
-        expectedVersion: currentVersion,
-      });
-      setPendingDecisionIds((current) => {
-        const updated = { ...current };
-        delete updated[candidate.subject.id];
-        return updated;
-      });
+      setActionError(null);
+      setConfirmedVersion(null);
+      invalidateComposition();
       setExclusionReasons((current) => ({
         ...current,
         [candidate.subject.id]: "",
@@ -524,6 +470,10 @@ export function CompositionConsole({
       setExcludingSubjectId(null);
     } catch (error) {
       setActionError(apiErrorText(error));
+      if (error instanceof ApiError && error.status === 409) {
+        setConfirmedVersion(null);
+        invalidateComposition();
+      }
     } finally {
       setIsExclusionPending(false);
       setExcludingSubjectId(null);
@@ -709,10 +659,33 @@ export function CompositionConsole({
                     </div>
                   </dl>
                 ) : entry?.disposition === "excluded" ? (
-                  <p>
-                    Décision motivée :{" "}
-                    <code>{entry.review_decision_id ?? "absente"}</code>
-                  </p>
+                  (() => {
+                    const exclusion = reviewQuery.data?.exclusions?.find(
+                      (item) => item.subject_id === subjectId,
+                    );
+                    return (
+                      <div>
+                        <p>
+                          Décision motivée :{" "}
+                          <code>{entry.review_decision_id ?? "absente"}</code>
+                        </p>
+                        <p>
+                          Applicabilité :{" "}
+                          {exclusion
+                            ? exclusion.applicable
+                              ? "valide"
+                              : "nouvelle décision requise"
+                            : "audit en chargement"}
+                          {exclusion?.actor_id
+                            ? ` · par ${exclusion.actor_id}`
+                            : " · acteur inconnu"}
+                          {exclusion?.reason
+                            ? ` · motif : ${exclusion.reason}`
+                            : " · motif indisponible"}
+                        </p>
+                      </div>
+                    );
+                  })()
                 ) : null}
 
                 <p className="composition-console__artifact-status">

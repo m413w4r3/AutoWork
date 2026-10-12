@@ -81,8 +81,8 @@ async def _compose_three_runs(
     uow_factory: UnitOfWorkFactory,
     tmp_path: Path,
     *,
-    production_order: tuple[str, str, str],
-    composition_order: tuple[str, str, str],
+    production_order: tuple[str, ...],
+    composition_order: tuple[str, ...],
 ) -> tuple[Edition, ProductionArtifactStore, dict[str, Subject], dict[str, UUID]]:
     token = uuid4().int
     year = 2000 + token % 6000

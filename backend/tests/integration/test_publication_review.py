@@ -565,6 +565,27 @@ async def test_publication_review_is_fk_backed_and_append_only(migrated_postgres
                         "(id, edition_id, subject_id, production_run_id, pipeline_generation, "
                         "document_artifact_id, document_artifact_version, document_input_hash, "
                         "decision, actor_id, reason, occurred_at) "
+                        "VALUES (:id, :edition_id, :subject_id, NULL, NULL, :artifact_id, 1, "
+                        ":hash, 'include', 'analyst', NULL, :occurred_at)"
+                    ),
+                    {
+                        "id": uuid4(),
+                        "edition_id": edition_id,
+                        "subject_id": subject_id,
+                        "artifact_id": artifact_id,
+                        "hash": "a" * 64,
+                        "occurred_at": now,
+                    },
+                )
+            await session.rollback()
+
+            with pytest.raises(IntegrityError):
+                await session.execute(
+                    text(
+                        "INSERT INTO publication_review_decisions "
+                        "(id, edition_id, subject_id, production_run_id, pipeline_generation, "
+                        "document_artifact_id, document_artifact_version, document_input_hash, "
+                        "decision, actor_id, reason, occurred_at) "
                         "VALUES (:id, :edition_id, :subject_id, :run_id, 2, :artifact_id, 1, "
                         ":hash, 'include', 'analyst', NULL, :occurred_at)"
                     ),

@@ -322,22 +322,11 @@ class SqlAlchemyEditionCompositionRepository:
             decision_matches_identity = decision is not None and (
                 decision.edition_id == edition_id
                 and decision.subject_id == entry.subject_id
-                and (
-                    (
-                        entry.artifact_id is None
-                        and decision.document_artifact_id is None
-                        and decision.document_artifact_version is None
-                        and decision.document_input_hash is None
-                    )
-                    or (
-                        entry.artifact_id is not None
-                        and decision.production_run_id == entry.production_run_id
-                        and decision.pipeline_generation == entry.pipeline_generation
-                        and decision.document_artifact_id == entry.artifact_id
-                        and decision.document_artifact_version == entry.artifact_version
-                        and decision.document_input_hash == entry.artifact_input_hash
-                    )
-                )
+                and decision.production_run_id == entry.production_run_id
+                and decision.pipeline_generation == entry.pipeline_generation
+                and decision.document_artifact_id == entry.artifact_id
+                and decision.document_artifact_version == entry.artifact_version
+                and decision.document_input_hash == entry.artifact_input_hash
             )
             state_by_subject[entry.subject_id] = CompositionReferenceState(
                 subject_exists=entry.subject_id in subjects,

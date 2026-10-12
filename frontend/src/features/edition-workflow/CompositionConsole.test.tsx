@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   ApiError,
+  excludeEditionCompositionSubject,
   getEditionComposition,
   listSubjects,
   putEditionComposition,
@@ -15,6 +16,7 @@ import {
 import {
   acceptEditionComposition,
   getEditionCompositionValidation,
+  getEditionReview,
   type EditionReview,
 } from "../../api/publication";
 import {
@@ -34,6 +36,7 @@ vi.mock("../../api/editions", async (importOriginal) => {
     getEditionComposition: vi.fn(),
     listSubjects: vi.fn(),
     putEditionComposition: vi.fn(),
+    excludeEditionCompositionSubject: vi.fn(),
   };
 });
 
@@ -42,8 +45,8 @@ vi.mock("../../api/publication", async (importOriginal) => {
   return {
     ...actual,
     acceptEditionComposition: vi.fn(),
-    excludeCompositionArtifact: vi.fn(),
     getEditionCompositionValidation: vi.fn(),
+    getEditionReview: vi.fn(),
   };
 });
 
@@ -244,6 +247,10 @@ beforeEach(() => {
     ),
   );
   vi.mocked(getEditionCompositionValidation).mockResolvedValue(validation);
+  vi.mocked(getEditionReview).mockResolvedValue({
+    ...validation,
+    exclusions: [],
+  });
   vi.mocked(getEditionProduction).mockResolvedValue(productionBoard());
   vi.mocked(getSubjectProductionRuns).mockImplementation((subjectId) =>
     Promise.resolve([run(subjectId === SUBJECT_A ? "a" : "b")]),
@@ -254,6 +261,13 @@ beforeEach(() => {
   vi.mocked(putEditionComposition).mockResolvedValue(
     composition(3, [compositionEntry("a", 1), compositionEntry("b", 2)]),
   );
+  vi.mocked(excludeEditionCompositionSubject).mockResolvedValue({
+    composition: composition(3, [
+      compositionEntry("a", 1),
+      compositionEntry("b", 2),
+    ]),
+    decision_id: "decision-b",
+  });
   vi.mocked(acceptEditionComposition).mockResolvedValue({
     edition_id: EDITION_ID,
     edition_state: "open",
@@ -355,5 +369,113 @@ describe("CompositionConsole", () => {
       expect.objectContaining({ expected_version: 2 }),
       "idempotency-1",
     );
+  });
+
+  it("exclut un sujet sans artifact vérifié en un appel et affiche son audit", async () => {
+    const excludedB = {
+      ...compositionEntry("b", 2),
+      disposition: "excluded" as const,
+      position: null,
+      review_decision_id: "decision-b",
+    };
+    vi.mocked(getEditionComposition)
+      .mockResolvedValueOnce(
+        compositionRead(
+          composition(2, [compositionEntry("a", 1), compositionEntry("b", 2)]),
+        ),
+      )
+      .mockResolvedValue(
+        compositionRead(composition(3, [compositionEntry("a", 1), excludedB])),
+      );
+    vi.mocked(getPublicationArtifact).mockImplementation((subjectId) =>
+      subjectId === SUBJECT_A
+        ? Promise.resolve(artifact("a"))
+        : Promise.reject(new Error("publication artifact unavailable")),
+    );
+    vi.mocked(getEditionReview).mockResolvedValue({
+      ...validation,
+      exclusions: [
+        {
+          subject_id: SUBJECT_B,
+          title: "Sujet B",
+          decision_id: "decision-b",
+          applicable: true,
+          actor_id: "analyst",
+          reason: "Hors périmètre du bulletin.",
+          occurred_at: "2026-10-12T10:00:00Z",
+          run_id: null,
+          document_artifact_id: null,
+          document_artifact_version: null,
+          document_input_hash: null,
+          pipeline_generation: null,
+        },
+      ],
+    });
+    renderComposition();
+    const user = userEvent.setup();
+    const headingB = await screen.findByRole("heading", { name: "Sujet B" });
+    const subjectB = headingB.closest("article");
+    expect(subjectB).not.toBeNull();
+    await user.click(
+      within(subjectB!).getByRole("button", { name: "Exclure…" }),
+    );
+    await user.type(
+      within(subjectB!).getByLabelText("Motif obligatoire de l’exclusion"),
+      "Hors périmètre du bulletin.",
+    );
+    await user.click(
+      within(subjectB!).getByRole("button", {
+        name: "Confirmer l’exclusion motivée",
+      }),
+    );
+
+    await waitFor(() =>
+      expect(excludeEditionCompositionSubject).toHaveBeenCalledWith(
+        EDITION_ID,
+        SUBJECT_B,
+        { reason: "Hors périmètre du bulletin.", expected_version: 2 },
+        "idempotency-1",
+      ),
+    );
+    expect(excludeEditionCompositionSubject).toHaveBeenCalledTimes(1);
+    expect(
+      await screen.findByText(
+        /par analyst · motif : Hors périmètre du bulletin/,
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("recharge et signale un conflit de version typé pendant l’exclusion", async () => {
+    vi.mocked(excludeEditionCompositionSubject).mockRejectedValue(
+      new ApiError(
+        "La composition a changé.",
+        "composition_version_conflict",
+        409,
+        { expected_version: 2, actual_version: 3 },
+      ),
+    );
+    renderComposition();
+    const user = userEvent.setup();
+    const headingB = await screen.findByRole("heading", { name: "Sujet B" });
+    const subjectB = headingB.closest("article");
+    expect(subjectB).not.toBeNull();
+    await user.click(
+      within(subjectB!).getByRole("button", { name: "Exclure…" }),
+    );
+    await user.type(
+      within(subjectB!).getByLabelText("Motif obligatoire de l’exclusion"),
+      "Hors périmètre.",
+    );
+    await user.click(
+      within(subjectB!).getByRole("button", {
+        name: "Confirmer l’exclusion motivée",
+      }),
+    );
+
+    expect(
+      await screen.findByText(/composition a changé pendant votre action/),
+    ).toBeInTheDocument();
+    await waitFor(() => expect(getEditionComposition).toHaveBeenCalledTimes(2));
+    expect(excludeEditionCompositionSubject).toHaveBeenCalledTimes(1);
   });
 });

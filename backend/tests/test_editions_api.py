@@ -1,11 +1,27 @@
-from uuid import uuid4
+from datetime import UTC, datetime
+from uuid import UUID, uuid4
 
+import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from cti_app.api.editions import router
+from cti_app.application.edition_composition import (
+    CompositionExclusionReasonRequired,
+    CompositionExclusionReasonTooLong,
+    CompositionIdempotencyConflict,
+    CompositionNotFound,
+    CompositionSubjectNotFound,
+    CompositionVersionConflict,
+)
 from cti_app.application.editions import EditionService
 from cti_app.application.identity import LocalIdentityProvider
+from cti_app.domain.edition_composition import (
+    CompositionDisposition,
+    CompositionPreparationStatus,
+    EditionComposition,
+    EditionCompositionEntry,
+)
 from cti_app.domain.editions import EditionStatus
 from tests.edition_support import InMemoryEditionUnitOfWorkFactory
 
@@ -162,3 +178,111 @@ async def test_edition_delete_endpoint_is_not_public() -> None:
         response = await client.delete(f"/api/editions/{uuid4()}?version=1")
 
     assert response.status_code == 405
+
+
+@pytest.mark.asyncio
+async def test_composition_exclusion_endpoint_returns_composition_and_decision_id() -> None:
+    factory = InMemoryEditionUnitOfWorkFactory()
+    application = _application(factory)
+    edition_id = uuid4()
+    subject_id = uuid4()
+    decision_id = uuid4()
+    now = datetime.now(UTC)
+    composition = EditionComposition(
+        id=uuid4(),
+        edition_id=edition_id,
+        version=2,
+        entries=(
+            EditionCompositionEntry(
+                subject_id=subject_id,
+                disposition=CompositionDisposition.EXCLUDED,
+                review_decision_id=decision_id,
+            ),
+        ),
+        actor_id="analyst",
+        preparation_status=CompositionPreparationStatus.UNASSESSED,
+        created_at=now,
+        updated_at=now,
+    )
+
+    class Service:
+        def __init__(self) -> None:
+            self.calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+        async def exclude_subject(
+            self, *args: object, **kwargs: object
+        ) -> tuple[EditionComposition, UUID]:
+            self.calls.append((args, kwargs))
+            return composition, decision_id
+
+    service = Service()
+    application.state.edition_composition_service = service
+    async with AsyncClient(
+        transport=ASGITransport(app=application), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            f"/api/editions/{edition_id}/composition/exclusions/{subject_id}",
+            headers={"Idempotency-Key": "exclude-attempt-1"},
+            json={"reason": "  Hors périmètre.  ", "expected_version": 1},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["decision_id"] == str(decision_id)
+    assert body["composition"]["version"] == 2
+    assert body["composition"]["entries"][0]["review_decision_id"] == str(decision_id)
+    args, kwargs = service.calls[0]
+    assert args == (edition_id, subject_id)
+    assert kwargs["reason"] == "  Hors périmètre.  "
+    assert kwargs["expected_version"] == 1
+    assert kwargs["idempotency_key"] == "exclude-attempt-1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "status_code", "code"),
+    [
+        (CompositionVersionConflict(2, 3), 409, "composition_version_conflict"),
+        (
+            CompositionIdempotencyConflict("different payload"),
+            409,
+            "composition_idempotency_conflict",
+        ),
+        (CompositionNotFound("edition not found"), 404, "edition_not_found"),
+        (CompositionSubjectNotFound("subject not found"), 404, "subject_not_found"),
+        (
+            CompositionExclusionReasonRequired("reason required"),
+            422,
+            "exclusion_reason_required",
+        ),
+        (
+            CompositionExclusionReasonTooLong("reason too long"),
+            422,
+            "exclusion_reason_too_long",
+        ),
+    ],
+)
+async def test_composition_exclusion_endpoint_maps_typed_errors(
+    error: Exception, status_code: int, code: str
+) -> None:
+    factory = InMemoryEditionUnitOfWorkFactory()
+    application = _application(factory)
+
+    class Service:
+        async def exclude_subject(
+            self, *_args: object, **_kwargs: object
+        ) -> tuple[EditionComposition, UUID]:
+            raise error
+
+    application.state.edition_composition_service = Service()
+    async with AsyncClient(
+        transport=ASGITransport(app=application), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            f"/api/editions/{uuid4()}/composition/exclusions/{uuid4()}",
+            headers={"Idempotency-Key": "exclude-attempt-1"},
+            json={"reason": "Motif.", "expected_version": 1},
+        )
+
+    assert response.status_code == status_code
+    assert response.json()["detail"]["code"] == code
