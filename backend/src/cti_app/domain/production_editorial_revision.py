@@ -91,11 +91,65 @@ class TargetedEditorialRevisionRefusalCode(StrEnum):
     SOURCE_EXTENSION_NOT_AVAILABLE_YET = "source_extension_not_available_yet"
 
 
+class TargetedEditorialRevisionRefusalReason(StrEnum):
+    MODEL_OUTPUT_INVALID = "model_output_invalid"
+    MODEL_DECLINED = "model_declined"
+    SOURCE_EXTRACTION_FAILED = "source_extraction_failed"
+    SOURCE_EVIDENCE_MISSING = "source_evidence_missing"
+    SOURCE_ADDITION_NOT_READY = "source_addition_not_ready"
+    SOURCE_ACCESS_POLICY_BLOCKED = "source_access_policy_blocked"
+    REVISION_FENCE_CHANGED = "revision_fence_changed"
+
+
+class TargetedEditorialRevisionTransportCode(StrEnum):
+    TRANSPORT_NOT_SUBMITTED = "targeted_revision_transport_not_submitted"
+    RECONCILIATION_REQUIRED = "targeted_revision_reconciliation_required"
+
+
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 class TargetedEditorialRevisionConflictError(RuntimeError):
     code = "targeted_editorial_revision_conflict"
+
+
+class TargetedEditorialRevisionTransportError(RuntimeError):
+    def __init__(
+        self,
+        code: TargetedEditorialRevisionTransportCode,
+        *,
+        request_identity: str,
+        model_run_id: UUID | None,
+        retryable: bool,
+        submission_state: str | None,
+    ) -> None:
+        if retryable is not (
+            code is TargetedEditorialRevisionTransportCode.TRANSPORT_NOT_SUBMITTED
+            and submission_state == "not_submitted"
+        ):
+            raise ValueError("targeted_revision_transport_retryability_unproven")
+        super().__init__(code.value)
+        self.code = code
+        self.request_identity = request_identity
+        self.model_run_id = model_run_id
+        self.retryable = retryable
+        self.submission_state = submission_state
+
+    @property
+    def next_safe_action(self) -> str:
+        if self.retryable:
+            return "Replay the same revision request with the same idempotency identity."
+        return "Reconcile this model run before any resubmission."
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "code": self.code.value,
+            "request_identity": self.request_identity,
+            "model_run_id": str(self.model_run_id) if self.model_run_id is not None else None,
+            "retryable": self.retryable,
+            "submission_state": self.submission_state,
+            "next_safe_action": self.next_safe_action,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,6 +282,10 @@ class TargetedEditorialRevisionRefusal:
     code: TargetedEditorialRevisionRefusalCode
     recommended_restart_stage: ProductionStage | None
     reason: str
+    refusal_reason: TargetedEditorialRevisionRefusalReason = (
+        TargetedEditorialRevisionRefusalReason.MODEL_OUTPUT_INVALID
+    )
+    next_safe_action: str = "Reformulate the instruction or add supporting evidence."
     details: Mapping[str, Any] = field(default_factory=dict)
 
     def to_json(self) -> dict[str, Any]:
@@ -238,7 +296,9 @@ class TargetedEditorialRevisionRefusal:
                 if self.recommended_restart_stage is not None
                 else None
             ),
+            "refusal_reason": self.refusal_reason.value,
             "reason": self.reason,
+            "next_safe_action": self.next_safe_action,
         }
         if self.details:
             payload["details"] = dict(self.details)

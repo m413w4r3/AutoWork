@@ -5132,7 +5132,7 @@ def test_claim_grounding_refusal_details_are_bounded_and_exclude_claim_content()
     safe_details = synthesis_revision_module._bounded_claim_grounding_details(raw_details)
     refusal = TargetedEditorialRevisionRefusal(
         code=TargetedEditorialRevisionRefusalCode.REVISION_NOT_APPLICABLE,
-        recommended_restart_stage=ProductionStage.SYNTHESIS,
+        recommended_restart_stage=None,
         reason="La révision n'est pas étayée.",
         details=safe_details,
     )
@@ -5140,6 +5140,9 @@ def test_claim_grounding_refusal_details_are_bounded_and_exclude_claim_content()
     serialized = refusal.to_json()
     assert serialized["details"]["claim_code"] == "C001"
     assert len(serialized["details"]["unsupported_terms"]) == 12
+    assert serialized["recommended_restart_stage"] is None
+    assert serialized["refusal_reason"] == "model_output_invalid"
+    assert serialized["next_safe_action"]
     assert "claim_text" not in serialized["details"]
     assert "private sentence" not in str(serialized)
 
@@ -5440,7 +5443,9 @@ def test_targeted_revision_wire_parses_typed_refusal_and_rejects_bad_hash() -> N
     )
     assert refusal.refusal is not None
     assert refusal.refusal.code.value == "revision_not_applicable"
-    assert refusal.refusal.recommended_restart_stage.value == "synthesis"
+    assert refusal.refusal.recommended_restart_stage is None
+    assert refusal.refusal.refusal_reason.value == "model_declined"
+    assert refusal.refusal.next_safe_action
 
     with pytest.raises(synthesis_revision_module.TargetedSynthesisRevisionValidationError):
         synthesis_revision_module._parse_wire_patch(
@@ -6087,7 +6092,8 @@ async def test_synthesis_revision_recovers_existing_model_run_without_resubmissi
         replace(ready_request, before_hash="f" * 64)
     )
     assert changed_target_preview.refusal is not None
-    assert changed_target_preview.refusal.recommended_restart_stage is ProductionStage.SYNTHESIS
+    assert changed_target_preview.refusal.recommended_restart_stage is None
+    assert changed_target_preview.refusal.refusal_reason.value == "revision_fence_changed"
     assert changed_target_preview.expected_model_calls == 1
 
     revision_service._source_addition_service.result = replace(

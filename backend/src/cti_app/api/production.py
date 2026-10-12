@@ -147,6 +147,7 @@ from cti_app.domain.production_editorial_revision import (
     TargetedEditorialRevisionRequest,
     TargetedEditorialRevisionTarget,
     TargetedEditorialRevisionTargetKind,
+    TargetedEditorialRevisionTransportError,
 )
 from cti_app.domain.production_pipeline import production_artifact_stages
 from cti_app.domain.production_references import ProductionReferenceKind
@@ -3039,6 +3040,13 @@ async def revise_editorial_enrichment_artifact(
                 instruction=payload.instruction,
             ),
         )
+    except TargetedEditorialRevisionTransportError as exc:
+        raise HTTPException(
+            status_code=(
+                status.HTTP_503_SERVICE_UNAVAILABLE if exc.retryable else status.HTTP_409_CONFLICT
+            ),
+            detail=exc.to_json(),
+        ) from exc
     except EditorialEnrichmentRevisionConflictError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -3368,6 +3376,13 @@ async def preview_targeted_synthesis_revision(
     )
     try:
         preview = await service.preview(domain_request)
+    except TargetedEditorialRevisionTransportError as exc:
+        raise HTTPException(
+            status_code=(
+                status.HTTP_503_SERVICE_UNAVAILABLE if exc.retryable else status.HTTP_409_CONFLICT
+            ),
+            detail=exc.to_json(),
+        ) from exc
     except TargetedEditorialRevisionConflictError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -3431,6 +3446,13 @@ async def revise_synthesis_artifact(
     )
     try:
         result = await service.revise(domain_request)
+    except TargetedEditorialRevisionTransportError as exc:
+        raise HTTPException(
+            status_code=(
+                status.HTTP_503_SERVICE_UNAVAILABLE if exc.retryable else status.HTTP_409_CONFLICT
+            ),
+            detail=exc.to_json(),
+        ) from exc
     except TargetedEditorialRevisionConflictError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,

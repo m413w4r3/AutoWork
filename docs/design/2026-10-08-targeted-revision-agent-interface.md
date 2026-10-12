@@ -33,4 +33,68 @@ Pour une extension de sources, enregistrer puis sélectionner l’URL opérateur
 {"base_artifact_id":"00000000-0000-4000-8000-000000000003","base_version":2,"base_input_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","base_canonical_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","target":{"kind":"enrichment_element","element_kind":"diagram","placement":{"kind":"after_lead"}},"operation":"create_diagram","instruction":"Crée un diagramme pour ce pipeline.","mode":"existing_evidence_only"}
 ```
 
-Le résultat contient l’artifact/version créés ou `refusal`. Lire son historique sans écriture avec `GET /api/production/artifacts/{artifact_id}/revision-lineage` (`revisions`, `paragraph_provenance`, `element_provenance`). Un `409` est un conflit de fences; un `422` peut être un refus `revision_not_applicable` avec `recommended_restart_stage`, une cible/opération incompatible, ou un bloqueur. Les valeurs d’exemple sont des gabarits : remplacer les fences et cibles par celles lues/renvoyées par l’API.
+Le résultat contient l’artifact/version créés ou `refusal`. Lire son historique sans écriture avec `GET /api/production/artifacts/{artifact_id}/revision-lineage` (`revisions`, `paragraph_provenance`, `element_provenance`). Les refus métier renvoient `refusal_reason` (cause stable), `recommended_restart_stage` (nullable) et `next_safe_action`. Une sortie modèle invalide ou refusée ne recommande pas un stage amont : l’agent reformule la consigne ou apporte des preuves. EXTRACTION/REFERENCES ne sont recommandées que pour un défaut amont établi.
+
+Exemple exact de requête refusée après validation du patch modèle (HTTP 200, aucun artifact créé) :
+
+```json
+{
+  "base_artifact_id": "00000000-0000-4000-8000-000000000001",
+  "base_version": 1,
+  "base_input_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "base_canonical_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "target": {"kind": "title"},
+  "operation": "rewrite_title",
+  "instruction": "Corrige uniquement le titre.",
+  "mode": "existing_evidence_only"
+}
+```
+
+```json
+{
+  "request_identity": null,
+  "artifact_id": null,
+  "artifact_version": null,
+  "artifact_input_hash": null,
+  "artifact_canonical_sha256": null,
+  "publication_artifact_id": null,
+  "revision": null,
+  "refusal": {
+    "code": "revision_not_applicable",
+    "recommended_restart_stage": null,
+    "refusal_reason": "model_declined",
+    "reason": "The admitted evidence does not establish a useful revision for this target.",
+    "next_safe_action": "Reformulate the instruction or add supporting evidence via source extension."
+  }
+}
+```
+
+Les erreurs de transport sont des HTTP errors avec un `detail` typé. Seul l’état PostgreSQL `not_submitted` autorise le retry (503); la même identité déterministe réutilise le même `ModelRun`. Un état ambigu reste en réconciliation (409) et ne doit jamais être soumis à nouveau :
+
+```json
+{
+  "detail": {
+    "code": "targeted_revision_transport_not_submitted",
+    "request_identity": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "model_run_id": "00000000-0000-4000-8000-000000000010",
+    "retryable": true,
+    "submission_state": "not_submitted",
+    "next_safe_action": "Replay the same revision request with the same idempotency identity."
+  }
+}
+```
+
+```json
+{
+  "detail": {
+    "code": "targeted_revision_reconciliation_required",
+    "request_identity": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "model_run_id": "00000000-0000-4000-8000-000000000011",
+    "retryable": false,
+    "submission_state": "external_state_unknown",
+    "next_safe_action": "Reconcile this model run before any resubmission."
+  }
+}
+```
+
+Un `409` reste aussi un conflit de fences; `422` couvre une cible/opération incompatible ou un bloqueur de requête. Les valeurs des exemples d’artifact restent des gabarits : reprendre les fences et cibles réellement lues/renvoyées par l’API.

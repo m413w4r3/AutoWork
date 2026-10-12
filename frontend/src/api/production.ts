@@ -1835,14 +1835,38 @@ export interface TargetedEditorialRevisionPreview {
 export type TargetedEditorialRevisionRefusalCode =
   "revision_not_applicable" | "source_extension_not_available_yet";
 
+export type TargetedEditorialRevisionRefusalReason =
+  | "model_output_invalid"
+  | "model_declined"
+  | "source_extraction_failed"
+  | "source_evidence_missing"
+  | "source_addition_not_ready"
+  | "source_access_policy_blocked"
+  | "revision_fence_changed";
+
 export interface TargetedEditorialRevisionRefusal {
   code: TargetedEditorialRevisionRefusalCode;
   recommended_restart_stage: ProductionStage | null;
   reason: string;
+  refusal_reason?: TargetedEditorialRevisionRefusalReason;
+  next_safe_action?: string;
   details?: {
     claim_code?: string;
     unsupported_terms?: string[];
   };
+}
+
+export type TargetedEditorialRevisionTransportCode =
+  | "targeted_revision_transport_not_submitted"
+  | "targeted_revision_reconciliation_required";
+
+export interface TargetedEditorialRevisionTransportFailure {
+  code: TargetedEditorialRevisionTransportCode;
+  request_identity: string;
+  model_run_id: string | null;
+  retryable: boolean;
+  submission_state: string | null;
+  next_safe_action: string;
 }
 
 export interface TargetedEditorialRevisionLineageEntry {

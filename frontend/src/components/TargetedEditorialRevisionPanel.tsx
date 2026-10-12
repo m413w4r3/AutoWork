@@ -49,6 +49,8 @@ function refusalMessage(refusal: {
   code: string;
   reason: string;
   recommended_restart_stage: string | null;
+  refusal_reason?: string;
+  next_safe_action?: string;
   details?: { claim_code?: string; unsupported_terms?: string[] };
 }): string {
   const restart = refusal.recommended_restart_stage

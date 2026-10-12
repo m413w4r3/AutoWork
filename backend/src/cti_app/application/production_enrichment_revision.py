@@ -11,6 +11,7 @@ from typing import Any, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from cti_app.application.media_assets import compile_and_store_diagrams
+from cti_app.application.model_gateway import ModelSubmissionReconciliationRequiredError
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_editorial_enrichment import (
     EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION,
@@ -53,6 +54,7 @@ from cti_app.application.production_synthesis_revision import (
     TargetedSynthesisRevisionResult,
     TargetedSynthesisRevisionValidationError,
     _critical_extraction_assessment,
+    _targeted_revision_transport_error,
 )
 from cti_app.application.publication_rendering import PublicationRenderService
 from cti_app.application.source_figure_inventory import load_archived_source_figure_inventory
@@ -83,6 +85,7 @@ from cti_app.domain.production_editorial_revision import (
     TargetedEditorialRevisionPlacementKind,
     TargetedEditorialRevisionRefusal,
     TargetedEditorialRevisionRefusalCode,
+    TargetedEditorialRevisionRefusalReason,
     TargetedEditorialRevisionRequest,
     TargetedEditorialRevisionTargetKind,
 )
@@ -92,6 +95,7 @@ from cti_app.domain.production_synthesis import (
     production_synthesis_from_json,
     production_synthesis_to_json,
 )
+from cti_app.integrations.models import BridgeTransportError
 
 MAX_EDITORIAL_REVISION_INSTRUCTION_LENGTH = 2000
 _LEGACY_EDITORIAL_ENRICHMENT_GENERATOR_VERSION = "model-text-blocks-v8-editorial-tables"
@@ -1352,6 +1356,12 @@ class ProductionEditorialEnrichmentRevisionService:
                         reason=(
                             "Source extension requires the E2a archival and extraction workflow."
                         ),
+                        refusal_reason=(
+                            TargetedEditorialRevisionRefusalReason.SOURCE_ADDITION_NOT_READY
+                        ),
+                        next_safe_action=(
+                            "Complete source archival and extraction before using source extension."
+                        ),
                     ),
                 )
             request_identity_payload = self._targeted_request_identity_payload(targeted_request)
@@ -1464,6 +1474,10 @@ class ProductionEditorialEnrichmentRevisionService:
                     "A critical source has an extraction failure without a current, reasoned "
                     "analyst waiver; repair or waive the source first.",
                     ProductionStage.EXTRACTION,
+                    refusal_reason=TargetedEditorialRevisionRefusalReason.SOURCE_EXTRACTION_FAILED,
+                    next_safe_action=(
+                        "Repair the failed source extraction or record a valid waiver, then retry."
+                    ),
                 )
 
         fence = await self._validate_input_fence(
@@ -1490,6 +1504,12 @@ class ProductionEditorialEnrichmentRevisionService:
                 return self._targeted_refusal(
                     "The current source access policy does not permit an editorial model call.",
                     None,
+                    refusal_reason=(
+                        TargetedEditorialRevisionRefusalReason.SOURCE_ACCESS_POLICY_BLOCKED
+                    ),
+                    next_safe_action=(
+                        "Choose evidence that is permitted by the current source access policy."
+                    ),
                 )
             raise ValueError("editorial_enrichment_revision_policy_blocked")
         list_name = {
@@ -1589,17 +1609,30 @@ class ProductionEditorialEnrichmentRevisionService:
                 target_placement=placement_json,
                 editorial_contract=editorial_contract,
             )
-            existing, archive_error = await self._enrichment._verified_existing_execution(request)
-            if archive_error is not None:
-                raise EditorialEnrichmentRevisionValidationError(
-                    [
-                        {
-                            "block_id": "response",
-                            "reason_code": str(archive_error.get("wire_error_code")),
-                        }
-                    ]
+            try:
+                existing, archive_error = await self._enrichment._verified_existing_execution(
+                    request
                 )
-            execution = existing or await self._enrichment._model_gateway.draft(request)
+                if archive_error is not None:
+                    raise EditorialEnrichmentRevisionValidationError(
+                        [
+                            {
+                                "block_id": "response",
+                                "reason_code": str(archive_error.get("wire_error_code")),
+                            }
+                        ]
+                    )
+                execution = existing or await self._enrichment._model_gateway.draft(request)
+            except (BridgeTransportError, ModelSubmissionReconciliationRequiredError) as exc:
+                if request.run_id is None:
+                    raise RuntimeError("targeted_revision_model_run_identity_missing") from exc
+                transport_error = await _targeted_revision_transport_error(
+                    self._enrichment._model_gateway,
+                    exc,
+                    request_identity=request_identity,
+                    model_run_id=request.run_id,
+                )
+                raise transport_error from exc
             if execution.run.status.value != "succeeded":
                 raise EditorialEnrichmentRevisionValidationError(
                     [{"block_id": "response", "reason_code": "editorial_enrichment_model_failed"}]
@@ -1640,19 +1673,37 @@ class ProductionEditorialEnrichmentRevisionService:
                         "delete the element instead."
                     )
                 )
-                return self._targeted_refusal(reason, None)
+                return self._targeted_refusal(
+                    reason,
+                    None,
+                    refusal_reason=TargetedEditorialRevisionRefusalReason.MODEL_DECLINED,
+                    next_safe_action=(
+                        "Reformulate the instruction or provide supporting evidence "
+                        "via source extension."
+                    ),
+                )
             if parsed.proposal is None:
                 if targeted_request is not None:
                     return self._targeted_refusal(
                         "; ".join(item["reason_code"] for item in validator_rejections)
                         or "The proposal is not supported by admitted evidence.",
-                        ProductionStage.EXTRACTION,
+                        None,
+                        refusal_reason=(
+                            TargetedEditorialRevisionRefusalReason.MODEL_OUTPUT_INVALID
+                        ),
+                        next_safe_action=(
+                            "Reformulate the revision instruction or correct the proposed target."
+                        ),
                     )
                 raise EditorialEnrichmentRevisionValidationError(validator_rejections)
             if targeted_request is not None and parsed.proposal.resource_needs:
                 return self._targeted_refusal(
                     "The requested enrichment needs evidence absent from the admitted pack.",
                     ProductionStage.REFERENCES,
+                    refusal_reason=TargetedEditorialRevisionRefusalReason.SOURCE_EVIDENCE_MISSING,
+                    next_safe_action=(
+                        "Add supporting evidence through source extension, then preview again."
+                    ),
                 )
         else:
             assert targeted_request is not None
@@ -1837,7 +1888,13 @@ class ProductionEditorialEnrichmentRevisionService:
                         )
                     return self._targeted_refusal(
                         reason,
-                        ProductionStage.EXTRACTION,
+                        None,
+                        refusal_reason=(
+                            TargetedEditorialRevisionRefusalReason.MODEL_OUTPUT_INVALID
+                        ),
+                        next_safe_action=(
+                            "Reformulate the instruction or correct the proposed enrichment block."
+                        ),
                         details={"validator_rejections": exc.rejections},
                     )
                 raise
@@ -1845,7 +1902,13 @@ class ProductionEditorialEnrichmentRevisionService:
                 if targeted_request is not None:
                     return self._targeted_refusal(
                         str(exc) or "The proposal failed canonical enrichment validation.",
-                        ProductionStage.EXTRACTION,
+                        None,
+                        refusal_reason=(
+                            TargetedEditorialRevisionRefusalReason.MODEL_OUTPUT_INVALID
+                        ),
+                        next_safe_action=(
+                            "Reformulate the instruction or correct the proposed enrichment block."
+                        ),
                     )
                 raise
             after_payload = editorial_enrichment_to_json(revised_enrichment)
@@ -2739,6 +2802,10 @@ class ProductionEditorialEnrichmentRevisionService:
         reason: str,
         restart_stage: ProductionStage | None,
         *,
+        refusal_reason: TargetedEditorialRevisionRefusalReason = (
+            TargetedEditorialRevisionRefusalReason.MODEL_OUTPUT_INVALID
+        ),
+        next_safe_action: str = "Reformulate the instruction or add supporting evidence.",
         details: Mapping[str, Any] | None = None,
     ) -> TargetedSynthesisRevisionResult:
         return TargetedSynthesisRevisionResult(
@@ -2749,6 +2816,8 @@ class ProductionEditorialEnrichmentRevisionService:
                 code=TargetedEditorialRevisionRefusalCode.REVISION_NOT_APPLICABLE,
                 recommended_restart_stage=restart_stage,
                 reason=reason,
+                refusal_reason=refusal_reason,
+                next_safe_action=next_safe_action,
                 details=dict(details or {}),
             ),
         )

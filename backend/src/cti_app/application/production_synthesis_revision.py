@@ -63,6 +63,7 @@ from cti_app.application.production_synthesis import (
 )
 from cti_app.application.publication_assembly import PublicationAssemblyService
 from cti_app.application.publication_rendering import PublicationRenderService
+from cti_app.domain.model_runs import ModelSubmissionState
 from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
@@ -90,9 +91,12 @@ from cti_app.domain.production_editorial_revision import (
     TargetedEditorialRevisionPlacementKind,
     TargetedEditorialRevisionRefusal,
     TargetedEditorialRevisionRefusalCode,
+    TargetedEditorialRevisionRefusalReason,
     TargetedEditorialRevisionRequest,
     TargetedEditorialRevisionTarget,
     TargetedEditorialRevisionTargetKind,
+    TargetedEditorialRevisionTransportCode,
+    TargetedEditorialRevisionTransportError,
 )
 from cti_app.domain.production_extraction import (
     ProductionExtractionOmissionReason,
@@ -118,6 +122,7 @@ from cti_app.domain.production_synthesis import (
     validate_synthesis_lineage,
     validate_synthesis_section_headings,
 )
+from cti_app.integrations.models import BridgeTransportError
 
 TARGETED_SYNTHESIS_REVISION_PARSER_VERSION = "targeted-synthesis-patch-parser-v4-optional-lead"
 # The revision contract includes validator-owned evidence grounding behavior.
@@ -140,6 +145,34 @@ class TargetedSynthesisRevisionValidationError(RuntimeError):
         self.reason_code = reason_code
         self.details = dict(details or {})
         super().__init__(reason_code)
+
+
+async def _targeted_revision_transport_error(
+    model_gateway: Any,
+    error: BridgeTransportError | ModelSubmissionReconciliationRequiredError,
+    *,
+    request_identity: str,
+    model_run_id: UUID,
+) -> TargetedEditorialRevisionTransportError:
+    """Classify a transport failure from the persisted ModelRun state only."""
+    persisted_run = await model_gateway.get_run(model_run_id)
+    submission_state = persisted_run.submission_state.value if persisted_run is not None else None
+    not_submitted = (
+        isinstance(error, BridgeTransportError)
+        and persisted_run is not None
+        and persisted_run.submission_state is ModelSubmissionState.NOT_SUBMITTED
+    )
+    return TargetedEditorialRevisionTransportError(
+        (
+            TargetedEditorialRevisionTransportCode.TRANSPORT_NOT_SUBMITTED
+            if not_submitted
+            else TargetedEditorialRevisionTransportCode.RECONCILIATION_REQUIRED
+        ),
+        request_identity=request_identity,
+        model_run_id=model_run_id,
+        retryable=not_submitted,
+        submission_state=submission_state,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -736,17 +769,6 @@ def _parse_wire_patch(raw_text: str) -> _WirePatch:
         code = values.get("code", raw.splitlines()[0].strip() if raw else "")
         if code != TargetedEditorialRevisionRefusalCode.REVISION_NOT_APPLICABLE.value:
             raise TargetedSynthesisRevisionValidationError("revision_refusal_code_invalid")
-        from cti_app.domain.production import ProductionStage
-
-        stage_value = values.get("recommended_restart_stage", "").upper()
-        try:
-            stage = next((item for item in ProductionStage if item.name == stage_value), None)
-            if stage is None and stage_value:
-                stage = ProductionStage(stage_value.lower())
-        except ValueError as exc:
-            raise TargetedSynthesisRevisionValidationError(
-                "revision_refusal_restart_stage_invalid"
-            ) from exc
         reason = values.get("reason", "").strip()
         if not reason:
             raise TargetedSynthesisRevisionValidationError("revision_refusal_reason_missing")
@@ -759,8 +781,12 @@ def _parse_wire_patch(raw_text: str) -> _WirePatch:
             rationale="",
             refusal=TargetedEditorialRevisionRefusal(
                 code=TargetedEditorialRevisionRefusalCode.REVISION_NOT_APPLICABLE,
-                recommended_restart_stage=stage,
+                recommended_restart_stage=None,
                 reason=reason,
+                refusal_reason=TargetedEditorialRevisionRefusalReason.MODEL_DECLINED,
+                next_safe_action=(
+                    "Reformulate the instruction or add supporting evidence via source extension."
+                ),
             ),
         )
     required = {"TARGET", "ACTION", "BASE_ARTIFACT_HASH", "BEFORE_HASH", "AFTER", "RATIONALE"}
@@ -1887,12 +1913,21 @@ class ProductionSynthesisRevisionService:
                         "current, reasoned analyst waiver; repair or waive the source "
                         "before revising the synthesis."
                     ),
+                    refusal_reason=TargetedEditorialRevisionRefusalReason.SOURCE_EXTRACTION_FAILED,
+                    next_safe_action=(
+                        "Repair the failed source extraction or record a valid waiver, then retry."
+                    ),
                 )
             elif source_addition_service is None or source_addition_request_id is None:
                 preview_refusal = TargetedEditorialRevisionRefusal(
                     code=TargetedEditorialRevisionRefusalCode.REVISION_NOT_APPLICABLE,
                     recommended_restart_stage=ProductionStage.REFERENCES,
                     reason="A source addition request is required before extension preview.",
+                    refusal_reason=TargetedEditorialRevisionRefusalReason.SOURCE_ADDITION_NOT_READY,
+                    next_safe_action=(
+                        "Complete source acquisition and extraction, then preview the "
+                        "revision again."
+                    ),
                 )
             else:
                 addition_preview = await source_addition_service.preview(
@@ -1902,8 +1937,12 @@ class ProductionSynthesisRevisionService:
                 if request.before_hash is not None and request.before_hash != resolved.before_hash:
                     preview_refusal = TargetedEditorialRevisionRefusal(
                         code=TargetedEditorialRevisionRefusalCode.REVISION_NOT_APPLICABLE,
-                        recommended_restart_stage=ProductionStage.SYNTHESIS,
+                        recommended_restart_stage=None,
                         reason="The target changed after the preview fences were captured.",
+                        refusal_reason=TargetedEditorialRevisionRefusalReason.REVISION_FENCE_CHANGED,
+                        next_safe_action=(
+                            "Reload the current artifact and capture a new revision preview."
+                        ),
                     )
                 elif (
                     request.source_additions_hash is not None
@@ -1913,6 +1952,10 @@ class ProductionSynthesisRevisionService:
                         code=TargetedEditorialRevisionRefusalCode.REVISION_NOT_APPLICABLE,
                         recommended_restart_stage=ProductionStage.REFERENCES,
                         reason="The source addition manifest changed after preview.",
+                        refusal_reason=TargetedEditorialRevisionRefusalReason.SOURCE_ADDITION_NOT_READY,
+                        next_safe_action=(
+                            "Refresh the source addition preview and use its current manifest hash."
+                        ),
                     )
             calls_by_stage = (
                 {key: dict(value) for key, value in addition_preview.model_calls.items()}
@@ -1953,6 +1996,11 @@ class ProductionSynthesisRevisionService:
                         "Une source critique est bloquée; la promotion attend sa réparation "
                         "ou une décision D effective."
                     ),
+                    refusal_reason=TargetedEditorialRevisionRefusalReason.SOURCE_ADDITION_NOT_READY,
+                    next_safe_action=(
+                        "Repair the blocked source or record an effective decision, "
+                        "then preview again."
+                    ),
                 )
             elif (
                 preview_refusal is None
@@ -1965,6 +2013,10 @@ class ProductionSynthesisRevisionService:
                     reason=(
                         "Aucune addition READY n'est disponible; terminez l'archivage "
                         "et l'extraction."
+                    ),
+                    refusal_reason=TargetedEditorialRevisionRefusalReason.SOURCE_ADDITION_NOT_READY,
+                    next_safe_action=(
+                        "Complete source archiving and extraction, then preview the revision again."
                     ),
                 )
             if critical_failures:
@@ -2118,6 +2170,11 @@ class ProductionSynthesisRevisionService:
                         "Source extension requires a READY archived and extracted addition "
                         "with matching preview fences."
                     ),
+                    refusal_reason=TargetedEditorialRevisionRefusalReason.SOURCE_ADDITION_NOT_READY,
+                    next_safe_action=(
+                        "Complete source archival and extraction, then capture current "
+                        "preview fences."
+                    ),
                 ),
             )
 
@@ -2152,6 +2209,13 @@ class ProductionSynthesisRevisionService:
                                 "enregistrez une décision D effective pour cette génération. "
                                 f"{blocked}"
                             ),
+                            refusal_reason=(
+                                TargetedEditorialRevisionRefusalReason.SOURCE_ADDITION_NOT_READY
+                            ),
+                            next_safe_action=(
+                                "Repair the blocked source or record an effective decision "
+                                "before retrying."
+                            ),
                         ),
                     )
                 except SourceAdditionConflictError:
@@ -2168,6 +2232,12 @@ class ProductionSynthesisRevisionService:
                                 "Aucune addition READY n'est disponible pour ce manifeste; "
                                 f"reprenez l'acquisition et l'extraction ({exc})."
                             ),
+                            refusal_reason=(
+                                TargetedEditorialRevisionRefusalReason.SOURCE_ADDITION_NOT_READY
+                            ),
+                            next_safe_action=(
+                                "Complete source acquisition and extraction, then preview again."
+                            ),
                         ),
                     )
             try:
@@ -2178,6 +2248,14 @@ class ProductionSynthesisRevisionService:
                 )
             except TargetedSynthesisRevisionValidationError as exc:
                 deterministic_refusals = {
+                    "revision_wire_invalid",
+                    "revision_wire_duplicate_block",
+                    "revision_refusal_code_invalid",
+                    "revision_refusal_reason_missing",
+                    "revision_wire_missing_block",
+                    "revision_wire_action_invalid",
+                    "revision_wire_hash_invalid",
+                    "revision_wire_rationale_missing",
                     "revision_claim_scope_missing_or_invalid",
                     "revision_tool_context_scope_mismatch",
                     "revision_tool_context_cannot_support_actor_activity",
@@ -2194,16 +2272,8 @@ class ProductionSynthesisRevisionService:
                     "revision_requires_one_section",
                     "revision_requires_one_section_claim",
                 }
-                if (
-                    request.mode is not TargetedEditorialRevisionMode.ALLOW_SOURCE_EXTENSION
-                    or exc.reason_code not in deterministic_refusals
-                ):
+                if exc.reason_code not in deterministic_refusals:
                     raise
-                restart_stage = (
-                    ProductionStage.EXTRACTION
-                    if "extraction" in exc.reason_code or "lineage" in exc.reason_code
-                    else ProductionStage.SYNTHESIS
-                )
                 refusal_details = _bounded_claim_grounding_details(exc.details)
                 return TargetedSynthesisRevisionResult(
                     artifact=None,
@@ -2211,10 +2281,15 @@ class ProductionSynthesisRevisionService:
                     revision=None,
                     refusal=TargetedEditorialRevisionRefusal(
                         code=TargetedEditorialRevisionRefusalCode.REVISION_NOT_APPLICABLE,
-                        recommended_restart_stage=restart_stage,
+                        recommended_restart_stage=None,
                         reason=(
-                            "Le patch de révision n'est pas étayé par les preuves autorisées. "
+                            "Le patch fourni par le modèle n'a pas passé la validation ciblée. "
                             f"Détail: {exc.reason_code}."
+                        ),
+                        refusal_reason=TargetedEditorialRevisionRefusalReason.MODEL_OUTPUT_INVALID,
+                        next_safe_action=(
+                            "Reformulate the instruction, correct the target, or add supporting "
+                            "evidence via source extension."
                         ),
                         details=refusal_details,
                     ),
@@ -2273,6 +2348,10 @@ class ProductionSynthesisRevisionService:
                         code=TargetedEditorialRevisionRefusalCode.REVISION_NOT_APPLICABLE,
                         recommended_restart_stage=ProductionStage.REFERENCES,
                         reason="A source addition must be promoted in this transaction first.",
+                        refusal_reason=TargetedEditorialRevisionRefusalReason.SOURCE_ADDITION_NOT_READY,
+                        next_safe_action=(
+                            "Promote a READY source addition and capture fresh preview fences."
+                        ),
                     ),
                 )
             if source_addition_promotion.source_additions_hash != request.source_additions_hash:
@@ -2284,6 +2363,10 @@ class ProductionSynthesisRevisionService:
                         code=TargetedEditorialRevisionRefusalCode.REVISION_NOT_APPLICABLE,
                         recommended_restart_stage=ProductionStage.REFERENCES,
                         reason="The ready source addition manifest changed after preview.",
+                        refusal_reason=TargetedEditorialRevisionRefusalReason.SOURCE_ADDITION_NOT_READY,
+                        next_safe_action=(
+                            "Refresh the source addition preview and use its current manifest hash."
+                        ),
                     ),
                 )
 
@@ -2349,6 +2432,10 @@ class ProductionSynthesisRevisionService:
                         code=TargetedEditorialRevisionRefusalCode.REVISION_NOT_APPLICABLE,
                         recommended_restart_stage=ProductionStage.REFERENCES,
                         reason="The source addition promotion has no verifiable base plan.",
+                        refusal_reason=TargetedEditorialRevisionRefusalReason.SOURCE_ADDITION_NOT_READY,
+                        next_safe_action=(
+                            "Refresh source addition fences and rebuild the promotion plan."
+                        ),
                     ),
                 )
             plan = promotion.promotion_plan
@@ -2510,6 +2597,10 @@ class ProductionSynthesisRevisionService:
                         "current, reasoned analyst waiver; repair or waive the source "
                         "before revising the synthesis."
                     ),
+                    refusal_reason=TargetedEditorialRevisionRefusalReason.SOURCE_EXTRACTION_FAILED,
+                    next_safe_action=(
+                        "Repair the failed source extraction or record a valid waiver, then retry."
+                    ),
                 ),
             )
         projection = (
@@ -2597,6 +2688,7 @@ class ProductionSynthesisRevisionService:
                 ),
             },
             run_id=model_run_id,
+            allow_failed_resubmit=True,
         )
         try:
             execution, archive_error = await self._synthesis._verified_existing_execution(
@@ -2611,11 +2703,14 @@ class ProductionSynthesisRevisionService:
                 execution = await draft_synthesis_proposal(
                     self._synthesis._model_gateway, model_request
                 )
-        except ModelSubmissionReconciliationRequiredError as exc:
-            raise TargetedSynthesisRevisionValidationError(
-                "synthesis_revision_reconciliation_required",
-                details={"model_run_id": str(exc.model_run_id or model_run_id), **exc.details},
-            ) from exc
+        except (BridgeTransportError, ModelSubmissionReconciliationRequiredError) as exc:
+            transport_error = await _targeted_revision_transport_error(
+                self._synthesis._model_gateway,
+                exc,
+                request_identity=request_identity,
+                model_run_id=model_run_id,
+            )
+            raise transport_error from exc
 
         if execution.run.status.value != "succeeded":
             raise TargetedSynthesisRevisionValidationError(

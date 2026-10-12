@@ -4835,7 +4835,10 @@ async def _revision_harness(
 
 
 async def _install_stale_enrichment_restore_history(
-    harness: SimpleNamespace, *, mode: str = "renamed"
+    harness: SimpleNamespace,
+    *,
+    mode: str = "renamed",
+    deleted_kind: str = "diagram",
 ) -> dict[str, ProductionArtifact]:
     from cti_app.application.production_editorial_enrichment import (
         build_editorial_figure_catalog,
@@ -4889,7 +4892,7 @@ async def _install_stale_enrichment_restore_history(
                 ),
             ),
         )
-    if mode == "renamed":
+    if mode in {"renamed", "deleted"}:
         evidence_ref = next(
             ref
             for ref in extraction_evidence_refs_v1(world.extraction)
@@ -5056,28 +5059,63 @@ async def _install_stale_enrichment_restore_history(
         current_artifacts["current"] = current
         current_synthesis = synthesis_chain[0]
     elif mode == "deleted":
-        deleted_enrichment = replace(
-            source_enrichment,
-            diagrams=(),
-            annotations=tuple(
+        family_fields = {
+            "table": "tables",
+            "diagram": "diagrams",
+            "chart": "charts",
+            "source_figure": "source_figures",
+        }
+        family_operations = {
+            "table": "delete_table",
+            "diagram": "delete_diagram",
+            "chart": "delete_chart",
+            "source_figure": "delete_source_figure",
+        }
+        family_element_kinds = {
+            "table": "table",
+            "diagram": "diagram",
+            "chart": "chart",
+            "source_figure": "figure",
+        }
+        if deleted_kind not in family_fields:
+            raise ValueError("unsupported deleted enrichment family")
+        field_name = family_fields[deleted_kind]
+        source_items = getattr(source_enrichment, field_name)
+        deleted_item = source_items[0]
+        updated_fields: dict[str, Any] = {
+            field_name: tuple(item for item in source_items if item.key != deleted_item.key),
+            "synthesis_hash": canonical_synthesis_hash(synthesis_chain[1]),
+        }
+        if deleted_kind == "diagram":
+            updated_fields["annotations"] = tuple(
                 item
                 for item in source_enrichment.annotations
-                if not item.paragraph_anchor.startswith("diagram:")
-            ),
-            synthesis_hash=canonical_synthesis_hash(synthesis_chain[1]),
-        )
+                if not item.paragraph_anchor.startswith(f"diagram:{deleted_item.key}:")
+            )
+        if deleted_kind == "source_figure":
+            deleted_figure_id = (
+                deleted_item.resolved_figure.figure_id
+                if deleted_item.resolved_figure is not None
+                else None
+            )
+            updated_fields["figure_decisions"] = tuple(
+                item
+                for item in source_enrichment.figure_decisions
+                if item.figure_id != deleted_figure_id
+            )
+        deleted_enrichment = replace(source_enrichment, **updated_fields)
         deleted = store_enrichment_version(
             version=2,
             enrichment=deleted_enrichment,
             synthesis=synthesis_chain[1],
             parent=source_artifact,
             revision={
-                "operation": "delete_diagram",
+                "operation": family_operations[deleted_kind],
                 "base_artifact_id": str(source_artifact.id),
                 "target": {
                     "kind": "enrichment_element",
-                    "element_kind": "diagram",
-                    "element_key": source_enrichment.diagrams[0].key,
+                    "element_kind": family_element_kinds[deleted_kind],
+                    "element_key": deleted_item.key,
                 },
             },
         )
@@ -5096,10 +5134,12 @@ async def _install_stale_enrichment_restore_history(
                 }
                 for kind, items in (
                     ("table", source_enrichment.tables),
+                    ("diagram", source_enrichment.diagrams),
                     ("chart", source_enrichment.charts),
                     ("source_figure", source_enrichment.source_figures),
                 )
                 for item in items
+                if not (kind == deleted_kind and item.key == deleted_item.key)
             ],
         )
         current_artifacts["deleted"] = deleted
@@ -6746,6 +6786,284 @@ def _common_enrichment_request(
     )
 
 
+def _canonical_enrichment_with_family_sibling(
+    harness: SimpleNamespace,
+    kind: EditorialEnrichmentElementKind,
+) -> Any:
+    from cti_app.domain.production_editorial_enrichment import (
+        ChartKind,
+        ChartPointV1,
+        ChartSpecV1,
+        EditorialAnalyticPurposeV1,
+    )
+
+    enrichment = editorial_enrichment_from_json(harness.base_payload)
+    if kind is EditorialEnrichmentElementKind.TABLE:
+        original = enrichment.tables[0]
+        assert original.purpose is not None
+        sibling = replace(
+            original,
+            key="sibling_tools_table",
+            title="Additional documented observations",
+            purpose=replace(
+                original.purpose,
+                question="Which additional observation is recorded?",
+                comprehension_gain="A separate table block groups the additional observation.",
+            ),
+        )
+        enrichment = replace(enrichment, tables=(*enrichment.tables, sibling))
+    elif kind is EditorialEnrichmentElementKind.DIAGRAM:
+        original = enrichment.diagrams[0]
+        assert original.purpose is not None
+        sibling = replace(
+            original,
+            key="sibling_infection_chain",
+            title="Additional observed sequence",
+            caption="A second view of the documented execution step.",
+            purpose=replace(
+                original.purpose,
+                question="What additional sequence is established?",
+                comprehension_gain="A separate diagram groups the additional sequence.",
+            ),
+        )
+        enrichment = replace(enrichment, diagrams=(*enrichment.diagrams, sibling))
+    elif kind is EditorialEnrichmentElementKind.CHART:
+        evidence_refs = enrichment.tables[0].rows[0].evidence_refs
+        first_chart = ChartSpecV1(
+            key="revision_timeline",
+            kind=ChartKind.TIMELINE,
+            title="Reported activity timeline",
+            caption="One source observation.",
+            placement=EnrichmentPlacementV1(kind=EnrichmentPlacementKind.AFTER_LEAD),
+            purpose=EditorialAnalyticPurposeV1(
+                question="When was the reported activity observed?",
+                available_data="The source records one dated observation.",
+                comprehension_gain="A timeline places the observation on a date axis.",
+                scope="Only the observation in the admitted source.",
+                evidence_refs=evidence_refs,
+                knowledge_limits="No events between observations are inferred.",
+                placement_reason="Place after the lead that introduces the activity.",
+            ),
+            points=(
+                ChartPointV1(
+                    label="ExampleRAT activity",
+                    date="2026-08-25",
+                    series="Reported activity",
+                    evidence_refs=evidence_refs,
+                ),
+            ),
+        )
+        sibling = replace(
+            first_chart,
+            key="sibling_revision_timeline",
+            title="Additional reported activity timeline",
+            purpose=replace(
+                first_chart.purpose,
+                question="What additional date is documented?",
+                comprehension_gain="A separate timeline presents the additional date.",
+            ),
+        )
+        enrichment = replace(enrichment, charts=(first_chart, sibling))
+    else:
+        catalog = build_editorial_figure_catalog(
+            harness.world.extraction, harness.inventory_state.value
+        )
+        assert len(catalog) >= 2
+        first_wire = _figure_wire(
+            handle=catalog[0].handle,
+            purpose_question="What does the first source visual establish?",
+        )
+        second_wire = _figure_wire(
+            handle=catalog[1].handle,
+            caption="Alternative documented source visual",
+            purpose_question="What additional visual evidence is present?",
+        ).replace("FIGURE P001", "FIGURE P002", 1)
+        parsed = parse_editorial_enrichment_proposal_wire(
+            f"{first_wire}\n\n{second_wire}",
+            harness.evidence_pack,
+            figure_catalog=catalog,
+        )
+        assert parsed.proposal is not None
+        selected = validate_editorial_enrichment_proposal(
+            parsed.proposal,
+            harness.evidence_pack,
+            harness.world.extraction,
+            harness.world.synthesis,
+            figure_catalog=catalog,
+        )
+        enrichment = replace(
+            enrichment,
+            source_figures=selected.source_figures,
+            figure_decisions=selected.figure_decisions,
+        )
+
+    canonical_payload = editorial_enrichment_to_json(enrichment)
+    canonical_enrichment = editorial_enrichment_from_json(canonical_payload)
+    canonical_payload = editorial_enrichment_to_json(canonical_enrichment)
+    artifact = replace(
+        harness.base,
+        canonical_blob_id=harness.world.store.put(canonical_payload),
+    )
+    harness.artifacts.artifacts = [
+        artifact if item.id == harness.base.id else item for item in harness.artifacts.artifacts
+    ]
+    harness.base = artifact
+    harness.base_payload = canonical_payload
+    harness.base_sha256 = hashlib.sha256(
+        ProductionArtifactStore.canonical_json_bytes(canonical_payload)
+    ).hexdigest()
+    return canonical_enrichment
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        EditorialEnrichmentElementKind.TABLE,
+        EditorialEnrichmentElementKind.DIAGRAM,
+        EditorialEnrichmentElementKind.CHART,
+        EditorialEnrichmentElementKind.FIGURE,
+    ],
+)
+@pytest.mark.asyncio
+async def test_targeted_rewrite_preserves_same_family_siblings(
+    monkeypatch: pytest.MonkeyPatch,
+    kind: EditorialEnrichmentElementKind,
+) -> None:
+    harness = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(lambda request: _succeeded_text(request, "unused")),
+        include_figure=kind is EditorialEnrichmentElementKind.FIGURE,
+        include_second_figure=kind is EditorialEnrichmentElementKind.FIGURE,
+    )
+    base = _canonical_enrichment_with_family_sibling(harness, kind)
+    field_name = {
+        EditorialEnrichmentElementKind.TABLE: "tables",
+        EditorialEnrichmentElementKind.DIAGRAM: "diagrams",
+        EditorialEnrichmentElementKind.CHART: "charts",
+        EditorialEnrichmentElementKind.FIGURE: "source_figures",
+    }[kind]
+    original_items = getattr(base, field_name)
+    target, sibling = original_items
+    replacement = (
+        replace(target, title="Revised targeted block")
+        if kind
+        in {
+            EditorialEnrichmentElementKind.TABLE,
+            EditorialEnrichmentElementKind.DIAGRAM,
+            EditorialEnrichmentElementKind.CHART,
+        }
+        else replace(target, caption="Revised targeted figure caption")
+    )
+    candidate = replace(base, **{field_name: (replacement,)})
+
+    revised = await harness.service._replace_target(
+        base,
+        candidate,
+        element_kind=kind,
+        element_key=target.key,
+        run_id=harness.world.run.id,
+    )
+    revised_payload = editorial_enrichment_to_json(revised)
+    original_payload = editorial_enrichment_to_json(base)
+    revised_by_key = {item["key"]: item for item in revised_payload[field_name]}
+
+    assert set(revised_by_key) == {target.key, sibling.key}
+    assert revised_by_key[sibling.key] == next(
+        item for item in original_payload[field_name] if item["key"] == sibling.key
+    )
+    assert revised_by_key[target.key] != next(
+        item for item in original_payload[field_name] if item["key"] == target.key
+    )
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        EditorialEnrichmentElementKind.TABLE,
+        EditorialEnrichmentElementKind.DIAGRAM,
+        EditorialEnrichmentElementKind.CHART,
+        EditorialEnrichmentElementKind.FIGURE,
+    ],
+)
+@pytest.mark.asyncio
+async def test_targeted_delete_removes_only_the_requested_family_key(
+    monkeypatch: pytest.MonkeyPatch,
+    kind: EditorialEnrichmentElementKind,
+) -> None:
+    harness = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(lambda request: _succeeded_text(request, "unused")),
+        include_figure=kind is EditorialEnrichmentElementKind.FIGURE,
+        include_second_figure=kind is EditorialEnrichmentElementKind.FIGURE,
+    )
+    base = _canonical_enrichment_with_family_sibling(harness, kind)
+    field_name = {
+        EditorialEnrichmentElementKind.TABLE: "tables",
+        EditorialEnrichmentElementKind.DIAGRAM: "diagrams",
+        EditorialEnrichmentElementKind.CHART: "charts",
+        EditorialEnrichmentElementKind.FIGURE: "source_figures",
+    }[kind]
+    target, sibling = getattr(base, field_name)
+
+    deleted = harness.service._remove_target(
+        base,
+        element_kind=kind,
+        element_key=target.key,
+    )
+    deleted_payload = editorial_enrichment_to_json(deleted)
+    original_payload = editorial_enrichment_to_json(base)
+
+    assert [item["key"] for item in deleted_payload[field_name]] == [sibling.key]
+    assert deleted_payload[field_name][0] == next(
+        item for item in original_payload[field_name] if item["key"] == sibling.key
+    )
+
+
+@pytest.mark.parametrize("deleted_kind", ("table", "diagram", "chart", "source_figure"))
+@pytest.mark.asyncio
+async def test_restore_does_not_resurrect_any_explicit_delete_family(
+    monkeypatch: pytest.MonkeyPatch,
+    deleted_kind: str,
+) -> None:
+    harness = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(lambda request: _succeeded_text(request, "unexpected")),
+        include_figure=True,
+    )
+    history = await _install_stale_enrichment_restore_history(
+        harness,
+        mode="deleted",
+        deleted_kind=deleted_kind,
+    )
+    source_payload = await harness.world.store.read_json(history["source"].canonical_blob_id)
+    deleted_entry = next(
+        item for item in history["deleted"].metadata["revision"].items() if item[0] == "operation"
+    )
+    assert (
+        deleted_entry[1]
+        == {
+            "table": "delete_table",
+            "diagram": "delete_diagram",
+            "chart": "delete_chart",
+            "source_figure": "delete_source_figure",
+        }[deleted_kind]
+    )
+
+    result = await harness.service.restore_stale_enrichment_blocks(
+        **_stale_enrichment_restore_args(harness), actor="analyst@example.test"
+    )
+    restored_payload = await harness.world.store.read_json(result.artifact.canonical_blob_id)
+    field_name = {
+        "table": "tables",
+        "diagram": "diagrams",
+        "chart": "charts",
+        "source_figure": "source_figures",
+    }[deleted_kind]
+    deleted_key = source_payload[field_name][0]["key"]
+
+    assert deleted_key not in {item["key"] for item in restored_payload[field_name]}
+
+
 def _simulate_repair_rebase_with_uncontextualized_fact(harness: SimpleNamespace) -> None:
     """Model the verified artifacts emitted by an IOC repair that grows extraction."""
     world = harness.world
@@ -8108,6 +8426,9 @@ async def test_targeted_output_invalid_includes_validation_diagnostic(
     result = await _common_revision_service(harness).revise(request)
 
     assert result.refusal is not None
+    assert result.refusal.recommended_restart_stage is None
+    assert result.refusal.refusal_reason.value == "model_output_invalid"
+    assert result.refusal.next_safe_action
     assert result.refusal.details["validator_rejections"][0]["diagnostic_code"] == (
         "plain_text_violation"
     )
