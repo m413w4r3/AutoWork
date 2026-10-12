@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any
@@ -265,7 +265,3 @@ def opcode_fragment16_lookup_value(ngram: CodeNgram) -> str | None:
     if ngram.masked_byte_count or not 8 <= ngram.byte_count <= 16:
         return None
     return ngram.pattern.replace(" ", "")
-
-
-def mapping_to_tuple(data: Mapping[str, int]) -> tuple[tuple[str, int], ...]:
-    return tuple(sorted((str(key), int(value)) for key, value in data.items()))
