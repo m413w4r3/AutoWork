@@ -41,12 +41,18 @@ relisent les assertions canoniques en PostgreSQL.
   la Composition épinglée restent identiques.
 - `test_w5_late_correction.py` (`workflow_full`) : A est produit dans P1 puis B
   dans P2 par les vrais jobs déterministes. Après composition et décision
-  d’exclusion auditée pour A v1, le service officiel
-  `ProductionEditorialEnrichmentRevisionService.revise_targeted` corrige A et
-  crée un nouvel artefact PUBLICATION. La lecture PostgreSQL vérifie l’historique
-  v1, les hashes/version/run, B inchangé, la Composition v1 épinglée et le refus
-  d’acceptation avant ré-épinglage explicite sur v2. La preview de l’artefact est
-  un double d’enregistrement : W5 ne revendique aucune preuve Typst/PDF.
+  d’exclusion auditée pour A v1, une décision INCLUDE v1 est inscrite par le vrai
+  `EditionReviewService`, puis `ProductionEditorialEnrichmentRevisionService`
+  corrige A et crée un nouvel artefact PUBLICATION. v1 passe à `STALE` avant
+  toute manipulation fixturée ; sa ligne, son identité, son blob et ses octets
+  sont conservés. Deux décisions fixturées, persistées par le repository réel,
+  ne doivent pas s’appliquer quand seule leur version ou leur hash diffère ; la
+  lecture passe par le vrai Review. Un bref
+  état Review fixturé remet v1 à VERIFIED pour isoler le blocage
+  `superseded_artifact_available`, puis restaure l’état issu du parcours officiel.
+  Le test vérifie les deux gardes d’acceptation et les codes exacts. La preview
+  de l’artefact est un double d’enregistrement : W5 ne revendique aucune preuve
+  Typst/PDF.
 - `test_w6_concurrency_and_resume.py` (`workflow_fast`) : runs READY et artefacts
   VERIFIED insérés ; mutations de Composition, acceptation, Review et Assembly
   réelles. Vérifie conflit de version, accept concurrent/idempotent, reprise
@@ -109,9 +115,14 @@ Les scénarios ne prouvent pas toutes les permutations de Review, Composition,
 Production et fusion Discovery. W7 vérifie une résolution explicite `SEPARATE`;
 le produit n’expose actuellement pas de route HTTP de revue de fusion. W5 couvre
 la correction ciblée par suppression déterministe d’un diagramme existant et
-utilise un double pour la preview. W9 prouve la compilation Typst, les pages,
-l’inspection sans erreur bloquante et la présence des titres extraits, mais ne
-prouve ni la qualité de mise en page ni la qualité éditoriale. Les chemins de
+utilise un double pour la preview. L’ancienne PUBLICATION v1 est observée `STALE`,
+car l’écriture du nouvel enrichissement invalide les étapes en aval. La mutation
+W5-d qui stalerait aussi v1 lors de `append` est équivalente et non détectable par
+construction ; les mutations qui annulent le blob canonique de v1 ou altèrent
+son `input_hash` sont tuées par les assertions de conservation d’historique.
+W9 prouve la compilation Typst, les pages, l’inspection sans erreur bloquante et
+la présence des titres extraits, mais ne prouve ni la qualité de mise en page ni
+la qualité éditoriale. Les chemins de
 rendu interrompu puis repris et une décision d’exclusion périmée après une
 transition réelle de génération restent hors de ces scénarios.
 

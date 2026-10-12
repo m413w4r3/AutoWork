@@ -2,6 +2,8 @@
 targeted editorial-enrichment correction service. PostgreSQL, publication assembly,
 Composition, Review and Acceptance are real. The ancillary subject-preview renderer
 is a recording double; this scenario does not claim Typst/PDF evidence.
+The review-identity probes are fixture-persisted through the canonical unit-of-work
+repository and checked through the real Review projection.
 """
 
 from __future__ import annotations
@@ -13,7 +15,12 @@ from typing import Any
 from uuid import UUID
 
 import pytest
+from sqlalchemy import update
 
+from cti_app.application.edition_publication import (
+    EditionPublicationService,
+    PublicationAcceptanceError,
+)
 from cti_app.application.edition_review import EditionReviewService
 from cti_app.application.media_assets import MediaAssetStore
 from cti_app.application.persistence import UnitOfWorkFactory
@@ -26,7 +33,11 @@ from cti_app.application.production_enrichment_revision import (
 )
 from cti_app.application.production_stages import EditorialEnrichmentService
 from cti_app.domain.edition_composition import CompositionDisposition
-from cti_app.domain.production import ProductionArtifactStage, ProductionRunStatus
+from cti_app.domain.production import (
+    ProductionArtifactStage,
+    ProductionArtifactStatus,
+    ProductionRunStatus,
+)
 from cti_app.domain.production_editorial_enrichment import EditorialEnrichmentElementKind
 from cti_app.domain.production_editorial_revision import (
     TargetedEditorialRevisionMode,
@@ -35,7 +46,9 @@ from cti_app.domain.production_editorial_revision import (
     TargetedEditorialRevisionTarget,
     TargetedEditorialRevisionTargetKind,
 )
+from cti_app.domain.publication_review import PublicationDecision, PublicationReviewDecision
 from cti_app.infrastructure.analytic_chart_renderer import AnalyticChartRenderer
+from cti_app.infrastructure.database.models.production import ProductionArtifactRow
 from tests.integration.production.support import grounded_editorial_proposal
 from tests.integration.production.test_pipeline_happy_path import (
     Q1_RESPONSE,
@@ -368,6 +381,53 @@ async def test_w5_late_correction_requires_explicit_repin(
         assert composition_with_v1_included is not None
         composition_with_decision = composition_with_v1_included
 
+        async def append_v1_inclusion_decision() -> PublicationReviewDecision:
+            return await EditionReviewService(uow_factory).decide(
+                edition_id,
+                selected["A"],
+                decision=PublicationDecision.INCLUDE,
+                production_run_id=run_a,
+                pipeline_generation=run_a_entity.pipeline_generation,
+                document_artifact_id=publication_v1.id,
+                document_artifact_version=publication_v1.version,
+                document_input_hash=publication_v1.input_hash,
+                actor_id="workflow-analyst",
+            )
+
+        async def verify_v1_inclusion_decision(
+            inclusion_decision: PublicationReviewDecision,
+        ) -> tuple[str, ...]:
+            async with uow_factory() as uow:
+                decisions = await uow.publication_review_decisions.list_for_edition(edition_id)
+            persisted = next((item for item in decisions if item.id == inclusion_decision.id), None)
+            invariants.require(
+                persisted == inclusion_decision
+                and persisted is not None
+                and persisted.subject_id == selected["A"]
+                and persisted.decision is PublicationDecision.INCLUDE
+                and persisted.document_artifact_id == publication_v1.id
+                and persisted.document_artifact_version == publication_v1.version
+                and persisted.document_input_hash == publication_v1.input_hash,
+                driver.scenario,
+                "include_a_v1_decision",
+                "the official inclusion decision must identify A's exact v1 document",
+            )
+            return ("official-v1-inclusion-decision-read-from-postgresql",)
+
+        inclusion_decision = await driver._perform(
+            "include_a_v1_decision",
+            append_v1_inclusion_decision,
+            via="service",
+            action_name="EditionReviewService.decide(INCLUDE) for A v1",
+            identities={
+                "edition": edition_id,
+                "subject": selected["A"],
+                "artifact": publication_v1.id,
+            },
+            assertions=("official-review-decision-identifies-v1",),
+            after=verify_v1_inclusion_decision,
+        )
+
         enrichment_store = driver.production_scenarios["A"].artifact_store
         enrichment_bytes_v1 = await enrichment_store.read_bytes(enrichment_v1.canonical_blob_id)
         publication_bytes_v1 = await enrichment_store.read_bytes(publication_v1.canonical_blob_id)
@@ -441,6 +501,7 @@ async def test_w5_late_correction_requires_explicit_repin(
         )
 
         model_run_count_before = (await invariants.work_counts(uow_factory))[1]
+        v1_status_after_correction: list[ProductionArtifactStatus] = []
 
         async def apply_correction() -> Any:
             return await revision_service.revise_targeted(request)
@@ -477,6 +538,8 @@ async def test_w5_late_correction_requires_explicit_repin(
                 ]
                 persisted_run = await uow.production_runs.get(run_a)
                 composition_after = await uow.edition_compositions.get_for_edition(edition_id)
+            if persisted_old is not None:
+                v1_status_after_correction.append(persisted_old.status)
             new_bytes = await enrichment_store.read_bytes(
                 result.publication_artifact.canonical_blob_id
             )
@@ -590,6 +653,9 @@ async def test_w5_late_correction_requires_explicit_repin(
                 decisions = await uow.publication_review_decisions.list_for_edition(edition_id)
                 composition = await uow.edition_compositions.get_for_edition(edition_id)
             decision = next((item for item in decisions if item.id == decision_id), None)
+            persisted_inclusion = next(
+                (item for item in decisions if item.id == inclusion_decision.id), None
+            )
             review = await EditionReviewService(uow_factory).get(edition_id)
             entry = (
                 next(
@@ -604,6 +670,12 @@ async def test_w5_late_correction_requires_explicit_repin(
                 and decision.production_run_id == run_a
                 and decision.document_artifact_id == publication_v1.id
                 and decision.document_artifact_version == publication_v1.version
+                and persisted_inclusion == inclusion_decision
+                and persisted_inclusion is not None
+                and persisted_inclusion.decision is PublicationDecision.INCLUDE
+                and persisted_inclusion.document_artifact_id == publication_v1.id
+                and persisted_inclusion.document_artifact_version == publication_v1.version
+                and persisted_inclusion.document_input_hash == publication_v1.input_hash
                 and new_publication.id != decision.document_artifact_id
                 and entry is not None
                 and entry.disposition is CompositionDisposition.INCLUDED
@@ -632,7 +704,292 @@ async def test_w5_late_correction_requires_explicit_repin(
             assertions=("decision-v1-not-rebound-to-v2", "stale-composition-pin-remains-v1"),
         )
 
+        async def persist_mismatched_review_identity(
+            *, case: str, document_artifact_version: int, document_input_hash: str
+        ) -> tuple[str, ...]:
+            fixture_decision = PublicationReviewDecision(
+                edition_id=edition_id,
+                subject_id=selected["A"],
+                production_run_id=run_a,
+                pipeline_generation=run_a_entity.pipeline_generation,
+                document_artifact_id=publication_v1.id,
+                document_artifact_version=document_artifact_version,
+                document_input_hash=document_input_hash,
+                decision=PublicationDecision.INCLUDE,
+                actor_id=f"workflow-fixture-{case}",
+            )
+            async with uow_factory() as uow:
+                await uow.publication_review_decisions.append(fixture_decision)
+                await uow.commit()
+                persisted_decisions = await uow.publication_review_decisions.list_for_edition(
+                    edition_id
+                )
+            persisted_fixture = next(
+                (item for item in persisted_decisions if item.id == fixture_decision.id), None
+            )
+            invariants.require(
+                persisted_fixture == fixture_decision
+                and persisted_fixture is not None
+                and persisted_fixture.document_artifact_id == publication_v1.id
+                and persisted_fixture.production_run_id == run_a
+                and persisted_fixture.pipeline_generation == run_a_entity.pipeline_generation
+                and (
+                    (case == "version" and document_artifact_version != publication_v1.version)
+                    or (case == "hash" and document_input_hash != publication_v1.input_hash)
+                )
+                and (
+                    (case == "version" and document_input_hash == publication_v1.input_hash)
+                    or (case == "hash" and document_artifact_version == publication_v1.version)
+                ),
+                driver.scenario,
+                f"review_identity_{case}_mismatch",
+                "fixture decision must differ from A v1 in exactly the targeted identity field",
+            )
+            review = await EditionReviewService(uow_factory).get(edition_id)
+            review_items = [item for item in review.items if item.subject_id == selected["A"]]
+            invariants.require(
+                len(review_items) == 1
+                and review_items[0].effective_decision is PublicationDecision.INCLUDE
+                and review_items[0].effective_decision_id == inclusion_decision.id
+                and review_items[0].effective_decision_id != fixture_decision.id,
+                driver.scenario,
+                f"review_identity_{case}_mismatch",
+                "real Review must keep the exact v1 inclusion and ignore the mismatched fixture "
+                f"decision; observed {review_items!r}",
+            )
+            return (
+                "mismatched-decision-persisted-via-canonical-uow-repository",
+                "real-review-read-model-did-not-apply-version-or-hash-mismatch",
+            )
+
+        wrong_hash = hashlib.sha256(b"workflow-w5-mismatched-review-input").hexdigest()
+        await driver._perform(
+            "review_identity_version_mismatch",
+            lambda: persist_mismatched_review_identity(
+                case="version",
+                document_artifact_version=publication_v1.version + 1,
+                document_input_hash=publication_v1.input_hash,
+            ),
+            via="fixture",
+            action_name="append INCLUDE decision with matching artifact id/hash and wrong version",
+            identities={
+                "edition": edition_id,
+                "subject": selected["A"],
+                "artifact": publication_v1.id,
+            },
+            assertions=("fixture-persistence-via-uow-publication-review-repository",),
+        )
+        await driver._perform(
+            "review_identity_hash_mismatch",
+            lambda: persist_mismatched_review_identity(
+                case="hash",
+                document_artifact_version=publication_v1.version,
+                document_input_hash=wrong_hash,
+            ),
+            via="fixture",
+            action_name="append INCLUDE decision with matching artifact id/version and wrong hash",
+            identities={
+                "edition": edition_id,
+                "subject": selected["A"],
+                "artifact": publication_v1.id,
+            },
+            assertions=("fixture-persistence-via-uow-publication-review-repository",),
+        )
+
         manifests_before_stale_accept = await invariants.manifest_hashes(uow_factory, edition_id)
+
+        async def set_v1_status_for_review_gate(
+            *, expected: ProductionArtifactStatus, status: ProductionArtifactStatus, step: str
+        ) -> tuple[str, ...]:
+            async with uow_factory() as uow:
+                before = await uow.production_artifacts.get(publication_v1.id)
+                invariants.require(
+                    before is not None and before.status is expected,
+                    driver.scenario,
+                    step,
+                    f"A v1 must be {expected.value} before the review-gate fixture; "
+                    f"observed {before.status.value if before is not None else None!r}",
+                )
+                result = await uow._session.execute(
+                    update(ProductionArtifactRow)
+                    .where(ProductionArtifactRow.id == publication_v1.id)
+                    .values(status=status.value)
+                )
+                await uow.commit()
+                persisted = await uow.production_artifacts.get(publication_v1.id)
+            invariants.require(
+                result.rowcount == 1 and persisted is not None and persisted.status is status,
+                driver.scenario,
+                step,
+                f"fixture did not persist A v1 status {status.value}",
+            )
+            return (f"fixture-persisted-v1-status-{status.value}",)
+
+        await driver._perform(
+            "accept_stale_pin_review_gate_fixture",
+            lambda: set_v1_status_for_review_gate(
+                expected=ProductionArtifactStatus.STALE,
+                status=ProductionArtifactStatus.VERIFIED,
+                step="accept_stale_pin_review_gate_fixture",
+            ),
+            via="fixture",
+            action_name="fixture v1 VERIFIED status to isolate superseded-pin Review guard",
+            identities={
+                "edition": edition_id,
+                "subject_a": selected["A"],
+                "artifact_v1": publication_v1.id,
+            },
+            assertions=("fixture-isolates-superseded-flag-from-stale-status",),
+        )
+
+        async def verify_review_guard() -> tuple[str, ...]:
+            review_body = await driver.review(
+                expected_superseded_artifacts={
+                    selected["A"]: (
+                        publication_v1.id,
+                        publication_v1.version,
+                        run_a,
+                        new_publication.id,
+                        new_publication.version,
+                    )
+                },
+                expect_can_accept=False,
+            )
+            review_projection = await EditionReviewService(uow_factory).get(edition_id)
+            invariants.require(
+                review_body["can_accept"] is False and review_projection.can_accept is False,
+                driver.scenario,
+                "accept_stale_pin_review_gate",
+                "Review.can_accept must be false for the verified v1 pin superseded by v2",
+            )
+            return ("real-review-can-accept-false-for-superseded-verified-pin",)
+
+        await driver._perform(
+            "accept_stale_pin_review_gate",
+            verify_review_guard,
+            via="service",
+            action_name="HTTP Review plus EditionReviewService on verified superseded v1 pin",
+            identities={"edition": edition_id, "subject_a": selected["A"]},
+            assertions=("superseded-artifact-diagnostic", "can-accept-false"),
+        )
+
+        async def reject_at_review_guard() -> str:
+            try:
+                await EditionPublicationService(uow_factory, driver.artifact_store).accept(
+                    edition_id,
+                    actor_id="workflow-analyst",
+                    expected_composition_version=composition_with_decision.version,
+                    correlation_id=f"workflow-w5-review-gate-{edition_id}",
+                )
+            except PublicationAcceptanceError as exc:
+                code = exc.code
+            else:
+                raise AssertionError(
+                    "W5-late-correction / accept_stale_pin_review_gate_service: "
+                    "direct publication service accepted a Review-blocked pin"
+                )
+            invariants.require(
+                code == "review_cannot_be_accepted",
+                driver.scenario,
+                "accept_stale_pin_review_gate_service",
+                "the direct service must reject the verified superseded pin at the Review guard; "
+                f"observed {code!r}",
+            )
+            invariants.require(
+                await invariants.manifest_hashes(uow_factory, edition_id)
+                == manifests_before_stale_accept,
+                driver.scenario,
+                "accept_stale_pin_review_gate_service",
+                "Review rejection changed the persisted manifest set",
+            )
+            return code
+
+        await driver._perform(
+            "accept_stale_pin_review_gate_service",
+            reject_at_review_guard,
+            via="service",
+            action_name="EditionPublicationService.accept at Review guard",
+            identities={"edition": edition_id, "subject_a": selected["A"]},
+            assertions=("review-guard-rejects-before-freeze",),
+        )
+
+        await driver._perform(
+            "accept_stale_pin_review_gate_restore",
+            lambda: set_v1_status_for_review_gate(
+                expected=ProductionArtifactStatus.VERIFIED,
+                status=ProductionArtifactStatus.STALE,
+                step="accept_stale_pin_review_gate_restore",
+            ),
+            via="fixture",
+            action_name="restore official correction result: A v1 is STALE",
+            identities={
+                "edition": edition_id,
+                "subject_a": selected["A"],
+                "artifact_v1": publication_v1.id,
+            },
+            assertions=("official-correction-stale-status-restored-before-freeze-probe",),
+        )
+
+        stale_review = await driver.review(
+            expected_superseded_artifacts={
+                selected["A"]: (
+                    publication_v1.id,
+                    publication_v1.version,
+                    run_a,
+                    new_publication.id,
+                    new_publication.version,
+                )
+            },
+            expect_can_accept=False,
+        )
+        review_projection = await EditionReviewService(uow_factory).get(edition_id)
+        invariants.require(
+            stale_review["can_accept"] is False and review_projection.can_accept is False,
+            driver.scenario,
+            "accept_stale_pin_review",
+            "Review.can_accept must be false while the composition still pins superseded v1",
+        )
+
+        async def reject_stale_accept_at_service() -> str:
+            service = EditionPublicationService(uow_factory, driver.artifact_store)
+            try:
+                await service.accept(
+                    edition_id,
+                    actor_id="workflow-analyst",
+                    expected_composition_version=composition_with_decision.version,
+                    correlation_id=f"workflow-w5-stale-pin-{edition_id}",
+                )
+            except PublicationAcceptanceError as exc:
+                code = exc.code
+            else:
+                raise AssertionError(
+                    "W5-late-correction / accept_stale_pin_service: "
+                    "direct publication service accepted the stale v1 pin"
+                )
+            invariants.require(
+                code == "publication_artifact_changed_during_freeze",
+                driver.scenario,
+                "accept_stale_pin_service",
+                "direct publication service must reject the replaced pin at the freeze guard; "
+                f"observed {code!r}",
+            )
+            invariants.require(
+                await invariants.manifest_hashes(uow_factory, edition_id)
+                == manifests_before_stale_accept,
+                driver.scenario,
+                "accept_stale_pin_service",
+                "direct freeze rejection changed the persisted manifest set",
+            )
+            return code
+
+        await driver._perform(
+            "accept_stale_pin_service",
+            reject_stale_accept_at_service,
+            via="service",
+            action_name="EditionPublicationService.accept bypassing HTTP console",
+            identities={"edition": edition_id, "subject_a": selected["A"]},
+            assertions=("freeze-guard-rejects-before-manifest-write",),
+        )
 
         async def reject_stale_accept() -> tuple[int, str]:
             response = await driver.client.post(
@@ -642,11 +999,12 @@ async def test_w5_late_correction_requires_explicit_repin(
             detail = response.json().get("detail", {})
             manifests_after = await invariants.manifest_hashes(uow_factory, edition_id)
             invariants.require(
-                response.status_code == 409 and isinstance(detail.get("code"), str),
+                response.status_code == 409
+                and detail.get("code") == "publication_artifact_changed_during_freeze",
                 driver.scenario,
                 "accept_stale_pin",
-                f"expected an HTTP 409 while A is pinned to v1, got "
-                f"{response.status_code} {detail!r}",
+                "expected HTTP 409 publication_artifact_changed_during_freeze while A is pinned "
+                f"to v1, got {response.status_code} {detail!r}",
             )
             invariants.require(
                 not manifests_before_stale_accept
@@ -663,7 +1021,10 @@ async def test_w5_late_correction_requires_explicit_repin(
             via="http",
             action_name="POST /publication/accept with A still pinned to v1",
             identities={"edition": edition_id, "subject_a": selected["A"]},
-            assertions=("http-409-while-v1-is-pinned", "no-manifest-or-release-created"),
+            assertions=(
+                "exact-http-freeze-code-while-v1-is-pinned",
+                "no-manifest-or-release-created",
+            ),
         )
 
         await driver.compose((selected["A"], selected["B"]))
@@ -734,4 +1095,32 @@ async def test_w5_late_correction_requires_explicit_repin(
             action_name="SQL verify accepted v2 manifest pins",
             identities={"edition": edition_id, "manifest": accepted.manifest.id},
             assertions=("manifest-points-at-a-v2", "b-unchanged"),
+        )
+
+        async def verify_v1_status_after_correction() -> tuple[str, ...]:
+            async with uow_factory() as uow:
+                persisted_old = await uow.production_artifacts.get(publication_v1.id)
+            invariants.require(
+                persisted_old is not None
+                and persisted_old.status is ProductionArtifactStatus.STALE
+                and v1_status_after_correction == [ProductionArtifactStatus.STALE],
+                driver.scenario,
+                "correction_apply_v1_status",
+                "v1 is superseded (STALE) but its row, identity, blob and bytes are retained; "
+                f"observed correction status={v1_status_after_correction!r}, "
+                f"current status={persisted_old.status if persisted_old is not None else None!r}",
+            )
+            return ("publication-v1-stale-row-identity-blob-and-bytes-retained-after-v2",)
+
+        await driver._perform(
+            "correction_apply_v1_status",
+            verify_v1_status_after_correction,
+            via="service",
+            action_name="read historical A v1 PUBLICATION status after explicit v2 acceptance",
+            identities={
+                "edition": edition_id,
+                "subject": selected["A"],
+                "artifact_v1": publication_v1.id,
+            },
+            assertions=("v1-status-stale-and-history-retained-after-correction",),
         )
