@@ -27,7 +27,6 @@ from cti_app.application.production_normalization import normalize_indicator_val
 from cti_app.domain.collection import (
     Claim,
     ClaimKind,
-    DerivedArtifact,
     DetectedMimeType,
     Indicator,
     IndicatorKind,
@@ -122,14 +121,6 @@ class ParsedDocument:
     text: str
     metadata: dict[str, str]
     links: tuple[ParsedLink, ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
-class ExtractionResult:
-    parsed: ParsedDocument
-    artifact: DerivedArtifact
-    indicators: tuple[Indicator, ...]
-    claims: tuple[Claim, ...]
 
 
 @dataclass(frozen=True, slots=True)
