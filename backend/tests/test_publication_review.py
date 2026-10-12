@@ -622,6 +622,27 @@ async def test_review_acceptance_requires_an_included_item() -> None:
     assert (await EditionReviewService(cast(Any, _Factory(mixed_uow))).get(EDITION_ID)).can_accept
 
 
+def test_review_acceptance_is_blocked_by_deferred_subject_diagnostic() -> None:
+    included = _row(ProductionRunStatus.READY)
+    deferred_scope = EditionReviewReadScope(
+        items=(included,),
+        composition_version=1,
+        diagnostics=(
+            EditionReviewDiagnostic(
+                code=EditionReviewDiagnosticCode.SUBJECT_DEFERRED,
+                subject_id=SUBJECT_ID,
+            ),
+        ),
+    )
+    clear_scope = EditionReviewReadScope(items=(included,), composition_version=1)
+
+    deferred_review = EditionReviewService.from_rows(EDITION_ID, deferred_scope)
+    clear_review = EditionReviewService.from_rows(EDITION_ID, clear_scope)
+
+    assert deferred_review.can_accept is False
+    assert clear_review.can_accept is True
+
+
 @pytest.mark.asyncio
 async def test_review_exposes_effective_decision_id_and_backend_retry_stage() -> None:
     explicit_id = UUID("55555555-5555-4555-8555-555555555555")

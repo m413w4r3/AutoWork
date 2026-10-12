@@ -307,6 +307,40 @@ describe("CompositionConsole", () => {
     expect(subjectA).toHaveTextContent("Production : Prête");
   });
 
+  it("traduit le diagnostic d’un sujet reporté et maintient l’acceptation bloquée", async () => {
+    vi.mocked(getEditionCompositionValidation).mockResolvedValueOnce({
+      ...validation,
+      can_accept: false,
+      diagnostics: [
+        {
+          code: "subject_deferred",
+          subject_id: SUBJECT_B,
+          disposition: "deferred",
+          run_id: null,
+          details: null,
+          active_repair_count: 0,
+          unresolved_repair_count: 0,
+          pending_rebuild_count: 0,
+        },
+      ],
+    });
+    renderComposition();
+
+    expect(
+      await screen.findAllByText(
+        "Sujet reporté : une décision explicite est requise avant acceptation.",
+      ),
+    ).toHaveLength(1);
+    expect(
+      screen.getByText(
+        "L’API signale des blocages. L’acceptation finale reste désactivée.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Accepter la composition" }),
+    ).toBeDisabled();
+  });
+
   it("confirme explicitement la version avant le POST composition/accept", async () => {
     renderComposition();
     const accept = await screen.findByRole("button", {

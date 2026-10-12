@@ -1033,6 +1033,7 @@ class EditionReviewService:
         blocking_scope_diagnostics = {
             EditionReviewDiagnosticCode.COMPOSITION_MISSING,
             EditionReviewDiagnosticCode.SUBJECT_UNADDRESSED,
+            EditionReviewDiagnosticCode.SUBJECT_DEFERRED,
             EditionReviewDiagnosticCode.EXCLUSION_DECISION_MISSING,
             EditionReviewDiagnosticCode.PINNED_RUN_GENERATION_STALE,
         }

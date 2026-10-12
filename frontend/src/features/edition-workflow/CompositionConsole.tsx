@@ -155,6 +155,13 @@ function diagnosticDetails(
   return JSON.stringify(details);
 }
 
+function reviewDiagnosticLabel(code: string): string | null {
+  if (code === "subject_deferred") {
+    return "Sujet reporté : une décision explicite est requise avant acceptation.";
+  }
+  return null;
+}
+
 export function CompositionConsole({
   editionId,
   readOnly = false,
@@ -707,7 +714,9 @@ export function CompositionConsole({
                     className="composition-console__diagnostic"
                     key={`${diagnostic.code}-${index}`}
                   >
-                    <code>{diagnostic.code}</code>
+                    {reviewDiagnosticLabel(diagnostic.code) ?? (
+                      <code>{diagnostic.code}</code>
+                    )}
                     {diagnostic.details
                       ? ` · ${JSON.stringify(diagnostic.details)}`
                       : ""}
@@ -838,7 +847,9 @@ export function CompositionConsole({
               <li
                 key={`${diagnostic.code}-${diagnostic.subject_id ?? "edition"}-${index}`}
               >
-                <code>{diagnostic.code}</code>
+                {reviewDiagnosticLabel(diagnostic.code) ?? (
+                  <code>{diagnostic.code}</code>
+                )}
                 {diagnostic.subject_id
                   ? ` · sujet ${diagnostic.subject_id}`
                   : ""}

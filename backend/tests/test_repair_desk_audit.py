@@ -1440,10 +1440,9 @@ def test_composition_review_scopes_repairs_and_reports_nonincluded_subjects() ->
             ),
         ),
     )
-    out_of_scope_repairs = [
-        _issue("6" * 64, deferred),
-        _issue("7" * 64, excluded),
-    ]
+    deferred_repair = _issue("6" * 64, deferred)
+    excluded_repair = _issue("7" * 64, excluded)
+    out_of_scope_repairs = [deferred_repair, excluded_repair]
 
     review = EditionReviewService.from_rows(
         EDITION_ID,
@@ -1451,7 +1450,8 @@ def test_composition_review_scopes_repairs_and_reports_nonincluded_subjects() ->
         repair_issues=out_of_scope_repairs,
     )
 
-    assert review.can_accept
+    # A deferred subject blocks acceptance, consistently with composition_incomplete at freeze.
+    assert not review.can_accept
     assert review.unresolved_repair_count == 0
     assert review.pending_rebuild_count == 0
     diagnostics = {item.subject_id: item for item in review.diagnostics}
@@ -1461,6 +1461,23 @@ def test_composition_review_scopes_repairs_and_reports_nonincluded_subjects() ->
     assert diagnostics[excluded.subject_id].code is EditionReviewDiagnosticCode.SUBJECT_EXCLUDED
     assert diagnostics[excluded.subject_id].active_repair_count == 1
     assert diagnostics[excluded.subject_id].unresolved_repair_count == 1
+
+    excluded_only_scope = replace(
+        scope,
+        diagnostics=tuple(
+            diagnostic
+            for diagnostic in scope.diagnostics
+            if diagnostic.code is not EditionReviewDiagnosticCode.SUBJECT_DEFERRED
+        ),
+    )
+    excluded_only_review = EditionReviewService.from_rows(
+        EDITION_ID,
+        excluded_only_scope,
+        repair_issues=[excluded_repair],
+    )
+    # Repairs for an explicitly excluded subject remain outside publication scope.
+    assert excluded_only_review.can_accept
+    assert excluded_only_review.unresolved_repair_count == 0
 
     unaddressed = replace(
         scope,
