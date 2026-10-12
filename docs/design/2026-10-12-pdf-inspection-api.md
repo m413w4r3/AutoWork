@@ -297,6 +297,14 @@ substituted for another.
 - Mapping sidecars share the derived-cache quota and 24 hour TTL. If one is
   evicted, inspection returns `location_sidecar_unavailable`; an existing
   render path must produce the sidecar again. Inspection does not recompile.
+- A mapping sidecar is only produced when the PDF is compiled. A render that is
+  reused (same inputs, same renderer version) does not recompile, so a sidecar
+  that was evicted or lost with the cache directory is not regenerated until a
+  new artifact version or renderer version forces a compile. The API and the
+  worker must share `PDF_INSPECTION_CACHE_ROOT` (a bind mount in
+  `compose.yaml`); otherwise a sidecar written by the worker is invisible to the
+  API. Recomputing locations on demand from the canonical render inputs, with
+  `typst query` only, is a recommended follow-up and is not implemented.
 - Poppler version is part of the cache key and returned metadata. Pixel output
   is tested for repeatability with the same local build; different Poppler
   builds can produce different pixels.

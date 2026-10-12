@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     subject_workspace_root: Path = Path("var/workspaces/subjects")
     edition_workspace_root: Path = Path("var/workspaces/editions")
     goodware_cache_root: Path = Path("/var/cache/autowork/goodware")
+    # Ephemeral PDF inspection projections (rasters, block locations). The API and the
+    # worker must share this directory for locations computed at render time to be
+    # visible to the inspection routes; None falls back to the process temp directory.
+    pdf_inspection_cache_root: Path | None = None
     # Local development trail of model answers and parser decisions.
     # Empty disables it; never enable outside a local environment.
     diagnostics_log_root: Path | None = None

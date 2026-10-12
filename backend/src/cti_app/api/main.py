@@ -245,7 +245,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
 
     production_artifact_store = ProductionArtifactStore(BlobCatalogService(blob_store, uow_factory))
-    pdf_inspection_cache = PdfInspectionCache()
+    pdf_inspection_cache = PdfInspectionCache(settings.pdf_inspection_cache_root)
     pdf_inspection_service = PdfInspectionService(
         SqlAlchemyPdfInspectionSourceRepository(session_factory),
         production_artifact_store,

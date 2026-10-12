@@ -146,3 +146,16 @@ def test_production_jitter_bounds_allow_zero_but_reject_inverted_ranges(
     monkeypatch.setenv("PRODUCTION_MODEL_JITTER_MAX_SECONDS", "1")
     with pytest.raises(ValidationError):
         Settings(_env_file=None)
+
+
+def test_pdf_inspection_cache_root_is_shared_through_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert Settings(_env_file=None).pdf_inspection_cache_root is None
+
+    monkeypatch.setenv("PDF_INSPECTION_CACHE_ROOT", "/var/cache/autowork/pdf-inspections")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.pdf_inspection_cache_root is not None
+    assert settings.pdf_inspection_cache_root.as_posix() == "/var/cache/autowork/pdf-inspections"

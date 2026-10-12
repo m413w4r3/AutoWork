@@ -175,6 +175,7 @@ services:
       SUBJECT_WORKSPACE_ROOT: /work/subjects
       EDITION_WORKSPACE_ROOT: /work/editions
       GOODWARE_CACHE_ROOT: ${GOODWARE_CACHE_ROOT:-/var/cache/autowork/goodware}
+      PDF_INSPECTION_CACHE_ROOT: ${PDF_INSPECTION_CACHE_ROOT:-/var/cache/autowork/pdf-inspections}
       DIAGNOSTICS_LOG_ROOT: ${DIAGNOSTICS_LOG_ROOT:-/var/diagnostics}
       VIRUSTOTAL_FILE_REPORT_ENABLED: ${VIRUSTOTAL_FILE_REPORT_ENABLED:-false}
       VIRUSTOTAL_PROXY_URL: ${VIRUSTOTAL_PROXY_URL:-}
@@ -197,6 +198,7 @@ services:
       - ./var/workspaces/editions:/work/editions
       - goodware_cache:/var/cache/autowork/goodware
       - ./var/diagnostics:/var/diagnostics
+      - ./var/pdf-inspections:/var/cache/autowork/pdf-inspections
     ports:
       - "${BACKEND_PORT:-8000}:8000"
     extra_hosts:
@@ -255,6 +257,7 @@ services:
       - ./var/workspaces/editions:/work/editions
       - goodware_cache:/var/cache/autowork/goodware
       - ./var/diagnostics:/var/diagnostics
+      - ./var/pdf-inspections:/var/cache/autowork/pdf-inspections
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:

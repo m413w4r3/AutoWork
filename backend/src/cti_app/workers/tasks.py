@@ -274,7 +274,7 @@ async def _execute_job(job_id: UUID) -> int | None:
         chp_typst_root, font_bundle_root, typst_fonts_lock_path = typst_bundle_paths()
         typst_compiler = TypstSubprocessCompiler()
         media_asset_store = MediaAssetStore(production_artifact_store, uow_factory)
-        pdf_inspection_cache = PdfInspectionCache()
+        pdf_inspection_cache = PdfInspectionCache(settings.pdf_inspection_cache_root)
         edition_render_service = EditionRenderService(
             uow_factory=uow_factory,
             artifact_store=production_artifact_store,
