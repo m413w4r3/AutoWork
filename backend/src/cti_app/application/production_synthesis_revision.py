@@ -3622,27 +3622,6 @@ class ProductionSynthesisRevisionService:
         return assembly.artifact
 
 
-def _target_value_for_display(
-    payload: Mapping[str, Any], target: TargetedEditorialRevisionTarget
-) -> Any:
-    if target.kind is TargetedEditorialRevisionTargetKind.TITLE:
-        return payload.get("title")
-    if target.kind is TargetedEditorialRevisionTargetKind.LEAD:
-        return payload.get("lead")
-    if target.kind is TargetedEditorialRevisionTargetKind.SECTIONS:
-        return payload.get("sections")
-    if target.kind is TargetedEditorialRevisionTargetKind.LEAD_PARAGRAPH:
-        return next(item for item in payload["lead"] if _paragraph_id(item) == target.stable_ids[0])
-    if target.kind is TargetedEditorialRevisionTargetKind.SECTION:
-        return next(
-            item for item in payload["sections"] if _section_id(item) == target.stable_ids[0]
-        )
-    section = next(item for item in payload["sections"] if _section_id(item) == target.parent_id)
-    return next(
-        item for item in section["paragraphs"] if _paragraph_id(item) == target.stable_ids[0]
-    )
-
-
 def _critical_extraction_failures(
     extraction: ProductionExtractionV1,
     reference_corpus: ProductionReferenceCorpusV1,
