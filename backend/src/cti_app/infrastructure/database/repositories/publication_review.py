@@ -556,7 +556,7 @@ class SqlAlchemyEditionReviewReadRepository:
             items=tuple(items),
             composition_version=composition_version,
             diagnostics=tuple(diagnostics),
-            exclusions=(),
+            exclusions=tuple(exclusions),
         )
 
 
