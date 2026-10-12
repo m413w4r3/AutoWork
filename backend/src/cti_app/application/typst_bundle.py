@@ -46,25 +46,6 @@ def resolve_bundle_files(
     return tuple(resolved_files)
 
 
-def hash_bundle_files(resolved_files: Sequence[tuple[str, Path]], *, error: type[Exception]) -> str:
-    """Hash resolved `(relative_path, absolute_path)` pairs deterministically.
-
-    Each entry is framed as an 8-byte big-endian UTF-8 path length, the path
-    bytes, an 8-byte big-endian file content length, and the file's exact
-    bytes. Length-prefixing both fields makes path/content and adjacent-entry
-    boundaries unambiguous. Callers must pass `resolved_files` already sorted
-    by relative path (as returned by `resolve_bundle_files`).
-    """
-    contents: list[tuple[str, bytes]] = []
-    for relative_path, absolute_path in resolved_files:
-        try:
-            file_bytes = absolute_path.read_bytes()
-        except OSError as exc:
-            raise error(f"Manifest-listed file cannot be read: {relative_path!r}") from exc
-        contents.append((relative_path, file_bytes))
-    return hash_bundle_contents(contents)
-
-
 def hash_bundle_contents(files: Sequence[tuple[str, bytes]]) -> str:
     """Hash in-memory `(relative_path, content)` pairs with the bundle framing."""
     digest = hashlib.sha256()
