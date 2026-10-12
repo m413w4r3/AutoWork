@@ -1,14 +1,21 @@
 # CTI Bulletin
 
 Application interne de production de bulletins CTI mensuels. Elle fournit l'environnement
-local, la persistance canonique, le stockage de blobs, les jobs asynchrones observables et le
-premier workflow métier de création et de suivi des éditions. La découverte ponctuelle crée
-des candidats sourcés et explicitement non vérifiés via la passerelle LLM typée. Le board
-éditorial exige une décision humaine pour créer une brève ou un article principal. Un analyste
-peut ensuite lancer explicitement un job de collecte sûre HTML/PDF, examiner les preuves et mener
-une brève jusqu’à son approbation et son export Markdown depuis un evidence pack gelé. Aucune
-chasse, attribution automatique, exécution d'échantillon ou génération d’article principal n'est
-encore activée.
+local, la persistance canonique (PostgreSQL, MinIO), les jobs asynchrones observables et le
+workflow éditorial complet, avec une décision humaine à chaque frontière métier :
+
+1. **Discovery** crée des candidats sourcés, explicitement non vérifiés, via la passerelle LLM
+   typée ; **Fusion** versionne le snapshot actif ; **Selection** matérialise les sujets retenus.
+2. **Production** traite explicitement les sujets sélectionnés, par étapes déterministes et
+   versionnées (références, extraction, projection de pertinence, synthèse, enrichissements
+   éditoriaux, assemblage et publication), avec réparations de provenance, décisions analyste sur
+   les sources critiques et révisions ciblées du contenu.
+3. **Review** et **Publication** figent les artefacts retenus dans un manifeste immuable, puis
+   rendent le bulletin PDF (Typst) et exportent les indicateurs (IOC).
+
+Aucune sortie de modèle n'est promue en preuve primaire. Aucune chasse, attribution automatique
+ou exécution d'échantillon n'est encore activée. Le contrat détaillé est dans
+[`docs/workflow.md`](docs/workflow.md) et [`docs/production.md`](docs/production.md).
 
 ## Prérequis
 
