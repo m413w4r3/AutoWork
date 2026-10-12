@@ -831,6 +831,8 @@ class WorkflowDriver:
         self,
         *,
         required_exclusions: Mapping[UUID, tuple[str, str]] | None = None,
+        expect_can_accept: bool | None = None,
+        expected_deferred_subject_id: UUID | None = None,
     ) -> dict[str, Any]:
         edition_id = self._edition_id()
 
@@ -848,6 +850,28 @@ class WorkflowDriver:
                 "review",
                 "HTTP Review differs from the canonical PostgreSQL review projection",
             )
+            if expect_can_accept is not None:
+                invariants.require(
+                    body["can_accept"] is expect_can_accept,
+                    self.scenario,
+                    "review",
+                    f"Review can_accept must be {expect_can_accept}; "
+                    f"observed {body['can_accept']!r}",
+                )
+            if expected_deferred_subject_id is not None:
+                deferred_diagnostics = [
+                    diagnostic
+                    for diagnostic in body["diagnostics"]
+                    if diagnostic["code"] == "subject_deferred"
+                    and diagnostic["subject_id"] == str(expected_deferred_subject_id)
+                ]
+                invariants.require(
+                    len(deferred_diagnostics) == 1,
+                    self.scenario,
+                    "review",
+                    "Review must expose exactly one subject_deferred diagnostic for "
+                    f"{expected_deferred_subject_id}; diagnostics={body['diagnostics']!r}",
+                )
             required = required_exclusions or {}
             for subject_id, (actor_id, reason) in required.items():
                 exclusion = next(
@@ -875,7 +899,16 @@ class WorkflowDriver:
                     "review",
                     "HTTP Review omitted the required exclusion audit",
                 )
-            return ("review-read-from-postgresql-backed-service", "exclusion-projection-verified")
+            return (
+                "review-read-from-postgresql-backed-service",
+                "exclusion-projection-verified",
+                *(("review-can-accept-verified",) if expect_can_accept is not None else ()),
+                *(
+                    ("subject-deferred-diagnostic-exposed",)
+                    if expected_deferred_subject_id is not None
+                    else ()
+                ),
+            )
 
         return await self._perform(
             "review",
@@ -883,6 +916,14 @@ class WorkflowDriver:
             via="http",
             action_name="GET /review",
             identities={"edition": edition_id},
+            assertions=(
+                *(("review-can-accept-expected",) if expect_can_accept is not None else ()),
+                *(
+                    ("review-exposes-subject-deferred-for-subject",)
+                    if expected_deferred_subject_id is not None
+                    else ()
+                ),
+            ),
             after=verify,
         )
 

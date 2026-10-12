@@ -7,6 +7,7 @@ from uuid import UUID
 
 from sqlalchemy import func, select
 
+from cti_app.application.edition_review import EditionReviewService
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.domain.edition_composition import CompositionDisposition
 from cti_app.domain.production import ProductionArtifactStage, ProductionArtifactStatus
@@ -125,7 +126,6 @@ async def assert_manifest_exclusions_applicable(
 async def assert_deferred_subjects_not_excluded(
     uow_factory: UnitOfWorkFactory, edition_id: UUID, *, scenario: str, step: str
 ) -> tuple[str, ...]:
-    checked = 0
     async with uow_factory() as uow:
         composition = await uow.edition_compositions.get_for_edition(edition_id)
         manifests = await uow._session.scalars(
@@ -136,17 +136,33 @@ async def assert_deferred_subjects_not_excluded(
             for entry in (composition.entries if composition is not None else ())
             if entry.disposition is CompositionDisposition.DEFERRED
         }
+        manifested_exclusions: set[UUID] = set()
         for row in manifests:
             exclusions = await uow.publication_manifest_exclusions.list_for_manifest(row.id)
-            excluded = {item.subject_id for item in exclusions}
-            require(
-                deferred.isdisjoint(excluded),
-                scenario,
-                step,
-                "a deferred subject is persisted as a publication exclusion",
-            )
-            checked += len(deferred)
-    return ("deferred-not-excluded", f"checked={checked}")
+            manifested_exclusions.update(item.subject_id for item in exclusions)
+
+    applicable_exclusions = {
+        item.subject_id
+        for item in (await EditionReviewService(uow_factory).get(edition_id)).exclusions
+        if item.applicable
+    }
+    require(
+        deferred.isdisjoint(manifested_exclusions),
+        scenario,
+        step,
+        "a deferred subject is persisted as a publication exclusion",
+    )
+    require(
+        deferred.isdisjoint(applicable_exclusions),
+        scenario,
+        step,
+        "a deferred subject has an applicable exclusion decision",
+    )
+    return (
+        "deferred-not-excluded",
+        f"checked={len(deferred)}",
+        f"manifests={len(manifested_exclusions)}",
+    )
 
 
 async def production_state(
