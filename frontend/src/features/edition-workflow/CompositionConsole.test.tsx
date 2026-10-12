@@ -326,11 +326,19 @@ describe("CompositionConsole", () => {
     });
     renderComposition();
 
+    const validationSection = await screen.findByRole("region", {
+      name: "Validation avant acceptation",
+    });
     expect(
-      await screen.findAllByText(
+      await within(validationSection).findAllByText(
         "Sujet reporté : une décision explicite est requise avant acceptation.",
       ),
     ).toHaveLength(1);
+    expect(
+      within(validationSection).getByText("subject_deferred", {
+        selector: "code",
+      }),
+    ).toBeVisible();
     expect(
       screen.getByText(
         "L’API signale des blocages. L’acceptation finale reste désactivée.",

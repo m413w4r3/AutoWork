@@ -714,9 +714,13 @@ export function CompositionConsole({
                     className="composition-console__diagnostic"
                     key={`${diagnostic.code}-${index}`}
                   >
-                    {reviewDiagnosticLabel(diagnostic.code) ?? (
-                      <code>{diagnostic.code}</code>
-                    )}
+                    <code>{diagnostic.code}</code>
+                    {reviewDiagnosticLabel(diagnostic.code) ? (
+                      <>
+                        {" — "}
+                        <span>{reviewDiagnosticLabel(diagnostic.code)}</span>
+                      </>
+                    ) : null}
                     {diagnostic.details
                       ? ` · ${JSON.stringify(diagnostic.details)}`
                       : ""}
@@ -847,9 +851,13 @@ export function CompositionConsole({
               <li
                 key={`${diagnostic.code}-${diagnostic.subject_id ?? "edition"}-${index}`}
               >
-                {reviewDiagnosticLabel(diagnostic.code) ?? (
-                  <code>{diagnostic.code}</code>
-                )}
+                <code>{diagnostic.code}</code>
+                {reviewDiagnosticLabel(diagnostic.code) ? (
+                  <>
+                    {" — "}
+                    <span>{reviewDiagnosticLabel(diagnostic.code)}</span>
+                  </>
+                ) : null}
                 {diagnostic.subject_id
                   ? ` · sujet ${diagnostic.subject_id}`
                   : ""}
