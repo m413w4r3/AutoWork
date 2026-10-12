@@ -406,7 +406,7 @@ test("Sujet : sélection, production, revue et publication PDF", async ({
           metadata: {},
           rendered_content: null,
           canonical_content: {
-            schema_version: 2,
+            schema_version: 1,
             subject_id: subjectId,
             production_input_hash: hash,
             references_corpus_hash: "b".repeat(64),
@@ -515,7 +515,7 @@ test("Sujet : sélection, production, revue et publication PDF", async ({
           metadata: { mode: "fresh", language: "fr" },
           rendered_content: null,
           canonical_content: {
-            schema_version: 1,
+            schema_version: 2,
             subject_id: subjectId,
             production_input_hash: hash,
             extraction_hash: "9".repeat(64),
@@ -678,9 +678,8 @@ test("Sujet : sélection, production, revue et publication PDF", async ({
   ).toBeVisible();
   await expect(page.getByText("Première activité observée.")).toBeVisible();
   await expect(page.getByText("c2.iranian-proxy.example")).toBeVisible();
-  await expect(
-    page.getByText("L’attribution de la campagne reste provisoire."),
-  ).toBeVisible();
+  // Uncertainties are part of the canonical Synthesis artifact checked below,
+  // not the public article projection.
   await expect(
     page.getByRole("link", { name: "Rapport Vendor" }).first(),
   ).toHaveAttribute("href", vendorUrl);
