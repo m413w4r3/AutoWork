@@ -430,9 +430,22 @@ async def test_preview_api_serializes_document_and_pdf_route_fences_staleness(
     tmp_path: Path,
 ) -> None:
     service, uow, compiler = _configured_preview_service(tmp_path)
+
+    class _InspectionCacheSpy:
+        def __init__(self) -> None:
+            self.calls: list[tuple[bytes, UUID, str]] = []
+
+        async def cache_preview_pdf(
+            self, content: bytes, *, edition_id: UUID, preview_input_hash: str
+        ) -> str:
+            self.calls.append((content, edition_id, preview_input_hash))
+            return hashlib.sha256(content).hexdigest()
+
+    inspection_cache = _InspectionCacheSpy()
     application = FastAPI()
     application.include_router(publication_router)
     application.state.edition_preview_service = service
+    application.state.pdf_inspection_service = inspection_cache
     async with AsyncClient(
         transport=ASGITransport(app=application),
         base_url="http://test",
@@ -460,6 +473,8 @@ async def test_preview_api_serializes_document_and_pdf_route_fences_staleness(
         'attachment; filename="bulletin-preview-2026-08-FR.pdf"'
     )
     assert pdf_response.content == compiler.pdf
+    assert pdf_response.headers["x-pdf-sha256"] == hashlib.sha256(compiler.pdf).hexdigest()
+    assert inspection_cache.calls == [(compiler.pdf, EDITION_ID, preview_hash)]
     assert stale_response.status_code == 409
     assert stale_response.json()["detail"]["code"] == "edition_preview_stale"
     assert len(compiler.requests) == 1

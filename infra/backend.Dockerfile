@@ -10,7 +10,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install --no-install-recommends --yes ca-certificates curl unzip xz-utils \
+    && apt-get install --no-install-recommends --yes ca-certificates curl poppler-utils unzip xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
 COPY infra/d2.lock /usr/local/share/autowork/d2.lock

@@ -74,6 +74,7 @@ jobs:
         run: |
           docker run --rm --network none autowork-backend-smoke sh -eu -c '
             typst --version
+            command -v pdftoppm pdfinfo pdffonts
             test -s /app/chpTypst/RENDERER/publication.typ
             test -s /app/chpTypst/UTILS/chap.png
             python3 -c "import json,pathlib,sys; root=pathlib.Path(\"/usr/local/share/autowork/typst-fonts\"); files=json.loads(pathlib.Path(\"/usr/local/share/autowork/typst-fonts.lock\").read_text())[\"files\"]; missing=[name for name in files if not (root/name).is_file() or (root/name).stat().st_size == 0]; print(\"missing or empty manifest fonts:\", missing) if missing else None; sys.exit(bool(missing))"

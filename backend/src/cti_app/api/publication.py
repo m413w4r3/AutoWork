@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import logging
 from collections.abc import Sequence
 from typing import Annotated, Any, Literal, NoReturn, cast
 from uuid import UUID
@@ -101,6 +103,7 @@ from cti_app.logging import get_correlation_id
 
 router = APIRouter(prefix="/api", tags=["publication"])
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
+logger = logging.getLogger(__name__)
 
 
 class ReviewRunRequest(BaseModel):
@@ -1601,10 +1604,24 @@ async def download_edition_preview_pdf(
         )
     except Exception as exc:
         _raise_publication_error(exc)
+    pdf_sha256 = hashlib.sha256(preview_pdf.content).hexdigest()
+    inspection_service = getattr(request.app.state, "pdf_inspection_service", None)
+    if inspection_service is not None:
+        try:
+            await inspection_service.cache_preview_pdf(
+                preview_pdf.content,
+                edition_id=edition_id,
+                preview_input_hash=preview_input_hash,
+            )
+        except Exception:
+            logger.warning("Unable to populate ephemeral edition preview PDF cache")
     return Response(
         content=preview_pdf.content,
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{preview_pdf.filename}"'},
+        headers={
+            "Content-Disposition": f'attachment; filename="{preview_pdf.filename}"',
+            "X-PDF-SHA256": pdf_sha256,
+        },
     )
 
 

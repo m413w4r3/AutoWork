@@ -24,7 +24,10 @@ from cti_app.domain.production import (
 )
 from cti_app.domain.publication_render import PublicationRender
 from cti_app.domain.typst_render import TypstRenderFormat, TypstRenderStatus
-from cti_app.infrastructure.database.session import create_postgres_engine
+from cti_app.infrastructure.database.repositories.pdf_inspection import (
+    SqlAlchemyPdfInspectionSourceRepository,
+)
+from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 
 pytestmark = pytest.mark.integration
 
@@ -151,6 +154,93 @@ async def test_edition_render_repository_round_trip_and_failed_release_intact(
         await uow.commit()
     assert retried.render.id == proposed.id
     assert retried.render.status is TypstRenderStatus.RUNNING
+
+
+async def test_pdf_inspection_source_repository_returns_publication_and_release_provenance(
+    uow_factory: UnitOfWorkFactory,
+    migrated_postgres_url: str,
+) -> None:
+    release, _ = await _persist_release(uow_factory)
+    output_blob = _blob("pdf-inspection-shared-output", b"shared PDF output")
+    pdf_sha256 = "a" * 64
+    output_size = 1234
+    edition_render = _render(release.id)
+    subject = Subject(
+        edition_id=release.edition_id,
+        title="PDF inspection provenance fixture",
+        slug=f"pdf-inspection-{uuid4().hex}",
+        tlp=TLP.AMBER,
+    )
+    run = ProductionRun(subject_id=subject.id, edition_id=release.edition_id)
+    artifact = ProductionArtifact(
+        production_run_id=run.id,
+        subject_id=subject.id,
+        stage=ProductionArtifactStage.PUBLICATION,
+        version=1,
+        input_hash=sha256(uuid4().bytes).hexdigest(),
+    )
+    now = datetime.now(UTC)
+    publication_render = PublicationRender(
+        id=uuid4(),
+        publication_artifact_id=artifact.id,
+        renderer="typst",
+        renderer_version="publication-v4-typst-v1",
+        template_version="chp-article-v1",
+        template_sha256="d" * 64,
+        compiler="typst",
+        compiler_version="0.15.1",
+        font_bundle_version="test-font-bundle-v1",
+        render_policy_version="test-render-policy-v1",
+        format=TypstRenderFormat.PDF,
+        input_hash=sha256(uuid4().bytes).hexdigest(),
+        source_blob_id=None,
+        render_data_blob_id=None,
+        output_blob_id=output_blob.id,
+        output_sha256=pdf_sha256,
+        output_byte_size=output_size,
+        status=TypstRenderStatus.SUCCEEDED,
+        error_code=None,
+        error_message=None,
+        created_at=now,
+        updated_at=now,
+    )
+    async with uow_factory() as uow:
+        await uow.blobs.add(output_blob)
+        await uow.edition_renders.acquire_for_render(
+            edition_render, stale_running_before=datetime.now(UTC)
+        )
+        await uow.edition_renders.mark_succeeded(
+            edition_render.id,
+            output_blob_id=output_blob.id,
+            output_sha256=pdf_sha256,
+            output_byte_size=output_size,
+        )
+        await uow.subjects.add(subject)
+        await uow.production_runs.add(run)
+        await uow.production_artifacts.append(artifact)
+        await uow.publication_renders.add(publication_render)
+        await uow.commit()
+
+    engine = create_postgres_engine(migrated_postgres_url)
+    try:
+        repository = SqlAlchemyPdfInspectionSourceRepository(create_session_factory(engine))
+        references = await repository.find_by_output_sha256(pdf_sha256)
+    finally:
+        await engine.dispose()
+
+    assert {reference.kind for reference in references} == {
+        "publication_render",
+        "edition_render",
+    }
+    assert {reference.output_sha256 for reference in references} == {pdf_sha256}
+    assert {reference.source["kind"] for reference in references} == {
+        "subject_publication",
+        "edition_release",
+    }
+    edition_source = next(
+        reference.source for reference in references if reference.kind == "edition_render"
+    )
+    assert edition_source["manifest_id"] == str(release.manifest_id)
 
 
 async def test_edition_render_blob_reachability_and_restrict_foreign_keys(

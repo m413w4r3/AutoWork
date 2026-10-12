@@ -16,6 +16,7 @@ from cti_app.api.fusion import fusion_router
 from cti_app.api.health import router as health_router
 from cti_app.api.jobs import router as jobs_router
 from cti_app.api.model_conversations import router as model_conversations_router
+from cti_app.api.pdf_inspection import router as pdf_inspection_router
 from cti_app.api.production import router as production_router
 from cti_app.api.production_control import router as production_control_router
 from cti_app.api.publication import router as publication_router
@@ -64,6 +65,7 @@ from cti_app.application.identity import LocalIdentityProvider
 from cti_app.application.jobs import DuplicateJobError, JobService, create_job_registry
 from cti_app.application.media_assets import MediaAssetStore
 from cti_app.application.model_conversations import ModelConversationService
+from cti_app.application.pdf_inspection import PdfInspectionService
 from cti_app.application.persistence import UnitOfWork
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_control_view import ProductionControlViewService
@@ -89,11 +91,15 @@ from cti_app.config import get_settings
 from cti_app.infrastructure.analytic_chart_renderer import AnalyticChartRenderer
 from cti_app.infrastructure.blob_storage.minio import MinioBlobStore
 from cti_app.infrastructure.d2_diagram_compiler import D2DiagramCompiler
+from cti_app.infrastructure.database.repositories.pdf_inspection import (
+    SqlAlchemyPdfInspectionSourceRepository,
+)
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
 from cti_app.infrastructure.health import InfrastructureReadinessChecker
 from cti_app.infrastructure.http import AsyncioPinnedHttpTransport
 from cti_app.infrastructure.jobs import DramatiqJobDispatcher
+from cti_app.infrastructure.pdf_inspection import PdfInspectionCache, PopplerSubprocess
 from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
 from cti_app.integrations.model_factory import (
     create_bridge_capabilities_provider,
@@ -239,6 +245,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
 
     production_artifact_store = ProductionArtifactStore(BlobCatalogService(blob_store, uow_factory))
+    pdf_inspection_service = PdfInspectionService(
+        SqlAlchemyPdfInspectionSourceRepository(session_factory),
+        production_artifact_store,
+        PopplerSubprocess(),
+        PdfInspectionCache(),
+    )
     production_checkpoint = EditionProductionCheckpointService(
         uow_factory,
         production_artifact_store,
@@ -311,6 +323,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.readiness = readiness
     app.state.uow_factory = uow_factory
     app.state.production_artifact_store = production_artifact_store
+    app.state.pdf_inspection_service = pdf_inspection_service
     app.state.media_asset_store = media_asset_store
     app.state.subject_content_service = subject_content_service
     app.state.publication_render_service = publication_render_service
@@ -433,6 +446,7 @@ def create_app() -> FastAPI:
     application.include_router(production_router)
     application.include_router(production_control_router)
     application.include_router(publication_router)
+    application.include_router(pdf_inspection_router)
     application.include_router(selection_router)
     application.include_router(subjects_router)
     application.include_router(subject_content_router)
