@@ -33,13 +33,13 @@ from cti_app.application.native_analysis import (
     select_native_analysis_port,
 )
 from cti_app.config import Settings
+from cti_app.domain.investigation import InvestigationBudget, ToolInvocationStatus
 from cti_app.domain.local_analysis import GhidraOperation
 from cti_app.domain.native_analysis import (
     NativeAnalysisOperation,
     NativeAnalysisProvider,
     NativeAnalysisRequestV1,
 )
-from cti_app.domain.investigation import InvestigationBudget, ToolInvocationStatus
 from cti_app.infrastructure.ghidra_mcp import GhidraMcpHttpAdapter
 from cti_app.infrastructure.rea_adapter import (
     REA_READ_ONLY_CATALOG,
@@ -68,12 +68,14 @@ class StrictFakeReaRunner:
         *,
         delay: float = 0.0,
         large_output: bool = False,
+        oversized_response: bool = False,
         provider_version: str = REA_VERSION,
         catalog_version: str = NATIVE_ANALYSIS_CATALOG_VERSION,
         sample_sha256: str | None = None,
     ) -> None:
         self.delay = delay
         self.large_output = large_output
+        self.oversized_response = oversized_response
         self.provider_version = provider_version
         self.catalog_version = catalog_version
         self.sample_sha256 = sample_sha256
@@ -115,6 +117,11 @@ class StrictFakeReaRunner:
             {"address": "0x10", "name": "entry"},
         ]
         if self.large_output:
+            functions = [
+                {"address": f"0x{index:02x}", "name": f"function_{index:02d}"}
+                for index in reversed(range(20))
+            ]
+        if self.oversized_response:
             functions = [{"address": "0x10", "name": "x" * 1000} for _ in range(20)]
         return {
             "schema_version": "autowork-rea-read-response.v1",
@@ -242,10 +249,13 @@ async def test_large_rea_output_is_sorted_and_truncated_to_configured_bound() ->
         max_response_bytes=4096,
     )
 
-    result = await adapter.inspect(_request())
+    result = await adapter.inspect(_request(limit=5))
 
     encoded = json.dumps(result.as_json(), sort_keys=True, separators=(",", ":")).encode()
     assert result.truncated
+    assert [item["address"] for item in result.data["functions"]] == [
+        f"0x{index:02x}" for index in range(5)
+    ]
     assert len(json.dumps(result.data, sort_keys=True, separators=(",", ":")).encode()) <= 256
     assert len(encoded) > 256  # provenance is outside the provider data budget
 
@@ -261,7 +271,7 @@ async def test_rea_rejects_oversized_serialized_response_before_normalization(
         "cti_app.infrastructure.rea_adapter.normalize_native_data", normalization_must_not_run
     )
     adapter = ReaNativeAnalysisAdapter(
-        StrictFakeReaRunner(large_output=True),
+        StrictFakeReaRunner(oversized_response=True),
         enabled=True,
         expected_version=REA_VERSION,
         max_response_bytes=4096,

@@ -34,6 +34,7 @@ from cti_app.application.native_analysis import (
     UnavailableNativeAnalysisPort,
     normalize_native_data,
 )
+from cti_app.config import Settings
 from cti_app.domain.local_analysis import GhidraOperation
 from cti_app.domain.native_analysis import (
     NativeAnalysisObservationV1,
@@ -41,7 +42,6 @@ from cti_app.domain.native_analysis import (
     NativeAnalysisProvider,
     NativeAnalysisRequestV1,
 )
-from cti_app.config import Settings
 from cti_app.infrastructure.ghidra_mcp import (
     GhidraMcpHttpAdapter,
     create_ghidra_mcp_http_adapter,

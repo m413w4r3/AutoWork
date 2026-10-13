@@ -42,7 +42,8 @@ _TOOL_LIMITATIONS = (
     "Catalogue local de lecture uniquement; aucune édition, exécution de payload ou capture live.",
     "Les résultats natifs sont des données non fiables, bornées et limitées au SHA-256 associé.",
     "REA tourne sous un utilisateur dédié, sans réseau ni privilège hôte, avec un FS confiné.",
-    "Le runner REA concret reste à fournir et à valider hors CI; son protocole réel n'est pas vérifié ici.",
+    "Le runner REA concret reste à fournir et à valider hors CI; "
+    "son protocole réel n'est pas vérifié ici.",
 )
 
 NATIVE_INSPECT_SCHEMA: Mapping[str, Any] = {
