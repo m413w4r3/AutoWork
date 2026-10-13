@@ -95,7 +95,7 @@ class EditionReleaseRematerializationService:
             render = (
                 await uow.edition_renders.get(edition_render_id)
                 if edition_render_id is not None
-                else await uow.edition_renders.get_latest_succeeded_for_release(release.id)
+                else await uow.edition_renders.get_pinned_succeeded_for_release(release.id)
             )
             if (
                 render is None

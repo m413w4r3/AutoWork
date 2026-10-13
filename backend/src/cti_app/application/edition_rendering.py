@@ -42,6 +42,11 @@ from cti_app.application.typst_render_lifecycle import (
     TypstRenderErrors,
     TypstRenderRunner,
 )
+from cti_app.application.typst_render_output import (
+    TypstRenderOutputIntegrityError,
+    TypstRenderOutputStorageError,
+    read_verified_render_pdf,
+)
 from cti_app.application.typst_rendering import TemplateBundleInvalidError, TypstRenderSource
 from cti_app.domain.edition_publication import (
     EditionDocumentV2,
@@ -186,7 +191,21 @@ class EditionRenderService:
                 raise EditionReleaseNotFoundError(
                     f"Edition release {edition_release_id} does not exist"
                 )
+            pinned_render = await uow.edition_renders.get_pinned_succeeded_for_release(release.id)
             await uow.commit()
+
+        pinned_output_error: (
+            TypstRenderOutputStorageError | TypstRenderOutputIntegrityError | None
+        ) = None
+        if pinned_render is not None:
+            try:
+                await read_verified_render_pdf(self._artifact_store, pinned_render)
+            except (TypstRenderOutputStorageError, TypstRenderOutputIntegrityError) as exc:
+                pinned_output_error = exc
+            else:
+                # A release's first successful PDF is its immutable render pin.
+                # Replayed jobs must not silently adopt the current Typst bundle.
+                return pinned_render
 
         document = await self._read_edition_document(release)
         artifact_identities = await self._read_manifest_artifact_identities(release)
@@ -217,6 +236,9 @@ class EditionRenderService:
             render_policy_version=EDITION_RENDER_POLICY_VERSION,
             format=TypstRenderFormat.PDF,
         )
+        if pinned_output_error is not None and pinned_render is not None:
+            if pinned_render.input_hash != input_hash:
+                raise pinned_output_error
         now = datetime.now(UTC)
         proposed = EditionRender(
             id=uuid4(),

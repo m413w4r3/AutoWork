@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import pairwise
 from typing import Protocol, cast
 from uuid import UUID
@@ -16,7 +16,10 @@ from cti_app.application.diagram_compilation import (
     DiagramCompiler,
 )
 from cti_app.application.media_assets import MediaAssetStore
-from cti_app.domain.analyst_opinion import OpinionProtocolFigureV1
+from cti_app.domain.analyst_opinion import (
+    OpinionProtocolFieldEvidenceV1,
+    OpinionProtocolFigureV1,
+)
 from cti_app.domain.media_assets import MediaAssetManifest
 from cti_app.domain.production_editorial_enrichment import (
     DiagramEdgeV1,
@@ -37,11 +40,14 @@ from cti_app.domain.protocol_model import (
     ProtocolDiagramNodeV1,
     ProtocolDiagramSpecV1,
     ProtocolDiagramStatus,
+    ProtocolEvidenceRefV1,
     ProtocolRenderResultV1,
     ProtocolValidationStatus,
 )
 
 PROTOCOL_DIAGRAM_PROJECTION_VERSION = "protocol-diagram-projection-v1"
+_MAX_FIELD_EVIDENCE_REFS = 8
+_MAX_FIELD_EVIDENCE_FRAMES = 12
 _STATUS_LABELS = {
     ProtocolValidationStatus.OBSERVED: "OBSERVED",
     ProtocolValidationStatus.INFERRED: "INFERRED",
@@ -197,6 +203,15 @@ def opinion_protocol_figures(
             compiler_version=item.compiled.compiler_version,
             compiler_policy_version=item.compiled.compiler_policy_version,
             caption=item.diagram.caption or item.spec.title,
+            field_evidence=(
+                tuple(
+                    _field_evidence_metadata(field.field_id, field.evidence)
+                    for field in item.spec.fields
+                    if field.evidence
+                )
+                if item.spec.kind is ProtocolDiagramKind.MESSAGE_FORMAT
+                else ()
+            ),
         )
         for item in sorted(
             rendered, key=lambda item: tuple(ProtocolDiagramKind).index(item.spec.kind)
@@ -368,6 +383,9 @@ def _project_field(field: ProtocolDiagramFieldV1, index: int) -> DiagramNodeV1:
     ]
     if field.condition:
         details.append(f"condition {field.condition.strip()}")
+    evidence_label = _field_evidence_label(field.evidence)
+    if evidence_label:
+        details.append(evidence_label)
     label = _status_label(field.validation_status, field_name + " · " + " · ".join(details))
     return DiagramNodeV1(
         node_id=f"protocol-field-{index:04d}",
@@ -375,6 +393,49 @@ def _project_field(field: ProtocolDiagramFieldV1, index: int) -> DiagramNodeV1:
         evidence_refs=(),
         role=DiagramNodeRole.PROTOCOL_FIELD,
     )
+
+
+def _bounded_field_evidence(
+    evidence: tuple[ProtocolEvidenceRefV1, ...],
+) -> tuple[tuple[ProtocolEvidenceRefV1, ...], bool]:
+    unique = tuple(dict.fromkeys(evidence))
+    truncated = len(unique) > _MAX_FIELD_EVIDENCE_REFS
+    bounded: list[ProtocolEvidenceRefV1] = []
+    for reference in unique[:_MAX_FIELD_EVIDENCE_REFS]:
+        frames = reference.frame_numbers[:_MAX_FIELD_EVIDENCE_FRAMES]
+        if len(frames) != len(reference.frame_numbers):
+            truncated = True
+            reference = replace(reference, frame_numbers=frames)
+        bounded.append(reference)
+    return tuple(bounded), truncated
+
+
+def _field_evidence_metadata(
+    field_id: str,
+    evidence: tuple[ProtocolEvidenceRefV1, ...],
+) -> OpinionProtocolFieldEvidenceV1:
+    bounded, truncated = _bounded_field_evidence(evidence)
+    return OpinionProtocolFieldEvidenceV1(
+        field_id=field_id,
+        evidence_refs=bounded,
+        truncated=truncated,
+    )
+
+
+def _field_evidence_label(evidence: tuple[ProtocolEvidenceRefV1, ...]) -> str:
+    bounded, truncated = _bounded_field_evidence(evidence)
+    citations: list[str] = []
+    for reference in bounded:
+        citation = f"capture {reference.capture_sha256[:12]}"
+        if reference.frame_numbers:
+            citation += " frames " + ", ".join(str(frame) for frame in reference.frame_numbers)
+        elif reference.start_offset is not None and reference.end_offset is not None:
+            citation += f" bytes {reference.start_offset}-{reference.end_offset}"
+        citations.append(citation)
+    if not citations:
+        return ""
+    suffix = " · additional evidence omitted" if truncated else ""
+    return "evidence " + "; ".join(citations) + suffix
 
 
 def _field_order_edges(fields: tuple[ProtocolDiagramFieldV1, ...]) -> list[DiagramEdgeV1]:

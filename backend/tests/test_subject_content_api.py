@@ -85,6 +85,15 @@ class _PublicationRenders:
         ]
         return matches[-1] if matches else None
 
+    async def get_pinned_succeeded_for_artifact(self, artifact_id: UUID) -> object | None:
+        matches = [
+            render
+            for render in self.renders.values()
+            if getattr(render, "publication_artifact_id", None) == artifact_id
+            and getattr(getattr(render, "status", None), "value", None) == "succeeded"
+        ]
+        return matches[0] if matches else None
+
     async def get_by_input_hash(self, input_hash: str) -> object | None:
         return next(
             (

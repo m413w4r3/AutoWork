@@ -34,6 +34,11 @@ from cti_app.application.typst_render_lifecycle import (
     TypstRenderErrors,
     TypstRenderRunner,
 )
+from cti_app.application.typst_render_output import (
+    TypstRenderOutputIntegrityError,
+    TypstRenderOutputStorageError,
+    read_verified_render_pdf,
+)
 from cti_app.application.typst_rendering import (
     TemplateBundleInvalidError,
     TypstRenderer,
@@ -178,7 +183,26 @@ class PublicationRenderService:
         )
 
     async def render_pdf(self, publication_artifact_id: UUID) -> PublicationRender:
+        async with self._uow_factory() as uow:
+            pinned_render = await uow.publication_renders.get_pinned_succeeded_for_artifact(
+                publication_artifact_id
+            )
+        pinned_output_error: (
+            TypstRenderOutputStorageError | TypstRenderOutputIntegrityError | None
+        ) = None
+        if pinned_render is not None:
+            try:
+                await read_verified_render_pdf(self._artifact_store, pinned_render)
+            except (TypstRenderOutputStorageError, TypstRenderOutputIntegrityError) as exc:
+                pinned_output_error = exc
+            else:
+                # Publication artifacts are immutable; a bundle update is a new
+                # render choice only when a new artifact version is published.
+                return pinned_render
         prepared = await self._prepare(publication_artifact_id)
+        if pinned_output_error is not None and pinned_render is not None:
+            if pinned_render.input_hash != prepared.proposed.input_hash:
+                raise pinned_output_error
         return await self._runner.run(
             prepared.proposed,
             template_bundle=prepared.template_bundle,

@@ -148,6 +148,10 @@ class PublicationRenderRepository(Protocol):
 
     async def get_latest_for_artifact(self, artifact_id: UUID) -> PublicationRender | None: ...
 
+    async def get_pinned_succeeded_for_artifact(
+        self, artifact_id: UUID
+    ) -> PublicationRender | None: ...
+
     async def list_latest_for_artifacts(
         self, artifact_ids: Sequence[UUID]
     ) -> Sequence[PublicationRender]: ...
@@ -196,6 +200,10 @@ class EditionRenderRepository(Protocol):
     async def get_latest_for_release(self, edition_release_id: UUID) -> EditionRender | None: ...
 
     async def get_latest_succeeded_for_release(
+        self, edition_release_id: UUID
+    ) -> EditionRender | None: ...
+
+    async def get_pinned_succeeded_for_release(
         self, edition_release_id: UUID
     ) -> EditionRender | None: ...
 

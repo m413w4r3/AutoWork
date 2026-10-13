@@ -16,7 +16,9 @@ from cti_app.domain.protocol_model import (
     ProtocolDiagramNodeV1,
     ProtocolDiagramSpecV1,
     ProtocolDiagramStatus,
+    ProtocolEvidenceRefV1,
     ProtocolValidationStatus,
+    StreamDirection,
 )
 from cti_app.infrastructure.d2_diagram_compiler import D2DiagramCompiler, encode_d2_source
 
@@ -64,6 +66,7 @@ def _field(
     status: ProtocolValidationStatus = ProtocolValidationStatus.OBSERVED,
     encrypted_opaque: bool = False,
     endianness: str | None = None,
+    evidence: tuple[ProtocolEvidenceRefV1, ...] = (),
 ) -> ProtocolDiagramFieldV1:
     return ProtocolDiagramFieldV1(
         field_id=field_id,
@@ -75,7 +78,20 @@ def _field(
         condition=None,
         encrypted_opaque=encrypted_opaque,
         validation_status=status,
-        evidence=(),
+        evidence=evidence,
+    )
+
+
+def _field_evidence() -> ProtocolEvidenceRefV1:
+    return ProtocolEvidenceRefV1(
+        capture_sha256="e" * 64,
+        flow_id="flow-1",
+        stream_id="stream-1",
+        direction=StreamDirection.ORIGINATOR_TO_RESPONDER,
+        frame_numbers=(31, 32),
+        start_offset=0,
+        end_offset=12,
+        source="tshark",
     )
 
 
@@ -155,8 +171,15 @@ def _three_views() -> tuple[ProtocolDiagramSpecV1, ...]:
         _spec(
             ProtocolDiagramKind.MESSAGE_FORMAT,
             fields=(
-                _field("length", "Frame length", 0, 2, endianness="little"),
-                _field("opcode", "Opcode", 2, 1),
+                _field(
+                    "length",
+                    "Frame length",
+                    0,
+                    2,
+                    endianness="little",
+                    evidence=(_field_evidence(),),
+                ),
+                _field("opcode", "Opcode", 2, 1, evidence=(_field_evidence(),)),
                 _field(
                     "payload",
                     "sensitive plaintext must not appear",
@@ -164,6 +187,7 @@ def _three_views() -> tuple[ProtocolDiagramSpecV1, ...]:
                     None,
                     status=ProtocolValidationStatus.UNRESOLVED,
                     encrypted_opaque=True,
+                    evidence=(_field_evidence(),),
                 ),
             ),
         ),
@@ -193,6 +217,8 @@ def test_protocol_projection_builds_three_distinct_views_and_keeps_statuses() ->
     assert "payload" in message_source
     assert "sensitive plaintext must not appear" not in message_source
     assert "bytes omitted" in message_source
+    assert "capture eeeeeeeeeeee frames 31, 32" in message.nodes[0].label
+    assert "eeeeeeeeeeee" in message_source
 
 
 def test_protocol_projection_escapes_model_text_before_d2_encoding() -> None:

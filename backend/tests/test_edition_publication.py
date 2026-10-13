@@ -634,6 +634,18 @@ class _EditionRenders:
             default=None,
         )
 
+    async def get_pinned_succeeded_for_release(self, release_id: UUID) -> EditionRender | None:
+        return min(
+            (
+                render
+                for render in self.renders.values()
+                if render.edition_release_id == release_id
+                and render.status is TypstRenderStatus.SUCCEEDED
+            ),
+            key=lambda render: (render.created_at, str(render.id)),
+            default=None,
+        )
+
     async def get(self, render_id: UUID) -> EditionRender | None:
         return self.renders.get(render_id)
 
