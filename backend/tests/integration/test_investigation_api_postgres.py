@@ -197,7 +197,9 @@ async def test_verified_synthesis_http_job_finding_and_opinion_postgres(
         }
     )
     proposal_sha256 = hashlib.sha256(
-        canonical_json_bytes(parsed.finding_proposals[0].model_dump(mode="json"))
+        canonical_json_bytes(
+            parsed.finding_proposals[0].model_dump(mode="json", exclude={"hypothesis_refs"})
+        )
     ).hexdigest()
     finding_id = uuid5(_FINDING_NAMESPACE, f"{investigation.id}:{proposal_sha256}")
     turn_transport = ScriptedTurnTransport(
