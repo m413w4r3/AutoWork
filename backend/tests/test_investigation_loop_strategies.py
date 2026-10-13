@@ -234,7 +234,9 @@ def test_hypothesis_conflicting_or_unlinked_findings_cannot_be_promoted() -> Non
         (FindingAssessment.SUPPORTED, observation_a),
         (FindingAssessment.REFUTED, observation_b),
     ):
-        proposal = _proposal(FindingKind.CLAIM_VERIFICATION.value, assessment.value, "Check", observation)
+        proposal = _proposal(
+            FindingKind.CLAIM_VERIFICATION.value, assessment.value, "Check", observation
+        )
         proposal["hypothesis_refs"] = ["a"]
         proposals.append(proposal)
         findings.append(
@@ -247,8 +249,12 @@ def test_hypothesis_conflicting_or_unlinked_findings_cannot_be_promoted() -> Non
             )
         )
     decision = AgentTurnDecisionV1.model_validate(
-        _decision(goal="reconcile contradiction", next_action="continue",
-                  findings=tuple(proposals), hypothesis_refs=("a",))
+        _decision(
+            goal="reconcile contradiction",
+            next_action="continue",
+            findings=tuple(proposals),
+            hypothesis_refs=("a",),
+        )
     )
     updated = InvestigationService._update_hypotheses(
         (Hypothesis(id="a", statement="Uncertain"),),
@@ -257,11 +263,19 @@ def test_hypothesis_conflicting_or_unlinked_findings_cannot_be_promoted() -> Non
     )
     assert updated[0].status is HypothesisStatus.OPEN
     assert set(updated[0].evidence_refs) == {observation_a, observation_b}
-    unlinked = _proposal(FindingKind.CLAIM_VERIFICATION.value,
-                         FindingAssessment.SUPPORTED.value, "Unrelated", observation_a)
+    unlinked = _proposal(
+        FindingKind.CLAIM_VERIFICATION.value,
+        FindingAssessment.SUPPORTED.value,
+        "Unrelated",
+        observation_a,
+    )
     decision_unlinked = AgentTurnDecisionV1.model_validate(
-        _decision(goal="do not infer a link", next_action="continue",
-                  findings=(unlinked,), hypothesis_refs=("a",))
+        _decision(
+            goal="do not infer a link",
+            next_action="continue",
+            findings=(unlinked,),
+            hypothesis_refs=("a",),
+        )
     )
     unchanged = InvestigationService._update_hypotheses(
         (Hypothesis(id="a", statement="Uncertain"),),

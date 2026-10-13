@@ -204,17 +204,19 @@ async def test_catalogued_commands_read_synthetic_elf_with_bounded_output() -> N
         assert "local_analysis_f1" in yara_result.output
     # Optional CLI binaries differ across development machines and CI runners.
     # Only tools present in the runtime catalogue read the sample bytes.
-    assert samples.reads == sum(
+    reading_commands = (
+        LocalCommandId.FILE,
+        LocalCommandId.STRINGS,
+        LocalCommandId.READELF,
+        LocalCommandId.OBJDUMP,
+        LocalCommandId.YARA,
+    )
+    available_readers = sum(
         1
-        for command_id in (
-            LocalCommandId.FILE,
-            LocalCommandId.STRINGS,
-            LocalCommandId.READELF,
-            LocalCommandId.OBJDUMP,
-            LocalCommandId.YARA,
-        )
+        for command_id in reading_commands
         if (capability := catalog.get(command_id)) is not None and capability.available
     )
+    assert samples.reads == available_readers
     assert service.estimate_budget(LocalCommandId.READELF).tool_seconds > 0
 
 
