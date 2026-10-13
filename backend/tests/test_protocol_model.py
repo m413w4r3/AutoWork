@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import json
 import struct
+from collections.abc import Mapping
+from datetime import UTC, datetime
+from typing import Any
 from uuid import UUID, uuid4, uuid5
 
 import pytest
@@ -16,7 +20,10 @@ from cti_app.application.investigation_protocol_tools import (
     protocol_tool_capabilities,
     register_protocol_tools,
 )
-from cti_app.application.investigation_tools import InMemoryToolRegistry
+from cti_app.application.investigation_tools import (
+    InMemoryToolRegistry,
+    ToolExecutionContext,
+)
 from cti_app.application.network_protocol_model import (
     HypothesisNotReplayableError,
     NetworkProtocolWorkbench,
@@ -26,6 +33,13 @@ from cti_app.application.network_workbench import (
     NetworkWorkbench,
     QuarantinedCapture,
     _flows,
+)
+from cti_app.domain.investigation import (
+    BudgetDimension,
+    EvidenceKind,
+    EvidenceObservation,
+    InvestigationBudget,
+    ToolInvocationStatus,
 )
 from cti_app.domain.network_protocol import (
     NetworkExtractionLimitsV1,
@@ -45,6 +59,7 @@ from cti_app.domain.protocol_model import (
     ProtocolValidationStatus,
 )
 from cti_app.infrastructure.pcap_reader import read_capture
+from cti_app.infrastructure.tshark_adapter import TsharkAdapter
 
 _INVESTIGATION_ID = UUID("2c2ae64e-a882-4cc0-b0cf-3bff6d111ba2")
 _BLOB_NAMESPACE = UUID("ed0b9892-9b57-4f73-850a-0867e2230c60")
@@ -54,7 +69,9 @@ class _Quarantine:
     def __init__(self, content: bytes) -> None:
         self.content = content
 
-    async def read_quarantined_capture(self, source_reference: str, *, max_bytes: int):
+    async def read_quarantined_capture(
+        self, source_reference: str, *, max_bytes: int
+    ) -> QuarantinedCapture:
         if len(self.content) > max_bytes:
             raise ValueError("capture too large")
         return QuarantinedCapture(
@@ -78,6 +95,113 @@ class _CaptureBlobs:
         if len(content) > max_bytes:
             raise ValueError("capture too large")
         return content
+
+
+class _EvidenceRecorder:
+    async def record_json(
+        self,
+        *,
+        investigation_id: UUID,
+        kind: EvidenceKind,
+        payload: Mapping[str, Any],
+        source: str,
+        source_version: str,
+        object_type: str,
+        object_id: str,
+        limitations: tuple[str, ...] = (),
+        invocation_ref: UUID | None = None,
+        observed_at: datetime | None = None,
+        idempotency_key: str | None = None,
+    ) -> EvidenceObservation:
+        encoded = json.dumps(dict(payload), sort_keys=True, default=str).encode()
+        return EvidenceObservation(
+            investigation_id=investigation_id,
+            kind=kind,
+            blob_id=uuid4(),
+            sha256=hashlib.sha256(encoded).hexdigest(),
+            source=source,
+            source_version=source_version,
+            observed_at=observed_at or datetime.now(UTC),
+            object_type=object_type,
+            object_id=object_id,
+            limitations=limitations,
+            invocation_ref=invocation_ref,
+        )
+
+    async def record_existing_blob(
+        self,
+        *,
+        investigation_id: UUID,
+        kind: EvidenceKind,
+        blob_id: UUID,
+        sha256: str,
+        source: str,
+        source_version: str,
+        object_type: str,
+        object_id: str,
+        limitations: tuple[str, ...] = (),
+        invocation_ref: UUID | None = None,
+        observed_at: datetime | None = None,
+        idempotency_key: str | None = None,
+    ) -> EvidenceObservation:
+        return EvidenceObservation(
+            investigation_id=investigation_id,
+            kind=kind,
+            blob_id=blob_id,
+            sha256=sha256,
+            source=source,
+            source_version=source_version,
+            observed_at=observed_at or datetime.now(UTC),
+            object_type=object_type,
+            object_id=object_id,
+            limitations=limitations,
+            invocation_ref=invocation_ref,
+        )
+
+    async def record_negative(
+        self,
+        *,
+        investigation_id: UUID,
+        reason: str,
+        source: str,
+        source_version: str,
+        object_type: str,
+        object_id: str,
+        limitations: tuple[str, ...],
+        details: Mapping[str, Any] | None = None,
+        invocation_ref: UUID | None = None,
+        observed_at: datetime | None = None,
+        idempotency_key: str | None = None,
+    ) -> EvidenceObservation:
+        return await self.record_json(
+            investigation_id=investigation_id,
+            kind=EvidenceKind.NEGATIVE_RESULT,
+            payload={"reason": reason, "details": dict(details or {})},
+            source=source,
+            source_version=source_version,
+            object_type=object_type,
+            object_id=object_id,
+            limitations=limitations,
+            invocation_ref=invocation_ref,
+            observed_at=observed_at,
+            idempotency_key=idempotency_key,
+        )
+
+
+class _ProtocolModelStore:
+    def __init__(self, model: ProtocolModelV1 | None = None) -> None:
+        self.model = model
+        self.blob_id = uuid4()
+
+    async def put_model(self, model: ProtocolModelV1) -> tuple[UUID, str]:
+        self.model = model
+        self.blob_id = uuid5(_BLOB_NAMESPACE, model.canonical_sha256)
+        return self.blob_id, model.canonical_sha256
+
+    async def get_model(self, blob_id: UUID) -> ProtocolModelV1:
+        if blob_id != self.blob_id or self.model is None:
+            raise AssertionError("unknown protocol model blob")
+        return self.model
 
 
 def _tcp_frame(
@@ -149,15 +273,39 @@ def _tls_capture() -> bytes:
     )
 
 
+def _bidirectional_capture() -> bytes:
+    return _pcap(
+        (
+            _tcp_frame(sequence=100, flags=0x02),
+            _tcp_frame(
+                sequence=101,
+                flags=0x18,
+                payload=b"\x00\x05\x01AB\x00\x05\x02CD",
+            ),
+            _tcp_frame(
+                source="203.0.113.10",
+                destination="10.0.0.2",
+                source_port=443,
+                destination_port=41000,
+                sequence=200,
+                flags=0x18,
+                payload=b"\x00\x05\x03ZY\x00\x05\x04XW",
+            ),
+        )
+    )
+
+
 def _workbench(content: bytes) -> tuple[NetworkWorkbench, _CaptureBlobs]:
-    class _Tshark:
-        available = False
+    class _UnavailableTshark(TsharkAdapter):
+        @property
+        def available(self) -> bool:
+            return False
 
     blobs = _CaptureBlobs()
     workbench = NetworkWorkbench(
-        quarantine=_Quarantine(content),  # type: ignore[arg-type]
-        blobs=blobs,  # type: ignore[arg-type]
-        tshark=_Tshark(),  # type: ignore[arg-type]
+        quarantine=_Quarantine(content),
+        blobs=blobs,
+        tshark=_UnavailableTshark(),
         limits=NetworkExtractionLimitsV1(),
     )
     return workbench, blobs
@@ -358,6 +506,17 @@ async def test_hypothesis_replays_then_holdout_contradiction_is_preserved() -> N
     assert all(field.evidence for field in model.fields)
     assert all(transition.evidence for transition in model.transitions)
     assert model.test_plan == proposal.test_plan
+    training_capture_hashes = {trace.capture.sha256 for trace in traces[:2]}
+    for proof in (
+        evidence for item in (*model.fields, *model.transitions) for evidence in item.evidence
+    ):
+        assert proof.capture_sha256 in training_capture_hashes
+        assert proof.stream_id
+        assert proof.frame_numbers
+        assert proof.start_offset is not None
+        assert proof.end_offset is not None
+    for item in (*model.fields, *model.transitions):
+        assert {proof.capture_sha256 for proof in item.evidence} == training_capture_hashes
 
     verified = await service.verify(model=model, traces=(traces[2],))
     opcode = next(field for field in verified.fields if field.field_id == "opcode_1")
@@ -382,6 +541,77 @@ async def test_hypothesis_replays_then_holdout_contradiction_is_preserved() -> N
     assert next(
         field for field in later.fields if field.field_id == "opcode_1"
     ).validation_status is (ProtocolValidationStatus.CONTRADICTED)
+
+
+@pytest.mark.asyncio
+async def test_hypothesis_conversations_keep_each_observed_direction() -> None:
+    service, traces = await _network_and_traces(((_bidirectional_capture(), False, None),))
+    proposal = ProtocolHypothesisProposalV1(
+        schema_version="ProtocolHypothesisProposalV1",
+        messages=(
+            HypothesisMessageV1(
+                "client_message",
+                "client_message",
+                1,
+                StreamDirection.ORIGINATOR_TO_RESPONDER,
+                5,
+                5,
+            ),
+            HypothesisMessageV1(
+                "client_message_2",
+                "client_message_2",
+                2,
+                StreamDirection.ORIGINATOR_TO_RESPONDER,
+                5,
+                5,
+            ),
+            HypothesisMessageV1(
+                "server_message",
+                "server_message",
+                1,
+                StreamDirection.RESPONDER_TO_ORIGINATOR,
+                5,
+                5,
+            ),
+            HypothesisMessageV1(
+                "server_message_2",
+                "server_message_2",
+                2,
+                StreamDirection.RESPONDER_TO_ORIGINATOR,
+                5,
+                5,
+            ),
+        ),
+        fields=(),
+        transitions=(),
+        test_plan=(),
+    )
+
+    model = await service.hypothesize(
+        subject_id="bidirectional-subject",
+        investigation_id=_INVESTIGATION_ID,
+        proposal=proposal,
+        traces=traces,
+    )
+
+    conversations = {item.direction: item for item in model.conversations}
+    client_to_server = conversations[StreamDirection.ORIGINATOR_TO_RESPONDER]
+    server_to_client = conversations[StreamDirection.RESPONDER_TO_ORIGINATOR]
+    assert (client_to_server.source.address, client_to_server.source.port) == ("10.0.0.2", 41000)
+    assert (client_to_server.destination.address, client_to_server.destination.port) == (
+        "203.0.113.10",
+        443,
+    )
+    assert client_to_server.message_ids == ("client_message", "client_message_2")
+    assert (server_to_client.source.address, server_to_client.source.port) == (
+        "203.0.113.10",
+        443,
+    )
+    assert (server_to_client.destination.address, server_to_client.destination.port) == (
+        "10.0.0.2",
+        41000,
+    )
+    assert server_to_client.message_ids == ("server_message", "server_message_2")
 
 
 @pytest.mark.asyncio
@@ -484,26 +714,56 @@ def test_protocol_tools_register_exact_capability_keys_and_strict_input_schemas(
     }
     workbench, _ = _workbench(_base_capture())
     registry = InMemoryToolRegistry()
-
-    class _Recorder:
-        async def record_json(self, **kwargs):
-            raise AssertionError("registration must not record evidence")
-
-    class _ModelStore:
-        async def put_model(self, model):
-            return uuid4(), model.canonical_sha256
-
-        async def get_model(self, blob_id):
-            raise AssertionError("registration must not read model blobs")
-
     register_protocol_tools(
         registry,
         service=NetworkProtocolWorkbench(workbench),
-        recorder=_Recorder(),  # type: ignore[arg-type]
-        model_store=_ModelStore(),  # type: ignore[arg-type]
+        recorder=_EvidenceRecorder(),
+        model_store=_ProtocolModelStore(),
     )
     for name in PROTOCOL_TOOL_NAMES:
-        definition, _adapter = registry.get(name, "1")  # type: ignore[misc]
+        registration = registry.get(name, "1")
+        assert registration is not None
+        definition, _adapter = registration
         assert definition.capability_key == name
         assert definition.input_schema["additionalProperties"] is False
         assert definition.confidentiality.value == "restricted"
+
+
+@pytest.mark.asyncio
+async def test_protocol_render_tool_returns_existing_observation_uuid() -> None:
+    service, traces = await _network_and_traces(((_messages_capture(endian="big"), False, None),))
+    model = (
+        await service.compare(
+            subject_id="render-subject",
+            investigation_id=_INVESTIGATION_ID,
+            traces=traces,
+        )
+    ).model
+    recorder = _EvidenceRecorder()
+    model_store = _ProtocolModelStore(model)
+    registry = InMemoryToolRegistry()
+    workbench, _ = _workbench(_base_capture())
+    register_protocol_tools(
+        registry,
+        service=NetworkProtocolWorkbench(workbench),
+        recorder=recorder,
+        model_store=model_store,
+    )
+    registration = registry.get(NETWORK_PROTOCOL_RENDER, "1")
+    assert registration is not None
+    _definition, adapter = registration
+    context = ToolExecutionContext(
+        investigation_id=_INVESTIGATION_ID,
+        envelope=None,
+        budget=InvestigationBudget({BudgetDimension.TOOL_SECONDS: 30}),
+        idempotency_key="protocol-render-observation-test",
+        available_capabilities=frozenset({NETWORK_PROTOCOL_RENDER}),
+    )
+
+    result = await adapter.execute({"model_blob_id": str(model_store.blob_id)}, context)
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    assert len(result.observation_refs) == 1
+    observation_ref = result.observation_refs[0]
+    assert isinstance(observation_ref, UUID)
+    assert result.output["observation_ref"] == str(observation_ref)
