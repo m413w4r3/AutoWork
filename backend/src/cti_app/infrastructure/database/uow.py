@@ -4,6 +4,19 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cti_app.application.edition_review import EditionReviewReadRepository
+from cti_app.application.investigation_persistence import (
+    AnalystOpinionRepository,
+    EvidenceObservationRepository,
+    FindingRepository,
+    InvestigationBudgetRepository,
+    InvestigationEnvelopeRepository,
+    SampleAssociationRepository,
+    ToolInvocationRepository,
+)
+from cti_app.application.investigation_persistence import (
+    DetectionCandidateRepository as InvestigationDetectionCandidateRepository,
+)
+from cti_app.application.investigation_state import InvestigationStateRepository
 from cti_app.application.persistence import (
     AnalystDecisionRepository,
     AnalystInputPackRepository,
@@ -130,6 +143,17 @@ from cti_app.infrastructure.database.repositories.editorial import SqlAlchemyHum
 from cti_app.infrastructure.database.repositories.invariants import (
     SqlAlchemyInvariantRepository,
 )
+from cti_app.infrastructure.database.repositories.investigation import (
+    SqlAlchemyAnalystOpinionRepository,
+    SqlAlchemyDetectionCandidateRepository,
+    SqlAlchemyEvidenceObservationRepository,
+    SqlAlchemyFindingRepository,
+    SqlAlchemyInvestigationBudgetRepository,
+    SqlAlchemyInvestigationEnvelopeRepository,
+    SqlAlchemyInvestigationStateRepository,
+    SqlAlchemySampleAssociationRepository,
+    SqlAlchemyToolInvocationRepository,
+)
 from cti_app.infrastructure.database.repositories.jobs import (
     SqlAlchemyJobEventRepository,
     SqlAlchemyJobRepository,
@@ -229,6 +253,15 @@ class SqlAlchemyUnitOfWork:
     claims: ClaimRepository
     indicators: IndicatorRepository
     rejected_model_proposals: RejectedModelProposalRepository
+    tool_invocations: ToolInvocationRepository
+    evidence_observations: EvidenceObservationRepository
+    investigation_findings: FindingRepository
+    sample_associations: SampleAssociationRepository
+    detection_candidates: InvestigationDetectionCandidateRepository
+    analyst_opinions: AnalystOpinionRepository
+    investigation_envelopes: InvestigationEnvelopeRepository
+    investigation_budgets: InvestigationBudgetRepository
+    investigation_states: InvestigationStateRepository
     production_runs: ProductionRunRepository
     production_input_snapshots: ProductionInputSnapshotRepository
     production_artifacts: ProductionArtifactRepository
@@ -314,6 +347,15 @@ class SqlAlchemyUnitOfWork:
         self.claims = SqlAlchemyClaimRepository(self._session)
         self.indicators = SqlAlchemyIndicatorRepository(self._session)
         self.rejected_model_proposals = SqlAlchemyRejectedModelProposalRepository(self._session)
+        self.tool_invocations = SqlAlchemyToolInvocationRepository(self._session)
+        self.evidence_observations = SqlAlchemyEvidenceObservationRepository(self._session)
+        self.investigation_findings = SqlAlchemyFindingRepository(self._session)
+        self.sample_associations = SqlAlchemySampleAssociationRepository(self._session)
+        self.detection_candidates = SqlAlchemyDetectionCandidateRepository(self._session)
+        self.analyst_opinions = SqlAlchemyAnalystOpinionRepository(self._session)
+        self.investigation_envelopes = SqlAlchemyInvestigationEnvelopeRepository(self._session)
+        self.investigation_budgets = SqlAlchemyInvestigationBudgetRepository(self._session)
+        self.investigation_states = SqlAlchemyInvestigationStateRepository(self._session)
         self.production_runs = SqlAlchemyProductionRunRepository(self._session)
         self.production_input_snapshots = SqlAlchemyProductionInputSnapshotRepository(self._session)
         self.production_artifacts = SqlAlchemyProductionArtifactRepository(self._session)

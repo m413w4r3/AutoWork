@@ -1,0 +1,173 @@
+from __future__ import annotations
+
+import hashlib
+from datetime import UTC, datetime
+from uuid import uuid4
+
+import pytest
+
+from cti_app.domain.analyst_opinion import (
+    AnalystOpinionStatus,
+    AnalystOpinionV1,
+    CitationViolationCode,
+    OpinionBlock,
+    OpinionBlockType,
+    OpinionClaimQualification,
+    verify_opinion_citations,
+)
+from cti_app.domain.investigation import (
+    EvidenceKind,
+    EvidenceObservation,
+    FindingAssessment,
+    FindingKind,
+    InvestigationFinding,
+)
+
+
+def _observation(investigation_id) -> EvidenceObservation:
+    return EvidenceObservation(
+        investigation_id=investigation_id,
+        kind=EvidenceKind.BINARY_ANALYSIS,
+        blob_id=uuid4(),
+        sha256=hashlib.sha256(b"captured report").hexdigest(),
+        source="static-analysis",
+        source_version="1.2",
+        observed_at=datetime.now(UTC),
+        object_type="sha256",
+        object_id="a" * 64,
+        limitations=("static result",),
+    )
+
+
+def _opinion(blocks, *, status=AnalystOpinionStatus.DRAFT, reviewer_id=None):
+    return AnalystOpinionV1(
+        investigation_id=uuid4(),
+        synthesis_artifact_id=uuid4(),
+        synthesis_sha256="1" * 64,
+        base_publication_artifact_id=uuid4(),
+        base_publication_sha256="2" * 64,
+        blocks=tuple(blocks),
+        unresolved_points=(),
+        author_id="analyst:author",
+        reviewer_id=reviewer_id,
+        status=status,
+    )
+
+
+def test_single_block_opinion_hash_is_canonical_and_reproducible() -> None:
+    investigation_id = uuid4()
+    observation = _observation(investigation_id)
+    finding = InvestigationFinding(
+        investigation_id=investigation_id,
+        kind=FindingKind.CAPABILITY,
+        assessment=FindingAssessment.SUPPORTED,
+        statement="The sample contains a second-stage loader.",
+        observation_refs=(observation.id,),
+    )
+    block = OpinionBlock(
+        block_type=OpinionBlockType.KEY_FINDINGS,
+        text="The analyzed sample contains a second-stage loader.",
+        finding_refs=(finding.id,),
+        evidence_refs=(observation.id,),
+        qualification=OpinionClaimQualification.FACT,
+        certainty=0.91,
+    )
+    opinion = _opinion((block,))
+    repeated = AnalystOpinionV1(
+        id=opinion.id,
+        version=opinion.version,
+        investigation_id=opinion.investigation_id,
+        synthesis_artifact_id=opinion.synthesis_artifact_id,
+        synthesis_sha256=opinion.synthesis_sha256,
+        base_publication_artifact_id=opinion.base_publication_artifact_id,
+        base_publication_sha256=opinion.base_publication_sha256,
+        blocks=opinion.blocks,
+        unresolved_points=opinion.unresolved_points,
+        author_id=opinion.author_id,
+        reviewer_id=opinion.reviewer_id,
+        status=opinion.status,
+        created_at=opinion.created_at,
+    )
+    assert opinion.content_sha256 == hashlib.sha256(opinion.canonical_bytes()).hexdigest()
+    assert opinion.content_sha256 == repeated.content_sha256
+    assert len(opinion.renderable_blocks) == 1
+    assert verify_opinion_citations(opinion, (finding,), (observation,)) == ()
+
+
+def test_nonexistent_citations_are_reported_for_factual_blocks() -> None:
+    opinion = _opinion(
+        (
+            OpinionBlock(
+                block_type=OpinionBlockType.CLAIM_VERIFICATION,
+                text="The article's C1 is confirmed.",
+                finding_refs=(uuid4(),),
+                evidence_refs=(uuid4(),),
+                qualification=OpinionClaimQualification.FACT,
+            ),
+        )
+    )
+    violations = verify_opinion_citations(opinion, (), ())
+    codes = {violation.code for violation in violations}
+    assert CitationViolationCode.FINDING_NOT_FOUND in codes
+    assert CitationViolationCode.OBSERVATION_NOT_FOUND in codes
+    assert CitationViolationCode.FACT_WITHOUT_SUPPORTED_FINDING in codes
+
+
+def test_factual_block_requires_supported_finding_with_existing_observation() -> None:
+    investigation_id = uuid4()
+    observation = _observation(investigation_id)
+    refuted = InvestigationFinding(
+        investigation_id=investigation_id,
+        kind=FindingKind.CLAIM_VERIFICATION,
+        assessment=FindingAssessment.REFUTED,
+        statement="The article's claimed domain does not appear in the reports.",
+        observation_refs=(observation.id,),
+    )
+    opinion = _opinion(
+        (
+            OpinionBlock(
+                block_type=OpinionBlockType.CLAIM_VERIFICATION,
+                text="The attribution is contradicted.",
+                finding_refs=(refuted.id,),
+                evidence_refs=(observation.id,),
+            ),
+        )
+    )
+    assert any(
+        issue.code is CitationViolationCode.FACT_WITHOUT_SUPPORTED_FINDING
+        for issue in verify_opinion_citations(opinion, (refuted,), (observation,))
+    )
+
+
+def test_empty_blocks_are_not_rendered_and_only_one_populated_block_is_valid() -> None:
+    opinion = _opinion(
+        (
+            OpinionBlock(block_type=OpinionBlockType.ADDITIONAL_SAMPLES, text="  "),
+            OpinionBlock(
+                block_type=OpinionBlockType.UNCERTAINTIES_AND_NEXT_LEADS,
+                text="The sample set is small.",
+                qualification=OpinionClaimQualification.HYPOTHESIS,
+                certainty=0.3,
+            ),
+        )
+    )
+    assert len(opinion.blocks) == 2
+    assert len(opinion.renderable_blocks) == 1
+
+
+def test_reviewed_opinion_requires_reviewer_identity_and_valid_hash() -> None:
+    with pytest.raises(ValueError, match="reviewer identity"):
+        _opinion((), status=AnalystOpinionStatus.APPROVED)
+
+    draft = _opinion(())
+    with pytest.raises(ValueError, match="content_sha256"):
+        AnalystOpinionV1(
+            investigation_id=draft.investigation_id,
+            synthesis_artifact_id=draft.synthesis_artifact_id,
+            synthesis_sha256=draft.synthesis_sha256,
+            base_publication_artifact_id=draft.base_publication_artifact_id,
+            base_publication_sha256=draft.base_publication_sha256,
+            blocks=(),
+            author_id=draft.author_id,
+            content_sha256="0" * 64,
+        )

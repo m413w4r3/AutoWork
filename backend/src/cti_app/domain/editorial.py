@@ -27,6 +27,8 @@ class AnalystDecisionType(StrEnum):
     PIVOT_REJECT = "pivot_reject"
     NOTE_APPROVE = "note_approve"
     NOTE_CHANGES_REQUESTED = "note_changes_requested"
+    DETECTION_APPROVE = "detection_approve"
+    DETECTION_REJECT = "detection_reject"
 
 
 class AnalystDecisionTargetType(StrEnum):
@@ -67,7 +69,11 @@ class AnalystDecision:
     correlation_id: str
     id: UUID = field(default_factory=uuid4)
     occurred_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    details: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.actor_id.strip() or not self.reason.strip() or not self.correlation_id.strip():
             raise ValueError("Analyst decision requires actor, reason and correlation")
+        if not isinstance(self.details, dict):
+            raise TypeError("Analyst decision details must be an object")
+        object.__setattr__(self, "details", dict(self.details))

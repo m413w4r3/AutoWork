@@ -63,7 +63,8 @@ ANALYST_INVESTIGATION_STAGE_VALUES_SQL = (
 )
 ANALYST_DECISION_VALUES_SQL = (
     "'member_validate', 'member_reject', 'feature_validate', 'feature_reject', "
-    "'pivot_approve', 'pivot_reject', 'note_approve', 'note_changes_requested'"
+    "'pivot_approve', 'pivot_reject', 'note_approve', 'note_changes_requested', "
+    "'detection_approve', 'detection_reject'"
 )
 ANALYST_DECISION_TARGET_VALUES_SQL = (
     "'member', 'feature', 'tool', 'invariant', 'pivot', 'corpus', 'detection', 'note'"
@@ -437,6 +438,9 @@ class AnalystDecisionRow(Base):
     reason: Mapped[str] = mapped_column(Text, nullable=False)
     correlation_id: Mapped[str] = mapped_column(String(128), nullable=False)
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    details: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
 
 
 class AnalystInputPackRow(Base):

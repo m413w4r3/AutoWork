@@ -23,6 +23,8 @@ from cti_app.infrastructure.database.models import (  # noqa: F401
     editions,
     editorial,
     invariants,
+    # The investigation module owns the versioned working-state table too.
+    investigation,
     jobs,
     media_assets,
     model_execution,
@@ -400,6 +402,10 @@ def upgrade() -> None:
     # non-null publication_language column in the ORM metadata below.
     # The target production_runs schema keeps no synthesis conversation
     # identity: the durable ModelRun owns provider recovery.
+    # AnalystDecisionRow's CHECK values and structured details column are
+    # created from the production model metadata in this mutable baseline.
+    # The investigation_run job's aggregate CHECK (ck_jobs_investigation_run_aggregate)
+    # is declared by the jobs ORM model and therefore created here.
     Base.metadata.create_all(bind=op.get_bind(), checkfirst=False)
     for _function_name, definition in _GUARD_FUNCTIONS:
         op.execute(definition)
@@ -426,7 +432,7 @@ def downgrade() -> None:
     # between source_collections and collection_attempts. PostgreSQL can drop
     # the fresh schema deterministically when the tables are removed with
     # CASCADE; this is only the inverse of the empty-database baseline.
-    for table in reversed(tuple(Base.metadata.tables.values())):
-        op.execute(f'DROP TABLE IF EXISTS "{table.name}" CASCADE')
+    for metadata_table in reversed(tuple(Base.metadata.tables.values())):
+        op.execute(f'DROP TABLE IF EXISTS "{metadata_table.name}" CASCADE')
     for function_name, _definition in reversed(_GUARD_FUNCTIONS):
         op.execute(f"DROP FUNCTION IF EXISTS {function_name}()")

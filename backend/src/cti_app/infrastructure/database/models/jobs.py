@@ -24,6 +24,10 @@ class JobRow(Base):
     __tablename__ = "jobs"
     __table_args__ = (
         CheckConstraint(f"status IN ({JOB_STATUS_VALUES_SQL})", name="ck_jobs_status"),
+        CheckConstraint(
+            "kind <> 'investigation_run' OR aggregate_type = 'investigation'",
+            name="ck_jobs_investigation_run_aggregate",
+        ),
         CheckConstraint("progress_current >= 0", name="ck_jobs_progress_current"),
         CheckConstraint("progress_total >= 0", name="ck_jobs_progress_total"),
         CheckConstraint(

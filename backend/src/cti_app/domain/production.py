@@ -1448,18 +1448,76 @@ class AnalystInvestigation:
         self.budget.consume(category, units)
         self._bump(now)
 
-    def finish_cycle(self, *, validated_new_members: int, now: datetime | None = None) -> None:
+    def record_turn(self, *, progress: bool, now: datetime | None = None) -> bool:
+        """Record one Bridge turn and report whether its configured turn budget is spent.
+
+        `progress` describes any verified gain (including infection-chain,
+        network, or claim-verification evidence); it is intentionally not
+        coupled to sample qualification or a stage transition.  The separate
+        working state owns the no-progress streak and stop reason.
+        """
         if self.status is not AnalystInvestigationStatus.RUNNING:
-            raise ValueError("Only a running investigation can finish a cycle")
+            raise ValueError("Only a running investigation can record a turn")
+        if not isinstance(progress, bool):
+            raise TypeError("progress must be a boolean")
+        if self.cycle_number < self.budget.max_cycles:
+            self.cycle_number += 1
+        self._bump(now)
+        return self.cycle_number >= self.budget.max_cycles
+
+    def finish_cycle(self, *, validated_new_members: int, now: datetime | None = None) -> None:
+        """Compatibility wrapper; lack of a new corpus member never exhausts work."""
         if validated_new_members < 0:
             raise ValueError("validated_new_members must be non-negative")
-        moment = now or datetime.now(UTC)
-        if validated_new_members == 0 or self.cycle_number >= self.budget.max_cycles:
-            self.status = AnalystInvestigationStatus.EXHAUSTED
-            self.finished_at = moment
+        self.record_turn(progress=validated_new_members > 0, now=now)
+
+    def conclude(self, reason: Any, *, now: datetime | None = None) -> None:
+        """Project the typed agent stop decision onto the persisted legacy status."""
+        from cti_app.domain.investigation_state import StopReason
+
+        if not isinstance(reason, StopReason):
+            raise TypeError("reason must use StopReason")
+        if (
+            reason is StopReason.AGENT_FINISHED
+            and self.status is AnalystInvestigationStatus.COMPLETED
+        ):
+            return
+        if (
+            reason is StopReason.USER_INTERRUPT
+            and self.status is AnalystInvestigationStatus.CANCELLED
+        ):
+            return
+        if (
+            reason in {StopReason.PERMISSION_REQUIRED, StopReason.SUBMISSION_NEEDS_REVIEW}
+            and self.status is AnalystInvestigationStatus.AWAITING_REVIEW
+        ):
+            return
+        non_exhaustion_reasons = {
+            StopReason.AGENT_FINISHED,
+            StopReason.USER_INTERRUPT,
+            StopReason.PERMISSION_REQUIRED,
+            StopReason.SUBMISSION_NEEDS_REVIEW,
+        }
+        if (
+            reason not in non_exhaustion_reasons
+            and self.status is AnalystInvestigationStatus.EXHAUSTED
+        ):
+            return
+        if reason is StopReason.AGENT_FINISHED:
+            self.complete(now=now)
+        elif reason is StopReason.USER_INTERRUPT:
+            self.cancel(now=now)
+        elif reason in {StopReason.PERMISSION_REQUIRED, StopReason.SUBMISSION_NEEDS_REVIEW}:
+            self.await_review(now=now)
         else:
-            self.cycle_number += 1
-        self._bump(moment)
+            if self.status not in (
+                AnalystInvestigationStatus.RUNNING,
+                AnalystInvestigationStatus.AWAITING_REVIEW,
+            ):
+                raise ValueError("Only an active investigation can conclude")
+            self.status = AnalystInvestigationStatus.EXHAUSTED
+            self.finished_at = now or datetime.now(UTC)
+            self._bump(self.finished_at)
 
     def await_review(self, *, now: datetime | None = None) -> None:
         if self.status is not AnalystInvestigationStatus.RUNNING:

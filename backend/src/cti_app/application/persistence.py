@@ -6,6 +6,19 @@ from types import TracebackType
 from typing import TYPE_CHECKING, Protocol, Self
 from uuid import UUID
 
+from cti_app.application.investigation_persistence import (
+    AnalystOpinionRepository,
+    EvidenceObservationRepository,
+    FindingRepository,
+    InvestigationBudgetRepository,
+    InvestigationEnvelopeRepository,
+    SampleAssociationRepository,
+    ToolInvocationRepository,
+)
+from cti_app.application.investigation_persistence import (
+    DetectionCandidateRepository as InvestigationDetectionCandidateRepository,
+)
+from cti_app.application.investigation_state import InvestigationStateRepository
 from cti_app.application.production_read_model import BatchStatusReadRepository
 from cti_app.domain.analysis import SampleFeatureSetV1
 from cti_app.domain.blobs import BlobRecord
@@ -840,6 +853,15 @@ class UnitOfWork(Protocol):
     claims: ClaimRepository
     indicators: IndicatorRepository
     rejected_model_proposals: RejectedModelProposalRepository
+    tool_invocations: ToolInvocationRepository
+    evidence_observations: EvidenceObservationRepository
+    investigation_findings: FindingRepository
+    sample_associations: SampleAssociationRepository
+    detection_candidates: InvestigationDetectionCandidateRepository
+    analyst_opinions: AnalystOpinionRepository
+    investigation_envelopes: InvestigationEnvelopeRepository
+    investigation_budgets: InvestigationBudgetRepository
+    investigation_states: InvestigationStateRepository
     # Defined further down in this module.
     production_runs: ProductionRunRepository
     production_input_snapshots: ProductionInputSnapshotRepository

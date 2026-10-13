@@ -6,6 +6,8 @@ from enum import StrEnum
 from typing import Any
 from uuid import UUID, uuid4
 
+INVESTIGATION_RUN_JOB_KIND = "investigation_run"
+
 
 class JobStatus(StrEnum):
     QUEUED = "queued"

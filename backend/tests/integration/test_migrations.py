@@ -63,6 +63,7 @@ from cti_app.infrastructure.database.models import (  # noqa: F401
     editions,
     editorial,
     invariants,
+    investigation,
     jobs,
     model_execution,
     production,
@@ -101,8 +102,36 @@ pytestmark = pytest.mark.integration
 ALEMBIC_TABLE = "alembic_version"
 _REPAIR_TABLE = "production_repair_decisions"
 _REPAIR_TRIGGER = "trg_production_repair_decisions_append_only"
+INVESTIGATION_TABLES = frozenset(
+    {
+        "tool_invocations",
+        "evidence_observations",
+        "investigation_finding_versions",
+        "investigation_finding_observations",
+        "investigation_finding_claims",
+        "sample_associations",
+        "sample_association_versions",
+        "sample_association_qualification_changes",
+        "detection_candidate_versions",
+        "detection_candidate_motifs",
+        "detection_candidate_motif_observations",
+        "detection_candidate_test_refs",
+        "analyst_opinion_versions",
+        "investigation_envelopes",
+        "investigation_budget_records",
+        "investigation_budget_limits",
+        "investigation_budget_reservations",
+        "investigation_budget_reservation_amounts",
+        "investigation_working_states",
+    }
+)
 
 EXPECTED_TABLES = frozenset(Base.metadata.tables) | {ALEMBIC_TABLE, "discovery_candidates"}
+
+
+def test_investigation_tables_are_registered_in_the_baseline_inventory() -> None:
+    assert INVESTIGATION_TABLES <= set(Base.metadata.tables)
+
 
 # (local columns, referred table, referred columns, ON DELETE) — shared by
 # both the ORM-derived and the reflected-from-database foreign key shapes.

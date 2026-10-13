@@ -239,7 +239,7 @@ class TestEditionProductionBatch:
 
 
 class TestAnalystInvestigation:
-    def test_requires_verified_synthesis_and_exhausts_without_members(self) -> None:
+    def test_requires_verified_synthesis_and_zero_new_members_is_not_exhaustion(self) -> None:
         artifact = ProductionArtifact(
             production_run_id=uuid4(),
             subject_id=uuid4(),
@@ -261,7 +261,10 @@ class TestAnalystInvestigation:
             investigation.consume_budget(LoopBudgetCategory.PIVOT_RUNS, now=datetime.now(UTC))
         investigation.finish_cycle(validated_new_members=0, now=datetime.now(UTC))
 
-        assert investigation.status is AnalystInvestigationStatus.EXHAUSTED
+        # A turn without a validated new corpus member is no longer exhaustion: infection
+        # chain, network and claim-verification gains are progress too (spec §2.2).
+        # Stopping is an explicit agent/budget decision (`conclude`).
+        assert investigation.status is AnalystInvestigationStatus.RUNNING
 
 
 class TestProductionArtifactValidation:

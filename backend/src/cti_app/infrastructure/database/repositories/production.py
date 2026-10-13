@@ -124,6 +124,7 @@ class SqlAlchemyAnalystDecisionRepository:
                 reason=value.reason,
                 correlation_id=value.correlation_id,
                 occurred_at=value.occurred_at,
+                details=value.details,
             )
         )
 
@@ -1476,6 +1477,7 @@ def _analyst_decision_from_row(row: AnalystDecisionRow) -> AnalystDecision:
         reason=row.reason,
         correlation_id=row.correlation_id,
         occurred_at=row.occurred_at,
+        details=dict(row.details or {}),
     )
 
 
