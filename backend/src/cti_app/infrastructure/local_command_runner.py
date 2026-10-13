@@ -339,7 +339,51 @@ def _build_argv(
     options: Mapping[str, object],
 ) -> tuple[list[str], tuple[str, ...]]:
     path = str(sample_path)
-    if spec.id is LocalCommandId.FILE:
+    if spec.binary == "tshark" and options.get("field_catalog") is True:
+        argv = [executable, "-G", "fields", "tls.handshake"]
+    elif spec.binary == "tshark":
+        fields = (
+            "frame.number",
+            "frame.time_epoch",
+            "frame.len",
+            "_ws.col.Protocol",
+            "frame.protocols",
+            "ip.src",
+            "ip.dst",
+            "ipv6.src",
+            "ipv6.dst",
+            "tcp.srcport",
+            "tcp.dstport",
+            "udp.srcport",
+            "udp.dstport",
+            "tcp.stream",
+            "udp.stream",
+            "dns.qry.name",
+            "dns.flags.response",
+            "http.host",
+            "http.request.method",
+            "http.request.uri",
+            "tls.handshake.extensions_server_name",
+        )
+        if options.get("include_ja3") is True:
+            fields = (*fields, "tls.handshake.ja3")
+        argv = [
+            executable,
+            "-n",
+            "-r",
+            path,
+            "-T",
+            "fields",
+            "-E",
+            "quote=d",
+            "-E",
+            "occurrence=a",
+        ]
+        for field_name in fields:
+            argv.extend(("-e", field_name))
+    elif spec.binary == "capinfos":
+        argv = [executable, "-M", "-c", "-a", "-e", "-t", "-u", path]
+    elif spec.id is LocalCommandId.FILE:
         flag = "--mime-type" if options.get("mime_type") else "-b"
         argv = [executable, flag, path]
     elif spec.id is LocalCommandId.STRINGS:
@@ -576,14 +620,35 @@ def _kill_process_group(process_id: int) -> None:
 
 
 def _sandbox_bootstrap_argv(command: list[str], spec: LocalCommandSpec) -> list[str]:
+    bootstrap = (
+        "import importlib.util, os, resource, sys\n"
+        "cpu, memory, file_size = map(int, sys.argv[1:4])\n"
+        "module_path = sys.argv[4]\n"
+        "spec = importlib.util.spec_from_file_location('_cti_seccomp_network', module_path)\n"
+        "if spec is None or spec.loader is None: raise SystemExit(125)\n"
+        "module = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(module)\n"
+        "command = sys.argv[6:]\n"
+        "if sys.argv[5] != '--' or not command or "
+        "not os.path.isabs(command[0]): raise SystemExit(125)\n"
+        "resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu + 1))\n"
+        "resource.setrlimit(resource.RLIMIT_AS, (memory, memory))\n"
+        "resource.setrlimit(resource.RLIMIT_FSIZE, (file_size, file_size))\n"
+        "resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))\n"
+        "resource.setrlimit(resource.RLIMIT_CORE, (0, 0))\n"
+        "module.install_network_seccomp_filter()\n"
+        "environment = os.environ.copy()\n"
+        "environment.pop('PYTHONPATH', None)\n"
+        "os.execve(command[0], command, environment)\n"
+    )
     return [
         sys.executable,
-        "-m",
-        "cti_app.infrastructure.local_command_runner",
-        "--cti-sandbox-exec",
+        "-c",
+        bootstrap,
         str(spec.cpu_limit_seconds),
         str(spec.memory_limit_bytes),
         str(spec.file_size_limit_bytes),
+        str(Path(__file__).with_name("seccomp_network.py")),
         "--",
         *command,
     ]
@@ -605,7 +670,9 @@ def _sandbox_exec(arguments: list[str]) -> int:
         resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
         _install_network_seccomp_filter()
-        os.execve(command[0], command, os.environ.copy())
+        environment = os.environ.copy()
+        environment.pop("PYTHONPATH", None)
+        os.execve(command[0], command, environment)
     except (OSError, ValueError, OverflowError):
         return 125
     return 125
