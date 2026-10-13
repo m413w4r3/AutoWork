@@ -189,9 +189,9 @@ class SampleSimilarityService:
                 tuple(sorted(set(descriptors_by_feature.values())))
             )
             for key, descriptor in descriptors_by_feature.items():
-                count = raw_counts.get(descriptor)
-                if count is not None:
-                    goodware_counts[key] = count
+                measured_count = raw_counts.get(descriptor)
+                if measured_count is not None:
+                    goodware_counts[key] = measured_count
 
         features_count = len(feature_keys)
         limits = SimilarityLimits(
