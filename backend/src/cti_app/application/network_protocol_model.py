@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import hashlib
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
 from uuid import UUID
 
@@ -563,13 +563,14 @@ class NetworkProtocolWorkbench:
         for trace in traces:
             ids = tuple(
                 dict.fromkeys(
-                    message_ids_by_trace[
+                    message_ids_by_trace.get(
                         (
                             trace.request.capture.sha256,
                             trace.request.flow_id,
                             trace.direction,
-                        )
-                    ]
+                        ),
+                        [],
+                    )
                 )
             )
             result.append(
@@ -602,23 +603,23 @@ def _replay_hypothesis(
     messages: list[MessageDefinitionV1] = []
     transitions: list[ProtocolTransitionV1] = []
     message_lookup = {item.message_id: item for item in proposal.messages}
-    trace_message_ids: dict[tuple[str, str], list[str]] = defaultdict(list)
+    trace_message_ids: dict[tuple[str, str, StreamDirection], list[str]] = defaultdict(list)
     for hypothesis_message in proposal.messages:
-        matching = [
+        message_matches = [
             (trace, item)
             for trace in traces
             if trace.direction is hypothesis_message.direction
             for item in trace.messages
             if item.ordinal == hypothesis_message.ordinal
         ]
-        if not matching:
+        if not message_matches:
             raise HypothesisNotReplayableError(
                 f"message {hypothesis_message.message_id} has no observed training example"
             )
-        for trace, item in matching:
-            trace_message_ids[(trace.request.capture.sha256, trace.request.flow_id)].append(
-                hypothesis_message.message_id
-            )
+        for trace, item in message_matches:
+            trace_message_ids[
+                (trace.request.capture.sha256, trace.request.flow_id, trace.direction)
+            ].append(hypothesis_message.message_id)
             if not hypothesis_message.min_length <= item.length <= hypothesis_message.max_length:
                 raise HypothesisNotReplayableError(
                     f"message length does not replay for {hypothesis_message.message_id}"
@@ -649,15 +650,19 @@ def _replay_hypothesis(
                     if hypothesis_message.encrypted_opaque
                     else ProtocolValidationStatus.INFERRED
                 ),
-                evidence=_unique_evidence(item.evidence for _, item in matching),
+                evidence=_unique_evidence(item.evidence for _, item in message_matches),
                 encrypted_opaque=hypothesis_message.encrypted_opaque
-                or any(item.stream.encrypted_opaque for _, item in matching),
+                or any(item.stream.encrypted_opaque for _, item in message_matches),
             )
         )
 
     for hypothesis_field in proposal.fields:
-        parent = message_lookup[hypothesis_field.message_id]
-        matching = [
+        parent = message_lookup.get(hypothesis_field.message_id)
+        if parent is None:
+            raise HypothesisNotReplayableError(
+                f"field {hypothesis_field.field_id} references a missing message"
+            )
+        field_matches = [
             (trace, item)
             for trace in traces
             if trace.direction is parent.direction
@@ -665,7 +670,7 @@ def _replay_hypothesis(
             if item.ordinal == parent.ordinal
         ]
         selected: list[tuple[_ObservedTrace, _ObservedMessage, bytes | None]] = []
-        for trace, item in matching:
+        for trace, item in field_matches:
             if item.stream.encrypted_opaque or item.content is None:
                 if not hypothesis_field.encrypted_opaque:
                     raise HypothesisNotReplayableError(
@@ -719,29 +724,33 @@ def _replay_hypothesis(
                 encrypted_opaque=opaque,
             )
         )
-    for transition in proposal.transitions:
-        parent = message_lookup[transition.message_id]
-        matching = [
-            item
+    for hypothesis_transition in proposal.transitions:
+        parent = message_lookup.get(hypothesis_transition.message_id)
+        if parent is None:
+            raise HypothesisNotReplayableError(
+                f"transition {hypothesis_transition.transition_id} references a missing message"
+            )
+        transition_matches = [
+            (trace, item)
             for trace in traces
             if trace.direction is parent.direction
             for item in trace.messages
             if item.ordinal == parent.ordinal
         ]
-        if not matching:
+        if not transition_matches:
             raise HypothesisNotReplayableError(
-                f"transition {transition.transition_id} has no observed message"
+                f"transition {hypothesis_transition.transition_id} has no observed message"
             )
         transitions.append(
             ProtocolTransitionV1(
-                transition_id=transition.transition_id,
-                from_state=transition.from_state,
-                to_state=transition.to_state,
-                message_id=transition.message_id,
-                trigger=transition.trigger,
-                hypotheses=(f"hypothesis:{transition.transition_id}",),
+                transition_id=hypothesis_transition.transition_id,
+                from_state=hypothesis_transition.from_state,
+                to_state=hypothesis_transition.to_state,
+                message_id=hypothesis_transition.message_id,
+                trigger=hypothesis_transition.trigger,
+                hypotheses=(f"hypothesis:{hypothesis_transition.transition_id}",),
                 validation_status=ProtocolValidationStatus.INFERRED,
-                evidence=_unique_evidence(item.evidence for item in matching),
+                evidence=_unique_evidence(item.evidence for _, item in transition_matches),
             )
         )
 
@@ -753,16 +762,16 @@ def _replay_hypothesis(
         current_state: str | None = None
         for observed in sorted(trace.messages, key=lambda item: item.ordinal):
             message_id = proposal_message_by_key.get((trace.direction, observed.ordinal))
-            transition = transition_by_message.get(message_id or "")
-            if transition is None:
+            model_transition = transition_by_message.get(message_id or "")
+            if model_transition is None:
                 continue
             if current_state is None:
-                current_state = transition.from_state
-            if current_state != transition.from_state:
+                current_state = model_transition.from_state
+            if current_state != model_transition.from_state:
                 raise HypothesisNotReplayableError(
-                    f"state transition {transition.transition_id} does not replay in order"
+                    f"state transition {model_transition.transition_id} does not replay in order"
                 )
-            current_state = transition.to_state
+            current_state = model_transition.to_state
 
     conversations = NetworkProtocolWorkbench._conversations(traces, trace_message_ids)
     endpoints = _unique_endpoints(
@@ -840,36 +849,42 @@ def _verify_model(model: ProtocolModelV1, traces: Sequence[_ObservedTrace]) -> P
 
     for trace in traces:
         by_ordinal = {item.ordinal: item for item in trace.messages}
-        for (direction, ordinal), definition in message_by_key.items():
+        for (direction, ordinal), expected_definition in message_by_key.items():
             if direction is not trace.direction:
                 continue
             actual = by_ordinal.get(ordinal)
             if actual is None:
                 proof = trace.evidence
                 finding = _finding(
-                    definition.message_id,
+                    expected_definition.message_id,
                     "message_missing",
                     ProtocolValidationStatus.UNRESOLVED,
-                    definition.name,
+                    expected_definition.name,
                     None,
                     "Expected message was absent from this holdout stream.",
                     (proof,),
                 )
                 new_findings[finding.finding_id] = finding
                 continue
-            if not definition.min_length <= actual.length <= definition.max_length:
+            if (
+                not expected_definition.min_length
+                <= actual.length
+                <= expected_definition.max_length
+            ):
                 finding = _finding(
-                    definition.message_id,
+                    expected_definition.message_id,
                     "message_length",
                     ProtocolValidationStatus.CONTRADICTED,
-                    f"{definition.min_length}..{definition.max_length}",
+                    f"{expected_definition.min_length}..{expected_definition.max_length}",
                     str(actual.length),
                     "Holdout message length falls outside the proposed range.",
                     (actual.evidence,),
                 )
                 new_findings[finding.finding_id] = finding
-                message_status[definition.message_id] = ProtocolValidationStatus.CONTRADICTED
-            for field in fields_by_message[definition.message_id]:
+                message_status[expected_definition.message_id] = (
+                    ProtocolValidationStatus.CONTRADICTED
+                )
+            for field in fields_by_message[expected_definition.message_id]:
                 if field.expected_hex is None:
                     continue
                 if actual.stream.encrypted_opaque or actual.content is None:
@@ -922,30 +937,34 @@ def _verify_model(model: ProtocolModelV1, traces: Sequence[_ObservedTrace]) -> P
         seen_transitions: set[str] = set()
         current_state: str | None = None
         for observed in sorted(trace.messages, key=lambda item: item.ordinal):
-            definition = message_by_key.get((trace.direction, observed.ordinal))
-            if definition is None:
+            observed_definition = message_by_key.get((trace.direction, observed.ordinal))
+            if observed_definition is None:
                 continue
-            transition = transitions_by_message.get(definition.message_id)
-            if transition is None:
+            model_transition = transitions_by_message.get(observed_definition.message_id)
+            if model_transition is None:
                 continue
-            seen_transitions.add(transition.transition_id)
+            seen_transitions.add(model_transition.transition_id)
             if current_state is None:
-                current_state = transition.from_state
-            if current_state != transition.from_state:
+                current_state = model_transition.from_state
+            if current_state != model_transition.from_state:
                 finding = _finding(
-                    transition.transition_id,
+                    model_transition.transition_id,
                     "state_transition",
                     ProtocolValidationStatus.CONTRADICTED,
-                    transition.from_state,
+                    model_transition.from_state,
                     current_state,
                     "Holdout message order contradicts the proposed state path.",
                     (observed.evidence,),
                 )
                 new_findings[finding.finding_id] = finding
-                transition_status[transition.transition_id] = ProtocolValidationStatus.CONTRADICTED
+                transition_status[model_transition.transition_id] = (
+                    ProtocolValidationStatus.CONTRADICTED
+                )
             else:
-                transition_status[transition.transition_id] = ProtocolValidationStatus.OBSERVED
-                current_state = transition.to_state
+                transition_status[model_transition.transition_id] = (
+                    ProtocolValidationStatus.OBSERVED
+                )
+                current_state = model_transition.to_state
         for transition in model.transitions:
             message_directions = next(
                 (
@@ -1285,10 +1304,10 @@ def _candidate_status(value: object) -> ProtocolValidationStatus:
 
 
 def _unique_evidence(
-    evidence: Sequence[ProtocolEvidenceRefV1] | object,
+    evidence: Iterable[ProtocolEvidenceRefV1],
 ) -> tuple[ProtocolEvidenceRefV1, ...]:
     by_key: dict[tuple[str, str, str, int | None, int | None], ProtocolEvidenceRefV1] = {}
-    for item in evidence:  # type: ignore[union-attr]
+    for item in evidence:
         key = (
             item.capture_sha256,
             item.stream_id,
@@ -1391,10 +1410,10 @@ def _range_evidence(message: _ObservedMessage, start: int, end: int) -> Protocol
 
 
 def _unique_endpoints(
-    endpoints: Sequence[ProtocolEndpointV1] | object,
+    endpoints: Iterable[ProtocolEndpointV1],
 ) -> tuple[ProtocolEndpointV1, ...]:
     by_key: dict[tuple[str, int | None, str | None], ProtocolEndpointV1] = {}
-    for endpoint in endpoints:  # type: ignore[union-attr]
+    for endpoint in endpoints:
         key = (endpoint.address, endpoint.port, endpoint.channel)
         existing = by_key.get(key)
         if existing is None:
@@ -1411,16 +1430,9 @@ def _unique_endpoints(
 
 
 def _unique_versions(
-    versions: Sequence[ExtractorVersionV1] | object,
+    versions: Iterable[ExtractorVersionV1],
 ) -> tuple[tuple[str, str], ...]:
-    return tuple(
-        sorted(
-            {
-                (item.name, item.version)
-                for item in versions  # type: ignore[union-attr]
-            }
-        )
-    )
+    return tuple(sorted({(item.name, item.version) for item in versions}))
 
 
 def _candidate_placeholder() -> None:

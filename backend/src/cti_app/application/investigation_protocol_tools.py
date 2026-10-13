@@ -356,10 +356,10 @@ class _ProtocolToolAdapter:
                     "family_assurance": model.family_assurance.value,
                     "message_count": len(model.messages),
                 }
-                observation = await self._record(context, model, blob_id, stored_sha, output)
-                output["observation_ref"] = str(observation)
+                observation_id = await self._record(context, model, blob_id, stored_sha, output)
+                output["observation_ref"] = str(observation_id)
                 return self._result(
-                    context, started, ToolInvocationStatus.SUCCEEDED, output, (observation,)
+                    context, started, ToolInvocationStatus.SUCCEEDED, output, (observation_id,)
                 )
 
             if self.name == NETWORK_PROTOCOL_HYPOTHESIZE:
@@ -381,10 +381,10 @@ class _ProtocolToolAdapter:
                     "transition_count": len(model.transitions),
                     "test_plan": [step.to_dict() for step in model.test_plan],
                 }
-                observation = await self._record(context, model, blob_id, stored_sha, output)
-                output["observation_ref"] = str(observation)
+                observation_id = await self._record(context, model, blob_id, stored_sha, output)
+                output["observation_ref"] = str(observation_id)
                 return self._result(
-                    context, started, ToolInvocationStatus.SUCCEEDED, output, (observation,)
+                    context, started, ToolInvocationStatus.SUCCEEDED, output, (observation_id,)
                 )
 
             if self.name == NETWORK_PROTOCOL_VERIFY:
@@ -409,18 +409,18 @@ class _ProtocolToolAdapter:
                         for item in verified.verification_findings
                     ),
                 }
-                observation = await self._record(context, verified, blob_id, stored_sha, output)
-                output["observation_ref"] = str(observation)
+                observation_id = await self._record(context, verified, blob_id, stored_sha, output)
+                output["observation_ref"] = str(observation_id)
                 status = (
                     ToolInvocationStatus.PARTIAL
                     if verified.validation_status.value in {"contradicted", "unresolved"}
                     else ToolInvocationStatus.SUCCEEDED
                 )
-                return self._result(context, started, status, output, (observation,))
+                return self._result(context, started, status, output, (observation_id,))
 
             model = await self.model_store.get_model(_uuid(arguments.get("model_blob_id")))
             rendered = self.service.render(model)
-            observation = await self.recorder.record_json(
+            render_observation = await self.recorder.record_json(
                 investigation_id=context.investigation_id,
                 kind=EvidenceKind.OTHER,
                 payload=rendered.to_dict(),
@@ -436,14 +436,14 @@ class _ProtocolToolAdapter:
             )
             output = {
                 **rendered.to_dict(),
-                "observation_ref": str(observation.id),
+                "observation_ref": str(render_observation.id),
             }
             return self._result(
                 context,
                 started,
                 ToolInvocationStatus.SUCCEEDED,
                 output,
-                (observation.id,),
+                (render_observation.id,),
             )
         except HypothesisNotReplayableError as exc:
             return self._result(
