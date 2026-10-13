@@ -419,7 +419,7 @@ def register_rule_tools(
     corpus_inventory: RuleCorpusInventoryPort | None = None,
     feature_provider: RuleFeatureProvider | None = None,
     max_tool_seconds: int = 30,
-) -> None:
+) -> _RuleTools:
     """Register local, optional rule tools without changing the investigation loop."""
     if not 1 <= max_tool_seconds <= 600:
         raise ValueError("max_tool_seconds must be between 1 and 600")
@@ -460,6 +460,7 @@ def register_rule_tools(
             ),
             _RuleToolAdapter(service, name),
         )
+    return service
 
 
 class _RuleToolAdapter(ToolAdapter):
@@ -539,6 +540,19 @@ class _RuleTools:
         self.corpus_inventory = corpus_inventory
         self.feature_provider = feature_provider
         self.max_tool_seconds = max_tool_seconds
+
+    @property
+    def signature_bridge_available(self) -> bool:
+        return all(
+            port is not None
+            for port in (
+                self.workbench,
+                self.candidates,
+                self.associations,
+                self.corpus_bytes,
+                self.recorder,
+            )
+        )
 
     async def execute(
         self, name: str, arguments: Mapping[str, Any], context: ToolExecutionContext
@@ -676,6 +690,38 @@ class _RuleTools:
         )
         output = self._version_output(result)
         return output, result.status, (result.observation.id,)
+
+    async def revise_with_added_motifs(
+        self,
+        arguments: Mapping[str, Any],
+        context: ToolExecutionContext,
+    ) -> tuple[Mapping[str, Any], ToolInvocationStatus, tuple[UUID, ...]]:
+        """Append bridge motifs to the latest immutable version via the rule path."""
+        assert self.candidates is not None
+        candidate_id = UUID(arguments["candidate_id"])
+        versions = await self._versions_for_investigation(candidate_id, context.investigation_id)
+        parent_number = arguments["parent_version"]
+        parent = next((item for item in versions if item.version == parent_number), None)
+        if parent is None or not versions or parent.id != versions[-1].id:
+            raise _ToolFailed("parent_must_be_latest")
+        existing = _motifs_from_version(parent)
+        additions = _motifs_from_json(arguments["motifs"])
+        combined: dict[tuple[str, str, str, str], RuleMotif] = {}
+        for motif in (*existing, *additions):
+            combined.setdefault(
+                (
+                    motif.kind.value,
+                    motif.value.casefold(),
+                    motif.provenance_kind.value,
+                    motif.provenance_id,
+                ),
+                motif,
+            )
+        if len(combined) == len(existing):
+            raise _ToolFailed("revision_adds_no_new_motifs")
+        revised_arguments = dict(arguments)
+        revised_arguments["motifs"] = [_motif_payload(item) for item in combined.values()]
+        return await self.revise(revised_arguments, context)
 
     async def test(
         self, arguments: Mapping[str, Any], context: ToolExecutionContext
@@ -1338,6 +1384,29 @@ def _motifs_from_json(raw_motifs: Sequence[Mapping[str, Any]]) -> tuple[RuleMoti
             values["offsets"] = tuple(values["offsets"])
         result.append(RuleMotif(**values))
     return tuple(result)
+
+
+def _motif_payload(motif: RuleMotif) -> dict[str, Any]:
+    """Serialize one typed motif for the existing rule tool contract."""
+    payload: dict[str, Any] = {
+        "kind": motif.kind.value,
+        "value": motif.value,
+        "provenance_kind": motif.provenance_kind.value,
+        "provenance_id": motif.provenance_id,
+        "observation_refs": [str(item) for item in motif.observation_refs],
+        "rationale": motif.rationale,
+    }
+    for name in (
+        "sample_sha256",
+        "offsets",
+        "positive_support",
+        "benign_prevalence",
+        "goodware_occurrence_count",
+    ):
+        value = getattr(motif, name)
+        if value is not None:
+            payload[name] = list(value) if name == "offsets" else value
+    return payload
 
 
 def _motifs_from_version(version: DetectionCandidateVersion) -> tuple[RuleMotif, ...]:
