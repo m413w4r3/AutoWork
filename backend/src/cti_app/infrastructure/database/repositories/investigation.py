@@ -22,6 +22,7 @@ from cti_app.domain.analyst_opinion import (
     OpinionBlock,
     OpinionBlockType,
     OpinionClaimQualification,
+    OpinionProtocolFigureV1,
 )
 from cti_app.domain.investigation import (
     AgendaItem,
@@ -921,6 +922,10 @@ def _opinion_from_row(row: AnalystOpinionVersionRow) -> AnalystOpinionV1:
         base_publication_sha256=str(content["base_publication_sha256"]),
         blocks=blocks,
         unresolved_points=tuple(str(value) for value in content["unresolved_points"]),
+        protocol_figures=tuple(
+            OpinionProtocolFigureV1.from_payload(item)
+            for item in content.get("protocol_figures", [])
+        ),
         author_id=str(content["author_id"]),
         reviewer_id=(str(content["reviewer_id"]) if content["reviewer_id"] is not None else None),
         status=AnalystOpinionStatus(row.status),

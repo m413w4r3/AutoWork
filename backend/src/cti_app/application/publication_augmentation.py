@@ -180,6 +180,7 @@ def augment_publication_with_opinion(
             for block in ordered_blocks
         ),
         unresolved_points=opinion.unresolved_points,
+        protocol_figures=opinion.protocol_figures,
     )
     provenance = PublicationDocumentV6ProvenanceV1(
         base_publication_artifact_id=citation_context.base_publication_artifact_id,

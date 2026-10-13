@@ -40,7 +40,7 @@ from cti_app.domain.semantic_annotation import (
     timeline_anchor,
 )
 
-_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v20-block-location"
+_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v21-protocol-figure-pins"
 _PUBLICATION_RENDERER_MANIFEST = "renderer-manifest.json"
 _FRENCH_MONTH_NAMES = (
     "janvier",
@@ -671,32 +671,57 @@ def project_publication_to_typst_model(
                 "href": (f"autowork://investigations/{investigation_id}/{uri_kind}/{reference_id}"),
             }
 
-        content_sections.append(
-            {
-                "type": "analyst_opinion",
-                "heading": "Avis de l'analyste",
-                "blocks": [
-                    {
-                        "number": f"1.{index + 1}",
-                        "heading": block.heading,
-                        "text": block.text,
-                        "qualification": block.qualification.value,
-                        "qualification_label": qualification_labels[block.qualification.value],
-                        "certainty_percent": round(block.certainty * 100),
-                        "finding_refs": [
-                            opinion_citation("finding", reference_id)
-                            for reference_id in block.finding_refs
-                        ],
-                        "evidence_refs": [
-                            opinion_citation("evidence", reference_id)
-                            for reference_id in block.evidence_refs
-                        ],
-                    }
-                    for index, block in enumerate(rendered_opinion.blocks)
-                ],
-                "unresolved_points": list(rendered_opinion.unresolved_points),
-            }
-        )
+        opinion_section: dict[str, Any] = {
+            "type": "analyst_opinion",
+            "heading": "Avis de l'analyste",
+            "blocks": [
+                {
+                    "number": f"1.{index + 1}",
+                    "heading": block.heading,
+                    "text": block.text,
+                    "qualification": block.qualification.value,
+                    "qualification_label": qualification_labels[block.qualification.value],
+                    "certainty_percent": round(block.certainty * 100),
+                    "finding_refs": [
+                        opinion_citation("finding", reference_id)
+                        for reference_id in block.finding_refs
+                    ],
+                    "evidence_refs": [
+                        opinion_citation("evidence", reference_id)
+                        for reference_id in block.evidence_refs
+                    ],
+                }
+                for index, block in enumerate(rendered_opinion.blocks)
+            ],
+            "unresolved_points": list(rendered_opinion.unresolved_points),
+        }
+        if rendered_opinion.protocol_figures:
+            opinion_section["protocol_figures"] = [
+                {
+                    "type": "diagram",
+                    "key": f"protocol-{figure.kind.value}",
+                    "title": _PROTOCOL_FIGURE_TITLES[figure.kind.value],
+                    "caption": figure.caption,
+                    "media_path": media_ref(
+                        asset_id=figure.asset_id,
+                        expected_kind=MediaAssetKind.DIAGRAM_SVG,
+                        expected_mime_type="image/svg+xml",
+                        expected_sha256=figure.asset_sha256,
+                        expected_byte_size=None,
+                    ).media_path,
+                    "model_sha256": figure.model_sha256,
+                    "spec_sha256": figure.spec_sha256,
+                    "asset_sha256": figure.asset_sha256,
+                    "preview_sha256": figure.preview_sha256,
+                    "pin_sha256": figure.pin_sha256,
+                    "compiler_name": figure.compiler_name,
+                    "compiler_version": figure.compiler_version,
+                    "compiler_policy_version": figure.compiler_policy_version,
+                    "figure_number": figure_number + index,
+                }
+                for index, figure in enumerate(rendered_opinion.protocol_figures, start=1)
+            ]
+        content_sections.append(opinion_section)
     if any(indicators.values()) or any(original_indicators.values()):
         content_sections.append(
             {
@@ -870,6 +895,13 @@ def _diagram_block(
         "caption": diagram.caption,
         "media_path": media.media_path,
     }
+
+
+_PROTOCOL_FIGURE_TITLES = {
+    "sequence": "Séquence réseau observée",
+    "state_machine": "Machine à états du protocole",
+    "message_format": "Format de message observé",
+}
 
 
 def _figure_block(

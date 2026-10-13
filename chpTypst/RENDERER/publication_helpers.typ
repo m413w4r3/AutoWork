@@ -305,6 +305,9 @@
           #parbreak()
         ]
       ]
+      #for figure in content_section.at("protocol_figures", default: ()) {
+        render-diagram(figure)
+      }
       #if content_section.unresolved_points.len() > 0 [
         #heading(level: 3)[Points non résolus]
         #for point in content_section.unresolved_points [

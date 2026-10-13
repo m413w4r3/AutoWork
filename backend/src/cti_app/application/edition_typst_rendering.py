@@ -29,7 +29,7 @@ from cti_app.domain.publication_document import (
     PublicationDocumentV6,
 )
 
-_EDITION_RENDER_DATA_SCHEMA_VERSION = "typst-edition-model-v20-analyst-opinion"
+_EDITION_RENDER_DATA_SCHEMA_VERSION = "typst-edition-model-v21-protocol-figure-pins"
 _FRENCH_MONTH_NAMES = (
     "janvier",
     "février",
