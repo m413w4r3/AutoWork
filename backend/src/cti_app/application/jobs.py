@@ -714,9 +714,16 @@ def create_job_registry(
     production_diagram_compiler: object | None = None,
     production_chart_compiler: object | None = None,
     edition_release_rematerializer: object | None = None,
+    investigation_runner: object | None = None,
 ) -> JobRegistry:
     registry = JobRegistry()
     registry.register("demo.deterministic", DemoJobParameters, demo_job_handler)
+    if investigation_runner is not None:
+        from cti_app.application.investigation_jobs import register_investigation_jobs
+
+        if not callable(investigation_runner):
+            raise TypeError("investigation_runner must be callable")
+        register_investigation_jobs(registry, cast(Any, investigation_runner))
     if model_gateway is not None:
         from cti_app.application.model_gateway import ModelGateway
         from cti_app.application.model_jobs import register_model_jobs

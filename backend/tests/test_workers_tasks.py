@@ -4,6 +4,7 @@ from cti_app.application.discovery.jobs import (
 )
 from cti_app.application.production_jobs import stage_job_kind
 from cti_app.config import get_settings
+from cti_app.domain.jobs import INVESTIGATION_RUN_JOB_KIND
 from cti_app.domain.production_pipeline import production_stages
 from cti_app.workers.tasks import DURABLE_RESUME_JOB_KINDS, execute_job
 
@@ -32,3 +33,7 @@ def test_archived_report_reprocessing_is_declared_durable_for_the_recovery_proce
 
 def test_every_article_production_stage_is_declared_durable() -> None:
     assert {stage_job_kind(stage) for stage in production_stages()} <= DURABLE_RESUME_JOB_KINDS
+
+
+def test_investigation_run_is_declared_durable_for_the_recovery_process() -> None:
+    assert INVESTIGATION_RUN_JOB_KIND in DURABLE_RESUME_JOB_KINDS
