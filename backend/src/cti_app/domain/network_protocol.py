@@ -363,7 +363,7 @@ def _json_value(value: Any) -> Any:
         return value.value
     if isinstance(value, UUID):
         return str(value)
-    if is_dataclass(value):
+    if is_dataclass(value) and not isinstance(value, type):
         return {key: _json_value(item) for key, item in asdict(value).items()}
     if isinstance(value, tuple):
         return [_json_value(item) for item in value]

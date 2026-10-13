@@ -363,7 +363,7 @@ def _build_argv(
     if spec.binary == "tshark" and options.get("field_catalog") is True:
         argv = [executable, "-G", "fields", "tls.handshake"]
     elif spec.binary == "tshark":
-        fields = (
+        fields: tuple[str, ...] = (
             "frame.number",
             "frame.time_epoch",
             "frame.len",
