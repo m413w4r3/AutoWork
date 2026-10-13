@@ -9,6 +9,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from itertools import pairwise
 from typing import Protocol
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from cti_app.application.blob_storage import BlobReadLimitExceededError, BlobStorageUnavailableError
@@ -55,6 +56,7 @@ from cti_app.infrastructure.pcap_reader import (
 from cti_app.infrastructure.tshark_adapter import TsharkAdapter, TsharkInspection
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_MAX_LOCAL_CAPTURE_ASSOCIATIONS = 16_384
 _NETWORK_CAPTURE_BUCKET = "network-captures-quarantine"
 _CAPTURE_SOURCE_VERSION = "network-capture-acceptance.v1"
 _PCAP_MIME = {
@@ -184,6 +186,7 @@ class NetworkWorkbench:
         self.tshark = tshark
         self.recorder = recorder
         self.limits = limits or NetworkExtractionLimitsV1()
+        self._accepted_capture_associations: set[tuple[UUID, UUID, str]] = set()
 
     async def accept_quarantined_capture(
         self,
@@ -237,10 +240,16 @@ class NetworkWorkbench:
                 ),
                 idempotency_key=idempotency_key,
             )
+        self._remember_capture_association(investigation_id, blob_id, actual_sha256)
         return reference
 
-    async def inspect(self, reference: NetworkCaptureRefV1) -> NetworkInspectionOutcome:
-        content, parsed = await self._load(reference)
+    async def inspect(
+        self,
+        reference: NetworkCaptureRefV1,
+        *,
+        investigation_id: UUID | None = None,
+    ) -> NetworkInspectionOutcome:
+        content, parsed = await self._load(reference, investigation_id=investigation_id)
         result = await self.tshark.inspect(content, reference.sha256)
         if result.status is LocalCommandStatus.UNAVAILABLE:
             return NetworkInspectionOutcome(
@@ -261,9 +270,13 @@ class NetworkWorkbench:
         return NetworkInspectionOutcome(status, report)
 
     async def reassemble(
-        self, reference: NetworkCaptureRefV1, flow_id: str
+        self,
+        reference: NetworkCaptureRefV1,
+        flow_id: str,
+        *,
+        investigation_id: UUID | None = None,
     ) -> NetworkStreamOutcome:
-        _, parsed = await self._load(reference)
+        _, parsed = await self._load(reference, investigation_id=investigation_id)
         flow = _find_flow(parsed.packets, flow_id)
         if flow is None:
             return NetworkStreamOutcome(ToolInvocationStatus.EMPTY, (), "flow_not_found")
@@ -285,9 +298,13 @@ class NetworkWorkbench:
         )
 
     async def segment(
-        self, reference: NetworkCaptureRefV1, flow_id: str
+        self,
+        reference: NetworkCaptureRefV1,
+        flow_id: str,
+        *,
+        investigation_id: UUID | None = None,
     ) -> NetworkSegmentationOutcome:
-        _, parsed = await self._load(reference)
+        _, parsed = await self._load(reference, investigation_id=investigation_id)
         flow = _find_flow(parsed.packets, flow_id)
         if flow is None:
             return NetworkSegmentationOutcome(
@@ -300,6 +317,7 @@ class NetworkWorkbench:
             material.contract.payload_truncated
             or material.contract.gaps
             or material.contract.details_truncated
+            or any(overlap.ambiguous for overlap in material.contract.overlaps)
             or segmentation.details_truncated
             for material, segmentation in zip(materials, segmentations, strict=True)
         )
@@ -309,7 +327,13 @@ class NetworkWorkbench:
             pack,
         )
 
-    async def _load(self, reference: NetworkCaptureRefV1) -> tuple[bytes, PcapReadResult]:
+    async def _load(
+        self,
+        reference: NetworkCaptureRefV1,
+        *,
+        investigation_id: UUID | None = None,
+    ) -> tuple[bytes, PcapReadResult]:
+        await self._require_capture_association(reference, investigation_id)
         if reference.size_bytes > self.limits.max_capture_bytes:
             raise NetworkCaptureRejected(NetworkCaptureRejection.SIZE_LIMIT)
         try:
@@ -338,6 +362,38 @@ class NetworkWorkbench:
         if parsed.format is not reference.format:
             raise NetworkCaptureRejected(NetworkCaptureRejection.INVALID_FORMAT)
         return content, parsed
+
+    async def _require_capture_association(
+        self,
+        reference: NetworkCaptureRefV1,
+        investigation_id: UUID | None,
+    ) -> None:
+        if investigation_id is None:
+            raise NetworkCaptureRejected(NetworkCaptureRejection.CAPTURE_NOT_ASSOCIATED)
+        association = (investigation_id, reference.blob_id, reference.sha256)
+        if association in self._accepted_capture_associations:
+            return
+        checker = getattr(self.recorder, "is_capture_associated", None)
+        if checker is not None and await checker(
+            investigation_id=investigation_id,
+            blob_id=reference.blob_id,
+            sha256=reference.sha256,
+        ):
+            self._remember_capture_association(
+                investigation_id, reference.blob_id, reference.sha256
+            )
+            return
+        raise NetworkCaptureRejected(NetworkCaptureRejection.CAPTURE_NOT_ASSOCIATED)
+
+    def _remember_capture_association(
+        self, investigation_id: UUID, blob_id: UUID, sha256: str
+    ) -> None:
+        association = (investigation_id, blob_id, sha256)
+        if association in self._accepted_capture_associations:
+            return
+        if len(self._accepted_capture_associations) >= _MAX_LOCAL_CAPTURE_ASSOCIATIONS:
+            self._accepted_capture_associations.pop()
+        self._accepted_capture_associations.add(association)
 
     def _parse(self, content: bytes) -> PcapReadResult:
         if not content or len(content) > self.limits.max_capture_bytes:
@@ -513,6 +569,11 @@ def _field_observations(
             if index >= len(fields) or not fields[index]:
                 continue
             value = fields[index]
+            if name == "http.uri":
+                try:
+                    value = urlsplit(value).path
+                except ValueError:
+                    value = ""
             target.append(
                 NetworkFieldObservationV1(
                     name,
@@ -1187,10 +1248,15 @@ def _segment_material(
                     )
                 )
         elif material.data:
+            payload_name = (
+                "encrypted_opaque_payload"
+                if contract.encrypted_opaque
+                else "unframed_observed_bytes"
+            )
             fields.append(
                 FieldCandidateV1(
                     FieldCandidateKind.PAYLOAD,
-                    "unframed_observed_bytes",
+                    payload_name,
                     0,
                     None,
                     None,
@@ -1199,7 +1265,11 @@ def _segment_material(
                     contract.frame_numbers[: limits.max_frame_refs_per_record],
                     contract.frame_numbers_truncated,
                     (_masked_hex(material.data, limits.max_preview_bytes),),
-                    "Aucune frontière de message n'est mesurée avec assez de support.",
+                    (
+                        "Charge TLS chiffrée opaque; aucune frontière applicative n'est inférée."
+                        if contract.encrypted_opaque
+                        else "Aucune frontière de message n'est mesurée avec assez de support."
+                    ),
                 )
             )
         evidence_frames = contract.frame_numbers
@@ -1241,6 +1311,10 @@ def _segment_material(
         )
     if contract.encrypted_opaque:
         limitations.append("La charge TLS chiffrée est opaque et n'a pas été décodée.")
+    if any(overlap.ambiguous for overlap in contract.overlaps):
+        limitations.append(
+            "Les octets en chevauchement ambigu sont exclus de l'inférence des frontières."
+        )
     details_truncated = (
         contract.details_truncated
         or len(boundaries) >= limits.max_messages
@@ -1263,14 +1337,23 @@ def _segment_material(
         extractor_versions=(ExtractorVersionV1("native-message-segmenter", "1"),),
         limits=limits,
         limitations=tuple(dict.fromkeys(limitations)),
+        overlaps=contract.overlaps,
     )
 
 
 def _length_prefix_candidates(
     material: _StreamMaterial, limits: NetworkExtractionLimitsV1
 ) -> list[tuple[int, str, bool, tuple[tuple[int, int], ...]]]:
+    if material.contract.encrypted_opaque:
+        return []
+    coverage = bytearray(material.coverage)
+    for overlap in material.contract.overlaps:
+        if overlap.ambiguous:
+            coverage[overlap.start_offset : overlap.end_offset] = b"\x00" * (
+                overlap.end_offset - overlap.start_offset
+            )
     candidates: list[tuple[int, str, bool, tuple[tuple[int, int], ...]]] = []
-    for run_start, run_end in _covered_runs(material.coverage):
+    for run_start, run_end in _covered_runs(coverage):
         if run_end - run_start < 4:
             continue
         for width in (1, 2, 4):
@@ -1359,6 +1442,7 @@ def _evidence_pack(
 ) -> ProtocolEvidencePackV1:
     fields = tuple(field for segmentation in segmentations for field in segmentation.fields)
     gaps = tuple(gap for item in materials for gap in item.contract.gaps)
+    overlaps = tuple(overlap for item in materials for overlap in item.contract.overlaps)
     direction_names = tuple(item.contract.direction.value for item in materials)
     flow_record = ProtocolEvidenceFlowV1(
         flow_id=flow.flow_id,
@@ -1369,6 +1453,7 @@ def _evidence_pack(
         frame_numbers_truncated=len(flow.packets) > limits.max_frame_refs_per_record,
         directions=direction_names,
         gaps=gaps,
+        overlaps=overlaps,
     )
     sequences = tuple(
         ProtocolEvidenceSequenceV1(

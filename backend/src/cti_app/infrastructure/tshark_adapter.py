@@ -88,6 +88,7 @@ def network_local_command_specs(
             memory_limit_bytes=512 * 1024 * 1024,
             file_size_limit_bytes=1 * 1024 * 1024,
             output_kind=LocalCommandOutputKind.TEXT,
+            requires_filesystem_confinement=True,
         ),
         LocalCommandSpec(
             id=cast(LocalCommandId, NetworkCommandId.CAPINFOS),
@@ -100,6 +101,7 @@ def network_local_command_specs(
             memory_limit_bytes=256 * 1024 * 1024,
             file_size_limit_bytes=1 * 1024 * 1024,
             output_kind=LocalCommandOutputKind.TEXT,
+            requires_filesystem_confinement=True,
         ),
     )
 
@@ -127,7 +129,13 @@ class TsharkAdapter:
     def available(self) -> bool:
         tshark = self._capability(NetworkCommandId.TSHARK)
         capinfos = self._capability(NetworkCommandId.CAPINFOS)
-        return bool(tshark and tshark.available and capinfos and capinfos.available)
+        return bool(
+            self._filesystem_confined
+            and tshark
+            and tshark.available
+            and capinfos
+            and capinfos.available
+        )
 
     def versions(self) -> tuple[str | None, str | None]:
         tshark = self._capability(NetworkCommandId.TSHARK)
@@ -151,6 +159,20 @@ class TsharkAdapter:
                 output_truncated=False,
                 ja3_available=None,
                 limitations=("TShark et capinfos sont des capacités locales optionnelles.",),
+            )
+        if not self._filesystem_confined:
+            return TsharkInspection(
+                status=LocalCommandStatus.UNAVAILABLE,
+                detail_code="filesystem_confinement_required",
+                tshark_version=tshark.version,
+                capinfos_version=capinfos.version,
+                packets=(),
+                capinfos_summary="",
+                output_truncated=False,
+                ja3_available=None,
+                limitations=(
+                    "TShark et capinfos requièrent le confinement du système de fichiers.",
+                ),
             )
 
         if self._ja3_available is None:
@@ -244,6 +266,10 @@ class TsharkAdapter:
 
     def _capability(self, command_id: NetworkCommandId) -> LocalCommandCapability | None:
         return self.catalog.get(cast(LocalCommandId, command_id))
+
+    @property
+    def _filesystem_confined(self) -> bool:
+        return bool(getattr(self.runner, "filesystem_confined", False))
 
 
 def _parse_tshark_rows(output: str, *, include_ja3: bool) -> tuple[TsharkPacketFields, ...]:

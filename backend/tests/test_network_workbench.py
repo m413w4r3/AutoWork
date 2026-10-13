@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import ipaddress
 import shutil
 import struct
-from uuid import UUID, uuid4, uuid5
+from uuid import UUID, uuid5
 
 import pytest
 
@@ -25,8 +26,11 @@ from cti_app.application.network_workbench import (
     NetworkWorkbench,
     QuarantineCaptureTooLargeError,
     QuarantinedCapture,
+    _field_observations,
+    _flows,
 )
 from cti_app.domain.investigation import InvestigationBudget, ToolInvocationStatus
+from cti_app.domain.local_analysis import LocalCommandStatus
 from cti_app.domain.network_protocol import (
     EvidenceStatus,
     FieldCandidateKind,
@@ -35,11 +39,20 @@ from cti_app.domain.network_protocol import (
     NetworkCaptureRejection,
     NetworkExtractionLimitsV1,
 )
+from cti_app.infrastructure import local_command_runner as local_runner_module
 from cti_app.infrastructure.local_command_runner import LocalCommandRunner
 from cti_app.infrastructure.pcap_reader import PcapReaderError, read_capture
-from cti_app.infrastructure.tshark_adapter import TsharkAdapter, network_local_command_specs
+from cti_app.infrastructure.tshark_adapter import (
+    TSHARK_FIELDS,
+    TsharkAdapter,
+    TsharkInspection,
+    TsharkPacketFields,
+    network_local_command_specs,
+)
 
 _BLOB_NAMESPACE = UUID("ed0b9892-9b57-4f73-850a-0867e2230c60")
+_NETWORK_INVESTIGATION_ID = UUID("03e8a72e-8d8c-4b39-8c12-79db601dca42")
+_OTHER_INVESTIGATION_ID = UUID("37ef2c3a-9c05-4dbc-ad93-860e24d2c492")
 
 
 class _Quarantine:
@@ -58,6 +71,7 @@ class _Quarantine:
 class _CaptureBlobs:
     def __init__(self) -> None:
         self.contents: dict[UUID, bytes] = {}
+        self.read_calls = 0
 
     async def put_capture(self, content: bytes, *, mime_type: str) -> UUID:
         blob_id = uuid5(_BLOB_NAMESPACE, hashlib.sha256(content).hexdigest())
@@ -65,10 +79,19 @@ class _CaptureBlobs:
         return blob_id
 
     async def read_capture(self, blob_id: UUID, *, max_bytes: int) -> bytes:
+        self.read_calls += 1
         data = self.contents[blob_id]
         if len(data) > max_bytes:
             raise ValueError("too large")
         return data
+
+
+class _TestConfinedLocalCommandRunner(LocalCommandRunner):
+    """Explicit local test adapter for running installed tools without host bwrap."""
+
+    @property
+    def filesystem_confined(self) -> bool:
+        return True
 
 
 def _tcp_frame(
@@ -220,6 +243,16 @@ def _ambiguous_overlap_capture() -> bytes:
     return _pcap(frames)
 
 
+def _ambiguous_message_overlap_capture() -> bytes:
+    messages = b"\x00\x03\x01AB\x00\x03\x02CD"
+    frames = (
+        _tcp_frame(sequence=100, flags=0x02),
+        _tcp_frame(sequence=101, flags=0x18, payload=messages),
+        _tcp_frame(sequence=108, flags=0x18, payload=b"\x09"),
+    )
+    return _pcap(frames)
+
+
 def _pcapng_one_frame(frame: bytes) -> bytes:
     section = struct.pack("<IIIHHqI", 0x0A0D0D0A, 28, 0x1A2B3C4D, 1, 0, -1, 28)
     interface = struct.pack("<IIHHII", 1, 20, 1, 0, 65_535, 20)
@@ -253,6 +286,19 @@ def _unavailable_tshark(limits: NetworkExtractionLimitsV1 | None = None) -> Tsha
     )
 
 
+def _test_tshark_adapter(
+    limits: NetworkExtractionLimitsV1 | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> TsharkAdapter:
+    monkeypatch.setattr(local_runner_module, "_detect_network_namespace", lambda *_args: None)
+    runner = _TestConfinedLocalCommandRunner(
+        network_sandbox_probe_seconds=0.01,
+        require_filesystem_confinement=False,
+    )
+    catalog = LocalCommandCatalog(specs=network_local_command_specs(limits))
+    return TsharkAdapter(runner=runner, catalog=catalog, limits=limits)
+
+
 def _workbench(
     content: bytes,
     *,
@@ -271,10 +317,13 @@ def _workbench(
     )
 
 
-async def _accepted_reference(workbench: NetworkWorkbench) -> NetworkCaptureRefV1:
+async def _accepted_reference(
+    workbench: NetworkWorkbench,
+    investigation_id: UUID = _NETWORK_INVESTIGATION_ID,
+) -> NetworkCaptureRefV1:
     return await workbench.accept_quarantined_capture(
         "quarantine:pcap:one",
-        investigation_id=uuid4(),
+        investigation_id=investigation_id,
     )
 
 
@@ -321,6 +370,76 @@ async def test_acceptance_rejects_format_size_corruption_and_source_hash_mismatc
         assert raised.value.reason is expected
 
 
+@pytest.mark.parametrize(
+    ("max_capture_bytes", "max_packets", "max_stream_bytes"),
+    (
+        (200 * 1024 * 1024 + 1, 100_000, 8 * 1024 * 1024),
+        (64 * 1024 * 1024, 1_000_001, 8 * 1024 * 1024),
+        (64 * 1024 * 1024, 100_000, 64 * 1024 * 1024 + 1),
+    ),
+)
+def test_network_limits_enforce_hard_capture_packet_and_stream_ceilings(
+    max_capture_bytes: int,
+    max_packets: int,
+    max_stream_bytes: int,
+) -> None:
+    with pytest.raises(ValueError):
+        NetworkExtractionLimitsV1(
+            max_capture_bytes=max_capture_bytes,
+            max_packets=max_packets,
+            max_stream_bytes=max_stream_bytes,
+        )
+
+
+@pytest.mark.asyncio
+async def test_capture_reference_cannot_cross_investigations_before_blob_or_tshark_read() -> None:
+    class _TsharkSpy:
+        available = True
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def inspect(self, *_args, **_kwargs):
+            self.calls += 1
+            raise AssertionError("unauthorized captures must not reach TShark")
+
+    capture = _mixed_capture()
+    blobs = _CaptureBlobs()
+    tshark = _TsharkSpy()
+    workbench = NetworkWorkbench(
+        quarantine=_Quarantine(capture),
+        blobs=blobs,
+        tshark=tshark,  # type: ignore[arg-type]
+    )
+    reference = await _accepted_reference(workbench, investigation_id=_NETWORK_INVESTIGATION_ID)
+
+    with pytest.raises(NetworkCaptureRejected) as raised:
+        await workbench.inspect(reference, investigation_id=_OTHER_INVESTIGATION_ID)
+
+    assert raised.value.reason is NetworkCaptureRejection.CAPTURE_NOT_ASSOCIATED
+    assert blobs.read_calls == 0
+    assert tshark.calls == 0
+
+    class _Recorder:
+        async def record_json(self, **_kwargs):
+            raise AssertionError("rejected captures must not create an observation")
+
+    registry = InMemoryToolRegistry()
+    register_network_tools(registry, workbench=workbench, recorder=_Recorder())  # type: ignore[arg-type]
+    context = ToolExecutionContext(
+        investigation_id=_OTHER_INVESTIGATION_ID,
+        envelope=None,
+        budget=InvestigationBudget(),
+        idempotency_key="network-foreign-capture",
+    )
+    _definition, adapter = registry.get(NETWORK_CAPTURE_INSPECT, "1")  # type: ignore[misc]
+    result = await adapter.execute({"capture_ref": reference.to_dict()}, context)
+    assert result.status is ToolInvocationStatus.POLICY_DENIED
+    assert result.output["detail_code"] == "capture_not_associated"
+    assert blobs.read_calls == 0
+    assert tshark.calls == 0
+
+
 @pytest.mark.asyncio
 async def test_native_reassembly_marks_retransmission_gaps_and_encrypted_tls_opaque() -> None:
     capture = _handshake_payload_capture()
@@ -330,7 +449,9 @@ async def test_native_reassembly_marks_retransmission_gaps_and_encrypted_tls_opa
     from cti_app.application.network_workbench import _flows
 
     flow = _flows(parsed.packets)[0]
-    outcome = await workbench.reassemble(reference, flow.flow_id)
+    outcome = await workbench.reassemble(
+        reference, flow.flow_id, investigation_id=_NETWORK_INVESTIGATION_ID
+    )
     stream = outcome.streams[0]
     assert stream.retransmission_frames == (6,)
     assert stream.gaps == ()
@@ -343,7 +464,9 @@ async def test_native_reassembly_marks_retransmission_gaps_and_encrypted_tls_opa
     ]
     assert outcome.status is ToolInvocationStatus.SUCCEEDED
 
-    segmentation = await workbench.segment(reference, flow.flow_id)
+    segmentation = await workbench.segment(
+        reference, flow.flow_id, investigation_id=_NETWORK_INVESTIGATION_ID
+    )
     one_direction = segmentation.segmentations[0]
     assert len(one_direction.boundaries) == 2
     assert all(item.status is EvidenceStatus.INFERRED for item in one_direction.boundaries)
@@ -355,11 +478,23 @@ async def test_native_reassembly_marks_retransmission_gaps_and_encrypted_tls_opa
     assert segmentation.evidence_pack is not None
     assert segmentation.evidence_pack.schema_version == "ProtocolEvidencePackV1"
 
+    periodic_flow = _flows(parsed.packets)[0]
+    periodic_intervals_ms = tuple(
+        (after.timestamp_ns - before.timestamp_ns) // 1_000_000
+        for before, after in zip(periodic_flow.packets, periodic_flow.packets[1:], strict=False)
+        if before.timestamp_ns is not None and after.timestamp_ns is not None
+    )
+    assert 1_000 in periodic_intervals_ms
+
     gap_capture = _gap_capture()
     gap_workbench, _ = _workbench(gap_capture)
     gap_reference = await _accepted_reference(gap_workbench)
     gap_flow = _flows(read_capture(gap_capture).packets)[0]
-    gap_stream = (await gap_workbench.reassemble(gap_reference, gap_flow.flow_id)).streams[0]
+    gap_stream = (
+        await gap_workbench.reassemble(
+            gap_reference, gap_flow.flow_id, investigation_id=_NETWORK_INVESTIGATION_ID
+        )
+    ).streams[0]
     assert [(item.start_offset, item.end_offset) for item in gap_stream.gaps] == [(3, 5)]
     assert gap_stream.contiguous_payload_sha256 is None
 
@@ -367,7 +502,11 @@ async def test_native_reassembly_marks_retransmission_gaps_and_encrypted_tls_opa
     overlap_workbench, _ = _workbench(overlap_capture)
     overlap_reference = await _accepted_reference(overlap_workbench)
     overlap_flow = _flows(read_capture(overlap_capture).packets)[0]
-    overlap_outcome = await overlap_workbench.reassemble(overlap_reference, overlap_flow.flow_id)
+    overlap_outcome = await overlap_workbench.reassemble(
+        overlap_reference,
+        overlap_flow.flow_id,
+        investigation_id=_NETWORK_INVESTIGATION_ID,
+    )
     assert overlap_outcome.status is ToolInvocationStatus.PARTIAL
     assert overlap_outcome.streams[0].overlaps[0].ambiguous is True
     assert overlap_outcome.streams[0].contiguous_payload_sha256 is None
@@ -378,7 +517,11 @@ async def test_native_reassembly_marks_retransmission_gaps_and_encrypted_tls_opa
     tls_flow = next(
         flow for flow in _flows(read_capture(tls_capture).packets) if flow.endpoint_a.port == 41000
     )
-    tls_stream = (await tls_workbench.reassemble(tls_reference, tls_flow.flow_id)).streams[0]
+    tls_stream = (
+        await tls_workbench.reassemble(
+            tls_reference, tls_flow.flow_id, investigation_id=_NETWORK_INVESTIGATION_ID
+        )
+    ).streams[0]
     assert tls_stream.encrypted_opaque is True
     assert "opaque" in tls_stream.limitations[0]
 
@@ -391,11 +534,59 @@ async def test_native_reassembly_marks_retransmission_gaps_and_encrypted_tls_opa
     truncated_reference = await _accepted_reference(truncated_workbench)
     truncated_flow = _flows(read_capture(truncated_capture).packets)[0]
     truncated_stream = (
-        await truncated_workbench.reassemble(truncated_reference, truncated_flow.flow_id)
+        await truncated_workbench.reassemble(
+            truncated_reference,
+            truncated_flow.flow_id,
+            investigation_id=_NETWORK_INVESTIGATION_ID,
+        )
     ).streams[0]
     assert truncated_stream.payload_truncated is True
     assert truncated_stream.truncated_frames == (1,)
     assert truncated_stream.contiguous_payload_sha256 is None
+
+
+@pytest.mark.asyncio
+async def test_segment_preserves_overlaps_and_does_not_infer_conflicted_or_tls_messages() -> None:
+    overlap_capture = _ambiguous_message_overlap_capture()
+    overlap_workbench, _ = _workbench(overlap_capture)
+    overlap_reference = await _accepted_reference(overlap_workbench)
+    overlap_flow = _flows(read_capture(overlap_capture).packets)[0]
+    overlap_outcome = await overlap_workbench.segment(
+        overlap_reference,
+        overlap_flow.flow_id,
+        investigation_id=_NETWORK_INVESTIGATION_ID,
+    )
+
+    assert overlap_outcome.status is ToolInvocationStatus.PARTIAL
+    assert overlap_outcome.evidence_pack is not None
+    assert any(
+        overlap.ambiguous
+        for segmentation in overlap_outcome.segmentations
+        for overlap in segmentation.overlaps
+    )
+    assert any(
+        overlap.ambiguous
+        for flow in overlap_outcome.evidence_pack.flows
+        for overlap in flow.overlaps
+    )
+    assert not any(segmentation.boundaries for segmentation in overlap_outcome.segmentations)
+
+    tls_capture = _mixed_capture()
+    tls_workbench, _ = _workbench(tls_capture)
+    tls_reference = await _accepted_reference(tls_workbench)
+    tls_flow = next(
+        flow
+        for flow in _flows(read_capture(tls_capture).packets)
+        if flow.endpoint_a.port == 41000 or flow.endpoint_b.port == 41000
+    )
+    tls_outcome = await tls_workbench.segment(
+        tls_reference,
+        tls_flow.flow_id,
+        investigation_id=_NETWORK_INVESTIGATION_ID,
+    )
+    opaque = next(item for item in tls_outcome.segmentations if item.encrypted_opaque)
+    assert opaque.boundaries == ()
+    assert not any(item.status is EvidenceStatus.INFERRED for item in opaque.fields)
 
 
 @pytest.mark.asyncio
@@ -404,12 +595,44 @@ async def test_unavailable_tshark_is_reported_without_suppressing_native_tools()
     tshark = _unavailable_tshark()
     workbench, _ = _workbench(capture, tshark=tshark)
     reference = await _accepted_reference(workbench)
-    outcome = await workbench.inspect(reference)
+    outcome = await workbench.inspect(reference, investigation_id=_NETWORK_INVESTIGATION_ID)
     assert outcome.status is ToolInvocationStatus.UNAVAILABLE
     assert outcome.detail_code == "binary_unavailable"
     assert NETWORK_CAPTURE_INSPECT not in network_tool_capabilities(tshark)
     assert NETWORK_STREAM_REASSEMBLE in network_tool_capabilities(tshark)
     assert NETWORK_MESSAGES_SEGMENT in network_tool_capabilities(tshark)
+
+
+@pytest.mark.asyncio
+async def test_tshark_requires_filesystem_confinement_and_reports_typed_unavailability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(local_runner_module, "_detect_network_namespace", lambda *_args: None)
+    runner = LocalCommandRunner(require_filesystem_confinement=False)
+    catalog = LocalCommandCatalog(
+        specs=network_local_command_specs(),
+        which=lambda _name: "/test-only/tshark",
+    )
+    tshark = TsharkAdapter(runner=runner, catalog=catalog)
+
+    assert all(spec.requires_filesystem_confinement for spec in network_local_command_specs())
+    assert not tshark.available
+    assert NETWORK_CAPTURE_INSPECT not in network_tool_capabilities(tshark)
+    outcome = await tshark.inspect(_mixed_capture(), hashlib.sha256(_mixed_capture()).hexdigest())
+    assert outcome.status.value == "unavailable"
+    assert outcome.detail_code == "filesystem_confinement_required"
+
+
+def test_http_uri_observations_strip_credentials_query_and_fragment() -> None:
+    values = [""] * (len(TSHARK_FIELDS) - 5)
+    values[14] = "http://user:password@example.test/private?token=secret#fragment"
+    row = TsharkPacketFields(1, None, 64, "HTTP", "frame:eth:ip:tcp:http", tuple(values))
+
+    _dns, http, _tls = _field_observations((row,), NetworkExtractionLimitsV1())
+
+    uri = next(item.value for item in http if item.name == "http.uri")
+    assert uri == "/private"
+    assert not any(secret in uri for secret in ("user", "password", "token", "secret", "fragment"))
 
 
 @pytest.mark.asyncio
@@ -423,14 +646,19 @@ async def test_tools_register_with_versioned_bounded_schemas() -> None:
     registry = InMemoryToolRegistry()
     register_network_tools(registry, workbench=workbench, recorder=_Recorder())  # type: ignore[arg-type]
     context = ToolExecutionContext(
-        investigation_id=uuid4(),
+        investigation_id=_NETWORK_INVESTIGATION_ID,
         envelope=None,
         budget=InvestigationBudget(),
         idempotency_key="network-missing-tshark",
     )
     definition, adapter = registry.get(NETWORK_CAPTURE_INSPECT, "1")  # type: ignore[misc]
     result = await adapter.execute(
-        {"capture_ref": (await _accepted_reference(workbench)).to_dict()}, context
+        {
+            "capture_ref": (
+                await _accepted_reference(workbench, investigation_id=context.investigation_id)
+            ).to_dict()
+        },
+        context,
     )
     assert definition.capability_key == NETWORK_CAPTURE_INSPECT
     assert definition.cost_model
@@ -438,17 +666,26 @@ async def test_tools_register_with_versioned_bounded_schemas() -> None:
 
 
 @pytest.mark.asyncio
-async def test_tshark_capinfos_inspection_and_deterministic_report_when_installed() -> None:
+async def test_tshark_capinfos_inspection_and_deterministic_report_when_installed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await asyncio.wait_for(_exercise_tshark_capinfos_report(monkeypatch), timeout=180)
+
+
+async def _exercise_tshark_capinfos_report(monkeypatch: pytest.MonkeyPatch) -> None:
     if not shutil.which("tshark") or not shutil.which("capinfos"):
         pytest.skip("TShark/capinfos capability is not installed")
     capture = _mixed_capture()
-    tshark = TsharkAdapter()
-    if not tshark.available:
-        pytest.skip("TShark/capinfos version discovery is unavailable")
+    tshark = _test_tshark_adapter(None, monkeypatch)
+    assert tshark.available
     workbench, _ = _workbench(capture, tshark=tshark)
     reference = await _accepted_reference(workbench)
-    first = await workbench.inspect(reference)
-    second = await workbench.inspect(reference)
+    first = await asyncio.wait_for(
+        workbench.inspect(reference, investigation_id=_NETWORK_INVESTIGATION_ID), timeout=80
+    )
+    second = await asyncio.wait_for(
+        workbench.inspect(reference, investigation_id=_NETWORK_INVESTIGATION_ID), timeout=80
+    )
     assert first.report is not None
     assert second.report is not None
     assert first.report.capture.sha256 == hashlib.sha256(capture).hexdigest()
@@ -465,33 +702,58 @@ async def test_tshark_capinfos_inspection_and_deterministic_report_when_installe
         item.name == "http.host" and item.value == "beacon.test"
         for item in first.report.http_observations
     )
+    assert any(
+        item.name == "http.uri" and item.value == "/health"
+        for item in first.report.http_observations
+    )
     assert any(item.protocol.startswith("TLS") for item in first.report.protocols)
     assert first.report.canonical_json_bytes() == second.report.canonical_json_bytes()
     assert first.report.canonical_sha256 == second.report.canonical_sha256
 
-    beacon_workbench, _ = _workbench(_handshake_payload_capture(), tshark=tshark)
+    beacon_capture = _handshake_payload_capture()
+    beacon_workbench, _ = _workbench(beacon_capture, tshark=tshark)
     beacon_reference = await _accepted_reference(beacon_workbench)
-    beacon_report = await beacon_workbench.inspect(beacon_reference)
-    assert beacon_report.report is not None
+    _beacon_bytes, beacon_parsed = await beacon_workbench._load(
+        beacon_reference, investigation_id=_NETWORK_INVESTIGATION_ID
+    )
+    beacon_inspection = TsharkInspection(
+        status=LocalCommandStatus.SUCCEEDED,
+        detail_code=None,
+        tshark_version="test-runner",
+        capinfos_version="test-runner",
+        packets=(),
+        capinfos_summary="",
+        output_truncated=False,
+        ja3_available=False,
+    )
+    beacon_report, _beacon_truncated = beacon_workbench._capture_report(
+        beacon_reference,
+        beacon_parsed,
+        _flows(beacon_parsed.packets),
+        beacon_inspection,
+        (),
+    )
     assert any(
-        1_000 in conversation.observed_intervals_ms
-        for conversation in beacon_report.report.conversations
+        1_000 in conversation.observed_intervals_ms for conversation in beacon_report.conversations
     )
 
 
 @pytest.mark.asyncio
-async def test_tshark_output_limit_is_visible_and_report_stays_compact() -> None:
+async def test_tshark_output_limit_is_visible_and_report_stays_compact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     if not shutil.which("tshark") or not shutil.which("capinfos"):
         pytest.skip("TShark/capinfos capability is not installed")
     frames = tuple(_tcp_frame(sequence=100 + index, payload=b"x") for index in range(100))
     capture = _pcap(frames)
     limits = NetworkExtractionLimitsV1(max_output_bytes=512)
-    tshark = TsharkAdapter(limits=limits)
-    if not tshark.available:
-        pytest.skip("TShark/capinfos version discovery is unavailable")
+    tshark = _test_tshark_adapter(limits, monkeypatch)
+    assert tshark.available
     workbench, _ = _workbench(capture, tshark=tshark, limits=limits)
     reference = await _accepted_reference(workbench)
-    outcome = await workbench.inspect(reference)
+    outcome = await asyncio.wait_for(
+        workbench.inspect(reference, investigation_id=_NETWORK_INVESTIGATION_ID), timeout=80
+    )
     assert outcome.report is not None
     assert outcome.status is ToolInvocationStatus.PARTIAL
     assert outcome.report.output_truncated is True

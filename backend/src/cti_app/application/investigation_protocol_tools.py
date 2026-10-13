@@ -392,6 +392,7 @@ class _ProtocolToolAdapter:
                 verified = await self.service.verify(
                     model=model,
                     traces=_trace_requests(arguments.get("traces")),
+                    investigation_id=context.investigation_id,
                 )
                 blob_id, stored_sha = await self.model_store.put_model(verified)
                 output = {
