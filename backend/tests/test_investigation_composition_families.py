@@ -382,22 +382,32 @@ def test_network_and_protocol_capabilities_are_exact() -> None:
 
 
 @pytest.mark.parametrize("missing_binary", ["tshark", "capinfos"])
-def test_missing_network_binary_keeps_other_tool_families_available(
+def test_missing_network_binary_disables_only_capture_inspection(
     missing_binary: str,
 ) -> None:
     composition = _build(
         replace(_all_family_ports(), tshark=_tshark(missing_binary=missing_binary))
     )
 
-    assert not (NETWORK_TOOL_NAMES | PROTOCOL_TOOL_NAMES).intersection(composition.available_tools)
+    assert "network.capture.inspect" not in composition.available_tools
+    assert {
+        "network.stream.reassemble",
+        "network.messages.segment",
+        *PROTOCOL_TOOL_NAMES,
+    } <= set(composition.available_tools)
     assert "samples.compare" in composition.available_tools
     assert "native.inspect" in composition.available_tools
 
 
-def test_missing_filesystem_confinement_keeps_other_families_available() -> None:
+def test_missing_filesystem_confinement_disables_only_capture_inspection() -> None:
     composition = _build(replace(_all_family_ports(), tshark=_tshark(confined=False)))
 
-    assert not (NETWORK_TOOL_NAMES | PROTOCOL_TOOL_NAMES).intersection(composition.available_tools)
+    assert "network.capture.inspect" not in composition.available_tools
+    assert {
+        "network.stream.reassemble",
+        "network.messages.segment",
+        *PROTOCOL_TOOL_NAMES,
+    } <= set(composition.available_tools)
     assert "samples.compare" in composition.available_tools
     assert "native.inspect" in composition.available_tools
 
