@@ -134,7 +134,7 @@ class NetworkProtocolWorkbench:
         traces: Sequence[ProtocolTraceRequestV1],
     ) -> ProtocolComparisonOutcomeV1:
         requests = _bounded_traces(traces, require_holdout=False)
-        observed = await self._load_traces(requests)
+        observed = await self._load_traces(requests, investigation_id=investigation_id)
         if not observed:
             raise ProtocolTraceError("no trace material is available")
         transports = {trace.transport for trace in observed}
@@ -379,7 +379,7 @@ class NetworkProtocolWorkbench:
         requests = _bounded_traces(traces, require_holdout=False)
         if any(item.holdout for item in requests):
             raise ProtocolTraceError("hypothesis replay only accepts training traces")
-        observed = await self._load_traces(requests)
+        observed = await self._load_traces(requests, investigation_id=investigation_id)
         return _replay_hypothesis(
             subject_id=subject_id,
             investigation_id=investigation_id,
@@ -392,16 +392,22 @@ class NetworkProtocolWorkbench:
         *,
         model: ProtocolModelV1,
         traces: Sequence[ProtocolTraceRequestV1],
+        investigation_id: UUID | None = None,
     ) -> ProtocolModelV1:
         requests = _bounded_traces(traces, require_holdout=True)
-        observed = await self._load_traces(requests)
+        observed = await self._load_traces(
+            requests, investigation_id=investigation_id or model.investigation_id
+        )
         return _verify_model(model, observed)
 
     def render(self, model: ProtocolModelV1) -> ProtocolRenderResultV1:
         return _render_model(model)
 
     async def _load_traces(
-        self, requests: Sequence[ProtocolTraceRequestV1]
+        self,
+        requests: Sequence[ProtocolTraceRequestV1],
+        *,
+        investigation_id: UUID,
     ) -> tuple[_ObservedTrace, ...]:
         # The L5 API intentionally returns only compact contracts. For this local
         # validator, use its immutable blob and shared deterministic reconstruction
@@ -414,7 +420,9 @@ class NetworkProtocolWorkbench:
 
         result: list[_ObservedTrace] = []
         for request in requests:
-            _, parsed = await self._workbench._load(request.capture)
+            _, parsed = await self._workbench._load(
+                request.capture, investigation_id=investigation_id
+            )
             flow = next(
                 (item for item in _flows(parsed.packets) if item.flow_id == request.flow_id), None
             )

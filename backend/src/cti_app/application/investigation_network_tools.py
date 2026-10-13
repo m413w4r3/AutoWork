@@ -201,7 +201,9 @@ class _CaptureInspectAdapter(_NetworkToolAdapter):
         started = time.monotonic()
         try:
             reference = self._capture_ref(arguments.get("capture_ref"))
-            outcome = await self.workbench.inspect(reference)
+            outcome = await self.workbench.inspect(
+                reference, investigation_id=context.investigation_id
+            )
         except NetworkCaptureRejected as exc:
             return self._rejected(context, started, exc)
         except NetworkAnalysisError as exc:
@@ -265,7 +267,9 @@ class _StreamReassembleAdapter(_NetworkToolAdapter):
         try:
             reference = self._capture_ref(arguments.get("capture_ref"))
             flow_id = _flow_id(arguments.get("flow_id"))
-            outcome = await self.workbench.reassemble(reference, flow_id)
+            outcome = await self.workbench.reassemble(
+                reference, flow_id, investigation_id=context.investigation_id
+            )
         except NetworkCaptureRejected as exc:
             status = (
                 ToolInvocationStatus.UNAVAILABLE
@@ -322,7 +326,9 @@ class _MessagesSegmentAdapter(_NetworkToolAdapter):
         try:
             reference = self._capture_ref(arguments.get("capture_ref"))
             flow_id = _flow_id(arguments.get("flow_id"))
-            outcome = await self.workbench.segment(reference, flow_id)
+            outcome = await self.workbench.segment(
+                reference, flow_id, investigation_id=context.investigation_id
+            )
         except NetworkCaptureRejected as exc:
             status = (
                 ToolInvocationStatus.UNAVAILABLE

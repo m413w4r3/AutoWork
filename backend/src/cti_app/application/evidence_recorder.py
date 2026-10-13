@@ -235,6 +235,20 @@ class ProductionEvidenceRecorder:
         )
         return await self._append_idempotently(observation)
 
+    async def is_capture_associated(
+        self, *, investigation_id: UUID, blob_id: UUID, sha256: str
+    ) -> bool:
+        observations = await self._observations.list_for_investigation(investigation_id)
+        return any(
+            observation.kind is EvidenceKind.OTHER
+            and observation.blob_id == blob_id
+            and observation.sha256 == sha256
+            and observation.source == "network.quarantine"
+            and observation.object_type == "network_capture"
+            and observation.object_id == sha256
+            for observation in observations
+        )
+
     async def record_negative(
         self,
         *,

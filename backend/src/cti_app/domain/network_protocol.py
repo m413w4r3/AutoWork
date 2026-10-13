@@ -16,6 +16,9 @@ from typing import Any
 from uuid import UUID
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_MAX_CAPTURE_BYTES = 200 * 1024 * 1024
+_MAX_PACKET_COUNT = 1_000_000
+_MAX_STREAM_BYTES = 64 * 1024 * 1024
 
 
 class NetworkCommandId(StrEnum):
@@ -37,6 +40,7 @@ class NetworkCaptureRejection(StrEnum):
     PACKET_LIMIT = "packet_limit"
     BLOB_UNAVAILABLE = "blob_unavailable"
     BLOB_HASH_MISMATCH = "blob_hash_mismatch"
+    CAPTURE_NOT_ASSOCIATED = "capture_not_associated"
 
 
 class NetworkTransport(StrEnum):
@@ -106,6 +110,12 @@ class NetworkExtractionLimitsV1:
             isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in values
         ):
             raise ValueError("Network extraction limits must be positive integers")
+        if self.max_capture_bytes > _MAX_CAPTURE_BYTES:
+            raise ValueError(f"max_capture_bytes must be <= {_MAX_CAPTURE_BYTES}")
+        if self.max_packets > _MAX_PACKET_COUNT:
+            raise ValueError(f"max_packets must be <= {_MAX_PACKET_COUNT}")
+        if self.max_stream_bytes > _MAX_STREAM_BYTES:
+            raise ValueError(f"max_stream_bytes must be <= {_MAX_STREAM_BYTES}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -324,6 +334,7 @@ class MessageSegmentationV1(_CanonicalContract):
     extractor_versions: tuple[ExtractorVersionV1, ...]
     limits: NetworkExtractionLimitsV1
     limitations: tuple[str, ...] = ()
+    overlaps: tuple[StreamOverlapV1, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -334,6 +345,7 @@ class ProtocolEvidenceFlowV1:
     frame_numbers_truncated: bool
     directions: tuple[str, ...]
     gaps: tuple[StreamGapV1, ...]
+    overlaps: tuple[StreamOverlapV1, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
