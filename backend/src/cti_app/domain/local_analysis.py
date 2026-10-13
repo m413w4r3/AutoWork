@@ -13,6 +13,9 @@ class LocalCommandId(StrEnum):
     READELF = "readelf"
     OBJDUMP = "objdump"
     YARA = "yara"
+    # L4: optional extractors remain outside the generic local.run_command catalogue.
+    FLOSS = "floss"
+    MWCP = "mwcp"
 
 
 class LocalCommandStatus(StrEnum):
@@ -68,6 +71,8 @@ class LocalCommandSpec:
     memory_limit_bytes: int
     file_size_limit_bytes: int
     output_kind: LocalCommandOutputKind
+    # L4 extractors drain stdout to EOF for a complete digest while retaining only a prefix.
+    capture_full_output_hash: bool = False
 
     def __post_init__(self) -> None:
         if not self.binary or "/" in self.binary or "\\" in self.binary:
@@ -96,6 +101,11 @@ class LocalCommandResult:
     duration_seconds: float = 0.0
     started_at: datetime | None = None
     detail_code: str | None = None
+    # Raw bytes are transient for vendor JSON parsing; archive_record excludes the prefix.
+    raw_output_sha256: str | None = None
+    raw_output_bytes: int = 0
+    raw_output_complete: bool = False
+    raw_output_prefix: bytes | None = None
 
     def __post_init__(self) -> None:
         if self.sample_sha256 is not None and not _SHA256.fullmatch(self.sample_sha256):
@@ -104,6 +114,17 @@ class LocalCommandResult:
             raise ValueError("duration_seconds must be non-negative")
         if self.started_at is not None and self.started_at.utcoffset() is None:
             raise ValueError("started_at must be timezone-aware")
+        if self.raw_output_sha256 is not None and not _SHA256.fullmatch(self.raw_output_sha256):
+            raise ValueError("raw_output_sha256 must be a lowercase SHA-256 digest")
+        if self.raw_output_bytes < 0:
+            raise ValueError("raw_output_bytes must be non-negative")
+        if self.raw_output_complete and self.raw_output_sha256 is None:
+            raise ValueError("Complete raw output requires a digest")
+        if (
+            self.raw_output_prefix is not None
+            and len(self.raw_output_prefix) > self.raw_output_bytes
+        ):
+            raise ValueError("Raw output prefix cannot exceed the captured byte count")
 
     def archive_record(self) -> dict[str, object]:
         """Return the bounded, byte-free execution journal record."""
@@ -118,6 +139,9 @@ class LocalCommandResult:
             "executable_version": self.executable_version,
             "output": self.output,
             "detail_code": self.detail_code,
+            "raw_output_sha256": self.raw_output_sha256,
+            "raw_output_bytes": self.raw_output_bytes,
+            "raw_output_complete": self.raw_output_complete,
         }
 
 

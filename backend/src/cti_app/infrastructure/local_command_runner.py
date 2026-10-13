@@ -204,13 +204,24 @@ class LocalCommandRunner:
             captured = bytearray()
             captured_stderr = bytearray()
             output_limit_hit = False
+            # L4: hash all stdout chunks while keeping the retained prefix bounded.
+            raw_stdout_hash = hashlib.sha256() if spec.capture_full_output_hash else None
+            raw_stdout_bytes = 0
 
             async def read_stream(stream: asyncio.StreamReader, *, is_stderr: bool) -> None:
-                nonlocal output_limit_hit
+                nonlocal output_limit_hit, raw_stdout_bytes
                 while True:
                     chunk = await stream.read(64 * 1024)
                     if not chunk:
                         return
+                    if raw_stdout_hash is not None and not is_stderr:
+                        raw_stdout_hash.update(chunk)
+                        raw_stdout_bytes += len(chunk)
+                    if spec.capture_full_output_hash and is_stderr:
+                        stderr_remaining = spec.max_output_bytes - len(captured_stderr)
+                        if stderr_remaining > 0:
+                            captured_stderr.extend(chunk[:stderr_remaining])
+                        continue
                     remaining = spec.max_output_bytes - len(captured)
                     if len(chunk) > remaining:
                         if remaining > 0:
@@ -220,8 +231,10 @@ class LocalCommandRunner:
                             if stderr_remaining > 0:
                                 captured_stderr.extend(chunk[:stderr_remaining])
                         output_limit_hit = True
-                        _kill_process_group(process.pid)
-                        return
+                        if not spec.capture_full_output_hash:
+                            _kill_process_group(process.pid)
+                            return
+                        continue
                     captured.extend(chunk)
                     if is_stderr:
                         stderr_remaining = spec.max_output_bytes - len(captured_stderr)
@@ -310,6 +323,14 @@ class LocalCommandRunner:
                 capability.version,
                 detail,
                 return_code,
+                raw_output_sha256=(
+                    raw_stdout_hash.hexdigest() if raw_stdout_hash is not None else None
+                ),
+                raw_output_bytes=raw_stdout_bytes,
+                raw_output_complete=(
+                    raw_stdout_hash is not None and not timed_out and return_code != 125
+                ),
+                raw_output_prefix=(bytes(captured) if raw_stdout_hash is not None else None),
             )
 
     def _wrap_network_namespace(
@@ -365,6 +386,15 @@ def _build_argv(
         if rule_path is None:
             raise ValueError("YARA rules were not staged")
         argv = [executable, str(rule_path), path]
+    # L4: arguments for the optional extractors are fixed; only parser_id comes
+    # from an application allowlist and is passed as one argv element.
+    elif spec.id is LocalCommandId.FLOSS:
+        argv = [executable, "--json", path]
+    elif spec.id is LocalCommandId.MWCP:
+        parser_id = options.get("parser_id")
+        if not isinstance(parser_id, str) or not parser_id:
+            raise ValueError("MWCP parser identifier was not validated")
+        argv = [executable, "parse", parser_id, "--json", path]
     else:
         raise ValueError("Uncatalogued local command")
     logical = tuple(
@@ -443,6 +473,11 @@ def _make_result(
     executable_version: str | None,
     detail_code: str | None,
     exit_code: int | None = None,
+    *,
+    raw_output_sha256: str | None = None,
+    raw_output_bytes: int = 0,
+    raw_output_complete: bool = False,
+    raw_output_prefix: bytes | None = None,
 ) -> LocalCommandResult:
     return LocalCommandResult(
         command_id=spec.id,
@@ -455,6 +490,10 @@ def _make_result(
         duration_seconds=max(0, duration),
         started_at=started_at,
         detail_code=detail_code,
+        raw_output_sha256=raw_output_sha256,
+        raw_output_bytes=raw_output_bytes,
+        raw_output_complete=raw_output_complete,
+        raw_output_prefix=raw_output_prefix,
     )
 
 
