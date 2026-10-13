@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 from uuid import UUID, uuid4
+
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class HumanDecisionType(StrEnum):
@@ -43,6 +46,23 @@ class AnalystDecisionTargetType(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class RetrohuntAuthorization:
+    """Structured authorization for one exact reviewed YARA version."""
+
+    authorized: bool
+    rule_version_id: UUID
+    source_sha256: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.authorized, bool):
+            raise TypeError("Retrohunt authorization must be a boolean")
+        if not isinstance(self.rule_version_id, UUID):
+            raise TypeError("Retrohunt authorization must identify a rule version")
+        if not isinstance(self.source_sha256, str) or not _SHA256_RE.fullmatch(self.source_sha256):
+            raise ValueError("Retrohunt authorization source must be a lowercase SHA-256")
+
+
+@dataclass(frozen=True, slots=True)
 class HumanDecision:
     edition_id: UUID
     decision_type: HumanDecisionType
@@ -70,10 +90,20 @@ class AnalystDecision:
     id: UUID = field(default_factory=uuid4)
     occurred_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     details: dict[str, Any] = field(default_factory=dict)
+    retrohunt_authorization: RetrohuntAuthorization | None = None
 
     def __post_init__(self) -> None:
         if not self.actor_id.strip() or not self.reason.strip() or not self.correlation_id.strip():
             raise ValueError("Analyst decision requires actor, reason and correlation")
         if not isinstance(self.details, dict):
             raise TypeError("Analyst decision details must be an object")
+        if self.retrohunt_authorization is not None:
+            if not isinstance(self.retrohunt_authorization, RetrohuntAuthorization):
+                raise TypeError("Retrohunt authorization must be structured")
+            if (
+                self.decision_type is not AnalystDecisionType.DETECTION_APPROVE
+                or self.target_type is not AnalystDecisionTargetType.DETECTION
+                or self.target_id != self.retrohunt_authorization.rule_version_id
+            ):
+                raise ValueError("Retrohunt authorization must target the approved rule version")
         object.__setattr__(self, "details", dict(self.details))

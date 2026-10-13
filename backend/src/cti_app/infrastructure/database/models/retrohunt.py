@@ -17,6 +17,8 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
+from cti_app.domain.retrohunt import RETROHUNT_MAX_SUBMISSIONS_PER_SUBJECT
+
 from .base import Base
 
 
@@ -25,7 +27,10 @@ class RetrohuntReservationRow(Base):
     __table_args__ = (
         UniqueConstraint("subject_id", "slot_number", name="uq_retrohunt_subject_slot"),
         UniqueConstraint("subject_id", "operation_key", name="uq_retrohunt_subject_operation"),
-        CheckConstraint("slot_number IN (1, 2)", name="ck_retrohunt_slot_number"),
+        CheckConstraint(
+            f"slot_number BETWEEN 1 AND {RETROHUNT_MAX_SUBMISSIONS_PER_SUBJECT}",
+            name="ck_retrohunt_slot_number",
+        ),
         CheckConstraint(
             "state IN ('reserved','submitting','submitted','completed','failed',"
             "'reconciliation_required')",

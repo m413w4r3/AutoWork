@@ -28,6 +28,7 @@ from cti_app.application.virustotal import (
     VirusTotalRoutingPolicy,
 )
 from cti_app.domain.investigation import ToolInvocationStatus
+from cti_app.domain.retrohunt import RetrohuntReservationState
 from cti_app.domain.virustotal import VirusTotalCapability, VirusTotalTransportKind
 
 _UUID_PATTERN = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
@@ -185,7 +186,8 @@ def _tool_result(outcome: RetrohuntOutcome) -> ToolResult:
     state = reservation.state.value
     status = (
         ToolInvocationStatus.UNAVAILABLE
-        if reservation.state.value == "reconciliation_required"
+        if outcome.provider_error is not None
+        or reservation.state is RetrohuntReservationState.RECONCILIATION_REQUIRED
         else ToolInvocationStatus.SUCCEEDED
     )
     return ToolResult(
@@ -198,6 +200,9 @@ def _tool_result(outcome: RetrohuntOutcome) -> ToolResult:
             "slots_consumed": outcome.slots_consumed,
             "slots_remaining": outcome.slots_remaining,
             "job_state": outcome.provider_job_state or state,
+            "provider_error": (
+                outcome.provider_error.value if outcome.provider_error is not None else None
+            ),
             "provider_job_id": reservation.provider_job_id,
             "candidate_hits": [
                 {"sha256": hit, "qualification": "candidate", "confirmed_member": False}
@@ -206,8 +211,10 @@ def _tool_result(outcome: RetrohuntOutcome) -> ToolResult:
             "observation_refs": [str(reference) for reference in outcome.observation_refs],
         },
         message=(
-            "Submission outcome needs manual reconciliation."
-            if reservation.state.value == "reconciliation_required"
+            "The Retrohunt provider is temporarily unavailable."
+            if outcome.provider_error is not None
+            else "Submission outcome needs manual reconciliation."
+            if reservation.state is RetrohuntReservationState.RECONCILIATION_REQUIRED
             else "Retrohunt result recorded; hits remain candidates."
             if outcome.candidate_hits
             else "Retrohunt operation completed."

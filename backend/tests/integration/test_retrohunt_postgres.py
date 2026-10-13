@@ -16,7 +16,12 @@ from cti_app.application.retrohunt import (
 )
 from cti_app.domain.classification import TLP
 from cti_app.domain.editions import Edition
-from cti_app.domain.editorial import AnalystDecision, AnalystDecisionTargetType, AnalystDecisionType
+from cti_app.domain.editorial import (
+    AnalystDecision,
+    AnalystDecisionTargetType,
+    AnalystDecisionType,
+    RetrohuntAuthorization,
+)
 from cti_app.domain.entities import Subject
 from cti_app.domain.investigation import (
     DetectionCandidateStatus,
@@ -167,6 +172,11 @@ def _approved_review(investigation_id: UUID, suffix: str):
         reason="Prévalidation Retrohunt autorisée pour cette version exacte.",
         correlation_id=f"retrohunt-{suffix}",
         details={"source_sha256": source_sha256, "known_false_positives": []},
+        retrohunt_authorization=RetrohuntAuthorization(
+            authorized=True,
+            rule_version_id=version.id,
+            source_sha256=source_sha256,
+        ),
     )
     test_report = SimpleNamespace(
         payload={

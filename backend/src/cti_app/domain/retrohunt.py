@@ -11,6 +11,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+RETROHUNT_MAX_SUBMISSIONS_PER_SUBJECT = 2
 
 
 class RetrohuntReservationState(StrEnum):
@@ -28,6 +29,10 @@ class RetrohuntProviderJobState(StrEnum):
     COMPLETED = "completed"
     FAILED = "failed"
     UNKNOWN = "unknown"
+
+
+class RetrohuntProviderErrorCode(StrEnum):
+    PROVIDER_UNAVAILABLE = "provider_unavailable"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -51,8 +56,8 @@ class RetrohuntReservation:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "state", RetrohuntReservationState(self.state))
-        if self.slot_number not in (1, 2):
-            raise ValueError("Retrohunt slots are limited to 1 or 2")
+        if not 1 <= self.slot_number <= RETROHUNT_MAX_SUBMISSIONS_PER_SUBJECT:
+            raise ValueError("Retrohunt slot is outside the subject submission limit")
         if not _SHA256_RE.fullmatch(self.operation_key):
             raise ValueError("operation_key must be a lowercase SHA-256")
         for name, value in (
