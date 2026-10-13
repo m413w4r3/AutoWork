@@ -604,16 +604,14 @@ class _ConfigurationToolAdapter(_ExtractionToolBase):
             for item in extraction.network_indicators[:_MAX_ARCHIVED_INDICATORS]
         ]
         truncated_field_count = sum(
-            len(item.truncated_fields)
-            for item in (
-                *extraction.values[: len(values)],
-                *extraction.network_indicators[: len(indicators)],
-            )
+            len(item.truncated_fields) for item in extraction.values[: len(values)]
+        ) + sum(
+            len(item.truncated_fields) for item in extraction.network_indicators[: len(indicators)]
         )
-        truncated_field_count = max(
-            truncated_field_count,
-            sum(len(item["truncated_fields"]) for item in (*values, *indicators)),
-        )
+        archived_truncated_field_count = sum(
+            len(item["truncated_fields"]) for item in values
+        ) + sum(len(item["truncated_fields"]) for item in indicators)
+        truncated_field_count = max(truncated_field_count, archived_truncated_field_count)
         truncated = (
             extraction.truncated
             or truncated_field_count > 0

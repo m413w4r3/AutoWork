@@ -239,6 +239,9 @@ async def test_floss_is_unavailable_without_filesystem_confinement(
     sample = b"safe fixture"
     sample_sha256 = hashlib.sha256(sample).hexdigest()
     binary = _fake_binary(tmp_path / "floss", '{"strings":[]}')
+    # The runner probes for bwrap at construction time: neutralise the probe first so the
+    # result does not depend on whether the host provides filesystem confinement.
+    monkeypatch.setattr(local_runner_module, "_detect_network_namespace", lambda *_args: None)
     service, catalog = _service(
         binary,
         _Samples(sample),
