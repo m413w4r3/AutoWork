@@ -31,6 +31,10 @@ class NativeAnalysisUnavailable(NativeAnalysisError):
     code = "native_analysis_unavailable"
 
 
+class NativeAnalysisRunnerNotConfigured(NativeAnalysisUnavailable):
+    code = "rea_runner_not_configured"
+
+
 class NativeAnalysisPolicyDenied(NativeAnalysisError):
     code = "native_analysis_policy_denied"
 
@@ -60,8 +64,14 @@ class NativeAnalysisPort(Protocol):
 
 
 class UnavailableNativeAnalysisPort:
-    def __init__(self, provider: NativeAnalysisProvider) -> None:
+    def __init__(
+        self,
+        provider: NativeAnalysisProvider,
+        *,
+        reason: NativeAnalysisUnavailable | None = None,
+    ) -> None:
         self._provider = provider
+        self._reason = reason
 
     @property
     def provider(self) -> NativeAnalysisProvider:
@@ -73,7 +83,15 @@ class UnavailableNativeAnalysisPort:
 
     async def inspect(self, request: NativeAnalysisRequestV1) -> NativeAnalysisObservationV1:
         del request
+        if self._reason is not None:
+            raise self._reason
         raise NativeAnalysisUnavailable(f"provider_unavailable:{self._provider.value}")
+
+    def unavailable_error(self) -> NativeAnalysisUnavailable:
+        """Return the configured typed reason for service-level unavailable checks."""
+        return self._reason or NativeAnalysisUnavailable(
+            f"provider_unavailable:{self._provider.value}"
+        )
 
 
 def select_native_analysis_port(
@@ -183,6 +201,8 @@ class NativeAnalysisService:
 
     async def inspect(self, request: NativeAnalysisRequestV1) -> NativeAnalysisObservationV1:
         if self._port is None or not self._port.available:
+            if isinstance(self._port, UnavailableNativeAnalysisPort):
+                raise self._port.unavailable_error()
             provider = self._port.provider.value if self._port is not None else "none"
             raise NativeAnalysisUnavailable(f"provider_unavailable:{provider}")
         try:

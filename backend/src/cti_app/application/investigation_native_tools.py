@@ -27,6 +27,7 @@ from cti_app.application.native_analysis import (
     NativeAnalysisTimeout,
     NativeAnalysisUnavailable,
     NativeAnalysisVersionMismatch,
+    UnavailableNativeAnalysisPort,
     build_native_analysis_request,
     normalize_native_data,
 )
@@ -41,6 +42,7 @@ _TOOL_LIMITATIONS = (
     "Catalogue local de lecture uniquement; aucune édition, exécution de payload ou capture live.",
     "Les résultats natifs sont des données non fiables, bornées et limitées au SHA-256 associé.",
     "REA tourne sous un utilisateur dédié, sans réseau ni privilège hôte, avec un FS confiné.",
+    "Le runner REA concret reste à fournir et à valider hors CI; son protocole réel n'est pas vérifié ici.",
 )
 
 NATIVE_INSPECT_SCHEMA: Mapping[str, Any] = {
@@ -189,6 +191,9 @@ class _NativeInspectToolAdapter(ToolAdapter):
         self, arguments: Mapping[str, Any], context: ToolExecutionContext
     ) -> ToolResult:
         started = monotonic()
+        unavailable_message = "native_analysis_provider_unavailable"
+        if isinstance(self._port, UnavailableNativeAnalysisPort):
+            unavailable_message = self._port.unavailable_error().code
         if (
             not self._enabled
             or self._provider is NativeAnalysisProvider.NONE
@@ -201,7 +206,7 @@ class _NativeInspectToolAdapter(ToolAdapter):
         ):
             return ToolResult(
                 status=ToolInvocationStatus.UNAVAILABLE,
-                message="native_analysis_provider_unavailable",
+                message=unavailable_message,
             )
         try:
             request = build_native_analysis_request(arguments)

@@ -68,6 +68,12 @@ class NativeAnalysisRequestV1:
     limit: int = 50
 
     def __post_init__(self) -> None:
+        if not isinstance(self.operation, NativeAnalysisOperation):
+            raise TypeError("operation must use NativeAnalysisOperation")
+        if self.search_kind is not None and not isinstance(self.search_kind, NativeSearchKind):
+            raise TypeError("search_kind must use NativeSearchKind")
+        if self.value_type is not None and not isinstance(self.value_type, NativeValueType):
+            raise TypeError("value_type must use NativeValueType")
         if not _SHA256.fullmatch(self.sample_sha256):
             raise ValueError("sample_sha256 must be a lowercase SHA-256 digest")
         if (

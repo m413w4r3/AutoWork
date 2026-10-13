@@ -9,6 +9,7 @@ read-only sample mount; REA itself is not a sandbox.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -26,9 +27,11 @@ from cti_app.application.native_analysis import (
     NativeAnalysisPolicyDenied,
     NativeAnalysisPort,
     NativeAnalysisResponseError,
+    NativeAnalysisRunnerNotConfigured,
     NativeAnalysisTimeout,
     NativeAnalysisUnavailable,
     NativeAnalysisVersionMismatch,
+    UnavailableNativeAnalysisPort,
     normalize_native_data,
 )
 from cti_app.domain.local_analysis import GhidraOperation
@@ -38,10 +41,18 @@ from cti_app.domain.native_analysis import (
     NativeAnalysisProvider,
     NativeAnalysisRequestV1,
 )
-from cti_app.infrastructure.ghidra_mcp import GhidraMcpHttpAdapter
+from cti_app.config import Settings
+from cti_app.infrastructure.ghidra_mcp import (
+    GhidraMcpHttpAdapter,
+    create_ghidra_mcp_http_adapter,
+)
 
 REA_READ_ONLY_CATALOG = NATIVE_READ_OPERATIONS
 REA_READ_ONLY_CATALOG_VERSION = NATIVE_ANALYSIS_CATALOG_VERSION
+
+
+class NativeAnalysisResponseTooLarge(NativeAnalysisResponseError):
+    code = "response_too_large"
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,6 +182,7 @@ class ReaNativeAnalysisAdapter(NativeAnalysisPort):
                 f"rea_read_client_failed:{type(exc).__name__}"
             ) from None
 
+        _enforce_response_size(response, self._max_response_bytes)
         parsed = _parse_rea_response(response, request)
         provider_version = parsed["provider_version"]
         catalog_version = parsed["catalog_version"]
@@ -193,6 +205,22 @@ class ReaNativeAnalysisAdapter(NativeAnalysisPort):
             data=data,
             truncated=truncated,
         )
+
+
+def _enforce_response_size(response: Mapping[str, Any], max_response_bytes: int) -> None:
+    """Reject an oversized serialized runner result before parsing or normalization."""
+    try:
+        serialized = json.dumps(
+            dict(response),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError, RecursionError):
+        raise NativeAnalysisResponseError("rea_response_contract_invalid") from None
+    if len(serialized) > max_response_bytes:
+        raise NativeAnalysisResponseTooLarge("rea_response_exceeds_configured_byte_limit")
 
 
 def _parse_rea_response(
@@ -336,3 +364,43 @@ class GhidraMcpNativeAnalysisAdapter(NativeAnalysisPort):
             data=data,
             truncated=observation.truncated or truncated,
         )
+
+
+def build_native_analysis_port(
+    settings: Settings,
+    runner: ReaReadOnlyRunner | None = None,
+) -> NativeAnalysisPort:
+    """Build the configured versioned port; REA still needs a verified worker client.
+
+    The concrete REA CLI/MCP runner is intentionally injected and must be supplied
+    and validated outside CI. Its real protocol is not verified in this repository,
+    so this factory never invents a CLI command, endpoint, or production fake.
+    """
+    provider = NativeAnalysisProvider(settings.native_analysis_provider)
+    if not settings.native_analysis_enabled or provider is NativeAnalysisProvider.NONE:
+        return UnavailableNativeAnalysisPort(provider)
+    if provider is NativeAnalysisProvider.REA:
+        if runner is None:
+            return UnavailableNativeAnalysisPort(
+                provider,
+                reason=NativeAnalysisRunnerNotConfigured(
+                    "REA runner must be supplied by a confined deployment worker"
+                ),
+            )
+        return ReaNativeAnalysisAdapter(
+            runner,
+            enabled=settings.native_analysis_enabled,
+            expected_version=settings.native_analysis_rea_expected_version,
+            catalog_version=settings.native_analysis_catalog_version,
+            timeout_seconds=settings.native_analysis_timeout_seconds,
+            max_response_bytes=settings.native_analysis_max_response_bytes,
+            max_output_bytes=settings.native_analysis_max_output_bytes,
+        )
+
+    ghidra = create_ghidra_mcp_http_adapter(settings)
+    return GhidraMcpNativeAnalysisAdapter(
+        ghidra,
+        enabled=settings.native_analysis_enabled and settings.ghidra_enabled,
+        catalog_version=settings.native_analysis_catalog_version,
+        max_output_bytes=settings.native_analysis_max_output_bytes,
+    )

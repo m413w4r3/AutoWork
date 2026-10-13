@@ -5,6 +5,7 @@ import hashlib
 import json
 from collections.abc import Mapping
 from typing import Any
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -14,10 +15,15 @@ from cti_app.application.investigation_native_tools import (
     native_tool_capabilities,
     register_native_tools,
 )
-from cti_app.application.investigation_tools import InMemoryToolRegistry
+from cti_app.application.investigation_tools import (
+    InMemoryToolRegistry,
+    RegistryToolDispatcher,
+    ToolExecutionContext,
+)
 from cti_app.application.native_analysis import (
     NATIVE_ANALYSIS_CATALOG_VERSION,
     NativeAnalysisPolicyDenied,
+    NativeAnalysisRunnerNotConfigured,
     NativeAnalysisService,
     NativeAnalysisTimeout,
     NativeAnalysisUnavailable,
@@ -33,12 +39,15 @@ from cti_app.domain.native_analysis import (
     NativeAnalysisProvider,
     NativeAnalysisRequestV1,
 )
+from cti_app.domain.investigation import InvestigationBudget, ToolInvocationStatus
 from cti_app.infrastructure.ghidra_mcp import GhidraMcpHttpAdapter
 from cti_app.infrastructure.rea_adapter import (
     REA_READ_ONLY_CATALOG,
     GhidraMcpNativeAnalysisAdapter,
+    NativeAnalysisResponseTooLarge,
     ReaNativeAnalysisAdapter,
     ReaReadOnlyRequestV1,
+    build_native_analysis_port,
 )
 
 SAMPLE_SHA256 = "a" * 64
@@ -60,11 +69,13 @@ class StrictFakeReaRunner:
         delay: float = 0.0,
         large_output: bool = False,
         provider_version: str = REA_VERSION,
+        catalog_version: str = NATIVE_ANALYSIS_CATALOG_VERSION,
         sample_sha256: str | None = None,
     ) -> None:
         self.delay = delay
         self.large_output = large_output
         self.provider_version = provider_version
+        self.catalog_version = catalog_version
         self.sample_sha256 = sample_sha256
         self.requests: list[ReaReadOnlyRequestV1] = []
         self.bounds: list[tuple[float, int]] = []
@@ -78,7 +89,7 @@ class StrictFakeReaRunner:
     ) -> Mapping[str, Any]:
         payload = request.as_json()
         assert payload["schema_version"] == "autowork-rea-read-request.v1"
-        assert payload["catalog_version"] == NATIVE_ANALYSIS_CATALOG_VERSION
+        assert payload["catalog_version"] == self.catalog_version
         assert payload["operation"] in {item.value for item in REA_READ_ONLY_CATALOG}
         if self.sample_sha256 is not None:
             assert payload["sample_sha256"] == self.sample_sha256
@@ -108,7 +119,7 @@ class StrictFakeReaRunner:
         return {
             "schema_version": "autowork-rea-read-response.v1",
             "provider_version": self.provider_version,
-            "catalog_version": NATIVE_ANALYSIS_CATALOG_VERSION,
+            "catalog_version": self.catalog_version,
             "sample_sha256": request.request.sample_sha256,
             "operation": request.request.operation.value,
             "request_fingerprint": request.request.fingerprint,
@@ -239,28 +250,151 @@ async def test_large_rea_output_is_sorted_and_truncated_to_configured_bound() ->
     assert len(encoded) > 256  # provenance is outside the provider data budget
 
 
-def test_active_operations_and_unlisted_inputs_are_rejected_before_provider_call() -> None:
+@pytest.mark.asyncio
+async def test_rea_rejects_oversized_serialized_response_before_normalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def normalization_must_not_run(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("oversized response must be rejected before normalization")
+
+    monkeypatch.setattr(
+        "cti_app.infrastructure.rea_adapter.normalize_native_data", normalization_must_not_run
+    )
+    adapter = ReaNativeAnalysisAdapter(
+        StrictFakeReaRunner(large_output=True),
+        enabled=True,
+        expected_version=REA_VERSION,
+        max_response_bytes=4096,
+    )
+
+    with pytest.raises(NativeAnalysisResponseTooLarge) as exc_info:
+        await adapter.inspect(_request())
+
+    assert exc_info.value.code == "response_too_large"
+
+
+@pytest.mark.parametrize("operation", ["edit", "execute", "capture_live"])
+@pytest.mark.asyncio
+async def test_tool_schema_and_adapter_reject_active_operations_before_provider_call(
+    operation: str,
+) -> None:
     runner = StrictFakeReaRunner()
-    for operation in (
-        "edit",
-        "write",
-        "execute",
-        "run_process",
-        "capture_live_site",
-        "capture_live_traffic",
-        "launch_payload",
-        "host_privilege",
-    ):
-        with pytest.raises(NativeAnalysisPolicyDenied):
-            _request(operation)
+    port = ReaNativeAnalysisAdapter(runner, enabled=True, expected_version=REA_VERSION)
+    registry = InMemoryToolRegistry()
+    register_native_tools(
+        registry,
+        service=NativeAnalysisService(port),
+        port=port,
+        sample_associations=object(),
+        recorder=object(),
+        enabled=True,
+        provider=NativeAnalysisProvider.REA,
+    )
+    registered = registry.get("native.inspect", "1")
+    assert registered is not None
+    _definition, tool_adapter = registered
+    context = ToolExecutionContext(
+        investigation_id=uuid4(),
+        envelope=None,
+        budget=InvestigationBudget(),
+        idempotency_key="native-active-operation",
+        available_capabilities=frozenset({"native.inspect"}),
+    )
+    arguments = {"sample_sha256": SAMPLE_SHA256, "operation": operation}
+    result = await RegistryToolDispatcher(registry).dispatch(
+        context,
+        tool_name="native.inspect",
+        schema_version="1",
+        arguments=arguments,
+        purpose="validate native read schema",
+        operation_key=f"native-active-{operation}",
+    )
+
+    assert result.status is ToolInvocationStatus.FAILED
+    assert result.message.startswith("Invalid tool arguments:")
+    direct_result = await tool_adapter.execute(arguments, context)
+    assert direct_result.status is ToolInvocationStatus.POLICY_DENIED
+    assert runner.requests == []
+
+
+def test_native_analysis_domain_rejects_non_enum_values() -> None:
+    with pytest.raises(TypeError, match="operation must use NativeAnalysisOperation"):
+        NativeAnalysisRequestV1(
+            sample_sha256=SAMPLE_SHA256,
+            operation="list_functions",  # type: ignore[arg-type]
+        )
+    with pytest.raises(TypeError, match="search_kind must use NativeSearchKind"):
+        NativeAnalysisRequestV1(
+            sample_sha256=SAMPLE_SHA256,
+            operation=NativeAnalysisOperation.SEARCH,
+            search_kind="bytes",  # type: ignore[arg-type]
+            query="ff",
+        )
+    with pytest.raises(TypeError, match="value_type must use NativeValueType"):
+        NativeAnalysisRequestV1(
+            sample_sha256=SAMPLE_SHA256,
+            operation=NativeAnalysisOperation.READ_VALUE,
+            address="401000",
+            value_type="u32",  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.asyncio
+async def test_factory_applies_rea_settings_and_reports_missing_runner_reason() -> None:
+    settings = Settings(
+        _env_file=None,
+        native_analysis_enabled=True,
+        native_analysis_provider="rea",
+        native_analysis_catalog_version="native-catalog.fixture-4",
+        native_analysis_rea_expected_version=REA_VERSION,
+        native_analysis_max_response_bytes=4096,
+    )
+    runner = StrictFakeReaRunner(catalog_version="native-catalog.fixture-4")
+    port = build_native_analysis_port(settings, runner)
+
+    assert isinstance(port, ReaNativeAnalysisAdapter)
+    result = await port.inspect(_request())
+    assert result.provider_version == REA_VERSION
+    assert result.catalog_version == "native-catalog.fixture-4"
+    assert runner.bounds == [(settings.native_analysis_timeout_seconds, 4096)]
+
+    missing_runner = build_native_analysis_port(settings)
+    assert missing_runner.provider is NativeAnalysisProvider.REA
+    assert not missing_runner.available
+    with pytest.raises(NativeAnalysisRunnerNotConfigured) as exc_info:
+        await NativeAnalysisService(missing_runner).inspect(_request())
+    assert exc_info.value.code == "rea_runner_not_configured"
+    registry = InMemoryToolRegistry()
+    register_native_tools(
+        registry,
+        service=NativeAnalysisService(missing_runner),
+        port=missing_runner,
+        sample_associations=object(),
+        recorder=object(),
+        enabled=True,
+        provider=NativeAnalysisProvider.REA,
+    )
+    registered = registry.get("native.inspect", "1")
+    assert registered is not None
+    _definition, tool_adapter = registered
+    tool_result = await tool_adapter.execute(
+        {"sample_sha256": SAMPLE_SHA256, "operation": "list_functions"},
+        ToolExecutionContext(
+            investigation_id=uuid4(),
+            envelope=None,
+            budget=InvestigationBudget(),
+            idempotency_key="native-runner-missing",
+        ),
+    )
+    assert tool_result.status is ToolInvocationStatus.UNAVAILABLE
+    assert tool_result.message == "rea_runner_not_configured"
+
+
+def test_domain_requests_enforce_closed_inputs_and_bounds() -> None:
     with pytest.raises(NativeAnalysisPolicyDenied):
         build_native_analysis_request(
             {"sample_sha256": SAMPLE_SHA256, "operation": "list_functions", "command": "sh"}
         )
-    assert runner.requests == []
-
-
-def test_domain_requests_enforce_closed_inputs_and_bounds() -> None:
     with pytest.raises(NativeAnalysisPolicyDenied):
         _request("read_value", address="401000")
     with pytest.raises(NativeAnalysisPolicyDenied):
@@ -288,6 +422,7 @@ def test_native_analysis_is_off_and_unselected_by_default() -> None:
     assert settings.native_analysis_enabled is False
     assert settings.native_analysis_provider == "none"
     assert settings.native_analysis_rea_expected_version is None
+    assert not build_native_analysis_port(settings).available
 
 
 def test_provider_selection_returns_an_unavailable_port_when_provider_is_missing() -> None:
