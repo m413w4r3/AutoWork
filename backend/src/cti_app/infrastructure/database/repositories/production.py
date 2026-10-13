@@ -15,7 +15,12 @@ from cti_app.application.production_read_model import (
     ProductionActivitySnapshot,
 )
 from cti_app.domain.classification import TLP
-from cti_app.domain.editorial import AnalystDecision, AnalystDecisionTargetType, AnalystDecisionType
+from cti_app.domain.editorial import (
+    AnalystDecision,
+    AnalystDecisionTargetType,
+    AnalystDecisionType,
+    RetrohuntAuthorization,
+)
 from cti_app.domain.production import (
     AnalystInputPack,
     AnalystInvestigation,
@@ -71,6 +76,8 @@ from cti_app.infrastructure.database.models.production import (
     SourceExtractionRow,
 )
 
+_RETROHUNT_AUTHORIZATION_SCHEMA = "detection-retrohunt-authorization.v1"
+
 
 class SqlAlchemyAnalystInvestigationRepository:
     def __init__(self, session: AsyncSession) -> None:
@@ -113,6 +120,16 @@ class SqlAlchemyAnalystDecisionRepository:
         self._session = session
 
     async def append(self, value: AnalystDecision) -> None:
+        details = dict(value.details)
+        details.pop("retrohunt_authorization", None)
+        if value.retrohunt_authorization is not None:
+            authorization = value.retrohunt_authorization
+            details["retrohunt_authorization"] = {
+                "schema": _RETROHUNT_AUTHORIZATION_SCHEMA,
+                "authorized": authorization.authorized,
+                "rule_version_id": str(authorization.rule_version_id),
+                "source_sha256": authorization.source_sha256,
+            }
         self._session.add(
             AnalystDecisionRow(
                 id=value.id,
@@ -124,7 +141,7 @@ class SqlAlchemyAnalystDecisionRepository:
                 reason=value.reason,
                 correlation_id=value.correlation_id,
                 occurred_at=value.occurred_at,
-                details=value.details,
+                details=details,
             )
         )
 
@@ -1467,6 +1484,10 @@ def _analyst_investigation_from_row(row: AnalystInvestigationRow) -> AnalystInve
 
 
 def _analyst_decision_from_row(row: AnalystDecisionRow) -> AnalystDecision:
+    details = dict(row.details or {})
+    retrohunt_authorization = _retrohunt_authorization_from_details(
+        details.pop("retrohunt_authorization", None)
+    )
     return AnalystDecision(
         id=row.id,
         investigation_id=row.investigation_id,
@@ -1477,8 +1498,29 @@ def _analyst_decision_from_row(row: AnalystDecisionRow) -> AnalystDecision:
         reason=row.reason,
         correlation_id=row.correlation_id,
         occurred_at=row.occurred_at,
-        details=dict(row.details or {}),
+        details=details,
+        retrohunt_authorization=retrohunt_authorization,
     )
+
+
+def _retrohunt_authorization_from_details(value: object) -> RetrohuntAuthorization | None:
+    if not isinstance(value, dict) or value.get("schema") != _RETROHUNT_AUTHORIZATION_SCHEMA:
+        return None
+    authorized = value.get("authorized")
+    version_id = value.get("rule_version_id")
+    source_sha256 = value.get("source_sha256")
+    if not isinstance(authorized, bool) or not isinstance(version_id, str):
+        return None
+    if not isinstance(source_sha256, str):
+        return None
+    try:
+        return RetrohuntAuthorization(
+            authorized=authorized,
+            rule_version_id=UUID(version_id),
+            source_sha256=source_sha256,
+        )
+    except (TypeError, ValueError):
+        return None
 
 
 def _analyst_input_pack_from_row(row: AnalystInputPackRow) -> AnalystInputPack:

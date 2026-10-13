@@ -19,6 +19,7 @@ from cti_app.domain.editorial import (
     AnalystDecision,
     AnalystDecisionTargetType,
     AnalystDecisionType,
+    RetrohuntAuthorization,
 )
 from cti_app.domain.investigation import (
     DetectionCandidateStatus,
@@ -47,6 +48,7 @@ class DetectionReviewErrorCode(StrEnum):
     FALSE_POSITIVE_NOT_ACKNOWLEDGED = "detection_false_positive_risk_not_acknowledged"
     INVALID_CORRELATION_ID = "detection_review_idempotency_key_required"
     IDEMPOTENCY_CONFLICT = "detection_review_idempotency_conflict"
+    INVALID_RETROHUNT_AUTHORIZATION = "detection_retrohunt_authorization_invalid"
 
 
 class DetectionReviewError(ValueError):
@@ -103,6 +105,7 @@ class DetectionReviewService:
         reason: str,
         known_limitations: str,
         correlation_id: str,
+        retrohunt_authorized: bool = False,
     ) -> AnalystDecision:
         return await self._decide(
             candidate_version_id,
@@ -112,6 +115,7 @@ class DetectionReviewService:
             known_limitations,
             correlation_id,
             decision_type=AnalystDecisionType.DETECTION_APPROVE,
+            retrohunt_authorized=retrohunt_authorized,
         )
 
     async def reject(
@@ -229,6 +233,7 @@ class DetectionReviewService:
         correlation_id: str,
         *,
         decision_type: AnalystDecisionType,
+        retrohunt_authorized: bool | None = None,
     ) -> AnalystDecision:
         actor = actor.strip()
         reason = reason.strip()
@@ -244,6 +249,21 @@ class DetectionReviewService:
             raise DetectionReviewError(DetectionReviewErrorCode.LIMITATIONS_REQUIRED)
         if not _SHA256.fullmatch(expected_source_sha256):
             raise DetectionReviewError(DetectionReviewErrorCode.SOURCE_SHA256_MISMATCH)
+        if (
+            decision_type is AnalystDecisionType.DETECTION_APPROVE
+            and type(retrohunt_authorized) is not bool
+        ):
+            raise DetectionReviewError(DetectionReviewErrorCode.INVALID_RETROHUNT_AUTHORIZATION)
+
+        retrohunt_authorization = (
+            RetrohuntAuthorization(
+                authorized=cast(bool, retrohunt_authorized),
+                rule_version_id=candidate_version_id,
+                source_sha256=expected_source_sha256,
+            )
+            if decision_type is AnalystDecisionType.DETECTION_APPROVE
+            else None
+        )
 
         async with self._uow_factory() as uow:
             version = await cast(Any, uow).detection_candidates.get(candidate_version_id)
@@ -277,6 +297,7 @@ class DetectionReviewService:
                     reason=reason,
                     source_sha256=expected_source_sha256,
                     known_limitations=known_limitations,
+                    retrohunt_authorization=retrohunt_authorization,
                 ):
                     return prior
                 raise DetectionReviewError(DetectionReviewErrorCode.IDEMPOTENCY_CONFLICT)
@@ -322,6 +343,7 @@ class DetectionReviewService:
                 reason=reason,
                 correlation_id=correlation_id,
                 occurred_at=datetime.now(UTC),
+                retrohunt_authorization=retrohunt_authorization,
                 details={
                     "schema": DETECTION_REVIEW_DETAILS_SCHEMA,
                     "source_sha256": expected_source_sha256,
@@ -369,6 +391,7 @@ class DetectionReviewService:
                     reason=reason,
                     source_sha256=expected_source_sha256,
                     known_limitations=known_limitations,
+                    retrohunt_authorization=retrohunt_authorization,
                 ):
                     raise DetectionReviewError(
                         DetectionReviewErrorCode.IDEMPOTENCY_CONFLICT
@@ -549,6 +572,7 @@ def _same_idempotent_decision(
     reason: str,
     source_sha256: str,
     known_limitations: str,
+    retrohunt_authorization: RetrohuntAuthorization | None,
 ) -> bool:
     return (
         decision.decision_type is decision_type
@@ -557,6 +581,7 @@ def _same_idempotent_decision(
         and decision.details.get("schema") == DETECTION_REVIEW_DETAILS_SCHEMA
         and decision.details.get("source_sha256") == source_sha256
         and decision.details.get("known_limitations") == known_limitations
+        and decision.retrohunt_authorization == retrohunt_authorization
     )
 
 

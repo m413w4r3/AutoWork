@@ -11,6 +11,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from cti_app.application.investigation_retrohunt_tools import (
+    _tool_result,
     register_retrohunt_tools,
     retrohunt_tool_capabilities,
 )
@@ -27,7 +28,12 @@ from cti_app.application.virustotal import (
     VirusTotalRouteUnavailableError,
     VirusTotalRoutingPolicy,
 )
-from cti_app.domain.editorial import AnalystDecision, AnalystDecisionTargetType, AnalystDecisionType
+from cti_app.domain.editorial import (
+    AnalystDecision,
+    AnalystDecisionTargetType,
+    AnalystDecisionType,
+    RetrohuntAuthorization,
+)
 from cti_app.domain.investigation import (
     DetectionCandidateStatus,
     DisclosureBounds,
@@ -35,9 +41,12 @@ from cti_app.domain.investigation import (
     InvestigationBudget,
     InvestigationEnvelope,
     TLPLevel,
+    ToolInvocationStatus,
 )
 from cti_app.domain.retrohunt import (
+    RETROHUNT_MAX_SUBMISSIONS_PER_SUBJECT,
     RetrohuntHit,
+    RetrohuntProviderErrorCode,
     RetrohuntProviderJob,
     RetrohuntProviderJobState,
     RetrohuntProviderResults,
@@ -49,6 +58,10 @@ from cti_app.domain.virustotal import (
     VirusTotalCapability,
     VirusTotalEndpointVariant,
     VirusTotalTransportKind,
+)
+from cti_app.infrastructure.database.repositories.production import (
+    SqlAlchemyAnalystDecisionRepository,
+    _analyst_decision_from_row,
 )
 from cti_app.infrastructure.virustotal import VirusTotalRetrohuntProxyAdapter
 
@@ -104,7 +117,14 @@ class _MemoryReservations:
                 for item in self.rows.values()
                 if item.subject_id == reservation.subject_id
             }
-            slot_number = next((slot for slot in (1, 2) if slot not in used), None)
+            slot_number = next(
+                (
+                    slot
+                    for slot in range(1, RETROHUNT_MAX_SUBMISSIONS_PER_SUBJECT + 1)
+                    if slot not in used
+                ),
+                None,
+            )
             if slot_number is None:
                 return None
             saved = RetrohuntReservation(
@@ -143,6 +163,52 @@ class _MemoryReservations:
                 return None
             self.rows[reservation.id] = reservation
             return reservation
+
+
+class _MemoryDecisionSession:
+    def __init__(self) -> None:
+        self.rows: list[Any] = []
+
+    def add(self, row: Any) -> None:
+        self.rows.append(row)
+
+
+@pytest.mark.asyncio
+async def test_structured_retrohunt_authorization_round_trips_and_legacy_missing_is_denied():
+    session = _MemoryDecisionSession()
+    version_id = uuid4()
+    source_sha256 = hashlib.sha256(b"reviewed exact rule").hexdigest()
+    authorization = RetrohuntAuthorization(
+        authorized=True,
+        rule_version_id=version_id,
+        source_sha256=source_sha256,
+    )
+    decision = AnalystDecision(
+        investigation_id=uuid4(),
+        decision_type=AnalystDecisionType.DETECTION_APPROVE,
+        target_type=AnalystDecisionTargetType.DETECTION,
+        target_id=version_id,
+        actor_id="analyst@example.test",
+        reason="Approval reason is not an authorization input.",
+        correlation_id=str(uuid4()),
+        details={"source_sha256": source_sha256},
+        retrohunt_authorization=authorization,
+    )
+
+    await SqlAlchemyAnalystDecisionRepository(session).append(decision)
+    persisted_row = session.rows[0]
+    restored = _analyst_decision_from_row(persisted_row)
+
+    assert persisted_row.details["retrohunt_authorization"] == {
+        "schema": "detection-retrohunt-authorization.v1",
+        "authorized": True,
+        "rule_version_id": str(version_id),
+        "source_sha256": source_sha256,
+    }
+    assert restored.retrohunt_authorization == authorization
+    persisted_row.details = {"source_sha256": source_sha256}
+    legacy = _analyst_decision_from_row(persisted_row)
+    assert legacy.retrohunt_authorization is None
 
 
 class _Uow:
@@ -186,6 +252,7 @@ class _StrictProvider:
         self.status_calls: list[str] = []
         self.results_calls: list[str] = []
         self.submit_error: Exception | None = None
+        self.status_error: Exception | None = None
         self.job_state = RetrohuntProviderJobState.RUNNING
         self.hits: tuple[RetrohuntHit, ...] = ()
 
@@ -199,6 +266,8 @@ class _StrictProvider:
     async def retrohunt_status(self, job_id: str) -> RetrohuntProviderJob:
         assert job_id.startswith("job-")
         self.status_calls.append(job_id)
+        if self.status_error is not None:
+            raise self.status_error
         return RetrohuntProviderJob(job_id=job_id, state=self.job_state)
 
     async def retrohunt_results(self, job_id: str) -> RetrohuntProviderResults:
@@ -237,7 +306,16 @@ class _Review:
         return self.rows.get(investigation_id, ())
 
 
-def _review(investigation_id: UUID, *, approved: bool = True, rule_source: str | None = None):
+def _review(
+    investigation_id: UUID,
+    *,
+    approved: bool = True,
+    rule_source: str | None = None,
+    retrohunt_authorized: bool | None = True,
+    authorization_version_id: UUID | None = None,
+    authorization_sha256: str | None = None,
+    decision_reason: str = "Prévalidation Retrohunt autorisée pour cette version exacte.",
+):
     from cti_app.domain.investigation import DetectionCandidateVersion
 
     source = rule_source or f"rule-{uuid4()} {{ condition: true }}"
@@ -277,9 +355,18 @@ def _review(investigation_id: UUID, *, approved: bool = True, rule_source: str |
         target_type=AnalystDecisionTargetType.DETECTION,
         target_id=version.id,
         actor_id="analyst@example.test",
-        reason="Prévalidation Retrohunt autorisée pour cette version exacte.",
+        reason=decision_reason,
         correlation_id=str(uuid4()),
         details={"source_sha256": source_sha256, "known_false_positives": []},
+        retrohunt_authorization=(
+            RetrohuntAuthorization(
+                authorized=retrohunt_authorized,
+                rule_version_id=authorization_version_id or version.id,
+                source_sha256=authorization_sha256 or source_sha256,
+            )
+            if retrohunt_authorized is not None
+            else None
+        ),
     )
     return source_sha256, SimpleNamespace(
         version=version,
@@ -572,3 +659,118 @@ async def test_status_and_results_do_not_consume_slots_and_hits_are_candidates()
     assert evidence.payloads[0]["confirmed_member"] is False
     assert evidence.payloads[0]["schema"] == "vt-retrohunt-candidate-hit.v1"
     assert await repo.count_for_subject(SUBJECT_ID) == 1
+
+
+@pytest.mark.asyncio
+async def test_status_provider_exception_is_typed_without_changing_reservation() -> None:
+    service, repo, _, sources, provider, _ = _service()
+    investigation_id, version_id, source_sha256 = sources[0]
+    submitted = await _submit(service, investigation_id, version_id, source_sha256)
+    provider.status_error = TimeoutError("simulated provider outage")
+
+    status = await service.status(
+        investigation_id=investigation_id,
+        reservation_id=submitted.reservation.id,
+    )
+
+    assert status.provider_error is RetrohuntProviderErrorCode.PROVIDER_UNAVAILABLE
+    assert status.provider_job_state == RetrohuntReservationState.SUBMITTED.value
+    assert status.reservation.state is RetrohuntReservationState.SUBMITTED
+    assert status.slots_consumed == 1 and status.slots_remaining == 1
+    assert await repo.count_for_subject(SUBJECT_ID) == 1
+    tool_result = _tool_result(status)
+    assert tool_result.status is ToolInvocationStatus.UNAVAILABLE
+    assert tool_result.output["provider_error"] == "provider_unavailable"
+    assert tool_result.output["job_state"] == RetrohuntReservationState.SUBMITTED.value
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "Ne pas autoriser Retrohunt",
+        "not approved for retrohunt",
+        "no retrohunt",
+        "Prévalidation Retrohunt autorisée pour cette version exacte.",
+    ],
+)
+@pytest.mark.asyncio
+async def test_free_text_never_grants_retrohunt_authorization(reason: str) -> None:
+    service, repo, review, sources, provider, _ = _service()
+    investigation_id, _, _ = sources[0]
+    source_sha256, unstructured = _review(
+        investigation_id,
+        retrohunt_authorized=None,
+        decision_reason=reason,
+    )
+    review.rows[investigation_id] = (unstructured,)
+
+    with pytest.raises(RetrohuntQualityError, match="explicit human Retrohunt authorization"):
+        await _submit(
+            service,
+            investigation_id,
+            unstructured.version.id,
+            source_sha256,
+        )
+
+    assert await repo.count_for_subject(SUBJECT_ID) == 0
+    assert provider.submit_calls == []
+
+
+@pytest.mark.parametrize("mismatch", ["version", "sha256"])
+@pytest.mark.asyncio
+async def test_authorization_bound_to_another_version_or_sha_is_rejected(mismatch: str) -> None:
+    service, repo, review, sources, provider, _ = _service()
+    investigation_id, _, _ = sources[0]
+    source_sha256, reviewed = _review(investigation_id)
+    wrong_version_id = uuid4() if mismatch == "version" else reviewed.version.id
+    wrong_sha256 = hashlib.sha256(b"different reviewed rule").hexdigest()
+    authorization = RetrohuntAuthorization(
+        authorized=True,
+        rule_version_id=wrong_version_id,
+        source_sha256=wrong_sha256 if mismatch == "sha256" else source_sha256,
+    )
+    reviewed.latest_decision = SimpleNamespace(
+        decision_type=AnalystDecisionType.DETECTION_APPROVE,
+        target_type=AnalystDecisionTargetType.DETECTION,
+        target_id=wrong_version_id,
+        details={"source_sha256": source_sha256},
+        reason="Reviewed for this version.",
+        retrohunt_authorization=authorization,
+    )
+    review.rows[investigation_id] = (reviewed,)
+
+    with pytest.raises(RetrohuntQualityError, match="explicit human Retrohunt authorization"):
+        await _submit(service, investigation_id, reviewed.version.id, source_sha256)
+
+    assert await repo.count_for_subject(SUBJECT_ID) == 0
+    assert provider.submit_calls == []
+
+
+@pytest.mark.asyncio
+async def test_revoked_detection_decision_cannot_authorize_retrohunt() -> None:
+    service, repo, review, sources, provider, _ = _service()
+    investigation_id, _, _ = sources[0]
+    source_sha256, previously_approved = _review(investigation_id)
+    previously_approved.status = DetectionCandidateStatus.REJECTED
+    previously_approved.latest_decision = AnalystDecision(
+        investigation_id=investigation_id,
+        decision_type=AnalystDecisionType.DETECTION_REJECT,
+        target_type=AnalystDecisionTargetType.DETECTION,
+        target_id=previously_approved.version.id,
+        actor_id="analyst@example.test",
+        reason="Revoke the prior detection approval.",
+        correlation_id=str(uuid4()),
+        details={"source_sha256": source_sha256},
+    )
+    review.rows[investigation_id] = (previously_approved,)
+
+    with pytest.raises(RetrohuntQualityError, match="human prevalidation"):
+        await _submit(
+            service,
+            investigation_id,
+            previously_approved.version.id,
+            source_sha256,
+        )
+
+    assert await repo.count_for_subject(SUBJECT_ID) == 0
+    assert provider.submit_calls == []

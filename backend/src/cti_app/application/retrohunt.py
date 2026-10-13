@@ -22,13 +22,15 @@ from cti_app.domain.investigation import (
     TLPLevel,
 )
 from cti_app.domain.retrohunt import (
+    RETROHUNT_MAX_SUBMISSIONS_PER_SUBJECT,
+    RetrohuntProviderErrorCode,
     RetrohuntProviderJobState,
     RetrohuntReservation,
     RetrohuntReservationState,
     RetrohuntSubmitRequest,
 )
 
-MAX_SUBMISSIONS_PER_SUBJECT = 2
+MAX_SUBMISSIONS_PER_SUBJECT = RETROHUNT_MAX_SUBMISSIONS_PER_SUBJECT
 RETROHUNT_CAPABILITY = "vt.retrohunt"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SECRET_PARAMETER_KEY = re.compile(
@@ -84,6 +86,7 @@ class RetrohuntOutcome:
     slots_consumed: int
     slots_remaining: int
     provider_job_state: str
+    provider_error: RetrohuntProviderErrorCode | None = None
     candidate_hits: tuple[str, ...] = ()
     observation_refs: tuple[UUID, ...] = ()
 
@@ -248,11 +251,17 @@ class RetrohuntService:
                 job = await self._provider.retrohunt_status(current.provider_job_id)
             except Exception:
                 return await self._outcome(
-                    subject_id, current, provider_job_state=provider_job_state
+                    subject_id,
+                    current,
+                    provider_job_state=provider_job_state,
+                    provider_error=RetrohuntProviderErrorCode.PROVIDER_UNAVAILABLE,
                 )
             if job.job_id != current.provider_job_id:
                 return await self._outcome(
-                    subject_id, current, provider_job_state=provider_job_state
+                    subject_id,
+                    current,
+                    provider_job_state=provider_job_state,
+                    provider_error=RetrohuntProviderErrorCode.PROVIDER_UNAVAILABLE,
                 )
             provider_job_state = job.state.value
             if job.state in {
@@ -314,6 +323,7 @@ class RetrohuntService:
             slots_consumed=outcome.slots_consumed,
             slots_remaining=outcome.slots_remaining,
             provider_job_state=outcome.provider_job_state,
+            provider_error=outcome.provider_error,
             candidate_hits=tuple(hit.sha256 for hit in provider_results.hits),
             observation_refs=tuple(references),
         )
@@ -340,7 +350,7 @@ class RetrohuntService:
             or decision.target_type is not AnalystDecisionTargetType.DETECTION
             or decision.target_id != version.id
             or decision.details.get("source_sha256") != source_sha256
-            or not _explicit_retrohunt_authorization(decision.reason)
+            or not _retrohunt_authorization_matches(decision, version.id, source_sha256)
         ):
             raise RetrohuntQualityError(
                 "retrohunt_human_authorization_required",
@@ -446,10 +456,16 @@ class RetrohuntService:
         reservation: RetrohuntReservation,
         *,
         provider_job_state: str,
+        provider_error: RetrohuntProviderErrorCode | None = None,
     ) -> RetrohuntOutcome:
         async with self._uow_factory() as uow:
             consumed = await uow.retrohunt_reservations.count_for_subject(subject_id)
-        return _outcome(reservation, consumed, provider_job_state=provider_job_state)
+        return _outcome(
+            reservation,
+            consumed,
+            provider_job_state=provider_job_state,
+            provider_error=provider_error,
+        )
 
     def _require_available(self) -> None:
         if not self._provider.available:
@@ -457,13 +473,18 @@ class RetrohuntService:
 
 
 def _outcome(
-    reservation: RetrohuntReservation, consumed: int, *, provider_job_state: str
+    reservation: RetrohuntReservation,
+    consumed: int,
+    *,
+    provider_job_state: str,
+    provider_error: RetrohuntProviderErrorCode | None = None,
 ) -> RetrohuntOutcome:
     return RetrohuntOutcome(
         reservation=reservation,
         slots_consumed=consumed,
         slots_remaining=max(0, MAX_SUBMISSIONS_PER_SUBJECT - consumed),
         provider_job_state=provider_job_state,
+        provider_error=provider_error,
     )
 
 
@@ -520,13 +541,14 @@ def _has_control(value: str) -> bool:
     return any(ord(character) < 32 or ord(character) == 127 for character in value)
 
 
-def _explicit_retrohunt_authorization(reason: str) -> bool:
-    normalized = reason.casefold()
-    names_retrohunt = "retrohunt" in normalized
-    accepts_authority = any(
-        token in normalized for token in ("prévalid", "prevalid", "autor", "authoriz", "approv")
+def _retrohunt_authorization_matches(decision: Any, version_id: UUID, source_sha256: str) -> bool:
+    authorization = getattr(decision, "retrohunt_authorization", None)
+    return bool(
+        authorization is not None
+        and authorization.authorized is True
+        and authorization.rule_version_id == version_id
+        and authorization.source_sha256 == source_sha256
     )
-    return names_retrohunt and accepts_authority
 
 
 def _quality_report_qualifies(

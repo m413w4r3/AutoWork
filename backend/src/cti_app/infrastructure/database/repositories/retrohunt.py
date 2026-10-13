@@ -8,7 +8,11 @@ from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from cti_app.domain.retrohunt import RetrohuntReservation, RetrohuntReservationState
+from cti_app.domain.retrohunt import (
+    RETROHUNT_MAX_SUBMISSIONS_PER_SUBJECT,
+    RetrohuntReservation,
+    RetrohuntReservationState,
+)
 from cti_app.infrastructure.database.models.retrohunt import RetrohuntReservationRow
 
 
@@ -23,7 +27,7 @@ class SqlAlchemyRetrohuntReservationRepository:
         if existing is not None:
             return existing, False
 
-        for slot_number in (1, 2):
+        for slot_number in range(1, RETROHUNT_MAX_SUBMISSIONS_PER_SUBJECT + 1):
             statement = (
                 insert(RetrohuntReservationRow)
                 .values(
