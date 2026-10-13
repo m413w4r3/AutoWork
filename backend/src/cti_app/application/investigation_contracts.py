@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Mapping
+from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any, ClassVar, Literal
 from uuid import UUID
 
@@ -221,6 +223,35 @@ class AgentTurnDecisionV1(_StrictContract):
         return cls.model_json_schema()
 
 
+class DecisionValidationCode(StrEnum):
+    UNKNOWN_HYPOTHESIS_REFERENCE = "unknown_hypothesis_reference"
+    FINDING_LINKS_MULTIPLE_HYPOTHESES = "finding_links_multiple_hypotheses"
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionValidationIssue:
+    code: DecisionValidationCode
+
+
+def validate_decision_hypothesis_references(
+    decision: AgentTurnDecisionV1,
+    *,
+    known_hypothesis_ids: set[str] | frozenset[str],
+) -> DecisionValidationIssue | None:
+    """Validate every hypothesis reference before applying a turn's side effects."""
+    references = [*decision.hypothesis_refs]
+    references.extend(
+        reference
+        for proposal in decision.finding_proposals
+        for reference in proposal.hypothesis_refs
+    )
+    if any(reference not in known_hypothesis_ids for reference in references):
+        return DecisionValidationIssue(DecisionValidationCode.UNKNOWN_HYPOTHESIS_REFERENCE)
+    if any(len(set(proposal.hypothesis_refs)) > 1 for proposal in decision.finding_proposals):
+        return DecisionValidationIssue(DecisionValidationCode.FINDING_LINKS_MULTIPLE_HYPOTHESES)
+    return None
+
+
 def _reject_disallowed_payload(value: Any, path: str = "payload") -> None:
     if isinstance(value, bytes | bytearray | memoryview):
         raise ValueError(f"{path} cannot contain bytes")
@@ -270,6 +301,8 @@ __all__ = [
     "ArticleContextV1",
     "ContextChangeV1",
     "ContextInvestigationV1",
+    "DecisionValidationCode",
+    "DecisionValidationIssue",
     "FindingProposalV1",
     "InvestigationContextV1",
     "InvestigationDeltaV1",
@@ -279,4 +312,5 @@ __all__ = [
     "ToolSummaryV1",
     "parse_agent_turn_decision",
     "parse_investigation_context",
+    "validate_decision_hypothesis_references",
 ]

@@ -42,7 +42,11 @@ from cti_app.domain.investigation import (
     InvestigationFinding,
     ToolInvocationStatus,
 )
-from cti_app.domain.investigation_state import InvestigationWorkingState
+from cti_app.domain.investigation_state import (
+    Hypothesis,
+    HypothesisStatus,
+    InvestigationWorkingState,
+)
 
 MAX_ARTICLE_NARRATIVE_CHARS = 12_000
 MAX_CONTEXT_HYPOTHESES = 16
@@ -319,6 +323,7 @@ class ResearchContextBuilder:
             )
         )
         all_observation_ids = {item.id for item in observations}
+        all_finding_ids = {item.id for item in findings}
         new_observations = tuple(
             item for item in observations if item.id not in state.last_seen_evidence_ids
         )
@@ -343,8 +348,25 @@ class ResearchContextBuilder:
                 key=lambda definition: (definition.name, definition.schema_version),
             )[:MAX_CONTEXT_TOOLS]
         )
+        hypotheses_for_context = state.hypotheses
+        if state.turn_index:
+            hypotheses_for_context = tuple(
+                sorted(
+                    (
+                        item
+                        for item in state.hypotheses
+                        if item.status in {HypothesisStatus.OPEN, HypothesisStatus.REFUTED}
+                    ),
+                    key=lambda item: item.id,
+                )
+            )
         hypothesis_payload = tuple(
-            self._hypothesis_payload(item) for item in state.hypotheses[:MAX_CONTEXT_HYPOTHESES]
+            self._hypothesis_payload(
+                item,
+                observation_ids=all_observation_ids,
+                finding_ids=all_finding_ids,
+            )
+            for item in hypotheses_for_context[:MAX_CONTEXT_HYPOTHESES]
         )
         user_requests = self._user_requests_from_actions(state.recent_actions)
         previous_actions = tuple(
@@ -522,13 +544,27 @@ class ResearchContextBuilder:
         )
 
     @staticmethod
-    def _hypothesis_payload(hypothesis: Any) -> dict[str, Any]:
+    def _hypothesis_payload(
+        hypothesis: Hypothesis,
+        *,
+        observation_ids: set[UUID],
+        finding_ids: set[UUID],
+    ) -> dict[str, Any]:
+        evidence_refs = tuple(
+            sorted(
+                {item for item in hypothesis.evidence_refs if item in observation_ids},
+                key=str,
+            )[:8]
+        )
+        finding_refs = tuple(
+            sorted({item for item in hypothesis.finding_refs if item in finding_ids}, key=str)[:8]
+        )
         return {
             "id": hypothesis.id,
             "statement": _truncate(_safe_untrusted(hypothesis.statement), 500),
             "status": hypothesis.status.value,
-            "evidence_refs": [str(item) for item in hypothesis.evidence_refs[:8]],
-            "finding_refs": [str(item) for item in hypothesis.finding_refs[:8]],
+            "evidence_refs": [str(item) for item in evidence_refs],
+            "finding_refs": [str(item) for item in finding_refs],
         }
 
     @staticmethod

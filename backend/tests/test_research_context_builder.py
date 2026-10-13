@@ -44,7 +44,11 @@ from cti_app.domain.investigation import (
     thaw_json,
     tool_operation_key,
 )
-from cti_app.domain.investigation_state import Hypothesis, InvestigationWorkingState
+from cti_app.domain.investigation_state import (
+    Hypothesis,
+    HypothesisStatus,
+    InvestigationWorkingState,
+)
 from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
@@ -231,6 +235,114 @@ async def test_context_builds_full_article_and_bounded_delta_with_contradictions
     assert delta.delta is not None
     assert delta.delta.changes[0].kind == "finding:refuted"
     assert len(delta.canonical_bytes()) < 262_144
+
+
+@pytest.mark.asyncio
+async def test_delta_includes_bounded_unresolved_hypotheses_with_local_evidence_only() -> None:
+    investigation_id = uuid4()
+    observation = EvidenceObservation(
+        investigation_id=investigation_id,
+        kind=EvidenceKind.SHODAN_OBSERVATION,
+        blob_id=uuid4(),
+        sha256="e" * 64,
+        source="shodan.host",
+        source_version="1",
+        observed_at=datetime.now(UTC),
+        object_type="ip",
+        object_id="203.0.113.11",
+    )
+    observations = InMemoryEvidenceObservationRepository()
+    await observations.append_if_absent(observation)
+    findings = InMemoryFindingRepository()
+    linked_finding = InvestigationFinding(
+        investigation_id=investigation_id,
+        kind=FindingKind.CLAIM_VERIFICATION,
+        assessment=FindingAssessment.REFUTED,
+        statement="The observed evidence contradicts the attribution.",
+        observation_refs=(observation.id,),
+    )
+    await findings.append_version(linked_finding, expected_previous_id=None)
+    snapshot = ArticleSnapshot(
+        subject_id=uuid4(),
+        production_run_id=uuid4(),
+        synthesis_artifact_id=uuid4(),
+        synthesis_sha256="f" * 64,
+        article=ArticleContextV1(
+            short_summary="Article summary.",
+            claims=(),
+            documented_samples=(),
+            known_chain=(),
+            open_questions=(),
+        ),
+    )
+    foreign_observation_id = uuid4()
+    invalid_observation_id = uuid4()
+    invalid_finding_id = uuid4()
+    hypotheses = (
+        Hypothesis(
+            id="z-open",
+            statement="An open question.",
+            evidence_refs=(observation.id, foreign_observation_id, invalid_observation_id),
+            finding_refs=(linked_finding.id, invalid_finding_id),
+        ),
+        Hypothesis(
+            id="a-refuted",
+            statement="A previously refuted question remains unresolved.",
+            status=HypothesisStatus.REFUTED,
+            evidence_refs=(observation.id,),
+            finding_refs=(linked_finding.id,),
+        ),
+        Hypothesis(
+            id="m-supported",
+            statement="A supported hypothesis is settled.",
+            status=HypothesisStatus.SUPPORTED,
+            evidence_refs=(observation.id,),
+            finding_refs=(linked_finding.id,),
+        ),
+        *(
+            Hypothesis(id=f"h-{index:02}", statement="Another open question.")
+            for index in range(14)
+        ),
+    )
+    state = _state(investigation_id, turn_index=1, hypotheses=hypotheses)
+    envelope = InvestigationEnvelope(
+        investigation_id=investigation_id,
+        allowed_providers=(),
+        budget=InvestigationBudget(),
+        acquire_hits_allowed=False,
+        disclosure=DisclosureBounds(),
+        approval_decision_id=uuid4(),
+        approval_actor_id="analyst-1",
+    )
+    builder = ResearchContextBuilder(
+        article_snapshots=_SnapshotPort(snapshot),
+        observations=observations,
+        findings=findings,
+    )
+
+    context = await builder.build(
+        investigation_id=investigation_id,
+        synthesis_artifact_id=snapshot.synthesis_artifact_id,
+        state=state,
+        tool_context=ToolExecutionContext(
+            investigation_id=investigation_id,
+            envelope=envelope,
+            budget=envelope.budget,
+            idempotency_key="unresolved-hypotheses",
+        ),
+        budget_remaining={},
+    )
+
+    assert context.delta is not None
+    unresolved = context.delta.stable_hypotheses
+    assert len(unresolved) == 16
+    assert [item["id"] for item in unresolved] == sorted(item["id"] for item in unresolved)
+    by_id = {item["id"]: item for item in unresolved}
+    assert "m-supported" not in by_id
+    assert by_id["a-refuted"]["evidence_refs"] == [str(observation.id)]
+    assert by_id["a-refuted"]["finding_refs"] == [str(linked_finding.id)]
+    assert by_id["z-open"]["evidence_refs"] == [str(observation.id)]
+    assert by_id["z-open"]["finding_refs"] == [str(linked_finding.id)]
 
 
 @pytest.mark.asyncio

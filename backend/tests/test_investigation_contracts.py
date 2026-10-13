@@ -11,11 +11,13 @@ from cti_app.application.investigation_contracts import (
     ArticleContextV1,
     ContextChangeV1,
     ContextInvestigationV1,
+    DecisionValidationCode,
     InvestigationContextV1,
     InvestigationDeltaV1,
     InvestigationSourceV1,
     parse_agent_turn_decision,
     parse_investigation_context,
+    validate_decision_hypothesis_references,
 )
 from cti_app.application.investigation_tools import ToolEffect
 from cti_app.domain.investigation import AgentNextAction
@@ -154,6 +156,64 @@ def test_bridge_parser_ignores_unknown_fields_but_validates_known_fields_strictl
     payload["next_action"] = "do_everything"
     with pytest.raises(ValueError, match="Invalid agent turn decision"):
         parse_agent_turn_decision(payload)
+
+
+def test_legacy_decision_json_without_hypothesis_refs_is_readable_and_replayable() -> None:
+    legacy_json = (
+        '{"schema":"agent-turn-decision.v1","reasoning_summary":"Keep investigating.",'
+        '"goal":"Check one claim.","proposed_tool_calls":[],"finding_proposals":['
+        '{"kind":"claim_verification","assessment":"inconclusive",'
+        '"statement":"The available evidence is incomplete.","subject_ref":null,'
+        '"observation_refs":[],"claim_refs":[],"novelty":null,"scope":"",'
+        '"limitations":[]}],"opinion_delta":null,"next_action":"continue"}'
+    )
+
+    first = parse_agent_turn_decision(legacy_json)
+    replayed = parse_agent_turn_decision(legacy_json)
+
+    assert first.hypothesis_refs == ()
+    assert first.finding_proposals[0].hypothesis_refs == ()
+    assert first.canonical_bytes() == replayed.canonical_bytes()
+    assert validate_decision_hypothesis_references(first, known_hypothesis_ids=set()) is None
+
+
+def test_hypothesis_references_have_stable_typed_rejection_codes() -> None:
+    unknown = AgentTurnDecisionV1(
+        reasoning_summary="Check an unresolved attribution.",
+        goal="Compare the new observation with the attribution hypothesis.",
+        hypothesis_refs=("missing",),
+        proposed_tool_calls=(),
+        finding_proposals=(),
+        next_action=AgentNextAction.CONTINUE,
+    )
+    unknown_issue = validate_decision_hypothesis_references(unknown, known_hypothesis_ids={"known"})
+    assert unknown_issue is not None
+    assert unknown_issue.code is DecisionValidationCode.UNKNOWN_HYPOTHESIS_REFERENCE
+
+    multi_target_finding = parse_agent_turn_decision(
+        {
+            "reasoning_summary": "One finding cannot settle two hypotheses.",
+            "goal": "Keep the two attributions separate.",
+            "hypothesis_refs": ["a", "b"],
+            "proposed_tool_calls": [],
+            "finding_proposals": [
+                {
+                    "kind": "claim_verification",
+                    "assessment": "supported",
+                    "statement": "The cited observation supports both claims.",
+                    "observation_refs": [str(uuid4())],
+                    "claim_refs": [],
+                    "hypothesis_refs": ["a", "b"],
+                }
+            ],
+            "next_action": "continue",
+        }
+    )
+    multi_issue = validate_decision_hypothesis_references(
+        multi_target_finding, known_hypothesis_ids={"a", "b"}
+    )
+    assert multi_issue is not None
+    assert multi_issue.code is DecisionValidationCode.FINDING_LINKS_MULTIPLE_HYPOTHESES
 
 
 def test_context_rejects_signed_urls_and_secret_fields() -> None:

@@ -30,6 +30,7 @@ from cti_app.application.evidence_recorder import (
 from cti_app.application.investigation_contracts import (
     AgentTurnDecisionV1,
     parse_investigation_context,
+    validate_decision_hypothesis_references,
 )
 from cti_app.application.investigation_findings import (
     constrain_supported_assessment,
@@ -471,6 +472,20 @@ class InvestigationService:
             decision = turn.decision
             if decision is None:
                 return await self.conclude(investigation_id, StopReason.MODEL_UNAVAILABLE)
+            validation_issue = validate_decision_hypothesis_references(
+                decision,
+                known_hypothesis_ids={item.id for item in state.hypotheses},
+            )
+            if validation_issue is not None:
+                rejected = state.with_bridge_validation_failure(
+                    f"decision_rejected:{validation_issue.code.value}"
+                )
+                await self._save_state(state, rejected)
+                concluded = await self.conclude(
+                    investigation_id, StopReason.SUBMISSION_NEEDS_REVIEW
+                )
+                await self._commit_current_uow()
+                return concluded
             seen_operation_keys = {
                 item.operation_key
                 for item in await self._invocations.list_for_investigation(investigation_id)
@@ -1319,8 +1334,9 @@ class InvestigationService:
                 or not finding.observation_refs
             ):
                 continue
-            for hypothesis_id in proposal.hypothesis_refs:
-                linked.setdefault(hypothesis_id, []).append(finding)
+            proposal_hypothesis_ids = tuple(dict.fromkeys(proposal.hypothesis_refs))
+            if len(proposal_hypothesis_ids) == 1:
+                linked.setdefault(proposal_hypothesis_ids[0], []).append(finding)
 
         updates = []
         target_ids = set(decision.hypothesis_refs)
@@ -1337,9 +1353,10 @@ class InvestigationService:
             elif FindingAssessment.SUPPORTED in assessments:
                 status = HypothesisStatus.SUPPORTED
             elif FindingAssessment.REFUTED in assessments:
-                status = HypothesisStatus.REFUTED
+                status = HypothesisStatus.OPEN
             elif decision.next_action is AgentNextAction.SWITCH_HYPOTHESIS:
-                status = HypothesisStatus.ABANDONED
+                if not decision.finding_proposals:
+                    status = HypothesisStatus.ABANDONED
             updates.append(
                 Hypothesis(
                     id=hypothesis.id,

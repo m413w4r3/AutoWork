@@ -1,7 +1,12 @@
 from uuid import UUID, uuid4, uuid5
 
+import pytest
+
 from cti_app.application.bridge_investigator import BridgeInvestigator, ScriptedTurnTransport
-from cti_app.application.investigation_contracts import AgentTurnDecisionV1
+from cti_app.application.investigation_contracts import (
+    FindingProposalV1,
+    parse_agent_turn_decision,
+)
 from cti_app.application.investigation_service import InvestigationService
 from cti_app.domain.analyst_opinion import OpinionBlockType
 from cti_app.domain.investigation import FindingAssessment, FindingKind, InvestigationFinding
@@ -163,7 +168,7 @@ async def test_two_agent_strategies_choose_distinct_tool_orders_and_draft_findin
     assert b_opinion is not None
     assert b_opinion.renderable_blocks[0].block_type is OpinionBlockType.KEY_FINDINGS
     final_hypothesis = (await fixture_b.states.get(b_state.investigation_id)).hypotheses[0]
-    assert final_hypothesis.status is HypothesisStatus.REFUTED
+    assert final_hypothesis.status is HypothesisStatus.OPEN
 
 
 def test_hypothesis_findings_are_explicitly_linked_not_shared_across_a_turn() -> None:
@@ -183,7 +188,7 @@ def test_hypothesis_findings_are_explicitly_linked_not_shared_across_a_turn() ->
         observation_b,
     )
     second["hypothesis_refs"] = ["b"]
-    decision = AgentTurnDecisionV1.model_validate(
+    decision = parse_agent_turn_decision(
         _decision(
             goal="check two unrelated hypotheses",
             next_action="continue",
@@ -214,7 +219,7 @@ def test_hypothesis_findings_are_explicitly_linked_not_shared_across_a_turn() ->
     )
     assert [item.status for item in updated] == [
         HypothesisStatus.SUPPORTED,
-        HypothesisStatus.REFUTED,
+        HypothesisStatus.OPEN,
         HypothesisStatus.OPEN,
     ]
     assert updated[0].evidence_refs == (observation_a,)
@@ -248,7 +253,7 @@ def test_hypothesis_conflicting_or_unlinked_findings_cannot_be_promoted() -> Non
                 observation_refs=(observation,),
             )
         )
-    decision = AgentTurnDecisionV1.model_validate(
+    decision = parse_agent_turn_decision(
         _decision(
             goal="reconcile contradiction",
             next_action="continue",
@@ -269,10 +274,10 @@ def test_hypothesis_conflicting_or_unlinked_findings_cannot_be_promoted() -> Non
         "Unrelated",
         observation_a,
     )
-    decision_unlinked = AgentTurnDecisionV1.model_validate(
+    decision_unlinked = parse_agent_turn_decision(
         _decision(
             goal="do not infer a link",
-            next_action="continue",
+            next_action="switch_hypothesis",
             findings=(unlinked,),
             hypothesis_refs=("a",),
         )
@@ -284,3 +289,107 @@ def test_hypothesis_conflicting_or_unlinked_findings_cannot_be_promoted() -> Non
     )
     assert unchanged[0].status is HypothesisStatus.OPEN
     assert unchanged[0].evidence_refs == ()
+
+
+@pytest.mark.asyncio
+async def test_unknown_hypothesis_reference_is_rejected_before_tool_or_finding_effects() -> None:
+    call = _tool_call("vt.search", "content:loader", "check a passive indicator")
+    proposal = _proposal(
+        FindingKind.CLAIM_VERIFICATION.value,
+        FindingAssessment.SUPPORTED.value,
+        "The observation supports an unknown hypothesis.",
+        uuid4(),
+    )
+    proposal["hypothesis_refs"] = ["missing-hypothesis"]
+    fixture = _Fixture(
+        responses=[
+            _decision(
+                goal="check the proposed attribution",
+                next_action="finish",
+                tools=(call,),
+                findings=(proposal,),
+                hypothesis_refs=("known-hypothesis",),
+            )
+        ],
+        tools=(("vt.search", "vt"),),
+    )
+    initial = await fixture.start(
+        hypotheses=(Hypothesis(id="known-hypothesis", statement="Known attribution."),)
+    )
+
+    result = await fixture.service.run(initial.investigation_id)
+
+    assert result.stop_reason is StopReason.SUBMISSION_NEEDS_REVIEW
+    assert result.hypotheses == initial.hypotheses
+    assert fixture.execution_order == []
+    assert await fixture.findings.list_for_investigation(initial.investigation_id) == ()
+    assert any(
+        "bridge_invalid_output:decision_rejected:unknown_hypothesis_reference" in action
+        for action in result.recent_actions
+    )
+
+
+@pytest.mark.asyncio
+async def test_frozen_legacy_decision_replays_without_hypothesis_annotation() -> None:
+    legacy_json = (
+        '{"schema":"agent-turn-decision.v1","reasoning_summary":"Keep investigating.",'
+        '"goal":"Check one claim.","proposed_tool_calls":[],"finding_proposals":['
+        '{"kind":"claim_verification","assessment":"inconclusive",'
+        '"statement":"The available evidence is incomplete.","subject_ref":null,'
+        '"observation_refs":[],"claim_refs":[],"novelty":null,"scope":"",'
+        '"limitations":[]}],"opinion_delta":null,"next_action":"finish"}'
+    )
+    fixture = _Fixture(responses=[legacy_json], tools=())
+    initial = await fixture.start(
+        hypotheses=(Hypothesis(id="still-open", statement="An unresolved hypothesis."),)
+    )
+
+    decision = parse_agent_turn_decision(legacy_json)
+    first = await fixture.service._persist_findings(
+        investigation_id=initial.investigation_id,
+        proposals=decision.finding_proposals,
+        decision_trace=decision.reasoning_summary,
+    )
+    replay = parse_agent_turn_decision(legacy_json)
+    replayed = await fixture.service._persist_findings(
+        investigation_id=initial.investigation_id,
+        proposals=replay.finding_proposals,
+        decision_trace=replay.reasoning_summary,
+    )
+    result = await fixture.service.run(initial.investigation_id)
+
+    assert decision.hypothesis_refs == ()
+    assert decision.finding_proposals[0].hypothesis_refs == ()
+    assert first[0].id == replayed[0].id
+    assert result.stop_reason is StopReason.AGENT_FINISHED
+    assert result.hypotheses == initial.hypotheses
+    assert len(await fixture.findings.list_for_investigation(initial.investigation_id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_finding_hypothesis_annotation_does_not_change_persisted_identity() -> None:
+    fixture = _Fixture(responses=[], tools=())
+    initial = await fixture.start()
+    raw_proposal = {
+        "kind": FindingKind.CLAIM_VERIFICATION,
+        "assessment": FindingAssessment.INCONCLUSIVE,
+        "statement": "A stable finding identity.",
+        "observation_refs": (),
+        "claim_refs": (),
+    }
+    plain = FindingProposalV1.model_validate(raw_proposal)
+    annotated = plain.model_copy(update={"hypothesis_refs": ("hypothesis-a",)})
+
+    persisted_plain = await fixture.service._persist_findings(
+        investigation_id=initial.investigation_id,
+        proposals=(plain,),
+        decision_trace="first replay",
+    )
+    persisted_annotated = await fixture.service._persist_findings(
+        investigation_id=initial.investigation_id,
+        proposals=(annotated,),
+        decision_trace="annotated replay",
+    )
+
+    assert persisted_plain[0].id == persisted_annotated[0].id
+    assert len(await fixture.findings.list_for_investigation(initial.investigation_id)) == 1
