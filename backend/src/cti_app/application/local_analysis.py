@@ -363,6 +363,64 @@ def default_local_command_specs() -> tuple[LocalCommandSpec, ...]:
     )
 
 
+def extraction_command_specs(
+    *, mwcp_parser_ids: tuple[str, ...] = ()
+) -> tuple[LocalCommandSpec, ...]:
+    """Return the opt-in catalogue entries used only by extraction tools.
+
+    MWCP parser identifiers are an operator allowlist. Keeping these entries in a
+    separate catalogue prevents the generic ``local.run_command`` tool from
+    exposing vendor output without the extraction adapters' normalisation.
+    """
+    parser_ids = tuple(sorted(set(mwcp_parser_ids)))
+    if any(re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", item) is None for item in parser_ids):
+        raise ValueError("MWCP parser identifiers contain unsupported characters")
+    any_file = frozenset(LocalAnalysisFileType)
+    specs = [
+        LocalCommandSpec(
+            LocalCommandId.FLOSS,
+            "floss",
+            (
+                LocalCommandOptionSpec(
+                    "max_strings", LocalOptionKind.INTEGER, 1024, minimum=1, maximum=4096
+                ),
+            ),
+            any_file,
+            60,
+            4 * 1024 * 1024,
+            45,
+            1024 * 1024 * 1024,
+            4 * 1024 * 1024,
+            LocalCommandOutputKind.TEXT,
+            capture_full_output_hash=True,
+        )
+    ]
+    if parser_ids:
+        specs.append(
+            LocalCommandSpec(
+                LocalCommandId.MWCP,
+                "mwcp",
+                (
+                    LocalCommandOptionSpec(
+                        "parser_id",
+                        LocalOptionKind.ENUM,
+                        None,
+                        allowed_values=parser_ids,
+                    ),
+                ),
+                any_file,
+                60,
+                4 * 1024 * 1024,
+                45,
+                1024 * 1024 * 1024,
+                4 * 1024 * 1024,
+                LocalCommandOutputKind.TEXT,
+                capture_full_output_hash=True,
+            )
+        )
+    return tuple(specs)
+
+
 def normalize_command_options(
     spec: LocalCommandSpec, options: Mapping[str, object]
 ) -> tuple[dict[str, object], str | None]:
@@ -448,6 +506,7 @@ def _with_configured_limits(
         memory_limit_bytes=memory_limit_bytes or spec.memory_limit_bytes,
         file_size_limit_bytes=file_size_limit_bytes or spec.file_size_limit_bytes,
         output_kind=spec.output_kind,
+        capture_full_output_hash=spec.capture_full_output_hash,
     )
 
 
