@@ -274,7 +274,7 @@ async def _start_and_approve(
             "downloads": downloads,
         },
         allow_acquisition=acquire,
-        max_volume=downloads,
+        max_acquire_volume=downloads,
     )
     assert approved.status_code == 200, approved.text
     assert approved.json()["approved"] is True

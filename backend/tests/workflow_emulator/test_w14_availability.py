@@ -297,7 +297,7 @@ async def test_w14_f_optional_outages_preserve_proof_and_resume_without_replay(
                     "downloads": 0,
                 },
                 allow_acquisition=False,
-                max_volume=0,
+                max_acquire_volume=0,
             )
             assert approved.status_code == 200, approved.text
             await run_http_job(app, uow_factory, registry, dispatcher, UUID(started["job_id"]))
