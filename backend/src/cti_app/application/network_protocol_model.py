@@ -222,11 +222,16 @@ class NetworkProtocolWorkbench:
                 relative_offset = _relative_field_offset(raw_offset, candidate_items, ordinal)
                 field_id = _field_id(message_id, candidate_name, relative_offset, length, endian)
                 proof_items = _unique_evidence(item.evidence for _, item in candidate_items)
-                digests = _candidate_value_digests(
-                    candidate, candidate_items, relative_offset, length
+                digests, independent_observations = _candidate_value_digests(
+                    candidate_items, relative_offset, length
                 )
                 state = _candidate_status(getattr(candidate, "status", EvidenceStatus.UNRESOLVED))
                 encrypted = opaque and kind == "payload"
+                stability = FieldStability.UNKNOWN
+                if independent_observations >= 2:
+                    stability = (
+                        FieldStability.VARIANT if len(digests) > 1 else FieldStability.STABLE
+                    )
                 if encrypted:
                     state = ProtocolValidationStatus.UNRESOLVED
                     relative_offset = None
@@ -243,9 +248,7 @@ class NetworkProtocolWorkbench:
                     condition=None,
                     source=_SOURCE,
                     validation_status=state,
-                    stability=(
-                        FieldStability.VARIANT if len(digests) > 1 else FieldStability.STABLE
-                    ),
+                    stability=stability,
                     evidence=proof_items,
                     value_sha256s=digests,
                     encrypted_opaque=encrypted,
@@ -255,15 +258,17 @@ class NetworkProtocolWorkbench:
                         raise ProtocolTraceError("protocol model exceeds the field limit")
                     fields.append(field)
                     field_ids_by_message[message_id].append(field_id)
-                    (
-                        stable_ids if field.stability is FieldStability.STABLE else variant_ids
-                    ).append(field_id)
+                    if field.stability is FieldStability.STABLE:
+                        stable_ids.append(field_id)
+                    elif field.stability is FieldStability.VARIANT:
+                        variant_ids.append(field_id)
 
-            raw_observations = [
-                (item, item.content)
+            raw_observations_by_key = {
+                _message_observation_key(item): (item, item.content)
                 for item in items
                 if item.content is not None and not item.stream.encrypted_opaque
-            ]
+            }
+            raw_observations = list(raw_observations_by_key.values())
             if len(raw_observations) >= 2:
                 for start, end, stable in _byte_runs(raw_observations):
                     name = f"{'stable' if stable else 'variant'}_bytes_{start}_{end - start}"
@@ -873,6 +878,31 @@ def _verify_model(model: ProtocolModelV1, traces: Sequence[_ObservedTrace]) -> P
                     (proof,),
                 )
                 new_findings[finding.finding_id] = finding
+                message_status[expected_definition.message_id] = _merge_status(
+                    message_status.get(
+                        expected_definition.message_id,
+                        expected_definition.validation_status,
+                    ),
+                    ProtocolValidationStatus.UNRESOLVED,
+                )
+                for expected_field in fields_by_message[expected_definition.message_id]:
+                    field_finding = _finding(
+                        expected_field.field_id,
+                        "field_missing",
+                        ProtocolValidationStatus.UNRESOLVED,
+                        expected_field.name,
+                        None,
+                        "The field cannot be checked because its parent message was absent.",
+                        (proof,),
+                    )
+                    new_findings[field_finding.finding_id] = field_finding
+                    field_status[expected_field.field_id] = _merge_status(
+                        field_status.get(
+                            expected_field.field_id,
+                            expected_field.validation_status,
+                        ),
+                        ProtocolValidationStatus.UNRESOLVED,
+                    )
                 continue
             if (
                 not expected_definition.min_length
@@ -889,8 +919,20 @@ def _verify_model(model: ProtocolModelV1, traces: Sequence[_ObservedTrace]) -> P
                     (actual.evidence,),
                 )
                 new_findings[finding.finding_id] = finding
-                message_status[expected_definition.message_id] = (
-                    ProtocolValidationStatus.CONTRADICTED
+                message_status[expected_definition.message_id] = _merge_status(
+                    message_status.get(
+                        expected_definition.message_id,
+                        expected_definition.validation_status,
+                    ),
+                    ProtocolValidationStatus.CONTRADICTED,
+                )
+            else:
+                message_status[expected_definition.message_id] = _merge_status(
+                    message_status.get(
+                        expected_definition.message_id,
+                        expected_definition.validation_status,
+                    ),
+                    ProtocolValidationStatus.OBSERVED,
                 )
             for field in fields_by_message[expected_definition.message_id]:
                 if field.expected_hex is None:
@@ -926,6 +968,10 @@ def _verify_model(model: ProtocolModelV1, traces: Sequence[_ObservedTrace]) -> P
                     status = ProtocolValidationStatus.CONTRADICTED
                     detail = "The holdout field value contradicts the proposed schema."
                 else:
+                    field_status[field.field_id] = _merge_status(
+                        field_status.get(field.field_id, field.validation_status),
+                        ProtocolValidationStatus.OBSERVED,
+                    )
                     continue
                 finding = _finding(
                     field.field_id,
@@ -965,12 +1011,20 @@ def _verify_model(model: ProtocolModelV1, traces: Sequence[_ObservedTrace]) -> P
                     (observed.evidence,),
                 )
                 new_findings[finding.finding_id] = finding
-                transition_status[model_transition.transition_id] = (
-                    ProtocolValidationStatus.CONTRADICTED
+                transition_status[model_transition.transition_id] = _merge_status(
+                    transition_status.get(
+                        model_transition.transition_id,
+                        model_transition.validation_status,
+                    ),
+                    ProtocolValidationStatus.CONTRADICTED,
                 )
             else:
-                transition_status[model_transition.transition_id] = (
-                    ProtocolValidationStatus.OBSERVED
+                transition_status[model_transition.transition_id] = _merge_status(
+                    transition_status.get(
+                        model_transition.transition_id,
+                        model_transition.validation_status,
+                    ),
+                    ProtocolValidationStatus.OBSERVED,
                 )
                 current_state = model_transition.to_state
         for transition in model.transitions:
@@ -997,7 +1051,13 @@ def _verify_model(model: ProtocolModelV1, traces: Sequence[_ObservedTrace]) -> P
                 (trace.evidence,),
             )
             new_findings[finding.finding_id] = finding
-            transition_status[transition.transition_id] = ProtocolValidationStatus.UNRESOLVED
+            transition_status[transition.transition_id] = _merge_status(
+                transition_status.get(
+                    transition.transition_id,
+                    transition.validation_status,
+                ),
+                ProtocolValidationStatus.UNRESOLVED,
+            )
 
     findings_by_id = {item.finding_id: item for item in model.verification_findings}
     findings_by_id.update(new_findings)
@@ -1006,7 +1066,7 @@ def _verify_model(model: ProtocolModelV1, traces: Sequence[_ObservedTrace]) -> P
             item,
             validation_status=_merge_status(
                 item.validation_status,
-                message_status.get(item.message_id, ProtocolValidationStatus.OBSERVED),
+                message_status.get(item.message_id, item.validation_status),
             ),
         )
         for item in model.messages
@@ -1016,7 +1076,7 @@ def _verify_model(model: ProtocolModelV1, traces: Sequence[_ObservedTrace]) -> P
             item,
             validation_status=_merge_status(
                 item.validation_status,
-                field_status.get(item.field_id, ProtocolValidationStatus.OBSERVED),
+                field_status.get(item.field_id, item.validation_status),
             ),
         )
         for item in model.fields
@@ -1026,7 +1086,7 @@ def _verify_model(model: ProtocolModelV1, traces: Sequence[_ObservedTrace]) -> P
             item,
             validation_status=_merge_status(
                 item.validation_status,
-                transition_status.get(item.transition_id, ProtocolValidationStatus.OBSERVED),
+                transition_status.get(item.transition_id, item.validation_status),
             ),
         )
         for item in model.transitions
@@ -1035,7 +1095,15 @@ def _verify_model(model: ProtocolModelV1, traces: Sequence[_ObservedTrace]) -> P
     status = model.validation_status
     for finding in findings:
         status = _merge_status(status, finding.validation_status)
-    if not new_findings and traces:
+    established_observations = any(
+        status is ProtocolValidationStatus.OBSERVED
+        for status in (
+            *message_status.values(),
+            *field_status.values(),
+            *transition_status.values(),
+        )
+    )
+    if not new_findings and established_observations:
         status = _merge_status(status, ProtocolValidationStatus.OBSERVED)
     return replace(
         model,
@@ -1359,22 +1427,36 @@ def _relative_field_offset(
 
 
 def _candidate_value_digests(
-    candidate: object,
     items: Sequence[tuple[object, _ObservedMessage]],
     relative_offset: int | None,
     length: int | None,
-) -> tuple[str, ...]:
+) -> tuple[tuple[str, ...], int]:
     if relative_offset is None or length is None:
-        return ()
+        return (), 0
     values: set[str] = set()
+    observations: set[tuple[str, str, str, int, int]] = set()
     for _, message in items:
         if message.content is not None and relative_offset + length <= len(message.content):
+            observations.add(_message_observation_key(message))
             values.add(
                 hashlib.sha256(
                     message.content[relative_offset : relative_offset + length]
                 ).hexdigest()
             )
-    return tuple(sorted(values))
+    return tuple(sorted(values)), len(observations)
+
+
+def _message_observation_key(
+    message: _ObservedMessage,
+) -> tuple[str, str, str, int, int]:
+    evidence = message.evidence
+    return (
+        evidence.capture_sha256,
+        evidence.flow_id,
+        evidence.stream_id,
+        message.boundary.start_offset,
+        message.boundary.end_offset,
+    )
 
 
 def _byte_runs(

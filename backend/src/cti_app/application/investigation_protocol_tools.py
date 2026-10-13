@@ -205,7 +205,11 @@ _PROPOSAL_SCHEMA: dict[str, Any] = {
 class ProtocolModelBlobStore(Protocol):
     async def put_model(self, model: ProtocolModelV1) -> tuple[UUID, str]: ...
 
-    async def get_model(self, blob_id: UUID) -> ProtocolModelV1: ...
+    async def get_model(self, blob_id: UUID, *, investigation_id: UUID) -> ProtocolModelV1: ...
+
+
+class ProtocolModelNotInInvestigation(PermissionError):
+    """The requested immutable protocol model belongs to another investigation."""
 
 
 class ProductionProtocolModelStore:
@@ -225,8 +229,11 @@ class ProductionProtocolModelStore:
         )
         return blob_id, model.canonical_sha256
 
-    async def get_model(self, blob_id: UUID) -> ProtocolModelV1:
-        return ProtocolModelV1.from_dict(await self._artifacts.read_json(blob_id))
+    async def get_model(self, blob_id: UUID, *, investigation_id: UUID) -> ProtocolModelV1:
+        model = ProtocolModelV1.from_dict(await self._artifacts.read_json(blob_id))
+        if model.investigation_id != investigation_id:
+            raise ProtocolModelNotInInvestigation
+        return model
 
 
 def protocol_tool_capabilities() -> frozenset[str]:
@@ -388,7 +395,9 @@ class _ProtocolToolAdapter:
                 )
 
             if self.name == NETWORK_PROTOCOL_VERIFY:
-                model = await self.model_store.get_model(_uuid(arguments.get("model_blob_id")))
+                model = await self._load_model_for_investigation(
+                    _uuid(arguments.get("model_blob_id")), context.investigation_id
+                )
                 verified = await self.service.verify(
                     model=model,
                     traces=_trace_requests(arguments.get("traces")),
@@ -419,7 +428,9 @@ class _ProtocolToolAdapter:
                 )
                 return self._result(context, started, status, output, (observation_id,))
 
-            model = await self.model_store.get_model(_uuid(arguments.get("model_blob_id")))
+            model = await self._load_model_for_investigation(
+                _uuid(arguments.get("model_blob_id")), context.investigation_id
+            )
             rendered = self.service.render(model)
             render_observation = await self.recorder.record_json(
                 investigation_id=context.investigation_id,
@@ -445,6 +456,13 @@ class _ProtocolToolAdapter:
                 ToolInvocationStatus.SUCCEEDED,
                 output,
                 (render_observation.id,),
+            )
+        except ProtocolModelNotInInvestigation:
+            return self._result(
+                context,
+                started,
+                ToolInvocationStatus.POLICY_DENIED,
+                {"detail_code": "protocol_model_not_in_investigation"},
             )
         except HypothesisNotReplayableError as exc:
             return self._result(
@@ -502,6 +520,14 @@ class _ProtocolToolAdapter:
             idempotency_key=context.idempotency_key,
         )
         return observation.id
+
+    async def _load_model_for_investigation(
+        self, blob_id: UUID, investigation_id: UUID
+    ) -> ProtocolModelV1:
+        model = await self.model_store.get_model(blob_id, investigation_id=investigation_id)
+        if model.investigation_id != investigation_id:
+            raise ProtocolModelNotInInvestigation
+        return model
 
     def _result(
         self,

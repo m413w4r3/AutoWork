@@ -4,7 +4,8 @@ import hashlib
 import ipaddress
 import json
 import struct
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4, uuid5
@@ -17,6 +18,8 @@ from cti_app.application.investigation_protocol_tools import (
     NETWORK_PROTOCOL_RENDER,
     NETWORK_PROTOCOL_VERIFY,
     PROTOCOL_TOOL_NAMES,
+    ProductionProtocolModelStore,
+    ProtocolModelNotInInvestigation,
     protocol_tool_capabilities,
     register_protocol_tools,
 )
@@ -34,6 +37,7 @@ from cti_app.application.network_workbench import (
     QuarantinedCapture,
     _flows,
 )
+from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.domain.investigation import (
     BudgetDimension,
     EvidenceKind,
@@ -54,6 +58,7 @@ from cti_app.domain.protocol_model import (
     ProtocolDiagramStatus,
     ProtocolHypothesisProposalV1,
     ProtocolModelV1,
+    ProtocolRenderResultV1,
     ProtocolTestKind,
     ProtocolTestPlanStepV1,
     ProtocolValidationStatus,
@@ -98,6 +103,9 @@ class _CaptureBlobs:
 
 
 class _EvidenceRecorder:
+    def __init__(self) -> None:
+        self.record_json_calls = 0
+
     async def record_json(
         self,
         *,
@@ -113,6 +121,7 @@ class _EvidenceRecorder:
         observed_at: datetime | None = None,
         idempotency_key: str | None = None,
     ) -> EvidenceObservation:
+        self.record_json_calls += 1
         encoded = json.dumps(dict(payload), sort_keys=True, default=str).encode()
         return EvidenceObservation(
             investigation_id=investigation_id,
@@ -192,15 +201,21 @@ class _ProtocolModelStore:
     def __init__(self, model: ProtocolModelV1 | None = None) -> None:
         self.model = model
         self.blob_id = uuid4()
+        self.get_calls = 0
+        self.put_calls = 0
 
     async def put_model(self, model: ProtocolModelV1) -> tuple[UUID, str]:
+        self.put_calls += 1
         self.model = model
         self.blob_id = uuid5(_BLOB_NAMESPACE, model.canonical_sha256)
         return self.blob_id, model.canonical_sha256
 
-    async def get_model(self, blob_id: UUID) -> ProtocolModelV1:
+    async def get_model(self, blob_id: UUID, *, investigation_id: UUID) -> ProtocolModelV1:
+        self.get_calls += 1
         if blob_id != self.blob_id or self.model is None:
             raise AssertionError("unknown protocol model blob")
+        if self.model.investigation_id != investigation_id:
+            raise ProtocolModelNotInInvestigation
         return self.model
 
 
@@ -311,12 +326,18 @@ def _workbench(content: bytes) -> tuple[NetworkWorkbench, _CaptureBlobs]:
     return workbench, blobs
 
 
-def _messages_capture(*, endian: str, first_opcode: int = 1, second_opcode: int = 2) -> bytes:
+def _messages_capture(
+    *,
+    endian: str,
+    first_opcode: int = 1,
+    second_opcode: int = 2,
+    initial_sequence: int = 100,
+) -> bytes:
     prefix = (3).to_bytes(2, endian)
     messages = prefix + bytes((first_opcode,)) + b"AB" + prefix + bytes((second_opcode,)) + b"CD"
     frames = (
-        _tcp_frame(sequence=100, flags=0x02),
-        _tcp_frame(sequence=101, flags=0x18, payload=messages),
+        _tcp_frame(sequence=initial_sequence, flags=0x02),
+        _tcp_frame(sequence=initial_sequence + 1, flags=0x18, payload=messages),
     )
     return _pcap(frames)
 
@@ -484,6 +505,76 @@ async def test_protocol_compare_is_deterministic_and_keeps_endianness_variants()
 
 
 @pytest.mark.asyncio
+async def test_candidate_stability_requires_two_independent_observations() -> None:
+    one_service, one_trace = await _network_and_traces(
+        ((_messages_capture(endian="big"), False, hashlib.sha256(b"sample-one").hexdigest()),)
+    )
+    one = await one_service.compare(
+        subject_id="stability-one",
+        investigation_id=_INVESTIGATION_ID,
+        traces=one_trace,
+    )
+    candidate_fields = [
+        field for field in one.model.fields if field.source == "network.messages.segment"
+    ]
+    assert candidate_fields
+    assert all(field.stability.value == "unknown" for field in candidate_fields)
+    assert not one.stable_field_ids
+
+    identical_service, identical_traces = await _network_and_traces(
+        (
+            (
+                _messages_capture(endian="big", initial_sequence=100),
+                False,
+                hashlib.sha256(b"identical-sample-one").hexdigest(),
+            ),
+            (
+                _messages_capture(endian="big", initial_sequence=300),
+                False,
+                hashlib.sha256(b"identical-sample-two").hexdigest(),
+            ),
+        )
+    )
+    identical = await identical_service.compare(
+        subject_id="stability-identical",
+        investigation_id=_INVESTIGATION_ID,
+        traces=identical_traces,
+    )
+    assert any(
+        field.name == "length_prefix" and field.stability.value == "stable"
+        for field in identical.model.fields
+    )
+
+    divergent_service, divergent_traces = await _network_and_traces(
+        (
+            (
+                _messages_capture(endian="big", initial_sequence=100),
+                False,
+                hashlib.sha256(b"divergent-sample-one").hexdigest(),
+            ),
+            (
+                _messages_capture(endian="big", first_opcode=0x7F, initial_sequence=300),
+                False,
+                hashlib.sha256(b"divergent-sample-two").hexdigest(),
+            ),
+        )
+    )
+    divergent = await divergent_service.compare(
+        subject_id="stability-divergent",
+        investigation_id=_INVESTIGATION_ID,
+        traces=divergent_traces,
+    )
+    first_message_fields = [
+        field
+        for field in divergent.model.fields
+        if field.name == "first_body_byte" and field.message_id.endswith("_1")
+    ]
+    assert len(first_message_fields) == 1
+    assert first_message_fields[0].stability.value == "variant"
+    assert first_message_fields[0].field_id in divergent.variant_field_ids
+
+
+@pytest.mark.asyncio
 async def test_hypothesis_replays_then_holdout_contradiction_is_preserved() -> None:
     service, traces = await _network_and_traces(
         (
@@ -638,10 +729,49 @@ async def test_non_replayable_hypothesis_is_rejected_and_incomplete_path_unresol
     )
     verified = await service.verify(model=model, traces=(traces[2],))
     assert verified.validation_status is ProtocolValidationStatus.UNRESOLVED
+    assert (
+        next(
+            item for item in verified.messages if item.message_id == "client_message_2"
+        ).validation_status
+        is ProtocolValidationStatus.UNRESOLVED
+    )
+    assert (
+        next(item for item in verified.fields if item.field_id == "opcode_2").validation_status
+        is ProtocolValidationStatus.UNRESOLVED
+    )
+    assert (
+        next(
+            item for item in verified.transitions if item.transition_id == "transition_beacon"
+        ).validation_status
+        is ProtocolValidationStatus.UNRESOLVED
+    )
     assert any(
         item.kind in {"message_missing", "transition_missing"}
         and item.validation_status is ProtocolValidationStatus.UNRESOLVED
         for item in verified.verification_findings
+    )
+    rendered = service.render(verified)
+    sequence = next(item for item in rendered.diagrams if item.kind is ProtocolDiagramKind.SEQUENCE)
+    state_machine = next(
+        item for item in rendered.diagrams if item.kind is ProtocolDiagramKind.STATE_MACHINE
+    )
+    message_format = next(
+        item for item in rendered.diagrams if item.kind is ProtocolDiagramKind.MESSAGE_FORMAT
+    )
+    assert next(
+        edge for edge in sequence.edges if edge.label == "client_beacon"
+    ).validation_status is (ProtocolValidationStatus.UNRESOLVED)
+    assert (
+        next(
+            edge for edge in state_machine.edges if edge.label.endswith("client_beacon")
+        ).validation_status
+        is ProtocolValidationStatus.UNRESOLVED
+    )
+    assert (
+        next(
+            field for field in message_format.fields if field.field_id == "opcode_2"
+        ).validation_status
+        is ProtocolValidationStatus.UNRESOLVED
     )
 
 
@@ -767,3 +897,100 @@ async def test_protocol_render_tool_returns_existing_observation_uuid() -> None:
     observation_ref = result.observation_refs[0]
     assert isinstance(observation_ref, UUID)
     assert result.output["observation_ref"] == str(observation_ref)
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    (NETWORK_PROTOCOL_VERIFY, NETWORK_PROTOCOL_RENDER),
+)
+@pytest.mark.asyncio
+async def test_protocol_tools_reject_model_from_another_investigation_without_effects(
+    tool_name: str,
+) -> None:
+    foreign_investigation_id = UUID("7731fc0d-b4c7-4a80-a7c0-dd87d3b258c8")
+    model_service, traces = await _network_and_traces(
+        ((_messages_capture(endian="big"), False, None),)
+    )
+    owned_model = (
+        await model_service.compare(
+            subject_id="foreign-model",
+            investigation_id=_INVESTIGATION_ID,
+            traces=traces,
+        )
+    ).model
+    foreign_model = replace(owned_model, investigation_id=foreign_investigation_id)
+
+    class _NoEffectService(NetworkProtocolWorkbench):
+        def __init__(self, workbench: NetworkWorkbench) -> None:
+            super().__init__(workbench)
+            self.verify_calls = 0
+            self.render_calls = 0
+
+        async def verify(
+            self,
+            *,
+            model: ProtocolModelV1,
+            traces: Sequence[ProtocolTraceRequestV1],
+            investigation_id: UUID | None = None,
+        ) -> ProtocolModelV1:
+            self.verify_calls += 1
+            raise AssertionError("foreign model must be rejected before verification")
+
+        def render(self, model: ProtocolModelV1) -> ProtocolRenderResultV1:
+            self.render_calls += 1
+            raise AssertionError("foreign model must be rejected before rendering")
+
+    workbench, _ = _workbench(_base_capture())
+    service = _NoEffectService(workbench)
+    recorder = _EvidenceRecorder()
+
+    class _ModelArtifacts(ProductionArtifactStore):
+        def __init__(self, model: ProtocolModelV1) -> None:
+            self.payload = model.to_dict()
+            self.read_calls = 0
+            self.put_calls = 0
+
+        async def read_json(self, blob_id: UUID) -> dict[str, Any]:
+            self.read_calls += 1
+            return self.payload
+
+        async def put_bytes(self, content: bytes, *, bucket: str, mime_type: str) -> UUID:
+            self.put_calls += 1
+            return uuid4()
+
+    artifacts = _ModelArtifacts(foreign_model)
+    model_store = ProductionProtocolModelStore(artifacts)
+    registry = InMemoryToolRegistry()
+    register_protocol_tools(
+        registry,
+        service=service,
+        recorder=recorder,
+        model_store=model_store,
+    )
+    registration = registry.get(tool_name, "1")
+    assert registration is not None
+    _definition, adapter = registration
+    context = ToolExecutionContext(
+        investigation_id=_INVESTIGATION_ID,
+        envelope=None,
+        budget=InvestigationBudget({BudgetDimension.TOOL_SECONDS: 30}),
+        idempotency_key=f"foreign-model-{tool_name}",
+        available_capabilities=frozenset({tool_name}),
+    )
+    arguments: dict[str, object] = {"model_blob_id": str(uuid4())}
+    if tool_name == NETWORK_PROTOCOL_VERIFY:
+        arguments["traces"] = []
+
+    result = await adapter.execute(arguments, context)
+
+    assert result.status is ToolInvocationStatus.POLICY_DENIED
+    assert result.output == {
+        "detail_code": "protocol_model_not_in_investigation",
+        "status": ToolInvocationStatus.POLICY_DENIED.value,
+    }
+    assert result.observation_refs == ()
+    assert artifacts.read_calls == 1
+    assert artifacts.put_calls == 0
+    assert recorder.record_json_calls == 0
+    assert service.verify_calls == 0
+    assert service.render_calls == 0
