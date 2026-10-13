@@ -40,8 +40,18 @@ class FlossAdapter:
 
     @property
     def available(self) -> bool:
+        return self.unavailable_reason is None
+
+    @property
+    def unavailable_reason(self) -> str | None:
+        if not self._enabled:
+            return "floss_disabled"
+        if not self._service.filesystem_confined:
+            return "filesystem_confinement_required"
         capability = self._catalog.get(LocalCommandId.FLOSS)
-        return self._enabled and capability is not None and capability.available
+        if capability is None or not capability.available:
+            return "binary_unavailable"
+        return None
 
     @property
     def version(self) -> str | None:
@@ -77,7 +87,11 @@ class FlossAdapter:
             }
             or not complete
         )
-        extraction_truncated = output_truncated or strings_observed > len(strings)
+        extraction_truncated = (
+            output_truncated
+            or strings_observed > len(strings)
+            or any(item.truncated_fields for item in strings)
+        )
         status = _status(result.status, empty=not strings)
         if parse_failed:
             status = ExtractionStatus.PARTIAL if output_truncated else ExtractionStatus.FAILED
@@ -143,25 +157,40 @@ def _parse_floss_payload(
             if path in seen_paths:
                 continue
             seen_paths.add(path)
+            truncated_fields: list[str] = []
+            bounded_value = value[:_MAX_ITEM_CHARS]
+            if len(value) > len(bounded_value):
+                truncated_fields.append("value")
+            encoding, encoding_truncated = _optional_text(item.get("encoding"), 128)
+            function, function_truncated = _optional_text(item.get("function"), 256)
+            context, context_truncated = _optional_text(item.get("context"), 1_000)
+            if encoding_truncated:
+                truncated_fields.append("encoding")
+            if function_truncated:
+                truncated_fields.append("function")
+            if context_truncated:
+                truncated_fields.append("context")
             result.append(
                 ExtractedString(
-                    value=value[:_MAX_ITEM_CHARS],
+                    value=bounded_value,
                     kind=item_kind,
-                    encoding=_optional_text(item.get("encoding"), 128),
+                    encoding=encoding,
                     offset=_optional_offset(item.get("offset")),
                     address=_optional_address(item.get("address")),
-                    function=_optional_text(item.get("function"), 256),
-                    context=_optional_text(item.get("context"), 1_000),
+                    function=function,
+                    context=context,
                     evidence_path=path,
+                    truncated_fields=tuple(truncated_fields),
                 )
             )
     return tuple(result), observed
 
 
-def _optional_text(value: object, max_chars: int) -> str | None:
+def _optional_text(value: object, max_chars: int) -> tuple[str | None, bool]:
     if isinstance(value, str) and value.strip():
-        return value[:max_chars]
-    return None
+        bounded = value[:max_chars]
+        return bounded, len(value) > len(bounded)
+    return None, False
 
 
 def _optional_offset(value: object) -> int | None:

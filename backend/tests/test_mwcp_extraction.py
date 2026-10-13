@@ -14,6 +14,7 @@ import pytest
 import cti_app.infrastructure.local_command_runner as local_runner_module
 from cti_app.application.investigation_extraction_tools import (
     MWCP_TOOL,
+    _configuration_value_json,
     extraction_tool_capabilities,
     register_extraction_tools,
 )
@@ -26,7 +27,7 @@ from cti_app.application.local_analysis import (
 from cti_app.domain.investigation import ToolInvocationStatus
 from cti_app.domain.local_analysis import LocalCommandSpec
 from cti_app.infrastructure.local_command_runner import LocalCommandRunner
-from cti_app.infrastructure.mwcp_adapter import MwcpAdapter
+from cti_app.infrastructure.mwcp_adapter import MwcpAdapter, _normalize_configuration
 
 
 class _Samples:
@@ -52,6 +53,14 @@ class _Recorder:
     async def record_json(self, *, payload: Mapping[str, Any], **kwargs: object) -> SimpleNamespace:
         self.payloads.append(dict(payload))
         return SimpleNamespace(id=uuid4())
+
+
+class _TestConfinedRunner(LocalCommandRunner):
+    """Explicit test-only shim for deterministic fake-binary executions."""
+
+    @property
+    def filesystem_confined(self) -> bool:
+        return True
 
 
 def _fake_mwcp(
@@ -137,7 +146,7 @@ async def test_mwcp_runs_only_allowlisted_parser_and_normalizes_typed_config(
     )
     service = LocalCommandService(
         _Samples(sample),  # type: ignore[arg-type]
-        LocalCommandRunner(require_filesystem_confinement=False),
+        _TestConfinedRunner(require_filesystem_confinement=False),
         catalog,
         enabled=True,
     )
@@ -206,7 +215,7 @@ async def test_mwcp_rejects_parser_outside_operator_allowlist_before_execution(
     )
     service = LocalCommandService(
         _Samples(sample),  # type: ignore[arg-type]
-        LocalCommandRunner(require_filesystem_confinement=False),
+        _TestConfinedRunner(require_filesystem_confinement=False),
         catalog,
         enabled=True,
     )
@@ -249,7 +258,7 @@ async def test_mwcp_empty_extraction_states_configuration_absence_is_unproven(
     )
     service = LocalCommandService(
         _Samples(sample),  # type: ignore[arg-type]
-        LocalCommandRunner(require_filesystem_confinement=False),
+        _TestConfinedRunner(require_filesystem_confinement=False),
         catalog,
         enabled=True,
     )
@@ -275,6 +284,23 @@ async def test_mwcp_empty_extraction_states_configuration_absence_is_unproven(
     )
 
 
+def test_mwcp_field_truncation_is_marked_and_counted() -> None:
+    values, indicators, truncated = _normalize_configuration(
+        {"configuration": {"payload": "x" * 5_000, "server": "c" * 2_200}}
+    )
+
+    assert truncated is True
+    assert indicators == ()
+    payload_value = next(item for item in values if item.key == "payload")
+    server_value = next(item for item in values if item.key == "server")
+    assert payload_value.truncated_fields == ("value",)
+    assert server_value.truncated_fields == ("network_indicator",)
+    serialized = _configuration_value_json(payload_value)
+    assert serialized["truncated_fields"] == ["value"]
+    assert serialized["truncated"] is True
+    assert sum(len(item.truncated_fields) for item in values) == 2
+
+
 @pytest.mark.asyncio
 async def test_mwcp_binary_absence_is_capability_unavailable_not_failure() -> None:
     sample = b"safe"
@@ -286,7 +312,7 @@ async def test_mwcp_binary_absence_is_capability_unavailable_not_failure() -> No
     )
     service = LocalCommandService(
         _Samples(sample),  # type: ignore[arg-type]
-        LocalCommandRunner(require_filesystem_confinement=False),
+        _TestConfinedRunner(require_filesystem_confinement=False),
         catalog,
         enabled=True,
     )
@@ -298,3 +324,37 @@ async def test_mwcp_binary_absence_is_capability_unavailable_not_failure() -> No
     )
     result = await port.extract(sample_sha256, parser_id="allowed.parser")
     assert result.status.value == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_mwcp_is_unavailable_without_filesystem_confinement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sample = b"safe fixture"
+    sample_sha256 = hashlib.sha256(sample).hexdigest()
+    marker = tmp_path / "parser-executed"
+    binary = _fake_mwcp(tmp_path / "mwcp", '{"configuration":{}}', marker)
+    monkeypatch.setattr(local_runner_module, "_detect_network_namespace", lambda *_args: None)
+    parser_versions = {"allowed.parser": "1.0"}
+    catalog = LocalCommandCatalog(
+        specs=extraction_command_specs(mwcp_parser_ids=tuple(parser_versions)),
+        which=lambda _name: str(binary),
+    )
+    service = LocalCommandService(
+        _Samples(sample),
+        LocalCommandRunner(require_filesystem_confinement=False),
+        catalog,
+        enabled=True,
+    )
+    port = MwcpAdapter(service, catalog, parser_versions=parser_versions, enabled=True)
+
+    assert not port.available
+    assert port.unavailable_reason == "filesystem_confinement_required"
+    assert MWCP_TOOL not in extraction_tool_capabilities(
+        floss=None, configuration=port, report_import_enabled=False
+    )
+    result = await port.extract(sample_sha256, parser_id="allowed.parser")
+
+    assert result.status.value == "unavailable"
+    assert result.detail_code == "filesystem_confinement_required"
+    assert not marker.exists()

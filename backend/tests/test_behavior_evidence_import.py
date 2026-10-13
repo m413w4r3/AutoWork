@@ -16,6 +16,7 @@ from cti_app.application.behavior_report_import import (
 )
 from cti_app.application.investigation_extraction_tools import (
     SANDBOX_REPORT_IMPORT_TOOL,
+    _behavior_json,
     extraction_tool_capabilities,
     register_extraction_tools,
 )
@@ -223,6 +224,32 @@ def test_report_rejects_missing_or_mismatched_source_hash_and_size_limit() -> No
             source=BehaviorEvidenceSource.OPERATOR,
             expected_sample_sha256="3" * 64,
         )
+
+
+def test_report_field_truncations_are_marked_counted_and_limit_result() -> None:
+    sample_sha256 = "c" * 64
+    report = {
+        "sample_sha256": sample_sha256,
+        "process_tree": [{"pid": 4, "command_line": "p" * 600}],
+        "dropped_files": [{"path": "d" * 600}],
+        "behaviors": [{"description": "b" * 1_200}],
+    }
+
+    evidence = BehaviorReportImporter().parse(
+        json.dumps(report),
+        source=BehaviorEvidenceSource.OPERATOR,
+        expected_sample_sha256=sample_sha256,
+    )
+    normalized = _behavior_json(evidence)
+
+    assert evidence.truncated is True
+    assert evidence.processes[0].truncated_fields == ("command_line",)
+    assert evidence.dropped_files[0].truncated_fields == ("path",)
+    assert evidence.behaviors[0].truncated_fields == ("description",)
+    assert normalized["truncated_field_count"] == 3
+    assert normalized["process_tree"][0]["truncated"] is True
+    assert normalized["dropped_files"][0]["truncated_fields"] == ["path"]
+    assert "see truncation flags" in " ".join(evidence.limitations)
 
 
 def test_report_bounds_collections_and_marks_truncation() -> None:

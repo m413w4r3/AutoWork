@@ -20,6 +20,7 @@ class BehaviorProcessV1:
     command_line: str | None
     started_at: datetime | None
     evidence_path: str
+    truncated_fields: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,6 +29,7 @@ class DroppedFileV1:
     sha256: str | None
     size: int | None
     evidence_path: str
+    truncated_fields: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.sha256 is not None and re.fullmatch(r"[0-9a-f]{64}", self.sha256) is None:
@@ -48,6 +50,7 @@ class NetworkSessionV1:
     started_at: datetime | None
     ended_at: datetime | None
     evidence_paths: tuple[str, ...]
+    truncated_fields: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +60,7 @@ class ObservedBehaviorV1:
     timestamp: datetime | None
     process_id: str | None
     evidence_path: str
+    truncated_fields: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

@@ -94,6 +94,12 @@ class BehaviorReportImporter:
                 (len(behavior_rows), MAX_BEHAVIORS),
             )
         )
+        truncated_field_count = sum(
+            len(item.truncated_fields)
+            for items in (processes, dropped_files, network_sessions, behaviors)
+            for item in items
+        )
+        truncated = truncated or truncated_field_count > 0
         if source is BehaviorEvidenceSource.OPERATOR and not (
             processes or dropped_files or network_sessions or behaviors
         ):
@@ -117,6 +123,11 @@ class BehaviorReportImporter:
                 "Imported events are untrusted and describe only the supplied report and its "
                 "coverage.",
                 "Missing report events do not establish that the behavior did not occur.",
+            )
+            + (
+                ("One or more fields or collections were bounded; see truncation flags.",)
+                if truncated
+                else ()
             ),
         )
 
@@ -243,13 +254,31 @@ def _behavior_rows(
 def _process(item: Mapping[str, Any], path: str) -> BehaviorProcessV1:
     pid = _first_value(item, "pid", "process_id", "id")
     parent = _first_value(item, "ppid", "parent_pid", "parent_process_id", "parent_id")
+    process_id, process_id_truncated = _safe_text_with_truncation(pid, 128)
+    parent_process_id, parent_process_id_truncated = _safe_text_with_truncation(parent, 128)
+    name, name_truncated = _safe_text_with_truncation(
+        _first_value(item, "process_name", "name", "image"), 256
+    )
+    command_line, command_line_truncated = _safe_text_with_truncation(
+        _first_value(item, "command_line", "cmdline", "command"), 512
+    )
     return BehaviorProcessV1(
-        process_id=_safe_scalar(pid) or "unknown",
-        parent_process_id=_safe_scalar(parent),
-        name=_safe_text(_first_value(item, "process_name", "name", "image"), 256),
-        command_line=_safe_text(_first_value(item, "command_line", "cmdline", "command"), 512),
+        process_id=process_id or "unknown",
+        parent_process_id=parent_process_id,
+        name=name,
+        command_line=command_line,
         started_at=_timestamp(_first_value(item, "first_seen", "started_at", "timestamp", "time")),
         evidence_path=path,
+        truncated_fields=tuple(
+            field
+            for field, was_truncated in (
+                ("process_id", process_id_truncated),
+                ("parent_process_id", parent_process_id_truncated),
+                ("name", name_truncated),
+                ("command_line", command_line_truncated),
+            )
+            if was_truncated
+        ),
     )
 
 
@@ -263,11 +292,15 @@ def _dropped_file(item: Mapping[str, Any], path: str) -> DroppedFileV1:
     size = _first_value(item, "size", "filesize", "file_size")
     if isinstance(size, bool) or not isinstance(size, int) or size < 0:
         size = None
+    file_path, path_truncated = _safe_text_with_truncation(
+        _first_value(item, "path", "filepath", "filename", "name"), 512
+    )
     return DroppedFileV1(
-        path=_safe_text(_first_value(item, "path", "filepath", "filename", "name"), 512),
+        path=file_path,
         sha256=digest,
         size=size,
         evidence_path=path,
+        truncated_fields=("path",) if path_truncated else (),
     )
 
 
@@ -282,9 +315,15 @@ def _network_session(item: Mapping[str, Any], paths: tuple[str, ...]) -> Network
     )
     host_value = _first_value(item, "host", "domain", "hostname", "server_name", "dns")
     uri_value = _first_value(item, "uri", "url", "request", "http_url")
-    host, uri = _host_and_uri(host_value, uri_value)
+    host, uri, host_uri_truncated_fields = _host_and_uri(host_value, uri_value)
+    protocol, protocol_truncated = _safe_text_with_truncation(
+        _first_value(item, "protocol", "proto", "transport"), 32
+    )
+    truncated_fields = list(host_uri_truncated_fields)
+    if protocol_truncated:
+        truncated_fields.append("protocol")
     return NetworkSessionV1(
-        protocol=_safe_text(_first_value(item, "protocol", "proto", "transport"), 32),
+        protocol=protocol,
         source_ip=source_ip,
         source_port=_port(_first_value(item, "src_port", "source_port") or source.get("port")),
         destination_ip=destination_ip,
@@ -297,19 +336,35 @@ def _network_session(item: Mapping[str, Any], paths: tuple[str, ...]) -> Network
         started_at=_timestamp(_first_value(item, "first_seen", "started_at", "timestamp", "time")),
         ended_at=_timestamp(_first_value(item, "last_seen", "ended_at", "end_time")),
         evidence_paths=paths,
+        truncated_fields=tuple(truncated_fields),
     )
 
 
 def _behavior(item: Mapping[str, Any], path: str) -> ObservedBehaviorV1:
+    category, category_truncated = _safe_text_with_truncation(
+        _first_value(item, "category", "name", "signature"), 128
+    )
+    description, description_truncated = _safe_text_with_truncation(
+        _first_value(item, "description", "message", "behavior", "summary"), 1_000
+    )
+    process_id, process_id_truncated = _safe_text_with_truncation(
+        _first_value(item, "pid", "process_id"), 128
+    )
     return ObservedBehaviorV1(
-        category=_safe_text(_first_value(item, "category", "name", "signature"), 128) or "observed",
-        description=_safe_text(
-            _first_value(item, "description", "message", "behavior", "summary"), 1_000
-        )
-        or "",
+        category=category or "observed",
+        description=description or "",
         timestamp=_timestamp(_first_value(item, "timestamp", "time", "first_seen")),
-        process_id=_safe_scalar(_first_value(item, "pid", "process_id")),
+        process_id=process_id,
         evidence_path=path,
+        truncated_fields=tuple(
+            field
+            for field, was_truncated in (
+                ("category", category_truncated),
+                ("description", description_truncated),
+                ("process_id", process_id_truncated),
+            )
+            if was_truncated
+        ),
     )
 
 
@@ -328,11 +383,17 @@ def _find_report_timestamp(
     return None
 
 
-def _host_and_uri(host_value: object, uri_value: object) -> tuple[str | None, str | None]:
+def _host_and_uri(
+    host_value: object, uri_value: object
+) -> tuple[str | None, str | None, tuple[str, ...]]:
     host = _normalize_host(host_value) if isinstance(host_value, str) else None
     uri: str | None = None
+    truncated_fields: list[str] = []
     if isinstance(uri_value, str) and uri_value.strip():
-        candidate = uri_value.strip()[:4_000]
+        raw_candidate = uri_value.strip()
+        candidate = raw_candidate[:4_000]
+        if len(raw_candidate) > len(candidate):
+            truncated_fields.append("uri")
         if "://" in candidate:
             try:
                 parsed = urlsplit(candidate)
@@ -349,9 +410,13 @@ def _host_and_uri(host_value: object, uri_value: object) -> tuple[str | None, st
                         uri = urlunsplit(
                             (parsed.scheme.casefold(), netloc, parsed.path or "/", "", "")
                         )
+                        if len(uri) > 1_000 and "uri" not in truncated_fields:
+                            truncated_fields.append("uri")
         else:
-            uri = _safe_text(candidate, 1_000)
-    return host, uri
+            uri, uri_truncated = _safe_text_with_truncation(candidate, 1_000)
+            if uri_truncated and "uri" not in truncated_fields:
+                truncated_fields.append("uri")
+    return host, uri, tuple(truncated_fields)
 
 
 def _normalize_ip(value: object) -> str | None:
@@ -383,13 +448,18 @@ def _normalize_host(value: str) -> str | None:
 
 
 def _safe_text(value: object, maximum: int) -> str | None:
+    return _safe_text_with_truncation(value, maximum)[0]
+
+
+def _safe_text_with_truncation(value: object, maximum: int) -> tuple[str | None, bool]:
     if not isinstance(value, (str, int, float)) or isinstance(value, bool):
-        return None
+        return None, False
+    truncated = len(str(value)) > maximum
     text = sanitize_evidence_text(value, max_chars=maximum)
     text = _HOME_PATH.sub("[home-path-redacted]", text)
     text = _WINDOWS_HOME.sub("[home-path-redacted]", text)
     text = _ENV_ASSIGNMENT.sub(r"\1=[redacted]", text)
-    return text or None
+    return text or None, truncated
 
 
 def _timestamp(value: object) -> datetime | None:

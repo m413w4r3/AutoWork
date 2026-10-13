@@ -24,6 +24,7 @@ class ExtractedString:
     function: str | None = None
     context: str | None = None
     evidence_path: str | None = None
+    truncated_fields: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.value:

@@ -138,7 +138,11 @@ class LocalCommandCatalog:
         executable = self._which(spec.binary)
         if not executable:
             return LocalCommandCapability(spec, None, None)
-        version = _read_executable_version(str(executable), self._version_timeout_seconds)
+        version = (
+            "unverified"
+            if spec.requires_filesystem_confinement
+            else _read_executable_version(str(executable), self._version_timeout_seconds)
+        )
         if version is None:
             return LocalCommandCapability(spec, None, None)
         return LocalCommandCapability(spec, str(executable), version)
@@ -196,6 +200,13 @@ class LocalCommandService:
                 LocalCommandStatus.UNAVAILABLE,
                 sample_sha256,
                 "local_analysis_disabled",
+            )
+        if capability.spec.requires_filesystem_confinement and not self.filesystem_confined:
+            return _result(
+                normalized_id,
+                LocalCommandStatus.UNAVAILABLE,
+                sample_sha256,
+                "filesystem_confinement_required",
             )
         if not capability.available:
             return _result(
@@ -393,6 +404,7 @@ def extraction_command_specs(
             4 * 1024 * 1024,
             LocalCommandOutputKind.TEXT,
             capture_full_output_hash=True,
+            requires_filesystem_confinement=True,
         )
     ]
     if parser_ids:
@@ -416,6 +428,7 @@ def extraction_command_specs(
                 4 * 1024 * 1024,
                 LocalCommandOutputKind.TEXT,
                 capture_full_output_hash=True,
+                requires_filesystem_confinement=True,
             )
         )
     return tuple(specs)
@@ -507,6 +520,7 @@ def _with_configured_limits(
         file_size_limit_bytes=file_size_limit_bytes or spec.file_size_limit_bytes,
         output_kind=spec.output_kind,
         capture_full_output_hash=spec.capture_full_output_hash,
+        requires_filesystem_confinement=spec.requires_filesystem_confinement,
     )
 
 
