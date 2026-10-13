@@ -901,21 +901,24 @@ class RuleWorkbench:
                     non_comparable=tuple(sorted(corpus_hashes - comparable)),
                 )
             )
-        goodware_result_a = _role_report(report_a, RuleTestCorpusRole.GOODWARE)
-        goodware_result_b = _role_report(report_b, RuleTestCorpusRole.GOODWARE)
-        comparable_goodware = (
-            set(goodware_result_a.matches) | set(goodware_result_a.non_matches)
-        ) & (set(goodware_result_b.matches) | set(goodware_result_b.non_matches))
-        goodware_a = set(goodware_result_a.matches) & comparable_goodware
-        goodware_b = set(goodware_result_b.matches) & comparable_goodware
+        false_positives_a: set[str] = set()
+        false_positives_b: set[str] = set()
+        for negative_role in (RuleTestCorpusRole.GOODWARE, RuleTestCorpusRole.HOLDOUT):
+            result_a = _role_report(report_a, negative_role)
+            result_b = _role_report(report_b, negative_role)
+            comparable = (set(result_a.matches) | set(result_a.non_matches)) & (
+                set(result_b.matches) | set(result_b.non_matches)
+            )
+            false_positives_a.update(set(result_a.matches) & comparable)
+            false_positives_b.update(set(result_b.matches) & comparable)
         return RuleVersionComparison(
             version_a_id=version_a.id,
             version_b_id=version_b.id,
             version_a=version_a.version_label,
             version_b=version_b.version_label,
             roles=tuple(roles),
-            false_positives_added=tuple(sorted(goodware_b - goodware_a)),
-            false_positives_removed=tuple(sorted(goodware_a - goodware_b)),
+            false_positives_added=tuple(sorted(false_positives_b - false_positives_a)),
+            false_positives_removed=tuple(sorted(false_positives_a - false_positives_b)),
             engine_version_a=report_a.engine_version,
             engine_version_b=report_b.engine_version,
         )

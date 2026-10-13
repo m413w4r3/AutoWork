@@ -634,7 +634,57 @@ class _RuleTools:
         if not generated:
             raise _ToolFailed("no_usable_motifs")
         candidate_id = UUID(arguments["candidate_id"]) if arguments.get("candidate_id") else uuid4()
-        if await self.candidates.list_for_candidate(candidate_id):
+        condition = arguments["condition"]
+        meta = cast(Mapping[str, str | int | bool] | None, arguments.get("meta"))
+        all_versions = await self.candidates.list_for_candidate(candidate_id)
+        existing_versions = tuple(
+            item for item in all_versions if item.investigation_id == context.investigation_id
+        )
+        if existing_versions:
+            validation = self.workbench.validate_motifs(generated, meta=meta)
+            if not validation.valid:
+                raise _ToolFailed("motif_validation_failed")
+            if any(not motif.observation_refs for motif in generated):
+                raise _ToolFailed("motifs_require_observation_refs")
+            build = self.workbench.build_rule(generated, condition, meta)
+            if not build.valid or build.source is None:
+                raise _ToolFailed("rule_build_failed")
+            latest = max(existing_versions, key=lambda item: item.version)
+            requested_sha256 = hashlib.sha256(build.source.encode("utf-8")).hexdigest()
+            expected_provenance = tuple(
+                MotifProvenance(
+                    motif=motif.value,
+                    rationale=_serialize_motif(motif),
+                    observation_refs=motif.observation_refs,
+                )
+                for motif in sorted(
+                    generated,
+                    key=lambda item: (item.kind.value, item.value.casefold(), item.provenance_id),
+                )
+            )
+            if (
+                latest.source_sha256 != requested_sha256
+                or latest.motif_provenance != expected_provenance
+            ):
+                raise _ToolFailed("candidate_id_already_exists_with_different_proposal")
+            return (
+                {
+                    "candidate_id": str(latest.candidate_id),
+                    "version_id": str(latest.id),
+                    "version": latest.version_label,
+                    "parent_version_id": (
+                        str(latest.parent_version_id) if latest.parent_version_id else None
+                    ),
+                    "source_sha256": latest.source_sha256,
+                    "candidate_status": latest.status.value,
+                    "evaluation_status": ToolInvocationStatus.SUCCEEDED.value,
+                    "observation_refs": [],
+                    "replayed": True,
+                },
+                ToolInvocationStatus.SUCCEEDED,
+                (),
+            )
+        if all_versions:
             raise _ToolFailed("candidate_id_already_exists")
         corpus = await self._build_corpus(context.investigation_id)
         result = await self._create_version(
@@ -642,8 +692,8 @@ class _RuleTools:
             candidate_id=candidate_id,
             parent=None,
             motifs=generated,
-            condition=arguments["condition"],
-            meta=cast(Mapping[str, str | int | bool] | None, arguments.get("meta")),
+            condition=condition,
+            meta=meta,
             corpus=corpus,
             operation="propose",
         )
@@ -1201,7 +1251,8 @@ def _candidate_status(
         return DetectionCandidateStatus.REJECTED
     positive = _role_for(report, RuleTestCorpusRole.CONFIRMED_POSITIVE)
     goodware = _role_for(report, RuleTestCorpusRole.GOODWARE)
-    if goodware.matches:
+    holdout = _role_for(report, RuleTestCorpusRole.HOLDOUT)
+    if goodware.matches or holdout.matches:
         return DetectionCandidateStatus.REJECTED
     if report.execution_status.value != "ok":
         return DetectionCandidateStatus.CANDIDATE
