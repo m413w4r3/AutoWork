@@ -236,6 +236,21 @@ class Settings(BaseSettings):
     ghidra_decompile_function_path: str = ""
     ghidra_search_path: str = ""
 
+    # Native inspection is opt-in and advertises one closed, read-only catalog.
+    # The REA worker client is supplied by the deployment and must independently
+    # report its confinement guarantees before the adapter becomes available.
+    native_analysis_enabled: bool = False
+    native_analysis_provider: Literal["rea", "ghidra_mcp", "none"] = "none"
+    native_analysis_catalog_version: str = Field(
+        default="autowork-native-read.v1", min_length=1, max_length=128
+    )
+    native_analysis_rea_expected_version: str | None = Field(
+        default=None, min_length=1, max_length=128
+    )
+    native_analysis_timeout_seconds: float = Field(default=30.0, gt=0, le=600)
+    native_analysis_max_response_bytes: int = Field(default=64 * 1024, ge=256, le=2 * 1024 * 1024)
+    native_analysis_max_output_bytes: int = Field(default=32 * 1024, ge=256, le=64 * 1024)
+
     # An investigation's loop budget is read exclusively from here — never
     # from a domain default. Twelve Bridge turns is the product default: three
     # turns is too short for an investigation that may use independent tools.
