@@ -366,12 +366,17 @@ class DiagramRelationType(StrEnum):
     FACTUAL = "factual"
     INFERENCE = "inference"
     COMPARISON = "comparison"
+    PROTOCOL_FACTUAL = "protocol_factual"
+    PROTOCOL_INFERENCE = "protocol_inference"
 
 
 class DiagramProfile(StrEnum):
     FLOW = "flow"
     ARCHITECTURE = "architecture"
     RELATIONSHIP = "relationship"
+    PROTOCOL_SEQUENCE = "protocol_sequence"
+    PROTOCOL_STATE_MACHINE = "protocol_state_machine"
+    PROTOCOL_MESSAGE_FORMAT = "protocol_message_format"
 
 
 class DiagramRelationDirection(StrEnum):
@@ -387,6 +392,10 @@ class DiagramNodeRole(StrEnum):
     DATA_ARTIFACT = "data_artifact"
     TECHNIQUE_STEP = "technique_step"
     UNKNOWN = "unknown"
+    PROTOCOL_PARTICIPANT = "protocol_participant"
+    PROTOCOL_STATE = "protocol_state"
+    PROTOCOL_FIELD = "protocol_field"
+    PROTOCOL_NOTE = "protocol_note"
 
 
 @dataclass(frozen=True, slots=True)
@@ -404,7 +413,17 @@ class DiagramNodeV1:
         object.__setattr__(
             self,
             "evidence_refs",
-            _normalize_evidence_refs(self.evidence_refs, "Diagram node evidence references"),
+            _normalize_evidence_refs(
+                self.evidence_refs,
+                "Diagram node evidence references",
+                required=self.role
+                not in {
+                    DiagramNodeRole.PROTOCOL_PARTICIPANT,
+                    DiagramNodeRole.PROTOCOL_STATE,
+                    DiagramNodeRole.PROTOCOL_FIELD,
+                    DiagramNodeRole.PROTOCOL_NOTE,
+                },
+            ),
         )
 
 
@@ -442,7 +461,15 @@ class DiagramEdgeV1:
         object.__setattr__(
             self,
             "evidence_refs",
-            _normalize_evidence_refs(self.evidence_refs, "Diagram edge evidence references"),
+            _normalize_evidence_refs(
+                self.evidence_refs,
+                "Diagram edge evidence references",
+                required=self.relation_type
+                not in {
+                    DiagramRelationType.PROTOCOL_FACTUAL,
+                    DiagramRelationType.PROTOCOL_INFERENCE,
+                },
+            ),
         )
 
 
@@ -500,9 +527,14 @@ class DiagramSpecV1:
                 not isinstance(value, item_type) for value in values
             ):
                 raise ValueError(f"Diagram {label} must be a tuple of {item_type.__name__}")
-        if len(self.nodes) < 2:
+        protocol_profile = self.profile in {
+            DiagramProfile.PROTOCOL_SEQUENCE,
+            DiagramProfile.PROTOCOL_STATE_MACHINE,
+            DiagramProfile.PROTOCOL_MESSAGE_FORMAT,
+        }
+        if not self.nodes or (len(self.nodes) < 2 and not protocol_profile):
             raise ValueError("Editorial enrichment diagrams require at least two nodes")
-        if not self.edges:
+        if not self.edges and not protocol_profile:
             raise ValueError("Editorial enrichment diagrams require at least one edge")
         node_ids = [node.node_id for node in self.nodes]
         if len(node_ids) != len(set(node_ids)):

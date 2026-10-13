@@ -59,7 +59,7 @@ def _render_data(*, required_title: bool = True, media: bool = False) -> dict[st
         "blocks": [],
     }
     result: dict[str, object] = {
-        "schema_version": "typst-publication-model-v20-block-location",
+        "schema_version": "typst-publication-model-v21-protocol-figure-pins",
         "language": "fr",
         "content_sections": [references, section],
     }
@@ -483,7 +483,7 @@ async def test_http_routes_return_typed_not_found_without_compiler_or_model_call
     assert file_content.status_code == 200
     assert file_content.json()["content"] == '#import "helpers.typ"\n'
     assert selected_data.json()["schema_version"] == "render-data-inspection-v1"
-    assert selected_data.json()["schema"] == "typst-publication-model-v20-block-location"
+    assert selected_data.json()["schema"] == "typst-publication-model-v21-protocol-figure-pins"
     assert selected_data.json()["selection"] == {"pointer": "/title", "value": "Sujet d'essai"}
     assert diagnostics.status_code == 200
     assert counters.calls == 0

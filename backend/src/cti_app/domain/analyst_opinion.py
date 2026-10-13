@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
+from typing import Any
 from uuid import UUID, uuid4
 
 from cti_app.domain.investigation import (
@@ -15,6 +16,7 @@ from cti_app.domain.investigation import (
     InvestigationFinding,
     canonical_json_bytes,
 )
+from cti_app.domain.protocol_model import ProtocolDiagramKind
 
 
 class OpinionBlockType(StrEnum):
@@ -71,6 +73,81 @@ class OpinionBlock:
 
 
 @dataclass(frozen=True, slots=True)
+class OpinionProtocolFigureV1:
+    """A version-pinned protocol view attached to the exact opinion content."""
+
+    kind: ProtocolDiagramKind
+    model_sha256: str
+    spec_sha256: str
+    asset_id: UUID
+    asset_sha256: str
+    preview_sha256: str
+    pin_sha256: str
+    compiler_name: str
+    compiler_version: str
+    compiler_policy_version: str
+    caption: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, ProtocolDiagramKind):
+            raise TypeError("Protocol figure kind must use ProtocolDiagramKind")
+        for name in ("model_sha256", "spec_sha256", "asset_sha256", "preview_sha256", "pin_sha256"):
+            _validate_sha256(getattr(self, name), name)
+        if not isinstance(self.asset_id, UUID):
+            raise ValueError("Protocol figure asset identity must be a UUID")
+        for name in ("compiler_name", "compiler_version", "compiler_policy_version", "caption"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"Protocol figure {name} must be non-empty text")
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "kind": self.kind.value,
+            "model_sha256": self.model_sha256,
+            "spec_sha256": self.spec_sha256,
+            "asset_id": str(self.asset_id),
+            "asset_sha256": self.asset_sha256,
+            "preview_sha256": self.preview_sha256,
+            "pin_sha256": self.pin_sha256,
+            "compiler_name": self.compiler_name,
+            "compiler_version": self.compiler_version,
+            "compiler_policy_version": self.compiler_policy_version,
+            "caption": self.caption,
+        }
+
+    @classmethod
+    def from_payload(cls, value: object) -> OpinionProtocolFigureV1:
+        expected = {
+            "kind",
+            "model_sha256",
+            "spec_sha256",
+            "asset_id",
+            "asset_sha256",
+            "preview_sha256",
+            "pin_sha256",
+            "compiler_name",
+            "compiler_version",
+            "compiler_policy_version",
+            "caption",
+        }
+        if not isinstance(value, Mapping) or set(value) != expected:
+            raise ValueError("Protocol figure payload has missing or unknown fields")
+        return cls(
+            kind=ProtocolDiagramKind(_payload_text(value, "kind")),
+            model_sha256=_payload_text(value, "model_sha256"),
+            spec_sha256=_payload_text(value, "spec_sha256"),
+            asset_id=UUID(_payload_text(value, "asset_id")),
+            asset_sha256=_payload_text(value, "asset_sha256"),
+            preview_sha256=_payload_text(value, "preview_sha256"),
+            pin_sha256=_payload_text(value, "pin_sha256"),
+            compiler_name=_payload_text(value, "compiler_name"),
+            compiler_version=_payload_text(value, "compiler_version"),
+            compiler_policy_version=_payload_text(value, "compiler_policy_version"),
+            caption=_payload_text(value, "caption"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class CitationViolation:
     code: CitationViolationCode
     block_type: OpinionBlockType
@@ -89,6 +166,7 @@ class AnalystOpinionV1:
     author_id: str
     status: AnalystOpinionStatus = AnalystOpinionStatus.DRAFT
     unresolved_points: tuple[str, ...] = ()
+    protocol_figures: tuple[OpinionProtocolFigureV1, ...] = ()
     reviewer_id: str | None = None
     id: UUID = field(default_factory=uuid4)
     version: int = 1
@@ -113,6 +191,14 @@ class AnalystOpinionV1:
             raise ValueError("created_at must be timezone-aware")
         object.__setattr__(self, "blocks", tuple(self.blocks))
         object.__setattr__(self, "unresolved_points", tuple(self.unresolved_points))
+        object.__setattr__(self, "protocol_figures", tuple(self.protocol_figures))
+        if any(not isinstance(item, OpinionProtocolFigureV1) for item in self.protocol_figures):
+            raise TypeError("Opinion protocol figures must contain OpinionProtocolFigureV1 values")
+        figure_kinds = tuple(item.kind for item in self.protocol_figures)
+        if figure_kinds and set(figure_kinds) != set(ProtocolDiagramKind):
+            raise ValueError("An opinion must attach all three protocol views together")
+        if len(figure_kinds) != len(set(figure_kinds)):
+            raise ValueError("An opinion must not repeat a protocol figure kind")
         block_types = tuple(block.block_type for block in self.blocks)
         if len(block_types) != len(set(block_types)):
             raise ValueError("An opinion may contain each block type only once")
@@ -127,7 +213,7 @@ class AnalystOpinionV1:
 
     def content_payload(self) -> dict[str, object]:
         """Return the stable JSON projection whose bytes are covered by content_sha256."""
-        return {
+        payload: dict[str, object] = {
             "schema": "analyst-opinion.v1",
             "id": str(self.id),
             "version": self.version,
@@ -153,6 +239,9 @@ class AnalystOpinionV1:
             "status": self.status.value,
             "created_at": self.created_at.isoformat(),
         }
+        if self.protocol_figures:
+            payload["protocol_figures"] = [item.to_payload() for item in self.protocol_figures]
+        return payload
 
     def canonical_bytes(self) -> bytes:
         return canonical_json_bytes(self.content_payload())
@@ -164,6 +253,13 @@ class AnalystOpinionV1:
 def _validate_sha256(value: str, name: str) -> None:
     if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
         raise ValueError(f"{name} must be lowercase SHA-256")
+
+
+def _payload_text(payload: Mapping[str, Any], key: str) -> str:
+    value = payload[key]
+    if not isinstance(value, str):
+        raise ValueError(f"Protocol figure {key} must be text")
+    return value
 
 
 def verify_opinion_citations(
@@ -241,5 +337,6 @@ __all__ = [
     "OpinionBlock",
     "OpinionBlockType",
     "OpinionClaimQualification",
+    "OpinionProtocolFigureV1",
     "verify_opinion_citations",
 ]

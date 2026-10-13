@@ -19,6 +19,7 @@ from xml.etree import ElementTree
 from cti_app.application.diagram_compilation import (
     DIAGRAM_COMPILATION_POLICY_VERSION,
     CompiledDiagram,
+    CompiledDiagramPreview,
     DiagramCompilerOutputInvalidError,
     DiagramCompilerOutputTooLargeError,
     DiagramCompilerProcessError,
@@ -28,6 +29,7 @@ from cti_app.application.diagram_compilation import (
 )
 from cti_app.domain.production_editorial_enrichment import (
     DiagramNodeRole,
+    DiagramProfile,
     DiagramRelationDirection,
     DiagramRelationType,
     DiagramSpecV1,
@@ -92,6 +94,16 @@ _NODE_STROKE_BY_ROLE = {
     DiagramNodeRole.DATA_ARTIFACT: "#52616B",
     DiagramNodeRole.TECHNIQUE_STEP: "#52616B",
     DiagramNodeRole.UNKNOWN: "#667085",
+    DiagramNodeRole.PROTOCOL_PARTICIPANT: "#52616B",
+    DiagramNodeRole.PROTOCOL_STATE: "#52616B",
+    DiagramNodeRole.PROTOCOL_FIELD: "#52616B",
+    DiagramNodeRole.PROTOCOL_NOTE: "#667085",
+}
+_PROTOCOL_STATUS_COLORS = {
+    "OBSERVED": ("#18794E", "#E6F4EC"),
+    "INFERRED": ("#B54708", "#FFF3E0"),
+    "UNRESOLVED": ("#667085", "#F2F4F7"),
+    "CONTRADICTED": ("#B42318", "#FEE4E2"),
 }
 _NODE_FILL = "#FFFFFF"
 _NODE_FONT_SIZE = 12
@@ -212,6 +224,9 @@ def _d2_requires_vertical_layout(node_count: int, labels: Sequence[str]) -> bool
 
 def encode_d2_source(diagram: DiagramSpecV1) -> bytes:
     """Encode the canonical graph using only synthetic D2 identifiers."""
+    if diagram.profile is DiagramProfile.PROTOCOL_SEQUENCE:
+        return _encode_protocol_sequence_source(diagram)
+
     node_references = _node_references(diagram)
     # Treat stored vertical directions from older enrichment versions as derived
     # layout choices. Compact graphs now use the print-safe horizontal default.
@@ -244,14 +259,19 @@ def encode_d2_source(diagram: DiagramSpecV1) -> bytes:
         )
 
     for node in diagram.nodes:
-        stroke = _NODE_STROKE_BY_ROLE[node.role]
+        protocol_status = _protocol_status(node.label) if _is_protocol_profile(diagram) else None
+        stroke, fill = (
+            _PROTOCOL_STATUS_COLORS[protocol_status]
+            if protocol_status is not None
+            else (_NODE_STROKE_BY_ROLE[node.role], _NODE_FILL)
+        )
         label = _wrap_d2_label(node.label, width=node_wrap_width)
         lines.extend(
             (
                 f"{node_references[node.node_id]}: {_escape_d2_label(label)} {{",
                 "  shape: rectangle",
                 "  style: {",
-                f'    fill: "{_NODE_FILL}"',
+                f'    fill: "{fill}"',
                 f'    stroke: "{stroke}"',
                 f'    font-color: "{_DARK_TEXT}"',
                 "    stroke-width: 1",
@@ -278,10 +298,13 @@ def encode_d2_source(diagram: DiagramSpecV1) -> bytes:
         label = _wrap_d2_label(edge.label or "", width=edge_wrap_width)
         if label:
             line += f": {_escape_d2_label(label)}"
+        edge_color = (
+            _protocol_edge_color(edge.label) if _is_protocol_profile(diagram) else _EDGE_COLOR
+        )
         edge_lines = [
             line + " {",
             "  style: {",
-            f'    stroke: "{_EDGE_COLOR}"',
+            f'    stroke: "{edge_color}"',
             "    stroke-width: 1",
             f"    font-size: {edge_font_size}",
             f'    font-color: "{_EDGE_COLOR}"',
@@ -289,9 +312,78 @@ def encode_d2_source(diagram: DiagramSpecV1) -> bytes:
         ]
         if edge.relation_type is DiagramRelationType.INFERENCE:
             edge_lines.append("    stroke-dash: 5")
+        elif _is_protocol_profile(diagram) and _protocol_status(edge.label or "") in {
+            "INFERRED",
+            "UNRESOLVED",
+            "CONTRADICTED",
+        }:
+            edge_lines.append("    stroke-dash: 5")
         edge_lines.extend(("  }", "}"))
         lines.extend(edge_lines)
 
+    return ("\n".join(lines) + "\n").encode(D2_SOURCE_ENCODING)
+
+
+def _is_protocol_profile(diagram: DiagramSpecV1) -> bool:
+    return diagram.profile in {
+        DiagramProfile.PROTOCOL_SEQUENCE,
+        DiagramProfile.PROTOCOL_STATE_MACHINE,
+        DiagramProfile.PROTOCOL_MESSAGE_FORMAT,
+    }
+
+
+def _protocol_status(label: str) -> str | None:
+    prefix = label.partition(" · ")[0].strip().strip("[]").upper()
+    return prefix if prefix in _PROTOCOL_STATUS_COLORS else None
+
+
+def _protocol_edge_color(label: str | None) -> str:
+    status = _protocol_status(label or "")
+    return _PROTOCOL_STATUS_COLORS[status][0] if status is not None else _EDGE_COLOR
+
+
+def _encode_protocol_sequence_source(diagram: DiagramSpecV1) -> bytes:
+    """Use D2's sequence diagram shape with synthetic identifiers and quoted labels."""
+    node_references = _node_references(diagram)
+    lines = ["shape: sequence_diagram"]
+    for node in diagram.nodes:
+        status = _protocol_status(node.label)
+        stroke, fill = (
+            _PROTOCOL_STATUS_COLORS[status]
+            if status is not None
+            else (_NODE_STROKE_BY_ROLE[node.role], _NODE_FILL)
+        )
+        lines.extend(
+            (
+                f"{node_references[node.node_id]}: {_escape_d2_label(node.label)} {{",
+                "  style: {",
+                f'    stroke: "{stroke}"',
+                f'    fill: "{fill}"',
+                "  }",
+                "}",
+            )
+        )
+    for edge in diagram.edges:
+        line = (
+            f"{node_references[edge.source_node_id]} -> "
+            f"{node_references[edge.target_node_id]}: "
+            f"{_escape_d2_label(edge.label or '')}"
+        )
+        status = _protocol_status(edge.label or "")
+        edge_color = _PROTOCOL_STATUS_COLORS[status][0] if status is not None else _EDGE_COLOR
+        lines.extend(
+            (
+                line + " {",
+                "  style: {",
+                f'    stroke: "{edge_color}"',
+                "    stroke-width: 1",
+                "    stroke-dash: 5"
+                if status in {"INFERRED", "UNRESOLVED", "CONTRADICTED"}
+                else "    stroke-dash: 0",
+                "  }",
+                "}",
+            )
+        )
     return ("\n".join(lines) + "\n").encode(D2_SOURCE_ENCODING)
 
 
@@ -713,6 +805,42 @@ class D2DiagramCompiler:
             media_type=D2_MEDIA_TYPE,
             media_bytes=rendered_svg,
             media_sha256=hashlib.sha256(rendered_svg).hexdigest(),
+            compiler=D2_COMPILER,
+            compiler_version=D2_COMPILER_VERSION,
+            compiler_policy_version=DIAGRAM_COMPILATION_POLICY_VERSION,
+        )
+
+    async def compile_preview(self, diagram: DiagramSpecV1) -> CompiledDiagramPreview:
+        source_bytes = encode_d2_source(diagram)
+        source_sha256 = hashlib.sha256(source_bytes).hexdigest()
+        await self._verify_version()
+        result = await self._runner.run(
+            (
+                self._binary,
+                f"--layout={D2_LAYOUT}",
+                *D2_LAYOUT_OPTIONS,
+                f"--timeout={D2_COMPILATION_TIMEOUT_SECONDS}",
+                "--omit-version",
+                f"--salt={source_sha256}",
+                "--stdout-format=png",
+                "-",
+                "-",
+            ),
+            stdin=source_bytes,
+            environment=d2_process_environment(),
+            timeout_seconds=float(D2_COMPILATION_TIMEOUT_SECONDS),
+            stdout_limit=D2_MAX_STDOUT_BYTES,
+            stderr_limit=D2_MAX_STDERR_BYTES,
+        )
+        _raise_process_failure(result)
+        if not result.stdout.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise DiagramCompilerOutputInvalidError("D2 preview output is not a PNG image")
+        return CompiledDiagramPreview(
+            diagram_key=diagram.key,
+            source_sha256=source_sha256,
+            media_type="image/png",
+            media_bytes=result.stdout,
+            media_sha256=hashlib.sha256(result.stdout).hexdigest(),
             compiler=D2_COMPILER,
             compiler_version=D2_COMPILER_VERSION,
             compiler_policy_version=DIAGRAM_COMPILATION_POLICY_VERSION,

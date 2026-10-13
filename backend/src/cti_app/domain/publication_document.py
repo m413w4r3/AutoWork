@@ -18,6 +18,7 @@ from cti_app.domain.analyst_opinion import (
     OpinionBlock,
     OpinionBlockType,
     OpinionClaimQualification,
+    OpinionProtocolFigureV1,
 )
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.media_assets import SUPPORTED_MEDIA_MIME_TYPES
@@ -1517,11 +1518,13 @@ class PublicationAnalystOpinionSectionV1:
     content_sha256: str
     blocks: tuple[PublicationAnalystOpinionBlockV1, ...]
     unresolved_points: tuple[str, ...] = ()
+    protocol_figures: tuple[OpinionProtocolFigureV1, ...] = ()
 
     def __post_init__(self) -> None:
         validate_sha256(self.content_sha256, "V6 opinion content SHA-256")
         object.__setattr__(self, "blocks", tuple(self.blocks))
         object.__setattr__(self, "unresolved_points", tuple(self.unresolved_points))
+        object.__setattr__(self, "protocol_figures", tuple(self.protocol_figures))
         if (
             not isinstance(self.opinion_id, UUID)
             or isinstance(self.opinion_version, bool)
@@ -1534,6 +1537,14 @@ class PublicationAnalystOpinionSectionV1:
         if not self.blocks:
             raise PublicationDocumentV6ValidationError(PublicationDocumentV6ErrorCode.OPINION_EMPTY)
         if any(not isinstance(block, PublicationAnalystOpinionBlockV1) for block in self.blocks):
+            raise PublicationDocumentV6ValidationError(
+                PublicationDocumentV6ErrorCode.OPINION_INVALID
+            )
+        if any(not isinstance(item, OpinionProtocolFigureV1) for item in self.protocol_figures):
+            raise PublicationDocumentV6ValidationError(
+                PublicationDocumentV6ErrorCode.OPINION_INVALID
+            )
+        if len({item.kind for item in self.protocol_figures}) != len(self.protocol_figures):
             raise PublicationDocumentV6ValidationError(
                 PublicationDocumentV6ErrorCode.OPINION_INVALID
             )
@@ -1611,6 +1622,7 @@ class PublicationDocumentV6:
             or section.opinion_id != opinion.id
             or section.opinion_version != opinion.version
             or section.content_sha256 != opinion.content_sha256
+            or section.protocol_figures != opinion.protocol_figures
             or not opinion.renderable_blocks
         ):
             code = (
@@ -1811,6 +1823,8 @@ def _analyst_opinion_from_json(raw: Any) -> AnalystOpinionV1:
             "content_sha256",
         }
     )
+    if isinstance(raw, Mapping) and "protocol_figures" in raw:
+        fields = fields | {"protocol_figures"}
     item = json_object(raw, fields, "AnalystOpinionV1")
     if item["schema"] != "analyst-opinion.v1":
         raise ValueError("AnalystOpinionV1 schema is unsupported")
@@ -1869,6 +1883,12 @@ def _analyst_opinion_from_json(raw: Any) -> AnalystOpinionV1:
             ),
             blocks=tuple(blocks),
             unresolved_points=unresolved,
+            protocol_figures=tuple(
+                OpinionProtocolFigureV1.from_payload(value)
+                for value in json_array(
+                    item.get("protocol_figures", []), "Opinion protocol figures"
+                )
+            ),
             author_id=json_text(item["author_id"], "Opinion author ID"),
             reviewer_id=json_text(item["reviewer_id"], "Opinion reviewer ID")
             if item["reviewer_id"] is not None
@@ -1886,7 +1906,7 @@ def _analyst_opinion_from_json(raw: Any) -> AnalystOpinionV1:
 def _rendered_opinion_to_json(
     value: PublicationAnalystOpinionSectionV1,
 ) -> dict[str, Any]:
-    return {
+    payload = {
         "opinion_id": str(value.opinion_id),
         "opinion_version": value.opinion_version,
         "content_sha256": value.content_sha256,
@@ -1904,14 +1924,18 @@ def _rendered_opinion_to_json(
         ],
         "unresolved_points": list(value.unresolved_points),
     }
+    if value.protocol_figures:
+        payload["protocol_figures"] = [item.to_payload() for item in value.protocol_figures]
+    return payload
 
 
 def _rendered_opinion_from_json(raw: Any) -> PublicationAnalystOpinionSectionV1:
+    fields = {"opinion_id", "opinion_version", "content_sha256", "blocks", "unresolved_points"}
+    if isinstance(raw, Mapping) and "protocol_figures" in raw:
+        fields.add("protocol_figures")
     item = json_object(
         raw,
-        frozenset(
-            {"opinion_id", "opinion_version", "content_sha256", "blocks", "unresolved_points"}
-        ),
+        frozenset(fields),
         "Rendered analyst opinion",
     )
     blocks: list[PublicationAnalystOpinionBlockV1] = []
@@ -1962,6 +1986,10 @@ def _rendered_opinion_from_json(raw: Any) -> PublicationAnalystOpinionSectionV1:
         unresolved_points=tuple(
             json_text(value, "Rendered unresolved point")
             for value in json_array(item["unresolved_points"], "Rendered unresolved points")
+        ),
+        protocol_figures=tuple(
+            OpinionProtocolFigureV1.from_payload(value)
+            for value in json_array(item.get("protocol_figures", []), "Rendered protocol figures")
         ),
     )
 

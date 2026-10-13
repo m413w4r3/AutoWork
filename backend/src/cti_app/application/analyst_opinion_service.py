@@ -20,6 +20,7 @@ from cti_app.domain.analyst_opinion import (
     OpinionBlock,
     OpinionBlockType,
     OpinionClaimQualification,
+    OpinionProtocolFigureV1,
     verify_opinion_citations,
 )
 from cti_app.domain.editorial import (
@@ -168,12 +169,17 @@ class OpinionCompositionSelection:
 class OpinionRevisionEdits:
     blocks: tuple[OpinionBlock, ...]
     unresolved_points: tuple[str, ...] = ()
+    protocol_figures: tuple[OpinionProtocolFigureV1, ...] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "blocks", tuple(self.blocks))
         object.__setattr__(self, "unresolved_points", tuple(self.unresolved_points))
         if any(not isinstance(item, OpinionBlock) for item in self.blocks):
             raise TypeError("Opinion edits must contain OpinionBlock values")
+        if self.protocol_figures is not None:
+            object.__setattr__(self, "protocol_figures", tuple(self.protocol_figures))
+            if any(not isinstance(item, OpinionProtocolFigureV1) for item in self.protocol_figures):
+                raise TypeError("Opinion edits must contain OpinionProtocolFigureV1 values")
 
 
 @dataclass(frozen=True, slots=True)
@@ -278,6 +284,7 @@ class AnalystOpinionService:
                 base_publication_sha256=base_sha256,
                 blocks=blocks,
                 unresolved_points=unresolved,
+                protocol_figures=current.protocol_figures if current is not None else (),
                 author_id=current.author_id if current is not None else self._author_id,
                 status=AnalystOpinionStatus.DRAFT,
             )
@@ -285,6 +292,7 @@ class AnalystOpinionService:
                 current.status is AnalystOpinionStatus.DRAFT
                 and current.blocks == opinion.blocks
                 and current.unresolved_points == opinion.unresolved_points
+                and current.protocol_figures == opinion.protocol_figures
             ):
                 return current
             violations = verify_opinion_citations(opinion, findings, observations)
@@ -320,6 +328,12 @@ class AnalystOpinionService:
                     and replay.author_id == actor_id
                     and replay.blocks == revision.blocks
                     and replay.unresolved_points == revision.unresolved_points
+                    and replay.protocol_figures
+                    == (
+                        revision.protocol_figures
+                        if revision.protocol_figures is not None
+                        else current.protocol_figures
+                    )
                 ):
                     return replay
                 raise OpinionError(OpinionErrorCode.STALE_VERSION)
@@ -335,6 +349,11 @@ class AnalystOpinionService:
                 base_publication_sha256=current.base_publication_sha256,
                 blocks=revision.blocks,
                 unresolved_points=revision.unresolved_points,
+                protocol_figures=(
+                    revision.protocol_figures
+                    if revision.protocol_figures is not None
+                    else current.protocol_figures
+                ),
                 author_id=actor_id,
                 status=AnalystOpinionStatus.DRAFT,
             )
@@ -352,6 +371,7 @@ class AnalystOpinionService:
                     and concurrent.author_id == actor_id
                     and concurrent.blocks == candidate.blocks
                     and concurrent.unresolved_points == candidate.unresolved_points
+                    and concurrent.protocol_figures == candidate.protocol_figures
                 ):
                     return concurrent
                 if type(exc).__name__ in {"VersionConflictError", "IntegrityError"}:
@@ -398,6 +418,7 @@ class AnalystOpinionService:
                 base_publication_sha256=reviewed.base_publication_sha256,
                 blocks=reviewed.blocks,
                 unresolved_points=reviewed.unresolved_points,
+                protocol_figures=reviewed.protocol_figures,
                 author_id=reviewed.author_id,
                 reviewer_id=actor_id,
                 status=AnalystOpinionStatus.APPROVED,
@@ -470,6 +491,7 @@ class AnalystOpinionService:
                 base_publication_sha256=reviewed.base_publication_sha256,
                 blocks=reviewed.blocks,
                 unresolved_points=reviewed.unresolved_points,
+                protocol_figures=reviewed.protocol_figures,
                 author_id=reviewed.author_id,
                 reviewer_id=actor_id,
                 status=AnalystOpinionStatus.REJECTED,
@@ -884,6 +906,7 @@ class AnalystOpinionService:
             and left.base_publication_sha256 == right.base_publication_sha256
             and left.blocks == right.blocks
             and left.unresolved_points == right.unresolved_points
+            and left.protocol_figures == right.protocol_figures
             and left.author_id == right.author_id
         )
 

@@ -52,6 +52,34 @@ class CompiledDiagram:
         _validate_bytes_hash(self.media_bytes, self.media_sha256, "media")
 
 
+@dataclass(frozen=True, slots=True)
+class CompiledDiagramPreview:
+    diagram_key: str
+    source_sha256: str
+    media_type: str
+    media_bytes: bytes
+    media_sha256: str
+    compiler: str
+    compiler_version: str
+    compiler_policy_version: str
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "diagram_key",
+            "source_sha256",
+            "media_type",
+            "compiler",
+            "compiler_version",
+            "compiler_policy_version",
+        ):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{field_name} must be non-empty text")
+        _validate_bytes_hash(self.media_bytes, self.media_sha256, "preview media")
+        if self.media_type != "image/png":
+            raise ValueError("Diagram previews must use PNG media")
+
+
 class DiagramCompiler(Protocol):
     async def compile(self, diagram: DiagramSpecV1) -> CompiledDiagram: ...
 
