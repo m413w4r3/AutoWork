@@ -3,6 +3,7 @@ import logging
 from pathlib import Path
 from uuid import uuid4
 
+import httpx
 import pytest
 from fastapi import FastAPI, Request
 from httpx import ASGITransport, AsyncClient
@@ -12,6 +13,7 @@ from cti_app.logging import (
     CorrelationIdMiddleware,
     JsonFormatter,
     configure_logging,
+    request_query_parameter_names,
     reset_correlation_id,
     set_correlation_id,
 )
@@ -36,6 +38,7 @@ def test_configure_logging_preserves_external_handlers_and_is_idempotent(
     root_logger = logging.getLogger()
     original_handlers = root_logger.handlers[:]
     original_level = root_logger.level
+    original_record_factory = logging.getLogRecordFactory()
     names = ("uvicorn", "uvicorn.error", "dramatiq", "uvicorn.access")
     named_loggers = {
         name: (
@@ -97,11 +100,104 @@ def test_configure_logging_preserves_external_handlers_and_is_idempotent(
     finally:
         root_logger.handlers[:] = original_handlers
         root_logger.setLevel(original_level)
+        logging.setLogRecordFactory(original_record_factory)
         for name, (handlers, propagate, disabled) in named_loggers.items():
             named_logger = logging.getLogger(name)
             named_logger.handlers[:] = handlers
             named_logger.propagate = propagate
             named_logger.disabled = disabled
+
+
+def test_httpx_and_httpcore_records_redact_query_urls_and_credentials(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    root_logger = logging.getLogger()
+    original_handlers = root_logger.handlers[:]
+    original_level = root_logger.level
+    original_record_factory = logging.getLogRecordFactory()
+    try:
+        configure_logging("INFO")
+        caplog.set_level(logging.INFO, logger="httpx")
+        caplog.set_level(logging.INFO, logger="httpcore.connection")
+        caplog.set_level(logging.INFO, logger="cti_app.test")
+        logging.getLogger("httpx").info(
+            "HTTP Request: GET %s",
+            httpx.URL("https://vt.example/files?apikey=vt-secret&safe=visible"),
+            extra={
+                "headers": {
+                    "x-apikey": "header-secret",
+                    "Authorization": "Bearer bearer-secret",
+                },
+                "raw_headers": (
+                    (b"x-apikey", b"header-secret"),
+                    (b"authorization", b"Bearer bearer-secret"),
+                ),
+            },
+        )
+        logging.getLogger("httpcore.connection").info(
+            "request %s",
+            "https://download.example/object?X-Amz-Signature=aws-secret"
+            "&X-Goog-Credential=google-secret&Expires=123456",
+        )
+        logging.getLogger("cti_app.test").warning(
+            "application response",
+            extra={"summary": "Authorization: Bearer application-secret"},
+        )
+
+        rendered = "\n".join(
+            record.getMessage()
+            + "".join(
+                str(getattr(record, field, "")) for field in ("headers", "raw_headers", "summary")
+            )
+            for record in caplog.records
+        )
+
+        for secret in (
+            "vt-secret",
+            "header-secret",
+            "bearer-secret",
+            "aws-secret",
+            "google-secret",
+            "123456",
+            "application-secret",
+        ):
+            assert secret not in rendered
+        assert "apikey=[REDACTED]" in rendered
+        assert "safe=visible" in rendered
+        assert "X-Amz-Signature=[REDACTED]" in rendered
+        assert "X-Goog-Credential=[REDACTED]" in rendered
+        assert "Expires=[REDACTED]" in rendered
+    finally:
+        root_logger.handlers[:] = original_handlers
+        root_logger.setLevel(original_level)
+        logging.setLogRecordFactory(original_record_factory)
+
+
+def test_diagnostic_query_helper_keeps_names_without_values() -> None:
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/diagnostics",
+            "query_string": b"token=SECRET&visible=value&token=second-secret",
+        }
+    )
+
+    assert request_query_parameter_names(request) == "token&visible"
+
+
+def test_workers_use_the_shared_logging_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    from cti_app.workers import tasks
+
+    configured_levels: list[str] = []
+    monkeypatch.setattr(tasks, "get_settings", lambda: SimpleNamespace(log_level="DEBUG"))
+    monkeypatch.setattr(tasks, "configure_logging", configured_levels.append)
+
+    tasks._configure_worker_logging()
+
+    assert configured_levels == ["DEBUG"]
 
 
 async def test_an_unhandled_request_failure_reaches_the_diagnostics_trail(tmp_path: Path) -> None:

@@ -11,6 +11,14 @@ def test_workspace_defaults_are_host_explorable() -> None:
     assert settings.edition_workspace_root.as_posix() == "var/workspaces/editions"
 
 
+def test_investigation_global_budget_defaults_are_bounded() -> None:
+    settings = Settings(_env_file=None)
+
+    assert settings.investigation_max_tool_seconds == 3600
+    assert settings.investigation_max_context_bytes == 4_000_000
+    assert settings.investigation_no_progress_limit == 3
+
+
 def test_settings_are_loaded_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("S3_BUCKET", "test-bucket")
     monkeypatch.setenv("READINESS_TIMEOUT_SECONDS", "1.5")
@@ -127,6 +135,36 @@ def test_virustotal_settings_are_optional_and_bounded(monkeypatch: pytest.Monkey
     settings = Settings(_env_file=None)
     assert settings.virustotal_proxy_url is None
     monkeypatch.setenv("VIRUSTOTAL_MAX_PAGE_SIZE", "101")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+def test_local_analysis_and_ghidra_are_disabled_with_bounded_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(_env_file=None)
+    assert settings.local_analysis_enabled is False
+    assert settings.local_analysis_require_filesystem_confinement is False
+    assert settings.local_analysis_timeout_seconds == 30
+    assert settings.local_analysis_max_output_bytes == 1_000_000
+    assert settings.ghidra_enabled is False
+    assert settings.ghidra_base_url == "http://127.0.0.1:8787"
+    assert settings.ghidra_functions_path == ""
+    assert settings.ghidra_search_path == ""
+
+    monkeypatch.setenv("LOCAL_ANALYSIS_ENABLED", "true")
+    monkeypatch.setenv("LOCAL_ANALYSIS_REQUIRE_FILESYSTEM_CONFINEMENT", "true")
+    monkeypatch.setenv("LOCAL_ANALYSIS_CPU_LIMIT_SECONDS", "45")
+    monkeypatch.setenv("GHIDRA_ENABLED", "true")
+    monkeypatch.setenv("GHIDRA_FUNCTIONS_PATH", "/verified/functions")
+    configured = Settings(_env_file=None)
+    assert configured.local_analysis_enabled is True
+    assert configured.local_analysis_require_filesystem_confinement is True
+    assert configured.local_analysis_cpu_limit_seconds == 45
+    assert configured.ghidra_enabled is True
+    assert configured.ghidra_functions_path == "/verified/functions"
+
+    monkeypatch.setenv("GHIDRA_MAX_RESPONSE_BYTES", "0")
     with pytest.raises(ValidationError):
         Settings(_env_file=None)
 

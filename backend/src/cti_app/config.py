@@ -152,6 +152,9 @@ class Settings(BaseSettings):
     # used unless a fallback is explicitly turned on.
     virustotal_proxy_url: str | None = None
     virustotal_file_report_enabled: bool = False
+    virustotal_object_relationships_enabled: bool = False
+    virustotal_intelligence_search_enabled: bool = False
+    virustotal_behaviour_reports_enabled: bool = False
     virustotal_base_url: str = "http://www.virustotal.com/api/v3"
     virustotal_fallback_base_url: str | None = "http://www.virustotal.com/api/v3"
     virustotal_legacy_base_url: str | None = "http://www.virustotal.com/vtapi/v2"
@@ -182,14 +185,70 @@ class Settings(BaseSettings):
     # default: deny-by-default until an operator explicitly configures it.
     virustotal_download_allowed_hosts: str = ""
 
+    # Shodan exposes only passive, indexed observations through this port.
+    # Each capability and the API key are opt-in; their presence never
+    # authorizes active scans or selects any write endpoint.
+    shodan_host_enabled: bool = False
+    shodan_search_enabled: bool = False
+    shodan_domain_enabled: bool = False
+    shodan_count_enabled: bool = False
+    shodan_base_url: str = "https://api.shodan.io"
+    shodan_api_key: SecretStr | None = None
+    shodan_connect_timeout_seconds: float = Field(default=5.0, gt=0, le=60)
+    shodan_read_timeout_seconds: float = Field(default=30.0, gt=0, le=600)
+    shodan_max_response_bytes: int = Field(default=10 * 1024 * 1024, gt=0, le=100 * 1024 * 1024)
+    shodan_max_pages: int = Field(default=10, ge=1, le=100)
+    shodan_max_results: int = Field(default=1000, ge=1, le=100_000)
+
+    # Local analysis is an explicit opt-in. The runner keeps a typed command
+    # catalogue, a minimal environment, resource limits, and network syscall
+    # filtering; these settings only widen its bounded defaults.
+    local_analysis_enabled: bool = False
+    local_analysis_require_filesystem_confinement: bool = False
+    local_analysis_timeout_seconds: float = Field(default=30.0, gt=0, le=600)
+    local_analysis_max_output_bytes: int = Field(default=1_000_000, gt=0, le=20_000_000)
+    local_analysis_cpu_limit_seconds: int = Field(default=30, ge=1, le=600)
+    local_analysis_memory_limit_bytes: int = Field(
+        default=512 * 1024 * 1024, ge=64 * 1024 * 1024, le=4 * 1024 * 1024 * 1024
+    )
+    local_analysis_file_size_limit_bytes: int = Field(
+        default=1 * 1024 * 1024, ge=4096, le=100 * 1024 * 1024
+    )
+    local_analysis_max_sample_bytes: int = Field(
+        default=200 * 1024 * 1024, gt=0, le=2 * 1024 * 1024 * 1024
+    )
+
+    # GhidraMCP's concrete HTTP transport and paths were not locally verifiable
+    # for this lot. Empty paths deliberately keep the adapter unavailable until
+    # a deployer confirms and configures each read endpoint.
+    ghidra_enabled: bool = False
+    ghidra_base_url: str = "http://127.0.0.1:8787"
+    ghidra_connect_timeout_seconds: float = Field(default=3.0, gt=0, le=60)
+    ghidra_read_timeout_seconds: float = Field(default=60.0, gt=0, le=600)
+    ghidra_max_response_bytes: int = Field(default=2 * 1024 * 1024, gt=0, le=20 * 1024 * 1024)
+    ghidra_expected_version: str | None = None
+    ghidra_expected_plugin_version: str | None = None
+    ghidra_allowed_hosts: str = ""
+    ghidra_functions_path: str = ""
+    ghidra_imports_path: str = ""
+    ghidra_xrefs_to_path: str = ""
+    ghidra_xrefs_from_path: str = ""
+    ghidra_decompile_function_path: str = ""
+    ghidra_search_path: str = ""
+
     # An investigation's loop budget is read exclusively from here — never
-    # from a domain default — so the deployed limits are the sole source of
-    # truth for how far an analyst investigation may run.
-    investigation_max_cycles: int = Field(default=3, ge=1, le=100)
+    # from a domain default. Twelve Bridge turns is the product default: three
+    # turns is too short for an investigation that may use independent tools.
+    investigation_max_cycles: int = Field(default=12, ge=1, le=100)
     investigation_max_pivot_runs: int = Field(default=0, ge=0)
     investigation_max_hits_acquired: int = Field(default=0, ge=0)
     investigation_max_new_samples: int = Field(default=0, ge=0)
     investigation_max_vt_read_units: int = Field(default=0, ge=0)
+    investigation_max_shodan_credits: int = Field(default=0, ge=0)
+    investigation_max_tool_seconds: int = Field(default=3600, ge=1)
+    investigation_max_context_bytes: int = Field(default=4_000_000, ge=1)
+    investigation_no_progress_limit: int = Field(default=3, ge=1, le=20)
+    rule_workbench_enabled: bool = False
     analysis_string_min_length: int = Field(default=4, ge=1, le=1024)
     analysis_max_strings: int = Field(default=10_000, ge=1, le=1_000_000)
     analysis_max_sample_bytes: int = Field(default=200 * 1024 * 1024, gt=0)
