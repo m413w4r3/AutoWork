@@ -12,6 +12,7 @@ from cti_app.application.investigation_composition import (
     OptionalInvestigationToolPorts,
     build_investigation_composition,
 )
+from cti_app.application.investigation_network_tools import network_tool_capabilities
 from cti_app.application.investigation_persistence import (
     InMemoryAnalystOpinionRepository,
     InMemoryEvidenceObservationRepository,
@@ -20,8 +21,10 @@ from cti_app.application.investigation_persistence import (
     InMemorySampleAssociationRepository,
     InMemoryToolInvocationRepository,
 )
+from cti_app.application.investigation_protocol_tools import protocol_tool_capabilities
 from cti_app.application.investigation_state import InMemoryInvestigationStateRepository
 from cti_app.application.investigation_tools import ToolExecutionContext
+from cti_app.application.local_analysis import LocalCommandCatalog
 from cti_app.application.sample_similarity import SampleSimilarityService
 from cti_app.application.virustotal import (
     VirusTotalCapabilities,
@@ -31,12 +34,13 @@ from cti_app.application.virustotal import (
 )
 from cti_app.config import Settings
 from cti_app.domain.investigation import InvestigationBudget, ToolInvocationStatus
-from cti_app.domain.native_analysis import NativeAnalysisProvider
+from cti_app.domain.network_protocol import NetworkExtractionLimitsV1
 from cti_app.domain.virustotal import (
     VirusTotalCapability,
     VirusTotalEndpointVariant,
     VirusTotalTransportKind,
 )
+from cti_app.infrastructure.tshark_adapter import TsharkAdapter, network_local_command_specs
 
 
 class _ArticleSnapshots:
@@ -91,12 +95,36 @@ class _RetrohuntProvider:
         raise AssertionError("composition tests do not contact a provider")
 
 
-class _NativePort:
-    provider = NativeAnalysisProvider.REA
+class _ConfinedReaRunner:
     available = True
+    worker_confined = True
+    dedicated_user = True
+    network_disabled = True
+    filesystem_confined = True
+    no_host_privileges = True
 
-    async def inspect(self, _request):
+    async def inspect(self, _request, *, timeout_seconds: float, max_response_bytes: int):
+        del timeout_seconds, max_response_bytes
         raise AssertionError("composition tests do not execute native analysis")
+
+
+class _Quarantine:
+    async def read_quarantined_capture(self, _source_reference: str, *, max_bytes: int):
+        del max_bytes
+        raise AssertionError("composition tests do not read captures")
+
+
+def _tshark(*, missing_binary: str | None = None, confined: bool = True) -> TsharkAdapter:
+    limits = NetworkExtractionLimitsV1()
+    catalog = LocalCommandCatalog(
+        specs=network_local_command_specs(limits),
+        which=lambda binary: None if binary == missing_binary else f"/fake/{binary}",
+    )
+    return TsharkAdapter(
+        catalog=catalog,
+        runner=cast(Any, SimpleNamespace(filesystem_confined=confined)),
+        limits=limits,
+    )
 
 
 def _uow():
@@ -135,7 +163,9 @@ def _all_family_ports() -> OptionalInvestigationToolPorts:
         retrohunt_provider=cast(Any, _RetrohuntProvider()),
         vt_capabilities=VirusTotalCapabilities(retrohunt=True),
         vt_routing_policy=_proxy_routing_policy(),
-        native_analysis_rea=cast(Any, _NativePort()),
+        network_quarantine=cast(Any, _Quarantine()),
+        tshark=_tshark(),
+        confined_rea_runner=cast(Any, _ConfinedReaRunner()),
     )
 
 
@@ -145,6 +175,11 @@ def _settings(*, native_enabled: bool = True, provider: str = "rea") -> Settings
         local_analysis_enabled=True,
         native_analysis_enabled=native_enabled,
         native_analysis_provider=provider,
+        native_analysis_rea_expected_version="rea-test",
+        native_analysis_catalog_version="autowork-native-read.v1",
+        native_analysis_timeout_seconds=30,
+        native_analysis_max_response_bytes=64 * 1024,
+        native_analysis_max_output_bytes=32 * 1024,
     )
 
 
@@ -179,6 +214,13 @@ FAMILY_TOOLS = frozenset(
         "vt.retrohunt.submit",
         "vt.retrohunt.status",
         "vt.retrohunt.results",
+        "network.capture.inspect",
+        "network.stream.reassemble",
+        "network.messages.segment",
+        "network.protocol.compare",
+        "network.protocol.hypothesize",
+        "network.protocol.verify",
+        "network.protocol.render",
         "native.inspect",
     }
 )
@@ -193,6 +235,13 @@ FAMILY_CAPABILITIES = frozenset(
         "sample.extract_configuration",
         "sandbox.report.import",
         "vt.retrohunt",
+        "network.capture.inspect",
+        "network.stream.reassemble",
+        "network.messages.segment",
+        "network.protocol.compare",
+        "network.protocol.hypothesize",
+        "network.protocol.verify",
+        "network.protocol.render",
         "native.inspect",
     }
 )
@@ -213,8 +262,9 @@ def test_composition_registers_all_optional_families_with_fake_ports() -> None:
     assert composition.registry.get("sample.extract_configuration", "1") is not None
 
 
-def test_missing_rea_provider_does_not_disable_other_tool_families() -> None:
-    composition = _build(replace(_all_family_ports(), native_analysis_rea=None))
+@pytest.mark.asyncio
+async def test_missing_rea_runner_does_not_disable_other_tool_families() -> None:
+    composition = _build(replace(_all_family_ports(), confined_rea_runner=None))
 
     assert "native.inspect" not in composition.available_tools
     assert {
@@ -223,7 +273,22 @@ def test_missing_rea_provider_does_not_disable_other_tool_families() -> None:
         "sample.extract_obfuscated_strings",
         "vt.retrohunt.status",
     } <= set(composition.available_tools)
+    assert NETWORK_TOOL_NAMES | PROTOCOL_TOOL_NAMES <= set(composition.available_tools)
     assert "native.inspect" not in composition.available_capabilities
+    registration = composition.registry.get("native.inspect", "1")
+    assert registration is not None
+    _definition, adapter = registration
+    result = await adapter.execute(
+        {},
+        ToolExecutionContext(
+            investigation_id=uuid4(),
+            envelope=None,
+            budget=InvestigationBudget(),
+            idempotency_key="missing-rea-runner",
+        ),
+    )
+    assert result.status is ToolInvocationStatus.UNAVAILABLE
+    assert result.message == "rea_runner_not_configured"
 
 
 @pytest.mark.asyncio
@@ -268,16 +333,78 @@ def test_absent_floss_and_mwcp_do_not_disable_report_import_or_other_families() 
     assert "native.inspect" in composition.available_tools
 
 
-def test_native_analysis_flag_is_off_by_default_even_with_rea_port() -> None:
+def test_native_analysis_flag_is_off_by_default_even_with_confined_runner() -> None:
     settings = Settings.model_construct(
         local_analysis_enabled=True,
         native_analysis_provider="rea",
     )
     assert settings.native_analysis_enabled is False
 
-    ports = replace(_all_family_ports(), native_analysis_ghidra_mcp=None)
-    composition = _build(ports, settings=settings)
+    composition = _build(_all_family_ports(), settings=settings)
 
     assert "native.inspect" not in composition.available_tools
     assert "samples.compare" in composition.available_tools
     assert "sample.extract_configuration" in composition.available_tools
+
+
+NETWORK_TOOL_NAMES = frozenset(
+    {
+        "network.capture.inspect",
+        "network.stream.reassemble",
+        "network.messages.segment",
+    }
+)
+PROTOCOL_TOOL_NAMES = frozenset(
+    {
+        "network.protocol.compare",
+        "network.protocol.hypothesize",
+        "network.protocol.verify",
+        "network.protocol.render",
+    }
+)
+
+
+def test_network_and_protocol_capabilities_are_exact() -> None:
+    assert network_tool_capabilities(_tshark()) == NETWORK_TOOL_NAMES
+    assert network_tool_capabilities(_tshark(missing_binary="tshark")) == {
+        "network.stream.reassemble",
+        "network.messages.segment",
+    }
+    assert network_tool_capabilities(_tshark(missing_binary="capinfos")) == {
+        "network.stream.reassemble",
+        "network.messages.segment",
+    }
+    assert network_tool_capabilities(_tshark(confined=False)) == {
+        "network.stream.reassemble",
+        "network.messages.segment",
+    }
+    assert protocol_tool_capabilities() == PROTOCOL_TOOL_NAMES
+
+
+@pytest.mark.parametrize("missing_binary", ["tshark", "capinfos"])
+def test_missing_network_binary_keeps_other_tool_families_available(
+    missing_binary: str,
+) -> None:
+    composition = _build(
+        replace(_all_family_ports(), tshark=_tshark(missing_binary=missing_binary))
+    )
+
+    assert not (NETWORK_TOOL_NAMES | PROTOCOL_TOOL_NAMES).intersection(composition.available_tools)
+    assert "samples.compare" in composition.available_tools
+    assert "native.inspect" in composition.available_tools
+
+
+def test_missing_filesystem_confinement_keeps_other_families_available() -> None:
+    composition = _build(replace(_all_family_ports(), tshark=_tshark(confined=False)))
+
+    assert not (NETWORK_TOOL_NAMES | PROTOCOL_TOOL_NAMES).intersection(composition.available_tools)
+    assert "samples.compare" in composition.available_tools
+    assert "native.inspect" in composition.available_tools
+
+
+def test_protocol_family_is_absent_without_a_network_workbench() -> None:
+    composition = _build(replace(_all_family_ports(), network_quarantine=None))
+
+    assert not (NETWORK_TOOL_NAMES | PROTOCOL_TOOL_NAMES).intersection(composition.available_tools)
+    assert "samples.compare" in composition.available_tools
+    assert "native.inspect" in composition.available_tools

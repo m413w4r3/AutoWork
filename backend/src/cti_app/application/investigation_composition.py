@@ -47,10 +47,19 @@ from cti_app.application.investigation_native_tools import (
     native_tool_capabilities,
     register_native_tools,
 )
+from cti_app.application.investigation_network_tools import (
+    network_tool_capabilities,
+    register_network_tools,
+)
 from cti_app.application.investigation_persistence import (
     EvidenceObservationRepository,
     FindingRepository,
     SampleAssociationRepository,
+)
+from cti_app.application.investigation_protocol_tools import (
+    ProductionProtocolModelStore,
+    protocol_tool_capabilities,
+    register_protocol_tools,
 )
 from cti_app.application.investigation_retrohunt_tools import (
     register_retrohunt_tools,
@@ -99,10 +108,12 @@ from cti_app.application.local_analysis import (
     SampleBytesUnavailableError,
 )
 from cti_app.application.model_conversations import ModelConversationService
-from cti_app.application.native_analysis import (
-    NativeAnalysisPort,
-    NativeAnalysisService,
-    select_native_analysis_port,
+from cti_app.application.native_analysis import NativeAnalysisService
+from cti_app.application.network_protocol_model import NetworkProtocolWorkbench
+from cti_app.application.network_workbench import (
+    NetworkWorkbench,
+    ProductionNetworkCaptureBlobStore,
+    QuarantinedCaptureSource,
 )
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
@@ -132,7 +143,10 @@ from cti_app.application.virustotal import (
 from cti_app.application.virustotal_persistence import VirusTotalObservationService
 from cti_app.config import Settings
 from cti_app.domain.goodware import NonDiscriminantPatternRegistry
+from cti_app.domain.network_protocol import NetworkExtractionLimitsV1
 from cti_app.infrastructure.legitimate_services import load_legitimate_services
+from cti_app.infrastructure.rea_adapter import ReaReadOnlyRunner, build_native_analysis_port
+from cti_app.infrastructure.tshark_adapter import TsharkAdapter
 from cti_app.infrastructure.virustotal import VirusTotalRetrohuntProxyAdapter
 
 LOCAL_READ_CAPABILITY = "investigation.local_read"
@@ -178,6 +192,13 @@ OPTIONAL_TOOL_NAMES = (
     "vt.retrohunt.submit",
     "vt.retrohunt.status",
     "vt.retrohunt.results",
+    "network.capture.inspect",
+    "network.stream.reassemble",
+    "network.messages.segment",
+    "network.protocol.compare",
+    "network.protocol.hypothesize",
+    "network.protocol.verify",
+    "network.protocol.render",
     NATIVE_TOOL_NAME,
 )
 FAMILY_CAPABILITY_KEYS = frozenset(
@@ -188,6 +209,13 @@ FAMILY_CAPABILITY_KEYS = frozenset(
         "sample.extract_configuration",
         "sandbox.report.import",
         RETROHUNT_CAPABILITY,
+        "network.capture.inspect",
+        "network.stream.reassemble",
+        "network.messages.segment",
+        "network.protocol.compare",
+        "network.protocol.hypothesize",
+        "network.protocol.verify",
+        "network.protocol.render",
         NATIVE_TOOL_NAME,
     }
 )
@@ -299,8 +327,9 @@ class InvestigationToolDependencies:
     behavior_report_importer: BehaviorReportImporter | None = None
     retrohunt_provider: VirusTotalRetrohuntPort | None = None
     vt_routing_policy: VirusTotalRoutingPolicy | None = None
-    native_analysis_rea: NativeAnalysisPort | None = None
-    native_analysis_ghidra_mcp: NativeAnalysisPort | None = None
+    network_quarantine: QuarantinedCaptureSource | None = None
+    tshark: TsharkAdapter | None = None
+    confined_rea_runner: ReaReadOnlyRunner | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -330,8 +359,9 @@ class OptionalInvestigationToolPorts:
     behavior_report_importer: BehaviorReportImporter | None = None
     retrohunt_provider: VirusTotalRetrohuntPort | None = None
     vt_routing_policy: VirusTotalRoutingPolicy | None = None
-    native_analysis_rea: NativeAnalysisPort | None = None
-    native_analysis_ghidra_mcp: NativeAnalysisPort | None = None
+    network_quarantine: QuarantinedCaptureSource | None = None
+    tshark: TsharkAdapter | None = None
+    confined_rea_runner: ReaReadOnlyRunner | None = None
 
 
 ToolRegistrar = Callable[[ToolRegistry, InvestigationToolDependencies], None]
@@ -460,6 +490,55 @@ def _register_retrohunt_tool_family(
     enabled.update(retrohunt_tool_capabilities(capabilities, routing_policy, proxy_provider))
 
 
+def _register_network_tool_family(
+    registry: ToolRegistry,
+    *,
+    dependencies: InvestigationToolDependencies,
+    recorder: EvidenceRecorder,
+    enabled: set[str],
+) -> NetworkWorkbench | None:
+    quarantine = dependencies.network_quarantine
+    if quarantine is None:
+        return None
+
+    limits = NetworkExtractionLimitsV1()
+    tshark = dependencies.tshark or TsharkAdapter(limits=limits)
+    if not tshark.available:
+        return None
+
+    workbench = NetworkWorkbench(
+        quarantine=quarantine,
+        blobs=ProductionNetworkCaptureBlobStore(dependencies.artifact_store),
+        tshark=tshark,
+        recorder=recorder,
+        limits=limits,
+    )
+    register_network_tools(registry, workbench=workbench, recorder=recorder)
+    enabled.update(network_tool_capabilities(tshark))
+    return workbench
+
+
+def _register_protocol_tool_family(
+    registry: ToolRegistry,
+    *,
+    workbench: NetworkWorkbench | None,
+    dependencies: InvestigationToolDependencies,
+    recorder: EvidenceRecorder,
+    enabled: set[str],
+) -> None:
+    if workbench is None:
+        return
+
+    protocol_workbench = NetworkProtocolWorkbench(workbench)
+    register_protocol_tools(
+        registry,
+        service=protocol_workbench,
+        recorder=recorder,
+        model_store=ProductionProtocolModelStore(dependencies.artifact_store),
+    )
+    enabled.update(protocol_tool_capabilities())
+
+
 def _register_native_tool_family(
     registry: ToolRegistry,
     *,
@@ -468,11 +547,7 @@ def _register_native_tool_family(
     settings: Settings,
     enabled: set[str],
 ) -> None:
-    port = select_native_analysis_port(
-        settings.native_analysis_provider,
-        rea=dependencies.native_analysis_rea,
-        ghidra_mcp=dependencies.native_analysis_ghidra_mcp,
-    )
+    port = build_native_analysis_port(settings, runner=dependencies.confined_rea_runner)
     service = NativeAnalysisService(
         port,
         timeout_seconds=settings.native_analysis_timeout_seconds,
@@ -602,8 +677,9 @@ def investigation_tool_dependencies_from_settings(
     behavior_report_importer: BehaviorReportImporter | None = None,
     retrohunt_provider: VirusTotalRetrohuntPort | None = None,
     vt_routing_policy: VirusTotalRoutingPolicy | None = None,
-    native_analysis_rea: NativeAnalysisPort | None = None,
-    native_analysis_ghidra_mcp: NativeAnalysisPort | None = None,
+    network_quarantine: QuarantinedCaptureSource | None = None,
+    tshark: TsharkAdapter | None = None,
+    confined_rea_runner: ReaReadOnlyRunner | None = None,
     available_capabilities: frozenset[str] = frozenset(),
 ) -> InvestigationToolDependencies:
     """Apply Settings opt-ins before making optional ports visible to registrars."""
@@ -694,8 +770,9 @@ def investigation_tool_dependencies_from_settings(
         behavior_report_importer=behavior_report_importer,
         retrohunt_provider=retrohunt_provider,
         vt_routing_policy=vt_routing_policy,
-        native_analysis_rea=native_analysis_rea,
-        native_analysis_ghidra_mcp=native_analysis_ghidra_mcp,
+        network_quarantine=network_quarantine,
+        tshark=tshark,
+        confined_rea_runner=confined_rea_runner,
         available_capabilities=frozenset(enabled_capabilities),
     )
 
@@ -796,8 +873,9 @@ def build_investigation_composition(
         behavior_report_importer=supplied("behavior_report_importer"),
         retrohunt_provider=supplied("retrohunt_provider"),
         vt_routing_policy=supplied("vt_routing_policy"),
-        native_analysis_rea=supplied("native_analysis_rea"),
-        native_analysis_ghidra_mcp=supplied("native_analysis_ghidra_mcp"),
+        network_quarantine=supplied("network_quarantine"),
+        tshark=supplied("tshark"),
+        confined_rea_runner=supplied("confined_rea_runner"),
         available_capabilities=ports.available_capabilities
         | (source_dependencies.available_capabilities if source_dependencies else frozenset()),
     )
@@ -1020,6 +1098,19 @@ def build_investigation_composition(
         uow=uow,
         uow_factory=uow_factory,
         artifact_store=artifact_store,
+        dependencies=dependencies,
+        recorder=recorder,
+        enabled=enabled,
+    )
+    network_workbench = _register_network_tool_family(
+        registry,
+        dependencies=dependencies,
+        recorder=recorder,
+        enabled=enabled,
+    )
+    _register_protocol_tool_family(
+        registry,
+        workbench=network_workbench,
         dependencies=dependencies,
         recorder=recorder,
         enabled=enabled,
