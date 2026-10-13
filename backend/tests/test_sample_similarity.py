@@ -36,6 +36,7 @@ from cti_app.domain.sample_similarity import (
     CorpusSnapshot,
     FamilyFeatureClass,
     FeatureRejectionReason,
+    GoodwarePrevalenceStatus,
     SignatureMotifKind,
     SimilarityFeatureKind,
     SimilarityPolicy,
@@ -250,6 +251,8 @@ async def test_masked_function_support_offsets_and_goodware_rejection_are_traced
     assert function.feature_class is FamilyFeatureClass.SUBFAMILY_DISCRIMINANT
     assert function.positive_support == 2
     assert function.positive_sample_count == 3
+    assert function.goodware_occurrence_count is None
+    assert function.to_json()["support"]["goodware_prevalence_status"] == "unmeasured"
     assert function.comparison_exclusive is True
     positive_locations = {
         item.sample_sha256: (item.offsets, item.function_offsets)
@@ -272,10 +275,15 @@ async def test_masked_function_support_offsets_and_goodware_rejection_are_traced
     assert source.source_kind == "code_feature_set"
     assert source.source_id == "e" * 64
     assert "??" in function.value
-    assert any(
-        candidate.motif_kind is SignatureMotifKind.HEX
+    masked_candidate = next(
+        candidate
         for candidate in function.signature_candidates
+        if candidate.motif_kind is SignatureMotifKind.HEX
     )
+    assert masked_candidate.qualified is False
+    assert masked_candidate.goodware_prevalence_status is GoodwarePrevalenceStatus.UNMEASURED
+    assert masked_candidate.goodware_occurrence_count is None
+    assert masked_candidate.to_json()["goodware_prevalence_status"] == "unmeasured"
     goodware_presence = next(
         item for item in function.sample_presence if item.sample_sha256 == _GOODWARE
     )
@@ -305,6 +313,76 @@ async def test_masked_function_support_offsets_and_goodware_rejection_are_traced
         for candidate in wide_feature.signature_candidates
     )
     assert stored.artifact_sha256 == comparison.sha256
+    assert any(
+        "RuleWorkbench/goodware" in item and "L3" in item
+        for item in comparison.recommended_next_tests
+    )
+
+
+@pytest.mark.asyncio
+async def test_missing_selected_pack_keeps_absence_unknown_and_hash_deterministic() -> None:
+    packs = _fixture_packs()
+    del packs[_SAMPLE_C]
+    service = _service(packs)
+
+    first = await service.compare(
+        investigation_id=_INVESTIGATION_ID,
+        sample_sha256s=(_SAMPLE_A, _SAMPLE_B, _SAMPLE_C),
+    )
+    second = await service.compare(
+        investigation_id=_INVESTIGATION_ID,
+        sample_sha256s=(_SAMPLE_A, _SAMPLE_B, _SAMPLE_C),
+    )
+
+    function = first.comparison.feature(_FUNCTION_KEY)
+    assert function is not None
+    assert function.feature_class is FamilyFeatureClass.OPTIONAL
+    missing_presence = next(
+        item for item in function.sample_presence if item.sample_sha256 == _SAMPLE_C
+    )
+    assert missing_presence.present is False
+    assert missing_presence.measured is False
+    limits = first.comparison.limits.to_json()
+    assert _SAMPLE_C in limits["packs_missing"]
+    assert first.comparison.status is SimilarityStatus.PARTIAL_FEATURE_COVERAGE
+    assert first.comparison.sha256 == second.comparison.sha256
+    assert first.artifact_sha256 == second.artifact_sha256
+
+
+@pytest.mark.asyncio
+async def test_feature_value_and_object_truncations_are_counted_with_causes() -> None:
+    packs = _fixture_packs()
+    sample_pack = dict(packs[_SAMPLE_A])
+    raw_features = sample_pack["features"]
+    assert isinstance(raw_features, dict)
+    strings = raw_features["strings"]
+    assert isinstance(strings, list)
+    raw_features["strings"] = [*strings, "x" * 2_100]
+
+    nested: dict[str, object] = {"leaf": "kept"}
+    for index in range(8):
+        nested = {f"level_{index}": nested}
+    raw_features["configuration"] = [
+        {
+            "deep": nested,
+            "fields": {f"field_{index:02d}": "value" for index in range(70)},
+        }
+    ]
+    sample_pack["features"] = raw_features
+    packs[_SAMPLE_A] = sample_pack
+
+    stored = await _service(packs).compare(
+        investigation_id=_INVESTIGATION_ID,
+        sample_sha256s=(_SAMPLE_A, _SAMPLE_B),
+    )
+    losses = {
+        item["cause"]: item["count"]
+        for item in stored.comparison.limits.to_json()["feature_losses"]
+    }
+    assert losses["feature_value_too_long"] == 1
+    assert losses["object_depth_limit"] >= 1
+    assert losses["object_field_limit"] == 6
+    assert stored.comparison.status is SimilarityStatus.PARTIAL_FEATURE_COVERAGE
 
 
 @pytest.mark.asyncio

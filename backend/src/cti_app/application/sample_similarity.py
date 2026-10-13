@@ -18,6 +18,7 @@ from cti_app.domain.sample_similarity import (
     CorpusSnapshot,
     ExtractorVersion,
     FamilyFeatureComparisonV1,
+    FeatureLoss,
     FeatureSource,
     MeasuredFeature,
     SimilarityFeatureKind,
@@ -118,6 +119,7 @@ class SampleSimilarityService:
         sample_inputs: list[SimilaritySampleInput] = []
         missing: list[str] = []
         per_sample_limits: list[str] = []
+        feature_loss_counts: dict[str, int] = {}
         feature_sets_by_sample: dict[str, tuple[MeasuredFeature, ...]] = {}
         for sample_hash in analysis_hashes:
             raw_pack = await self._feature_packs.get_feature_pack(sample_hash)
@@ -134,11 +136,15 @@ class SampleSimilarityService:
             declared_hash = raw_pack.get("sample_sha256")
             if declared_hash is not None and declared_hash != sample_hash:
                 raise SampleSimilarityError("feature pack is bound to another sample SHA-256")
-            features, extractor_versions, packer_markers, was_limited = _extract_pack(
-                raw_pack,
-                sample_sha256=sample_hash,
-                policy=self._policy,
-            )
+            (
+                features,
+                extractor_versions,
+                packer_markers,
+                was_limited,
+                pack_losses,
+            ) = _extract_pack(raw_pack, sample_sha256=sample_hash, policy=self._policy)
+            for cause, count in pack_losses:
+                _increment_loss(feature_loss_counts, cause, count)
             if was_limited:
                 per_sample_limits.append(sample_hash)
             feature_sets_by_sample[sample_hash] = features
@@ -159,6 +165,12 @@ class SampleSimilarityService:
             for feature in sample_features
         )
         if feature_limit_applied:
+            discarded_feature_count = sum(
+                feature.key not in feature_keys
+                for sample_features in feature_sets_by_sample.values()
+                for feature in sample_features
+            )
+            _increment_loss(feature_loss_counts, "maximum_total_features", discarded_feature_count)
             sample_inputs = [
                 replace(
                     item,
@@ -190,6 +202,10 @@ class SampleSimilarityService:
             corpus_sample_limit_applied=corpus_limit_applied,
             feature_limit_applied=feature_limit_applied,
             per_sample_feature_limit_applied=tuple(per_sample_limits),
+            feature_losses=tuple(
+                FeatureLoss(cause=cause, count=count)
+                for cause, count in sorted(feature_loss_counts.items())
+            ),
         )
         comparison = build_family_feature_comparison(
             snapshot=snapshot,
@@ -282,13 +298,20 @@ def _extract_pack(
     *,
     sample_sha256: str,
     policy: SimilarityPolicy,
-) -> tuple[tuple[MeasuredFeature, ...], tuple[ExtractorVersion, ...], tuple[str, ...], bool]:
+) -> tuple[
+    tuple[MeasuredFeature, ...],
+    tuple[ExtractorVersion, ...],
+    tuple[str, ...],
+    bool,
+    tuple[tuple[str, int], ...],
+]:
     root = pack.get("features", pack)
     if not isinstance(root, Mapping):
         raise SampleSimilarityError("feature pack payload must be an object")
     features: list[MeasuredFeature] = []
     versions: list[ExtractorVersion] = []
     packer_markers: set[str] = set()
+    feature_loss_counts: dict[str, int] = {}
     base_version = _text(pack.get("extractor_version", pack.get("tool_version"))) or "unknown"
     base_parameters = _valid_sha256(pack.get("parameters_sha256"))
     base_ruleset = _valid_sha256(pack.get("ruleset_sha256"))
@@ -329,6 +352,8 @@ def _extract_pack(
             feature_encoding = _text(_mapping_value(item, "encoding")) or encoding
             normalized = _normalize_feature_value(kind, feature_value)
             if not normalized or len(normalized) > policy.maximum_feature_value_characters:
+                if len(normalized) > policy.maximum_feature_value_characters:
+                    _increment_loss(feature_loss_counts, "feature_value_too_long")
                 continue
             category = _text(_mapping_value(item, "category", "noise_category"))
             offsets = _offset_value(_mapping_value(item, "offset", "start_offset"))
@@ -505,7 +530,7 @@ def _extract_pack(
             if value is not None:
                 family_values: list[str] = []
                 for item in _as_sequence(value):
-                    text = _family_trait_text(item)
+                    text = _family_trait_text(item, feature_loss_counts)
                     if text is not None:
                         family_values.append(text)
                 add_list(
@@ -558,6 +583,12 @@ def _extract_pack(
 
     ordered = tuple(sorted(set(features), key=_measured_sort_key))
     was_limited = len(ordered) > policy.maximum_features_per_sample
+    if was_limited:
+        _increment_loss(
+            feature_loss_counts,
+            "maximum_features_per_sample",
+            len(ordered) - policy.maximum_features_per_sample,
+        )
     return (
         ordered[: policy.maximum_features_per_sample],
         tuple(
@@ -568,6 +599,7 @@ def _extract_pack(
         ),
         tuple(sorted(packer_markers)),
         was_limited,
+        tuple(sorted(feature_loss_counts.items())),
     )
 
 
@@ -647,10 +679,10 @@ def _feature_text(value: Any, fields: tuple[str, ...]) -> str | None:
     return selected.strip() or None if isinstance(selected, str) else None
 
 
-def _family_trait_text(value: Any) -> str | None:
+def _family_trait_text(value: Any, loss_counts: dict[str, int]) -> str | None:
     if isinstance(value, str):
         return value.strip() or None
-    normalized = _stable_feature_json(value)
+    normalized = _stable_feature_json(value, loss_counts=loss_counts)
     if normalized is None:
         return None
     try:
@@ -665,31 +697,50 @@ def _family_trait_text(value: Any) -> str | None:
         return None
 
 
-def _stable_feature_json(value: Any, *, depth: int = 0) -> Any:
+def _stable_feature_json(
+    value: Any, *, depth: int = 0, loss_counts: dict[str, int] | None = None
+) -> Any:
     if depth > 6:
+        _increment_loss(loss_counts, "object_depth_limit")
         return None
     if value is None or isinstance(value, (str, bool, int)):
         return value
     if isinstance(value, float):
-        return value if value == value and abs(value) != float("inf") else None
+        if value == value and abs(value) != float("inf"):
+            return value
+        _increment_loss(loss_counts, "object_invalid_float")
+        return None
     if isinstance(value, Mapping):
         ignored = {"address", "addresses", "offset", "offsets", "timestamp", "time_seen"}
         result: dict[str, Any] = {}
-        for key in sorted(value, key=str)[:64]:
+        ordered_keys = sorted(value, key=str)
+        if len(ordered_keys) > 64:
+            _increment_loss(loss_counts, "object_field_limit", len(ordered_keys) - 64)
+        for key in ordered_keys[:64]:
             name = str(key)
             if name.casefold() in ignored:
                 continue
-            child = _stable_feature_json(value[key], depth=depth + 1)
+            child = _stable_feature_json(value[key], depth=depth + 1, loss_counts=loss_counts)
             if child is not None:
                 result[name] = child
         return result
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        if len(value) > 64:
+            _increment_loss(loss_counts, "object_sequence_limit", len(value) - 64)
         return [
             child
             for item in value[:64]
-            if (child := _stable_feature_json(item, depth=depth + 1)) is not None
+            if (child := _stable_feature_json(item, depth=depth + 1, loss_counts=loss_counts))
+            is not None
         ]
+    _increment_loss(loss_counts, "object_unsupported_value")
     return None
+
+
+def _increment_loss(loss_counts: dict[str, int] | None, cause: str, count: int = 1) -> None:
+    if loss_counts is None or count <= 0:
+        return
+    loss_counts[cause] = loss_counts.get(cause, 0) + count
 
 
 def _normalize_feature_value(kind: SimilarityFeatureKind, value: str) -> str:

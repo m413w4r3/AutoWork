@@ -70,6 +70,11 @@ class FeatureRejectionReason(StrEnum):
     SIMILARITY_HASH_ONLY = "similarity_hash_is_not_a_family_proof"
 
 
+class GoodwarePrevalenceStatus(StrEnum):
+    MEASURED = "measured"
+    UNMEASURED = "unmeasured"
+
+
 class SignatureMotifKind(StrEnum):
     ASCII = "ascii"
     WIDE = "wide"
@@ -296,6 +301,8 @@ class SignatureCandidate:
     positive_sample_sha256s: tuple[str, ...]
     source_offsets: tuple[SampleFeaturePresence, ...]
     rejection_reasons: tuple[FeatureRejectionReason, ...] = ()
+    goodware_prevalence_status: GoodwarePrevalenceStatus = GoodwarePrevalenceStatus.UNMEASURED
+    goodware_occurrence_count: int | None = None
 
     def __post_init__(self) -> None:
         _validate_sha256(self.feature_key, "feature_key")
@@ -310,6 +317,13 @@ class SignatureCandidate:
         object.__setattr__(
             self, "rejection_reasons", tuple(sorted(set(self.rejection_reasons), key=str))
         )
+        if self.goodware_prevalence_status is GoodwarePrevalenceStatus.MEASURED:
+            if self.goodware_occurrence_count is None:
+                raise ValueError("measured goodware prevalence requires an occurrence count")
+        elif self.goodware_occurrence_count is not None:
+            raise ValueError("unmeasured goodware prevalence cannot have an occurrence count")
+        if self.goodware_occurrence_count is not None and self.goodware_occurrence_count < 0:
+            raise ValueError("goodware occurrence count cannot be negative")
         if self.positive_support != len(self.positive_sample_sha256s):
             raise ValueError("positive_support must match positive_sample_sha256s")
         if self.qualified and self.rejection_reasons:
@@ -325,6 +339,8 @@ class SignatureCandidate:
             "positive_sample_sha256s": list(self.positive_sample_sha256s),
             "source_offsets": [item.to_json() for item in self.source_offsets],
             "rejection_reasons": [item.value for item in self.rejection_reasons],
+            "goodware_prevalence_status": self.goodware_prevalence_status.value,
+            "goodware_occurrence_count": self.goodware_occurrence_count,
         }
 
 
@@ -389,6 +405,11 @@ class FeatureComparison:
                 "corpus": self.corpus_support,
                 "corpus_sample_count": self.corpus_sample_count,
                 "goodware_occurrence_count": self.goodware_occurrence_count,
+                "goodware_prevalence_status": (
+                    GoodwarePrevalenceStatus.MEASURED.value
+                    if self.goodware_occurrence_count is not None
+                    else GoodwarePrevalenceStatus.UNMEASURED.value
+                ),
                 "comparison_exclusive": self.comparison_exclusive,
             },
             "sample_presence": [item.to_json() for item in self.sample_presence],
@@ -426,6 +447,21 @@ class ExtractorVersion:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class FeatureLoss:
+    cause: str
+    count: int
+
+    def __post_init__(self) -> None:
+        if not self.cause.strip():
+            raise ValueError("feature-loss cause is required")
+        if self.count <= 0:
+            raise ValueError("feature-loss count must be positive")
+
+    def to_json(self) -> dict[str, Any]:
+        return {"cause": self.cause, "count": self.count}
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class SimilarityLimits:
     selected_samples: int
     corpus_samples: int
@@ -434,6 +470,7 @@ class SimilarityLimits:
     corpus_sample_limit_applied: bool = False
     feature_limit_applied: bool = False
     per_sample_feature_limit_applied: tuple[str, ...] = ()
+    feature_losses: tuple[FeatureLoss, ...] = ()
 
     def __post_init__(self) -> None:
         if min(self.selected_samples, self.corpus_samples, self.features) < 0:
@@ -443,6 +480,17 @@ class SimilarityLimits:
             self,
             "per_sample_feature_limit_applied",
             tuple(sorted(set(self.per_sample_feature_limit_applied))),
+        )
+        aggregated_losses: dict[str, int] = {}
+        for loss in self.feature_losses:
+            aggregated_losses[loss.cause] = aggregated_losses.get(loss.cause, 0) + loss.count
+        object.__setattr__(
+            self,
+            "feature_losses",
+            tuple(
+                FeatureLoss(cause=cause, count=count)
+                for cause, count in sorted(aggregated_losses.items())
+            ),
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -454,6 +502,7 @@ class SimilarityLimits:
             "corpus_sample_limit_applied": self.corpus_sample_limit_applied,
             "feature_limit_applied": self.feature_limit_applied,
             "per_sample_feature_limit_applied": list(self.per_sample_feature_limit_applied),
+            "feature_losses": [item.to_json() for item in self.feature_losses],
         }
 
 
@@ -552,6 +601,9 @@ def build_family_feature_comparison(
         absent_selected = tuple(
             sample_hash for sample_hash in selected if sample_hash not in per_sample
         )
+        absence_coverage_complete = all(
+            input_by_hash[sample_hash].measured for sample_hash in absent_selected
+        )
         positive_support = len(positive_hashes)
         goodware_count = goodware_occurrences.get(key)
         reasons: set[FeatureRejectionReason] = set()
@@ -636,7 +688,13 @@ def build_family_feature_comparison(
             for sample_hash in absent_selected
         )
         version_divergence = any(len(versions) > 1 for versions in versions_by_kind.values())
-        if absent_selected and (version_divergence or packer_on_missing):
+        if absent_selected and not absence_coverage_complete:
+            rationale.add("Feature absence is unknown because a selected feature pack is missing.")
+        if (
+            absent_selected
+            and absence_coverage_complete
+            and (version_divergence or packer_on_missing)
+        ):
             reasons.add(FeatureRejectionReason.VERSION_OR_PACKING_DIVERGENCE)
             rationale.add("Absence may reflect extractor-version or packing differences.")
 
@@ -648,7 +706,11 @@ def build_family_feature_comparison(
         )
         if contamination:
             feature_class = FamilyFeatureClass.LIBRARY_OR_PACKER_CONTAMINATION
-        elif absent_selected and FeatureRejectionReason.VERSION_OR_PACKING_DIVERGENCE in reasons:
+        elif (
+            absent_selected
+            and absence_coverage_complete
+            and FeatureRejectionReason.VERSION_OR_PACKING_DIVERGENCE in reasons
+        ):
             feature_class = FamilyFeatureClass.EXPLAINED_DIVERGENCE
         elif (
             selected_count >= policy.minimum_positive_support
@@ -663,6 +725,7 @@ def build_family_feature_comparison(
         elif (
             positive_support >= policy.minimum_positive_support
             and positive_support < selected_count
+            and absence_coverage_complete
         ):
             feature_class = FamilyFeatureClass.SUBFAMILY_DISCRIMINANT
         else:
@@ -679,7 +742,9 @@ def build_family_feature_comparison(
         }:
             candidate_reasons.add(FeatureRejectionReason.FAMILY_TRAIT_ONLY)
         candidate_qualified = (
-            not candidate_reasons and positive_support >= policy.minimum_positive_support
+            not candidate_reasons
+            and positive_support >= policy.minimum_positive_support
+            and goodware_count is not None
         )
         presence: list[SampleFeaturePresence] = []
         for sample_hash in snapshot.sample_sha256s:
@@ -716,6 +781,7 @@ def build_family_feature_comparison(
             qualified=candidate_qualified,
             rejection_reasons=tuple(candidate_reasons),
             policy=policy,
+            goodware_occurrence_count=goodware_count,
         )
         features.append(
             FeatureComparison(
@@ -773,6 +839,7 @@ def build_family_feature_comparison(
         or limits.corpus_sample_limit_applied
         or limits.feature_limit_applied
         or limits.per_sample_feature_limit_applied
+        or limits.feature_losses
     ):
         status = SimilarityStatus.PARTIAL_FEATURE_COVERAGE
     else:
@@ -793,8 +860,8 @@ def build_family_feature_comparison(
         )
     if any(item.goodware_occurrence_count is None for item in ranked):
         next_tests.add(
-            "Measure candidate feature prevalence against the investigation's frozen "
-            "goodware baseline."
+            "Measure candidate goodware prevalence through the RuleWorkbench/goodware "
+            "workflow in L3 before qualifying its signature motif."
         )
     if any(item.feature_class is FamilyFeatureClass.EXPLAINED_DIVERGENCE for item in ranked):
         next_tests.add(
@@ -833,6 +900,7 @@ def _signature_candidates(
     qualified: bool,
     rejection_reasons: tuple[FeatureRejectionReason, ...],
     policy: SimilarityPolicy,
+    goodware_occurrence_count: int | None,
 ) -> tuple[SignatureCandidate, ...]:
     excluded_reasons = {
         FeatureRejectionReason.TOO_SHORT,
@@ -876,6 +944,12 @@ def _signature_candidates(
             positive_sample_sha256s=positive_hashes,
             source_offsets=evidence,
             rejection_reasons=rejection_reasons,
+            goodware_prevalence_status=(
+                GoodwarePrevalenceStatus.MEASURED
+                if goodware_occurrence_count is not None
+                else GoodwarePrevalenceStatus.UNMEASURED
+            ),
+            goodware_occurrence_count=goodware_occurrence_count,
         )
         for motif_kind in motif_kinds
     )
@@ -1044,8 +1118,10 @@ __all__ = [
     "FamilyFeatureClass",
     "FamilyFeatureComparisonV1",
     "FeatureComparison",
+    "FeatureLoss",
     "FeatureRejectionReason",
     "FeatureSource",
+    "GoodwarePrevalenceStatus",
     "MeasuredFeature",
     "SampleFeaturePresence",
     "SignatureCandidate",
