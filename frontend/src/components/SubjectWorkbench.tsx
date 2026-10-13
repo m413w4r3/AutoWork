@@ -6,10 +6,12 @@ import { TlpBadge } from "../features/editions/editionPresentation";
 import { ArticleTab } from "../features/subject/ArticleTab";
 import { AssetsTab } from "../features/subject/AssetsTab";
 import { IndicatorsTab } from "../features/subject/IndicatorsTab";
+import { InvestigationTab } from "../features/investigation/InvestigationTab";
 import { PipelineTab } from "../features/subject/PipelineTab";
 import { Link } from "../routing";
 
-type SubjectTab = "article" | "indicators" | "assets" | "pipeline";
+type SubjectTab =
+  "article" | "indicators" | "assets" | "pipeline" | "investigation";
 const REJECTION_ANCHOR = "production-rejections-heading";
 
 const TABS: ReadonlyArray<readonly [SubjectTab, string]> = [
@@ -17,6 +19,7 @@ const TABS: ReadonlyArray<readonly [SubjectTab, string]> = [
   ["indicators", "IOC"],
   ["assets", "Sources et fichiers"],
   ["pipeline", "Pipeline"],
+  ["investigation", "Enquête / Avis de l’analyste"],
 ];
 
 export function SubjectWorkbench({ subjectId }: { subjectId: string }) {
@@ -80,6 +83,12 @@ export function SubjectWorkbench({ subjectId }: { subjectId: string }) {
       {tab === "assets" ? <AssetsTab subjectId={subjectId} /> : null}
       {tab === "pipeline" ? (
         <PipelineTab subjectId={subjectId} editionId={subject.edition_id} />
+      ) : null}
+      {tab === "investigation" ? (
+        <InvestigationTab
+          subjectId={subjectId}
+          editionId={subject.edition_id}
+        />
       ) : null}
     </section>
   );
