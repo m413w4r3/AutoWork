@@ -1086,10 +1086,9 @@ class InvestigationService:
         for proposal in proposals:
             # Hypothesis links are transient annotations for the working state,
             # not part of the finding's persistent evidence identity.
-            proposal_payload = proposal.model_dump(mode="json", exclude={"hypothesis_refs"})
             finding_id = uuid5(
                 _FINDING_NAMESPACE,
-                f"{investigation_id}:{hashlib.sha256(canonical_json_bytes(proposal_payload)).hexdigest()}",
+                f"{investigation_id}:{hashlib.sha256(proposal.persistent_identity_bytes()).hexdigest()}",
             )
             existing = await self._findings.get(finding_id)
             if existing is not None:
@@ -1323,7 +1322,17 @@ class InvestigationService:
         decision: AgentTurnDecisionV1,
         findings: tuple[InvestigationFinding, ...],
     ) -> tuple[Hypothesis, ...]:
-        if not hypotheses or not decision.hypothesis_refs:
+        if not hypotheses:
+            return hypotheses
+        # Proposal links are sufficient to target their hypotheses. Legacy
+        # decisions without either kind of link keep their prior no-op behavior.
+        target_ids = set(decision.hypothesis_refs)
+        target_ids.update(
+            reference
+            for proposal in decision.finding_proposals
+            for reference in proposal.hypothesis_refs
+        )
+        if not target_ids:
             return hypotheses
         # A turn may propose unrelated findings. Never attribute the last
         # finding to every hypothesis mentioned in the decision.
@@ -1339,7 +1348,6 @@ class InvestigationService:
                 linked.setdefault(proposal_hypothesis_ids[0], []).append(finding)
 
         updates = []
-        target_ids = set(decision.hypothesis_refs)
         for hypothesis in hypotheses:
             if hypothesis.id not in target_ids:
                 updates.append(hypothesis)
@@ -1353,7 +1361,7 @@ class InvestigationService:
             elif FindingAssessment.SUPPORTED in assessments:
                 status = HypothesisStatus.SUPPORTED
             elif FindingAssessment.REFUTED in assessments:
-                status = HypothesisStatus.OPEN
+                status = HypothesisStatus.REFUTED
             elif decision.next_action is AgentNextAction.SWITCH_HYPOTHESIS:
                 if not decision.finding_proposals:
                     status = HypothesisStatus.ABANDONED

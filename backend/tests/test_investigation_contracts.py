@@ -21,6 +21,9 @@ from cti_app.application.investigation_contracts import (
 )
 from cti_app.application.investigation_tools import ToolEffect
 from cti_app.domain.investigation import AgentNextAction
+from cti_app.domain.investigation_state import (
+    DecisionValidationCode as DomainDecisionValidationCode,
+)
 
 
 def _source() -> InvestigationSourceV1:
@@ -178,6 +181,7 @@ def test_legacy_decision_json_without_hypothesis_refs_is_readable_and_replayable
 
 
 def test_hypothesis_references_have_stable_typed_rejection_codes() -> None:
+    assert DecisionValidationCode is DomainDecisionValidationCode
     unknown = AgentTurnDecisionV1(
         reasoning_summary="Check an unresolved attribution.",
         goal="Compare the new observation with the attribution hypothesis.",
@@ -214,6 +218,36 @@ def test_hypothesis_references_have_stable_typed_rejection_codes() -> None:
     )
     assert multi_issue is not None
     assert multi_issue.code is DecisionValidationCode.FINDING_LINKS_MULTIPLE_HYPOTHESES
+
+
+def test_duplicate_finding_identity_with_conflicting_links_has_stable_rejection_code() -> None:
+    proposal = {
+        "kind": "claim_verification",
+        "assessment": "inconclusive",
+        "statement": "The evidence remains incomplete.",
+        "observation_refs": [],
+        "claim_refs": [],
+    }
+    linked_a = {**proposal, "hypothesis_refs": ["a"]}
+    linked_b = {**proposal, "hypothesis_refs": ["b"]}
+    decision = parse_agent_turn_decision(
+        {
+            "reasoning_summary": "Keep two hypotheses distinct.",
+            "goal": "Avoid assigning one finding to both hypotheses.",
+            "hypothesis_refs": ["a", "b"],
+            "finding_proposals": [linked_a, linked_b],
+            "next_action": "continue",
+        }
+    )
+
+    assert (
+        decision.finding_proposals[0].persistent_identity_bytes()
+        == decision.finding_proposals[1].persistent_identity_bytes()
+    )
+    issue = validate_decision_hypothesis_references(decision, known_hypothesis_ids={"a", "b"})
+
+    assert issue is not None
+    assert issue.code is DecisionValidationCode.DUPLICATE_FINDING_IDENTITY_CONFLICTING_LINKS
 
 
 def test_context_rejects_signed_urls_and_secret_fields() -> None:

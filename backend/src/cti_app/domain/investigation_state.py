@@ -11,6 +11,12 @@ from uuid import UUID
 from cti_app.domain.investigation import InvestigationAgenda, canonical_json_bytes
 
 
+class DecisionValidationCode(StrEnum):
+    UNKNOWN_HYPOTHESIS_REFERENCE = "unknown_hypothesis_reference"
+    FINDING_LINKS_MULTIPLE_HYPOTHESES = "finding_links_multiple_hypotheses"
+    DUPLICATE_FINDING_IDENTITY_CONFLICTING_LINKS = "duplicate_finding_identity_conflicting_links"
+
+
 class HypothesisStatus(StrEnum):
     OPEN = "open"
     SUPPORTED = "supported"

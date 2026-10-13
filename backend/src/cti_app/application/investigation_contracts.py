@@ -6,7 +6,6 @@ import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from enum import StrEnum
 from typing import Any, ClassVar, Literal
 from uuid import UUID
 
@@ -22,6 +21,7 @@ from cti_app.domain.investigation import (
     NoveltyClass,
     canonical_json_bytes,
 )
+from cti_app.domain.investigation_state import DecisionValidationCode
 
 MAX_CONTEXT_BYTES = 262_144
 MAX_DECISION_BYTES = 131_072
@@ -174,6 +174,10 @@ class FindingProposalV1(_StrictContract):
             raise ValueError("A supported finding proposal must cite an observation")
         return self
 
+    def persistent_identity_bytes(self) -> bytes:
+        """Return the canonical identity payload, excluding hypothesis annotations."""
+        return canonical_json_bytes(self.model_dump(mode="json", exclude={"hypothesis_refs"}))
+
 
 class OpinionBlockDeltaV1(_StrictContract):
     block_type: OpinionBlockType
@@ -223,11 +227,6 @@ class AgentTurnDecisionV1(_StrictContract):
         return cls.model_json_schema()
 
 
-class DecisionValidationCode(StrEnum):
-    UNKNOWN_HYPOTHESIS_REFERENCE = "unknown_hypothesis_reference"
-    FINDING_LINKS_MULTIPLE_HYPOTHESES = "finding_links_multiple_hypotheses"
-
-
 @dataclass(frozen=True, slots=True)
 class DecisionValidationIssue:
     code: DecisionValidationCode
@@ -249,6 +248,16 @@ def validate_decision_hypothesis_references(
         return DecisionValidationIssue(DecisionValidationCode.UNKNOWN_HYPOTHESIS_REFERENCE)
     if any(len(set(proposal.hypothesis_refs)) > 1 for proposal in decision.finding_proposals):
         return DecisionValidationIssue(DecisionValidationCode.FINDING_LINKS_MULTIPLE_HYPOTHESES)
+    links_by_identity: dict[bytes, frozenset[str]] = {}
+    for proposal in decision.finding_proposals:
+        identity = proposal.persistent_identity_bytes()
+        links = frozenset(proposal.hypothesis_refs)
+        previous_links = links_by_identity.get(identity)
+        if previous_links is not None and previous_links != links:
+            return DecisionValidationIssue(
+                DecisionValidationCode.DUPLICATE_FINDING_IDENTITY_CONFLICTING_LINKS
+            )
+        links_by_identity[identity] = links
     return None
 
 

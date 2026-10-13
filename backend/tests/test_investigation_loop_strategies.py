@@ -168,7 +168,7 @@ async def test_two_agent_strategies_choose_distinct_tool_orders_and_draft_findin
     assert b_opinion is not None
     assert b_opinion.renderable_blocks[0].block_type is OpinionBlockType.KEY_FINDINGS
     final_hypothesis = (await fixture_b.states.get(b_state.investigation_id)).hypotheses[0]
-    assert final_hypothesis.status is HypothesisStatus.OPEN
+    assert final_hypothesis.status is HypothesisStatus.REFUTED
 
 
 def test_hypothesis_findings_are_explicitly_linked_not_shared_across_a_turn() -> None:
@@ -219,7 +219,7 @@ def test_hypothesis_findings_are_explicitly_linked_not_shared_across_a_turn() ->
     )
     assert [item.status for item in updated] == [
         HypothesisStatus.SUPPORTED,
-        HypothesisStatus.OPEN,
+        HypothesisStatus.REFUTED,
         HypothesisStatus.OPEN,
     ]
     assert updated[0].evidence_refs == (observation_a,)
@@ -228,6 +228,42 @@ def test_hypothesis_findings_are_explicitly_linked_not_shared_across_a_turn() ->
     assert updated[0].finding_refs == (findings[0].id,)
     assert updated[1].finding_refs == (findings[1].id,)
     assert updated[2].finding_refs == ()
+
+
+def test_finding_link_alone_targets_and_refutes_one_hypothesis() -> None:
+    observation = uuid4()
+    investigation_id = uuid4()
+    proposal = _proposal(
+        FindingKind.CLAIM_VERIFICATION.value,
+        FindingAssessment.REFUTED.value,
+        "The observation contradicts the attribution.",
+        observation,
+    )
+    proposal["hypothesis_refs"] = ["a"]
+    decision = parse_agent_turn_decision(
+        _decision(
+            goal="evaluate the linked attribution",
+            next_action="continue",
+            findings=(proposal,),
+        )
+    )
+    finding = InvestigationFinding(
+        investigation_id=investigation_id,
+        kind=FindingKind.CLAIM_VERIFICATION,
+        assessment=FindingAssessment.REFUTED,
+        statement="The observation contradicts the attribution.",
+        observation_refs=(observation,),
+    )
+
+    updated = InvestigationService._update_hypotheses(
+        (Hypothesis(id="a", statement="The attribution is correct."),),
+        decision=decision,
+        findings=(finding,),
+    )
+
+    assert updated[0].status is HypothesisStatus.REFUTED
+    assert updated[0].evidence_refs == (observation,)
+    assert updated[0].finding_refs == (finding.id,)
 
 
 def test_hypothesis_conflicting_or_unlinked_findings_cannot_be_promoted() -> None:
@@ -325,6 +361,50 @@ async def test_unknown_hypothesis_reference_is_rejected_before_tool_or_finding_e
     assert await fixture.findings.list_for_investigation(initial.investigation_id) == ()
     assert any(
         "bridge_invalid_output:decision_rejected:unknown_hypothesis_reference" in action
+        for action in result.recent_actions
+    )
+
+
+@pytest.mark.asyncio
+async def test_duplicate_finding_identity_cannot_promote_two_hypotheses() -> None:
+    call = _tool_call("vt.search", "content:loader", "collect one passive observation")
+    observation = uuid4()
+    proposal_a = _proposal(
+        FindingKind.CLAIM_VERIFICATION.value,
+        FindingAssessment.SUPPORTED.value,
+        "The same finding content.",
+        observation,
+    )
+    proposal_a["hypothesis_refs"] = ["a"]
+    proposal_b = {**proposal_a, "hypothesis_refs": ["b"]}
+    fixture = _Fixture(
+        responses=[
+            _decision(
+                goal="keep two hypotheses separate",
+                next_action="finish",
+                tools=(call,),
+                findings=(proposal_a, proposal_b),
+                hypothesis_refs=("a", "b"),
+            )
+        ],
+        tools=(("vt.search", "vt"),),
+    )
+    initial = await fixture.start(
+        hypotheses=(
+            Hypothesis(id="a", statement="Hypothesis A."),
+            Hypothesis(id="b", statement="Hypothesis B."),
+        )
+    )
+
+    result = await fixture.service.run(initial.investigation_id)
+
+    assert result.stop_reason is StopReason.SUBMISSION_NEEDS_REVIEW
+    assert result.hypotheses == initial.hypotheses
+    assert fixture.execution_order == []
+    assert await fixture.findings.list_for_investigation(initial.investigation_id) == ()
+    assert any(
+        "bridge_invalid_output:decision_rejected:duplicate_finding_identity_conflicting_links"
+        in action
         for action in result.recent_actions
     )
 
