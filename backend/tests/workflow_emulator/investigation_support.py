@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from datetime import UTC, date, datetime
 from types import SimpleNamespace
 from typing import Any, cast
@@ -33,13 +33,22 @@ from cti_app.config import Settings
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.editions import Edition
-from cti_app.domain.entities import Subject
+from cti_app.domain.entities import (
+    Sample,
+    SampleState,
+    Subject,
+)
+from cti_app.domain.entities import (
+    SampleOrigin as EntitySampleOrigin,
+)
 from cti_app.domain.investigation import (
     EvidenceKind,
     EvidenceObservation,
     FindingAssessment,
     FindingKind,
     NoveltyClass,
+    SampleAssociation,
+    SampleOrigin,
     SampleQualification,
 )
 from cti_app.domain.production import (
@@ -49,6 +58,9 @@ from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionRun,
+    SampleAcquisitionAttempt,
+    SampleAcquisitionOutcome,
+    SampleAcquisitionReason,
 )
 from cti_app.domain.production_references import ProductionReferenceKind, ProductionReferenceTier
 from cti_app.domain.publication import (
@@ -172,7 +184,10 @@ class HashCheckedVirusTotal(FakeVirusTotalPort):
         sink.write(sample_bytes)
 
 
-FinalResponseBuilder = Callable[[tuple[EvidenceObservation, ...]], Awaitable[Mapping[str, Any]]]
+FinalResponseBuilder = Callable[
+    [tuple[EvidenceObservation, ...]],
+    Awaitable[Mapping[str, Any] | TurnSubmission],
+]
 
 
 class ScriptedInvestigationTransport(ScriptedTurnTransport):
@@ -701,6 +716,7 @@ def composition_factory(
     include_local_analysis: bool = False,
     rule_corpus_bytes: Any | None = None,
     yara_engine: Any | None = None,
+    additional_ports: OptionalInvestigationToolPorts | None = None,
 ) -> InvestigationCompositionFactory:
     ports = OptionalInvestigationToolPorts()
     if virustotal is not None:
@@ -749,6 +765,13 @@ def composition_factory(
             rule_corpus_bytes=rule_corpus_bytes,
             yara_engine=yara_engine,
         )
+    if additional_ports is not None:
+        overrides = {
+            item.name: getattr(additional_ports, item.name)
+            for item in fields(OptionalInvestigationToolPorts)
+            if getattr(additional_ports, item.name) is not None
+        }
+        ports = replace(ports, **overrides)
     return InvestigationCompositionFactory(
         uow_factory=uow_factory,
         artifact_store=artifact_store,
@@ -757,6 +780,73 @@ def composition_factory(
         optional_tool_ports=ports,
         turn_transport=transport,
     )
+
+
+async def persist_sample_association_fixture(
+    uow_factory: Any,
+    artifact_store: ProductionArtifactStore,
+    *,
+    investigation_id: UUID,
+    subject_id: UUID,
+    sample_bytes: bytes | None = None,
+    sample_sha256: str | None = None,
+    origin: SampleOrigin = SampleOrigin.MANUAL,
+    logical_name: str = "synthetic-fixture.bin",
+) -> SampleAssociation:
+    """Persist an exact sample association and optional quarantined fixture bytes."""
+    if sample_bytes is not None:
+        actual_sha256 = hashlib.sha256(sample_bytes).hexdigest()
+        if sample_sha256 is not None and sample_sha256 != actual_sha256:
+            raise ValueError("Fixture bytes do not match the declared sample SHA-256")
+        sample_sha256 = actual_sha256
+    if sample_sha256 is None:
+        raise ValueError("A sample SHA-256 or fixture byte payload is required")
+
+    sample: Sample | None = None
+    if sample_bytes is not None:
+        blob_id = await artifact_store.put_bytes(
+            sample_bytes,
+            bucket="workflow-quarantined-samples",
+            mime_type="application/octet-stream",
+        )
+        sample = Sample(
+            subject_id=subject_id,
+            blob_id=blob_id,
+            original_name=logical_name,
+            origin="workflow emulator synthetic fixture",
+            acquired_at=datetime.now(UTC),
+            license_restriction=None,
+            tlp=TLP.CLEAR,
+            do_not_submit=True,
+            external_llm_allowed=False,
+            origin_kind=EntitySampleOrigin.MANUAL,
+            state=SampleState.QUARANTINED,
+            source_service="workflow-emulator",
+            source_object_id=sample_sha256,
+            expected_hash=sample_sha256,
+        )
+
+    association = SampleAssociation(
+        investigation_id=investigation_id,
+        sample_sha256=sample_sha256,
+        origin=origin,
+    )
+    async with uow_factory() as uow:
+        if sample is not None:
+            await uow.samples.add(sample)
+            await uow.sample_acquisition_attempts.append(
+                SampleAcquisitionAttempt(
+                    investigation_id=investigation_id,
+                    requested_hash=sample_sha256,
+                    hash_family="sha256",
+                    reason=SampleAcquisitionReason.SEED,
+                    outcome=SampleAcquisitionOutcome.SUCCESS,
+                    sample_id=sample.id,
+                )
+            )
+        association = await uow.sample_associations.append_version(association, expected_version=0)
+        await uow.commit()
+    return association
 
 
 class DeferredDispatcher:
