@@ -148,6 +148,7 @@ def _source_sample_sha256(payload: Mapping[str, Any], source: BehaviorEvidenceSo
 def _process_rows(
     payload: Mapping[str, Any], source: BehaviorEvidenceSource
 ) -> list[tuple[Mapping[str, Any], str]]:
+    candidates: tuple[tuple[str, ...], ...]
     if source is BehaviorEvidenceSource.CAPE:
         candidates = (("behavior", "processes"), ("processes",))
     elif source is BehaviorEvidenceSource.TRIAGE:
@@ -179,6 +180,7 @@ def _process_rows(
 def _dropped_rows(
     payload: Mapping[str, Any], source: BehaviorEvidenceSource
 ) -> list[tuple[Mapping[str, Any], str]]:
+    candidates: tuple[tuple[str, ...], ...]
     if source is BehaviorEvidenceSource.CAPE:
         candidates = (("dropped",), ("files", "dropped"), ("target", "file", "dropped"))
     elif source is BehaviorEvidenceSource.TRIAGE:
@@ -225,6 +227,7 @@ def _network_rows(
 def _behavior_rows(
     payload: Mapping[str, Any], source: BehaviorEvidenceSource
 ) -> list[tuple[Mapping[str, Any], str]]:
+    candidates: tuple[tuple[str, ...], ...]
     if source is BehaviorEvidenceSource.CAPE:
         candidates = (("behavior", "events"), ("signatures",), ("behaviors",))
     elif source is BehaviorEvidenceSource.TRIAGE:

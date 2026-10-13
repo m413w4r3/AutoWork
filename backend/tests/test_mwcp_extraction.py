@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -45,10 +47,10 @@ class _Associations:
 
 class _Recorder:
     def __init__(self) -> None:
-        self.payloads: list[dict[str, object]] = []
+        self.payloads: list[dict[str, Any]] = []
 
-    async def record_json(self, **kwargs: object) -> SimpleNamespace:
-        self.payloads.append(dict(kwargs["payload"]))  # type: ignore[arg-type]
+    async def record_json(self, *, payload: Mapping[str, Any], **kwargs: object) -> SimpleNamespace:
+        self.payloads.append(dict(payload))
         return SimpleNamespace(id=uuid4())
 
 
@@ -187,8 +189,9 @@ async def test_mwcp_runs_only_allowlisted_parser_and_normalizes_typed_config(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("parser_id", ["unauthorized.parser", 17, None])
 async def test_mwcp_rejects_parser_outside_operator_allowlist_before_execution(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    parser_id: str | int | None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     sample = b"safe"
     sample_sha256 = hashlib.sha256(sample).hexdigest()
@@ -219,7 +222,7 @@ async def test_mwcp_rejects_parser_outside_operator_allowlist_before_execution(
     _definition, adapter = registry.get(MWCP_TOOL, "1")  # type: ignore[misc]
 
     result = await adapter.execute(
-        {"sample_sha256": sample_sha256, "parser_id": "unauthorized.parser"},
+        {"sample_sha256": sample_sha256, "parser_id": parser_id},
         _context(sample_sha256),
     )
 

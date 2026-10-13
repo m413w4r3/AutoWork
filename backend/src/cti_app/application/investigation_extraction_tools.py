@@ -420,7 +420,8 @@ class _FlossToolAdapter(_ExtractionToolBase):
             limitations=limitations,
         )
         result_strings = records[:]
-        bounded, display_truncated = _bounded_output(result_strings)
+        bounded, display_truncated = _bounded_output({"strings": result_strings})
+        bounded_strings = bounded.get("strings", bounded)
         status = _tool_status(extraction.status)
         if archived_truncated or display_truncated or evidence_truncated:
             status = ToolInvocationStatus.PARTIAL
@@ -446,7 +447,7 @@ class _FlossToolAdapter(_ExtractionToolBase):
                     else None
                 ),
                 "strings_observed": extraction.strings_observed,
-                "strings": bounded,
+                "strings": bounded_strings,
                 "goodware_prevalence": _public_goodware(prevalence),
                 "untrusted_data": True,
                 "observation_ref": str(observation_ref),
@@ -517,9 +518,15 @@ class _ConfigurationToolAdapter(_ExtractionToolBase):
                 message="Only a sample associated with this investigation can be extracted.",
             )
         parser_id = arguments.get("parser_id")
-        parser_version = (
-            self.port.allowed_parsers.get(parser_id) if isinstance(parser_id, str) else None
-        )
+        if not isinstance(parser_id, str):
+            return self._result(
+                context,
+                ToolInvocationStatus.POLICY_DENIED,
+                started=started,
+                output={"sample_sha256": sample_sha256, "reason": "parser_not_allowlisted"},
+                message="The requested MWCP parser is not configured in the operator allowlist.",
+            )
+        parser_version = self.port.allowed_parsers.get(parser_id)
         if parser_version is None:
             return self._result(
                 context,
@@ -700,6 +707,14 @@ class _BehaviorReportToolAdapter(_ExtractionToolBase):
                 ),
             )
         source_value, report_json = arguments.get("source"), arguments.get("report_json")
+        if not isinstance(source_value, str):
+            return self._result(
+                context,
+                ToolInvocationStatus.POLICY_DENIED,
+                started=started,
+                output={"sample_sha256": sample_sha256, "reason": "unsupported_report_source"},
+                message="Only CAPE, Triage, or operator supplied JSON reports are accepted.",
+            )
         try:
             source = BehaviorEvidenceSource(source_value)
         except (TypeError, ValueError):
