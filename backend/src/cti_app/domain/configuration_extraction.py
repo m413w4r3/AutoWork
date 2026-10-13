@@ -30,6 +30,7 @@ class ConfigurationKeyValue:
     value_type: ConfigurationValueType
     value: JsonScalar
     evidence_path: str
+    truncated_fields: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.key or not self.evidence_path.startswith("/"):
@@ -42,6 +43,7 @@ class NetworkIndicator:
     value: str
     normalized_value: str
     evidence_path: str
+    truncated_fields: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

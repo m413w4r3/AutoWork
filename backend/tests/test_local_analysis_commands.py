@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import struct
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -9,14 +10,17 @@ import pytest
 
 import cti_app.infrastructure.local_command_runner as local_runner_module
 from cti_app.application.local_analysis import (
+    LocalCommandCapability,
     LocalCommandCatalog,
     LocalCommandService,
     SampleBytesUnavailableError,
     default_local_command_specs,
+    extraction_command_specs,
 )
 from cti_app.domain.local_analysis import (
     LocalAnalysisFileType,
     LocalCommandId,
+    LocalCommandSpec,
     LocalCommandStatus,
 )
 from cti_app.infrastructure.local_command_runner import LocalCommandRunner
@@ -37,6 +41,31 @@ class _Samples:
 
 def _sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
+
+
+def _test_bootstrap_argv(command: list[str], spec: LocalCommandSpec) -> list[str]:
+    source_root = Path(__file__).resolve().parents[1] / "src"
+    bootstrap = (
+        "import sys; "
+        f"sys.path[:0] = {[str(source_root), *sys.path]!r}; "
+        "from cti_app.infrastructure.local_command_runner import _sandbox_exec; "
+        "raise SystemExit(_sandbox_exec(sys.argv[1:]))"
+    )
+    return [
+        sys.executable,
+        "-c",
+        bootstrap,
+        str(spec.cpu_limit_seconds),
+        str(spec.memory_limit_bytes),
+        str(spec.file_size_limit_bytes),
+        "--",
+        *command,
+    ]
+
+
+@pytest.fixture(autouse=True)
+def _use_test_runner_bootstrap(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(local_runner_module, "_sandbox_bootstrap_argv", _test_bootstrap_argv)
 
 
 def _elf_fixture() -> bytes:
@@ -145,6 +174,53 @@ async def test_required_filesystem_confinement_refuses_execution_when_unavailabl
         assert not marker.exists()
     finally:
         local_runner_module._detect_network_namespace.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_extraction_specs_require_filesystem_confinement_and_skip_version_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    version_marker = tmp_path / "version-executed"
+    executable = tmp_path / "extractor"
+    executable.write_text(
+        f'#!/bin/sh\nif [ "$1" = "--version" ]; then touch \'{version_marker}\'; fi\nexit 0\n',
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    detect_network_namespace = local_runner_module._detect_network_namespace
+    detect_network_namespace.cache_clear()
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(local_runner_module, "_detect_network_namespace", lambda *_args: None)
+            specs = extraction_command_specs(mwcp_parser_ids=("allowed.parser",))
+            catalog = LocalCommandCatalog(specs=specs, which=lambda _name: str(executable))
+
+            assert all(spec.requires_filesystem_confinement for spec in specs)
+            for spec in specs:
+                capability = catalog.get(spec.id)
+                assert capability is not None
+                assert capability.version == "unverified"
+            assert not version_marker.exists()
+
+            runner = LocalCommandRunner(require_filesystem_confinement=False)
+            sample = b"harmless fixture"
+            sample_sha256 = _sha256(sample)
+            for spec in specs:
+                capability = LocalCommandCapability(spec, str(executable), "unverified")
+                result = await runner.run(
+                    capability,
+                    sample_sha256=sample_sha256,
+                    sample_bytes=sample,
+                    options={},
+                )
+                assert result.status is LocalCommandStatus.UNAVAILABLE
+                assert result.detail_code == "filesystem_confinement_required"
+            assert not version_marker.exists()
+            assert all(
+                not spec.requires_filesystem_confinement for spec in default_local_command_specs()
+            )
+    finally:
+        detect_network_namespace.cache_clear()
 
 
 @pytest.mark.asyncio

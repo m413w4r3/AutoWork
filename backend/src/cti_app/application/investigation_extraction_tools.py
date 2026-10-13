@@ -329,7 +329,10 @@ class _FlossToolAdapter(_ExtractionToolBase):
                 context,
                 ToolInvocationStatus.UNAVAILABLE,
                 started=started,
-                output={"sample_sha256": sample_sha256, "reason": "floss_unavailable"},
+                output={
+                    "sample_sha256": sample_sha256,
+                    "reason": _extraction_unavailable_reason(self.port, "floss_unavailable"),
+                },
                 message="FLOSS is not available in the local command catalogue.",
             )
         max_strings = arguments.get("max_strings", 512)
@@ -368,7 +371,18 @@ class _FlossToolAdapter(_ExtractionToolBase):
             )
 
         records = [_string_json(item) for item in extraction.strings[:_MAX_ARCHIVED_STRINGS]]
-        archived_truncated = extraction.truncated or len(extraction.strings) > len(records)
+        truncated_field_count = sum(
+            len(item.truncated_fields) for item in extraction.strings[: len(records)]
+        )
+        truncated_field_count = max(
+            truncated_field_count,
+            sum(len(item["truncated_fields"]) for item in records),
+        )
+        archived_truncated = (
+            extraction.truncated
+            or truncated_field_count > 0
+            or len(extraction.strings) > len(records)
+        )
         tool_version = (
             _safe_untrusted_text(extraction.provenance.tool_version, max_chars=160) or "unavailable"
         )
@@ -388,7 +402,9 @@ class _FlossToolAdapter(_ExtractionToolBase):
         payload = {
             "schema": "sample-obfuscated-strings.v1",
             "sample_sha256": sample_sha256,
-            "status": extraction.status.value,
+            "status": (
+                ExtractionStatus.PARTIAL.value if archived_truncated else extraction.status.value
+            ),
             "tool": extraction.provenance.tool_id,
             "tool_version": tool_version,
             "parameters_sha256": extraction.provenance.parameters_sha256,
@@ -398,8 +414,9 @@ class _FlossToolAdapter(_ExtractionToolBase):
             "exit_code": extraction.provenance.exit_code,
             "detail_code": extraction.detail_code,
             "output_truncated": extraction.provenance.output_truncated or archived_truncated,
+            "truncated_field_count": truncated_field_count,
             "truncation_marker": (
-                "[TRUNCATED: raw FLOSS output exceeded the configured bound]"
+                "[TRUNCATED: FLOSS fields or output exceeded configured bounds]"
                 if extraction.provenance.output_truncated or archived_truncated
                 else None
             ),
@@ -441,8 +458,9 @@ class _FlossToolAdapter(_ExtractionToolBase):
                 "exit_code": extraction.provenance.exit_code,
                 "detail_code": extraction.detail_code,
                 "output_truncated": archived_truncated or display_truncated or evidence_truncated,
+                "truncated_field_count": truncated_field_count,
                 "truncation_marker": (
-                    "[TRUNCATED: raw FLOSS output exceeded the configured bound]"
+                    "[TRUNCATED: FLOSS fields or output exceeded configured bounds]"
                     if archived_truncated or display_truncated or evidence_truncated
                     else None
                 ),
@@ -543,7 +561,7 @@ class _ConfigurationToolAdapter(_ExtractionToolBase):
                 output={
                     "sample_sha256": sample_sha256,
                     "parser_id": parser_id,
-                    "reason": "mwcp_unavailable",
+                    "reason": _extraction_unavailable_reason(self.port, "mwcp_unavailable"),
                 },
                 message="DC3-MWCP is not available in the local command catalogue.",
             )
@@ -585,8 +603,20 @@ class _ConfigurationToolAdapter(_ExtractionToolBase):
             _network_indicator_json(item)
             for item in extraction.network_indicators[:_MAX_ARCHIVED_INDICATORS]
         ]
+        truncated_field_count = sum(
+            len(item.truncated_fields)
+            for item in (
+                *extraction.values[: len(values)],
+                *extraction.network_indicators[: len(indicators)],
+            )
+        )
+        truncated_field_count = max(
+            truncated_field_count,
+            sum(len(item["truncated_fields"]) for item in (*values, *indicators)),
+        )
         truncated = (
             extraction.truncated
+            or truncated_field_count > 0
             or len(extraction.values) > len(values)
             or len(extraction.network_indicators) > len(indicators)
         )
@@ -602,7 +632,7 @@ class _ConfigurationToolAdapter(_ExtractionToolBase):
         payload = {
             "schema": "sample-configuration.v1",
             "sample_sha256": sample_sha256,
-            "status": extraction.status.value,
+            "status": (ExtractionStatus.PARTIAL.value if truncated else extraction.status.value),
             "parser_id": parser_id,
             "parser_version": safe_parser_version,
             "tool_version": tool_version,
@@ -613,8 +643,11 @@ class _ConfigurationToolAdapter(_ExtractionToolBase):
             "exit_code": extraction.provenance.exit_code,
             "detail_code": extraction.detail_code,
             "output_truncated": truncated,
+            "truncated_field_count": truncated_field_count,
             "truncation_marker": (
-                "[TRUNCATED: raw MWCP output exceeded the configured bound]" if truncated else None
+                "[TRUNCATED: MWCP fields or output exceeded configured bounds]"
+                if truncated
+                else None
             ),
             "configuration": values,
             "network_indicators": indicators,
@@ -655,8 +688,9 @@ class _ConfigurationToolAdapter(_ExtractionToolBase):
                 "exit_code": extraction.provenance.exit_code,
                 "detail_code": extraction.detail_code,
                 "output_truncated": truncated or display_truncated or evidence_truncated,
+                "truncated_field_count": truncated_field_count,
                 "truncation_marker": (
-                    "[TRUNCATED: raw MWCP output exceeded the configured bound]"
+                    "[TRUNCATED: MWCP fields or output exceeded configured bounds]"
                     if truncated or display_truncated or evidence_truncated
                     else None
                 ),
@@ -792,6 +826,19 @@ class _SamplePolicyError(ValueError):
 
 
 def _string_json(item: Any) -> dict[str, Any]:
+    truncated_fields = set(item.truncated_fields)
+    bounded_fields = (
+        ("value", item.value, 512),
+        ("encoding", item.encoding, 64),
+        ("function", item.function, 128),
+        ("context", item.context, 256),
+        ("evidence_path", item.evidence_path, 512),
+    )
+    truncated_fields.update(
+        field
+        for field, value, maximum in bounded_fields
+        if isinstance(value, str) and len(value) > maximum
+    )
     return {
         "value": _safe_untrusted_text(item.value, max_chars=512),
         "type": item.kind.value,
@@ -801,22 +848,41 @@ def _string_json(item: Any) -> dict[str, Any]:
         "function": _safe_untrusted_text(item.function, max_chars=128) if item.function else None,
         "context": _safe_untrusted_text(item.context, max_chars=256) if item.context else None,
         "evidence_path": _safe_untrusted_text(item.evidence_path, max_chars=512),
+        "truncated_fields": sorted(truncated_fields),
+        "truncated": bool(truncated_fields),
     }
 
 
 def _configuration_value_json(item: Any) -> dict[str, Any]:
     value = item.value
+    truncated_fields = set(item.truncated_fields)
     if isinstance(value, str):
+        if len(value) > 512:
+            truncated_fields.add("value")
         value = _safe_untrusted_text(value, max_chars=512)
+    if len(item.key) > 128:
+        truncated_fields.add("key")
+    if len(item.evidence_path) > 512:
+        truncated_fields.add("evidence_path")
     return {
         "key": _safe_untrusted_text(item.key, max_chars=128),
         "type": item.value_type.value,
         "value": value,
         "evidence_path": _safe_untrusted_text(item.evidence_path, max_chars=512),
+        "truncated_fields": sorted(truncated_fields),
+        "truncated": bool(truncated_fields),
     }
 
 
 def _network_indicator_json(item: Any) -> dict[str, Any]:
+    truncated_fields = set(item.truncated_fields)
+    for field, value in (
+        ("value", item.value),
+        ("normalized_value", item.normalized_value),
+        ("evidence_path", item.evidence_path),
+    ):
+        if len(value) > 512:
+            truncated_fields.add(field)
     result = {
         "type": item.kind.value,
         "value": _safe_untrusted_text(item.value, max_chars=512),
@@ -830,6 +896,8 @@ def _network_indicator_json(item: Any) -> dict[str, Any]:
             parsed = None
         if parsed is not None and parsed.hostname:
             host = parsed.hostname.casefold()
+            if len(parsed.path or "/") > 512:
+                truncated_fields.add("path")
             path = _safe_untrusted_text(parsed.path or "/", max_chars=512)
             result.update(
                 {
@@ -842,6 +910,8 @@ def _network_indicator_json(item: Any) -> dict[str, Any]:
                     "normalized_value": f"{parsed.scheme.casefold()} {host}{path}",
                 }
             )
+    result["truncated_fields"] = sorted(truncated_fields)
+    result["truncated"] = bool(truncated_fields)
     return result
 
 
@@ -947,10 +1017,26 @@ def _tool_status(status: ExtractionStatus) -> ToolInvocationStatus:
     }[status]
 
 
+def _extraction_unavailable_reason(port: object, fallback: str) -> str:
+    if getattr(port, "unavailable_reason", None) == "filesystem_confinement_required":
+        return "filesystem_confinement_required"
+    return fallback
+
+
 def _behavior_json(evidence: Any) -> dict[str, Any]:
     def iso(value: Any) -> str | None:
         return value.isoformat() if value is not None else None
 
+    truncated_field_count = sum(
+        len(item.truncated_fields)
+        for items in (
+            evidence.processes,
+            evidence.dropped_files,
+            evidence.network_sessions,
+            evidence.behaviors,
+        )
+        for item in items
+    )
     return {
         "schema": "BehaviorEvidenceV1",
         "source": evidence.source.value,
@@ -965,6 +1051,8 @@ def _behavior_json(evidence: Any) -> dict[str, Any]:
                 "command_line": item.command_line,
                 "started_at": iso(item.started_at),
                 "evidence_path": item.evidence_path,
+                "truncated_fields": list(item.truncated_fields),
+                "truncated": bool(item.truncated_fields),
             }
             for item in evidence.processes
         ],
@@ -974,6 +1062,8 @@ def _behavior_json(evidence: Any) -> dict[str, Any]:
                 "sha256": item.sha256,
                 "size": item.size,
                 "evidence_path": item.evidence_path,
+                "truncated_fields": list(item.truncated_fields),
+                "truncated": bool(item.truncated_fields),
             }
             for item in evidence.dropped_files
         ],
@@ -989,6 +1079,8 @@ def _behavior_json(evidence: Any) -> dict[str, Any]:
                 "started_at": iso(item.started_at),
                 "ended_at": iso(item.ended_at),
                 "evidence_paths": list(item.evidence_paths),
+                "truncated_fields": list(item.truncated_fields),
+                "truncated": bool(item.truncated_fields),
             }
             for item in evidence.network_sessions
         ],
@@ -999,10 +1091,13 @@ def _behavior_json(evidence: Any) -> dict[str, Any]:
                 "timestamp": iso(item.timestamp),
                 "process_id": item.process_id,
                 "evidence_path": item.evidence_path,
+                "truncated_fields": list(item.truncated_fields),
+                "truncated": bool(item.truncated_fields),
             }
             for item in evidence.behaviors
         ],
         "truncated": evidence.truncated,
+        "truncated_field_count": truncated_field_count,
         "limitations": list(evidence.limitations),
         "untrusted_data": True,
     }

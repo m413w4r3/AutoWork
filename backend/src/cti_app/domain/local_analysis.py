@@ -73,6 +73,7 @@ class LocalCommandSpec:
     output_kind: LocalCommandOutputKind
     # L4 extractors drain stdout to EOF for a complete digest while retaining only a prefix.
     capture_full_output_hash: bool = False
+    requires_filesystem_confinement: bool = False
 
     def __post_init__(self) -> None:
         if not self.binary or "/" in self.binary or "\\" in self.binary:

@@ -51,13 +51,20 @@ class MwcpAdapter:
 
     @property
     def available(self) -> bool:
+        return self.unavailable_reason is None
+
+    @property
+    def unavailable_reason(self) -> str | None:
+        if not self._enabled:
+            return "mwcp_disabled"
+        if not self._parser_versions:
+            return "parser_allowlist_empty"
+        if not self._service.filesystem_confined:
+            return "filesystem_confinement_required"
         capability = self._catalog.get(LocalCommandId.MWCP)
-        return (
-            self._enabled
-            and bool(self._parser_versions)
-            and capability is not None
-            and capability.available
-        )
+        if capability is None or not capability.available:
+            return "binary_unavailable"
+        return None
 
     async def extract(self, sample_sha256: str, *, parser_id: str) -> ConfigurationExtractionV1:
         parser_version = self._parser_versions.get(parser_id)
@@ -160,7 +167,13 @@ def _normalize_configuration(
     truncated = False
     visited_nodes = 0
 
-    def visit(value: object, path: str, depth: int) -> None:
+    def visit(
+        value: object,
+        path: str,
+        depth: int,
+        path_truncated: bool = False,
+        key_truncated: bool = False,
+    ) -> None:
         nonlocal truncated, visited_nodes
         visited_nodes += 1
         if visited_nodes > 4096 or len(values) >= _MAX_VALUES or depth > 12:
@@ -168,28 +181,48 @@ def _normalize_configuration(
             return
         if isinstance(value, Mapping):
             for key, item in value.items():
-                key_text = str(key)[:128]
+                raw_key_text = str(key)
+                key_text = raw_key_text[:128]
+                key_truncated = len(raw_key_text) > len(key_text)
                 if _SECRET_KEY.search(key_text):
                     continue
                 child_path = f"{path}/{_escape_pointer(key_text)}"
-                visit(item, child_path, depth + 1)
+                visit(item, child_path, depth + 1, path_truncated or key_truncated, key_truncated)
             return
         if isinstance(value, list | tuple):
             if len(value) > 64:
                 truncated = True
             for index, item in enumerate(value[:64]):
-                visit(item, f"{path}/{index}", depth + 1)
+                visit(item, f"{path}/{index}", depth + 1, path_truncated, key_truncated)
             return
         if isinstance(value, (str, int, float, bool)) or value is None:
             if isinstance(value, float) and not __import__("math").isfinite(value):
                 return
+            truncated_fields: list[str] = []
+            if key_truncated:
+                truncated_fields.append("key")
+            if path_truncated:
+                truncated_fields.append("evidence_path")
             if isinstance(value, str):
-                value = value[:_MAX_VALUE_CHARS]
+                raw_value = value
+                value = raw_value[:_MAX_VALUE_CHARS]
+                value_truncated = len(raw_value) > len(value)
+                if value_truncated:
+                    truncated_fields.append("value")
                 value_type = ConfigurationValueType.STRING
                 if _NETWORK_KEY.search(path):
-                    indicator = _network_indicator(path, value)
+                    indicator = _network_indicator(
+                        path,
+                        value,
+                        truncated_fields=(
+                            (("evidence_path",) if path_truncated else ())
+                            + (("value",) if value_truncated else ())
+                        ),
+                    )
                     if indicator is not None:
                         indicators.append(indicator)
+                    elif len(raw_value) > 2_048:
+                        truncated_fields.append("network_indicator")
             elif isinstance(value, bool):
                 value_type = ConfigurationValueType.BOOLEAN
             elif isinstance(value, int):
@@ -204,14 +237,19 @@ def _normalize_configuration(
                     value_type=value_type,
                     value=value,
                     evidence_path=path or "/",
+                    truncated_fields=tuple(truncated_fields),
                 )
             )
+            if truncated_fields:
+                truncated = True
 
     visit(config, "/configuration", 0)
     return tuple(values), tuple(indicators), truncated
 
 
-def _network_indicator(path: str, value: str) -> NetworkIndicator | None:
+def _network_indicator(
+    path: str, value: str, *, truncated_fields: tuple[str, ...] = ()
+) -> NetworkIndicator | None:
     candidate = value.strip().strip("[](){}\"'")
     if not candidate or len(candidate) > 2_048:
         return None
@@ -221,7 +259,11 @@ def _network_indicator(path: str, value: str) -> NetworkIndicator | None:
         normalized_ip = None
     if normalized_ip is not None:
         return NetworkIndicator(
-            NetworkIndicatorKind.IP_ADDRESS, candidate, normalized_ip, path or "/"
+            NetworkIndicatorKind.IP_ADDRESS,
+            candidate,
+            normalized_ip,
+            path or "/",
+            truncated_fields,
         )
 
     if "://" in candidate:
@@ -236,11 +278,15 @@ def _network_indicator(path: str, value: str) -> NetworkIndicator | None:
             return None
         netloc = f"[{host}]" if ":" in host else host
         normalized = urlunsplit((parsed.scheme.casefold(), netloc, parsed.path or "/", "", ""))
-        return NetworkIndicator(NetworkIndicatorKind.URL, candidate, normalized, path or "/")
+        return NetworkIndicator(
+            NetworkIndicatorKind.URL, candidate, normalized, path or "/", truncated_fields
+        )
 
     host = _normalize_host(candidate)
     if host is not None and ("." in host or host == "localhost"):
-        return NetworkIndicator(NetworkIndicatorKind.DOMAIN, candidate, host, path or "/")
+        return NetworkIndicator(
+            NetworkIndicatorKind.DOMAIN, candidate, host, path or "/", truncated_fields
+        )
     return None
 
 

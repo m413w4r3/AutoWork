@@ -107,6 +107,18 @@ class LocalCommandRunner:
                 capability.version,
                 "binary_unavailable",
             )
+        if spec.requires_filesystem_confinement and not self.filesystem_confined:
+            return _make_result(
+                spec,
+                LocalCommandStatus.UNAVAILABLE,
+                sample_sha256,
+                started_at,
+                0,
+                "",
+                (spec.binary,),
+                capability.version,
+                "filesystem_confinement_required",
+            )
         if self._require_filesystem_confinement and not self.filesystem_confined:
             return _make_result(
                 spec,
