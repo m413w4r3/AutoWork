@@ -307,6 +307,36 @@ describe("CompositionConsole", () => {
     expect(subjectA).toHaveTextContent("Production : Prête");
   });
 
+  it("reste éditable quand seule une version d’artifact plus récente est disponible", async () => {
+    const read = compositionRead(
+      composition(2, [compositionEntry("a", 1), compositionEntry("b", 2)]),
+    );
+    vi.mocked(getEditionComposition).mockResolvedValue({
+      ...read,
+      reasons: [
+        {
+          code: "superseded_artifact_available",
+          message: "A newer verified artifact is available",
+          subject_id: SUBJECT_A,
+          details: null,
+        },
+      ],
+      axes: { ...read.axes, composition_eligibility: false },
+    });
+    renderComposition();
+
+    const subjectA = (
+      await screen.findByRole("heading", { name: "Sujet A" })
+    ).closest("article");
+    expect(subjectA).not.toBeNull();
+    // The explicit re-pin gesture must stay available: it is the remedy itself.
+    expect(
+      await within(subjectA!).findByRole("button", {
+        name: /Épingler la version disponible|Inclure/,
+      }),
+    ).toBeInTheDocument();
+  });
+
   it("traduit le diagnostic d’un sujet reporté et maintient l’acceptation bloquée", async () => {
     vi.mocked(getEditionCompositionValidation).mockResolvedValueOnce({
       ...validation,

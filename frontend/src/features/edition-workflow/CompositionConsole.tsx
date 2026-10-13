@@ -361,7 +361,18 @@ export function CompositionConsole({
 
   const compositionRead = compositionQuery.data;
   const validation = validationQuery.data;
-  const canEdit = !readOnly && compositionRead.axes.composition_eligibility;
+  // A newer verified artifact (`superseded_artifact_available`) makes the composition
+  // ineligible for acceptance, but it is exactly the situation the editor resolves by an
+  // explicit re-pin: when it is the only blocker, the console must stay editable.
+  const onlySupersededBlockers =
+    compositionRead.composition !== null &&
+    compositionRead.reasons.length > 0 &&
+    compositionRead.reasons.every(
+      (reason) => reason.code === "superseded_artifact_available",
+    );
+  const canEdit =
+    !readOnly &&
+    (compositionRead.axes.composition_eligibility || onlySupersededBlockers);
   const mutationPending = updateComposition.isPending || isExclusionPending;
   const entries = composition?.entries ?? [];
   const included = entries
