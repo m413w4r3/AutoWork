@@ -6,6 +6,7 @@ import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -49,10 +50,10 @@ class _Associations:
 
 class _Recorder:
     def __init__(self) -> None:
-        self.payloads: list[dict[str, object]] = []
+        self.payloads: list[dict[str, Any]] = []
 
-    async def record_json(self, **kwargs: object) -> SimpleNamespace:
-        self.payloads.append(dict(kwargs["payload"]))  # type: ignore[arg-type]
+    async def record_json(self, *, payload: Mapping[str, Any], **kwargs: object) -> SimpleNamespace:
+        self.payloads.append(dict(payload))
         return SimpleNamespace(id=uuid4())
 
 
