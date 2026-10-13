@@ -92,9 +92,9 @@ PYTEST_ARGS ?=
 INTEGRATION_TEST_PATH ?= tests/integration
 INTEGRATION_PYTEST_ARGS ?=
 
-# Workflow emulator floors include W13's three FAST cases and W12's FULL case.
-WORKFLOW_FAST_MIN ?= 10
-WORKFLOW_FULL_MIN ?= 16
+# W14 adds five PostgreSQL-backed FAST scenarios (A, C, D, E, F).
+WORKFLOW_FAST_MIN ?= 15
+WORKFLOW_FULL_MIN ?= 21
 WORKFLOW_RESULTS_DIR ?= $(CURDIR)/var/workflow-results
 
 # Optional command prefix used to measure the pytest process (for example,
