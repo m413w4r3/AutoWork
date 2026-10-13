@@ -77,7 +77,7 @@ Les réponses ont les versions `render-input-inspection-v1`, `render-input-files
   },
   "render_data": {
     "availability": "ready",
-    "schema_version": "typst-publication-model-v20-block-location",
+    "schema_version": "typst-publication-model-v21-protocol-figure-pins",
     "sha256": "fff4685ed3cb516dd8332f6fcee89cbda27ede036d866027513971eec24d3cf0",
     "href": "/api/render-inspections/00000000-0000-4000-8000-000000000001/render-data"
   },
@@ -172,7 +172,7 @@ Pour un rendu d’édition, `origin` expose également `manifest_id`, `manifest_
   "schema_version": "render-data-inspection-v1",
   "render_id": "00000000-0000-4000-8000-000000000001",
   "sha256": "fff4685ed3cb516dd8332f6fcee89cbda27ede036d866027513971eec24d3cf0",
-  "schema": "typst-publication-model-v20-block-location",
+  "schema": "typst-publication-model-v21-protocol-figure-pins",
   "availability": "ready",
   "selection": {"pointer": "/title", "value": "Sujet d'essai"}
 }
