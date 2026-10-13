@@ -6,6 +6,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, BinaryIO, Protocol
 
+from cti_app.domain.retrohunt import (
+    RetrohuntProviderJob,
+    RetrohuntProviderResults,
+    RetrohuntSubmitRequest,
+)
 from cti_app.domain.virustotal import (
     VirusTotalBehaviourSummary,
     VirusTotalCapability,
@@ -345,6 +350,19 @@ class VirusTotalPort(Protocol):
         descriptors_only: bool = True,
         order: str | None = None,
     ) -> VirusTotalSearchResult: ...
+
+
+class VirusTotalRetrohuntPort(Protocol):
+    """Optional proxy-backed Retrohunt sub-port; no provider wire API is assumed."""
+
+    @property
+    def available(self) -> bool: ...
+
+    async def submit_retrohunt(self, request: RetrohuntSubmitRequest) -> RetrohuntProviderJob: ...
+
+    async def retrohunt_status(self, job_id: str) -> RetrohuntProviderJob: ...
+
+    async def retrohunt_results(self, job_id: str) -> RetrohuntProviderResults: ...
 
 
 _HASH_RE = re.compile(r"^(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})$", re.IGNORECASE)

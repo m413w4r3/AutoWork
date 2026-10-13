@@ -98,6 +98,7 @@ from cti_app.domain.production_source_additions import SourceAdditionJournalEntr
 from cti_app.domain.publication_render import PublicationRender
 from cti_app.domain.publication_review import PublicationReviewDecision
 from cti_app.domain.reference_corpus import ReferenceMember, ReferenceMemberDispute
+from cti_app.domain.retrohunt import RetrohuntReservation
 from cti_app.domain.selection import (
     SelectionDecision,
     SelectionIdempotencyRecord,
@@ -802,6 +803,24 @@ class RejectedModelProposalRepository(Protocol):
     async def append_many(self, proposals: Sequence[RejectedModelProposal]) -> None: ...
 
 
+class RetrohuntReservationRepository(Protocol):
+    """Atomic per-subject reservation and optimistic state updates."""
+
+    async def reserve(
+        self, reservation: RetrohuntReservation
+    ) -> tuple[RetrohuntReservation, bool] | None: ...
+
+    async def get_for_subject(
+        self, subject_id: UUID, reservation_id: UUID
+    ) -> RetrohuntReservation | None: ...
+
+    async def count_for_subject(self, subject_id: UUID) -> int: ...
+
+    async def update_if_version(
+        self, reservation: RetrohuntReservation, *, expected_version: int
+    ) -> RetrohuntReservation | None: ...
+
+
 class UnitOfWork(Protocol):
     blobs: BlobRepository
     media_assets: MediaAssetRepository
@@ -825,6 +844,7 @@ class UnitOfWork(Protocol):
     provenance: ProvenanceRepository
     virustotal_observations: VirusTotalObservationRepository
     virustotal_file_views: VirusTotalFileViewRepository
+    retrohunt_reservations: RetrohuntReservationRepository
     analyst_investigations: AnalystInvestigationRepository
     analyst_decisions: AnalystDecisionRepository
     analyst_input_packs: AnalystInputPackRepository

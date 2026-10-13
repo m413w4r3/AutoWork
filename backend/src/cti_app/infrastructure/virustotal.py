@@ -39,6 +39,7 @@ from cti_app.application.virustotal import (
     VirusTotalRawResponse,
     VirusTotalRelationNotAllowedError,
     VirusTotalResponseTooLargeError,
+    VirusTotalRetrohuntPort,
     VirusTotalRouteStep,
     VirusTotalRouteUnavailableError,
     VirusTotalRoutingPolicy,
@@ -50,6 +51,11 @@ from cti_app.application.virustotal import (
     validate_search_query,
 )
 from cti_app.config import Settings
+from cti_app.domain.retrohunt import (
+    RetrohuntProviderJob,
+    RetrohuntProviderResults,
+    RetrohuntSubmitRequest,
+)
 from cti_app.domain.virustotal import (
     VIRUSTOTAL_RELATIONSHIPS_BY_OBJECT_TYPE,
     VirusTotalBehaviourSummary,
@@ -1193,3 +1199,57 @@ def _is_tls_error(error: BaseException) -> bool:
             return True
         current = current.__cause__ or current.__context__
     return False
+
+
+class VirusTotalRetrohuntProxyAdapter:
+    """Capability-gated adapter for a separately verified vtUI proxy client.
+
+    This adapter deliberately has no HTTP endpoint or payload assumptions.
+    A provider-specific client can be injected only after its proxy contract
+    has been verified. Until then, an absent capability, proxy route, or
+    delegate makes Retrohunt unavailable without affecting other VT tools.
+    """
+
+    def __init__(
+        self,
+        *,
+        capabilities: VirusTotalCapabilities,
+        routing_policy: VirusTotalRoutingPolicy,
+        proxy_client: VirusTotalRetrohuntPort | None = None,
+    ) -> None:
+        self._capabilities = capabilities
+        self._routing_policy = routing_policy
+        self._proxy_client = proxy_client
+
+    @property
+    def available(self) -> bool:
+        route = self._routing_policy.route_for(VirusTotalCapability.RETROHUNT)
+        return bool(
+            self._capabilities.retrohunt
+            and self._proxy_client is not None
+            and self._proxy_client.available
+            and route is not None
+            and route.primary.transport is VirusTotalTransportKind.PROXY
+            and all(step.transport is VirusTotalTransportKind.PROXY for step in route.steps())
+        )
+
+    async def submit_retrohunt(self, request: RetrohuntSubmitRequest) -> RetrohuntProviderJob:
+        return await self._require_proxy().submit_retrohunt(request)
+
+    async def retrohunt_status(self, job_id: str) -> RetrohuntProviderJob:
+        return await self._require_proxy().retrohunt_status(job_id)
+
+    async def retrohunt_results(self, job_id: str) -> RetrohuntProviderResults:
+        return await self._require_proxy().retrohunt_results(job_id)
+
+    def _require_proxy(self) -> VirusTotalRetrohuntPort:
+        if not self._capabilities.retrohunt:
+            raise VirusTotalCapabilityDisabledError(
+                "La capability Retrohunt VirusTotal est désactivée."
+            )
+        if not self.available:
+            raise VirusTotalRouteUnavailableError(
+                "Aucune route proxy vtUI vérifiée n'expose Retrohunt."
+            )
+        assert self._proxy_client is not None
+        return self._proxy_client
