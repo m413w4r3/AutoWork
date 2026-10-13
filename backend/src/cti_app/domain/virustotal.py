@@ -17,6 +17,9 @@ class VirusTotalOperation(StrEnum):
     INTELLIGENCE_SEARCH = "intelligence_search"
     BEHAVIOURS = "behaviours"
     FILE_DOWNLOAD = "file_download"
+    RETROHUNT_SUBMIT = "retrohunt_submit"
+    RETROHUNT_STATUS = "retrohunt_status"
+    RETROHUNT_RESULTS = "retrohunt_results"
 
 
 class VirusTotalCapability(StrEnum):

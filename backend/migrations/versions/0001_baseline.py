@@ -31,6 +31,7 @@ from cti_app.infrastructure.database.models import (  # noqa: F401
     production,
     publication_render,
     publication_review,
+    retrohunt,
     selection,
     source_media,
 )
