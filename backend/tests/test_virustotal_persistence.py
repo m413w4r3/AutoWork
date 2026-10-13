@@ -300,6 +300,87 @@ async def test_capability_is_persisted_as_the_typed_enum(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_behaviour_pages_are_archived_with_cursor_order_and_operation_metadata(
+    tmp_path: Path,
+) -> None:
+    factory = _Factory()
+    store = FilesystemBlobStore(tmp_path / "blobs")
+    service = VirusTotalObservationService(BlobCatalogService(store, factory), factory)
+    page = VirusTotalPage(
+        items=({"id": "sandbox-1"}, {"id": "sandbox-2"}),
+        next_cursor="cursor-3",
+        observed_count=2,
+        stopped_due_to_limit=True,
+        exhaustive=False,
+        raw_json_pages=(
+            b'{"data":[{"id":"sandbox-1"}],"meta":{"cursor":"cursor-2"}}',
+            b'{"data":[{"id":"sandbox-2"}],"meta":{"cursor":"cursor-3"}}',
+        ),
+        http_statuses=(200, 206),
+        limit_used=10,
+        transport=VirusTotalTransportKind.PROXY,
+        api_generation=VirusTotalEndpointVariant.V3,
+    )
+
+    observations = await service.store_behaviours(
+        page,
+        file_hash=VALID_SHA256,
+        input_cursor="cursor-1",
+        observed_at=datetime.now(UTC),
+    )
+
+    assert [item.operation for item in observations] == [
+        VirusTotalOperation.BEHAVIOURS,
+        VirusTotalOperation.BEHAVIOURS,
+    ]
+    assert all(item.capability is VirusTotalCapability.BEHAVIOUR_REPORTS for item in observations)
+    assert [item.input_cursor for item in observations] == ["cursor-1", "cursor-2"]
+    assert [item.output_cursor for item in observations] == ["cursor-2", "cursor-3"]
+    assert [item.page_order for item in observations] == [0, 1]
+    assert [item.observed_count for item in observations] == [1, 1]
+    assert all(item.exhaustive is False for item in observations)
+    assert all(item.safe_parameters["limit"] == 10 for item in observations)
+    assert len(factory.blobs) == 2
+
+
+@pytest.mark.asyncio
+async def test_search_observation_archives_effective_descriptors_and_order(
+    tmp_path: Path,
+) -> None:
+    factory = _Factory()
+    store = FilesystemBlobStore(tmp_path / "blobs")
+    service = VirusTotalObservationService(BlobCatalogService(store, factory), factory)
+    result = VirusTotalSearchResult(
+        items=(),
+        next_cursor=None,
+        observed_count=0,
+        stopped_due_to_limit=False,
+        exhaustive=True,
+        raw_json_pages=(b'{"data":[]}',),
+        http_statuses=(200,),
+        limit_used=40,
+        transport=VirusTotalTransportKind.PROXY,
+        api_generation=VirusTotalEndpointVariant.V3,
+        empty=True,
+        descriptors_only=False,
+        order="last_submission_date-",
+    )
+
+    (observation,) = await service.store_intelligence_search(
+        result,
+        query='name:"sample"',
+        observed_at=datetime.now(UTC),
+    )
+
+    assert observation.operation is VirusTotalOperation.INTELLIGENCE_SEARCH
+    assert observation.capability is VirusTotalCapability.INTELLIGENCE_SEARCH
+    assert observation.safe_parameters["descriptors_only"] is False
+    assert observation.safe_parameters["order"] == "last_submission_date-"
+    assert observation.observed_count == 0
+    assert observation.exhaustive is True
+
+
+@pytest.mark.asyncio
 async def test_no_secret_ever_reaches_safe_parameters(tmp_path: Path) -> None:
     factory = _Factory()
     store = FilesystemBlobStore(tmp_path / "blobs")

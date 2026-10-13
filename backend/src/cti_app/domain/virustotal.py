@@ -13,7 +13,10 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 class VirusTotalOperation(StrEnum):
     FILE_REPORT = "file_report"
     FILE_RELATIONSHIP = "file_relationship"
+    OBJECT_RELATIONSHIP = "object_relationship"
     INTELLIGENCE_SEARCH = "intelligence_search"
+    BEHAVIOURS = "behaviours"
+    FILE_DOWNLOAD = "file_download"
 
 
 class VirusTotalCapability(StrEnum):
@@ -29,8 +32,91 @@ class VirusTotalCapability(StrEnum):
     INTELLIGENCE_SEARCH = "intelligence_search"
     FILE_DOWNLOAD = "file_download"
     SUBMISSIONS = "submissions"
+    BEHAVIOUR_REPORTS = "behaviour_reports"
     BEHAVIOUR_PCAP = "behaviour_pcap"
     RETROHUNT = "retrohunt"
+
+
+class VirusTotalObjectType(StrEnum):
+    FILE = "file"
+    IP_ADDRESS = "ip_address"
+    DOMAIN = "domain"
+    URL = "url"
+
+
+class VirusTotalFileRelationship(StrEnum):
+    CONTACTED_DOMAINS = "contacted_domains"
+    CONTACTED_IPS = "contacted_ips"
+    CONTACTED_URLS = "contacted_urls"
+    DROPPED_FILES = "dropped_files"
+    EXECUTION_PARENTS = "execution_parents"
+    ITW_URLS = "itw_urls"
+    EMBEDDED_URLS = "embedded_urls"
+    SIMILAR_FILES = "similar_files"
+    BUNDLED_FILES = "bundled_files"
+    SUBMISSIONS = "submissions"
+
+
+class VirusTotalIpRelationship(StrEnum):
+    COMMENTS = "comments"
+    COMMUNICATING_FILES = "communicating_files"
+    DOWNLOADED_FILES = "downloaded_files"
+    GRAPHS = "graphs"
+    HISTORICAL_SSL_CERTIFICATES = "historical_ssl_certificates"
+    HISTORICAL_WHOIS = "historical_whois"
+    RELATED_COMMENTS = "related_comments"
+    RELATED_REFERENCES = "related_references"
+    RELATED_THREAT_ACTORS = "related_threat_actors"
+    REFERRER_FILES = "referrer_files"
+    RESOLUTIONS = "resolutions"
+    URLS = "urls"
+
+
+class VirusTotalDomainRelationship(StrEnum):
+    CAA_RECORDS = "caa_records"
+    CNAME_RECORDS = "cname_records"
+    COMMENTS = "comments"
+    COMMUNICATING_FILES = "communicating_files"
+    DOWNLOADED_FILES = "downloaded_files"
+    GRAPHS = "graphs"
+    HISTORICAL_SSL_CERTIFICATES = "historical_ssl_certificates"
+    HISTORICAL_WHOIS = "historical_whois"
+    IMMEDIATE_PARENT = "immediate_parent"
+    MX_RECORDS = "mx_records"
+    NS_RECORDS = "ns_records"
+    PARENT = "parent"
+    REFERRER_FILES = "referrer_files"
+    RELATED_COMMENTS = "related_comments"
+    RELATED_REFERENCES = "related_references"
+    RELATED_THREAT_ACTORS = "related_threat_actors"
+    RESOLUTIONS = "resolutions"
+    SOA_RECORDS = "soa_records"
+    SIBLINGS = "siblings"
+    SUBDOMAINS = "subdomains"
+    URLS = "urls"
+    USER_VOTES = "user_votes"
+
+
+class VirusTotalUrlRelationship(StrEnum):
+    COMMUNICATING_FILES = "communicating_files"
+    DOWNLOADED_FILES = "downloaded_files"
+    REFERRER_FILES = "referrer_files"
+    REDIRECTING_URLS = "redirecting_urls"
+
+
+type VirusTotalRelationship = (
+    VirusTotalFileRelationship
+    | VirusTotalIpRelationship
+    | VirusTotalDomainRelationship
+    | VirusTotalUrlRelationship
+)
+
+VIRUSTOTAL_RELATIONSHIPS_BY_OBJECT_TYPE: dict[VirusTotalObjectType, frozenset[str]] = {
+    VirusTotalObjectType.FILE: frozenset(item.value for item in VirusTotalFileRelationship),
+    VirusTotalObjectType.IP_ADDRESS: frozenset(item.value for item in VirusTotalIpRelationship),
+    VirusTotalObjectType.DOMAIN: frozenset(item.value for item in VirusTotalDomainRelationship),
+    VirusTotalObjectType.URL: frozenset(item.value for item in VirusTotalUrlRelationship),
+}
 
 
 class VirusTotalTransportKind(StrEnum):
@@ -94,6 +180,16 @@ class VirusTotalObservation:
             raise DomainError("VirusTotal observation counts cannot be negative")
         if self.observed_at.tzinfo is None or self.observed_at.utcoffset() is None:
             raise DomainError("observed_at must be timezone-aware")
+
+
+@dataclass(frozen=True, slots=True)
+class VirusTotalBehaviourSummary:
+    sandbox: str | None
+    date: int | str | None
+    tags: tuple[str, ...]
+    has_pcap: bool
+    has_html_report: bool
+    available_sections: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

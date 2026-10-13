@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from enum import StrEnum
 from typing import Any, BinaryIO, Protocol
 
 from cti_app.domain.virustotal import (
+    VirusTotalBehaviourSummary,
     VirusTotalCapability,
     VirusTotalEndpointVariant,
     VirusTotalFallbackTrigger,
+    VirusTotalFileRelationship,
+    VirusTotalObjectType,
+    VirusTotalOperation,
+    VirusTotalRelationship,
     VirusTotalTransportKind,
 )
 
@@ -19,6 +24,10 @@ class VirusTotalError(RuntimeError):
     retryable = False
     status_code: int | None = None
     retry_after: float | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+    route: str | None = None
+    operation: VirusTotalOperation | None = None
 
     def __init__(
         self,
@@ -28,6 +37,10 @@ class VirusTotalError(RuntimeError):
         retryable: bool | None = None,
         status_code: int | None = None,
         retry_after: float | None = None,
+        error_code: str | None = None,
+        error_message: str | None = None,
+        route: str | None = None,
+        operation: VirusTotalOperation | None = None,
     ) -> None:
         super().__init__(message)
         if code is not None:
@@ -36,6 +49,10 @@ class VirusTotalError(RuntimeError):
             self.retryable = retryable
         self.status_code = status_code
         self.retry_after = retry_after
+        self.error_code = error_code
+        self.error_message = error_message
+        self.route = route
+        self.operation = operation
 
 
 class VirusTotalConfigurationError(VirusTotalError):
@@ -104,6 +121,14 @@ class VirusTotalHttpError(VirusTotalError):
     pass
 
 
+class VirusTotalQuotaExceededError(VirusTotalHttpError):
+    code = "virustotal_quota_exceeded"
+
+
+class VirusTotalNotAuthorizedError(VirusTotalHttpError):
+    code = "virustotal_not_authorized"
+
+
 class VirusTotalTransportError(VirusTotalError):
     pass
 
@@ -122,6 +147,7 @@ class VirusTotalCapabilities:
     intelligence_search: bool = False
     file_download: bool = False
     submissions: bool = False
+    behaviour_reports: bool = False
     behaviour_pcap: bool = False
     retrohunt: bool = False
 
@@ -178,16 +204,7 @@ class VirusTotalRoutingPolicy:
         return self.routes.get(capability)
 
 
-class FileRelationship(StrEnum):
-    CONTACTED_DOMAINS = "contacted_domains"
-    CONTACTED_IPS = "contacted_ips"
-    CONTACTED_URLS = "contacted_urls"
-    DROPPED_FILES = "dropped_files"
-    EXECUTION_PARENTS = "execution_parents"
-    ITW_URLS = "itw_urls"
-    EMBEDDED_URLS = "embedded_urls"
-    SIMILAR_FILES = "similar_files"
-    BUNDLED_FILES = "bundled_files"
+FileRelationship = VirusTotalFileRelationship
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,6 +263,8 @@ class VirusTotalPage:
     limit_used: int
     transport: VirusTotalTransportKind
     api_generation: VirusTotalEndpointVariant
+    empty: bool = False
+    behaviour_summaries: tuple[VirusTotalBehaviourSummary, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -260,6 +279,9 @@ class VirusTotalSearchResult:
     limit_used: int
     transport: VirusTotalTransportKind
     api_generation: VirusTotalEndpointVariant
+    empty: bool = False
+    descriptors_only: bool = True
+    order: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,6 +315,26 @@ class VirusTotalPort(Protocol):
         paginate: bool = False,
     ) -> VirusTotalPage: ...
 
+    async def object_relationship(
+        self,
+        object_type: VirusTotalObjectType,
+        object_id: str,
+        relation: VirusTotalRelationship | str,
+        *,
+        limit: int | None = None,
+        cursor: str | None = None,
+        paginate: bool = False,
+    ) -> VirusTotalPage: ...
+
+    async def behaviours(
+        self,
+        file_hash: str,
+        *,
+        limit: int | None = None,
+        cursor: str | None = None,
+        paginate: bool = False,
+    ) -> VirusTotalPage: ...
+
     async def intelligence_search(
         self,
         query: str,
@@ -300,10 +342,14 @@ class VirusTotalPort(Protocol):
         limit: int | None = None,
         cursor: str | None = None,
         paginate: bool = False,
+        descriptors_only: bool = True,
+        order: str | None = None,
     ) -> VirusTotalSearchResult: ...
 
 
 _HASH_RE = re.compile(r"^(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})$", re.IGNORECASE)
+_CONTENT_DORK_RE = re.compile(r'(?i)(?<![\w])content\s*:\s*("(?:\\.|[^"\\])*"|\{[^}]*\}|[^\s()]+)?')
+_HEX_BYTE_RE = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{2}(?![0-9a-fA-F])")
 
 
 def normalize_file_hash(value: str) -> str:
@@ -325,7 +371,40 @@ def file_hash_family(normalized_hash: str) -> str:
 
 
 def validate_search_query(value: str) -> str:
+    if not isinstance(value, str):
+        raise VirusTotalInvalidInputError("La requête Intelligence Search doit être du texte.")
+    if len(value) > 2000:
+        raise VirusTotalInvalidInputError(
+            "La requête Intelligence Search dépasse 2 000 caractères."
+        )
+    if any(unicodedata.category(character) == "Cc" for character in value):
+        raise VirusTotalInvalidInputError(
+            "La requête Intelligence Search contient un caractère de contrôle."
+        )
     candidate = value.strip()
     if not candidate:
         raise VirusTotalInvalidInputError("La requête Intelligence Search est vide.")
+    for match in _CONTENT_DORK_RE.finditer(candidate):
+        term = match.group(1)
+        if not term:
+            raise VirusTotalInvalidInputError("Le motif content: doit contenir au moins 4 octets.")
+        if term.startswith('"') and term.endswith('"'):
+            content = term[1:-1]
+            byte_count = len(content.encode("utf-8"))
+        elif term.startswith("{") and term.endswith("}"):
+            content = term[1:-1]
+            compact_hex = re.sub(r"\s+", "", content)
+            if (
+                compact_hex
+                and len(compact_hex) % 2 == 0
+                and re.fullmatch(r"[0-9a-fA-F]+", compact_hex)
+            ):
+                byte_count = len(compact_hex) // 2
+            else:
+                hex_bytes = _HEX_BYTE_RE.findall(content)
+                byte_count = len(hex_bytes) if hex_bytes else len(content.encode("utf-8"))
+        else:
+            byte_count = len(term.encode("utf-8"))
+        if byte_count < 4:
+            raise VirusTotalInvalidInputError("Le motif content: doit contenir au moins 4 octets.")
     return candidate

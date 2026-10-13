@@ -15,7 +15,6 @@ from cti_app.application.virustotal import (
     VirusTotalError,
     VirusTotalInvalidInputError,
     VirusTotalOperationRoute,
-    VirusTotalRelationNotAllowedError,
     VirusTotalResponseTooLargeError,
     VirusTotalRouteStep,
     VirusTotalRouteUnavailableError,
@@ -199,22 +198,20 @@ async def test_invalid_hash_is_rejected_without_http() -> None:
 
 
 @pytest.mark.asyncio
-async def test_relationship_allowlist_and_submission_rejection() -> None:
-    calls = 0
+async def test_submissions_is_an_allowed_file_relationship() -> None:
+    seen: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal calls
-        calls += 1
+        seen.append(request.url.path)
         return httpx.Response(200, json={"data": []}, request=request)
 
     value, client = adapter(handler)
     try:
-        with pytest.raises(VirusTotalRelationNotAllowedError) as caught:
-            await value.file_relationship(SHA256, "submissions")  # type: ignore[arg-type]
-        assert caught.value.code == "virustotal_relation_not_allowed"
+        result = await value.file_relationship(SHA256, "submissions")  # type: ignore[arg-type]
     finally:
         await client.aclose()
-    assert calls == 0
+    assert result.empty is True
+    assert seen == [f"/api/v3/files/{SHA256.lower()}/submissions"]
 
 
 @pytest.mark.asyncio
@@ -314,10 +311,10 @@ async def test_capability_disabled_and_missing_proxy_are_local() -> None:
     ("status", "code", "retryable"),
     [
         (401, "virustotal_upstream_unauthorized", False),
-        (403, "virustotal_upstream_forbidden", False),
+        (403, "virustotal_not_authorized", False),
         (404, "virustotal_not_found", False),
         (407, "virustotal_proxy_auth_required", False),
-        (429, "virustotal_rate_limited", True),
+        (429, "virustotal_quota_exceeded", True),
         (503, "virustotal_upstream_error", True),
     ],
 )

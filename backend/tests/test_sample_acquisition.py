@@ -255,7 +255,7 @@ _CLEAR_POLICY = SampleAcquisitionPolicy(
 
 def test_investigation_budget_settings_are_configurable_and_default_to_current_p04_shape() -> None:
     defaults = Settings(_env_file=None)
-    assert defaults.investigation_max_cycles == 3
+    assert defaults.investigation_max_cycles == 12
     assert defaults.investigation_max_pivot_runs == 0
     assert defaults.investigation_max_hits_acquired == 0
     assert defaults.investigation_max_new_samples == 0
@@ -616,8 +616,12 @@ async def test_adapter_signed_download_carries_no_vt_auth_header_and_verifies_sh
     content = b"quarantined-bytes"
     sha256 = hashlib.sha256(content).hexdigest()
     seen_download_headers: list[httpx.Headers] = []
+    seen_routes: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        seen_routes.append(request.url.path)
+        if request.url.path.endswith("/download"):
+            return httpx.Response(404, request=request)
         assert request.url.path == f"/api/v3/files/{sha256}/download_url"
         assert "x-apikey" not in request.headers
         return httpx.Response(
@@ -634,6 +638,10 @@ async def test_adapter_signed_download_carries_no_vt_auth_header_and_verifies_sh
 
     assert result.sha256 == sha256
     assert sink.getvalue() == content
+    assert seen_routes == [
+        f"/api/v3/files/{sha256}/download",
+        f"/api/v3/files/{sha256}/download_url",
+    ]
     assert "x-apikey" not in seen_download_headers[0]
     assert "authorization" not in seen_download_headers[0]
 
@@ -648,6 +656,8 @@ async def test_adapter_rejects_signed_host_outside_the_allowlist_before_download
         return httpx.Response(200, content=b"x", request=request)
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/download"):
+            return httpx.Response(404, request=request)
         return httpx.Response(
             200, json={"data": "https://not-allowed.example.test/object"}, request=request
         )
@@ -663,6 +673,8 @@ async def test_adapter_rejects_signed_host_outside_the_allowlist_before_download
 @pytest.mark.asyncio
 async def test_adapter_refuses_a_redirect_from_the_signed_download() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/download"):
+            return httpx.Response(404, request=request)
         return httpx.Response(
             200, json={"data": "https://signed.example.test/object"}, request=request
         )
@@ -682,6 +694,8 @@ async def test_adapter_refuses_a_redirect_from_the_signed_download() -> None:
 @pytest.mark.asyncio
 async def test_adapter_rejects_wrong_bytes_for_the_requested_hash() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/download"):
+            return httpx.Response(404, request=request)
         return httpx.Response(
             200, json={"data": "https://signed.example.test/object"}, request=request
         )
@@ -699,6 +713,8 @@ async def test_adapter_rejects_wrong_bytes_for_the_requested_hash() -> None:
 @pytest.mark.asyncio
 async def test_adapter_enforces_the_download_size_limit_while_streaming() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/download"):
+            return httpx.Response(404, request=request)
         return httpx.Response(
             200, json={"data": "https://signed.example.test/object"}, request=request
         )

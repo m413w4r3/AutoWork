@@ -24,6 +24,7 @@ from cti_app.application.virustotal import (
 from cti_app.domain.virustotal import (
     VirusTotalCapability,
     VirusTotalFileView,
+    VirusTotalObjectType,
     VirusTotalObservation,
     VirusTotalOperation,
 )
@@ -119,6 +120,66 @@ class VirusTotalObservationService:
             observed_at,
         )
 
+    async def store_object_relationship(
+        self,
+        page: VirusTotalPage,
+        *,
+        object_type: VirusTotalObjectType,
+        object_id: str,
+        relation: str,
+        subject_id: UUID | None = None,
+        input_cursor: str | None = None,
+        observed_at: datetime,
+    ) -> tuple[VirusTotalObservation, ...]:
+        return await self._store_pages(
+            page.raw_json_pages,
+            page.http_statuses,
+            VirusTotalOperation.OBJECT_RELATIONSHIP,
+            VirusTotalCapability.FILE_RELATIONSHIPS,
+            object_id,
+            {
+                "object_type": object_type.value,
+                "object_id": object_id,
+                "relation": relation,
+                "limit": page.limit_used,
+                "input_cursor": input_cursor,
+                "transport": page.transport.value,
+                "api_generation": page.api_generation.value,
+            },
+            page,
+            subject_id,
+            input_cursor,
+            observed_at,
+        )
+
+    async def store_behaviours(
+        self,
+        page: VirusTotalPage,
+        *,
+        file_hash: str,
+        subject_id: UUID | None = None,
+        input_cursor: str | None = None,
+        observed_at: datetime,
+    ) -> tuple[VirusTotalObservation, ...]:
+        return await self._store_pages(
+            page.raw_json_pages,
+            page.http_statuses,
+            VirusTotalOperation.BEHAVIOURS,
+            VirusTotalCapability.BEHAVIOUR_REPORTS,
+            file_hash,
+            {
+                "file_hash": file_hash,
+                "limit": page.limit_used,
+                "input_cursor": input_cursor,
+                "transport": page.transport.value,
+                "api_generation": page.api_generation.value,
+            },
+            page,
+            subject_id,
+            input_cursor,
+            observed_at,
+        )
+
     async def store_intelligence_search(
         self,
         result: VirusTotalSearchResult,
@@ -127,7 +188,13 @@ class VirusTotalObservationService:
         subject_id: UUID | None = None,
         input_cursor: str | None = None,
         observed_at: datetime,
+        descriptors_only: bool | None = None,
+        order: str | None = None,
     ) -> tuple[VirusTotalObservation, ...]:
+        effective_descriptors_only = (
+            result.descriptors_only if descriptors_only is None else descriptors_only
+        )
+        effective_order = result.order if order is None else order
         return await self._store_pages(
             result.raw_json_pages,
             result.http_statuses,
@@ -138,7 +205,8 @@ class VirusTotalObservationService:
                 "query": query,
                 "limit": result.limit_used,
                 "input_cursor": input_cursor,
-                "descriptors_only": True,
+                "descriptors_only": effective_descriptors_only,
+                "order": effective_order,
                 "transport": result.transport.value,
                 "api_generation": result.api_generation.value,
             },

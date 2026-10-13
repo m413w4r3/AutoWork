@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
+import re
 import ssl
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
+from enum import StrEnum
 from typing import Any, BinaryIO
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import httpx
 
@@ -27,10 +30,12 @@ from cti_app.application.virustotal import (
     VirusTotalHttpError,
     VirusTotalInvalidInputError,
     VirusTotalJsonError,
+    VirusTotalNotAuthorizedError,
     VirusTotalOperationRoute,
     VirusTotalPage,
     VirusTotalPayloadError,
     VirusTotalPort,
+    VirusTotalQuotaExceededError,
     VirusTotalRawResponse,
     VirusTotalRelationNotAllowedError,
     VirusTotalResponseTooLargeError,
@@ -46,12 +51,18 @@ from cti_app.application.virustotal import (
 )
 from cti_app.config import Settings
 from cti_app.domain.virustotal import (
+    VIRUSTOTAL_RELATIONSHIPS_BY_OBJECT_TYPE,
+    VirusTotalBehaviourSummary,
     VirusTotalCapability,
     VirusTotalEndpointVariant,
+    VirusTotalObjectType,
+    VirusTotalOperation,
+    VirusTotalRelationship,
     VirusTotalTransportKind,
 )
 
 logger = logging.getLogger(__name__)
+_MAX_ERROR_BODY_BYTES = 64 * 1024
 
 
 def create_virustotal_http_client(settings: Settings) -> httpx.AsyncClient:
@@ -195,8 +206,39 @@ class VirusTotalHttpAdapter(VirusTotalPort):
         self._require(VirusTotalCapability.FILE_DOWNLOAD)
         normalized = normalize_file_hash(file_hash)
         family = file_hash_family(normalized)
-        self._resolve_route(VirusTotalCapability.FILE_DOWNLOAD)
-        ticket = await self._get(f"/files/{normalized}/download_url")
+        route = self._resolve_route(VirusTotalCapability.FILE_DOWNLOAD)
+
+        async def direct_download(step: VirusTotalRouteStep) -> VirusTotalDownloadResult:
+            client, base_url = self._resolve_transport(step)
+            return await _stream_route_download(
+                client,
+                f"{base_url}/files/{normalized}/download",
+                sink=sink,
+                expected_hash=normalized,
+                expected_family=family,
+                max_bytes=self._download_max_bytes,
+                operation=VirusTotalOperation.FILE_DOWNLOAD,
+                route=_route_name(step),
+            )
+
+        try:
+            direct_result, _ = await self._execute_route(route, direct_download)
+            return direct_result
+        except VirusTotalHttpError as error:
+            if error.status_code != 404:
+                raise
+
+        async def download_ticket(step: VirusTotalRouteStep) -> VirusTotalRawResponse:
+            client, base_url = self._resolve_transport(step)
+            return await self._get(
+                f"/files/{normalized}/download_url",
+                client=client,
+                base_url=base_url,
+                operation=VirusTotalOperation.FILE_DOWNLOAD,
+                route=_route_name(step),
+            )
+
+        ticket, step = await self._execute_route(route, download_ticket)
         payload = _json_object(ticket.body)
         signed_url = payload.get("data")
         if not isinstance(signed_url, str) or not signed_url:
@@ -212,6 +254,8 @@ class VirusTotalHttpAdapter(VirusTotalPort):
             expected_family=family,
             max_bytes=self._download_max_bytes,
             client=self._download_client(),
+            operation=VirusTotalOperation.FILE_DOWNLOAD,
+            route=f"signed:{step.variant.value}",
         )
 
     def _download_client(self) -> httpx.AsyncClient:
@@ -227,19 +271,29 @@ class VirusTotalHttpAdapter(VirusTotalPort):
     ) -> VirusTotalRawResponse:
         client, base_url = self._resolve_transport(step)
         if step.variant is VirusTotalEndpointVariant.LEGACY_V2:
+            # VT v2 defines `apikey` as a query argument; this compatibility route
+            # cannot move it to the v3 x-apikey header. configure_logging redacts it.
             return await self._get(
                 "/file/report",
                 client=client,
                 base_url=base_url,
                 params={"resource": file_hash, "apikey": self._api_key},
+                operation=VirusTotalOperation.FILE_REPORT,
+                route=_route_name(step),
             )
-        return await self._get(f"/files/{file_hash}", client=client, base_url=base_url)
+        return await self._get(
+            f"/files/{file_hash}",
+            client=client,
+            base_url=base_url,
+            operation=VirusTotalOperation.FILE_REPORT,
+            route=_route_name(step),
+        )
 
-    async def _execute_route(
+    async def _execute_route[ResultT](
         self,
         route: VirusTotalOperationRoute,
-        request: Callable[[VirusTotalRouteStep], Awaitable[VirusTotalRawResponse]],
-    ) -> tuple[VirusTotalRawResponse, VirusTotalRouteStep]:
+        request: Callable[[VirusTotalRouteStep], Awaitable[ResultT]],
+    ) -> tuple[ResultT, VirusTotalRouteStep]:
         steps = route.steps()
         for index, step in enumerate(steps):
             is_last = index == len(steps) - 1
@@ -273,6 +327,12 @@ class VirusTotalHttpAdapter(VirusTotalPort):
             raise VirusTotalRouteUnavailableError(
                 "Aucune route VirusTotal n'est configurée pour cette opération."
             )
+        if capability is not VirusTotalCapability.FILE_REPORT and any(
+            step.transport is VirusTotalTransportKind.DIRECT for step in route.steps()
+        ):
+            raise VirusTotalRouteUnavailableError(
+                "Les opérations VirusTotal hors rapport fichier doivent utiliser le proxy."
+            )
         return route
 
     async def file_relationship(
@@ -287,10 +347,103 @@ class VirusTotalHttpAdapter(VirusTotalPort):
         self._require(VirusTotalCapability.FILE_RELATIONSHIPS)
         self._resolve_route(VirusTotalCapability.FILE_RELATIONSHIPS)
         normalized = normalize_file_hash(file_hash)
-        if not isinstance(relation, FileRelationship):
-            raise VirusTotalRelationNotAllowedError("La relation fichier n'est pas autorisée.")
+        try:
+            resolved_relation = FileRelationship(relation)
+        except (TypeError, ValueError) as exc:
+            raise VirusTotalRelationNotAllowedError(
+                "La relation fichier n'est pas autorisée."
+            ) from exc
         return await self._paginate(
-            f"/files/{normalized}/{relation.value}", limit=limit, cursor=cursor, paginate=paginate
+            f"/files/{normalized}/{resolved_relation.value}",
+            limit=limit,
+            cursor=cursor,
+            paginate=paginate,
+            operation=VirusTotalOperation.FILE_RELATIONSHIP,
+        )
+
+    async def object_relationship(
+        self,
+        object_type: VirusTotalObjectType,
+        object_id: str,
+        relation: VirusTotalRelationship | str,
+        *,
+        limit: int | None = None,
+        cursor: str | None = None,
+        paginate: bool = False,
+    ) -> VirusTotalPage:
+        self._require(VirusTotalCapability.FILE_RELATIONSHIPS)
+        self._resolve_route(VirusTotalCapability.FILE_RELATIONSHIPS)
+        try:
+            resolved_type = VirusTotalObjectType(object_type)
+        except (TypeError, ValueError) as exc:
+            raise VirusTotalInvalidInputError("Le type d'objet VirusTotal est invalide.") from exc
+        relation_value = relation.value if isinstance(relation, StrEnum) else relation
+        if (
+            not isinstance(relation_value, str)
+            or relation_value not in VIRUSTOTAL_RELATIONSHIPS_BY_OBJECT_TYPE[resolved_type]
+        ):
+            raise VirusTotalRelationNotAllowedError(
+                "La relation demandée n'est pas autorisée pour ce type d'objet."
+            )
+        if not isinstance(object_id, str) or not object_id.strip():
+            raise VirusTotalInvalidInputError("L'identifiant d'objet VirusTotal est vide.")
+        if resolved_type is VirusTotalObjectType.FILE:
+            normalized_id = normalize_file_hash(object_id)
+        elif resolved_type is VirusTotalObjectType.URL:
+            normalized_id = base64.urlsafe_b64encode(object_id.encode("utf-8")).decode("ascii")
+            normalized_id = normalized_id.rstrip("=")
+        else:
+            normalized_id = object_id.strip()
+        collection = {
+            VirusTotalObjectType.FILE: "files",
+            VirusTotalObjectType.IP_ADDRESS: "ip_addresses",
+            VirusTotalObjectType.DOMAIN: "domains",
+            VirusTotalObjectType.URL: "urls",
+        }[resolved_type]
+        safe_id = (
+            normalized_id
+            if resolved_type is VirusTotalObjectType.URL
+            else quote(normalized_id, safe="")
+        )
+        return await self._paginate(
+            f"/{collection}/{safe_id}/{relation_value}",
+            limit=limit,
+            cursor=cursor,
+            paginate=paginate,
+            operation=VirusTotalOperation.OBJECT_RELATIONSHIP,
+        )
+
+    async def behaviours(
+        self,
+        file_hash: str,
+        *,
+        limit: int | None = None,
+        cursor: str | None = None,
+        paginate: bool = False,
+    ) -> VirusTotalPage:
+        self._require(VirusTotalCapability.BEHAVIOUR_REPORTS)
+        self._resolve_route(VirusTotalCapability.BEHAVIOUR_REPORTS)
+        normalized = normalize_file_hash(file_hash)
+        page = await self._paginate(
+            f"/files/{normalized}/behaviours",
+            limit=10 if limit is None else limit,
+            cursor=cursor,
+            paginate=paginate,
+            operation=VirusTotalOperation.BEHAVIOURS,
+        )
+        return VirusTotalPage(
+            items=page.items,
+            next_cursor=page.next_cursor,
+            observed_count=page.observed_count,
+            stopped_due_to_limit=page.stopped_due_to_limit,
+            exhaustive=page.exhaustive,
+            raw_json_pages=page.raw_json_pages,
+            http_statuses=page.http_statuses,
+            limit_used=page.limit_used,
+            transport=page.transport,
+            api_generation=page.api_generation,
+            empty=page.empty,
+            behaviour_summaries=tuple(_behaviour_summary(item) for item in page.items),
         )
 
     async def intelligence_search(
@@ -300,6 +453,8 @@ class VirusTotalHttpAdapter(VirusTotalPort):
         limit: int | None = None,
         cursor: str | None = None,
         paginate: bool = False,
+        descriptors_only: bool = True,
+        order: str | None = None,
     ) -> VirusTotalSearchResult:
         self._require(VirusTotalCapability.INTELLIGENCE_SEARCH)
         self._resolve_route(VirusTotalCapability.INTELLIGENCE_SEARCH)
@@ -309,7 +464,12 @@ class VirusTotalHttpAdapter(VirusTotalPort):
             limit=limit,
             cursor=cursor,
             paginate=paginate,
-            extra_params={"query": query, "descriptors_only": "true"},
+            extra_params={
+                "query": query,
+                "descriptors_only": str(descriptors_only).lower(),
+                **({"order": order} if order is not None else {}),
+            },
+            operation=VirusTotalOperation.INTELLIGENCE_SEARCH,
         )
         return VirusTotalSearchResult(
             items=page.items,
@@ -322,6 +482,9 @@ class VirusTotalHttpAdapter(VirusTotalPort):
             limit_used=page.limit_used,
             transport=page.transport,
             api_generation=page.api_generation,
+            empty=page.empty,
+            descriptors_only=descriptors_only,
+            order=order,
         )
 
     async def _paginate(
@@ -331,6 +494,7 @@ class VirusTotalHttpAdapter(VirusTotalPort):
         limit: int | None,
         cursor: str | None,
         paginate: bool,
+        operation: VirusTotalOperation,
         extra_params: Mapping[str, str] | None = None,
     ) -> VirusTotalPage:
         page_limit = self._page_limit(limit)
@@ -344,7 +508,12 @@ class VirusTotalHttpAdapter(VirusTotalPort):
             params["limit"] = page_limit
             if current_cursor:
                 params["cursor"] = current_cursor
-            response = await self._get(path, params=params)
+            response = await self._get(
+                path,
+                params=params,
+                operation=operation,
+                route="proxy:v3",
+            )
             payload = _json_object(response.body)
             page_items = _parse_items(payload)
             pages.append(response.body)
@@ -375,6 +544,7 @@ class VirusTotalHttpAdapter(VirusTotalPort):
             limit_used=page_limit,
             transport=VirusTotalTransportKind.PROXY,
             api_generation=VirusTotalEndpointVariant.V3,
+            empty=not items and exhaustive,
         )
 
     async def _get(
@@ -384,6 +554,8 @@ class VirusTotalHttpAdapter(VirusTotalPort):
         params: Mapping[str, Any] | None = None,
         client: httpx.AsyncClient | None = None,
         base_url: str | None = None,
+        operation: VirusTotalOperation | None = None,
+        route: str | None = "proxy:v3",
     ) -> VirusTotalRawResponse:
         try:
             response = await (client or self._client).get(
@@ -393,10 +565,19 @@ class VirusTotalHttpAdapter(VirusTotalPort):
                 raise VirusTotalUnexpectedRedirectError(
                     "VirusTotal a renvoyé une redirection inattendue.",
                     status_code=response.status_code,
+                    operation=operation,
+                    route=route,
                 )
             if response.status_code >= 400:
                 retry_after = _retry_after(response.headers.get("Retry-After"))
-                raise _http_error(response.status_code, retry_after)
+                body = response.content[:_MAX_ERROR_BODY_BYTES]
+                raise _http_error(
+                    response.status_code,
+                    retry_after,
+                    body=body,
+                    operation=operation,
+                    route=route,
+                )
             body = await _read_bounded(response, self._max_response_bytes)
             return VirusTotalRawResponse(body=body, status_code=response.status_code)
         except VirusTotalError:
@@ -406,18 +587,24 @@ class VirusTotalHttpAdapter(VirusTotalPort):
                 "Le proxy VirusTotal a expiré pendant la connexion.",
                 code="virustotal_connect_timeout",
                 retryable=True,
+                operation=operation,
+                route=route,
             ) from exc
         except httpx.ReadTimeout as exc:
             raise VirusTotalTransportError(
                 "VirusTotal a expiré pendant la lecture.",
                 code="virustotal_read_timeout",
                 retryable=True,
+                operation=operation,
+                route=route,
             ) from exc
         except httpx.ProxyError as exc:
             raise VirusTotalTransportError(
                 "La connexion au proxy VirusTotal a échoué.",
                 code="virustotal_proxy_error",
                 retryable=True,
+                operation=operation,
+                route=route,
             ) from exc
         except httpx.ConnectError as exc:
             if _is_tls_error(exc):
@@ -425,21 +612,31 @@ class VirusTotalHttpAdapter(VirusTotalPort):
                     "La vérification TLS de VirusTotal a échoué.",
                     code="virustotal_tls_error",
                     retryable=False,
+                    operation=operation,
+                    route=route,
                 ) from exc
             raise VirusTotalTransportError(
                 "La connexion au proxy VirusTotal a échoué.",
                 code="virustotal_connection_error",
                 retryable=True,
+                operation=operation,
+                route=route,
             ) from exc
         except httpx.TimeoutException as exc:
             raise VirusTotalTransportError(
-                "La requête VirusTotal a expiré.", code="virustotal_timeout", retryable=True
+                "La requête VirusTotal a expiré.",
+                code="virustotal_timeout",
+                retryable=True,
+                operation=operation,
+                route=route,
             ) from exc
         except httpx.TransportError as exc:
             raise VirusTotalTransportError(
                 "Le transport VirusTotal a échoué.",
                 code="virustotal_transport_error",
                 retryable=True,
+                operation=operation,
+                route=route,
             ) from exc
 
     def _page_limit(self, value: int | None) -> int:
@@ -501,10 +698,15 @@ def _default_routing_policy(
         ),
         VirusTotalCapability.FILE_RELATIONSHIPS: proxy_only,
         VirusTotalCapability.INTELLIGENCE_SEARCH: proxy_only,
+        VirusTotalCapability.BEHAVIOUR_REPORTS: proxy_only,
     }
     if file_download_enabled:
         routes[VirusTotalCapability.FILE_DOWNLOAD] = proxy_only
     return VirusTotalRoutingPolicy(routes=routes)
+
+
+def _route_name(step: VirusTotalRouteStep) -> str:
+    return f"{step.transport.value}:{step.variant.value}"
 
 
 def _validate_base_url(value: str) -> str:
@@ -570,34 +772,24 @@ async def _stream_signed_download(
     expected_family: str,
     max_bytes: int,
     client: httpx.AsyncClient,
+    operation: VirusTotalOperation,
+    route: str,
 ) -> VirusTotalDownloadResult:
-    md5 = hashlib.md5()
-    sha1 = hashlib.sha1()
-    sha256 = hashlib.sha256()
-    size = 0
     # A dedicated, ephemeral, headerless client: it must never carry
     # x-apikey or any other VT client authentication header, and it never
     # follows redirects away from the validated signed host.
     async with client:
         try:
             async with client.stream("GET", url) as response:
-                if 300 <= response.status_code < 400:
-                    raise VirusTotalUnexpectedRedirectError(
-                        "Le téléchargement signé VirusTotal a été redirigé.",
-                        status_code=response.status_code,
-                    )
-                if response.status_code >= 400:
-                    raise _http_error(response.status_code, None)
-                async for chunk in response.aiter_bytes():
-                    size += len(chunk)
-                    if size > max_bytes:
-                        raise VirusTotalDownloadTooLargeError(
-                            "Le téléchargement VirusTotal dépasse la limite configurée."
-                        )
-                    md5.update(chunk)
-                    sha1.update(chunk)
-                    sha256.update(chunk)
-                    sink.write(chunk)
+                return await _stream_verified_response(
+                    response,
+                    sink=sink,
+                    expected_hash=expected_hash,
+                    expected_family=expected_family,
+                    max_bytes=max_bytes,
+                    operation=operation,
+                    route=route,
+                )
         except VirusTotalError:
             raise
         except httpx.TimeoutException as exc:
@@ -605,17 +797,109 @@ async def _stream_signed_download(
                 "Le téléchargement VirusTotal a expiré.",
                 code="virustotal_download_timeout",
                 retryable=True,
+                operation=operation,
+                route=route,
             ) from exc
         except httpx.TransportError as exc:
             raise VirusTotalTransportError(
                 "Le flux de téléchargement VirusTotal a échoué ou a été tronqué.",
                 code="virustotal_download_transport_error",
                 retryable=True,
+                operation=operation,
+                route=route,
             ) from exc
+
+
+async def _stream_route_download(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    sink: BinaryIO,
+    expected_hash: str,
+    expected_family: str,
+    max_bytes: int,
+    operation: VirusTotalOperation,
+    route: str,
+) -> VirusTotalDownloadResult:
+    try:
+        async with client.stream("GET", url) as response:
+            return await _stream_verified_response(
+                response,
+                sink=sink,
+                expected_hash=expected_hash,
+                expected_family=expected_family,
+                max_bytes=max_bytes,
+                operation=operation,
+                route=route,
+            )
+    except VirusTotalError:
+        raise
+    except httpx.TimeoutException as exc:
+        raise VirusTotalTransportError(
+            "Le téléchargement VirusTotal a expiré.",
+            code="virustotal_download_timeout",
+            retryable=True,
+            operation=operation,
+            route=route,
+        ) from exc
+    except httpx.TransportError as exc:
+        raise VirusTotalTransportError(
+            "Le flux de téléchargement VirusTotal a échoué ou a été tronqué.",
+            code="virustotal_download_transport_error",
+            retryable=True,
+            operation=operation,
+            route=route,
+        ) from exc
+
+
+async def _stream_verified_response(
+    response: httpx.Response,
+    *,
+    sink: BinaryIO,
+    expected_hash: str,
+    expected_family: str,
+    max_bytes: int,
+    operation: VirusTotalOperation,
+    route: str,
+) -> VirusTotalDownloadResult:
+    if 300 <= response.status_code < 400:
+        raise VirusTotalUnexpectedRedirectError(
+            "Le téléchargement VirusTotal a été redirigé.",
+            status_code=response.status_code,
+            operation=operation,
+            route=route,
+        )
+    if response.status_code >= 400:
+        body = await _read_error_prefix(response)
+        raise _http_error(
+            response.status_code,
+            _retry_after(response.headers.get("Retry-After")),
+            body=body,
+            operation=operation,
+            route=route,
+        )
+    md5 = hashlib.md5()
+    sha1 = hashlib.sha1()
+    sha256 = hashlib.sha256()
+    size = 0
+    async for chunk in response.aiter_bytes():
+        size += len(chunk)
+        if size > max_bytes:
+            raise VirusTotalDownloadTooLargeError(
+                "Le téléchargement VirusTotal dépasse la limite configurée.",
+                operation=operation,
+                route=route,
+            )
+        md5.update(chunk)
+        sha1.update(chunk)
+        sha256.update(chunk)
+        sink.write(chunk)
     computed = {"md5": md5.hexdigest(), "sha1": sha1.hexdigest(), "sha256": sha256.hexdigest()}
     if computed[expected_family] != expected_hash:
         raise VirusTotalDownloadHashMismatchError(
-            "Les octets téléchargés ne correspondent pas au hash demandé."
+            "Les octets téléchargés ne correspondent pas au hash demandé.",
+            operation=operation,
+            route=route,
         )
     return VirusTotalDownloadResult(
         md5=computed["md5"], sha1=computed["sha1"], sha256=computed["sha256"], size=size
@@ -638,6 +922,17 @@ async def _read_bounded(response: httpx.Response, maximum: int) -> bytes:
                 "La réponse VirusTotal dépasse la limite configurée."
             )
         chunks.append(chunk)
+    return b"".join(chunks)
+
+
+async def _read_error_prefix(response: httpx.Response) -> bytes:
+    chunks: list[bytes] = []
+    remaining = _MAX_ERROR_BODY_BYTES
+    async for chunk in response.aiter_bytes():
+        chunks.append(chunk[:remaining])
+        remaining -= min(len(chunk), remaining)
+        if remaining == 0:
+            break
     return b"".join(chunks)
 
 
@@ -748,6 +1043,42 @@ def _parse_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return data
 
 
+def _behaviour_summary(item: dict[str, Any]) -> VirusTotalBehaviourSummary:
+    raw_attributes = item.get("attributes")
+    attributes = raw_attributes if isinstance(raw_attributes, dict) else {}
+    sandbox_value = attributes.get("sandbox_name", attributes.get("sandbox"))
+    sandbox = sandbox_value if isinstance(sandbox_value, str) else None
+    date_value = attributes.get("analysis_date", attributes.get("date"))
+    date = date_value if isinstance(date_value, str) or type(date_value) is int else None
+    raw_tags = attributes.get("tags")
+    tags = (
+        tuple(tag for tag in raw_tags if isinstance(tag, str)) if isinstance(raw_tags, list) else ()
+    )
+    metadata_keys = {
+        "sandbox_name",
+        "sandbox",
+        "analysis_date",
+        "date",
+        "tags",
+        "has_pcap",
+        "has_html_report",
+        "behash",
+    }
+    available_sections = tuple(
+        key
+        for key, value in attributes.items()
+        if key not in metadata_keys and value not in (None, [], {})
+    )
+    return VirusTotalBehaviourSummary(
+        sandbox=sandbox,
+        date=date,
+        tags=tags,
+        has_pcap=attributes.get("has_pcap") is True,
+        has_html_report=attributes.get("has_html_report") is True,
+        available_sections=available_sections,
+    )
+
+
 def _next_cursor(payload: dict[str, Any]) -> str | None:
     meta = payload.get("meta")
     if isinstance(meta, dict) and isinstance(meta.get("cursor"), str) and meta["cursor"]:
@@ -759,7 +1090,54 @@ def _next_cursor(payload: dict[str, Any]) -> str | None:
     return None
 
 
-def _http_error(status: int, retry_after: float | None) -> VirusTotalHttpError:
+def _http_error(
+    status: int,
+    retry_after: float | None,
+    *,
+    body: bytes = b"",
+    operation: VirusTotalOperation | None = None,
+    route: str | None = None,
+) -> VirusTotalHttpError:
+    raw_code: str | None = None
+    raw_message: str | None = None
+    try:
+        payload = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        payload = None
+    if isinstance(payload, dict):
+        raw_error = payload.get("error")
+        if isinstance(raw_error, dict):
+            code_value = raw_error.get("code")
+            message_value = raw_error.get("message")
+            raw_code = _safe_error_detail(code_value, 160) if isinstance(code_value, str) else None
+            raw_message = (
+                _safe_error_detail(message_value, 1024) if isinstance(message_value, str) else None
+            )
+    normalized = f"{raw_code or ''} {raw_message or ''}".lower().replace("_", " ").replace("-", " ")
+    if status == 429 or "quota" in normalized or "rate limit" in normalized:
+        return VirusTotalQuotaExceededError(
+            "VirusTotal a signalé une limite de quota ou de débit.",
+            retryable=status == 429,
+            status_code=status,
+            retry_after=retry_after,
+            error_code=raw_code,
+            error_message=raw_message,
+            operation=operation,
+            route=route,
+        )
+    if status == 403 or any(
+        phrase in normalized
+        for phrase in ("not authorized", "notauthorized", "unauthorized", "plan")
+    ):
+        return VirusTotalNotAuthorizedError(
+            "VirusTotal n'autorise pas cette opération avec le plan actuel.",
+            status_code=status,
+            retry_after=retry_after,
+            error_code=raw_code,
+            error_message=raw_message,
+            operation=operation,
+            route=route,
+        )
     mapping = {
         401: ("virustotal_upstream_unauthorized", False),
         403: ("virustotal_upstream_forbidden", False),
@@ -774,6 +1152,20 @@ def _http_error(status: int, retry_after: float | None) -> VirusTotalHttpError:
         retryable=retryable,
         status_code=status,
         retry_after=retry_after,
+        error_code=raw_code,
+        error_message=raw_message,
+        operation=operation,
+        route=route,
+    )
+
+
+def _safe_error_detail(value: str, maximum: int) -> str:
+    bounded = value[:maximum]
+    bounded = re.sub(r"https?://[^\s\"'<>]+", "[redacted-url]", bounded, flags=re.IGNORECASE)
+    return re.sub(
+        r"(?i)\b(?:x-apikey|api[_ -]?key)(?:\s*[:=]\s*|\s+)[^\s,;]+",
+        "[redacted-key]",
+        bounded,
     )
 
 
