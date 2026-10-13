@@ -31,6 +31,7 @@ analysis = [
   "ppdeep==20260221",
   "py-tlsh==5.0.0",
   "smda==4.5.0",
+  "yara-python==4.5.0",
 ]
 dev = [
   "aiosqlite>=0.20,<1",

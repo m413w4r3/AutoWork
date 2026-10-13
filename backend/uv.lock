@@ -316,6 +316,7 @@ analysis = [
     { name = "py-tlsh" },
     { name = "pyelftools" },
     { name = "smda" },
+    { name = "yara-python" },
 ]
 dev = [
     { name = "aiosqlite" },
@@ -349,6 +350,7 @@ analysis = [
     { name = "py-tlsh", specifier = "==5.0.0" },
     { name = "pyelftools", specifier = "==0.33" },
     { name = "smda", specifier = "==4.5.0" },
+    { name = "yara-python", specifier = "==4.5.0" },
 ]
 dev = [
     { name = "aiosqlite", specifier = ">=0.20,<1" },
@@ -2067,4 +2069,22 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/19/70/80f3b7c10d2630aa66414bf23d210386700aa390547278c789afa994fd7e/xmltodict-1.0.4.tar.gz", hash = "sha256:6d94c9f834dd9e44514162799d344d815a3a4faec913717a9ecbfa5be1bb8e61", size = 26124, upload-time = "2026-02-22T02:21:22.074Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/38/34/98a2f52245f4d47be93b580dae5f9861ef58977d73a79eb47c58f1ad1f3a/xmltodict-1.0.4-py3-none-any.whl", hash = "sha256:a4a00d300b0e1c59fc2bfccb53d7b2e88c32f200df138a0dd2229f842497026a", size = 13580, upload-time = "2026-02-22T02:21:21.039Z" },
+]
+
+[[package]]
+name = "yara-python"
+version = "4.5.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/62/7b/81789fafcc6167fe8cfd94b3813c0971a083cde142731213007e2456f35b/yara-python-4.5.0.tar.gz", hash = "sha256:4feecc56d2fe1d23ecb17cb2d3bc2e3859ebf7a2201d0ca3ae0756a728122b27", size = 548521, upload-time = "2024-03-26T17:46:07.757Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f1/73/269d0441195b6859e202286dd70b9dfdd6f6a2cb8e14fd99daf250e5e037/yara_python-4.5.0-cp312-cp312-macosx_10_9_universal2.whl", hash = "sha256:6918ddc68d89f4da1eb851d6a841ebc615cec31532f74698e4f51e58b44213e0", size = 414939, upload-time = "2024-02-14T11:28:39.706Z" },
+    { url = "https://files.pythonhosted.org/packages/c6/23/3d3c22045dd8a1eebcd4f25ace44650b3668f0ca63e1d2718430b73d95e2/yara_python-4.5.0-cp312-cp312-macosx_10_9_x86_64.whl", hash = "sha256:9a9d666acc4d6d1ec59da4864ac4e25552169bd92520b050e5fcf92212d3ab1e", size = 2054382, upload-time = "2024-02-14T11:28:41.009Z" },
+    { url = "https://files.pythonhosted.org/packages/53/3b/7975def085afb1a5bd96f598d279867c5fa82b6a9d8f22c205c8d878cb8a/yara_python-4.5.0-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:a96d7b4a7e060c40b290d2264c17623f063a5604e6502b06cd145f2f0e6e82ed", size = 2245739, upload-time = "2024-02-14T11:28:42.908Z" },
+    { url = "https://files.pythonhosted.org/packages/49/98/fb0cbf6942dd331ba3439f5af1420f5aca3ab675b8cb07231099f790fe2b/yara_python-4.5.0-cp312-cp312-manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:91f782bdea16441c87f0231f038cf6d151e36718154871f5c5fb274364d144e7", size = 2324993, upload-time = "2024-02-14T11:28:44.466Z" },
+    { url = "https://files.pythonhosted.org/packages/54/3a/808290e614677be713fc1bd6f3dc0a051020ba2a463360eb79b1726f446d/yara_python-4.5.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:006f4af0cf30725425b6777016e6d6d7b2854955f0402b227f70d6fbdc594272", size = 2329256, upload-time = "2024-02-14T11:28:46.496Z" },
+    { url = "https://files.pythonhosted.org/packages/0f/e6/15bf97e97d492f7e0160945c7e2aa888508a3edb387ba0d3aa63940cc444/yara_python-4.5.0-cp312-cp312-musllinux_1_1_aarch64.whl", hash = "sha256:7645a4d23d7749c390da92de105831762499eba22e39e956d0fddfda05d949eb", size = 1956426, upload-time = "2024-02-14T11:28:47.774Z" },
+    { url = "https://files.pythonhosted.org/packages/c3/68/76d07585387039b3166ba052fd102371461f0d6ed67113b36ff590d780a5/yara_python-4.5.0-cp312-cp312-musllinux_1_1_i686.whl", hash = "sha256:244fd95d0e4f4f1fbe85032f7e9b779e2cb4c6678787725482d2b43925ff2ed3", size = 2013142, upload-time = "2024-02-14T11:28:49.128Z" },
+    { url = "https://files.pythonhosted.org/packages/8c/26/b25fb74baef232f0746f04cdab8b99e93be709ee14c255cd5a99945fb53d/yara_python-4.5.0-cp312-cp312-musllinux_1_1_x86_64.whl", hash = "sha256:c17980d60ff3f7cfabab2df28965efb8e0b38508a5c47a0ad6917016edc0328c", size = 2062163, upload-time = "2024-02-14T11:28:50.499Z" },
+    { url = "https://files.pythonhosted.org/packages/4c/e7/b98bd35b1c3dfa303ac35c7122f5787961ab0b52e9de8edcf562530aca33/yara_python-4.5.0-cp312-cp312-win32.whl", hash = "sha256:86549302cae8f9c5fb1394e2e9fd9dc802e3c488723935e50fdcb0d6b639ab51", size = 1332788, upload-time = "2024-02-14T11:28:52.19Z" },
+    { url = "https://files.pythonhosted.org/packages/6c/c2/3ce2fbc919218b7b45a1c7922cf02a865c2564d114cc75c0393a9afaf71d/yara_python-4.5.0-cp312-cp312-win_amd64.whl", hash = "sha256:36423ffd5e2e1f39562df6bd569be997c2fd06e0f30019dfadf339ff88278a4f", size = 1679662, upload-time = "2024-02-14T11:28:54.071Z" },
 ]
