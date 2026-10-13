@@ -54,6 +54,12 @@ _UUID_PATTERN = (
     r"[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
 )
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
+_P10_LIMITATION = (
+    "P10 n'est pas invoqué par ce pont : aucun motif P10 n'est inclus dans cette exécution. "
+    "Pour en utiliser, lancer séparément ProposalConversationService.propose, puis mapper "
+    "explicitement ses propositions vers les feature_refs attendues par le RuleFeatureProvider "
+    "avant rule.propose ; ce mapping n'est pas fait ici."
+)
 _SAMPLE_HASHES = {
     "type": "array",
     "minItems": 2,
@@ -151,6 +157,7 @@ def register_signature_bridge_tools(
             limitations=(
                 "Le pont ne modifie aucune qualification de sample et ne publie pas de règle.",
                 "Les provenances P09 et l'artefact L2 exact restent liés aux motifs YARA.",
+                _P10_LIMITATION,
                 "Une révision v2 conserve les motifs du parent et appelle rule.compare après test.",
                 "Les règles longues, triviales, invalides ou contaminées restent rejetées par "
                 "les contrôles L2, P09 et RuleWorkbench.",
@@ -348,6 +355,8 @@ class _SignatureBridgeAdapter(ToolAdapter):
                         "comparison_observation_ref": str(observation.id),
                         "candidates": decisions,
                         "sample_membership_changed": False,
+                        "p10_status": "not_invoked",
+                        "limitations": [_P10_LIMITATION],
                     },
                     observation_refs=(observation.id,),
                 )
@@ -406,13 +415,11 @@ class _SignatureBridgeAdapter(ToolAdapter):
                 "candidates": decisions,
                 "rule": dict(rule_output),
                 "sample_membership_changed": False,
-                "p10_input_invariant_ids": [
-                    item["p09_invariant_id"]
-                    for item in decisions
-                    if item.get("status") == "p09_proposed"
-                ],
+                "p10_status": "not_invoked",
+                "limitations": [_P10_LIMITATION],
             }
             observation_refs = [observation.id, *rule_refs]
+            result_status = rule_status
             if "parent_version" in arguments and rule_output.get("version"):
                 version_label = str(rule_output["version"])
                 version_b = _version_number(version_label)
@@ -434,15 +441,27 @@ class _SignatureBridgeAdapter(ToolAdapter):
                         output["before_after"] = dict(comparison_output)
                         output["before_after_status"] = comparison_status.value
                         observation_refs.extend(comparison_refs)
+                        if comparison_status is not ToolInvocationStatus.SUCCEEDED:
+                            result_status = ToolInvocationStatus.PARTIAL
                     except Exception as exc:
+                        result_status = ToolInvocationStatus.PARTIAL
                         output["before_after"] = {
                             "status": "unavailable",
                             "reason": type(exc).__name__,
                             "required_tool": "rule.compare",
                         }
+                        output["before_after_status"] = ToolInvocationStatus.UNAVAILABLE.value
+                else:
+                    result_status = ToolInvocationStatus.PARTIAL
+                    output["before_after"] = {
+                        "status": "unavailable",
+                        "reason": "version_b_unparseable",
+                        "required_tool": "rule.compare",
+                    }
+                    output["before_after_status"] = ToolInvocationStatus.UNAVAILABLE.value
             return self._result(
                 started,
-                rule_status,
+                result_status,
                 "signature_candidates_proposed_to_rule_workbench",
                 output=output,
                 observation_refs=tuple(dict.fromkeys(observation_refs)),
