@@ -161,6 +161,7 @@ class FindingProposalV1(_StrictContract):
     subject_ref: str | None = Field(default=None, min_length=1, max_length=256)
     observation_refs: tuple[UUID, ...] = Field(max_length=128)
     claim_refs: tuple[str, ...] = Field(max_length=128)
+    hypothesis_refs: tuple[str, ...] = Field(default=(), max_length=16)
     novelty: NoveltyClass | None = None
     scope: str = Field(default="", max_length=2_000)
     limitations: tuple[str, ...] = Field(default=(), max_length=128)

@@ -1069,7 +1069,9 @@ class InvestigationService:
         )
         persisted = []
         for proposal in proposals:
-            proposal_payload = proposal.model_dump(mode="json")
+            # Hypothesis links are transient annotations for the working state,
+            # not part of the finding's persistent evidence identity.
+            proposal_payload = proposal.model_dump(mode="json", exclude={"hypothesis_refs"})
             finding_id = uuid5(
                 _FINDING_NAMESPACE,
                 f"{investigation_id}:{hashlib.sha256(canonical_json_bytes(proposal_payload)).hexdigest()}",
@@ -1308,17 +1310,33 @@ class InvestigationService:
     ) -> tuple[Hypothesis, ...]:
         if not hypotheses or not decision.hypothesis_refs:
             return hypotheses
-        target_ids = set(decision.hypothesis_refs)
-        latest = findings[-1] if findings else None
+        # A turn may propose unrelated findings. Never attribute the last
+        # finding to every hypothesis mentioned in the decision.
+        linked: dict[str, list[InvestigationFinding]] = {}
+        for proposal, finding in zip(decision.finding_proposals, findings, strict=True):
+            if (
+                finding.assessment not in {FindingAssessment.SUPPORTED, FindingAssessment.REFUTED}
+                or not finding.observation_refs
+            ):
+                continue
+            for hypothesis_id in proposal.hypothesis_refs:
+                linked.setdefault(hypothesis_id, []).append(finding)
+
         updates = []
+        target_ids = set(decision.hypothesis_refs)
         for hypothesis in hypotheses:
             if hypothesis.id not in target_ids:
                 updates.append(hypothesis)
                 continue
+            relevant = tuple(linked.get(hypothesis.id, ()))
+            assessments = {item.assessment for item in relevant}
             status = hypothesis.status
-            if latest is not None and latest.assessment is FindingAssessment.SUPPORTED:
+            if len(assessments) > 1:
+                # Contradictory observations do not justify a categorical verdict.
+                status = HypothesisStatus.OPEN
+            elif FindingAssessment.SUPPORTED in assessments:
                 status = HypothesisStatus.SUPPORTED
-            elif latest is not None and latest.assessment is FindingAssessment.REFUTED:
+            elif FindingAssessment.REFUTED in assessments:
                 status = HypothesisStatus.REFUTED
             elif decision.next_action is AgentNextAction.SWITCH_HYPOTHESIS:
                 status = HypothesisStatus.ABANDONED
@@ -1331,17 +1349,12 @@ class InvestigationService:
                         dict.fromkeys(
                             (
                                 *hypothesis.evidence_refs,
-                                *(latest.observation_refs if latest is not None else ()),
+                                *(ref for item in relevant for ref in item.observation_refs),
                             )
                         )
                     ),
                     finding_refs=tuple(
-                        dict.fromkeys(
-                            (
-                                *hypothesis.finding_refs,
-                                *((latest.id,) if latest is not None else ()),
-                            )
-                        )
+                        dict.fromkeys((*hypothesis.finding_refs, *(item.id for item in relevant)))
                     ),
                 )
             )

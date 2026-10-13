@@ -1,8 +1,10 @@
-from uuid import UUID, uuid5
+from uuid import UUID, uuid4, uuid5
 
 from cti_app.application.bridge_investigator import BridgeInvestigator, ScriptedTurnTransport
+from cti_app.application.investigation_contracts import AgentTurnDecisionV1
+from cti_app.application.investigation_service import InvestigationService
 from cti_app.domain.analyst_opinion import OpinionBlockType
-from cti_app.domain.investigation import FindingAssessment, FindingKind
+from cti_app.domain.investigation import FindingAssessment, FindingKind, InvestigationFinding
 from cti_app.domain.investigation_state import Hypothesis, HypothesisStatus, StopReason
 from tests.test_investigation_service import (
     _decision,
@@ -104,6 +106,7 @@ async def test_two_agent_strategies_choose_distinct_tool_orders_and_draft_findin
         b_claim_observation,
         ("C1",),
     )
+    b_claim_proposal["hypothesis_refs"] = ["ip-attribution"]
     b_transport = ScriptedTurnTransport(
         [
             _decision(
@@ -161,3 +164,109 @@ async def test_two_agent_strategies_choose_distinct_tool_orders_and_draft_findin
     assert b_opinion.renderable_blocks[0].block_type is OpinionBlockType.KEY_FINDINGS
     final_hypothesis = (await fixture_b.states.get(b_state.investigation_id)).hypotheses[0]
     assert final_hypothesis.status is HypothesisStatus.REFUTED
+
+
+def test_hypothesis_findings_are_explicitly_linked_not_shared_across_a_turn() -> None:
+    observation_a, observation_b = uuid4(), uuid4()
+    investigation_id = uuid4()
+    first = _proposal(
+        FindingKind.NETWORK_BEHAVIOUR.value,
+        FindingAssessment.SUPPORTED.value,
+        "First hypothesis is supported.",
+        observation_a,
+    )
+    first["hypothesis_refs"] = ["a"]
+    second = _proposal(
+        FindingKind.CLAIM_VERIFICATION.value,
+        FindingAssessment.REFUTED.value,
+        "Second hypothesis is refuted.",
+        observation_b,
+    )
+    second["hypothesis_refs"] = ["b"]
+    decision = AgentTurnDecisionV1.model_validate(
+        _decision(
+            goal="check two unrelated hypotheses",
+            next_action="continue",
+            findings=(first, second),
+            hypothesis_refs=("a", "b", "c"),
+        )
+    )
+    findings = (
+        InvestigationFinding(
+            investigation_id=investigation_id,
+            kind=FindingKind.NETWORK_BEHAVIOUR,
+            assessment=FindingAssessment.SUPPORTED,
+            statement="First hypothesis is supported.",
+            observation_refs=(observation_a,),
+        ),
+        InvestigationFinding(
+            investigation_id=investigation_id,
+            kind=FindingKind.CLAIM_VERIFICATION,
+            assessment=FindingAssessment.REFUTED,
+            statement="Second hypothesis is refuted.",
+            observation_refs=(observation_b,),
+        ),
+    )
+    updated = InvestigationService._update_hypotheses(
+        tuple(Hypothesis(id=name, statement=f"Hypothesis {name}") for name in ("a", "b", "c")),
+        decision=decision,
+        findings=findings,
+    )
+    assert [item.status for item in updated] == [
+        HypothesisStatus.SUPPORTED,
+        HypothesisStatus.REFUTED,
+        HypothesisStatus.OPEN,
+    ]
+    assert updated[0].evidence_refs == (observation_a,)
+    assert updated[1].evidence_refs == (observation_b,)
+    assert updated[2].evidence_refs == ()
+    assert updated[0].finding_refs == (findings[0].id,)
+    assert updated[1].finding_refs == (findings[1].id,)
+    assert updated[2].finding_refs == ()
+
+
+def test_hypothesis_conflicting_or_unlinked_findings_cannot_be_promoted() -> None:
+    observation_a, observation_b = uuid4(), uuid4()
+    investigation_id = uuid4()
+    proposals = []
+    findings = []
+    for assessment, observation in (
+        (FindingAssessment.SUPPORTED, observation_a),
+        (FindingAssessment.REFUTED, observation_b),
+    ):
+        proposal = _proposal(FindingKind.CLAIM_VERIFICATION.value, assessment.value, "Check", observation)
+        proposal["hypothesis_refs"] = ["a"]
+        proposals.append(proposal)
+        findings.append(
+            InvestigationFinding(
+                investigation_id=investigation_id,
+                kind=FindingKind.CLAIM_VERIFICATION,
+                assessment=assessment,
+                statement="Check",
+                observation_refs=(observation,),
+            )
+        )
+    decision = AgentTurnDecisionV1.model_validate(
+        _decision(goal="reconcile contradiction", next_action="continue",
+                  findings=tuple(proposals), hypothesis_refs=("a",))
+    )
+    updated = InvestigationService._update_hypotheses(
+        (Hypothesis(id="a", statement="Uncertain"),),
+        decision=decision,
+        findings=tuple(findings),
+    )
+    assert updated[0].status is HypothesisStatus.OPEN
+    assert set(updated[0].evidence_refs) == {observation_a, observation_b}
+    unlinked = _proposal(FindingKind.CLAIM_VERIFICATION.value,
+                         FindingAssessment.SUPPORTED.value, "Unrelated", observation_a)
+    decision_unlinked = AgentTurnDecisionV1.model_validate(
+        _decision(goal="do not infer a link", next_action="continue",
+                  findings=(unlinked,), hypothesis_refs=("a",))
+    )
+    unchanged = InvestigationService._update_hypotheses(
+        (Hypothesis(id="a", statement="Uncertain"),),
+        decision=decision_unlinked,
+        findings=(findings[0],),
+    )
+    assert unchanged[0].status is HypothesisStatus.OPEN
+    assert unchanged[0].evidence_refs == ()

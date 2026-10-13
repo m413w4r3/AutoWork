@@ -209,6 +209,10 @@ jobs:
         uses: typst-community/setup-typst@v4
         with:
           typst-version: "0.15.1"
+      - name: Install pinned Typst font bundle for J2
+        run: |
+          ./scripts/install-typst-fonts.sh "$RUNNER_TEMP/typst-fonts"
+          echo "FONT_BUNDLE_ROOT=$RUNNER_TEMP/typst-fonts" >> "$GITHUB_ENV"
       - name: Workflow W10 — real-backend browser exclusion
         run: make test-workflow-browser
       - name: Workflow J2 — investigation, human repin and real PDF
