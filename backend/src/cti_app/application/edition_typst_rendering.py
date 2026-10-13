@@ -23,9 +23,13 @@ from cti_app.application.typst_rendering import (
     project_publication_to_typst_model,
 )
 from cti_app.domain.edition_publication import EditionDocumentV2
-from cti_app.domain.publication_document import PublicationDocumentV4, PublicationDocumentV5
+from cti_app.domain.publication_document import (
+    PublicationDocumentV4,
+    PublicationDocumentV5,
+    PublicationDocumentV6,
+)
 
-_EDITION_RENDER_DATA_SCHEMA_VERSION = "typst-edition-model-v19-block-location"
+_EDITION_RENDER_DATA_SCHEMA_VERSION = "typst-edition-model-v20-analyst-opinion"
 _FRENCH_MONTH_NAMES = (
     "janvier",
     "février",
@@ -67,7 +71,7 @@ class EditionRenderPublicationSchemaUnsupportedError(EditionTypstRendererError):
 
 
 class EditionTypstRenderer:
-    """Render an ordered edition using the shared V4 publication projection."""
+    """Render an ordered edition using the shared V4/V5/V6 publication projection."""
 
     def render(
         self,
@@ -111,7 +115,7 @@ class EditionTypstRenderer:
         if any(
             not isinstance(
                 publication.document,
-                (PublicationDocumentV4, PublicationDocumentV5),
+                (PublicationDocumentV4, PublicationDocumentV5, PublicationDocumentV6),
             )
             for publication in document.publications
         ):

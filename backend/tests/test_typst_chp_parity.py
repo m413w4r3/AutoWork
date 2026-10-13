@@ -29,6 +29,9 @@ import anyio
 import pytest
 from pypdf import PdfReader
 
+from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.publication_augmentation import augment_publication_with_opinion
+from cti_app.application.publication_builder import build_publication_document_v5
 from cti_app.application.semantic_annotation import EnglishTermDetector, SemanticAnnotator
 from cti_app.application.typst_compilation import (
     TYPST_COMPILER_VERSION,
@@ -70,6 +73,7 @@ from cti_app.domain.publication_document import (
     PublicationTableColumnV1,
     PublicationTableRowV1,
     publication_document_text_anchors,
+    serialize_publication_document,
 )
 from cti_app.domain.semantic_annotation import (
     SEMANTIC_ANNOTATION_POLICY_VERSION,
@@ -84,6 +88,8 @@ from cti_app.infrastructure.typst_compiler import (
     TypstProcessStatus,
     TypstSubprocessCompiler,
 )
+from tests.test_publication_builder_v4 import _canonical_inputs, _enrichment_with
+from tests.test_publication_document_v6 import _approved_opinion
 from tests.test_typst_rendering import (
     _diagram_at,
     _figure_at,
@@ -995,6 +1001,110 @@ async def test_real_typst_pdf_preserves_chp_publication_structure(
         "image/png",
     }
     assert _embedded_visual_xobject_count(reader) >= len(render_source.media_refs)
+
+
+@pytest.mark.asyncio
+async def test_real_typst_and_poppler_render_v6_opinion_without_changing_v5(
+    tmp_path: Path,
+    typst_binary: str,
+    font_bundle_root: Path,
+) -> None:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    enrichment = _enrichment_with(extraction=extraction, synthesis=synthesis)
+    base = build_publication_document_v5(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+    )
+    opinion, citation_context = _approved_opinion(base)
+    template_bundle = load_template_bundle(_CHP_TYPST_ROOT)
+    font_snapshot = load_font_bundle_snapshot(font_bundle_root, _FONT_BUNDLE_LOCK)
+
+    async def compile_document(document: Any, name: str):
+        root = tmp_path / name
+        workspace_root = root / "workspace"
+        root.mkdir(parents=True)
+        render_source = TypstRenderer().render(document, template_bundle)
+        _build_workspace(
+            workspace_root,
+            bundle_files=template_bundle.files,
+            render_data_bytes=render_source.render_data_bytes,
+            media_refs=render_source.media_refs,
+        )
+        font_root = root / "font-snapshot"
+        font_root.mkdir()
+        return await TypstSubprocessCompiler(binary=str(typst_binary)).compile(
+            TypstCompileRequest(
+                workspace_root=workspace_root,
+                entrypoint_relative_path="RENDERER/publication.typ",
+                font_paths=materialize_font_bundle(font_snapshot, font_root),
+            )
+        )
+
+    old_v5_blob = ProductionArtifactStore.canonical_json_bytes(serialize_publication_document(base))
+    old_v5_pdf = await compile_document(base, "v5-before")
+    augmented = augment_publication_with_opinion(base, opinion, citation_context)
+    v6_pdf = await compile_document(augmented, "v6")
+    repeated_v5_blob = ProductionArtifactStore.canonical_json_bytes(
+        serialize_publication_document(base)
+    )
+    repeated_v5_pdf = await compile_document(base, "v5-after")
+
+    assert old_v5_blob == repeated_v5_blob
+    assert old_v5_pdf.content == repeated_v5_pdf.content
+    reader = PdfReader(BytesIO(v6_pdf.content), strict=True)
+    assert v6_pdf.compiler_version == TYPST_COMPILER_VERSION
+    assert len(reader.pages) >= 1
+    pdftotext = shutil.which("pdftotext")
+    pdftoppm = shutil.which("pdftoppm")
+    assert pdftotext is not None, "Poppler pdftotext is required for V6 PDF verification"
+    assert pdftoppm is not None, "Poppler pdftoppm is required for V6 PDF verification"
+    pdf_path = tmp_path / "publication-v6.pdf"
+    pdf_path.write_bytes(v6_pdf.content)
+    with anyio.fail_after(10):
+        text_result = await anyio.run_process(
+            (pdftotext, str(pdf_path), "-"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+    extracted = text_result.stdout.decode("utf-8", errors="replace")
+    normalized_extracted = extracted.upper().replace("\u2019", "'")
+    assert "AVIS DE L'ANALYSTE" in normalized_extracted
+    assert "1.1 APPORTS DE L'ENQUÊTE" in normalized_extracted
+    assert "APPORTS DE L'ENQUÊTE" in normalized_extracted
+    assert "FAIT ÉTAYÉ" in normalized_extracted
+    assert "LE CONSTAT SUPPLÉMENTAIRE EST CORROBORÉ" in normalized_extracted
+    assert "CONFIANCE : 90%" in normalized_extracted
+
+    uris = []
+    for page in reader.pages:
+        for annotation_ref in page.get("/Annots", ()):
+            action = annotation_ref.get_object().get("/A")
+            if action is not None and action.get("/URI") is not None:
+                uris.append(str(action["/URI"]))
+    assert any(uri.startswith("autowork://investigations/") for uri in uris)
+    page_prefix = tmp_path / "publication-v6-page"
+    with anyio.fail_after(15):
+        await anyio.run_process(
+            (
+                pdftoppm,
+                "-f",
+                "1",
+                "-l",
+                "1",
+                "-singlefile",
+                "-png",
+                str(pdf_path),
+                str(page_prefix),
+            ),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+    assert page_prefix.with_suffix(".png").is_file()
 
 
 @pytest.mark.asyncio

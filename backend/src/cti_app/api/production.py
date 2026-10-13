@@ -103,6 +103,7 @@ from cti_app.application.production_synthesis_revision import (
     TargetedSynthesisRevisionValidationError,
     build_targeted_revision_target_catalog,
 )
+from cti_app.application.subject_content import analyst_opinion_view
 from cti_app.application.subject_production import (
     EditionProductionBatchNotFoundError,
     EditionProductionBatchOwnershipError,
@@ -156,6 +157,11 @@ from cti_app.domain.production_source_additions import (
     source_addition_to_json,
 )
 from cti_app.domain.publication import is_publication_ioc_artifact_type
+from cti_app.domain.publication_document import (
+    PublicationDocumentV6,
+    parse_publication_document,
+    serialize_publication_document,
+)
 from cti_app.domain.selection import SubjectDiscoveryOrigin
 from cti_app.infrastructure.analytic_chart_renderer import AnalyticChartRenderer
 from cti_app.infrastructure.d2_diagram_compiler import D2DiagramCompiler
@@ -2923,6 +2929,22 @@ async def _artifact_view_for_run(
                 canonical_sha256 = hashlib.sha256(canonical_bytes).hexdigest()
                 canonical = await store.read_json(artifact.canonical_blob_id)
 
+        publication_v6_extras: dict[str, Any] = {}
+        if (
+            artifact.stage is ProductionArtifactStage.PUBLICATION
+            and isinstance(canonical, dict)
+            and canonical.get("schema_version") == "6"
+        ):
+            # A V6 wrapper keeps its V5 base readable for every existing consumer
+            # (canonical_content); the approved opinion is exposed additively.
+            v6_document = parse_publication_document(canonical)
+            if isinstance(v6_document, PublicationDocumentV6):
+                publication_v6_extras = {
+                    "document_version": v6_document.schema_version,
+                    "analyst_opinion": analyst_opinion_view(v6_document),
+                }
+                canonical = serialize_publication_document(v6_document.base_publication)
+
         response = {
             "artifact_id": str(artifact.id),
             "production_run_id": str(run.id),
@@ -2946,6 +2968,7 @@ async def _artifact_view_for_run(
         }
         if artifact.stage is not ProductionArtifactStage.PUBLICATION:
             response["rendered_content"] = rendered
+        response.update(publication_v6_extras)
         return response
 
 

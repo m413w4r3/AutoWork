@@ -355,9 +355,68 @@ async def test_content_returns_current_artifact_without_raw_blob(subject: Subjec
     assert body["run_id"] == str(run.id)
     assert body["pipeline_generation"] == 3
     assert body["artifact_id"] == str(artifact.id)
+    assert body["document_version"] == "4"
+    assert body["analyst_opinion"] is None
+    assert body["canonical_content"] == _document("Current title")
     assert body["canonical_content"]["title"] == "Current title"
     assert "rendered_content" not in body
     assert "raw_blob" not in body
+
+
+@pytest.mark.anyio
+async def test_subject_content_exposes_v6_opinion_and_preserves_its_v5_base(
+    subject: Subject,
+) -> None:
+    from cti_app.application.publication_augmentation import augment_publication_with_opinion
+    from cti_app.domain.publication_document import serialize_publication_document
+    from tests.test_publication_document_v6 import _approved_opinion, _base_v5
+
+    base = _base_v5()
+    opinion, context = _approved_opinion(base)
+    canonical_id = uuid4()
+    v6 = augment_publication_with_opinion(base, opinion, context)
+    run = _run(generation=3)
+    artifact = _artifact(run, ProductionArtifactStage.PUBLICATION, canonical_id)
+    payloads = _Payloads({canonical_id: serialize_publication_document(v6)})
+    app = _app(_Uow(subject, [run], [artifact]), payloads)
+
+    async with await _client(app) as api:
+        response = await api.get(f"/api/subjects/{SUBJECT_ID}/content")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["schema_version"] == "5"
+    assert body["document_version"] == "6"
+    assert body["canonical_content"] == serialize_publication_document(base)
+    assert body["canonical_content"]["schema_version"] == "5"
+    opinion_view = body["analyst_opinion"]
+    assert opinion_view["status"] == "approved"
+    assert (
+        opinion_view["blocks"] == serialize_publication_document(v6)["rendered_opinion"]["blocks"]
+    )
+    assert opinion_view["provenance"] == serialize_publication_document(v6)["provenance"]
+
+
+@pytest.mark.anyio
+async def test_subject_content_keeps_v5_content_and_reports_its_version(subject: Subject) -> None:
+    from cti_app.domain.publication_document import serialize_publication_document
+    from tests.test_publication_document_v6 import _base_v5
+
+    base = _base_v5()
+    canonical_id = uuid4()
+    run = _run(generation=4)
+    artifact = _artifact(run, ProductionArtifactStage.PUBLICATION, canonical_id)
+    payloads = _Payloads({canonical_id: serialize_publication_document(base)})
+    app = _app(_Uow(subject, [run], [artifact]), payloads)
+
+    async with await _client(app) as api:
+        response = await api.get(f"/api/subjects/{SUBJECT_ID}/content")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["document_version"] == "5"
+    assert body["canonical_content"] == serialize_publication_document(base)
+    assert body["analyst_opinion"] is None
 
 
 @pytest.mark.anyio

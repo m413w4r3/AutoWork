@@ -2,12 +2,23 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
+from enum import StrEnum
 from typing import Any
 from uuid import UUID
 
+from cti_app.domain.analyst_opinion import (
+    AnalystOpinionStatus,
+    AnalystOpinionV1,
+    OpinionBlock,
+    OpinionBlockType,
+    OpinionClaimQualification,
+)
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.media_assets import SUPPORTED_MEDIA_MIME_TYPES
 from cti_app.domain.production_editorial_enrichment import (
@@ -75,6 +86,7 @@ from cti_app.domain.semantic_annotation import (
 
 PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION = "4"
 PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION = "5"
+PUBLICATION_DOCUMENT_V6_SCHEMA_VERSION = "6"
 _PUBLICATION_SOURCE_REQUIRED_FIELDS = frozenset(
     {
         "source_document_id",
@@ -1392,7 +1404,571 @@ class PublicationDocumentV5:
         )
 
 
-type CanonicalPublicationDocument = PublicationDocumentV4 | PublicationDocumentV5
+class PublicationDocumentV6ErrorCode(StrEnum):
+    BASE_IDENTITY_MISMATCH = "publication_v6_base_identity_mismatch"
+    OPINION_INVALID = "publication_v6_opinion_invalid"
+    OPINION_NOT_APPROVED = "publication_v6_opinion_not_approved"
+    OPINION_EMPTY = "publication_v6_opinion_empty"
+
+
+class PublicationDocumentV6ValidationError(ValueError):
+    """A typed invariant failure in a V6 wrapper."""
+
+    def __init__(self, code: PublicationDocumentV6ErrorCode) -> None:
+        self.code = code
+        super().__init__(code.value)
+
+
+class PublicationDocumentV6BaseMismatchError(PublicationDocumentV6ValidationError):
+    """The wrapper provenance does not identify its embedded V5 document."""
+
+    def __init__(self) -> None:
+        super().__init__(PublicationDocumentV6ErrorCode.BASE_IDENTITY_MISMATCH)
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationDocumentV6ProvenanceV1:
+    base_publication_artifact_id: UUID
+    base_publication_sha256: str
+    investigation_id: UUID | None = None
+    opinion_id: UUID | None = None
+    opinion_version: int | None = None
+    opinion_content_sha256: str | None = None
+    reviewer_id: str | None = None
+    approver_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.base_publication_artifact_id, UUID):
+            raise PublicationDocumentV6BaseMismatchError()
+        validate_sha256(self.base_publication_sha256, "V6 base publication SHA-256")
+        values = (
+            self.investigation_id,
+            self.opinion_id,
+            self.opinion_version,
+            self.opinion_content_sha256,
+            self.reviewer_id,
+            self.approver_id,
+        )
+        if all(value is None for value in values):
+            return
+        if any(value is None for value in values):
+            raise PublicationDocumentV6ValidationError(
+                PublicationDocumentV6ErrorCode.OPINION_INVALID
+            )
+        assert self.opinion_content_sha256 is not None
+        validate_sha256(self.opinion_content_sha256, "V6 opinion content SHA-256")
+        if (
+            isinstance(self.opinion_version, bool)
+            or not isinstance(self.opinion_version, int)
+            or self.opinion_version < 1
+        ):
+            raise PublicationDocumentV6ValidationError(
+                PublicationDocumentV6ErrorCode.OPINION_INVALID
+            )
+        if not self.reviewer_id or not self.reviewer_id.strip():
+            raise PublicationDocumentV6ValidationError(
+                PublicationDocumentV6ErrorCode.OPINION_INVALID
+            )
+        if not self.approver_id or not self.approver_id.strip():
+            raise PublicationDocumentV6ValidationError(
+                PublicationDocumentV6ErrorCode.OPINION_INVALID
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationAnalystOpinionBlockV1:
+    block_type: OpinionBlockType
+    heading: str
+    text: str
+    qualification: OpinionClaimQualification
+    certainty: float
+    finding_refs: tuple[UUID, ...] = ()
+    evidence_refs: tuple[UUID, ...] = ()
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.block_type, OpinionBlockType)
+            or not isinstance(self.qualification, OpinionClaimQualification)
+            or self.heading != _OPINION_BLOCK_HEADINGS.get(self.block_type)
+            or not isinstance(self.text, str)
+            or not self.text.strip()
+            or isinstance(self.certainty, bool)
+            or not isinstance(self.certainty, (int, float))
+            or not math.isfinite(self.certainty)
+            or not 0.0 <= self.certainty <= 1.0
+        ):
+            raise PublicationDocumentV6ValidationError(
+                PublicationDocumentV6ErrorCode.OPINION_INVALID
+            )
+        object.__setattr__(self, "finding_refs", tuple(self.finding_refs))
+        object.__setattr__(self, "evidence_refs", tuple(self.evidence_refs))
+        if any(
+            not isinstance(reference, UUID) for reference in self.finding_refs + self.evidence_refs
+        ):
+            raise PublicationDocumentV6ValidationError(
+                PublicationDocumentV6ErrorCode.OPINION_INVALID
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationAnalystOpinionSectionV1:
+    opinion_id: UUID
+    opinion_version: int
+    content_sha256: str
+    blocks: tuple[PublicationAnalystOpinionBlockV1, ...]
+    unresolved_points: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        validate_sha256(self.content_sha256, "V6 opinion content SHA-256")
+        object.__setattr__(self, "blocks", tuple(self.blocks))
+        object.__setattr__(self, "unresolved_points", tuple(self.unresolved_points))
+        if (
+            not isinstance(self.opinion_id, UUID)
+            or isinstance(self.opinion_version, bool)
+            or not isinstance(self.opinion_version, int)
+            or self.opinion_version < 1
+        ):
+            raise PublicationDocumentV6ValidationError(
+                PublicationDocumentV6ErrorCode.OPINION_INVALID
+            )
+        if not self.blocks:
+            raise PublicationDocumentV6ValidationError(PublicationDocumentV6ErrorCode.OPINION_EMPTY)
+        if any(not isinstance(block, PublicationAnalystOpinionBlockV1) for block in self.blocks):
+            raise PublicationDocumentV6ValidationError(
+                PublicationDocumentV6ErrorCode.OPINION_INVALID
+            )
+        if any(not isinstance(point, str) or not point.strip() for point in self.unresolved_points):
+            raise PublicationDocumentV6ValidationError(
+                PublicationDocumentV6ErrorCode.OPINION_INVALID
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationDocumentV6:
+    """Additive opinion wrapper around an immutable, exact V5 publication."""
+
+    base_publication: PublicationDocumentV5
+    provenance: PublicationDocumentV6ProvenanceV1
+    analyst_opinion: AnalystOpinionV1 | None = None
+    rendered_opinion: PublicationAnalystOpinionSectionV1 | None = None
+
+    @property
+    def schema_version(self) -> str:
+        return PUBLICATION_DOCUMENT_V6_SCHEMA_VERSION
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.base_publication, name)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.base_publication, PublicationDocumentV5):
+            raise PublicationDocumentV6BaseMismatchError()
+        if not isinstance(self.provenance, PublicationDocumentV6ProvenanceV1):
+            raise PublicationDocumentV6BaseMismatchError()
+        if publication_document_v5_sha256(self.base_publication) != (
+            self.provenance.base_publication_sha256
+        ):
+            raise PublicationDocumentV6BaseMismatchError()
+
+        opinion = self.analyst_opinion
+        section = self.rendered_opinion
+        provenance = self.provenance
+        if opinion is None:
+            if section is not None or any(
+                value is not None
+                for value in (
+                    provenance.investigation_id,
+                    provenance.opinion_id,
+                    provenance.opinion_version,
+                    provenance.opinion_content_sha256,
+                    provenance.reviewer_id,
+                    provenance.approver_id,
+                )
+            ):
+                raise PublicationDocumentV6ValidationError(
+                    PublicationDocumentV6ErrorCode.OPINION_INVALID
+                )
+            return
+        if opinion.status is not AnalystOpinionStatus.APPROVED:
+            raise PublicationDocumentV6ValidationError(
+                PublicationDocumentV6ErrorCode.OPINION_NOT_APPROVED
+            )
+        if hashlib.sha256(opinion.canonical_bytes()).hexdigest() != opinion.content_sha256:
+            raise PublicationDocumentV6ValidationError(
+                PublicationDocumentV6ErrorCode.OPINION_INVALID
+            )
+        if (
+            provenance.base_publication_artifact_id != opinion.base_publication_artifact_id
+            or provenance.base_publication_sha256 != opinion.base_publication_sha256
+        ):
+            raise PublicationDocumentV6BaseMismatchError()
+        if (
+            provenance.investigation_id != opinion.investigation_id
+            or provenance.opinion_id != opinion.id
+            or provenance.opinion_version != opinion.version
+            or provenance.opinion_content_sha256 != opinion.content_sha256
+            or provenance.reviewer_id != opinion.reviewer_id
+            or section is None
+            or section.opinion_id != opinion.id
+            or section.opinion_version != opinion.version
+            or section.content_sha256 != opinion.content_sha256
+            or not opinion.renderable_blocks
+        ):
+            code = (
+                PublicationDocumentV6ErrorCode.OPINION_EMPTY
+                if not opinion.renderable_blocks
+                else PublicationDocumentV6ErrorCode.OPINION_INVALID
+            )
+            raise PublicationDocumentV6ValidationError(code)
+
+        expected_blocks = tuple(
+            sorted(
+                opinion.renderable_blocks, key=lambda block: _OPINION_BLOCK_ORDER[block.block_type]
+            )
+        )
+        if len(expected_blocks) != len(section.blocks):
+            raise PublicationDocumentV6ValidationError(
+                PublicationDocumentV6ErrorCode.OPINION_INVALID
+            )
+        for source, rendered in zip(expected_blocks, section.blocks, strict=True):
+            if (
+                rendered.block_type is not source.block_type
+                or rendered.text != source.text
+                or rendered.qualification is not source.qualification
+                or rendered.certainty != source.certainty
+                or rendered.finding_refs != source.finding_refs
+                or rendered.evidence_refs != source.evidence_refs
+            ):
+                raise PublicationDocumentV6ValidationError(
+                    PublicationDocumentV6ErrorCode.OPINION_INVALID
+                )
+        if section.unresolved_points != opinion.unresolved_points:
+            raise PublicationDocumentV6ValidationError(
+                PublicationDocumentV6ErrorCode.OPINION_INVALID
+            )
+
+    def _to_json(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "base_publication": publication_document_v5_to_json(self.base_publication),
+            "provenance": _publication_v6_provenance_to_json(self.provenance),
+            "analyst_opinion": (
+                self.analyst_opinion.to_payload() if self.analyst_opinion is not None else None
+            ),
+            "rendered_opinion": (
+                _rendered_opinion_to_json(self.rendered_opinion)
+                if self.rendered_opinion is not None
+                else None
+            ),
+        }
+
+    @classmethod
+    def _from_json(cls, payload: Mapping[str, Any]) -> PublicationDocumentV6:
+        document = json_object(
+            payload,
+            frozenset(
+                {
+                    "schema_version",
+                    "base_publication",
+                    "provenance",
+                    "analyst_opinion",
+                    "rendered_opinion",
+                }
+            ),
+            "PublicationDocumentV6",
+        )
+        if document["schema_version"] != PUBLICATION_DOCUMENT_V6_SCHEMA_VERSION:
+            raise ValueError("PublicationDocumentV6 schema version is unsupported")
+        raw_base = document["base_publication"]
+        if (
+            not isinstance(raw_base, Mapping)
+            or raw_base.get("schema_version") != PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION
+        ):
+            raise PublicationDocumentV6BaseMismatchError()
+        base = publication_document_v5_from_json(raw_base)
+        raw_opinion = document["analyst_opinion"]
+        raw_rendered = document["rendered_opinion"]
+        return cls(
+            base_publication=base,
+            provenance=_publication_v6_provenance_from_json(document["provenance"]),
+            analyst_opinion=_analyst_opinion_from_json(raw_opinion)
+            if raw_opinion is not None
+            else None,
+            rendered_opinion=_rendered_opinion_from_json(raw_rendered)
+            if raw_rendered is not None
+            else None,
+        )
+
+
+_OPINION_BLOCK_ORDER = {item: index for index, item in enumerate(OpinionBlockType)}
+_OPINION_BLOCK_HEADINGS = {
+    OpinionBlockType.KEY_FINDINGS: "Apports de l'enquête",
+    OpinionBlockType.ADDITIONAL_SAMPLES: "Échantillons complémentaires",
+    OpinionBlockType.INFECTION_CHAIN_AND_CAPABILITIES: "Chaîne d'infection et capacités",
+    OpinionBlockType.NETWORK_AND_INFRASTRUCTURE: "Activité réseau et infrastructure",
+    OpinionBlockType.CLAIM_VERIFICATION: "Vérification des affirmations",
+    OpinionBlockType.PROPOSED_DETECTIONS: "Détections proposées",
+    OpinionBlockType.UNCERTAINTIES_AND_NEXT_LEADS: "Incertitudes et prochaines pistes",
+}
+
+
+def publication_document_v5_sha256(document: PublicationDocumentV5) -> str:
+    """Hash the canonical JSON bytes used for a PUBLICATION V5 blob."""
+    encoded = json.dumps(
+        publication_document_v5_to_json(document),
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _publication_v6_provenance_to_json(
+    value: PublicationDocumentV6ProvenanceV1,
+) -> dict[str, Any]:
+    return {
+        "base_publication_artifact_id": str(value.base_publication_artifact_id),
+        "base_publication_sha256": value.base_publication_sha256,
+        "investigation_id": str(value.investigation_id) if value.investigation_id else None,
+        "opinion_id": str(value.opinion_id) if value.opinion_id else None,
+        "opinion_version": value.opinion_version,
+        "opinion_content_sha256": value.opinion_content_sha256,
+        "reviewer_id": value.reviewer_id,
+        "approver_id": value.approver_id,
+    }
+
+
+def _publication_v6_provenance_from_json(raw: Any) -> PublicationDocumentV6ProvenanceV1:
+    item = json_object(
+        raw,
+        frozenset(
+            {
+                "base_publication_artifact_id",
+                "base_publication_sha256",
+                "investigation_id",
+                "opinion_id",
+                "opinion_version",
+                "opinion_content_sha256",
+                "reviewer_id",
+                "approver_id",
+            }
+        ),
+        "PublicationDocumentV6 provenance",
+    )
+    return PublicationDocumentV6ProvenanceV1(
+        base_publication_artifact_id=json_uuid(
+            item["base_publication_artifact_id"], "V6 base publication artifact ID"
+        ),
+        base_publication_sha256=json_sha256(
+            item["base_publication_sha256"], "V6 base publication SHA-256"
+        ),
+        investigation_id=json_uuid(item["investigation_id"], "V6 investigation ID")
+        if item["investigation_id"] is not None
+        else None,
+        opinion_id=json_uuid(item["opinion_id"], "V6 opinion ID")
+        if item["opinion_id"] is not None
+        else None,
+        opinion_version=json_int(item["opinion_version"], "V6 opinion version")
+        if item["opinion_version"] is not None
+        else None,
+        opinion_content_sha256=json_sha256(
+            item["opinion_content_sha256"], "V6 opinion content SHA-256"
+        )
+        if item["opinion_content_sha256"] is not None
+        else None,
+        reviewer_id=json_text(item["reviewer_id"], "V6 reviewer ID")
+        if item["reviewer_id"] is not None
+        else None,
+        approver_id=json_text(item["approver_id"], "V6 approver ID")
+        if item["approver_id"] is not None
+        else None,
+    )
+
+
+def _opinion_certainty(value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0.0 <= value <= 1.0:
+        raise ValueError("Opinion certainty must be between 0 and 1")
+    return float(value)
+
+
+def _analyst_opinion_from_json(raw: Any) -> AnalystOpinionV1:
+    fields = frozenset(
+        {
+            "schema",
+            "id",
+            "version",
+            "investigation_id",
+            "synthesis_artifact_id",
+            "synthesis_sha256",
+            "base_publication_artifact_id",
+            "base_publication_sha256",
+            "blocks",
+            "unresolved_points",
+            "author_id",
+            "reviewer_id",
+            "status",
+            "created_at",
+            "content_sha256",
+        }
+    )
+    item = json_object(raw, fields, "AnalystOpinionV1")
+    if item["schema"] != "analyst-opinion.v1":
+        raise ValueError("AnalystOpinionV1 schema is unsupported")
+    blocks: list[OpinionBlock] = []
+    for raw_block in json_array(item["blocks"], "Opinion blocks"):
+        block = json_object(
+            raw_block,
+            frozenset(
+                {
+                    "type",
+                    "text",
+                    "finding_refs",
+                    "evidence_refs",
+                    "qualification",
+                    "certainty",
+                }
+            ),
+            "Opinion block",
+        )
+        blocks.append(
+            OpinionBlock(
+                block_type=json_enum(OpinionBlockType, block["type"], "Opinion block type"),
+                text=json_text(block["text"], "Opinion block text"),
+                finding_refs=tuple(
+                    json_uuid(value, "Opinion finding reference")
+                    for value in json_array(block["finding_refs"], "Opinion finding references")
+                ),
+                evidence_refs=tuple(
+                    json_uuid(value, "Opinion evidence reference")
+                    for value in json_array(block["evidence_refs"], "Opinion evidence references")
+                ),
+                qualification=json_enum(
+                    OpinionClaimQualification, block["qualification"], "Opinion qualification"
+                ),
+                certainty=_opinion_certainty(block["certainty"]),
+            )
+        )
+    unresolved = tuple(
+        json_text(value, "Opinion unresolved point")
+        for value in json_array(item["unresolved_points"], "Opinion unresolved points")
+    )
+    try:
+        return AnalystOpinionV1(
+            id=json_uuid(item["id"], "Opinion ID"),
+            version=json_int(item["version"], "Opinion version"),
+            investigation_id=json_uuid(item["investigation_id"], "Opinion investigation ID"),
+            synthesis_artifact_id=json_uuid(
+                item["synthesis_artifact_id"], "Opinion synthesis artifact ID"
+            ),
+            synthesis_sha256=json_sha256(item["synthesis_sha256"], "Opinion synthesis SHA-256"),
+            base_publication_artifact_id=json_uuid(
+                item["base_publication_artifact_id"], "Opinion base publication artifact ID"
+            ),
+            base_publication_sha256=json_sha256(
+                item["base_publication_sha256"], "Opinion base publication SHA-256"
+            ),
+            blocks=tuple(blocks),
+            unresolved_points=unresolved,
+            author_id=json_text(item["author_id"], "Opinion author ID"),
+            reviewer_id=json_text(item["reviewer_id"], "Opinion reviewer ID")
+            if item["reviewer_id"] is not None
+            else None,
+            status=json_enum(AnalystOpinionStatus, item["status"], "Opinion status"),
+            created_at=datetime.fromisoformat(json_text(item["created_at"], "Opinion created_at")),
+            content_sha256=json_sha256(item["content_sha256"], "Opinion content SHA-256"),
+        )
+    except (TypeError, ValueError) as exc:
+        raise PublicationDocumentV6ValidationError(
+            PublicationDocumentV6ErrorCode.OPINION_INVALID
+        ) from exc
+
+
+def _rendered_opinion_to_json(
+    value: PublicationAnalystOpinionSectionV1,
+) -> dict[str, Any]:
+    return {
+        "opinion_id": str(value.opinion_id),
+        "opinion_version": value.opinion_version,
+        "content_sha256": value.content_sha256,
+        "blocks": [
+            {
+                "type": block.block_type.value,
+                "heading": block.heading,
+                "text": block.text,
+                "qualification": block.qualification.value,
+                "certainty": block.certainty,
+                "finding_refs": [str(ref) for ref in block.finding_refs],
+                "evidence_refs": [str(ref) for ref in block.evidence_refs],
+            }
+            for block in value.blocks
+        ],
+        "unresolved_points": list(value.unresolved_points),
+    }
+
+
+def _rendered_opinion_from_json(raw: Any) -> PublicationAnalystOpinionSectionV1:
+    item = json_object(
+        raw,
+        frozenset(
+            {"opinion_id", "opinion_version", "content_sha256", "blocks", "unresolved_points"}
+        ),
+        "Rendered analyst opinion",
+    )
+    blocks: list[PublicationAnalystOpinionBlockV1] = []
+    for raw_block in json_array(item["blocks"], "Rendered opinion blocks"):
+        block = json_object(
+            raw_block,
+            frozenset(
+                {
+                    "type",
+                    "heading",
+                    "text",
+                    "qualification",
+                    "certainty",
+                    "finding_refs",
+                    "evidence_refs",
+                }
+            ),
+            "Rendered opinion block",
+        )
+        blocks.append(
+            PublicationAnalystOpinionBlockV1(
+                block_type=json_enum(
+                    OpinionBlockType, block["type"], "Rendered opinion block type"
+                ),
+                heading=json_text(block["heading"], "Rendered opinion heading"),
+                text=json_text(block["text"], "Rendered opinion text"),
+                qualification=json_enum(
+                    OpinionClaimQualification,
+                    block["qualification"],
+                    "Rendered opinion qualification",
+                ),
+                certainty=_opinion_certainty(block["certainty"]),
+                finding_refs=tuple(
+                    json_uuid(value, "Rendered finding reference")
+                    for value in json_array(block["finding_refs"], "Rendered finding references")
+                ),
+                evidence_refs=tuple(
+                    json_uuid(value, "Rendered evidence reference")
+                    for value in json_array(block["evidence_refs"], "Rendered evidence references")
+                ),
+            )
+        )
+    return PublicationAnalystOpinionSectionV1(
+        opinion_id=json_uuid(item["opinion_id"], "Rendered opinion ID"),
+        opinion_version=json_int(item["opinion_version"], "Rendered opinion version"),
+        content_sha256=json_sha256(item["content_sha256"], "Rendered opinion content SHA-256"),
+        blocks=tuple(blocks),
+        unresolved_points=tuple(
+            json_text(value, "Rendered unresolved point")
+            for value in json_array(item["unresolved_points"], "Rendered unresolved points")
+        ),
+    )
+
+
+type CanonicalPublicationDocument = (
+    PublicationDocumentV4 | PublicationDocumentV5 | PublicationDocumentV6
+)
 
 
 def publication_document_v4_to_json(document: PublicationDocumentV4) -> dict[str, Any]:
@@ -1415,12 +1991,18 @@ def publication_document_v5_from_json(payload: Mapping[str, Any]) -> Publication
     return PublicationDocumentV5._from_json(payload)
 
 
+def publication_document_v6_from_json(payload: Mapping[str, Any]) -> PublicationDocumentV6:
+    return PublicationDocumentV6._from_json(payload)
+
+
 def publication_document_from_json(payload: Mapping[str, Any]) -> CanonicalPublicationDocument:
     version = payload.get("schema_version")
     if version == PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION:
         return publication_document_v4_from_json(payload)
     if version == PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION:
         return publication_document_v5_from_json(payload)
+    if version == PUBLICATION_DOCUMENT_V6_SCHEMA_VERSION:
+        return publication_document_v6_from_json(payload)
     raise ValueError(f"unsupported publication document schema_version={version!r}")
 
 
@@ -1428,10 +2010,11 @@ def validate_publication_document(
     value: Mapping[str, Any] | CanonicalPublicationDocument,
 ) -> CanonicalPublicationDocument:
     """Validate one parsed model or canonical JSON payload."""
-    if isinstance(value, (PublicationDocumentV4, PublicationDocumentV5)):
+    if isinstance(value, (PublicationDocumentV4, PublicationDocumentV5, PublicationDocumentV6)):
         if value.schema_version not in {
             PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
             PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION,
+            PUBLICATION_DOCUMENT_V6_SCHEMA_VERSION,
         }:
             raise ValueError(
                 f"unsupported publication document schema_version={value.schema_version!r}"
@@ -1452,6 +2035,8 @@ def serialize_publication_document(
 ) -> dict[str, Any]:
     """Validate and serialize the canonical publication model."""
     validated = validate_publication_document(document)
+    if isinstance(validated, PublicationDocumentV6):
+        return validated._to_json()
     if isinstance(validated, PublicationDocumentV5):
         return publication_document_v5_to_json(validated)
     return publication_document_v4_to_json(validated)
@@ -1460,11 +2045,19 @@ def serialize_publication_document(
 __all__ = [
     "PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION",
     "PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION",
+    "PUBLICATION_DOCUMENT_V6_SCHEMA_VERSION",
     "CanonicalPublicationDocument",
+    "PublicationAnalystOpinionBlockV1",
+    "PublicationAnalystOpinionSectionV1",
     "PublicationChartV1",
     "PublicationDiagramV1",
     "PublicationDocumentV4",
     "PublicationDocumentV5",
+    "PublicationDocumentV6",
+    "PublicationDocumentV6BaseMismatchError",
+    "PublicationDocumentV6ErrorCode",
+    "PublicationDocumentV6ProvenanceV1",
+    "PublicationDocumentV6ValidationError",
     "PublicationSourceFigureV1",
     "PublicationTableColumnV1",
     "PublicationTableRowV1",
@@ -1476,7 +2069,9 @@ __all__ = [
     "publication_document_v4_from_json",
     "publication_document_v4_to_json",
     "publication_document_v5_from_json",
+    "publication_document_v5_sha256",
     "publication_document_v5_to_json",
+    "publication_document_v6_from_json",
     "serialize_publication_document",
     "validate_publication_document",
 ]

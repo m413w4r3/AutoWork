@@ -17,7 +17,7 @@ from cti_app.domain.typst_render import (
 )
 
 EDITION_RENDERER = "typst"
-EDITION_RENDERER_VERSION = "edition-v4-typst-v3-block-location"
+EDITION_RENDERER_VERSION = "edition-v4-typst-v4-analyst-opinion"
 EDITION_RENDER_POLICY_VERSION = "typst-edition-v3-v1"
 
 

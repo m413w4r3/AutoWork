@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from enum import StrEnum
 from typing import Any
 
 from cti_app.application.publication_builder import (
@@ -27,6 +28,8 @@ from cti_app.domain.production_synthesis import (
 from cti_app.domain.publication_document import (
     CanonicalPublicationDocument,
     PublicationDocumentV5,
+    PublicationDocumentV6,
+    PublicationDocumentV6ValidationError,
     serialize_publication_document,
 )
 from cti_app.domain.semantic_annotation import (
@@ -56,6 +59,22 @@ _PIPELINE_VOCABULARY_TERMS = (
     "evidence handle",
     "evidence handles",
 )
+
+
+class PublicationQaErrorCode(StrEnum):
+    DOCUMENT_NOT_V6 = "publication_qa_document_not_v6"
+    V6_INVARIANT_INVALID = "publication_qa_v6_invariant_invalid"
+    BASE_PROJECTION_MISMATCH = "publication_qa_v6_base_projection_mismatch"
+    SECTION_ORDER_INVALID = "publication_qa_section_order_invalid"
+    PUBLICATION_QA_FAILED = "publication_qa_failed"
+
+
+class PublicationQaValidationError(ValueError):
+    """Typed error for callers that invoke the V6-specific QA boundary incorrectly."""
+
+    def __init__(self, code: PublicationQaErrorCode) -> None:
+        self.code = code
+        super().__init__(code.value)
 
 
 def _fold_accents(value: str) -> str:
@@ -110,6 +129,8 @@ def qa_publication_v5(
     publication: CanonicalPublicationDocument,
 ) -> dict[str, Any]:
     """Rebuild the pure projection and require byte-for-byte semantic equality."""
+    v6 = publication if isinstance(publication, PublicationDocumentV6) else None
+    base_publication = v6.base_publication if v6 is not None else publication
     checks: dict[str, bool] = {}
     errors: list[str] = []
     warnings: list[str] = []
@@ -122,22 +143,22 @@ def qa_publication_v5(
     if not checks["publication_language"]:
         errors.append("Publication language differs from the frozen snapshot")
     checks["title_format"] = not isinstance(
-        publication, PublicationDocumentV5
-    ) or is_valid_editorial_title(publication.title)
+        base_publication, PublicationDocumentV5
+    ) or is_valid_editorial_title(base_publication.title)
     if not checks["title_format"]:
         errors.append("Publication title does not match the [Groupe] Titre format")
-    if isinstance(publication, PublicationDocumentV5):
+    if isinstance(base_publication, PublicationDocumentV5):
         if semantic_policy_requires_full_occurrence_coverage(
-            publication.semantic_text.policy_version
+            base_publication.semantic_text.policy_version
         ):
             checks["semantic_annotation_coverage"] = (
-                _semantic_annotation_has_full_occurrence_coverage(publication)
+                _semantic_annotation_has_full_occurrence_coverage(base_publication)
             )
             if not checks["semantic_annotation_coverage"]:
                 errors.append("A semantic annotation is missing from another exact occurrence")
         else:
             checks["semantic_annotation_coverage"] = True
-        semantic_paragraphs = publication.semantic_text.paragraphs
+        semantic_paragraphs = base_publication.semantic_text.paragraphs
         annotated_spans = sum(
             span.role.value != "text"
             for paragraph in semantic_paragraphs
@@ -158,7 +179,7 @@ def qa_publication_v5(
     try:
         expected_builder = (
             build_publication_document_v5
-            if isinstance(publication, PublicationDocumentV5)
+            if isinstance(base_publication, PublicationDocumentV5)
             else build_publication_document_v4
         )
         expected = expected_builder(
@@ -175,7 +196,7 @@ def qa_publication_v5(
     else:
         checks["canonical_inputs_valid"] = True
         checks["exact_projection"] = serialize_publication_document(
-            publication
+            base_publication
         ) == serialize_publication_document(expected)
         if not checks["exact_projection"]:
             errors.append("Publication differs from canonical Assembly projection")
@@ -206,7 +227,7 @@ def qa_publication_v5(
                 "from the canonical reference corpus"
             )
 
-    v5 = publication if isinstance(publication, PublicationDocumentV5) else None
+    v5 = base_publication if isinstance(base_publication, PublicationDocumentV5) else None
     reference_texts = tuple(item.text for item in v5.references) if v5 else ()
     original_ioc_texts = (
         tuple(
@@ -244,6 +265,11 @@ def qa_publication_v5(
             for text in (indicator.value, indicator.normalized_value)
         ),
         *original_ioc_texts,
+        *(
+            block.text
+            for block in (v6.rendered_opinion.blocks if v6 and v6.rendered_opinion else ())
+        ),
+        *(v6.rendered_opinion.unresolved_points if v6 and v6.rendered_opinion else ()),
         *(
             text
             for table in publication.tables
@@ -310,6 +336,8 @@ def qa_publication_v5(
     else:
         section_types = [section["type"] for section in render_model.content_sections]
         expected_types = ["references", "synthesis"]
+        if v6 is not None and v6.rendered_opinion is not None:
+            expected_types.append("analyst_opinion")
         if publication.indicators or (v5 and v5.original_indicators):
             expected_types.append("technical_annex")
         checks["references_then_synthesis"] = section_types == expected_types
@@ -376,7 +404,12 @@ def qa_publication_v5(
             paragraph_fingerprints.count(text) == 1 for text in lead_fingerprints
         )
     if not checks["references_then_synthesis"]:
-        errors.append("Publication sections are not ordered references then synthesis")
+        errors.append(
+            "Publication sections are not ordered references, synthesis, analyst opinion, "
+            "then technical annex"
+            if v6 is not None
+            else "Publication sections are not ordered references then synthesis"
+        )
     if not checks.get("lead_is_first_and_not_duplicated", False):
         errors.append("Publication lead is not the first unique synthesis paragraph")
 
@@ -394,7 +427,39 @@ def qa_publication_v5(
             "Publication failed no_pipeline_vocabulary_leaks: internal production "
             "vocabulary is present"
         )
-    return {"passed": not errors, "checks": checks, "errors": errors, "warnings": warnings}
+    result: dict[str, Any] = {
+        "passed": not errors,
+        "checks": checks,
+        "errors": errors,
+        "warnings": warnings,
+    }
+    if v6 is not None:
+        try:
+            serialize_publication_document(v6)
+        except PublicationDocumentV6ValidationError:
+            checks["analyst_opinion_invariants"] = False
+            errors.append("PublicationDocumentV6 opinion or provenance invariants are invalid")
+        else:
+            checks["analyst_opinion_invariants"] = True
+        error_codes: list[str] = []
+        if not checks["analyst_opinion_invariants"]:
+            error_codes.append(PublicationQaErrorCode.V6_INVARIANT_INVALID.value)
+        if not checks["exact_projection"]:
+            error_codes.append(PublicationQaErrorCode.BASE_PROJECTION_MISMATCH.value)
+        if not checks["references_then_synthesis"]:
+            error_codes.append(PublicationQaErrorCode.SECTION_ORDER_INVALID.value)
+        if errors and not error_codes:
+            error_codes.append(PublicationQaErrorCode.PUBLICATION_QA_FAILED.value)
+        result["passed"] = not errors
+        result["error_codes"] = error_codes
+    return result
+
+
+def qa_publication_v6(**kwargs: Any) -> dict[str, Any]:
+    publication = kwargs.get("publication")
+    if not isinstance(publication, PublicationDocumentV6):
+        raise PublicationQaValidationError(PublicationQaErrorCode.DOCUMENT_NOT_V6)
+    return qa_publication_v5(**kwargs)
 
 
 # Keep the old consumer name for frozen V4 documents. The validation function

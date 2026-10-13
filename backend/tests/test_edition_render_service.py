@@ -39,6 +39,7 @@ from cti_app.domain.edition_render import (
 from cti_app.domain.publication_document import (
     PublicationDocumentV4,
     PublicationDocumentV5,
+    PublicationDocumentV6,
 )
 from cti_app.domain.semantic_annotation import (
     SEMANTIC_ANNOTATION_POLICY_VERSION,
@@ -596,6 +597,44 @@ async def test_edition_render_service_accepts_v5_publication_end_to_end(tmp_path
     assert rendered.status is TypstRenderStatus.SUCCEEDED
     assert compiler.call_count == 1
     assert isinstance(renderer.documents[0].publications[0].document, PublicationDocumentV5)
+
+
+@pytest.mark.asyncio
+async def test_edition_render_service_accepts_v6_publication_end_to_end(tmp_path: Path) -> None:
+    from cti_app.application.publication_augmentation import augment_publication_with_opinion
+    from tests.test_publication_document_v6 import _approved_opinion
+
+    v4_edition = _edition_document()
+    v4_publication = v4_edition.publications[0].document
+    assert isinstance(v4_publication, PublicationDocumentV4)
+    base = PublicationDocumentV5(
+        document=v4_publication,
+        semantic_text=SemanticTextV1(
+            schema_version=SEMANTIC_ANNOTATION_SCHEMA_VERSION,
+            policy_version=SEMANTIC_ANNOTATION_POLICY_VERSION,
+            paragraphs=(
+                SemanticParagraphV1(
+                    anchor="title",
+                    spans=(SemanticTextSpanV1(SemanticRole.TEXT, v4_publication.title),),
+                ),
+            ),
+        ),
+    )
+    opinion, context = _approved_opinion(base)
+    publication = augment_publication_with_opinion(base, opinion, context)
+    edition = replace(
+        v4_edition,
+        publications=(replace(v4_edition.publications[0], document=publication),),
+    )
+    service, release, _document, _renders, _store, renderer, compiler, *_ = _service_fixture(
+        tmp_path, edition
+    )
+
+    rendered = await service.render_pdf(release.id)
+
+    assert rendered.status is TypstRenderStatus.SUCCEEDED
+    assert compiler.call_count == 1
+    assert isinstance(renderer.documents[0].publications[0].document, PublicationDocumentV6)
 
 
 @pytest.mark.asyncio

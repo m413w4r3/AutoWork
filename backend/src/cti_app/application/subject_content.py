@@ -23,7 +23,11 @@ from cti_app.domain.production import (
     ProductionRun,
 )
 from cti_app.domain.publication import ArtifactType
-from cti_app.domain.publication_document import parse_publication_document
+from cti_app.domain.publication_document import (
+    PublicationDocumentV6,
+    parse_publication_document,
+    serialize_publication_document,
+)
 
 
 class ArtifactPayloadReader(Protocol):
@@ -40,7 +44,9 @@ class SubjectContentView:
     artifact_input_hash: str
     status: ProductionArtifactStatus
     schema_version: str
+    document_version: str
     canonical_content: dict[str, Any]
+    analyst_opinion: dict[str, Any] | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +85,39 @@ class SubjectAssetsView:
     samples: tuple[SubjectAssetView, ...]
 
 
+def analyst_opinion_view(document: PublicationDocumentV6) -> dict[str, Any] | None:
+    """Additive read projection of the approved opinion carried by a V6 wrapper."""
+    if document.analyst_opinion is None or document.rendered_opinion is None:
+        return None
+    provenance = document.provenance
+    return {
+        "status": document.analyst_opinion.status.value,
+        "blocks": [
+            {
+                "type": block.block_type.value,
+                "heading": block.heading,
+                "text": block.text,
+                "qualification": block.qualification.value,
+                "certainty": block.certainty,
+                "finding_refs": [str(item) for item in block.finding_refs],
+                "evidence_refs": [str(item) for item in block.evidence_refs],
+            }
+            for block in document.rendered_opinion.blocks
+        ],
+        "unresolved_points": list(document.rendered_opinion.unresolved_points),
+        "provenance": {
+            "base_publication_artifact_id": str(provenance.base_publication_artifact_id),
+            "base_publication_sha256": provenance.base_publication_sha256,
+            "investigation_id": str(provenance.investigation_id),
+            "opinion_id": str(provenance.opinion_id),
+            "opinion_version": provenance.opinion_version,
+            "opinion_content_sha256": provenance.opinion_content_sha256,
+            "reviewer_id": provenance.reviewer_id,
+            "approver_id": provenance.approver_id,
+        },
+    }
+
+
 class SubjectContentService:
     """Resolve only the current read-side data needed by Subject screens."""
 
@@ -97,6 +136,12 @@ class SubjectContentService:
         assert artifact.canonical_blob_id is not None
         canonical = await self._artifact_store.read_json(artifact.canonical_blob_id)
         document = parse_publication_document(canonical)
+        document_version = document.schema_version
+        analyst_opinion: dict[str, Any] | None = None
+        if isinstance(document, PublicationDocumentV6):
+            analyst_opinion = analyst_opinion_view(document)
+            document = document.base_publication
+            canonical = serialize_publication_document(document)
         return SubjectContentView(
             subject_id=subject_id,
             run_id=publication.run.id,
@@ -106,7 +151,9 @@ class SubjectContentService:
             artifact_input_hash=artifact.input_hash,
             status=artifact.status,
             schema_version=document.schema_version,
+            document_version=document_version,
             canonical_content=canonical,
+            analyst_opinion=analyst_opinion,
         )
 
     async def current_publication(self, subject_id: UUID) -> CurrentSubjectPublication | None:

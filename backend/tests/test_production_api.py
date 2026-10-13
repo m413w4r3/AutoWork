@@ -2164,6 +2164,40 @@ async def test_publication_artifact_response_has_no_rendered_content(
     assert "rendered_content" not in response.json()
 
 
+async def test_legacy_publication_artifact_api_returns_typed_conflict_for_v6(
+    api: AsyncClient,
+    uow: _Uow,
+    production_app: FastAPI,
+) -> None:
+    from cti_app.application.publication_augmentation import augment_publication_with_opinion
+    from cti_app.domain.publication_document import serialize_publication_document
+    from tests.test_publication_document_v6 import _approved_opinion, _base_v5
+
+    run = _terminal_run(uuid4(), uuid4(), status=ProductionRunStatus.FAILED)
+    await uow.production_runs.add(run)
+    artifact = _artifact(run, ProductionArtifactStage.PUBLICATION)
+    base = _base_v5()
+    opinion, context = _approved_opinion(base)
+    v6 = augment_publication_with_opinion(base, opinion, context)
+    artifact.canonical_blob_id = uuid4()
+    production_app.state.production_artifact_store.payloads[artifact.canonical_blob_id] = (
+        serialize_publication_document(v6)
+    )
+    await uow.production_artifacts.append(artifact)
+
+    response = await api.get(f"/api/production/runs/{run.id}/artifacts/publication")
+
+    # A V6 wrapper stays readable: its V5 base is the canonical content and the approved
+    # opinion is exposed additively (the composition console depends on this endpoint).
+    assert response.status_code == 200
+    body = response.json()
+    assert body["document_version"] == "6"
+    assert body["canonical_content"]["schema_version"] == "5"
+    assert body["analyst_opinion"] is not None
+    assert body["analyst_opinion"]["blocks"]
+    assert body["artifact_id"] == str(artifact.id)
+
+
 async def test_legacy_synthesis_artifact_keeps_rendered_content(
     api: AsyncClient,
     uow: _Uow,

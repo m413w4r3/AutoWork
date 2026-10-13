@@ -10,10 +10,13 @@ from uuid import UUID
 
 import pytest
 
+from cti_app.application.edition_classification import classify_edition_publications
+from cti_app.application.edition_ioc_export import project_publication_iocs
 from cti_app.application.edition_typst_rendering import (
     EditionRenderPublicationSchemaUnsupportedError,
     EditionTypstRenderer,
 )
+from cti_app.application.publication_augmentation import augment_publication_with_opinion
 from cti_app.application.typst_compilation import (
     CompiledTypstDocument,
     FontBundleSnapshot,
@@ -48,6 +51,7 @@ from cti_app.domain.semantic_annotation import (
     SemanticTextV1,
 )
 from tests.test_publication_builder_v4 import _frontmatter_v6_case
+from tests.test_publication_document_v6 import _approved_opinion
 from tests.test_typst_rendering import (
     _INJECTION_TEXT,
     _diagram_at,
@@ -155,7 +159,7 @@ def test_renders_one_article_with_edition_metadata_and_private_entrypoint(tmp_pa
 
     assert source.entrypoint_relative_path == "RENDERER/edition.typ"
     assert source.render_data_relative_path == "RENDERER/edition-render-data.json"
-    assert data["schema_version"] == "typst-edition-model-v19-block-location"
+    assert data["schema_version"] == "typst-edition-model-v20-analyst-opinion"
     assert data["edition"] == {
         "id": str(_EDITION_ID),
         "country": "Iran",
@@ -194,6 +198,39 @@ def test_edition_keeps_v6_title_dated_references_and_ioc_groups(tmp_path: Path) 
         "context.example",
         "original.example",
     ]
+
+
+def test_edition_renders_v6_opinion_between_synthesis_and_annex(tmp_path: Path) -> None:
+    base = _semantic_policy_publication(SEMANTIC_ANNOTATION_POLICY_VERSION, 301)
+    opinion, context = _approved_opinion(base)
+    augmented = augment_publication_with_opinion(base, opinion, context)
+    without_opinion = _semantic_policy_publication(SEMANTIC_ANNOTATION_POLICY_VERSION, 302)
+    document = _edition_document(((1, augmented), (2, without_opinion)))
+
+    _, data = _render_data(tmp_path, document)
+
+    with_opinion = data["publications"][0]["content_sections"]
+    section_types = [section["type"] for section in with_opinion]
+    assert section_types[:3] == ["references", "synthesis", "analyst_opinion"]
+    assert section_types.index("analyst_opinion") < section_types.index("technical_annex")
+    assert with_opinion[2]["heading"] == "Avis de l'analyste"
+    assert with_opinion[2]["blocks"][0]["text"] == "Le constat supplémentaire est corroboré."
+    assert "analyst_opinion" not in {
+        section["type"] for section in data["publications"][1]["content_sections"]
+    }
+    assert data["edition"]["tlp"] == _edition_metadata()["tlp"]
+
+    v6_classification = classify_edition_publications(document.publications)
+    v5_document = _edition_document(((1, base), (2, without_opinion)))
+    v5_classification = classify_edition_publications(v5_document.publications)
+    assert [
+        (item.publication.subject_id, item.kind, item.number, item.anchor)
+        for item in v6_classification
+    ] == [
+        (item.publication.subject_id, item.kind, item.number, item.anchor)
+        for item in v5_classification
+    ]
+    assert project_publication_iocs(augmented) == project_publication_iocs(base)
 
 
 def test_edition_uses_shared_reader_facing_figure_source_projection(tmp_path: Path) -> None:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import Any, Literal, cast
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response, status
@@ -45,6 +45,34 @@ from cti_app.domain.typst_render import TypstRenderStatus
 router = APIRouter(prefix="/api", tags=["subject-content"])
 
 
+class AnalystOpinionBlockResponse(BaseModel):
+    type: str
+    heading: str
+    text: str
+    qualification: str
+    certainty: float
+    finding_refs: list[UUID]
+    evidence_refs: list[UUID]
+
+
+class AnalystOpinionProvenanceResponse(BaseModel):
+    base_publication_artifact_id: UUID
+    base_publication_sha256: str
+    investigation_id: UUID
+    opinion_id: UUID
+    opinion_version: int
+    opinion_content_sha256: str
+    reviewer_id: str
+    approver_id: str
+
+
+class AnalystOpinionContentResponse(BaseModel):
+    status: Literal["approved"]
+    blocks: list[AnalystOpinionBlockResponse]
+    unresolved_points: list[str]
+    provenance: AnalystOpinionProvenanceResponse
+
+
 class ContentResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -56,7 +84,9 @@ class ContentResponse(BaseModel):
     artifact_input_hash: str
     status: ProductionArtifactStatus
     schema_version: str
+    document_version: str
     canonical_content: dict[str, Any]
+    analyst_opinion: AnalystOpinionContentResponse | None
 
 
 class IndicatorResponse(BaseModel):

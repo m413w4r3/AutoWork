@@ -278,6 +278,39 @@
       #for item in content_section.blocks {
         render-body-block(item)
       }
+    ] else if content_section.type == "analyst_opinion" [
+      #section-title[AVIS DE L'ANALYSTE]
+      #for item in content_section.blocks [
+        #heading(level: 3)[#item.number #item.heading]
+        #text(size: 8pt, weight: "bold")[#item.qualification_label]
+        #h(1em)
+        #text(size: 8pt)[Confiance : #item.certainty_percent%]
+        #parbreak()
+        #item.text
+        #parbreak()
+        #if item.finding_refs.len() > 0 [
+          #text(size: 8pt, fill: grey)[Findings : ]
+          #for (index, reference) in item.finding_refs.enumerate() [
+            #if index > 0 [ · ]
+            #link(reference.href)[#reference.label]
+          ]
+          #parbreak()
+        ]
+        #if item.evidence_refs.len() > 0 [
+          #text(size: 8pt, fill: grey)[Évidences : ]
+          #for (index, reference) in item.evidence_refs.enumerate() [
+            #if index > 0 [ · ]
+            #link(reference.href)[#reference.label]
+          ]
+          #parbreak()
+        ]
+      ]
+      #if content_section.unresolved_points.len() > 0 [
+        #heading(level: 3)[Points non résolus]
+        #for point in content_section.unresolved_points [
+          #list.item[#point]
+        ]
+      ]
     ] else if content_section.type == "technical_annex" [
       #let indicators = content_section.indicators
       #let originals = content_section.original_indicators

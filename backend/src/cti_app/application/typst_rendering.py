@@ -29,6 +29,7 @@ from cti_app.domain.publication_document import (
     PublicationDiagramV1,
     PublicationDocumentV4,
     PublicationDocumentV5,
+    PublicationDocumentV6,
     PublicationSourceFigureV1,
     PublicationTableV1,
 )
@@ -372,11 +373,14 @@ def project_publication_to_typst_model(
     value: CanonicalPublicationDocument,
 ) -> TypstPublicationModelV2:
     """Project a canonical publication while keeping semantic content as data."""
-    if isinstance(value, PublicationDocumentV5):
-        document = value.document
-        semantic_by_anchor = {item.anchor: item for item in value.semantic_text.paragraphs}
-        reference_entries = value.references
-        original_indicator_groups = value.original_indicators
+    publication_v6 = value if isinstance(value, PublicationDocumentV6) else None
+    publication_v5 = publication_v6.base_publication if publication_v6 is not None else value
+    rendered_opinion = publication_v6.rendered_opinion if publication_v6 is not None else None
+    if isinstance(publication_v5, PublicationDocumentV5):
+        document = publication_v5.document
+        semantic_by_anchor = {item.anchor: item for item in publication_v5.semantic_text.paragraphs}
+        reference_entries = publication_v5.references
+        original_indicator_groups = publication_v5.original_indicators
     elif isinstance(value, PublicationDocumentV4):
         document = value
         semantic_by_anchor = {}
@@ -640,12 +644,59 @@ def project_publication_to_typst_model(
     content_sections: list[dict[str, Any]] = [
         {
             "type": "references",
-            "timeline": source_references if isinstance(value, PublicationDocumentV5) else timeline,
+            "timeline": (
+                source_references if isinstance(publication_v5, PublicationDocumentV5) else timeline
+            ),
             "blocks": reference_blocks,
             "sources": sources,
         },
         {"type": "synthesis", "blocks": body_blocks},
     ]
+    if rendered_opinion is not None:
+        assert publication_v6 is not None
+        investigation_id = publication_v6.provenance.investigation_id
+        if investigation_id is None:
+            raise ValueError("PublicationDocumentV6 analyst opinion has no investigation identity")
+        qualification_labels = {
+            "fact": "Fait étayé",
+            "inference": "Inférence",
+            "hypothesis": "Hypothèse",
+        }
+
+        def opinion_citation(kind: str, reference_id: UUID) -> dict[str, str]:
+            noun = "Finding" if kind == "finding" else "Évidence"
+            uri_kind = "findings" if kind == "finding" else "evidence"
+            return {
+                "label": f"{noun} {reference_id}",
+                "href": (f"autowork://investigations/{investigation_id}/{uri_kind}/{reference_id}"),
+            }
+
+        content_sections.append(
+            {
+                "type": "analyst_opinion",
+                "heading": "Avis de l'analyste",
+                "blocks": [
+                    {
+                        "number": f"1.{index + 1}",
+                        "heading": block.heading,
+                        "text": block.text,
+                        "qualification": block.qualification.value,
+                        "qualification_label": qualification_labels[block.qualification.value],
+                        "certainty_percent": round(block.certainty * 100),
+                        "finding_refs": [
+                            opinion_citation("finding", reference_id)
+                            for reference_id in block.finding_refs
+                        ],
+                        "evidence_refs": [
+                            opinion_citation("evidence", reference_id)
+                            for reference_id in block.evidence_refs
+                        ],
+                    }
+                    for index, block in enumerate(rendered_opinion.blocks)
+                ],
+                "unresolved_points": list(rendered_opinion.unresolved_points),
+            }
+        )
     if any(indicators.values()) or any(original_indicators.values()):
         content_sections.append(
             {

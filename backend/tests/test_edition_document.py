@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date
 from types import SimpleNamespace
 from uuid import UUID, uuid4
@@ -10,6 +11,7 @@ from cti_app.application.edition_document import (
     EditionDocumentArtifactRef,
     build_edition_document,
 )
+from cti_app.application.publication_augmentation import augment_publication_with_opinion
 from cti_app.domain.classification import TLP
 from cti_app.domain.edition_publication import EditionDocumentV2
 from cti_app.domain.editions import Edition, EditionStatus
@@ -18,6 +20,8 @@ from cti_app.domain.publication_document import (
     PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
     PublicationDocumentV4,
     PublicationDocumentV5,
+    PublicationDocumentV6,
+    publication_document_v5_sha256,
     serialize_publication_document,
 )
 from cti_app.domain.semantic_annotation import (
@@ -98,11 +102,27 @@ class _ArtifactStore:
 
 
 @pytest.mark.asyncio
-async def test_build_edition_document_accepts_a_legacy_and_current_policy_mix() -> None:
-    documents = (
+async def test_build_edition_document_preserves_v6_opinion_and_v5_article() -> None:
+    base_documents = (
         _publication(SUBJECT_IDS[0], LEGACY_POLICY_VERSION),
         _publication(SUBJECT_IDS[1], SEMANTIC_ANNOTATION_POLICY_VERSION),
     )
+    from tests.test_publication_document_v6 import _approved_opinion
+
+    opinion, citation_context = _approved_opinion(base_documents[0])
+    opinion = replace(
+        opinion,
+        base_publication_artifact_id=ARTIFACT_IDS[0],
+        base_publication_sha256=publication_document_v5_sha256(base_documents[0]),
+        content_sha256="",
+    )
+    citation_context = replace(
+        citation_context,
+        base_publication_artifact_id=ARTIFACT_IDS[0],
+        base_publication_sha256=publication_document_v5_sha256(base_documents[0]),
+    )
+    v6_document = augment_publication_with_opinion(base_documents[0], opinion, citation_context)
+    documents = (v6_document, base_documents[1])
     artifacts = {
         ARTIFACT_IDS[index]: SimpleNamespace(
             id=ARTIFACT_IDS[index],
@@ -164,9 +184,25 @@ async def test_build_edition_document_accepts_a_legacy_and_current_policy_mix() 
     )
 
     assert isinstance(result, EditionDocumentV2)
-    assert all(isinstance(item.document, PublicationDocumentV5) for item in result.publications)
+    assert isinstance(result.publications[0].document, PublicationDocumentV6)
+    assert isinstance(result.publications[1].document, PublicationDocumentV5)
     assert [
         item.document.semantic_text.policy_version
         for item in result.publications
         if isinstance(item.document, PublicationDocumentV5)
-    ] == [LEGACY_POLICY_VERSION, SEMANTIC_ANNOTATION_POLICY_VERSION]
+    ] == [SEMANTIC_ANNOTATION_POLICY_VERSION]
+    assert result.publications[0].document == v6_document
+    assert result.publications[1].document == base_documents[1]
+
+    preserved = result.publications[0].document
+    assert isinstance(preserved, PublicationDocumentV6)
+    assert preserved.base_publication == base_documents[0]
+    assert preserved.provenance.base_publication_artifact_id == ARTIFACT_IDS[0]
+    assert preserved.provenance.base_publication_sha256 == opinion.base_publication_sha256
+    assert preserved.provenance.opinion_id == opinion.id
+    assert preserved.provenance.opinion_version == opinion.version
+    assert preserved.provenance.opinion_content_sha256 == opinion.content_sha256
+    assert preserved.rendered_opinion is not None
+
+    round_tripped = EditionDocumentV2.from_json(result.to_json())
+    assert round_tripped == result
