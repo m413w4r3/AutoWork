@@ -65,7 +65,7 @@ jobs:
         if: always()
         run: make -C .. test-workflow
       # Run only workflow_full here; FAST already ran above, avoiding duplicates.
-      # workflow_full currently collects W1, W5, W7 and W9, so the FULL-only floor is 4.
+      # workflow_full collects W1, W5, W7, W9, W11 and W12, so the FULL-only floor is 6.
       # Keep FULL in this job so it reuses Typst, fonts, D2, PostgreSQL and uv.
       # A separate job would reinstall those tools; this trades a longer backend
       # job for avoiding duplicate setup and keeps FAST and FULL independently visible.
@@ -88,7 +88,7 @@ jobs:
             uv run --no-sync --python 3.12 -- python -I ../scripts/ci/check_workflow_results.py \
               --junitxml "$results/junit.xml" \
               --expression workflow_full \
-              --min-count 4 \
+              --min-count 6 \
               --uv uv; then
             guard_status=0
           else
@@ -164,7 +164,7 @@ jobs:
       - run: pnpm test:e2e
 
   workflow-browser:
-    name: Workflow W10 — browser with real PostgreSQL backend
+    name: Workflow W10 + J2 — browser with real PostgreSQL backend
     runs-on: ubuntu-latest
     env:
       TEST_POSTGRES_ADMIN_DSN: postgresql+asyncpg://postgres:postgres@localhost:5432/postgres
@@ -203,14 +203,24 @@ jobs:
       - name: Install Playwright Chromium
         working-directory: frontend
         run: pnpm exec playwright install --with-deps chromium
+      - name: Install Poppler for the J2 release PDF check
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes poppler-utils
+      - name: Install Typst 0.15.1 for the J2 release PDF
+        uses: typst-community/setup-typst@v4
+        with:
+          typst-version: "0.15.1"
       - name: Workflow W10 — real-backend browser exclusion
         run: make test-workflow-browser
-      - name: Upload W10 browser report and trace
+      - name: Workflow J2 — investigation, human repin and real PDF
+        run: make test-workflow-browser-investigation
+      - name: Upload W10/J2 browser report and trace
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: workflow-browser-evidence
-          path: var/workflow-results/browser/
+          path: |
+            var/workflow-results/browser/
+            var/workflow-results/browser-investigation/
           if-no-files-found: warn
           retention-days: 3
 

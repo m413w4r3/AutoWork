@@ -10,11 +10,24 @@
 - **Rendu réel** : le rendu passe par le vrai compilateur Typst et le PDF par les
   outils Poppler. Cela prouve l’exécution et les assertions de contenu faites,
   pas la qualité graphique ou éditoriale.
+- **Navigateur réel** : Playwright Chromium traverse le frontend servi par Vite,
+  son proxy API, les routes FastAPI et le PostgreSQL isolé du harness. J2 ajoute
+  le vrai `JobExecutor`, la composition `build_investigation_composition`, le
+  rendu Typst et l’extraction Poppler ; Bridge, VT et Shodan répondent avec des
+  scripts déterministes et aucun fournisseur distant n’est contacté.
 
 Tous les scénarios `workflow_full` et `workflow_fast` portent les deux marqueurs
 `integration` et leur profil. Ils écrivent une trace JSONL pour chaque action,
 utilisent des identifiants/octet uniques quand ils capturent des réponses, et
 relisent les assertions canoniques en PostgreSQL.
+
+## Planchers CI
+
+`make test-workflow` exige les 10 scénarios `workflow_fast` (les 7 existants et
+les 3 cas W13). La garde combinée `make test-workflow-full` exige 16 scénarios
+`workflow_fast` et `workflow_full` (les 12 existants, W12 et les 3 cas W13).
+Le job CI qui exécute uniquement `workflow_full` exige 6 scénarios ; W12 porte
+ce compte de 5 à 6.
 
 ## Scénarios
 
@@ -76,9 +89,64 @@ relisent les assertions canoniques en PostgreSQL.
   Acceptation et Assembly suivent les services/routes réels. Le vrai
   `EditionRenderService` compile avec `TypstSubprocessCompiler`; le blob PDF,
   SHA-256, pagination et chaîne manifeste/release/document/rendu sont relus en
-  base. Poppler inspecte le PDF et l’extraction vérifie les titres Article A et
+  base. Poppler inspecte le PDF et l'extraction vérifie les titres Article A et
   B. Un Typst, un template, un bundle de polices ou Poppler manquant fait échouer
   le test avec le prérequis nommé ; aucun saut n’est possible.
+- `test_w11_analyst_opinion_repin.py` (`workflow_full`) : A, B et C ont des runs
+  et publications V5 indépendants. Composition, exclusion, Review, Acceptation,
+  Assembly et le premier rendu Typst/Poppler sont réels. Le vrai
+  `PublicationAugmentationArtifactService` crée ensuite une nouvelle PUBLICATION
+  V6 sur A ; sans mutation de composition, les octets du document V5, le manifeste,
+  le release et le PDF v1 restent identiques. Le repin passe ensuite par le vrai
+  `EditionCompositionService.replace_entries` avec compare-and-swap de version ;
+  une seconde Composition/Review/Acceptation/Assembly et un second rendu
+  Typst/Poppler vérifient que seul A porte l’avis, que B/C et l’exclusion restent
+  inchangés, et que le manifeste/release/PDF historiques sont encore lisibles.
+  Les octets canoniques V5 du document assemblé correspondent à la projection
+  pré-H1b ; le SHA-256 du PDF v1 lu en base reste identique après approbation.
+  Les preuves couvrent les services PostgreSQL réels et le rendu PDF réel, sans
+  appel fournisseur.
+- `test_w12_investigation_discovery_chain_and_repin.py` (`workflow_full`) : un
+  seul scénario compose A/B/C à partir de runs indépendants, puis enquête sur A
+  par l'API et exécute G2/G3, VT, acquisition, analyse locale, relations et avis
+  via les vrais jobs/services PostgreSQL avec des ports synthétiques. D1 vérifie
+  que S2 est nouveau uniquement pour l'article et reste candidat jusqu'à G3 ; D2
+  cite `dropped_files`/`parents` pour une transition tout en laissant le rôle
+  final hypothétique ; D3 confronte C1 avec les observations relationnelles et
+  statiques et rétrograde une affirmation `supported` sans observation. Une
+  citation d'avis inconnue est refusée par l'API. Publication V6 ne repin pas
+  automatiquement : le manifeste, le release et le PDF Typst/Poppler v1 restent
+  identiques. Le CAS humain repin uniquement A, puis le nouveau PDF réel contient
+  l'avis et la vérification C1 ; B/C et les artefacts historiques restent
+  inchangés (D6).
+- `test_w13_investigation_infra_detection_resume.py` (`workflow_fast`, trois
+  tests, sans Typst) : D4 part d'un article IP-only, lit les relations VT et
+  l'index Shodan daté, limite explicitement l'attribution par certificat partagé
+  et l'activité à la fenêtre observée, sans téléchargement ni YARA. Une seconde
+  enquête désactive VT et confirme que Shodan permet toujours de composer un
+  avis. D5 utilise le vrai `RuleWorkbench`, l'isolateur YARA, l'API de revue des
+  règles et l'archive liée au manifeste : v1 matche le corpus goodware et reste
+  rejetée/non publiée ; un nouvel échantillon est associé, v2 est distincte,
+  retestée et comparée avec des matches gagnés/perdus. L'avis est publiable avant
+  l'approbation de règle ; seule l'approbation humaine du hash/version v2 apparaît
+  dans un nouveau manifeste qui retient l'article, sans brouillon ni v1 bruitée.
+  D7 rejoue le même `ToolInvocation` sans second téléchargement, simule une
+  soumission Bridge ambiguë et vérifie que la reprise ne la resoumet pas ; le
+  budget téléchargements et `do_not_submit` bloquent seulement l'acquisition
+  visée, tandis que Shodan continue. Un quota VT produit un résultat local
+  `unavailable` et n'empêche pas la piste Shodan.
+- `investigation-opinion-repin.spec.ts` (`test-workflow-browser-investigation`) :
+  Playwright ouvre A, lance l’enquête depuis l’onglet Enquête/Avis, approuve G2,
+  puis demande au endpoint local réservé au harness d’exécuter le vrai job par
+  `JobExecutor`. Les outils VT/Shodan reçoivent des réponses déterministes ; les
+  octets acquis sont une fixture synthétique inoffensive. Les gestes UI qualifient
+  le candidat par G3, révisent et approuvent la version exacte de l’avis, proposent
+  la PUBLICATION V6, vérifient la composition inchangée puis réépinglent A depuis
+  Composition. Acceptation, jobs d’assemblage/rendu et Typst/Poppler aboutissent
+  à un PDF téléchargé depuis l’écran Publication. Le vérificateur compare son
+  hash au rendu canonique PostgreSQL, extrait le texte avec `pdftotext`, vérifie
+  que l’avis apparaît seulement dans l’édition de A et compare les hashes du
+  manifeste, du release, du document assemblé et du PDF historiques après repin.
 - `test_network_guard.py` (`workflow_fast`) : vérifie sans base que les tentatives
   socket, DNS et HTTP sont refusées avant tout accès réseau.
 
@@ -92,10 +160,11 @@ ni les sockets connectées avant le test.
 
 ## Prérequis du rendu réel
 
-W9 requiert Typst 0.15.1, le bundle de templates `chpTypst`, un bundle de polices
-et son fichier `typst-fonts.lock`, ainsi que `pdfinfo`, `pdffonts`, `pdftotext` et
-`pdftoppm` (Poppler). Les chemins peuvent être précisés avec `TYPST_BINARY`,
-`CHP_TYPST_ROOT`, `FONT_BUNDLE_ROOT` et `TYPST_FONTS_LOCK_FILE`.
+W9, W11 et W12 requièrent Typst 0.15.1, le bundle de templates `chpTypst`, un bundle
+de polices et son fichier `typst-fonts.lock`, ainsi que `pdfinfo`, `pdffonts`,
+`pdftotext` et `pdftoppm` (Poppler). Les chemins peuvent être précisés avec
+`TYPST_BINARY`, `CHP_TYPST_ROOT`, `FONT_BUNDLE_ROOT` et
+`TYPST_FONTS_LOCK_FILE`.
 
 Dans l’environnement local où Typst est fourni par snap, le snap ne peut pas lire
 les fichiers sous `/tmp`. Utiliser un répertoire temporaire sous le home :
@@ -132,6 +201,25 @@ Depuis la racine du dépôt :
 make test-workflow
 make test-workflow-full
 ```
+
+Le parcours navigateur W10 reste une cible séparée. J2 se lance avec
+`make test-workflow-browser-investigation` et requiert lui aussi
+`TEST_POSTGRES_ADMIN_DSN`. Le service réservé aux tests est celui du profil
+`integration-test` sur le port `TEST_POSTGRES_PORT` (55432 par défaut), jamais
+le Postgres applicatif ni `yara_signator_postgres_testing` :
+
+```sh
+timeout 120s flock /tmp/autowork-integration.lock make integration-db-up
+mkdir -p "$HOME/typst-tmp"
+timeout 20m flock /tmp/autowork-integration.lock env \
+  TEST_POSTGRES_ADMIN_DSN=postgresql+asyncpg://postgres:postgres@127.0.0.1:55432/postgres \
+  TMPDIR="$HOME/typst-tmp" make test-workflow-browser-investigation
+```
+
+La cible crée et supprime sa propre base `cti_j2_browser_<uuid>` sur ce serveur,
+sert FastAPI uniquement sur `127.0.0.1`, puis ferme le serveur après la
+vérification. Elle écrit l’état, les logs, le PDF téléchargé, les traces et le
+rapport Playwright sous `var/workflow-results/browser-investigation/`.
 
 Ces cibles délèguent à `make test-integration`, définissent
 `WORKFLOW_EMULATOR_REQUIRED=1`, écrivent JUnit et traces dans
