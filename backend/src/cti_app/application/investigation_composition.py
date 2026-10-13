@@ -12,6 +12,7 @@ from cti_app.application.analyst_handoff import (
     loop_budget_from_settings,
 )
 from cti_app.application.article_novelty import ArticleNoveltyService
+from cti_app.application.behavior_report_import import BehaviorReportImporter
 from cti_app.application.bridge_investigator import (
     BridgeInvestigator,
     InvestigationTurnTransport,
@@ -20,8 +21,10 @@ from cti_app.application.bridge_investigator import (
     TurnSubmissionStatus,
 )
 from cti_app.application.code_features import CodeFeatureService
+from cti_app.application.detection_review_service import DetectionReviewService
 from cti_app.application.evidence_recorder import EvidenceRecorder, ProductionEvidenceRecorder
 from cti_app.application.goodware import GoodwareMeasurementService
+from cti_app.application.invariants import InvariantRegistryService
 from cti_app.application.investigation_acquisition import HitAcquisitionService
 from cti_app.application.investigation_acquisition_tools import (
     LocalSampleAnalysisService,
@@ -29,16 +32,29 @@ from cti_app.application.investigation_acquisition_tools import (
     register_acquisition_tools,
 )
 from cti_app.application.investigation_article_snapshot import ProductionArticleSnapshotAdapter
+from cti_app.application.investigation_extraction_tools import (
+    extraction_tool_capabilities,
+    register_extraction_tools,
+)
 from cti_app.application.investigation_governance import SampleQualificationService
 from cti_app.application.investigation_local_tools import (
     SampleBytesReader,
     local_tool_capabilities,
     register_local_analysis_tools,
 )
+from cti_app.application.investigation_native_tools import (
+    NATIVE_TOOL_NAME,
+    native_tool_capabilities,
+    register_native_tools,
+)
 from cti_app.application.investigation_persistence import (
     EvidenceObservationRepository,
     FindingRepository,
     SampleAssociationRepository,
+)
+from cti_app.application.investigation_retrohunt_tools import (
+    register_retrohunt_tools,
+    retrohunt_tool_capabilities,
 )
 from cti_app.application.investigation_rule_tools import (
     EvidencePayloadReader,
@@ -53,6 +69,16 @@ from cti_app.application.investigation_service import (
 from cti_app.application.investigation_shodan_tools import (
     register_shodan_tools,
     shodan_tool_capabilities,
+)
+from cti_app.application.investigation_signature_bridge_tools import (
+    RuleToolExecutionPort,
+    register_signature_bridge_tools,
+    signature_bridge_tool_capabilities,
+)
+from cti_app.application.investigation_similarity_tools import (
+    SIMILARITY_TOOL_NAMES,
+    register_similarity_tools,
+    similarity_tool_capabilities,
 )
 from cti_app.application.investigation_tools import (
     InMemoryToolRegistry,
@@ -73,6 +99,11 @@ from cti_app.application.local_analysis import (
     SampleBytesUnavailableError,
 )
 from cti_app.application.model_conversations import ModelConversationService
+from cti_app.application.native_analysis import (
+    NativeAnalysisPort,
+    NativeAnalysisService,
+    select_native_analysis_port,
+)
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.research_context_builder import (
@@ -83,14 +114,26 @@ from cti_app.application.research_context_builder import (
     ResearchContextBuilder,
     SampleFeaturePackPort,
 )
+from cti_app.application.retrohunt import RETROHUNT_CAPABILITY, RetrohuntService
 from cti_app.application.rule_workbench import RuleCorpusBytesPort, RuleWorkbench, YaraEnginePort
 from cti_app.application.sample_acquisition import VirusTotalSampleAcquisitionService
+from cti_app.application.sample_extraction_ports import (
+    ConfigurationExtractionPort,
+    ObfuscatedStringExtractionPort,
+)
+from cti_app.application.sample_similarity import SampleSimilarityService
 from cti_app.application.shodan import ShodanBudgetEstimate, ShodanCapabilities, ShodanPort
-from cti_app.application.virustotal import VirusTotalCapabilities, VirusTotalPort
+from cti_app.application.virustotal import (
+    VirusTotalCapabilities,
+    VirusTotalPort,
+    VirusTotalRetrohuntPort,
+    VirusTotalRoutingPolicy,
+)
 from cti_app.application.virustotal_persistence import VirusTotalObservationService
 from cti_app.config import Settings
 from cti_app.domain.goodware import NonDiscriminantPatternRegistry
 from cti_app.infrastructure.legitimate_services import load_legitimate_services
+from cti_app.infrastructure.virustotal import VirusTotalRetrohuntProxyAdapter
 
 LOCAL_READ_CAPABILITY = "investigation.local_read"
 OPTIONAL_CAPABILITIES = {
@@ -124,6 +167,29 @@ OPTIONAL_TOOL_NAMES = (
     "rule.revise",
     "rule.compare",
     "rule.get",
+    "samples.compare",
+    "features.common",
+    "signatures.candidates",
+    "features.explain",
+    "rule.propose_from_candidates",
+    "sample.extract_obfuscated_strings",
+    "sample.extract_configuration",
+    "sandbox.report.import",
+    "vt.retrohunt.submit",
+    "vt.retrohunt.status",
+    "vt.retrohunt.results",
+    NATIVE_TOOL_NAME,
+)
+FAMILY_CAPABILITY_KEYS = frozenset(
+    {
+        *SIMILARITY_TOOL_NAMES,
+        "rule.propose_from_candidates",
+        "sample.extract_obfuscated_strings",
+        "sample.extract_configuration",
+        "sandbox.report.import",
+        RETROHUNT_CAPABILITY,
+        NATIVE_TOOL_NAME,
+    }
 )
 
 
@@ -226,6 +292,15 @@ class InvestigationToolDependencies:
     sample_code_features: CodeFeatureService | None = None
     sample_goodware: GoodwareMeasurementService | None = None
     available_capabilities: frozenset[str] = frozenset()
+    sample_similarity: SampleSimilarityService | None = None
+    invariant_registry: InvariantRegistryService | None = None
+    floss_extraction: ObfuscatedStringExtractionPort | None = None
+    configuration_extraction: ConfigurationExtractionPort | None = None
+    behavior_report_importer: BehaviorReportImporter | None = None
+    retrohunt_provider: VirusTotalRetrohuntPort | None = None
+    vt_routing_policy: VirusTotalRoutingPolicy | None = None
+    native_analysis_rea: NativeAnalysisPort | None = None
+    native_analysis_ghidra_mcp: NativeAnalysisPort | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -248,9 +323,179 @@ class OptionalInvestigationToolPorts:
     sample_code_features: CodeFeatureService | None = None
     sample_goodware: GoodwareMeasurementService | None = None
     available_capabilities: frozenset[str] = frozenset()
+    sample_similarity: SampleSimilarityService | None = None
+    invariant_registry: InvariantRegistryService | None = None
+    floss_extraction: ObfuscatedStringExtractionPort | None = None
+    configuration_extraction: ConfigurationExtractionPort | None = None
+    behavior_report_importer: BehaviorReportImporter | None = None
+    retrohunt_provider: VirusTotalRetrohuntPort | None = None
+    vt_routing_policy: VirusTotalRoutingPolicy | None = None
+    native_analysis_rea: NativeAnalysisPort | None = None
+    native_analysis_ghidra_mcp: NativeAnalysisPort | None = None
 
 
 ToolRegistrar = Callable[[ToolRegistry, InvestigationToolDependencies], None]
+
+
+def _register_similarity_tool_family(
+    registry: ToolRegistry,
+    *,
+    dependencies: InvestigationToolDependencies,
+    recorder: EvidenceRecorder,
+    enabled: set[str],
+) -> None:
+    register_similarity_tools(
+        registry,
+        service=dependencies.sample_similarity,
+        sample_associations=dependencies.sample_associations,
+        recorder=recorder,
+    )
+    enabled.update(
+        similarity_tool_capabilities(
+            service=dependencies.sample_similarity,
+            sample_associations=dependencies.sample_associations,
+            recorder=recorder,
+        )
+    )
+
+
+def _register_signature_bridge_tool_family(
+    registry: ToolRegistry,
+    *,
+    dependencies: InvestigationToolDependencies,
+    recorder: EvidenceRecorder,
+    rule_tools: RuleToolExecutionPort | None,
+    uow_factory: UnitOfWorkFactory,
+    settings: Settings,
+    enabled: set[str],
+) -> None:
+    invariant_registry = dependencies.invariant_registry
+    if invariant_registry is None:
+        invariant_registry = InvariantRegistryService(
+            uow_factory,
+            dependencies.sample_goodware,
+            settings=settings,
+        )
+    register_signature_bridge_tools(
+        registry,
+        service=dependencies.sample_similarity,
+        sample_associations=dependencies.sample_associations,
+        recorder=recorder,
+        uow_factory=uow_factory,
+        invariant_registry=invariant_registry,
+        rule_tools=rule_tools,
+    )
+    enabled.update(
+        signature_bridge_tool_capabilities(
+            service=dependencies.sample_similarity,
+            sample_associations=dependencies.sample_associations,
+            recorder=recorder,
+            uow_factory=uow_factory,
+            invariant_registry=invariant_registry,
+            rule_tools=rule_tools,
+        )
+    )
+
+
+def _register_extraction_tool_family(
+    registry: ToolRegistry,
+    *,
+    dependencies: InvestigationToolDependencies,
+    recorder: EvidenceRecorder,
+    settings: Settings,
+    uow_factory: UnitOfWorkFactory,
+    enabled: set[str],
+) -> None:
+    floss = dependencies.floss_extraction if settings.local_analysis_enabled else None
+    configuration = (
+        dependencies.configuration_extraction if settings.local_analysis_enabled else None
+    )
+    importer = dependencies.behavior_report_importer
+    register_extraction_tools(
+        registry,
+        sample_associations=dependencies.sample_associations,
+        recorder=recorder,
+        floss=floss,
+        configuration=configuration,
+        goodware=dependencies.sample_goodware,
+        uow_factory=uow_factory,
+        report_importer=importer,
+    )
+    enabled.update(
+        extraction_tool_capabilities(
+            floss=floss,
+            configuration=configuration,
+            report_import_enabled=importer is not None,
+        )
+    )
+
+
+def _register_retrohunt_tool_family(
+    registry: ToolRegistry,
+    *,
+    uow: UnitOfWork,
+    uow_factory: UnitOfWorkFactory,
+    artifact_store: ProductionArtifactStore,
+    dependencies: InvestigationToolDependencies,
+    recorder: EvidenceRecorder,
+    enabled: set[str],
+) -> None:
+    provider = dependencies.retrohunt_provider
+    if provider is None or getattr(uow, "retrohunt_reservations", None) is None:
+        return
+    capabilities = dependencies.vt_capabilities or VirusTotalCapabilities()
+    routing_policy = dependencies.vt_routing_policy or VirusTotalRoutingPolicy()
+    proxy_provider = VirusTotalRetrohuntProxyAdapter(
+        capabilities=capabilities,
+        routing_policy=routing_policy,
+        proxy_client=provider,
+    )
+    service = RetrohuntService(
+        uow_factory=uow_factory,
+        review_service=DetectionReviewService(uow_factory, artifact_store),
+        provider=proxy_provider,
+        evidence_recorder=recorder,
+    )
+    register_retrohunt_tools(registry, service=service)
+    enabled.update(retrohunt_tool_capabilities(capabilities, routing_policy, proxy_provider))
+
+
+def _register_native_tool_family(
+    registry: ToolRegistry,
+    *,
+    dependencies: InvestigationToolDependencies,
+    recorder: EvidenceRecorder,
+    settings: Settings,
+    enabled: set[str],
+) -> None:
+    port = select_native_analysis_port(
+        settings.native_analysis_provider,
+        rea=dependencies.native_analysis_rea,
+        ghidra_mcp=dependencies.native_analysis_ghidra_mcp,
+    )
+    service = NativeAnalysisService(
+        port,
+        timeout_seconds=settings.native_analysis_timeout_seconds,
+        max_output_bytes=settings.native_analysis_max_output_bytes,
+    )
+    register_native_tools(
+        registry,
+        service=service,
+        port=port,
+        sample_associations=dependencies.sample_associations,
+        recorder=recorder,
+        enabled=settings.native_analysis_enabled,
+        provider=settings.native_analysis_provider,
+    )
+    enabled.update(
+        native_tool_capabilities(
+            enabled=settings.native_analysis_enabled,
+            provider=settings.native_analysis_provider,
+            port=port,
+            recorder=recorder,
+            sample_associations=dependencies.sample_associations,
+        )
+    )
 
 
 class _PermissionAwareInvestigationTransport:
@@ -350,6 +595,15 @@ def investigation_tool_dependencies_from_settings(
     sample_capabilities_analysis: Any | None = None,
     sample_code_features: CodeFeatureService | None = None,
     sample_goodware: GoodwareMeasurementService | None = None,
+    sample_similarity: SampleSimilarityService | None = None,
+    invariant_registry: InvariantRegistryService | None = None,
+    floss_extraction: ObfuscatedStringExtractionPort | None = None,
+    configuration_extraction: ConfigurationExtractionPort | None = None,
+    behavior_report_importer: BehaviorReportImporter | None = None,
+    retrohunt_provider: VirusTotalRetrohuntPort | None = None,
+    vt_routing_policy: VirusTotalRoutingPolicy | None = None,
+    native_analysis_rea: NativeAnalysisPort | None = None,
+    native_analysis_ghidra_mcp: NativeAnalysisPort | None = None,
     available_capabilities: frozenset[str] = frozenset(),
 ) -> InvestigationToolDependencies:
     """Apply Settings opt-ins before making optional ports visible to registrars."""
@@ -415,7 +669,9 @@ def investigation_tool_dependencies_from_settings(
         ghidra=ghidra,
         acquisition=acquisition,
         virustotal_observations=virustotal_observations if virustotal is not None else None,
-        vt_capabilities=vt_capabilities if virustotal is not None else None,
+        vt_capabilities=(
+            vt_capabilities if virustotal is not None or retrohunt_provider is not None else None
+        ),
         shodan_capabilities=shodan_capabilities if shodan is not None else None,
         shodan_budget_estimate=shodan_budget_estimate if shodan is not None else None,
         rule_corpus_bytes=rule_corpus_bytes,
@@ -429,6 +685,17 @@ def investigation_tool_dependencies_from_settings(
         ),
         sample_code_features=(sample_code_features if settings.local_analysis_enabled else None),
         sample_goodware=(sample_goodware if settings.local_analysis_enabled else None),
+        sample_similarity=sample_similarity,
+        invariant_registry=invariant_registry,
+        floss_extraction=(floss_extraction if settings.local_analysis_enabled else None),
+        configuration_extraction=(
+            configuration_extraction if settings.local_analysis_enabled else None
+        ),
+        behavior_report_importer=behavior_report_importer,
+        retrohunt_provider=retrohunt_provider,
+        vt_routing_policy=vt_routing_policy,
+        native_analysis_rea=native_analysis_rea,
+        native_analysis_ghidra_mcp=native_analysis_ghidra_mcp,
         available_capabilities=frozenset(enabled_capabilities),
     )
 
@@ -522,6 +789,15 @@ def build_investigation_composition(
         sample_capabilities_analysis=supplied("sample_capabilities_analysis"),
         sample_code_features=supplied("sample_code_features"),
         sample_goodware=supplied("sample_goodware"),
+        sample_similarity=supplied("sample_similarity"),
+        invariant_registry=supplied("invariant_registry"),
+        floss_extraction=supplied("floss_extraction"),
+        configuration_extraction=supplied("configuration_extraction"),
+        behavior_report_importer=supplied("behavior_report_importer"),
+        retrohunt_provider=supplied("retrohunt_provider"),
+        vt_routing_policy=supplied("vt_routing_policy"),
+        native_analysis_rea=supplied("native_analysis_rea"),
+        native_analysis_ghidra_mcp=supplied("native_analysis_ghidra_mcp"),
         available_capabilities=ports.available_capabilities
         | (source_dependencies.available_capabilities if source_dependencies else frozenset()),
     )
@@ -572,7 +848,9 @@ def build_investigation_composition(
         artifact_store, uow.evidence_observations
     )
     enabled = set(dependencies.available_capabilities)
+    enabled.difference_update(FAMILY_CAPABILITY_KEYS)
     enabled.add(LOCAL_READ_CAPABILITY)
+    rule_tools: RuleToolExecutionPort | None = None
 
     if dependencies.virustotal is not None and dependencies.virustotal_observations is not None:
         vt_capabilities = dependencies.vt_capabilities or VirusTotalCapabilities()
@@ -658,7 +936,7 @@ def build_investigation_composition(
         and dependencies.rule_corpus_bytes is not None
         and getattr(uow, "detection_candidates", None) is not None
     ):
-        register_rule_tools(
+        rule_tools = register_rule_tools(
             registry,
             workbench=dependencies.rule_workbench,
             candidates=uow.detection_candidates,
@@ -713,6 +991,46 @@ def build_investigation_composition(
         if not settings.local_analysis_enabled:
             local_caps.discard("local.run_command")
         enabled.update(local_caps)
+
+    _register_similarity_tool_family(
+        registry,
+        dependencies=dependencies,
+        recorder=recorder,
+        enabled=enabled,
+    )
+    _register_signature_bridge_tool_family(
+        registry,
+        dependencies=dependencies,
+        recorder=recorder,
+        rule_tools=rule_tools,
+        uow_factory=uow_factory,
+        settings=settings,
+        enabled=enabled,
+    )
+    _register_extraction_tool_family(
+        registry,
+        dependencies=dependencies,
+        recorder=recorder,
+        settings=settings,
+        uow_factory=uow_factory,
+        enabled=enabled,
+    )
+    _register_retrohunt_tool_family(
+        registry,
+        uow=uow,
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+        dependencies=dependencies,
+        recorder=recorder,
+        enabled=enabled,
+    )
+    _register_native_tool_family(
+        registry,
+        dependencies=dependencies,
+        recorder=recorder,
+        settings=settings,
+        enabled=enabled,
+    )
 
     if tool_registrar is not None:
         tool_registrar(registry, dependencies)
