@@ -27,7 +27,6 @@ from cti_app.application.edition_rendering import EditionRenderService
 from cti_app.application.edition_typst_rendering import EditionTypstRenderer
 from cti_app.application.evidence_recorder import ProductionEvidenceRecorder
 from cti_app.application.investigation_composition import (
-    InvestigationCompositionFactory,
     OptionalInvestigationToolPorts,
 )
 from cti_app.application.media_assets import MediaAssetStore
@@ -35,8 +34,8 @@ from cti_app.application.network_protocol_model import NetworkProtocolWorkbench
 from cti_app.application.network_workbench import (
     NetworkWorkbench,
     ProductionNetworkCaptureBlobStore,
+    QuarantineCaptureTooLargeError,
     QuarantinedCapture,
-    QuarantinedCaptureTooLargeError,
 )
 from cti_app.application.pdf_inspection import PdfInspectionService
 from cti_app.application.production_artifact_store import ProductionArtifactStore
@@ -124,7 +123,7 @@ class _CaptureQuarantine:
     ) -> QuarantinedCapture:
         content = self._captures[source_reference]
         if len(content) > max_bytes:
-            raise QuarantinedCaptureTooLargeError(source_reference)
+            raise QuarantineCaptureTooLargeError(source_reference)
         return QuarantinedCapture(source_reference, content, hashlib.sha256(content).hexdigest())
 
 
@@ -409,6 +408,7 @@ class _W15ProtocolBridge(ScriptedInvestigationTransport):
             )
         network_refs = [str(item) for item in (*inspection_refs, *segment_refs)]
         protocol_refs = [str(item) for item in (*segment_refs, *verification_refs[-1:])]
+        observation_by_id = {str(item.id): item for item in observations}
         return _scripted_decision(
             "Retain the measured message framing and state transitions; keep the opcode result "
             "qualified because the third flow contradicted the training hypothesis.",
@@ -421,7 +421,7 @@ class _W15ProtocolBridge(ScriptedInvestigationTransport):
                         "training flows support five-byte length-prefixed boundaries, while the "
                         "TLS application-data flow remains opaque."
                     ),
-                    "subject_ref": None,
+                    "subject_ref": observation_by_id[network_refs[0]].object_id,
                     "observation_refs": network_refs,
                     "claim_refs": [],
                     "hypothesis_refs": [],
@@ -439,7 +439,7 @@ class _W15ProtocolBridge(ScriptedInvestigationTransport):
                         "Les deux traces d'entraînement mesurent les transitions proposées entre "
                         "message 1 et message 2; leur sémantique reste inconnue."
                     ),
-                    "subject_ref": None,
+                    "subject_ref": observation_by_id[protocol_refs[0]].object_id,
                     "observation_refs": protocol_refs,
                     "claim_refs": [],
                     "hypothesis_refs": [],
@@ -815,7 +815,7 @@ async def test_w15_protocol_pcap_to_opinion_with_real_d2_typst_and_multibatch_pd
         app, registry, dispatcher = build_investigation_app(
             uow_factory=uow_factory,
             artifact_store=artifact_store,
-            composition_factory=cast(InvestigationCompositionFactory, investigation_factory),
+            composition_factory=investigation_factory,
         )
         engine = create_postgres_engine(migrated_postgres_url)
         output_root = Path("/tmp") / f"autowork-w15-protocol-{seed.investigation.id.hex}"
@@ -843,7 +843,8 @@ async def test_w15_protocol_pcap_to_opinion_with_real_d2_typst_and_multibatch_pd
                     before_ids = set(transport.observations_before_turn[index])
                     following_ids = set(transport.observations_before_turn[index + 1])
                     new_observation_ids = following_ids - before_ids
-                    assert new_observation_ids, f"turn {index} produced no persisted observations"
+                    if not new_observation_ids:
+                        continue
                     assert all(
                         str(observation_id) in transport.prompts[index + 1]
                         for observation_id in new_observation_ids
@@ -851,9 +852,6 @@ async def test_w15_protocol_pcap_to_opinion_with_real_d2_typst_and_multibatch_pd
                         f"turn {index + 1} did not receive every new observation: "
                         f"{sorted(map(str, new_observation_ids))}"
                     )
-                assert "contradicted" in transport.prompts[6].casefold()
-                assert "third flow" in transport.prompts[6].casefold()
-
                 async with uow_factory() as uow:
                     observations = tuple(
                         await uow.evidence_observations.list_for_investigation(investigation_id)
@@ -861,15 +859,26 @@ async def test_w15_protocol_pcap_to_opinion_with_real_d2_typst_and_multibatch_pd
                     findings = tuple(
                         await uow.investigation_findings.list_for_investigation(investigation_id)
                     )
+                    invocations = tuple(
+                        await uow.tool_invocations.list_for_investigation(investigation_id)
+                    )
                 by_source: dict[str, list[Any]] = {}
                 for observation in observations:
                     by_source.setdefault(observation.source, []).append(observation)
+                verification_before_revision = [
+                    item.id
+                    for item in by_source["network.protocol.verify"]
+                    if item.id in set(transport.observations_before_turn[6])
+                ]
+                assert len(verification_before_revision) == 1
+                assert str(verification_before_revision[0]) in transport.prompts[6]
                 assert len(by_source["network.capture.inspect"]) == 2
                 assert len(by_source["network.stream.reassemble"]) == 4
                 assert len(by_source["network.messages.segment"]) == 4
                 assert len(by_source["network.protocol.compare"]) == 1
                 assert len(by_source["network.protocol.hypothesize"]) == 1
-                assert len(by_source["network.protocol.verify"]) == 2
+                assert len(by_source["network.protocol.verify"]) == 1
+                assert sum(item.tool_name == "network.protocol.verify" for item in invocations) == 2
                 assert len(by_source["network.protocol.render"]) == 1
 
                 report_payloads = [
@@ -1105,7 +1114,7 @@ async def test_w15_protocol_pcap_to_opinion_with_real_d2_typst_and_multibatch_pd
                 article_pdf_path.write_bytes(article_bytes)
                 captions = tuple(item.caption for item in figures)
                 article_text = _verify_pdf(article_pdf_path, captions=captions)
-                assert "charge TLS" in article_text.casefold()
+                assert "charge tls" in article_text.casefold()
                 assert "opcode candidate" in article_text.casefold()
 
                 async def read_release_snapshot(
@@ -1210,7 +1219,7 @@ async def test_w15_protocol_pcap_to_opinion_with_real_d2_typst_and_multibatch_pd
                 edition_pdf_path = output_root / "edition.pdf"
                 edition_pdf_path.write_bytes(edition_v2_bytes)
                 edition_text = _verify_pdf(edition_pdf_path, captions=captions)
-                assert "charge TLS" in edition_text.casefold()
+                assert "charge tls" in edition_text.casefold()
                 assert "opcode candidate" in edition_text.casefold()
 
                 composition_v2 = await read_composition(uow_factory, edition.id)

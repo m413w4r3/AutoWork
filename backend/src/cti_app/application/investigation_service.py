@@ -29,6 +29,7 @@ from cti_app.application.evidence_recorder import (
 )
 from cti_app.application.investigation_contracts import (
     AgentTurnDecisionV1,
+    InvestigationContextV1,
     parse_investigation_context,
     validate_decision_hypothesis_references,
 )
@@ -496,6 +497,7 @@ class InvestigationService:
                 budget=budget,
                 state=state,
                 decision=decision,
+                context=context,
                 context_sha256=turn.context_sha256,
                 user_request_ids=user_request_ids,
             )
@@ -526,6 +528,7 @@ class InvestigationService:
         budget: InvestigationBudget,
         state: InvestigationWorkingState,
         decision: AgentTurnDecisionV1,
+        context: InvestigationContextV1,
         context_sha256: str,
         user_request_ids: tuple[UUID, ...],
     ) -> tuple[InvestigationWorkingState, StopReason | None]:
@@ -798,8 +801,6 @@ class InvestigationService:
             delta=decision.opinion_delta,
         )
         progress = progress or opinion_written
-        all_observations = await self._observations.list_for_investigation(investigation.id)
-        all_findings = await self._findings.list_for_investigation(investigation.id)
         hypotheses = self._update_hypotheses(
             state.hypotheses,
             decision=decision,
@@ -818,8 +819,22 @@ class InvestigationService:
             context_sha256=context_sha256,
             decision_sha256=decision_sha256,
             progress=progress,
-            evidence_ids=tuple(item.id for item in all_observations),
-            finding_ids=tuple(item.id for item in all_findings),
+            evidence_ids=tuple(
+                dict.fromkeys(
+                    (
+                        *state.last_seen_evidence_ids,
+                        *(item.evidence_id for item in context.investigation.new_evidence),
+                    )
+                )
+            ),
+            finding_ids=tuple(
+                dict.fromkeys(
+                    (
+                        *state.last_seen_finding_ids,
+                        *(item.finding_id for item in context.investigation.findings),
+                    )
+                )
+            ),
             action_summaries=tuple(action_summaries),
             hypotheses=hypotheses,
         )
