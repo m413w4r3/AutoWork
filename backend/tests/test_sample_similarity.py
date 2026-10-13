@@ -462,3 +462,25 @@ async def test_similarity_tools_are_versioned_read_only_and_return_evidence_refs
     assert len(recorder.calls) == len(SIMILARITY_TOOL_NAMES)
     assert recorder.calls[0]["object_type"] == "family_feature_comparison"
     assert recorder.calls[0]["sha256"] == results["samples.compare"].output["comparison_sha256"]
+
+    explain_registration = registry.get("features.explain", "1")
+    assert explain_registration is not None
+    _definition, explain_adapter = explain_registration
+    missing_feature_result = await explain_adapter.execute(
+        {
+            "sample_sha256s": [_SAMPLE_A, _SAMPLE_B, _SAMPLE_C],
+            "feature_key": "f" * 64,
+        },
+        ToolExecutionContext(
+            investigation_id=_INVESTIGATION_ID,
+            envelope=None,
+            budget=InvestigationBudget(limits={BudgetDimension.TOOL_SECONDS: 30}),
+            idempotency_key="similarity-missing-feature",
+            available_capabilities=frozenset(SIMILARITY_TOOL_NAMES),
+        ),
+    )
+    assert missing_feature_result.status is ToolInvocationStatus.EMPTY
+    assert missing_feature_result.output["feature"] is None
+    assert missing_feature_result.output["empty"] is True
+    assert missing_feature_result.output["reason"] == "feature_key_not_in_comparison"
+    assert missing_feature_result.observation_refs == (recorder.observation_id,)

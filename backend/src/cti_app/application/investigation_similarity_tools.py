@@ -348,12 +348,19 @@ def _tool_output(
     if tool_name == "features.explain":
         if not isinstance(feature_key, str):
             return {**base, "feature": None, "empty": True, "reason": "feature_key_required"}
-        feature = comparison.feature(feature_key)
+        explained_feature = comparison.feature(feature_key)
+        if explained_feature is None:
+            return {
+                **base,
+                "feature": None,
+                "empty": True,
+                "reason": "feature_key_not_in_comparison",
+            }
         return {
             **base,
-            "feature": _bounded_feature(feature) if feature is not None else None,
-            "empty": feature is None,
-            "reason": None if feature is not None else "feature_key_not_in_comparison",
+            "feature": _bounded_feature(explained_feature),
+            "empty": False,
+            "reason": None,
         }
     return {**base, "empty": True, "reason": "unsupported_similarity_tool"}
 

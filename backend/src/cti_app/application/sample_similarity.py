@@ -207,16 +207,16 @@ class SampleSimilarityService:
             logical_bucket=_SIMILARITY_BUCKET,
             mime_type=_JSON_MIME_TYPE,
         )
-        descriptor = blob.descriptor
-        if descriptor.sha256 != comparison.sha256 or descriptor.size != len(payload):
+        blob_descriptor = blob.descriptor
+        if blob_descriptor.sha256 != comparison.sha256 or blob_descriptor.size != len(payload):
             raise SampleSimilarityError(
                 "artifact store returned a mismatched comparison descriptor"
             )
         return StoredFamilyFeatureComparison(
             comparison=comparison,
             artifact_blob_id=blob.id,
-            artifact_sha256=descriptor.sha256,
-            artifact_size=descriptor.size,
+            artifact_sha256=blob_descriptor.sha256,
+            artifact_size=blob_descriptor.size,
         )
 
     async def _prepare_goodware(
@@ -336,17 +336,16 @@ def _extract_pack(
                 _mapping_value(item, "function_offsets", "function_addresses", "function_offset")
             )
             item_source_id = _source_id(item) or source_id_override or base_source_id
-            common = {
-                "source_kind": source_kind,
-                "source_id": item_source_id,
-                "extractor_version": source_version or base_version,
-                "parameters_sha256": _valid_sha256(_mapping_value(item, "parameters_sha256"))
+            item_parameters_sha256 = (
+                _valid_sha256(_mapping_value(item, "parameters_sha256"))
                 or parameters_sha256
-                or base_parameters,
-                "ruleset_sha256": _valid_sha256(_mapping_value(item, "ruleset_sha256"))
+                or base_parameters
+            )
+            item_ruleset_sha256 = (
+                _valid_sha256(_mapping_value(item, "ruleset_sha256"))
                 or ruleset_sha256
-                or base_ruleset,
-            }
+                or base_ruleset
+            )
             locations = function_offsets or (None,)
             for function_offset in locations:
                 features.append(
@@ -356,7 +355,11 @@ def _extract_pack(
                         encoding=feature_encoding,
                         category=category,
                         source=FeatureSource(
-                            **common,
+                            source_kind=source_kind,
+                            source_id=item_source_id,
+                            extractor_version=source_version or base_version,
+                            parameters_sha256=item_parameters_sha256,
+                            ruleset_sha256=item_ruleset_sha256,
                             offset=offsets,
                             function_offset=function_offset,
                         ),
