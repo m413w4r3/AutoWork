@@ -1387,7 +1387,7 @@ def _length_prefix_candidates(
     return best
 
 
-def _covered_runs(coverage: bytes) -> tuple[tuple[int, int], ...]:
+def _covered_runs(coverage: bytes | bytearray) -> tuple[tuple[int, int], ...]:
     runs: list[tuple[int, int]] = []
     cursor = 0
     while cursor < len(coverage):
