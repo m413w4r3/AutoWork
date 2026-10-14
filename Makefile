@@ -83,6 +83,9 @@ UV_RUN := $(UV_ENV) $(UV) run --no-sync
 #
 PYTEST_ARGS ?=
 
+# Read-only supervised investigation preflight options.
+PREFLIGHT_ARGS ?=
+
 # Integration tests live here. Can be narrowed explicitly:
 #
 #   make test-integration \
@@ -137,6 +140,7 @@ CLEAN_PATHS := \
 	test \
 	test-all \
 	test-backend \
+	preflight-supervised-first-run \
 	test-frontend \
 	test-frontend-e2e \
 	test-integration \
@@ -313,6 +317,12 @@ test-backend: backend-sync ## Lance les tests backend hors intégration
 			--ignore=tests/integration \
 			-m "not integration" \
 			$(PYTEST_ARGS)
+
+preflight-supervised-first-run: ## Prévol local en lecture seule du premier run CTI supervisé
+	cd $(BACKEND_DIR) && \
+		UV_PYTHON_DOWNLOADS=never $(UV_RUN) --python $(PYTHON_VERSION) \
+			python ../scripts/ops/supervised_first_run_preflight.py \
+			$(PREFLIGHT_ARGS)
 
 test-frontend: frontend-sync ## Lance les tests frontend
 	cd $(FRONTEND_DIR) && $(PNPM) test --run
