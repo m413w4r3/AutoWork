@@ -173,7 +173,9 @@ def _compile_pdf(
     font_root: Path,
     entrypoint: str,
 ):
-    font_snapshot = load_font_bundle_snapshot(_REPOSITORY_ROOT / "chpTypst", _FONT_LOCK)
+    # CI installs the pinned fonts outside the repository and exports FONT_BUNDLE_ROOT.
+    font_bundle_root = Path(os.environ.get("FONT_BUNDLE_ROOT") or _REPOSITORY_ROOT / "chpTypst")
+    font_snapshot = load_font_bundle_snapshot(font_bundle_root, _FONT_LOCK)
     font_paths = materialize_font_bundle(font_snapshot, font_root)
     return TypstSubprocessCompiler(binary=typst_binary).compile(
         TypstCompileRequest(
