@@ -6,25 +6,33 @@ import asyncio
 import calendar
 import hashlib
 import ipaddress
+import json
 import os
 import shutil
 import socket
 from dataclasses import replace
-from datetime import date
+from datetime import date, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
+from fastapi import FastAPI
+from httpx import ASGITransport, AsyncClient
 from pypdf import PdfReader
-from sqlalchemy import text
+from sqlalchemy import func, select, text
 from sqlalchemy.engine import make_url
 
+from cti_app.api.subject_content import router as subject_content_router
 from cti_app.application import publication_rendering
 from cti_app.application.blobs import BlobCatalogService
+from cti_app.application.edition_publication import EditionPublicationService
+from cti_app.application.edition_rendering import EditionRenderService
+from cti_app.application.edition_typst_rendering import EditionTypstRenderer
 from cti_app.application.media_assets import MediaAssetStore
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.subject_content import SubjectContentService
 from cti_app.application.typst_compilation import (
     CompiledTypstDocument,
     TypstCompileFailedError,
@@ -34,12 +42,23 @@ from cti_app.application.typst_compilation import (
 )
 from cti_app.application.typst_rendering import TypstRenderer
 from cti_app.domain.classification import TLP
+from cti_app.domain.edition_publication import (
+    EditionDocumentV2,
+    EditionPublicationV2,
+    EditionRelease,
+    PublicationManifestEntryV1,
+    PublicationManifestV1,
+)
 from cti_app.domain.editions import Edition
 from cti_app.domain.entities import Subject
 from cti_app.domain.production import (
+    EditionProductionBatch,
+    EditionProductionBatchItem,
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
+    ProductionBatchPhase,
+    ProductionBatchStatus,
     ProductionRun,
 )
 from cti_app.domain.publication_document import (
@@ -53,6 +72,8 @@ from cti_app.domain.publication_render import (
 )
 from cti_app.domain.typst_render import TypstRenderFormat, TypstRenderStatus
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
+from cti_app.infrastructure.database.models.edition_render import EditionRenderRow
+from cti_app.infrastructure.database.models.publication_render import PublicationRenderRow
 from cti_app.infrastructure.database.session import create_postgres_engine
 from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
 from tests.test_publication_v4 import _diagram
@@ -191,6 +212,113 @@ def _service(
     )
 
 
+async def _persist_release_for_publication(
+    *,
+    uow_factory: UnitOfWorkFactory,
+    artifact_store: ProductionArtifactStore,
+    edition: Edition,
+    run: ProductionRun,
+    artifact: ProductionArtifact,
+    document: PublicationDocumentV4,
+    created_at: datetime | None = None,
+) -> tuple[EditionRelease, PublicationManifestV1, str]:
+    batch = EditionProductionBatch(
+        edition_id=edition.id,
+        status=ProductionBatchStatus.COMPLETED,
+        phase=ProductionBatchPhase.REVIEW,
+        idempotency_key=f"immutable-release-{uuid4().hex}",
+        actor_id="release-immutability-test",
+        correlation_id=f"release-immutability-{uuid4().hex}",
+    )
+    entry = PublicationManifestEntryV1(
+        position=1,
+        subject_id=artifact.subject_id,
+        production_run_id=run.id,
+        pipeline_generation=run.pipeline_generation,
+        document_artifact_id=artifact.id,
+        document_artifact_version=artifact.version,
+        document_input_hash=artifact.input_hash,
+    )
+    manifest = PublicationManifestV1.create(
+        edition_id=edition.id,
+        edition_version=edition.version,
+        batch_id=batch.id,
+        created_by="release-immutability-test",
+        entries=(entry,),
+        exclusions=(),
+        created_at=created_at,
+    )
+    manifest_blob_id, manifest_sha256 = await artifact_store.put_canonical_json(
+        manifest.to_json(), bucket="release-immutability-manifests"
+    )
+    edition_document = EditionDocumentV2(
+        edition={
+            "id": str(edition.id),
+            "country": edition.country,
+            "country_code": edition.country_code,
+            "period_start": edition.period_start.isoformat(),
+            "period_end": edition.period_end.isoformat(),
+            "tlp": edition.tlp.value,
+            "languages": list(edition.languages),
+            "version": edition.version,
+        },
+        publications=(
+            EditionPublicationV2(
+                position=1,
+                subject_id=artifact.subject_id,
+                document=document,
+            ),
+        ),
+    )
+    edition_document_blob_id, edition_document_sha256 = await artifact_store.put_canonical_json(
+        edition_document.to_json(), bucket="release-immutability-documents"
+    )
+    release = EditionRelease(
+        edition_id=edition.id,
+        manifest_id=manifest.id,
+        edition_document_blob_id=edition_document_blob_id,
+        edition_document_sha256=edition_document_sha256,
+    )
+    async with uow_factory() as uow:
+        await uow.edition_production_batches.add(batch)
+        await uow.commit()
+        await uow.edition_production_batch_items.append_many(
+            (
+                EditionProductionBatchItem(
+                    batch_id=batch.id,
+                    subject_id=artifact.subject_id,
+                    production_run_id=run.id,
+                    position=1,
+                ),
+            )
+        )
+        await uow.commit()
+    async with uow_factory() as uow:
+        await uow.publication_manifests.add(manifest, manifest_blob_id)
+        await uow.commit()
+        await uow.publication_manifest_entries.append_many(manifest.id, manifest.entries)
+        await uow.publication_manifest_exclusions.append_many(manifest.id, manifest.exclusions)
+        assert await uow.edition_releases.add_if_absent(release)
+        await uow.commit()
+    return release, manifest, manifest_sha256
+
+
+async def _served_article_pdf(
+    *,
+    uow_factory: UnitOfWorkFactory,
+    artifact_store: ProductionArtifactStore,
+    publication_renderer: publication_rendering.PublicationRenderService,
+    subject_id: UUID,
+):
+    app = FastAPI()
+    app.include_router(subject_content_router)
+    app.state.subject_content_service = SubjectContentService(uow_factory, artifact_store)
+    app.state.publication_render_service = publication_renderer
+    app.state.production_artifact_store = artifact_store
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        return await client.get(f"/api/subjects/{subject_id}/publication/pdf")
+
+
 async def _render_status_rows(
     database_url: str, publication_artifact_id: UUID
 ) -> list[tuple[str, str | None]]:
@@ -271,7 +399,7 @@ async def _persisted_blob_ids(database_url: str, blob_ids: tuple[UUID, ...]) -> 
 
 
 @pytest.mark.asyncio
-async def test_publication_render_postgres_success_idempotency_and_template_identity(
+async def test_publication_render_postgres_success_idempotency_and_template_pin(
     uow_factory: UnitOfWorkFactory,
     migrated_postgres_url: str,
     tmp_path: Path,
@@ -317,26 +445,23 @@ async def test_publication_render_postgres_success_idempotency_and_template_iden
     changed_template_path.write_bytes(changed)
     changed_template = await service.render_pdf(artifact.id)
 
-    assert changed_template.id != first.id
-    assert changed_template.input_hash != first.input_hash
-    assert changed_template.template_sha256 != first.template_sha256
+    assert changed_template.id == first.id
+    assert changed_template.input_hash == first.input_hash
+    assert changed_template.template_sha256 == first.template_sha256
     assert changed_template.font_bundle_version == first.font_bundle_version
     assert changed_template.render_policy_version == first.render_policy_version
     assert changed_template.publication_artifact_id == first.publication_artifact_id == artifact.id
-    assert compiler.call_count == 2
+    assert compiler.call_count == 1
     async with uow_factory() as uow:
         assert await uow.production_artifacts.get(artifact.id) == before_artifact
         assert await uow.production_runs.get(run.id) == before_run
         assert await uow.blobs.get(artifact.canonical_blob_id) == before_canonical_blob
     assert await artifact_store.read_bytes(artifact.canonical_blob_id) == before_canonical_bytes
-    assert await _render_status_rows(migrated_postgres_url, artifact.id) == [
-        ("succeeded", None),
-        ("succeeded", None),
-    ]
+    assert await _render_status_rows(migrated_postgres_url, artifact.id) == [("succeeded", None)]
 
 
 @pytest.mark.asyncio
-async def test_publication_render_postgres_font_only_change_creates_new_identity(
+async def test_publication_render_postgres_font_only_change_keeps_pinned_identity(
     uow_factory: UnitOfWorkFactory,
     migrated_postgres_url: str,
     tmp_path: Path,
@@ -379,14 +504,14 @@ async def test_publication_render_postgres_font_only_change_creates_new_identity
     assert changed_font_bundle.font_bundle_version != initial_font_bundle.font_bundle_version
     second = await service.render_pdf(artifact.id)
 
-    assert second.id != first.id
-    assert second.input_hash != first.input_hash
+    assert second.id == first.id
+    assert second.input_hash == first.input_hash
     assert first.font_bundle_version == initial_font_bundle.font_bundle_version
-    assert second.font_bundle_version == changed_font_bundle.font_bundle_version
+    assert second.font_bundle_version == initial_font_bundle.font_bundle_version
     assert second.template_sha256 == first.template_sha256
     assert second.render_policy_version == first.render_policy_version
     assert second.publication_artifact_id == first.publication_artifact_id == artifact.id
-    assert compiler.call_count == 2
+    assert compiler.call_count == 1
     async with uow_factory() as uow:
         assert await uow.production_artifacts.get(artifact.id) == before_artifact
         assert await uow.production_runs.get(run.id) == before_run
@@ -395,10 +520,7 @@ async def test_publication_render_postgres_font_only_change_creates_new_identity
     assert canonical_bytes == ProductionArtifactStore.canonical_json_bytes(
         publication_document_v4_to_json(document)
     )
-    assert await _render_status_rows(migrated_postgres_url, artifact.id) == [
-        ("succeeded", None),
-        ("succeeded", None),
-    ]
+    assert await _render_status_rows(migrated_postgres_url, artifact.id) == [("succeeded", None)]
 
 
 @pytest.mark.asyncio
@@ -673,3 +795,321 @@ async def test_publication_render_postgres_missing_media_only_fails_render(
     assert await _render_status_rows(migrated_postgres_url, artifact.id) == [
         ("failed", "publication_render_media_missing")
     ]
+
+
+@pytest.mark.asyncio
+async def test_postgres_real_typst_release_pins_survive_bundle_bump_and_explicit_repin(
+    uow_factory: UnitOfWorkFactory,
+    tmp_path: Path,
+) -> None:
+    typst_binary = os.environ.get("TYPST_BINARY") or shutil.which("typst")
+    if typst_binary is None:
+        pytest.skip("Typst compiler capability is unavailable")
+    version_process = await asyncio.create_subprocess_exec(
+        typst_binary,
+        "--version",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    version_stdout, _version_stderr = await asyncio.wait_for(version_process.communicate(), 10)
+    assert version_process.returncode == 0
+    assert version_stdout.decode("utf-8", errors="replace").strip().startswith("typst 0.15.1")
+
+    artifact_store = ProductionArtifactStore(
+        BlobCatalogService(FilesystemBlobStore(tmp_path / "release-pin-blobs"), uow_factory)
+    )
+    template_root = tmp_path / "chpTypst"
+    shutil.copytree(CHP_TYPST_ROOT, template_root)
+    font_root = tmp_path / "fonts"
+    shutil.copytree(FONT_BUNDLE_ROOT, font_root)
+    font_lock = tmp_path / "typst-fonts.lock"
+    shutil.copyfile(REPO_ROOT / "infra" / "typst-fonts.lock", font_lock)
+    compiler = TypstSubprocessCompiler(binary=typst_binary)
+    publication_renderer = _service(
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+        compiler=compiler,
+        chp_typst_root=template_root,
+        font_bundle_root=font_root,
+        typst_fonts_lock_path=font_lock,
+    )
+
+    run, artifact, document = await _seed_verified_publication(
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+    )
+    async with uow_factory() as uow:
+        edition = await uow.editions.get(run.edition_id)
+    assert edition is not None
+    release, manifest, recorded_manifest_sha256 = await _persist_release_for_publication(
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+        edition=edition,
+        run=run,
+        artifact=artifact,
+        document=document,
+    )
+    async with uow_factory() as uow:
+        r1_manifest_blob_id = await uow.publication_manifests.get_blob_id(manifest.id)
+    assert r1_manifest_blob_id is not None
+    r1_manifest_bytes = await artifact_store.read_bytes(r1_manifest_blob_id)
+    assert hashlib.sha256(r1_manifest_bytes).hexdigest() == recorded_manifest_sha256
+
+    edition_renderer = EditionRenderService(
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+        media_asset_store=MediaAssetStore(artifact_store, uow_factory),
+        renderer=EditionTypstRenderer(),
+        compiler=compiler,
+        chp_typst_root=template_root,
+        font_bundle_root=font_root,
+        typst_fonts_lock_path=font_lock,
+    )
+    edition_publication = EditionPublicationService(uow_factory, artifact_store)
+    article_r1_response = await _served_article_pdf(
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+        publication_renderer=publication_renderer,
+        subject_id=artifact.subject_id,
+    )
+    assert article_r1_response.status_code == 200, article_r1_response.text
+    assert article_r1_response.headers["x-publication-artifact-version"] == "1"
+    article_r1_bytes = article_r1_response.content
+    async with uow_factory() as uow:
+        article_r1 = await uow.publication_renders.get_pinned_succeeded_for_artifact(artifact.id)
+    assert article_r1 is not None
+    edition_r1 = await edition_renderer.render_pdf(release.id)
+    assert article_r1.output_blob_id is not None
+    assert edition_r1.output_sha256 is not None
+    assert await artifact_store.read_bytes(article_r1.output_blob_id) == article_r1_bytes
+    served_edition_r1 = await edition_publication.read_release_pdf(edition.id)
+    assert served_edition_r1.content.startswith(b"%PDF-")
+    assert len(PdfReader(BytesIO(article_r1_bytes), strict=True).pages) >= 1
+    assert len(PdfReader(BytesIO(served_edition_r1.content), strict=True).pages) >= 1
+    article_r1_sha256 = hashlib.sha256(article_r1_bytes).hexdigest()
+    edition_r1_sha256 = hashlib.sha256(served_edition_r1.content).hexdigest()
+    assert article_r1_sha256 == article_r1.output_sha256
+    assert edition_r1_sha256 == edition_r1.output_sha256
+
+    article_manifest_path = template_root / "renderer-manifest.json"
+    edition_manifest_path = template_root / "edition-renderer-manifest.json"
+    for manifest_path in (article_manifest_path, edition_manifest_path):
+        bundle_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        bundle_manifest["template_version"] += "-explicit-repin-test"
+        manifest_path.write_text(
+            json.dumps(bundle_manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    article_entrypoint = template_root / "RENDERER" / "publication.typ"
+    article_source = article_entrypoint.read_text(encoding="utf-8")
+    assert article_source.count("#render-publication(publication)") == 1
+    article_entrypoint.write_text(
+        article_source.replace(
+            "#render-publication(publication)",
+            '#render-publication(publication)\n  #v(8pt)\n  #text("BUNDLE R2 TEST")',
+        ),
+        encoding="utf-8",
+    )
+    edition_entrypoint = template_root / "RENDERER" / "edition.typ"
+    edition_source = edition_entrypoint.read_text(encoding="utf-8")
+    assert edition_source.count("#render-edition(edition)") == 1
+    edition_entrypoint.write_text(
+        edition_source.replace(
+            "#render-edition(edition)",
+            '#render-edition(edition)\n  #v(8pt)\n  #text("BUNDLE R2 TEST")',
+        ),
+        encoding="utf-8",
+    )
+
+    # Model a later successful row left by the previous latest-row behavior.
+    legacy_article_bytes = b"%PDF-legacy-unpinned-article-render"
+    legacy_article_blob_id = await artifact_store.put_bytes(
+        legacy_article_bytes,
+        bucket="publication-renders-output",
+        mime_type="application/pdf",
+    )
+    legacy_article_created_at = article_r1.created_at + timedelta(seconds=10)
+    legacy_article = replace(
+        article_r1,
+        id=uuid4(),
+        template_version=article_r1.template_version + "-legacy-current-bundle",
+        template_sha256=hashlib.sha256(b"legacy article template").hexdigest(),
+        input_hash=hashlib.sha256(b"legacy article input identity").hexdigest(),
+        source_blob_id=None,
+        render_data_blob_id=None,
+        output_blob_id=None,
+        output_sha256=None,
+        output_byte_size=None,
+        status=TypstRenderStatus.RUNNING,
+        error_code=None,
+        error_message=None,
+        created_at=legacy_article_created_at,
+        updated_at=legacy_article_created_at,
+    )
+    async with uow_factory() as uow:
+        acquired_article = await uow.publication_renders.acquire_for_render(
+            legacy_article,
+            stale_running_before=datetime.now().astimezone(),
+        )
+        await uow.publication_renders.mark_succeeded(
+            acquired_article.render.id,
+            output_blob_id=legacy_article_blob_id,
+            output_sha256=hashlib.sha256(legacy_article_bytes).hexdigest(),
+            output_byte_size=len(legacy_article_bytes),
+        )
+        await uow.commit()
+
+    legacy_edition_bytes = b"%PDF-legacy-unpinned-edition-render"
+    legacy_edition_blob_id = await artifact_store.put_bytes(
+        legacy_edition_bytes,
+        bucket="edition-renders-output",
+        mime_type="application/pdf",
+    )
+    legacy_edition_created_at = edition_r1.created_at + timedelta(seconds=10)
+    legacy_edition = replace(
+        edition_r1,
+        id=uuid4(),
+        template_version=edition_r1.template_version + "-legacy-current-bundle",
+        template_sha256=hashlib.sha256(b"legacy edition template").hexdigest(),
+        input_hash=hashlib.sha256(b"legacy edition input identity").hexdigest(),
+        source_blob_id=None,
+        render_data_blob_id=None,
+        output_blob_id=None,
+        output_sha256=None,
+        output_byte_size=None,
+        status=TypstRenderStatus.RUNNING,
+        error_code=None,
+        error_message=None,
+        created_at=legacy_edition_created_at,
+        updated_at=legacy_edition_created_at,
+    )
+    async with uow_factory() as uow:
+        acquired_edition = await uow.edition_renders.acquire_for_render(
+            legacy_edition,
+            stale_running_before=datetime.now().astimezone(),
+        )
+        await uow.edition_renders.mark_succeeded(
+            acquired_edition.render.id,
+            output_blob_id=legacy_edition_blob_id,
+            output_sha256=hashlib.sha256(legacy_edition_bytes).hexdigest(),
+            output_byte_size=len(legacy_edition_bytes),
+        )
+        await uow.commit()
+
+    article_after_bump_response = await _served_article_pdf(
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+        publication_renderer=publication_renderer,
+        subject_id=artifact.subject_id,
+    )
+    edition_after_bump = await edition_renderer.render_pdf(release.id)
+    served_edition_after_bump = await edition_publication.read_release_pdf(edition.id)
+    assert article_after_bump_response.status_code == 200
+    assert article_after_bump_response.content == article_r1_bytes
+    assert (
+        article_after_bump_response.headers["x-publication-render-identity"]
+        == article_r1.input_hash
+    )
+    assert await artifact_store.read_bytes(article_r1.output_blob_id) == article_r1_bytes
+    assert edition_after_bump.id == edition_r1.id
+    assert edition_after_bump.output_sha256 == edition_r1_sha256
+    assert hashlib.sha256(served_edition_after_bump.content).hexdigest() == edition_r1_sha256
+    assert served_edition_after_bump.content != legacy_edition_bytes
+    assert await artifact_store.read_bytes(r1_manifest_blob_id) == r1_manifest_bytes
+    async with uow_factory() as uow:
+        assert await uow.publication_manifests.get_blob_id(manifest.id) == r1_manifest_blob_id
+        assert (
+            await uow._session.scalar(
+                select(func.count())
+                .select_from(PublicationRenderRow)
+                .where(PublicationRenderRow.publication_artifact_id == artifact.id)
+            )
+            == 2
+        )
+        assert (
+            await uow._session.scalar(
+                select(func.count())
+                .select_from(EditionRenderRow)
+                .where(EditionRenderRow.edition_release_id == release.id)
+            )
+            == 2
+        )
+        assert (
+            await uow.publication_renders.get_latest_for_artifact(artifact.id)
+        ).id == legacy_article.id
+        assert (
+            await uow.edition_renders.get_latest_for_release(release.id)
+        ).id == legacy_edition.id
+
+    # A repin appends a new artifact, manifest and release. It does not mutate R1.
+    repinned_artifact = replace(
+        artifact,
+        id=uuid4(),
+        version=2,
+        input_hash=hashlib.sha256(f"repin-{uuid4()}".encode()).hexdigest(),
+    )
+    async with uow_factory() as uow:
+        await uow.production_artifacts.append(repinned_artifact)
+        await uow.commit()
+    release_r2, manifest_r2, _r2_manifest_sha256 = await _persist_release_for_publication(
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+        edition=edition,
+        run=run,
+        artifact=repinned_artifact,
+        document=document,
+        created_at=manifest.created_at + timedelta(seconds=1),
+    )
+    article_r2_response = await _served_article_pdf(
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+        publication_renderer=publication_renderer,
+        subject_id=repinned_artifact.subject_id,
+    )
+    assert article_r2_response.status_code == 200
+    assert article_r2_response.headers["x-publication-artifact-version"] == "2"
+    async with uow_factory() as uow:
+        article_r2 = await uow.publication_renders.get_pinned_succeeded_for_artifact(
+            repinned_artifact.id
+        )
+    assert article_r2 is not None
+    edition_r2 = await edition_renderer.render_pdf(release_r2.id)
+    served_edition_r2 = await edition_publication.read_release_pdf(edition.id)
+    assert article_r2.id != article_r1.id
+    assert edition_r2.id != edition_r1.id
+    assert article_r2.output_blob_id is not None
+    assert edition_r2.output_blob_id is not None
+    assert article_r2_response.content == await artifact_store.read_bytes(article_r2.output_blob_id)
+    assert article_r2.template_version.endswith("-explicit-repin-test")
+    assert edition_r2.template_version.endswith("-explicit-repin-test")
+    assert article_r2.output_sha256 != article_r1_sha256
+    assert edition_r2.output_sha256 != edition_r1_sha256
+    assert hashlib.sha256(served_edition_r2.content).hexdigest() == edition_r2.output_sha256
+    assert await artifact_store.read_bytes(r1_manifest_blob_id) == r1_manifest_bytes
+    assert hashlib.sha256(r1_manifest_bytes).hexdigest() == recorded_manifest_sha256
+    assert (await artifact_store.read_bytes(article_r1.output_blob_id)) == article_r1_bytes
+    assert (await artifact_store.read_bytes(edition_r1.output_blob_id)) == served_edition_r1.content
+    async with uow_factory() as uow:
+        assert await uow.edition_releases.get(release.id) == release
+        assert await uow.publication_manifests.get(manifest.id) == manifest
+        assert await uow.publication_manifests.get(manifest_r2.id) == manifest_r2
+        assert (
+            await uow._session.scalar(
+                select(func.count())
+                .select_from(PublicationRenderRow)
+                .where(
+                    PublicationRenderRow.publication_artifact_id.in_(
+                        (artifact.id, repinned_artifact.id)
+                    )
+                )
+            )
+            == 3
+        )
+        assert (
+            await uow._session.scalar(
+                select(func.count())
+                .select_from(EditionRenderRow)
+                .where(EditionRenderRow.edition_release_id.in_((release.id, release_r2.id)))
+            )
+            == 3
+        )

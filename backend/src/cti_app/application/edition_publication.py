@@ -368,11 +368,17 @@ class EditionPublicationService:
                 if manifest is not None
                 else None
             )
-            render = (
+            latest_render = (
                 await uow.edition_renders.get_latest_for_release(release.id)
                 if release is not None
                 else None
             )
+            pinned_render = (
+                await uow.edition_renders.get_pinned_succeeded_for_release(release.id)
+                if release is not None
+                else None
+            )
+            render = pinned_render or latest_render
             assembly_job = None
             render_job = None
             jobs = getattr(uow, "jobs", None)
@@ -436,7 +442,7 @@ class EditionPublicationService:
             )
 
     async def read_release_pdf(self, edition_id: UUID) -> EditionReleasePdf:
-        """Return the verified PDF of the latest release's most recent successful render."""
+        """Return the PDF pinned by the latest immutable release."""
         async with self._uow_factory() as uow:
             edition = await uow.editions.get(edition_id)
             manifest = await uow.publication_manifests.get_latest_manifest_for_edition(edition_id)
@@ -446,7 +452,7 @@ class EditionPublicationService:
                 else None
             )
             render = (
-                await uow.edition_renders.get_latest_for_release(release.id)
+                await uow.edition_renders.get_pinned_succeeded_for_release(release.id)
                 if release is not None
                 else None
             )

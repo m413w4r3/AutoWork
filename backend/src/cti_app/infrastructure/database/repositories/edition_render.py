@@ -56,6 +56,21 @@ class SqlAlchemyEditionRenderRepository:
         )
         return _edition_render_from_row(row) if row is not None else None
 
+    async def get_pinned_succeeded_for_release(
+        self, edition_release_id: UUID
+    ) -> EditionRender | None:
+        """Return the first successful render pinned to this immutable release."""
+        row = await self._session.scalar(
+            select(EditionRenderRow)
+            .where(
+                EditionRenderRow.edition_release_id == edition_release_id,
+                EditionRenderRow.status == TypstRenderStatus.SUCCEEDED.value,
+            )
+            .order_by(EditionRenderRow.created_at.asc(), EditionRenderRow.id.asc())
+            .limit(1)
+        )
+        return _edition_render_from_row(row) if row is not None else None
+
     async def acquire_for_render(
         self, proposed: EditionRender, *, stale_running_before: datetime
     ) -> TypstRenderAcquisition[EditionRender]:

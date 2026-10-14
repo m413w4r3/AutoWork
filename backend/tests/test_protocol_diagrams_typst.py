@@ -250,6 +250,14 @@ async def test_real_article_and_edition_render_all_protocol_figures(
         production_run_id=UUID(int=9901),
     )
     figures = opinion_protocol_figures(rendered)
+    format_figure = next(
+        figure for figure in figures if figure.kind is ProtocolDiagramKind.MESSAGE_FORMAT
+    )
+    assert len(format_figure.field_evidence) == 3
+    assert format_figure.field_evidence[0].field_id == "length"
+    assert format_figure.field_evidence[0].evidence_refs[0].capture_sha256 == "e" * 64
+    assert format_figure.field_evidence[0].evidence_refs[0].frame_numbers == (31, 32)
+    assert OpinionProtocolFigureV1.from_payload(format_figure.to_payload()) == format_figure
     base = _base_v5()
     opinion, citation_context = _approved_opinion(base)
     approved_with_figures = replace(
@@ -310,6 +318,14 @@ async def test_real_article_and_edition_render_all_protocol_figures(
         assert {figure["spec_sha256"] for figure in projected_figures} == {
             item.spec_sha256 for item in rendered
         }
+        projected_format = next(
+            figure for figure in projected_figures if figure["key"] == "protocol-message_format"
+        )
+        assert projected_format["field_evidence"][0]["field_id"] == "length"
+        assert projected_format["field_evidence"][0]["evidence_refs"][0]["frame_numbers"] == [
+            31,
+            32,
+        ]
     edition_media = {
         reference.asset_id: await media_store.read(reference.asset_id)
         for reference in edition_source.media_refs

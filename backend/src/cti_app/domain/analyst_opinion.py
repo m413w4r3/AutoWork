@@ -16,7 +16,11 @@ from cti_app.domain.investigation import (
     InvestigationFinding,
     canonical_json_bytes,
 )
-from cti_app.domain.protocol_model import ProtocolDiagramKind
+from cti_app.domain.network_protocol import StreamDirection
+from cti_app.domain.protocol_model import (
+    ProtocolDiagramKind,
+    ProtocolEvidenceRefV1,
+)
 
 
 class OpinionBlockType(StrEnum):
@@ -46,6 +50,39 @@ class CitationViolationCode(StrEnum):
     OBSERVATION_NOT_FOUND = "observation_not_found"
     FACT_WITHOUT_SUPPORTED_FINDING = "fact_without_supported_finding"
     SUPPORTED_FINDING_WITHOUT_OBSERVATION = "supported_finding_without_observation"
+
+
+@dataclass(frozen=True, slots=True)
+class OpinionProtocolFieldEvidenceV1:
+    """Bounded capture and frame provenance retained for one protocol field."""
+
+    field_id: str
+    evidence_refs: tuple[ProtocolEvidenceRefV1, ...]
+    truncated: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.field_id, str) or not self.field_id.strip():
+            raise ValueError("Protocol field evidence requires a field ID")
+        if not isinstance(self.evidence_refs, tuple) or not self.evidence_refs:
+            raise ValueError("Protocol field evidence requires at least one reference")
+        if len(self.evidence_refs) > 8:
+            raise ValueError("Protocol field evidence is limited to eight capture references")
+        if any(
+            not isinstance(ref, ProtocolEvidenceRefV1) or len(ref.frame_numbers) > 12
+            for ref in self.evidence_refs
+        ):
+            raise ValueError("Protocol field evidence references exceed their bounds")
+        if len(self.evidence_refs) != len(set(self.evidence_refs)):
+            raise ValueError("Protocol field evidence references must be unique")
+        if not isinstance(self.truncated, bool):
+            raise ValueError("Protocol field evidence truncation marker is invalid")
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "field_id": self.field_id,
+            "evidence_refs": [ref.to_dict() for ref in self.evidence_refs],
+            "truncated": self.truncated,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +124,7 @@ class OpinionProtocolFigureV1:
     compiler_version: str
     compiler_policy_version: str
     caption: str
+    field_evidence: tuple[OpinionProtocolFieldEvidenceV1, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, ProtocolDiagramKind):
@@ -99,9 +137,15 @@ class OpinionProtocolFigureV1:
             value = getattr(self, name)
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"Protocol figure {name} must be non-empty text")
+        if not isinstance(self.field_evidence, tuple) or any(
+            not isinstance(item, OpinionProtocolFieldEvidenceV1) for item in self.field_evidence
+        ):
+            raise ValueError("Protocol figure field evidence metadata is invalid")
+        if len({item.field_id for item in self.field_evidence}) != len(self.field_evidence):
+            raise ValueError("Protocol figure field evidence IDs must be unique")
 
     def to_payload(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "kind": self.kind.value,
             "model_sha256": self.model_sha256,
             "spec_sha256": self.spec_sha256,
@@ -114,6 +158,9 @@ class OpinionProtocolFigureV1:
             "compiler_policy_version": self.compiler_policy_version,
             "caption": self.caption,
         }
+        if self.field_evidence:
+            payload["field_evidence"] = [item.to_payload() for item in self.field_evidence]
+        return payload
 
     @classmethod
     def from_payload(cls, value: object) -> OpinionProtocolFigureV1:
@@ -130,8 +177,14 @@ class OpinionProtocolFigureV1:
             "compiler_policy_version",
             "caption",
         }
-        if not isinstance(value, Mapping) or set(value) != expected:
+        if not isinstance(value, Mapping) or frozenset(value) not in {
+            frozenset(expected),
+            frozenset(expected | {"field_evidence"}),
+        }:
             raise ValueError("Protocol figure payload has missing or unknown fields")
+        field_evidence_payload = value.get("field_evidence", [])
+        if not isinstance(field_evidence_payload, (list, tuple)):
+            raise ValueError("Protocol figure field evidence metadata must be a list")
         return cls(
             kind=ProtocolDiagramKind(_payload_text(value, "kind")),
             model_sha256=_payload_text(value, "model_sha256"),
@@ -144,6 +197,9 @@ class OpinionProtocolFigureV1:
             compiler_version=_payload_text(value, "compiler_version"),
             compiler_policy_version=_payload_text(value, "compiler_policy_version"),
             caption=_payload_text(value, "caption"),
+            field_evidence=tuple(
+                _protocol_field_evidence_from_payload(item) for item in field_evidence_payload
+            ),
         )
 
 
@@ -262,6 +318,79 @@ def _payload_text(payload: Mapping[str, Any], key: str) -> str:
     return value
 
 
+def _protocol_field_evidence_from_payload(value: object) -> OpinionProtocolFieldEvidenceV1:
+    if not isinstance(value, Mapping) or set(value) != {
+        "field_id",
+        "evidence_refs",
+        "truncated",
+    }:
+        raise ValueError("Protocol field evidence payload has missing or unknown fields")
+    field_id = value["field_id"]
+    raw_refs = value["evidence_refs"]
+    truncated = value["truncated"]
+    if not isinstance(field_id, str):
+        raise ValueError("Protocol field evidence ID must be text")
+    if not isinstance(raw_refs, (list, tuple)):
+        raise ValueError("Protocol field evidence references must be a list")
+    if not isinstance(truncated, bool):
+        raise ValueError("Protocol field evidence truncation marker is invalid")
+    return OpinionProtocolFieldEvidenceV1(
+        field_id=field_id,
+        evidence_refs=tuple(_protocol_evidence_from_payload(item) for item in raw_refs),
+        truncated=truncated,
+    )
+
+
+def _protocol_evidence_from_payload(value: object) -> ProtocolEvidenceRefV1:
+    expected = {
+        "capture_sha256",
+        "flow_id",
+        "stream_id",
+        "direction",
+        "frame_numbers",
+        "start_offset",
+        "end_offset",
+        "source",
+        "observation_id",
+        "timestamp_start_ns",
+        "timestamp_end_ns",
+    }
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise ValueError("Protocol evidence payload has missing or unknown fields")
+    frames = value["frame_numbers"]
+    if not isinstance(frames, (list, tuple)):
+        raise ValueError("Protocol evidence frame numbers must be a list")
+
+    def optional_int(raw: object) -> int | None:
+        if raw is None:
+            return None
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            raise ValueError("Protocol evidence numeric metadata is invalid")
+        return raw
+
+    text_fields = ("capture_sha256", "flow_id", "stream_id", "direction", "source")
+    if any(not isinstance(value[name], str) for name in text_fields):
+        raise ValueError("Protocol evidence text metadata is invalid")
+    if any(isinstance(frame, bool) or not isinstance(frame, int) for frame in frames):
+        raise ValueError("Protocol evidence frame numbers are invalid")
+    observation_id = value["observation_id"]
+    if observation_id is not None and not isinstance(observation_id, str):
+        raise ValueError("Protocol evidence observation identity is invalid")
+    return ProtocolEvidenceRefV1(
+        capture_sha256=value["capture_sha256"],
+        flow_id=value["flow_id"],
+        stream_id=value["stream_id"],
+        direction=StreamDirection(value["direction"]),
+        frame_numbers=tuple(frames),
+        start_offset=optional_int(value["start_offset"]),
+        end_offset=optional_int(value["end_offset"]),
+        source=value["source"],
+        observation_id=UUID(observation_id) if observation_id is not None else None,
+        timestamp_start_ns=optional_int(value["timestamp_start_ns"]),
+        timestamp_end_ns=optional_int(value["timestamp_end_ns"]),
+    )
+
+
 def verify_opinion_citations(
     opinion: AnalystOpinionV1,
     findings: Iterable[InvestigationFinding],
@@ -337,6 +466,7 @@ __all__ = [
     "OpinionBlock",
     "OpinionBlockType",
     "OpinionClaimQualification",
+    "OpinionProtocolFieldEvidenceV1",
     "OpinionProtocolFigureV1",
     "verify_opinion_citations",
 ]

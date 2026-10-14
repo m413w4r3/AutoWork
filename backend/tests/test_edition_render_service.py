@@ -278,6 +278,15 @@ class _ServiceRenders:
         ]
         return max(renders, key=lambda render: (render.created_at, str(render.id)), default=None)
 
+    async def get_pinned_succeeded_for_release(self, release_id: Any) -> EditionRender | None:
+        renders = [
+            render
+            for render in self.renders.values()
+            if render.edition_release_id == release_id
+            and render.status is TypstRenderStatus.SUCCEEDED
+        ]
+        return min(renders, key=lambda render: (render.created_at, str(render.id)), default=None)
+
     async def acquire_for_render(
         self, proposed: EditionRender, *, stale_running_before: datetime
     ) -> TypstRenderAcquisition:
@@ -655,7 +664,7 @@ async def test_render_uses_the_frozen_document_after_current_publication_changes
 
 
 @pytest.mark.asyncio
-async def test_template_change_creates_a_new_render_for_the_same_frozen_release(
+async def test_template_change_keeps_the_first_render_for_the_same_frozen_release(
     tmp_path: Path,
 ) -> None:
     service, release, document, renders, store, _renderer, compiler, entrypoint, *_ = (
@@ -668,7 +677,7 @@ async def test_template_change_creates_a_new_render_for_the_same_frozen_release(
 
     second = await service.render_pdf(release.id)
 
-    assert second.id != first.id
+    assert second.id == first.id
     assert first.id in renders.renders
     assert renders.renders[first.id] == first
     assert second.edition_release_id == first.edition_release_id == release.id
@@ -676,13 +685,13 @@ async def test_template_change_creates_a_new_render_for_the_same_frozen_release(
     assert service._uow_factory.releases[release.id] == release  # type: ignore[attr-defined]
     assert service._uow_factory.unexpected_accesses == []  # type: ignore[attr-defined]
     assert document == _edition_document_from_blob(first_document_bytes)
-    assert first.output_sha256 != second.output_sha256
-    assert compiler.call_count == 2
+    assert first.output_sha256 == second.output_sha256
+    assert compiler.call_count == 1
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("changed_input", ["font", "compiler"])
-async def test_font_or_compiler_change_creates_a_new_render(
+async def test_font_or_compiler_change_keeps_the_first_render(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     changed_input: str,
@@ -699,9 +708,9 @@ async def test_font_or_compiler_change_creates_a_new_render(
 
     second = await service.render_pdf(release.id)
 
-    assert second.id != first.id
-    assert second.input_hash != first.input_hash
-    assert compiler.call_count == 2
+    assert second.id == first.id
+    assert second.input_hash == first.input_hash
+    assert compiler.call_count == 1
 
 
 @pytest.mark.asyncio

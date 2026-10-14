@@ -717,6 +717,7 @@ def project_publication_to_typst_model(
                     "compiler_name": figure.compiler_name,
                     "compiler_version": figure.compiler_version,
                     "compiler_policy_version": figure.compiler_policy_version,
+                    "field_evidence": [item.to_payload() for item in figure.field_evidence],
                     "figure_number": figure_number + index,
                 }
                 for index, figure in enumerate(rendered_opinion.protocol_figures, start=1)

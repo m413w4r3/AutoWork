@@ -132,6 +132,17 @@ class FakePublicationRenders:
             None,
         )
 
+    async def get_pinned_succeeded_for_artifact(
+        self, artifact_id: UUID
+    ) -> PublicationRender | None:
+        matches = [
+            render
+            for render in self.renders.values()
+            if render.publication_artifact_id == artifact_id
+            and render.status is TypstRenderStatus.SUCCEEDED
+        ]
+        return min(matches, key=lambda render: (render.created_at, str(render.id)), default=None)
+
     async def acquire_for_render(
         self, proposed: PublicationRender, *, stale_running_before: datetime
     ) -> TypstRenderAcquisition:
@@ -711,7 +722,7 @@ async def test_publication_render_preview_exposes_and_reuses_the_lifecycle_ident
 
 
 @pytest.mark.asyncio
-async def test_publication_render_service_creates_new_row_when_template_changes(
+async def test_publication_render_service_keeps_the_pinned_row_when_template_changes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     service, artifact, _, _, _, compiler = _make_service(tmp_path, monkeypatch)
@@ -719,16 +730,20 @@ async def test_publication_render_service_creates_new_row_when_template_changes(
     first = await service.render_pdf(artifact.id)
     template_file = service._chp_typst_root / "UTILS/helpers.typ"
     template_file.write_bytes(template_file.read_bytes() + b" changed")
+
+    async def fail_if_prepared(_artifact_id: UUID) -> Any:
+        pytest.fail("a pinned PDF read must not load the current Typst bundle")
+
+    monkeypatch.setattr(service, "_prepare", fail_if_prepared)
     second = await service.render_pdf(artifact.id)
 
-    assert first.id != second.id
-    assert first.input_hash != second.input_hash
+    assert first == second
     assert first.publication_artifact_id == second.publication_artifact_id == artifact.id
-    assert compiler.call_count == 2
+    assert compiler.call_count == 1
 
 
 @pytest.mark.asyncio
-async def test_publication_render_service_creates_new_row_when_font_changes(
+async def test_publication_render_service_keeps_the_pinned_row_when_font_changes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     service, artifact, _, _, _, compiler = _make_service(tmp_path, monkeypatch)
@@ -738,10 +753,9 @@ async def test_publication_render_service_creates_new_row_when_font_changes(
     font_file.write_bytes(font_file.read_bytes() + b" changed")
     second = await service.render_pdf(artifact.id)
 
-    assert first.id != second.id
-    assert first.input_hash != second.input_hash
+    assert first == second
     assert first.publication_artifact_id == second.publication_artifact_id == artifact.id
-    assert compiler.call_count == 2
+    assert compiler.call_count == 1
 
 
 @pytest.mark.asyncio

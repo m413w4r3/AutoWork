@@ -43,6 +43,21 @@ class SqlAlchemyPublicationRenderRepository:
         )
         return _publication_render_from_row(row) if row is not None else None
 
+    async def get_pinned_succeeded_for_artifact(
+        self, artifact_id: UUID
+    ) -> PublicationRender | None:
+        """Return the first successful render pinned to this immutable artifact."""
+        row = await self._session.scalar(
+            select(PublicationRenderRow)
+            .where(
+                PublicationRenderRow.publication_artifact_id == artifact_id,
+                PublicationRenderRow.status == TypstRenderStatus.SUCCEEDED.value,
+            )
+            .order_by(PublicationRenderRow.created_at.asc(), PublicationRenderRow.id.asc())
+            .limit(1)
+        )
+        return _publication_render_from_row(row) if row is not None else None
+
     async def list_latest_for_artifacts(
         self, artifact_ids: Sequence[UUID]
     ) -> Sequence[PublicationRender]:
