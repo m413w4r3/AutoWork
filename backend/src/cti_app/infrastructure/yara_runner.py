@@ -8,6 +8,7 @@ import sys
 import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
+from importlib.util import find_spec
 from pathlib import Path
 
 from cti_app.application.rule_workbench import YaraEnginePort, YaraSampleInput
@@ -48,6 +49,14 @@ class IsolatedYaraRunner(YaraEnginePort):
     def __init__(self, limits: YaraRunnerLimits | None = None) -> None:
         self.limits = limits or YaraRunnerLimits()
         self._worker_path = Path(__file__).with_name("yara_runner_worker.py")
+
+    @property
+    def available(self) -> bool:
+        """Whether the isolated worker and its Python YARA engine are installed."""
+        try:
+            return self._worker_path.is_file() and find_spec("yara") is not None
+        except (ImportError, ValueError):
+            return False
 
     def compile(self, source: str) -> YaraEngineResult:
         return self._run_worker("compile", source, ())

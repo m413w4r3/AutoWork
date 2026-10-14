@@ -5,7 +5,10 @@ from uuid import NAMESPACE_URL, uuid5
 
 import httpx
 from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from minio import Minio
+from starlette.middleware.base import RequestResponseEndpoint
+from starlette.responses import Response
 
 from cti_app.api.analyst_opinion import router as analyst_opinion_router
 from cti_app.api.collection import router as collection_router
@@ -18,6 +21,7 @@ from cti_app.api.editions import router as editions_router
 from cti_app.api.fusion import fusion_router
 from cti_app.api.health import router as health_router
 from cti_app.api.investigation import router as investigation_router
+from cti_app.api.investigation_captures import router as investigation_captures_router
 from cti_app.api.jobs import router as jobs_router
 from cti_app.api.model_conversations import router as model_conversations_router
 from cti_app.api.pdf_inspection import router as pdf_inspection_router
@@ -29,8 +33,6 @@ from cti_app.api.subject_content import router as subject_content_router
 from cti_app.api.subjects import router as subjects_router
 from cti_app.api.typst_input_inspection import router as typst_input_inspection_router
 from cti_app.application.blobs import BlobCatalogService
-from cti_app.application.capabilities import CapabilitiesService
-from cti_app.application.code_features import CodeFeatureService
 from cti_app.application.collection import SubjectCollectionService
 from cti_app.application.collection_review import CollectionReviewService
 from cti_app.application.diagnostics import DiagnosticsLog
@@ -63,25 +65,25 @@ from cti_app.application.edition_workspace import (
     EditionWorkspaceMaterializer,
 )
 from cti_app.application.editions import EditionService
-from cti_app.application.goodware import GoodwareMeasurementService
 from cti_app.application.http_collection import (
     CollectionPolicy,
     SafeHttpCollector,
     SystemDnsResolver,
     parse_domain_policy,
 )
-from cti_app.application.identity import LocalIdentityProvider
-from cti_app.application.investigation_composition import (
-    InvestigationCompositionFactory,
-    OptionalInvestigationToolPorts,
-    QuarantineSampleBytesAdapter,
+from cti_app.application.identity import (
+    PROTECTED_APP_ENVIRONMENTS,
+    LocalIdentityProvider,
+    StaticTokenIdentityProvider,
+    is_human_actor_id,
+    is_loopback_bind_host,
+    validate_local_identity_bind,
 )
 from cti_app.application.investigation_jobs import make_investigation_runner
-from cti_app.application.investigation_rule_tools import QuarantineRuleCorpusBytes
 from cti_app.application.jobs import DuplicateJobError, JobService, create_job_registry
-from cti_app.application.local_analysis import LocalCommandCatalog, LocalCommandService
 from cti_app.application.media_assets import MediaAssetStore
 from cti_app.application.model_conversations import ModelConversationService
+from cti_app.application.network_capture_import import NetworkCaptureImportService
 from cti_app.application.pdf_inspection import PdfInspectionService
 from cti_app.application.persistence import UnitOfWork
 from cti_app.application.production_artifact_store import ProductionArtifactStore
@@ -98,9 +100,7 @@ from cti_app.application.production_repairs import (
     ProductionRepairProjectionService,
 )
 from cti_app.application.publication_rendering import PublicationRenderService
-from cti_app.application.sample_acquisition import VirusTotalSampleAcquisitionService
 from cti_app.application.selection import SelectionService
-from cti_app.application.static_analysis import StaticAnalysisService
 from cti_app.application.subject_content import SubjectContentService
 from cti_app.application.subjects import SubjectService
 from cti_app.application.typst_input_inspection import RenderInputInspectionService
@@ -121,18 +121,20 @@ from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
 from cti_app.infrastructure.ghidra_mcp import create_ghidra_mcp_http_adapter
 from cti_app.infrastructure.health import InfrastructureReadinessChecker
 from cti_app.infrastructure.http import AsyncioPinnedHttpTransport
+from cti_app.infrastructure.investigation_runtime_ports import (
+    build_investigation_runtime_composition_factory,
+    describe_tool_inventory,
+)
 from cti_app.infrastructure.jobs import DramatiqJobDispatcher
-from cti_app.infrastructure.local_command_runner import LocalCommandRunner
 from cti_app.infrastructure.pdf_inspection import PdfInspectionCache, PopplerSubprocess
+from cti_app.infrastructure.quarantined_capture_source import ProductionQuarantinedCaptureSource
 from cti_app.infrastructure.shodan import create_shodan_http_adapter, create_shodan_http_client
-from cti_app.infrastructure.smda import SmdaAdapter
 from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
 from cti_app.infrastructure.virustotal import (
     VirusTotalHttpAdapter,
     create_virustotal_direct_http_client,
     create_virustotal_http_client,
 )
-from cti_app.infrastructure.yara_runner import IsolatedYaraRunner
 from cti_app.integrations.model_factory import (
     create_bridge_capabilities_provider,
     create_model_gateway,
@@ -149,6 +151,13 @@ configure_logging(settings.log_level)
 
 
 logger = logging.getLogger(__name__)
+_AUTH_EXEMPT_PATHS = frozenset(
+    {
+        "/api/identity/status",
+        "/api/health/live",
+        "/api/health/ready",
+    }
+)
 
 
 @asynccontextmanager
@@ -164,6 +173,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     model_gateway = create_model_gateway(settings, uow_factory)
     vt_proxy_client: httpx.AsyncClient | None = None
     vt_direct_client: httpx.AsyncClient | None = None
+    retrohunt_http_client: httpx.AsyncClient | None = None
     shodan_client: httpx.AsyncClient | None = None
     ghidra_adapter = None
     vt_capabilities = VirusTotalCapabilities(
@@ -172,7 +182,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         intelligence_search=settings.virustotal_intelligence_search_enabled,
         file_download=settings.virustotal_file_download_enabled,
         behaviour_reports=settings.virustotal_behaviour_reports_enabled,
+        retrohunt=settings.virustotal_retrohunt_proxy_enabled,
     )
+    if (
+        settings.virustotal_retrohunt_proxy_enabled
+        and settings.virustotal_retrohunt_proxy_base_url
+        and settings.virustotal_retrohunt_proxy_allowed_hosts.strip()
+    ):
+        retrohunt_http_client = httpx.AsyncClient(
+            follow_redirects=False,
+            trust_env=False,
+        )
     vt_enabled = any(
         (
             settings.virustotal_file_report_enabled,
@@ -350,106 +370,35 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     blob_catalog = BlobCatalogService(blob_store, uow_factory)
     production_artifact_store = ProductionArtifactStore(blob_catalog)
+    network_capture_import_service = NetworkCaptureImportService(
+        uow_factory=uow_factory,
+        blob_catalog=blob_catalog,
+        settings=settings,
+    )
     vt_observations = (
         VirusTotalObservationService(blob_catalog, uow_factory) if vt_adapter is not None else None
     )
-    quarantine_bytes = None
-    local_command_catalog = None
-    local_command_service = None
-    static_analysis = None
-    capabilities_analysis = None
-    code_features = None
-    goodware_measurement = None
-    yara_engine = None
-    if (
-        settings.local_analysis_enabled
-        or settings.ghidra_enabled
-        or settings.rule_workbench_enabled
-    ):
-        quarantine_bytes = QuarantineRuleCorpusBytes(
-            uow_factory,
-            blob_store,
-            maximum_sample_bytes=max(
-                settings.local_analysis_max_sample_bytes,
-                64 * 1024 * 1024 if settings.rule_workbench_enabled else 1,
-            ),
-        )
-    if settings.local_analysis_enabled or settings.ghidra_enabled:
-        local_command_catalog = LocalCommandCatalog(
-            timeout_seconds=settings.local_analysis_timeout_seconds,
-            max_output_bytes=settings.local_analysis_max_output_bytes,
-            cpu_limit_seconds=settings.local_analysis_cpu_limit_seconds,
-            memory_limit_bytes=settings.local_analysis_memory_limit_bytes,
-            file_size_limit_bytes=settings.local_analysis_file_size_limit_bytes,
-        )
-        assert quarantine_bytes is not None
-        local_command_service = LocalCommandService(
-            QuarantineSampleBytesAdapter(
-                quarantine_bytes,
-                max_sample_bytes=settings.local_analysis_max_sample_bytes,
-            ),
-            LocalCommandRunner(max_sample_bytes=settings.local_analysis_max_sample_bytes),
-            local_command_catalog,
-            enabled=settings.local_analysis_enabled,
-            max_sample_bytes=settings.local_analysis_max_sample_bytes,
-        )
-    if settings.local_analysis_enabled:
-        static_analysis = StaticAnalysisService(
-            blob_catalog,
-            uow_factory,
-            max_sample_bytes=settings.analysis_max_sample_bytes,
-            string_min_length=settings.analysis_string_min_length,
-            max_strings=settings.analysis_max_strings,
-        )
-        capabilities_analysis = CapabilitiesService(
-            blob_catalog,
-            uow_factory,
-            rules_path=settings.analysis_capa_rules_path,
-            timeout_seconds=settings.analysis_capa_timeout_seconds,
-            max_output_bytes=settings.analysis_capa_max_output_bytes,
-            max_memory_bytes=settings.analysis_capa_max_memory_bytes,
-        )
-        code_features = CodeFeatureService(blob_catalog, uow_factory, SmdaAdapter())
-        goodware_measurement = GoodwareMeasurementService(
-            blob_store,
-            uow_factory,
-            cache_root=settings.goodware_cache_root,
-        )
-    if settings.rule_workbench_enabled:
-        yara_engine = IsolatedYaraRunner()
-    acquisition_service = (
-        VirusTotalSampleAcquisitionService(
-            vt_adapter,
-            vt_capabilities,
-            blob_catalog,
-            uow_factory,
-            LocalIdentityProvider("system:investigation"),
-        )
-        if vt_adapter is not None
-        else None
-    )
-    investigation_composition_factory = InvestigationCompositionFactory(
+    investigation_runtime_composition = build_investigation_runtime_composition_factory(
+        settings,
         uow_factory=uow_factory,
+        blob_store=blob_store,
+        blob_catalog=blob_catalog,
         artifact_store=production_artifact_store,
         model_conversations=model_conversation_service,
-        settings=settings,
-        optional_tool_ports=OptionalInvestigationToolPorts(
-            virustotal=vt_adapter,
-            shodan=shodan_adapter,
-            ghidra=ghidra_adapter,
-            acquisition=acquisition_service,
-            virustotal_observations=vt_observations,
-            vt_capabilities=vt_capabilities,
-            rule_corpus_bytes=quarantine_bytes,
-            yara_engine=yara_engine,
-            local_commands=local_command_service,
-            local_command_catalog=local_command_catalog,
-            sample_static_analysis=static_analysis,
-            sample_capabilities_analysis=capabilities_analysis,
-            sample_code_features=code_features,
-            sample_goodware=goodware_measurement,
+        vt_adapter=vt_adapter,
+        vt_capabilities=vt_capabilities,
+        vt_observations=vt_observations,
+        shodan_adapter=shodan_adapter,
+        ghidra_adapter=ghidra_adapter,
+        network_quarantine_factory=lambda investigation_id: ProductionQuarantinedCaptureSource(
+            uow_factory=uow_factory,
+            blob_catalog=blob_catalog,
+            settings=settings,
+            investigation_id=investigation_id,
         ),
+        retrohunt_http_client=retrohunt_http_client,
     )
+    investigation_composition_factory = investigation_runtime_composition.composition_factory
     investigation_runner = make_investigation_runner(
         uow_factory,
         investigation_composition_factory,
@@ -559,11 +508,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.job_dispatcher = job_dispatcher
     app.state.edition_service = EditionService(uow_factory)
     app.state.subject_service = SubjectService(uow_factory)
-    app.state.identity_provider = LocalIdentityProvider()
+    app.state.network_capture_import_service = network_capture_import_service
     app.state.model_gateway = model_gateway
     app.state.bridge_capabilities_provider = bridge_provider
     app.state.model_conversation_service = model_conversation_service
     app.state.investigation_composition_factory = investigation_composition_factory
+    app.state.investigation_runtime_composition = investigation_runtime_composition
+    app.state.investigation_tool_inventory = describe_tool_inventory(
+        investigation_runtime_composition
+    )
     app.state.discovery_service = discovery_service
     app.state.discovery_run_service = discovery_run_service
     app.state.cumulative_discovery_service = cumulative_discovery_service
@@ -640,6 +593,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await vt_direct_client.aclose()
     if vt_proxy_client is not None:
         await vt_proxy_client.aclose()
+    if retrohunt_http_client is not None:
+        await retrohunt_http_client.aclose()
     if shodan_client is not None:
         await shodan_client.aclose()
     if ghidra_adapter is not None:
@@ -650,7 +605,110 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 def create_app() -> FastAPI:
     application = FastAPI(title="CTI Bulletin API", version="0.1.0", lifespan=lifespan)
     settings = get_settings()
+    identity_provider = (
+        StaticTokenIdentityProvider(settings.operator_api_token.get_secret_value())
+        if settings.operator_api_token is not None
+        else LocalIdentityProvider()
+    )
+    if identity_provider.mode == "local":
+        validate_local_identity_bind(app_env=settings.app_env, bind_host=settings.api_bind_host)
+    application.state.identity_provider = identity_provider
     request_failures = DiagnosticsLog.from_env(settings.diagnostics_log_root)
+
+    environment_is_protected = settings.app_env.strip().casefold() in PROTECTED_APP_ENVIRONMENTS
+
+    @application.middleware("http")
+    async def identity_safety_guard(
+        request: Request,
+        call_next: RequestResponseEndpoint,
+    ) -> Response:
+        if not request.url.path.startswith("/api/") or request.url.path in _AUTH_EXEMPT_PATHS:
+            return await call_next(request)
+
+        provider = request.app.state.identity_provider
+        if isinstance(provider, StaticTokenIdentityProvider) and not provider.verify_authorization(
+            request.headers.get("authorization")
+        ):
+            return JSONResponse(
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer"},
+                content={"detail": {"code": "operator_token_required"}},
+            )
+        identity = await provider.current()
+        provider_mode = getattr(provider, "mode", "custom")
+        if environment_is_protected and provider_mode == "local":
+            server = request.scope.get("server")
+            server_host = server[0] if isinstance(server, tuple) and server else None
+            if not isinstance(server_host, str) or not is_loopback_bind_host(server_host):
+                logger.error(
+                    "operator_identity_refused_exposed_bind",
+                    extra={
+                        "event": "operator_identity.exposed_bind_refused",
+                        "identity_mode": "local",
+                        "identity_verified": False,
+                    },
+                )
+                return JSONResponse(
+                    status_code=503,
+                    content={"detail": {"code": "local_identity_requires_loopback_bind"}},
+                )
+        if not is_human_actor_id(identity.actor_id):
+            return JSONResponse(
+                status_code=403,
+                content={"detail": {"code": "human_operator_identity_required"}},
+            )
+
+        return await call_next(request)
+
+    @application.get("/api/identity/status")
+    async def operator_identity_status(request: Request) -> dict[str, object]:
+        provider = request.app.state.identity_provider
+        identity = await provider.current()
+        mode_value = getattr(provider, "mode", "custom")
+        mode = (
+            mode_value
+            if isinstance(mode_value, str) and mode_value in {"local", "authenticated", "custom"}
+            else "custom"
+        )
+        verified = bool(getattr(provider, "verified", False))
+        human_identity = is_human_actor_id(identity.actor_id)
+        server = request.scope.get("server")
+        server_host = server[0] if isinstance(server, tuple) and server else None
+        bind_host = server_host if isinstance(server_host, str) else settings.api_bind_host
+        loopback = is_loopback_bind_host(bind_host)
+        authenticated = mode == "authenticated" and verified
+        if mode == "local":
+            identity_scope = "local-isolated" if loopback else "local-unverified"
+        else:
+            identity_scope = mode
+        return {
+            "schema_version": "operator-identity-status.v1",
+            "mode": mode,
+            "verified": verified,
+            "identity_scope": identity_scope,
+            "human_identity": human_identity,
+            "approvals_allowed": human_identity
+            and (authenticated or not environment_is_protected or loopback),
+            "bind_scope": "loopback" if loopback else "exposed",
+            "warning": (
+                "Identité locale non vérifiée; accès local isolé uniquement sur loopback."
+                if mode == "local"
+                else None
+            ),
+        }
+
+    if identity_provider.mode == "local":
+        logger.warning(
+            "operator_identity_local_unverified",
+            extra={
+                "event": "operator_identity.local_unverified",
+                "identity_mode": identity_provider.mode,
+                "identity_verified": identity_provider.verified,
+                "bind_scope": (
+                    "loopback" if is_loopback_bind_host(settings.api_bind_host) else "exposed"
+                ),
+            },
+        )
 
     def record_request_failure(request: Request, error: BaseException) -> None:
         # Keyed by correlation id, not a domain id: at this level that's all we know, and
@@ -678,6 +736,7 @@ def create_app() -> FastAPI:
     application.include_router(collection_router)
     application.include_router(model_conversations_router)
     application.include_router(investigation_router)
+    application.include_router(investigation_captures_router)
     application.include_router(production_router)
     application.include_router(production_control_router)
     application.include_router(publication_router)

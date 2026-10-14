@@ -57,8 +57,8 @@ services:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-local-minio-user}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-local-minio-password}
     ports:
-      - "${MINIO_API_PORT:-9000}:9000"
-      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+      - "127.0.0.1:${MINIO_API_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"
     volumes:
       - minio_data:/data
     healthcheck:
@@ -92,7 +92,9 @@ services:
       context: .
       dockerfile: infra/backend.Dockerfile
     environment: &backend-environment
-      APP_ENV: development
+      APP_ENV: ${APP_ENV:-development}
+      API_BIND_HOST: ${API_BIND_HOST:-0.0.0.0}
+      OPERATOR_API_TOKEN: ${OPERATOR_API_TOKEN:-}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       POSTGRES_DSN: postgresql+asyncpg://${POSTGRES_USER:-cti_app}:${POSTGRES_PASSWORD:-local-postgres-only}@postgres:5432/${POSTGRES_DB:-cti_app}
       REDIS_URL: redis://redis:6379/0
@@ -200,7 +202,7 @@ services:
       - ./var/diagnostics:/var/diagnostics
       - ./var/pdf-inspections:/var/cache/autowork/pdf-inspections
     ports:
-      - "${BACKEND_PORT:-8000}:8000"
+      - "127.0.0.1:${BACKEND_PORT:-8000}:8000"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -213,6 +215,7 @@ services:
       migrate:
         condition: service_completed_successfully
     healthcheck:
+      # The exact readiness route is deliberately reachable without a bearer token.
       test:
         [
           "CMD",
@@ -231,7 +234,9 @@ services:
       context: .
       dockerfile: infra/backend.Dockerfile
     command: ["alembic", "upgrade", "head"]
-    environment: *backend-environment
+    environment:
+      <<: *backend-environment
+      OPERATOR_API_TOKEN: null
     depends_on:
       postgres:
         condition: service_healthy
@@ -251,7 +256,9 @@ services:
         "2",
         "--skip-logging",
       ]
-    environment: *backend-environment
+    environment:
+      <<: *backend-environment
+      OPERATOR_API_TOKEN: null
     volumes:
       - ./var/workspaces/subjects:/work/subjects
       - ./var/workspaces/editions:/work/editions
@@ -283,7 +290,9 @@ services:
       context: .
       dockerfile: infra/backend.Dockerfile
     command: ["python", "-m", "cti_app.workers.scheduler"]
-    environment: *backend-environment
+    environment:
+      <<: *backend-environment
+      OPERATOR_API_TOKEN: null
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -310,7 +319,7 @@ services:
       dockerfile: infra/analysis-worker.Dockerfile
     command: ["dramatiq", "cti_app.workers.analysis_tasks"]
     environment:
-      APP_ENV: development
+      APP_ENV: ${APP_ENV:-development}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       POSTGRES_DSN: postgresql+asyncpg://${POSTGRES_USER:-cti_app}:${POSTGRES_PASSWORD:-local-postgres-only}@postgres:5432/${POSTGRES_DB:-cti_app}
       REDIS_URL: redis://redis:6379/0
@@ -354,8 +363,9 @@ services:
       dockerfile: infra/frontend.Dockerfile
     environment:
       VITE_API_PROXY_TARGET: http://backend:8000
+      OPERATOR_API_TOKEN: ${OPERATOR_API_TOKEN:-}
     ports:
-      - "${FRONTEND_PORT:-5173}:5173"
+      - "127.0.0.1:${FRONTEND_PORT:-5173}:5173"
     depends_on:
       backend:
         condition: service_healthy

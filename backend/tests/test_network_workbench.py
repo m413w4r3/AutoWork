@@ -673,9 +673,16 @@ async def test_tshark_capinfos_inspection_and_deterministic_report_when_installe
 
 
 async def _exercise_tshark_capinfos_report(monkeypatch: pytest.MonkeyPatch) -> None:
-    if not shutil.which("tshark") or not shutil.which("capinfos"):
-        pytest.skip("TShark/capinfos capability is not installed")
     capture = _mixed_capture()
+    if not shutil.which("tshark") or not shutil.which("capinfos"):
+        tshark = _unavailable_tshark()
+        workbench, _ = _workbench(capture, tshark=tshark)
+        reference = await _accepted_reference(workbench)
+        result = await workbench.inspect(reference, investigation_id=_NETWORK_INVESTIGATION_ID)
+        assert result.status is ToolInvocationStatus.UNAVAILABLE
+        assert result.detail_code == "binary_unavailable"
+        return
+
     tshark = _test_tshark_adapter(None, monkeypatch)
     assert tshark.available
     workbench, _ = _workbench(capture, tshark=tshark)

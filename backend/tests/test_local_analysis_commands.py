@@ -23,7 +23,11 @@ from cti_app.domain.local_analysis import (
     LocalCommandSpec,
     LocalCommandStatus,
 )
-from cti_app.infrastructure.local_command_runner import LocalCommandRunner
+from cti_app.infrastructure.local_command_runner import (
+    LocalCommandRunner,
+    NamespaceFailureReason,
+    NetworkIsolationStatus,
+)
 
 
 class _Samples:
@@ -43,13 +47,19 @@ def _sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _test_bootstrap_argv(command: list[str], spec: LocalCommandSpec) -> list[str]:
+def _test_bootstrap_argv(
+    command: list[str],
+    spec: LocalCommandSpec,
+    *,
+    install_network_filter_before_exec: bool = True,
+) -> list[str]:
     source_root = Path(__file__).resolve().parents[1] / "src"
     bootstrap = (
         "import sys; "
         f"sys.path[:0] = {[str(source_root), *sys.path]!r}; "
         "from cti_app.infrastructure.local_command_runner import _sandbox_exec; "
-        "raise SystemExit(_sandbox_exec(sys.argv[1:]))"
+        "raise SystemExit(_sandbox_exec("
+        f"sys.argv[1:], install_network_filter={install_network_filter_before_exec!r}))"
     )
     return [
         sys.executable,
@@ -119,6 +129,8 @@ def test_bubblewrap_is_preferred_and_reports_filesystem_confinement(
         runner = LocalCommandRunner(network_sandbox_probe_seconds=0.37)
 
         assert runner.network_isolation == "bwrap-net"
+        assert runner.namespace_status is NetworkIsolationStatus.BWRAP_NET
+        assert runner.namespace_reason is None
         assert runner.filesystem_confined is True
         assert probed == ["bwrap"]
 
@@ -131,6 +143,8 @@ def test_bubblewrap_is_preferred_and_reports_filesystem_confinement(
         monkeypatch.setattr(local_runner_module, "_probe_bwrap_namespace", unavailable_bwrap)
         fallback = LocalCommandRunner(network_sandbox_probe_seconds=0.38)
         assert fallback.network_isolation == "unshare-net"
+        assert fallback.namespace_status is NetworkIsolationStatus.UNSHARE_NET
+        assert fallback.namespace_reasons == (NamespaceFailureReason.BWRAP_PROBE_FAILED,)
         assert fallback.filesystem_confined is False
         assert probed == ["bwrap", "unshare"]
     finally:
@@ -169,6 +183,11 @@ async def test_required_filesystem_confinement_refuses_execution_when_unavailabl
         assert result.status is LocalCommandStatus.UNAVAILABLE
         assert result.detail_code == "filesystem_confinement_unavailable"
         assert runner.filesystem_confined is False
+        assert runner.namespace_status is NetworkIsolationStatus.SECCOMP_ONLY
+        assert runner.namespace_reasons == (
+            NamespaceFailureReason.BWRAP_NOT_INSTALLED,
+            NamespaceFailureReason.UNSHARE_NOT_INSTALLED,
+        )
         assert service.filesystem_confined is False
         assert samples.reads == 1
         assert not marker.exists()
@@ -533,6 +552,10 @@ async def test_namespace_launcher_failure_retries_once_with_seccomp(
     assert result.status is LocalCommandStatus.SUCCEEDED
     assert "isolated-result" in result.output
     assert runner.network_isolation == "seccomp-network-syscall-filter"
+    assert runner.namespace_status is NetworkIsolationStatus.SECCOMP_ONLY
+    assert (
+        runner.namespace_reason is NamespaceFailureReason.NAMESPACE_LAUNCHER_FAILED_DURING_EXECUTION
+    )
     calls = invocations.read_text(encoding="utf-8").splitlines()
     assert len(calls) == 2
     assert "--unshare-net" in calls[0]

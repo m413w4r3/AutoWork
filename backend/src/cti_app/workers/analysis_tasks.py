@@ -47,13 +47,17 @@ async def _execute_analysis_job(job_id: UUID) -> None:
             string_min_length=settings.analysis_string_min_length,
             max_strings=settings.analysis_max_strings,
         )
-        capabilities_service = CapabilitiesService(
-            blobs,
-            factory,
-            rules_path=settings.analysis_capa_rules_path,
-            timeout_seconds=settings.analysis_capa_timeout_seconds,
-            max_output_bytes=settings.analysis_capa_max_output_bytes,
-            max_memory_bytes=settings.analysis_capa_max_memory_bytes,
+        capabilities_service = (
+            None
+            if settings.local_analysis_require_filesystem_confinement
+            else CapabilitiesService(
+                blobs,
+                factory,
+                rules_path=settings.analysis_capa_rules_path,
+                timeout_seconds=settings.analysis_capa_timeout_seconds,
+                max_output_bytes=settings.analysis_capa_max_output_bytes,
+                max_memory_bytes=settings.analysis_capa_max_memory_bytes,
+            )
         )
         executor = JobExecutor(
             factory,

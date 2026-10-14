@@ -132,7 +132,12 @@ from cti_app.application.sample_extraction_ports import (
     ConfigurationExtractionPort,
     ObfuscatedStringExtractionPort,
 )
-from cti_app.application.sample_similarity import SampleSimilarityService
+from cti_app.application.sample_similarity import (
+    CorpusSnapshotPort,
+    GoodwarePrevalencePort,
+    SampleSimilarityService,
+    SimilarityArtifactStorePort,
+)
 from cti_app.application.shodan import ShodanBudgetEstimate, ShodanCapabilities, ShodanPort
 from cti_app.application.virustotal import (
     VirusTotalCapabilities,
@@ -143,7 +148,9 @@ from cti_app.application.virustotal import (
 from cti_app.application.virustotal_persistence import VirusTotalObservationService
 from cti_app.config import Settings
 from cti_app.domain.goodware import NonDiscriminantPatternRegistry
+from cti_app.domain.investigation import SampleAssociation
 from cti_app.domain.network_protocol import NetworkExtractionLimitsV1
+from cti_app.domain.sample_similarity import CorpusMember, CorpusSnapshot
 from cti_app.infrastructure.legitimate_services import load_legitimate_services
 from cti_app.infrastructure.rea_adapter import ReaReadOnlyRunner, build_native_analysis_port
 from cti_app.infrastructure.tshark_adapter import TsharkAdapter
@@ -291,6 +298,43 @@ class RepositorySampleFeaturePackReader(SampleFeaturePackPort):
         }
 
 
+class RepositoryCorpusSnapshotReader(CorpusSnapshotPort):
+    """Read the exact sample associations of one investigation as a corpus view."""
+
+    def __init__(self, uow: UnitOfWork, investigation_id: UUID) -> None:
+        self._uow = uow
+        self._investigation_id = investigation_id
+
+    async def get_snapshot(self, investigation_id: UUID) -> CorpusSnapshot:
+        if investigation_id != self._investigation_id:
+            raise ValueError("Corpus reader belongs to another investigation")
+        associations = await self._uow.sample_associations.list_for_investigation(investigation_id)
+        latest: dict[str, SampleAssociation] = {}
+        for association in associations:
+            current = latest.get(association.sample_sha256)
+            if current is None or association.version > current.version:
+                latest[association.sample_sha256] = association
+        goodware_repository = getattr(self._uow, "investigation_goodware_baselines", None)
+        baseline_id = (
+            await goodware_repository.get(investigation_id)
+            if goodware_repository is not None
+            else None
+        )
+        return CorpusSnapshot(
+            investigation_id=investigation_id,
+            members=tuple(
+                CorpusMember(
+                    sample_sha256=association.sample_sha256,
+                    qualification=association.qualification.value,
+                    origin=association.origin.value,
+                    association_version=association.version,
+                )
+                for association in latest.values()
+            ),
+            goodware_baseline_id=baseline_id,
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class InvestigationToolDependencies:
     """Dependencies visible to tool registrars; unavailable capabilities are ``None``."""
@@ -360,8 +404,14 @@ class OptionalInvestigationToolPorts:
     retrohunt_provider: VirusTotalRetrohuntPort | None = None
     vt_routing_policy: VirusTotalRoutingPolicy | None = None
     network_quarantine: QuarantinedCaptureSource | None = None
+    network_quarantine_factory: Callable[[UUID], QuarantinedCaptureSource] | None = None
     tshark: TsharkAdapter | None = None
     confined_rea_runner: ReaReadOnlyRunner | None = None
+    # Process-level collaborators of SampleSimilarityService. The service itself is
+    # assembled per composition so its feature-pack and corpus readers are bound to
+    # the exact investigation and unit of work, never to a stale one.
+    similarity_artifacts: SimilarityArtifactStorePort | None = None
+    goodware_prevalence: GoodwarePrevalencePort | None = None
 
 
 ToolRegistrar = Callable[[ToolRegistry, InvestigationToolDependencies], None]
@@ -498,7 +548,7 @@ def _register_network_tool_family(
     enabled: set[str],
 ) -> NetworkWorkbench | None:
     quarantine = dependencies.network_quarantine
-    if quarantine is None:
+    if quarantine is None or not callable(getattr(quarantine, "read_quarantined_capture", None)):
         return None
 
     limits = NetworkExtractionLimitsV1()
@@ -796,6 +846,12 @@ def build_investigation_composition(
         value = getattr(ports, name, None)
         return value if value is not None else getattr(source_dependencies, name, None)
 
+    network_quarantine = supplied("network_quarantine")
+    if network_quarantine is None:
+        network_quarantine_factory = supplied("network_quarantine_factory")
+        if network_quarantine_factory is not None:
+            network_quarantine = network_quarantine_factory(investigation_id)
+
     base_dependencies = investigation_tool_dependencies_from_settings(
         settings,
         investigation_id=investigation_id,
@@ -871,7 +927,7 @@ def build_investigation_composition(
         behavior_report_importer=supplied("behavior_report_importer"),
         retrohunt_provider=supplied("retrohunt_provider"),
         vt_routing_policy=supplied("vt_routing_policy"),
-        network_quarantine=supplied("network_quarantine"),
+        network_quarantine=network_quarantine,
         tshark=supplied("tshark"),
         confined_rea_runner=supplied("confined_rea_runner"),
         available_capabilities=ports.available_capabilities
@@ -880,11 +936,23 @@ def build_investigation_composition(
     if base_dependencies.investigation_id != investigation_id:
         raise ValueError("Tool dependencies belong to another investigation")
 
+    if base_dependencies.sample_similarity is None and ports.similarity_artifacts is not None:
+        base_dependencies = replace(
+            base_dependencies,
+            sample_similarity=SampleSimilarityService(
+                feature_packs=base_dependencies.feature_packs,
+                corpus_snapshots=RepositoryCorpusSnapshotReader(uow, investigation_id),
+                artifacts=ports.similarity_artifacts,
+                goodware=ports.goodware_prevalence,
+            ),
+        )
+
     if (
         settings.rule_workbench_enabled
         and base_dependencies.rule_workbench is None
         and base_dependencies.rule_corpus_bytes is not None
         and base_dependencies.yara_engine is not None
+        and getattr(base_dependencies.yara_engine, "available", True)
         and getattr(uow, "detection_candidates", None) is not None
     ):
         base_dependencies = replace(

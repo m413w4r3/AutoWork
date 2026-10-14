@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     )
 
     app_env: str = "development"
+    api_bind_host: str = "127.0.0.1"
+    operator_api_token: SecretStr | None = None
     log_level: str = "INFO"
     postgres_dsn: str = "postgresql+asyncpg://cti_app:local-postgres-only@postgres:5432/cti_app"
     redis_url: str = "redis://redis:6379/0"
@@ -151,6 +153,11 @@ class Settings(BaseSettings):
     # and the *_fallback_enabled flags below) — proxy stays the only transport
     # used unless a fallback is explicitly turned on.
     virustotal_proxy_url: str | None = None
+    # Retrohunt remains unavailable until both the explicit operator opt-in and
+    # the verified vtUI origin/host allowlist are configured.
+    virustotal_retrohunt_proxy_enabled: bool = False
+    virustotal_retrohunt_proxy_base_url: str | None = None
+    virustotal_retrohunt_proxy_allowed_hosts: str = ""
     virustotal_file_report_enabled: bool = False
     virustotal_object_relationships_enabled: bool = False
     virustotal_intelligence_search_enabled: bool = False
@@ -217,6 +224,10 @@ class Settings(BaseSettings):
     local_analysis_max_sample_bytes: int = Field(
         default=200 * 1024 * 1024, gt=0, le=2 * 1024 * 1024 * 1024
     )
+
+    # MWCP runs only parsers listed here (parser id -> pinned parser version);
+    # an empty allowlist keeps configuration extraction unavailable.
+    mwcp_parser_versions: dict[str, str] = Field(default_factory=dict)
 
     # GhidraMCP's concrete HTTP transport and paths were not locally verifiable
     # for this lot. Empty paths deliberately keep the adapter unavailable until
@@ -288,6 +299,16 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_production_jitter_bounds(self) -> Settings:
+        if self.operator_api_token is not None:
+            operator_token = self.operator_api_token.get_secret_value()
+            if (
+                len(operator_token) < 32
+                or not operator_token.isascii()
+                or any(character.isspace() for character in operator_token)
+            ):
+                raise ValueError(
+                    "OPERATOR_API_TOKEN must contain at least 32 ASCII non-whitespace characters"
+                )
         if self.production_subject_jitter_max_seconds < self.production_subject_jitter_min_seconds:
             raise ValueError("production subject jitter max must be >= min")
         if self.production_model_jitter_max_seconds < self.production_model_jitter_min_seconds:

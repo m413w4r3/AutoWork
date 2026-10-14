@@ -91,13 +91,19 @@ def _context(sample_sha256: str) -> SimpleNamespace:
     )
 
 
-def _test_bootstrap_argv(command: list[str], spec: LocalCommandSpec) -> list[str]:
+def _test_bootstrap_argv(
+    command: list[str],
+    spec: LocalCommandSpec,
+    *,
+    install_network_filter_before_exec: bool = True,
+) -> list[str]:
     source_root = Path(__file__).resolve().parents[1] / "src"
     bootstrap = (
         "import sys; "
         f"sys.path[:0] = {[str(source_root), *sys.path]!r}; "
         "from cti_app.infrastructure.local_command_runner import _sandbox_exec; "
-        "raise SystemExit(_sandbox_exec(sys.argv[1:]))"
+        "raise SystemExit(_sandbox_exec("
+        f"sys.argv[1:], install_network_filter={install_network_filter_before_exec!r}))"
     )
     return [
         sys.executable,
