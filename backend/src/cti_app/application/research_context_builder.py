@@ -327,6 +327,11 @@ class ResearchContextBuilder:
         new_observations = tuple(
             item for item in observations if item.id not in state.last_seen_evidence_ids
         )
+        if state.turn_index:
+            # The delta window is bounded: present the freshest evidence first so a
+            # tool result produced by the previous turn is never queued behind an
+            # older backlog. Older unseen evidence follows on later turns.
+            new_observations = tuple(reversed(new_observations))
         new_findings = tuple(
             item for item in findings if item.id not in state.last_seen_finding_ids
         )

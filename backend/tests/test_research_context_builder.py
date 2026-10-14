@@ -238,6 +238,102 @@ async def test_context_builds_full_article_and_bounded_delta_with_contradictions
 
 
 @pytest.mark.asyncio
+async def test_delta_window_presents_the_freshest_evidence_first_and_defers_the_backlog() -> None:
+    from datetime import timedelta
+
+    from cti_app.application.research_context_builder import MAX_CONTEXT_EVIDENCE
+
+    investigation_id = uuid4()
+    started = datetime.now(UTC) - timedelta(hours=1)
+    observations = InMemoryEvidenceObservationRepository()
+    backlog = []
+    for index in range(MAX_CONTEXT_EVIDENCE + 4):
+        item = EvidenceObservation(
+            investigation_id=investigation_id,
+            kind=EvidenceKind.BINARY_STRING,
+            blob_id=uuid4(),
+            sha256=f"{index:064x}",
+            source="autowork.static_analysis",
+            source_version="1",
+            observed_at=started + timedelta(seconds=index),
+            object_type="sample",
+            object_id=f"backlog-{index}",
+        )
+        await observations.append_if_absent(item)
+        backlog.append(item)
+    fresh = EvidenceObservation(
+        investigation_id=investigation_id,
+        kind=EvidenceKind.BINARY_ANALYSIS,
+        blob_id=uuid4(),
+        sha256="f" * 64,
+        source="sample_similarity",
+        source_version="1",
+        observed_at=started + timedelta(minutes=30),
+        object_type="sample",
+        object_id="fresh-tool-result",
+    )
+    await observations.append_if_absent(fresh)
+    snapshot = ArticleSnapshot(
+        subject_id=uuid4(),
+        production_run_id=uuid4(),
+        synthesis_artifact_id=uuid4(),
+        synthesis_sha256="a" * 64,
+        article=ArticleContextV1(
+            short_summary="Bounded delta window",
+            claims=(),
+            documented_samples=(),
+            known_chain=(),
+            open_questions=(),
+        ),
+    )
+    envelope = InvestigationEnvelope(
+        investigation_id=investigation_id,
+        allowed_providers=(),
+        budget=InvestigationBudget(),
+        acquire_hits_allowed=False,
+        disclosure=DisclosureBounds(tlp=TLPLevel.GREEN),
+        approval_decision_id=uuid4(),
+        approval_actor_id="analyst-1",
+    )
+    builder = ResearchContextBuilder(
+        article_snapshots=_SnapshotPort(snapshot),
+        observations=observations,
+        findings=InMemoryFindingRepository(),
+        registry=InMemoryToolRegistry(),
+    )
+    tool_context = ToolExecutionContext(
+        investigation_id=investigation_id,
+        envelope=envelope,
+        budget=envelope.budget,
+        idempotency_key="context-window",
+    )
+
+    delta = await builder.build(
+        investigation_id=investigation_id,
+        synthesis_artifact_id=snapshot.synthesis_artifact_id,
+        state=_state(investigation_id, turn_index=1),
+        tool_context=tool_context,
+        budget_remaining={},
+    )
+    shown = [item.evidence_id for item in delta.investigation.new_evidence]
+
+    assert len(shown) == MAX_CONTEXT_EVIDENCE
+    assert shown[0] == fresh.id  # the previous turn's result is never queued behind the backlog
+    assert backlog[0].id not in shown  # the oldest backlog is deferred, not dropped
+
+    # Once shown, evidence is seen; the deferred backlog then surfaces on the next turn.
+    next_delta = await builder.build(
+        investigation_id=investigation_id,
+        synthesis_artifact_id=snapshot.synthesis_artifact_id,
+        state=_state(investigation_id, turn_index=2, evidence_ids=tuple(shown)),
+        tool_context=tool_context,
+        budget_remaining={},
+    )
+    deferred = {item.evidence_id for item in next_delta.investigation.new_evidence}
+    assert deferred == {item.id for item in backlog} - set(shown)
+
+
+@pytest.mark.asyncio
 async def test_delta_includes_bounded_unresolved_hypotheses_with_local_evidence_only() -> None:
     investigation_id = uuid4()
     observation = EvidenceObservation(

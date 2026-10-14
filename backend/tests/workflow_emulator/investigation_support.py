@@ -848,9 +848,11 @@ async def persist_sample_association_fixture(
                     sample_id=sample.id,
                 )
             )
-        association = await uow.sample_associations.append_version(association, expected_version=0)
+        persisted: SampleAssociation = await uow.sample_associations.append_version(
+            association, expected_version=0
+        )
         await uow.commit()
-    return association
+    return persisted
 
 
 class DeferredDispatcher:

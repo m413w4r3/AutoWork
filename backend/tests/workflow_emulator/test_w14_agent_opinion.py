@@ -92,7 +92,9 @@ async def _string_observation(
     for item in observations:
         if item.kind is not EvidenceKind.BINARY_STRING or item.object_id != object_id:
             continue
-        rendered = json.dumps(await driver.artifact_store.read_json(item.blob_id), ensure_ascii=True)
+        rendered = json.dumps(
+            await driver.artifact_store.read_json(item.blob_id), ensure_ascii=True
+        )
         if marker in rendered:
             return item
     raise AssertionError(f"no BINARY_STRING observation for {object_id} carries {marker!r}")
@@ -332,21 +334,34 @@ async def _approve_opinion(
 def _assert_observations_reach_following_bridge_turns(
     transport: ScriptedInvestigationTransport,
     invocations: Sequence[Any],
+    *,
+    immediate: bool = True,
 ) -> None:
-    """One tool call per turn: the next prompt must contain every produced proof ID."""
+    """Every produced proof ID must reach a Bridge prompt following its first producer.
+
+    Observations are content-addressed: several tools may return the same ID, which is
+    presented once, right after the first invocation that produced it. ``immediate``
+    requires delivery in the very next turn; ``immediate=False`` accepts any later turn
+    (useful when one turn produces more evidence than the bounded delta window).
+    """
+    delivered_for: set[Any] = set()
     for index, invocation in enumerate(invocations):
-        if not invocation.response_refs:
+        fresh = [ref for ref in invocation.response_refs if ref not in delivered_for]
+        delivered_for.update(invocation.response_refs)
+        if not fresh:
             continue
         assert index + 1 < len(transport.prompts), (
             invocation.tool_name,
             "no following Bridge turn consumed the tool observation",
         )
-        next_prompt = transport.prompts[index + 1]
-        for reference in invocation.response_refs:
-            assert str(reference) in next_prompt, (
+        following = (
+            [transport.prompts[index + 1]] if immediate else list(transport.prompts[index + 1 :])
+        )
+        for reference in fresh:
+            assert any(str(reference) in prompt for prompt in following), (
                 invocation.tool_name,
                 reference,
-                "the next Bridge turn omitted the observation ID",
+                "no following Bridge turn carried the observation ID",
             )
 
 
@@ -770,9 +785,9 @@ async def test_w14_a_similarity_rule_revision_and_new_article_sample(
             assert new_sample.kind is FindingKind.NEW_SAMPLE
             cited = {item.id: item for item in observations}
             assert new_sample.observation_refs
-            assert all(
-                cited[ref].object_id == sha_c for ref in new_sample.observation_refs
-            ), "the NEW_SAMPLE finding must cite observations of sample C only"
+            assert all(cited[ref].object_id == sha_c for ref in new_sample.observation_refs), (
+                "the NEW_SAMPLE finding must cite observations of sample C only"
+            )
             assert new_sample.novelty is NoveltyClass.NEW_TO_ARTICLE
             assert new_sample.assessment is FindingAssessment.SUPPORTED
 
@@ -959,7 +974,9 @@ async def test_w14_c_contradictory_report_keeps_one_hypothesis_open(
                     invocations = tuple(
                         await uow.tool_invocations.list_for_investigation(seeded.investigation.id)
                     )
-                imports = [item for item in invocations if item.tool_name == "sandbox.report.import"]
+                imports = [
+                    item for item in invocations if item.tool_name == "sandbox.report.import"
+                ]
                 if len(imports) < 2:
                     payload = report_other if not imports else report_target
                     return decision(
