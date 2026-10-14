@@ -9,6 +9,7 @@ import {
   useSampleComparison,
   useSampleComparisons,
   type ProtocolDiagramKind,
+  type ProtocolModelDetail,
   type SampleComparisonFeature,
 } from "../../api/investigation";
 
@@ -49,8 +50,16 @@ const DIAGRAM_KIND: Record<ProtocolDiagramKind, string> = {
   message_format: "Format des messages",
 };
 
-function StatusBadge({ value, labels }: { value: string; labels: Record<string, string> }) {
-  return <span className="badge">{labels[value] ?? value.replaceAll("_", " ")}</span>;
+function StatusBadge({
+  value,
+  labels,
+}: {
+  value: string;
+  labels: Record<string, string>;
+}) {
+  return (
+    <span className="badge">{labels[value] ?? value.replaceAll("_", " ")}</span>
+  );
 }
 
 export function InvestigationReadPanels({
@@ -68,7 +77,11 @@ export function InvestigationReadPanels({
   );
 }
 
-function SampleComparisonPanel({ investigationId }: { investigationId: string }) {
+function SampleComparisonPanel({
+  investigationId,
+}: {
+  investigationId: string;
+}) {
   const comparisonsQuery = useSampleComparisons(investigationId);
   const [selectedBlobId, setSelectedBlobId] = useState("");
   const blobId =
@@ -85,10 +98,15 @@ function SampleComparisonPanel({ investigationId }: { investigationId: string })
           Les comparaisons sont indisponibles : {comparisonsQuery.error.message}
         </p>
       ) : comparisonsQuery.data.comparisons.length === 0 ? (
-        <p>Aucune comparaison de caractéristiques n’est disponible pour cette enquête.</p>
+        <p>
+          Aucune comparaison de caractéristiques n’est disponible pour cette
+          enquête.
+        </p>
       ) : (
         <>
-          <label htmlFor="sample-comparison-select">Comparaison enregistrée</label>
+          <label htmlFor="sample-comparison-select">
+            Comparaison enregistrée
+          </label>
           <select
             id="sample-comparison-select"
             value={blobId}
@@ -96,7 +114,9 @@ function SampleComparisonPanel({ investigationId }: { investigationId: string })
           >
             {comparisonsQuery.data.comparisons.map((comparison) => (
               <option key={comparison.blob_id} value={comparison.blob_id}>
-                {COMPARISON_STATUS[comparison.status] ?? comparison.status} · {comparison.sample_count} échantillon(s) · {comparison.feature_count} traits
+                {COMPARISON_STATUS[comparison.status] ?? comparison.status} ·{" "}
+                {comparison.sample_count} échantillon(s) ·{" "}
+                {comparison.feature_count} traits
               </option>
             ))}
           </select>
@@ -104,21 +124,29 @@ function SampleComparisonPanel({ investigationId }: { investigationId: string })
             <p role="status">Lecture des caractéristiques mesurées…</p>
           ) : detailQuery.isError ? (
             <p className="error-message" role="alert">
-              Le détail de cette comparaison est indisponible : {detailQuery.error.message}
+              Le détail de cette comparaison est indisponible :{" "}
+              {detailQuery.error.message}
             </p>
           ) : (
             <>
               <p>
-                <StatusBadge value={detailQuery.data.status} labels={COMPARISON_STATUS} />
-                {" "}SHA-256 de la comparaison : <code>{detailQuery.data.sha256}</code>
+                <StatusBadge
+                  value={detailQuery.data.status}
+                  labels={COMPARISON_STATUS}
+                />{" "}
+                SHA-256 de la comparaison :{" "}
+                <code>{detailQuery.data.sha256}</code>
               </p>
               <p>
-                Échantillons comparés : {detailQuery.data.sample_sha256s.length} · traits mesurés : {detailQuery.data.feature_count}
+                Échantillons comparés : {detailQuery.data.sample_sha256s.length}{" "}
+                · traits mesurés : {detailQuery.data.feature_count}
               </p>
               <ComparisonLimits limits={detailQuery.data.limits} />
               <div className="table-scroll">
                 <table>
-                  <caption>Support, prévalence goodware et classe des traits</caption>
+                  <caption>
+                    Support, prévalence goodware et classe des traits
+                  </caption>
                   <thead>
                     <tr>
                       <th scope="col">Trait</th>
@@ -130,7 +158,10 @@ function SampleComparisonPanel({ investigationId }: { investigationId: string })
                   </thead>
                   <tbody>
                     {detailQuery.data.features.map((feature) => (
-                      <ComparisonFeatureRow key={feature.feature_key} feature={feature} />
+                      <ComparisonFeatureRow
+                        key={feature.feature_key}
+                        feature={feature}
+                      />
                     ))}
                   </tbody>
                 </table>
@@ -139,12 +170,18 @@ function SampleComparisonPanel({ investigationId }: { investigationId: string })
                 <p>Aucun trait comparable n’a été mesuré.</p>
               ) : null}
               {detailQuery.data.features_truncated ? (
-                <p role="note">La liste des traits est limitée pour cet affichage.</p>
+                <p role="note">
+                  La liste des traits est limitée pour cet affichage.
+                </p>
               ) : null}
               {detailQuery.data.warnings.length > 0 ? (
                 <div role="note">
                   <strong>Limites</strong>
-                  <ul>{detailQuery.data.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul>
+                  <ul>
+                    {detailQuery.data.warnings.map((warning) => (
+                      <li key={warning}>{warning}</li>
+                    ))}
+                  </ul>
                 </div>
               ) : null}
             </>
@@ -163,27 +200,45 @@ function ComparisonLimits({ limits }: { limits: Record<string, unknown> }) {
   const missingCount = Array.isArray(missing) ? missing.length : 0;
   return (
     <p role="note">
-      Limites de mesure : {selected ?? "?"} échantillon(s) sélectionné(s), {corpus ?? "?"} du corpus et {features ?? "?"} trait(s)
-      {missingCount > 0 ? ` · ${missingCount} pack(s) de caractéristiques absent(s)` : ""}
+      Limites de mesure : {selected ?? "?"} échantillon(s) sélectionné(s),{" "}
+      {corpus ?? "?"} du corpus et {features ?? "?"} trait(s)
+      {missingCount > 0
+        ? ` · ${missingCount} pack(s) de caractéristiques absent(s)`
+        : ""}
       {limits.corpus_sample_limit_applied === true ? " · corpus tronqué" : ""}
-      {limits.feature_limit_applied === true ? " · nombre de traits plafonné" : ""}.
+      {limits.feature_limit_applied === true
+        ? " · nombre de traits plafonné"
+        : ""}
+      .
     </p>
   );
 }
 
-function ComparisonFeatureRow({ feature }: { feature: SampleComparisonFeature }) {
+function ComparisonFeatureRow({
+  feature,
+}: {
+  feature: SampleComparisonFeature;
+}) {
   const support = feature.support;
   const provenance = feature.sample_presence
     .flatMap((presence) => presence.sources)
     .map((source) => {
       const kind = source.source_kind;
       const version = source.extractor_version;
-      return [kind, version].filter((value): value is string => typeof value === "string").join(" ");
+      return [kind, version]
+        .filter((value): value is string => typeof value === "string")
+        .join(" ");
     })
     .filter(Boolean);
   const locations = feature.sample_presence.flatMap((presence) => [
-    ...presence.offsets.map((offset) => `${presence.sample_sha256.slice(0, 12)} +0x${offset.toString(16)}`),
-    ...presence.function_offsets.map((offset) => `${presence.sample_sha256.slice(0, 12)} fonction +0x${offset.toString(16)}`),
+    ...presence.offsets.map(
+      (offset) =>
+        `${presence.sample_sha256.slice(0, 12)} +0x${offset.toString(16)}`,
+    ),
+    ...presence.function_offsets.map(
+      (offset) =>
+        `${presence.sample_sha256.slice(0, 12)} fonction +0x${offset.toString(16)}`,
+    ),
   ]);
   return (
     <tr>
@@ -191,24 +246,42 @@ function ComparisonFeatureRow({ feature }: { feature: SampleComparisonFeature })
         <code>{feature.value || feature.kind}</code>
         {feature.encoding ? <small> · {feature.encoding}</small> : null}
       </th>
-      <td>{support.positive}/{support.positive_sample_count} positifs · {support.corpus}/{support.corpus_sample_count} corpus</td>
       <td>
-        {support.goodware_prevalence_status === "measured" && support.goodware_occurrence_count !== null
+        {support.positive}/{support.positive_sample_count} positifs ·{" "}
+        {support.corpus}/{support.corpus_sample_count} corpus
+      </td>
+      <td>
+        {support.goodware_prevalence_status === "measured" &&
+        support.goodware_occurrence_count !== null
           ? `${support.goodware_occurrence_count} occurrence(s) mesurée(s)`
           : "Non mesurée"}
       </td>
-      <td><StatusBadge value={feature.feature_class} labels={FEATURE_CLASS} /></td>
       <td>
-        {feature.rationale.length > 0 ? <p>{feature.rationale.join(" · ")}</p> : null}
-        {feature.rejection_reasons.length > 0 ? <p>Réserves : {feature.rejection_reasons.join(", ")}</p> : null}
-        {provenance.length > 0 ? <p>Sources : {[...new Set(provenance)].join(", ")}</p> : null}
-        {locations.length > 0 ? <p>Positions : {locations.slice(0, 12).join(" · ")}</p> : null}
+        <StatusBadge value={feature.feature_class} labels={FEATURE_CLASS} />
+      </td>
+      <td>
+        {feature.rationale.length > 0 ? (
+          <p>{feature.rationale.join(" · ")}</p>
+        ) : null}
+        {feature.rejection_reasons.length > 0 ? (
+          <p>Réserves : {feature.rejection_reasons.join(", ")}</p>
+        ) : null}
+        {provenance.length > 0 ? (
+          <p>Sources : {[...new Set(provenance)].join(", ")}</p>
+        ) : null}
+        {locations.length > 0 ? (
+          <p>Positions : {locations.slice(0, 12).join(" · ")}</p>
+        ) : null}
       </td>
     </tr>
   );
 }
 
-function HypothesisEvidencePanel({ investigationId }: { investigationId: string }) {
+function HypothesisEvidencePanel({
+  investigationId,
+}: {
+  investigationId: string;
+}) {
   const query = useInvestigationHypotheses(investigationId);
   return (
     <section className="job-card" aria-labelledby="hypothesis-evidence-heading">
@@ -226,14 +299,25 @@ function HypothesisEvidencePanel({ investigationId }: { investigationId: string 
           {query.data.hypotheses.map((hypothesis) => (
             <li key={hypothesis.id}>
               <h3>{hypothesis.statement}</h3>
-              <StatusBadge value={hypothesis.status} labels={HYPOTHESIS_STATUS} />
+              <StatusBadge
+                value={hypothesis.status}
+                labels={HYPOTHESIS_STATUS}
+              />
               {hypothesis.findings.length > 0 ? (
                 <div>
                   <h4>Constats liés</h4>
                   <ul>
                     {hypothesis.findings.map((finding) => (
                       <li key={finding.id}>
-                        <StatusBadge value={finding.assessment} labels={{ supported: "Étayé", refuted: "Réfuté", qualified: "Nuancé", inconclusive: "Non établi" }} />{" "}
+                        <StatusBadge
+                          value={finding.assessment}
+                          labels={{
+                            supported: "Étayé",
+                            refuted: "Réfuté",
+                            qualified: "Nuancé",
+                            inconclusive: "Non établi",
+                          }}
+                        />{" "}
                         {finding.statement}
                       </li>
                     ))}
@@ -246,8 +330,11 @@ function HypothesisEvidencePanel({ investigationId }: { investigationId: string 
                   <ul>
                     {hypothesis.observations.map((observation) => (
                       <li key={observation.id}>
-                        {observation.source} · {observation.kind} · <code>{observation.sha256.slice(0, 16)}</code>
-                        {observation.limitations.length > 0 ? ` · ${observation.limitations.join(" ; ")}` : ""}
+                        {observation.source} · {observation.kind} ·{" "}
+                        <code>{observation.sha256.slice(0, 16)}</code>
+                        {observation.limitations.length > 0
+                          ? ` · ${observation.limitations.join(" ; ")}`
+                          : ""}
                       </li>
                     ))}
                   </ul>
@@ -256,10 +343,15 @@ function HypothesisEvidencePanel({ investigationId }: { investigationId: string 
               {hypothesis.contradictions.length > 0 ? (
                 <div role="note" className="verification-warning">
                   <h4>Contradictions conservées</h4>
-                  <ul>{hypothesis.contradictions.map((item) => <li key={item.id}>{item.statement}</li>)}</ul>
+                  <ul>
+                    {hypothesis.contradictions.map((item) => (
+                      <li key={item.id}>{item.statement}</li>
+                    ))}
+                  </ul>
                 </div>
               ) : null}
-              {hypothesis.findings.length === 0 && hypothesis.observations.length === 0 ? (
+              {hypothesis.findings.length === 0 &&
+              hypothesis.observations.length === 0 ? (
                 <p>Aucune preuve liée n’est disponible pour l’instant.</p>
               ) : null}
             </li>
@@ -283,28 +375,52 @@ function ProtocolPanel({ investigationId }: { investigationId: string }) {
       {modelsQuery.isPending ? (
         <p role="status">Chargement des modèles de protocole…</p>
       ) : modelsQuery.isError ? (
-        <p className="error-message" role="alert">Les modèles de protocole sont indisponibles : {modelsQuery.error.message}</p>
+        <p className="error-message" role="alert">
+          Les modèles de protocole sont indisponibles :{" "}
+          {modelsQuery.error.message}
+        </p>
       ) : modelsQuery.data.models.length === 0 ? (
         <p>Aucun modèle de protocole n’est disponible dans cette enquête.</p>
       ) : (
         <>
           <label htmlFor="protocol-model-select">Modèle de protocole</label>
-          <select id="protocol-model-select" value={blobId} onChange={(event) => setSelectedBlobId(event.currentTarget.value)}>
+          <select
+            id="protocol-model-select"
+            value={blobId}
+            onChange={(event) => setSelectedBlobId(event.currentTarget.value)}
+          >
             {modelsQuery.data.models.map((model) => (
               <option key={model.blob_id} value={model.blob_id}>
-                {model.protocol ?? model.transport} · {VALIDATION_STATUS[model.validation_status] ?? model.validation_status} · {model.message_count} message(s)
+                {model.protocol ?? model.transport} ·{" "}
+                {VALIDATION_STATUS[model.validation_status] ??
+                  model.validation_status}{" "}
+                · {model.message_count} message(s)
               </option>
             ))}
           </select>
           {modelQuery.isPending ? (
             <p role="status">Lecture du modèle…</p>
           ) : modelQuery.isError ? (
-            <p className="error-message" role="alert">Le modèle sélectionné est indisponible : {modelQuery.error.message}</p>
+            <p className="error-message" role="alert">
+              Le modèle sélectionné est indisponible :{" "}
+              {modelQuery.error.message}
+            </p>
           ) : (
             <>
               <p>
-                {stringField(modelQuery.data.model, "protocol") ?? "Protocole non identifié"} · {stringField(modelQuery.data.model, "transport") ?? "Transport inconnu"} ·{" "}
-                <StatusBadge value={stringField(modelQuery.data.model, "validation_status") ?? "unresolved"} labels={VALIDATION_STATUS} />
+                {stringField(modelQuery.data.model, "protocol") ??
+                  "Protocole non identifié"}{" "}
+                ·{" "}
+                {stringField(modelQuery.data.model, "transport") ??
+                  "Transport inconnu"}{" "}
+                ·{" "}
+                <StatusBadge
+                  value={
+                    stringField(modelQuery.data.model, "validation_status") ??
+                    "unresolved"
+                  }
+                  labels={VALIDATION_STATUS}
+                />
               </p>
               <ProtocolDefinitions model={modelQuery.data.model} />
             </>
@@ -312,23 +428,51 @@ function ProtocolPanel({ investigationId }: { investigationId: string }) {
           {diagramsQuery.isPending ? (
             <p role="status">Compilation des trois prévisualisations…</p>
           ) : diagramsQuery.isError ? (
-            <p className="error-message" role="alert">Les diagrammes ne peuvent pas être prévisualisés : {diagramsQuery.error.message}</p>
+            <p className="error-message" role="alert">
+              Les diagrammes ne peuvent pas être prévisualisés :{" "}
+              {diagramsQuery.error.message}
+            </p>
           ) : (
             <div>
               <h3>Prévisualisations des diagrammes</h3>
               {diagramsQuery.data.diagrams.map((diagram) => (
-                <article key={diagram.kind} aria-labelledby={`protocol-diagram-${diagram.kind}`}>
-                  <h4 id={`protocol-diagram-${diagram.kind}`}>{DIAGRAM_KIND[diagram.kind]}</h4>
-                  <StatusBadge value={diagram.status} labels={{ ready: "Disponible", insufficient_evidence: "Éléments insuffisants" }} />
+                <article
+                  key={diagram.kind}
+                  aria-labelledby={`protocol-diagram-${diagram.kind}`}
+                >
+                  <h4 id={`protocol-diagram-${diagram.kind}`}>
+                    {DIAGRAM_KIND[diagram.kind]}
+                  </h4>
+                  <StatusBadge
+                    value={diagram.status}
+                    labels={{
+                      ready: "Disponible",
+                      insufficient_evidence: "Éléments insuffisants",
+                    }}
+                  />
                   {diagram.status === "insufficient_evidence" ? (
-                    <p role="note">Éléments insuffisants : aucune séquence générique n’est présentée comme observée.</p>
+                    <p role="note">
+                      Éléments insuffisants : aucune séquence générique n’est
+                      présentée comme observée.
+                    </p>
                   ) : null}
-                  <img className="investigation-protocol-preview" src={diagram.png_preview.data_url} alt={`${DIAGRAM_KIND[diagram.kind]} : ${diagram.title}`} />
+                  <img
+                    className="investigation-protocol-preview"
+                    src={diagram.png_preview.data_url}
+                    alt={`${DIAGRAM_KIND[diagram.kind]} : ${diagram.title}`}
+                  />
                   <p>
                     SHA-256 SVG : <code>{diagram.asset_sha256}</code>{" "}
-                    <a href={diagram.svg.data_url} download={`${diagram.kind}.svg`}>Ouvrir le SVG</a>
+                    <a
+                      href={diagram.svg.data_url}
+                      download={`${diagram.kind}.svg`}
+                    >
+                      Ouvrir le SVG
+                    </a>
                   </p>
-                  {diagram.limitations.length > 0 ? <p>Limites : {diagram.limitations.join(" · ")}</p> : null}
+                  {diagram.limitations.length > 0 ? (
+                    <p>Limites : {diagram.limitations.join(" · ")}</p>
+                  ) : null}
                 </article>
               ))}
             </div>
@@ -339,48 +483,86 @@ function ProtocolPanel({ investigationId }: { investigationId: string }) {
   );
 }
 
-function ProtocolDefinitions({ model }: { model: ProtocolModelDetail["model"] }) {
+function ProtocolDefinitions({
+  model,
+}: {
+  model: ProtocolModelDetail["model"];
+}) {
   return (
     <div>
       <h3>Messages et champs</h3>
-      {model.messages.length === 0 ? <p>Aucun message établi.</p> : (
+      {model.messages.length === 0 ? (
+        <p>Aucun message établi.</p>
+      ) : (
         <ul>
           {model.messages.map((message, index) => (
             <li key={stringField(message, "message_id") ?? index}>
-              <strong>{stringField(message, "name") ?? "Message sans nom"}</strong>{" "}
-              <StatusBadge value={stringField(message, "validation_status") ?? "unresolved"} labels={VALIDATION_STATUS} />
-              <span> · longueur {numberField(message, "min_length") ?? "?"}–{numberField(message, "max_length") ?? "?"} octets</span>
+              <strong>
+                {stringField(message, "name") ?? "Message sans nom"}
+              </strong>{" "}
+              <StatusBadge
+                value={
+                  stringField(message, "validation_status") ?? "unresolved"
+                }
+                labels={VALIDATION_STATUS}
+              />
+              <span>
+                {" "}
+                · longueur {numberField(message, "min_length") ?? "?"}–
+                {numberField(message, "max_length") ?? "?"} octets
+              </span>
             </li>
           ))}
         </ul>
       )}
-      {model.fields.length === 0 ? <p>Aucun champ établi.</p> : (
+      {model.fields.length === 0 ? (
+        <p>Aucun champ établi.</p>
+      ) : (
         <ul>
           {model.fields.map((field, index) => (
             <li key={stringField(field, "field_id") ?? index}>
               <strong>{stringField(field, "name") ?? "Champ sans nom"}</strong>{" "}
-              <StatusBadge value={stringField(field, "validation_status") ?? "unresolved"} labels={VALIDATION_STATUS} />
-              <span> · offset {numberField(field, "offset") ?? "inconnu"} · longueur {numberField(field, "length") ?? "inconnue"} · {stringField(field, "endianness") ?? "endianness inconnue"}</span>
+              <StatusBadge
+                value={stringField(field, "validation_status") ?? "unresolved"}
+                labels={VALIDATION_STATUS}
+              />
+              <span>
+                {" "}
+                · offset {numberField(field, "offset") ?? "inconnu"} · longueur{" "}
+                {numberField(field, "length") ?? "inconnue"} ·{" "}
+                {stringField(field, "endianness") ?? "endianness inconnue"}
+              </span>
             </li>
           ))}
         </ul>
       )}
-      {model.limitations.length > 0 ? <p>Limites du modèle : {model.limitations.join(" · ")}</p> : null}
+      {model.limitations.length > 0 ? (
+        <p>Limites du modèle : {model.limitations.join(" · ")}</p>
+      ) : null}
     </div>
   );
 }
 
-function stringField(value: Record<string, unknown>, key: string): string | null {
+function stringField(
+  value: Record<string, unknown>,
+  key: string,
+): string | null {
   const item = value[key];
   return typeof item === "string" ? item : null;
 }
 
-function numberField(value: Record<string, unknown>, key: string): number | null {
+function numberField(
+  value: Record<string, unknown>,
+  key: string,
+): number | null {
   const item = value[key];
   return typeof item === "number" ? item : null;
 }
 
-function numericField(value: Record<string, unknown>, key: string): number | null {
+function numericField(
+  value: Record<string, unknown>,
+  key: string,
+): number | null {
   const item = value[key];
   return typeof item === "number" ? item : null;
 }
@@ -393,16 +575,39 @@ function RetrohuntPanel({ investigationId }: { investigationId: string }) {
       {query.isPending ? (
         <p role="status">Chargement du quota Retrohunt…</p>
       ) : query.isError ? (
-        <p className="error-message" role="alert">Le compteur Retrohunt est indisponible : {query.error.message}</p>
+        <p className="error-message" role="alert">
+          Le compteur Retrohunt est indisponible : {query.error.message}
+        </p>
       ) : (
         <>
-          <p><strong>{query.data.consumed_slots}/{query.data.maximum_slots} emplacements consommés</strong> · {query.data.remaining_slots} restant(s) pour le sujet.</p>
-          {query.data.jobs.length === 0 ? <p>Aucun job Retrohunt enregistré pour cette enquête.</p> : (
+          <p>
+            <strong>
+              {query.data.consumed_slots}/{query.data.maximum_slots}{" "}
+              emplacements consommés
+            </strong>{" "}
+            · {query.data.remaining_slots} restant(s) pour le sujet.
+          </p>
+          {query.data.jobs.length === 0 ? (
+            <p>Aucun job Retrohunt enregistré pour cette enquête.</p>
+          ) : (
             <ul>
               {query.data.jobs.map((job) => (
                 <li key={job.reservation_id}>
-                  Emplacement {job.slot} · état : <StatusBadge value={job.status} labels={{ reserved: "Réservé", submitting: "Soumission en cours", submitted: "Soumis", reconciliation_required: "Réconciliation requise", completed: "Terminé", failed: "Échec" }} />
-                  {job.has_provider_job ? " · job fournisseur associé" : " · aucun identifiant de job fournisseur"}
+                  Emplacement {job.slot} · état :{" "}
+                  <StatusBadge
+                    value={job.status}
+                    labels={{
+                      reserved: "Réservé",
+                      submitting: "Soumission en cours",
+                      submitted: "Soumis",
+                      reconciliation_required: "Réconciliation requise",
+                      completed: "Terminé",
+                      failed: "Échec",
+                    }}
+                  />
+                  {job.has_provider_job
+                    ? " · job fournisseur associé"
+                    : " · aucun identifiant de job fournisseur"}
                 </li>
               ))}
             </ul>

@@ -314,7 +314,9 @@ describe("AnalystOpinionEditor", () => {
         protocol_model_blob_id: PROTOCOL_MODEL_ID,
         protocol_views: ["sequence", "state_machine", "message_format"],
       });
-      expect(new Headers(revision?.init?.headers).get("Idempotency-Key")).toBeTruthy();
+      expect(
+        new Headers(revision?.init?.headers).get("Idempotency-Key"),
+      ).toBeTruthy();
     });
   });
 

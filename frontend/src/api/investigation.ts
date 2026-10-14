@@ -342,7 +342,8 @@ export interface ProtocolModelDetail {
   truncated: Record<string, boolean>;
 }
 
-export type ProtocolDiagramKind = "sequence" | "state_machine" | "message_format";
+export type ProtocolDiagramKind =
+  "sequence" | "state_machine" | "message_format";
 
 export interface ProtocolDiagramPreview {
   kind: ProtocolDiagramKind;
@@ -467,9 +468,11 @@ export function getInvestigation(
   );
 }
 
-export function listSampleComparisons(
-  investigationId: string,
-): Promise<{ investigation_id: string; comparisons: SampleComparisonSummary[]; truncated: boolean }> {
+export function listSampleComparisons(investigationId: string): Promise<{
+  investigation_id: string;
+  comparisons: SampleComparisonSummary[];
+  truncated: boolean;
+}> {
   return investigationRequest(
     `/api/investigations/${encodeURIComponent(investigationId)}/sample-comparisons`,
   );
@@ -492,9 +495,11 @@ export function getInvestigationHypotheses(
   );
 }
 
-export function listProtocolModels(
-  investigationId: string,
-): Promise<{ investigation_id: string; models: ProtocolModelSummary[]; truncated: boolean }> {
+export function listProtocolModels(investigationId: string): Promise<{
+  investigation_id: string;
+  models: ProtocolModelSummary[];
+  truncated: boolean;
+}> {
   return investigationRequest(
     `/api/investigations/${encodeURIComponent(investigationId)}/protocol-models`,
   );
@@ -512,7 +517,12 @@ export function getProtocolModel(
 export function getProtocolDiagrams(
   investigationId: string,
   blobId: string,
-): Promise<{ investigation_id: string; model_blob_id: string; model_sha256: string; diagrams: ProtocolDiagramPreview[] }> {
+): Promise<{
+  investigation_id: string;
+  model_blob_id: string;
+  model_sha256: string;
+  diagrams: ProtocolDiagramPreview[];
+}> {
   return investigationRequest(
     `/api/investigations/${encodeURIComponent(investigationId)}/protocol-models/${encodeURIComponent(blobId)}/diagrams`,
   );

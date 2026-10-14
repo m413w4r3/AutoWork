@@ -181,7 +181,11 @@ function createFetch(view: InvestigationView | null) {
     }
     if (url === `/api/investigations/${INVESTIGATION_ID}/protocol-models`) {
       return Promise.resolve(
-        Response.json({ investigation_id: INVESTIGATION_ID, models: [], truncated: false }),
+        Response.json({
+          investigation_id: INVESTIGATION_ID,
+          models: [],
+          truncated: false,
+        }),
       );
     }
     if (url === `/api/investigations/${INVESTIGATION_ID}/retrohunt`) {

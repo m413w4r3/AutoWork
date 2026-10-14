@@ -93,7 +93,8 @@ function mockResponse(url: string): Response {
               id: "finding-refuted",
               kind: "network_behaviour",
               assessment: "refuted",
-              statement: "La capture de contrôle ne montre pas cette connexion.",
+              statement:
+                "La capture de contrôle ne montre pas cette connexion.",
               observation_refs: [],
               limitations: [],
               contradictory: true,
@@ -105,7 +106,8 @@ function mockResponse(url: string): Response {
               id: "finding-refuted",
               kind: "network_behaviour",
               assessment: "refuted",
-              statement: "La capture de contrôle ne montre pas cette connexion.",
+              statement:
+                "La capture de contrôle ne montre pas cette connexion.",
               observation_refs: [],
               limitations: [],
               contradictory: true,
@@ -177,18 +179,22 @@ function mockResponse(url: string): Response {
       investigation_id: INVESTIGATION_ID,
       model_blob_id: MODEL_ID,
       model_sha256: "e".repeat(64),
-      diagrams: [
-        "sequence",
-        "state_machine",
-        "message_format",
-      ].map((kind) => ({
+      diagrams: ["sequence", "state_machine", "message_format"].map((kind) => ({
         kind,
         status: kind === "state_machine" ? "insufficient_evidence" : "ready",
         title: `Vue ${kind}`,
         limitations: [],
         asset_sha256: "f".repeat(64),
-        svg: { mime_type: "image/svg+xml", sha256: "f".repeat(64), data_url: svg },
-        png_preview: { mime_type: "image/png", sha256: "1".repeat(64), data_url: png },
+        svg: {
+          mime_type: "image/svg+xml",
+          sha256: "f".repeat(64),
+          data_url: svg,
+        },
+        png_preview: {
+          mime_type: "image/png",
+          sha256: "1".repeat(64),
+          data_url: png,
+        },
       })),
     });
   }
@@ -211,7 +217,10 @@ function mockResponse(url: string): Response {
       ],
     });
   }
-  return Response.json({ detail: { code: "unexpected_request" } }, { status: 500 });
+  return Response.json(
+    { detail: { code: "unexpected_request" } },
+    { status: 500 },
+  );
 }
 
 afterEach(() => vi.unstubAllGlobals());
@@ -224,7 +233,12 @@ describe("InvestigationReadPanels", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn((input: RequestInfo | URL) => {
-        const url = typeof input === "string" ? input : input.toString();
+        const url =
+          typeof input === "string"
+            ? input
+            : input instanceof URL
+              ? input.href
+              : input.url;
         return Promise.resolve(mockResponse(url));
       }),
     );
@@ -236,9 +250,19 @@ describe("InvestigationReadPanels", () => {
 
     expect(await screen.findByText("CreateFileW")).toBeInTheDocument();
     expect(screen.getByText("3 occurrence(s) mesurée(s)")).toBeInTheDocument();
-    expect(await screen.findByText("Contradictions conservées")).toBeInTheDocument();
-    expect(screen.getByText("Éléments insuffisants : aucune séquence générique n’est présentée comme observée.")).toBeInTheDocument();
-    expect(screen.getByRole("img", { name: "Machine à états : Vue state_machine" })).toBeInTheDocument();
-    expect(await screen.findByText("1/2 emplacements consommés")).toBeInTheDocument();
+    expect(
+      await screen.findByText("Contradictions conservées"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Éléments insuffisants : aucune séquence générique n’est présentée comme observée.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("img", { name: "Machine à états : Vue state_machine" }),
+    ).toBeInTheDocument();
+    expect(
+      await screen.findByText("1/2 emplacements consommés"),
+    ).toBeInTheDocument();
   });
 });

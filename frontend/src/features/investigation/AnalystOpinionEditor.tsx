@@ -7,12 +7,12 @@ import {
   usePublishAnalystOpinion,
   useRequestAnalystOpinionChanges,
   useReviseAnalystOpinion,
-  useProtocolModels,
   type PublishOpinionResponse,
   type OpinionBlockEdit,
 } from "../../api/analystOpinion";
 import {
   InvestigationApiError,
+  useProtocolModels,
   type CitationViolationPayload,
   type InvestigationOpinionDraft,
   type OpinionBlockType,
@@ -431,10 +431,13 @@ export function AnalystOpinionEditor({
               />
             </label>
             <fieldset disabled={!canEdit || protocolModelsQuery.isPending}>
-              <legend>Figures du protocole · attachées à la prochaine version</legend>
+              <legend>
+                Figures du protocole · attachées à la prochaine version
+              </legend>
               {protocolModelsQuery.isError ? (
                 <p className="error-message" role="alert">
-                  Les modèles de protocole ne peuvent pas être chargés : {protocolModelsQuery.error.message}
+                  Les modèles de protocole ne peuvent pas être chargés :{" "}
+                  {protocolModelsQuery.error.message}
                 </p>
               ) : protocolModelsQuery.data?.models.length ? (
                 <>
@@ -442,21 +445,28 @@ export function AnalystOpinionEditor({
                   <select
                     id="opinion-protocol-model"
                     value={selectedProtocolBlobId}
-                    onChange={(event) => setProtocolBlobId(event.currentTarget.value)}
+                    onChange={(event) =>
+                      setProtocolBlobId(event.currentTarget.value)
+                    }
                   >
                     {protocolModelsQuery.data.models.map((model) => (
                       <option key={model.blob_id} value={model.blob_id}>
-                        {model.protocol ?? model.transport} · {PROTOCOL_STATUS_LABELS[model.validation_status] ?? model.validation_status} · SHA {model.sha256.slice(0, 12)}
+                        {model.protocol ?? model.transport} ·{" "}
+                        {PROTOCOL_STATUS_LABELS[model.validation_status] ??
+                          model.validation_status}{" "}
+                        · SHA {model.sha256.slice(0, 12)}
                       </option>
                     ))}
                   </select>
                   <div>
                     <p>Vues à attacher</p>
-                    {([
-                      ["sequence", "Séquence des échanges"],
-                      ["state_machine", "Machine à états"],
-                      ["message_format", "Format des messages"],
-                    ] as const).map(([kind, label]) => (
+                    {(
+                      [
+                        ["sequence", "Séquence des échanges"],
+                        ["state_machine", "Machine à états"],
+                        ["message_format", "Format des messages"],
+                      ] as const
+                    ).map(([kind, label]) => (
                       <label key={kind}>
                         <input
                           type="checkbox"
@@ -468,21 +478,30 @@ export function AnalystOpinionEditor({
                     ))}
                   </div>
                   <p role="note">
-                    L’attache crée une nouvelle version de l’avis. Les modifications locales sont enregistrées avec les figures.
+                    L’attache crée une nouvelle version de l’avis. Les
+                    modifications locales sont enregistrées avec les figures.
                   </p>
                   <button
                     type="button"
                     className="button button--secondary"
-                    disabled={!selectedProtocolBlobId || protocolViews.length === 0 || revise.isPending}
+                    disabled={
+                      !selectedProtocolBlobId ||
+                      protocolViews.length === 0 ||
+                      revise.isPending
+                    }
                     onClick={attachProtocolFigures}
                   >
-                    {revise.isPending ? "Compilation et attache…" : "Attacher les figures à une nouvelle révision"}
+                    {revise.isPending
+                      ? "Compilation et attache…"
+                      : "Attacher les figures à une nouvelle révision"}
                   </button>
                 </>
               ) : protocolModelsQuery.isPending ? (
                 <p role="status">Chargement des modèles de protocole…</p>
               ) : (
-                <p>Aucun modèle de protocole n’est disponible pour cette enquête.</p>
+                <p>
+                  Aucun modèle de protocole n’est disponible pour cette enquête.
+                </p>
               )}
             </fieldset>
             {draft.protocol_figures?.length ? (
@@ -491,7 +510,8 @@ export function AnalystOpinionEditor({
                 <ul>
                   {draft.protocol_figures.map((figure) => (
                     <li key={`${figure.kind}-${figure.asset_sha256}`}>
-                      {figure.kind} · <code>{figure.asset_sha256}</code> · {figure.caption}
+                      {figure.kind} · <code>{figure.asset_sha256}</code> ·{" "}
+                      {figure.caption}
                     </li>
                   ))}
                 </ul>
