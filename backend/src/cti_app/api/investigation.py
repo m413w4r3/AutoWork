@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import re
@@ -10,7 +11,7 @@ from datetime import datetime
 from typing import Annotated, Any, cast
 from uuid import UUID, uuid5
 
-from fastapi import APIRouter, Header, HTTPException, Request, status
+from fastapi import APIRouter, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from cti_app.application.analyst_handoff import (
@@ -19,6 +20,7 @@ from cti_app.application.analyst_handoff import (
     analyst_handoff_policy_from_sources,
     loop_budget_from_settings,
 )
+from cti_app.application.diagram_compilation import DiagramCompilationError
 from cti_app.application.identity import IdentityProvider
 from cti_app.application.investigation_composition import (
     InvestigationComposition,
@@ -43,6 +45,12 @@ from cti_app.application.investigation_jobs import (
 from cti_app.application.investigation_persistence import VersionConflictError
 from cti_app.application.investigation_state import InvestigationStateVersionConflict
 from cti_app.application.jobs import DuplicateJobError
+from cti_app.application.network_protocol_model import render_protocol_model
+from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.protocol_diagram_projection import (
+    ProtocolDiagramProjectionError,
+    compile_protocol_render_preview,
+)
 from cti_app.application.research_context_builder import USER_REQUEST_ACTION_PREFIX
 from cti_app.domain.analyst_opinion import AnalystOpinionV1
 from cti_app.domain.investigation import (
@@ -65,12 +73,17 @@ from cti_app.domain.production import (
     ProductionArtifactStatus,
     ProductionRun,
 )
+from cti_app.domain.protocol_model import ProtocolModelV1
+from cti_app.domain.retrohunt import RETROHUNT_MAX_SUBMISSIONS_PER_SUBJECT
+from cti_app.infrastructure.d2_diagram_compiler import D2DiagramCompiler
 from cti_app.logging import get_correlation_id
 
 router = APIRouter(prefix="/api", tags=["investigations"])
 _SHA256 = r"^[0-9a-f]{64}$"
 _OPINION_NAMESPACE = UUID("f141ae8e-999c-4a7f-b07d-5ffb0bd7b86d")
 _USER_REQUEST_NAMESPACE = UUID("92e23e22-b681-49c9-87dd-a7fd13398c05")
+_SIMILARITY_BUCKET = "investigation-sample-similarity"
+_PROTOCOL_MODEL_BUCKET = "network-protocol-models"
 
 
 class InvestigationStartRequest(BaseModel):
@@ -666,6 +679,234 @@ async def list_investigation_samples(
             raise _http_error(404, "investigation_not_found")
         associations = await uow.sample_associations.list_for_investigation(investigation_id)
         return [_sample_detail(item) for item in associations]
+
+
+@router.get("/investigations/{investigation_id}/sample-comparisons")
+async def list_investigation_sample_comparisons(
+    investigation_id: UUID,
+    request: Request,
+    limit: int = Query(default=25, ge=1, le=50),
+) -> dict[str, Any]:
+    artifact_store = _artifact_store(request)
+    async with _uow_factory(request)() as uow:
+        await _require_investigation(uow, investigation_id)
+        observations = await uow.evidence_observations.list_for_investigation(investigation_id)
+        summaries: list[dict[str, Any]] = []
+        seen: set[UUID] = set()
+        for observation in observations:
+            if observation.object_type != "family_feature_comparison":
+                continue
+            blob = await uow.blobs.get_by_address(_SIMILARITY_BUCKET, observation.object_id)
+            if blob is None or blob.id in seen or blob.descriptor.sha256 != observation.sha256:
+                continue
+            raw = await artifact_store.read_json(blob.id)
+            if raw.get("investigation_id") != str(investigation_id):
+                continue
+            seen.add(blob.id)
+            summaries.append(_comparison_summary(raw, blob.id, blob.descriptor.sha256))
+            if len(summaries) > limit:
+                break
+    return {
+        "investigation_id": investigation_id,
+        "comparisons": summaries[:limit],
+        "truncated": len(summaries) > limit,
+    }
+
+
+@router.get("/investigations/{investigation_id}/sample-comparisons/{blob_id}")
+async def get_investigation_sample_comparison(
+    investigation_id: UUID,
+    blob_id: UUID,
+    request: Request,
+    feature_limit: int = Query(default=50, ge=1, le=100),
+) -> dict[str, Any]:
+    artifact_store = _artifact_store(request)
+    async with _uow_factory(request)() as uow:
+        await _require_investigation(uow, investigation_id)
+        blob = await _require_evidence_blob(
+            uow,
+            investigation_id=investigation_id,
+            blob_id=blob_id,
+            logical_bucket=_SIMILARITY_BUCKET,
+            object_type="family_feature_comparison",
+        )
+    raw = await artifact_store.read_json(blob.id)
+    if raw.get("investigation_id") != str(investigation_id):
+        raise _http_error(404, "sample_comparison_not_found")
+    return _bounded_comparison(raw, blob.id, blob.descriptor.sha256, feature_limit=feature_limit)
+
+
+@router.get("/investigations/{investigation_id}/hypotheses")
+async def list_investigation_hypotheses(
+    investigation_id: UUID,
+    request: Request,
+) -> dict[str, Any]:
+    async with _uow_factory(request)() as uow:
+        investigation, state = await _require_working_state(uow, investigation_id)
+        all_findings = await uow.investigation_findings.list_for_investigation(investigation_id)
+        superseded_ids = {item.supersedes for item in all_findings if item.supersedes is not None}
+        findings_by_id = {item.id: item for item in all_findings if item.id not in superseded_ids}
+        observations_by_id = {
+            item.id: item
+            for item in await uow.evidence_observations.list_for_investigation(investigation_id)
+        }
+        hypotheses: list[dict[str, Any]] = []
+        for hypothesis in state.hypotheses[:64]:
+            finding_ids = tuple(ref for ref in hypothesis.finding_refs if ref in findings_by_id)[
+                :64
+            ]
+            linked_observation_refs = tuple(
+                dict.fromkeys(
+                    (
+                        *hypothesis.evidence_refs,
+                        *(
+                            observation_ref
+                            for finding_id in finding_ids
+                            for observation_ref in findings_by_id[finding_id].observation_refs
+                        ),
+                    )
+                )
+            )
+            observation_ids = tuple(
+                ref for ref in linked_observation_refs if ref in observations_by_id
+            )[:64]
+            linked_findings = [findings_by_id[ref] for ref in finding_ids]
+            linked_observations = [observations_by_id[ref] for ref in observation_ids]
+            contradictions = [
+                _finding_evidence_view(item)
+                for item in linked_findings
+                if item.assessment is FindingAssessment.REFUTED
+            ]
+            hypotheses.append(
+                {
+                    "id": hypothesis.id,
+                    "statement": hypothesis.statement,
+                    "status": hypothesis.status.value,
+                    "findings": [_finding_evidence_view(item) for item in linked_findings],
+                    "observations": [
+                        _observation_evidence_view(item) for item in linked_observations
+                    ],
+                    "contradictions": contradictions,
+                }
+            )
+    return {"investigation_id": investigation.id, "hypotheses": hypotheses}
+
+
+@router.get("/investigations/{investigation_id}/protocol-models")
+async def list_investigation_protocol_models(
+    investigation_id: UUID,
+    request: Request,
+    limit: int = Query(default=25, ge=1, le=50),
+) -> dict[str, Any]:
+    artifact_store = _artifact_store(request)
+    async with _uow_factory(request)() as uow:
+        await _require_investigation(uow, investigation_id)
+        observations = await uow.evidence_observations.list_for_investigation(investigation_id)
+        models: list[dict[str, Any]] = []
+        seen: set[UUID] = set()
+        for observation in observations:
+            if observation.object_type != "protocol_model":
+                continue
+            blob = await uow.blobs.get_by_address(_PROTOCOL_MODEL_BUCKET, observation.object_id)
+            if blob is None or blob.id in seen or blob.descriptor.sha256 != observation.object_id:
+                continue
+            model = ProtocolModelV1.from_dict(await artifact_store.read_json(blob.id))
+            if model.investigation_id != investigation_id:
+                continue
+            seen.add(blob.id)
+            models.append(_protocol_model_summary(model, blob.id, observation.object_id))
+            if len(models) > limit:
+                break
+    return {
+        "investigation_id": investigation_id,
+        "models": models[:limit],
+        "truncated": len(models) > limit,
+    }
+
+
+@router.get("/investigations/{investigation_id}/protocol-models/{blob_id}")
+async def get_investigation_protocol_model(
+    investigation_id: UUID,
+    blob_id: UUID,
+    request: Request,
+) -> dict[str, Any]:
+    model = await _read_protocol_model(request, investigation_id, blob_id)
+    return _bounded_protocol_model(model, blob_id)
+
+
+@router.get("/investigations/{investigation_id}/protocol-models/{blob_id}/diagrams")
+async def get_investigation_protocol_diagrams(
+    investigation_id: UUID,
+    blob_id: UUID,
+    request: Request,
+) -> dict[str, Any]:
+    model = await _read_protocol_model(request, investigation_id, blob_id)
+    try:
+        rendered = await compile_protocol_render_preview(
+            render_protocol_model(model),
+            compiler=D2DiagramCompiler(),
+        )
+    except (DiagramCompilationError, ProtocolDiagramProjectionError) as exc:
+        raise _http_error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "protocol_diagram_rendering_unavailable",
+        ) from exc
+    return {
+        "investigation_id": investigation_id,
+        "model_blob_id": blob_id,
+        "model_sha256": model.canonical_sha256,
+        "diagrams": [
+            {
+                "kind": item.spec.kind.value,
+                "status": item.spec.status.value,
+                "title": item.spec.title,
+                "limitations": list(item.spec.limitations[:32]),
+                "asset_sha256": item.compiled.media_sha256,
+                "svg": {
+                    "mime_type": item.compiled.media_type,
+                    "sha256": item.compiled.media_sha256,
+                    "data_url": _data_url(item.compiled.media_type, item.compiled.media_bytes),
+                },
+                "png_preview": {
+                    "mime_type": item.preview.media_type,
+                    "sha256": item.preview.media_sha256,
+                    "data_url": _data_url(item.preview.media_type, item.preview.media_bytes),
+                },
+            }
+            for item in rendered
+        ],
+    }
+
+
+@router.get("/investigations/{investigation_id}/retrohunt")
+async def get_investigation_retrohunt(
+    investigation_id: UUID,
+    request: Request,
+) -> dict[str, Any]:
+    async with _uow_factory(request)() as uow:
+        investigation = await _require_investigation(uow, investigation_id)
+        consumed = await uow.retrohunt_reservations.count_for_subject(investigation.subject_id)
+        reservations = await uow.retrohunt_reservations.list_for_subject(investigation.subject_id)
+    jobs = [
+        {
+            "reservation_id": item.id,
+            "slot": item.slot_number,
+            "status": item.state.value,
+            "version": item.version,
+            "updated_at": item.updated_at,
+            "has_provider_job": item.provider_job_id is not None,
+        }
+        for item in reservations
+        if item.investigation_id == investigation_id
+    ]
+    return {
+        "investigation_id": investigation_id,
+        "subject_id": investigation.subject_id,
+        "maximum_slots": RETROHUNT_MAX_SUBMISSIONS_PER_SUBJECT,
+        "consumed_slots": consumed,
+        "remaining_slots": max(0, RETROHUNT_MAX_SUBMISSIONS_PER_SUBJECT - consumed),
+        "jobs": jobs,
+    }
 
 
 @router.post(
@@ -1541,6 +1782,245 @@ def _sample_detail(association: Any) -> SampleDetailView:
             for item in association.changes
         ],
     )
+
+
+async def _require_investigation(uow: Any, investigation_id: UUID) -> Any:
+    investigation = await uow.analyst_investigations.get(investigation_id)
+    if investigation is None:
+        raise _http_error(404, "investigation_not_found")
+    return investigation
+
+
+async def _require_evidence_blob(
+    uow: Any,
+    *,
+    investigation_id: UUID,
+    blob_id: UUID,
+    logical_bucket: str,
+    object_type: str,
+) -> Any:
+    blob = await uow.blobs.get(blob_id)
+    if blob is None or blob.descriptor.logical_bucket != logical_bucket:
+        raise _http_error(404, "investigation_artifact_not_found")
+    observations = await uow.evidence_observations.list_for_investigation(investigation_id)
+    if not any(
+        item.object_type == object_type
+        and item.object_id == blob.descriptor.sha256
+        and (object_type == "protocol_model" or item.sha256 == blob.descriptor.sha256)
+        for item in observations
+    ):
+        raise _http_error(404, "investigation_artifact_not_found")
+    return blob
+
+
+async def _read_protocol_model(
+    request: Request,
+    investigation_id: UUID,
+    blob_id: UUID,
+) -> ProtocolModelV1:
+    async with _uow_factory(request)() as uow:
+        investigation = await _require_investigation(uow, investigation_id)
+        blob = await _require_evidence_blob(
+            uow,
+            investigation_id=investigation_id,
+            blob_id=blob_id,
+            logical_bucket=_PROTOCOL_MODEL_BUCKET,
+            object_type="protocol_model",
+        )
+    model = ProtocolModelV1.from_dict(await _artifact_store(request).read_json(blob.id))
+    if model.investigation_id != investigation_id or model.subject_id != str(
+        investigation.subject_id
+    ):
+        raise _http_error(404, "protocol_model_not_found")
+    return model
+
+
+def _artifact_store(request: Request) -> ProductionArtifactStore:
+    configured = getattr(request.app.state, "production_artifact_store", None)
+    if configured is None:
+        raise _http_error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "investigation_artifacts_unavailable",
+        )
+    return cast(ProductionArtifactStore, configured)
+
+
+def _comparison_summary(raw: dict[str, Any], blob_id: UUID, sha256: str) -> dict[str, Any]:
+    features = raw.get("features")
+    limits = raw.get("limits")
+    return {
+        "blob_id": blob_id,
+        "sha256": sha256,
+        "schema_version": raw.get("schema_version"),
+        "status": raw.get("status"),
+        "sample_sha256s": list(raw.get("comparison_sample_sha256s", []))[:32],
+        "sample_count": len(raw.get("comparison_sample_sha256s", [])),
+        "feature_count": len(features) if isinstance(features, list) else 0,
+        "limits": _bounded_comparison_limits(limits),
+        "warnings": list(raw.get("warnings", []))[:16],
+    }
+
+
+def _bounded_comparison(
+    raw: dict[str, Any], blob_id: UUID, sha256: str, *, feature_limit: int
+) -> dict[str, Any]:
+    features = raw.get("features")
+    if not isinstance(features, list):
+        features = []
+    return {
+        "blob_id": blob_id,
+        "sha256": sha256,
+        "schema_version": raw.get("schema_version"),
+        "investigation_id": raw.get("investigation_id"),
+        "corpus_snapshot_sha256": raw.get("corpus_snapshot_sha256"),
+        "status": raw.get("status"),
+        "sample_sha256s": list(raw.get("comparison_sample_sha256s", []))[:32],
+        "sample_count": len(raw.get("comparison_sample_sha256s", [])),
+        "features": [_bounded_comparison_feature(item) for item in features[:feature_limit]],
+        "feature_count": len(features),
+        "features_truncated": len(features) > feature_limit,
+        "limits": _bounded_comparison_limits(raw.get("limits")),
+        "provenance": {
+            "extractor_versions": list(raw.get("extractor_versions", []))[:64],
+            "policy": raw.get("policy", {}),
+        },
+        "warnings": list(raw.get("warnings", []))[:32],
+        "recommended_next_tests": list(raw.get("recommended_next_tests", []))[:32],
+    }
+
+
+def _bounded_comparison_limits(raw: object) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        **raw,
+        "packs_missing": list(raw.get("packs_missing", []))[:32],
+        "per_sample_feature_limit_applied": list(raw.get("per_sample_feature_limit_applied", []))[
+            :32
+        ],
+        "feature_losses": list(raw.get("feature_losses", []))[:32],
+    }
+
+
+def _bounded_comparison_feature(raw: object) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    bounded = dict(raw)
+    value = bounded.get("value")
+    if isinstance(value, str) and len(value) > 512:
+        bounded["value"] = value[:512]
+        bounded["value_truncated"] = True
+    bounded["rationale"] = list(raw.get("rationale", []))[:16]
+    bounded["rejection_reasons"] = list(raw.get("rejection_reasons", []))[:16]
+    presences = raw.get("sample_presence", [])
+    bounded["sample_presence"] = (
+        [
+            {
+                **item,
+                "offsets": list(item.get("offsets", []))[:32],
+                "function_offsets": list(item.get("function_offsets", []))[:32],
+                "sources": list(item.get("sources", []))[:16],
+            }
+            for item in presences[:64]
+            if isinstance(item, dict)
+        ]
+        if isinstance(presences, list)
+        else []
+    )
+    candidates = raw.get("signature_candidates", [])
+    bounded["signature_candidates"] = (
+        [
+            {
+                **item,
+                "pattern": str(item.get("pattern", ""))[:512],
+                "positive_sample_sha256s": list(item.get("positive_sample_sha256s", []))[:32],
+                "source_offsets": list(item.get("source_offsets", []))[:32],
+                "rejection_reasons": list(item.get("rejection_reasons", []))[:16],
+            }
+            for item in candidates[:16]
+            if isinstance(item, dict)
+        ]
+        if isinstance(candidates, list)
+        else []
+    )
+    return bounded
+
+
+def _protocol_model_summary(model: ProtocolModelV1, blob_id: UUID, sha256: str) -> dict[str, Any]:
+    return {
+        "blob_id": blob_id,
+        "sha256": sha256,
+        "schema_version": model.schema_version,
+        "model_version": model.model_version,
+        "protocol": model.protocol,
+        "transport": model.transport.value,
+        "validation_status": model.validation_status.value,
+        "family_assurance": model.family_assurance.value,
+        "sample_sha256s": list(model.sample_sha256s[:32]),
+        "message_count": len(model.messages),
+        "field_count": len(model.fields),
+        "transition_count": len(model.transitions),
+    }
+
+
+def _bounded_protocol_model(model: ProtocolModelV1, blob_id: UUID) -> dict[str, Any]:
+    payload = model.to_dict()
+    bounds = {
+        "endpoints": 64,
+        "conversations": 64,
+        "messages": 128,
+        "fields": 256,
+        "transitions": 128,
+        "function_provenance": 64,
+        "verification_findings": 128,
+        "test_plan": 64,
+        "limitations": 64,
+        "extractor_versions": 64,
+        "sample_sha256s": 32,
+        "capture_sha256s": 32,
+        "report_ids": 32,
+    }
+    truncated: dict[str, bool] = {}
+    for key, maximum in bounds.items():
+        value = payload.get(key)
+        if isinstance(value, list):
+            truncated[key] = len(value) > maximum
+            payload[key] = value[:maximum]
+    return {
+        "blob_id": blob_id,
+        "sha256": model.canonical_sha256,
+        "model": payload,
+        "truncated": truncated,
+    }
+
+
+def _finding_evidence_view(finding: Any) -> dict[str, Any]:
+    return {
+        "id": finding.id,
+        "kind": finding.kind.value,
+        "assessment": finding.assessment.value,
+        "statement": finding.statement,
+        "observation_refs": list(finding.observation_refs[:64]),
+        "limitations": list(finding.limitations[:32]),
+        "contradictory": finding.assessment is FindingAssessment.REFUTED,
+    }
+
+
+def _observation_evidence_view(observation: Any) -> dict[str, Any]:
+    return {
+        "id": observation.id,
+        "kind": observation.kind.value,
+        "sha256": observation.sha256,
+        "source": observation.source,
+        "source_version": observation.source_version,
+        "observed_at": observation.observed_at,
+        "limitations": list(observation.limitations[:32]),
+    }
+
+
+def _data_url(mime_type: str, content: bytes) -> str:
+    encoded = base64.b64encode(content).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
 
 
 def _composition_factory(request: Request) -> InvestigationCompositionFactory:

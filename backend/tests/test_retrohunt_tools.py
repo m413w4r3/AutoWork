@@ -156,6 +156,14 @@ class _MemoryReservations:
     async def count_for_subject(self, subject_id: UUID) -> int:
         return sum(item.subject_id == subject_id for item in self.rows.values())
 
+    async def list_for_subject(self, subject_id: UUID):
+        return tuple(
+            sorted(
+                (item for item in self.rows.values() if item.subject_id == subject_id),
+                key=lambda item: (item.slot_number, item.created_at),
+            )
+        )
+
     async def update_if_version(self, reservation: RetrohuntReservation, *, expected_version: int):
         async with self._lock:
             current = self.rows.get(reservation.id)

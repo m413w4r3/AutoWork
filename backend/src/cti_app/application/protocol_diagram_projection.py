@@ -91,6 +91,18 @@ class ProtocolDiagramRenderV1:
     pin_sha256: str
 
 
+@dataclass(frozen=True, slots=True)
+class ProtocolDiagramPreviewV1:
+    """Transient SVG/PNG output for an HTTP preview; stores no media assets."""
+
+    spec: ProtocolDiagramSpecV1
+    diagram: DiagramSpecV1
+    compiled: CompiledDiagram
+    preview: CompiledDiagramPreview
+    model_sha256: str
+    spec_sha256: str
+
+
 def project_protocol_diagram(spec: ProtocolDiagramSpecV1) -> DiagramSpecV1:
     """Convert one validated protocol view into the existing safe D2 input model."""
     if not isinstance(spec, ProtocolDiagramSpecV1):
@@ -283,6 +295,54 @@ async def compile_protocol_render_result(
             )
         )
     return tuple(rendered)
+
+
+async def compile_protocol_render_preview(
+    result: ProtocolRenderResultV1,
+    *,
+    compiler: DiagramCompiler,
+) -> tuple[ProtocolDiagramPreviewV1, ...]:
+    """Compile all three safe views for a GET preview without persisting assets."""
+    if not isinstance(result, ProtocolRenderResultV1):
+        raise TypeError("Protocol diagram preview requires ProtocolRenderResultV1")
+    specs = result.diagrams
+    if len(specs) != len(ProtocolDiagramKind) or {item.kind for item in specs} != set(
+        ProtocolDiagramKind
+    ):
+        raise ProtocolDiagramProjectionError("Exactly one spec for each protocol view is required")
+    preview_compiler = cast(DiagramPreviewCompiler, compiler)
+    if not callable(getattr(preview_compiler, "compile_preview", None)):
+        raise ProtocolDiagramProjectionError(
+            "The configured D2 compiler does not export PNG previews"
+        )
+
+    previews: list[ProtocolDiagramPreviewV1] = []
+    for spec in sorted(specs, key=lambda item: tuple(ProtocolDiagramKind).index(item.kind)):
+        diagram = project_protocol_diagram(spec)
+        compiled = await compiler.compile(diagram)
+        preview = await preview_compiler.compile_preview(diagram)
+        if compiled.diagram_key != diagram.key or preview.diagram_key != diagram.key:
+            raise ProtocolDiagramProjectionError("D2 returned output for a different protocol view")
+        if compiled.source_sha256 != preview.source_sha256:
+            raise ProtocolDiagramProjectionError(
+                "D2 SVG and PNG previews use different source bytes"
+            )
+        if (
+            compiled.compiler != preview.compiler
+            or compiled.compiler_version != preview.compiler_version
+        ):
+            raise ProtocolDiagramProjectionError("D2 SVG and PNG compiler identities differ")
+        previews.append(
+            ProtocolDiagramPreviewV1(
+                spec=spec,
+                diagram=diagram,
+                compiled=compiled,
+                preview=preview,
+                model_sha256=result.model_sha256,
+                spec_sha256=spec.canonical_sha256,
+            )
+        )
+    return tuple(previews)
 
 
 def _status(status: ProtocolValidationStatus) -> str:
@@ -506,8 +566,10 @@ def _validate_projected_graph(
 
 __all__ = [
     "PROTOCOL_DIAGRAM_PROJECTION_VERSION",
+    "ProtocolDiagramPreviewV1",
     "ProtocolDiagramProjectionError",
     "ProtocolDiagramRenderV1",
+    "compile_protocol_render_preview",
     "compile_protocol_render_result",
     "opinion_protocol_figures",
     "project_protocol_diagram",

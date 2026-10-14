@@ -13,6 +13,7 @@ import {
 } from "../../api/investigation";
 import { AnalystOpinionEditor } from "./AnalystOpinionEditor";
 import { InvestigationGovernancePanel } from "./InvestigationGovernancePanel";
+import { InvestigationReadPanels } from "./InvestigationReadPanels";
 import {
   ClaimVerification,
   DetectionReviewPanel,
@@ -320,6 +321,7 @@ function InvestigationDetail({
         investigationId={investigation.id}
         observations={investigation.observations}
       />
+      <InvestigationReadPanels investigationId={investigation.id} />
       <ClaimVerification
         findings={investigation.findings}
         observations={investigation.observations}

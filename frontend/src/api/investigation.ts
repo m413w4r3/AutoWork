@@ -227,6 +227,149 @@ export interface CitationViolationPayload {
   message: string;
 }
 
+export interface SampleComparisonSummary {
+  blob_id: string;
+  sha256: string;
+  schema_version: string;
+  status: string;
+  sample_sha256s: string[];
+  sample_count: number;
+  feature_count: number;
+  limits: Record<string, unknown>;
+  warnings: string[];
+}
+
+export interface SampleComparisonFeature {
+  feature_key: string;
+  kind: string;
+  value: string;
+  encoding: string | null;
+  feature_class: string;
+  rank: number;
+  support: {
+    positive: number;
+    positive_sample_count: number;
+    corpus: number;
+    corpus_sample_count: number;
+    goodware_occurrence_count: number | null;
+    goodware_prevalence_status: string;
+    comparison_exclusive: boolean;
+  };
+  sample_presence: Array<{
+    sample_sha256: string;
+    present: boolean;
+    measured: boolean;
+    selected: boolean;
+    qualification: string;
+    offsets: number[];
+    function_offsets: number[];
+    sources: Array<Record<string, unknown>>;
+  }>;
+  rejection_reasons: string[];
+  rationale: string[];
+}
+
+export interface SampleComparisonDetail extends SampleComparisonSummary {
+  investigation_id: string;
+  corpus_snapshot_sha256: string;
+  features: SampleComparisonFeature[];
+  features_truncated: boolean;
+  provenance: {
+    extractor_versions: Array<Record<string, unknown>>;
+    policy: Record<string, unknown>;
+  };
+  recommended_next_tests: string[];
+}
+
+export interface HypothesisEvidence {
+  id: string;
+  statement: string;
+  status: "open" | "supported" | "refuted" | "abandoned";
+  findings: Array<{
+    id: string;
+    kind: string;
+    assessment: FindingAssessment;
+    statement: string;
+    observation_refs: string[];
+    limitations: string[];
+    contradictory: boolean;
+  }>;
+  observations: Array<{
+    id: string;
+    kind: EvidenceKind;
+    sha256: string;
+    source: string;
+    source_version: string;
+    observed_at: string;
+    limitations: string[];
+  }>;
+  contradictions: Array<{
+    id: string;
+    kind: string;
+    assessment: FindingAssessment;
+    statement: string;
+    observation_refs: string[];
+    limitations: string[];
+    contradictory: boolean;
+  }>;
+}
+
+export interface ProtocolModelSummary {
+  blob_id: string;
+  sha256: string;
+  schema_version: string;
+  model_version: string;
+  protocol: string | null;
+  transport: string;
+  validation_status: string;
+  family_assurance: string;
+  sample_sha256s: string[];
+  message_count: number;
+  field_count: number;
+  transition_count: number;
+}
+
+export interface ProtocolModelDetail {
+  blob_id: string;
+  sha256: string;
+  model: {
+    messages: Array<Record<string, unknown>>;
+    fields: Array<Record<string, unknown>>;
+    transitions: Array<Record<string, unknown>>;
+    limitations: string[];
+    [key: string]: unknown;
+  };
+  truncated: Record<string, boolean>;
+}
+
+export type ProtocolDiagramKind = "sequence" | "state_machine" | "message_format";
+
+export interface ProtocolDiagramPreview {
+  kind: ProtocolDiagramKind;
+  status: "ready" | "insufficient_evidence";
+  title: string;
+  limitations: string[];
+  asset_sha256: string;
+  svg: { mime_type: string; sha256: string; data_url: string };
+  png_preview: { mime_type: string; sha256: string; data_url: string };
+}
+
+export interface InvestigationRetrohuntView {
+  investigation_id: string;
+  subject_id: string;
+  maximum_slots: 2;
+  consumed_slots: number;
+  remaining_slots: number;
+  jobs: Array<{
+    reservation_id: string;
+    slot: number;
+    status: string;
+    version: number;
+    updated_at: string;
+    has_provider_job: boolean;
+  }>;
+}
+
 export class InvestigationApiError extends Error {
   constructor(
     message: string,
@@ -292,6 +435,20 @@ export const investigationQueryKeys = {
     ["subject-investigations", subjectId] as const,
   detail: (investigationId: string) =>
     ["investigation", investigationId] as const,
+  sampleComparisons: (investigationId: string) =>
+    ["investigation-sample-comparisons", investigationId] as const,
+  sampleComparison: (investigationId: string, blobId: string) =>
+    ["investigation-sample-comparison", investigationId, blobId] as const,
+  hypotheses: (investigationId: string) =>
+    ["investigation-hypotheses", investigationId] as const,
+  protocolModels: (investigationId: string) =>
+    ["investigation-protocol-models", investigationId] as const,
+  protocolModel: (investigationId: string, blobId: string) =>
+    ["investigation-protocol-model", investigationId, blobId] as const,
+  protocolDiagrams: (investigationId: string, blobId: string) =>
+    ["investigation-protocol-diagrams", investigationId, blobId] as const,
+  retrohunt: (investigationId: string) =>
+    ["investigation-retrohunt", investigationId] as const,
 };
 
 export function listSubjectInvestigations(
@@ -307,6 +464,65 @@ export function getInvestigation(
 ): Promise<InvestigationView> {
   return investigationRequest(
     `/api/investigations/${encodeURIComponent(investigationId)}`,
+  );
+}
+
+export function listSampleComparisons(
+  investigationId: string,
+): Promise<{ investigation_id: string; comparisons: SampleComparisonSummary[]; truncated: boolean }> {
+  return investigationRequest(
+    `/api/investigations/${encodeURIComponent(investigationId)}/sample-comparisons`,
+  );
+}
+
+export function getSampleComparison(
+  investigationId: string,
+  blobId: string,
+): Promise<SampleComparisonDetail> {
+  return investigationRequest(
+    `/api/investigations/${encodeURIComponent(investigationId)}/sample-comparisons/${encodeURIComponent(blobId)}`,
+  );
+}
+
+export function getInvestigationHypotheses(
+  investigationId: string,
+): Promise<{ investigation_id: string; hypotheses: HypothesisEvidence[] }> {
+  return investigationRequest(
+    `/api/investigations/${encodeURIComponent(investigationId)}/hypotheses`,
+  );
+}
+
+export function listProtocolModels(
+  investigationId: string,
+): Promise<{ investigation_id: string; models: ProtocolModelSummary[]; truncated: boolean }> {
+  return investigationRequest(
+    `/api/investigations/${encodeURIComponent(investigationId)}/protocol-models`,
+  );
+}
+
+export function getProtocolModel(
+  investigationId: string,
+  blobId: string,
+): Promise<ProtocolModelDetail> {
+  return investigationRequest(
+    `/api/investigations/${encodeURIComponent(investigationId)}/protocol-models/${encodeURIComponent(blobId)}`,
+  );
+}
+
+export function getProtocolDiagrams(
+  investigationId: string,
+  blobId: string,
+): Promise<{ investigation_id: string; model_blob_id: string; model_sha256: string; diagrams: ProtocolDiagramPreview[] }> {
+  return investigationRequest(
+    `/api/investigations/${encodeURIComponent(investigationId)}/protocol-models/${encodeURIComponent(blobId)}/diagrams`,
+  );
+}
+
+export function getInvestigationRetrohunt(
+  investigationId: string,
+): Promise<InvestigationRetrohuntView> {
+  return investigationRequest(
+    `/api/investigations/${encodeURIComponent(investigationId)}/retrohunt`,
   );
 }
 
@@ -364,6 +580,62 @@ export function useInvestigation(investigationId: string | null) {
       query.state.data?.status === "running"
         ? 2_000
         : false,
+  });
+}
+
+export function useSampleComparisons(investigationId: string) {
+  return useQuery({
+    queryKey: investigationQueryKeys.sampleComparisons(investigationId),
+    queryFn: () => listSampleComparisons(investigationId),
+    enabled: Boolean(investigationId),
+  });
+}
+
+export function useSampleComparison(investigationId: string, blobId: string) {
+  return useQuery({
+    queryKey: investigationQueryKeys.sampleComparison(investigationId, blobId),
+    queryFn: () => getSampleComparison(investigationId, blobId),
+    enabled: Boolean(investigationId && blobId),
+  });
+}
+
+export function useInvestigationHypotheses(investigationId: string) {
+  return useQuery({
+    queryKey: investigationQueryKeys.hypotheses(investigationId),
+    queryFn: () => getInvestigationHypotheses(investigationId),
+    enabled: Boolean(investigationId),
+  });
+}
+
+export function useProtocolModels(investigationId: string) {
+  return useQuery({
+    queryKey: investigationQueryKeys.protocolModels(investigationId),
+    queryFn: () => listProtocolModels(investigationId),
+    enabled: Boolean(investigationId),
+  });
+}
+
+export function useProtocolModel(investigationId: string, blobId: string) {
+  return useQuery({
+    queryKey: investigationQueryKeys.protocolModel(investigationId, blobId),
+    queryFn: () => getProtocolModel(investigationId, blobId),
+    enabled: Boolean(investigationId && blobId),
+  });
+}
+
+export function useProtocolDiagrams(investigationId: string, blobId: string) {
+  return useQuery({
+    queryKey: investigationQueryKeys.protocolDiagrams(investigationId, blobId),
+    queryFn: () => getProtocolDiagrams(investigationId, blobId),
+    enabled: Boolean(investigationId && blobId),
+  });
+}
+
+export function useInvestigationRetrohunt(investigationId: string) {
+  return useQuery({
+    queryKey: investigationQueryKeys.retrohunt(investigationId),
+    queryFn: () => getInvestigationRetrohunt(investigationId),
+    enabled: Boolean(investigationId),
   });
 }
 
