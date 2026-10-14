@@ -86,6 +86,15 @@ class SqlAlchemyRetrohuntReservationRepository:
         )
         return int(count or 0)
 
+    async def list_for_subject(self, subject_id: UUID) -> tuple[RetrohuntReservation, ...]:
+        rows = await self._session.scalars(
+            select(RetrohuntReservationRow)
+            .where(RetrohuntReservationRow.subject_id == subject_id)
+            .order_by(RetrohuntReservationRow.slot_number, RetrohuntReservationRow.created_at)
+            .execution_options(populate_existing=True)
+        )
+        return tuple(_to_domain(row) for row in rows)
+
     async def update_if_version(
         self, reservation: RetrohuntReservation, *, expected_version: int
     ) -> RetrohuntReservation | None:

@@ -303,3 +303,110 @@ async def test_verified_synthesis_http_job_finding_and_opinion_postgres(
     async with uow_factory() as uow:
         persisted_publication = await uow.production_artifacts.get(publication.id)
     assert persisted_publication == publication
+
+
+@pytest.mark.asyncio
+async def test_protocol_model_blob_from_another_investigation_is_not_read_postgres(
+    uow_factory, tmp_path
+) -> None:
+    artifact_store = ProductionArtifactStore(
+        BlobCatalogService(
+            FilesystemBlobStore(tmp_path / "investigation-protocol-guard"), uow_factory
+        )
+    )
+    suffix = uuid4().hex
+    edition = Edition(
+        country=f"Protocol guard {suffix}",
+        country_code=reserve_edition_code(),
+        period_start=date(2026, 10, 1),
+        period_end=date(2026, 10, 31),
+        tlp=TLP.AMBER,
+        languages=("en",),
+    )
+    subjects = [
+        Subject(
+            edition_id=edition.id,
+            title=f"Protocol guard subject {index}",
+            slug=f"protocol-guard-{suffix}-{index}",
+            tlp=TLP.AMBER,
+        )
+        for index in range(2)
+    ]
+    investigations: list[AnalystInvestigation] = []
+    runs: list[ProductionRun] = []
+    syntheses: list[ProductionArtifact] = []
+    for index, subject in enumerate(subjects):
+        run = ProductionRun(subject_id=subject.id, edition_id=edition.id)
+        payload = {
+            "title": f"Protocol guard synthesis {index} {suffix}",
+            "subject_id": str(subject.id),
+            "lead": [{"text": "A synthetic verified report."}],
+            "sections": [],
+            "timeline": [],
+            "uncertainties": [],
+        }
+        blob_id, sha256 = await artifact_store.put_canonical_json(
+            payload, bucket=f"protocol-guard-synthesis-{index}"
+        )
+        synthesis = ProductionArtifact(
+            production_run_id=run.id,
+            subject_id=subject.id,
+            stage=ProductionArtifactStage.SYNTHESIS,
+            version=1,
+            input_hash=sha256,
+            canonical_blob_id=blob_id,
+        )
+        runs.append(run)
+        syntheses.append(synthesis)
+        investigations.append(
+            AnalystInvestigation.from_verified_synthesis(
+                synthesis=synthesis,
+                budget=LoopBudget(),
+            )
+        )
+
+    async with uow_factory() as uow:
+        assert await uow.editions.add_if_absent(edition)
+        for subject in subjects:
+            await uow.subjects.add(subject)
+        for run, synthesis, investigation in zip(runs, syntheses, investigations, strict=True):
+            await uow.production_runs.add(run)
+            await uow.production_artifacts.append(synthesis)
+            await uow.analyst_investigations.add(investigation)
+        await uow.commit()
+
+    model_bytes = b"synthetic foreign protocol model blob"
+    model_blob_id = await artifact_store.put_bytes(
+        model_bytes,
+        bucket="network-protocol-models",
+        mime_type="application/json",
+    )
+    model_observation = EvidenceObservation(
+        investigation_id=investigations[0].id,
+        kind=EvidenceKind.OTHER,
+        blob_id=model_blob_id,
+        sha256=hashlib.sha256(model_bytes).hexdigest(),
+        source="network.protocol.compare",
+        source_version="1",
+        observed_at=datetime.now(UTC),
+        object_type="protocol_model",
+        object_id=hashlib.sha256(model_bytes).hexdigest(),
+        limitations=("Synthetic guard fixture.",),
+    )
+    async with uow_factory() as uow:
+        await uow.evidence_observations.append_if_absent(model_observation)
+        await uow.commit()
+
+    app = FastAPI()
+    app.include_router(router)
+    app.state.uow_factory = uow_factory
+    app.state.production_artifact_store = artifact_store
+    async with httpx.AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get(
+            f"/api/investigations/{investigations[1].id}/protocol-models/{model_blob_id}"
+        )
+
+    assert response.status_code == 404
+    assert response.json()["detail"]["code"] == "investigation_artifact_not_found"

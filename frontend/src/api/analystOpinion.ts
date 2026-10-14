@@ -8,6 +8,7 @@ import {
   type InvestigationOpinionBlock,
   type OpinionBlockType,
   type OpinionQualification,
+  type ProtocolDiagramKind,
 } from "./investigation";
 
 export interface OpinionProvenance {
@@ -28,6 +29,7 @@ export interface AnalystOpinionVersion {
   base_publication_artifact_id: string;
   base_publication_sha256: string;
   blocks: InvestigationOpinionBlock[];
+  protocol_figures?: OpinionProtocolFigure[];
   unresolved_points: string[];
   author_id: string;
   reviewer_id: string | null;
@@ -36,6 +38,20 @@ export interface AnalystOpinionVersion {
   content_sha256: string;
   renderable_blocks: InvestigationOpinionBlock[];
   provenance: OpinionProvenance;
+}
+
+export interface OpinionProtocolFigure {
+  kind: ProtocolDiagramKind;
+  model_sha256: string;
+  spec_sha256: string;
+  asset_id: string;
+  asset_sha256: string;
+  preview_sha256: string;
+  pin_sha256: string;
+  compiler_name: string;
+  compiler_version: string;
+  compiler_policy_version: string;
+  caption: string;
 }
 
 export interface AnalystOpinionResponse {
@@ -69,6 +85,8 @@ export interface ReviseOpinionInput {
   expected_version: number;
   blocks: OpinionBlockEdit[];
   unresolved_points: string[];
+  protocol_model_blob_id?: string;
+  protocol_views?: ProtocolDiagramKind[];
 }
 
 export interface ReviewOpinionInput {
@@ -225,6 +243,8 @@ export function useReviseAnalystOpinion(investigationId: string) {
         expected_version: input.expected_version,
         blocks: input.blocks,
         unresolved_points: input.unresolved_points,
+        protocol_model_blob_id: input.protocol_model_blob_id,
+        protocol_views: input.protocol_views,
       }),
     investigationId,
   );

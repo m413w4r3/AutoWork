@@ -7,6 +7,7 @@ import {
   usePublishAnalystOpinion,
   useRequestAnalystOpinionChanges,
   useReviseAnalystOpinion,
+  useProtocolModels,
   type PublishOpinionResponse,
   type OpinionBlockEdit,
 } from "../../api/analystOpinion";
@@ -16,6 +17,7 @@ import {
   type InvestigationOpinionDraft,
   type OpinionBlockType,
   type OpinionQualification,
+  type ProtocolDiagramKind,
 } from "../../api/investigation";
 
 const BLOCK_ORDER: OpinionBlockType[] = [
@@ -44,6 +46,13 @@ const QUALIFICATION_LABELS: Record<OpinionQualification, string> = {
   hypothesis: "Hypothèse",
 };
 
+const PROTOCOL_STATUS_LABELS: Record<string, string> = {
+  observed: "Observé",
+  inferred: "Inféré",
+  unresolved: "Non résolu",
+  contradicted: "Contredit",
+};
+
 export function AnalystOpinionEditor({
   investigationId,
   currentDraft,
@@ -54,6 +63,7 @@ export function AnalystOpinionEditor({
   compositionHref: string;
 }) {
   const opinionQuery = useAnalystOpinion(investigationId);
+  const protocolModelsQuery = useProtocolModels(investigationId);
   const compose = useComposeAnalystOpinion(investigationId);
   const revise = useReviseAnalystOpinion(investigationId);
   const approve = useApproveAnalystOpinion(investigationId);
@@ -64,6 +74,12 @@ export function AnalystOpinionEditor({
   const [reviewReason, setReviewReason] = useState("");
   const [dirty, setDirty] = useState(false);
   const [newBlockType, setNewBlockType] = useState<OpinionBlockType | "">("");
+  const [protocolBlobId, setProtocolBlobId] = useState("");
+  const [protocolViews, setProtocolViews] = useState<ProtocolDiagramKind[]>([
+    "sequence",
+    "state_machine",
+    "message_format",
+  ]);
   const [publishedArtifact, setPublishedArtifact] = useState<
     PublishOpinionResponse["publication"] | null
   >(null);
@@ -136,6 +152,8 @@ export function AnalystOpinionEditor({
   const canPublish = Boolean(
     draft && draft.status === "approved" && hashMatchesCurrent && !dirty,
   );
+  const selectedProtocolBlobId =
+    protocolBlobId || protocolModelsQuery.data?.models[0]?.blob_id || "";
 
   function saveRevision() {
     if (!draft) return;
@@ -148,6 +166,29 @@ export function AnalystOpinionEditor({
         .map((point) => point.trim())
         .filter(Boolean),
     });
+  }
+
+  function attachProtocolFigures() {
+    if (!draft || !selectedProtocolBlobId || protocolViews.length === 0) return;
+    revise.mutate({
+      opinionId: draft.id,
+      expected_version: draft.version,
+      blocks: blocks.filter((block) => block.text.trim()),
+      unresolved_points: unresolvedPoints
+        .split("\n")
+        .map((point) => point.trim())
+        .filter(Boolean),
+      protocol_model_blob_id: selectedProtocolBlobId,
+      protocol_views: protocolViews,
+    });
+  }
+
+  function toggleProtocolView(kind: ProtocolDiagramKind) {
+    setProtocolViews((current) =>
+      current.includes(kind)
+        ? current.filter((item) => item !== kind)
+        : [...current, kind],
+    );
   }
 
   function handleAddBlock() {
@@ -389,6 +430,73 @@ export function AnalystOpinionEditor({
                 disabled={!canEdit}
               />
             </label>
+            <fieldset disabled={!canEdit || protocolModelsQuery.isPending}>
+              <legend>Figures du protocole · attachées à la prochaine version</legend>
+              {protocolModelsQuery.isError ? (
+                <p className="error-message" role="alert">
+                  Les modèles de protocole ne peuvent pas être chargés : {protocolModelsQuery.error.message}
+                </p>
+              ) : protocolModelsQuery.data?.models.length ? (
+                <>
+                  <label htmlFor="opinion-protocol-model">Modèle source</label>
+                  <select
+                    id="opinion-protocol-model"
+                    value={selectedProtocolBlobId}
+                    onChange={(event) => setProtocolBlobId(event.currentTarget.value)}
+                  >
+                    {protocolModelsQuery.data.models.map((model) => (
+                      <option key={model.blob_id} value={model.blob_id}>
+                        {model.protocol ?? model.transport} · {PROTOCOL_STATUS_LABELS[model.validation_status] ?? model.validation_status} · SHA {model.sha256.slice(0, 12)}
+                      </option>
+                    ))}
+                  </select>
+                  <div>
+                    <p>Vues à attacher</p>
+                    {([
+                      ["sequence", "Séquence des échanges"],
+                      ["state_machine", "Machine à états"],
+                      ["message_format", "Format des messages"],
+                    ] as const).map(([kind, label]) => (
+                      <label key={kind}>
+                        <input
+                          type="checkbox"
+                          checked={protocolViews.includes(kind)}
+                          onChange={() => toggleProtocolView(kind)}
+                        />{" "}
+                        {label}
+                      </label>
+                    ))}
+                  </div>
+                  <p role="note">
+                    L’attache crée une nouvelle version de l’avis. Les modifications locales sont enregistrées avec les figures.
+                  </p>
+                  <button
+                    type="button"
+                    className="button button--secondary"
+                    disabled={!selectedProtocolBlobId || protocolViews.length === 0 || revise.isPending}
+                    onClick={attachProtocolFigures}
+                  >
+                    {revise.isPending ? "Compilation et attache…" : "Attacher les figures à une nouvelle révision"}
+                  </button>
+                </>
+              ) : protocolModelsQuery.isPending ? (
+                <p role="status">Chargement des modèles de protocole…</p>
+              ) : (
+                <p>Aucun modèle de protocole n’est disponible pour cette enquête.</p>
+              )}
+            </fieldset>
+            {draft.protocol_figures?.length ? (
+              <div>
+                <h3>Figures déjà liées à cette version</h3>
+                <ul>
+                  {draft.protocol_figures.map((figure) => (
+                    <li key={`${figure.kind}-${figure.asset_sha256}`}>
+                      {figure.kind} · <code>{figure.asset_sha256}</code> · {figure.caption}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
             {canEdit ? (
               <button
                 type="button"

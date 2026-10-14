@@ -1336,6 +1336,34 @@ h1 {
   border-radius: 0.65rem;
 }
 
+.table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.table-scroll table {
+  width: 100%;
+  min-width: 54rem;
+  border-collapse: collapse;
+}
+
+.table-scroll th,
+.table-scroll td {
+  padding: 0.65rem;
+  border-bottom: 1px solid #e2e8e4;
+  text-align: left;
+  vertical-align: top;
+}
+
+.investigation-protocol-preview {
+  display: block;
+  max-width: 100%;
+  max-height: 34rem;
+  margin-block: 0.75rem;
+  border: 1px solid #cfdbd3;
+  background: #fff;
+}
+
 .subject-data-table__row {
   display: grid;
   grid-template-columns:

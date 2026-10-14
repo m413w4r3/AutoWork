@@ -406,7 +406,7 @@ class NetworkProtocolWorkbench:
         return _verify_model(model, observed)
 
     def render(self, model: ProtocolModelV1) -> ProtocolRenderResultV1:
-        return _render_model(model)
+        return render_protocol_model(model)
 
     async def _load_traces(
         self,
@@ -1315,6 +1315,13 @@ def _render_model(model: ProtocolModelV1) -> ProtocolRenderResultV1:
         diagrams=(sequence, state_diagram, format_diagram),
         factual_statements=tuple(statements),
     )
+
+
+def render_protocol_model(model: ProtocolModelV1) -> ProtocolRenderResultV1:
+    """Project a stored semantic model into its three evidence-bound diagram specs."""
+    if not isinstance(model, ProtocolModelV1):
+        raise TypeError("Protocol rendering requires ProtocolModelV1")
+    return _render_model(model)
 
 
 def _bounded_traces(

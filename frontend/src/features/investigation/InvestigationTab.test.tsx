@@ -165,6 +165,37 @@ function createFetch(view: InvestigationView | null) {
         ),
       );
     }
+    if (url === `/api/investigations/${INVESTIGATION_ID}/sample-comparisons`) {
+      return Promise.resolve(
+        Response.json({
+          investigation_id: INVESTIGATION_ID,
+          comparisons: [],
+          truncated: false,
+        }),
+      );
+    }
+    if (url === `/api/investigations/${INVESTIGATION_ID}/hypotheses`) {
+      return Promise.resolve(
+        Response.json({ investigation_id: INVESTIGATION_ID, hypotheses: [] }),
+      );
+    }
+    if (url === `/api/investigations/${INVESTIGATION_ID}/protocol-models`) {
+      return Promise.resolve(
+        Response.json({ investigation_id: INVESTIGATION_ID, models: [], truncated: false }),
+      );
+    }
+    if (url === `/api/investigations/${INVESTIGATION_ID}/retrohunt`) {
+      return Promise.resolve(
+        Response.json({
+          investigation_id: INVESTIGATION_ID,
+          subject_id: SUBJECT_ID,
+          maximum_slots: 2,
+          consumed_slots: 0,
+          remaining_slots: 2,
+          jobs: [],
+        }),
+      );
+    }
     if (url === `/api/investigations/${INVESTIGATION_ID}/detections`) {
       return Promise.resolve(
         Response.json({ investigation_id: INVESTIGATION_ID, versions: [] }),

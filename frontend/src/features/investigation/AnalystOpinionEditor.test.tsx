@@ -16,6 +16,7 @@ const CONTENT_HASH = "a".repeat(64);
 const BASE_HASH = "b".repeat(64);
 const FINDING_ID = "33333333-3333-4333-8333-333333333333";
 const EVIDENCE_ID = "44444444-4444-4444-8444-444444444444";
+const PROTOCOL_MODEL_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
 function requestBody(init?: RequestInit): unknown {
   const body = init?.body;
@@ -112,6 +113,30 @@ function renderEditor(
           ? input.href
           : input.url;
     calls.push({ url, init });
+    if (url === `/api/investigations/${INVESTIGATION_ID}/protocol-models`) {
+      return Promise.resolve(
+        Response.json({
+          investigation_id: INVESTIGATION_ID,
+          models: [
+            {
+              blob_id: PROTOCOL_MODEL_ID,
+              sha256: "9".repeat(64),
+              schema_version: "ProtocolModelV1",
+              model_version: "1",
+              protocol: "test protocol",
+              transport: "tcp",
+              validation_status: "observed",
+              family_assurance: "medium",
+              sample_sha256s: [],
+              message_count: 1,
+              field_count: 1,
+              transition_count: 0,
+            },
+          ],
+          truncated: false,
+        }),
+      );
+    }
     if (url === `/api/investigations/${INVESTIGATION_ID}/opinion`) {
       return Promise.resolve(
         Response.json({
@@ -265,6 +290,32 @@ describe("AnalystOpinionEditor", () => {
     expect(
       new Headers(call?.init?.headers).get("Idempotency-Key"),
     ).toBeTruthy();
+  });
+
+  it("attache les vues choisies à une nouvelle version précise de l’avis", async () => {
+    const opinion = makeOpinion();
+    const { calls } = renderEditor(opinion);
+    const user = userEvent.setup();
+
+    await user.click(
+      await screen.findByRole("button", {
+        name: "Attacher les figures à une nouvelle révision",
+      }),
+    );
+
+    await waitFor(() => {
+      const revision = calls.find(
+        (call) =>
+          call.url === `/api/opinions/${OPINION_ID}/revise` &&
+          call.init?.method === "POST",
+      );
+      expect(requestBody(revision?.init)).toMatchObject({
+        expected_version: opinion.version,
+        protocol_model_blob_id: PROTOCOL_MODEL_ID,
+        protocol_views: ["sequence", "state_machine", "message_format"],
+      });
+      expect(new Headers(revision?.init?.headers).get("Idempotency-Key")).toBeTruthy();
+    });
   });
 
   it("approuve la version et le hash précis soumis", async () => {
