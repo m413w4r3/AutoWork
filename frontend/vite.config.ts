@@ -1,6 +1,8 @@
 import react from "@vitejs/plugin-react";
 import { configDefaults, defineConfig } from "vitest/config";
 
+import { createApiProxyOptions } from "./src/viteProxyConfig";
+
 export default defineConfig({
   plugins: [react()],
   server: {
@@ -8,8 +10,10 @@ export default defineConfig({
     fs: { allow: [".."] },
     proxy: {
       "/api": {
-        target: process.env.VITE_API_PROXY_TARGET ?? "http://localhost:8000",
-        changeOrigin: true,
+        ...createApiProxyOptions(
+          process.env.VITE_API_PROXY_TARGET ?? "http://localhost:8000",
+          process.env.OPERATOR_API_TOKEN,
+        ),
       },
     },
   },

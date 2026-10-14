@@ -41,4 +41,4 @@ RUN uv sync --frozen --no-dev --no-group analysis
 
 ENV PATH="/app/.venv/bin:$PATH" \
     FONT_BUNDLE_ROOT=/usr/local/share/autowork/typst-fonts
-CMD ["uvicorn", "cti_app.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["sh", "-c", "exec uvicorn cti_app.api.main:app --host \"${API_BIND_HOST:-127.0.0.1}\" --port 8000"]

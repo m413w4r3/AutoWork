@@ -134,6 +134,11 @@ def test_job_actor_time_limit_outlives_the_dramatiq_default(
 def test_virustotal_settings_are_optional_and_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = Settings(_env_file=None)
     assert settings.virustotal_proxy_url is None
+    assert settings.virustotal_retrohunt_proxy_enabled is False
+    assert settings.virustotal_retrohunt_proxy_base_url is None
+    assert settings.virustotal_retrohunt_proxy_allowed_hosts == ""
+    monkeypatch.setenv("VIRUSTOTAL_RETROHUNT_PROXY_ENABLED", "true")
+    assert Settings(_env_file=None).virustotal_retrohunt_proxy_enabled is True
     monkeypatch.setenv("VIRUSTOTAL_MAX_PAGE_SIZE", "101")
     with pytest.raises(ValidationError):
         Settings(_env_file=None)

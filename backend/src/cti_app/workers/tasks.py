@@ -8,8 +8,6 @@ from minio import Minio
 
 from cti_app.application.analyst_vt_enrichment import VirusTotalSeedEnrichmentService
 from cti_app.application.blobs import BlobCatalogService
-from cti_app.application.capabilities import CapabilitiesService
-from cti_app.application.code_features import CodeFeatureService
 from cti_app.application.collection import SubjectCollectionService
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.discovery.cumulative.chatgpt_planner import ChatGptMergePlanner
@@ -38,29 +36,20 @@ from cti_app.application.edition_workspace import (
     EditionProductionCheckpointService,
     EditionWorkspaceMaterializer,
 )
-from cti_app.application.goodware import GoodwareMeasurementService
 from cti_app.application.http_collection import (
     CollectionPolicy,
     SafeHttpCollector,
     SystemDnsResolver,
     parse_domain_policy,
 )
-from cti_app.application.identity import LocalIdentityProvider
-from cti_app.application.investigation_composition import (
-    InvestigationCompositionFactory,
-    OptionalInvestigationToolPorts,
-    QuarantineSampleBytesAdapter,
-)
 from cti_app.application.investigation_jobs import (
     make_investigation_runner,
 )
-from cti_app.application.investigation_rule_tools import QuarantineRuleCorpusBytes
 from cti_app.application.jobs import (
     JobExecutor,
     JobService,
     create_job_registry,
 )
-from cti_app.application.local_analysis import LocalCommandCatalog, LocalCommandService
 from cti_app.application.media_assets import MediaAssetStore
 from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.persistence import JobUnitOfWork, UnitOfWork
@@ -71,8 +60,6 @@ from cti_app.application.production_jobs import (
     stage_job_kind,
 )
 from cti_app.application.production_pacing import ProductionPacingPolicy
-from cti_app.application.sample_acquisition import VirusTotalSampleAcquisitionService
-from cti_app.application.static_analysis import StaticAnalysisService
 from cti_app.application.typst_paths import typst_bundle_paths
 from cti_app.application.virustotal import VirusTotalCapabilities, VirusTotalRoutingPolicy
 from cti_app.application.virustotal_persistence import VirusTotalObservationService
@@ -87,18 +74,19 @@ from cti_app.infrastructure.database.session import create_postgres_engine, crea
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
 from cti_app.infrastructure.ghidra_mcp import create_ghidra_mcp_http_adapter
 from cti_app.infrastructure.http import AsyncioPinnedHttpTransport
+from cti_app.infrastructure.investigation_runtime_ports import (
+    build_investigation_runtime_composition_factory,
+)
 from cti_app.infrastructure.jobs import DramatiqJobDispatcher
-from cti_app.infrastructure.local_command_runner import LocalCommandRunner
 from cti_app.infrastructure.pdf_inspection import PdfInspectionCache
+from cti_app.infrastructure.quarantined_capture_source import ProductionQuarantinedCaptureSource
 from cti_app.infrastructure.shodan import create_shodan_http_adapter, create_shodan_http_client
-from cti_app.infrastructure.smda import SmdaAdapter
 from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
 from cti_app.infrastructure.virustotal import (
     VirusTotalHttpAdapter,
     create_virustotal_direct_http_client,
     create_virustotal_http_client,
 )
-from cti_app.infrastructure.yara_runner import IsolatedYaraRunner
 from cti_app.integrations.model_factory import (
     create_bridge_capabilities_provider,
     create_model_gateway,
@@ -126,6 +114,7 @@ def virustotal_capabilities_from_settings(settings: Settings) -> VirusTotalCapab
         intelligence_search=settings.virustotal_intelligence_search_enabled,
         file_download=settings.virustotal_file_download_enabled,
         behaviour_reports=settings.virustotal_behaviour_reports_enabled,
+        retrohunt=settings.virustotal_retrohunt_proxy_enabled,
     )
 
 
@@ -173,9 +162,19 @@ async def _execute_job(job_id: UUID) -> int | None:
     session_factory = create_session_factory(engine)
     vt_proxy_client: httpx.AsyncClient | None = None
     vt_direct_client: httpx.AsyncClient | None = None
+    retrohunt_http_client: httpx.AsyncClient | None = None
     shodan_client: httpx.AsyncClient | None = None
     ghidra_adapter = None
     vt_capabilities = virustotal_capabilities_from_settings(settings)
+    if (
+        settings.virustotal_retrohunt_proxy_enabled
+        and settings.virustotal_retrohunt_proxy_base_url
+        and settings.virustotal_retrohunt_proxy_allowed_hosts.strip()
+    ):
+        retrohunt_http_client = httpx.AsyncClient(
+            follow_redirects=False,
+            trust_env=False,
+        )
 
     def uow_factory() -> UnitOfWork:
         return SqlAlchemyUnitOfWork(session_factory)
@@ -226,7 +225,11 @@ async def _execute_job(job_id: UUID) -> int | None:
         )
         blob_catalog = BlobCatalogService(blob_store, uow_factory)
         production_artifact_store = ProductionArtifactStore(blob_catalog)
-        vt_observations = VirusTotalObservationService(blob_catalog, uow_factory)
+        vt_observations = (
+            VirusTotalObservationService(blob_catalog, uow_factory)
+            if vt_adapter is not None
+            else None
+        )
         shodan_enabled = settings.shodan_api_key is not None and any(
             (
                 settings.shodan_host_enabled,
@@ -241,83 +244,6 @@ async def _execute_job(job_id: UUID) -> int | None:
             shodan_adapter = create_shodan_http_adapter(client=shodan_client, settings=settings)
         if settings.ghidra_enabled:
             ghidra_adapter = create_ghidra_mcp_http_adapter(settings)
-        quarantine_bytes = None
-        local_command_catalog = None
-        local_command_service = None
-        static_analysis = None
-        capabilities_analysis = None
-        code_features = None
-        goodware_measurement = None
-        yara_engine = None
-        if (
-            settings.local_analysis_enabled
-            or settings.ghidra_enabled
-            or settings.rule_workbench_enabled
-        ):
-            quarantine_bytes = QuarantineRuleCorpusBytes(
-                uow_factory,
-                blob_store,
-                maximum_sample_bytes=max(
-                    settings.local_analysis_max_sample_bytes,
-                    64 * 1024 * 1024 if settings.rule_workbench_enabled else 1,
-                ),
-            )
-        if settings.local_analysis_enabled or settings.ghidra_enabled:
-            local_command_catalog = LocalCommandCatalog(
-                timeout_seconds=settings.local_analysis_timeout_seconds,
-                max_output_bytes=settings.local_analysis_max_output_bytes,
-                cpu_limit_seconds=settings.local_analysis_cpu_limit_seconds,
-                memory_limit_bytes=settings.local_analysis_memory_limit_bytes,
-                file_size_limit_bytes=settings.local_analysis_file_size_limit_bytes,
-            )
-            assert quarantine_bytes is not None
-            local_command_service = LocalCommandService(
-                QuarantineSampleBytesAdapter(
-                    quarantine_bytes,
-                    max_sample_bytes=settings.local_analysis_max_sample_bytes,
-                ),
-                LocalCommandRunner(
-                    max_sample_bytes=settings.local_analysis_max_sample_bytes,
-                ),
-                local_command_catalog,
-                enabled=settings.local_analysis_enabled,
-                max_sample_bytes=settings.local_analysis_max_sample_bytes,
-            )
-        if settings.local_analysis_enabled:
-            static_analysis = StaticAnalysisService(
-                blob_catalog,
-                uow_factory,
-                max_sample_bytes=settings.analysis_max_sample_bytes,
-                string_min_length=settings.analysis_string_min_length,
-                max_strings=settings.analysis_max_strings,
-            )
-            capabilities_analysis = CapabilitiesService(
-                blob_catalog,
-                uow_factory,
-                rules_path=settings.analysis_capa_rules_path,
-                timeout_seconds=settings.analysis_capa_timeout_seconds,
-                max_output_bytes=settings.analysis_capa_max_output_bytes,
-                max_memory_bytes=settings.analysis_capa_max_memory_bytes,
-            )
-            code_features = CodeFeatureService(blob_catalog, uow_factory, SmdaAdapter())
-            goodware_measurement = GoodwareMeasurementService(
-                blob_store,
-                uow_factory,
-                cache_root=settings.goodware_cache_root,
-            )
-        if settings.rule_workbench_enabled:
-            yara_engine = IsolatedYaraRunner()
-        acquisition_service = (
-            VirusTotalSampleAcquisitionService(
-                vt_adapter,
-                vt_capabilities,
-                blob_catalog,
-                uow_factory,
-                LocalIdentityProvider("system:investigation"),
-            )
-            if vt_adapter is not None
-            else None
-        )
         seed_enrichment = VirusTotalSeedEnrichmentService(
             vt_adapter,
             vt_observations,
@@ -397,28 +323,27 @@ async def _execute_job(job_id: UUID) -> int | None:
             retention_days=settings.model_conversation_retention_days,
             conversation_session_closer=bridge_provider,
         )
-        investigation_composition_factory = InvestigationCompositionFactory(
+        investigation_runtime_composition = build_investigation_runtime_composition_factory(
+            settings,
             uow_factory=uow_factory,
+            blob_store=blob_store,
+            blob_catalog=blob_catalog,
             artifact_store=production_artifact_store,
             model_conversations=model_conversation_service,
-            settings=settings,
-            optional_tool_ports=OptionalInvestigationToolPorts(
-                virustotal=vt_adapter,
-                shodan=shodan_adapter,
-                ghidra=ghidra_adapter,
-                acquisition=acquisition_service,
-                virustotal_observations=vt_observations,
-                vt_capabilities=vt_capabilities,
-                rule_corpus_bytes=quarantine_bytes,
-                yara_engine=yara_engine,
-                local_commands=local_command_service,
-                local_command_catalog=local_command_catalog,
-                sample_static_analysis=static_analysis,
-                sample_capabilities_analysis=capabilities_analysis,
-                sample_code_features=code_features,
-                sample_goodware=goodware_measurement,
+            vt_adapter=vt_adapter,
+            vt_capabilities=vt_capabilities,
+            vt_observations=vt_observations,
+            shodan_adapter=shodan_adapter,
+            ghidra_adapter=ghidra_adapter,
+            network_quarantine_factory=lambda investigation_id: ProductionQuarantinedCaptureSource(
+                uow_factory=uow_factory,
+                blob_catalog=blob_catalog,
+                settings=settings,
+                investigation_id=investigation_id,
             ),
+            retrohunt_http_client=retrohunt_http_client,
         )
+        investigation_composition_factory = investigation_runtime_composition.composition_factory
         investigation_runner = make_investigation_runner(
             uow_factory,
             investigation_composition_factory,
@@ -501,6 +426,8 @@ async def _execute_job(job_id: UUID) -> int | None:
             await vt_direct_client.aclose()
         if vt_proxy_client is not None:
             await vt_proxy_client.aclose()
+        if retrohunt_http_client is not None:
+            await retrohunt_http_client.aclose()
         if shodan_client is not None:
             await shodan_client.aclose()
         if ghidra_adapter is not None:
