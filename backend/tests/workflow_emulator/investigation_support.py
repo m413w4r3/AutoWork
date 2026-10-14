@@ -666,14 +666,18 @@ def decision(
     tool_call: Mapping[str, Any] | None = None,
     next_action: str = "continue",
     finding_proposals: list[Mapping[str, Any]] | None = None,
+    hypothesis_refs: list[str] | None = None,
 ) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "reasoning_summary": reasoning,
         "goal": "Use the next bounded evidence step for this verified article.",
         "proposed_tool_calls": [dict(tool_call)] if tool_call is not None else [],
         "finding_proposals": [dict(item) for item in finding_proposals or []],
         "next_action": next_action,
     }
+    if hypothesis_refs:
+        payload["hypothesis_refs"] = list(hypothesis_refs)
+    return payload
 
 
 def investigation_settings(

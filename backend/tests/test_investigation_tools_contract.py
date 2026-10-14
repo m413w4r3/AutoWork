@@ -363,3 +363,35 @@ async def test_acquisition_and_active_effects_have_distinct_policy_outcomes() ->
     )
     assert acquire_result.status is ToolInvocationStatus.POLICY_DENIED
     assert active_result.status is ToolInvocationStatus.NEEDS_REVIEW
+
+
+@pytest.mark.asyncio
+async def test_external_submit_follows_provider_policy_and_is_not_an_active_probe() -> None:
+    """A reviewed-artefact submission is governed like an external read, not always paused."""
+    registry = InMemoryToolRegistry()
+    submit = _definition("vt.retrohunt.submit", ToolEffect.EXTERNAL_SUBMIT)
+    adapter = FakeAdapter()
+    registry.register(submit, adapter)
+    dispatcher = RegistryToolDispatcher(registry)
+    arguments = {"sha256": "a" * 64}
+
+    allowed = await dispatcher.dispatch(
+        _context(),
+        tool_name=submit.name,
+        schema_version="1",
+        arguments=arguments,
+        purpose="submit the reviewed rule",
+        operation_key="submit-allowed",
+    )
+    denied = await dispatcher.dispatch(
+        _context(allowed=("shodan",)),
+        tool_name=submit.name,
+        schema_version="1",
+        arguments=arguments,
+        purpose="submit the reviewed rule",
+        operation_key="submit-denied",
+    )
+
+    assert allowed.status is ToolInvocationStatus.SUCCEEDED
+    assert denied.status is ToolInvocationStatus.POLICY_DENIED
+    assert adapter.calls == 1

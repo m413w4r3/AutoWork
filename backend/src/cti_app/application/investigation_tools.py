@@ -39,6 +39,10 @@ class ToolEffect(StrEnum):
     LOCAL_COMPUTE = "local_compute"
     ACQUIRE = "acquire"
     EXTERNAL_ACTIVE = "external_active"
+    # Discloses a bounded artefact to a provider and spends durable provider quota
+    # (e.g. a reviewed YARA rule). Provider and disclosure policy apply like an
+    # external read; the tool itself enforces its own explicit human authorization.
+    EXTERNAL_SUBMIT = "external_submit"
 
 
 class ToolConfidentiality(StrEnum):
@@ -603,7 +607,11 @@ class RegistryToolDispatcher:
     ) -> ToolInvocationStatus | None:
         if definition.effect is ToolEffect.EXTERNAL_ACTIVE:
             return ToolInvocationStatus.NEEDS_REVIEW
-        if definition.effect in (ToolEffect.ACQUIRE, ToolEffect.EXTERNAL_READ):
+        if definition.effect in (
+            ToolEffect.ACQUIRE,
+            ToolEffect.EXTERNAL_READ,
+            ToolEffect.EXTERNAL_SUBMIT,
+        ):
             if envelope is None:
                 return ToolInvocationStatus.POLICY_DENIED
             provider = definition.capability_key.partition(".")[0]

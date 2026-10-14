@@ -82,7 +82,7 @@ def register_retrohunt_tools(registry: ToolRegistry, *, service: RetrohuntServic
     """Register the optional tools; the caller supplies effective capabilities separately."""
     for name, schema in _TOOL_SCHEMAS.items():
         effect = (
-            ToolEffect.EXTERNAL_ACTIVE if name.endswith(".submit") else ToolEffect.EXTERNAL_READ
+            ToolEffect.EXTERNAL_SUBMIT if name.endswith(".submit") else ToolEffect.EXTERNAL_READ
         )
         registry.register(
             ToolDefinition(

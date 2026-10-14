@@ -39,7 +39,7 @@ from cti_app.domain.investigation import (
     ToolInvocationStatus,
 )
 from cti_app.domain.investigation_state import Hypothesis, HypothesisStatus
-from cti_app.domain.production import ProductionRun
+from cti_app.domain.production import ProductionRun, ProductionRunStatus, ProductionStage
 from cti_app.domain.retrohunt import (
     RetrohuntHit,
     RetrohuntProviderJob,
@@ -82,12 +82,30 @@ from tests.workflow_emulator.investigation_support import (
 pytestmark = [pytest.mark.integration, pytest.mark.workflow_fast]
 
 
-def _call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+async def _string_observation(
+    driver: WorkflowDriver,
+    observations: Sequence[EvidenceObservation],
+    *,
+    object_id: str,
+    marker: str,
+) -> EvidenceObservation:
+    for item in observations:
+        if item.kind is not EvidenceKind.BINARY_STRING or item.object_id != object_id:
+            continue
+        rendered = json.dumps(await driver.artifact_store.read_json(item.blob_id), ensure_ascii=True)
+        if marker in rendered:
+            return item
+    raise AssertionError(f"no BINARY_STRING observation for {object_id} carries {marker!r}")
+
+
+def _call(name: str, arguments: dict[str, Any], *, purpose: str | None = None) -> dict[str, Any]:
     return {
         "tool_name": name,
         "schema_version": "1",
         "arguments": arguments,
-        "purpose": f"Run the bounded synthetic {name} operation.",
+        # The purpose is part of the operation key: a retest after the corpus changed
+        # must state its own purpose, otherwise it is an idempotent replay.
+        "purpose": purpose or f"Run the bounded synthetic {name} operation.",
     }
 
 
@@ -308,7 +326,7 @@ async def _approve_opinion(
         sha256=opinion["content_sha256"],
     )
     assert approved.status_code == 200, approved.text
-    return opinion
+    return dict(approved.json()["approved"])
 
 
 def _assert_observations_reach_following_bridge_turns(
@@ -489,15 +507,8 @@ async def test_w14_a_similarity_rule_revision_and_new_article_sample(
                     ),
                 )
             if not versions:
-                observation = next(
-                    item
-                    for item in observations
-                    if item.kind is EvidenceKind.BINARY_STRING
-                    and item.object_id == sha_a
-                    and marker_common
-                    in json.dumps(
-                        await driver.artifact_store.read_json(item.blob_id), ensure_ascii=True
-                    )
+                observation = await _string_observation(
+                    driver, observations, object_id=sha_a, marker=marker_common
                 )
                 return decision(
                     "Propose a measured common loader motif as YARA v1.",
@@ -555,29 +566,17 @@ async def test_w14_a_similarity_rule_revision_and_new_article_sample(
                 return decision(
                     "Retest v1 on C; a miss keeps C a candidate and informs the revision.",
                     tool_call=_call(
-                        "rule.test", {"candidate_id": str(rule_candidate_id), "version": 1}
+                        "rule.test",
+                        {"candidate_id": str(rule_candidate_id), "version": 1},
+                        purpose="Retest immutable v1 now that stage C joined the corpus.",
                     ),
                 )
             if len(versions) == 1:
-                observation = next(
-                    item
-                    for item in observations
-                    if item.kind is EvidenceKind.BINARY_STRING
-                    and item.object_id == sha_c
-                    and marker_c
-                    in json.dumps(
-                        await driver.artifact_store.read_json(item.blob_id), ensure_ascii=True
-                    )
+                observation = await _string_observation(
+                    driver, observations, object_id=sha_c, marker=marker_c
                 )
-                first_observation = next(
-                    item
-                    for item in observations
-                    if item.kind is EvidenceKind.BINARY_STRING
-                    and item.object_id == sha_a
-                    and marker_common
-                    in json.dumps(
-                        await driver.artifact_store.read_json(item.blob_id), ensure_ascii=True
-                    )
+                first_observation = await _string_observation(
+                    driver, observations, object_id=sha_a, marker=marker_common
                 )
                 return decision(
                     "Revise v1 with C's new measured motif while retaining the A/B invariant.",
@@ -743,8 +742,11 @@ async def test_w14_a_similarity_rule_revision_and_new_article_sample(
             assert {sha_a, sha_b, sha_c} <= {item.sample_sha256 for item in associations}
             association_c = next(item for item in associations if item.sample_sha256 == sha_c)
             assert association_c.qualification is SampleQualification.CANDIDATE
+            # v1 is measured "tested" on A/B; v2 also matches C, an out-of-cluster
+            # candidate, which by policy keeps the version a candidate: C is never
+            # promoted to a confirmed member automatically.
             assert [(item.version, item.status.value) for item in versions] == [
-                (1, "candidate"),
+                (1, "tested"),
                 (2, "candidate"),
             ]
             assert {
@@ -762,19 +764,15 @@ async def test_w14_a_similarity_rule_revision_and_new_article_sample(
                 item.kind is EvidenceKind.BINARY_ANALYSIS and item.source == "sample_similarity"
                 for item in observations
             )
-            assert any(
-                item.kind is EvidenceKind.BINARY_STRING
-                and item.object_id == sha_c
-                and marker_c
-                in json.dumps(
-                    await driver.artifact_store.read_json(item.blob_id), ensure_ascii=True
-                )
-                for item in observations
-            )
+            await _string_observation(driver, observations, object_id=sha_c, marker=marker_c)
             assert len(findings) == 1
             new_sample = findings[0]
             assert new_sample.kind is FindingKind.NEW_SAMPLE
-            assert new_sample.subject_ref == sha_c
+            cited = {item.id: item for item in observations}
+            assert new_sample.observation_refs
+            assert all(
+                cited[ref].object_id == sha_c for ref in new_sample.observation_refs
+            ), "the NEW_SAMPLE finding must cite observations of sample C only"
             assert new_sample.novelty is NoveltyClass.NEW_TO_ARTICLE
             assert new_sample.assessment is FindingAssessment.SUPPORTED
 
@@ -935,6 +933,25 @@ async def test_w14_c_contradictory_report_keeps_one_hypothesis_open(
             )
             await _seed_hypotheses(uow_factory, seeded.investigation.id, (hypothesis,))
 
+            def _report(destination_ip: str, host: str) -> str:
+                return json.dumps(
+                    {
+                        "sample_sha256": sample_sha,
+                        "network_sessions": [
+                            {
+                                "protocol": "tcp",
+                                "destination_ip": destination_ip,
+                                "destination_port": 443,
+                                "host": host,
+                            }
+                        ],
+                    },
+                    sort_keys=True,
+                )
+
+            report_other = _report("192.0.2.55", "operator-run-a.invalid")
+            report_target = _report(target_host, "operator-run-b.invalid")
+
             async def choose_after_report(
                 observations: tuple[EvidenceObservation, ...],
             ) -> Mapping[str, Any]:
@@ -942,42 +959,42 @@ async def test_w14_c_contradictory_report_keeps_one_hypothesis_open(
                     invocations = tuple(
                         await uow.tool_invocations.list_for_investigation(seeded.investigation.id)
                     )
-                if not any(item.tool_name == "sandbox.report.import" for item in invocations):
-                    report_json = json.dumps(
-                        {
-                            "sample_sha256": sample_sha,
-                            "network_sessions": [
-                                {
-                                    "protocol": "tcp",
-                                    "destination_ip": "192.0.2.55",
-                                    "destination_port": 443,
-                                    "host": "operator-fixture.invalid",
-                                }
-                            ],
-                        },
-                        sort_keys=True,
-                    )
+                imports = [item for item in invocations if item.tool_name == "sandbox.report.import"]
+                if len(imports) < 2:
+                    payload = report_other if not imports else report_target
                     return decision(
-                        "Import the supplied bounded operator report, scoped to this exact sample.",
+                        "Import one supplied operator report, scoped to this exact sample.",
                         tool_call=_call(
                             "sandbox.report.import",
                             {
                                 "sample_sha256": sample_sha,
                                 "source": BehaviorEvidenceSource.OPERATOR.value,
-                                "report_json": report_json,
+                                "report_json": payload,
                             },
                         ),
                     )
-                report_observation = next(
+                report_observations = [
                     item
                     for item in observations
                     if item.source == "autowork.sandbox-report.operator"
                     and item.object_id == sample_sha
-                )
-                assert seeded.seed_observation is not None
+                ]
+                assert len(report_observations) == 2
+                # Observation IDs are deterministic per payload: pick them by content.
+                target_observation = None
+                other_observation = None
+                for item in report_observations:
+                    rendered = json.dumps(
+                        await driver.artifact_store.read_json(item.blob_id), ensure_ascii=True
+                    )
+                    if target_host in rendered:
+                        target_observation = item
+                    else:
+                        other_observation = item
+                assert target_observation is not None and other_observation is not None
                 return decision(
-                    "Keep the article assertion and the limited negative run linked to H-C2-1; "
-                    "their disagreement leaves the hypothesis open.",
+                    "Two independent operator runs disagree about the endpoint; keep both linked "
+                    "to H-C2-1 so the disagreement leaves the hypothesis open.",
                     next_action=AgentNextAction.FINISH.value,
                     hypothesis_refs=[hypothesis.id],
                     finding_proposals=[
@@ -985,29 +1002,29 @@ async def test_w14_c_contradictory_report_keeps_one_hypothesis_open(
                             "kind": FindingKind.CLAIM_VERIFICATION.value,
                             "assessment": FindingAssessment.SUPPORTED.value,
                             "statement": (
-                                f"The source article asserts communication with {target_host}."
+                                f"An operator run records a session to {target_host}, in line "
+                                "with the article assertion."
                             ),
                             "subject_ref": sample_sha,
-                            "observation_refs": [str(seeded.seed_observation.id)],
-                            "claim_refs": [],
+                            "observation_refs": [str(target_observation.id)],
+                            "claim_refs": ["L1.1"],
                             "hypothesis_refs": [hypothesis.id],
                             "novelty": NoveltyClass.CLAIM_CORRECTION.value,
-                            "scope": "This finding records the source article's assertion.",
+                            "scope": "One supplied sample run and its recorded network events.",
                             "limitations": [
-                                "A source assertion is not independent proof of incident-time "
-                                "traffic."
+                                "A single supplied run does not establish incident-time traffic."
                             ],
                         },
                         {
                             "kind": FindingKind.CLAIM_VERIFICATION.value,
                             "assessment": FindingAssessment.REFUTED.value,
                             "statement": (
-                                "The supplied operator report records a different endpoint and "
-                                f"does not corroborate {target_host} in that run."
+                                "A second operator run records a different endpoint and does "
+                                f"not corroborate {target_host} in that run."
                             ),
                             "subject_ref": sample_sha,
-                            "observation_refs": [str(report_observation.id)],
-                            "claim_refs": [],
+                            "observation_refs": [str(other_observation.id)],
+                            "claim_refs": ["L1.1"],
                             "hypothesis_refs": [hypothesis.id],
                             "novelty": NoveltyClass.CLAIM_CORRECTION.value,
                             "scope": "One supplied sample run and its recorded network events.",
@@ -1044,20 +1061,18 @@ async def test_w14_c_contradictory_report_keeps_one_hypothesis_open(
                 state = await uow.investigation_states.get(seeded.investigation.id)
 
             assert any(item.source == "autowork.sandbox-report.operator" for item in observations)
-            assert sum(item.tool_name == "sandbox.report.import" for item in invocations) == 1
-            linked = [item for item in findings if item.subject_ref == sample_sha]
-            assert len(linked) == 2
-            assert {item.assessment for item in linked} == {
-                FindingAssessment.SUPPORTED,
-                FindingAssessment.REFUTED,
-            }
+            assert sum(item.tool_name == "sandbox.report.import" for item in invocations) == 2
             assert state is not None
             persisted_hypothesis = next(
                 item for item in state.hypotheses if item.id == hypothesis.id
             )
             assert persisted_hypothesis.status is HypothesisStatus.OPEN
-            assert {str(item) for item in persisted_hypothesis.finding_refs} == {
-                str(item.id) for item in linked
+            linked_ids = {str(item) for item in persisted_hypothesis.finding_refs}
+            linked = [item for item in findings if str(item.id) in linked_ids]
+            assert len(linked) == 2
+            assert {item.assessment for item in linked} == {
+                FindingAssessment.SUPPORTED,
+                FindingAssessment.REFUTED,
             }
             assert all(len(item.observation_refs) == 1 for item in linked)
             _assert_observations_reach_following_bridge_turns(transport, invocations)
@@ -1379,10 +1394,17 @@ async def test_w14_e_retrohunt_subject_slots_replay_and_concurrent_investigation
             article_claim="Two scoped investigations measure a local candidate before Retrohunt.",
         )
 
+        # The first seeded run is still queued (active); a subject admits a single
+        # active run, so the independent second run is a completed one.
+        completed_at = datetime.now(UTC)
         second_run = ProductionRun(
             subject_id=first.subject.id,
             edition_id=first.edition.id,
             run_number=2,
+            status=ProductionRunStatus.READY,
+            current_stage=ProductionStage.SYNTHESIS,
+            started_at=completed_at,
+            finished_at=completed_at,
         )
         second_publication = replace(
             first.publication,
@@ -1906,7 +1928,7 @@ async def test_w14_e_retrohunt_subject_slots_replay_and_concurrent_investigation
         candidate_finding = next(
             item
             for item in first_findings
-            if item.kind is FindingKind.NEW_SAMPLE and item.subject_ref == hit_observation.object_id
+            if item.kind is FindingKind.NEW_SAMPLE and hit_observation.id in item.observation_refs
         )
         assert candidate_finding.assessment is FindingAssessment.QUALIFIED
         async with uow_factory() as uow:

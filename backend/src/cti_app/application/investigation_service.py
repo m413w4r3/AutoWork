@@ -551,6 +551,7 @@ class InvestigationService:
                 ToolEffect.EXTERNAL_READ,
                 ToolEffect.ACQUIRE,
                 ToolEffect.EXTERNAL_ACTIVE,
+                ToolEffect.EXTERNAL_SUBMIT,
             }
             if (
                 invocation is not None
@@ -1561,7 +1562,11 @@ def _envelope_reduced_since(
 def _tool_allowed_by_envelope(definition: Any, envelope: InvestigationEnvelope | None) -> bool:
     if envelope is None or definition.effect is ToolEffect.EXTERNAL_ACTIVE:
         return False
-    if definition.effect in {ToolEffect.EXTERNAL_READ, ToolEffect.ACQUIRE}:
+    if definition.effect in {
+        ToolEffect.EXTERNAL_READ,
+        ToolEffect.ACQUIRE,
+        ToolEffect.EXTERNAL_SUBMIT,
+    }:
         provider = definition.capability_key.partition(".")[0]
         if (
             provider not in envelope.allowed_providers
