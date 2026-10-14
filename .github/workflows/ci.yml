@@ -31,13 +31,22 @@ jobs:
         working-directory: backend
     steps:
       - uses: actions/checkout@v4
-      - name: Install Poppler utilities for PDF render tests
+      - name: Install Poppler, TShark and bubblewrap for render and network workbench tests
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends --yes poppler-utils
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends --yes \
+            poppler-utils tshark bubblewrap
+          # Ubuntu 24.04 restricts unprivileged user namespaces; the confined analysis
+          # runner needs them for the filesystem confinement of tshark/capinfos.
+          if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
           command -v pdftoppm
           command -v pdftotext
           command -v pdfinfo
+          command -v tshark
+          command -v capinfos
+          command -v bwrap
       - name: Install pinned D2 for diagram compilation tests
         run: |
           ../scripts/install-d2.sh "$RUNNER_TEMP/d2"
