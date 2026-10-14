@@ -204,6 +204,8 @@ class NetworkWorkbench:
             )
         except QuarantineCaptureTooLargeError as exc:
             raise NetworkCaptureRejected(NetworkCaptureRejection.SIZE_LIMIT) from exc
+        except NetworkCaptureRejected:
+            raise
         except (OSError, ValueError) as exc:
             raise NetworkCaptureRejected(NetworkCaptureRejection.BLOB_UNAVAILABLE) from exc
         if not isinstance(quarantined.content, bytes):

@@ -52,10 +52,11 @@ _CAPTURE_REF_SCHEMA: dict[str, Any] = {
 
 def network_tool_capabilities(tshark: TsharkAdapter) -> frozenset[str]:
     """Discover L5 registry keys without importing or starting optional tools."""
-    capabilities = {NETWORK_STREAM_REASSEMBLE, NETWORK_MESSAGES_SEGMENT}
-    if tshark.available:
-        capabilities.add(NETWORK_CAPTURE_INSPECT)
-    return frozenset(capabilities)
+    return (
+        NETWORK_TOOL_NAMES
+        if tshark.available
+        else frozenset({NETWORK_STREAM_REASSEMBLE, NETWORK_MESSAGES_SEGMENT})
+    )
 
 
 def register_network_tools(
