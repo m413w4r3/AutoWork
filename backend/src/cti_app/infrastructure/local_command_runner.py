@@ -16,9 +16,10 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
-from typing import cast
+from typing import BinaryIO, cast
 
 from cti_app.application.local_analysis import LocalCommandCapability
 from cti_app.config import get_settings
@@ -31,6 +32,9 @@ from cti_app.domain.local_analysis import (
 )
 from cti_app.infrastructure.seccomp_network import (
     install_network_seccomp_filter as _install_network_seccomp_filter,
+)
+from cti_app.infrastructure.seccomp_network import (
+    network_seccomp_filter_program,
 )
 
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
@@ -49,7 +53,32 @@ _PRIVATE_KEY_BLOCK = re.compile(
 )
 _DEFAULT_MAX_SAMPLE_BYTES = 200 * 1024 * 1024
 _FAILED_NAMESPACE_LAUNCHERS: set[tuple[str, str]] = set()
+_FAILED_NAMESPACE_LAUNCHER_REASONS: dict[tuple[str, str], NamespaceFailureReason] = {}
 _NAMESPACE_LAUNCHERS_LOCK = threading.Lock()
+
+
+class NetworkIsolationStatus(StrEnum):
+    BWRAP_NET = "bwrap-net"
+    UNSHARE_NET = "unshare-net"
+    SECCOMP_ONLY = "seccomp-network-syscall-filter"
+
+
+class NamespaceFailureReason(StrEnum):
+    BWRAP_NOT_INSTALLED = "bwrap_not_installed"
+    BWRAP_PROBE_FAILED = "bwrap_probe_failed"
+    BWRAP_PREVIOUSLY_FAILED = "bwrap_previously_failed"
+    UNSHARE_NOT_INSTALLED = "unshare_not_installed"
+    UNSHARE_PROBE_FAILED = "unshare_probe_failed"
+    UNSHARE_PREVIOUSLY_FAILED = "unshare_previously_failed"
+    NAMESPACE_LAUNCHER_FAILED_DURING_EXECUTION = "namespace_launcher_failed_during_execution"
+    NO_NETWORK_NAMESPACE_AVAILABLE = "no_network_namespace_available"
+
+
+@dataclass(frozen=True, slots=True)
+class _NamespaceDetection:
+    status: NetworkIsolationStatus
+    launcher: tuple[str, str] | None
+    reasons: tuple[NamespaceFailureReason, ...] = ()
 
 
 class LocalCommandRunner:
@@ -70,18 +99,35 @@ class LocalCommandRunner:
             if require_filesystem_confinement is None
             else require_filesystem_confinement
         )
-        launcher = _detect_network_namespace(network_sandbox_probe_seconds)
-        self._namespace_launcher = None if _namespace_launcher_failed(launcher) else launcher
+        detection = _detect_network_namespace(network_sandbox_probe_seconds)
+        if detection is None:
+            detection = _NamespaceDetection(
+                NetworkIsolationStatus.SECCOMP_ONLY,
+                None,
+                (NamespaceFailureReason.NO_NETWORK_NAMESPACE_AVAILABLE,),
+            )
+        self._namespace_detection = detection
+        self._namespace_launcher = detection.launcher
 
     @property
     def network_isolation(self) -> str:
-        if self._namespace_launcher is not None:
-            return self._namespace_launcher[0]
-        return "seccomp-network-syscall-filter"
+        return self._namespace_detection.status.value
+
+    @property
+    def namespace_status(self) -> NetworkIsolationStatus:
+        return self._namespace_detection.status
+
+    @property
+    def namespace_reasons(self) -> tuple[NamespaceFailureReason, ...]:
+        return self._namespace_detection.reasons
+
+    @property
+    def namespace_reason(self) -> NamespaceFailureReason | None:
+        return self._namespace_detection.reasons[-1] if self._namespace_detection.reasons else None
 
     @property
     def filesystem_confined(self) -> bool:
-        return self._namespace_launcher is not None and self._namespace_launcher[0] == "bwrap-net"
+        return self._namespace_detection.status is NetworkIsolationStatus.BWRAP_NET
 
     async def run(
         self,
@@ -175,20 +221,53 @@ class LocalCommandRunner:
                 options,
             )
             logical_argv = (*logical_argv, f"<options_sha256:{_options_sha256(options)}>")
+            seccomp_filter_file: BinaryIO | None = None
+            pass_fds: tuple[int, ...] = ()
+            install_filter_before_exec = True
             if self._namespace_launcher is not None:
-                argv = self._wrap_network_namespace(argv, sample_path, rule_path)
+                if self._namespace_launcher[0] == NetworkIsolationStatus.BWRAP_NET.value:
+                    try:
+                        seccomp_filter_file = _network_seccomp_filter_file()
+                        seccomp_fd = seccomp_filter_file.fileno()
+                        argv = self._wrap_network_namespace(
+                            argv, sample_path, rule_path, seccomp_fd=seccomp_fd
+                        )
+                    except OSError:
+                        if seccomp_filter_file is not None:
+                            seccomp_filter_file.close()
+                        return _make_result(
+                            spec,
+                            LocalCommandStatus.UNAVAILABLE,
+                            sample_sha256,
+                            started_at,
+                            time.monotonic() - monotonic_start,
+                            "",
+                            logical_argv,
+                            capability.version,
+                            "seccomp_filter_unavailable",
+                        )
+                    pass_fds = (seccomp_fd,)
+                    install_filter_before_exec = False
+                else:
+                    argv = self._wrap_network_namespace(argv, sample_path, rule_path)
             environment = {
                 "PATH": "/usr/bin:/bin",
                 "LANG": "C",
                 "LC_ALL": "C",
-                "HOME": "/analysis" if self.network_isolation == "bwrap-net" else str(directory),
+                "HOME": "/analysis"
+                if self.namespace_status is NetworkIsolationStatus.BWRAP_NET
+                else str(directory),
                 "TMPDIR": "/tmp"
-                if self._namespace_launcher and self._namespace_launcher[0] == "bwrap-net"
+                if self.namespace_status is NetworkIsolationStatus.BWRAP_NET
                 else str(directory),
             }
 
-            launch_argv = _sandbox_bootstrap_argv(argv, spec)
             try:
+                launch_argv = _sandbox_bootstrap_argv(
+                    argv,
+                    spec,
+                    install_network_filter_before_exec=install_filter_before_exec,
+                )
                 process = await asyncio.create_subprocess_exec(
                     *launch_argv,
                     cwd=directory,
@@ -197,6 +276,7 @@ class LocalCommandRunner:
                     stderr=asyncio.subprocess.PIPE,
                     env=environment,
                     start_new_session=True,
+                    pass_fds=pass_fds,
                 )
             except (OSError, subprocess.SubprocessError, ValueError):
                 return _make_result(
@@ -210,6 +290,9 @@ class LocalCommandRunner:
                     capability.version,
                     "isolation_or_process_start_unavailable",
                 )
+            finally:
+                if seccomp_filter_file is not None:
+                    seccomp_filter_file.close()
 
             assert process.stdout is not None
             assert process.stderr is not None
@@ -298,7 +381,13 @@ class LocalCommandRunner:
             ):
                 failed_launcher = self._namespace_launcher
                 self._namespace_launcher = None
-                _remember_failed_namespace_launcher(failed_launcher)
+                failure_reason = NamespaceFailureReason.NAMESPACE_LAUNCHER_FAILED_DURING_EXECUTION
+                self._namespace_detection = _NamespaceDetection(
+                    NetworkIsolationStatus.SECCOMP_ONLY,
+                    None,
+                    (*self._namespace_detection.reasons, failure_reason),
+                )
+                _remember_failed_namespace_launcher(failed_launcher, failure_reason)
                 return await self.run(
                     capability,
                     sample_sha256=sample_sha256,
@@ -350,12 +439,16 @@ class LocalCommandRunner:
         argv: list[str],
         sample_path: Path,
         rule_path: Path | None,
+        *,
+        seccomp_fd: int | None = None,
     ) -> list[str]:
         assert self._namespace_launcher is not None
         launcher, executable = self._namespace_launcher
-        if launcher == "unshare-net":
+        if launcher == NetworkIsolationStatus.UNSHARE_NET.value:
             return [executable, "--net", "--", *argv]
-        return _bwrap_command(executable, argv, sample_path, rule_path)
+        if seccomp_fd is None:
+            raise ValueError("bwrap requires a seccomp filter file descriptor")
+        return _bwrap_command(executable, argv, sample_path, rule_path, seccomp_fd=seccomp_fd)
 
 
 @dataclass(frozen=True, slots=True)
@@ -559,46 +652,66 @@ def _options_sha256(options: Mapping[str, object]) -> str:
 
 
 @lru_cache(maxsize=4)
-def _detect_network_namespace(timeout_seconds: float) -> tuple[str, str] | None:
+def _detect_network_namespace(timeout_seconds: float) -> _NamespaceDetection:
     environment = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"}
     bwrap = shutil.which("bwrap")
+    reasons: list[NamespaceFailureReason] = []
     if bwrap:
-        launcher = ("bwrap-net", bwrap)
-        if not _namespace_launcher_failed(launcher) and _probe_bwrap_namespace(
-            bwrap, environment, timeout_seconds
-        ):
-            return launcher
+        launcher = (NetworkIsolationStatus.BWRAP_NET.value, bwrap)
+        if _namespace_launcher_failed(launcher):
+            reasons.append(_namespace_launcher_failure_reason(launcher))
+        elif _probe_bwrap_namespace(bwrap, environment, timeout_seconds):
+            return _NamespaceDetection(NetworkIsolationStatus.BWRAP_NET, launcher)
+        else:
+            reasons.append(NamespaceFailureReason.BWRAP_PROBE_FAILED)
+    else:
+        reasons.append(NamespaceFailureReason.BWRAP_NOT_INSTALLED)
+
     unshare = shutil.which("unshare")
-    if (
-        unshare
-        and not _namespace_launcher_failed(("unshare-net", unshare))
-        and _probe_namespace(
+    if unshare:
+        launcher = (NetworkIsolationStatus.UNSHARE_NET.value, unshare)
+        if _namespace_launcher_failed(launcher):
+            reasons.append(_namespace_launcher_failure_reason(launcher))
+        elif _probe_namespace(
             [unshare, "--net", "--", "/usr/bin/true"], environment, timeout_seconds
-        )
-    ):
-        return "unshare-net", unshare
-    return None
+        ):
+            return _NamespaceDetection(NetworkIsolationStatus.UNSHARE_NET, launcher, tuple(reasons))
+        else:
+            reasons.append(NamespaceFailureReason.UNSHARE_PROBE_FAILED)
+    else:
+        reasons.append(NamespaceFailureReason.UNSHARE_NOT_INSTALLED)
+    if not reasons:
+        reasons.append(NamespaceFailureReason.NO_NETWORK_NAMESPACE_AVAILABLE)
+    return _NamespaceDetection(NetworkIsolationStatus.SECCOMP_ONLY, None, tuple(reasons))
 
 
 def _probe_bwrap_namespace(
     executable: str, environment: dict[str, str], timeout_seconds: float
 ) -> bool:
-    """Exercise bwrap with the same namespace and read-only analysis mounts as a run."""
-    with tempfile.TemporaryDirectory(prefix="cti-bwrap-probe-") as temporary:
-        directory = Path(temporary)
-        sample_path = directory / "sample.bin"
-        sample_path.write_bytes(b"probe")
-        sample_path.chmod(0o400)
-        rule_path = directory / "rules.yar"
-        rule_path.write_text("rule probe { condition: true }\n", encoding="ascii")
-        rule_path.chmod(0o400)
-        command = _bwrap_command(
-            executable,
-            ["/usr/bin/true", "-b", str(sample_path), str(rule_path)],
-            sample_path,
-            rule_path,
-        )
-        return _probe_namespace(command, environment, timeout_seconds)
+    """Exercise bwrap with the run's mounts and the exact seccomp BPF program."""
+    try:
+        with tempfile.TemporaryDirectory(prefix="cti-bwrap-probe-") as temporary:
+            directory = Path(temporary)
+            sample_path = directory / "sample.bin"
+            sample_path.write_bytes(b"probe")
+            sample_path.chmod(0o400)
+            rule_path = directory / "rules.yar"
+            rule_path.write_text("rule probe { condition: true }\n", encoding="ascii")
+            rule_path.chmod(0o400)
+            with _network_seccomp_filter_file() as filter_file:
+                seccomp_fd = filter_file.fileno()
+                command = _bwrap_command(
+                    executable,
+                    ["/usr/bin/true", "-b", str(sample_path), str(rule_path)],
+                    sample_path,
+                    rule_path,
+                    seccomp_fd=seccomp_fd,
+                )
+                return _probe_namespace(
+                    command, environment, timeout_seconds, pass_fds=(seccomp_fd,)
+                )
+    except OSError:
+        return False
 
 
 def _namespace_launcher_failed(launcher: tuple[str, str] | None) -> bool:
@@ -608,9 +721,25 @@ def _namespace_launcher_failed(launcher: tuple[str, str] | None) -> bool:
         return launcher in _FAILED_NAMESPACE_LAUNCHERS
 
 
-def _remember_failed_namespace_launcher(launcher: tuple[str, str]) -> None:
+def _namespace_launcher_failure_reason(launcher: tuple[str, str]) -> NamespaceFailureReason:
+    with _NAMESPACE_LAUNCHERS_LOCK:
+        return _FAILED_NAMESPACE_LAUNCHER_REASONS.get(
+            launcher,
+            NamespaceFailureReason.BWRAP_PREVIOUSLY_FAILED
+            if launcher[0] == NetworkIsolationStatus.BWRAP_NET.value
+            else NamespaceFailureReason.UNSHARE_PREVIOUSLY_FAILED,
+        )
+
+
+def _remember_failed_namespace_launcher(
+    launcher: tuple[str, str],
+    reason: NamespaceFailureReason = (
+        NamespaceFailureReason.NAMESPACE_LAUNCHER_FAILED_DURING_EXECUTION
+    ),
+) -> None:
     with _NAMESPACE_LAUNCHERS_LOCK:
         _FAILED_NAMESPACE_LAUNCHERS.add(launcher)
+        _FAILED_NAMESPACE_LAUNCHER_REASONS[launcher] = reason
     _detect_network_namespace.cache_clear()
 
 
@@ -619,7 +748,13 @@ def _is_namespace_launcher_error(launcher: str, stderr: bytes) -> bool:
     return prefix is not None and stderr.lstrip().startswith(prefix)
 
 
-def _probe_namespace(command: list[str], env: dict[str, str], timeout_seconds: float) -> bool:
+def _probe_namespace(
+    command: list[str],
+    env: dict[str, str],
+    timeout_seconds: float,
+    *,
+    pass_fds: tuple[int, ...] = (),
+) -> bool:
     try:
         result = subprocess.run(
             command,
@@ -630,6 +765,7 @@ def _probe_namespace(command: list[str], env: dict[str, str], timeout_seconds: f
             env=env,
             shell=False,
             check=False,
+            pass_fds=pass_fds,
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -641,11 +777,18 @@ def _bwrap_command(
     argv: list[str],
     sample_path: Path,
     rule_path: Path | None,
+    *,
+    seccomp_fd: int,
 ) -> list[str]:
     command = [
         executable,
         "--unshare-net",
+        "--unshare-pid",
+        "--unshare-ipc",
+        "--unshare-uts",
         "--die-with-parent",
+        "--seccomp",
+        str(seccomp_fd),
         "--ro-bind",
         "/usr",
         "/usr",
@@ -663,6 +806,18 @@ def _bwrap_command(
     return command
 
 
+def _network_seccomp_filter_file() -> BinaryIO:
+    filter_file = tempfile.TemporaryFile(mode="w+b", prefix="cti-network-seccomp-")
+    try:
+        filter_file.write(network_seccomp_filter_program())
+        filter_file.flush()
+        filter_file.seek(0)
+    except BaseException:
+        filter_file.close()
+        raise
+    return filter_file
+
+
 def _kill_process_group(process_id: int) -> None:
     try:
         os.killpg(process_id, signal.SIGKILL)
@@ -670,7 +825,15 @@ def _kill_process_group(process_id: int) -> None:
         pass
 
 
-def _sandbox_bootstrap_argv(command: list[str], spec: LocalCommandSpec) -> list[str]:
+def _sandbox_bootstrap_argv(
+    command: list[str],
+    spec: LocalCommandSpec,
+    *,
+    install_network_filter_before_exec: bool = True,
+) -> list[str]:
+    filter_install = (
+        "module.install_network_seccomp_filter()\n" if install_network_filter_before_exec else ""
+    )
     bootstrap = (
         "import importlib.util, os, resource, sys\n"
         "cpu, memory, file_size = map(int, sys.argv[1:4])\n"
@@ -687,8 +850,8 @@ def _sandbox_bootstrap_argv(command: list[str], spec: LocalCommandSpec) -> list[
         "resource.setrlimit(resource.RLIMIT_FSIZE, (file_size, file_size))\n"
         "resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))\n"
         "resource.setrlimit(resource.RLIMIT_CORE, (0, 0))\n"
-        "module.install_network_seccomp_filter()\n"
-        "environment = os.environ.copy()\n"
+        + filter_install
+        + "environment = os.environ.copy()\n"
         "environment.pop('PYTHONPATH', None)\n"
         "os.execve(command[0], command, environment)\n"
     )
@@ -705,7 +868,7 @@ def _sandbox_bootstrap_argv(command: list[str], spec: LocalCommandSpec) -> list[
     ]
 
 
-def _sandbox_exec(arguments: list[str]) -> int:
+def _sandbox_exec(arguments: list[str], *, install_network_filter: bool = True) -> int:
     if len(arguments) < 5 or arguments[3] != "--":
         return 125
     try:
@@ -720,7 +883,8 @@ def _sandbox_exec(arguments: list[str]) -> int:
         resource.setrlimit(resource.RLIMIT_FSIZE, (file_size_limit, file_size_limit))
         resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-        _install_network_seccomp_filter()
+        if install_network_filter:
+            _install_network_seccomp_filter()
         environment = os.environ.copy()
         environment.pop("PYTHONPATH", None)
         os.execve(command[0], command, environment)
