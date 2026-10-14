@@ -503,8 +503,6 @@ def _register_network_tool_family(
 
     limits = NetworkExtractionLimitsV1()
     tshark = dependencies.tshark or TsharkAdapter(limits=limits)
-    if not tshark.available:
-        return None
 
     workbench = NetworkWorkbench(
         quarantine=quarantine,
