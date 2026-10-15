@@ -45,6 +45,8 @@ async def persist_discovery_fixture(
         evidence_pack_hash=sha256(f"evidence:{fixture_identity}".encode()).hexdigest(),
         parameters={"fixture_version": "workflow-discovery-v1"},
     )
+    source_tlps = tuple(bundles[label].source_tlp for label in subject_labels)
+    batch_tlp = max(source_tlps, key=tuple(TLP).index) if source_tlps else TLP.AMBER
     batch = DiscoveryBatch(
         edition_id=edition.id,
         request_hash=sha256(f"{fixture_identity}:request".encode()).hexdigest(),
@@ -53,7 +55,7 @@ async def persist_discovery_fixture(
         citations=(),
         discovery_run_id=discovery_run.id,
         discovery_model_run_id=model_run_id,
-        tlp=TLP.AMBER,
+        tlp=batch_tlp,
         sensitivity="public",
         external_llm_allowed=True,
         parser_version="workflow-discovery-v1",

@@ -41,6 +41,8 @@ frontend/playwright-report/
 docs/references/
 docs/operations/supervised-first-run-readiness.json
 docs/operations/supervised-first-run-readiness.md
+chpTypst/CascadiaCode/
+chpTypst/HankenGrotesk/
 data/
 !backend/src/cti_app/data/
 !backend/src/cti_app/data/legitimate_services_v1.json
