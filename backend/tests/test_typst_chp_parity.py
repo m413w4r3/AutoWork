@@ -821,7 +821,10 @@ def test_direct_v4_composition_is_deliberate_and_shares_chp_visual_modules() -> 
     assert human_document_imports[document_style] == {"apply-document-style"}
     assert production_imports[publication_helpers] == {"render-publication"}
     assert human_imports[shared_helpers] >= {"article", "ioc-list", "styled-table"}
-    assert re.search(r"#apply-document-style\s*\[\s*#render-publication\s*\(", production_source)
+    assert re.search(
+        r"#apply-document-style\s*(?:\(draft-watermark:[^\n]*\))?\s*\[\s*#render-publication\s*\(",
+        production_source,
+    )
     assert re.search(r"#apply-document-style\s*\[", human_document_source)
     assert re.search(r"#article\s*\(", human_source)
     assert not re.search(r"\barticle\s*\(", production_source + production_helpers_source)
