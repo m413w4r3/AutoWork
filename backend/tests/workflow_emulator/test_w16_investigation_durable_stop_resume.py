@@ -271,3 +271,42 @@ async def test_w16_g2_revocation_during_vt_archives_reply_and_blocks_followup(
         assert len(first_observation_ids) == 2
         assert first_observation_ids.issubset({item.id for item in observations})
         assert transport.submission_count == 1
+
+        resumed = await client.post(
+            f"/api/investigations/{seeded.investigation.id}/resume",
+            json={"expected_version": stopped.version},
+            headers={"Idempotency-Key": "w16-resume-with-revoked-g2"},
+        )
+        assert resumed.status_code == 200, resumed.text
+        await run_http_job(
+            app,
+            uow_factory,
+            registry,
+            dispatcher,
+            UUID(resumed.json()["job_id"]),
+        )
+
+    async with uow_factory() as uow:
+        resumed_state = await uow.investigation_states.get(seeded.investigation.id)
+        resumed_envelope = await uow.investigation_envelopes.get(seeded.investigation.id)
+        resumed_invocations = await uow.tool_invocations.list_for_investigation(
+            seeded.investigation.id
+        )
+        resumed_observations = await uow.evidence_observations.list_for_investigation(
+            seeded.investigation.id
+        )
+    assert resumed_state is not None
+    assert resumed_state.stop_reason is StopReason.MODEL_UNAVAILABLE
+    assert resumed_envelope is not None
+    assert resumed_envelope.allowed_providers == ()
+    assert resumed_envelope.budget.limits[BudgetDimension.VT_UNITS] == 0
+    assert resumed_envelope.budget.consumed[BudgetDimension.VT_UNITS] == 1
+    assert resumed_envelope.budget.reserved[BudgetDimension.VT_UNITS] == 0
+    assert virustotal.calls["file_report"] == 1
+    assert transport.submission_count == 1
+    assert len([item for item in resumed_invocations if item.status.value == "succeeded"]) == 1
+    assert len([item for item in resumed_invocations if item.status.value == "policy_denied"]) == 1
+    resumed_observation_ids = [item.id for item in resumed_observations]
+    assert first_observation_ids.issubset(set(resumed_observation_ids))
+    for observation_id in first_observation_ids:
+        assert sum(item.id == observation_id for item in resumed_observations) == 1
