@@ -26,6 +26,9 @@ COMPOSE_PROJECT ?= cti-bulletin
 # bypass target validation or the persistent marker for a started supervised run.
 CONFIRM_INITIAL_RESET ?= no
 SUPERVISED_FIRST_RUN_DB_DISPOSABLE ?= 0
+# Live smoke approval: the exact plan SHA-256 printed by `make smoke-live-plan`.
+SMOKE_LIVE_PLAN_SHA256 ?=
+SMOKE_LIVE_OPERATOR ?=
 
 # Application stack files. compose.models.yaml joins the external MetaHarness
 # network so the services reach the ChatGPT Bridge by its Docker name; without it
@@ -147,6 +150,8 @@ CLEAN_PATHS := \
 	test-backend \
 	preflight-supervised-first-run \
 	preflight-supervised-first-run-stack \
+	smoke-live \
+	smoke-live-plan \
 	test-frontend \
 	test-frontend-e2e \
 	test-integration \
@@ -330,6 +335,18 @@ preflight-supervised-first-run-stack: ## Prévol en lecture seule depuis le work
 		-e SUPERVISED_FIRST_RUN_DB_DISPOSABLE=1 \
 		worker python /app/scripts/ops/supervised_first_run_preflight.py \
 		$(PREFLIGHT_ARGS)
+
+SMOKE_LIVE_EXEC = $(STACK_COMPOSE) --project-name cti-bulletin exec -T \
+	worker python /app/scripts/ops/live_smoke.py
+
+smoke-live-plan: ## Affiche le plan du smoke live (requêtes, données, coût) et son SHA-256; aucun appel réseau
+	$(SMOKE_LIVE_EXEC) --plan-only
+
+smoke-live: ## Smoke live Bridge + VT (proxy) + Shodan passif depuis le worker; exige SMOKE_LIVE_PLAN_SHA256 et SMOKE_LIVE_OPERATOR
+	@if [ -n "$(PREFLIGHT_ARGS)" ]; then $(MAKE) preflight-supervised-first-run-stack; fi
+	$(SMOKE_LIVE_EXEC) \
+		$(if $(SMOKE_LIVE_PLAN_SHA256),--approve-sha256 "$(SMOKE_LIVE_PLAN_SHA256)") \
+		$(if $(SMOKE_LIVE_OPERATOR),--operator "$(SMOKE_LIVE_OPERATOR)")
 
 test-frontend: frontend-sync ## Lance les tests frontend
 	cd $(FRONTEND_DIR) && $(PNPM) test --run

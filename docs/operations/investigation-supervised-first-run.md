@@ -128,6 +128,29 @@ pas la stack : l’exécution de cette commande contre les conteneurs réels, le
 réseaux et leurs données reste à faire avant le premier run. Un échec garde le
 prévol en NO_GO.
 
+### Smoke live des fournisseurs (une commande)
+
+Après `make up`, depuis le worker de la stack (mêmes réglages et secrets que le
+run, jamais sur l'hôte) :
+
+```sh
+make smoke-live-plan                       # plan exact + SHA-256, aucun appel réseau
+make smoke-live SMOKE_LIVE_PLAN_SHA256=<sha> SMOKE_LIVE_OPERATOR=<nom>
+```
+
+Le smoke exécute : Bridge `GET /bridge/capabilities` et un tour synthétique
+(prompt fixe non sensible, conversation archivée ensuite), VirusTotal via le
+proxy (rapport, relation `contacted_ips` limitée à 5 et une recherche
+d'intelligence limitée à 1, sur le hash public EICAR), Shodan passif (`host`
+sur 8.8.8.8 et `count`). Pas de Retrohunt, de téléchargement, d'envoi, de scan
+ni de donnée d'enquête. L'approbation est liée au SHA-256 exact du plan ; sans
+elle, `make smoke-live` affiche le plan et sort en code 2. Ajouter
+`PREFLIGHT_ARGS="..."` y enchaîne le prévol de la stack. Code de sortie 0 si
+tout est `PASS`, 1 sinon (un fournisseur non configuré est `NOT_VALIDATED`).
+Il liste aussi, à titre informatif, les binaires locaux présents. Tests :
+`backend/tests/test_live_smoke.py` (transports simulés uniquement) ; aucun
+résultat live n'a été obtenu dans ce chantier.
+
 ## 4. Subject, investigation et décisions G2/G3
 
 Choisissez un `Subject` déjà sélectionné par son UUID et vérifiez les liens

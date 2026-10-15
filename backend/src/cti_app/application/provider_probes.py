@@ -357,8 +357,16 @@ class LiveSmokeEndpoint:
     expected_cost: str
 
     def __post_init__(self) -> None:
-        if self.method.upper() != "GET":
-            raise ValueError("live smoke endpoints may only use passive GET requests")
+        bridge_turn = (
+            self.method.upper() == "POST"
+            and self.provider.lower() == "bridge"
+            and self.operation.lower() == "turn"
+        )
+        if self.method.upper() != "GET" and not bridge_turn:
+            raise ValueError(
+                "live smoke endpoints may only use passive GET requests "
+                "(plus the synthetic Bridge turn)"
+            )
         if not all(
             value.strip()
             for value in (
