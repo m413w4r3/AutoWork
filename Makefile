@@ -22,6 +22,10 @@ FRONTEND_DIR := frontend
 # Keep this in sync with compose.yaml "name:".
 COMPOSE_PROJECT ?= cti-bulletin
 
+# `yes` confirms only the one-time cleanup of existing local DB data. It cannot
+# bypass target validation or the persistent marker for a started supervised run.
+CONFIRM_INITIAL_RESET ?= no
+
 # Application stack files. compose.models.yaml joins the external MetaHarness
 # network so the services reach the ChatGPT Bridge by its Docker name; without it
 # they fall back to host.docker.internal, which the loopback-only Bridge refuses.
@@ -282,7 +286,8 @@ logs: ## Suit les logs principaux
 clean: ## ATTENTION: supprime les données applicatives locales
 	$(UV_RUN) --project $(BACKEND_DIR) python scripts/ops/safe_local_reset.py \
 		--project-name "$(COMPOSE_PROJECT)" \
-		--compose-command '$(COMPOSE)'
+		--compose-command '$(COMPOSE)' \
+		$(if $(filter yes,$(CONFIRM_INITIAL_RESET)),--confirm-initial-reset,)
 
 clean-dev: ## Supprime uniquement les environnements de dépendances locaux
 	rm -rf $(BACKEND_DIR)/.venv

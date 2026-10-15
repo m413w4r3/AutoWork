@@ -146,7 +146,7 @@ def test_reset_refuses_workspace_bind_paths_outside_var(tmp_path: Path) -> None:
         reset.validate_reset_configuration(config, root=tmp_path, project_name="cti-bulletin")
 
 
-def test_run_marker_blocks_reset_before_any_deletion(tmp_path: Path) -> None:
+def test_real_run_marker_blocks_confirmed_reset_before_any_deletion(tmp_path: Path) -> None:
     config = _compose_config(tmp_path)
     plan = reset.validate_reset_configuration(config, root=tmp_path, project_name="cti-bulletin")
     present = reset.validate_volume_ownership(plan, _owned_volumes())
@@ -160,14 +160,15 @@ def test_run_marker_blocks_reset_before_any_deletion(tmp_path: Path) -> None:
         commands.append(command)
         return reset.CommandResult(0)
 
-    with pytest.raises(reset.ResetRefusedError, match="ProductionRun/AnalystInvestigation"):
+    with pytest.raises(reset.ResetRefusedError, match="premier run supervisé a démarré"):
         reset.safe_local_reset(
             plan=plan,
             present_volumes=present,
             compose_prefix=("docker", "compose", "-p", "cti-bulletin"),
             root=tmp_path,
-            database_marker_probe=lambda: True,
+            database_status_probe=lambda: reset.DatabaseResetStatus(run_started=True),
             dry_run=False,
+            confirm_initial_reset=True,
             runner=runner,
         )
 
@@ -191,24 +192,138 @@ def test_dry_run_checks_fake_db_and_leaves_volumes_and_paths_untouched(tmp_path:
         commands.append(command)
         return reset.CommandResult(0)
 
-    def probe_empty_database() -> bool:
+    def probe_empty_database() -> reset.DatabaseResetStatus:
         probes.append("checked")
-        return False
+        return reset.DatabaseResetStatus()
+
+    reported: list[str] = []
 
     messages = reset.safe_local_reset(
         plan=plan,
         present_volumes=present,
         compose_prefix=("docker", "compose", "-p", "cti-bulletin"),
         root=tmp_path,
-        database_marker_probe=probe_empty_database,
+        database_status_probe=probe_empty_database,
         dry_run=True,
+        reporter=reported.append,
         runner=runner,
     )
 
     assert probes == ["checked"]
     assert commands == []
-    assert any("cti-bulletin_postgres_data" in line for line in messages)
+    assert any("cti-bulletin_postgres_data" in line for line in reported)
+    assert any("production_runs=0" in line for line in reported)
+    assert any("analyst_investigations=0" in line for line in reported)
+    assert any("subjects=0" in line for line in reported)
+    assert any("editions=0" in line for line in reported)
+    assert "Dry-run validé : aucune donnée n'a été supprimée." in messages
     assert marker.read_text(encoding="utf-8") == "fixture"
+
+
+def test_initial_data_reset_requires_confirmation_and_displays_counts(tmp_path: Path) -> None:
+    plan = reset.validate_reset_configuration(
+        _compose_config(tmp_path), root=tmp_path, project_name="cti-bulletin"
+    )
+    present = reset.validate_volume_ownership(plan, _owned_volumes())
+    status = reset.DatabaseResetStatus(
+        production_runs=2,
+        analyst_investigations=1,
+        subjects=4,
+        editions=2,
+    )
+    reported: list[str] = []
+
+    with pytest.raises(reset.ResetRefusedError, match="make up-clean CONFIRM_INITIAL_RESET=yes"):
+        reset.safe_local_reset(
+            plan=plan,
+            present_volumes=present,
+            compose_prefix=("docker", "compose", "-p", "cti-bulletin"),
+            root=tmp_path,
+            database_status_probe=lambda: status,
+            dry_run=True,
+            reporter=reported.append,
+            runner=lambda _command, _root: reset.CommandResult(0),
+        )
+
+    assert any(
+        "production_runs=2, analyst_investigations=1, subjects=4, editions=2" in line
+        for line in reported
+    )
+    assert any("volumes à retirer" in line for line in reported)
+    assert any("chemins locaux à nettoyer" in line for line in reported)
+
+
+def test_initial_data_reset_accepts_explicit_confirmation(tmp_path: Path) -> None:
+    plan = reset.validate_reset_configuration(
+        _compose_config(tmp_path), root=tmp_path, project_name="cti-bulletin"
+    )
+    present = reset.validate_volume_ownership(plan, _owned_volumes())
+    workspace = tmp_path / "var/workspaces/subjects"
+    workspace.mkdir(parents=True)
+    (workspace / "legacy-test.txt").write_text("old test data", encoding="utf-8")
+    status = reset.DatabaseResetStatus(
+        production_runs=2,
+        analyst_investigations=1,
+        subjects=4,
+        editions=2,
+    )
+    commands: list[Sequence[str]] = []
+
+    def runner(command: Sequence[str], _root: Path) -> reset.CommandResult:
+        commands.append(command)
+        return reset.CommandResult(0)
+
+    outcome = reset.safe_local_reset(
+        plan=plan,
+        present_volumes=present,
+        compose_prefix=("docker", "compose", "-p", "cti-bulletin"),
+        root=tmp_path,
+        database_status_probe=lambda: status,
+        dry_run=False,
+        confirm_initial_reset=True,
+        runner=runner,
+    )
+
+    assert outcome == ("Données applicatives locales effacées.",)
+    assert not workspace.exists()
+    assert commands[0][-1] == "down"
+    assert [command[-1] for command in commands[1:]] == list(present)
+
+
+def test_reset_rechecks_run_marker_after_stopping_stack(tmp_path: Path) -> None:
+    plan = reset.validate_reset_configuration(
+        _compose_config(tmp_path), root=tmp_path, project_name="cti-bulletin"
+    )
+    present = reset.validate_volume_ownership(plan, _owned_volumes())
+    workspace = tmp_path / "var/workspaces/subjects"
+    workspace.mkdir(parents=True)
+    marker = workspace / "preserve.txt"
+    marker.write_text("run evidence", encoding="utf-8")
+    statuses = [
+        reset.DatabaseResetStatus(),
+        reset.DatabaseResetStatus(run_started=True),
+    ]
+    commands: list[Sequence[str]] = []
+
+    def runner(command: Sequence[str], _root: Path) -> reset.CommandResult:
+        commands.append(command)
+        return reset.CommandResult(0)
+
+    with pytest.raises(reset.ResetRefusedError, match="apparu pendant l'arrêt"):
+        reset.safe_local_reset(
+            plan=plan,
+            present_volumes=present,
+            compose_prefix=("docker", "compose", "-p", "cti-bulletin"),
+            root=tmp_path,
+            database_status_probe=lambda: statuses.pop(0),
+            dry_run=False,
+            confirm_initial_reset=True,
+            runner=runner,
+        )
+
+    assert len(statuses) == 0
+    assert commands == [["docker", "compose", "-p", "cti-bulletin", "down"]]
+    assert marker.read_text(encoding="utf-8") == "run evidence"
 
 
 def test_clean_reset_only_removes_prevalidated_targets_when_db_is_empty(tmp_path: Path) -> None:
@@ -230,7 +345,7 @@ def test_clean_reset_only_removes_prevalidated_targets_when_db_is_empty(tmp_path
         present_volumes=present,
         compose_prefix=("docker", "compose", "-p", "cti-bulletin"),
         root=tmp_path,
-        database_marker_probe=lambda: False,
+        database_status_probe=lambda: reset.DatabaseResetStatus(),
         dry_run=False,
         runner=runner,
     )

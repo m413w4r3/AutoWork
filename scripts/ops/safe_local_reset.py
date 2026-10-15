@@ -27,18 +27,42 @@ WORKSPACE_MOUNTS = {
     "/work/subjects": Path("var/workspaces/subjects"),
     "/work/editions": Path("var/workspaces/editions"),
 }
-_MARKER_SQL = """DO $reset_guard$
-DECLARE started boolean := false;
+# A persisted G2 envelope records an explicit approval (`approval_decision_id`
+# and `approved_at` are required columns). A tool invocation records a real
+# runtime attempt. Either is durable evidence that the supervised run began.
+_DATABASE_STATUS_SQL = """DO $reset_status$
+DECLARE
+  production_runs_count bigint := 0;
+  analyst_investigations_count bigint := 0;
+  subjects_count bigint := 0;
+  editions_count bigint := 0;
+  run_started boolean := false;
 BEGIN
   IF to_regclass('public.production_runs') IS NOT NULL THEN
-    EXECUTE 'SELECT EXISTS (SELECT 1 FROM public.production_runs)' INTO started;
+    EXECUTE 'SELECT count(*) FROM public.production_runs' INTO production_runs_count;
   END IF;
-  IF NOT started AND to_regclass('public.analyst_investigations') IS NOT NULL THEN
-    EXECUTE 'SELECT EXISTS (SELECT 1 FROM public.analyst_investigations)' INTO started;
+  IF to_regclass('public.analyst_investigations') IS NOT NULL THEN
+    EXECUTE 'SELECT count(*) FROM public.analyst_investigations'
+      INTO analyst_investigations_count;
   END IF;
-  RAISE NOTICE 'AUTOWORK_RUN_MARKER=%', started;
+  IF to_regclass('public.subjects') IS NOT NULL THEN
+    EXECUTE 'SELECT count(*) FROM public.subjects' INTO subjects_count;
+  END IF;
+  IF to_regclass('public.editions') IS NOT NULL THEN
+    EXECUTE 'SELECT count(*) FROM public.editions' INTO editions_count;
+  END IF;
+  IF to_regclass('public.investigation_envelopes') IS NOT NULL THEN
+    EXECUTE 'SELECT EXISTS (SELECT 1 FROM public.investigation_envelopes)'
+      INTO run_started;
+  END IF;
+  IF NOT run_started AND to_regclass('public.tool_invocations') IS NOT NULL THEN
+    EXECUTE 'SELECT EXISTS (SELECT 1 FROM public.tool_invocations)'
+      INTO run_started;
+  END IF;
+  RAISE NOTICE 'AUTOWORK_RESET_STATUS=%|%|%|%|%', production_runs_count,
+    analyst_investigations_count, subjects_count, editions_count, run_started;
 END
-$reset_guard$;"""
+$reset_status$;"""
 
 
 class ResetRefusedError(ValueError):
@@ -62,6 +86,26 @@ class CommandResult:
     stderr: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class DatabaseResetStatus:
+    production_runs: int = 0
+    analyst_investigations: int = 0
+    subjects: int = 0
+    editions: int = 0
+    run_started: bool = False
+
+    @property
+    def has_existing_data(self) -> bool:
+        return any(
+            (
+                self.production_runs,
+                self.analyst_investigations,
+                self.subjects,
+                self.editions,
+            )
+        )
+
+
 CommandRunner = Callable[[Sequence[str], Path], CommandResult]
 
 
@@ -70,7 +114,10 @@ def validate_reset_configuration(
 ) -> ResetPlan:
     """Validate project identity, local PostgreSQL DSN, volumes, and bind paths."""
     resolved_root = root.resolve()
-    if project_name != EXPECTED_PROJECT or compose_config.get("name") != EXPECTED_PROJECT:
+    if (
+        project_name != EXPECTED_PROJECT
+        or compose_config.get("name") != EXPECTED_PROJECT
+    ):
         raise ResetRefusedError(
             f"Refus du reset : le projet Compose doit être exactement {EXPECTED_PROJECT}."
         )
@@ -82,7 +129,9 @@ def validate_reset_configuration(
     postgres = services.get("postgres")
     backend = services.get("backend")
     if not isinstance(postgres, Mapping) or not isinstance(backend, Mapping):
-        raise ResetRefusedError("Refus du reset : services PostgreSQL/backend inconnus.")
+        raise ResetRefusedError(
+            "Refus du reset : services PostgreSQL/backend inconnus."
+        )
 
     postgres_environment = postgres.get("environment")
     backend_environment = backend.get("environment")
@@ -106,7 +155,9 @@ def validate_reset_configuration(
         dsn_host = parsed_dsn.hostname
         dsn_port = parsed_dsn.port
     except ValueError:
-        raise ResetRefusedError("Refus du reset : DSN PostgreSQL Compose invalide.") from None
+        raise ResetRefusedError(
+            "Refus du reset : DSN PostgreSQL Compose invalide."
+        ) from None
     if (
         parsed_dsn.scheme not in {"postgres", "postgresql", "postgresql+asyncpg"}
         or dsn_host != "postgres"
@@ -124,9 +175,14 @@ def validate_reset_configuration(
     for volume_key in VOLUME_KEYS:
         declaration = volumes.get(volume_key)
         if not isinstance(declaration, Mapping):
-            raise ResetRefusedError(f"Refus du reset : volume Compose {volume_key} absent.")
+            raise ResetRefusedError(
+                f"Refus du reset : volume Compose {volume_key} absent."
+            )
         expected_name = f"{EXPECTED_PROJECT}_{volume_key}"
-        if declaration.get("external") is True or declaration.get("name", expected_name) != expected_name:
+        if (
+            declaration.get("external") is True
+            or declaration.get("name", expected_name) != expected_name
+        ):
             raise ResetRefusedError(
                 f"Refus du reset : le volume {volume_key} ne porte pas le nom local attendu."
             )
@@ -152,7 +208,9 @@ def validate_reset_configuration(
                 f"Refus du reset : le workspace monté sur {target} doit rester sous var/."
             )
 
-    directories = tuple(_checked_local_path(resolved_root, item) for item in CLEAN_DIRECTORIES)
+    directories = tuple(
+        _checked_local_path(resolved_root, item) for item in CLEAN_DIRECTORIES
+    )
     files = tuple(_checked_local_path(resolved_root, item) for item in CLEAN_FILES)
     return ResetPlan(
         project_name=EXPECTED_PROJECT,
@@ -196,42 +254,88 @@ def safe_local_reset(
     present_volumes: Sequence[str],
     compose_prefix: Sequence[str],
     root: Path,
-    database_marker_probe: Callable[[], bool] | None,
+    database_status_probe: Callable[[], DatabaseResetStatus] | None,
     dry_run: bool,
+    confirm_initial_reset: bool = False,
+    reporter: Callable[[str], None] | None = None,
     runner: CommandRunner | None = None,
 ) -> tuple[str, ...]:
-    """Probe the durable run marker, then remove only validated local targets."""
+    """Check counts and durable run markers before removing validated targets."""
     if runner is None:
         runner = _run_command
+    if reporter is None:
+        reporter = lambda _message: None
     if not set(present_volumes).issubset(plan.volume_names):
-        raise ResetRefusedError("Refus du reset : la liste des volumes à effacer est inconnue.")
+        raise ResetRefusedError(
+            "Refus du reset : la liste des volumes à effacer est inconnue."
+        )
+    database_status = DatabaseResetStatus()
     if "postgres_data" in {
         name.removeprefix(f"{EXPECTED_PROJECT}_") for name in present_volumes
     }:
-        if database_marker_probe is None:
+        if database_status_probe is None:
             raise ResetRefusedError(
                 "Refus du reset : impossible de vérifier les marqueurs de run PostgreSQL."
             )
         try:
-            run_started = database_marker_probe()
-        except Exception:
+            database_status = database_status_probe()
+        except ResetRefusedError:
             raise ResetRefusedError(
                 "Refus du reset : impossible de vérifier les marqueurs de run PostgreSQL."
             ) from None
-        if run_started:
-            raise ResetRefusedError(
-                "Refus du reset : des ProductionRun/AnalystInvestigation existent déjà."
-            )
 
-    relative_paths = tuple(CLEAN_DIRECTORIES) + tuple(CLEAN_FILES)
-    if dry_run:
-        return (
-            f"projet Compose : {plan.project_name}",
-            "volumes : " + (", ".join(present_volumes) if present_volumes else "aucun"),
-            "chemins locaux : " + ", ".join(path.as_posix() for path in relative_paths),
+    plan_messages = (
+        (
+            f"données PostgreSQL : production_runs={database_status.production_runs}, "
+            f"analyst_investigations={database_status.analyst_investigations}, "
+            f"subjects={database_status.subjects}, editions={database_status.editions}"
+        ),
+        f"projet Compose : {plan.project_name}",
+        "volumes à retirer : "
+        + (", ".join(present_volumes) if present_volumes else "aucun"),
+        "chemins locaux à nettoyer : "
+        + ", ".join(path.as_posix() for path in (*CLEAN_DIRECTORIES, *CLEAN_FILES)),
+    )
+    for message in plan_messages:
+        reporter(message)
+
+    if database_status.run_started:
+        raise ResetRefusedError(
+            "Refus du reset : le premier run supervisé a démarré "
+            "(enveloppe G2 approuvée ou invocation d'outil persistée). "
+            "--confirm-initial-reset ne peut pas lever cette garde."
+        )
+    if database_status.has_existing_data and not confirm_initial_reset:
+        raise ResetRefusedError(
+            "Refus du reset : des données existent déjà. Pour confirmer l'unique "
+            "reset initial, relancez `make up-clean CONFIRM_INITIAL_RESET=yes` "
+            "ou `python scripts/ops/safe_local_reset.py --confirm-initial-reset`."
         )
 
+    if dry_run:
+        return ("Dry-run validé : aucune donnée n'a été supprimée.",)
+
     _run_checked(runner, [*compose_prefix, "down"], root, "arrêt de la stack locale")
+    if "postgres_data" in {
+        name.removeprefix(f"{EXPECTED_PROJECT}_") for name in present_volumes
+    }:
+        if database_status_probe is None:
+            raise ResetRefusedError(
+                "Refus du reset : impossible de revérifier le marqueur après l'arrêt "
+                "de la stack; les volumes sont conservés."
+            )
+        try:
+            stopped_status = database_status_probe()
+        except ResetRefusedError:
+            raise ResetRefusedError(
+                "Refus du reset : impossible de revérifier le marqueur après l'arrêt "
+                "de la stack; les volumes sont conservés."
+            ) from None
+        if stopped_status.run_started:
+            raise ResetRefusedError(
+                "Refus du reset : le marqueur du premier run est apparu pendant "
+                "l'arrêt de la stack; les volumes sont conservés."
+            )
     for volume_name in present_volumes:
         _run_checked(
             runner,
@@ -282,7 +386,9 @@ def _has_safe_workspace_bind(
             return False
         expected = _checked_local_path(root, relative_path)
         source_path = Path(source)
-        actual = (source_path if source_path.is_absolute() else root / source_path).resolve()
+        actual = (
+            source_path if source_path.is_absolute() else root / source_path
+        ).resolve()
         return actual == expected and actual.is_relative_to(root / "var")
     return False
 
@@ -293,7 +399,9 @@ def _checked_local_path(root: Path, relative_path: Path) -> Path:
     resolved_root = root.resolve()
     raw_var_root = resolved_root / "var"
     if raw_var_root.is_symlink():
-        raise ResetRefusedError("Refus du reset : var/ ne peut pas être un lien symbolique.")
+        raise ResetRefusedError(
+            "Refus du reset : var/ ne peut pas être un lien symbolique."
+        )
     var_root = raw_var_root.resolve()
     if not var_root.is_relative_to(resolved_root):
         raise ResetRefusedError("Refus du reset : var/ sort de la racine du projet.")
@@ -302,7 +410,9 @@ def _checked_local_path(root: Path, relative_path: Path) -> Path:
         raise ResetRefusedError("Refus du reset : un chemin de nettoyage sort de var/.")
     candidate = resolved_root / relative_path
     if candidate.is_symlink():
-        raise ResetRefusedError("Refus du reset : un chemin de nettoyage est un lien symbolique.")
+        raise ResetRefusedError(
+            "Refus du reset : un chemin de nettoyage est un lien symbolique."
+        )
     return path
 
 
@@ -348,7 +458,9 @@ def _load_compose_config(
             "Refus du reset : la configuration Compose n'est pas un JSON valide."
         ) from None
     if not isinstance(config, Mapping):
-        raise ResetRefusedError("Refus du reset : la configuration Compose est invalide.")
+        raise ResetRefusedError(
+            "Refus du reset : la configuration Compose est invalide."
+        )
     return config
 
 
@@ -397,7 +509,7 @@ def _inspect_project_volumes(
     return metadata, present
 
 
-def _database_marker_probe(
+def _database_status_probe(
     *,
     root: Path,
     compose_prefix: Sequence[str],
@@ -405,8 +517,8 @@ def _database_marker_probe(
     postgres_user: str,
     postgres_database: str,
     dry_run: bool,
-) -> Callable[[], bool]:
-    def probe() -> bool:
+) -> Callable[[], DatabaseResetStatus]:
+    def probe() -> DatabaseResetStatus:
         running = _run_checked(
             runner,
             [*compose_prefix, "ps", "--status", "running", "--services"],
@@ -436,6 +548,8 @@ def _database_marker_probe(
                     "postgres",
                     "psql",
                     "-qAt",
+                    "-F",
+                    "|",
                     "-v",
                     "ON_ERROR_STOP=1",
                     "-U",
@@ -443,17 +557,12 @@ def _database_marker_probe(
                     "-d",
                     postgres_database,
                     "-c",
-                    _MARKER_SQL,
+                    _DATABASE_STATUS_SQL,
                 ],
                 root,
                 "vérification des marqueurs de run PostgreSQL",
             )
-        except ResetRefusedError:
-            if started_here:
-                runner([*compose_prefix, "stop", "postgres"], root)
-            raise
-        combined = dsn_result.stdout + "\n" + dsn_result.stderr
-        if "AUTOWORK_RUN_MARKER=t" in combined:
+        finally:
             if started_here:
                 _run_checked(
                     runner,
@@ -461,14 +570,31 @@ def _database_marker_probe(
                     root,
                     "arrêt du PostgreSQL temporaire",
                 )
-            return True
-        if "AUTOWORK_RUN_MARKER=f" not in combined:
-            if started_here:
-                runner([*compose_prefix, "stop", "postgres"], root)
+        output = dsn_result.stdout + "\n" + dsn_result.stderr
+        status_line = next(
+            (
+                line.split("AUTOWORK_RESET_STATUS=", maxsplit=1)[1]
+                for line in output.splitlines()
+                if "AUTOWORK_RESET_STATUS=" in line
+            ),
+            "",
+        )
+        fields = status_line.strip().split("|")
+        if len(fields) != 5:
             raise ResetRefusedError(
-                "Refus du reset : PostgreSQL n'a pas confirmé l'absence de runs démarrés."
+                "Refus du reset : PostgreSQL a renvoyé un dénombrement invalide."
             )
-        return False
+        try:
+            counts = tuple(int(value) for value in fields[:4])
+        except ValueError:
+            raise ResetRefusedError(
+                "Refus du reset : PostgreSQL a renvoyé un dénombrement invalide."
+            ) from None
+        if any(value < 0 for value in counts) or fields[4].lower() not in {"t", "f"}:
+            raise ResetRefusedError(
+                "Refus du reset : PostgreSQL a renvoyé un état de run invalide."
+            )
+        return DatabaseResetStatus(*counts, run_started=fields[4].lower() == "t")
 
     return probe
 
@@ -478,7 +604,9 @@ def validate_local_docker_endpoint(endpoint: str) -> None:
     try:
         parsed = urlsplit(endpoint)
     except ValueError:
-        raise ResetRefusedError("Refus du reset : cible Docker locale inconnue.") from None
+        raise ResetRefusedError(
+            "Refus du reset : cible Docker locale inconnue."
+        ) from None
     if parsed.scheme != "unix" or not parsed.path.startswith("/") or parsed.netloc:
         raise ResetRefusedError(
             "Refus du reset : le reset exige un socket Docker Unix local."
@@ -516,7 +644,9 @@ def _verify_local_docker_context(
         payload = json.loads(inspected.stdout)
         endpoint = payload[0]["Endpoints"]["docker"]["Host"]
     except (IndexError, KeyError, TypeError, json.JSONDecodeError):
-        raise ResetRefusedError("Refus du reset : cible Docker locale inconnue.") from None
+        raise ResetRefusedError(
+            "Refus du reset : cible Docker locale inconnue."
+        ) from None
     if not isinstance(endpoint, str):
         raise ResetRefusedError("Refus du reset : cible Docker locale inconnue.")
     validate_local_docker_endpoint(endpoint)
@@ -527,6 +657,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--project-name", default=EXPECTED_PROJECT)
     parser.add_argument("--compose-command", default="docker compose")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--confirm-initial-reset",
+        action="store_true",
+        help="confirme le reset initial des données existantes avant le premier run",
+    )
     return parser
 
 
@@ -560,7 +695,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             runner=_run_command,
         )
         probe = (
-            _database_marker_probe(
+            _database_status_probe(
                 root=root,
                 compose_prefix=compose_prefix,
                 runner=_run_command,
@@ -576,8 +711,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             present_volumes=present_volumes,
             compose_prefix=compose_prefix,
             root=root,
-            database_marker_probe=probe,
+            database_status_probe=probe,
             dry_run=args.dry_run,
+            confirm_initial_reset=args.confirm_initial_reset,
+            reporter=print,
             runner=_run_command,
         )
     except ResetRefusedError as exc:
