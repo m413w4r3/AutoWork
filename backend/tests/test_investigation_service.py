@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 from dataclasses import replace
@@ -888,6 +889,42 @@ async def test_unavailable_tool_does_not_abort_later_agent_decision() -> None:
 
 
 @pytest.mark.asyncio
+async def test_two_tools_in_one_turn_use_latest_envelope_and_commit_both_budgets() -> None:
+    first = _tool_call("vt.search", "content:abc", "find related payloads")
+    second = _tool_call("vt.lookup", "content:def", "check a second payload")
+    fixture = _Fixture(
+        responses=[
+            _decision(goal="compare payloads", next_action="finish", tools=(first, second)),
+        ],
+        tools=(("vt.search", "vt"), ("vt.lookup", "vt")),
+    )
+    state = await fixture.start()
+
+    result = await fixture.service.run(state.investigation_id)
+
+    envelope = await fixture.envelopes.get(state.investigation_id)
+    assert result.stop_reason is StopReason.AGENT_FINISHED
+    assert fixture.execution_order == ["vt.search", "vt.lookup"]
+    assert fixture.bridge_transport.submission_count == 1
+    assert envelope is not None
+    assert envelope.budget.consumed[BudgetDimension.BRIDGE_TURNS] == 1
+    assert envelope.budget.consumed[BudgetDimension.VT_UNITS] == 2
+    for call in (first, second):
+        operation_key = tool_operation_key(
+            investigation_id=state.investigation_id,
+            tool_name=call["tool_name"],
+            schema_version=call["schema_version"],
+            normalized_parameters=call["arguments"],
+            purpose=call["purpose"],
+        )
+        reservation = next(
+            item for item in envelope.budget.reservations if item.operation_key == operation_key
+        )
+        assert reservation.status.value == "committed"
+        assert reservation.committed_amounts[BudgetDimension.VT_UNITS] == 1
+
+
+@pytest.mark.asyncio
 async def test_tool_outside_envelope_is_denied_with_alternative_and_budget_release() -> None:
     denied = _tool_call("vt.search", "content:abc", "check a related payload")
     fixture = _Fixture(
@@ -1008,6 +1045,8 @@ async def test_running_invocation_is_committed_before_dispatch_and_never_replaye
     assert invocation.status is ToolInvocationStatus.RUNNING
     assert operation_key in fixture.committed_running_keys
     assert fixture.tools["vt.search"].calls == [call["arguments"]]
+    with pytest.raises(ValueError, match="reconciled before resuming"):
+        await fixture.service.resume(state.investigation_id)
 
     ambiguous = await fixture.service.run(state.investigation_id)
     invocation = await fixture.invocations.get_by_operation_key(operation_key)
@@ -1042,6 +1081,176 @@ async def test_running_invocation_is_committed_before_dispatch_and_never_replaye
         len([item for item in envelope.budget.reservations if item.operation_key == operation_key])
         == 1
     )
+
+
+@pytest.mark.asyncio
+async def test_interrupt_during_bridge_wait_preserves_turn_for_resume() -> None:
+    call = _tool_call("vt.search", "content:resume", "check the pending payload")
+    fixture = _Fixture(
+        responses=[_decision(goal="check payload", next_action="finish", tools=(call,))],
+        tools=(("vt.search", "vt"),),
+    )
+    state = await fixture.start()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_submit = fixture.bridge_transport.submit
+    first_submit = True
+
+    async def delayed_submit(**kwargs):
+        nonlocal first_submit
+        if first_submit:
+            first_submit = False
+            entered.set()
+            await release.wait()
+        return await original_submit(**kwargs)
+
+    fixture.bridge_transport.submit = delayed_submit
+    worker = asyncio.create_task(fixture.service.run(state.investigation_id))
+    await asyncio.wait_for(entered.wait(), timeout=2)
+
+    stopped = await fixture.service.interrupt(state.investigation_id)
+    assert stopped.stop_reason is StopReason.USER_INTERRUPT
+    assert stopped.pending_context_snapshot_id is not None
+    release.set()
+    after_interrupt = await worker
+
+    assert after_interrupt.stop_reason is StopReason.USER_INTERRUPT
+    assert fixture.tools["vt.search"].calls == []
+    assert fixture.bridge_transport.submission_count == 1
+
+    await fixture.service.resume(state.investigation_id)
+    resumed = await fixture.service.run(state.investigation_id)
+
+    assert resumed.stop_reason is StopReason.AGENT_FINISHED
+    assert fixture.bridge_transport.submission_count == 1
+    assert fixture.tools["vt.search"].calls == [call["arguments"]]
+
+
+@pytest.mark.asyncio
+async def test_interrupt_during_tool_wait_archives_result_and_blocks_next_tool() -> None:
+    first = _tool_call("vt.search", "content:first", "check the first payload")
+    second = _tool_call("vt.search", "content:second", "check the second payload")
+    fixture = _Fixture(
+        responses=[
+            _decision(goal="check both payloads", next_action="finish", tools=(first, second))
+        ],
+        tools=(("vt.search", "vt"),),
+    )
+    state = await fixture.start()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed_tool():
+        entered.set()
+        await release.wait()
+
+    fixture.tools["vt.search"].after_execute = delayed_tool
+    worker = asyncio.create_task(fixture.service.run(state.investigation_id))
+    await asyncio.wait_for(entered.wait(), timeout=2)
+
+    stopped = await fixture.service.interrupt(state.investigation_id)
+    assert stopped.stop_reason is StopReason.USER_INTERRUPT
+    release.set()
+    after_interrupt = await worker
+
+    first_key, _ = _operation_and_observation_id(state.investigation_id, first)
+    first_invocation = await fixture.invocations.get_by_operation_key(first_key)
+    assert after_interrupt.stop_reason is StopReason.USER_INTERRUPT
+    assert first_invocation is not None
+    assert first_invocation.status is ToolInvocationStatus.SUCCEEDED
+    assert len(first_invocation.response_refs) == 1
+    assert len(await fixture.observations.list_for_investigation(state.investigation_id)) == 1
+    assert fixture.tools["vt.search"].calls == [first["arguments"]]
+
+    fixture.tools["vt.search"].after_execute = None
+    await fixture.service.resume(state.investigation_id)
+    resumed = await fixture.service.run(state.investigation_id)
+
+    assert resumed.stop_reason is StopReason.AGENT_FINISHED
+    assert fixture.tools["vt.search"].calls == [first["arguments"], second["arguments"]]
+    assert len(await fixture.observations.list_for_investigation(state.investigation_id)) == 2
+
+
+@pytest.mark.asyncio
+async def test_interrupt_after_running_checkpoint_prevents_tool_dispatch() -> None:
+    call = _tool_call("vt.search", "content:before-dispatch", "check before dispatch")
+    fixture = _Fixture(
+        responses=[_decision(goal="check payload", next_action="finish", tools=(call,))],
+        tools=(("vt.search", "vt"),),
+    )
+    state = await fixture.start()
+    original_update = fixture.invocations.update_if_version
+    interrupted = False
+
+    async def update_then_interrupt(invocation, *, expected_version):
+        nonlocal interrupted
+        saved = await original_update(invocation, expected_version=expected_version)
+        if saved.status is ToolInvocationStatus.RUNNING and not interrupted:
+            interrupted = True
+            await fixture.service.interrupt(state.investigation_id)
+        return saved
+
+    fixture.invocations.update_if_version = update_then_interrupt
+    result = await fixture.service.run(state.investigation_id)
+
+    operation_key, _ = _operation_and_observation_id(state.investigation_id, call)
+    invocation = await fixture.invocations.get_by_operation_key(operation_key)
+    assert result.stop_reason is StopReason.USER_INTERRUPT
+    assert invocation is not None
+    assert invocation.status is ToolInvocationStatus.FAILED
+    assert fixture.tools["vt.search"].calls == []
+
+
+@pytest.mark.asyncio
+async def test_external_timeout_requires_reconciliation_before_resume() -> None:
+    call = _tool_call("vt.search", "content:uncertain", "check an uncertain operation")
+    fixture = _Fixture(
+        responses=[_decision(goal="check payload", next_action="finish", tools=(call,))],
+        tools=(("vt.search", "vt"),),
+    )
+    state = await fixture.start()
+
+    async def timeout_after_dispatch():
+        raise TimeoutError("provider response was not confirmed")
+
+    fixture.tools["vt.search"].after_execute = timeout_after_dispatch
+    stopped = await fixture.service.run(state.investigation_id)
+
+    operation_key, _ = _operation_and_observation_id(state.investigation_id, call)
+    invocation = await fixture.invocations.get_by_operation_key(operation_key)
+    envelope = await fixture.envelopes.get(state.investigation_id)
+    reservation = next(
+        item for item in envelope.budget.reservations if item.operation_key == operation_key
+    )
+    assert stopped.stop_reason is StopReason.SUBMISSION_NEEDS_REVIEW
+    assert invocation is not None
+    assert invocation.status is ToolInvocationStatus.NEEDS_REVIEW
+    assert reservation.status.value == "reserved"
+    with pytest.raises(ValueError, match="reconciled before resuming"):
+        await fixture.service.resume(state.investigation_id)
+
+    await fixture.service.reconcile_invocation(
+        state.investigation_id,
+        invocation.id,
+        outcome=InvocationReconciliationOutcome.NOT_EXECUTED,
+        actor="analyst-1",
+        reason="The provider confirms the request did not execute.",
+        expected_version=invocation.version,
+        idempotency_key="w16-timeout-not-executed",
+    )
+    resolved_envelope = await fixture.envelopes.get(state.investigation_id)
+    resolved_reservation = next(
+        item
+        for item in resolved_envelope.budget.reservations
+        if item.operation_key == operation_key
+    )
+    assert resolved_reservation.status.value == "released"
+
+    fixture.tools["vt.search"].after_execute = None
+    await fixture.service.resume(state.investigation_id)
+    resumed = await fixture.service.run(state.investigation_id)
+    assert resumed.stop_reason is StopReason.AGENT_FINISHED
+    assert fixture.tools["vt.search"].calls == [call["arguments"]]
 
 
 @pytest.mark.asyncio

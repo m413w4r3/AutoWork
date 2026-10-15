@@ -279,6 +279,29 @@ class InvestigationBudget:
         self._reservations[operation_key] = reservation
         return reservation
 
+    def restore_reservation(self, reservation: BudgetReservation) -> BudgetReservation:
+        """Restore a canonical reservation record after a policy snapshot changes."""
+        if not isinstance(reservation, BudgetReservation):
+            raise TypeError("reservation must be a BudgetReservation")
+        existing = self._reservations.get(reservation.operation_key)
+        if existing is None:
+            self._reservations[reservation.operation_key] = reservation
+            return reservation
+        if existing == reservation:
+            return existing
+        if (
+            existing.status is not BudgetReservationStatus.RESERVED
+            or reservation.status is not BudgetReservationStatus.RESERVED
+        ):
+            raise ValueError("Only a reserved operation can be restored")
+        if any(
+            reservation.amounts.get(dimension) != amount
+            for dimension, amount in existing.amounts.items()
+        ):
+            raise ValueError("A restored reservation cannot change existing amounts")
+        self._reservations[reservation.operation_key] = reservation
+        return reservation
+
     def commit(
         self,
         operation_key: str,

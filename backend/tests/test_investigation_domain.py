@@ -175,6 +175,34 @@ def test_investigation_budget_reserve_commit_release_are_idempotent_and_bounded(
     assert budget.reserved[BudgetDimension.VT_UNITS] == 0
 
 
+def test_revoked_budget_can_restore_and_commit_an_in_flight_reservation() -> None:
+    approved = InvestigationBudget(
+        limits={BudgetDimension.VT_UNITS: 2, BudgetDimension.TOOL_SECONDS: 120}
+    )
+    reservation = approved.reserve(
+        "vt-read-1",
+        {BudgetDimension.VT_UNITS: 1, BudgetDimension.TOOL_SECONDS: 120},
+    )
+
+    revoked = InvestigationBudget(
+        limits={BudgetDimension.VT_UNITS: 0, BudgetDimension.TOOL_SECONDS: 120}
+    )
+    revoked.restore_reservation(reservation)
+
+    assert revoked.limits[BudgetDimension.VT_UNITS] == 0
+    assert revoked.reserved[BudgetDimension.VT_UNITS] == 1
+    with pytest.raises(BudgetExceeded) as raised:
+        revoked.reserve("vt-read-2", {BudgetDimension.VT_UNITS: 1})
+    assert raised.value.dimension is BudgetDimension.VT_UNITS
+
+    revoked.commit(
+        "vt-read-1",
+        {BudgetDimension.VT_UNITS: 1, BudgetDimension.TOOL_SECONDS: 4},
+    )
+    assert revoked.consumed[BudgetDimension.VT_UNITS] == 1
+    assert revoked.remaining[BudgetDimension.VT_UNITS] == 0
+
+
 def test_agenda_ranks_questions_by_potential_and_supports_flexible_actions() -> None:
     agenda = InvestigationAgenda(
         (

@@ -282,8 +282,10 @@ class _InvestigationService:
         self.uow._store.investigations[INVESTIGATION_ID].status = AnalystInvestigationStatus.RUNNING
         return state
 
-    async def resume(self, investigation_id: UUID):
+    async def resume(self, investigation_id: UUID, *, expected_version: int | None = None):
         state = await self.uow.investigation_states.get(investigation_id)
+        if expected_version is not None and state.version != expected_version:
+            raise ValueError("stale investigation version")
         updated = state.resume()
         if updated is not state:
             await self.uow.investigation_states.save_if_version(
@@ -292,8 +294,10 @@ class _InvestigationService:
         self.uow._store.investigations[investigation_id].status = AnalystInvestigationStatus.RUNNING
         return updated
 
-    async def interrupt(self, investigation_id: UUID):
+    async def interrupt(self, investigation_id: UUID, *, expected_version: int | None = None):
         state = await self.uow.investigation_states.get(investigation_id)
+        if expected_version is not None and state.version != expected_version:
+            raise ValueError("stale investigation version")
         updated = state.conclude(StopReason.USER_INTERRUPT)
         if updated is not state:
             await self.uow.investigation_states.save_if_version(
