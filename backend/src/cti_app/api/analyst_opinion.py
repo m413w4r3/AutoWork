@@ -5,9 +5,10 @@ from __future__ import annotations
 from typing import Any, cast
 from uuid import UUID
 
-from fastapi import APIRouter, Header, HTTPException, Request, status
+from fastapi import APIRouter, Header, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, ConfigDict, Field
 
+from cti_app.application.analyst_opinion_preview import AnalystOpinionPreviewService
 from cti_app.application.analyst_opinion_service import (
     AnalystOpinionDraftView,
     AnalystOpinionService,
@@ -30,7 +31,12 @@ from cti_app.application.protocol_diagram_projection import (
     opinion_protocol_figures,
 )
 from cti_app.application.publication_augmentation import PublicationAugmentationArtifactService
+from cti_app.application.publication_rendering import PublicationRenderError
+from cti_app.application.typst_compilation import TypstCompilationError
 from cti_app.domain.analyst_opinion import (
+    AnalystObservationRelation,
+    AnalystObservationState,
+    AnalystObservationV1,
     AnalystOpinionV1,
     OpinionBlock,
     OpinionBlockType,
@@ -49,7 +55,9 @@ class OpinionSelectionPayload(BaseModel):
 
     finding_ids: tuple[UUID, ...] = ()
     claim_ids: tuple[str, ...] = ()
-    block_types: tuple[OpinionBlockType, ...] = tuple(OpinionBlockType)
+    block_types: tuple[OpinionBlockType, ...] = tuple(
+        item for item in OpinionBlockType if item is not OpinionBlockType.ANALYST_OBSERVATIONS
+    )
 
 
 class ComposeOpinionPayload(BaseModel):
@@ -79,12 +87,37 @@ class OpinionBlockEdit(BaseModel):
         )
 
 
+class OpinionObservationEdit(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: UUID
+    anchor: str = Field(min_length=1, max_length=128)
+    text: str = Field(min_length=1, max_length=6000)
+    state: AnalystObservationState
+    relation: AnalystObservationRelation
+    finding_refs: tuple[UUID, ...] = ()
+    evidence_refs: tuple[UUID, ...] = ()
+
+    def to_domain(self) -> AnalystObservationV1:
+        return AnalystObservationV1(
+            id=self.id,
+            anchor=self.anchor,
+            text=self.text,
+            state=self.state,
+            relation=self.relation,
+            finding_refs=self.finding_refs,
+            evidence_refs=self.evidence_refs,
+        )
+
+
 class ReviseOpinionPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     expected_version: int = Field(ge=1)
+    expected_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     blocks: tuple[OpinionBlockEdit, ...]
     unresolved_points: tuple[str, ...] = ()
+    observations: tuple[OpinionObservationEdit, ...] | None = None
     protocol_model_blob_id: UUID | None = None
     protocol_views: tuple[ProtocolDiagramKind, ...] | None = Field(default=None, max_length=3)
 
@@ -102,6 +135,23 @@ class OpinionPublishPayload(BaseModel):
 
     version: int = Field(ge=1)
     expected_base_publication_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+def _opinion_preview_service(request: Request) -> AnalystOpinionPreviewService:
+    configured = getattr(request.app.state, "analyst_opinion_preview_service", None)
+    if configured is not None:
+        return cast(AnalystOpinionPreviewService, configured)
+    renderer = getattr(request.app.state, "publication_render_service", None)
+    if renderer is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "opinion_preview_rendering_unavailable"},
+        )
+    return AnalystOpinionPreviewService(
+        uow_factory=request.app.state.uow_factory,
+        artifact_store=request.app.state.production_artifact_store,
+        renderer=renderer,
+    )
 
 
 def _opinion_service(request: Request) -> AnalystOpinionService:
@@ -166,7 +216,9 @@ def _raise_opinion_error(exc: OpinionError) -> None:
         OpinionErrorCode.TLP_FORBIDDEN: status.HTTP_403_FORBIDDEN,
         OpinionErrorCode.DO_NOT_SUBMIT: status.HTTP_403_FORBIDDEN,
         OpinionErrorCode.INVALID_SELECTION: status.HTTP_422_UNPROCESSABLE_CONTENT,
+        OpinionErrorCode.INVALID_OBSERVATION_ANCHOR: status.HTTP_422_UNPROCESSABLE_CONTENT,
         OpinionErrorCode.CITATIONS_INVALID: status.HTTP_422_UNPROCESSABLE_CONTENT,
+        OpinionErrorCode.OPINION_NOT_DRAFT: status.HTTP_409_CONFLICT,
         OpinionErrorCode.INVALID_STATE: status.HTTP_422_UNPROCESSABLE_CONTENT,
         OpinionErrorCode.OPINION_NOT_APPROVED: status.HTTP_409_CONFLICT,
         OpinionErrorCode.STALE_VERSION: status.HTTP_409_CONFLICT,
@@ -195,8 +247,21 @@ def _opinion_payload(opinion: AnalystOpinionV1 | None) -> dict[str, Any] | None:
     if opinion is None:
         return None
     item = opinion
+    item_payload = item.to_payload()
+    item_payload["blocks"] = [
+        {
+            "type": block.block_type.value,
+            "text": block.text,
+            "finding_refs": [str(ref) for ref in block.finding_refs],
+            "evidence_refs": [str(ref) for ref in block.evidence_refs],
+            "qualification": block.qualification.value,
+            "certainty": block.certainty,
+        }
+        for block in item.blocks
+        if block.block_type is not OpinionBlockType.ANALYST_OBSERVATIONS
+    ]
     return {
-        **item.to_payload(),
+        **item_payload,
         "renderable_blocks": [
             {
                 "type": block.block_type.value,
@@ -207,6 +272,18 @@ def _opinion_payload(opinion: AnalystOpinionV1 | None) -> dict[str, Any] | None:
                 "certainty": block.certainty,
             }
             for block in item.renderable_blocks
+        ],
+        "observations": [
+            {
+                "id": str(observation.id),
+                "anchor": observation.anchor,
+                "text": observation.text,
+                "state": observation.state.value,
+                "relation": observation.relation.value,
+                "finding_refs": [str(ref) for ref in observation.finding_refs],
+                "evidence_refs": [str(ref) for ref in observation.evidence_refs],
+            }
+            for observation in item.observations
         ],
         "provenance": {
             "investigation_id": str(item.investigation_id),
@@ -274,6 +351,11 @@ async def revise_opinion(
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> dict[str, Any]:
     _require_idempotency_key(idempotency_key)
+    if payload.observations is not None and payload.expected_sha256 is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={"code": "expected_opinion_sha256_required_for_observation_edits"},
+        )
     actor_id = await _actor_id(request)
     protocol_figures = None
     if payload.protocol_model_blob_id is not None:
@@ -296,6 +378,11 @@ async def revise_opinion(
     edits = OpinionRevisionEdits(
         blocks=tuple(block.to_domain() for block in payload.blocks),
         unresolved_points=payload.unresolved_points,
+        observations=(
+            tuple(item.to_domain() for item in payload.observations)
+            if payload.observations is not None
+            else None
+        ),
         protocol_figures=protocol_figures,
     )
     try:
@@ -304,10 +391,50 @@ async def revise_opinion(
             payload.expected_version,
             edits,
             actor_id,
+            expected_sha256=payload.expected_sha256,
         )
     except OpinionError as exc:
         _raise_opinion_error(exc)
     return {"draft": _opinion_payload(opinion)}
+
+
+@router.get("/opinions/{opinion_id}/preview.pdf")
+async def preview_opinion_pdf(
+    opinion_id: UUID,
+    request: Request,
+    version: int = Query(ge=1),
+    opinion_sha256: str = Query(pattern=r"^[0-9a-f]{64}$"),
+    base_publication_sha256: str = Query(pattern=r"^[0-9a-f]{64}$"),
+) -> Response:
+    try:
+        preview = await _opinion_preview_service(request).preview_pdf(
+            opinion_id,
+            version=version,
+            expected_opinion_sha256=opinion_sha256,
+            expected_base_publication_sha256=base_publication_sha256,
+        )
+    except OpinionError as exc:
+        _raise_opinion_error(exc)
+    except (PublicationRenderError, TypstCompilationError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": getattr(exc, "code", "opinion_preview_render_failed")},
+        ) from exc
+    return Response(
+        content=preview.content,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="opinion-{preview.opinion_id}-v'
+                f'{preview.opinion_version}-draft.pdf"'
+            ),
+            "X-PDF-SHA256": preview.sha256,
+            "X-Opinion-Version": str(preview.opinion_version),
+            "X-Opinion-Content-SHA256": preview.opinion_sha256,
+            "X-Base-Publication-SHA256": preview.base_publication_sha256,
+            "X-Opinion-Status": "draft-unapproved",
+        },
+    )
 
 
 async def _compile_opinion_protocol_figures(

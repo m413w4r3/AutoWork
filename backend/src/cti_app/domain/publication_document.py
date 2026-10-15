@@ -1603,6 +1603,18 @@ class PublicationDocumentV6:
             raise PublicationDocumentV6ValidationError(
                 PublicationDocumentV6ErrorCode.OPINION_NOT_APPROVED
             )
+        anchors = publication_document_text_anchors(
+            self.base_publication.document,
+            references=self.base_publication.references,
+        )
+        if any(
+            observation.anchor not in anchors
+            or not observation.anchor.startswith(("lead:", "section:"))
+            for observation in opinion.observations
+        ):
+            raise PublicationDocumentV6ValidationError(
+                PublicationDocumentV6ErrorCode.OPINION_INVALID
+            )
         if hashlib.sha256(opinion.canonical_bytes()).hexdigest() != opinion.content_sha256:
             raise PublicationDocumentV6ValidationError(
                 PublicationDocumentV6ErrorCode.OPINION_INVALID

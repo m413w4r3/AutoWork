@@ -3,6 +3,6 @@
 
 #let publication = json("render-data.json")
 
-#apply-document-style[
+#apply-document-style(draft-watermark: publication.at("draft_watermark", default: none))[
   #render-publication(publication)
 ]

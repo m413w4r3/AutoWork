@@ -1,19 +1,38 @@
 from __future__ import annotations
 
+import hashlib
+from uuid import UUID
+
 import httpx
 import pytest
 from fastapi import FastAPI
 
 from cti_app.api.analyst_opinion import router
+from cti_app.application.analyst_opinion_preview import AnalystOpinionPreviewService
+from cti_app.application.analyst_opinion_service import AnalystOpinionService
 from cti_app.application.analyst_publication_service import AnalystPublicationService
 from cti_app.application.identity import Identity
 from cti_app.application.publication_augmentation import PublicationAugmentationArtifactService
+from cti_app.application.typst_compilation import CompiledTypstDocument
 from tests.test_analyst_opinion_service import make_opinion_harness
 
 
 class _IdentityProvider:
     async def current(self) -> Identity:
         return Identity(actor_id="editor:api")
+
+
+class _PreviewRenderer:
+    async def render_draft_preview(self, document, opinion, synthesis) -> CompiledTypstDocument:
+        content = b"%PDF-1.4\npreview fixture\n"
+        return CompiledTypstDocument(
+            media_type="application/pdf",
+            content=content,
+            sha256=hashlib.sha256(content).hexdigest(),
+            byte_size=len(content),
+            compiler="typst",
+            compiler_version="0.15.1",
+        )
 
 
 @pytest.mark.asyncio
@@ -32,6 +51,11 @@ async def test_opinion_api_composes_revises_approves_and_publishes_without_repin
     app.include_router(router)
     app.state.analyst_opinion_service = harness.service
     app.state.analyst_publication_service = publication_service
+    app.state.analyst_opinion_preview_service = AnalystOpinionPreviewService(
+        uow_factory=harness.uow_factory,  # type: ignore[arg-type]
+        artifact_store=harness.store,  # type: ignore[arg-type]
+        renderer=_PreviewRenderer(),
+    )
     app.state.identity_provider = _IdentityProvider()
 
     async with httpx.AsyncClient(
@@ -52,6 +76,7 @@ async def test_opinion_api_composes_revises_approves_and_publishes_without_repin
             f"/api/opinions/{draft['id']}/revise",
             json={
                 "expected_version": draft["version"],
+                "expected_sha256": draft["content_sha256"],
                 "blocks": [
                     {
                         "block_type": block["type"],
@@ -64,12 +89,127 @@ async def test_opinion_api_composes_revises_approves_and_publishes_without_repin
                     for block in draft["blocks"]
                 ],
                 "unresolved_points": draft["unresolved_points"],
+                "observations": [
+                    {
+                        "id": "00000000-0000-0000-0000-000000000991",
+                        "anchor": "lead:0001",
+                        "text": (
+                            "La corrélation des indices ajoute un lien absent du texte initial."
+                        ),
+                        "state": "inferred",
+                        "relation": "qualifies",
+                        "finding_refs": [str(harness.finding.id)],
+                        "evidence_refs": [str(harness.observation.id)],
+                    }
+                ],
             },
             headers={"Idempotency-Key": "revise-1"},
         )
         assert revise.status_code == 200
         revised = revise.json()["draft"]
         assert revised["version"] == draft["version"] + 1
+        assert revised["observations"][0]["anchor"] == "lead:0001"
+
+        revise_again = await client.post(
+            f"/api/opinions/{draft['id']}/revise",
+            json={
+                "expected_version": revised["version"],
+                "expected_sha256": revised["content_sha256"],
+                "blocks": [
+                    {
+                        "block_type": block["type"],
+                        "text": block["text"],
+                        "finding_refs": block["finding_refs"],
+                        "evidence_refs": block["evidence_refs"],
+                        "qualification": block["qualification"],
+                        "certainty": block["certainty"],
+                    }
+                    for block in revised["blocks"]
+                ],
+                "unresolved_points": revised["unresolved_points"],
+                "observations": [
+                    {
+                        **revised["observations"][0],
+                        "text": "La seconde retouche conserve la réserve sur l'attribution.",
+                    }
+                ],
+            },
+            headers={"Idempotency-Key": "revise-2"},
+        )
+        assert revise_again.status_code == 200
+        revised = revise_again.json()["draft"]
+        assert revised["version"] == draft["version"] + 2
+
+        stale_revise = await client.post(
+            f"/api/opinions/{draft['id']}/revise",
+            json={
+                "expected_version": revised["version"] - 1,
+                "expected_sha256": revised["content_sha256"],
+                "blocks": [
+                    {
+                        "block_type": block["type"],
+                        "text": block["text"],
+                        "finding_refs": block["finding_refs"],
+                        "evidence_refs": block["evidence_refs"],
+                        "qualification": block["qualification"],
+                        "certainty": block["certainty"],
+                    }
+                    for block in revised["blocks"]
+                ],
+                "unresolved_points": revised["unresolved_points"],
+                "observations": [
+                    {
+                        **revised["observations"][0],
+                        "text": "Cette retouche périmée ne doit pas être persistée.",
+                    }
+                ],
+            },
+            headers={"Idempotency-Key": "revise-stale"},
+        )
+        assert stale_revise.status_code == 409
+
+        # A fresh service object simulates a process restart against persisted versions.
+        app.state.analyst_opinion_service = AnalystOpinionService(
+            uow_factory=harness.uow_factory,  # type: ignore[arg-type]
+            artifact_store=harness.store,  # type: ignore[arg-type]
+        )
+        restarted = await client.get(f"/api/investigations/{investigation_id}/opinion")
+        assert restarted.status_code == 200
+        assert len(restarted.json()["history"]) == 3
+        assert restarted.json()["draft"]["observations"][0]["text"] == (
+            "La seconde retouche conserve la réserve sur l'attribution."
+        )
+
+        opinion_id = UUID(draft["id"])
+        versions_before_preview = tuple(harness.uow.analyst_opinions.items[opinion_id])
+        artifacts_before_preview = tuple(harness.artifacts.items)
+        decisions_before_preview = tuple(harness.decisions.items)
+        preview = await client.get(
+            f"/api/opinions/{draft['id']}/preview.pdf",
+            params={
+                "version": revised["version"],
+                "opinion_sha256": revised["content_sha256"],
+                "base_publication_sha256": revised["provenance"]["base_publication_sha256"],
+            },
+        )
+        assert preview.status_code == 200
+        assert preview.headers["content-type"] == "application/pdf"
+        assert preview.headers["x-opinion-status"] == "draft-unapproved"
+        assert preview.headers["x-pdf-sha256"] == hashlib.sha256(preview.content).hexdigest()
+        assert tuple(harness.uow.analyst_opinions.items[opinion_id]) == versions_before_preview
+        assert tuple(harness.artifacts.items) == artifacts_before_preview
+        assert tuple(harness.decisions.items) == decisions_before_preview
+
+        stale_preview = await client.get(
+            f"/api/opinions/{draft['id']}/preview.pdf",
+            params={
+                "version": revised["version"],
+                "opinion_sha256": "0" * 64,
+                "base_publication_sha256": revised["provenance"]["base_publication_sha256"],
+            },
+        )
+        assert stale_preview.status_code == 409
+        assert tuple(harness.uow.analyst_opinions.items[opinion_id]) == versions_before_preview
 
         approve = await client.post(
             f"/api/opinions/{draft['id']}/approve",
@@ -104,7 +244,7 @@ async def test_opinion_api_composes_revises_approves_and_publishes_without_repin
 
         current = await client.get(f"/api/investigations/{investigation_id}/opinion")
         assert current.status_code == 200
-        assert len(current.json()["history"]) == 3
+        assert len(current.json()["history"]) == 4
         assert current.json()["renderable_blocks"]
         assert current.json()["citation_violations"] == []
 

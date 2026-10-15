@@ -12,11 +12,15 @@ from cti_app.application.publication_augmentation import (
 )
 from cti_app.application.publication_builder import build_publication_document_v5
 from cti_app.domain.analyst_opinion import (
+    AnalystObservationRelation,
+    AnalystObservationState,
+    AnalystObservationV1,
     AnalystOpinionStatus,
     AnalystOpinionV1,
     OpinionBlock,
     OpinionBlockType,
     OpinionClaimQualification,
+    opinion_blocks_with_observations,
 )
 from cti_app.domain.investigation import (
     EvidenceKind,
@@ -136,6 +140,35 @@ def test_v6_round_trip_keeps_exact_v5_wrapper_and_opinion_provenance() -> None:
     assert serialize_publication_document(base) == base_bytes
     assert payload["schema_version"] == "6"
     assert payload["base_publication"]["schema_version"] == PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION
+
+
+def test_v6_round_trip_keeps_anchored_observations_in_the_opinion_projection() -> None:
+    base = _base_v5()
+    opinion, context = _approved_opinion(base)
+    note = AnalystObservationV1(
+        id=UUID(int=908),
+        anchor="lead:0001",
+        text="A second source links the two domains through a shared certificate.",
+        state=AnalystObservationState.INFERRED,
+        relation=AnalystObservationRelation.QUALIFIES,
+        finding_refs=(context.findings[0].id,),
+        evidence_refs=(context.observations[0].id,),
+    )
+    opinion = replace(
+        opinion,
+        blocks=opinion_blocks_with_observations(opinion.blocks, (note,)),
+        content_sha256="",
+    )
+
+    v6 = augment_publication_with_opinion(base, opinion, context)
+    parsed = publication_document_from_json(serialize_publication_document(v6))
+
+    assert isinstance(parsed, PublicationDocumentV6)
+    assert parsed.analyst_opinion is not None
+    assert parsed.analyst_opinion.observations == (note,)
+    assert parsed.rendered_opinion is not None
+    assert len(parsed.rendered_opinion.blocks) == 1
+    assert parsed.base_publication == base
 
 
 def test_v6_rejects_a_base_hash_that_does_not_match_the_embedded_v5() -> None:

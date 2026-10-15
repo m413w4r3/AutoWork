@@ -14,6 +14,7 @@ from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.research_context_builder import ArticleSnapshotPort
 from cti_app.domain.analyst_opinion import (
+    AnalystObservationV1,
     AnalystOpinionStatus,
     AnalystOpinionV1,
     CitationViolation,
@@ -21,6 +22,7 @@ from cti_app.domain.analyst_opinion import (
     OpinionBlockType,
     OpinionClaimQualification,
     OpinionProtocolFigureV1,
+    opinion_blocks_with_observations,
     verify_opinion_citations,
 )
 from cti_app.domain.editorial import (
@@ -45,6 +47,7 @@ from cti_app.domain.production import (
 from cti_app.domain.publication_document import (
     PublicationDocumentV5,
     publication_document_from_json,
+    publication_document_text_anchors,
     publication_document_v5_sha256,
 )
 
@@ -68,7 +71,9 @@ class OpinionErrorCode(StrEnum):
     BASE_IDENTITY_MISMATCH = "base_identity_mismatch"
     SYNTHESIS_IDENTITY_MISMATCH = "synthesis_identity_mismatch"
     OPINION_NOT_APPROVED = "opinion_not_approved"
+    OPINION_NOT_DRAFT = "opinion_not_draft"
     INVALID_SELECTION = "invalid_selection"
+    INVALID_OBSERVATION_ANCHOR = "invalid_observation_anchor"
     INVALID_STATE = "invalid_opinion_state"
     IDEMPOTENCY_CONFLICT = "idempotency_conflict"
 
@@ -151,7 +156,9 @@ class OpinionCompositionSelection:
 
     finding_ids: tuple[UUID, ...] = ()
     claim_ids: tuple[str, ...] = ()
-    block_types: tuple[OpinionBlockType, ...] = tuple(OpinionBlockType)
+    block_types: tuple[OpinionBlockType, ...] = tuple(
+        item for item in OpinionBlockType if item is not OpinionBlockType.ANALYST_OBSERVATIONS
+    )
 
     def __post_init__(self) -> None:
         if any(not isinstance(item, UUID) for item in self.finding_ids):
@@ -170,6 +177,7 @@ class OpinionRevisionEdits:
     blocks: tuple[OpinionBlock, ...]
     unresolved_points: tuple[str, ...] = ()
     protocol_figures: tuple[OpinionProtocolFigureV1, ...] | None = None
+    observations: tuple[AnalystObservationV1, ...] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "blocks", tuple(self.blocks))
@@ -180,6 +188,10 @@ class OpinionRevisionEdits:
             object.__setattr__(self, "protocol_figures", tuple(self.protocol_figures))
             if any(not isinstance(item, OpinionProtocolFigureV1) for item in self.protocol_figures):
                 raise TypeError("Opinion edits must contain OpinionProtocolFigureV1 values")
+        if self.observations is not None:
+            object.__setattr__(self, "observations", tuple(self.observations))
+            if any(not isinstance(item, AnalystObservationV1) for item in self.observations):
+                raise TypeError("Opinion edits must contain AnalystObservationV1 values")
 
 
 @dataclass(frozen=True, slots=True)
@@ -313,6 +325,8 @@ class AnalystOpinionService:
         expected_version: int,
         edits: OpinionRevisionEdits | Iterable[OpinionBlock],
         actor: str,
+        *,
+        expected_sha256: str | None = None,
     ) -> AnalystOpinionV1:
         actor_id = self._require_actor(actor)
         revision = (
@@ -320,13 +334,19 @@ class AnalystOpinionService:
         )
         async with self._uow_factory() as uow:
             current = await self._require_current(uow, opinion_id)
+            if expected_sha256 is not None:
+                self._require_expected_sha(current, expected_sha256)
+            edited_observations = (
+                revision.observations if revision.observations is not None else current.observations
+            )
+            edited_blocks = opinion_blocks_with_observations(revision.blocks, edited_observations)
             if current.version != expected_version:
                 replay = await uow.analyst_opinions.get(opinion_id, version=expected_version + 1)
                 if (
                     replay is not None
                     and replay.status is AnalystOpinionStatus.DRAFT
                     and replay.author_id == actor_id
-                    and replay.blocks == revision.blocks
+                    and replay.blocks == edited_blocks
                     and replay.unresolved_points == revision.unresolved_points
                     and replay.protocol_figures
                     == (
@@ -347,7 +367,7 @@ class AnalystOpinionService:
                 synthesis_sha256=current.synthesis_sha256,
                 base_publication_artifact_id=current.base_publication_artifact_id,
                 base_publication_sha256=current.base_publication_sha256,
-                blocks=revision.blocks,
+                blocks=edited_blocks,
                 unresolved_points=revision.unresolved_points,
                 protocol_figures=(
                     revision.protocol_figures
@@ -783,6 +803,26 @@ class AnalystOpinionService:
                 OpinionErrorCode.CITATIONS_INVALID,
                 citation_violations=violations,
             )
+        if opinion.observations:
+            base = await uow.production_artifacts.get(opinion.base_publication_artifact_id)
+            if base is None or base.canonical_blob_id is None:
+                raise OpinionError(OpinionErrorCode.BASE_INVALID)
+            try:
+                base_bytes = await self._artifact_store.read_bytes(base.canonical_blob_id)
+                base_document = publication_document_from_json(json.loads(base_bytes))
+            except Exception as exc:
+                raise OpinionError(OpinionErrorCode.BASE_INVALID) from exc
+            if not isinstance(base_document, PublicationDocumentV5):
+                raise OpinionError(OpinionErrorCode.BASE_INVALID)
+            anchors = publication_document_text_anchors(
+                base_document.document,
+                references=base_document.references,
+            )
+            if any(
+                note.anchor not in anchors or not note.anchor.startswith(("lead:", "section:"))
+                for note in opinion.observations
+            ):
+                raise OpinionError(OpinionErrorCode.INVALID_OBSERVATION_ANCHOR)
 
     async def _resolve_base(
         self, uow: UnitOfWork, investigation: AnalystInvestigation
@@ -932,7 +972,17 @@ class AnalystOpinionService:
             claim_ids = tuple(
                 str(item) for item in cast(Iterable[object], value.get("claim_ids", ()))
             )
-            raw_blocks = cast(Iterable[object], value.get("block_types", tuple(OpinionBlockType)))
+            raw_blocks = cast(
+                Iterable[object],
+                value.get(
+                    "block_types",
+                    tuple(
+                        item
+                        for item in OpinionBlockType
+                        if item is not OpinionBlockType.ANALYST_OBSERVATIONS
+                    ),
+                ),
+            )
             block_types = tuple(
                 item if isinstance(item, OpinionBlockType) else OpinionBlockType(str(item))
                 for item in raw_blocks

@@ -20,13 +20,20 @@ from cti_app.application.render_target_identities import (
 from cti_app.application.typst_compilation import (
     TYPST_COMPILER,
     TYPST_COMPILER_VERSION,
+    CompiledTypstDocument,
     FontBundleInvalidError,
     FontBundleSnapshot,
     TypstCompilationError,
     TypstCompiler,
     load_font_bundle_snapshot,
 )
-from cti_app.application.typst_render_execution import TypstRenderExecutionErrorTypes
+from cti_app.application.typst_render_execution import (
+    TypstRenderExecutionError,
+    TypstRenderExecutionErrorTypes,
+    TypstRenderExecutor,
+    load_typst_render_bundle_snapshots,
+    translate_execution_error,
+)
 from cti_app.application.typst_render_lifecycle import (
     TypstMappingSidecarCache,
     TypstRenderBuckets,
@@ -41,13 +48,17 @@ from cti_app.application.typst_render_output import (
 )
 from cti_app.application.typst_rendering import (
     TemplateBundleInvalidError,
+    TypstDraftPreviewDocument,
     TypstRenderer,
     TypstRenderSource,
     TypstTemplateBundle,
     load_template_bundle,
 )
+from cti_app.domain.analyst_opinion import AnalystOpinionV1
 from cti_app.domain.production import ProductionArtifactStage, ProductionArtifactStatus
+from cti_app.domain.production_synthesis import ProductionSynthesisV1
 from cti_app.domain.publication_document import (
+    PublicationDocumentV5,
     publication_document_from_json,
     serialize_publication_document,
 )
@@ -59,7 +70,7 @@ from cti_app.domain.publication_render import (
 from cti_app.domain.typst_render import TypstRenderFormat, TypstRenderStatus
 
 PUBLICATION_RENDERER = "typst"
-PUBLICATION_RENDERER_VERSION = "publication-v8-typst-v5-block-location"
+PUBLICATION_RENDERER_VERSION = "publication-v9-typst-v6-draft-preview-synthesis-context"
 
 PUBLICATION_RENDER_BUCKETS = TypstRenderBuckets(
     source="publication-renders-source",
@@ -165,6 +176,12 @@ class PublicationRenderService:
         self._uow_factory = uow_factory
         self._artifact_store = artifact_store
         self._renderer = renderer
+        self._media_asset_store = media_asset_store
+        self._compiler = compiler
+        self._preview_executor = TypstRenderExecutor(
+            media_asset_store=media_asset_store,
+            compiler=compiler,
+        )
         self._chp_typst_root = chp_typst_root
         self._font_bundle_root = font_bundle_root
         self._typst_fonts_lock_path = typst_fonts_lock_path
@@ -181,6 +198,45 @@ class PublicationRenderService:
             wait_timeout_seconds=wait_timeout_seconds,
             running_lease_seconds=running_lease_seconds,
         )
+
+    async def render_draft_preview(
+        self,
+        document: PublicationDocumentV5,
+        opinion: AnalystOpinionV1,
+        synthesis: ProductionSynthesisV1 | None = None,
+    ) -> CompiledTypstDocument:
+        """Compile an ephemeral, watermarked draft without creating render state."""
+        try:
+            projection = TypstDraftPreviewDocument(document, opinion, synthesis)
+        except ValueError as exc:
+            raise PublicationRenderDocumentInvalidError(str(exc)) from exc
+        try:
+            template_bundle, font_bundle = load_typst_render_bundle_snapshots(
+                chp_typst_root=self._chp_typst_root,
+                font_bundle_root=self._font_bundle_root,
+                typst_fonts_lock_path=self._typst_fonts_lock_path,
+                manifest_name="renderer-manifest.json",
+            )
+        except (TemplateBundleInvalidError, FontBundleInvalidError) as exc:
+            raise PublicationRenderTemplateInvalidError(str(exc)) from exc
+        try:
+            render_source = self._renderer.render(projection, template_bundle)
+            executed = await self._preview_executor.execute(
+                render_source=render_source,
+                template_bundle=template_bundle,
+                font_bundle=font_bundle,
+            )
+        except TypstRenderExecutionError as exc:
+            raise translate_execution_error(exc, _PUBLICATION_RENDER_ERRORS.execution) from exc
+        except TemplateBundleInvalidError as exc:
+            raise PublicationRenderTemplateInvalidError(str(exc)) from exc
+        except ValueError as exc:
+            raise PublicationRenderDocumentInvalidError(str(exc)) from exc
+        except TypstCompilationError:
+            raise
+        except Exception as exc:
+            raise PublicationRenderFailedError("Unable to compile the draft preview") from exc
+        return executed.compiled_document
 
     async def render_pdf(self, publication_artifact_id: UUID) -> PublicationRender:
         async with self._uow_factory() as uow:
