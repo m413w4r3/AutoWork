@@ -310,13 +310,18 @@ class InvestigationService:
             await self._investigations.save(investigation)
         return state
 
-    async def resume(self, investigation_id: UUID) -> InvestigationWorkingState:
+    async def resume(
+        self, investigation_id: UUID, *, expected_version: int | None = None
+    ) -> InvestigationWorkingState:
         state = await self._require_state(investigation_id)
+        if expected_version is not None and state.version != expected_version:
+            raise InvestigationStateVersionConflict("Investigation state version changed")
         investigation = await self._require_investigation(investigation_id)
         unresolved = tuple(
             item
             for item in await self._invocations.list_for_investigation(investigation_id)
-            if item.status is ToolInvocationStatus.NEEDS_REVIEW and not item.response_refs
+            if item.status in {ToolInvocationStatus.RUNNING, ToolInvocationStatus.NEEDS_REVIEW}
+            and not item.response_refs
         )
         if unresolved:
             raise ValueError(
@@ -337,6 +342,7 @@ class InvestigationService:
             AnalystInvestigationStatus.AWAITING_REVIEW,
             AnalystInvestigationStatus.COMPLETED,
             AnalystInvestigationStatus.EXHAUSTED,
+            AnalystInvestigationStatus.CANCELLED,
         }:
             investigation.status = AnalystInvestigationStatus.RUNNING
             investigation.finished_at = None
@@ -344,13 +350,25 @@ class InvestigationService:
             await self._investigations.save(investigation)
         return state
 
-    async def interrupt(self, investigation_id: UUID) -> InvestigationWorkingState:
-        return await self.conclude(investigation_id, StopReason.USER_INTERRUPT)
+    async def interrupt(
+        self, investigation_id: UUID, *, expected_version: int | None = None
+    ) -> InvestigationWorkingState:
+        return await self.conclude(
+            investigation_id,
+            StopReason.USER_INTERRUPT,
+            expected_state_version=expected_version,
+        )
 
     async def conclude(
-        self, investigation_id: UUID, reason: StopReason
+        self,
+        investigation_id: UUID,
+        reason: StopReason,
+        *,
+        expected_state_version: int | None = None,
     ) -> InvestigationWorkingState:
         state = await self._require_state(investigation_id)
+        if expected_state_version is not None and state.version != expected_state_version:
+            raise InvestigationStateVersionConflict("Investigation state version changed")
         investigation = await self._require_investigation(investigation_id)
         updated = state.conclude(reason)
         if updated is not state:
@@ -378,6 +396,8 @@ class InvestigationService:
 
         for _ in range(self._max_turns_per_run):
             state = await self._require_state(investigation_id)
+            if state.stop_reason is not None:
+                return state
             envelope = await self._envelopes.get(investigation_id)
             if envelope is None and state.turn_index >= investigation.budget.max_cycles:
                 return await self.conclude(investigation_id, StopReason.BUDGET_EXHAUSTED)
@@ -414,6 +434,9 @@ class InvestigationService:
                     },
                     registry=self._registry,
                 )
+            stopped = await self._requested_stop(investigation_id)
+            if stopped is not None:
+                return stopped
             allowed = self._external_allowed(snapshot, envelope)
             if not allowed:
                 # Context construction is the local read path; no model transport runs.
@@ -431,6 +454,9 @@ class InvestigationService:
                 pending = state.with_pending_context(context_snapshot_id, context_sha256)
                 await self._save_state(state, pending)
                 state = pending
+            stopped = await self._requested_stop(investigation_id)
+            if stopped is not None:
+                return stopped
             bridge_key = f"bridge:{investigation_id}:{state.turn_index}:{context_sha256}"
             try:
                 reservation_before = _reservation_status(budget, bridge_key)
@@ -442,7 +468,6 @@ class InvestigationService:
                         BudgetDimension.CONTEXT_TOKENS: (context_size_bytes + 3) // 4,
                     },
                 )
-                budget.commit(bridge_key)
             except BudgetExceeded:
                 return await self.conclude(investigation_id, StopReason.BUDGET_EXHAUSTED)
             if envelope is not None and reservation_before is not BudgetReservationStatus.COMMITTED:
@@ -459,8 +484,32 @@ class InvestigationService:
                 on_invalid_output=lambda key, detail: self._record_bridge_rejection(
                     investigation_id, key, detail
                 ),
+                before_submission=(
+                    lambda approved_envelope=envelope: self._bridge_submission_allowed(
+                        investigation_id, approved_envelope
+                    )
+                ),
             )
+            await self._complete_bridge_reservation(
+                investigation_id,
+                bridge_key,
+                budget,
+                blocked=turn.submissions_made == 0,
+            )
+            await self._commit_current_uow()
             state = await self._require_state(investigation_id)
+            if state.stop_reason is not None:
+                return state
+            latest_envelope = await self._envelopes.get(investigation_id)
+            if _envelope_reduced_since(envelope, latest_envelope):
+                await self._record_policy_reduction(
+                    investigation_id=investigation_id,
+                    attempted_operation="bridge.turn",
+                    approved_envelope=envelope,
+                    current_envelope=latest_envelope,
+                    budget=budget,
+                )
+                return await self.conclude(investigation_id, StopReason.PERMISSION_REQUIRED)
             stop = await self._bridge_stop(turn)
             if stop is not None:
                 if turn.status is TurnSubmissionStatus.INVALID_OUTPUT:
@@ -537,8 +586,10 @@ class InvestigationService:
         action_summaries: list[str] = []
         progress = False
         turn_envelope = envelope
-        policy_changed_stop = False
-        for proposed in decision.proposed_tool_calls:
+        for proposed_index, proposed in enumerate(decision.proposed_tool_calls):
+            stopped = await self._requested_stop(investigation.id)
+            if stopped is not None:
+                return stopped, stopped.stop_reason
             definition_adapter = self._registry.get(proposed.tool_name, proposed.schema_version)
             definition = definition_adapter[0] if definition_adapter else None
             base_operation_key = tool_operation_key(
@@ -575,7 +626,6 @@ class InvestigationService:
             if external_effect:
                 current_envelope = await self._envelopes.get(investigation.id)
                 if _envelope_reduced_since(turn_envelope, current_envelope):
-                    policy_changed_stop = True
                     denied_key = (
                         f"{base_operation_key}:g2-denied:"
                         f"{current_envelope.version if current_envelope is not None else 'revoked'}"
@@ -616,7 +666,14 @@ class InvestigationService:
                         )
                     )
                     await self._commit_current_uow()
-                    break
+                    await self._record_policy_reduction(
+                        investigation_id=investigation.id,
+                        attempted_operation=proposed.tool_name,
+                        approved_envelope=turn_envelope,
+                        current_envelope=current_envelope,
+                        budget=budget,
+                    )
+                    return state, StopReason.PERMISSION_REQUIRED
                 envelope = current_envelope
                 if envelope is not None:
                     budget = envelope.budget
@@ -663,11 +720,10 @@ class InvestigationService:
 
             cost = thaw_json(definition.cost_model) if definition else {}
             try:
-                reservation_before = _reservation_status(budget, operation_key)
                 budget.reserve(operation_key, cost)
             except BudgetExceeded:
                 # The dispatcher repeats the preflight and returns a typed result.
-                reservation_before = BudgetReservationStatus.RELEASED
+                pass
             invocation = ToolInvocation(
                 investigation_id=investigation.id,
                 operation_key=operation_key,
@@ -704,10 +760,27 @@ class InvestigationService:
             # crash after the remote side has accepted the operation.
             await self._commit_current_uow()
 
+            stopped = await self._requested_stop(investigation.id)
+            if stopped is not None:
+                budget.release(operation_key)
+                cancelled = invocation.transition(ToolInvocationStatus.FAILED)
+                await self._invocations.update_if_version(
+                    cancelled, expected_version=invocation.version
+                )
+                if envelope is not None:
+                    current_envelope = await self._envelopes.get(investigation.id)
+                    if current_envelope is not None:
+                        current_envelope.budget.release(operation_key)
+                        await self._save_envelope_version(current_envelope)
+                await self._commit_current_uow()
+                return stopped, stopped.stop_reason
+
+            tool_budget = _copy_investigation_budget(budget)
+            tool_envelope = replace(envelope, budget=tool_budget) if envelope is not None else None
             tool_context = ToolExecutionContext(
                 investigation_id=investigation.id,
-                envelope=envelope,
-                budget=budget,
+                envelope=tool_envelope,
+                budget=tool_budget,
                 idempotency_key=operation_key,
                 available_capabilities=self._available_capabilities,
             )
@@ -719,11 +792,25 @@ class InvestigationService:
                 purpose=proposed.purpose,
                 operation_key=operation_key,
             )
+            uncertain_external = external_effect and (
+                result.status is ToolInvocationStatus.FAILED
+                or (
+                    result.status is ToolInvocationStatus.NEEDS_REVIEW
+                    and not result.output.get("request_permission", False)
+                )
+            )
+            if external_effect and result.status is ToolInvocationStatus.FAILED:
+                result = replace(
+                    result,
+                    status=ToolInvocationStatus.NEEDS_REVIEW,
+                    message=(
+                        "The external operation returned without a confirmed outcome; "
+                        "reconcile it before resuming. " + result.message
+                    )[:2_000],
+                )
             if result.status in {
                 ToolInvocationStatus.UNAVAILABLE,
                 ToolInvocationStatus.POLICY_DENIED,
-                ToolInvocationStatus.NEEDS_REVIEW,
-                ToolInvocationStatus.FAILED,
             }:
                 budget.release(operation_key)
             try:
@@ -735,16 +822,15 @@ class InvestigationService:
                 reviewed = invocation.transition(
                     ToolInvocationStatus.NEEDS_REVIEW,
                     response_refs=valid_refs,
-                    consumed_budget=_actual_tool_consumption(budget, operation_key, result),
+                    consumed_budget={},
                 )
                 await self._invocations.update_if_version(
                     reviewed, expected_version=invocation.version
                 )
-                if envelope is not None and _reservation_status(budget, operation_key) != (
-                    reservation_before
-                ):
-                    envelope = await self._save_envelope_version(envelope)
                 await self._commit_current_uow()
+                stopped = await self._requested_stop(investigation.id)
+                if stopped is not None:
+                    return stopped, stopped.stop_reason
                 return state, StopReason.SUBMISSION_NEEDS_REVIEW
             result_refs = list(result.observation_refs)
             result_refs.extend(item.id for item in persisted_observations)
@@ -757,16 +843,41 @@ class InvestigationService:
             terminal = invocation.transition(
                 result.status,
                 response_refs=valid_refs,
-                consumed_budget=_actual_tool_consumption(budget, operation_key, result),
+                consumed_budget=(
+                    {}
+                    if uncertain_external
+                    else _actual_tool_consumption(tool_context.budget, operation_key, result)
+                ),
             )
             invocation = await self._invocations.update_if_version(
                 terminal, expected_version=invocation.version
             )
-            if envelope is not None and _reservation_status(budget, operation_key) != (
-                reservation_before
-            ):
-                envelope = await self._save_envelope_version(envelope)
+            await self._complete_tool_reservation(
+                investigation_id=investigation.id,
+                operation_key=operation_key,
+                result=result,
+                reserved_amounts=cost,
+                uncertain=uncertain_external,
+            )
             await self._commit_current_uow()
+            stopped = await self._requested_stop(investigation.id)
+            if stopped is not None:
+                return stopped, stopped.stop_reason
+            latest_envelope = await self._envelopes.get(investigation.id)
+            if external_effect and _envelope_reduced_since(turn_envelope, latest_envelope):
+                await self._record_g2_blocked_calls(
+                    investigation_id=investigation.id,
+                    proposed_calls=decision.proposed_tool_calls[proposed_index + 1 :],
+                    current_envelope=latest_envelope,
+                )
+                await self._record_policy_reduction(
+                    investigation_id=investigation.id,
+                    attempted_operation=proposed.tool_name,
+                    approved_envelope=turn_envelope,
+                    current_envelope=latest_envelope,
+                    budget=budget,
+                )
+                return state, StopReason.PERMISSION_REQUIRED
             outcome_message = result.message
             if result.suggested_alternatives:
                 outcome_message = f"{outcome_message} Alternatives: " + "; ".join(
@@ -780,10 +891,13 @@ class InvestigationService:
             if result.status is ToolInvocationStatus.NEEDS_REVIEW and not result.output.get(
                 "request_permission", False
             ):
-                return state, StopReason.PERMISSION_REQUIRED
+                return state, StopReason.SUBMISSION_NEEDS_REVIEW
             # An ordinary policy denial is local to the operation; G2 reductions above
             # end this turn before any other proposed external operation is started.
 
+        stopped = await self._requested_stop(investigation.id)
+        if stopped is not None:
+            return stopped, stopped.stop_reason
         new_findings = await self._persist_findings(
             investigation_id=investigation.id,
             proposals=decision.finding_proposals,
@@ -796,12 +910,18 @@ class InvestigationService:
             for item in new_findings
         ):
             progress = True
+        stopped = await self._requested_stop(investigation.id)
+        if stopped is not None:
+            return stopped, stopped.stop_reason
         opinion_written = await self._apply_opinion_delta(
             investigation_id=investigation.id,
             state=state,
             delta=decision.opinion_delta,
         )
         progress = progress or opinion_written
+        stopped = await self._requested_stop(investigation.id)
+        if stopped is not None:
+            return stopped, stopped.stop_reason
         hypotheses = self._update_hypotheses(
             state.hypotheses,
             decision=decision,
@@ -847,10 +967,7 @@ class InvestigationService:
         current.record_turn(progress=progress)
         await self._investigations.save(current)
         await self._commit_current_uow()
-        return (
-            updated,
-            StopReason.PERMISSION_REQUIRED if policy_changed_stop else None,
-        )
+        return updated, None
 
     async def reconcile_invocation(
         self,
@@ -1464,6 +1581,174 @@ class InvestigationService:
         if self._commit_uow is not None:
             await self._commit_uow()
 
+    async def _requested_stop(self, investigation_id: UUID) -> InvestigationWorkingState | None:
+        """Reload the durable stop decision at every externally visible boundary."""
+        state = await self._require_state(investigation_id)
+        return state if state.stop_reason is not None else None
+
+    async def _record_policy_reduction(
+        self,
+        *,
+        investigation_id: UUID,
+        attempted_operation: str,
+        approved_envelope: InvestigationEnvelope | None,
+        current_envelope: InvestigationEnvelope | None,
+        budget: InvestigationBudget,
+    ) -> None:
+        state = await self._require_state(investigation_id)
+        if state.stop_reason is not None:
+            return
+        alternatives = self._alternative_tools(
+            investigation_id=investigation_id,
+            envelope=current_envelope,
+            budget=current_envelope.budget if current_envelope is not None else budget,
+            exclude_name=attempted_operation,
+        )
+        detail = (
+            f"g2_reduced_after:{attempted_operation}: "
+            f"approved_version={approved_envelope.version if approved_envelope else 0}: "
+            f"current_version={current_envelope.version if current_envelope else 0}"
+        )
+        if alternatives:
+            detail += "; alternatives: " + ", ".join(alternatives)
+        updated = replace(
+            state,
+            version=state.version + 1,
+            recent_actions=(*state.recent_actions, detail)[-32:],
+        )
+        await self._save_state(state, updated)
+        await self._commit_current_uow()
+
+    async def _record_g2_blocked_calls(
+        self,
+        *,
+        investigation_id: UUID,
+        proposed_calls: Sequence[Any],
+        current_envelope: InvestigationEnvelope | None,
+    ) -> None:
+        version = current_envelope.version if current_envelope is not None else "revoked"
+        for proposed in proposed_calls:
+            adapter = self._registry.get(proposed.tool_name, proposed.schema_version)
+            definition = adapter[0] if adapter is not None else None
+            if definition is None or definition.effect not in {
+                ToolEffect.EXTERNAL_READ,
+                ToolEffect.ACQUIRE,
+                ToolEffect.EXTERNAL_ACTIVE,
+                ToolEffect.EXTERNAL_SUBMIT,
+            }:
+                continue
+            base_key = tool_operation_key(
+                investigation_id=investigation_id,
+                tool_name=proposed.tool_name,
+                schema_version=proposed.schema_version,
+                normalized_parameters=proposed.arguments,
+                purpose=proposed.purpose,
+            )
+            denied_key = f"{base_key}:g2-denied:{version}"
+            invocation = await self._invocations.get_by_operation_key(denied_key)
+            if invocation is None:
+                invocation = await self._invocations.add_if_absent(
+                    ToolInvocation(
+                        investigation_id=investigation_id,
+                        operation_key=denied_key,
+                        tool_name=proposed.tool_name,
+                        schema_version=proposed.schema_version,
+                        normalized_parameters=proposed.arguments,
+                        purpose=proposed.purpose,
+                    )
+                )
+            if invocation.status is ToolInvocationStatus.PENDING:
+                denied = invocation.transition(ToolInvocationStatus.POLICY_DENIED)
+                await self._invocations.update_if_version(
+                    denied, expected_version=invocation.version
+                )
+        await self._commit_current_uow()
+
+    async def _bridge_submission_allowed(
+        self,
+        investigation_id: UUID,
+        approved_envelope: InvestigationEnvelope | None,
+    ) -> bool:
+        if await self._requested_stop(investigation_id) is not None:
+            return False
+        current_envelope = await self._envelopes.get(investigation_id)
+        return not _envelope_reduced_since(approved_envelope, current_envelope)
+
+    async def _complete_bridge_reservation(
+        self,
+        investigation_id: UUID,
+        operation_key: str,
+        budget: InvestigationBudget,
+        *,
+        blocked: bool,
+    ) -> None:
+        if await self._envelopes.get(investigation_id) is None:
+            if blocked:
+                budget.release(operation_key)
+            else:
+                budget.commit(operation_key)
+            return
+        for _ in range(3):
+            envelope = await self._envelopes.get(investigation_id)
+            if envelope is None:
+                return
+            reservation = next(
+                (
+                    item
+                    for item in envelope.budget.reservations
+                    if item.operation_key == operation_key
+                ),
+                None,
+            )
+            if reservation is None or reservation.status is BudgetReservationStatus.RESERVED:
+                if blocked:
+                    envelope.budget.release(operation_key)
+                elif reservation is not None:
+                    envelope.budget.commit(operation_key)
+                if reservation is None and blocked:
+                    return
+                if reservation is None:
+                    return
+                try:
+                    await self._save_envelope_version(envelope)
+                    return
+                except VersionConflictError:
+                    continue
+            return
+        raise VersionConflictError("Bridge budget reservation changed repeatedly")
+
+    async def _complete_tool_reservation(
+        self,
+        *,
+        investigation_id: UUID,
+        operation_key: str,
+        result: ToolResult,
+        reserved_amounts: dict[BudgetDimension, int],
+        uncertain: bool,
+    ) -> None:
+        for _ in range(3):
+            envelope = await self._envelopes.get(investigation_id)
+            if envelope is None:
+                return
+            status = _reservation_status(envelope.budget, operation_key)
+            if status is None or status is not BudgetReservationStatus.RESERVED or uncertain:
+                return
+            if result.status in {
+                ToolInvocationStatus.SUCCEEDED,
+                ToolInvocationStatus.EMPTY,
+                ToolInvocationStatus.PARTIAL,
+            }:
+                consumed = dict(result.budget_consumed or reserved_amounts)
+                envelope.budget.commit(operation_key, consumed)
+            else:
+                envelope.budget.release(operation_key)
+            try:
+                await self._save_envelope_version(envelope)
+                return
+            except VersionConflictError:
+                continue
+        raise VersionConflictError("Tool budget reservation changed repeatedly")
+
     @staticmethod
     def _with_turn_budget(
         envelope: InvestigationEnvelope, legacy_budget: LoopBudget
@@ -1698,6 +1983,17 @@ def _reservation_status(
         (item.status for item in budget.reservations if item.operation_key == operation_key),
         None,
     )
+
+
+def _copy_investigation_budget(budget: InvestigationBudget) -> InvestigationBudget:
+    copied = InvestigationBudget(limits=dict(budget.limits))
+    for reservation in budget.reservations:
+        copied.reserve(reservation.operation_key, reservation.amounts)
+        if reservation.status is BudgetReservationStatus.COMMITTED:
+            copied.commit(reservation.operation_key, reservation.committed_amounts)
+        elif reservation.status is BudgetReservationStatus.RELEASED:
+            copied.release(reservation.operation_key)
+    return copied
 
 
 def _action_summary(tool_name: str, status: ToolInvocationStatus, message: str) -> str:

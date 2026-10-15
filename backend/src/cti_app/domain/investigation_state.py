@@ -209,7 +209,10 @@ class InvestigationWorkingState:
     def conclude(self, reason: StopReason) -> InvestigationWorkingState:
         if not isinstance(reason, StopReason):
             raise TypeError("reason must use StopReason")
-        if self.stop_reason is reason:
+        # A durable stop decision wins races with an in-flight worker. The
+        # worker must resume explicitly before another conclusion can replace
+        # it.
+        if self.stop_reason is not None:
             return self
         return replace(self, version=self.version + 1, stop_reason=reason)
 

@@ -42,6 +42,10 @@ from cti_app.application.investigation_jobs import (
     INVESTIGATION_RUN_AGGREGATE_TYPE,
     InvestigationRunParameters,
 )
+from cti_app.application.investigation_operator_view import (
+    InvestigationOperatorErrorCode,
+    build_investigation_operator_view,
+)
 from cti_app.application.investigation_persistence import VersionConflictError
 from cti_app.application.investigation_state import InvestigationStateVersionConflict
 from cti_app.application.jobs import DuplicateJobError
@@ -316,6 +320,43 @@ class InvestigationSummaryView(BaseModel):
     updated_at: datetime
 
 
+class InvestigationOperatorStatusResponse(BaseModel):
+    """Read-only operator projection; error codes use InvestigationOperatorErrorCode."""
+
+    investigation_id: UUID
+    subject_id: UUID
+    production_run_id: UUID
+    synthesis_artifact_id: UUID
+    synthesis_sha256: str
+    base_publication_artifact_id: UUID | None
+    base_publication_sha256: str | None
+    investigation_status: str
+    investigation_version: int
+    working_state_version: int
+    working_state_sha256: str
+    job_generation: int
+    active_job_ids: list[UUID]
+    active_job_statuses: list[str]
+    turn_index: int
+    stop_reason: StopReason | None
+    pending_context_snapshot_id: UUID | None
+    pending_context_sha256: str | None
+    last_context_sha256: str | None
+    last_decision_sha256: str | None
+    bridge_conversation_id: UUID
+    last_operation: dict[str, Any] | None
+    invocations: list[dict[str, Any]]
+    ambiguous_invocations: list[dict[str, Any]]
+    invocations_requiring_reconciliation: list[dict[str, Any]]
+    evidence_checkpoint: dict[str, Any]
+    opinion_checkpoint: dict[str, Any] | None
+    g2: dict[str, Any]
+    budget: dict[str, Any]
+    budget_reservations: list[dict[str, Any]]
+    dependencies: dict[str, list[str]]
+    next_idempotent_action: dict[str, Any]
+
+
 @router.post(
     "/subjects/{subject_id}/investigations",
     response_model=InvestigationActionResponse,
@@ -484,6 +525,63 @@ async def get_investigation(investigation_id: UUID, request: Request) -> Investi
             investigation_id,
             composition=composition,
         )
+
+
+@router.get(
+    "/investigations/{investigation_id}/operator-status",
+    response_model=InvestigationOperatorStatusResponse,
+)
+async def get_investigation_operator_status(
+    investigation_id: UUID,
+    request: Request,
+) -> InvestigationOperatorStatusResponse:
+    """Read durable checkpoints without changing versions.
+
+    Stable error codes are ``investigation_not_found`` (404),
+    ``investigation_not_started`` (409), and
+    ``investigation_operator_status_unavailable`` (503).
+    """
+    async with _uow_factory(request)() as uow:
+        investigation = await uow.analyst_investigations.get(investigation_id)
+        if investigation is None:
+            raise _http_error(404, InvestigationOperatorErrorCode.INVESTIGATION_NOT_FOUND.value)
+        state = await uow.investigation_states.get(investigation_id)
+        if state is None:
+            raise _http_error(409, InvestigationOperatorErrorCode.INVESTIGATION_STATE_MISSING.value)
+        composition_factory = _composition_factory(request)
+        composition = composition_factory.build(uow, investigation_id)
+        try:
+            snapshot = await composition.tool_dependencies.article_snapshots.resolve(
+                investigation.synthesis_artifact_id
+            )
+        except (KeyError, ValueError) as exc:
+            raise _http_error(503, InvestigationOperatorErrorCode.STATUS_UNAVAILABLE.value) from exc
+        envelope = await uow.investigation_envelopes.get(investigation_id)
+        invocations = tuple(await uow.tool_invocations.list_for_investigation(investigation_id))
+        observations = tuple(
+            await uow.evidence_observations.list_for_investigation(investigation_id)
+        )
+        opinion = await uow.analyst_opinions.get(uuid5(_OPINION_NAMESPACE, str(investigation_id)))
+        jobs = tuple(
+            await uow.jobs.list_for_aggregate(
+                INVESTIGATION_RUN_AGGREGATE_TYPE,
+                investigation_id,
+                kind=INVESTIGATION_RUN_JOB_KIND,
+            )
+        )
+        view = build_investigation_operator_view(
+            investigation=investigation,
+            state=state,
+            synthesis_sha256=snapshot.synthesis_sha256,
+            envelope=envelope,
+            invocations=invocations,
+            observations=observations,
+            opinion=opinion,
+            jobs=jobs,
+            available_tools=composition.available_tools,
+            unavailable_tools=composition.unavailable_tools,
+        )
+        return InvestigationOperatorStatusResponse.model_validate(view.payload)
 
 
 @router.get("/investigations/{investigation_id}/envelope", response_model=EnvelopeView)
@@ -1133,7 +1231,9 @@ async def resume_investigation(
         )
         composition = _composition_factory(request).build(uow, investigation_id)
         try:
-            state = await composition.service.resume(investigation_id)
+            state = await composition.service.resume(
+                investigation_id, expected_version=payload.expected_version
+            )
             marker = f"api:resume:{key_hash}:{generation}"
             state = await _save_idempotency_marker(uow, state, marker)
             job, replay = await _submit_run_job(
@@ -1208,7 +1308,9 @@ async def interrupt_investigation(
         active_job = _active_job(jobs)
         composition = _composition_factory(request).build(uow, investigation_id)
         try:
-            state = await composition.service.interrupt(investigation_id)
+            state = await composition.service.interrupt(
+                investigation_id, expected_version=payload.expected_version
+            )
             state = await _save_idempotency_marker(
                 uow,
                 state,

@@ -75,6 +75,7 @@ class BridgeTurnResult:
     idempotency_key: str
     conversation_id: UUID | None = None
     detail: str = ""
+    submissions_made: int = 0
 
 
 class ModelConversationTurnTransport:
@@ -108,7 +109,7 @@ class ModelConversationTurnTransport:
             turn_index=turn_index,
             context_sha256=context_sha256,
         )
-        conversation_id = uuid5(_CONVERSATION_NAMESPACE, str(investigation_id))
+        conversation_id = make_investigation_conversation_id(investigation_id)
         if not external_llm_allowed:
             return TurnSubmission(
                 status=TurnSubmissionStatus.BLOCKED,
@@ -325,6 +326,7 @@ class BridgeInvestigator:
         context: InvestigationContextV1,
         external_llm_allowed: bool,
         on_invalid_output: Callable[[str, str], Awaitable[None]] | None = None,
+        before_submission: Callable[[], Awaitable[bool]] | None = None,
     ) -> BridgeTurnResult:
         if not external_llm_allowed:
             context_sha256 = hashlib.sha256(context.canonical_bytes()).hexdigest()
@@ -342,6 +344,7 @@ class BridgeInvestigator:
             )
         active_context = context
         validation_errors: list[str] = []
+        submissions_made = 0
         for failed_attempt in range(self.MAX_CORRECTIVE_ATTEMPTS + 1):
             context_sha256 = hashlib.sha256(active_context.canonical_bytes()).hexdigest()
             idempotency_key = make_investigation_turn_idempotency_key(
@@ -349,6 +352,15 @@ class BridgeInvestigator:
                 turn_index=turn_index,
                 context_sha256=context_sha256,
             )
+            if before_submission is not None and not await before_submission():
+                return BridgeTurnResult(
+                    TurnSubmissionStatus.BLOCKED,
+                    None,
+                    context_sha256,
+                    idempotency_key,
+                    detail="Durable investigation policy changed before Bridge submission.",
+                    submissions_made=submissions_made,
+                )
             submission = await self._transport.submit(
                 investigation_id=investigation_id,
                 subject_id=subject_id,
@@ -357,6 +369,7 @@ class BridgeInvestigator:
                 prompt=render_investigation_prompt(active_context),
                 external_llm_allowed=external_llm_allowed,
             )
+            submissions_made += 1
             if (
                 submission.status is not TurnSubmissionStatus.SUCCEEDED
                 or submission.output_text is None
@@ -368,6 +381,7 @@ class BridgeInvestigator:
                     submission.idempotency_key or idempotency_key,
                     submission.conversation_id,
                     submission.detail,
+                    submissions_made,
                 )
             normalized = _downgrade_unverifiable_supported_proposals(submission.output_text)
             try:
@@ -388,6 +402,7 @@ class BridgeInvestigator:
                         submission.idempotency_key or idempotency_key,
                         submission.conversation_id,
                         "Corrective attempts exhausted: " + "; ".join(validation_errors),
+                        submissions_made,
                     )
                 active_context = _context_with_validation_error(
                     active_context,
@@ -402,6 +417,7 @@ class BridgeInvestigator:
                 submission.idempotency_key or idempotency_key,
                 submission.conversation_id,
                 submission.detail,
+                submissions_made,
             )
         raise AssertionError("Corrective turn loop must return a result")
 
@@ -421,6 +437,11 @@ def make_investigation_turn_idempotency_key(
             }
         )
     ).hexdigest()
+
+
+def make_investigation_conversation_id(investigation_id: UUID) -> UUID:
+    """Return the canonical Bridge conversation identity for an investigation."""
+    return uuid5(_CONVERSATION_NAMESPACE, str(investigation_id))
 
 
 def render_investigation_prompt(context: InvestigationContextV1) -> str:
@@ -507,6 +528,7 @@ __all__ = [
     "ScriptedTurnTransport",
     "TurnSubmission",
     "TurnSubmissionStatus",
+    "make_investigation_conversation_id",
     "make_investigation_turn_idempotency_key",
     "render_investigation_prompt",
 ]
