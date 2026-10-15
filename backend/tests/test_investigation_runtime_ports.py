@@ -103,7 +103,7 @@ def test_api_and_worker_roots_share_real_runtime_assembly_without_infrastructure
     assert statuses["behavior_report_import"] == {"status": "available", "reason": None}
     assert statuses["retrohunt"] == {
         "status": "unavailable",
-        "reason": "retrohunt_proxy_disabled_by_configuration",
+        "reason": "retrohunt_disabled_by_configuration",
     }
     assert statuses["network_capture"] == {
         "status": "unavailable",
@@ -300,9 +300,9 @@ async def test_optional_future_adapters_are_passed_and_reflected_in_statuses() -
         )
     )
     settings = Settings.model_construct(
-        virustotal_retrohunt_proxy_enabled=True,
-        virustotal_retrohunt_proxy_base_url="https://vtui.test",
-        virustotal_retrohunt_proxy_allowed_hosts="vtui.test",
+        virustotal_retrohunt_enabled=True,
+        virustotal_proxy_url="http://proxy.test:8080",
+        virustotal_api_key="test-vt-key",
         native_analysis_enabled=True,
         native_analysis_provider="rea",
         native_analysis_rea_expected_version="rea-test",
@@ -452,8 +452,8 @@ async def test_retrohunt_runtime_requires_opt_in_capability_and_proxy_route() ->
         trust_env=False,
     )
     configured = {
-        "virustotal_retrohunt_proxy_base_url": "https://vtui.test",
-        "virustotal_retrohunt_proxy_allowed_hosts": "vtui.test",
+        "virustotal_proxy_url": "http://proxy.test:8080",
+        "virustotal_api_key": "test-vt-key",
     }
     configured_runtimes: list[InvestigationRuntimeComposition] = []
 
@@ -473,12 +473,12 @@ async def test_retrohunt_runtime_requires_opt_in_capability_and_proxy_route() ->
                 VirusTotalCapabilities(retrohunt=True),
             )
             assert _status_map(disabled)["retrohunt"]["reason"] == (
-                "retrohunt_proxy_disabled_by_configuration"
+                "retrohunt_disabled_by_configuration"
             )
 
             enabled_without_route = build(
                 root_builder,
-                Settings.model_construct(virustotal_retrohunt_proxy_enabled=True),
+                Settings.model_construct(virustotal_retrohunt_enabled=True),
                 VirusTotalCapabilities(retrohunt=True),
             )
             assert _status_map(enabled_without_route)["retrohunt"]["reason"] == (
@@ -488,7 +488,7 @@ async def test_retrohunt_runtime_requires_opt_in_capability_and_proxy_route() ->
             enabled_without_capability = build(
                 root_builder,
                 Settings.model_construct(
-                    virustotal_retrohunt_proxy_enabled=True,
+                    virustotal_retrohunt_enabled=True,
                     **configured,
                 ),
                 VirusTotalCapabilities(retrohunt=False),
@@ -500,7 +500,7 @@ async def test_retrohunt_runtime_requires_opt_in_capability_and_proxy_route() ->
             enabled = build(
                 root_builder,
                 Settings.model_construct(
-                    virustotal_retrohunt_proxy_enabled=True,
+                    virustotal_retrohunt_enabled=True,
                     **configured,
                 ),
                 VirusTotalCapabilities(retrohunt=True),
@@ -522,8 +522,10 @@ async def test_retrohunt_runtime_requires_opt_in_capability_and_proxy_route() ->
         assert job.job_id == "job-1"
 
         assert len(observed) == 1
-        assert str(observed[0].url) == "https://vtui.test/api/tools/retrohunt/jobs/get"
-        assert "x-apikey" not in observed[0].headers
+        assert str(observed[0].url) == (
+            "https://www.virustotal.com/api/v3/intelligence/retrohunt_jobs/job-1"
+        )
+        assert observed[0].headers["x-apikey"] == "test-vt-key"
     finally:
         await http_client.aclose()
 

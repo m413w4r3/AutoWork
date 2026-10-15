@@ -3,6 +3,7 @@ from fastapi import FastAPI
 from httpx import AsyncClient
 
 from cti_app.application.health import DependencyStatus
+from cti_app.config import Settings
 
 
 class FakeReadinessChecker:
@@ -100,3 +101,41 @@ async def test_model_status_exposes_routes_and_versions_without_credentials(
     assert payload["worker_code_version"]
     assert "api_key" not in response.text.casefold()
     assert "credential" not in response.text.casefold()
+
+
+@pytest.mark.asyncio
+async def test_health_and_model_status_never_echo_configured_secrets(
+    client: AsyncClient, app: FastAPI
+) -> None:
+    markers = (
+        "operator-test-secret-012345678901234567890",
+        "bridge-test-secret",
+        "virustotal-test-secret",
+        "shodan-test-secret",
+    )
+    app.state.settings = Settings(
+        _env_file=None,
+        operator_api_token=markers[0],
+        openai_bridge_api_key=markers[1],
+        virustotal_api_key=markers[2],
+        shodan_api_key=markers[3],
+    )
+    app.state.readiness = FakeReadinessChecker(
+        {
+            "postgresql": DependencyStatus(status="ok"),
+            "redis": DependencyStatus(status="ok"),
+            "object_storage": DependencyStatus(status="ok"),
+        }
+    )
+    app.state.model_gateway = FakeModelGatewayStatus()
+
+    responses = [
+        await client.get("/api/health/live"),
+        await client.get("/api/health/ready"),
+        await client.get("/api/health/models"),
+    ]
+
+    assert all(response.status_code == 200 for response in responses)
+    for response in responses:
+        for marker in markers:
+            assert marker not in response.text

@@ -50,6 +50,7 @@ from cti_app.application.virustotal import (
     VirusTotalPort,
     VirusTotalRetrohuntPort,
     VirusTotalRouteStep,
+    VirusTotalRouteUnavailableError,
     VirusTotalRoutingPolicy,
 )
 from cti_app.application.virustotal_persistence import VirusTotalObservationService
@@ -68,6 +69,7 @@ from cti_app.infrastructure.rea_adapter import (
 )
 from cti_app.infrastructure.smda import SmdaAdapter
 from cti_app.infrastructure.tshark_adapter import TsharkAdapter
+from cti_app.infrastructure.virustotal import configure_virustotal_proxy_http_client
 from cti_app.infrastructure.virustotal_retrohunt_client import VirusTotalRetrohuntHttpClient
 from cti_app.infrastructure.yara_runner import IsolatedYaraRunner
 
@@ -167,7 +169,7 @@ def build_investigation_runtime_ports(
 ) -> InvestigationRuntimePorts:
     statuses: list[RuntimePortStatus] = []
 
-    retrohunt_enabled = bool(getattr(settings, "virustotal_retrohunt_proxy_enabled", False))
+    retrohunt_enabled = bool(settings.virustotal_retrohunt_enabled)
     retrohunt_available: bool
     retrohunt_reason: str | None
     if not retrohunt_enabled:
@@ -175,12 +177,12 @@ def build_investigation_runtime_ports(
         vt_capabilities = replace(vt_capabilities, retrohunt=False)
         vt_routing_policy = VirusTotalRoutingPolicy()
     else:
-        vtui_base_url = getattr(settings, "virustotal_retrohunt_proxy_base_url", None)
-        vtui_allowed_hosts = getattr(settings, "virustotal_retrohunt_proxy_allowed_hosts", "")
-        vtui_origin_configured = bool(
-            vtui_base_url and any(host.strip() for host in vtui_allowed_hosts.split(","))
+        route_configuration_available = bool(
+            settings.virustotal_proxy_url
+            and settings.virustotal_api_key is not None
+            and settings.virustotal_base_url
         )
-        if not vtui_origin_configured:
+        if not route_configuration_available:
             retrohunt_provider = None
             vt_routing_policy = VirusTotalRoutingPolicy()
         elif vt_routing_policy is None:
@@ -192,20 +194,21 @@ def build_investigation_runtime_ports(
             and vt_capabilities.retrohunt
             and route is not None
         ):
-            allowed_hosts = frozenset(
-                host.strip().lower() for host in vtui_allowed_hosts.split(",") if host.strip()
-            )
             try:
+                configure_virustotal_proxy_http_client(retrohunt_http_client, settings)
                 retrohunt_provider = VirusTotalRetrohuntHttpClient(
                     client=retrohunt_http_client,
-                    base_url=vtui_base_url,
-                    allowed_hosts=allowed_hosts,
+                    base_url=settings.virustotal_base_url,
+                    api_key=settings.virustotal_api_key,
+                    proxy_url=settings.virustotal_proxy_url,
                     capabilities=vt_capabilities,
                     routing_policy=vt_routing_policy,
                     max_response_bytes=settings.virustotal_max_response_bytes,
+                    max_result_pages=settings.virustotal_retrohunt_max_result_pages,
+                    max_results=settings.virustotal_retrohunt_max_results,
                 )
-            except ValueError:
-                # Invalid local vtUI configuration stays unavailable and does not
+            except (ValueError, VirusTotalRouteUnavailableError):
+                # Invalid local VirusTotal configuration stays unavailable and does not
                 # make API/worker startup fail or guess a different endpoint.
                 retrohunt_provider = None
 
@@ -337,7 +340,7 @@ def build_investigation_runtime_ports(
         else "tshark_or_filesystem_confinement_unavailable"
     )
     if not retrohunt_enabled:
-        retrohunt_available, retrohunt_reason = False, "retrohunt_proxy_disabled_by_configuration"
+        retrohunt_available, retrohunt_reason = False, "retrohunt_disabled_by_configuration"
     else:
         retrohunt_available, retrohunt_reason = _retrohunt_availability(
             vt_capabilities=vt_capabilities,
@@ -580,9 +583,7 @@ def _retrohunt_availability(
 
 
 def _configured_retrohunt_routing_policy(settings: Settings) -> VirusTotalRoutingPolicy:
-    base_url = getattr(settings, "virustotal_retrohunt_proxy_base_url", None)
-    allowed_hosts = getattr(settings, "virustotal_retrohunt_proxy_allowed_hosts", "")
-    if not base_url or not any(host.strip() for host in allowed_hosts.split(",")):
+    if not settings.virustotal_proxy_url or settings.virustotal_api_key is None:
         return VirusTotalRoutingPolicy()
     route = VirusTotalOperationRoute(
         primary=VirusTotalRouteStep(
