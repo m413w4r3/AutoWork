@@ -43,6 +43,7 @@ class CaptureBundle:
     sources: dict[str, dict[str, object]]
     references_response: str
     extraction_responses: dict[str, str]
+    source_tlp: TLP = TLP.AMBER
 
 
 def capture_bundle(label: str) -> CaptureBundle:
@@ -181,7 +182,7 @@ def discovery_candidate(label: str, bundle: CaptureBundle) -> CandidateTopic:
             publisher="CTI Emulator",
             role=SourceRole.PRIMARY if position == 1 else SourceRole.INDEPENDENT,
             published_at=date(2026, 8, 9 + position),
-            tlp=TLP.AMBER,
+            tlp=bundle.source_tlp,
             sensitivity="public",
             external_llm_allowed=True,
         )
@@ -203,7 +204,7 @@ def discovery_candidate(label: str, bundle: CaptureBundle) -> CandidateTopic:
         countries=("France",),
         likely_artifacts=("domain",),
         sources=sources,
-        tlp=TLP.AMBER,
+        tlp=bundle.source_tlp,
         sensitivity="public",
         external_llm_allowed=True,
         actor_or_campaign=f"Example campaign {label}",

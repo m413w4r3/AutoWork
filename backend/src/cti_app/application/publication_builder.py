@@ -933,9 +933,7 @@ def build_publication_document_v5(
         extraction=extraction,
         synthesis=synthesis,
     )
-    narrative = _project_synthesis_publication(
-        extraction=extraction, synthesis=synthesis, include_timeline=False
-    )
+    narrative = _project_synthesis_publication(extraction=extraction, synthesis=synthesis)
     projection = _project_publication_iocs(
         extraction=extraction,
         narrative=narrative,
@@ -974,7 +972,7 @@ def build_publication_document_v5(
         title=synthesis.title,
         lead=projection.lead,
         sections=projection.sections,
-        timeline=(),
+        timeline=projection.timeline,
         indicators=projection.indicators,
         sources=sources,
         uncertainties=projection.uncertainties,

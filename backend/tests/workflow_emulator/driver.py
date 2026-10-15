@@ -195,14 +195,14 @@ class WorkflowDriver:
             raise AssertionError(f"{self.scenario} / database: edition is missing")
         return edition
 
-    async def create_edition(self) -> UUID:
+    async def create_edition(self, *, tlp: TLP = TLP.AMBER) -> UUID:
         country_code = reserve_edition_code()
         payload = {
             "country": f"Workflow emulator {country_code}",
             "country_code": country_code,
             "period_start": date(2026, 8, 1).isoformat(),
             "period_end": date(2026, 8, 31).isoformat(),
-            "tlp": TLP.AMBER.value,
+            "tlp": tlp.value,
             "languages": ["fr"],
         }
 
@@ -234,12 +234,22 @@ class WorkflowDriver:
         )
 
     async def run_discovery(
-        self, batch_label: str, subject_labels: Sequence[str]
+        self,
+        batch_label: str,
+        subject_labels: Sequence[str],
+        *,
+        bundle_overrides: Mapping[str, CaptureBundle] | None = None,
     ) -> DiscoveryBatch:
         edition = await self._edition()
         before = await invariants.production_state(self.uow_factory, edition.id)
+        overrides = dict(bundle_overrides or {})
+        unknown_overrides = set(overrides).difference(subject_labels)
+        if unknown_overrides:
+            raise ValueError(f"Unknown Discovery bundle overrides: {sorted(unknown_overrides)}")
         for label in subject_labels:
-            self.discovery_bundles[label] = capture_bundle(label)
+            self.discovery_bundles[label] = (
+                overrides[label] if label in overrides else capture_bundle(label)
+            )
 
         async def action() -> DiscoveryBatch:
             batch = await persist_discovery_fixture(
