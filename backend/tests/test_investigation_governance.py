@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from uuid import uuid4
 
 import pytest
 
 from cti_app.application.investigation_governance import (
+    EnvelopeRevokedError,
     EnvelopeVersionConflictError,
     InvestigationActor,
     InvestigationEnvelopeService,
@@ -15,9 +17,11 @@ from cti_app.config import Settings
 from cti_app.domain.editorial import AnalystDecisionType
 from cti_app.domain.investigation import (
     BudgetDimension,
+    DisclosureBounds,
     InvestigationBudget,
     QualificationActorKind,
     SampleQualification,
+    TLPLevel,
 )
 from tests.investigation_c2_fakes import (
     FakeDatabase,
@@ -186,6 +190,241 @@ async def test_g2_rejection_is_a_persisted_pre_approval_decision() -> None:
     assert decision.target_id == investigation.id
     assert await service.current(investigation.id) is None
     assert len(database.decisions) == 1
+
+
+@pytest.mark.asyncio
+async def test_revoke_then_explicit_reextension_preserves_scope_and_consumption() -> None:
+    database = FakeDatabase()
+    investigation = make_investigation(max_hits=4, max_vt_units=4)
+    database.investigations[investigation.id] = investigation
+    service = InvestigationEnvelopeService(lambda: FakeUow(database))
+    proposal = make_approved_proposal(
+        investigation,
+        allowed_providers=("vt",),
+        acquire_hits_allowed=False,
+        vt_units=4,
+        downloads=0,
+    )
+    proposal = replace(
+        proposal,
+        disclosure=DisclosureBounds(
+            tlp=TLPLevel.GREEN,
+            do_not_submit=False,
+            external_llm_allowed=True,
+        ),
+    )
+    initial = await service.approve(
+        proposal,
+        actor_id="analyst:alice",
+        reason="Approve bounded VT and Bridge work.",
+        correlation_id="g2:revoke-extend:initial",
+    )
+    initial.budget.reserve("already-completed-vt", {BudgetDimension.VT_UNITS: 1})
+    initial.budget.commit("already-completed-vt")
+    revoked = await service.revoke(
+        investigation.id,
+        expected_version=initial.version,
+        actor_id="analyst:alice",
+        reason="Stop external work.",
+        correlation_id="g2:revoke-extend:revoke",
+    )
+    authorization = await service.authorization_state(investigation.id)
+    assert authorization.revoked is True
+    assert authorization.authorization_ceiling is not None
+    assert revoked.budget.consumed[BudgetDimension.VT_UNITS] == 1
+
+    extended = await service.extend(
+        investigation.id,
+        expected_version=revoked.version,
+        allowed_providers=("vt",),
+        budget=InvestigationBudget(
+            limits={BudgetDimension.VT_UNITS: 4, BudgetDimension.DOWNLOADS: 0}
+        ),
+        acquire_hits_allowed=False,
+        disclosure=initial.disclosure,
+        actor_id="analyst:alice",
+        reason="Explicitly resume within the prior authorization.",
+        correlation_id="g2:revoke-extend:extend",
+    )
+
+    assert extended.allowed_providers == ("vt",)
+    assert extended.budget.limits[BudgetDimension.VT_UNITS] == 4
+    assert extended.budget.consumed[BudgetDimension.VT_UNITS] == 1
+    assert extended.budget.remaining[BudgetDimension.VT_UNITS] == 3
+    assert extended.version == revoked.version + 1
+    final_state = await service.authorization_state(investigation.id)
+    assert final_state.revoked is False
+
+
+@pytest.mark.parametrize(
+    ("providers", "vt_units", "disclosure", "message"),
+    (
+        (
+            ("vt", "shodan"),
+            4,
+            DisclosureBounds(TLPLevel.AMBER, True, False),
+            "prior G2 provider authorization",
+        ),
+        (
+            ("vt",),
+            5,
+            DisclosureBounds(TLPLevel.AMBER, True, False),
+            "prior G2 vt_units budget",
+        ),
+        (
+            ("vt",),
+            4,
+            DisclosureBounds(TLPLevel.GREEN, True, False),
+            "widen the approved TLP",
+        ),
+        (
+            ("vt",),
+            4,
+            DisclosureBounds(TLPLevel.AMBER, False, False),
+            "cannot remove do_not_submit",
+        ),
+    ),
+)
+@pytest.mark.asyncio
+async def test_revoked_envelope_reextension_cannot_exceed_approved_bounds(
+    providers, vt_units, disclosure, message
+) -> None:
+    database = FakeDatabase()
+    investigation = make_investigation(max_hits=4, max_vt_units=4)
+    database.investigations[investigation.id] = investigation
+    service = InvestigationEnvelopeService(lambda: FakeUow(database))
+    proposal = replace(
+        make_approved_proposal(
+            investigation,
+            allowed_providers=("vt",),
+            acquire_hits_allowed=False,
+            vt_units=4,
+            downloads=0,
+        ),
+        disclosure=DisclosureBounds(
+            tlp=TLPLevel.AMBER,
+            do_not_submit=True,
+            external_llm_allowed=False,
+        ),
+    )
+    initial = await service.approve(
+        proposal,
+        actor_id="analyst:alice",
+        reason="Approve one constrained VT scope.",
+        correlation_id="g2:bounds:initial",
+    )
+    revoked = await service.revoke(
+        investigation.id,
+        expected_version=initial.version,
+        actor_id="analyst:alice",
+        reason="Stop the approved scope.",
+        correlation_id="g2:bounds:revoke",
+    )
+
+    with pytest.raises(ValueError, match=message):
+        await service.extend(
+            investigation.id,
+            expected_version=revoked.version,
+            allowed_providers=providers,
+            budget=InvestigationBudget(
+                limits={BudgetDimension.VT_UNITS: vt_units, BudgetDimension.DOWNLOADS: 0}
+            ),
+            acquire_hits_allowed=False,
+            disclosure=disclosure,
+            actor_id="analyst:alice",
+            reason="Request an extension outside the prior G2 bounds.",
+            correlation_id=f"g2:bounds:extend:{message}",
+        )
+
+    current = await service.current(investigation.id)
+    assert current == revoked
+    assert len(database.decisions) == 2
+
+
+@pytest.mark.asyncio
+async def test_revoked_reextension_cannot_reduce_budget_below_consumed_usage() -> None:
+    database = FakeDatabase()
+    investigation = make_investigation(max_hits=4, max_vt_units=4)
+    database.investigations[investigation.id] = investigation
+    service = InvestigationEnvelopeService(lambda: FakeUow(database))
+    initial = await service.approve(
+        make_approved_proposal(
+            investigation,
+            allowed_providers=("vt",),
+            acquire_hits_allowed=False,
+            vt_units=4,
+            downloads=0,
+        ),
+        actor_id="analyst:alice",
+        reason="Approve one bounded VT scope.",
+        correlation_id="g2:consumed-budget:initial",
+    )
+    initial.budget.reserve("already-consumed", {BudgetDimension.VT_UNITS: 1})
+    initial.budget.commit("already-consumed")
+    revoked = await service.revoke(
+        investigation.id,
+        expected_version=initial.version,
+        actor_id="analyst:alice",
+        reason="Stop the approved scope.",
+        correlation_id="g2:consumed-budget:revoke",
+    )
+
+    with pytest.raises(ValueError, match="below its consumed or reserved usage"):
+        await service.extend(
+            investigation.id,
+            expected_version=revoked.version,
+            allowed_providers=("vt",),
+            budget=InvestigationBudget(
+                limits={BudgetDimension.VT_UNITS: 0, BudgetDimension.DOWNLOADS: 0}
+            ),
+            acquire_hits_allowed=False,
+            disclosure=initial.disclosure,
+            actor_id="analyst:alice",
+            reason="The previous VT read remains chargeable.",
+            correlation_id="g2:consumed-budget:extend-too-small",
+        )
+
+    assert await service.current(investigation.id) == revoked
+    assert len(database.decisions) == 2
+
+
+@pytest.mark.asyncio
+async def test_legacy_revocation_without_saved_bounds_requires_new_investigation() -> None:
+    database = FakeDatabase()
+    investigation = make_investigation()
+    database.investigations[investigation.id] = investigation
+    service = InvestigationEnvelopeService(lambda: FakeUow(database))
+    initial = await service.approve(
+        make_approved_proposal(investigation),
+        actor_id="analyst:alice",
+        reason="Approve a bounded investigation.",
+        correlation_id="g2:legacy-revoke:initial",
+    )
+    revoked = await service.revoke(
+        investigation.id,
+        expected_version=initial.version,
+        actor_id="analyst:alice",
+        reason="Revoke a pre-upgrade envelope.",
+        correlation_id="g2:legacy-revoke:revoke",
+    )
+    database.decisions[-1] = replace(database.decisions[-1], details={})
+
+    with pytest.raises(EnvelopeRevokedError, match="create a new investigation"):
+        await service.extend(
+            investigation.id,
+            expected_version=revoked.version,
+            allowed_providers=("vt",),
+            budget=InvestigationBudget(
+                limits={BudgetDimension.VT_UNITS: 20, BudgetDimension.DOWNLOADS: 10}
+            ),
+            acquire_hits_allowed=True,
+            disclosure=initial.disclosure,
+            actor_id="analyst:alice",
+            reason="Try to reopen without durable pre-revoke bounds.",
+            correlation_id="g2:legacy-revoke:extend",
+        )
+
+    assert await service.current(investigation.id) == revoked
 
 
 @pytest.mark.asyncio
