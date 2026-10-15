@@ -1,147 +1,76 @@
-# Readiness — premier run CTI technique supervisé
+# Readiness — premier run CTI supervisé
 
-**Décision au 14 octobre 2026 : NO_GO pour un premier run réel aujourd'hui.**
-Le chemin critique n'a pas de smoke réel, le Bridge local est inaccessible, le
-proxy vtUI n'est pas configuré et l'identité locale `dev-analyst` n'est pas
-vérifiée.
+**Verdict au 15 octobre 2026 : NO_GO.** Le parcours applicatif et ses barrières
+ont des preuves offline, mais aucune de ces preuves n’établit une connectivité
+live. Bridge, VirusTotal via proxy et Shodan restent **non vérifiés en live**;
+les smokes live doivent être approuvés puis exécutés par l’utilisateur avant
+tout run.
 
-Le dépôt est **prêt à valider** : les contrôles et parcours offline sont verts.
-Passer à `GO_PARTIEL`, puis à `GO`, exige une approbation explicite de
-l'opérateur et des smoke live dans cet ordre : Bridge, VT via vtUI, puis Shodan.
-Une CI verte ou `offline_simulated` ne vaut jamais un GO live. `NOT_VALIDATED`
-n'est jamais `PASS`.
+## État des capacités
 
-## Base et branche examinées
-
-- Base : `main` à `f01acc9`; le workflow GitHub Actions `38553748944` était
-  vert à cette date.
-- Branche : `chantier/premier-run-technique-supervise-2026-10-14`, pas encore
-  poussée.
-- Le prévol réel conclut `NO_GO` : pas de DSN ni de référence exacte, Bridge
-  local inaccessible, proxy vtUI non configuré, identité `dev-analyst` locale.
-
-## Gates L0–L7
-
-Les gates décrivent la validation live de la mission. Les validations offline
-ci-dessous ne les font pas passer.
-
-| Gate | Verdict | Justification |
+| Capacité | État constaté dans cette worktree | Ce que cela prouve |
 |---|---|---|
-| L0 — identité et référence | `NOT_VALIDATED` | Pas d'identifiants canoniques exacts pour le run; `/api/identity/status` annonce `verified=false` pour `dev-analyst`. Le gate d'identité du prévol reste non validé dans ce mode. |
-| L1 — environnement et base | `NOT_VALIDATED` | L'environnement de test est corrigé et validé, mais aucune DSN/reference exacte ni base pilote identifiée n'est présente au prévol réel. |
-| L2 — services | `FAIL` | Bridge local inaccessible et proxy vtUI non configuré. |
-| L3 — gouvernance G2 | `BLOCKED_APPROVAL` | L'opérateur doit autoriser explicitement fournisseurs, budgets et divulgation. |
-| L4 — chemin fournisseur | `NOT_VALIDATED` | Aucun appel Bridge, VT/vtUI ou Shodan réel; tout résultat fournisseur est `offline_simulated`. |
-| L5 — quarantaine et analyse | `NOT_VALIDATED` | Les tests réels de confinement Bubblewrap passent sur échantillon inerte; aucun échantillon autorisé n'a été analysé dans ce run. FLOSS, MWCP et REA/Ghidra sont indisponibles sur cette machine. |
-| L6 — avis, G3 et PDF | `FAIL` | L'API d'aperçu PDF du brouillon « Avis de l'analyste » n'a pas été vérifiée et aucune route correspondante n'est livrée; G3 reste à approuver. |
-| L7 — publication | `NOT_APPLICABLE` | La publication est hors périmètre du premier run; aucune publication ne doit être lancée. |
+| Configuration Bridge, VT, Shodan et limites | `.env.example` et Compose exposent les réglages aux processus backend/worker; `test_compose_propagates_critical_settings_to_api_and_worker_from_a_fake_env` utilise un `.env` factice. | Le câblage offline des paramètres; aucune clé ni connectivité fournisseur réelle. |
+| VT v3 / Retrohunt | Le client Retrohunt ne dépend pas de vtUI; Retrohunt reste désactivé par défaut (`VIRUSTOTAL_RETROHUNT_ENABLED=false`). | L’isolation du client et les opt-ins locaux; aucune soumission VT réelle ni validation YARA. |
+| Shodan | Lectures passives protégées par clé, flags et enveloppe. | Les refus et parcours simulés; aucune permission, crédit ou réponse live. |
+| Reset initial | `safe_local_reset.py` valide projet, contexte Docker, volumes et chemins; `--dry-run` ne supprime rien. Un marqueur G2/invocation bloque le reset même confirmé. | La garde offline du reset; pas une autorisation à nettoyer après le début du run. |
+| Arrêt/reprise | W16 vérifie l’interruption durable pendant des appels en attente et l’arrêt de la suite après révocation G2. Operator-status et réconciliation sont exposés par l’API. | Les scénarios de test en stockage local; aucune garantie qu’un appel fournisseur déjà parti soit annulé. |
+| Avis et preview | Le PDF brouillon existe sur `GET /api/opinions/{opinion_id}/preview.pdf`, hashé et lié à la version de l’avis et à la publication source; W17 inspecte un PDF Typst réel et une note ancrée. | Le rendu simulé avec le compilateur local et la cohérence des hashes; pas la qualité éditoriale du vrai dossier. |
+| Reprise intégrée | W18 vérifie le parcours et la récupération sans rejouer les effets confirmés avec fournisseurs simulés. | La cohérence du scénario offline; aucune intégration live. |
 
-Une CI verte n'est pas un GO live. Les gates `NOT_VALIDATED` ne peuvent pas
-être interprétés comme `PASS`.
+## NO_GO — écarts encore ouverts
 
-## Corrections de sécurité confirmées
+- **Fournisseurs live :** aucune sonde Bridge depuis le worker, aucun appel VT via
+  le proxy avec clé réelle, et aucune lecture Shodan réelle n’a été approuvée ou
+  exécutée. Les gates L2/L4 restent `NOT_VALIDATED`; `offline_simulated` n’est
+  jamais `PASS`.
+- **Prévol/base :** le prévol lit `POSTGRES_DSN` dans l’environnement du processus
+  et exige une cible loopback jetable dont le nom contient `pilot`, `first-run`
+  ou `disposable`. Il ne charge pas `.env`. Or le service Postgres de la stack
+  Compose standard n’a pas de port publié sur l’hôte et la cible Make lance le
+  script sur l’hôte. Aucun chemin vérifié ne relie donc ce prévol à la base
+  standard démarrée par `make up`; le gate base reste `NOT_VALIDATED` jusqu’à
+  établissement d’une cible locale joignable.
+- **Identité :** avec les valeurs de `.env.example`, l’API utilise
+  `LocalIdentityProvider/dev-analyst`, déclaré non vérifié et loopback seulement.
+  Le rapport du prévol code cette identité locale en dur. Une décision humaine
+  réelle doit rester distincte d’un Bearer d’accès API.
+- **Révocation G2 :** W16 prouve qu’une investigation révoquée ne reprend pas.
+  `POST /api/investigations/{investigation_id}/envelope/extend` et
+  `InvestigationEnvelopeService.extend` n’ont pas
+  de garde explicite sur une révocation; les tests disponibles ne prouvent donc
+  pas la règle « non ré-étendable ». Traitement opératoire : ne jamais appeler
+  `extend` après révocation, ne pas reprendre, et garder le chantier NO_GO
+  jusqu’à une garde/test explicites. La continuation dans une nouvelle
+  investigation n’est pas démontrée ici.
+- **Analyse locale :** FLOSS et MWCP sont absents. Le binaire Ghidra présent ne
+  fournit pas à lui seul un adaptateur/runner REA livré; REA reste indisponible.
+- **Exécution :** le Dockerfile backend ne déclare pas d’utilisateur dédié.
+  L’exposition hors loopback reste à traiter avant tout déploiement exposé.
+- **Retrohunt :** il reste OFF pour le premier run jusqu’à validation YARA et
+  décision explicite. Les tests offline de quotas n’autorisent aucun job live.
+- **Validation humaine :** le test d’un tiers sur environnement vierge n’est
+  pas établi. L’inspection du vrai PDF, l’approbation G2, la décision G3, le
+  repin V6, la revue de composition et la publication finale restent des actes
+  supervisés séparés.
 
-La revue indépendante a confirmé quatre défauts, corrigés dans cette branche :
+## Scénarios de test présents
 
-1. `live` rejoint `pilot`, `prod` et `production` dans la liste partagée des
-   environnements protégés. Sans jeton, l'identité locale refuse un bind non
-   loopback au démarrage et refuse les requêtes sur un bind exposé.
-2. Avec `OPERATOR_API_TOKEN`, seuls les chemins exacts
-   `/api/health/live` et `/api/health/ready` sont exempts de Bearer;
-   `/api/health/models` et les routes métier restent protégés. Le healthcheck
-   Compose utilise `/api/health/ready` sans jeton.
-3. Le proxy du serveur Vite ajoute le Bearer configuré par
-   `OPERATOR_API_TOKEN`. La variable est transmise au service frontend côté
-   serveur; elle n'est pas préfixée `VITE_` et n'entre pas dans le bundle.
-4. Bubblewrap isole les PID, IPC et UTS en plus du réseau. Le filtre reste
-   installé par `bwrap --seccomp <fd>`, après le démarrage de Bubblewrap.
+Ces noms identifient les scénarios dans le HEAD de cette worktree; ils n’ont
+pas été relancés pendant cette passe documentaire. Les scénarios simulés ne
+remplacent pas les smokes live.
 
-L'identité locale `dev-analyst` en loopback est conservée : l'accès local isolé
-est accepté pour ce pilote. Elle reste `verified=false`, et son gate readiness
-ne peut pas être `PASS`. Un bind non loopback est interdit avec identité locale
-en `pilot`, `prod`, `production` et `live`.
+| Lot | Scénario repère | Portée visible dans le test |
+|---|---|---|
+| Configuration | [`test_compose_propagates_critical_settings_to_api_and_worker_from_a_fake_env`](../../backend/tests/test_config.py) | Correspondance `.env` factice, Settings API/worker et absence des secrets dans leur représentation. |
+| Reset | [`test_real_run_marker_blocks_confirmed_reset_before_any_deletion`](../../backend/tests/test_safe_local_reset.py), [`test_initial_data_reset_requires_confirmation_and_displays_counts`](../../backend/tests/test_safe_local_reset.py) | Refus après démarrage du run, confirmation explicite et prévisualisation des cibles. |
+| G2/CAS | [`test_governance_routes_approve_extend_revoke_and_enforce_cas`](../../backend/tests/test_investigation_api.py) | Approbation, extension, révocation et contrôle de version; ne vérifie pas l’extension après révocation. |
+| W16 | [`test_w16_interrupt_during_bridge_wait_is_durable_read_only_and_resumable`](../../backend/tests/workflow_emulator/test_w16_investigation_durable_stop_resume.py), [`test_w16_g2_revocation_during_vt_archives_reply_and_blocks_followup`](../../backend/tests/workflow_emulator/test_w16_investigation_durable_stop_resume.py) | Pause pendant attente Bridge, résultat VT archivé et suite bloquée après révocation. |
+| W17 | [`test_w17_real_typst_draft_preview_preserves_structure_and_limits`](../../backend/tests/workflow_emulator/test_w17_opinion_draft_preview_quality.py) | Rendu Typst local, structure du brouillon, limites et note placée après son ancre. |
+| W18 | [`test_w18_supervised_first_run_recovers_without_replaying_confirmed_effects`](../../backend/tests/workflow_emulator/test_w18_supervised_first_run_recovery.py) | Parcours intégré avec fournisseurs simulés; interruption, redémarrage worker, réconciliation, preview/révision, publication V6, repin explicite et rendu final après frontières de reprise. |
 
-Les ports publiés par défaut pour MinIO, backend et frontend sont liés à
-`127.0.0.1`. `APP_ENV`, `API_BIND_HOST` et `OPERATOR_API_TOKEN` sont
-paramétrables; le `CMD` Uvicorn lit `API_BIND_HOST`.
-
-## Environnement et défaut P0
-
-Le venv backend avait été construit sur Miniconda CPython 3.12.4, interdit par
-`.claude/CLAUDE.md`; il provoquait deux timeouts TShark. Il a été reconstruit
-avec `/usr/bin/python3.12` (CPython 3.12.3), sans Conda. Depuis, le
-workbench réseau passe 16/16 tests. La commande de reconstruction utilisée :
-
-```sh
-rm -rf backend/.venv && cd backend && uv sync --locked --python /usr/bin/python3.12 --group dev --group analysis
-```
-
-Pour Typst sous Snap, `TMPDIR` doit être un chemin non caché sous `$HOME`;
-dans cette session il vaut `$HOME/autowork-tmp`.
-
-Le défaut P0 préexistant installait seccomp avant Bubblewrap. Ainsi,
-`bwrap --unshare-net` ne pouvait pas monter `lo`; la sonde annonçait un
-confinement qui échouait à la première exécution. Le filtre est maintenant
-transmis avec `bwrap --seccomp <fd>`. Le test réel montre `socket()` → `EPERM`,
-le PID du worker absent de `/proc`, l'environnement hôte inaccessible par ce
-PID et les lecteurs catalogués confinés.
-
-## Validations
-
-Relancées après les corrections de cette branche :
-
-- `make lint-backend` : OK, 729 fichiers.
-- `make typecheck-backend` : OK, 706 fichiers.
-- `make test-backend` : 3 613 passés, 22 désélectionnés.
-- Tests ciblés sécurité/prévol/workbench : 60 passés; les tests Bubblewrap
-  réels et `test_network_workbench.py` sont inclus.
-- `cd frontend && pnpm lint && pnpm typecheck && pnpm test --run` : OK,
-  37 fichiers de test, 289 tests passés.
-
-Autres validations consignées le 14 octobre dans `.validation/` (journaux non
-versionnés; non rejouées pendant cette passe de corrections) :
-
-- `make test-integration` : 310 passés avec le PostgreSQL jetable Compose
-  `postgres-test`.
-- `make test-workflow` : 15 passés.
-- `make test-workflow-full` : 23 passés; garde JUnit OK.
-- `make test-workflow-browser-investigation` : 1 passé. Le manifeste et les
-  releases historiques étaient inchangés avant repin; le PDF final a été
-  vérifié avec Poppler.
-
-## Capacités non validées
-
-- Aucun appel fournisseur réel : Bridge, VT via vtUI et Shodan restent
-  `LIVE_NOT_VALIDATED` / `NOT_VALIDATED`.
-- Retrohunt n'est pas branché par défaut : flag OFF, aucun slot consommé. La
-  limite de deux jobs par sujet et le refus du troisième sont testés offline.
-- FLOSS et MWCP sont absents de cette machine. REA/Ghidra est absent; le runner
-  REA confiné n'est pas livré.
-- Aucune API n'a été vérifiée pour l'aperçu PDF de l'avis. L'aperçu d'édition
-  existant ne prouve pas le rendu du brouillon d'avis.
-- Le gate L5 « un autre développeur suit la doc sur un environnement vierge »
-  est `NOT_VALIDATED` : cette vérification par un tiers n'a pas été faite.
-- L'écart éditorial CN2609 reste : l'Avis de l'analyste est structuré, mais
-  les sections n'ont pas de notes contextualisées par section.
-
-## Décisions manuelles restantes
-
-1. Fournir et vérifier les UUID, version, SHA-256 et TLP exacts, ainsi qu'une
-   DSN explicitement jetable.
-2. Résoudre Bridge/vtUI et choisir une identité vérifiée pour tout gate qui
-   l'exige; l'identité locale seule ne peut le passer.
-3. Après approbation explicite, exécuter et conserver les smoke live dans
-   l'ordre Bridge, VT/vtUI, Shodan, avec une enveloppe G2 adaptée à chaque
-   étape.
-4. Relire l'avis, décider G3 et résoudre le chemin d'aperçu PDF. La publication
-   reste exclue.
-
-Risque P1 : le conteneur backend ne tourne pas sous un utilisateur dédié; le
-pilote local tourne sous l'utilisateur non privilégié de la machine. Un
-utilisateur dédié reste à mettre en place avant toute exposition.
-
-Le runbook opératoire, ses commandes existantes et la commande de régénération
-du prévol sont dans
+La procédure future, ses commandes Make, champs de routes et conditions de
+reprise sont dans
 [investigation-supervised-first-run.md](../operations/investigation-supervised-first-run.md).
-Les rapports JSON et Markdown générés sont supprimés et ignorés par Git : ils
-sont propres à une machine et à un SHA.
+Le statut reste NO_GO jusqu’à la résolution des blocages ci-dessus et à la
+validation live supervisée.
