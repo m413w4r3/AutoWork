@@ -1,7 +1,8 @@
 """Read-only preflight for a supervised CTI investigation pilot.
 
 The command never calls a provider, starts a service, migrates PostgreSQL, or
-reads sample bytes. Local service checks are TCP connects to loopback only.
+reads sample bytes. Stack checks run from the worker and only use read probes:
+PostgreSQL SELECTs, Redis PING, MinIO HEAD bucket, and Bridge GET /models.
 """
 
 from __future__ import annotations
@@ -22,11 +23,19 @@ from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 from uuid import UUID
 
 ROOT = Path(__file__).resolve().parents[2]
 BACKEND_SRC = ROOT / "backend" / "src"
+if not BACKEND_SRC.is_dir():
+    BACKEND_SRC = ROOT / "src"
+MIGRATIONS_DIR = ROOT / "backend" / "migrations"
+if not MIGRATIONS_DIR.is_dir():
+    MIGRATIONS_DIR = ROOT / "migrations"
+ALEMBIC_CONFIG = ROOT / "backend" / "alembic.ini"
+if not ALEMBIC_CONFIG.is_file():
+    ALEMBIC_CONFIG = ROOT / "alembic.ini"
 if str(BACKEND_SRC) not in sys.path:
     sys.path.insert(0, str(BACKEND_SRC))
 
@@ -258,7 +267,205 @@ def _probe_local_tcp(
     }
 
 
-def _database_identity(dsn: str | None) -> dict[str, Any]:
+def _stack_runtime(env: Mapping[str, str]) -> bool:
+    return (
+        env.get("SUPERVISED_FIRST_RUN_COMPOSE_PROJECT") == "cti-bulletin"
+        and env.get("SUPERVISED_FIRST_RUN_DB_DISPOSABLE") == "1"
+    )
+
+
+def _probe_stack_redis(value: str | None) -> dict[str, Any]:
+    target = "redis:6379"
+    if not value:
+        return {"state": "ABSENT", "target": None, "reason": "not_configured"}
+    try:
+        parsed = urlsplit(value)
+        if parsed.scheme != "redis" or parsed.hostname != "redis" or (parsed.port or 6379) != 6379:
+            return {
+                "state": "NOT_PROBED",
+                "target": "non_standard_target_omitted",
+                "reason": "stack_service_target_mismatch",
+            }
+        import redis
+
+        client = redis.Redis.from_url(
+            value,
+            decode_responses=True,
+            socket_connect_timeout=2,
+            socket_timeout=2,
+        )
+        try:
+            available = bool(client.ping())
+        finally:
+            client.close()
+    except Exception as exc:  # noqa: BLE001 - never print endpoint credentials.
+        return {
+            "state": "UNAVAILABLE",
+            "target": target,
+            "reason": f"read_only_probe_failed:{type(exc).__name__}",
+        }
+    return {
+        "state": "AVAILABLE" if available else "UNAVAILABLE",
+        "target": target,
+        "reason": "redis_ping",
+    }
+
+
+def _probe_stack_minio(
+    endpoint: str | None, env: Mapping[str, str]
+) -> dict[str, Any]:
+    target = "minio:9000/HEAD bucket"
+    if not endpoint:
+        return {"state": "ABSENT", "target": None, "reason": "not_configured"}
+    host, port = _safe_url_target(endpoint, default_scheme="http")
+    if host != "minio" or port != 9000:
+        return {
+            "state": "NOT_PROBED",
+            "target": "non_standard_target_omitted",
+            "reason": "stack_service_target_mismatch",
+        }
+    bucket = env.get("S3_BUCKET")
+    if not bucket:
+        return {"state": "UNAVAILABLE", "target": target, "reason": "bucket_not_configured"}
+    try:
+        from minio import Minio
+
+        secure = env.get("S3_SECURE", "false").casefold() in {"1", "true", "yes"}
+        client = Minio(
+            "minio:9000",
+            access_key=env.get("S3_ACCESS_KEY") or None,
+            secret_key=env.get("S3_SECRET_KEY") or None,
+            secure=secure,
+        )
+        exists = client.bucket_exists(bucket)
+    except Exception as exc:  # noqa: BLE001 - never expose endpoint or credentials.
+        return {
+            "state": "UNAVAILABLE",
+            "target": target,
+            "reason": f"read_only_probe_failed:{type(exc).__name__}",
+        }
+    return {
+        "state": "AVAILABLE" if exists else "MISSING",
+        "target": target,
+        "reason": "minio_head_bucket",
+    }
+
+
+def _probe_stack_bridge(value: str | None, api_key: str | None) -> dict[str, Any]:
+    if not value:
+        return {"state": "ABSENT", "target": None, "reason": "not_configured"}
+    try:
+        parsed = urlsplit(value)
+        host = parsed.hostname
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not host
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("invalid_bridge_endpoint")
+        if host.casefold() not in {
+            "localhost",
+            "127.0.0.1",
+            "::1",
+            "host.docker.internal",
+            "chatgpt-bridge",
+        } and not _local_host(host):
+            return {
+                "state": "NOT_PROBED",
+                "target": "non_local_target_omitted",
+                "reason": "local_bridge_target_required",
+            }
+        base_path = parsed.path.rstrip("/")
+        models_path = (
+            f"{base_path}/models"
+            if base_path.endswith("/v1")
+            else f"{base_path}/v1/models"
+        )
+        models_url = urlunsplit((parsed.scheme, parsed.netloc, models_path, "", ""))
+    except ValueError:
+        return {
+            "state": "NOT_PROBED",
+            "target": "invalid_target_omitted",
+            "reason": "invalid_bridge_endpoint",
+        }
+
+    try:
+        import httpx
+
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        with httpx.Client(timeout=3, trust_env=False, follow_redirects=False) as client:
+            with client.stream("GET", models_url, headers=headers) as response:
+                status_code = response.status_code
+    except Exception as exc:  # noqa: BLE001 - never include URL or credential details.
+        return {
+            "state": "UNAVAILABLE",
+            "target": f"{host}:{port}/v1/models",
+            "reason": f"capability_probe_failed:{type(exc).__name__}",
+        }
+    return {
+        "state": "CAPABLE" if 200 <= status_code < 300 else "HTTP_UNAVAILABLE",
+        "target": f"{host}:{port}/v1/models",
+        "http_status": status_code,
+        "reason": "bridge_models_get_no_investigation_data",
+    }
+
+
+def _probe_stack_identity() -> tuple[dict[str, Any], dict[str, Any] | None]:
+    target = "backend:8000/api/identity/status"
+    try:
+        import httpx
+
+        with httpx.Client(timeout=2, trust_env=False, follow_redirects=False) as client:
+            response = client.get(f"http://{target}")
+        if response.status_code != 200:
+            return (
+                {
+                    "state": "UNAVAILABLE",
+                    "target": target,
+                    "reason": f"identity_status_http_{response.status_code}",
+                },
+                None,
+            )
+        payload = response.json()
+        identity = {
+            key: payload.get(key)
+            for key in (
+                "mode",
+                "verified",
+                "identity_scope",
+                "human_identity",
+                "approvals_allowed",
+                "bind_scope",
+            )
+        }
+        if identity["mode"] not in {"local", "authenticated", "custom"}:
+            raise ValueError("invalid_identity_status")
+    except Exception as exc:  # noqa: BLE001 - no response body is included.
+        return (
+            {
+                "state": "UNAVAILABLE",
+                "target": target,
+                "reason": f"identity_probe_failed:{type(exc).__name__}",
+            },
+            None,
+        )
+    return (
+        {
+            "state": "AVAILABLE",
+            "target": target,
+            "reason": "read_only_identity_status",
+        },
+        identity,
+    )
+
+
+def _database_identity(
+    dsn: str | None, *, env: Mapping[str, str] | None = None
+) -> dict[str, Any]:
     if not dsn:
         return {
             "state": "REFUSED",
@@ -294,6 +501,8 @@ def _database_identity(dsn: str | None) -> dict[str, Any]:
     host_display = (
         host
         if _local_host(host) and host
+        else "postgres"
+        if host == "postgres"
         else "local_socket"
         if host is None
         else "non_local_omitted"
@@ -303,10 +512,10 @@ def _database_identity(dsn: str | None) -> dict[str, Any]:
         if database and not re.search(r"(?i)(prod|live)", database)
         else "sensitive_or_live_name_omitted"
     )
-    app_env = os.environ.get("APP_ENV", "development").casefold()
-    disposable_marker = os.environ.get(
-        "SUPERVISED_FIRST_RUN_DB_DISPOSABLE", ""
-    ).casefold() in {
+    environment = os.environ if env is None else env
+    app_env = environment.get("APP_ENV", "development").casefold()
+    disposable_value = environment.get("SUPERVISED_FIRST_RUN_DB_DISPOSABLE", "")
+    disposable_marker = disposable_value.casefold() in {
         "1",
         "true",
         "yes",
@@ -318,10 +527,29 @@ def _database_identity(dsn: str | None) -> dict[str, Any]:
         database and re.search(r"(?i)(^|[_-])(prod|production|live)([_-]|$)", database)
     )
     environment_is_live = app_env in PROTECTED_APP_ENVIRONMENTS
-    if not _local_host(host):
-        reason = "database_host_not_loopback"
-    elif live_name or environment_is_live:
+    stack_project = environment.get("SUPERVISED_FIRST_RUN_COMPOSE_PROJECT")
+    if live_name or environment_is_live:
         reason = "live_database_refused"
+    elif host == "postgres":
+        if stack_project != "cti-bulletin":
+            reason = "compose_project_identity_required"
+        elif port != 5432:
+            reason = "stack_postgres_port_not_standard"
+        elif disposable_value != "1":
+            reason = "explicit_disposable_stack_attestation_required"
+        else:
+            return _inspect_safe_local_database(
+                raw,
+                host,
+                port,
+                database,
+                host_display,
+                database_display,
+                require_alembic_head=True,
+                stack_database=True,
+            )
+    elif not _local_host(host):
+        reason = "database_host_not_loopback"
     elif not disposable_marker or not pilot_name:
         reason = "explicit_disposable_pilot_identity_required"
     else:
@@ -348,6 +576,9 @@ def _inspect_safe_local_database(
     database: str | None,
     host_display: str,
     database_display: str | None,
+    *,
+    require_alembic_head: bool = False,
+    stack_database: bool = False,
 ) -> dict[str, Any]:
     try:
         import asyncpg
@@ -398,17 +629,45 @@ def _inspect_safe_local_database(
         finally:
             await connection.close()
         empty = int(table_count or 0) == 0
-        identified_schema = bool(revisions)
-        safe = bool(current_database == database and (empty or identified_schema))
+        try:
+            expected_heads = _expected_alembic_heads() if alembic_exists else ()
+        except Exception as exc:  # noqa: BLE001 - report only the exception type.
+            return {
+                "state": "REFUSED",
+                "safe": False,
+                "host": host_display,
+                "port": port,
+                "database": database_display,
+                "schema": "unknown",
+                "reason": f"alembic_head_detection_failed:{type(exc).__name__}",
+                "read_only": True,
+                "migrated": False,
+            }
+        migrated = bool(expected_heads) and set(revisions) == set(expected_heads)
+        safe_schema = migrated or (empty and not require_alembic_head)
+        safe = bool(current_database == database and safe_schema)
         if current_database != database:
             reason = "connected_database_mismatch"
             schema = "mismatch"
-        elif not empty and not identified_schema:
+        elif empty and require_alembic_head:
+            reason = "alembic_head_required"
+            schema = "empty"
+        elif not empty and not alembic_exists:
             reason = "non_empty_database_without_alembic_identity"
             schema = "unidentified_non_empty"
+        elif not empty and not expected_heads:
+            reason = "alembic_head_unavailable"
+            schema = "alembic_head_unknown"
+        elif not empty and not migrated:
+            reason = "alembic_revision_not_at_head"
+            schema = "alembic_not_at_head"
         else:
-            reason = "explicit_disposable_pilot_read_only"
-            schema = "empty" if empty else "alembic_version_present"
+            reason = (
+                "explicit_disposable_stack_read_only"
+                if stack_database
+                else "explicit_disposable_pilot_read_only"
+            )
+            schema = "alembic_head" if migrated else "empty"
         return {
             "state": "SAFE_READ_ONLY" if safe else "REFUSED",
             "safe": safe,
@@ -419,7 +678,7 @@ def _inspect_safe_local_database(
             "alembic_revisions": revisions,
             "reason": reason,
             "read_only": True,
-            "migrated": False,
+            "migrated": migrated,
         }
 
     try:
@@ -444,6 +703,15 @@ def _inspect_safe_local_database(
             "read_only": True,
             "migrated": False,
         }
+
+
+def _expected_alembic_heads() -> tuple[str, ...]:
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    config = Config(str(ALEMBIC_CONFIG))
+    config.set_main_option("script_location", str(MIGRATIONS_DIR))
+    return tuple(sorted(ScriptDirectory.from_config(config).get_heads()))
 
 
 def _validated_reference(args: argparse.Namespace) -> dict[str, Any]:
@@ -535,29 +803,120 @@ def _source_calls_shared_assembly(path: Path) -> bool:
 
 
 def _safe_runtime_inventories() -> dict[str, Any]:
-    """Build the shared composition with provider adapters omitted and no I/O ports."""
+    """Build the worker's shared tool registry without making provider requests."""
     sys.path.insert(0, str(BACKEND_SRC))
     settings: Any | None = None
     factory_error: str | None = None
     try:
         from cti_app.application.blobs import BlobCatalogService
-        from cti_app.application.virustotal import VirusTotalCapabilities
+        from cti_app.application.virustotal import (
+            VirusTotalCapabilities,
+            VirusTotalRoutingPolicy,
+        )
+        from cti_app.application.virustotal_persistence import VirusTotalObservationService
         from cti_app.config import Settings
         from cti_app.infrastructure import local_command_runner
+        from cti_app.infrastructure.ghidra_mcp import create_ghidra_mcp_http_adapter
         from cti_app.infrastructure.investigation_runtime_ports import (
             build_investigation_runtime_composition_factory,
             describe_tool_inventory,
         )
+        from cti_app.infrastructure.shodan import (
+            create_shodan_http_adapter,
+            create_shodan_http_client,
+        )
+        from cti_app.infrastructure.virustotal import (
+            VirusTotalHttpAdapter,
+            create_virustotal_direct_http_client,
+            create_virustotal_http_client,
+        )
+        from cti_app.infrastructure.quarantined_capture_source import (
+            ProductionQuarantinedCaptureSource,
+        )
+        import httpx
 
         settings = Settings(_env_file=None)
         original_get_settings = local_command_runner.get_settings
         local_command_runner.get_settings = lambda: settings
+        clients: list[Any] = []
 
         def uow_factory() -> None:
             return None
 
         blob_store = object()
         blob_catalog = BlobCatalogService(blob_store, uow_factory)
+        vt_proxy_client = (
+            create_virustotal_http_client(settings)
+            if settings.virustotal_proxy_url
+            else httpx.AsyncClient()
+        )
+        clients.append(vt_proxy_client)
+        vt_direct_client = None
+        if settings.virustotal_api_key and settings.virustotal_file_report_legacy_fallback_enabled:
+            vt_direct_client = create_virustotal_direct_http_client(settings)
+            clients.append(vt_direct_client)
+        retrohunt_http_client = None
+        if (
+            settings.virustotal_retrohunt_proxy_enabled
+            and settings.virustotal_retrohunt_proxy_base_url
+            and settings.virustotal_retrohunt_proxy_allowed_hosts.strip()
+        ):
+            retrohunt_http_client = httpx.AsyncClient(
+                follow_redirects=False,
+                trust_env=False,
+            )
+            clients.append(retrohunt_http_client)
+        vt_capabilities = VirusTotalCapabilities(
+            file_report=settings.virustotal_file_report_enabled,
+            file_relationships=settings.virustotal_object_relationships_enabled,
+            intelligence_search=settings.virustotal_intelligence_search_enabled,
+            file_download=settings.virustotal_file_download_enabled,
+            behaviour_reports=settings.virustotal_behaviour_reports_enabled,
+            retrohunt=settings.virustotal_retrohunt_proxy_enabled,
+        )
+        vt_adapter = VirusTotalHttpAdapter(
+            client=vt_proxy_client,
+            base_url=settings.virustotal_base_url,
+            fallback_base_url=settings.virustotal_fallback_base_url,
+            legacy_base_url=settings.virustotal_legacy_base_url,
+            direct_client=vt_direct_client,
+            api_key=(
+                settings.virustotal_api_key.get_secret_value()
+                if vt_direct_client is not None and settings.virustotal_api_key is not None
+                else None
+            ),
+            capabilities=vt_capabilities,
+            file_report_proxy_fallback_enabled=settings.virustotal_file_report_proxy_fallback_enabled,
+            file_report_legacy_fallback_enabled=settings.virustotal_file_report_legacy_fallback_enabled,
+            routing_policy=(
+                None if settings.virustotal_proxy_url else VirusTotalRoutingPolicy(routes={})
+            ),
+            max_response_bytes=settings.virustotal_max_response_bytes,
+            default_page_size=settings.virustotal_default_page_size,
+            max_page_size=settings.virustotal_max_page_size,
+            max_pages=settings.virustotal_max_pages,
+            max_results=settings.virustotal_max_results,
+            file_download_enabled=settings.virustotal_file_download_enabled,
+        )
+        shodan_enabled = settings.shodan_api_key is not None and any(
+            (
+                settings.shodan_host_enabled,
+                settings.shodan_search_enabled,
+                settings.shodan_domain_enabled,
+                settings.shodan_count_enabled,
+            )
+        )
+        shodan_adapter = None
+        if shodan_enabled:
+            shodan_client = create_shodan_http_client(settings)
+            clients.append(shodan_client)
+            shodan_adapter = create_shodan_http_adapter(
+                client=shodan_client, settings=settings
+            )
+        ghidra_adapter = (
+            create_ghidra_mcp_http_adapter(settings) if settings.ghidra_enabled else None
+        )
+        vt_observations = VirusTotalObservationService(blob_catalog, uow_factory)
         inputs: dict[str, Any] = {
             "settings": settings,
             "uow_factory": uow_factory,
@@ -565,27 +924,40 @@ def _safe_runtime_inventories() -> dict[str, Any]:
             "blob_catalog": blob_catalog,
             "artifact_store": object(),
             "model_conversations": object(),
-            "vt_adapter": None,
-            "vt_capabilities": VirusTotalCapabilities(),
-            "vt_observations": None,
-            "shodan_adapter": None,
-            "ghidra_adapter": None,
+            "vt_adapter": vt_adapter,
+            "vt_capabilities": vt_capabilities,
+            "vt_observations": vt_observations,
+            "shodan_adapter": shodan_adapter,
+            "ghidra_adapter": ghidra_adapter,
+            "network_quarantine_factory": lambda investigation_id: ProductionQuarantinedCaptureSource(
+                uow_factory=uow_factory,
+                blob_catalog=blob_catalog,
+                settings=settings,
+                investigation_id=investigation_id,
+            ),
+            "retrohunt_http_client": retrohunt_http_client,
         }
         try:
             api_runtime = build_investigation_runtime_composition_factory(**inputs)
             worker_runtime = build_investigation_runtime_composition_factory(**inputs)
         finally:
             local_command_runner.get_settings = original_get_settings
+            if clients:
+
+                async def close_clients() -> None:
+                    await asyncio.gather(*(client.aclose() for client in clients))
+
+                asyncio.run(close_clients())
         api_inventory = describe_tool_inventory(api_runtime)
         worker_inventory = describe_tool_inventory(worker_runtime)
         return {
-            "mode": "offline_simulated",
+            "mode": "worker_runtime_registry",
             "provider_calls": 0,
             "api": api_inventory,
             "worker": worker_inventory,
             "constructed_inventory_matches": api_inventory == worker_inventory,
             "live_process_inventory_observed": False,
-            "reason": "shared_composition_built_with_provider_adapters_omitted",
+            "reason": "shared_composition_built_from_worker_settings_without_provider_requests",
         }
     except Exception as exc:  # noqa: BLE001 - runtime version mismatch uses safe inventory fallback.
         factory_error = factory_error or type(exc).__name__
@@ -749,6 +1121,15 @@ def _environment_profile(env: Mapping[str, str]) -> dict[str, Any]:
         if app_env_raw in {"dev", "development", "local"}
         else "custom_or_unset"
     )
+    operator_token = env.get("OPERATOR_API_TOKEN")
+    token_configured = bool(operator_token)
+    token_valid = bool(
+        operator_token
+        and len(operator_token) >= 32
+        and operator_token.isascii()
+        and not any(character.isspace() for character in operator_token)
+    )
+    identity_mode = "authenticated" if token_valid else "local" if not token_configured else "invalid"
     return {
         "app_env": app_env,
         "platform": platform.system().lower(),
@@ -760,11 +1141,24 @@ def _environment_profile(env: Mapping[str, str]) -> dict[str, Any]:
         in {"1", "true", "yes"},
         "local_analysis_enabled": env.get("LOCAL_ANALYSIS_ENABLED", "false").casefold()
         in {"1", "true", "yes"},
-        "operator_identity": "LocalIdentityProvider/dev-analyst",
+        "operator_identity": (
+            "StaticTokenIdentityProvider/operator:static-token"
+            if token_valid
+            else "LocalIdentityProvider/dev-analyst"
+            if not token_configured
+            else "StaticTokenIdentityProvider/invalid-configuration"
+        ),
+        "identity_provider_mode": identity_mode,
+        "identity_provider_verified": token_valid,
         "operator_identity_verified": False,
-        "operator_identity_scope": "local-isolated",
+        "operator_identity_scope": "authenticated" if token_valid else "local-isolated",
         "operator_identity_warning": (
-            "accès local isolé uniquement; ce n'est pas une identité externe vérifiée"
+            "le fournisseur de jeton est configuré; aucune identité humaine n'est "
+            "authentifiée par ce prévol"
+            if token_valid
+            else "accès local isolé uniquement; ce n'est pas une identité externe vérifiée"
+            if not token_configured
+            else "la configuration OPERATOR_API_TOKEN est invalide; l'API ne peut pas démarrer"
         ),
     }
 
@@ -833,7 +1227,11 @@ def _build_gates(
             checked_at=checked_at,
             git_sha=git_sha,
             environment=environment,
-            evidence_refs=["loopback TCP probes only; no provider request"],
+            evidence_refs=[
+                "worker-local Redis PING and MinIO HEAD bucket",
+                "Bridge GET /v1/models capability probe; no investigation data",
+                "no VirusTotal or Shodan request",
+            ],
             next_action=(
                 "faire confirmer Bridge et proxy VirusTotal par l'opérateur dans leur "
                 "interface locale"
@@ -856,8 +1254,8 @@ def _build_gates(
             environment=environment,
             evidence_refs=api_worker_evidence,
             next_action=(
-                "obtenir une trace fournisseur réelle; l'inventaire hors ligne ne "
-                "valide pas le chemin critique"
+                "obtenir une trace fournisseur réelle; le registre construit depuis "
+                "le code worker n'atteste aucun appel provider"
             ),
         ),
         _gate(
@@ -916,32 +1314,70 @@ def build_report(
     git = _git_snapshot()
     environment = _environment_profile(environment_values)
     reference = _validated_reference(args)
-    database = _database_identity(environment_values.get("POSTGRES_DSN"))
+    stack_runtime = _stack_runtime(environment_values)
+    database = _database_identity(
+        environment_values.get("POSTGRES_DSN"), env=environment_values
+    )
     redis_url = environment_values.get("REDIS_URL", "redis://redis:6379/0")
     minio_endpoint = environment_values.get("S3_ENDPOINT", "minio:9000")
     bridge_url = environment_values.get(
         "OPENAI_BRIDGE_BASE_URL", "http://127.0.0.1:8001/v1"
     )
     proxy_url = environment_values.get("VIRUSTOTAL_PROXY_URL")
-    services = {
-        "redis": _probe_local_tcp("redis", redis_url),
-        "minio": _probe_local_tcp("minio", minio_endpoint, default_scheme="http"),
-        "bridge": _probe_local_tcp("bridge", bridge_url),
-        "virustotal_proxy": _probe_local_tcp("virustotal_proxy", proxy_url),
-    }
+    if stack_runtime:
+        identity_service, stack_identity = _probe_stack_identity()
+        services = {
+            "redis": _probe_stack_redis(redis_url),
+            "minio": _probe_stack_minio(minio_endpoint, environment_values),
+            "bridge": _probe_stack_bridge(
+                bridge_url, environment_values.get("OPENAI_BRIDGE_API_KEY")
+            ),
+            "identity": identity_service,
+            "virustotal_proxy": _probe_local_tcp("virustotal_proxy", proxy_url),
+        }
+        if stack_identity is not None:
+            environment.update(
+                {
+                    "identity_provider_mode": stack_identity["mode"],
+                    "identity_provider_verified": stack_identity["verified"],
+                    "operator_identity_scope": stack_identity["identity_scope"],
+                    "operator_identity_verified": False,
+                    "operator_identity_warning": (
+                        "statut API réel interrogé; ce prévol n'authentifie pas "
+                        "l'opérateur humain"
+                    ),
+                }
+            )
+    else:
+        stack_identity = None
+        services = {
+            "redis": _probe_local_tcp("redis", redis_url),
+            "minio": _probe_local_tcp("minio", minio_endpoint, default_scheme="http"),
+            "bridge": _probe_local_tcp("bridge", bridge_url),
+            "identity": {
+                "state": "NOT_PROBED",
+                "target": None,
+                "reason": "requires_compose_worker_context",
+            },
+            "virustotal_proxy": _probe_local_tcp("virustotal_proxy", proxy_url),
+        }
     binaries = _binary_profile()
     inventory = _safe_runtime_inventories()
+    if stack_runtime:
+        inventory["execution_context"] = "compose_worker_image"
+        inventory["provider_requests_made"] = 0
+        inventory["live_process_inventory_observed"] = False
     wiring = {
         "api_calls_shared_assembly": _source_calls_shared_assembly(
-            ROOT / "backend" / "src" / "cti_app" / "api" / "main.py"
+            BACKEND_SRC / "cti_app" / "api" / "main.py"
         ),
         "worker_calls_shared_assembly": _source_calls_shared_assembly(
-            ROOT / "backend" / "src" / "cti_app" / "workers" / "tasks.py"
+            BACKEND_SRC / "cti_app" / "workers" / "tasks.py"
         ),
         "live_processes_queried": False,
     }
     reference_valid = bool(reference.get("valid"))
-    bridge_accessible = services["bridge"]["state"] == "REACHABLE"
+    bridge_accessible = services["bridge"]["state"] in {"REACHABLE", "CAPABLE"}
     virustotal_proxy_present = services["virustotal_proxy"]["state"] == "REACHABLE"
     signals: dict[str, bool | None] = {
         "python_312": environment["python_version"].startswith("3.12."),
@@ -969,6 +1405,7 @@ def build_report(
         "environment": environment,
         "reference": reference,
         "database": database,
+        "identity_status": stack_identity,
         "binaries": binaries,
         "services": services,
         "tool_inventory": inventory,
@@ -1074,8 +1511,9 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             "```",
             "",
             (
-                "L'inventaire est construit hors ligne avec les adapters provider absents. "
-                "Il n'atteste aucun appel réel."
+                "L'inventaire utilise la factory et les settings du worker; les adapters "
+                "configurés sont construits sans requête fournisseur. Il n'atteste aucun "
+                "résultat live d'outil."
             ),
             "",
         ]
@@ -1120,10 +1558,12 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             "## Blocages et limites",
             "",
             f"- Refus/base : `{', '.join(report.get('refusals', [])) or 'aucun'}`.",
-            "- Les probes sont limitées à TCP loopback. Aucun endpoint provider n'a été appelé.",
+            "- Les probes d'infrastructure sont en lecture seule; le Bridge reçoit uniquement "
+            "GET /v1/models sans données d'enquête. Aucun endpoint VirusTotal ou Shodan "
+            "n'est appelé.",
             (
-                "- L'identité `LocalIdentityProvider/dev-analyst` autorise uniquement "
-                "un accès local isolé; elle ne vérifie pas un opérateur externe."
+                "- Le statut d'identité décrit le fournisseur configuré; ce prévol "
+                "n'authentifie pas l'opérateur humain."
             ),
             (
                 "- Un résultat `offline_simulated`, une CI verte ou un gate "

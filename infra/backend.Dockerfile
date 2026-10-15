@@ -33,6 +33,7 @@ RUN TYPST_FONTS_LOCK_FILE=/usr/local/share/autowork/typst-fonts.lock \
 
 COPY chpTypst /app/chpTypst
 COPY scripts/typst_edition_smoke.py /app/scripts/typst_edition_smoke.py
+COPY scripts/ops/supervised_first_run_preflight.py /app/scripts/ops/supervised_first_run_preflight.py
 
 COPY backend/pyproject.toml backend/uv.lock backend/README.md backend/alembic.ini ./
 COPY backend/migrations ./migrations

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 from argparse import Namespace
 from pathlib import Path
 from typing import Any
@@ -155,6 +156,321 @@ def test_pilot_database_without_disposable_marker_is_refused(
     )
     assert result["safe"] is False
     assert result["reason"] == "explicit_disposable_pilot_identity_required"
+
+
+def test_standard_stack_database_requires_compose_identity_and_attestation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, Any] = {}
+
+    def inspect_database(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        calls["args"] = args
+        calls["kwargs"] = kwargs
+        return {"state": "SAFE_READ_ONLY", "safe": True, "migrated": True}
+
+    monkeypatch.setattr(preflight, "_inspect_safe_local_database", inspect_database)
+    result = preflight._database_identity(
+        "postgresql+asyncpg://cti_app:fixture@postgres:5432/cti_app",
+        env={
+            "APP_ENV": "development",
+            "SUPERVISED_FIRST_RUN_COMPOSE_PROJECT": "cti-bulletin",
+            "SUPERVISED_FIRST_RUN_DB_DISPOSABLE": "1",
+        },
+    )
+
+    assert result["safe"] is True
+    assert calls["args"][1:4] == ("postgres", 5432, "cti_app")
+    assert calls["kwargs"] == {"require_alembic_head": True, "stack_database": True}
+
+
+@pytest.mark.parametrize(
+    ("host", "project", "attestation", "reason"),
+    (
+        ("postgres", "cti-bulletin", None, "explicit_disposable_stack_attestation_required"),
+        ("postgres", "unknown-project", "1", "compose_project_identity_required"),
+        ("postgres.internal.example", "cti-bulletin", "1", "database_host_not_loopback"),
+    ),
+)
+def test_stack_database_without_exact_local_identity_is_refused(
+    host: str,
+    project: str,
+    attestation: str | None,
+    reason: str,
+) -> None:
+    env = {
+        "APP_ENV": "development",
+        "SUPERVISED_FIRST_RUN_COMPOSE_PROJECT": project,
+    }
+    if attestation is not None:
+        env["SUPERVISED_FIRST_RUN_DB_DISPOSABLE"] = attestation
+    result = preflight._database_identity(
+        f"postgresql://cti_app:fixture@{host}:5432/cti_app", env=env
+    )
+    assert result["safe"] is False
+    assert result["reason"] == reason
+
+
+@pytest.mark.parametrize(
+    ("revision", "safe", "reason"),
+    (
+        ("head-revision", True, "explicit_disposable_stack_read_only"),
+        ("stale-revision", False, "alembic_revision_not_at_head"),
+    ),
+)
+def test_stack_database_requires_the_current_alembic_head(
+    monkeypatch: pytest.MonkeyPatch, revision: str, safe: bool, reason: str
+) -> None:
+    class ReadOnlyTransaction:
+        async def __aenter__(self) -> None:
+            return None
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    class FakeConnection:
+        def transaction(self, *, readonly: bool) -> ReadOnlyTransaction:
+            assert readonly is True
+            return ReadOnlyTransaction()
+
+        async def fetchval(self, query: str) -> Any:
+            if "current_database" in query:
+                return "cti_app"
+            if "count(*)" in query:
+                return 3
+            if "to_regclass" in query:
+                return True
+            raise AssertionError("unexpected database query")
+
+        async def fetch(self, _query: str) -> list[dict[str, str]]:
+            return [{"version_num": revision}]
+
+        async def close(self) -> None:
+            return None
+
+    async def fake_connect(**_kwargs: Any) -> FakeConnection:
+        return FakeConnection()
+
+    monkeypatch.setattr(asyncpg, "connect", fake_connect)
+    monkeypatch.setattr(preflight, "_expected_alembic_heads", lambda: ("head-revision",))
+    result = preflight._inspect_safe_local_database(
+        "postgresql://cti_app:fixture@postgres:5432/cti_app",
+        "postgres",
+        5432,
+        "cti_app",
+        "postgres",
+        "cti_app",
+        require_alembic_head=True,
+        stack_database=True,
+    )
+    assert result["safe"] is safe
+    assert result["migrated"] is safe
+    assert result["reason"] == reason
+
+
+def test_make_stack_preflight_executes_script_inside_worker() -> None:
+    result = subprocess.run(
+        [
+            "make",
+            "-n",
+            "preflight-supervised-first-run-stack",
+            "COMPOSE_MODELS=off",
+            "SUPERVISED_FIRST_RUN_DB_DISPOSABLE=1",
+        ],
+        cwd=_SCRIPT_PATH.parents[2],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert "--project-name cti-bulletin exec -T" in result.stdout
+    assert "-e SUPERVISED_FIRST_RUN_COMPOSE_PROJECT=cti-bulletin" in result.stdout
+    assert "-e SUPERVISED_FIRST_RUN_DB_DISPOSABLE=1" in result.stdout
+    assert "worker python /app/scripts/ops/supervised_first_run_preflight.py" in result.stdout
+
+
+def test_stack_identity_profile_never_claims_the_human_is_authenticated() -> None:
+    environment = preflight._environment_profile({"OPERATOR_API_TOKEN": "x" * 40})
+    assert environment["identity_provider_mode"] == "authenticated"
+    assert environment["identity_provider_verified"] is True
+    assert environment["operator_identity_verified"] is False
+    assert "x" * 40 not in str(environment)
+
+
+def test_stack_redis_probe_uses_ping_without_disclosing_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import redis
+
+    calls: dict[str, Any] = {}
+
+    class FakeRedis:
+        def ping(self) -> bool:
+            calls["ping"] = True
+            return True
+
+        def close(self) -> None:
+            calls["closed"] = True
+
+    def from_url(_cls: type[redis.Redis], value: str, **kwargs: Any) -> FakeRedis:
+        calls["url"] = value
+        calls["kwargs"] = kwargs
+        return FakeRedis()
+
+    monkeypatch.setattr(redis.Redis, "from_url", classmethod(from_url))
+    result = preflight._probe_stack_redis("redis://:redis-secret@redis:6379/0")
+    assert result["state"] == "AVAILABLE"
+    assert result["reason"] == "redis_ping"
+    assert calls["ping"] is True
+    assert calls["closed"] is True
+    assert "redis-secret" not in str(result)
+
+
+def test_stack_minio_probe_checks_bucket_with_read_only_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import minio
+
+    calls: dict[str, Any] = {}
+
+    def fake_execute(
+        _client: Any,
+        method: str,
+        bucket: str,
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> None:
+        calls["method"] = method
+        calls["bucket"] = bucket
+
+    monkeypatch.setattr(minio.Minio, "_execute", fake_execute)
+    result = preflight._probe_stack_minio(
+        "minio:9000",
+        {
+            "S3_ACCESS_KEY": "access-secret",
+            "S3_SECRET_KEY": "secret-key",
+            "S3_BUCKET": "cti-local",
+        },
+    )
+    assert result["state"] == "AVAILABLE"
+    assert result["reason"] == "minio_head_bucket"
+    assert calls["method"] == "HEAD"
+    assert calls["bucket"] == "cti-local"
+    assert "secret-key" not in str(result)
+
+
+def test_bridge_probe_sends_only_get_models_capability_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx
+
+    calls: dict[str, Any] = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def __enter__(self) -> FakeResponse:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    class FakeClient:
+        def __init__(self, **kwargs: Any) -> None:
+            calls["client_kwargs"] = kwargs
+
+        def __enter__(self) -> FakeClient:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def stream(self, method: str, url: str, *, headers: dict[str, str]) -> FakeResponse:
+            calls["request"] = {"method": method, "url": url, "headers": headers}
+            return FakeResponse()
+
+    monkeypatch.setattr(httpx, "Client", FakeClient)
+    result = preflight._probe_stack_bridge("http://chatgpt-bridge:8001/v1", "bridge-secret")
+    assert result["state"] == "CAPABLE"
+    assert calls["request"]["method"] == "GET"
+    assert calls["request"]["url"] == "http://chatgpt-bridge:8001/v1/models"
+    assert calls["request"]["headers"] == {"Authorization": "Bearer bridge-secret"}
+    assert calls["client_kwargs"] == {
+        "timeout": 3,
+        "trust_env": False,
+        "follow_redirects": False,
+    }
+    assert "bridge-secret" not in str(result)
+
+
+def test_stack_identity_probe_reports_only_identity_status_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx
+
+    class FakeResponse:
+        status_code = 200
+
+        @staticmethod
+        def json() -> dict[str, Any]:
+            return {
+                "mode": "authenticated",
+                "verified": True,
+                "identity_scope": "authenticated",
+                "human_identity": True,
+                "approvals_allowed": True,
+                "bind_scope": "loopback",
+                "token": "must-not-be-reported",
+            }
+
+    class FakeClient:
+        def __init__(self, **_kwargs: Any) -> None:
+            return None
+
+        def __enter__(self) -> FakeClient:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def get(self, url: str) -> FakeResponse:
+            assert url == "http://backend:8000/api/identity/status"
+            return FakeResponse()
+
+    monkeypatch.setattr(httpx, "Client", FakeClient)
+    service, identity = preflight._probe_stack_identity()
+    assert service["state"] == "AVAILABLE"
+    assert identity == {
+        "mode": "authenticated",
+        "verified": True,
+        "identity_scope": "authenticated",
+        "human_identity": True,
+        "approvals_allowed": True,
+        "bind_scope": "loopback",
+    }
+    assert "must-not-be-reported" not in str(identity)
+
+
+def test_runtime_inventory_uses_worker_factory_without_provider_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "VIRUSTOTAL_PROXY_URL",
+        "VIRUSTOTAL_API_KEY",
+        "SHODAN_API_KEY",
+        "OPERATOR_API_TOKEN",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("VIRUSTOTAL_FILE_REPORT_ENABLED", "true")
+    monkeypatch.setenv("VIRUSTOTAL_FILE_REPORT_LEGACY_FALLBACK_ENABLED", "false")
+    monkeypatch.setenv("VIRUSTOTAL_RETROHUNT_ENABLED", "false")
+
+    inventory = preflight._safe_runtime_inventories()
+
+    assert inventory["mode"] == "worker_runtime_registry"
+    assert inventory["provider_calls"] == 0
+    assert inventory["constructed_inventory_matches"] is True
+    assert inventory["live_process_inventory_observed"] is False
+    assert inventory["worker"]["families"]["virustotal"]["status"] == "available"
 
 
 def test_non_empty_database_without_alembic_identity_is_refused(

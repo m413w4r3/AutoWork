@@ -25,6 +25,7 @@ COMPOSE_PROJECT ?= cti-bulletin
 # `yes` confirms only the one-time cleanup of existing local DB data. It cannot
 # bypass target validation or the persistent marker for a started supervised run.
 CONFIRM_INITIAL_RESET ?= no
+SUPERVISED_FIRST_RUN_DB_DISPOSABLE ?= 0
 
 # Application stack files. compose.models.yaml joins the external MetaHarness
 # network so the services reach the ChatGPT Bridge by its Docker name; without it
@@ -145,6 +146,7 @@ CLEAN_PATHS := \
 	test-all \
 	test-backend \
 	preflight-supervised-first-run \
+	preflight-supervised-first-run-stack \
 	test-frontend \
 	test-frontend-e2e \
 	test-integration \
@@ -319,6 +321,15 @@ preflight-supervised-first-run: ## Prévol local en lecture seule du premier run
 		UV_PYTHON_DOWNLOADS=never $(UV_RUN) --python $(PYTHON_VERSION) \
 			python ../scripts/ops/supervised_first_run_preflight.py \
 			$(PREFLIGHT_ARGS)
+
+preflight-supervised-first-run-stack: ## Prévol en lecture seule depuis le worker de la stack cti-bulletin
+	@test "$(COMPOSE_PROJECT)" = "cti-bulletin" || { echo "ERREUR: cette cible exige COMPOSE_PROJECT=cti-bulletin." >&2; exit 2; }
+	@test "$(SUPERVISED_FIRST_RUN_DB_DISPOSABLE)" = "1" || { echo "ERREUR: attestez la base locale autorisée avec SUPERVISED_FIRST_RUN_DB_DISPOSABLE=1." >&2; exit 2; }
+	$(STACK_COMPOSE) --project-name cti-bulletin exec -T \
+		-e SUPERVISED_FIRST_RUN_COMPOSE_PROJECT=cti-bulletin \
+		-e SUPERVISED_FIRST_RUN_DB_DISPOSABLE=1 \
+		worker python /app/scripts/ops/supervised_first_run_preflight.py \
+		$(PREFLIGHT_ARGS)
 
 test-frontend: frontend-sync ## Lance les tests frontend
 	cd $(FRONTEND_DIR) && $(PNPM) test --run
