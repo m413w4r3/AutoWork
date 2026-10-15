@@ -889,6 +889,42 @@ async def test_unavailable_tool_does_not_abort_later_agent_decision() -> None:
 
 
 @pytest.mark.asyncio
+async def test_two_tools_in_one_turn_use_latest_envelope_and_commit_both_budgets() -> None:
+    first = _tool_call("vt.search", "content:abc", "find related payloads")
+    second = _tool_call("vt.lookup", "content:def", "check a second payload")
+    fixture = _Fixture(
+        responses=[
+            _decision(goal="compare payloads", next_action="finish", tools=(first, second)),
+        ],
+        tools=(("vt.search", "vt"), ("vt.lookup", "vt")),
+    )
+    state = await fixture.start()
+
+    result = await fixture.service.run(state.investigation_id)
+
+    envelope = await fixture.envelopes.get(state.investigation_id)
+    assert result.stop_reason is StopReason.AGENT_FINISHED
+    assert fixture.execution_order == ["vt.search", "vt.lookup"]
+    assert fixture.bridge_transport.submission_count == 1
+    assert envelope is not None
+    assert envelope.budget.consumed[BudgetDimension.BRIDGE_TURNS] == 1
+    assert envelope.budget.consumed[BudgetDimension.VT_UNITS] == 2
+    for call in (first, second):
+        operation_key = tool_operation_key(
+            investigation_id=state.investigation_id,
+            tool_name=call["tool_name"],
+            schema_version=call["schema_version"],
+            normalized_parameters=call["arguments"],
+            purpose=call["purpose"],
+        )
+        reservation = next(
+            item for item in envelope.budget.reservations if item.operation_key == operation_key
+        )
+        assert reservation.status.value == "committed"
+        assert reservation.committed_amounts[BudgetDimension.VT_UNITS] == 1
+
+
+@pytest.mark.asyncio
 async def test_tool_outside_envelope_is_denied_with_alternative_and_budget_release() -> None:
     denied = _tool_call("vt.search", "content:abc", "check a related payload")
     fixture = _Fixture(

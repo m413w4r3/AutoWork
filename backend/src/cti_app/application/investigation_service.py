@@ -894,6 +894,12 @@ class InvestigationService:
                     budget=budget,
                 )
                 return state, StopReason.PERMISSION_REQUIRED
+            # Completing a tool reservation persists a newer envelope version.
+            # Keep the next tool's reservation CAS and budget view on that durable
+            # checkpoint, while preserving the original turn envelope for G2 checks.
+            envelope = latest_envelope
+            if envelope is not None:
+                budget = envelope.budget
             outcome_message = result.message
             if result.suggested_alternatives:
                 outcome_message = f"{outcome_message} Alternatives: " + "; ".join(
