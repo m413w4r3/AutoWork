@@ -17,18 +17,11 @@
       right: 2.2cm,
     ),
     header: report-header(country: country, period: period),
-    footer: report-footer(country: country, period: period),
-    background: if draft-watermark == none {
-      none
-    } else {
-      place(center)[
-        #rotate(-32deg)[
-          #text(size: 34pt, weight: "bold", fill: rgb("#eedfe2"), tracking: 2pt)[
-            #draft-watermark
-          ]
-        ]
-      ]
-    },
+    footer: report-footer(
+      country: country,
+      period: period,
+      draft-notice: draft-watermark,
+    ),
   )
 
   // Inline and block code styling.

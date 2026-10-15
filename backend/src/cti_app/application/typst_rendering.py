@@ -647,10 +647,12 @@ def project_publication_to_typst_model(
         body_blocks.extend(notes_by_anchor.get(anchor, ()))
 
     body_blocks: list[dict[str, Any]] = []
-    for index, item in enumerate(document.lead, start=1):
-        append_paragraph(item.text, lead_paragraph_anchor(index))
+    for index, lead_paragraph in enumerate(document.lead, start=1):
+        append_paragraph(lead_paragraph.text, lead_paragraph_anchor(index))
     body_blocks.extend(rich_by_placement.get((EnrichmentPlacementKind.AFTER_LEAD, None), ()))
-    lead_fingerprints = {" ".join(item.text.casefold().split()) for item in document.lead}
+    lead_fingerprints = {
+        " ".join(lead_paragraph.text.casefold().split()) for lead_paragraph in document.lead
+    }
     for section_index, section in enumerate(document.sections):
         paragraph_blocks = [
             (paragraph_index, paragraph)
@@ -676,18 +678,22 @@ def project_publication_to_typst_model(
             block["figure_number"] = figure_number
 
     sources_by_id = {source.source_document_id: source for source in document.sources}
-    timeline = []
-    for index, entry in enumerate(document.timeline, start=1):
-        item: dict[str, Any] = {
-            "display_date": _display_date(entry.date_text, entry.event_date),
-            "text": entry.text,
-            "source_urls": _timeline_source_urls(entry.evidence_refs, sources_by_id),
+    timeline: list[dict[str, Any]] = []
+    for index, publication_timeline_entry in enumerate(document.timeline, start=1):
+        timeline_row: dict[str, Any] = {
+            "display_date": _display_date(
+                publication_timeline_entry.date_text, publication_timeline_entry.event_date
+            ),
+            "text": publication_timeline_entry.text,
+            "source_urls": _timeline_source_urls(
+                publication_timeline_entry.evidence_refs, sources_by_id
+            ),
         }
-        spans = semantic_spans(timeline_anchor(index), entry.text)
+        spans = semantic_spans(timeline_anchor(index), publication_timeline_entry.text)
         if spans is not None:
-            item["semantic_spans"] = spans
-        timeline.append(item)
-    source_references = []
+            timeline_row["semantic_spans"] = spans
+        timeline.append(timeline_row)
+    source_references: list[dict[str, Any]] = []
     for index, reference in enumerate(reference_entries, start=1):
         source = sources_by_id.get(reference.source_document_id)
         if source is None:
@@ -695,7 +701,7 @@ def project_publication_to_typst_model(
                 "Publication reference identifies an unknown source document: "
                 f"{reference.source_document_id}"
             )
-        item = {
+        reference_row: dict[str, Any] = {
             "display_date": (
                 _display_date(None, source.published_at)
                 if source.published_at is not None
@@ -705,11 +711,11 @@ def project_publication_to_typst_model(
             "source_urls": [source.canonical_url],
         }
         if source.kind.value == "technical_resource":
-            item["role_label"] = "Contexte technique"
+            reference_row["role_label"] = "Contexte technique"
         spans = semantic_spans(f"reference:{index:04d}", reference.text)
         if spans is not None:
-            item["semantic_spans"] = spans
-        source_references.append(item)
+            reference_row["semantic_spans"] = spans
+        source_references.append(reference_row)
 
     def publisher_label(source: Any) -> str | None:
         if source.editorial_role is None or source.editorial_role.value != "context":
@@ -762,11 +768,11 @@ def project_publication_to_typst_model(
     ]
     if draft_preview is not None and draft_preview.synthesis is not None:
         chronology: list[dict[str, Any]] = []
-        for entry in draft_preview.synthesis.timeline:
+        for synthesis_timeline_entry in draft_preview.synthesis.timeline:
             source_urls = sorted(
                 {
                     sources_by_id[reference.source_document_id].canonical_url
-                    for reference in entry.evidence_refs
+                    for reference in synthesis_timeline_entry.evidence_refs
                     if reference.source_document_id in sources_by_id
                 }
             )
@@ -776,8 +782,11 @@ def project_publication_to_typst_model(
                 )
             chronology.append(
                 {
-                    "display_date": _display_date(entry.date_text, entry.event_date),
-                    "text": entry.text,
+                    "display_date": _display_date(
+                        synthesis_timeline_entry.date_text,
+                        synthesis_timeline_entry.event_date,
+                    ),
+                    "text": synthesis_timeline_entry.text,
                     "source_urls": source_urls,
                 }
             )
@@ -787,16 +796,16 @@ def project_publication_to_typst_model(
             )
         limitations = [
             {
-                "text": item.text,
+                "text": uncertainty.text,
                 "source_urls": sorted(
                     {
                         sources_by_id[source_id].canonical_url
-                        for source_id in item.source_document_ids
+                        for source_id in uncertainty.source_document_ids
                         if source_id in sources_by_id
                     }
                 ),
             }
-            for item in draft_preview.synthesis.uncertainties
+            for uncertainty in draft_preview.synthesis.uncertainties
         ]
         if limitations:
             content_sections.append(
@@ -808,31 +817,31 @@ def project_publication_to_typst_model(
             "inference": "Inférence",
             "hypothesis": "Hypothèse",
         }
-        display_blocks = (
-            [
-                {
-                    "heading": block.heading,
-                    "text": block.text,
-                    "qualification": block.qualification.value,
-                    "certainty": block.certainty,
-                    "finding_refs": block.finding_refs,
-                    "evidence_refs": block.evidence_refs,
-                }
-                for block in rendered_opinion.blocks
-            ]
-            if rendered_opinion is not None
-            else [
-                {
-                    "heading": _OPINION_BLOCK_HEADINGS[block.block_type],
-                    "text": block.text,
-                    "qualification": block.qualification.value,
-                    "certainty": block.certainty,
-                    "finding_refs": block.finding_refs,
-                    "evidence_refs": block.evidence_refs,
-                }
-                for block in opinion.renderable_blocks
-            ]
-        )
+        display_blocks: list[tuple[str, str, str, float, tuple[UUID, ...], tuple[UUID, ...]]] = []
+        if rendered_opinion is not None:
+            for rendered_block in rendered_opinion.blocks:
+                display_blocks.append(
+                    (
+                        rendered_block.heading,
+                        rendered_block.text,
+                        rendered_block.qualification.value,
+                        rendered_block.certainty,
+                        rendered_block.finding_refs,
+                        rendered_block.evidence_refs,
+                    )
+                )
+        else:
+            for opinion_block in opinion.renderable_blocks:
+                display_blocks.append(
+                    (
+                        _OPINION_BLOCK_HEADINGS[opinion_block.block_type],
+                        opinion_block.text,
+                        opinion_block.qualification.value,
+                        opinion_block.certainty,
+                        opinion_block.finding_refs,
+                        opinion_block.evidence_refs,
+                    )
+                )
         opinion_figures = (
             rendered_opinion.protocol_figures
             if rendered_opinion is not None
@@ -850,21 +859,26 @@ def project_publication_to_typst_model(
             "blocks": [
                 {
                     "number": f"1.{index + 1}",
-                    "heading": block["heading"],
-                    "text": block["text"],
-                    "qualification": block["qualification"],
-                    "qualification_label": qualification_labels[block["qualification"]],
-                    "certainty_percent": round(block["certainty"] * 100),
+                    "heading": heading,
+                    "text": text,
+                    "qualification": qualification,
+                    "qualification_label": qualification_labels[qualification],
+                    "certainty_percent": round(certainty * 100),
                     "finding_refs": [
-                        opinion_citation("finding", reference_id)
-                        for reference_id in block["finding_refs"]
+                        opinion_citation("finding", reference_id) for reference_id in finding_refs
                     ],
                     "evidence_refs": [
-                        opinion_citation("evidence", reference_id)
-                        for reference_id in block["evidence_refs"]
+                        opinion_citation("evidence", reference_id) for reference_id in evidence_refs
                     ],
                 }
-                for index, block in enumerate(display_blocks)
+                for index, (
+                    heading,
+                    text,
+                    qualification,
+                    certainty,
+                    finding_refs,
+                    evidence_refs,
+                ) in enumerate(display_blocks)
             ],
             "unresolved_points": list(unresolved_points),
         }

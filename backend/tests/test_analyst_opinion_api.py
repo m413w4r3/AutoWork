@@ -14,6 +14,7 @@ from cti_app.application.analyst_publication_service import AnalystPublicationSe
 from cti_app.application.identity import Identity
 from cti_app.application.publication_augmentation import PublicationAugmentationArtifactService
 from cti_app.application.typst_compilation import CompiledTypstDocument
+from cti_app.domain.production_synthesis import ProductionSynthesisV1
 from tests.test_analyst_opinion_service import make_opinion_harness
 
 
@@ -23,7 +24,11 @@ class _IdentityProvider:
 
 
 class _PreviewRenderer:
+    def __init__(self) -> None:
+        self.rendered_synthesis: ProductionSynthesisV1 | None = None
+
     async def render_draft_preview(self, document, opinion, synthesis) -> CompiledTypstDocument:
+        self.rendered_synthesis = synthesis
         content = b"%PDF-1.4\npreview fixture\n"
         return CompiledTypstDocument(
             media_type="application/pdf",
@@ -51,10 +56,11 @@ async def test_opinion_api_composes_revises_approves_and_publishes_without_repin
     app.include_router(router)
     app.state.analyst_opinion_service = harness.service
     app.state.analyst_publication_service = publication_service
+    preview_renderer = _PreviewRenderer()
     app.state.analyst_opinion_preview_service = AnalystOpinionPreviewService(
         uow_factory=harness.uow_factory,  # type: ignore[arg-type]
         artifact_store=harness.store,  # type: ignore[arg-type]
-        renderer=_PreviewRenderer(),
+        renderer=preview_renderer,
     )
     app.state.identity_provider = _IdentityProvider()
 
@@ -196,11 +202,23 @@ async def test_opinion_api_composes_revises_approves_and_publishes_without_repin
         assert preview.headers["content-type"] == "application/pdf"
         assert preview.headers["x-opinion-status"] == "draft-unapproved"
         assert preview.headers["x-pdf-sha256"] == hashlib.sha256(preview.content).hexdigest()
+        assert isinstance(preview_renderer.rendered_synthesis, ProductionSynthesisV1)
+        assert preview_renderer.rendered_synthesis.subject_id == harness.investigation.subject_id
         assert tuple(harness.uow.analyst_opinions.items[opinion_id]) == versions_before_preview
         assert tuple(harness.artifacts.items) == artifacts_before_preview
         assert tuple(harness.decisions.items) == decisions_before_preview
 
-        stale_preview = await client.get(
+        stale_version_preview = await client.get(
+            f"/api/opinions/{draft['id']}/preview.pdf",
+            params={
+                "version": revised["version"] - 1,
+                "opinion_sha256": revised["content_sha256"],
+                "base_publication_sha256": revised["provenance"]["base_publication_sha256"],
+            },
+        )
+        assert stale_version_preview.status_code == 409
+
+        stale_opinion_hash_preview = await client.get(
             f"/api/opinions/{draft['id']}/preview.pdf",
             params={
                 "version": revised["version"],
@@ -208,7 +226,17 @@ async def test_opinion_api_composes_revises_approves_and_publishes_without_repin
                 "base_publication_sha256": revised["provenance"]["base_publication_sha256"],
             },
         )
-        assert stale_preview.status_code == 409
+        assert stale_opinion_hash_preview.status_code == 409
+
+        stale_base_hash_preview = await client.get(
+            f"/api/opinions/{draft['id']}/preview.pdf",
+            params={
+                "version": revised["version"],
+                "opinion_sha256": revised["content_sha256"],
+                "base_publication_sha256": "0" * 64,
+            },
+        )
+        assert stale_base_hash_preview.status_code == 409
         assert tuple(harness.uow.analyst_opinions.items[opinion_id]) == versions_before_preview
 
         approve = await client.post(

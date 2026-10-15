@@ -248,7 +248,10 @@ def _document_and_opinion() -> tuple[
             (
                 OpinionBlock(
                     block_type=OpinionBlockType.UNCERTAINTIES_AND_NEXT_LEADS,
-                    text="L'attribution opérationnelle demeure indéterminée.",
+                    text=(
+                        "Une résolution DNS ponctuelle relie alpha.example à 203.0.113.24; "
+                        "l'attribution opérationnelle demeure indéterminée."
+                    ),
                     finding_refs=(finding_id,),
                     evidence_refs=(observation_id,),
                     qualification=OpinionClaimQualification.INFERENCE,
@@ -328,21 +331,31 @@ async def test_w17_real_typst_draft_preview_preserves_structure_and_limits(
         pdftoppm,
     )
     text = " ".join(extracted_text.split())
+    normalized_text = text.casefold().replace("\u2019", "'")
     for required in (
         "BROUILLON NON APPROUVÉ",
         "Synthèse",
         "Infrastructure réseau",
         "CHRONOLOGIE",
+        "AVIS DE L'ANALYSTE",
+        "Incertitudes et prochaines pistes",
         "15 janvier 2025",
         "alpha.example",
-        "Le rapport indique l'observation du domaine",
+        "Le rapport mentionne alpha.example comme domaine observé",
         "LIMITES DES PREUVES",
         "La source ne permet pas d'établir l'attribution opérationnelle",
         "Inférence de l'analyste",
         "ne démontre ni contrôle opérationnel ni attribution",
         "203.0.113.24",
+        "1/1",
     ):
-        assert required.casefold() in text.casefold(), f"W17 PDF text is missing {required!r}"
+        assert required.casefold() in normalized_text, f"W17 PDF text is missing {required!r}"
 
     assert rendered_pages
+    assert normalized_text.count("brouillon non approuvé") >= len(rendered_pages)
+    source_paragraph = normalized_text.index(
+        "le rapport mentionne alpha.example comme domaine observé"
+    )
+    anchored_note = normalized_text.index("une résolution dns isolée ajoute un indice")
+    assert source_paragraph < anchored_note, "W17 analyst note must follow its anchored paragraph"
     assert len(compiled.content) > 2_000

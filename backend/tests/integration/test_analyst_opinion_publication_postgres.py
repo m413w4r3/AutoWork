@@ -6,12 +6,18 @@ from dataclasses import replace
 from datetime import UTC, date, datetime
 from uuid import UUID, uuid4
 
+import httpx
 import pytest
+from fastapi import FastAPI
+from sqlalchemy import text
 
+from cti_app.api.analyst_opinion import router as analyst_opinion_router
+from cti_app.application.analyst_opinion_preview import AnalystOpinionPreviewService
 from cti_app.application.analyst_opinion_service import AnalystOpinionService
 from cti_app.application.analyst_publication_service import AnalystPublicationService
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.publication_augmentation import PublicationAugmentationArtifactService
+from cti_app.application.typst_compilation import CompiledTypstDocument
 from cti_app.domain.analyst_opinion import AnalystOpinionStatus
 from cti_app.domain.blobs import BlobDescriptor, BlobRecord
 from cti_app.domain.classification import TLP
@@ -41,6 +47,10 @@ from cti_app.domain.production import (
     ProductionArtifactStatus,
     ProductionRun,
 )
+from cti_app.domain.production_synthesis import (
+    ProductionSynthesisV1,
+    production_synthesis_to_json,
+)
 from cti_app.domain.publication_document import (
     PublicationDocumentV6,
     publication_document_from_json,
@@ -49,6 +59,7 @@ from cti_app.domain.publication_document import (
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
 from tests.integration.edition_codes import reserve_edition_code
+from tests.test_publication_builder_v4 import _canonical_inputs
 from tests.test_publication_document_v6 import _base_v5
 
 pytestmark = pytest.mark.integration
@@ -83,6 +94,28 @@ class _PostgresArtifactStore:
         return None, record.id, None
 
 
+class _DraftPreviewRenderer:
+    def __init__(self) -> None:
+        self.rendered_synthesis: ProductionSynthesisV1 | None = None
+
+    async def render_draft_preview(
+        self,
+        document,
+        opinion,
+        synthesis: ProductionSynthesisV1,
+    ) -> CompiledTypstDocument:
+        self.rendered_synthesis = synthesis
+        content = b"%PDF-1.4\npostgres preview fixture\n"
+        return CompiledTypstDocument(
+            media_type="application/pdf",
+            content=content,
+            sha256=hashlib.sha256(content).hexdigest(),
+            byte_size=len(content),
+            compiler="typst",
+            compiler_version="0.15.1",
+        )
+
+
 @pytest.mark.asyncio
 async def test_postgres_opinion_approval_publishes_new_v6_and_preserves_v5(
     migrated_postgres_url: str,
@@ -102,7 +135,16 @@ async def test_postgres_opinion_approval_publishes_new_v6_and_preserves_v5(
     base_bytes = ProductionArtifactStore.canonical_json_bytes(
         serialize_publication_document(base_document)
     )
-    synthesis_bytes = b"harmless integration synthesis evidence"
+    _, _, _, synthesis = _canonical_inputs()
+    synthesis = replace(
+        synthesis,
+        subject_id=subject_id,
+        title=base_document.document.title,
+        publication_language=base_document.document.publication_language,
+    )
+    synthesis_bytes = ProductionArtifactStore.canonical_json_bytes(
+        production_synthesis_to_json(synthesis)
+    )
     observation_bytes = b"harmless integration observation evidence"
     blobs: dict[UUID, bytes] = {}
     suffix = uuid4().hex
@@ -243,6 +285,76 @@ async def test_postgres_opinion_approval_publishes_new_v6_and_preserves_v5(
         )
         draft = await opinion_service.compose_from_findings(investigation.id)
         assert draft.status is AnalystOpinionStatus.DRAFT
+
+        preview_renderer = _DraftPreviewRenderer()
+        preview_app = FastAPI()
+        preview_app.include_router(analyst_opinion_router)
+        preview_app.state.analyst_opinion_preview_service = AnalystOpinionPreviewService(
+            uow_factory=uow_factory,
+            artifact_store=store,  # type: ignore[arg-type]
+            renderer=preview_renderer,
+        )
+
+        async def canonical_state_snapshot() -> dict[str, tuple[tuple[object, ...], ...]]:
+            async with engine.connect() as connection:
+
+                async def rows(
+                    statement: str,
+                    parameters: dict[str, object] | None = None,
+                ) -> tuple[tuple[object, ...], ...]:
+                    result = await connection.execute(text(statement), parameters or {})
+                    return tuple(tuple(row) for row in result.all())
+
+                return {
+                    "artifacts": await rows(
+                        "SELECT * FROM production_artifacts WHERE production_run_id = :run_id "
+                        "ORDER BY id",
+                        {"run_id": run.id},
+                    ),
+                    "blobs": await rows("SELECT * FROM blobs ORDER BY id"),
+                    "manifests": await rows("SELECT * FROM publication_manifests ORDER BY id"),
+                    "manifest_entries": await rows(
+                        "SELECT * FROM publication_manifest_entries ORDER BY manifest_id, position"
+                    ),
+                    "renders": await rows("SELECT * FROM publication_renders ORDER BY id"),
+                    "opinions": await rows(
+                        "SELECT * FROM analyst_opinion_versions WHERE opinion_id = :opinion_id "
+                        "ORDER BY version",
+                        {"opinion_id": draft.id},
+                    ),
+                    "run": await rows(
+                        "SELECT * FROM production_runs WHERE id = :run_id",
+                        {"run_id": run.id},
+                    ),
+                    "investigation": await rows(
+                        "SELECT * FROM analyst_investigations WHERE id = :investigation_id",
+                        {"investigation_id": investigation.id},
+                    ),
+                    "envelope": await rows(
+                        "SELECT * FROM investigation_envelopes WHERE investigation_id = "
+                        ":investigation_id",
+                        {"investigation_id": investigation.id},
+                    ),
+                }
+
+        state_before_preview = await canonical_state_snapshot()
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=preview_app), base_url="http://test"
+        ) as client:
+            preview = await client.get(
+                f"/api/opinions/{draft.id}/preview.pdf",
+                params={
+                    "version": draft.version,
+                    "opinion_sha256": draft.content_sha256,
+                    "base_publication_sha256": draft.base_publication_sha256,
+                },
+            )
+        assert preview.status_code == 200
+        assert preview.headers["x-opinion-status"] == "draft-unapproved"
+        assert preview.headers["x-pdf-sha256"] == hashlib.sha256(preview.content).hexdigest()
+        assert preview_renderer.rendered_synthesis == synthesis
+        assert await canonical_state_snapshot() == state_before_preview
+
         approved = await opinion_service.approve(
             draft.id,
             draft.version,

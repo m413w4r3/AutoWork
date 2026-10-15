@@ -621,7 +621,7 @@ def verify_opinion_citations(
                 )
             )
     for note in opinion.observations:
-        referenced_findings: list[InvestigationFinding] = []
+        note_referenced_findings: list[InvestigationFinding] = []
         for finding_ref in note.finding_refs:
             finding = finding_by_id.get(finding_ref)
             if finding is None:
@@ -634,7 +634,7 @@ def verify_opinion_citations(
                     )
                 )
             else:
-                referenced_findings.append(finding)
+                note_referenced_findings.append(finding)
         for evidence_ref in note.evidence_refs:
             if evidence_ref not in observation_ids:
                 violations.append(
@@ -649,7 +649,7 @@ def verify_opinion_citations(
             finding.assessment is FindingAssessment.SUPPORTED
             and finding.observation_refs
             and all(ref in observation_ids for ref in finding.observation_refs)
-            for finding in referenced_findings
+            for finding in note_referenced_findings
         ):
             violations.append(
                 CitationViolation(

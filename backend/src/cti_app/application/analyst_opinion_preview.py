@@ -92,7 +92,7 @@ class AnalystOpinionPreviewService:
                 ProductionArtifactStage.PUBLICATION.value,
             )
             base = await uow.production_artifacts.get(opinion.base_publication_artifact_id)
-            synthesis = await uow.production_artifacts.get(opinion.synthesis_artifact_id)
+            synthesis_artifact = await uow.production_artifacts.get(opinion.synthesis_artifact_id)
             if (
                 base is None
                 or current_publication is None
@@ -102,11 +102,11 @@ class AnalystOpinionPreviewService:
                 or base.canonical_blob_id is None
                 or base.production_run_id != investigation.production_run_id
                 or base.subject_id != investigation.subject_id
-                or synthesis is None
-                or synthesis.stage is not ProductionArtifactStage.SYNTHESIS
-                or synthesis.status is not ProductionArtifactStatus.VERIFIED
-                or synthesis.production_run_id != investigation.production_run_id
-                or synthesis.canonical_blob_id is None
+                or synthesis_artifact is None
+                or synthesis_artifact.stage is not ProductionArtifactStage.SYNTHESIS
+                or synthesis_artifact.status is not ProductionArtifactStatus.VERIFIED
+                or synthesis_artifact.production_run_id != investigation.production_run_id
+                or synthesis_artifact.canonical_blob_id is None
                 or investigation.synthesis_artifact_id != opinion.synthesis_artifact_id
             ):
                 raise OpinionError(OpinionErrorCode.STALE_BASE)
@@ -119,11 +119,13 @@ class AnalystOpinionPreviewService:
 
         try:
             base_bytes = await self._artifact_store.read_bytes(base.canonical_blob_id)
-            synthesis_bytes = await self._artifact_store.read_bytes(synthesis.canonical_blob_id)
+            synthesis_bytes = await self._artifact_store.read_bytes(
+                synthesis_artifact.canonical_blob_id
+            )
             raw_document = json.loads(base_bytes)
             document = publication_document_from_json(raw_document)
             raw_synthesis = json.loads(synthesis_bytes)
-            synthesis = production_synthesis_from_json(raw_synthesis)
+            parsed_synthesis = production_synthesis_from_json(raw_synthesis)
         except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
             raise OpinionError(OpinionErrorCode.BASE_INVALID) from exc
         except Exception as exc:
@@ -137,9 +139,9 @@ class AnalystOpinionPreviewService:
             or base_sha256 != opinion.base_publication_sha256
             or base_sha256 != expected_base_publication_sha256
             or synthesis_sha256 != opinion.synthesis_sha256
-            or synthesis.subject_id != document.subject_id
-            or synthesis.title != document.title
-            or synthesis.publication_language != document.publication_language
+            or parsed_synthesis.subject_id != document.subject_id
+            or parsed_synthesis.title != document.title
+            or parsed_synthesis.publication_language != document.publication_language
         ):
             raise OpinionError(OpinionErrorCode.STALE_BASE)
 
@@ -150,7 +152,7 @@ class AnalystOpinionPreviewService:
                 citation_violations=citation_violations,
             )
 
-        compiled = await self._renderer.render_draft_preview(document, opinion, synthesis)
+        compiled = await self._renderer.render_draft_preview(document, opinion, parsed_synthesis)
         content = compiled.content
         renderer_sha256 = compiled.sha256
         pdf_sha256 = hashlib.sha256(content).hexdigest()

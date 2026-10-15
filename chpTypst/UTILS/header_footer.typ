@@ -22,7 +22,7 @@
   )
 }
 
-#let report-footer(country: none, period: none) = context {
+#let report-footer(country: none, period: none, draft-notice: none) = context {
   let bulletin = if has-text(country) {
     "Bulletin-" + country + " | Actualité des codes et infrastructures " + country
   } else {
@@ -33,14 +33,38 @@
   } else {
     bulletin
   }
-  line(length: 100%, stroke: 0.6pt + light-grey)
-  grid(
-    columns: (1fr, auto),
-    inset: (x: 8pt, y: 4pt),
-    [#text(size: 9pt)[#label]],
-    [
-      #set text(size: 8pt, weight: "bold", fill: dark)
-      #counter(page).display() #text("/") #counter(page).final().at(0)
-    ],
-  )
+  if draft-notice != none [
+    #block(
+      width: 100%,
+      height: 24pt,
+      fill: rgb("#8c1d2c"),
+      radius: 2pt,
+    )[
+      #grid(
+        columns: (1fr, auto),
+        inset: (x: 8pt, y: 4pt),
+        align: (center, right),
+        [
+          #align(center + horizon)[
+            #text(size: 10pt, weight: "bold", fill: white, tracking: 0.5pt)[#draft-notice]
+          ]
+        ],
+        [
+          #set text(size: 8pt, weight: "bold", fill: white)
+          #counter(page).display() #text("/") #counter(page).final().at(0)
+        ],
+      )
+    ]
+  ] else {
+    line(length: 100%, stroke: 0.6pt + light-grey)
+    grid(
+      columns: (1fr, auto),
+      inset: (x: 8pt, y: 4pt),
+      [#text(size: 9pt)[#label]],
+      [
+        #set text(size: 8pt, weight: "bold", fill: dark)
+        #counter(page).display() #text("/") #counter(page).final().at(0)
+      ],
+    )
+  }
 }
