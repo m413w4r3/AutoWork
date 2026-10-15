@@ -73,9 +73,47 @@ _MAX_ERROR_BODY_BYTES = 64 * 1024
 
 def create_virustotal_http_client(settings: Settings) -> httpx.AsyncClient:
     """Create the proxy-only client; its caller owns and closes its lifecycle."""
-    if not settings.virustotal_proxy_url:
-        raise VirusTotalConfigurationError("Le proxy VirusTotal n'est pas configuré.")
+    proxy, verify, timeout = _virustotal_proxy_options(settings)
+    return httpx.AsyncClient(
+        proxy=proxy,
+        verify=verify,
+        timeout=timeout,
+        follow_redirects=False,
+        headers={"accept": "application/json"},
+        trust_env=False,
+    )
+
+
+def configure_virustotal_proxy_http_client(
+    client: httpx.AsyncClient, settings: Settings
+) -> httpx.AsyncClient:
+    """Bind a fresh lifecycle-owned HTTPX client to the configured VT proxy.
+
+    The API and worker roots already own a placeholder client for Retrohunt.
+    Replacing its unused default transport here preserves their existing close
+    lifecycle while giving it exactly the same proxy, TLS, and timeout policy
+    as ordinary VirusTotal reads. Injected transports (notably MockTransport)
+    remain intact for deterministic tests.
+    """
+    proxy, verify, timeout = _virustotal_proxy_options(settings)
+    if isinstance(client._transport, httpx.AsyncHTTPTransport):
+        client._transport = httpx.AsyncHTTPTransport(
+            proxy=proxy,
+            verify=verify,
+            trust_env=False,
+        )
+    client.timeout = timeout
+    client.follow_redirects = False
+    client.headers["accept"] = "application/json"
+    return client
+
+
+def _virustotal_proxy_options(
+    settings: Settings,
+) -> tuple[str | httpx.Proxy, bool, httpx.Timeout]:
     proxy_url = settings.virustotal_proxy_url
+    if not proxy_url:
+        raise VirusTotalConfigurationError("Le proxy VirusTotal n'est pas configuré.")
     proxy: str | httpx.Proxy = proxy_url
     if settings.virustotal_proxy_insecure and proxy_url.startswith("https://"):
         context = ssl.create_default_context()
@@ -86,14 +124,7 @@ def create_virustotal_http_client(settings: Settings) -> httpx.AsyncClient:
         settings.virustotal_read_timeout_seconds,
         connect=settings.virustotal_connect_timeout_seconds,
     )
-    return httpx.AsyncClient(
-        proxy=proxy,
-        verify=not settings.virustotal_proxy_insecure,
-        timeout=timeout,
-        follow_redirects=False,
-        headers={"accept": "application/json"},
-        trust_env=False,
-    )
+    return proxy, not settings.virustotal_proxy_insecure, timeout
 
 
 def create_virustotal_direct_http_client(settings: Settings) -> httpx.AsyncClient:
@@ -1202,7 +1233,7 @@ def _is_tls_error(error: BaseException) -> bool:
 
 
 class VirusTotalRetrohuntProxyAdapter:
-    """Capability-gated adapter for a separately verified vtUI proxy client.
+    """Capability-gated adapter for a separately verified VirusTotal v3 client.
 
     This adapter deliberately has no HTTP endpoint or payload assumptions.
     A provider-specific client can be injected only after its proxy contract
@@ -1249,7 +1280,7 @@ class VirusTotalRetrohuntProxyAdapter:
             )
         if not self.available:
             raise VirusTotalRouteUnavailableError(
-                "Aucune route proxy vtUI vérifiée n'expose Retrohunt."
+                "Aucune route proxy VirusTotal v3 vérifiée n'expose Retrohunt."
             )
         assert self._proxy_client is not None
         return self._proxy_client

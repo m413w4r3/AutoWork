@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from uuid import uuid4
 
 import httpx
@@ -17,9 +18,11 @@ from cti_app.application.virustotal import (
     VirusTotalOperationRoute,
     VirusTotalPayloadError,
     VirusTotalQuotaExceededError,
+    VirusTotalResponseTooLargeError,
     VirusTotalRouteStep,
     VirusTotalRouteUnavailableError,
     VirusTotalRoutingPolicy,
+    VirusTotalTransportError,
 )
 from cti_app.domain.retrohunt import (
     RetrohuntProviderJobState,
@@ -34,34 +37,25 @@ from cti_app.infrastructure.virustotal_retrohunt_client import (
     VirusTotalRetrohuntHttpClient,
 )
 
-VTUI_ORIGIN = "https://vtui.test"
-ALLOWED_HOSTS = frozenset({"vtui.test"})
+VT_BASE_URL = "https://www.virustotal.com/api/v3"
+PROXY_URL = "http://proxy.test:8080"
+API_KEY = "vt-test-secret-do-not-log"
 RULE = 'rule approved { strings: $a = "marker" condition: $a }'
 
 
-def _route(*, direct: bool = False, fallback: bool = False) -> VirusTotalRoutingPolicy:
-    primary = VirusTotalRouteStep(
-        transport=(VirusTotalTransportKind.DIRECT if direct else VirusTotalTransportKind.PROXY),
-        variant=VirusTotalEndpointVariant.V3,
+def _route(
+    *,
+    transport: VirusTotalTransportKind = VirusTotalTransportKind.PROXY,
+    variant: VirusTotalEndpointVariant = VirusTotalEndpointVariant.V3,
+    fallback: bool = False,
+) -> VirusTotalRoutingPolicy:
+    steps = VirusTotalOperationRoute(
+        primary=VirusTotalRouteStep(transport=transport, variant=variant),
+        fallbacks=(
+            (VirusTotalRouteStep(transport=transport, variant=variant),) if fallback else ()
+        ),
     )
-    fallbacks = (
-        (
-            VirusTotalRouteStep(
-                transport=VirusTotalTransportKind.PROXY,
-                variant=VirusTotalEndpointVariant.V3_FALLBACK,
-            ),
-        )
-        if fallback
-        else ()
-    )
-    return VirusTotalRoutingPolicy(
-        routes={
-            VirusTotalCapability.RETROHUNT: VirusTotalOperationRoute(
-                primary=primary,
-                fallbacks=fallbacks,
-            )
-        }
-    )
+    return VirusTotalRoutingPolicy(routes={VirusTotalCapability.RETROHUNT: steps})
 
 
 def _client(
@@ -69,18 +63,27 @@ def _client(
     *,
     capabilities: VirusTotalCapabilities | None = None,
     routing_policy: VirusTotalRoutingPolicy | None = None,
-    fallback_base_url: str | None = None,
-    allowed_hosts: frozenset[str] = ALLOWED_HOSTS,
+    base_url: str | None = VT_BASE_URL,
+    api_key: str | None = API_KEY,
+    proxy_url: str | None = PROXY_URL,
+    max_response_bytes: int = 10 * 1024 * 1024,
+    max_result_pages: int = 20,
+    max_results: int = 1000,
 ) -> tuple[VirusTotalRetrohuntHttpClient, httpx.AsyncClient]:
-    transport = httpx.MockTransport(handler)
-    http_client = httpx.AsyncClient(transport=transport, trust_env=False)
+    http_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        trust_env=False,
+    )
     client = VirusTotalRetrohuntHttpClient(
         client=http_client,
-        base_url=VTUI_ORIGIN,
-        allowed_hosts=allowed_hosts,
+        base_url=base_url,
+        api_key=api_key,
+        proxy_url=proxy_url,
         capabilities=capabilities or VirusTotalCapabilities(retrohunt=True),
         routing_policy=routing_policy or _route(),
-        fallback_base_url=fallback_base_url,
+        max_response_bytes=max_response_bytes,
+        max_result_pages=max_result_pages,
+        max_results=max_results,
     )
     return client, http_client
 
@@ -113,7 +116,7 @@ def _job_response(job_id: str = "job-1", status: str = "queued") -> dict[str, ob
 
 
 @pytest.mark.asyncio
-async def test_submit_uses_verified_vtui_route_and_payload_without_api_key() -> None:
+async def test_submit_uses_only_the_v3_job_route_and_header_authentication() -> None:
     observed: list[httpx.Request] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -134,32 +137,41 @@ async def test_submit_uses_verified_vtui_route_and_payload_without_api_key() -> 
     assert len(observed) == 1
     request = observed[0]
     assert request.method == "POST"
-    assert str(request.url) == f"{VTUI_ORIGIN}/api/tools/retrohunt/jobs"
+    assert str(request.url) == f"{VT_BASE_URL}/intelligence/retrohunt_jobs"
     assert request.headers["accept"] == "application/json"
-    assert "x-apikey" not in request.headers
+    assert request.headers["x-apikey"] == API_KEY
+    assert API_KEY not in str(request.url)
     assert json.loads(request.content) == {
-        "rules": RULE,
-        "corpus": "main",
-        "start": 1_700_000_000,
-        "end": 1_700_001_000,
+        "data": {
+            "type": "retrohunt_job",
+            "attributes": {
+                "rules": RULE,
+                "corpus": "main",
+                "start_date": "2023-11-14T22:13:20+00:00",
+                "end_date": "2023-11-14T22:30:00+00:00",
+            },
+        }
     }
 
 
 @pytest.mark.asyncio
-async def test_status_and_results_follow_vtui_post_routes_and_cursor_contract() -> None:
+async def test_status_and_results_use_get_routes_and_bounded_cursor_pagination() -> None:
     sha_a = "a" * 64
     sha_b = "b" * 64
-    requests: list[tuple[str, str, dict[str, object]]] = []
+    requests: list[httpx.Request] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content)
-        requests.append((request.method, request.url.path, body))
-        if request.url.path.endswith("/jobs/get"):
-            payload = _job_response(status="in-progress")
-        elif body.get("cursor") == "next-page":
-            payload = {"data": [{"id": sha_b, "type": "file"}]}
+        requests.append(request)
+        if request.url.path.endswith("/matching_files"):
+            if request.url.params.get("cursor") == "next-page":
+                payload: dict[str, object] = {"data": [{"id": sha_b, "type": "file"}]}
+            else:
+                payload = {
+                    "data": [{"id": sha_a, "type": "file"}],
+                    "meta": {"cursor": "next-page"},
+                }
         else:
-            payload = {"data": [{"id": sha_a, "type": "file"}], "meta": {"cursor": "next-page"}}
+            payload = _job_response(status="in-progress")
         return httpx.Response(200, json=payload, request=request)
 
     client, http_client = _client(handler)
@@ -172,84 +184,37 @@ async def test_status_and_results_follow_vtui_post_routes_and_cursor_contract() 
     assert status.state is RetrohuntProviderJobState.RUNNING
     assert results.job_id == "job-1"
     assert [hit.sha256 for hit in results.hits] == [sha_a, sha_b]
-    assert requests == [
-        ("POST", "/api/tools/retrohunt/jobs/get", {"job_id": "job-1"}),
-        (
-            "POST",
-            "/api/tools/retrohunt/jobs/matching-files",
-            {"job_id": "job-1", "limit": 100},
-        ),
-        (
-            "POST",
-            "/api/tools/retrohunt/jobs/matching-files",
-            {"job_id": "job-1", "limit": 100, "cursor": "next-page"},
-        ),
+    assert [(item.method, item.url.path) for item in requests] == [
+        ("GET", "/api/v3/intelligence/retrohunt_jobs/job-1"),
+        ("GET", "/api/v3/intelligence/retrohunt_jobs/job-1/matching_files"),
+        ("GET", "/api/v3/intelligence/retrohunt_jobs/job-1/matching_files"),
     ]
-
-
-@pytest.mark.asyncio
-async def test_fallback_is_proxy_only_and_only_after_policy_permitted_404() -> None:
-    requests: list[str] = []
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request.url.host)
-        if request.url.host == "vtui.test":
-            return httpx.Response(404, json={"message": "route absent"}, request=request)
-        return httpx.Response(200, json=_job_response(), request=request)
-
-    fallback_origin = "https://vtui-fallback.test"
-    client, http_client = _client(
-        handler,
-        routing_policy=_route(fallback=True),
-        fallback_base_url=fallback_origin,
-        allowed_hosts=frozenset({"vtui.test", "vtui-fallback.test"}),
-    )
-    try:
-        job = await client.submit_retrohunt(_submit_request())
-    finally:
-        await http_client.aclose()
-
-    assert job.job_id == "job-1"
-    assert requests == ["vtui.test", "vtui-fallback.test"]
-
-    blocked_requests: list[str] = []
-
-    async def forbidden(request: httpx.Request) -> httpx.Response:
-        blocked_requests.append(request.url.host)
-        return httpx.Response(403, json={"message": "forbidden"}, request=request)
-
-    client, http_client = _client(
-        forbidden,
-        routing_policy=_route(fallback=True),
-        fallback_base_url=fallback_origin,
-        allowed_hosts=frozenset({"vtui.test", "vtui-fallback.test"}),
-    )
-    try:
-        with pytest.raises(VirusTotalNotAuthorizedError):
-            await client.submit_retrohunt(_submit_request())
-    finally:
-        await http_client.aclose()
-    assert blocked_requests == ["vtui.test"]
+    assert [item.url.params.get("cursor") for item in requests] == [None, None, "next-page"]
+    assert all(item.headers["x-apikey"] == API_KEY for item in requests)
+    assert all(API_KEY not in str(item.url) for item in requests)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("http_status", "expected_error"),
+    ("http_status", "expected_error", "expected_code"),
     [
-        (401, VirusTotalNotAuthorizedError),
-        (403, VirusTotalNotAuthorizedError),
-        (404, VirusTotalHttpError),
-        (429, VirusTotalQuotaExceededError),
+        (401, VirusTotalNotAuthorizedError, "vt_unauthorized"),
+        (403, VirusTotalNotAuthorizedError, "vt_forbidden"),
+        (404, VirusTotalHttpError, "vt_http_404"),
+        (429, VirusTotalQuotaExceededError, "vt_rate_limited"),
+        (503, VirusTotalHttpError, "vt_http_503"),
     ],
 )
-async def test_http_errors_remain_typed_and_do_not_become_job_results(
-    http_status: int, expected_error: type[Exception]
+async def test_http_errors_are_typed_and_never_disclose_the_api_key(
+    http_status: int,
+    expected_error: type[Exception],
+    expected_code: str,
 ) -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             http_status,
             headers={"Retry-After": "7"} if http_status == 429 else {},
-            json={"message": "provider response"},
+            json={"message": API_KEY},
             request=request,
         )
 
@@ -262,8 +227,28 @@ async def test_http_errors_remain_typed_and_do_not_become_job_results(
 
     assert isinstance(caught.value, VirusTotalError)
     assert caught.value.status_code == http_status
+    assert caught.value.code == expected_code
+    assert API_KEY not in str(caught.value)
     if http_status == 429:
         assert caught.value.retry_after == 7.0
+
+
+@pytest.mark.asyncio
+async def test_timeout_and_transport_errors_are_sanitized(caplog: pytest.LogCaptureFixture) -> None:
+    async def timeout(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout(API_KEY)
+
+    caplog.set_level(logging.DEBUG)
+    client, http_client = _client(timeout)
+    try:
+        with pytest.raises(VirusTotalTransportError) as caught:
+            await client.submit_retrohunt(_submit_request())
+    finally:
+        await http_client.aclose()
+
+    assert caught.value.code == "vt_timeout"
+    assert API_KEY not in str(caught.value)
+    assert API_KEY not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -275,7 +260,7 @@ async def test_http_errors_remain_typed_and_do_not_become_job_results(
         (b'{"data":{"id":"job-1","type":"retrohunt_job"}}', VirusTotalPayloadError),
     ],
 )
-async def test_malformed_or_partial_job_responses_are_typed_errors(
+async def test_malformed_or_partial_v3_job_responses_are_typed_errors(
     content: bytes, expected_error: type[Exception]
 ) -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -290,11 +275,55 @@ async def test_malformed_or_partial_job_responses_are_typed_errors(
 
 
 @pytest.mark.asyncio
-async def test_partial_matching_result_page_is_not_returned_as_a_hit_set() -> None:
-    async def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"data": [{"id": "not-a-sha256"}]}, request=request)
+async def test_matching_pages_stop_at_configured_result_and_page_limits() -> None:
+    sha_a = "a" * 64
+    sha_b = "b" * 64
 
-    client, http_client = _client(handler)
+    async def two_pages(request: httpx.Request) -> httpx.Response:
+        payload = (
+            {"data": [{"id": sha_b, "type": "file"}]}
+            if request.url.params.get("cursor")
+            else {"data": [{"id": sha_a, "type": "file"}], "meta": {"cursor": "next"}}
+        )
+        return httpx.Response(200, json=payload, request=request)
+
+    client, http_client = _client(two_pages, max_result_pages=1)
+    try:
+        with pytest.raises(VirusTotalResponseTooLargeError):
+            await client.retrohunt_results("job-1")
+    finally:
+        await http_client.aclose()
+
+    client, http_client = _client(two_pages, max_results=1)
+    try:
+        with pytest.raises(VirusTotalResponseTooLargeError):
+            await client.retrohunt_results("job-1")
+    finally:
+        await http_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_response_size_duplicate_hits_and_cursor_cycles_fail_closed() -> None:
+    async def large_response(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b" " * 64, request=request)
+
+    client, http_client = _client(large_response, max_response_bytes=32)
+    try:
+        with pytest.raises(VirusTotalResponseTooLargeError):
+            await client.submit_retrohunt(_submit_request())
+    finally:
+        await http_client.aclose()
+
+    sha = "a" * 64
+
+    async def duplicate(request: httpx.Request) -> httpx.Response:
+        payload = {
+            "data": [{"id": sha, "type": "file"}],
+            "meta": {"cursor": "again"},
+        }
+        return httpx.Response(200, json=payload, request=request)
+
+    client, http_client = _client(duplicate)
     try:
         with pytest.raises(VirusTotalPayloadError):
             await client.retrohunt_results("job-1")
@@ -303,67 +332,71 @@ async def test_partial_matching_result_page_is_not_returned_as_a_hit_set() -> No
 
 
 @pytest.mark.asyncio
-async def test_client_is_unavailable_without_explicit_proxy_route_or_with_direct_route() -> None:
+async def test_client_requires_proxy_key_capability_and_a_single_v3_proxy_route() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         raise AssertionError("unavailable Retrohunt must not make a request")
 
-    no_route, no_route_client = _client(handler, routing_policy=VirusTotalRoutingPolicy())
-    direct_route, direct_client = _client(handler, routing_policy=_route(direct=True))
-    no_capability, no_capability_client = _client(
+    disabled_route, client_a = _client(handler, routing_policy=VirusTotalRoutingPolicy())
+    direct_route, client_b = _client(
         handler,
-        capabilities=VirusTotalCapabilities(),
+        routing_policy=_route(transport=VirusTotalTransportKind.DIRECT),
     )
+    no_key, client_c = _client(handler, api_key=None)
+    no_proxy, client_d = _client(handler, proxy_url=None)
     try:
-        assert not no_route.available
-        assert "route" in (no_route.available_reason or "")
+        assert not disabled_route.available
         assert not direct_route.available
-        assert "proxy" in (direct_route.available_reason or "")
-        assert not no_capability.available
-        assert "désactivée" in (no_capability.available_reason or "")
+        assert not no_key.available
+        assert not no_proxy.available
         with pytest.raises(VirusTotalRouteUnavailableError):
-            await no_route.retrohunt_status("job-1")
+            await no_key.retrohunt_status("job-1")
     finally:
-        await no_route_client.aclose()
-        await direct_client.aclose()
-        await no_capability_client.aclose()
+        for item in (client_a, client_b, client_c, client_d):
+            await item.aclose()
 
 
 @pytest.mark.asyncio
-async def test_vtui_origin_requires_explicit_host_allowlist() -> None:
-    async def handler(request: httpx.Request) -> httpx.Response:
-        raise AssertionError("invalid origin must not make a request")
-
-    transport = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    with pytest.raises(VirusTotalRouteUnavailableError):
-        VirusTotalRetrohuntHttpClient(
-            client=transport,
-            base_url="https://unapproved.test",
-            allowed_hosts=ALLOWED_HOSTS,
-            capabilities=VirusTotalCapabilities(retrohunt=True),
-            routing_policy=_route(),
-        )
-    with pytest.raises(VirusTotalRouteUnavailableError):
-        VirusTotalRetrohuntHttpClient(
-            client=transport,
-            base_url="https://www.virustotal.com",
-            allowed_hosts=frozenset({"www.virustotal.com"}),
-            capabilities=VirusTotalCapabilities(retrohunt=True),
-            routing_policy=_route(),
-        )
-    await transport.aclose()
-
-
-@pytest.mark.asyncio
-async def test_submit_rejects_modified_rule_and_unmapped_parameters_before_http() -> None:
+async def test_submit_rejects_bad_rule_parameters_and_unknown_corpus_without_http() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         raise AssertionError("invalid submission must not make a request")
 
     client, http_client = _client(handler)
     try:
-        modified = _submit_request(rule_source=f" {RULE}")
         with pytest.raises(VirusTotalInvalidInputError):
-            await client.submit_retrohunt(modified)
+            await client.submit_retrohunt(_submit_request(rule_source=f" {RULE}"))
         with pytest.raises(VirusTotalInvalidInputError):
             await client.submit_retrohunt(_submit_request(parameters={"window_days": 30}))
+        with pytest.raises(VirusTotalInvalidInputError):
+            await client.retrohunt_status(f"{API_KEY}/job")
     finally:
         await http_client.aclose()
+
+
+def test_base_url_must_be_the_official_https_v3_origin() -> None:
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("invalid URL must not make a request")
+
+    transport = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(VirusTotalRouteUnavailableError):
+            VirusTotalRetrohuntHttpClient(
+                client=transport,
+                base_url="https://unapproved.test/api/v3",
+                api_key=API_KEY,
+                proxy_url=PROXY_URL,
+                capabilities=VirusTotalCapabilities(retrohunt=True),
+                routing_policy=_route(),
+            )
+        with pytest.raises(VirusTotalRouteUnavailableError):
+            VirusTotalRetrohuntHttpClient(
+                client=transport,
+                base_url="https://www.virustotal.com/api/tools",
+                api_key=API_KEY,
+                proxy_url=PROXY_URL,
+                capabilities=VirusTotalCapabilities(retrohunt=True),
+                routing_policy=_route(),
+            )
+    finally:
+        import asyncio
+
+        asyncio.run(transport.aclose())

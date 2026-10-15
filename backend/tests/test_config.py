@@ -1,4 +1,8 @@
+import re
+from pathlib import Path
+
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from cti_app.config import Settings
@@ -134,14 +138,132 @@ def test_job_actor_time_limit_outlives_the_dramatiq_default(
 def test_virustotal_settings_are_optional_and_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = Settings(_env_file=None)
     assert settings.virustotal_proxy_url is None
+    assert settings.virustotal_retrohunt_enabled is False
     assert settings.virustotal_retrohunt_proxy_enabled is False
-    assert settings.virustotal_retrohunt_proxy_base_url is None
-    assert settings.virustotal_retrohunt_proxy_allowed_hosts == ""
-    monkeypatch.setenv("VIRUSTOTAL_RETROHUNT_PROXY_ENABLED", "true")
+    assert settings.virustotal_base_url == "https://www.virustotal.com/api/v3"
+    assert settings.virustotal_retrohunt_max_result_pages == 20
+    assert settings.virustotal_retrohunt_max_results == 1000
+    monkeypatch.setenv("VIRUSTOTAL_RETROHUNT_ENABLED", "true")
     assert Settings(_env_file=None).virustotal_retrohunt_proxy_enabled is True
     monkeypatch.setenv("VIRUSTOTAL_MAX_PAGE_SIZE", "101")
     with pytest.raises(ValidationError):
         Settings(_env_file=None)
+
+
+def test_compose_propagates_critical_settings_to_api_and_worker_from_a_fake_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    compose = yaml.safe_load((repo_root / "compose.yaml").read_text(encoding="utf-8"))
+    services = compose["services"]
+    backend_env = services["backend"]["environment"]
+    worker_env = services["worker"]["environment"]
+
+    critical_fields = {
+        name
+        for name in Settings.model_fields
+        if name.startswith(("virustotal_", "shodan_", "openai_bridge_", "investigation_"))
+    } | {"operator_api_token", "postgres_dsn"}
+    expected_keys = {name.upper() for name in critical_fields}
+    compose_keys = {
+        name
+        for name in backend_env
+        if name.startswith(("VIRUSTOTAL_", "SHODAN_", "OPENAI_BRIDGE_", "INVESTIGATION_"))
+        or name in {"OPERATOR_API_TOKEN", "POSTGRES_DSN"}
+    }
+    assert compose_keys == expected_keys
+    assert all(key in worker_env for key in expected_keys)
+    frontend_env = services["frontend"]["environment"]
+    assert not expected_keys.intersection(frontend_env)
+
+    fake_dotenv = tmp_path / ".env"
+    fake_dotenv.write_text(
+        "\n".join(
+            (
+                "POSTGRES_DB=fixture_db",
+                "POSTGRES_USER=fixture_user",
+                "POSTGRES_PASSWORD=fixture-password",
+                "OPERATOR_API_TOKEN=operator-test-token-with-more-than-32-characters",
+                "OPENAI_BRIDGE_API_KEY=bridge-test-secret",
+                "VIRUSTOTAL_API_KEY=virustotal-test-secret",
+                "VIRUSTOTAL_PROXY_URL=http://proxy.test:8080",
+                "SHODAN_API_KEY=shodan-test-secret",
+                "SHODAN_SEARCH_ENABLED=true",
+                "INVESTIGATION_MAX_SHODAN_CREDITS=4",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+    fake_values = _parse_fake_dotenv(fake_dotenv)
+    resolved_api = _resolve_compose_environment(backend_env, fake_values)
+    resolved_worker = _resolve_compose_environment(worker_env, fake_values)
+
+    assert {key: resolved_api[key] for key in expected_keys} == {
+        key: resolved_worker[key] for key in expected_keys
+    }
+    assert resolved_api["POSTGRES_DSN"].startswith(
+        "postgresql+asyncpg://fixture_user:fixture-password@postgres:5432/fixture_db"
+    )
+
+    snapshots: list[Settings] = []
+    all_critical_keys = expected_keys
+    for environment in (resolved_api, resolved_worker):
+        with monkeypatch.context() as scoped:
+            for key in all_critical_keys:
+                scoped.delenv(key, raising=False)
+            for key in expected_keys:
+                value = environment[key]
+                if value is None:
+                    scoped.delenv(key, raising=False)
+                else:
+                    scoped.setenv(key, str(value))
+            snapshots.append(Settings(_env_file=None))
+
+    for name in critical_fields:
+        assert getattr(snapshots[0], name) == getattr(snapshots[1], name)
+    rendered_settings = repr(snapshots[0])
+    for secret in (
+        "operator-test-token-with-more-than-32-characters",
+        "bridge-test-secret",
+        "virustotal-test-secret",
+        "shodan-test-secret",
+    ):
+        assert secret not in rendered_settings
+
+
+_COMPOSE_VARIABLE = re.compile(r"\$\{([A-Z0-9_]+)(?:(:-|-)([^{}]*))?\}")
+
+
+def _parse_fake_dotenv(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line or line.startswith("#"):
+            continue
+        key, value = line.split("=", 1)
+        values[key] = value
+    return values
+
+
+def _resolve_compose_environment(
+    environment: dict[str, object], fake_values: dict[str, str]
+) -> dict[str, str | None]:
+    def interpolate(value: str) -> str:
+        def replace(match: re.Match[str]) -> str:
+            name, operator, fallback = match.groups()
+            found = fake_values.get(name)
+            if operator == ":-" and (found is None or found == ""):
+                return fallback or ""
+            if operator == "-" and found is None:
+                return fallback or ""
+            return found or ""
+
+        return _COMPOSE_VARIABLE.sub(replace, value)
+
+    return {
+        name: None if value is None else interpolate(str(value))
+        for name, value in environment.items()
+    }
 
 
 def test_local_analysis_and_ghidra_are_disabled_with_bounded_settings(

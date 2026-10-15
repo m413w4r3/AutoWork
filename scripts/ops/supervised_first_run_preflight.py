@@ -30,7 +30,7 @@ BACKEND_SRC = ROOT / "backend" / "src"
 if str(BACKEND_SRC) not in sys.path:
     sys.path.insert(0, str(BACKEND_SRC))
 
-from cti_app.application.identity import PROTECTED_APP_ENVIRONMENTS  # noqa: E402
+from cti_app.application.identity import PROTECTED_APP_ENVIRONMENTS
 
 GATE_STATUSES = {
     "PASS",
@@ -94,7 +94,7 @@ def calculate_conclusion(
         "critical_path_only_mocked": False,
         "api_worker_match": True,
         "bridge_accessible": True,
-        "live_proxy_present": True,
+        "virustotal_proxy_present": True,
         "quarantine_ok": True,
         "tlp_known": True,
         "operator_identity_verified": True,
@@ -835,7 +835,7 @@ def _build_gates(
             environment=environment,
             evidence_refs=["loopback TCP probes only; no provider request"],
             next_action=(
-                "faire confirmer Bridge et proxy vtUI par l'opérateur dans leur "
+                "faire confirmer Bridge et proxy VirusTotal par l'opérateur dans leur "
                 "interface locale"
             ),
         ),
@@ -927,7 +927,7 @@ def build_report(
         "redis": _probe_local_tcp("redis", redis_url),
         "minio": _probe_local_tcp("minio", minio_endpoint, default_scheme="http"),
         "bridge": _probe_local_tcp("bridge", bridge_url),
-        "vtui_proxy": _probe_local_tcp("vtui_proxy", proxy_url),
+        "virustotal_proxy": _probe_local_tcp("virustotal_proxy", proxy_url),
     }
     binaries = _binary_profile()
     inventory = _safe_runtime_inventories()
@@ -942,7 +942,7 @@ def build_report(
     }
     reference_valid = bool(reference.get("valid"))
     bridge_accessible = services["bridge"]["state"] == "REACHABLE"
-    live_proxy_present = services["vtui_proxy"]["state"] == "REACHABLE"
+    virustotal_proxy_present = services["virustotal_proxy"]["state"] == "REACHABLE"
     signals: dict[str, bool | None] = {
         "python_312": environment["python_version"].startswith("3.12."),
         "conda_active": environment["conda_active"],
@@ -953,7 +953,7 @@ def build_report(
             and wiring["worker_calls_shared_assembly"]
         ),
         "bridge_accessible": bridge_accessible,
-        "live_proxy_present": live_proxy_present,
+        "virustotal_proxy_present": virustotal_proxy_present,
         "quarantine_ok": None,
         "tlp_known": reference_valid,
         "operator_identity_verified": False,

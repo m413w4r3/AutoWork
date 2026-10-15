@@ -153,17 +153,17 @@ class Settings(BaseSettings):
     # and the *_fallback_enabled flags below) — proxy stays the only transport
     # used unless a fallback is explicitly turned on.
     virustotal_proxy_url: str | None = None
-    # Retrohunt remains unavailable until both the explicit operator opt-in and
-    # the verified vtUI origin/host allowlist are configured.
-    virustotal_retrohunt_proxy_enabled: bool = False
-    virustotal_retrohunt_proxy_base_url: str | None = None
-    virustotal_retrohunt_proxy_allowed_hosts: str = ""
+    # Retrohunt is an explicit opt-in and uses the same VirusTotal API v3 base,
+    # proxy transport, and API key as ordinary VirusTotal requests.
+    virustotal_retrohunt_enabled: bool = False
+    virustotal_retrohunt_max_result_pages: int = Field(default=20, ge=1, le=100)
+    virustotal_retrohunt_max_results: int = Field(default=1000, ge=1, le=100_000)
     virustotal_file_report_enabled: bool = False
     virustotal_object_relationships_enabled: bool = False
     virustotal_intelligence_search_enabled: bool = False
     virustotal_behaviour_reports_enabled: bool = False
-    virustotal_base_url: str = "http://www.virustotal.com/api/v3"
-    virustotal_fallback_base_url: str | None = "http://www.virustotal.com/api/v3"
+    virustotal_base_url: str = "https://www.virustotal.com/api/v3"
+    virustotal_fallback_base_url: str | None = "https://www.virustotal.com/api/v3"
     virustotal_legacy_base_url: str | None = "http://www.virustotal.com/vtapi/v2"
     virustotal_api_key: SecretStr | None = None
     # Explicit opt-in for file_report's proxy fallback base URL (still proxy
@@ -191,6 +191,21 @@ class Settings(BaseSettings):
     # Exact hostnames the signed download URL is allowed to target. Empty by
     # default: deny-by-default until an operator explicitly configures it.
     virustotal_download_allowed_hosts: str = ""
+
+    @property
+    def virustotal_retrohunt_proxy_enabled(self) -> bool:
+        """Compatibility for the API/worker client lifecycle until their next lot."""
+        return self.virustotal_retrohunt_enabled
+
+    @property
+    def virustotal_retrohunt_proxy_base_url(self) -> str:
+        """Compatibility sentinel; Retrohunt routes use virustotal_base_url."""
+        return self.virustotal_base_url
+
+    @property
+    def virustotal_retrohunt_proxy_allowed_hosts(self) -> str:
+        """Compatibility sentinel; endpoint trust is validated by the v3 client."""
+        return "www.virustotal.com"
 
     # Shodan exposes only passive, indexed observations through this port.
     # Each capability and the API key are opt-in; their presence never
