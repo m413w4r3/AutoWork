@@ -247,6 +247,36 @@
     heading(level: 3)[#item.text]
   } else if item.type == "paragraph" {
     [#semantic-or-plain(item.text, item.at("semantic_spans", default: none)) #parbreak()]
+  } else if item.type == "analyst_observation" {
+    block(
+      width: 100%,
+      fill: rgb("#f3eff5"),
+      inset: 8pt,
+      radius: 4pt,
+      breakable: true,
+    )[
+      #text(size: 9pt, weight: "bold", fill: rgb("#51305f"))[
+        Note de l'analyste · #item.state_label · #item.relation_label
+      ]
+      #parbreak()
+      #item.text
+      #if item.finding_refs.len() > 0 [
+        #parbreak()
+        #text(size: 8pt, fill: grey)[Findings : ]
+        #for (index, reference) in item.finding_refs.enumerate() [
+          #if index > 0 [ · ]
+          #link(reference.href)[#reference.label]
+        ]
+      ]
+      #if item.evidence_refs.len() > 0 [
+        #parbreak()
+        #text(size: 8pt, fill: grey)[Évidences : ]
+        #for (index, reference) in item.evidence_refs.enumerate() [
+          #if index > 0 [ · ]
+          #link(reference.href)[#reference.label]
+        ]
+      ]
+    ]
   } else if item.type == "table" {
     render-table(item)
   } else if item.type == "diagram" {
@@ -278,6 +308,23 @@
       #for item in content_section.blocks {
         render-body-block(item)
       }
+    ] else if content_section.type == "chronology" [
+      #section-title[CHRONOLOGIE]
+      #render-publication-timeline(content_section.timeline)
+    ] else if content_section.type == "limitations" [
+      #section-title[LIMITES DES PREUVES]
+      #for item in content_section.items [
+        #item.text
+        #if item.source_urls.len() > 0 [
+          #parbreak()
+          #text(size: 8pt, fill: grey)[Sources : ]
+          #for (index, url) in item.source_urls.enumerate() [
+            #if index > 0 [ · ]
+            #link(url)[#url]
+          ]
+        ]
+        #parbreak()
+      ]
     ] else if content_section.type == "analyst_opinion" [
       #section-title[AVIS DE L'ANALYSTE]
       #for item in content_section.blocks [

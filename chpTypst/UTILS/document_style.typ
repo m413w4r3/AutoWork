@@ -1,7 +1,7 @@
 #import "colors.typ": purple
 #import "header_footer.typ": report-header, report-footer
 
-#let apply-document-style(body, country: none, period: none) = {
+#let apply-document-style(body, country: none, period: none, draft-watermark: none) = {
   set text(
     font: "Hanken Grotesk",
     size: 11pt,
@@ -17,7 +17,11 @@
       right: 2.2cm,
     ),
     header: report-header(country: country, period: period),
-    footer: report-footer(country: country, period: period),
+    footer: report-footer(
+      country: country,
+      period: period,
+      draft-notice: draft-watermark,
+    ),
   )
 
   // Inline and block code styling.

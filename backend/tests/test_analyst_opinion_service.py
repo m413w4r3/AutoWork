@@ -45,9 +45,11 @@ from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionArtifactStatus,
 )
+from cti_app.domain.production_synthesis import production_synthesis_to_json
 from cti_app.domain.publication_document import (
     serialize_publication_document,
 )
+from tests.test_publication_builder_v4 import _canonical_inputs
 from tests.test_publication_document_v6 import _base_v5
 
 
@@ -235,7 +237,10 @@ def make_opinion_harness(*, tlp: TLPLevel = TLPLevel.CLEAR) -> OpinionHarness:
     base_bytes = ProductionArtifactStore.canonical_json_bytes(serialize_publication_document(base))
     base_blob_id = uuid4()
     synthesis_blob_id = uuid4()
-    synthesis_bytes = b"verified harmless synthesis fixture"
+    _, _, _, synthesis = _canonical_inputs()
+    synthesis_bytes = ProductionArtifactStore.canonical_json_bytes(
+        production_synthesis_to_json(synthesis)
+    )
     run_id = uuid4()
     investigation_id = uuid4()
     base_artifact = ProductionArtifact(

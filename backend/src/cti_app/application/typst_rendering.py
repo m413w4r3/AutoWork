@@ -16,8 +16,16 @@ from uuid import UUID
 
 from cti_app.application.pdf_mapping import MAPPING_RENDERER_VERSION, target_descriptor
 from cti_app.application.typst_bundle import hash_bundle_contents, resolve_bundle_files
+from cti_app.domain.analyst_opinion import (
+    AnalystObservationRelation,
+    AnalystObservationState,
+    AnalystOpinionStatus,
+    AnalystOpinionV1,
+    OpinionBlockType,
+)
 from cti_app.domain.media_assets import MediaAssetKind
 from cti_app.domain.production_editorial_enrichment import EnrichmentPlacementKind
+from cti_app.domain.production_synthesis import ProductionSynthesisV1
 from cti_app.domain.publication import (
     ArtifactType,
     PublicationEvidenceRefV1,
@@ -32,6 +40,8 @@ from cti_app.domain.publication_document import (
     PublicationDocumentV6,
     PublicationSourceFigureV1,
     PublicationTableV1,
+    publication_document_text_anchors,
+    publication_document_v5_sha256,
 )
 from cti_app.domain.semantic_annotation import (
     SEMANTIC_ROLE_TYPST_FUNCTION_V1,
@@ -40,7 +50,9 @@ from cti_app.domain.semantic_annotation import (
     timeline_anchor,
 )
 
-_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v21-protocol-figure-pins"
+_RENDER_DATA_SCHEMA_VERSION = (
+    "typst-publication-model-v22-draft-watermark-analyst-notes-synthesis-context"
+)
 _PUBLICATION_RENDERER_MANIFEST = "renderer-manifest.json"
 _FRENCH_MONTH_NAMES = (
     "janvier",
@@ -89,6 +101,26 @@ _TABLE_WINDOWS_REGISTRY_PATH = re.compile(
     r"^(?:HK(?:CU|LM|CR|U|CC)|HKEY_(?:CLASSES_ROOT|CURRENT_USER|LOCAL_MACHINE|USERS|CURRENT_CONFIG))\\",
     re.IGNORECASE,
 )
+_OPINION_BLOCK_HEADINGS = {
+    OpinionBlockType.KEY_FINDINGS: "Apports de l'enquête",
+    OpinionBlockType.ADDITIONAL_SAMPLES: "Échantillons complémentaires",
+    OpinionBlockType.INFECTION_CHAIN_AND_CAPABILITIES: "Chaîne d'infection et capacités",
+    OpinionBlockType.NETWORK_AND_INFRASTRUCTURE: "Activité réseau et infrastructure",
+    OpinionBlockType.CLAIM_VERIFICATION: "Vérification des affirmations",
+    OpinionBlockType.PROPOSED_DETECTIONS: "Détections proposées",
+    OpinionBlockType.UNCERTAINTIES_AND_NEXT_LEADS: "Incertitudes et prochaines pistes",
+}
+_OBSERVATION_STATE_LABELS = {
+    AnalystObservationState.OBSERVED: "Observation étayée",
+    AnalystObservationState.INFERRED: "Inférence de l'analyste",
+    AnalystObservationState.UNRESOLVED: "Point non résolu",
+}
+_OBSERVATION_RELATION_LABELS = {
+    AnalystObservationRelation.CONFIRMS: "confirme",
+    AnalystObservationRelation.REFUTES: "contredit",
+    AnalystObservationRelation.QUALIFIES: "nuance",
+    AnalystObservationRelation.UNRESOLVED: "ne permet pas de trancher",
+}
 
 
 def _breakable_typst_display_text(value: str) -> dict[str, Any]:
@@ -203,6 +235,42 @@ class TypstPublicationModelV2:
     title: str
     content_sections: list[dict[str, Any]]
     media_refs: tuple[TypstMediaRef, ...]
+    draft_watermark: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TypstDraftPreviewDocument:
+    """Ephemeral V5 plus draft opinion projection; it is never a canonical V6."""
+
+    base_publication: PublicationDocumentV5
+    analyst_opinion: AnalystOpinionV1
+    synthesis: ProductionSynthesisV1 | None = None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.base_publication, name)
+
+    def __post_init__(self) -> None:
+        if self.analyst_opinion.status is not AnalystOpinionStatus.DRAFT:
+            raise ValueError("Only draft opinions can use the draft preview projection")
+        if self.synthesis is not None and (
+            self.synthesis.subject_id != self.base_publication.subject_id
+            or self.synthesis.title != self.base_publication.title
+            or self.synthesis.publication_language != self.base_publication.publication_language
+        ):
+            raise ValueError("Draft preview synthesis does not match the pinned publication")
+        if publication_document_v5_sha256(self.base_publication) != (
+            self.analyst_opinion.base_publication_sha256
+        ):
+            raise ValueError("Draft opinion does not identify this exact V5 publication")
+        anchors = publication_document_text_anchors(
+            self.base_publication.document,
+            references=self.base_publication.references,
+        )
+        if any(
+            item.anchor not in anchors or not item.anchor.startswith(("lead:", "section:"))
+            for item in self.analyst_opinion.observations
+        ):
+            raise ValueError("Draft opinion observation anchor is stale or unsupported")
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,7 +291,7 @@ class TypstRenderer:
 
     def render(
         self,
-        document: CanonicalPublicationDocument,
+        document: CanonicalPublicationDocument | TypstDraftPreviewDocument,
         template_bundle: TypstTemplateBundle,
         *,
         target_artifact_identities: Mapping[str, Mapping[str, Any]] | None = None,
@@ -262,6 +330,8 @@ class TypstRenderer:
             render_data["article_title_target_id"] = article_title_target_id
         if target_descriptors or unmapped:
             render_data["mapping_instrumentation_version"] = MAPPING_RENDERER_VERSION
+        if model.draft_watermark is not None:
+            render_data["draft_watermark"] = model.draft_watermark
         render_data_bytes = json.dumps(
             render_data,
             ensure_ascii=False,
@@ -370,12 +440,26 @@ def instrument_publication_targets(
 
 
 def project_publication_to_typst_model(
-    value: CanonicalPublicationDocument,
+    value: CanonicalPublicationDocument | TypstDraftPreviewDocument,
 ) -> TypstPublicationModelV2:
     """Project a canonical publication while keeping semantic content as data."""
+    draft_preview = value if isinstance(value, TypstDraftPreviewDocument) else None
     publication_v6 = value if isinstance(value, PublicationDocumentV6) else None
-    publication_v5 = publication_v6.base_publication if publication_v6 is not None else value
+    publication_v5 = (
+        publication_v6.base_publication
+        if publication_v6 is not None
+        else draft_preview.base_publication
+        if draft_preview is not None
+        else value
+    )
     rendered_opinion = publication_v6.rendered_opinion if publication_v6 is not None else None
+    opinion = (
+        publication_v6.analyst_opinion
+        if publication_v6 is not None
+        else draft_preview.analyst_opinion
+        if draft_preview is not None
+        else None
+    )
     if isinstance(publication_v5, PublicationDocumentV5):
         document = publication_v5.document
         semantic_by_anchor = {item.anchor: item for item in publication_v5.semantic_text.paragraphs}
@@ -518,44 +602,70 @@ def project_publication_to_typst_model(
     reference_blocks = list(
         rich_by_placement.get((EnrichmentPlacementKind.AFTER_TIMELINE, None), ())
     )
-    body_blocks: list[dict[str, Any]] = []
-    body_blocks.extend(
-        {
-            "type": "paragraph",
-            "text": item.text,
-            **(
-                {"semantic_spans": spans}
-                if (spans := semantic_spans(lead_paragraph_anchor(index), item.text)) is not None
-                else {}
-            ),
+    investigation_id = opinion.investigation_id if opinion is not None else None
+
+    def opinion_citation(kind: str, reference_id: UUID) -> dict[str, str]:
+        noun = "Finding" if kind == "finding" else "Évidence"
+        uri_kind = "findings" if kind == "finding" else "evidence"
+        return {
+            "label": f"{noun} {reference_id}",
+            "href": (f"autowork://investigations/{investigation_id}/{uri_kind}/{reference_id}"),
         }
-        for index, item in enumerate(document.lead, start=1)
-    )
-    body_blocks.extend(rich_by_placement.get((EnrichmentPlacementKind.AFTER_LEAD, None), ()))
-    lead_fingerprints = {" ".join(item.text.casefold().split()) for item in document.lead}
-    for section_index, section in enumerate(document.sections):
-        paragraph_blocks = [
+
+    notes_by_anchor: dict[str, list[dict[str, Any]]] = {}
+    if opinion is not None:
+        for observation in opinion.observations:
+            notes_by_anchor.setdefault(observation.anchor, []).append(
+                {
+                    "type": "analyst_observation",
+                    "state_label": _OBSERVATION_STATE_LABELS[observation.state],
+                    "relation_label": _OBSERVATION_RELATION_LABELS[observation.relation],
+                    "text": observation.text,
+                    "finding_refs": [
+                        opinion_citation("finding", reference_id)
+                        for reference_id in observation.finding_refs
+                    ],
+                    "evidence_refs": [
+                        opinion_citation("evidence", reference_id)
+                        for reference_id in observation.evidence_refs
+                    ],
+                }
+            )
+
+    def append_paragraph(text: str, anchor: str) -> None:
+        body_blocks.append(
             {
                 "type": "paragraph",
-                "text": paragraph.text,
+                "text": text,
                 **(
                     {"semantic_spans": spans}
-                    if (
-                        spans := semantic_spans(
-                            section_paragraph_anchor(section_index, paragraph_index),
-                            paragraph.text,
-                        )
-                    )
-                    is not None
+                    if (spans := semantic_spans(anchor, text)) is not None
                     else {}
                 ),
             }
+        )
+        body_blocks.extend(notes_by_anchor.get(anchor, ()))
+
+    body_blocks: list[dict[str, Any]] = []
+    for index, lead_paragraph in enumerate(document.lead, start=1):
+        append_paragraph(lead_paragraph.text, lead_paragraph_anchor(index))
+    body_blocks.extend(rich_by_placement.get((EnrichmentPlacementKind.AFTER_LEAD, None), ()))
+    lead_fingerprints = {
+        " ".join(lead_paragraph.text.casefold().split()) for lead_paragraph in document.lead
+    }
+    for section_index, section in enumerate(document.sections):
+        paragraph_blocks = [
+            (paragraph_index, paragraph)
             for paragraph_index, paragraph in enumerate(section.paragraphs, start=1)
             if " ".join(paragraph.text.casefold().split()) not in lead_fingerprints
         ]
         if section.heading and paragraph_blocks:
             body_blocks.append({"type": "section_heading", "text": section.heading})
-        body_blocks.extend(paragraph_blocks)
+        for paragraph_index, paragraph in paragraph_blocks:
+            append_paragraph(
+                paragraph.text,
+                section_paragraph_anchor(section_index, paragraph_index),
+            )
         body_blocks.extend(
             rich_by_placement.get((EnrichmentPlacementKind.AFTER_SECTION, section_index), ())
         )
@@ -568,18 +678,22 @@ def project_publication_to_typst_model(
             block["figure_number"] = figure_number
 
     sources_by_id = {source.source_document_id: source for source in document.sources}
-    timeline = []
-    for index, entry in enumerate(document.timeline, start=1):
-        item: dict[str, Any] = {
-            "display_date": _display_date(entry.date_text, entry.event_date),
-            "text": entry.text,
-            "source_urls": _timeline_source_urls(entry.evidence_refs, sources_by_id),
+    timeline: list[dict[str, Any]] = []
+    for index, publication_timeline_entry in enumerate(document.timeline, start=1):
+        timeline_row: dict[str, Any] = {
+            "display_date": _display_date(
+                publication_timeline_entry.date_text, publication_timeline_entry.event_date
+            ),
+            "text": publication_timeline_entry.text,
+            "source_urls": _timeline_source_urls(
+                publication_timeline_entry.evidence_refs, sources_by_id
+            ),
         }
-        spans = semantic_spans(timeline_anchor(index), entry.text)
+        spans = semantic_spans(timeline_anchor(index), publication_timeline_entry.text)
         if spans is not None:
-            item["semantic_spans"] = spans
-        timeline.append(item)
-    source_references = []
+            timeline_row["semantic_spans"] = spans
+        timeline.append(timeline_row)
+    source_references: list[dict[str, Any]] = []
     for index, reference in enumerate(reference_entries, start=1):
         source = sources_by_id.get(reference.source_document_id)
         if source is None:
@@ -587,7 +701,7 @@ def project_publication_to_typst_model(
                 "Publication reference identifies an unknown source document: "
                 f"{reference.source_document_id}"
             )
-        item = {
+        reference_row: dict[str, Any] = {
             "display_date": (
                 _display_date(None, source.published_at)
                 if source.published_at is not None
@@ -597,11 +711,11 @@ def project_publication_to_typst_model(
             "source_urls": [source.canonical_url],
         }
         if source.kind.value == "technical_resource":
-            item["role_label"] = "Contexte technique"
+            reference_row["role_label"] = "Contexte technique"
         spans = semantic_spans(f"reference:{index:04d}", reference.text)
         if spans is not None:
-            item["semantic_spans"] = spans
-        source_references.append(item)
+            reference_row["semantic_spans"] = spans
+        source_references.append(reference_row)
 
     def publisher_label(source: Any) -> str | None:
         if source.editorial_role is None or source.editorial_role.value != "context":
@@ -652,24 +766,92 @@ def project_publication_to_typst_model(
         },
         {"type": "synthesis", "blocks": body_blocks},
     ]
-    if rendered_opinion is not None:
-        assert publication_v6 is not None
-        investigation_id = publication_v6.provenance.investigation_id
-        if investigation_id is None:
-            raise ValueError("PublicationDocumentV6 analyst opinion has no investigation identity")
+    if draft_preview is not None and draft_preview.synthesis is not None:
+        chronology: list[dict[str, Any]] = []
+        for synthesis_timeline_entry in draft_preview.synthesis.timeline:
+            source_urls = sorted(
+                {
+                    sources_by_id[reference.source_document_id].canonical_url
+                    for reference in synthesis_timeline_entry.evidence_refs
+                    if reference.source_document_id in sources_by_id
+                }
+            )
+            if not source_urls:
+                raise ValueError(
+                    "Draft preview chronology has no source represented in the pinned V5"
+                )
+            chronology.append(
+                {
+                    "display_date": _display_date(
+                        synthesis_timeline_entry.date_text,
+                        synthesis_timeline_entry.event_date,
+                    ),
+                    "text": synthesis_timeline_entry.text,
+                    "source_urls": source_urls,
+                }
+            )
+        if chronology:
+            content_sections.append(
+                {"type": "chronology", "heading": "Chronologie", "timeline": chronology}
+            )
+        limitations = [
+            {
+                "text": uncertainty.text,
+                "source_urls": sorted(
+                    {
+                        sources_by_id[source_id].canonical_url
+                        for source_id in uncertainty.source_document_ids
+                        if source_id in sources_by_id
+                    }
+                ),
+            }
+            for uncertainty in draft_preview.synthesis.uncertainties
+        ]
+        if limitations:
+            content_sections.append(
+                {"type": "limitations", "heading": "Limites des preuves", "items": limitations}
+            )
+    if opinion is not None and (rendered_opinion is not None or draft_preview is not None):
         qualification_labels = {
             "fact": "Fait étayé",
             "inference": "Inférence",
             "hypothesis": "Hypothèse",
         }
-
-        def opinion_citation(kind: str, reference_id: UUID) -> dict[str, str]:
-            noun = "Finding" if kind == "finding" else "Évidence"
-            uri_kind = "findings" if kind == "finding" else "evidence"
-            return {
-                "label": f"{noun} {reference_id}",
-                "href": (f"autowork://investigations/{investigation_id}/{uri_kind}/{reference_id}"),
-            }
+        display_blocks: list[tuple[str, str, str, float, tuple[UUID, ...], tuple[UUID, ...]]] = []
+        if rendered_opinion is not None:
+            for rendered_block in rendered_opinion.blocks:
+                display_blocks.append(
+                    (
+                        rendered_block.heading,
+                        rendered_block.text,
+                        rendered_block.qualification.value,
+                        rendered_block.certainty,
+                        rendered_block.finding_refs,
+                        rendered_block.evidence_refs,
+                    )
+                )
+        else:
+            for opinion_block in opinion.renderable_blocks:
+                display_blocks.append(
+                    (
+                        _OPINION_BLOCK_HEADINGS[opinion_block.block_type],
+                        opinion_block.text,
+                        opinion_block.qualification.value,
+                        opinion_block.certainty,
+                        opinion_block.finding_refs,
+                        opinion_block.evidence_refs,
+                    )
+                )
+        opinion_figures = (
+            rendered_opinion.protocol_figures
+            if rendered_opinion is not None
+            else opinion.protocol_figures
+        )
+        unresolved_points = (
+            rendered_opinion.unresolved_points
+            if rendered_opinion is not None
+            else opinion.unresolved_points
+        )
 
         opinion_section: dict[str, Any] = {
             "type": "analyst_opinion",
@@ -677,25 +859,30 @@ def project_publication_to_typst_model(
             "blocks": [
                 {
                     "number": f"1.{index + 1}",
-                    "heading": block.heading,
-                    "text": block.text,
-                    "qualification": block.qualification.value,
-                    "qualification_label": qualification_labels[block.qualification.value],
-                    "certainty_percent": round(block.certainty * 100),
+                    "heading": heading,
+                    "text": text,
+                    "qualification": qualification,
+                    "qualification_label": qualification_labels[qualification],
+                    "certainty_percent": round(certainty * 100),
                     "finding_refs": [
-                        opinion_citation("finding", reference_id)
-                        for reference_id in block.finding_refs
+                        opinion_citation("finding", reference_id) for reference_id in finding_refs
                     ],
                     "evidence_refs": [
-                        opinion_citation("evidence", reference_id)
-                        for reference_id in block.evidence_refs
+                        opinion_citation("evidence", reference_id) for reference_id in evidence_refs
                     ],
                 }
-                for index, block in enumerate(rendered_opinion.blocks)
+                for index, (
+                    heading,
+                    text,
+                    qualification,
+                    certainty,
+                    finding_refs,
+                    evidence_refs,
+                ) in enumerate(display_blocks)
             ],
-            "unresolved_points": list(rendered_opinion.unresolved_points),
+            "unresolved_points": list(unresolved_points),
         }
-        if rendered_opinion.protocol_figures:
+        if opinion_figures:
             opinion_section["protocol_figures"] = [
                 {
                     "type": "diagram",
@@ -720,7 +907,7 @@ def project_publication_to_typst_model(
                     "field_evidence": [item.to_payload() for item in figure.field_evidence],
                     "figure_number": figure_number + index,
                 }
-                for index, figure in enumerate(rendered_opinion.protocol_figures, start=1)
+                for index, figure in enumerate(opinion_figures, start=1)
             ]
         content_sections.append(opinion_section)
     if any(indicators.values()) or any(original_indicators.values()):
@@ -737,6 +924,7 @@ def project_publication_to_typst_model(
         title=document.title,
         content_sections=content_sections,
         media_refs=tuple(media_refs_by_id.values()),
+        draft_watermark=("BROUILLON NON APPROUVÉ" if draft_preview is not None else None),
     )
 
 

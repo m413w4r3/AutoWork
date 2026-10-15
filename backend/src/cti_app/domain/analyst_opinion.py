@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -31,12 +33,26 @@ class OpinionBlockType(StrEnum):
     CLAIM_VERIFICATION = "claim_verification"
     PROPOSED_DETECTIONS = "proposed_detections"
     UNCERTAINTIES_AND_NEXT_LEADS = "uncertainties_and_next_leads"
+    ANALYST_OBSERVATIONS = "analyst_observations"
 
 
 class OpinionClaimQualification(StrEnum):
     FACT = "fact"
     INFERENCE = "inference"
     HYPOTHESIS = "hypothesis"
+
+
+class AnalystObservationState(StrEnum):
+    OBSERVED = "observed"
+    INFERRED = "inferred"
+    UNRESOLVED = "unresolved"
+
+
+class AnalystObservationRelation(StrEnum):
+    CONFIRMS = "confirms"
+    REFUTES = "refutes"
+    QUALIFIES = "qualifies"
+    UNRESOLVED = "unresolved"
 
 
 class AnalystOpinionStatus(StrEnum):
@@ -50,6 +66,7 @@ class CitationViolationCode(StrEnum):
     OBSERVATION_NOT_FOUND = "observation_not_found"
     FACT_WITHOUT_SUPPORTED_FINDING = "fact_without_supported_finding"
     SUPPORTED_FINDING_WITHOUT_OBSERVATION = "supported_finding_without_observation"
+    OBSERVATION_NOT_SUPPORTED = "analyst_observation_not_supported"
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,6 +124,95 @@ class OpinionBlock:
     @property
     def is_renderable(self) -> bool:
         return bool(self.text.strip())
+
+
+_OPINION_ANCHOR = re.compile(r"^[a-z][a-z0-9:_-]{0,127}$")
+
+
+@dataclass(frozen=True, slots=True)
+class AnalystObservationV1:
+    """An analyst observation projected beside one stable V5 paragraph anchor."""
+
+    id: UUID
+    anchor: str
+    text: str
+    state: AnalystObservationState
+    relation: AnalystObservationRelation
+    finding_refs: tuple[UUID, ...] = ()
+    evidence_refs: tuple[UUID, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.id, UUID):
+            raise ValueError("Analyst observation identity must be a UUID")
+        if not isinstance(self.anchor, str) or _OPINION_ANCHOR.fullmatch(self.anchor) is None:
+            raise ValueError("Analyst observation anchor is invalid")
+        if not isinstance(self.text, str) or not self.text.strip():
+            raise ValueError("Analyst observation text must be non-empty")
+        if not isinstance(self.state, AnalystObservationState):
+            raise TypeError("Analyst observation state must use AnalystObservationState")
+        if not isinstance(self.relation, AnalystObservationRelation):
+            raise TypeError("Analyst observation relation must use AnalystObservationRelation")
+        object.__setattr__(self, "finding_refs", tuple(self.finding_refs))
+        object.__setattr__(self, "evidence_refs", tuple(self.evidence_refs))
+        if any(not isinstance(item, UUID) for item in self.finding_refs + self.evidence_refs):
+            raise ValueError("Analyst observation references must be UUIDs")
+        if len(set(self.finding_refs)) != len(self.finding_refs) or len(
+            set(self.evidence_refs)
+        ) != len(self.evidence_refs):
+            raise ValueError("Analyst observation references must be unique")
+        if self.state in {
+            AnalystObservationState.OBSERVED,
+            AnalystObservationState.INFERRED,
+        } and not (self.finding_refs or self.evidence_refs):
+            raise ValueError("Sourced analyst observations require finding or evidence references")
+        if self.state is AnalystObservationState.OBSERVED and not self.evidence_refs:
+            raise ValueError("Observed analyst notes require explicit evidence references")
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "id": str(self.id),
+            "anchor": self.anchor,
+            "text": self.text,
+            "state": self.state.value,
+            "relation": self.relation.value,
+            "finding_refs": [str(ref) for ref in self.finding_refs],
+            "evidence_refs": [str(ref) for ref in self.evidence_refs],
+        }
+
+    @classmethod
+    def from_payload(cls, value: object) -> AnalystObservationV1:
+        expected = {
+            "id",
+            "anchor",
+            "text",
+            "state",
+            "relation",
+            "finding_refs",
+            "evidence_refs",
+        }
+        if not isinstance(value, Mapping) or set(value) != expected:
+            raise ValueError("Analyst observation payload has missing or unknown fields")
+        if any(
+            not isinstance(value[key], str) for key in ("id", "anchor", "text", "state", "relation")
+        ):
+            raise ValueError("Analyst observation text fields are invalid")
+        finding_refs = value["finding_refs"]
+        evidence_refs = value["evidence_refs"]
+        if not isinstance(finding_refs, (list, tuple)) or not isinstance(
+            evidence_refs, (list, tuple)
+        ):
+            raise ValueError("Analyst observation references must be lists")
+        if any(not isinstance(item, str) for item in (*finding_refs, *evidence_refs)):
+            raise ValueError("Analyst observation reference IDs must be strings")
+        return cls(
+            id=UUID(value["id"]),
+            anchor=value["anchor"],
+            text=value["text"],
+            state=AnalystObservationState(value["state"]),
+            relation=AnalystObservationRelation(value["relation"]),
+            finding_refs=tuple(UUID(item) for item in finding_refs),
+            evidence_refs=tuple(UUID(item) for item in evidence_refs),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -255,6 +361,7 @@ class AnalystOpinionV1:
             raise ValueError("An opinion must attach all three protocol views together")
         if len(figure_kinds) != len(set(figure_kinds)):
             raise ValueError("An opinion must not repeat a protocol figure kind")
+        _ = self.observations
         block_types = tuple(block.block_type for block in self.blocks)
         if len(block_types) != len(set(block_types)):
             raise ValueError("An opinion may contain each block type only once")
@@ -265,7 +372,40 @@ class AnalystOpinionV1:
 
     @property
     def renderable_blocks(self) -> tuple[OpinionBlock, ...]:
-        return tuple(block for block in self.blocks if block.is_renderable)
+        return tuple(
+            block
+            for block in self.blocks
+            if block.is_renderable and block.block_type is not OpinionBlockType.ANALYST_OBSERVATIONS
+        )
+
+    @property
+    def observations(self) -> tuple[AnalystObservationV1, ...]:
+        payload_blocks = [
+            block
+            for block in self.blocks
+            if block.block_type is OpinionBlockType.ANALYST_OBSERVATIONS
+        ]
+        if not payload_blocks:
+            return ()
+        if len(payload_blocks) != 1:
+            raise ValueError("Opinion must contain one analyst-observation projection block")
+        try:
+            payload = json.loads(payload_blocks[0].text)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Opinion analyst-observation projection is invalid JSON") from exc
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"schema", "items"}
+            or payload["schema"] != "analyst-observations.v1"
+            or not isinstance(payload["items"], list)
+        ):
+            raise ValueError("Opinion analyst-observation projection is unsupported")
+        result = tuple(AnalystObservationV1.from_payload(item) for item in payload["items"])
+        if not result or len({item.id for item in result}) != len(result):
+            raise ValueError("Opinion analyst-observation identities must be unique and non-empty")
+        if len(result) > 100:
+            raise ValueError("An opinion is limited to 100 analyst observations")
+        return result
 
     def content_payload(self) -> dict[str, object]:
         """Return the stable JSON projection whose bytes are covered by content_sha256."""
@@ -309,6 +449,31 @@ class AnalystOpinionV1:
 def _validate_sha256(value: str, name: str) -> None:
     if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
         raise ValueError(f"{name} must be lowercase SHA-256")
+
+
+def opinion_blocks_with_observations(
+    blocks: Iterable[OpinionBlock], observations: Iterable[AnalystObservationV1]
+) -> tuple[OpinionBlock, ...]:
+    """Persist the versioned note projection inside the existing immutable opinion payload."""
+    ordinary_blocks = tuple(
+        block for block in blocks if block.block_type is not OpinionBlockType.ANALYST_OBSERVATIONS
+    )
+    notes = tuple(observations)
+    if not notes:
+        return ordinary_blocks
+    payload = {
+        "schema": "analyst-observations.v1",
+        "items": [item.to_payload() for item in notes],
+    }
+    projection = OpinionBlock(
+        block_type=OpinionBlockType.ANALYST_OBSERVATIONS,
+        text=canonical_json_bytes(payload).decode("utf-8"),
+        finding_refs=(),
+        evidence_refs=(),
+        qualification=OpinionClaimQualification.HYPOTHESIS,
+        certainty=0.0,
+    )
+    return (*ordinary_blocks, projection)
 
 
 def _payload_text(payload: Mapping[str, Any], key: str) -> str:
@@ -455,10 +620,52 @@ def verify_opinion_citations(
                     "A factual block requires a supported finding backed by existing observations.",
                 )
             )
+    for note in opinion.observations:
+        note_referenced_findings: list[InvestigationFinding] = []
+        for finding_ref in note.finding_refs:
+            finding = finding_by_id.get(finding_ref)
+            if finding is None:
+                violations.append(
+                    CitationViolation(
+                        CitationViolationCode.FINDING_NOT_FOUND,
+                        OpinionBlockType.KEY_FINDINGS,
+                        finding_ref,
+                        "The cited analyst-observation finding does not exist.",
+                    )
+                )
+            else:
+                note_referenced_findings.append(finding)
+        for evidence_ref in note.evidence_refs:
+            if evidence_ref not in observation_ids:
+                violations.append(
+                    CitationViolation(
+                        CitationViolationCode.OBSERVATION_NOT_FOUND,
+                        OpinionBlockType.KEY_FINDINGS,
+                        evidence_ref,
+                        "The cited analyst-observation evidence does not exist.",
+                    )
+                )
+        if note.state is AnalystObservationState.OBSERVED and not any(
+            finding.assessment is FindingAssessment.SUPPORTED
+            and finding.observation_refs
+            and all(ref in observation_ids for ref in finding.observation_refs)
+            for finding in note_referenced_findings
+        ):
+            violations.append(
+                CitationViolation(
+                    CitationViolationCode.OBSERVATION_NOT_SUPPORTED,
+                    OpinionBlockType.KEY_FINDINGS,
+                    note.id,
+                    "An observed analyst note requires a supported finding backed by evidence.",
+                )
+            )
     return tuple(violations)
 
 
 __all__ = [
+    "AnalystObservationRelation",
+    "AnalystObservationState",
+    "AnalystObservationV1",
     "AnalystOpinionStatus",
     "AnalystOpinionV1",
     "CitationViolation",

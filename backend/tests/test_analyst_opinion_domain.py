@@ -7,12 +7,16 @@ from uuid import uuid4
 import pytest
 
 from cti_app.domain.analyst_opinion import (
+    AnalystObservationRelation,
+    AnalystObservationState,
+    AnalystObservationV1,
     AnalystOpinionStatus,
     AnalystOpinionV1,
     CitationViolationCode,
     OpinionBlock,
     OpinionBlockType,
     OpinionClaimQualification,
+    opinion_blocks_with_observations,
     verify_opinion_citations,
 )
 from cti_app.domain.investigation import (
@@ -170,4 +174,52 @@ def test_reviewed_opinion_requires_reviewer_identity_and_valid_hash() -> None:
             blocks=(),
             author_id=draft.author_id,
             content_sha256="0" * 64,
+        )
+
+
+def test_analyst_observation_projection_is_versioned_and_requires_citations() -> None:
+    investigation_id = uuid4()
+    observation = _observation(investigation_id)
+    finding = InvestigationFinding(
+        investigation_id=investigation_id,
+        kind=FindingKind.NETWORK_BEHAVIOUR,
+        assessment=FindingAssessment.SUPPORTED,
+        statement="A preserved certificate lists both infrastructure domains.",
+        observation_refs=(observation.id,),
+    )
+    note = AnalystObservationV1(
+        id=uuid4(),
+        anchor="section:1:paragraph:0001",
+        text="The shared certificate links the two domains, but does not identify an operator.",
+        state=AnalystObservationState.INFERRED,
+        relation=AnalystObservationRelation.QUALIFIES,
+        finding_refs=(finding.id,),
+        evidence_refs=(observation.id,),
+    )
+    blocks = opinion_blocks_with_observations(
+        (
+            OpinionBlock(
+                block_type=OpinionBlockType.KEY_FINDINGS,
+                text="The report identifies two domains.",
+                finding_refs=(finding.id,),
+                evidence_refs=(observation.id,),
+                qualification=OpinionClaimQualification.FACT,
+            ),
+        ),
+        (note,),
+    )
+    opinion = _opinion(blocks)
+
+    assert opinion.observations == (note,)
+    assert len(opinion.renderable_blocks) == 1
+    assert opinion.to_payload()["schema"] == "analyst-opinion.v1"
+    assert verify_opinion_citations(opinion, (finding,), (observation,)) == ()
+
+    with pytest.raises(ValueError, match="evidence references"):
+        AnalystObservationV1(
+            id=uuid4(),
+            anchor="section:1:paragraph:0001",
+            text="A factual observation without a source.",
+            state=AnalystObservationState.OBSERVED,
+            relation=AnalystObservationRelation.CONFIRMS,
         )
