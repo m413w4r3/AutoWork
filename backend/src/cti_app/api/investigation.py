@@ -29,6 +29,7 @@ from cti_app.application.investigation_composition import (
 from cti_app.application.investigation_governance import (
     EnvelopeDecisionConflictError,
     EnvelopeNotFoundError,
+    EnvelopeRevokedError,
     EnvelopeVersionConflictError,
     InvestigationActor,
     InvestigationEnvelopeProposal,
@@ -37,6 +38,7 @@ from cti_app.application.investigation_governance import (
     SampleQualificationEvidenceError,
     SampleQualificationPermissionError,
     SampleQualificationService,
+    g2_envelope_authorization_state,
 )
 from cti_app.application.investigation_jobs import (
     INVESTIGATION_RUN_AGGREGATE_TYPE,
@@ -539,7 +541,9 @@ async def get_investigation_operator_status(
 
     Stable error codes are ``investigation_not_found`` (404),
     ``investigation_not_started`` (409), and
-    ``investigation_operator_status_unavailable`` (503).
+    ``investigation_operator_status_unavailable`` (503). A revoked envelope
+    exposes ``g2.revoked`` and its next human action; unsupported legacy
+    reapproval uses ``envelope_revoked`` (409).
     """
     async with _uow_factory(request)() as uow:
         investigation = await uow.analyst_investigations.get(investigation_id)
@@ -557,6 +561,8 @@ async def get_investigation_operator_status(
         except (KeyError, ValueError) as exc:
             raise _http_error(503, InvestigationOperatorErrorCode.STATUS_UNAVAILABLE.value) from exc
         envelope = await uow.investigation_envelopes.get(investigation_id)
+        decisions = tuple(await uow.analyst_decisions.list_for_investigation(investigation_id))
+        authorization = g2_envelope_authorization_state(envelope, decisions)
         invocations = tuple(await uow.tool_invocations.list_for_investigation(investigation_id))
         observations = tuple(
             await uow.evidence_observations.list_for_investigation(investigation_id)
@@ -574,6 +580,10 @@ async def get_investigation_operator_status(
             state=state,
             synthesis_sha256=snapshot.synthesis_sha256,
             envelope=envelope,
+            g2_revoked=authorization.revoked,
+            g2_reapproval_supported=(
+                authorization.revoked and authorization.authorization_ceiling is not None
+            ),
             invocations=invocations,
             observations=observations,
             opinion=opinion,
@@ -688,12 +698,21 @@ async def extend_investigation_envelope(
 ) -> EnvelopeView:
     identity = await _identity(request)
     service = InvestigationEnvelopeService(_uow_factory(request))
-    current = await service.current(investigation_id)
-    if current is None:
-        raise _http_error(404, "envelope_not_found")
-    if payload.expected_version is None:
-        raise _http_error(422, "expected_version_required")
     async with _uow_factory(request)() as uow:
+        current = await uow.investigation_envelopes.get(investigation_id)
+        if current is None:
+            raise _http_error(404, "envelope_not_found")
+        if payload.expected_version is None:
+            raise _http_error(422, "expected_version_required")
+        decisions = tuple(await uow.analyst_decisions.list_for_investigation(investigation_id))
+        authorization = g2_envelope_authorization_state(current, decisions)
+        if authorization.revoked and authorization.authorization_ceiling is None:
+            raise _http_error(
+                409,
+                InvestigationOperatorErrorCode.ENVELOPE_REVOKED.value,
+                "The revoked envelope has no retained authorization bounds; "
+                "create a new investigation.",
+            )
         investigation = await uow.analyst_investigations.get(investigation_id)
         if investigation is None:
             raise _http_error(404, "investigation_not_found")
@@ -716,7 +735,14 @@ async def extend_investigation_envelope(
             else payload.acquire_hits_allowed
         )
         disclosure = _disclosure_from_request(
-            payload.disclosure, snapshot, current=current.disclosure
+            payload.disclosure,
+            snapshot,
+            current=current.disclosure,
+            ceiling=(
+                authorization.authorization_ceiling.disclosure
+                if authorization.authorization_ceiling is not None
+                else current.disclosure
+            ),
         )
     try:
         await service.extend(
@@ -732,6 +758,10 @@ async def extend_investigation_envelope(
         )
     except EnvelopeNotFoundError as exc:
         raise _http_error(404, "envelope_not_found") from exc
+    except EnvelopeRevokedError as exc:
+        raise _http_error(
+            409, InvestigationOperatorErrorCode.ENVELOPE_REVOKED.value, str(exc)
+        ) from exc
     except (EnvelopeVersionConflictError, EnvelopeDecisionConflictError) as exc:
         raise _http_error(409, "envelope_conflict", str(exc)) from exc
     except ValueError as exc:
@@ -1777,9 +1807,11 @@ def _disclosure_from_request(
     snapshot: Any,
     *,
     current: DisclosureBounds | None = None,
+    ceiling: DisclosureBounds | None = None,
 ) -> DisclosureBounds:
     source = _source_disclosure(snapshot)
     baseline = current or source
+    approved_ceiling = ceiling or baseline
     tlp = _tlp_level(payload.tlp) if payload.tlp is not None else baseline.tlp
     if payload.tlp is not None and tlp is None:
         raise _http_error(422, "invalid_tlp")
@@ -1791,11 +1823,13 @@ def _disclosure_from_request(
         if payload.external_llm_allowed is None
         else payload.external_llm_allowed
     )
-    if (source.do_not_submit or baseline.do_not_submit) and not do_not_submit:
+    if (source.do_not_submit or approved_ceiling.do_not_submit) and not do_not_submit:
         raise _http_error(422, "disclosure_bounds_cannot_be_relaxed")
-    if (not source.external_llm_allowed or not baseline.external_llm_allowed) and external_allowed:
+    if (
+        not source.external_llm_allowed or not approved_ceiling.external_llm_allowed
+    ) and external_allowed:
         raise _http_error(422, "disclosure_bounds_cannot_be_relaxed")
-    if _tlp_rank(tlp) < max(_tlp_rank(source.tlp), _tlp_rank(baseline.tlp)):
+    if _tlp_rank(tlp) < max(_tlp_rank(source.tlp), _tlp_rank(approved_ceiling.tlp)):
         raise _http_error(422, "disclosure_bounds_cannot_be_relaxed")
     if do_not_submit or tlp is TLPLevel.RED:
         external_allowed = False

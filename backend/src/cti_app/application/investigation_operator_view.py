@@ -29,6 +29,7 @@ class InvestigationOperatorErrorCode(StrEnum):
     INVESTIGATION_NOT_FOUND = "investigation_not_found"
     INVESTIGATION_STATE_MISSING = "investigation_not_started"
     STATUS_UNAVAILABLE = "investigation_operator_status_unavailable"
+    ENVELOPE_REVOKED = "envelope_revoked"
 
 
 class OperatorNextAction(StrEnum):
@@ -36,6 +37,7 @@ class OperatorNextAction(StrEnum):
     INSPECT_BRIDGE_TURN = "inspect_bridge_turn"
     RECONCILE_TOOL_INVOCATION = "reconcile_tool_invocation"
     REQUEST_G2_DECISION = "request_g2_decision"
+    CREATE_NEW_INVESTIGATION = "create_new_investigation"
     RESUME_INVESTIGATION = "resume_investigation"
     NO_ACTION = "no_action"
 
@@ -57,6 +59,8 @@ def build_investigation_operator_view(
     jobs: tuple[Job, ...],
     available_tools: tuple[str, ...],
     unavailable_tools: tuple[str, ...],
+    g2_revoked: bool = False,
+    g2_reapproval_supported: bool = False,
 ) -> InvestigationOperatorView:
     ordered_jobs = tuple(sorted(jobs, key=lambda item: (item.created_at, item.id.hex)))
     generation = max(
@@ -184,6 +188,8 @@ def build_investigation_operator_view(
         pending_bridge_key=pending_bridge_key,
         bridge_conversation_id=bridge_conversation_id,
         envelope_version=envelope.version if envelope else 0,
+        g2_revoked=g2_revoked,
+        g2_reapproval_supported=g2_reapproval_supported,
     )
     return InvestigationOperatorView(
         payload={
@@ -220,6 +226,8 @@ def build_investigation_operator_view(
             "opinion_checkpoint": opinion_checkpoint,
             "g2": {
                 "approved": envelope is not None,
+                "revoked": g2_revoked,
+                "reapproval_supported": g2_reapproval_supported,
                 "version": envelope.version if envelope else 0,
                 "approval_decision_id": envelope.approval_decision_id if envelope else None,
                 "approval_actor_id": envelope.approval_actor_id if envelope else None,
@@ -280,6 +288,8 @@ def _next_action(
     pending_bridge_key: str | None,
     bridge_conversation_id: UUID,
     envelope_version: int,
+    g2_revoked: bool,
+    g2_reapproval_supported: bool,
 ) -> dict[str, Any]:
     prefix = f"/api/investigations/{investigation.id}"
     if active_jobs:
@@ -311,6 +321,28 @@ def _next_action(
             "requires_human_reconciliation": True,
         }
     if state.stop_reason is StopReason.PERMISSION_REQUIRED:
+        if g2_revoked and g2_reapproval_supported:
+            return {
+                "code": OperatorNextAction.REQUEST_G2_DECISION.value,
+                "method": "POST",
+                "path": f"{prefix}/envelope/extend",
+                "expected_version": envelope_version,
+                "requires_idempotency_key": True,
+                "requires_human_decision": True,
+                "authorization_ceiling_enforced": True,
+            }
+        if g2_revoked:
+            return {
+                "code": OperatorNextAction.CREATE_NEW_INVESTIGATION.value,
+                "method": "POST",
+                "path": f"/api/subjects/{investigation.subject_id}/investigations",
+                "request_fields": [
+                    "production_run_id",
+                    "synthesis_artifact_id",
+                    "synthesis_sha256",
+                ],
+                "requires_new_verified_synthesis": True,
+            }
         return {
             "code": OperatorNextAction.REQUEST_G2_DECISION.value,
             "method": "POST",

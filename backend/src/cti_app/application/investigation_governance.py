@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID, uuid5
@@ -27,6 +27,7 @@ from cti_app.domain.investigation import (
     QualificationActorKind,
     SampleAssociation,
     SampleQualification,
+    TLPLevel,
 )
 from cti_app.domain.production import AnalystInvestigation
 
@@ -49,6 +50,10 @@ class EnvelopeVersionConflictError(InvestigationGovernanceError):
 
 class EnvelopeDecisionConflictError(InvestigationGovernanceError):
     pass
+
+
+class EnvelopeRevokedError(InvestigationGovernanceError):
+    """A revoked envelope cannot be reapproved from its retained audit data."""
 
 
 class SampleAssociationNotFoundError(InvestigationGovernanceError):
@@ -76,6 +81,46 @@ class InvestigationEnvelopeProposal:
     @property
     def approved(self) -> bool:
         return False
+
+
+@dataclass(frozen=True, slots=True)
+class G2AuthorizationBounds:
+    allowed_providers: tuple[str, ...]
+    budget_limits: Mapping[BudgetDimension, int]
+    acquire_hits_allowed: bool
+    disclosure: DisclosureBounds
+
+
+@dataclass(frozen=True, slots=True)
+class G2EnvelopeAuthorizationState:
+    revoked: bool
+    authorization_ceiling: G2AuthorizationBounds | None
+
+
+def g2_envelope_authorization_state(
+    envelope: InvestigationEnvelope | None,
+    decisions: Sequence[AnalystDecision],
+) -> G2EnvelopeAuthorizationState:
+    if envelope is None:
+        return G2EnvelopeAuthorizationState(revoked=False, authorization_ceiling=None)
+    revocation = next(
+        (
+            item
+            for item in decisions
+            if item.id == envelope.approval_decision_id
+            and item.decision_type is AnalystDecisionType.PIVOT_REJECT
+            and item.target_type is AnalystDecisionTargetType.PIVOT
+            and item.target_id == envelope.investigation_id
+        ),
+        None,
+    )
+    if revocation is None:
+        return G2EnvelopeAuthorizationState(
+            revoked=False,
+            authorization_ceiling=_authorization_bounds_for_envelope(envelope),
+        )
+    ceiling = _authorization_bounds_from_payload(revocation.details.get("authorization_ceiling"))
+    return G2EnvelopeAuthorizationState(revoked=True, authorization_ceiling=ceiling)
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,6 +267,8 @@ class InvestigationEnvelopeService:
             current = await uow.investigation_envelopes.get(investigation_id)
             if current is None:
                 raise EnvelopeNotFoundError("No approved G2 envelope exists")
+            decisions = tuple(await uow.analyst_decisions.list_for_investigation(investigation_id))
+            authorization = g2_envelope_authorization_state(current, decisions)
             limits = dict(current.budget.limits)
             limits.update(budget.limits)
             requested_budget = InvestigationBudget(limits=limits)
@@ -252,11 +299,28 @@ class InvestigationEnvelopeService:
                 return current
             if current.version != expected_version:
                 raise EnvelopeVersionConflictError("Investigation envelope version changed")
-            if not set(current.allowed_providers).issubset(normalized_providers):
-                raise ValueError("An envelope extension cannot remove an allowed provider")
-            if current.acquire_hits_allowed and not acquire_hits_allowed:
-                raise ValueError("An envelope extension cannot revoke acquisition rights")
-            _require_budget_extension(current.budget, requested_budget)
+            if authorization.revoked:
+                ceiling = authorization.authorization_ceiling
+                if ceiling is None:
+                    raise EnvelopeRevokedError(
+                        "The revoked envelope has no retained authorization bounds; "
+                        "create a new investigation."
+                    )
+                _require_revoked_reextension(
+                    current_budget=current.budget,
+                    providers=normalized_providers,
+                    requested_budget=requested_budget,
+                    acquire_hits_allowed=acquire_hits_allowed,
+                    disclosure=disclosure,
+                    ceiling=ceiling,
+                )
+            else:
+                if not set(current.allowed_providers).issubset(normalized_providers):
+                    raise ValueError("An envelope extension cannot remove an allowed provider")
+                if current.acquire_hits_allowed and not acquire_hits_allowed:
+                    raise ValueError("An envelope extension cannot revoke acquisition rights")
+                _require_budget_extension(current.budget, requested_budget)
+                _require_disclosure_within_bounds(disclosure, current.disclosure)
             investigation = await uow.analyst_investigations.get(investigation_id)
             if investigation is None:
                 raise EnvelopeNotFoundError("Investigation does not exist")
@@ -391,23 +455,7 @@ class InvestigationEnvelopeService:
             limits.update({dimension: 0 for dimension in external_dimensions})
             budget = InvestigationBudget(limits=limits)
             for reservation in current.budget.reservations:
-                amounts = {
-                    dimension: amount
-                    for dimension, amount in reservation.amounts.items()
-                    if dimension not in external_dimensions
-                }
-                if not amounts:
-                    continue
-                budget.reserve(reservation.operation_key, amounts)
-                if reservation.status is BudgetReservationStatus.COMMITTED:
-                    consumed = {
-                        dimension: amount
-                        for dimension, amount in reservation.committed_amounts.items()
-                        if dimension not in external_dimensions
-                    }
-                    budget.commit(reservation.operation_key, consumed)
-                elif reservation.status is BudgetReservationStatus.RELEASED:
-                    budget.release(reservation.operation_key)
+                budget.restore_reservation(reservation)
 
             revoked = InvestigationEnvelope(
                 investigation_id=investigation_id,
@@ -424,6 +472,10 @@ class InvestigationEnvelopeService:
                 approved_at=datetime.now(UTC),
                 version=current.version + 1,
             )
+            decision = replace(
+                decision,
+                details={"authorization_ceiling": _authorization_bounds_payload(current)},
+            )
             await uow.analyst_decisions.append(decision)
             try:
                 await uow.investigation_envelopes.save_if_version(
@@ -437,6 +489,12 @@ class InvestigationEnvelopeService:
     async def current(self, investigation_id: UUID) -> InvestigationEnvelope | None:
         async with self._uow_factory() as uow:
             return await uow.investigation_envelopes.get(investigation_id)
+
+    async def authorization_state(self, investigation_id: UUID) -> G2EnvelopeAuthorizationState:
+        async with self._uow_factory() as uow:
+            envelope = await uow.investigation_envelopes.get(investigation_id)
+            decisions = tuple(await uow.analyst_decisions.list_for_investigation(investigation_id))
+            return g2_envelope_authorization_state(envelope, decisions)
 
 
 class SampleQualificationService:
@@ -569,6 +627,130 @@ def _decision(
         reason=reason.strip(),
         correlation_id=correlation_id.strip(),
     )
+
+
+def _authorization_bounds_for_envelope(
+    envelope: InvestigationEnvelope,
+) -> G2AuthorizationBounds:
+    return G2AuthorizationBounds(
+        allowed_providers=tuple(envelope.allowed_providers),
+        budget_limits=dict(envelope.budget.limits),
+        acquire_hits_allowed=envelope.acquire_hits_allowed,
+        disclosure=envelope.disclosure,
+    )
+
+
+def _authorization_bounds_payload(envelope: InvestigationEnvelope) -> dict[str, object]:
+    return {
+        "allowed_providers": list(envelope.allowed_providers),
+        "budget_limits": {
+            dimension.value: amount for dimension, amount in envelope.budget.limits.items()
+        },
+        "acquire_hits_allowed": envelope.acquire_hits_allowed,
+        "disclosure": _disclosure_identity(envelope.disclosure),
+    }
+
+
+def _authorization_bounds_from_payload(value: object) -> G2AuthorizationBounds | None:
+    if not isinstance(value, Mapping):
+        return None
+    providers = value.get("allowed_providers")
+    limits = value.get("budget_limits")
+    acquisition = value.get("acquire_hits_allowed")
+    disclosure_payload = value.get("disclosure")
+    if (
+        not isinstance(providers, (list, tuple))
+        or not all(isinstance(item, str) for item in providers)
+        or not isinstance(limits, Mapping)
+        or not isinstance(acquisition, bool)
+        or not isinstance(disclosure_payload, Mapping)
+    ):
+        return None
+    try:
+        normalized_providers = _normalize_providers(tuple(providers))
+        budget_limits: dict[BudgetDimension, int] = {}
+        for raw_dimension, amount in limits.items():
+            if (
+                not isinstance(raw_dimension, str)
+                or isinstance(amount, bool)
+                or not isinstance(amount, int)
+            ):
+                return None
+            budget_limits[BudgetDimension(raw_dimension)] = amount
+        raw_tlp = disclosure_payload.get("tlp")
+        tlp = TLPLevel(raw_tlp) if isinstance(raw_tlp, str) else None
+        do_not_submit = disclosure_payload.get("do_not_submit")
+        external_llm_allowed = disclosure_payload.get("external_llm_allowed")
+        if not isinstance(do_not_submit, bool) or not isinstance(external_llm_allowed, bool):
+            return None
+        budget = InvestigationBudget(limits=budget_limits)
+    except (TypeError, ValueError):
+        return None
+    return G2AuthorizationBounds(
+        allowed_providers=normalized_providers,
+        budget_limits=dict(budget.limits),
+        acquire_hits_allowed=acquisition,
+        disclosure=DisclosureBounds(
+            tlp=tlp,
+            do_not_submit=do_not_submit,
+            external_llm_allowed=external_llm_allowed,
+        ),
+    )
+
+
+def _require_revoked_reextension(
+    *,
+    current_budget: InvestigationBudget,
+    providers: tuple[str, ...],
+    requested_budget: InvestigationBudget,
+    acquire_hits_allowed: bool,
+    disclosure: DisclosureBounds,
+    ceiling: G2AuthorizationBounds,
+) -> None:
+    if not set(providers).issubset(ceiling.allowed_providers):
+        raise ValueError("A re-extension cannot exceed the prior G2 provider authorization")
+    if acquire_hits_allowed and not ceiling.acquire_hits_allowed:
+        raise ValueError("A re-extension cannot restore unapproved acquisition rights")
+    _require_disclosure_within_bounds(disclosure, ceiling.disclosure)
+    for dimension in BudgetDimension:
+        limit = requested_budget.limits.get(dimension)
+        ceiling_limit = ceiling.budget_limits.get(dimension)
+        if ceiling_limit is not None and (limit is None or limit > ceiling_limit):
+            raise ValueError(f"A re-extension cannot exceed the prior G2 {dimension.value} budget")
+        used = current_budget.consumed[dimension] + current_budget.reserved[dimension]
+        if limit is not None and limit < used:
+            raise ValueError(
+                f"A re-extension cannot reduce {dimension.value} below its consumed "
+                "or reserved usage"
+            )
+
+
+def _require_disclosure_within_bounds(
+    disclosure: DisclosureBounds,
+    ceiling: DisclosureBounds,
+) -> None:
+    if ceiling.do_not_submit and not disclosure.do_not_submit:
+        raise ValueError("An envelope extension cannot remove do_not_submit")
+    if not ceiling.external_llm_allowed and disclosure.external_llm_allowed:
+        raise ValueError("An envelope extension cannot enable external LLM access")
+    if _tlp_rank(disclosure.tlp) < _tlp_rank(ceiling.tlp):
+        raise ValueError("An envelope extension cannot widen the approved TLP")
+    if (disclosure.do_not_submit or disclosure.tlp is TLPLevel.RED) and (
+        disclosure.external_llm_allowed
+    ):
+        raise ValueError("Disclosure policy forbids external LLM access")
+
+
+def _tlp_rank(level: TLPLevel | None) -> int:
+    if level is None:
+        return 0
+    return {
+        TLPLevel.WHITE: 1,
+        TLPLevel.CLEAR: 1,
+        TLPLevel.GREEN: 2,
+        TLPLevel.AMBER: 3,
+        TLPLevel.RED: 4,
+    }[level]
 
 
 async def _decision_by_correlation(
@@ -729,7 +911,10 @@ def _qualification_correlation(
 __all__ = [
     "EnvelopeDecisionConflictError",
     "EnvelopeNotFoundError",
+    "EnvelopeRevokedError",
     "EnvelopeVersionConflictError",
+    "G2AuthorizationBounds",
+    "G2EnvelopeAuthorizationState",
     "InvestigationActor",
     "InvestigationEnvelopeProposal",
     "InvestigationEnvelopeService",
@@ -738,4 +923,5 @@ __all__ = [
     "SampleQualificationEvidenceError",
     "SampleQualificationPermissionError",
     "SampleQualificationService",
+    "g2_envelope_authorization_state",
 ]
