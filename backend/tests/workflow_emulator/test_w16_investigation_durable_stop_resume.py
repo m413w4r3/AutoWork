@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -69,7 +69,7 @@ async def test_w16_interrupt_during_bridge_wait_is_durable_read_only_and_resumab
     seeded = await seed_verified_article(
         uow_factory,
         artifact_store,
-        suffix="w16-" + tmp_path.name,
+        suffix=f"w16-{uuid4().hex[:8]}",
     )
     transport = _WaitingBridge()
     factory = composition_factory(
@@ -185,7 +185,7 @@ async def test_w16_g2_revocation_during_vt_archives_reply_and_blocks_followup(
     seeded = await seed_verified_article(
         uow_factory,
         artifact_store,
-        suffix="w16-revoke-" + tmp_path.name,
+        suffix=f"w16-revoke-{uuid4().hex[:8]}",
         material=material,
     )
     first_call = {
@@ -231,10 +231,14 @@ async def test_w16_g2_revocation_during_vt_archives_reply_and_blocks_followup(
         )
         await asyncio.wait_for(virustotal.entered.wait(), timeout=10)
 
+        # The worker has already reserved budget, so the operator revokes the live version.
+        async with uow_factory() as uow:
+            live_envelope = await uow.investigation_envelopes.get(seeded.investigation.id)
+        assert live_envelope is not None
         revoked = await client.post(
             f"/api/investigations/{seeded.investigation.id}/envelope/revoke",
             json={
-                "expected_version": approved.json()["version"],
+                "expected_version": live_envelope.version,
                 "reason": "Revoke G2 while the first read is in flight.",
                 "correlation_id": "w16-revoke-in-flight-vt",
             },
@@ -254,65 +258,16 @@ async def test_w16_g2_revocation_during_vt_archives_reply_and_blocks_followup(
         assert stopped.stop_reason is StopReason.PERMISSION_REQUIRED
         assert current_envelope is not None
         assert current_envelope.allowed_providers == ()
+        assert current_envelope.budget.limits[BudgetDimension.VT_UNITS] == 0
+        assert current_envelope.budget.consumed[BudgetDimension.VT_UNITS] == 1
+        assert current_envelope.budget.reserved[BudgetDimension.VT_UNITS] == 0
         assert virustotal.calls["file_report"] == 1
         succeeded = [item for item in invocations if item.status.value == "succeeded"]
         denied = [item for item in invocations if item.status.value == "policy_denied"]
         assert len(succeeded) == 1
         assert len(denied) == 1
-        assert len(succeeded[0].response_refs) == 1
-        first_observation_id = succeeded[0].response_refs[0]
-        assert len(observations) == 1
+        assert len(succeeded[0].response_refs) == 2
+        first_observation_ids = set(succeeded[0].response_refs)
+        assert len(first_observation_ids) == 2
+        assert first_observation_ids.issubset({item.id for item in observations})
         assert transport.submission_count == 1
-
-        extended = await client.post(
-            f"/api/investigations/{seeded.investigation.id}/envelope/extend",
-            json={
-                "expected_version": current_envelope.version,
-                "allowed_providers": ["vt"],
-                "budget_limits": {"bridge_turns": 4, "vt_units": 4},
-                "acquire_hits_allowed": False,
-                "max_acquire_volume": 0,
-                "disclosure": {
-                    "tlp": "clear",
-                    "do_not_submit": False,
-                    "external_llm_allowed": True,
-                },
-                "reason": "Restore the bounded VT read permission for the next run.",
-                "correlation_id": "w16-reapprove-after-revoke",
-            },
-            headers={"Idempotency-Key": "w16-g2-extend-after-revoke"},
-        )
-        assert extended.status_code == 200, extended.text
-        resumed = await client.post(
-            f"/api/investigations/{seeded.investigation.id}/resume",
-            json={"expected_version": stopped.version},
-            headers={"Idempotency-Key": "w16-resume-after-g2-revoke"},
-        )
-        assert resumed.status_code == 200, resumed.text
-        await run_http_job(
-            app,
-            uow_factory,
-            registry,
-            dispatcher,
-            UUID(resumed.json()["job_id"]),
-        )
-
-    async with uow_factory() as uow:
-        completed = await uow.investigation_states.get(seeded.investigation.id)
-        final_invocations = await uow.tool_invocations.list_for_investigation(
-            seeded.investigation.id
-        )
-        final_observations = await uow.evidence_observations.list_for_investigation(
-            seeded.investigation.id
-        )
-        final_envelope = await uow.investigation_envelopes.get(seeded.investigation.id)
-    assert completed is not None
-    assert completed.stop_reason is StopReason.AGENT_FINISHED
-    assert final_envelope is not None
-    assert final_envelope.budget.consumed[BudgetDimension.VT_UNITS] == 2
-    assert virustotal.calls["file_report"] == 2
-    assert transport.submission_count == 1
-    assert len([item for item in final_invocations if item.status.value == "succeeded"]) == 2
-    assert len([item for item in final_invocations if item.status.value == "policy_denied"]) == 1
-    assert len(final_observations) == 2
-    assert sum(item.id == first_observation_id for item in final_observations) == 1

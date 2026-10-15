@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Awaitable, Callable, Iterable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -82,6 +82,7 @@ from cti_app.domain.investigation import (
     AgentNextAction,
     BudgetDimension,
     BudgetExceeded,
+    BudgetReservation,
     BudgetReservationStatus,
     EvidenceKind,
     EvidenceObservation,
@@ -441,6 +442,12 @@ class InvestigationService:
             if not allowed:
                 # Context construction is the local read path; no model transport runs.
                 return await self.conclude(investigation_id, StopReason.MODEL_UNAVAILABLE)
+
+            async def before_bridge_submission(
+                approved_envelope: InvestigationEnvelope | None = envelope,
+            ) -> bool:
+                return await self._bridge_submission_allowed(investigation_id, approved_envelope)
+
             context_bytes = context.canonical_bytes()
             context_size_bytes = len(context_bytes)
             context_sha256 = hashlib.sha256(context_bytes).hexdigest()
@@ -484,11 +491,7 @@ class InvestigationService:
                 on_invalid_output=lambda key, detail: self._record_bridge_rejection(
                     investigation_id, key, detail
                 ),
-                before_submission=(
-                    lambda approved_envelope=envelope: self._bridge_submission_allowed(
-                        investigation_id, approved_envelope
-                    )
-                ),
+                before_submission=before_bridge_submission,
             )
             await self._complete_bridge_reservation(
                 investigation_id,
@@ -510,6 +513,12 @@ class InvestigationService:
                     budget=budget,
                 )
                 return await self.conclude(investigation_id, StopReason.PERMISSION_REQUIRED)
+            # Bridge reservation completion writes a newer envelope version. Pass
+            # that durable snapshot onward so tool reservations do not CAS against
+            # the pre-Bridge version.
+            envelope = latest_envelope
+            if envelope is not None:
+                budget = envelope.budget
             stop = await self._bridge_stop(turn)
             if stop is not None:
                 if turn.status is TurnSubmissionStatus.INVALID_OUTPUT:
@@ -793,13 +802,20 @@ class InvestigationService:
                 operation_key=operation_key,
             )
             uncertain_external = external_effect and (
-                result.status is ToolInvocationStatus.FAILED
+                (
+                    result.status is ToolInvocationStatus.FAILED
+                    and not _confirmed_external_non_execution(result)
+                )
                 or (
                     result.status is ToolInvocationStatus.NEEDS_REVIEW
                     and not result.output.get("request_permission", False)
                 )
             )
-            if external_effect and result.status is ToolInvocationStatus.FAILED:
+            if (
+                external_effect
+                and result.status is ToolInvocationStatus.FAILED
+                and not _confirmed_external_non_execution(result)
+            ):
                 result = replace(
                     result,
                     status=ToolInvocationStatus.NEEDS_REVIEW,
@@ -856,7 +872,7 @@ class InvestigationService:
                 investigation_id=investigation.id,
                 operation_key=operation_key,
                 result=result,
-                reserved_amounts=cost,
+                reserved_amounts=invocation.reserved_budget,
                 uncertain=uncertain_external,
             )
             await self._commit_current_uow()
@@ -1723,15 +1739,36 @@ class InvestigationService:
         investigation_id: UUID,
         operation_key: str,
         result: ToolResult,
-        reserved_amounts: dict[BudgetDimension, int],
+        reserved_amounts: Mapping[BudgetDimension, int],
         uncertain: bool,
     ) -> None:
         for _ in range(3):
             envelope = await self._envelopes.get(investigation_id)
             if envelope is None:
                 return
-            status = _reservation_status(envelope.budget, operation_key)
-            if status is None or status is not BudgetReservationStatus.RESERVED or uncertain:
+            reservation = next(
+                (
+                    item
+                    for item in envelope.budget.reservations
+                    if item.operation_key == operation_key
+                ),
+                None,
+            )
+            expected_reservation = BudgetReservation(
+                operation_key=operation_key,
+                amounts=reserved_amounts,
+            )
+            if reservation is None or (
+                reservation.status is BudgetReservationStatus.RESERVED
+                and reservation.amounts != expected_reservation.amounts
+            ):
+                # G2 revocation zeroes external limits while an already-dispatched
+                # operation is in flight. Restore its persisted reservation before
+                # recording the response; this does not grant permission for another
+                # operation because the envelope's limits and provider scope stay revoked.
+                envelope.budget.restore_reservation(expected_reservation)
+                reservation = expected_reservation
+            if reservation.status is not BudgetReservationStatus.RESERVED or uncertain:
                 return
             if result.status in {
                 ToolInvocationStatus.SUCCEEDED,
@@ -1988,12 +2025,13 @@ def _reservation_status(
 def _copy_investigation_budget(budget: InvestigationBudget) -> InvestigationBudget:
     copied = InvestigationBudget(limits=dict(budget.limits))
     for reservation in budget.reservations:
-        copied.reserve(reservation.operation_key, reservation.amounts)
-        if reservation.status is BudgetReservationStatus.COMMITTED:
-            copied.commit(reservation.operation_key, reservation.committed_amounts)
-        elif reservation.status is BudgetReservationStatus.RELEASED:
-            copied.release(reservation.operation_key)
+        copied.restore_reservation(reservation)
     return copied
+
+
+def _confirmed_external_non_execution(result: ToolResult) -> bool:
+    """Return true for an explicit local/provider rejection known to have no effect."""
+    return result.output.get("reason") == "subject_slot_limit"
 
 
 def _action_summary(tool_name: str, status: ToolInvocationStatus, message: str) -> str:

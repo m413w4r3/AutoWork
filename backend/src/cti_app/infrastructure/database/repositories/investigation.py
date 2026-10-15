@@ -27,6 +27,7 @@ from cti_app.domain.analyst_opinion import (
 from cti_app.domain.investigation import (
     AgendaItem,
     BudgetDimension,
+    BudgetReservation,
     BudgetReservationStatus,
     DetectionCandidateStatus,
     DetectionCandidateVersion,
@@ -109,18 +110,18 @@ def _budget_from_payload(payload: Mapping[str, Any]) -> InvestigationBudget:
     for value in payload["reservations"]:
         amounts = {BudgetDimension(key): amount for key, amount in dict(value["amounts"]).items()}
         operation_key = str(value["operation_key"])
-        budget.reserve(operation_key, amounts)
         status = BudgetReservationStatus(value["status"])
-        if status is BudgetReservationStatus.COMMITTED:
-            committed = {
-                BudgetDimension(key): amount
-                for key, amount in dict(value["committed_amounts"]).items()
-            }
-            budget.commit(operation_key, committed)
-        elif status is BudgetReservationStatus.RELEASED:
-            budget.release(operation_key)
-        elif status is not BudgetReservationStatus.RESERVED:
-            raise ValueError(f"Unsupported budget reservation status: {status}")
+        committed = {
+            BudgetDimension(key): amount for key, amount in dict(value["committed_amounts"]).items()
+        }
+        budget.restore_reservation(
+            BudgetReservation(
+                operation_key=operation_key,
+                amounts=amounts,
+                status=status,
+                committed_amounts=committed,
+            )
+        )
     return budget
 
 
