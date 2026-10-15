@@ -486,14 +486,23 @@ async def _new_article_findings(
     }
 
 
+def _artifact_dir(tmp_path: Path) -> Path:
+    """Reviewable artefacts land in W18_ARTIFACT_DIR when set, else in the test sandbox."""
+    directory = Path(os.environ.get("W18_ARTIFACT_DIR") or tmp_path / "w18")
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
 @pytest.mark.asyncio
 async def test_w18_supervised_first_run_recovers_without_replaying_confirmed_effects(
     workflow_driver: WorkflowDriver,
     uow_factory,
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     driver = workflow_driver
     driver.begin("W18-supervised-first-run-recovery")
+    artifact_dir = _artifact_dir(tmp_path)
     typst_binary = os.environ.get("TYPST_BINARY", "typst")
     assert shutil.which(typst_binary), "W18 requires the real Typst compiler"
     pdftotext = shutil.which("pdftotext")
@@ -502,7 +511,8 @@ async def test_w18_supervised_first_run_recovers_without_replaying_confirmed_eff
     assert pdftoppm, "W18 requires Poppler pdftoppm"
     template_root, font_root, fonts_lock = typst_bundle_paths()
     assert template_root.is_dir() and font_root.is_dir() and fonts_lock.is_file()
-    monkeypatch.setenv("TMPDIR", str(Path(os.environ["TMPDIR"])))
+    if os.environ.get("TMPDIR"):
+        monkeypatch.setenv("TMPDIR", os.environ["TMPDIR"])
     tempfile.tempdir = None
 
     sample_material = SyntheticSampleMaterial.unique()
@@ -581,7 +591,7 @@ async def test_w18_supervised_first_run_recovers_without_replaying_confirmed_eff
         assert await production.runner.run_next(), "pipeline stalled before synthesis"
 
     checkpoint_journal: list[dict[str, Any]] = []
-    checkpoint_path = Path.home() / "autowork-tmp" / "w18" / "checkpoints.json"
+    checkpoint_path = artifact_dir / "checkpoints.json"
     before_failure = await _checkpoint(
         label="before-production-synthesis-failure",
         driver=driver,
@@ -1210,8 +1220,7 @@ async def test_w18_supervised_first_run_recovers_without_replaying_confirmed_eff
         )
         return " ".join(extracted.split()), pages, response.content
 
-    home_output = Path.home() / "autowork-tmp" / "w18"
-    home_output.mkdir(parents=True, exist_ok=True)
+    home_output = artifact_dir
     preview_v1_text, preview_v1_pages, preview_v1_bytes = await preview_current(
         draft, home_output / "opinion-preview-v1.pdf"
     )
