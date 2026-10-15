@@ -201,7 +201,8 @@ async def _read_operator_status(
     assert first.json() == second.json()
     after = await _working_checkpoint(uow_factory, investigation_id)
     assert after == before, "operator-status must not mutate the durable working state"
-    return first.json()
+    status: dict[str, Any] = first.json()
+    return status
 
 
 async def _checkpoint(
