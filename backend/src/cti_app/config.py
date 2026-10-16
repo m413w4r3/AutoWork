@@ -162,9 +162,9 @@ class Settings(BaseSettings):
     virustotal_object_relationships_enabled: bool = False
     virustotal_intelligence_search_enabled: bool = False
     virustotal_behaviour_reports_enabled: bool = False
-    virustotal_base_url: str = "https://www.virustotal.com/api/v3"
-    virustotal_fallback_base_url: str | None = "https://www.virustotal.com/api/v3"
-    virustotal_legacy_base_url: str | None = "http://www.virustotal.com/vtapi/v2"
+    virustotal_base_url: str = "http://www.virustotal.com/api/v3"
+    virustotal_fallback_base_url: str | None = "http://www.virustotal.com/api/v3"
+    virustotal_legacy_base_url: str | None = "https://www.virustotal.com/vtapi/v2"
     virustotal_api_key: SecretStr | None = None
     # Explicit opt-in for file_report's proxy fallback base URL (still proxy
     # transport, second v3 base) and its legacy v2 direct fallback. Both

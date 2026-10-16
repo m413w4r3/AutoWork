@@ -300,7 +300,9 @@ dependencies = [
     { name = "fastapi" },
     { name = "httpx" },
     { name = "minio" },
+    { name = "pefile" },
     { name = "pydantic-settings" },
+    { name = "pyelftools" },
     { name = "pypdf" },
     { name = "python-multipart" },
     { name = "redis" },
@@ -311,10 +313,8 @@ dependencies = [
 [package.dev-dependencies]
 analysis = [
     { name = "flare-capa" },
-    { name = "pefile" },
     { name = "ppdeep" },
     { name = "py-tlsh" },
-    { name = "pyelftools" },
     { name = "smda" },
     { name = "yara-python" },
 ]
@@ -334,7 +334,9 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.116,<1" },
     { name = "httpx", specifier = ">=0.28,<1" },
     { name = "minio", specifier = ">=7.2,<8" },
+    { name = "pefile", specifier = "==2024.8.26" },
     { name = "pydantic-settings", specifier = ">=2.10,<3" },
+    { name = "pyelftools", specifier = "==0.33" },
     { name = "pypdf", specifier = ">=5.9,<7" },
     { name = "python-multipart", specifier = ">=0.0.20,<1" },
     { name = "redis", specifier = ">=6.4,<7" },
@@ -345,10 +347,8 @@ requires-dist = [
 [package.metadata.requires-dev]
 analysis = [
     { name = "flare-capa", specifier = "==9.4.0" },
-    { name = "pefile", specifier = "==2024.8.26" },
     { name = "ppdeep", specifier = "==20260221" },
     { name = "py-tlsh", specifier = "==5.0.0" },
-    { name = "pyelftools", specifier = "==0.33" },
     { name = "smda", specifier = "==4.5.0" },
     { name = "yara-python", specifier = "==4.5.0" },
 ]

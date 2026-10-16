@@ -45,7 +45,11 @@ from cti_app.domain.virustotal import (
     VirusTotalTransportKind,
 )
 from cti_app.infrastructure.shodan import create_shodan_http_adapter, create_shodan_http_client
-from cti_app.infrastructure.virustotal import VirusTotalHttpAdapter, create_virustotal_http_client
+from cti_app.infrastructure.virustotal import (
+    VirusTotalHttpAdapter,
+    create_virustotal_direct_http_client,
+    create_virustotal_http_client,
+)
 from cti_app.integrations.model_factory import create_bridge_capabilities_provider
 from cti_app.integrations.models import ChatGPTBridgeClient, _responses_output_text
 
@@ -381,14 +385,34 @@ async def open_live_smoke_clients(settings: Settings, stack: AsyncExitStack) -> 
     if settings.virustotal_proxy_url:
         vt_client = create_virustotal_http_client(settings)
         await stack.enter_async_context(vt_client)
+        # Same fallback wiring as the API/worker roots: the smoke must exercise
+        # the production file_report route, not a proxy-only simplification.
+        vt_direct_client: httpx.AsyncClient | None = None
+        if (
+            settings.virustotal_api_key is not None
+            and settings.virustotal_file_report_legacy_fallback_enabled
+        ):
+            vt_direct_client = create_virustotal_direct_http_client(settings)
+            await stack.enter_async_context(vt_direct_client)
         vt = VirusTotalHttpAdapter(
             client=vt_client,
             base_url=settings.virustotal_base_url,
+            fallback_base_url=settings.virustotal_fallback_base_url,
+            legacy_base_url=settings.virustotal_legacy_base_url,
+            direct_client=vt_direct_client,
+            api_key=(
+                settings.virustotal_api_key.get_secret_value()
+                if vt_direct_client is not None and settings.virustotal_api_key is not None
+                else None
+            ),
             capabilities=VirusTotalCapabilities(
                 file_report=True, file_relationships=True, intelligence_search=True
             ),
-            routing_policy=VirusTotalRoutingPolicy(
-                routes={capability: _PROXY_ROUTE for capability in _VT_CAPABILITIES}
+            file_report_proxy_fallback_enabled=(
+                settings.virustotal_file_report_proxy_fallback_enabled
+            ),
+            file_report_legacy_fallback_enabled=(
+                settings.virustotal_file_report_legacy_fallback_enabled
             ),
             max_response_bytes=settings.virustotal_max_response_bytes,
         )
