@@ -318,6 +318,9 @@ analysis = [
     { name = "smda" },
     { name = "yara-python" },
 ]
+analysis-runtime = [
+    { name = "yara-python" },
+]
 dev = [
     { name = "aiosqlite" },
     { name = "mypy" },
@@ -352,6 +355,7 @@ analysis = [
     { name = "smda", specifier = "==4.5.0" },
     { name = "yara-python", specifier = "==4.5.0" },
 ]
+analysis-runtime = [{ name = "yara-python", specifier = "==4.5.0" }]
 dev = [
     { name = "aiosqlite", specifier = ">=0.20,<1" },
     { name = "mypy", specifier = ">=1.17,<2" },

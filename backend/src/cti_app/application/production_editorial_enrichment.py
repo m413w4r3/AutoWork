@@ -6924,6 +6924,7 @@ class ProductionEditorialEnrichmentService:
             model_policy_version=EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION,
             routing_policy_version=EDITORIAL_ENRICHMENT_ROUTING_POLICY_VERSION,
             source_figure_inventory_hash=source_figure_inventory.functional_hash(),
+            resource_search_enabled=self._resource_search_enabled,
             metadata_extra={
                 "editorial_enrichment_wire_details": wire_details,
                 "repaired_block_count": repaired_block_count,

@@ -44,10 +44,12 @@ from cti_app.domain.investigation import (
 from cti_app.domain.legitimate_services import LegitimateServiceRegistry
 from cti_app.domain.rule_workbench import (
     RuleConditionStrategy,
+    RuleCorpusInventoryItem,
     RuleMotif,
     RuleMotifIssueCode,
     RuleMotifKind,
     RuleMotifProvenanceKind,
+    RuleSampleProvenance,
     RuleTestCase,
     RuleTestCorpusRole,
 )
@@ -581,11 +583,15 @@ class _MemoryRuleAssociations:
 
 
 class _MemoryRuleCorpusInventory:
-    def __init__(self, *, goodware: Sequence[str], holdout: Sequence[str]) -> None:
+    def __init__(
+        self, *, goodware: Sequence[RuleCorpusInventoryItem], holdout: Sequence[str]
+    ) -> None:
         self.goodware = tuple(goodware)
         self.holdout = tuple(holdout)
 
-    async def goodware_sample_sha256s(self, investigation_id: UUID) -> Sequence[str]:
+    async def manual_rule_corpus_imports(
+        self, investigation_id: UUID
+    ) -> Sequence[RuleCorpusInventoryItem]:
         assert investigation_id == _INVESTIGATION_ID
         return self.goodware
 
@@ -678,7 +684,18 @@ async def test_real_bridge_uses_p09_and_rule_tools_and_replays_same_candidate() 
         non_discriminant_patterns=NonDiscriminantPatternRegistry(()),
         legitimate_services=LegitimateServiceRegistry(()),
     )
-    inventory = _MemoryRuleCorpusInventory(goodware=(goodware_hash,), holdout=(holdout_hash,))
+    inventory = _MemoryRuleCorpusInventory(
+        goodware=(
+            RuleCorpusInventoryItem(
+                sample_sha256=goodware_hash,
+                role=RuleTestCorpusRole.GOODWARE,
+                provenance=RuleSampleProvenance.SYNTHETIC,
+                size_bytes=len(goodware),
+                source_description="Synthetic benign-like bytes for the local YARA test.",
+            ),
+        ),
+        holdout=(holdout_hash,),
+    )
     rule_registry = InMemoryToolRegistry()
     rule_tools = register_rule_tools(
         rule_registry,
@@ -718,6 +735,9 @@ async def test_real_bridge_uses_p09_and_rule_tools_and_replays_same_candidate() 
     assert v1_result.status is ToolInvocationStatus.SUCCEEDED
     assert v1_result.output["rule"]["version"] == "v1"
     assert v1_result.output["rule"]["candidate_status"] == DetectionCandidateStatus.TESTED.value
+    assert v1_result.output["rule"]["report"]["validation_status"] == "real_partial"
+    goodware_case = _output_role(v1_result.output, RuleTestCorpusRole.GOODWARE)["test_cases"][0]
+    assert goodware_case["provenance"] == RuleSampleProvenance.SYNTHETIC.value
     assert _output_role(v1_result.output, RuleTestCorpusRole.HOLDOUT)["non_matches"] == (
         holdout_hash,
     )

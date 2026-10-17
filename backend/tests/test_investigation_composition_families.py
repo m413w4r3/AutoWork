@@ -188,12 +188,13 @@ def _build(
     *,
     settings: Settings | None = None,
     uow: Any | None = None,
+    artifact_store: Any | None = None,
 ):
     investigation_id = uuid4()
     return build_investigation_composition(
         uow or _uow(),
         uow_factory=lambda: None,
-        artifact_store=SimpleNamespace(),
+        artifact_store=artifact_store or SimpleNamespace(),
         model_conversations=SimpleNamespace(),
         settings=settings or _settings(),
         investigation_id=investigation_id,
@@ -260,6 +261,23 @@ def test_composition_registers_all_optional_families_with_fake_ports() -> None:
     assert composition.registry.get("samples.compare", "1") is not None
     assert composition.registry.get("rule.propose_from_candidates", "1") is not None
     assert composition.registry.get("sample.extract_configuration", "1") is not None
+
+
+def test_rule_get_is_registered_without_the_rule_workbench_when_read_ports_exist() -> None:
+    class _ReadableArtifacts:
+        async def read_json(self, _blob_id):
+            return {}
+
+    ports = replace(_all_family_ports(), rule_workbench=None, rule_corpus_bytes=None)
+    settings = _settings()
+    settings.rule_workbench_enabled = False
+
+    composition = _build(ports, settings=settings, artifact_store=_ReadableArtifacts())
+
+    assert "rule.get" in composition.available_tools
+    assert "rule.propose" not in composition.available_tools
+    assert "rule.test" not in composition.available_tools
+    assert composition.registry.get("rule.propose", "1") is None
 
 
 @pytest.mark.asyncio

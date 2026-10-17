@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
@@ -15,6 +16,7 @@ from httpx import ASGITransport
 from cti_app.api.investigation import router
 from cti_app.application.identity import LocalIdentityProvider
 from cti_app.application.investigation_persistence import VersionConflictError
+from cti_app.application.investigation_state import InvestigationStateVersionConflict
 from cti_app.application.jobs import DuplicateJobError
 from cti_app.domain.classification import TLP
 from cti_app.domain.investigation import (
@@ -58,6 +60,15 @@ class _Rows:
             None,
         )
 
+    async def get_current(self, run_id: UUID, stage: str):
+        candidates = [
+            row
+            for row in self.rows.values()
+            if getattr(row, "production_run_id", None) == run_id
+            and getattr(getattr(row, "stage", None), "value", getattr(row, "stage", None)) == stage
+        ]
+        return max(candidates, key=lambda row: getattr(row, "version", 0), default=None)
+
     async def list_for_subject(self, subject_id: UUID):
         return [row for row in self.rows.values() if getattr(row, "subject_id", None) == subject_id]
 
@@ -77,6 +88,17 @@ class _States:
             raise VersionConflictError("stale test state")
         self.rows[state.investigation_id] = state
         return state
+
+
+class _ConversationTurns:
+    def __init__(self) -> None:
+        self.row: Any = None
+
+    async def get_by_idempotency_key(self, _key: str):
+        return self.row
+
+    async def get(self, _turn_id: UUID):
+        return self.row
 
 
 class _Envelopes:
@@ -137,6 +159,7 @@ class _Uow:
         self.production_artifacts = _Rows(store.artifacts)
         self.analyst_investigations = _Rows(store.investigations)
         self.investigation_states = store.states
+        self.model_conversation_turns = store.conversation_turns
         self.investigation_envelopes = store.envelopes
         self.jobs = store.jobs
         self.evidence_observations = _Items(store.observations)
@@ -144,7 +167,7 @@ class _Uow:
         self.sample_associations = _Items(store.associations)
         self.analyst_decisions = _Decisions(store.decisions)
         self.analyst_opinions = _Opinions(store.opinions)
-        self.tool_invocations = SimpleNamespace()
+        self.tool_invocations = _Items(store.invocations)
         self.production_input_snapshots = _InputSnapshots(store)
 
     async def __aenter__(self):
@@ -226,15 +249,19 @@ class _Store:
             )
         }
         self.states = _States()
+        self.conversation_turns = _ConversationTurns()
         self.envelopes = _Envelopes()
         self.jobs = _Jobs()
         self.observations: list[object] = []
+        self.invocations: list[object] = []
         self.findings: list[object] = []
         self.associations: list[object] = []
         self.opinions: dict[UUID, object] = {}
         self.input_snapshots: dict[UUID, Any] = {}
         self.decisions: list[object] = []
         self.reconciliations: list[dict[str, object]] = []
+        self.start_extraction_inputs: list[tuple[tuple[Any, ...], tuple[Any, ...]]] = []
+        self.resume_owner_job_terminal_values: list[bool] = []
 
     def uow(self) -> _Uow:
         return _Uow(self)
@@ -270,9 +297,16 @@ class _SnapshotPort:
 class _InvestigationService:
     def __init__(self, uow: _Uow) -> None:
         self.uow = uow
+        self.resume_owner_job_terminal_values: list[bool] = []
 
-    async def start(self, *, run, synthesis, envelope, **_kwargs):
+    async def start(self, *, run, synthesis, envelope, **kwargs):
         assert run.id == RUN_ID and synthesis.id == SYNTHESIS_ID
+        self.uow._store.start_extraction_inputs.append(
+            (
+                tuple(kwargs.get("extraction_artifacts", ())),
+                tuple(kwargs.get("extraction_items", ())),
+            )
+        )
         existing = await self.uow.investigation_states.get(INVESTIGATION_ID)
         if existing is not None:
             return existing
@@ -282,7 +316,14 @@ class _InvestigationService:
         self.uow._store.investigations[INVESTIGATION_ID].status = AnalystInvestigationStatus.RUNNING
         return state
 
-    async def resume(self, investigation_id: UUID, *, expected_version: int | None = None):
+    async def resume(
+        self,
+        investigation_id: UUID,
+        *,
+        expected_version: int | None = None,
+        owner_job_terminal: bool = False,
+    ):
+        self.uow._store.resume_owner_job_terminal_values.append(owner_job_terminal)
         state = await self.uow.investigation_states.get(investigation_id)
         if expected_version is not None and state.version != expected_version:
             raise ValueError("stale investigation version")
@@ -482,6 +523,72 @@ def test_start_is_idempotent_without_manufacturing_an_approval_envelope() -> Non
     assert first_body["investigation"]["envelope_approved"] is False
 
 
+def test_operator_status_json_preserves_bridge_conversation_scope() -> None:
+    client, store = _client()
+    store.investigations[INVESTIGATION_ID].version = 1
+    pending_state = replace(
+        _working_state(),
+        turn_index=1,
+        pending_context_snapshot_id=uuid4(),
+        pending_context_sha256=SHA256,
+        stop_reason=StopReason.USER_INTERRUPT,
+    )
+    store.states.rows[INVESTIGATION_ID] = pending_state
+    store.conversation_turns.row = SimpleNamespace(
+        id=uuid4(),
+        status=SimpleNamespace(value="needs_review"),
+        error_code="operator_interrupted",
+        idempotency_key="synthetic-pending-turn-key",
+    )
+
+    response = client.get(f"/api/investigations/{INVESTIGATION_ID}/operator-status")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["bridge_conversation_id_scope"] == "local_autowork_record_only"
+    assert body["bridge_external_target"] == {
+        "mode": "stateless",
+        "lifecycle": "temporary_chat_per_turn",
+    }
+    assert body["last_operation"]["conversation_id_scope"] == ("local_autowork_record_only")
+    assert body["last_operation"]["decision_expected"] == (
+        "reconcile interrupted Bridge turn before resume"
+    )
+    assert body["next_idempotent_action"]["reason"] == "operator_interrupted"
+    assert body["next_idempotent_action"]["path"].endswith("/reconciliation/abandon")
+
+
+def test_operator_status_unavailable_dependencies_include_recorded_reason_codes() -> None:
+    client, store = _client()
+    store.investigations[INVESTIGATION_ID].version = 1
+    store.states.rows[INVESTIGATION_ID] = _working_state()
+    client.app.state.investigation_runtime_composition = SimpleNamespace(
+        ports=SimpleNamespace(
+            statuses=(
+                SimpleNamespace(family="local_analysis", reason="local_analysis_disabled"),
+                SimpleNamespace(family="local_command_execution", reason="bwrap_not_installed"),
+                SimpleNamespace(family="rule_workbench", reason="rule_workbench_disabled"),
+                SimpleNamespace(family="ghidra", reason="ghidra_disabled"),
+                SimpleNamespace(family="shodan", reason="shodan_not_configured"),
+                SimpleNamespace(family="virustotal", reason="virustotal_not_configured"),
+            )
+        )
+    )
+
+    response = client.get(f"/api/investigations/{INVESTIGATION_ID}/operator-status")
+
+    assert response.status_code == 200
+    unavailable = response.json()["dependencies"]["unavailable"]
+    assert "acquisition:virustotal_not_configured" in unavailable
+    assert "ghidra:ghidra_disabled" in unavailable
+    assert "local_commands:bwrap_not_installed" in unavailable
+    assert "rule_workbench:rule_workbench_disabled" in unavailable
+    assert "shodan:shodan_not_configured" in unavailable
+    assert "virustotal:virustotal_not_configured" in unavailable
+    assert all(":" in item for item in unavailable)
+    assert all("/" not in item for item in unavailable)
+
+
 def test_governance_routes_approve_extend_revoke_and_enforce_cas() -> None:
     client, store = _client()
     assert (
@@ -677,6 +784,49 @@ def test_targeted_request_is_idempotent_and_requeues_a_paused_investigation() ->
     )
 
 
+def test_targeted_request_returns_409_on_concurrent_state_write_without_side_effects(
+    monkeypatch,
+) -> None:
+    client, store = _client()
+    started = client.post(f"/api/subjects/{SUBJECT_ID}/investigations", json=_start_body())
+    start_job = store.jobs.rows[UUID(started.json()["job_id"])]
+    start_job.status = JobStatus.SUCCEEDED
+    state = store.states.rows[INVESTIGATION_ID]
+    before_jobs = set(store.jobs.rows)
+    concurrent_state = replace(
+        state,
+        version=state.version + 1,
+        recent_actions=(*state.recent_actions, "concurrent-job-progress"),
+    )
+
+    async def conflict_after_concurrent_write(_updated, *, expected_version):
+        assert expected_version == state.version
+        store.states.rows[INVESTIGATION_ID] = concurrent_state
+        raise InvestigationStateVersionConflict("Investigation state version changed")
+
+    monkeypatch.setattr(store.states, "save_if_version", conflict_after_concurrent_write)
+    response = None
+    try:
+        response = client.post(
+            f"/api/investigations/{INVESTIGATION_ID}/requests",
+            json={"text": "Inspect a synthetic host.", "expected_version": state.version},
+            headers={"Idempotency-Key": "request-cas-conflict"},
+        )
+    except InvestigationStateVersionConflict:
+        pass
+
+    assert response is not None, "the CAS conflict escaped the API route"
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "stale_investigation_version"
+    assert store.states.rows[INVESTIGATION_ID] == concurrent_state
+    assert "concurrent-job-progress" in store.states.rows[INVESTIGATION_ID].recent_actions
+    assert not any(
+        action.startswith("user-request:")
+        for action in store.states.rows[INVESTIGATION_ID].recent_actions
+    )
+    assert set(store.jobs.rows) == before_jobs
+
+
 def test_start_rejects_an_unverified_synthesis() -> None:
     client, store = _client()
     store.artifacts[SYNTHESIS_ID].status = ProductionArtifactStatus.NEEDS_REVIEW
@@ -695,6 +845,34 @@ def test_http_start_creates_a_missing_handoff_from_exact_verified_synthesis(monk
     store = _Store()
     store.investigations.clear()
     store.input_snapshots[RUN_ID] = SimpleNamespace(subject_tlp=TLP.AMBER, core_sources=())
+    extraction_blob_id = uuid4()
+    extraction_artifact = SimpleNamespace(
+        id=uuid4(),
+        production_run_id=RUN_ID,
+        subject_id=SUBJECT_ID,
+        stage=ProductionArtifactStage.EXTRACTION,
+        status=ProductionArtifactStatus.VERIFIED,
+        version=3,
+        input_hash="b" * 64,
+        canonical_blob_id=extraction_blob_id,
+    )
+    store.artifacts[extraction_artifact.id] = extraction_artifact
+    extraction_payload = {
+        "items": [
+            {
+                "id": "synthetic-q2-hash",
+                "category": "indicators",
+                "value": "c" * 64,
+                "normalized_value": "c" * 64,
+                "context": "Synthetic source verified this indicator.",
+                "artifact_type": "hash",
+                "indicator_status": "confirmed_ioc",
+                "source_ids": ["synthetic-source"],
+                "supported": True,
+                "display_policy": "ioc_section",
+            }
+        ]
+    }
     payload = {
         "subject_id": str(SUBJECT_ID),
         "title": "Verified synthesis from HTTP start",
@@ -710,7 +888,9 @@ def test_http_start_creates_a_missing_handoff_from_exact_verified_synthesis(monk
     ).hexdigest()
 
     class _ArtifactStore:
-        async def read_json(self, _blob_id: UUID):
+        async def read_json(self, blob_id: UUID):
+            if blob_id == extraction_blob_id:
+                return extraction_payload
             return payload
 
         @staticmethod
@@ -727,10 +907,15 @@ def test_http_start_creates_a_missing_handoff_from_exact_verified_synthesis(monk
         def __init__(self, *_args, **_kwargs) -> None:
             pass
 
-        async def ensure_for_verified_synthesis(self, *, run, synthesis, policy, **_kwargs):
+        async def ensure_for_verified_synthesis(self, *, run, synthesis, policy, **kwargs):
             assert run.id == RUN_ID and synthesis.id == SYNTHESIS_ID
             assert policy.tlp == TLP.AMBER.value
             assert policy.external_llm_allowed is False
+            handoff_artifacts = tuple(kwargs.get("extraction_artifacts", ()))
+            handoff_items = tuple(kwargs.get("extraction_items", ()))
+            assert handoff_artifacts == (extraction_artifact,)
+            assert len(handoff_items) == 1
+            assert handoff_items[0].value == "c" * 64
             store.investigations[INVESTIGATION_ID] = SimpleNamespace(
                 id=INVESTIGATION_ID,
                 subject_id=SUBJECT_ID,
@@ -759,10 +944,18 @@ def test_http_start_creates_a_missing_handoff_from_exact_verified_synthesis(monk
     body["synthesis_sha256"] = synthesis_sha256
 
     response = client.post(f"/api/subjects/{SUBJECT_ID}/investigations", json=body)
+    replay = client.post(f"/api/subjects/{SUBJECT_ID}/investigations", json=body)
 
     assert response.status_code == 200, response.text
+    assert replay.status_code == 200, replay.text
     assert response.json()["investigation"]["id"] == str(INVESTIGATION_ID)
+    assert replay.json()["idempotent_replay"] is True
     assert store.investigations[INVESTIGATION_ID].synthesis_artifact_id == SYNTHESIS_ID
+    assert len(store.start_extraction_inputs) == 2
+    for start_artifacts, start_items in store.start_extraction_inputs:
+        assert start_artifacts == (extraction_artifact,)
+        assert len(start_items) == 1
+        assert start_items[0].value == "c" * 64
 
 
 def test_resume_and_interrupt_enforce_cas_and_idempotency() -> None:
@@ -798,6 +991,7 @@ def test_resume_and_interrupt_enforce_cas_and_idempotency() -> None:
     assert first.json()["job_id"] == second.json()["job_id"]
     assert first.json()["idempotent_replay"] is False
     assert second.json()["idempotent_replay"] is True
+    assert store.resume_owner_job_terminal_values == [True]
 
     resumed_state = store.states.rows[INVESTIGATION_ID]
     resume_job = store.jobs.rows[UUID(first.json()["job_id"])]
@@ -815,6 +1009,26 @@ def test_resume_and_interrupt_enforce_cas_and_idempotency() -> None:
     assert interrupted.status_code == repeated_interrupt.status_code == 200
     assert interrupted.json()["investigation"]["stop_reason"] == "user_interrupt"
     assert repeated_interrupt.json()["idempotent_replay"] is True
+
+
+def test_resume_rejects_active_owner_job_without_submitting_another_job() -> None:
+    client, store = _client()
+    started = client.post(f"/api/subjects/{SUBJECT_ID}/investigations", json=_start_body())
+    assert started.status_code == 200
+    active_job = store.jobs.rows[UUID(started.json()["job_id"])]
+    active_job.status = JobStatus.RUNNING
+    before = len(store.jobs.rows)
+    state = store.states.rows[INVESTIGATION_ID]
+
+    response = client.post(
+        f"/api/investigations/{INVESTIGATION_ID}/resume",
+        json={"expected_version": state.version},
+        headers={"Idempotency-Key": "resume-while-owner-active"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "investigation_job_already_running"
+    assert len(store.jobs.rows) == before
 
 
 def test_read_projection_exposes_metadata_without_blobs_or_raw_outputs() -> None:

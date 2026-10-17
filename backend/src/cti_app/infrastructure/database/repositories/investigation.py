@@ -187,7 +187,6 @@ class SqlAlchemyToolInvocationRepository:
             or existing.tool_name != invocation.tool_name
             or existing.schema_version != invocation.schema_version
             or existing.normalized_parameters != invocation.normalized_parameters
-            or existing.purpose != invocation.purpose
         ):
             raise ValueError("An operation key cannot identify different invocation content")
         return existing
@@ -696,6 +695,20 @@ class SqlAlchemyDetectionCandidateRepository:
         )
         return tuple([await self._candidate_from_row(row) for row in rows])
 
+    async def list_for_investigation(
+        self, investigation_id: UUID
+    ) -> tuple[DetectionCandidateVersion, ...]:
+        rows = await self._session.scalars(
+            select(DetectionCandidateVersionRow)
+            .where(DetectionCandidateVersionRow.investigation_id == investigation_id)
+            .order_by(
+                DetectionCandidateVersionRow.candidate_id,
+                DetectionCandidateVersionRow.version,
+                DetectionCandidateVersionRow.id,
+            )
+        )
+        return tuple([await self._candidate_from_row(row) for row in rows])
+
     async def append_version(
         self, version: DetectionCandidateVersion, *, expected_previous_id: UUID | None
     ) -> DetectionCandidateVersion:
@@ -980,6 +993,7 @@ def _working_state_from_row(row: InvestigationWorkingStateRow) -> InvestigationW
             if payload["stop_reason"] is not None
             else None,
             no_progress_streak=payload["no_progress_streak"],
+            deduplicated_findings=payload.get("deduplicated_findings", 0),
             last_seen_evidence_ids=tuple(
                 UUID(value) for value in payload["last_seen_evidence_ids"]
             ),

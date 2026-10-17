@@ -1,11 +1,30 @@
 from __future__ import annotations
 
+import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_HOST_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$", re.ASCII)
+
+
+def _normalize_download_host_list(value: str) -> frozenset[str]:
+    hosts: set[str] = set()
+    for raw_host in value.split(","):
+        host = raw_host.strip().lower()
+        if not host:
+            continue
+        labels = host.split(".")
+        if len(host) > 253 or not all(_HOST_LABEL.fullmatch(label) for label in labels):
+            raise ValueError(
+                "virustotal_download_allowed_hosts must contain exact hostnames only "
+                "(without scheme, path, port, wildcard, or userinfo)"
+            )
+        hosts.add(host)
+    return frozenset(hosts)
 
 
 class Settings(BaseSettings):
@@ -192,6 +211,11 @@ class Settings(BaseSettings):
     # default: deny-by-default until an operator explicitly configures it.
     virustotal_download_allowed_hosts: str = ""
 
+    @field_validator("virustotal_download_allowed_hosts")
+    @classmethod
+    def validate_download_allowed_hosts(cls, value: str) -> str:
+        return ",".join(sorted(_normalize_download_host_list(value)))
+
     @property
     def virustotal_retrohunt_proxy_enabled(self) -> bool:
         """Compatibility for the API/worker client lifecycle until their next lot."""
@@ -311,6 +335,7 @@ class Settings(BaseSettings):
     smda_timeout_seconds: float = Field(default=120.0, gt=0, le=3600)
     smda_max_output_bytes: int = Field(default=32 * 1024 * 1024, gt=0)
     smda_max_memory_bytes: int = Field(default=1024 * 1024 * 1024, gt=0)
+    rule_corpus_import_max_bytes: int = Field(default=64 * 1024 * 1024, gt=0)
 
     @model_validator(mode="after")
     def validate_production_jitter_bounds(self) -> Settings:

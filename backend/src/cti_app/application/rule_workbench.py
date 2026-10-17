@@ -162,6 +162,28 @@ _NOISE_CATEGORIES = frozenset(
 _PERSISTED_MOTIF_PREFIX = "rule-workbench-motif-v1:"
 
 
+def _coverage_with_provenance(
+    base_statement: str, role_reports: Sequence[RuleRoleTestReport]
+) -> str:
+    summaries: dict[RuleTestCorpusRole, str] = {}
+    for role_report in role_reports:
+        measured = set(role_report.matches) | set(role_report.non_matches)
+        counts = {"real": 0, "synthetic": 0}
+        for case in role_report.test_cases:
+            if case.sample_sha256 in measured:
+                counts[case.provenance.value] += 1
+        labels = [f"{counts[name]} {name}" for name in ("real", "synthetic") if counts[name]]
+        summaries[role_report.role] = ", ".join(labels) if labels else "none"
+
+    return (
+        f"{base_statement.rstrip()} Validation by YARA on bytes: positives: "
+        f"{summaries[RuleTestCorpusRole.CONFIRMED_POSITIVE]}; goodware: "
+        f"{summaries[RuleTestCorpusRole.GOODWARE]}; holdout: "
+        f"{summaries[RuleTestCorpusRole.HOLDOUT]}; PE-only features not applicable to raw-byte "
+        "YARA matching."
+    )
+
+
 class RuleWorkbench:
     def __init__(
         self,
@@ -972,6 +994,7 @@ class RuleWorkbench:
                     errors=tuple(errors),
                 )
             )
+        coverage_statement = _coverage_with_provenance(coverage_statement, role_reports)
         return RuleTestReport(
             source_sha256=source_sha256,
             execution_status=status,
@@ -1164,6 +1187,7 @@ def _serialize_motif(motif: RuleMotif) -> str:
         "kind": motif.kind.value,
         "provenance_kind": motif.provenance_kind.value,
         "provenance_id": motif.provenance_id,
+        "article_claim_refs": list(motif.article_claim_refs),
         "sample_sha256": motif.sample_sha256,
         "offsets": list(motif.offsets) if motif.offsets is not None else None,
         "rationale": motif.rationale,
@@ -1189,6 +1213,7 @@ def _motifs_from_version(version: DetectionCandidateVersion) -> tuple[RuleMotif,
                 provenance_kind=RuleMotifProvenanceKind(payload["provenance_kind"]),
                 provenance_id=payload["provenance_id"],
                 observation_refs=saved.observation_refs,
+                article_claim_refs=tuple(payload.get("article_claim_refs", ())),
                 sample_sha256=payload.get("sample_sha256"),
                 offsets=tuple(payload["offsets"]) if payload.get("offsets") is not None else None,
                 rationale=payload.get("rationale", ""),

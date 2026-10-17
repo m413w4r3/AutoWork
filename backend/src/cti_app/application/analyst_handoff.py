@@ -16,11 +16,14 @@ from cti_app.application.analyst_input_pack import (
 )
 from cti_app.application.persistence import ProductionUnitOfWork, ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_extraction import legacy_technical_extraction_from_payload
 from cti_app.domain.production import (
     AnalystInputPack,
     AnalystInvestigation,
     LoopBudget,
     ProductionArtifact,
+    ProductionArtifactStage,
+    ProductionArtifactStatus,
     ProductionRun,
 )
 
@@ -69,6 +72,36 @@ def analyst_handoff_policy_from_sources(sources: Iterable[object]) -> AnalystHan
         do_not_submit=do_not_submit,
         external_llm_allowed=external_llm_allowed,
     )
+
+
+async def current_verified_extraction_inputs(
+    *,
+    uow: ProductionUnitOfWork,
+    run: ProductionRun,
+    artifact_store: ProductionArtifactStore,
+) -> tuple[tuple[ProductionArtifact, ...], tuple[Any, ...]]:
+    """Read the run's current verified extraction through the legacy projection.
+
+    This matches the canonical EXTRACTION read path used by subject indicators.
+    An absent, non-verified, or contentless current extraction preserves the
+    historical empty-input handoff behavior.
+    """
+    artifact = await uow.production_artifacts.get_current(
+        run.id, ProductionArtifactStage.EXTRACTION.value
+    )
+    if (
+        artifact is None
+        or artifact.production_run_id != run.id
+        or artifact.subject_id != run.subject_id
+        or artifact.stage is not ProductionArtifactStage.EXTRACTION
+        or artifact.status is not ProductionArtifactStatus.VERIFIED
+        or artifact.canonical_blob_id is None
+    ):
+        return (), ()
+
+    payload = await artifact_store.read_json(artifact.canonical_blob_id)
+    extraction = legacy_technical_extraction_from_payload(payload)
+    return (artifact,), extraction.items
 
 
 def _extraction_items(items: Iterable[Any]) -> list[dict[str, Any]]:

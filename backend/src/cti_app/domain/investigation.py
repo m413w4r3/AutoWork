@@ -333,6 +333,23 @@ class InvestigationBudget:
         self._reservations[operation_key] = released
         return released
 
+    def release_confirmed_non_submission(self, operation_key: str) -> BudgetReservation | None:
+        """Release a Bridge reservation when durable evidence proves no request was sent.
+
+        This also reverses a committed reservation left by older workers that charged
+        a Bridge turn before persisting the provider's explicit pre-submission result.
+        """
+        existing = self._reservations.get(operation_key)
+        if existing is None or existing.status is BudgetReservationStatus.RELEASED:
+            return existing
+        released = replace(
+            existing,
+            status=BudgetReservationStatus.RELEASED,
+            committed_amounts={},
+        )
+        self._reservations[operation_key] = released
+        return released
+
 
 _SECRET_KEY = re.compile(
     r"(?:^|[_-])(api[_-]?key|token|secret|password|authorization|credential|cookie|signature)(?:$|[_-])",
@@ -368,14 +385,17 @@ def tool_operation_key(
     normalized_parameters: Mapping[str, Any],
     purpose: str,
 ) -> str:
-    """Build a stable operation identity without relying on call order."""
+    """Build a stable operation identity from the operation and normalized input.
+
+    ``purpose`` remains in the API for existing callers and invocation records,
+    but explanatory model text must not split an otherwise identical operation.
+    """
     _validate_safe_parameters(normalized_parameters)
     payload = {
         "investigation_id": str(investigation_id),
         "tool_name": tool_name,
         "schema_version": schema_version,
         "parameters": normalized_parameters,
-        "purpose": purpose,
     }
     return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
 

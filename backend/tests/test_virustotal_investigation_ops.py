@@ -235,6 +235,11 @@ async def test_search_rejects_short_content_long_or_controlled_queries_without_h
             {"error": {"code": "NotAuthorized", "message": "plan does not allow this"}},
             VirusTotalNotAuthorizedError,
         ),
+        (
+            401,
+            {"error": {"code": "Unauthorized", "message": "authentication required"}},
+            VirusTotalNotAuthorizedError,
+        ),
     ],
 )
 async def test_quota_and_authorization_errors_keep_journal_metadata(

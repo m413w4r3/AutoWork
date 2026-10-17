@@ -6,11 +6,17 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from uuid import UUID, uuid4, uuid5
 
+import httpx
 import pytest
+from pydantic import SecretStr
 
 from cti_app.application.bridge_investigator import BridgeInvestigator, ScriptedTurnTransport
 from cti_app.application.evidence_recorder import ProductionEvidenceRecorder
-from cti_app.application.investigation_contracts import ArticleClaimV1, ArticleContextV1
+from cti_app.application.investigation_contracts import (
+    ArticleClaimV1,
+    ArticleContextV1,
+    parse_agent_turn_decision,
+)
 from cti_app.application.investigation_persistence import (
     InMemoryEvidenceObservationRepository,
     InMemoryFindingRepository,
@@ -23,6 +29,7 @@ from cti_app.application.investigation_shodan_tools import (
 from cti_app.application.investigation_tools import (
     InMemoryToolRegistry,
     RegistryToolDispatcher,
+    ToolEffect,
     ToolExecutionContext,
 )
 from cti_app.application.production_artifact_store import ProductionArtifactStore
@@ -30,6 +37,8 @@ from cti_app.application.research_context_builder import ArticleSnapshot
 from cti_app.application.shodan import (
     ShodanBudgetEstimate,
     ShodanCapabilities,
+    ShodanCapabilityDisabledError,
+    ShodanHttpError,
     ShodanNotFoundError,
     ShodanQuotaError,
     ShodanTransportError,
@@ -37,6 +46,7 @@ from cti_app.application.shodan import (
 from cti_app.domain.analyst_opinion import OpinionBlockType, OpinionClaimQualification
 from cti_app.domain.investigation import (
     BudgetDimension,
+    BudgetReservationStatus,
     DisclosureBounds,
     EvidenceKind,
     EvidenceObservation,
@@ -50,6 +60,7 @@ from cti_app.domain.investigation import (
     tool_operation_key,
 )
 from cti_app.domain.investigation_state import StopReason
+from cti_app.infrastructure.shodan import ShodanHttpAdapter
 from tests.shodan_support import CAPTURED_AT, HOST_RESPONSE, FakeShodanPort
 from tests.test_investigation_service import (
     _ArticlePort,
@@ -265,6 +276,138 @@ async def test_registers_2020_12_schemas_and_rejects_invalid_shodan_arguments() 
     assert port.calls == []
 
 
+def test_compact_shodan_count_justification_keeps_commas_using_real_schema() -> None:
+    rig = _Rig(shodan=FakeShodanPort())
+    registered = rig.registry.get("shodan.count", "1")
+    assert registered is not None
+    definition, _adapter = registered
+    wire = """@@DECISION@@
+GOAL: Count the listed hosts.
+SUMMARY: Preserve the full justification as a string.
+NEXT: continue
+@@END@@
+@@TOOL@@
+NAME: shodan.count
+VERSION: 1
+PURPOSE: Count the listed hosts.
+ARG query: port:443
+ARG justification: Check the first marker, compare the passive index, then report the scope.
+ARG evidence_refs: []
+@@END@@"""
+
+    decision = parse_agent_turn_decision(
+        wire,
+        tool_schemas={(definition.name, definition.schema_version): definition.input_schema},
+    )
+
+    assert decision.proposed_tool_calls[0].arguments["justification"] == (
+        "Check the first marker, compare the passive index, then report the scope."
+    )
+
+
+@pytest.mark.asyncio
+async def test_invalid_shodan_count_arguments_are_definitive_local_failures() -> None:
+    port = FakeShodanPort()
+    rig = _Rig(shodan=port)
+    invalid_arguments = (
+        {
+            "query": "port:443",
+            "justification": ["api_key=synthetic-secret", "second"],
+            "evidence_refs": [],
+        },
+        {"query": "port:443", "evidence_refs": []},
+        {
+            "query": "port:443",
+            "justification": "synthetic check",
+            "evidence_refs": [],
+            "unexpected": "extra",
+        },
+    )
+
+    for index, arguments in enumerate(invalid_arguments):
+        result = await rig.dispatch(
+            "shodan.count",
+            arguments,
+            operation_key=f"invalid-shodan-count-{index}",
+        )
+        assert result.status is ToolInvocationStatus.FAILED
+        assert result.error_code == "invalid_tool_arguments"
+        detail = result.output["validation_errors"][0]
+        if index == 0:
+            assert detail["argument"] == "justification"
+            assert detail["expected"] == "string"
+            assert detail["received"] == "array"
+            assert "synthetic-secret" not in result.message
+            assert "synthetic-secret" not in detail["value"]
+        elif index == 1:
+            assert detail["argument"] == "justification"
+            assert detail["received"] == "missing"
+        else:
+            assert detail["argument"] == "unexpected"
+            assert detail["expected"] == "no additional properties"
+            assert detail["received"] == "extra property"
+    assert port.calls == []
+
+
+@pytest.mark.asyncio
+async def test_invalid_shodan_arguments_release_budget_and_reach_the_next_agent_turn() -> None:
+    provider = FakeShodanPort()
+    real_registry = _Rig(shodan=provider).registry
+    registered = real_registry.get("shodan.count", "1")
+    assert registered is not None
+    definition, adapter = registered
+    invalid_call = {
+        "tool_name": "shodan.count",
+        "schema_version": "1",
+        "arguments": {
+            "query": "port:443",
+            "justification": ["compare the marker", "record the scope"],
+            "evidence_refs": [],
+        },
+        "purpose": "Check the synthetic query.",
+    }
+    fixture = _Fixture(
+        responses=[
+            _decision(
+                goal="Validate the Shodan request.",
+                next_action="continue",
+                tools=(invalid_call,),
+            ),
+            _decision(goal="Finish after the correction is shown.", next_action="finish"),
+        ],
+        tools=(
+            (
+                "shodan.count",
+                "shodan",
+                ToolEffect.EXTERNAL_READ,
+                definition.capability_key,
+                dict(definition.cost_model),
+            ),
+        ),
+    )
+    fixture.registry.unregister("shodan.count", "1")
+    fixture.registry.register(definition, adapter)
+
+    initial = await fixture.start()
+    state = await fixture.service.run(initial.investigation_id)
+
+    invocation = (await fixture.invocations.list_for_investigation(fixture.investigation_id))[0]
+    envelope = await fixture.envelopes.get(fixture.investigation_id)
+    reservation = next(
+        item
+        for item in envelope.budget.reservations
+        if item.operation_key == invocation.operation_key
+    )
+    assert state.stop_reason is StopReason.AGENT_FINISHED
+    assert invocation.status is ToolInvocationStatus.FAILED
+    assert invocation.consumed_budget == {}
+    assert reservation.status is BudgetReservationStatus.RELEASED
+    assert provider.calls == []
+    assert len(fixture.bridge_transport.prompts) == 2
+    assert "invalid_tool_arguments" in fixture.bridge_transport.prompts[1]
+    assert "justification" in fixture.bridge_transport.prompts[1]
+
+
 @pytest.mark.asyncio
 async def test_absent_capability_is_local_unavailable_without_provider_call() -> None:
     port = FakeShodanPort()
@@ -316,6 +459,88 @@ async def test_quota_error_maps_to_unavailable_with_quota_reason() -> None:
     assert result.output["reason"] == "quota"
     assert result.budget_consumed[BudgetDimension.SHODAN_CREDITS] == 0
     assert "provider-secret" not in str(result)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [401, 403])
+async def test_provider_authorization_refusal_maps_to_final_unavailable(status_code: int) -> None:
+    class AuthorizationPort(FakeShodanPort):
+        async def host(self, ip):
+            self.calls.append(("host", (ip,)))
+            raise ShodanHttpError(
+                "synthetic provider authorization refusal",
+                status_code=status_code,
+            )
+
+    port = AuthorizationPort()
+    rig = _Rig(shodan=port)
+
+    result = await rig.dispatch("shodan.host", {"ip": _SHODAN_IP})
+
+    assert result.status is ToolInvocationStatus.UNAVAILABLE
+    assert result.output["reason"] == "provider_authorization_refused"
+    assert port.calls == [("host", (_SHODAN_IP,))]
+
+
+@pytest.mark.asyncio
+async def test_authorization_unavailable_details_include_safe_provider_diagnostic() -> None:
+    class AuthorizationPort(FakeShodanPort):
+        async def host(self, ip):
+            self.calls.append(("host", (ip,)))
+            raise ShodanCapabilityDisabledError(
+                "provider authorization refused",
+                code="shodan_upstream_forbidden",
+                status_code=403,
+                upstream_message="Requires membership or higher to access",
+                plan="oss",
+                query_credits=0,
+            )
+
+    result = await _Rig(shodan=AuthorizationPort()).dispatch("shodan.host", {"ip": _SHODAN_IP})
+
+    assert result.status is ToolInvocationStatus.UNAVAILABLE
+    details = result.output["details"]
+    assert details["upstream_message"] == "Requires membership or higher to access"
+    assert details["plan"] == "oss"
+    assert details["query_credits"] == 0
+    assert any("oss" in item for item in details["limitations"])
+
+
+@pytest.mark.asyncio
+async def test_forbidden_http_response_reaches_unavailable_tool_result_safely() -> None:
+    api_key = "synthetic-shodan-key"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api-info":
+            return httpx.Response(
+                200,
+                json={"plan": "oss", "query_credits": 0},
+                request=request,
+            )
+        return httpx.Response(
+            403,
+            json={"error": f"Requires membership; key={api_key}"},
+            request=request,
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    shodan = ShodanHttpAdapter(
+        client=client,
+        capabilities=ShodanCapabilities(host=True),
+        api_key=SecretStr(api_key),
+    )
+    try:
+        result = await _Rig(shodan=shodan).dispatch("shodan.host", {"ip": _SHODAN_IP})
+    finally:
+        await client.aclose()
+
+    assert result.status is ToolInvocationStatus.UNAVAILABLE
+    details = result.output["details"]
+    assert details["upstream_message"] == "Requires membership; key=[REDACTED]"
+    assert details["plan"] == "oss"
+    assert details["query_credits"] == 0
+    assert any("oss" in item for item in details["limitations"])
+    assert api_key not in str(result)
 
 
 @pytest.mark.asyncio

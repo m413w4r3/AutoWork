@@ -592,6 +592,29 @@ class _BaseShodanToolAdapter:
     def _error_result(self, exc: ShodanError, *, object_type: str, object_id: str) -> ToolResult:
         if isinstance(exc, ShodanNotFoundError) or exc.status_code == 404:
             raise exc
+        if exc.status_code in {401, 403}:
+            details: dict[str, Any] = {
+                "limitations": [
+                    "Shodan refused this provider capability; no host or domain data was returned."
+                ]
+            }
+            upstream_message = getattr(exc, "upstream_message", None)
+            if isinstance(upstream_message, str) and upstream_message:
+                details["upstream_message"] = upstream_message[:200]
+            plan = getattr(exc, "plan", None)
+            if isinstance(plan, str) and plan:
+                details["plan"] = plan[:50]
+                details["limitations"].append(f"Shodan account plan reported: {plan[:50]}.")
+            query_credits = getattr(exc, "query_credits", None)
+            if isinstance(query_credits, int) and not isinstance(query_credits, bool):
+                details["query_credits"] = max(0, query_credits)
+            return _local_result(
+                ToolInvocationStatus.UNAVAILABLE,
+                "provider_authorization_refused",
+                "Shodan refused authorization for this provider capability.",
+                credits=0,
+                details=details,
+            )
         if isinstance(exc, ShodanQuotaError) or exc.status_code in {402, 429}:
             return _local_result(
                 ToolInvocationStatus.UNAVAILABLE,
@@ -1441,12 +1464,13 @@ def _local_result(
     *,
     alternatives: tuple[str, ...] = (),
     credits: int = 0,
+    details: Mapping[str, Any] | None = None,
 ) -> ToolResult:
     return ToolResult(
         status=status,
         budget_consumed={BudgetDimension.SHODAN_CREDITS: credits},
         suggested_alternatives=alternatives,
-        output={"reason": reason},
+        output={"reason": reason, **({"details": dict(details)} if details else {})},
         message=message,
     )
 

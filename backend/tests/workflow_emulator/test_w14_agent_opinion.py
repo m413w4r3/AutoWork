@@ -47,6 +47,11 @@ from cti_app.domain.retrohunt import (
     RetrohuntProviderResults,
     RetrohuntSubmitRequest,
 )
+from cti_app.domain.rule_workbench import (
+    RuleCorpusInventoryItem,
+    RuleSampleProvenance,
+    RuleTestCorpusRole,
+)
 from cti_app.domain.sample_similarity import (
     CorpusMember,
     CorpusSnapshot,
@@ -193,8 +198,19 @@ class _ControlledRuleCorpus:
         assert hashlib.sha256(payload).hexdigest() == sample_sha256
         return payload
 
-    async def goodware_sample_sha256s(self, _investigation_id: UUID) -> tuple[str, ...]:
-        return self._goodware
+    async def manual_rule_corpus_imports(
+        self, _investigation_id: UUID
+    ) -> tuple[RuleCorpusInventoryItem, ...]:
+        return tuple(
+            RuleCorpusInventoryItem(
+                sample_sha256=sample_sha256,
+                role=RuleTestCorpusRole.GOODWARE,
+                provenance=RuleSampleProvenance.SYNTHETIC,
+                size_bytes=len(self._samples[sample_sha256]),
+                source_description="Synthetic benign-like W14 fixture for local YARA testing.",
+            )
+            for sample_sha256 in self._goodware
+        )
 
     async def holdout_sample_sha256s(self, _investigation_id: UUID) -> tuple[str, ...]:
         return self._holdout
@@ -547,7 +563,8 @@ async def test_w14_a_similarity_rule_revision_and_new_article_sample(
             rule_tests = [item for item in invocations if item.tool_name == "rule.test"]
             if not any(item.normalized_parameters.get("version") == 1 for item in rule_tests):
                 return decision(
-                    "Compile and measure v1 against the two samples, goodware, and holdout.",
+                    "Compile and measure v1 against the two samples, synthetic benign-like "
+                    "fixture, and holdout.",
                     tool_call=_call(
                         "rule.test", {"candidate_id": str(rule_candidate_id), "version": 1}
                     ),
@@ -622,7 +639,8 @@ async def test_w14_a_similarity_rule_revision_and_new_article_sample(
                 )
             if not any(item.normalized_parameters.get("version") == 2 for item in rule_tests):
                 return decision(
-                    "Compile v2 against A, B, C, goodware, and the independent holdout.",
+                    "Compile v2 against A, B, C, the synthetic benign-like fixture, and the "
+                    "independent holdout.",
                     tool_call=_call(
                         "rule.test", {"candidate_id": str(rule_candidate_id), "version": 2}
                     ),
@@ -803,6 +821,7 @@ async def test_w14_a_similarity_rule_revision_and_new_article_sample(
             report_payloads = [item for item in report_payloads if item["operation"] == "test"]
             assert len(report_payloads) == 3
             assert all(item["execution_status"] == "ok" for item in report_payloads)
+            assert all(item["validation_status"] == "real_partial" for item in report_payloads)
             first_v1 = next(
                 item
                 for item in report_payloads
@@ -812,6 +831,8 @@ async def test_w14_a_similarity_rule_revision_and_new_article_sample(
             roles_first_v1 = {item["role"]: item for item in first_v1["roles"]}
             assert {sha_a, sha_b} <= set(roles_first_v1["confirmed_positive"]["matches"])
             assert goodware_sha in roles_first_v1["goodware"]["non_matches"]
+            first_goodware_case = roles_first_v1["goodware"]["test_cases"][0]
+            assert first_goodware_case["provenance"] == RuleSampleProvenance.SYNTHETIC.value
             assert holdout_sha in roles_first_v1["holdout"]["non_matches"]
             v1_after_c = next(
                 item
@@ -1199,6 +1220,11 @@ async def test_w14_d_evidence_bounded_opinion_without_yara(
                     invocations = tuple(
                         await uow.tool_invocations.list_for_investigation(seeded.investigation.id)
                     )
+                    findings = tuple(
+                        await uow.investigation_findings.list_for_investigation(
+                            seeded.investigation.id
+                        )
+                    )
                 if not any(item.tool_name == "sandbox.report.import" for item in invocations):
                     report_json = json.dumps(
                         {
@@ -1241,10 +1267,61 @@ async def test_w14_d_evidence_bounded_opinion_without_yara(
                     if item.source == "autowork.sandbox-report.operator"
                     and item.object_id == sample_sha
                 )
+                supported_findings = tuple(
+                    item
+                    for item in findings
+                    if item.assessment is FindingAssessment.SUPPORTED and item.observation_refs
+                )
+                if supported_findings:
+                    static_finding = next(
+                        item for item in supported_findings if item.kind is FindingKind.CAPABILITY
+                    )
+                    behavior_finding = next(
+                        item
+                        for item in supported_findings
+                        if item.kind is FindingKind.NETWORK_BEHAVIOUR
+                    )
+                    response = decision(
+                        "Draft fact and inference blocks from the persisted supported findings.",
+                        next_action=AgentNextAction.FINISH.value,
+                    )
+                    response["opinion_delta"] = {
+                        "blocks": [
+                            {
+                                "block_type": OpinionBlockType.NETWORK_AND_INFRASTRUCTURE.value,
+                                "text": (
+                                    "The supplied report records a TCP session to the fixture "
+                                    "endpoint for this sample."
+                                ),
+                                "finding_refs": [str(behavior_finding.id)],
+                                "evidence_refs": [str(behavior_observation.id)],
+                                "qualification": OpinionClaimQualification.FACT.value,
+                                "certainty": 0.95,
+                            },
+                            {
+                                "block_type": OpinionBlockType.KEY_FINDINGS.value,
+                                "text": (
+                                    "The process and network details are consistent with a "
+                                    "staged worker chain; that relationship is inferred."
+                                ),
+                                "finding_refs": [
+                                    str(static_finding.id),
+                                    str(behavior_finding.id),
+                                ],
+                                "evidence_refs": [
+                                    str(static_observation.id),
+                                    str(behavior_observation.id),
+                                ],
+                                "qualification": OpinionClaimQualification.INFERENCE.value,
+                                "certainty": 0.61,
+                            },
+                        ]
+                    }
+                    return response
                 return decision(
                     "Finish with process and network events as observed evidence, and the chain "
                     "interpretation explicitly inferred.",
-                    next_action=AgentNextAction.FINISH.value,
+                    next_action=AgentNextAction.CONTINUE.value,
                     finding_proposals=[
                         {
                             "kind": FindingKind.CAPABILITY.value,

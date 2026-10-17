@@ -28,6 +28,18 @@ class RuleTestCorpusRole(StrEnum):
     HOLDOUT = "holdout"
 
 
+class RuleSampleProvenance(StrEnum):
+    REAL = "real"
+    SYNTHETIC = "synthetic"
+
+
+class RuleValidationStatus(StrEnum):
+    UNTESTED = "untested"
+    SYNTHETIC_ONLY = "synthetic_only"
+    REAL_PARTIAL = "real_partial"
+    REAL_VALIDATED = "real_validated"
+
+
 class RuleConditionStrategy(StrEnum):
     ANY = "any"
     ALL = "all"
@@ -82,6 +94,7 @@ class RuleMotif:
     provenance_kind: RuleMotifProvenanceKind
     provenance_id: str
     observation_refs: tuple[UUID, ...] = ()
+    article_claim_refs: tuple[str, ...] = ()
     sample_sha256: str | None = None
     offsets: tuple[int, ...] | None = None
     rationale: str = ""
@@ -111,6 +124,15 @@ class RuleMotif:
         if len(refs) != len(set(refs)):
             raise ValueError("observation_refs must be unique")
         object.__setattr__(self, "observation_refs", refs)
+        claim_refs = tuple(self.article_claim_refs)
+        if any(
+            not isinstance(reference, str) or not reference.strip() or len(reference) > 128
+            for reference in claim_refs
+        ):
+            raise ValueError("article_claim_refs must contain bounded claim ids")
+        if len(claim_refs) != len(set(claim_refs)):
+            raise ValueError("article_claim_refs must be unique")
+        object.__setattr__(self, "article_claim_refs", claim_refs)
         for name, value in (
             ("positive_support", self.positive_support),
             ("benign_prevalence", self.benign_prevalence),
@@ -124,6 +146,7 @@ class RuleMotif:
 class RuleTestCase:
     sample_sha256: str
     role: RuleTestCorpusRole
+    provenance: RuleSampleProvenance = RuleSampleProvenance.REAL
     sample_id: UUID | None = None
     expected_match: bool | None = None
     id: UUID = field(default_factory=uuid4)
@@ -131,6 +154,7 @@ class RuleTestCase:
     def __post_init__(self) -> None:
         _require_sha256(self.sample_sha256, "sample_sha256")
         object.__setattr__(self, "role", RuleTestCorpusRole(self.role))
+        object.__setattr__(self, "provenance", RuleSampleProvenance(self.provenance))
         if self.expected_match is not None and not isinstance(self.expected_match, bool):
             raise TypeError("expected_match must be a boolean or None")
 
@@ -224,6 +248,13 @@ class RuleRoleTestReport:
         ):
             raise ValueError("test results must belong to the declared corpus")
 
+    @property
+    def provenance_counts(self) -> dict[str, int]:
+        counts = {item.value: 0 for item in RuleSampleProvenance}
+        for case in self.test_cases:
+            counts[case.provenance.value] += 1
+        return counts
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class RuleTestReport:
@@ -257,6 +288,108 @@ class RuleTestReport:
             f"{role.role.value}:{','.join(role.corpus_sha256s)}" for role in self.roles
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    @property
+    def provenance_counts_by_role(self) -> dict[str, dict[str, int]]:
+        return {result.role.value: result.provenance_counts for result in self.roles}
+
+    @property
+    def false_positive_sha256s(self) -> tuple[str, ...]:
+        goodware = next(item for item in self.roles if item.role is RuleTestCorpusRole.GOODWARE)
+        return tuple(sorted(goodware.matches))
+
+    @property
+    def false_negative_sha256s(self) -> tuple[str, ...]:
+        positives = next(
+            item for item in self.roles if item.role is RuleTestCorpusRole.CONFIRMED_POSITIVE
+        )
+        return tuple(sorted(positives.non_matches))
+
+    @property
+    def validation_status(self) -> RuleValidationStatus:
+        measured_roles = {
+            role.role: set(role.matches) | set(role.non_matches) for role in self.roles
+        }
+        measured_cases = [
+            case
+            for role in self.roles
+            for case in role.test_cases
+            if case.sample_sha256 in measured_roles[role.role]
+        ]
+        if not measured_cases:
+            return RuleValidationStatus.UNTESTED
+
+        positives = next(
+            item for item in self.roles if item.role is RuleTestCorpusRole.CONFIRMED_POSITIVE
+        )
+        goodware = next(item for item in self.roles if item.role is RuleTestCorpusRole.GOODWARE)
+        measured_real_positives = [
+            case
+            for case in positives.test_cases
+            if case.provenance is RuleSampleProvenance.REAL
+            and case.sample_sha256 in measured_roles[RuleTestCorpusRole.CONFIRMED_POSITIVE]
+        ]
+        measured_real_goodware = [
+            case
+            for case in goodware.test_cases
+            if case.provenance is RuleSampleProvenance.REAL
+            and case.sample_sha256 in measured_roles[RuleTestCorpusRole.GOODWARE]
+        ]
+        if not measured_real_positives:
+            if any(case.provenance is RuleSampleProvenance.REAL for case in measured_cases):
+                return RuleValidationStatus.REAL_PARTIAL
+            return RuleValidationStatus.SYNTHETIC_ONLY
+
+        if (
+            self.execution_status is YaraExecutionStatus.OK
+            and measured_real_goodware
+            and len(measured_real_positives)
+            == sum(case.provenance is RuleSampleProvenance.REAL for case in positives.test_cases)
+            and len(measured_real_goodware)
+            == sum(case.provenance is RuleSampleProvenance.REAL for case in goodware.test_cases)
+            and all(case.sample_sha256 in positives.matches for case in measured_real_positives)
+            and not any(case.sample_sha256 in goodware.matches for case in measured_real_goodware)
+            and not positives.errors
+            and not goodware.errors
+            and not any(
+                case.provenance is RuleSampleProvenance.REAL
+                for case in positives.test_cases
+                if case.sample_sha256 in positives.non_measurable
+            )
+            and not any(
+                case.provenance is RuleSampleProvenance.REAL
+                for case in goodware.test_cases
+                if case.sample_sha256 in goodware.non_measurable
+            )
+        ):
+            return RuleValidationStatus.REAL_VALIDATED
+        return RuleValidationStatus.REAL_PARTIAL
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class RuleCorpusInventoryItem:
+    sample_sha256: str
+    role: RuleTestCorpusRole
+    provenance: RuleSampleProvenance
+    size_bytes: int
+    source_description: str = ""
+
+    def __post_init__(self) -> None:
+        _require_sha256(self.sample_sha256, "sample_sha256")
+        object.__setattr__(self, "role", RuleTestCorpusRole(self.role))
+        object.__setattr__(self, "provenance", RuleSampleProvenance(self.provenance))
+        if self.role is RuleTestCorpusRole.HOLDOUT:
+            raise ValueError("operator imports cannot declare the holdout role")
+        if (
+            isinstance(self.size_bytes, bool)
+            or not isinstance(self.size_bytes, int)
+            or self.size_bytes < 0
+        ):
+            raise ValueError("size_bytes must be a non-negative integer")
+        if not isinstance(self.source_description, str):
+            raise TypeError("source_description must be text")
+        if len(self.source_description) > 2_000:
+            raise ValueError("source_description is too long")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

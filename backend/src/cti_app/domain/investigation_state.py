@@ -75,6 +75,7 @@ class InvestigationWorkingState:
     pending_context_sha256: str | None = None
     stop_reason: StopReason | None = None
     no_progress_streak: int = 0
+    deduplicated_findings: int = 0
     last_seen_evidence_ids: tuple[UUID, ...] = ()
     last_seen_finding_ids: tuple[UUID, ...] = ()
     recent_actions: tuple[str, ...] = ()
@@ -82,7 +83,12 @@ class InvestigationWorkingState:
     base_publication_sha256: str | None = None
 
     def __post_init__(self) -> None:
-        if self.version < 1 or self.turn_index < 0 or self.no_progress_streak < 0:
+        if (
+            self.version < 1
+            or self.turn_index < 0
+            or self.no_progress_streak < 0
+            or self.deduplicated_findings < 0
+        ):
             raise ValueError("Investigation state counters are invalid")
         if self.stop_reason is not None and not isinstance(self.stop_reason, StopReason):
             raise TypeError("stop_reason must use StopReason")
@@ -129,6 +135,7 @@ class InvestigationWorkingState:
             "pending_context_sha256": self.pending_context_sha256,
             "stop_reason": self.stop_reason.value if self.stop_reason else None,
             "no_progress_streak": self.no_progress_streak,
+            "deduplicated_findings": self.deduplicated_findings,
             "last_seen_evidence_ids": [str(item) for item in self.last_seen_evidence_ids],
             "last_seen_finding_ids": [str(item) for item in self.last_seen_finding_ids],
             "recent_actions": list(self.recent_actions),
@@ -206,6 +213,18 @@ class InvestigationWorkingState:
             )[-32:],
         )
 
+    def with_context_limit_failure(
+        self, *, actual_bytes: int, max_bytes: int
+    ) -> InvestigationWorkingState:
+        return replace(
+            self,
+            version=self.version + 1,
+            recent_actions=(
+                *self.recent_actions,
+                f"investigation_context_too_large:{actual_bytes}>{max_bytes}",
+            )[-32:],
+        )
+
     def conclude(self, reason: StopReason) -> InvestigationWorkingState:
         if not isinstance(reason, StopReason):
             raise TypeError("reason must use StopReason")
@@ -222,9 +241,56 @@ class InvestigationWorkingState:
         return replace(self, version=self.version + 1, stop_reason=None)
 
 
+def investigation_bridge_attempt(recent_actions: tuple[str, ...], turn_index: int) -> int:
+    """Return the next Bridge attempt after an explicit or automatic disposition."""
+    prefixes = (
+        f"bridge_turn_abandoned:{turn_index}:next_attempt=",
+        f"bridge_turn_orphaned:{turn_index}:next_attempt=",
+        f"bridge_turn_pre_submission_retry_exhausted:{turn_index}:next_attempt=",
+    )
+    attempts = []
+    for action in recent_actions:
+        for prefix in prefixes:
+            if action.startswith(prefix):
+                raw = action[len(prefix) :].split(":turn_id=", 1)[0]
+                if raw.isdecimal():
+                    attempts.append(int(raw))
+                break
+    return max(attempts, default=0)
+
+
+def investigation_abandoned_turn_id(
+    recent_actions: tuple[str, ...], turn_index: int, next_attempt: int
+) -> UUID | None:
+    prefix = f"bridge_turn_abandoned:{turn_index}:next_attempt={next_attempt}:turn_id="
+    for action in reversed(recent_actions):
+        if action.startswith(prefix):
+            try:
+                return UUID(action.removeprefix(prefix))
+            except ValueError:
+                return None
+    return None
+
+
+def investigation_orphaned_turn_id(
+    recent_actions: tuple[str, ...], turn_index: int, next_attempt: int
+) -> UUID | None:
+    prefix = f"bridge_turn_orphaned:{turn_index}:next_attempt={next_attempt}:turn_id="
+    for action in reversed(recent_actions):
+        if action.startswith(prefix):
+            try:
+                return UUID(action.removeprefix(prefix))
+            except ValueError:
+                return None
+    return None
+
+
 __all__ = [
     "Hypothesis",
     "HypothesisStatus",
     "InvestigationWorkingState",
     "StopReason",
+    "investigation_abandoned_turn_id",
+    "investigation_bridge_attempt",
+    "investigation_orphaned_turn_id",
 ]

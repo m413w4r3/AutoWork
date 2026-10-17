@@ -114,9 +114,9 @@ def test_bubblewrap_is_preferred_and_reports_filesystem_confinement(
     executables = {"bwrap": "/test/bwrap", "unshare": "/test/unshare"}
     monkeypatch.setattr(local_runner_module.shutil, "which", executables.get)
 
-    def probe_bwrap(*_args: object) -> bool:
+    def probe_bwrap(*_args: object) -> NamespaceFailureReason | None:
         probed.append("bwrap")
-        return True
+        return None
 
     def probe_namespace(command: list[str], *_args: object) -> bool:
         probed.append("unshare" if command[0] == "/test/unshare" else "other")
@@ -136,19 +136,73 @@ def test_bubblewrap_is_preferred_and_reports_filesystem_confinement(
 
         probed.clear()
 
-        def unavailable_bwrap(*_args: object) -> bool:
+        def unavailable_bwrap(*_args: object) -> NamespaceFailureReason:
             probed.append("bwrap")
-            return False
+            return NamespaceFailureReason.BWRAP_PROBE_FILESYSTEM_NOT_CONFINED
 
         monkeypatch.setattr(local_runner_module, "_probe_bwrap_namespace", unavailable_bwrap)
         fallback = LocalCommandRunner(network_sandbox_probe_seconds=0.38)
         assert fallback.network_isolation == "unshare-net"
         assert fallback.namespace_status is NetworkIsolationStatus.UNSHARE_NET
-        assert fallback.namespace_reasons == (NamespaceFailureReason.BWRAP_PROBE_FAILED,)
+        assert fallback.namespace_reasons == (
+            NamespaceFailureReason.BWRAP_PROBE_FILESYSTEM_NOT_CONFINED,
+        )
         assert fallback.filesystem_confined is False
         assert probed == ["bwrap", "unshare"]
     finally:
         local_runner_module._detect_network_namespace.cache_clear()
+
+
+@pytest.mark.parametrize(
+    ("returncode", "expected_reason"),
+    (
+        (0, None),
+        (10, "bwrap_probe_network_socket_allowed"),
+        (11, "bwrap_probe_network_socket_unexpected_error"),
+        (12, "bwrap_probe_filesystem_not_confined"),
+        (13, "bwrap_probe_sample_mount_unreadable"),
+        (77, "bwrap_probe_failed"),
+    ),
+)
+def test_bwrap_probe_measures_network_and_filesystem_restrictions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    returncode: int,
+    expected_reason: str | None,
+) -> None:
+    filter_path = tmp_path / "filter"
+    filter_path.write_bytes(b"synthetic filter handle")
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def run(command: list[str], **kwargs: object) -> object:
+        calls.append((command, kwargs))
+        return type("Completed", (), {"returncode": returncode})()
+
+    monkeypatch.setattr(
+        local_runner_module,
+        "_network_seccomp_filter_file",
+        lambda: filter_path.open("rb"),
+    )
+    monkeypatch.setattr(local_runner_module.subprocess, "run", run)
+
+    reason = local_runner_module._probe_bwrap_namespace(
+        "/test/bwrap", {"PATH": "/usr/bin:/bin"}, 0.5
+    )
+
+    assert getattr(reason, "value", None) == expected_reason
+    assert len(calls) == 1
+    command, options = calls[0]
+    delimiter = command.index("--")
+    assert command[0] == "/test/bwrap"
+    assert command[1:3] == ["--unshare-net", "--unshare-pid"]
+    assert "--seccomp" in command
+    assert command[delimiter + 1] == (getattr(sys, "_base_executable", None) or sys.executable)
+    probe_program = command[delimiter + 3]
+    assert "socket.socket" in probe_program
+    assert "/etc/passwd" in probe_program
+    assert "/analysis/sample.bin" in probe_program
+    assert options["shell"] is False
+    assert options["pass_fds"] == (int(command[command.index("--seccomp") + 1]),)
 
 
 @pytest.mark.asyncio
@@ -519,7 +573,6 @@ async def test_namespace_launcher_failure_retries_once_with_seccomp(
     launcher.write_text(
         "#!/bin/sh\n"
         f"printf '%s\\n' \"$*\" >> '{invocations}'\n"
-        'case "$*" in *"/usr/bin/true"*) exit 0 ;; esac\n'
         "printf '%s\\n' 'bwrap: loopback: Failed to look up lo: No such file or directory' >&2\n"
         "exit 1\n",
         encoding="utf-8",
@@ -539,11 +592,16 @@ async def test_namespace_launcher_failure_retries_once_with_seccomp(
         "which",
         lambda name: str(launcher) if name == "bwrap" else None,
     )
+    # The probe is a double here; this test covers an execution-time launcher failure.
+    monkeypatch.setattr(local_runner_module, "_probe_bwrap_namespace", lambda *_args: None)
     local_runner_module._detect_network_namespace.cache_clear()
     catalog = LocalCommandCatalog(
         specs=(default_local_command_specs()[0],), which=lambda _: str(tool)
     )
-    runner = LocalCommandRunner(network_sandbox_probe_seconds=1.5)
+    runner = LocalCommandRunner(
+        network_sandbox_probe_seconds=1.5,
+        require_filesystem_confinement=False,
+    )
     payload = b"safe"
     service = LocalCommandService(_Samples(payload), runner, catalog, enabled=True)
 
@@ -557,12 +615,11 @@ async def test_namespace_launcher_failure_retries_once_with_seccomp(
         runner.namespace_reason is NamespaceFailureReason.NAMESPACE_LAUNCHER_FAILED_DURING_EXECUTION
     )
     calls = invocations.read_text(encoding="utf-8").splitlines()
-    assert len(calls) == 2
+    assert len(calls) == 1
     assert "--unshare-net" in calls[0]
     assert "--dir /analysis" in calls[0]
     assert "--chdir /analysis" in calls[0]
     assert "sample.bin" in calls[0]
-    assert "rules.yar" in calls[0]
 
     # A runtime failure is remembered for later runner instances in this process.
     assert LocalCommandRunner(network_sandbox_probe_seconds=1.5).network_isolation == (

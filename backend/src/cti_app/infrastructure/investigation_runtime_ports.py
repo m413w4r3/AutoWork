@@ -229,8 +229,11 @@ def build_investigation_runtime_ports(
     code_features: CodeFeatureService | None = None
     goodware_measurement: GoodwareMeasurementService | None = None
     yara_engine: IsolatedYaraRunner | None = None
+    yara_probe_reason: str | None = None
+    local_command_runner: LocalCommandRunner | None = None
     floss: FlossAdapter | None = None
     mwcp: MwcpAdapter | None = None
+    behavior_report_importer: BehaviorReportImporter | None = BehaviorReportImporter()
 
     if (
         settings.local_analysis_enabled
@@ -302,6 +305,8 @@ def build_investigation_runtime_ports(
         candidate_yara_engine = IsolatedYaraRunner()
         if candidate_yara_engine.available:
             yara_engine = candidate_yara_engine
+        else:
+            yara_probe_reason = candidate_yara_engine.unavailable_reason or "yara_probe_failed"
 
     network_source_configured = (
         network_quarantine is not None or network_quarantine_factory is not None
@@ -373,6 +378,19 @@ def build_investigation_runtime_ports(
         if not settings.local_analysis_enabled
         else "sample_analysis_services_unavailable",
     )
+    if not settings.local_analysis_enabled:
+        local_command_reason = "local_analysis_disabled"
+    elif (
+        settings.local_analysis_require_filesystem_confinement
+        and local_command_service is not None
+        and not local_command_service.filesystem_confined
+    ):
+        local_command_reason = (
+            getattr(local_command_runner, "namespace_reason", None)
+            or "filesystem_confinement_unavailable"
+        )
+    else:
+        local_command_reason = "no_local_command_available"
     record(
         "local_command_execution",
         bool(
@@ -385,15 +403,7 @@ def build_investigation_runtime_ports(
             )
             and local_command_catalog.available_commands()
         ),
-        "local_analysis_disabled"
-        if not settings.local_analysis_enabled
-        else "filesystem_confinement_unavailable"
-        if (
-            settings.local_analysis_require_filesystem_confinement
-            and local_command_service is not None
-            and not local_command_service.filesystem_confined
-        )
-        else "no_local_command_available",
+        local_command_reason,
     )
     record(
         "rule_workbench",
@@ -402,7 +412,7 @@ def build_investigation_runtime_ports(
         if not settings.rule_workbench_enabled
         else "filesystem_confinement_unavailable"
         if not _allow_unconfined_analysis_processes(settings)
-        else "yara_engine_or_worker_unavailable",
+        else yara_probe_reason or "yara_engine_or_worker_unavailable",
     )
     if settings.local_analysis_require_filesystem_confinement:
         record(
@@ -422,7 +432,12 @@ def build_investigation_runtime_ports(
     )
     record("floss_extraction", floss_available, floss_reason)
     record("configuration_extraction", mwcp_available, mwcp_reason)
-    record("behavior_report_import", True)
+    behavior_report_import_available = callable(getattr(behavior_report_importer, "parse", None))
+    record(
+        "behavior_report_import",
+        behavior_report_import_available,
+        None if behavior_report_import_available else "behavior_report_importer_unavailable",
+    )
     record("retrohunt", retrohunt_available, retrohunt_reason)
     record("network_capture", network_available, network_reason)
     record(
@@ -450,7 +465,9 @@ def build_investigation_runtime_ports(
         goodware_prevalence=cast(GoodwarePrevalencePort | None, goodware_measurement),
         floss_extraction=floss,
         configuration_extraction=mwcp,
-        behavior_report_importer=BehaviorReportImporter(),
+        behavior_report_importer=(
+            behavior_report_importer if behavior_report_import_available else None
+        ),
         retrohunt_provider=retrohunt_provider,
         vt_routing_policy=vt_routing_policy,
         network_quarantine=network_quarantine,

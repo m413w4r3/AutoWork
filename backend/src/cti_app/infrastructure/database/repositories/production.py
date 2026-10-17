@@ -196,6 +196,21 @@ class SqlAlchemySampleAcquisitionAttemptRepository:
         )
         return _sample_acquisition_attempt_from_row(row) if row else None
 
+    async def find_latest_error(
+        self, investigation_id: UUID, requested_hash: str
+    ) -> SampleAcquisitionAttempt | None:
+        row = await self._session.scalar(
+            select(SampleAcquisitionAttemptRow)
+            .where(
+                SampleAcquisitionAttemptRow.investigation_id == investigation_id,
+                SampleAcquisitionAttemptRow.requested_hash == requested_hash,
+                SampleAcquisitionAttemptRow.outcome == SampleAcquisitionOutcome.ERROR.value,
+            )
+            .order_by(SampleAcquisitionAttemptRow.occurred_at.desc())
+            .limit(1)
+        )
+        return _sample_acquisition_attempt_from_row(row) if row else None
+
     async def append(self, attempt: SampleAcquisitionAttempt) -> None:
         self._session.add(
             SampleAcquisitionAttemptRow(

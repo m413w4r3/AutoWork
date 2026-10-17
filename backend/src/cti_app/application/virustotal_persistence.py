@@ -8,6 +8,8 @@ VirusTotal request.
 """
 
 import json
+import logging
+import re
 from datetime import datetime
 from io import BytesIO
 from typing import Any
@@ -31,6 +33,9 @@ from cti_app.domain.virustotal import (
 
 VIRUSTOTAL_RAW_BUCKET = "virustotal-raw"
 VIRUSTOTAL_JSON_MIME_TYPE = "application/json"
+_logger = logging.getLogger(__name__)
+_SAFE_LOG_IDENTIFIER = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$")
+_SAFE_CONSTRAINT_NAME = re.compile(r"^[a-z][a-z0-9_]{0,127}$")
 
 
 class VirusTotalObservationService:
@@ -84,10 +89,7 @@ class VirusTotalObservationService:
             execution_id=uuid4(),
         )
         view = _file_view(observation.id, report.file)
-        async with self._uow_factory() as uow:
-            await uow.virustotal_observations.add(observation)
-            await uow.virustotal_file_views.add_if_absent(view)
-            await uow.commit()
+        await self._persist_observation(observation, raw_blob_id=blob.id, file_view=view)
         return observation
 
     async def store_file_relationship(
@@ -259,18 +261,78 @@ class VirusTotalObservationService:
                 page_order=order,
                 execution_id=execution_id,
             )
-            async with self._uow_factory() as uow:
-                await uow.virustotal_observations.add(observation)
-                await uow.commit()
+            await self._persist_observation(observation, raw_blob_id=blob.id)
             observations.append(observation)
             cursor = emitted
         return tuple(observations)
+
+    async def _persist_observation(
+        self,
+        observation: VirusTotalObservation,
+        *,
+        raw_blob_id: UUID,
+        file_view: VirusTotalFileView | None = None,
+    ) -> None:
+        try:
+            async with self._uow_factory() as uow:
+                await uow.virustotal_observations.add(observation)
+                if file_view is not None:
+                    await uow.virustotal_file_views.add_if_absent(file_view)
+                await uow.commit()
+        except Exception as exc:
+            _logger.warning(
+                "VirusTotal observation persistence failed after raw response archive",
+                extra={
+                    "event": "vt_observation_persistence_failed",
+                    "operation": observation.operation.value,
+                    "capability": observation.capability.value,
+                    "exception_class": _safe_exception_class(exc),
+                    "constraint_name": _constraint_name(exc),
+                    "observation_id": str(observation.id),
+                    "raw_blob_id": str(raw_blob_id),
+                    "raw_response_archived": True,
+                },
+            )
+            raise
 
 
 def _cursor(payload: dict[str, Any]) -> str | None:
     meta = payload.get("meta")
     value = meta.get("cursor") if isinstance(meta, dict) else None
     return value if isinstance(value, str) else None
+
+
+def _safe_exception_class(exc: Exception) -> str:
+    name = type(exc).__name__
+    return name if _SAFE_LOG_IDENTIFIER.fullmatch(name) else "UnknownException"
+
+
+def _constraint_name(exc: Exception) -> str:
+    pending: list[BaseException] = [exc]
+    seen: set[int] = set()
+    for _ in range(12):
+        if not pending:
+            break
+        current = pending.pop(0)
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        diagnostic = getattr(current, "diag", None)
+        candidates = (
+            getattr(current, "constraint_name", None),
+            getattr(diagnostic, "constraint_name", None),
+        )
+        for candidate in candidates:
+            if isinstance(candidate, str) and _SAFE_CONSTRAINT_NAME.fullmatch(candidate):
+                return candidate
+        for nested in (
+            getattr(current, "orig", None),
+            current.__cause__,
+            current.__context__,
+        ):
+            if isinstance(nested, BaseException) and id(nested) not in seen:
+                pending.append(nested)
+    return "unknown"
 
 
 def _file_view(observation_id: UUID, file: VirusTotalFile) -> VirusTotalFileView:

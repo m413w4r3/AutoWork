@@ -9,8 +9,10 @@ from uuid import UUID
 from pydantic import Field
 
 from cti_app.application.investigation_composition import InvestigationCompositionFactory
+from cti_app.application.investigation_state import InvestigationStateVersionConflict
 from cti_app.application.jobs import (
     JobExecutionContext,
+    JobHandlerError,
     JobParameters,
     JobRegistry,
 )
@@ -42,7 +44,17 @@ def register_investigation_jobs(
         await context.report_progress(0, 1, "Enquête en cours")
         # InvestigationService and BridgeInvestigator persist deterministic turn keys. A
         # replay therefore reloads a successful turn or moves an ambiguous one to review.
-        state = await runner(parameters.investigation_id)
+        try:
+            state = await runner(parameters.investigation_id)
+        except InvestigationStateVersionConflict as exc:
+            # Bounded CAS rebases happen inside InvestigationService. If other
+            # concurrent state mutations still prevent a safe merge, let the
+            # durable job retry instead of marking the investigation run failed.
+            raise JobHandlerError(
+                "investigation_state_conflict",
+                "Conflit de version concurrent; une nouvelle tentative est planifiée.",
+                transient=True,
+            ) from exc
         await context.report_progress(1, 1, _public_status(state))
         return f"investigation://{parameters.investigation_id}/runs/{parameters.run_generation}"
 

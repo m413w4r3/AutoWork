@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import httpx
@@ -12,10 +17,33 @@ from httpx import ASGITransport
 from sqlalchemy import select
 
 from cti_app.application.blobs import BlobCatalogService
-from cti_app.application.bridge_investigator import ScriptedTurnTransport
+from cti_app.application.bridge_investigator import (
+    ScriptedTurnTransport,
+    make_investigation_conversation_id,
+    make_investigation_turn_idempotency_key,
+)
+from cti_app.application.investigation_jobs import (
+    INVESTIGATION_RUN_AGGREGATE_TYPE,
+)
+from cti_app.application.investigation_service import bridge_budget_operation_key
+from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.production_artifact_store import ProductionArtifactStore
-from cti_app.domain.investigation import BudgetDimension
+from cti_app.domain.investigation import (
+    BudgetDimension,
+    InvestigationBudget,
+)
 from cti_app.domain.investigation_state import StopReason
+from cti_app.domain.jobs import INVESTIGATION_RUN_JOB_KIND, Job, JobStatus
+from cti_app.domain.model_conversations import (
+    ConversationMode,
+    ConversationPurpose,
+    ConversationTransport,
+    ConversationTurnStatus,
+    ModelConversation,
+    ModelConversationTurn,
+)
+from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRun
+from cti_app.domain.production import AnalystInvestigationStatus
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 from cti_app.infrastructure.database.models.investigation import InvestigationWorkingStateRow
 from tests.workflow_emulator.investigation_support import (
@@ -46,6 +74,47 @@ class _WaitingBridge(ScriptedTurnTransport):
         self.entered.set()
         await self.release.wait()
         return await super().submit(**kwargs)
+
+
+class _InterruptedThenRetryBridge(ScriptedTurnTransport):
+    def __init__(self, model_conversations: ModelConversationService) -> None:
+        super().__init__(
+            [
+                decision("Synthetic interrupted response.", next_action="finish"),
+                decision("Finish from the distinct retry.", next_action="finish"),
+            ]
+        )
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.request_keys: list[str] = []
+        self._model_conversations = model_conversations
+
+    async def submit(self, **kwargs):
+        self.request_keys.append(
+            make_investigation_turn_idempotency_key(
+                investigation_id=kwargs["investigation_id"],
+                turn_index=kwargs["turn_index"],
+                context_sha256=kwargs["context_sha256"],
+            )
+        )
+        if len(self.request_keys) == 1:
+            self.entered.set()
+            await self.release.wait()
+        return await super().submit(**kwargs)
+
+    async def submit_with_attempt(self, *, attempt: int, **kwargs):
+        self.request_keys.append(
+            make_investigation_turn_idempotency_key(
+                investigation_id=kwargs["investigation_id"],
+                turn_index=kwargs["turn_index"],
+                context_sha256=kwargs["context_sha256"],
+                attempt=attempt,
+            )
+        )
+        return await super().submit_with_attempt(attempt=attempt, **kwargs)
+
+    async def reconcile_orphaned_investigation_turn(self, **kwargs):
+        return await self._model_conversations.reconcile_orphaned_investigation_turn(**kwargs)
 
 
 async def _working_state_checkpoint(uow_factory, investigation_id: UUID) -> tuple[int, object]:
@@ -113,6 +182,14 @@ async def test_w16_interrupt_during_bridge_wait_is_durable_read_only_and_resumab
         assert status_body["pending_context_snapshot_id"] is not None
         assert status_body["last_operation"]["kind"] == "bridge_turn"
         assert status_body["last_operation"]["id"]
+        assert status_body["bridge_conversation_id_scope"] == "local_autowork_record_only"
+        assert status_body["bridge_external_target"] == {
+            "mode": "stateless",
+            "lifecycle": "temporary_chat_per_turn",
+        }
+        assert status_body["last_operation"]["conversation_id_scope"] == (
+            "local_autowork_record_only"
+        )
         assert status_body["g2"]["approved"] is True
 
         version_after_read, updated_at_after_read = await _working_state_checkpoint(
@@ -160,6 +237,208 @@ async def test_w16_interrupt_during_bridge_wait_is_durable_read_only_and_resumab
     assert completed.turn_index == 1
     assert completed.stop_reason is StopReason.AGENT_FINISHED
     assert transport.submission_count == 1
+
+
+@pytest.mark.asyncio
+async def test_w16_resume_recovers_orphan_after_model_unavailable_and_retries_distinctly(
+    uow_factory, tmp_path: Path
+) -> None:
+    artifact_store = ProductionArtifactStore(
+        BlobCatalogService(FilesystemBlobStore(tmp_path / "w16-orphan-recovery-blobs"), uow_factory)
+    )
+    seeded = await seed_verified_article(
+        uow_factory,
+        artifact_store,
+        suffix=f"w16-orphan-{uuid4().hex[:8]}",
+    )
+    model_conversations = ModelConversationService(
+        uow_factory,
+        cast(Any, SimpleNamespace()),
+        cast(Any, SimpleNamespace()),
+    )
+    transport = _InterruptedThenRetryBridge(model_conversations)
+    factory = composition_factory(
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+        settings=investigation_settings(providers=False),
+        transport=transport,
+    )
+    app, registry, dispatcher = build_investigation_app(
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+        composition_factory=factory,
+    )
+
+    async with httpx.AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        started = await start_investigation_http(client, seeded)
+        investigation_id = seeded.investigation.id
+        approved = await approve_envelope_http(
+            client,
+            investigation_id,
+            providers=(),
+            budget_limits={"bridge_turns": 4},
+            allow_acquisition=False,
+        )
+        assert approved.status_code == 200, approved.text
+        original_job_id = UUID(started["job_id"])
+        worker = asyncio.create_task(
+            run_http_job(app, uow_factory, registry, dispatcher, original_job_id)
+        )
+        await asyncio.wait_for(transport.entered.wait(), timeout=10)
+
+        before_interrupt = await client.get(
+            f"/api/investigations/{investigation_id}/operator-status"
+        )
+        assert before_interrupt.status_code == 200, before_interrupt.text
+        interrupted = await client.post(
+            f"/api/investigations/{investigation_id}/interrupt",
+            json={"expected_version": before_interrupt.json()["working_state_version"]},
+            headers={"Idempotency-Key": "w16-orphan-interrupt"},
+        )
+        assert interrupted.status_code == 200, interrupted.text
+        transport.release.set()
+        await worker
+
+        async with uow_factory() as uow:
+            state = await uow.investigation_states.get(investigation_id)
+            investigation = await uow.analyst_investigations.get(investigation_id)
+            original_job = await uow.jobs.get(original_job_id)
+            envelope = await uow.investigation_envelopes.get(investigation_id)
+            assert state is not None and state.pending_context_sha256 is not None
+            assert investigation is not None and original_job is not None and envelope is not None
+            orphan_context_sha256 = state.pending_context_sha256
+            orphan_key = make_investigation_turn_idempotency_key(
+                investigation_id=investigation_id,
+                turn_index=state.turn_index,
+                context_sha256=orphan_context_sha256,
+            )
+            assert transport.request_keys[0] == orphan_key
+
+            # Recreate the durable state left by the pre-fix cancelled worker,
+            # then the model_unavailable result from its first resume attempt.
+            original_job.status = JobStatus.CANCELLED
+            original_job.finished_at = datetime.now(UTC)
+            await uow.jobs.save(original_job)
+
+            conversation = ModelConversation(
+                id=make_investigation_conversation_id(investigation_id),
+                provider=ModelProvider.OPENAI,
+                transport=ConversationTransport.CHATGPT_BRIDGE,
+                purpose=ConversationPurpose.PIVOT_RESEARCH,
+                title="Synthetic orphan investigation",
+                subject_id=seeded.subject.id,
+            )
+            conversation.start_turn(mode=ConversationMode.FRESH)
+            run = ModelRun(
+                provider=ModelProvider.OPENAI,
+                model_role=ModelRole.RESEARCH,
+                requested_model="synthetic-bridge-model",
+                prompt_template_id="synthetic-investigation-turn",
+                prompt_template_version="1",
+                authorized_input_hash="a" * 64,
+                evidence_pack_hash="b" * 64,
+                parameters={},
+            )
+            orphaned_turn = ModelConversationTurn(
+                conversation_id=conversation.id,
+                sequence=conversation.turn_count,
+                model_run_id=run.id,
+                input_blob_reference=f"blob://{uuid4()}",
+                input_sha256=hashlib.sha256(b"synthetic interrupted prompt").hexdigest(),
+                idempotency_key=orphan_key,
+                correlation_id=(
+                    f"investigation:{investigation_id}:turn:{state.turn_index}:{orphan_key[:16]}"
+                ),
+            )
+            await uow.model_conversations.add(conversation)
+            await uow.model_runs.add(run)
+            await uow.model_conversation_turns.add(orphaned_turn)
+
+            stale_budget = InvestigationBudget(limits=dict(envelope.budget.limits))
+            old_budget_key = bridge_budget_operation_key(
+                investigation_id=investigation_id,
+                turn_index=state.turn_index,
+                context_sha256=orphan_context_sha256,
+            )
+            stale_budget.reserve(old_budget_key, {BudgetDimension.BRIDGE_TURNS: 1})
+            await uow.investigation_envelopes.save_if_version(
+                replace(envelope, version=envelope.version + 1, budget=stale_budget),
+                expected_version=envelope.version,
+            )
+
+            exhausted = replace(
+                state,
+                version=state.version + 1,
+                stop_reason=StopReason.MODEL_UNAVAILABLE,
+            )
+            await uow.investigation_states.save_if_version(
+                exhausted, expected_version=state.version
+            )
+            investigation.status = AnalystInvestigationStatus.EXHAUSTED
+            investigation.finished_at = datetime.now(UTC)
+            investigation._bump()
+            await uow.analyst_investigations.save(investigation)
+
+            second_job = Job(
+                kind=INVESTIGATION_RUN_JOB_KIND,
+                aggregate_type=INVESTIGATION_RUN_AGGREGATE_TYPE,
+                aggregate_id=investigation_id,
+                idempotency_key=f"w16-synthetic-generation-2:{uuid4()}",
+                correlation_id=f"w16-synthetic-generation-2:{uuid4()}",
+                input_parameters={
+                    "run_generation": 2,
+                    "request_key_sha256": "c" * 64,
+                },
+            )
+            second_job.start()
+            second_job.succeed(None)
+            assert await uow.jobs.add_if_absent(second_job)
+            await uow.commit()
+
+        resumed = await client.post(
+            f"/api/investigations/{investigation_id}/resume",
+            json={"expected_version": exhausted.version},
+            headers={"Idempotency-Key": "w16-model-unavailable-orphan-resume"},
+        )
+        assert resumed.status_code == 200, resumed.text
+        await run_http_job(
+            app,
+            uow_factory,
+            registry,
+            dispatcher,
+            UUID(resumed.json()["job_id"]),
+        )
+
+    async with uow_factory() as uow:
+        stored_turn = await uow.model_conversation_turns.get(orphaned_turn.id)
+        final_state = await uow.investigation_states.get(investigation_id)
+        final_envelope = await uow.investigation_envelopes.get(investigation_id)
+        jobs = await uow.jobs.list_for_aggregate(
+            INVESTIGATION_RUN_AGGREGATE_TYPE,
+            investigation_id,
+            kind=INVESTIGATION_RUN_JOB_KIND,
+        )
+    assert stored_turn is not None
+    assert stored_turn.status is ConversationTurnStatus.NEEDS_REVIEW
+    assert stored_turn.error_code == "orphaned_running_turn"
+    assert final_state is not None and final_envelope is not None
+    assert len(transport.request_keys) == 2
+    assert transport.request_keys[1] != orphan_key
+    assert transport.submission_count == 2  # Initial interrupted call plus one distinct retry.
+    reservations = {item.operation_key: item for item in final_envelope.budget.reservations}
+    retry_budget_key = bridge_budget_operation_key(
+        investigation_id=investigation_id,
+        turn_index=0,
+        context_sha256=orphan_context_sha256,
+        attempt=1,
+    )
+    assert reservations[old_budget_key].status.value == "released"
+    assert reservations[retry_budget_key].status.value == "committed"
+    assert final_envelope.budget.reserved[BudgetDimension.BRIDGE_TURNS] == 0
+    assert final_envelope.budget.consumed[BudgetDimension.BRIDGE_TURNS] == 1
+    assert max(int(job.input_parameters.get("run_generation", 0)) for job in jobs) == 3
 
 
 class _WaitingVirusTotal(HashCheckedVirusTotal):

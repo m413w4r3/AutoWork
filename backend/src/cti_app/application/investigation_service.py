@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import logging
+import re
+import unicodedata
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
-from dataclasses import replace
+from dataclasses import fields, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Protocol
@@ -62,14 +66,24 @@ from cti_app.application.persistence import (
 )
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.research_context_builder import (
+    PROVIDER_AUTHORIZATION_REFUSAL_OBJECT_TYPE,
+    PROVIDER_DOWNLOAD_AUTH_REFUSAL_OBJECT_TYPE,
+    PROVIDER_DOWNLOAD_ROUTE_REFUSAL_OBJECT_TYPE,
     USER_REQUEST_ACTION_PREFIX,
     ArticleSnapshot,
+    InvestigationContextTooLarge,
     ResearchContextBuilder,
+    ensure_investigation_context_size,
+    provider_authorization_blocked_capabilities,
+    provider_download_blocked_capabilities,
 )
 from cti_app.domain.analyst_opinion import (
+    AnalystObservationV1,
     AnalystOpinionStatus,
     AnalystOpinionV1,
     OpinionBlock,
+    investigation_opinion_id,
+    opinion_blocks_with_observations,
     verify_opinion_citations,
 )
 from cti_app.domain.editorial import (
@@ -104,6 +118,7 @@ from cti_app.domain.investigation_state import (
     HypothesisStatus,
     InvestigationWorkingState,
     StopReason,
+    investigation_bridge_attempt,
 )
 from cti_app.domain.production import (
     AnalystInvestigation,
@@ -113,10 +128,18 @@ from cti_app.domain.production import (
     ProductionRun,
 )
 
+_logger = logging.getLogger(__name__)
+_SAFE_LOG_TOKEN = re.compile(r"[^A-Za-z0-9_.-]+")
+
 _FINDING_NAMESPACE = UUID("3e2a06e9-660e-44a7-9a9c-6db60a16ff55")
 _OPINION_NAMESPACE = UUID("f141ae8e-999c-4a7f-b07d-5ffb0bd7b86d")
 _INVOCATION_RECONCILIATION_NAMESPACE = UUID("ac8d1f15-c6ca-4808-97db-d3b63d34f851")
 _INVALID_BRIDGE_ACTION_PREFIX = "bridge_invalid_output:"
+MAX_OPINION_DRAFT_CORRECTIONS = 2
+MAX_IDENTICAL_DEFINITE_TOOL_FAILURES = 2
+MAX_STATE_VERSION_CONFLICT_RETRIES = 4
+_RECENT_ACTIONS_LIMIT = 32
+_OPERATOR_REQUEST_MARKER_PREFIX = "api:user-request:"
 
 
 class InvocationReconciliationOutcome(StrEnum):
@@ -144,7 +167,26 @@ class ProductionArtifactObservationWriter:
     async def archive(
         self, invocation: ToolInvocation, result: ToolResult
     ) -> tuple[EvidenceObservation, ...]:
-        if result.observation_refs:
+        reason = result.output.get("reason")
+        provider_auth_refusal = (
+            result.status is ToolInvocationStatus.UNAVAILABLE
+            and reason == "provider_authorization_refused"
+        )
+        download_refusal_object_type = (
+            {
+                "provider_download_route_not_found": PROVIDER_DOWNLOAD_ROUTE_REFUSAL_OBJECT_TYPE,
+                "provider_download_authorization_refused": (
+                    PROVIDER_DOWNLOAD_AUTH_REFUSAL_OBJECT_TYPE
+                ),
+            }.get(reason)
+            if isinstance(reason, str)
+            else None
+        )
+        provider_download_refusal = (
+            result.status is ToolInvocationStatus.UNAVAILABLE
+            and download_refusal_object_type is not None
+        )
+        if result.observation_refs and not provider_auth_refusal and not provider_download_refusal:
             return ()
         safe_result = _sanitize_json(thaw_json(result.output))
         if not safe_result:
@@ -162,7 +204,11 @@ class ProductionArtifactObservationWriter:
             payload=payload,
             source=invocation.tool_name,
             source_version=invocation.schema_version,
-            object_type="tool_call",
+            object_type=(
+                PROVIDER_AUTHORIZATION_REFUSAL_OBJECT_TYPE
+                if provider_auth_refusal
+                else download_refusal_object_type or "tool_call"
+            ),
             object_id=invocation.operation_key,
             limitations=("Tool output is untrusted provider or analysis data.",),
             invocation_ref=invocation.id,
@@ -312,12 +358,55 @@ class InvestigationService:
         return state
 
     async def resume(
-        self, investigation_id: UUID, *, expected_version: int | None = None
+        self,
+        investigation_id: UUID,
+        *,
+        expected_version: int | None = None,
+        owner_job_terminal: bool = False,
     ) -> InvestigationWorkingState:
         state = await self._require_state(investigation_id)
         if expected_version is not None and state.version != expected_version:
             raise InvestigationStateVersionConflict("Investigation state version changed")
         investigation = await self._require_investigation(investigation_id)
+        if owner_job_terminal and state.pending_context_sha256 is not None:
+            attempt = investigation_bridge_attempt(state.recent_actions, state.turn_index)
+            disposition = await self._bridge.reconcile_orphaned_turn(
+                investigation_id=investigation_id,
+                turn_index=state.turn_index,
+                context_sha256=state.pending_context_sha256,
+                attempt=attempt,
+                owner_job_terminal=True,
+            )
+            envelope = await self._envelopes.get(investigation_id)
+            if envelope is not None:
+                changed = False
+                for prior_attempt in range(attempt + 1):
+                    reservation_key = bridge_budget_operation_key(
+                        investigation_id=investigation_id,
+                        turn_index=state.turn_index,
+                        context_sha256=state.pending_context_sha256,
+                        attempt=prior_attempt,
+                    )
+                    status = _reservation_status(envelope.budget, reservation_key)
+                    if status is not BudgetReservationStatus.RESERVED:
+                        continue
+                    if prior_attempt < attempt or disposition == "orphaned_running_turn":
+                        envelope.budget.release(reservation_key)
+                        changed = True
+                    elif disposition in {"captured_output", "needs_review"}:
+                        envelope.budget.commit(reservation_key)
+                        changed = True
+                if changed:
+                    await self._save_envelope_version(envelope)
+                    await self._commit_current_uow()
+            if disposition == "needs_review":
+                raise ValueError(
+                    "The pending Bridge turn has output or provider state requiring reconciliation"
+                )
+            if disposition == "active_job":
+                raise ValueError("The pending Bridge turn still has an active owner job")
+            if disposition == "orphaned_running_turn":
+                state = await self._require_state(investigation_id)
         unresolved = tuple(
             item
             for item in await self._invocations.list_for_investigation(investigation_id)
@@ -415,26 +504,42 @@ class InvestigationService:
                 idempotency_key=f"context:{state.turn_index}",
                 available_capabilities=self._available_capabilities,
             )
-            if state.pending_context_snapshot_id is not None:
-                pending_json = await self._context_snapshots.load(state.pending_context_snapshot_id)
-                if (
-                    pending_json is None
-                    or hashlib.sha256(pending_json.encode("utf-8")).hexdigest()
-                    != state.pending_context_sha256
-                ):
-                    return await self.conclude(investigation_id, StopReason.SUBMISSION_NEEDS_REVIEW)
-                context = parse_investigation_context(pending_json)
-            else:
-                context = await self._context_builder.build(
-                    investigation_id=investigation_id,
-                    synthesis_artifact_id=investigation.synthesis_artifact_id,
-                    state=state,
-                    tool_context=tool_context,
-                    budget_remaining={
-                        dimension.value: amount for dimension, amount in budget.remaining.items()
-                    },
-                    registry=self._registry,
+            try:
+                if state.pending_context_snapshot_id is not None:
+                    pending_json = await self._context_snapshots.load(
+                        state.pending_context_snapshot_id
+                    )
+                    if (
+                        pending_json is None
+                        or hashlib.sha256(pending_json.encode("utf-8")).hexdigest()
+                        != state.pending_context_sha256
+                    ):
+                        return await self.conclude(
+                            investigation_id, StopReason.SUBMISSION_NEEDS_REVIEW
+                        )
+                    ensure_investigation_context_size(pending_json.encode("utf-8"))
+                    context = parse_investigation_context(pending_json)
+                else:
+                    context = await self._context_builder.build(
+                        investigation_id=investigation_id,
+                        synthesis_artifact_id=investigation.synthesis_artifact_id,
+                        state=state,
+                        tool_context=tool_context,
+                        budget_remaining={
+                            dimension.value: amount
+                            for dimension, amount in budget.remaining.items()
+                        },
+                        registry=self._registry,
+                    )
+                context_bytes = context.canonical_bytes()
+                ensure_investigation_context_size(context_bytes)
+            except InvestigationContextTooLarge as exc:
+                over_limit = state.with_context_limit_failure(
+                    actual_bytes=exc.actual_bytes,
+                    max_bytes=exc.max_bytes,
                 )
+                await self._save_state(state, over_limit)
+                return await self.conclude(investigation_id, StopReason.BUDGET_EXHAUSTED)
             stopped = await self._requested_stop(investigation_id)
             if stopped is not None:
                 return stopped
@@ -448,11 +553,16 @@ class InvestigationService:
             ) -> bool:
                 return await self._bridge_submission_allowed(investigation_id, approved_envelope)
 
-            context_bytes = context.canonical_bytes()
             context_size_bytes = len(context_bytes)
             context_sha256 = hashlib.sha256(context_bytes).hexdigest()
             user_request_ids = tuple(
-                item.request_id for item in context.investigation.user_requests
+                dict.fromkeys(
+                    item.request_id
+                    for item in (
+                        *context.operator_requests,
+                        *context.investigation.user_requests,
+                    )
+                )
             )
             if state.pending_context_snapshot_id is None:
                 context_snapshot_id = await self._context_snapshots.store(
@@ -464,7 +574,13 @@ class InvestigationService:
             stopped = await self._requested_stop(investigation_id)
             if stopped is not None:
                 return stopped
-            bridge_key = f"bridge:{investigation_id}:{state.turn_index}:{context_sha256}"
+            bridge_attempt = investigation_bridge_attempt(state.recent_actions, state.turn_index)
+            bridge_key = bridge_budget_operation_key(
+                investigation_id=investigation_id,
+                turn_index=state.turn_index,
+                context_sha256=context_sha256,
+                attempt=bridge_attempt,
+            )
             try:
                 reservation_before = _reservation_status(budget, bridge_key)
                 budget.reserve(
@@ -482,27 +598,64 @@ class InvestigationService:
                 # Acquisition tools use their own UoW. Commit this approved
                 # budget snapshot before the Bridge/adapter can read it there.
                 await self._commit_current_uow()
-            turn = await self._bridge.turn(
-                investigation_id=investigation_id,
-                subject_id=investigation.subject_id,
-                turn_index=state.turn_index,
-                context=context,
-                external_llm_allowed=allowed,
-                on_invalid_output=lambda key, detail: self._record_bridge_rejection(
-                    investigation_id, key, detail
-                ),
-                before_submission=before_bridge_submission,
-            )
+            try:
+                turn = await self._bridge.turn(
+                    investigation_id=investigation_id,
+                    subject_id=investigation.subject_id,
+                    turn_index=state.turn_index,
+                    attempt=bridge_attempt,
+                    context=context,
+                    external_llm_allowed=allowed,
+                    on_invalid_output=lambda key, detail: self._record_bridge_rejection(
+                        investigation_id, key, detail
+                    ),
+                    before_submission=before_bridge_submission,
+                )
+            except asyncio.CancelledError as exc:
+                # Once transport submission starts, the external provider may
+                # have accepted the request. A cancellation while waiting between
+                # confirmed pre-submission failures has no such external effect.
+                submitted = getattr(exc, "bridge_submissions_made", 1)
+                await asyncio.shield(
+                    self._complete_bridge_reservation(
+                        investigation_id,
+                        bridge_key,
+                        budget,
+                        blocked=submitted == 0,
+                    )
+                )
+                await asyncio.shield(self._commit_current_uow())
+                raise
             await self._complete_bridge_reservation(
                 investigation_id,
                 bridge_key,
                 budget,
                 blocked=turn.submissions_made == 0,
+                confirmed_non_submission=(
+                    turn.status is TurnSubmissionStatus.PRE_SUBMISSION_RETRY_EXHAUSTED
+                    and turn.submission_state == "pre_submission"
+                    and turn.submissions_made == 0
+                ),
             )
             await self._commit_current_uow()
             state = await self._require_state(investigation_id)
             if state.stop_reason is not None:
                 return state
+            if turn.status is TurnSubmissionStatus.PRE_SUBMISSION_RETRY_EXHAUSTED:
+                next_attempt = bridge_attempt + turn.attempts_made
+                action = (
+                    "bridge_turn_pre_submission_retry_exhausted:"
+                    f"{state.turn_index}:next_attempt={next_attempt}"
+                )
+                if action not in state.recent_actions:
+                    updated = replace(
+                        state,
+                        version=state.version + 1,
+                        recent_actions=(*state.recent_actions, action)[-32:],
+                    )
+                    await self._save_state(state, updated)
+                    await self._commit_current_uow()
+                    state = updated
             latest_envelope = await self._envelopes.get(investigation_id)
             if _envelope_reduced_since(envelope, latest_envelope):
                 await self._record_policy_reduction(
@@ -546,7 +699,13 @@ class InvestigationService:
                 await self._commit_current_uow()
                 return concluded
             seen_operation_keys = {
-                item.operation_key
+                tool_operation_key(
+                    investigation_id=item.investigation_id,
+                    tool_name=item.tool_name,
+                    schema_version=item.schema_version,
+                    normalized_parameters=item.normalized_parameters,
+                    purpose=item.purpose,
+                )
                 for item in await self._invocations.list_for_investigation(investigation_id)
             }
             outcome = await self._process_turn(
@@ -565,6 +724,143 @@ class InvestigationService:
             if outcome[1] is not None:
                 return await self.conclude(investigation_id, outcome[1])
             if next_action is AgentNextAction.FINISH:
+                opinion_id = investigation_opinion_id(investigation_id)
+                opinion = await self._opinions.get(opinion_id)
+                opinion_eligible_findings = tuple(
+                    item
+                    for item in await self._findings.list_for_investigation(investigation_id)
+                    if item.assessment is not FindingAssessment.INCONCLUSIVE
+                )
+                rejected_opinion_attempt = (
+                    f"opinion_attempt_rejected:{turn.context_sha256}" in latest_state.recent_actions
+                )
+                missing_required_opinion = bool(opinion_eligible_findings) and not (
+                    opinion and opinion.renderable_blocks
+                )
+                if missing_required_opinion or rejected_opinion_attempt:
+                    retries = sum(
+                        action.startswith(
+                            (
+                                "opinion_draft_required:",
+                                "opinion_rejected_requires_correction:",
+                            )
+                        )
+                        for action in latest_state.recent_actions
+                    )
+                    current_envelope = await self._envelopes.get(investigation_id)
+                    remaining_turns = (
+                        current_envelope.budget.remaining.get(BudgetDimension.BRIDGE_TURNS)
+                        if current_envelope is not None
+                        else budget.remaining.get(BudgetDimension.BRIDGE_TURNS)
+                    )
+                    if retries >= MAX_OPINION_DRAFT_CORRECTIONS or remaining_turns == 0:
+                        stopped = latest_state.conclude(StopReason.SUBMISSION_NEEDS_REVIEW)
+                        await self._save_state(latest_state, stopped)
+                        await self._commit_current_uow()
+                        return stopped
+                    correction_code = (
+                        "opinion_rejected_requires_correction"
+                        if rejected_opinion_attempt
+                        else "opinion_draft_required"
+                    )
+                    correction = (
+                        f"{correction_code}: "
+                        + (
+                            "a proposed OPINION block was rejected; correct it or omit it, and "
+                            "do not repeat the invalid block; "
+                            if rejected_opinion_attempt
+                            else "non-inconclusive findings exist without a renderable opinion; "
+                            "use existing findings and evidence references; "
+                        )
+                        + f"correction={retries + 1}/{MAX_OPINION_DRAFT_CORRECTIONS}"
+                    )
+                    corrected = replace(
+                        latest_state,
+                        version=latest_state.version + 1,
+                        recent_actions=(*latest_state.recent_actions, correction)[-32:],
+                    )
+                    await self._save_state(latest_state, corrected)
+                    await self._commit_current_uow()
+                    state = corrected
+                    continue
+                pending_rule_tests, unavailable_rule_tests = _rule_test_finish_status(
+                    context,
+                    await self._invocations.list_for_investigation(investigation_id),
+                )
+                if pending_rule_tests:
+                    required_markers = tuple(
+                        f"rule_test_required:{candidate_id}:v{version}"
+                        for candidate_id, version in pending_rule_tests
+                    )
+                    already_requested = all(
+                        marker in latest_state.recent_actions for marker in required_markers
+                    )
+                    if already_requested:
+                        stopped = latest_state.conclude(StopReason.SUBMISSION_NEEDS_REVIEW)
+                        await self._save_state(latest_state, stopped)
+                        await self._commit_current_uow()
+                        return stopped
+                    current_envelope = await self._envelopes.get(investigation_id)
+                    remaining_turns = (
+                        current_envelope.budget.remaining.get(BudgetDimension.BRIDGE_TURNS)
+                        if current_envelope is not None
+                        else budget.remaining.get(BudgetDimension.BRIDGE_TURNS)
+                    )
+                    if remaining_turns == 0:
+                        stopped = latest_state.conclude(StopReason.SUBMISSION_NEEDS_REVIEW)
+                        await self._save_state(latest_state, stopped)
+                        await self._commit_current_uow()
+                        return stopped
+                    missing_markers = tuple(
+                        marker
+                        for marker in required_markers
+                        if marker not in latest_state.recent_actions
+                    )
+                    correction = (
+                        "rule_test_required: run rule.test with each exact candidate_id "
+                        "and version "
+                        "before finish: "
+                        + ", ".join(
+                            f"{candidate_id}@v{version}"
+                            for candidate_id, version in pending_rule_tests
+                        )
+                        + "; if rule.test is unavailable or refuses, record that limitation."
+                    )
+                    corrected = replace(
+                        latest_state,
+                        version=latest_state.version + 1,
+                        recent_actions=(
+                            *latest_state.recent_actions,
+                            *missing_markers,
+                            correction,
+                        )[-32:],
+                    )
+                    await self._save_state(latest_state, corrected)
+                    await self._commit_current_uow()
+                    state = corrected
+                    continue
+                if unavailable_rule_tests:
+                    limitation_markers = tuple(
+                        f"rule_test_unavailable:{candidate_id}:v{version}: "
+                        "candidate remains untested"
+                        for candidate_id, version in unavailable_rule_tests
+                    )
+                    new_limitations = tuple(
+                        marker
+                        for marker in limitation_markers
+                        if marker not in latest_state.recent_actions
+                    )
+                    if new_limitations:
+                        recorded = replace(
+                            latest_state,
+                            version=latest_state.version + 1,
+                            recent_actions=(
+                                *latest_state.recent_actions,
+                                *new_limitations,
+                            )[-32:],
+                        )
+                        await self._save_state(latest_state, recorded)
+                        await self._commit_current_uow()
                 return await self.conclude(investigation_id, StopReason.AGENT_FINISHED)
             if next_action is AgentNextAction.REQUEST_PERMISSION:
                 return await self.conclude(investigation_id, StopReason.PERMISSION_REQUIRED)
@@ -599,8 +895,51 @@ class InvestigationService:
             stopped = await self._requested_stop(investigation.id)
             if stopped is not None:
                 return stopped, stopped.stop_reason
+            prior_invocations = await self._invocations.list_for_investigation(investigation.id)
+            prior_observations = await self._observations.list_for_investigation(investigation.id)
+            blocked_capabilities = await provider_authorization_blocked_capabilities(
+                investigation_id=investigation.id,
+                invocations=prior_invocations,
+                observations=prior_observations,
+            )
+            blocked_capabilities = tuple(
+                sorted(
+                    set(blocked_capabilities).union(
+                        provider_download_blocked_capabilities(
+                            investigation_id=investigation.id,
+                            invocations=prior_invocations,
+                            observations=prior_observations,
+                        )
+                    )
+                )
+            )
+            blocked_providers = {item.split(":", 1)[0] for item in blocked_capabilities}
+            blocked_download_capabilities = {
+                item.split(":", 1)[0]
+                for item in blocked_capabilities
+                if item.startswith("vt.file_download:")
+            }
+            provider = proposed.tool_name.split(".", 1)[0].lower()
             definition_adapter = self._registry.get(proposed.tool_name, proposed.schema_version)
             definition = definition_adapter[0] if definition_adapter else None
+            if provider in blocked_providers or (
+                definition is not None
+                and definition.capability_key in blocked_download_capabilities
+            ):
+                unavailable_reason = (
+                    "The VirusTotal download capability is blocked after repeated provider refusal."
+                    if definition is not None
+                    and definition.capability_key in blocked_download_capabilities
+                    else f"{provider}: provider authorization refused; capability is blocked."
+                )
+                action_summaries.append(
+                    _action_summary(
+                        proposed.tool_name,
+                        ToolInvocationStatus.UNAVAILABLE,
+                        unavailable_reason,
+                    )
+                )
+                continue
             base_operation_key = tool_operation_key(
                 investigation_id=investigation.id,
                 tool_name=proposed.tool_name,
@@ -608,18 +947,71 @@ class InvestigationService:
                 normalized_parameters=proposed.arguments,
                 purpose=proposed.purpose,
             )
-            operation_key = base_operation_key
-            invocation = await self._invocations.get_by_operation_key(base_operation_key)
+            deduplicate_read = definition is not None and definition.effect in {
+                ToolEffect.LOCAL_READ,
+                ToolEffect.EXTERNAL_READ,
+            }
+            call_scope = hashlib.sha256(
+                f"{state.turn_index}:{context_sha256}".encode()
+            ).hexdigest()[:20]
+            operation_key = (
+                base_operation_key
+                if deduplicate_read
+                else f"{base_operation_key}:turn:{call_scope}"
+            )
+            all_matching_invocations = tuple(
+                item
+                for item in await self._invocations.list_for_investigation(investigation.id)
+                if item.tool_name == proposed.tool_name
+                and item.schema_version == proposed.schema_version
+                and thaw_json(item.normalized_parameters) == thaw_json(proposed.arguments)
+            )
+            matching_invocations = (
+                all_matching_invocations
+                if deduplicate_read
+                else tuple(
+                    item
+                    for item in all_matching_invocations
+                    if item.operation_key == operation_key
+                    or item.operation_key.startswith(f"{operation_key}:retry:")
+                )
+            )
+            invocation = matching_invocations[-1] if matching_invocations else None
             external_effect = definition is not None and definition.effect in {
                 ToolEffect.EXTERNAL_READ,
                 ToolEffect.ACQUIRE,
                 ToolEffect.EXTERNAL_ACTIVE,
                 ToolEffect.EXTERNAL_SUBMIT,
             }
+            definitive_failures = sum(
+                item.status is ToolInvocationStatus.FAILED and not item.response_refs
+                for item in all_matching_invocations
+            )
+            if external_effect and definitive_failures >= MAX_IDENTICAL_DEFINITE_TOOL_FAILURES:
+                action_summaries.append(
+                    _action_summary(
+                        proposed.tool_name,
+                        ToolInvocationStatus.FAILED,
+                        "Identical arguments have already failed definitively twice without a "
+                        "provider result. Correct the argument types or stop retrying this input.",
+                    )
+                )
+                continue
             if (
                 invocation is not None
-                and invocation.status is not ToolInvocationStatus.POLICY_DENIED
+                and invocation.status is ToolInvocationStatus.FAILED
+                and (not external_effect or invocation.response_refs)
             ):
+                failed_attempts = sum(
+                    item.status is ToolInvocationStatus.FAILED for item in matching_invocations
+                )
+                retry_parent_key = base_operation_key if deduplicate_read else operation_key
+                operation_key = f"{retry_parent_key}:retry:{failed_attempts}"
+                invocation = await self._invocations.get_by_operation_key(operation_key)
+            if invocation is not None and invocation.status not in {
+                ToolInvocationStatus.POLICY_DENIED,
+                ToolInvocationStatus.FAILED,
+            }:
                 replay, refs, stop = await self._replay_invocation(invocation)
                 observation_ids.extend(refs)
                 if set(refs).difference(state.last_seen_evidence_ids):
@@ -636,7 +1028,7 @@ class InvestigationService:
                 current_envelope = await self._envelopes.get(investigation.id)
                 if _envelope_reduced_since(turn_envelope, current_envelope):
                     denied_key = (
-                        f"{base_operation_key}:g2-denied:"
+                        f"{operation_key}:g2-denied:"
                         f"{current_envelope.version if current_envelope is not None else 'revoked'}"
                     )
                     denied = await self._invocations.get_by_operation_key(denied_key)
@@ -696,7 +1088,7 @@ class InvestigationService:
                     # A previously denied operation had no external effect. A new G2
                     # version gets a fresh idempotency identity so explicit approval
                     # can retry it without rewriting its denial record.
-                    operation_key = f"{base_operation_key}:g2:{current_envelope.version}"
+                    operation_key = f"{operation_key}:g2:{current_envelope.version}"
                     invocation = await self._invocations.get_by_operation_key(operation_key)
                 elif invocation is not None:
                     replay, refs, stop = await self._replay_invocation(invocation)
@@ -782,6 +1174,14 @@ class InvestigationService:
                         current_envelope.budget.release(operation_key)
                         await self._save_envelope_version(current_envelope)
                 await self._commit_current_uow()
+                _log_terminal_tool_failure(
+                    cancelled,
+                    ToolResult(
+                        status=ToolInvocationStatus.FAILED,
+                        exception_class="OperatorInterruption",
+                        error_code="operator_interrupted_before_tool_dispatch",
+                    ),
+                )
                 return stopped, stopped.stop_reason
 
             tool_budget = _copy_investigation_budget(budget)
@@ -824,14 +1224,23 @@ class InvestigationService:
                         "reconcile it before resuming. " + result.message
                     )[:2_000],
                 )
-            if result.status in {
-                ToolInvocationStatus.UNAVAILABLE,
-                ToolInvocationStatus.POLICY_DENIED,
-            }:
+            confirmed_partial_external_result = (
+                result.status is ToolInvocationStatus.UNAVAILABLE
+                and result.output.get("confirmed_non_execution") is True
+                and any(amount > 0 for amount in result.budget_consumed.values())
+            )
+            if (
+                result.status
+                in {
+                    ToolInvocationStatus.UNAVAILABLE,
+                    ToolInvocationStatus.POLICY_DENIED,
+                }
+                and not confirmed_partial_external_result
+            ):
                 budget.release(operation_key)
             try:
                 persisted_observations = await self._persist_result_observations(invocation, result)
-            except Exception:
+            except Exception as exc:
                 valid_refs = await self._valid_observation_refs(
                     investigation.id, result.observation_refs
                 )
@@ -844,6 +1253,12 @@ class InvestigationService:
                     reviewed, expected_version=invocation.version
                 )
                 await self._commit_current_uow()
+                _log_terminal_tool_failure(
+                    reviewed,
+                    result,
+                    exception_class=type(exc).__name__,
+                    error_code="tool_observation_persistence_failed",
+                )
                 stopped = await self._requested_stop(investigation.id)
                 if stopped is not None:
                     return stopped, stopped.stop_reason
@@ -876,6 +1291,7 @@ class InvestigationService:
                 uncertain=uncertain_external,
             )
             await self._commit_current_uow()
+            _log_terminal_tool_failure(invocation, result)
             stopped = await self._requested_stop(investigation.id)
             if stopped is not None:
                 return stopped, stopped.stop_reason
@@ -920,7 +1336,7 @@ class InvestigationService:
         stopped = await self._requested_stop(investigation.id)
         if stopped is not None:
             return stopped, stopped.stop_reason
-        new_findings = await self._persist_findings(
+        new_findings, deduplicated_findings = await self._persist_findings_with_count(
             investigation_id=investigation.id,
             proposals=decision.finding_proposals,
             decision_trace=decision.reasoning_summary,
@@ -935,11 +1351,17 @@ class InvestigationService:
         stopped = await self._requested_stop(investigation.id)
         if stopped is not None:
             return stopped, stopped.stop_reason
-        opinion_written = await self._apply_opinion_delta(
+        valid_anchors = frozenset(
+            item.anchor
+            for item in (context.article.publication_anchors if context.article is not None else ())
+        )
+        opinion_written, opinion_rejections = await self._apply_opinion_delta(
             investigation_id=investigation.id,
             state=state,
             delta=decision.opinion_delta,
+            valid_anchors=valid_anchors,
         )
+        action_summaries.extend(opinion_rejections)
         progress = progress or opinion_written
         stopped = await self._requested_stop(investigation.id)
         if stopped is not None:
@@ -950,12 +1372,19 @@ class InvestigationService:
             findings=new_findings,
         )
         decision_sha256 = hashlib.sha256(decision.canonical_bytes()).hexdigest()
+        if any(item.startswith("opinion_validation_rejected:") for item in opinion_rejections):
+            action_summaries.append(f"opinion_attempt_rejected:{context_sha256}")
+        acknowledged_request_ids = tuple(
+            request_id
+            for request_id in decision.addressed_request_ids
+            if request_id in set(user_request_ids)
+        )
         turn_state = replace(
             state,
             recent_actions=tuple(
                 action
                 for action in state.recent_actions
-                if not _user_request_was_in_context(action, user_request_ids)
+                if not _user_request_was_in_context(action, acknowledged_request_ids)
             ),
         )
         updated = turn_state.with_turn(
@@ -981,6 +1410,38 @@ class InvestigationService:
             action_summaries=tuple(action_summaries),
             hypotheses=hypotheses,
         )
+        if deduplicated_findings:
+            updated = replace(
+                updated,
+                deduplicated_findings=(state.deduplicated_findings + deduplicated_findings),
+            )
+        pending_request_actions = tuple(
+            action
+            for action in turn_state.recent_actions
+            if action.startswith(USER_REQUEST_ACTION_PREFIX)
+        )
+        pending_request_ids = {
+            str(request_id)
+            for action in pending_request_actions
+            if (request_id := _user_request_id(action)) is not None
+        }
+        pending_request_markers = tuple(
+            action
+            for action in state.recent_actions
+            if action.startswith("api:user-request:")
+            and action.rsplit(":", 1)[-1] in pending_request_ids
+        )
+        protected_actions = (*pending_request_markers, *pending_request_actions)
+        protected_set = set(protected_actions)
+        history_actions = tuple(
+            action for action in updated.recent_actions if action not in protected_set
+        )
+        history_limit = max(0, 32 - len(protected_actions))
+        if history_limit:
+            history_actions = history_actions[-history_limit:]
+        else:
+            history_actions = ()
+        updated = replace(updated, recent_actions=(*history_actions, *protected_actions))
         await self._save_state(state, updated)
         # Tools such as hit acquisition consume the aggregate's LoopBudget in their
         # own unit of work; apply only this turn's mutation on the current row so
@@ -1118,6 +1579,19 @@ class InvestigationService:
             await self._save_envelope_version(envelope)
         await self._audit_decisions.append(decision)
         await self._commit_current_uow()
+        if resolved.status is ToolInvocationStatus.FAILED:
+            _log_terminal_tool_failure(
+                resolved,
+                ToolResult(
+                    status=ToolInvocationStatus.FAILED,
+                    exception_class="OperatorReconciliation",
+                    error_code=(
+                        "operator_declared_not_executed"
+                        if outcome is InvocationReconciliationOutcome.NOT_EXECUTED
+                        else "operator_abandoned_invocation"
+                    ),
+                ),
+            )
         return resolved
 
     def _alternative_tools(
@@ -1150,12 +1624,33 @@ class InvestigationService:
     ) -> tuple[ToolResult, tuple[UUID, ...], StopReason | None]:
         status = invocation.status
         if status in {ToolInvocationStatus.SUCCEEDED, ToolInvocationStatus.EMPTY}:
+            reference = (
+                f" See observation {invocation.response_refs[0]}."
+                if invocation.response_refs
+                else " No observation reference was recorded."
+            )
             return (
                 ToolResult(
                     status=status,
                     observation_refs=invocation.response_refs,
                     budget_consumed=invocation.consumed_budget,
-                    message="Reused persisted tool invocation.",
+                    message="Already executed; reuse the persisted result." + reference,
+                ),
+                invocation.response_refs,
+                None,
+            )
+        if status is ToolInvocationStatus.UNAVAILABLE:
+            reference = (
+                f" See observation {invocation.response_refs[0]}."
+                if invocation.response_refs
+                else " No observation reference was recorded."
+            )
+            return (
+                ToolResult(
+                    status=status,
+                    observation_refs=invocation.response_refs,
+                    budget_consumed=invocation.consumed_budget,
+                    message="Already executed and provider unavailable; do not repeat." + reference,
                 ),
                 invocation.response_refs,
                 None,
@@ -1164,6 +1659,14 @@ class InvestigationService:
             reviewed = invocation.transition(ToolInvocationStatus.NEEDS_REVIEW)
             await self._invocations.update_if_version(reviewed, expected_version=invocation.version)
             await self._commit_current_uow()
+            _log_terminal_tool_failure(
+                reviewed,
+                ToolResult(
+                    status=ToolInvocationStatus.NEEDS_REVIEW,
+                    exception_class="InvocationReplayRecovery",
+                    error_code="running_invocation_requires_reconciliation",
+                ),
+            )
             return (
                 ToolResult(
                     status=ToolInvocationStatus.NEEDS_REVIEW,
@@ -1205,7 +1708,27 @@ class InvestigationService:
     async def _persist_result_observations(
         self, invocation: ToolInvocation, result: ToolResult
     ) -> tuple[EvidenceObservation, ...]:
-        if not result.output or result.observation_refs:
+        if (
+            result.error_code == "invalid_tool_arguments"
+            or result.output.get("error_code") == "invalid_tool_arguments"
+        ):
+            # Local schema rejection is a correction signal, not evidence about
+            # the external subject or the provider's response.
+            return ()
+        provider_auth_refusal = (
+            result.status is ToolInvocationStatus.UNAVAILABLE
+            and result.output.get("reason") == "provider_authorization_refused"
+        )
+        provider_download_refusal = result.status is ToolInvocationStatus.UNAVAILABLE and (
+            result.output.get("reason")
+            in {
+                "provider_download_route_not_found",
+                "provider_download_authorization_refused",
+            }
+        )
+        if not result.output or (
+            result.observation_refs and not provider_auth_refusal and not provider_download_refusal
+        ):
             return ()
         if self._observation_writer is None:
             raise RuntimeError("No observation archive is configured for tool output")
@@ -1228,6 +1751,20 @@ class InvestigationService:
         proposals: Sequence[Any],
         decision_trace: str,
     ) -> tuple[InvestigationFinding, ...]:
+        findings, _ = await self._persist_findings_with_count(
+            investigation_id=investigation_id,
+            proposals=proposals,
+            decision_trace=decision_trace,
+        )
+        return findings
+
+    async def _persist_findings_with_count(
+        self,
+        *,
+        investigation_id: UUID,
+        proposals: Sequence[Any],
+        decision_trace: str,
+    ) -> tuple[tuple[InvestigationFinding, ...], int]:
         snapshot = await self._context_builder.article_snapshots.resolve(
             (await self._require_investigation(investigation_id)).synthesis_artifact_id
         )
@@ -1238,6 +1775,8 @@ class InvestigationService:
             article_snapshots=self._context_builder.article_snapshots,
         )
         persisted = []
+        deduplicated = 0
+        existing_findings = list(await self._findings.list_for_investigation(investigation_id))
         for proposal in proposals:
             # Hypothesis links are transient annotations for the working state,
             # not part of the finding's persistent evidence identity.
@@ -1248,6 +1787,7 @@ class InvestigationService:
             existing = await self._findings.get(finding_id)
             if existing is not None:
                 persisted.append(existing)
+                deduplicated += 1
                 continue
             raw_refs = tuple(proposal.observation_refs)
             observation_refs = await self._valid_observation_refs(investigation_id, raw_refs)
@@ -1363,10 +1903,22 @@ class InvestigationService:
                 limitations=tuple(limitations),
                 id=finding_id,
             )
-            persisted.append(
-                await self._findings.append_version(finding, expected_previous_id=None)
+            semantic_duplicate = next(
+                (
+                    item
+                    for item in existing_findings
+                    if _semantic_finding_identity(item) == _semantic_finding_identity(finding)
+                ),
+                None,
             )
-        return tuple(persisted)
+            if semantic_duplicate is not None:
+                persisted.append(semantic_duplicate)
+                deduplicated += 1
+                continue
+            saved = await self._findings.append_version(finding, expected_previous_id=None)
+            persisted.append(saved)
+            existing_findings.append(saved)
+        return tuple(persisted), deduplicated
 
     async def _apply_opinion_delta(
         self,
@@ -1374,14 +1926,15 @@ class InvestigationService:
         investigation_id: UUID,
         state: InvestigationWorkingState,
         delta: Any | None,
-    ) -> bool:
+        valid_anchors: frozenset[str] = frozenset(),
+    ) -> tuple[bool, tuple[str, ...]]:
         if (
             delta is None
             or state.base_publication_artifact_id is None
             or state.base_publication_sha256 is None
         ):
-            return False
-        opinion_id = uuid5(_OPINION_NAMESPACE, str(investigation_id))
+            return False, ()
+        opinion_id = investigation_opinion_id(investigation_id)
         current = await self._opinions.get(opinion_id)
         findings = tuple(await self._findings.list_for_investigation(investigation_id))
         observations = tuple(await self._observations.list_for_investigation(investigation_id))
@@ -1389,6 +1942,8 @@ class InvestigationService:
         observation_ids = {item.id for item in observations}
         blocks_by_type = {item.block_type: item for item in current.blocks} if current else {}
         unresolved = list(current.unresolved_points if current else ())
+        rejections: list[str] = []
+        notes_by_anchor = {item.anchor: item for item in (current.observations if current else ())}
         for proposed in delta.blocks:
             valid_findings = tuple(ref for ref in proposed.finding_refs if ref in finding_by_id)
             valid_observations = tuple(
@@ -1437,16 +1992,109 @@ class InvestigationService:
                 unresolved.append(
                     f"Opinion block {block.block_type.value} withheld: citation validation failed."
                 )
+                rejections.append(
+                    "opinion_validation_rejected: cite existing finding and evidence IDs that "
+                    "satisfy the requested qualification."
+                )
                 continue
             blocks_by_type[block.block_type] = block
+        for proposed in getattr(delta, "notes", ()):
+            if proposed.anchor not in valid_anchors:
+                rejections.append(
+                    "note_validation_rejected: use an anchor listed in article.publication_anchors."
+                )
+                continue
+            valid_findings = tuple(ref for ref in proposed.finding_refs if ref in finding_by_id)
+            valid_evidence = tuple(ref for ref in proposed.evidence_refs if ref in observation_ids)
+            if len(valid_findings) != len(proposed.finding_refs) or len(valid_evidence) != len(
+                proposed.evidence_refs
+            ):
+                rejections.append(
+                    "note_validation_rejected: cite only existing finding and observation IDs."
+                )
+                continue
+            existing_note = notes_by_anchor.get(proposed.anchor)
+            if existing_note is not None and _normalize_opinion_note_text(
+                existing_note.text
+            ) == _normalize_opinion_note_text(proposed.text):
+                continue
+            if existing_note is None and len(notes_by_anchor) >= 24:
+                rejections.append(
+                    "note_validation_rejected: the opinion already has the 24-note limit."
+                )
+                continue
+            note_id = (
+                existing_note.id
+                if existing_note is not None
+                else uuid5(
+                    _OPINION_NAMESPACE,
+                    f"{investigation_id}:note:{proposed.anchor}",
+                )
+            )
+            note = AnalystObservationV1(
+                id=note_id,
+                anchor=proposed.anchor,
+                text=proposed.text,
+                state=proposed.state,
+                relation=proposed.relation,
+                finding_refs=valid_findings,
+                evidence_refs=valid_evidence,
+            )
+            trial_notes_by_anchor = {**notes_by_anchor, proposed.anchor: note}
+            trial_blocks = opinion_blocks_with_observations(
+                tuple(
+                    item
+                    for item in blocks_by_type.values()
+                    if item.block_type.value != "analyst_observations"
+                ),
+                tuple(trial_notes_by_anchor.values()),
+            )
+            trial = AnalystOpinionV1(
+                id=opinion_id,
+                version=(current.version + 1) if current else 1,
+                investigation_id=investigation_id,
+                synthesis_artifact_id=(
+                    await self._require_investigation(investigation_id)
+                ).synthesis_artifact_id,
+                synthesis_sha256=(
+                    await self._context_builder.article_snapshots.resolve(
+                        (await self._require_investigation(investigation_id)).synthesis_artifact_id
+                    )
+                ).synthesis_sha256,
+                base_publication_artifact_id=state.base_publication_artifact_id,
+                base_publication_sha256=state.base_publication_sha256,
+                blocks=trial_blocks,
+                author_id=self._author_id,
+                status=AnalystOpinionStatus.DRAFT,
+                unresolved_points=tuple(unresolved),
+            )
+            note_violations = tuple(
+                violation
+                for violation in verify_opinion_citations(trial, findings, observations)
+                if violation.reference_id == note.id
+                or violation.reference_id in {*note.finding_refs, *note.evidence_refs}
+            )
+            if note_violations:
+                rejections.append(
+                    "note_validation_rejected: the cited evidence does not support this note state."
+                )
+                continue
+            notes_by_anchor[proposed.anchor] = note
         unresolved.extend(delta.unresolved_points)
-        blocks = tuple(blocks_by_type.values())
+        blocks = opinion_blocks_with_observations(
+            tuple(
+                item
+                for item in blocks_by_type.values()
+                if item.block_type.value != "analyst_observations"
+            ),
+            tuple(notes_by_anchor.values()),
+        )
         if (
             current is not None
             and blocks == current.blocks
             and tuple(unresolved) == current.unresolved_points
         ):
-            return False
+            return False, tuple(rejections)
         investigation = await self._require_investigation(investigation_id)
         snapshot = await self._context_builder.article_snapshots.resolve(
             investigation.synthesis_artifact_id
@@ -1466,9 +2114,13 @@ class InvestigationService:
             unresolved_points=tuple(dict.fromkeys(unresolved)),
         )
         if verify_opinion_citations(opinion, findings, observations):
-            return False
+            rejections.append(
+                "opinion_validation_rejected: correct citations to existing supported findings "
+                "and observations."
+            )
+            return False, tuple(rejections)
         await self._opinions.append_version(opinion, expected_version=expected_version)
-        return True
+        return True, tuple(rejections)
 
     @staticmethod
     def _update_hypotheses(
@@ -1546,6 +2198,8 @@ class InvestigationService:
         if turn.status is TurnSubmissionStatus.NEEDS_REVIEW:
             return StopReason.SUBMISSION_NEEDS_REVIEW
         if turn.status is TurnSubmissionStatus.INVALID_OUTPUT:
+            return StopReason.SUBMISSION_NEEDS_REVIEW
+        if turn.status is TurnSubmissionStatus.PRE_SUBMISSION_RETRY_EXHAUSTED:
             return StopReason.SUBMISSION_NEEDS_REVIEW
         return StopReason.MODEL_UNAVAILABLE
 
@@ -1703,9 +2357,12 @@ class InvestigationService:
         budget: InvestigationBudget,
         *,
         blocked: bool,
+        confirmed_non_submission: bool = False,
     ) -> None:
         if await self._envelopes.get(investigation_id) is None:
-            if blocked:
+            if confirmed_non_submission:
+                budget.release_confirmed_non_submission(operation_key)
+            elif blocked:
                 budget.release(operation_key)
             else:
                 budget.commit(operation_key)
@@ -1722,7 +2379,9 @@ class InvestigationService:
                 ),
                 None,
             )
-            if reservation is None or reservation.status is BudgetReservationStatus.RESERVED:
+            if confirmed_non_submission and reservation is not None:
+                envelope.budget.release_confirmed_non_submission(operation_key)
+            elif reservation is None or reservation.status is BudgetReservationStatus.RESERVED:
                 if blocked:
                     envelope.budget.release(operation_key)
                 elif reservation is not None:
@@ -1780,7 +2439,11 @@ class InvestigationService:
                 ToolInvocationStatus.SUCCEEDED,
                 ToolInvocationStatus.EMPTY,
                 ToolInvocationStatus.PARTIAL,
-            }:
+            } or (
+                result.status is ToolInvocationStatus.UNAVAILABLE
+                and result.output.get("confirmed_non_execution") is True
+                and any(amount > 0 for amount in result.budget_consumed.values())
+            ):
                 consumed = dict(result.budget_consumed or reserved_amounts)
                 envelope.budget.commit(operation_key, consumed)
             else:
@@ -1819,21 +2482,108 @@ class InvestigationService:
     async def _save_state(
         self, current: InvestigationWorkingState, updated: InvestigationWorkingState
     ) -> None:
-        try:
-            await self._states.save_if_version(updated, expected_version=current.version)
-        except InvestigationStateVersionConflict:
-            raise
+        base = current
+        candidate = updated
+        for attempt in range(MAX_STATE_VERSION_CONFLICT_RETRIES):
+            try:
+                await self._states.save_if_version(candidate, expected_version=base.version)
+                return
+            except InvestigationStateVersionConflict:
+                if attempt + 1 >= MAX_STATE_VERSION_CONFLICT_RETRIES:
+                    raise
+                latest = await self._require_state(base.investigation_id)
+                candidate = _rebase_investigation_state_update(base, candidate, latest)
+                base = latest
+
+
+def _rebase_investigation_state_update(
+    base: InvestigationWorkingState,
+    candidate: InvestigationWorkingState,
+    latest: InvestigationWorkingState,
+) -> InvestigationWorkingState:
+    """Apply a job's state delta over a concurrent operator-action append.
+
+    Concurrent writes to other investigation state fields are not silently
+    overwritten. Operator requests only append to ``recent_actions``; that
+    history is merged so neither the request nor the job's own action is lost.
+    """
+    if base.investigation_id != candidate.investigation_id or (
+        base.investigation_id != latest.investigation_id
+    ):
+        raise InvestigationStateVersionConflict("Investigation state identity changed")
+
+    changed_fields = {
+        item.name: getattr(candidate, item.name)
+        for item in fields(InvestigationWorkingState)
+        if item.name not in {"version", "recent_actions"}
+        and getattr(candidate, item.name) != getattr(base, item.name)
+    }
+    conflicting_fields = tuple(
+        name
+        for name, value in changed_fields.items()
+        if getattr(latest, name) != getattr(base, name) and getattr(latest, name) != value
+    )
+    if conflicting_fields:
+        raise InvestigationStateVersionConflict(
+            "Investigation state changed concurrently in fields: "
+            + ", ".join(sorted(conflicting_fields))
+        )
+
+    recent_actions = _merge_recent_actions(
+        base.recent_actions,
+        candidate.recent_actions,
+        latest.recent_actions,
+    )
+    return replace(
+        latest,
+        version=latest.version + 1,
+        recent_actions=recent_actions,
+        **changed_fields,
+    )
+
+
+def _merge_recent_actions(
+    base: tuple[str, ...],
+    candidate: tuple[str, ...],
+    latest: tuple[str, ...],
+) -> tuple[str, ...]:
+    removed = set(base).difference(candidate)
+    merged = [action for action in latest if action not in removed]
+    for action in candidate:
+        if action not in base and action not in merged:
+            merged.append(action)
+
+    protected = [
+        action
+        for action in merged
+        if action.startswith(USER_REQUEST_ACTION_PREFIX)
+        or action.startswith(_OPERATOR_REQUEST_MARKER_PREFIX)
+    ]
+    protected_set = set(protected)
+    history = [action for action in merged if action not in protected_set]
+    history_limit = max(0, _RECENT_ACTIONS_LIMIT - len(protected))
+    if history_limit:
+        history = history[-history_limit:]
+    else:
+        history = []
+    if len(protected) > _RECENT_ACTIONS_LIMIT:
+        protected = protected[-_RECENT_ACTIONS_LIMIT:]
+    return (*history, *protected)
 
 
 def _user_request_was_in_context(action: str, request_ids: tuple[UUID, ...]) -> bool:
+    request_id = _user_request_id(action)
+    return request_id in request_ids if request_id is not None else False
+
+
+def _user_request_id(action: str) -> UUID | None:
     if not action.startswith(USER_REQUEST_ACTION_PREFIX):
-        return False
+        return None
     try:
         payload = json.loads(action[len(USER_REQUEST_ACTION_PREFIX) :])
-        request_id = UUID(str(payload.get("request_id", "")))
+        return UUID(str(payload.get("request_id", "")))
     except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
-        return False
-    return request_id in request_ids
+        return None
 
 
 def _same_reconciliation_decision(actual: AnalystDecision, expected: AnalystDecision) -> bool:
@@ -1993,6 +2743,71 @@ def _normalize_subject_ref(subject_ref: str | None) -> str | None:
     return normalized
 
 
+def _normalize_opinion_note_text(text: str) -> str:
+    return " ".join(unicodedata.normalize("NFKC", text).casefold().split())
+
+
+def _rule_test_finish_status(
+    context: InvestigationContextV1,
+    invocations: Sequence[ToolInvocation],
+) -> tuple[tuple[tuple[str, int], ...], tuple[tuple[str, int], ...]]:
+    candidates: set[tuple[str, int]] = set()
+    for item in context.investigation.rule_deltas:
+        if not isinstance(item, Mapping) or item.get("kind") != "rule_candidate":
+            continue
+        if item.get("validation_status") != "untested":
+            continue
+        version = item.get("version")
+        if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+            continue
+        try:
+            candidate_id = str(UUID(str(item.get("candidate_id"))))
+        except (TypeError, ValueError):
+            continue
+        candidates.add((candidate_id, version))
+
+    if not candidates:
+        return (), ()
+    rule_test_available = any(item.name == "rule.test" for item in context.available_tools)
+    pending: list[tuple[str, int]] = []
+    unavailable: list[tuple[str, int]] = []
+    completed_statuses = {
+        ToolInvocationStatus.SUCCEEDED,
+        ToolInvocationStatus.PARTIAL,
+        ToolInvocationStatus.EMPTY,
+    }
+    for candidate_id, version in sorted(candidates):
+        matching = tuple(
+            invocation
+            for invocation in invocations
+            if invocation.tool_name == "rule.test"
+            and invocation.normalized_parameters.get("candidate_id") == candidate_id
+            and invocation.normalized_parameters.get("version") == version
+        )
+        if any(item.status in completed_statuses for item in matching):
+            continue
+        if not rule_test_available or any(
+            item.status is ToolInvocationStatus.UNAVAILABLE for item in matching
+        ):
+            unavailable.append((candidate_id, version))
+            continue
+        pending.append((candidate_id, version))
+    return tuple(pending), tuple(unavailable)
+
+
+def _semantic_finding_identity(
+    finding: InvestigationFinding,
+) -> tuple[FindingKind, FindingAssessment, str, frozenset[str], frozenset[UUID]]:
+    statement = " ".join(unicodedata.normalize("NFC", finding.statement).split())
+    return (
+        finding.kind,
+        finding.assessment,
+        statement,
+        frozenset(finding.claim_refs),
+        frozenset(finding.observation_refs),
+    )
+
+
 def _is_sample_hash(value: str | None) -> bool:
     if value is None or len(value) not in {32, 40, 64}:
         return False
@@ -2028,6 +2843,13 @@ def _reservation_status(
     )
 
 
+def bridge_budget_operation_key(
+    *, investigation_id: UUID, turn_index: int, context_sha256: str, attempt: int = 0
+) -> str:
+    key = f"bridge:{investigation_id}:{turn_index}:{context_sha256}"
+    return f"{key}:attempt={attempt}" if attempt else key
+
+
 def _copy_investigation_budget(budget: InvestigationBudget) -> InvestigationBudget:
     copied = InvestigationBudget(limits=dict(budget.limits))
     for reservation in budget.reservations:
@@ -2037,7 +2859,11 @@ def _copy_investigation_budget(budget: InvestigationBudget) -> InvestigationBudg
 
 def _confirmed_external_non_execution(result: ToolResult) -> bool:
     """Return true for an explicit local/provider rejection known to have no effect."""
-    return result.output.get("reason") == "subject_slot_limit"
+    return (
+        result.error_code == "invalid_tool_arguments"
+        or result.output.get("error_code") == "invalid_tool_arguments"
+        or result.output.get("reason") == "subject_slot_limit"
+    )
 
 
 def _action_summary(tool_name: str, status: ToolInvocationStatus, message: str) -> str:
@@ -2046,6 +2872,50 @@ def _action_summary(tool_name: str, status: ToolInvocationStatus, message: str) 
         " ".join(message.replace("\x00", "").split()), max_chars=300
     )
     return f"{safe_tool_name}: {status.value}{': ' + safe_message if safe_message else ''}"
+
+
+def _log_terminal_tool_failure(
+    invocation: ToolInvocation,
+    result: ToolResult,
+    *,
+    exception_class: str | None = None,
+    error_code: str | None = None,
+) -> None:
+    if invocation.status not in {
+        ToolInvocationStatus.NEEDS_REVIEW,
+        ToolInvocationStatus.FAILED,
+    }:
+        return
+    raw_code = (
+        error_code
+        or result.error_code
+        or result.output.get("error_code")
+        or (
+            "tool_execution_failed"
+            if invocation.status is ToolInvocationStatus.FAILED
+            else "tool_outcome_needs_review"
+        )
+    )
+    raw_exception = exception_class or result.exception_class or "not_reported"
+    safe_code = _SAFE_LOG_TOKEN.sub("_", str(raw_code))[:96] or "unspecified"
+    safe_exception = _SAFE_LOG_TOKEN.sub("_", str(raw_exception))[:96] or "unknown"
+    safe_tool = _SAFE_LOG_TOKEN.sub("_", invocation.tool_name)[:128] or "unknown"
+    # Tool messages are static, provider-free strings; keep a bounded one-line copy
+    # so a needs_review outcome without an error code stays diagnosable from logs.
+    safe_reason = " ".join(str(result.message or "").replace("\x00", "").split())[:200]
+    _logger.warning(
+        "investigation tool invocation finished in a failure state"
+        + (f": {safe_reason}" if safe_reason else ""),
+        extra={
+            "event": "investigation_tool_invocation_terminal_failure",
+            "tool_name": safe_tool,
+            "exception_class": safe_exception,
+            "error_code": safe_code,
+            "investigation_id": str(invocation.investigation_id),
+            "invocation_id": str(invocation.id),
+            "status": invocation.status.value,
+        },
+    )
 
 
 __all__ = [

@@ -22,6 +22,7 @@ from cti_app.api.fusion import fusion_router
 from cti_app.api.health import router as health_router
 from cti_app.api.investigation import router as investigation_router
 from cti_app.api.investigation_captures import router as investigation_captures_router
+from cti_app.api.investigation_rule_corpus import router as investigation_rule_corpus_router
 from cti_app.api.jobs import router as jobs_router
 from cti_app.api.model_conversations import router as model_conversations_router
 from cti_app.api.pdf_inspection import router as pdf_inspection_router
@@ -100,6 +101,7 @@ from cti_app.application.production_repairs import (
     ProductionRepairProjectionService,
 )
 from cti_app.application.publication_rendering import PublicationRenderService
+from cti_app.application.rule_corpus_import import ManualRuleCorpusImportService
 from cti_app.application.selection import SelectionService
 from cti_app.application.subject_content import SubjectContentService
 from cti_app.application.subjects import SubjectService
@@ -131,8 +133,8 @@ from cti_app.infrastructure.quarantined_capture_source import ProductionQuaranti
 from cti_app.infrastructure.shodan import create_shodan_http_adapter, create_shodan_http_client
 from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
 from cti_app.infrastructure.virustotal import (
-    VirusTotalHttpAdapter,
     create_virustotal_direct_http_client,
+    create_virustotal_http_adapter,
     create_virustotal_http_client,
 )
 from cti_app.integrations.model_factory import (
@@ -211,29 +213,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
         if settings.virustotal_api_key and settings.virustotal_file_report_legacy_fallback_enabled:
             vt_direct_client = create_virustotal_direct_http_client(settings)
-        vt_adapter = VirusTotalHttpAdapter(
+        vt_adapter = create_virustotal_http_adapter(
             client=vt_proxy_client,
-            base_url=settings.virustotal_base_url,
-            fallback_base_url=settings.virustotal_fallback_base_url,
-            legacy_base_url=settings.virustotal_legacy_base_url,
-            direct_client=vt_direct_client,
-            api_key=(
-                settings.virustotal_api_key.get_secret_value()
-                if vt_direct_client is not None and settings.virustotal_api_key is not None
-                else None
-            ),
+            settings=settings,
             capabilities=vt_capabilities,
-            file_report_proxy_fallback_enabled=settings.virustotal_file_report_proxy_fallback_enabled,
-            file_report_legacy_fallback_enabled=settings.virustotal_file_report_legacy_fallback_enabled,
+            direct_client=vt_direct_client,
             routing_policy=(
                 None if settings.virustotal_proxy_url else VirusTotalRoutingPolicy(routes={})
             ),
-            max_response_bytes=settings.virustotal_max_response_bytes,
-            default_page_size=settings.virustotal_default_page_size,
-            max_page_size=settings.virustotal_max_page_size,
-            max_pages=settings.virustotal_max_pages,
-            max_results=settings.virustotal_max_results,
-            file_download_enabled=settings.virustotal_file_download_enabled,
         )
     shodan_enabled = settings.shodan_api_key is not None and any(
         (
@@ -366,6 +353,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         blob_store,
         retention_days=settings.model_conversation_retention_days,
         conversation_session_closer=bridge_provider,
+        visible_recovery_transport=bridge_provider,
     )
 
     blob_catalog = BlobCatalogService(blob_store, uow_factory)
@@ -373,6 +361,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     network_capture_import_service = NetworkCaptureImportService(
         uow_factory=uow_factory,
         blob_catalog=blob_catalog,
+        settings=settings,
+    )
+    rule_corpus_import_service = ManualRuleCorpusImportService(
+        uow_factory=uow_factory,
+        blob_catalog=blob_catalog,
+        artifact_store=production_artifact_store,
         settings=settings,
     )
     vt_observations = (
@@ -509,6 +503,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.edition_service = EditionService(uow_factory)
     app.state.subject_service = SubjectService(uow_factory)
     app.state.network_capture_import_service = network_capture_import_service
+    app.state.rule_corpus_import_service = rule_corpus_import_service
     app.state.model_gateway = model_gateway
     app.state.bridge_capabilities_provider = bridge_provider
     app.state.model_conversation_service = model_conversation_service
@@ -737,6 +732,7 @@ def create_app() -> FastAPI:
     application.include_router(model_conversations_router)
     application.include_router(investigation_router)
     application.include_router(investigation_captures_router)
+    application.include_router(investigation_rule_corpus_router)
     application.include_router(production_router)
     application.include_router(production_control_router)
     application.include_router(publication_router)

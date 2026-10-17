@@ -5,11 +5,12 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import logging
 import math
 import re
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol, cast, runtime_checkable
 from uuid import UUID, uuid4, uuid5
 
@@ -32,8 +33,10 @@ from cti_app.application.investigation_tools import (
     ToolExecutionContext,
     ToolRegistry,
     ToolResult,
+    validate_json_schema,
 )
 from cti_app.application.persistence import UnitOfWorkFactory
+from cti_app.application.rule_corpus_import import list_manual_rule_corpus_imports
 from cti_app.application.rule_workbench import (
     RuleCorpusBytesPort,
     RuleCorpusBytesUnavailable,
@@ -58,6 +61,7 @@ from cti_app.domain.investigation import (
 )
 from cti_app.domain.rule_workbench import (
     RuleConditionStrategy,
+    RuleCorpusInventoryItem,
     RuleMotif,
     RuleMotifKind,
     RuleMotifProvenanceKind,
@@ -65,6 +69,7 @@ from cti_app.domain.rule_workbench import (
     RuleTestCase,
     RuleTestCorpusRole,
     RuleTestReport,
+    RuleValidationStatus,
     RuleVersionComparison,
 )
 
@@ -99,6 +104,19 @@ def _schema(
     return result
 
 
+def _allow_empty_optional(schema: Mapping[str, Any], description: str) -> dict[str, Any]:
+    result = dict(schema)
+    schema_type = result["type"]
+    if schema_type == "string":
+        pattern = result.get("pattern")
+        result["pattern"] = f"(?:{pattern})|^$" if pattern else "^$"
+    else:
+        result["type"] = [schema_type, "string"]
+        result["pattern"] = "^$"
+    result["description"] = description
+    return result
+
+
 _MOTIF_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
@@ -127,6 +145,13 @@ _MOTIF_SCHEMA: dict[str, Any] = {
             "maxItems": 16,
             "uniqueItems": True,
         },
+        "article_claim_refs": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1, "maxLength": 128},
+            "minItems": 1,
+            "maxItems": 16,
+            "uniqueItems": True,
+        },
         "sample_sha256": {"type": "string", "pattern": _SHA256_PATTERN},
         "offsets": {
             "type": "array",
@@ -140,67 +165,110 @@ _MOTIF_SCHEMA: dict[str, Any] = {
         "benign_prevalence": {"type": "integer", "minimum": 0},
         "goodware_occurrence_count": {"type": "integer", "minimum": 0},
     },
-    "required": ["kind", "value", "provenance_kind", "provenance_id", "observation_refs"],
+    "required": ["kind", "value", "provenance_kind", "provenance_id"],
 }
+
+_META_OBJECT_SCHEMA: dict[str, Any] = {
+    "type": ["object", "string", "null"],
+    "additionalProperties": False,
+    "properties": {
+        "classification": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": _SAFE_TEXT_PATTERN,
+        },
+        "family": {"type": "string", "maxLength": 128, "pattern": _SAFE_TEXT_PATTERN},
+        "description": {"type": "string", "maxLength": 512, "pattern": _SAFE_TEXT_PATTERN},
+        "source": {"type": "string", "maxLength": 128, "pattern": _SAFE_TEXT_PATTERN},
+    },
+}
+_META_INPUT_SCHEMA: dict[str, Any] = {
+    **_META_OBJECT_SCHEMA,
+    "default": {},
+    "description": (
+        "Optional JSON object with classification, family, description, or source. Omit it, "
+        "use {}, or leave it empty for no metadata. Example: ARG meta: "
+        '{"description": "..."}. A JSON-encoded object string is also accepted.'
+    ),
+}
+_META_AGENT_ERROR = (
+    'meta must be an object or a JSON-encoded object. Example: ARG meta: {"description": "..."}'
+)
 
 RULE_PROPOSE_SCHEMA = _schema(
     {
-        "motifs": {"type": "array", "items": _MOTIF_SCHEMA, "minItems": 1, "maxItems": 128},
-        "feature_refs": {
-            "type": "array",
-            "items": {"type": "string", "pattern": _UUID_PATTERN},
-            "minItems": 1,
-            "maxItems": 64,
-            "uniqueItems": True,
-        },
-        "candidate_id": {"type": "string", "pattern": _UUID_PATTERN},
-        "condition": {"type": "string", "enum": [item.value for item in RuleConditionStrategy]},
-        "meta": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "classification": {
-                    "type": "string",
-                    "maxLength": 128,
-                    "pattern": _SAFE_TEXT_PATTERN,
-                },
-                "family": {"type": "string", "maxLength": 128, "pattern": _SAFE_TEXT_PATTERN},
-                "description": {"type": "string", "maxLength": 512, "pattern": _SAFE_TEXT_PATTERN},
-                "source": {"type": "string", "maxLength": 128, "pattern": _SAFE_TEXT_PATTERN},
+        "motifs": _allow_empty_optional(
+            {"type": "array", "items": _MOTIF_SCHEMA, "maxItems": 128},
+            "Optional structured motif array; an empty value means no supplied motifs.",
+        ),
+        "feature_refs": _allow_empty_optional(
+            {
+                "type": "array",
+                "items": {"type": "string", "pattern": _UUID_PATTERN},
+                "maxItems": 64,
+                "uniqueItems": True,
             },
+            "Optional feature UUID array; an empty value means no feature references.",
+        ),
+        "candidate_id": _allow_empty_optional(
+            {"type": "string", "pattern": _UUID_PATTERN},
+            "Optional UUID; omit or leave empty to create a new candidate ID.",
+        ),
+        "condition": {
+            "type": "string",
+            "enum": [item.value for item in RuleConditionStrategy],
+            "description": "Required strategy: all, any, or majority; this is not free text.",
         },
+        "meta": _META_INPUT_SCHEMA,
     },
     required=("condition",),
 )
 
 RULE_TEST_SCHEMA = _schema(
     {
-        "candidate_id": {"type": "string", "pattern": _UUID_PATTERN},
-        "version": {"type": "integer", "minimum": 1},
+        "candidate_id": {
+            "type": "string",
+            "pattern": _UUID_PATTERN,
+            "description": (
+                "Use candidate_id returned by rule.propose or listed in investigation.rule_deltas "
+                "under kind=rule_candidate."
+            ),
+        },
+        "version": _allow_empty_optional(
+            {"type": "integer", "minimum": 1},
+            "Optional version number; omit or leave empty to select the latest version.",
+        ),
     },
     ("candidate_id",),
 )
 
 RULE_REVISE_SCHEMA = _schema(
     {
-        "candidate_id": {"type": "string", "pattern": _UUID_PATTERN},
-        "parent_version": {"type": "integer", "minimum": 1},
-        "motifs": {"type": "array", "items": _MOTIF_SCHEMA, "minItems": 1, "maxItems": 128},
-        "condition": {"type": "string", "enum": [item.value for item in RuleConditionStrategy]},
-        "meta": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "classification": {
-                    "type": "string",
-                    "maxLength": 128,
-                    "pattern": _SAFE_TEXT_PATTERN,
-                },
-                "family": {"type": "string", "maxLength": 128, "pattern": _SAFE_TEXT_PATTERN},
-                "description": {"type": "string", "maxLength": 512, "pattern": _SAFE_TEXT_PATTERN},
-                "source": {"type": "string", "maxLength": 128, "pattern": _SAFE_TEXT_PATTERN},
-            },
+        "candidate_id": {
+            "type": "string",
+            "pattern": _UUID_PATTERN,
+            "description": (
+                "Use candidate_id returned by rule.propose or listed in investigation.rule_deltas "
+                "under kind=rule_candidate."
+            ),
         },
+        "parent_version": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Use the current version shown for that candidate in rule_deltas.",
+        },
+        "motifs": _allow_empty_optional(
+            {"type": "array", "items": _MOTIF_SCHEMA, "maxItems": 128},
+            "Optional structured motif array; empty means retain the current motifs.",
+        ),
+        "condition": {
+            "type": "string",
+            "enum": [*(item.value for item in RuleConditionStrategy), ""],
+            "description": (
+                "Optional strategy: all, any, or majority. Omit or leave empty to retain it."
+            ),
+        },
+        "meta": _META_INPUT_SCHEMA,
     },
     ("candidate_id", "parent_version"),
 )
@@ -217,8 +285,14 @@ RULE_COMPARE_SCHEMA = _schema(
 RULE_GET_SCHEMA = _schema(
     {
         "candidate_id": {"type": "string", "pattern": _UUID_PATTERN},
-        "version": {"type": "integer", "minimum": 1},
-        "include_history": {"type": "boolean"},
+        "version": _allow_empty_optional(
+            {"type": "integer", "minimum": 1},
+            "Optional version number; omit or leave empty to select the latest version.",
+        ),
+        "include_history": _allow_empty_optional(
+            {"type": "boolean"},
+            "Optional boolean; omit or leave empty to return only the selected version.",
+        ),
     },
     ("candidate_id",),
 )
@@ -239,11 +313,21 @@ class EvidencePayloadReader(Protocol):
     async def read_json(self, blob_id: UUID) -> dict[str, Any]: ...
 
 
+class RuleArticleClaimPort(Protocol):
+    async def get_claims(
+        self, investigation_id: UUID, claim_ids: tuple[str, ...]
+    ) -> Sequence[Any]: ...
+
+
 @runtime_checkable
 class RuleCorpusInventoryPort(Protocol):
     async def goodware_sample_sha256s(self, investigation_id: UUID) -> Sequence[str]: ...
 
     async def holdout_sample_sha256s(self, investigation_id: UUID) -> Sequence[str]: ...
+
+    async def manual_rule_corpus_imports(
+        self, investigation_id: UUID
+    ) -> Sequence[RuleCorpusInventoryItem]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -269,6 +353,12 @@ class _EmptyRuleCorpusInventory:
         return ()
 
     async def holdout_sample_sha256s(self, investigation_id: UUID) -> Sequence[str]:
+        del investigation_id
+        return ()
+
+    async def manual_rule_corpus_imports(
+        self, investigation_id: UUID
+    ) -> Sequence[RuleCorpusInventoryItem]:
         del investigation_id
         return ()
 
@@ -331,19 +421,25 @@ class QuarantineRuleCorpusBytes(RuleCorpusBytesPort):
         return payload
 
     async def goodware_sample_sha256s(self, investigation_id: UUID) -> Sequence[str]:
-        async with self._uow_factory() as uow:
-            baseline_id = await uow.investigation_goodware_baselines.get(investigation_id)
-            if baseline_id is None:
-                return ()
-            baseline = await uow.goodware_baselines.get(baseline_id)
-        if baseline is None:
-            return ()
-        return tuple(sorted({source.sha256 for source in baseline.sources}))
+        # Goodware baselines contain feature fingerprints, not benign file bytes.
+        del investigation_id
+        return ()
 
     async def holdout_sample_sha256s(self, investigation_id: UUID) -> Sequence[str]:
         if self._holdout_sample_provider is None:
             return ()
         return tuple(await self._holdout_sample_provider(investigation_id))
+
+    async def manual_rule_corpus_imports(
+        self, investigation_id: UUID
+    ) -> Sequence[RuleCorpusInventoryItem]:
+        return await list_manual_rule_corpus_imports(self._uow_factory, investigation_id)
+
+    async def rule_candidate_versions(
+        self, investigation_id: UUID
+    ) -> Sequence[DetectionCandidateVersion]:
+        async with self._uow_factory() as uow:
+            return await uow.detection_candidates.list_for_investigation(investigation_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -376,7 +472,9 @@ class _ToolUnavailable(RuntimeError):
 
 
 class _ToolFailed(RuntimeError):
-    pass
+    def __init__(self, reason: str, *, agent_message: str | None = None) -> None:
+        super().__init__(reason)
+        self.agent_message = agent_message
 
 
 def rule_tool_capabilities(
@@ -409,6 +507,7 @@ def rule_tool_capabilities(
 def register_rule_tools(
     registry: ToolRegistry,
     *,
+    tool_names: tuple[str, ...] | None = None,
     workbench: RuleWorkbench | None,
     candidates: DetectionCandidateRepository | None,
     associations: SampleAssociationRepository | None,
@@ -418,6 +517,7 @@ def register_rule_tools(
     evidence_payloads: EvidencePayloadReader | None = None,
     corpus_inventory: RuleCorpusInventoryPort | None = None,
     feature_provider: RuleFeatureProvider | None = None,
+    article_claims: RuleArticleClaimPort | None = None,
     max_tool_seconds: int = 30,
 ) -> _RuleTools:
     """Register local, optional rule tools without changing the investigation loop."""
@@ -438,9 +538,12 @@ def register_rule_tools(
         evidence_payloads=evidence_payloads,
         corpus_inventory=inventory,
         feature_provider=feature_provider,
+        article_claims=article_claims,
         max_tool_seconds=max_tool_seconds,
     )
-    for name, schema in _TOOL_SCHEMAS.items():
+    selected_names = tuple(_TOOL_SCHEMAS) if tool_names is None else tool_names
+    for name in selected_names:
+        schema = _TOOL_SCHEMAS[name]
         multiplier = 2 if name == "rule.compare" else 1
         cost = max_tool_seconds * multiplier if name != "rule.get" else 0
         registry.register(
@@ -455,12 +558,32 @@ def register_rule_tools(
                     "Règle locale facultative; aucun statut approuvé ou publié n'est produit.",
                     "Les sorties exposent des hashes et résumés bornés, jamais la source YARA "
                     "ni les octets.",
+                    *(
+                        (
+                            "meta est facultatif et doit être un objet JSON; omettez-le ou "
+                            "utilisez "
+                            '{} pour aucune méta. Exemple: ARG meta: {"description": "..."}.',
+                        )
+                        if name in {"rule.propose", "rule.revise"}
+                        else ()
+                    ),
+                    *(
+                        (
+                            "Pour tester ou réviser, passez candidate_id de rule.propose ou d'une "
+                            "entrée rule_deltas kind=rule_candidate.",
+                        )
+                        if name in {"rule.test", "rule.revise"}
+                        else ()
+                    ),
                 ),
                 capability_key=_TOOL_CAPABILITY_KEYS[name],
             ),
             _RuleToolAdapter(service, name),
         )
     return service
+
+
+_logger = logging.getLogger(__name__)
 
 
 class _RuleToolAdapter(ToolAdapter):
@@ -491,12 +614,22 @@ class _RuleToolAdapter(ToolAdapter):
             output = {"reason": str(exc)}
             status = ToolInvocationStatus.FAILED
             observation_refs = ()
-            message = "Rule workbench could not complete this local operation."
-        except Exception:
-            output = {"reason": "local_rule_operation_failed"}
+            message = exc.agent_message or "Rule workbench could not complete this local operation."
+            _logger.warning(
+                "rule tool %s failed locally: %s",
+                self._tool_name,
+                _safe_error_code(exc),
+                exc_info=exc.__cause__ is not None,
+            )
+        except Exception as exc:
+            output = {"reason": _unexpected_operation_error_code(exc)}
             status = ToolInvocationStatus.FAILED
             observation_refs = ()
             message = "Rule workbench could not complete this local operation."
+            # The agent only sees a generic message; keep the real cause in worker logs.
+            _logger.warning(
+                "rule tool %s raised %s", self._tool_name, type(exc).__name__, exc_info=True
+            )
         consumed_seconds = min(
             math.ceil(max(0.0, time.monotonic() - started)),
             self._service.max_tool_seconds * (2 if self._tool_name == "rule.compare" else 1),
@@ -528,7 +661,8 @@ class _RuleTools:
         evidence_payloads: EvidencePayloadReader | None,
         corpus_inventory: RuleCorpusInventoryPort,
         feature_provider: RuleFeatureProvider | None,
-        max_tool_seconds: int,
+        article_claims: RuleArticleClaimPort | None = None,
+        max_tool_seconds: int = 30,
     ) -> None:
         self.workbench = workbench
         self.candidates = candidates
@@ -539,6 +673,7 @@ class _RuleTools:
         self.evidence_payloads = evidence_payloads
         self.corpus_inventory = corpus_inventory
         self.feature_provider = feature_provider
+        self.article_claims = article_claims
         self.max_tool_seconds = max_tool_seconds
 
     @property
@@ -575,6 +710,110 @@ class _RuleTools:
             return await self.compare(arguments, context)
         raise _ToolUnavailable("unknown_rule_tool")
 
+    async def _resolve_article_claim_motifs(
+        self,
+        context: ToolExecutionContext,
+        motifs: Sequence[RuleMotif],
+    ) -> tuple[RuleMotif, ...]:
+        claim_ids = tuple(
+            sorted({claim_id for motif in motifs for claim_id in motif.article_claim_refs})
+        )
+        if not claim_ids:
+            return tuple(motifs)
+        refs_by_claim: dict[str, UUID] = {}
+        if self.evidence_observations is not None:
+            try:
+                prior_observations = await self.evidence_observations.list_for_investigation(
+                    context.investigation_id
+                )
+            except Exception as exc:
+                raise _ToolUnavailable("article_claim_citation_unavailable") from exc
+            refs_by_claim = {
+                observation.object_id: observation.id
+                for observation in prior_observations
+                if observation.kind is EvidenceKind.CLAIM_SOURCE
+                and observation.source == "AutoWork verified article snapshot"
+                and observation.source_version == "investigation-rule-article-claim.v1"
+                and observation.object_type == "article_claim_citation"
+                and observation.object_id in claim_ids
+            }
+        unresolved_ids = tuple(item for item in claim_ids if item not in refs_by_claim)
+        if unresolved_ids and (self.article_claims is None or self.recorder is None):
+            raise _ToolUnavailable("article_claim_citation_unavailable")
+        recorder = self.recorder
+        try:
+            claims = (
+                tuple(
+                    await self.article_claims.get_claims(context.investigation_id, unresolved_ids)
+                )
+                if unresolved_ids and self.article_claims is not None
+                else ()
+            )
+        except Exception as exc:
+            raise _ToolUnavailable("article_claim_citation_unavailable") from exc
+        by_id = {getattr(claim, "id", None): claim for claim in claims}
+        if any(claim_id not in by_id for claim_id in unresolved_ids):
+            raise _ToolFailed("article_claim_reference_not_found")
+
+        if unresolved_ids and recorder is None:
+            raise _ToolUnavailable("article_claim_citation_unavailable")
+        for claim_id in unresolved_ids:
+            claim = by_id[claim_id]
+            statement = getattr(claim, "statement", None)
+            source_refs = getattr(claim, "source_refs", None)
+            if (
+                not isinstance(statement, str)
+                or not statement.strip()
+                or not isinstance(source_refs, Sequence)
+                or isinstance(source_refs, str | bytes)
+                or any(not isinstance(item, str) for item in source_refs)
+            ):
+                raise _ToolFailed("article_claim_reference_invalid")
+            payload = {
+                "schema": "investigation-rule-article-claim.v1",
+                "claim_id": claim_id,
+                "statement": statement,
+                "source_refs": list(source_refs),
+            }
+            claim_sha256 = hashlib.sha256(
+                json.dumps(
+                    payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            ).hexdigest()
+            assert recorder is not None
+            observation = await recorder.record_json(
+                investigation_id=context.investigation_id,
+                kind=EvidenceKind.CLAIM_SOURCE,
+                payload=payload,
+                source="AutoWork verified article snapshot",
+                source_version="investigation-rule-article-claim.v1",
+                object_type="article_claim_citation",
+                object_id=claim_id,
+                limitations=(
+                    "Citation to a claim in the verified article snapshot; this is not sample "
+                    "behavioral evidence.",
+                ),
+                idempotency_key=(
+                    f"rule-article-claim:{context.investigation_id}:{claim_id}:{claim_sha256}"
+                ),
+            )
+            refs_by_claim[claim_id] = observation.id
+
+        return tuple(
+            replace(
+                motif,
+                observation_refs=tuple(
+                    dict.fromkeys(
+                        (
+                            *motif.observation_refs,
+                            *(refs_by_claim[claim_id] for claim_id in motif.article_claim_refs),
+                        )
+                    )
+                ),
+            )
+            for motif in motifs
+        )
+
     def _require_test_ports(self) -> None:
         if (
             self.workbench is None
@@ -592,8 +831,12 @@ class _RuleTools:
         self, arguments: Mapping[str, Any], context: ToolExecutionContext
     ) -> tuple[Mapping[str, Any], ToolInvocationStatus, tuple[UUID, ...]]:
         assert self.workbench is not None and self.candidates is not None
-        motifs = _motifs_from_json(arguments.get("motifs", ()))
-        feature_refs = tuple(UUID(value) for value in arguments.get("feature_refs", ()))
+        raw_motifs = _empty_optional_value(arguments.get("motifs"))
+        motifs = await self._resolve_article_claim_motifs(
+            context, _motifs_from_json(raw_motifs or ())
+        )
+        raw_feature_refs = _empty_optional_value(arguments.get("feature_refs"))
+        feature_refs = tuple(UUID(value) for value in (raw_feature_refs or ()))
         if feature_refs:
             if self.feature_provider is None:
                 raise _ToolUnavailable("rule_features_unavailable")
@@ -633,9 +876,12 @@ class _RuleTools:
         generated = tuple(unique_motifs.values())
         if not generated:
             raise _ToolFailed("no_usable_motifs")
-        candidate_id = UUID(arguments["candidate_id"]) if arguments.get("candidate_id") else uuid4()
+        if any(not motif.observation_refs for motif in generated):
+            raise _ToolFailed("motifs_require_observation_refs")
+        candidate_id_value = _empty_optional_value(arguments.get("candidate_id"))
+        candidate_id = UUID(candidate_id_value) if candidate_id_value is not None else uuid4()
         condition = arguments["condition"]
-        meta = cast(Mapping[str, str | int | bool] | None, arguments.get("meta"))
+        meta = _normalize_meta(arguments.get("meta"))
         all_versions = await self.candidates.list_for_candidate(candidate_id)
         existing_versions = tuple(
             item for item in all_versions if item.investigation_id == context.investigation_id
@@ -714,17 +960,20 @@ class _RuleTools:
             raise _ToolFailed("parent_must_be_latest")
         if parent.status is DetectionCandidateStatus.APPROVED:
             raise _ToolFailed("approved_versions_are_immutable")
-        motifs = _motifs_from_json(arguments["motifs"]) if "motifs" in arguments else None
-        condition = arguments.get("condition")
+        raw_motifs = _empty_optional_value(arguments.get("motifs"))
+        motifs = _motifs_from_json(raw_motifs) if raw_motifs is not None else None
+        condition = _empty_optional_value(arguments.get("condition"))
         if motifs is None and condition is None:
             raise _ToolFailed("revision_requires_a_change")
         if motifs is None:
             motifs = _motifs_from_version(parent)
-        elif any(not motif.observation_refs for motif in motifs):
-            raise _ToolFailed("motifs_require_observation_refs")
+        else:
+            motifs = await self._resolve_article_claim_motifs(context, motifs)
+            if any(not motif.observation_refs for motif in motifs):
+                raise _ToolFailed("motifs_require_observation_refs")
         if condition is None:
             condition = _condition_from_source(parent.source)
-        meta = arguments.get("meta")
+        meta = _normalize_meta(arguments.get("meta"))
         if meta is None:
             meta = _meta_from_source(parent.source)
         corpus = await self._build_corpus(context.investigation_id)
@@ -734,7 +983,7 @@ class _RuleTools:
             parent=parent,
             motifs=motifs,
             condition=condition,
-            meta=cast(Mapping[str, str | int | bool] | None, meta),
+            meta=meta,
             corpus=corpus,
             operation="revise",
         )
@@ -779,7 +1028,7 @@ class _RuleTools:
         assert self.workbench is not None and self.candidates is not None
         candidate_id = UUID(arguments["candidate_id"])
         versions = await self._versions_for_investigation(candidate_id, context.investigation_id)
-        selected = self._select_version(versions, arguments.get("version"))
+        selected = self._select_version(versions, _empty_optional_value(arguments.get("version")))
         corpus = await self._build_corpus(context.investigation_id)
         report = await self.workbench.compile_and_test(
             selected.source,
@@ -788,13 +1037,14 @@ class _RuleTools:
             coverage_statement=corpus.coverage_statement,
         )
         evaluation = _status_for_report(report, corpus)
+        candidate_status = _candidate_status(report, corpus)
         observation = await self._record_report(
             context,
             report,
             corpus,
             candidate_id=selected.candidate_id,
             version=selected,
-            candidate_status=_candidate_status(report, corpus),
+            candidate_status=candidate_status,
             operation="test",
         )
         return (
@@ -803,7 +1053,8 @@ class _RuleTools:
                 "version_id": str(selected.id),
                 "version": selected.version_label,
                 "source_sha256": selected.source_sha256,
-                "candidate_status": _candidate_status(report, corpus).value,
+                "candidate_status": candidate_status.value,
+                "validation_status": report.validation_status.value,
                 "report": _report_summary(report, observation.id, corpus),
             },
             evaluation,
@@ -860,13 +1111,13 @@ class _RuleTools:
                 ToolInvocationStatus.EMPTY,
                 (),
             )
-        selected_version = arguments.get("version")
+        selected_version = _empty_optional_value(arguments.get("version"))
         selected = (
             self._select_version(versions, selected_version)
             if selected_version is not None
             else versions[-1]
         )
-        include_history = bool(arguments.get("include_history", False))
+        include_history = bool(_empty_optional_value(arguments.get("include_history")))
         visible = versions[-_MAX_HISTORY:] if include_history else (selected,)
         visible_ids = {str(version.id) for version in visible}
         observations = await self.evidence_observations.list_for_investigation(
@@ -879,6 +1130,7 @@ class _RuleTools:
             and observation.object_type == "detection_candidate_version"
             and observation.object_id in visible_ids
         ]
+        report_observations.sort(key=lambda item: (item.observed_at, item.id.hex))
         reports: dict[str, list[Mapping[str, Any]]] = {version_id: [] for version_id in visible_ids}
         for observation in report_observations:
             try:
@@ -1043,6 +1295,7 @@ class _RuleTools:
             "candidate_id": str(result.candidate_id),
             "source_sha256": result.report.source_sha256,
             "candidate_status": result.candidate_status.value,
+            "validation_status": result.report.validation_status.value,
             "execution_status": result.report.execution_status.value,
             "evaluation_status": result.status.value,
             "report": _report_summary(result.report, result.observation.id, result.corpus),
@@ -1082,16 +1335,28 @@ class _RuleTools:
             cases[(role, sample_sha256)] = _rule_case(investigation_id, role, sample_sha256)
 
         limitations: list[str] = []
+        manual_import_reader = getattr(self.corpus_inventory, "manual_rule_corpus_imports", None)
         try:
-            goodware_hashes = await self.corpus_inventory.goodware_sample_sha256s(investigation_id)
+            manual_imports = tuple(
+                await manual_import_reader(investigation_id)
+                if callable(manual_import_reader)
+                else ()
+            )
         except Exception:
-            goodware_hashes = ()
-            limitations.append("L'index goodware associé à l'enquête n'a pas pu être lu.")
-        if not goodware_hashes:
-            limitations.append("Aucun échantillon du baseline goodware associé n'a été fourni.")
-        for sample_sha256 in _unique_valid_hashes(goodware_hashes):
-            cases[(RuleTestCorpusRole.GOODWARE, sample_sha256)] = _rule_case(
-                investigation_id, RuleTestCorpusRole.GOODWARE, sample_sha256
+            manual_imports = ()
+            limitations.append("L'inventaire des imports manuels du corpus n'a pas pu être lu.")
+        manual_goodware_present = any(
+            item.role is RuleTestCorpusRole.GOODWARE for item in manual_imports
+        )
+        if not manual_goodware_present:
+            limitations.append("Aucun binaire goodware importé par l'opérateur n'a été fourni.")
+        for item in manual_imports:
+            if not _unique_valid_hashes((item.sample_sha256,)):
+                continue
+            cases[(item.role, item.sample_sha256)] = RuleTestCase(
+                sample_sha256=item.sample_sha256,
+                role=item.role,
+                provenance=item.provenance,
             )
 
         try:
@@ -1107,11 +1372,15 @@ class _RuleTools:
             cases[key] for key in sorted(cases, key=lambda item: (item[0].value, item[1]))
         )
         coverage = (
-            "Corpus exact par SHA-256; positifs confirmés et seeds documentés, "
-            "candidats hors-cluster, "
-            "sources du baseline goodware et holdout indépendant lorsque disponibles. Les octets "
-            "absents de la quarantaine ou du baseline restent non mesurables."
+            "Corpus exact par SHA-256; positifs confirmés et seeds documentés, candidats "
+            "hors-cluster, fichiers goodware importés par l'opérateur et holdout indépendant. "
+            "Les hashes des baselines de caractéristiques sont exclus: aucun binaire goodware "
+            "n'est testé sans import manuel. YARA examine directement les octets; l'extraction "
+            "de caractéristiques réservées aux PE n'est pas appliquée. Les octets absents de la "
+            "quarantaine restent non mesurables."
         )
+        if not manual_goodware_present:
+            coverage += " No goodware binaries tested."
         selection_bias = (
             "Corpus de convenance propre à cette enquête: les seeds et associations reflètent "
             "la sélection antérieure; les résultats ne mesurent pas une prévalence universelle."
@@ -1312,11 +1581,17 @@ def _report_payload(
     return {
         "source_sha256": report.source_sha256,
         "execution_status": report.execution_status.value,
+        "validation_status": report.validation_status.value,
         "engine_version": report.engine_version[:200],
         "candidate_status": candidate_status.value,
         "selection_bias": corpus.selection_bias,
-        "coverage_statement": corpus.coverage_statement,
+        "coverage_statement": report.coverage_statement,
         "corpus_sha256": report.corpus_sha256,
+        "provenance_counts_by_role": report.provenance_counts_by_role,
+        "false_positive_count": len(report.false_positive_sha256s),
+        "false_positive_sha256s": list(report.false_positive_sha256s),
+        "false_negative_count": len(report.false_negative_sha256s),
+        "false_negative_sha256s": list(report.false_negative_sha256s),
         "corpus_sha256s_by_role": {
             role.value: list(hashes) for role, hashes in corpus.hashes_by_role().items()
         },
@@ -1324,6 +1599,15 @@ def _report_payload(
             {
                 "role": role.role.value,
                 "corpus_sha256s": list(role.corpus_sha256s),
+                "provenance_counts": role.provenance_counts,
+                "test_cases": [
+                    {
+                        "sha256": case.sample_sha256,
+                        "provenance": case.provenance.value,
+                        "outcome": _case_outcome(role, case.sample_sha256),
+                    }
+                    for case in role.test_cases
+                ],
                 "matches": list(role.matches),
                 "non_matches": list(role.non_matches),
                 "non_measurable": list(role.non_measurable),
@@ -1350,12 +1634,28 @@ def _report_summary(
     result: dict[str, Any] = {
         "source_sha256": report.source_sha256,
         "execution_status": report.execution_status.value,
+        "validation_status": report.validation_status.value,
         "engine_version": report.engine_version[:200],
         "corpus_sha256": report.corpus_sha256,
+        "coverage_statement": report.coverage_statement,
+        "provenance_counts_by_role": report.provenance_counts_by_role,
+        "false_positive_count": len(report.false_positive_sha256s),
+        "false_positive_sha256s": list(report.false_positive_sha256s),
+        "false_negative_count": len(report.false_negative_sha256s),
+        "false_negative_sha256s": list(report.false_negative_sha256s),
         "roles": [
             {
                 "role": role.role.value,
                 "corpus_sha256s": list(role.corpus_sha256s),
+                "provenance_counts": role.provenance_counts,
+                "test_cases": [
+                    {
+                        "sha256": case.sample_sha256,
+                        "provenance": case.provenance.value,
+                        "outcome": _case_outcome(role, case.sample_sha256),
+                    }
+                    for case in role.test_cases
+                ],
                 "matches": list(role.matches),
                 "non_matches": list(role.non_matches),
                 "non_measurable": list(role.non_measurable),
@@ -1369,6 +1669,16 @@ def _report_summary(
     if corpus is not None:
         result["limitations"] = list(corpus.limitations)
     return result
+
+
+def _case_outcome(role: RuleRoleTestReport, sample_sha256: str) -> str:
+    if sample_sha256 in role.matches:
+        return "match"
+    if sample_sha256 in role.non_matches:
+        return "no_match"
+    if sample_sha256 in role.non_measurable:
+        return "non_measurable"
+    return "error"
 
 
 def _comparison_summary(
@@ -1405,12 +1715,34 @@ def _comparison_summary(
 def _version_summary(
     version: DetectionCandidateVersion, reports: Sequence[Mapping[str, Any]]
 ) -> dict[str, Any]:
+    matching_reports = tuple(
+        report for report in reports if report.get("source_sha256") == version.source_sha256
+    )
+    latest_report = matching_reports[-1] if matching_reports else None
+    try:
+        validation_status = RuleValidationStatus(
+            latest_report.get("validation_status", "untested") if latest_report else "untested"
+        ).value
+    except (TypeError, ValueError):
+        validation_status = RuleValidationStatus.UNTESTED.value
     return {
         "version_id": str(version.id),
         "version": version.version_label,
         "parent_version_id": str(version.parent_version_id) if version.parent_version_id else None,
         "source_sha256": version.source_sha256,
         "status": version.status.value,
+        "validation_status": validation_status,
+        "latest_test_report": (
+            {
+                "validation_status": validation_status,
+                "execution_status": latest_report.get("execution_status"),
+                "provenance_counts_by_role": latest_report.get("provenance_counts_by_role", {}),
+                "false_positive_count": latest_report.get("false_positive_count", 0),
+                "false_negative_count": latest_report.get("false_negative_count", 0),
+            }
+            if latest_report is not None
+            else None
+        ),
         "test_refs": [str(reference) for reference in version.test_refs],
         "motif_count": len(version.motif_provenance),
         "motif_kinds": sorted(
@@ -1418,6 +1750,35 @@ def _version_summary(
         ),
         "reports": list(reports),
     }
+
+
+def _empty_optional_value(value: Any) -> Any | None:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes) and not value:
+        return None
+    return value
+
+
+def _normalize_meta(value: Any) -> Mapping[str, str | int | bool] | None:
+    if value is None or value == {}:
+        return None
+    if isinstance(value, str):
+        if not value.strip():
+            return None
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise _ToolFailed("invalid_meta", agent_message=_META_AGENT_ERROR) from exc
+    if not isinstance(value, Mapping):
+        raise _ToolFailed("invalid_meta", agent_message=_META_AGENT_ERROR)
+    if not value:
+        return None
+    try:
+        validate_json_schema(value, _META_OBJECT_SCHEMA)
+    except ValueError as exc:
+        raise _ToolFailed("invalid_meta", agent_message=_META_AGENT_ERROR) from exc
+    return cast(Mapping[str, str | int | bool], value)
 
 
 def _motifs_from_json(raw_motifs: Sequence[Mapping[str, Any]]) -> tuple[RuleMotif, ...]:
@@ -1430,7 +1791,10 @@ def _motifs_from_json(raw_motifs: Sequence[Mapping[str, Any]]) -> tuple[RuleMoti
         values = dict(item)
         values["kind"] = RuleMotifKind(values["kind"])
         values["provenance_kind"] = RuleMotifProvenanceKind(values["provenance_kind"])
-        values["observation_refs"] = tuple(UUID(value) for value in values["observation_refs"])
+        values["observation_refs"] = tuple(
+            UUID(value) for value in values.get("observation_refs", ())
+        )
+        values["article_claim_refs"] = tuple(values.get("article_claim_refs", ()))
         if "offsets" in values:
             values["offsets"] = tuple(values["offsets"])
         result.append(RuleMotif(**values))
@@ -1445,6 +1809,7 @@ def _motif_payload(motif: RuleMotif) -> dict[str, Any]:
         "provenance_kind": motif.provenance_kind.value,
         "provenance_id": motif.provenance_id,
         "observation_refs": [str(item) for item in motif.observation_refs],
+        "article_claim_refs": list(motif.article_claim_refs),
         "rationale": motif.rationale,
     }
     for name in (
@@ -1474,6 +1839,7 @@ def _motifs_from_version(version: DetectionCandidateVersion) -> tuple[RuleMotif,
                     provenance_kind=RuleMotifProvenanceKind(metadata["provenance_kind"]),
                     provenance_id=metadata["provenance_id"],
                     observation_refs=item.observation_refs,
+                    article_claim_refs=tuple(metadata.get("article_claim_refs", ())),
                     sample_sha256=metadata.get("sample_sha256"),
                     offsets=(
                         tuple(metadata["offsets"]) if metadata.get("offsets") is not None else None
@@ -1503,6 +1869,7 @@ def _serialize_motif(motif: RuleMotif) -> str:
         "kind": motif.kind.value,
         "provenance_kind": motif.provenance_kind.value,
         "provenance_id": motif.provenance_id,
+        "article_claim_refs": list(motif.article_claim_refs),
         "sample_sha256": motif.sample_sha256,
         "offsets": list(motif.offsets) if motif.offsets is not None else None,
         "rationale": motif.rationale,
@@ -1576,6 +1943,32 @@ def _safe_error_code(exc: Exception) -> str:
     if isinstance(exc, ValueError):
         return "invalid_rule_input"
     return "local_rule_operation_failed"
+
+
+def _unexpected_operation_error_code(exc: Exception) -> str:
+    """Expose a stable exception category without forwarding exception text to the agent."""
+    exception_types = [_safe_exception_type_name(exc)]
+    current: BaseException = exc
+    root_cause: BaseException = exc
+    seen = {id(exc)}
+    for _ in range(8):
+        cause = current.__cause__ or current.__context__
+        if cause is None or id(cause) in seen:
+            break
+        seen.add(id(cause))
+        root_cause = cause
+        current = cause
+    root_type = _safe_exception_type_name(root_cause)
+    if root_type != exception_types[0]:
+        exception_types.append(root_type)
+    return f"local_rule_operation_failed:{':'.join(exception_types)}"
+
+
+def _safe_exception_type_name(exc: BaseException) -> str:
+    exception_type = type(exc).__name__
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,47}", exception_type):
+        return "UnknownError"
+    return exception_type
 
 
 __all__ = [

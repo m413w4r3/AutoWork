@@ -35,6 +35,11 @@ from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionArtifactStatus,
 )
+from cti_app.domain.rule_workbench import (
+    RuleCorpusInventoryItem,
+    RuleSampleProvenance,
+    RuleTestCorpusRole,
+)
 from cti_app.infrastructure.virustotal import VirusTotalQuotaExceededError
 from cti_app.infrastructure.yara_runner import IsolatedYaraRunner
 from tests.integration.test_edition_multibatch_publication_postgres import _compose_three_runs
@@ -81,9 +86,22 @@ class _ControlledRuleCorpus:
         assert hashlib.sha256(payload).hexdigest() == sample_sha256
         return payload
 
-    async def goodware_sample_sha256s(self, investigation_id: UUID) -> tuple[str, ...]:
+    async def manual_rule_corpus_imports(
+        self, investigation_id: UUID
+    ) -> tuple[RuleCorpusInventoryItem, ...]:
         del investigation_id
-        return self.goodware
+        return tuple(
+            RuleCorpusInventoryItem(
+                sample_sha256=sample_sha256,
+                role=RuleTestCorpusRole.GOODWARE,
+                provenance=RuleSampleProvenance.SYNTHETIC,
+                size_bytes=len(self.samples[sample_sha256]),
+                source_description=(
+                    "Synthetic benign-like W13 fixture for YARA false-positive testing."
+                ),
+            )
+            for sample_sha256 in self.goodware
+        )
 
     async def holdout_sample_sha256s(self, investigation_id: UUID) -> tuple[str, ...]:
         del investigation_id
@@ -701,7 +719,7 @@ async def test_w13_d5_rule_v1_v2_review_and_manifest_bound_archive(
                 for item in invocations
             ):
                 return decision(
-                    "Retest v1 on the controlled positive and goodware corpus.",
+                    "Retest v1 on the controlled positive and synthetic benign-like corpus.",
                     tool_call=_call("rule.test", {"candidate_id": str(candidate_id), "version": 1}),
                 )
             if len(versions) == 1 and second_sha not in {
@@ -907,6 +925,16 @@ async def test_w13_d5_rule_v1_v2_review_and_manifest_bound_archive(
                 for report in v1_view["test_reports"]
             )
             assert v1_view["status"] == "rejected"
+            rejected_v1_report = next(
+                report
+                for report in v1_view["test_reports"]
+                if goodware_sha in report["known_false_positives"]
+            )
+            assert rejected_v1_report["validation_status"] == "real_partial"
+            goodware_report = next(
+                item for item in rejected_v1_report["roles"] if item["role"] == "goodware"
+            )
+            assert goodware_report["test_cases"][0]["provenance"] == "synthetic"
 
             opinion_draft_response = await compose_opinion_http(client, seeded.investigation.id)
             assert opinion_draft_response.status_code == 200, opinion_draft_response.text

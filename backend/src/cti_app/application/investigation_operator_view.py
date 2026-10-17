@@ -20,7 +20,11 @@ from cti_app.domain.investigation import (
     ToolInvocationStatus,
     canonical_json_bytes,
 )
-from cti_app.domain.investigation_state import InvestigationWorkingState, StopReason
+from cti_app.domain.investigation_state import (
+    InvestigationWorkingState,
+    StopReason,
+    investigation_bridge_attempt,
+)
 from cti_app.domain.jobs import Job, JobStatus
 from cti_app.domain.production import AnalystInvestigation
 
@@ -35,6 +39,7 @@ class InvestigationOperatorErrorCode(StrEnum):
 class OperatorNextAction(StrEnum):
     WAIT_FOR_WORKER = "wait_for_worker"
     INSPECT_BRIDGE_TURN = "inspect_bridge_turn"
+    RECONCILE_MODEL_CONVERSATION_TURN = "reconcile_model_conversation_turn"
     RECONCILE_TOOL_INVOCATION = "reconcile_tool_invocation"
     REQUEST_G2_DECISION = "request_g2_decision"
     CREATE_NEW_INVESTIGATION = "create_new_investigation"
@@ -61,6 +66,10 @@ def build_investigation_operator_view(
     unavailable_tools: tuple[str, ...],
     g2_revoked: bool = False,
     g2_reapproval_supported: bool = False,
+    pending_bridge_turn_id: UUID | None = None,
+    pending_bridge_turn_status: str | None = None,
+    pending_bridge_turn_error_code: str | None = None,
+    pending_bridge_turn_key: str | None = None,
 ) -> InvestigationOperatorView:
     ordered_jobs = tuple(sorted(jobs, key=lambda item: (item.created_at, item.id.hex)))
     generation = max(
@@ -93,32 +102,84 @@ def build_investigation_operator_view(
     pending_bridge_key = None
     bridge_conversation_id = make_investigation_conversation_id(investigation.id)
     if state.pending_context_sha256 is not None:
+        attempt = investigation_bridge_attempt(state.recent_actions, state.turn_index)
         pending_bridge_key = make_investigation_turn_idempotency_key(
             investigation_id=investigation.id,
             turn_index=state.turn_index,
             context_sha256=state.pending_context_sha256,
+            attempt=attempt,
         )
+    pre_submission_retry_exhausted = any(
+        item.startswith(f"bridge_turn_pre_submission_retry_exhausted:{state.turn_index}:")
+        for item in state.recent_actions
+    )
 
     if pending_bridge_key is not None:
         last_operation: dict[str, Any] | None = {
             "kind": "bridge_turn",
-            "id": pending_bridge_key,
+            "id": pending_bridge_turn_key or pending_bridge_key,
+            "turn_id": pending_bridge_turn_id,
             "conversation_id": bridge_conversation_id,
+            "conversation_id_scope": "local_autowork_record_only",
+            "external_target": "temporary_chat_per_turn",
             "turn_index": state.turn_index,
             "context_snapshot_id": state.pending_context_snapshot_id,
             "context_sha256": state.pending_context_sha256,
             "status": (
+                "pre_submission_retry_exhausted"
+                if pre_submission_retry_exhausted
+                else pending_bridge_turn_status
+            )
+            or (
                 "needs_review"
                 if state.stop_reason is StopReason.SUBMISSION_NEEDS_REVIEW
                 else "pending_or_running"
             ),
-            "evidence_missing": ["persisted Bridge turn result or provider outcome"],
-            "decision_expected": "inspect persisted turn, then reconcile uncertain transport state",
+            "error_code": (
+                "bridge_pre_submission_retry_exhausted"
+                if pre_submission_retry_exhausted
+                else pending_bridge_turn_error_code
+            ),
+            "evidence_missing": (
+                []
+                if pre_submission_retry_exhausted or pending_bridge_turn_status == "succeeded"
+                else ["persisted Bridge turn result or provider outcome"]
+            ),
+            "decision_expected": (
+                "resume to submit the next distinct attempt after confirmed pre-submission failures"
+                if pre_submission_retry_exhausted
+                else "consume adopted output after resume"
+                if pending_bridge_turn_status == "succeeded"
+                else "reconcile orphaned Bridge turn before a distinct retry"
+                if pending_bridge_turn_error_code == "orphaned_running_turn"
+                else "reconcile interrupted Bridge turn before resume"
+                if pending_bridge_turn_error_code == "operator_interrupted"
+                else "submit a new attempt after explicit operator abandonment"
+                if pending_bridge_turn_error_code == "operator_abandoned"
+                else "reconcile the exact persisted turn before resume"
+            ),
         }
     elif latest_invocation is not None:
         last_operation = _invocation_view(latest_invocation)
     else:
         last_operation = None
+
+    context_limit_action = next(
+        (
+            item
+            for item in reversed(state.recent_actions)
+            if item.startswith("investigation_context_too_large:")
+        ),
+        None,
+    )
+    last_error = (
+        {
+            "code": "investigation_context_too_large",
+            "details": context_limit_action.removeprefix("investigation_context_too_large:"),
+        }
+        if context_limit_action is not None
+        else None
+    )
 
     dimensions = envelope.budget if envelope is not None else None
     fallback_limits = {
@@ -187,6 +248,10 @@ def build_investigation_operator_view(
         unresolved=unresolved,
         pending_bridge_key=pending_bridge_key,
         bridge_conversation_id=bridge_conversation_id,
+        pending_bridge_turn_id=pending_bridge_turn_id,
+        pending_bridge_turn_status=pending_bridge_turn_status,
+        pending_bridge_turn_error_code=pending_bridge_turn_error_code,
+        pending_bridge_turn_key=pending_bridge_turn_key,
         envelope_version=envelope.version if envelope else 0,
         g2_revoked=g2_revoked,
         g2_reapproval_supported=g2_reapproval_supported,
@@ -204,6 +269,7 @@ def build_investigation_operator_view(
             "investigation_version": investigation.version,
             "working_state_version": state.version,
             "working_state_sha256": state.sha256,
+            "deduplicated_findings": state.deduplicated_findings,
             "job_generation": generation,
             "active_job_ids": [item.id for item in active_jobs],
             "active_job_statuses": [item.status.value for item in active_jobs],
@@ -214,6 +280,12 @@ def build_investigation_operator_view(
             "last_context_sha256": state.last_context_sha256,
             "last_decision_sha256": state.last_decision_sha256,
             "bridge_conversation_id": bridge_conversation_id,
+            "bridge_conversation_id_scope": "local_autowork_record_only",
+            "bridge_external_target": {
+                "mode": "stateless",
+                "lifecycle": "temporary_chat_per_turn",
+            },
+            "last_error": last_error,
             "last_operation": last_operation,
             "invocations": [_invocation_view(item) for item in ordered_invocations],
             "ambiguous_invocations": [_invocation_view(item) for item in ambiguous],
@@ -287,6 +359,10 @@ def _next_action(
     unresolved: tuple[ToolInvocation, ...],
     pending_bridge_key: str | None,
     bridge_conversation_id: UUID,
+    pending_bridge_turn_id: UUID | None,
+    pending_bridge_turn_status: str | None,
+    pending_bridge_turn_error_code: str | None,
+    pending_bridge_turn_key: str | None,
     envelope_version: int,
     g2_revoked: bool,
     g2_reapproval_supported: bool,
@@ -311,7 +387,83 @@ def _next_action(
             "accepted_outcomes": ["executed_with_result", "not_executed", "abandon"],
             "requires_idempotency_key": True,
         }
+    retry_exhausted_action = any(
+        item.startswith(f"bridge_turn_pre_submission_retry_exhausted:{state.turn_index}:")
+        for item in state.recent_actions
+    )
+    if (
+        pending_bridge_key is not None
+        and state.stop_reason is StopReason.SUBMISSION_NEEDS_REVIEW
+        and retry_exhausted_action
+    ):
+        return {
+            "code": OperatorNextAction.RESUME_INVESTIGATION.value,
+            "reason": "bridge_pre_submission_retry_exhausted",
+            "method": "POST",
+            "path": f"{prefix}/resume",
+            "expected_version": state.version,
+            "next_generation": generation + 1,
+            "requires_idempotency_key": True,
+        }
+    if (
+        pending_bridge_key is not None
+        and pending_bridge_turn_id is not None
+        and pending_bridge_turn_status == "needs_review"
+        and pending_bridge_turn_error_code in {"operator_interrupted", "orphaned_running_turn"}
+    ):
+        turn_prefix = (
+            f"/api/model-conversations/{bridge_conversation_id}/turns/"
+            f"{pending_bridge_turn_id}/reconciliation"
+        )
+        return {
+            "code": OperatorNextAction.RECONCILE_MODEL_CONVERSATION_TURN.value,
+            "reason": "orphaned_running_turn"
+            if pending_bridge_turn_error_code == "orphaned_running_turn"
+            else "operator_interrupted",
+            "method": "POST",
+            "path": f"{turn_prefix}/abandon",
+            "preview_path": f"{turn_prefix}/visible/preview",
+            "abandon_path": f"{turn_prefix}/abandon",
+            "query": {"subject_id": str(investigation.subject_id)},
+            "submission_key": pending_bridge_turn_key or pending_bridge_key,
+            "requires_human_reconciliation": True,
+            "abandon_body_fields": ["reason"],
+        }
     if pending_bridge_key is not None and state.stop_reason is StopReason.SUBMISSION_NEEDS_REVIEW:
+        if pending_bridge_turn_status == "succeeded" or (
+            pending_bridge_turn_status == "failed"
+            and pending_bridge_turn_error_code == "operator_abandoned"
+        ):
+            return {
+                "code": OperatorNextAction.RESUME_INVESTIGATION.value,
+                "method": "POST",
+                "path": f"{prefix}/resume",
+                "expected_version": state.version,
+                "next_generation": generation + 1,
+                "requires_idempotency_key": True,
+                "adopted_turn_id": (
+                    pending_bridge_turn_id if pending_bridge_turn_status == "succeeded" else None
+                ),
+            }
+        if pending_bridge_turn_id is not None and pending_bridge_turn_status == "needs_review":
+            turn_prefix = (
+                f"/api/model-conversations/{bridge_conversation_id}/turns/"
+                f"{pending_bridge_turn_id}/reconciliation"
+            )
+            return {
+                "code": OperatorNextAction.RECONCILE_MODEL_CONVERSATION_TURN.value,
+                "method": "POST",
+                "path": f"{turn_prefix}/visible/preview",
+                "preview_path": f"{turn_prefix}/visible/preview",
+                "adopt_path": f"{turn_prefix}/visible/adopt",
+                "abandon_path": f"{turn_prefix}/abandon",
+                "query": {"subject_id": str(investigation.subject_id)},
+                "submission_key": pending_bridge_turn_key or pending_bridge_key,
+                "requires_human_reconciliation": True,
+                "adoption_requires_expected_sha256": True,
+                "adoption_is_not_g2_g3_approval": True,
+                "abandon_body_fields": ["reason"],
+            }
         return {
             "code": OperatorNextAction.INSPECT_BRIDGE_TURN.value,
             "method": "GET",

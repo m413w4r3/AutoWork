@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import tomllib
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
@@ -42,8 +43,11 @@ from cti_app.infrastructure.investigation_runtime_ports import (
 )
 from cti_app.infrastructure.local_command_runner import (
     LocalCommandRunner,
+    NamespaceFailureReason,
+    NetworkIsolationStatus,
     _build_argv,
     _bwrap_command,
+    _NamespaceDetection,
 )
 from cti_app.infrastructure.tshark_adapter import network_local_command_specs
 from cti_app.workers import analysis_tasks
@@ -118,7 +122,11 @@ def test_strict_runtime_disables_every_unconfined_local_executor(
 ) -> None:
     monkeypatch.setattr(
         "cti_app.infrastructure.local_command_runner._detect_network_namespace",
-        lambda _timeout: None,
+        lambda _timeout: _NamespaceDetection(
+            NetworkIsolationStatus.SECCOMP_ONLY,
+            None,
+            (NamespaceFailureReason.NO_NETWORK_NAMESPACE_AVAILABLE,),
+        ),
     )
     settings = Settings(
         local_analysis_enabled=True,
@@ -140,7 +148,7 @@ def test_strict_runtime_disables_every_unconfined_local_executor(
     statuses = {status.family: status for status in runtime.statuses}
     ports = runtime.optional_tool_ports
 
-    assert statuses["local_command_execution"].reason == "filesystem_confinement_unavailable"
+    assert statuses["local_command_execution"].reason == "no_network_namespace_available"
     assert statuses["rule_workbench"].reason == "filesystem_confinement_unavailable"
     assert statuses["capa_analysis"].reason == "filesystem_confinement_unavailable"
     assert statuses["smda_analysis"].reason == "filesystem_confinement_unavailable"
@@ -544,3 +552,26 @@ async def test_static_operator_token_authenticates_without_becoming_identity_or_
     provider = StaticTokenIdentityProvider(token)
     assert provider.verify_authorization(f"Bearer {token}")
     assert not provider.verify_authorization("Bearer wrong-token")
+
+
+def test_backend_image_has_only_the_investigation_runtime_analysis_dependencies() -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    dockerfile = (project_root / "infra" / "backend.Dockerfile").read_text(encoding="utf-8")
+    project = tomllib.loads(
+        (project_root / "backend" / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    dependencies = project["project"]["dependencies"]
+    groups = project["dependency-groups"]
+
+    assert "DEBIAN_FRONTEND=noninteractive" in dockerfile
+    assert "bubblewrap" in dockerfile
+    assert "tshark" in dockerfile
+    assert (
+        "if ! uv sync --frozen --no-dev --no-group analysis --group analysis-runtime; then"
+        in dockerfile
+    )
+    assert "RUN uv sync --frozen --no-dev --no-group analysis \\" in dockerfile
+    assert "uv sync --frozen --no-dev --no-group analysis --no-group analysis-runtime" in dockerfile
+    assert groups["analysis-runtime"] == ["yara-python==4.5.0"]
+    assert "pefile==2024.8.26" in dependencies
+    assert "pyelftools==0.33" in dependencies

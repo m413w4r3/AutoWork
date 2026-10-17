@@ -7,6 +7,10 @@ import pytest
 
 from cti_app.application.investigation_acquisition import HitAcquisitionService
 from cti_app.application.investigation_governance import InvestigationEnvelopeService
+from cti_app.application.virustotal import (
+    VirusTotalDownloadHashMismatchError,
+    VirusTotalHttpError,
+)
 from cti_app.domain.investigation import (
     BudgetDimension,
     InvestigationBudget,
@@ -25,6 +29,19 @@ from tests.investigation_c2_fakes import (
     make_investigation,
     make_sample_acquisition_service,
 )
+
+
+class _FailingVirusTotalPort(FakeVirusTotalPort):
+    def __init__(self, content: bytes, error: Exception, *, partial_bytes: int = 0) -> None:
+        super().__init__(content)
+        self.error = error
+        self.partial_bytes = partial_bytes
+
+    async def file_download(self, file_hash: str, *, sink) -> None:
+        self.download_calls.append(file_hash)
+        if self.partial_bytes:
+            sink.write(self.sample_bytes[: self.partial_bytes])
+        raise self.error
 
 
 def _approved_service(database: FakeDatabase, investigation, content: bytes):
@@ -112,6 +129,157 @@ async def test_approved_g2_acquires_unknown_hit_without_g3_and_replay_is_free() 
     g2_after_replay = await envelope_service.current(investigation.id)
     assert g2_after_replay is not None
     assert g2_after_replay.budget.consumed == g2_after_first.budget.consumed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "error_code", "reason"),
+    [
+        pytest.param(
+            VirusTotalHttpError(
+                "synthetic route absent",
+                code="virustotal_not_found",
+                status_code=404,
+                route="/files/{hash}/download",
+            ),
+            "virustotal_download_route_not_found",
+            "provider_download_route_not_found",
+            id="download-route-404",
+        ),
+        pytest.param(
+            VirusTotalHttpError(
+                "synthetic route absent",
+                code="virustotal_not_found",
+                status_code=404,
+                route="/files/{hash}/download_url",
+            ),
+            "virustotal_download_route_not_found",
+            "provider_download_route_not_found",
+            id="download-url-route-404",
+        ),
+        pytest.param(
+            VirusTotalHttpError(
+                "synthetic authorization refused",
+                code="virustotal_not_authorized",
+                status_code=403,
+            ),
+            "virustotal_download_authorization_refused",
+            "provider_download_authorization_refused",
+            id="authorization-403",
+        ),
+        pytest.param(
+            TimeoutError("synthetic timeout before bytes"),
+            "virustotal_download_failed_before_bytes",
+            "provider_download_failed_before_bytes",
+            id="timeout-before-bytes",
+        ),
+    ],
+)
+async def test_definitive_download_failures_are_unavailable_and_cached_by_hash(
+    error: Exception, error_code: str, reason: str
+) -> None:
+    database = FakeDatabase()
+    content = b"synthetic sample bytes"
+    investigation = make_investigation()
+    database.investigations[investigation.id] = investigation
+    envelope_service = InvestigationEnvelopeService(lambda: FakeUow(database))
+    await envelope_service.approve(
+        make_approved_proposal(investigation, vt_units=4, downloads=4),
+        actor_id="analyst:synthetic",
+        reason="Allow bounded synthetic sample review.",
+        correlation_id="g2:synthetic-download-failure",
+    )
+    port = _FailingVirusTotalPort(content, error)
+    hits = HitAcquisitionService(
+        lambda: FakeUow(database),
+        acquisition=make_sample_acquisition_service(database, port),
+        recorder=make_evidence_recorder(database),
+    )
+    sample_hash = hashlib.sha256(content).hexdigest()
+    association = await hits.register_hit(investigation.id, sample_hash, SampleOrigin.VT_PIVOT)
+
+    first = await hits.acquire_hit(
+        association.id, purpose="Review the synthetic hit", operation_key="synthetic-download-1"
+    )
+    second = await hits.acquire_hit(
+        association.id, purpose="Retry the synthetic hit", operation_key="synthetic-download-2"
+    )
+
+    assert first.status is ToolInvocationStatus.UNAVAILABLE
+    assert first.error_code == error_code
+    assert first.reason == reason
+    assert first.confirmed_non_execution is True
+    assert str(error) not in first.message
+    assert first.budget_consumed == {
+        BudgetDimension.VT_UNITS: 1,
+        BudgetDimension.DOWNLOADS: 0,
+    }
+    assert second.status is ToolInvocationStatus.UNAVAILABLE
+    assert second.error_code == error_code
+    assert second.cached is True
+    assert port.download_calls == [sample_hash]
+    different_hash = hashlib.sha256(b"another synthetic hash").hexdigest()
+    different_association = await hits.register_hit(
+        investigation.id, different_hash, SampleOrigin.VT_PIVOT
+    )
+    different_result = await hits.acquire_hit(
+        different_association.id,
+        purpose="Review a different synthetic hit",
+        operation_key="synthetic-download-different-hash",
+    )
+    assert different_result.status is ToolInvocationStatus.UNAVAILABLE
+    assert port.download_calls == [sample_hash, different_hash]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "partial_bytes", "error_code"),
+    [
+        pytest.param(
+            TimeoutError("synthetic timeout after partial bytes"),
+            5,
+            "virustotal_download_interrupted_after_bytes",
+            id="partial-write-then-timeout",
+        ),
+        pytest.param(
+            VirusTotalDownloadHashMismatchError("synthetic hash mismatch"),
+            22,
+            "virustotal_download_hash_mismatch",
+            id="hash-mismatch",
+        ),
+    ],
+)
+async def test_ambiguous_download_failures_remain_needs_review(
+    error: Exception, partial_bytes: int, error_code: str
+) -> None:
+    database = FakeDatabase()
+    content = b"synthetic sample bytes"
+    investigation = make_investigation()
+    database.investigations[investigation.id] = investigation
+    envelope_service = InvestigationEnvelopeService(lambda: FakeUow(database))
+    await envelope_service.approve(
+        make_approved_proposal(investigation, vt_units=4, downloads=4),
+        actor_id="analyst:synthetic",
+        reason="Allow bounded synthetic sample review.",
+        correlation_id="g2:synthetic-ambiguous-download",
+    )
+    port = _FailingVirusTotalPort(content, error, partial_bytes=partial_bytes)
+    hits = HitAcquisitionService(
+        lambda: FakeUow(database),
+        acquisition=make_sample_acquisition_service(database, port),
+        recorder=make_evidence_recorder(database),
+    )
+    sample_hash = hashlib.sha256(content).hexdigest()
+    association = await hits.register_hit(investigation.id, sample_hash, SampleOrigin.VT_PIVOT)
+
+    result = await hits.acquire_hit(
+        association.id, purpose="Review the synthetic hit", operation_key="synthetic-ambiguous-1"
+    )
+
+    assert result.status is ToolInvocationStatus.NEEDS_REVIEW
+    assert result.error_code == error_code
+    assert result.confirmed_non_execution is False
+    assert port.download_calls == [sample_hash]
 
 
 @pytest.mark.asyncio

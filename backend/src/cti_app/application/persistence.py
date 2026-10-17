@@ -483,6 +483,10 @@ class SampleAcquisitionAttemptRepository(Protocol):
         self, investigation_id: UUID, requested_hash: str
     ) -> SampleAcquisitionAttempt | None: ...
 
+    async def find_latest_error(
+        self, investigation_id: UUID, requested_hash: str
+    ) -> SampleAcquisitionAttempt | None: ...
+
     async def append(self, attempt: SampleAcquisitionAttempt) -> None: ...
 
 

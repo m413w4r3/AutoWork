@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import re
-from typing import Any
+from typing import Any, Literal
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from cti_app.application.analyst_input_pack import (
@@ -12,17 +14,30 @@ from cti_app.application.analyst_input_pack import (
     AnalystInputPackV1,
 )
 from cti_app.application.investigation_contracts import (
+    MAX_CONTEXT_CONFIRMED_IOCS,
+    MAX_CONTEXT_PUBLICATION_ANCHORS,
     MAX_SUMMARY_CHARS,
     ArticleClaimV1,
     ArticleContextV1,
+    ConfirmedIOCContextV1,
+    PublicationAnchorV1,
 )
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_normalization import normalize_indicator_value
 from cti_app.application.research_context_builder import ArticleSnapshot
 from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
+)
+from cti_app.domain.publication import ArtifactType
+from cti_app.domain.publication_document import (
+    PublicationDocumentV4,
+    PublicationDocumentV5,
+    PublicationDocumentV6,
+    publication_document_from_json,
+    publication_document_text_anchors,
 )
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -137,6 +152,8 @@ class ProductionArticleSnapshotAdapter:
         narrative_hashes = _extract_narrative_hashes(synthesis_payload)
         documented_samples: set[str] = set()
         ioc_rows: list[dict[str, Any]] = []
+        confirmed_iocs: list[ConfirmedIOCContextV1] = []
+        confirmed_iocs_truncated = False
         for indicator in pack_payload.get("file_indicators", []):
             if not isinstance(indicator, dict):
                 continue
@@ -183,8 +200,16 @@ class ProductionArticleSnapshotAdapter:
                             "context": str(indicator.get("context", "")),
                             "evidence_quote": str(indicator.get("evidence_quote", "")),
                             "source_refs": refs,
+                            "extraction_artifact_id": str(artifact.id),
+                            "extraction_artifact_version": artifact.version,
                         }
                     )
+                    inventory_item = _confirmed_ioc_context(indicator, artifact)
+                    if inventory_item is not None:
+                        if len(confirmed_iocs) < MAX_CONTEXT_CONFIRMED_IOCS:
+                            confirmed_iocs.append(inventory_item)
+                        else:
+                            confirmed_iocs_truncated = True
                     if indicator.get("artifact_type") == "hash" and _SHA256.fullmatch(value):
                         documented_samples.add(value)
         documented_iocs = tuple({"kind": "documented_ioc", **row} for row in ioc_rows[:128])
@@ -198,6 +223,11 @@ class ProductionArticleSnapshotAdapter:
             documented_samples=tuple(sorted(documented_samples)[:256]),
             known_chain=known_chain,
             open_questions=tuple(uncertainties),
+            publication_anchors=(
+                await self._publication_anchors(publication.canonical_blob_id)
+                if publication is not None
+                else ()
+            ),
         )
         policy = pack_payload.get("policy", {})
         return ArticleSnapshot(
@@ -218,6 +248,8 @@ class ProductionArticleSnapshotAdapter:
             if isinstance(policy, dict)
             else False,
             narrative_hashes=tuple(sorted(narrative_hashes)),
+            confirmed_iocs=tuple(confirmed_iocs),
+            confirmed_iocs_truncated=confirmed_iocs_truncated,
         )
 
     async def get_claims(
@@ -239,6 +271,39 @@ class ProductionArticleSnapshotAdapter:
             raise ValueError("Verified publication has no canonical payload")
         payload = await self._artifact_store.read_json(blob_id)
         return hashlib.sha256(self._artifact_store.canonical_json_bytes(payload)).hexdigest()
+
+    async def _publication_anchors(self, blob_id: UUID | None) -> tuple[PublicationAnchorV1, ...]:
+        if blob_id is None:
+            return ()
+        payload = await self._artifact_store.read_json(blob_id)
+        if payload.get("schema_version") not in {"4", "5", "6"}:
+            return ()
+        document = publication_document_from_json(payload)
+        if isinstance(document, PublicationDocumentV6):
+            publication = document.base_publication
+        elif isinstance(document, PublicationDocumentV5):
+            publication = document
+        elif isinstance(document, PublicationDocumentV4):
+            anchors = publication_document_text_anchors(document)
+            publication = None
+        else:  # pragma: no cover - exhaustive union guard
+            return ()
+        if publication is not None:
+            anchors = publication_document_text_anchors(
+                publication.document,
+                references=publication.references,
+            )
+        paragraph_anchors = {
+            anchor: text
+            for anchor, text in anchors.items()
+            if re.fullmatch(r"lead:\d{4}|section:\d+:paragraph:\d{4}", anchor)
+        }
+        result = []
+        for anchor, text in sorted(paragraph_anchors.items())[:MAX_CONTEXT_PUBLICATION_ANCHORS]:
+            excerpt = " ".join(text.split())[:160].rstrip()
+            if excerpt:
+                result.append(PublicationAnchorV1(anchor=anchor, excerpt=excerpt))
+        return tuple(result)
 
 
 def _synthesis_content(
@@ -337,6 +402,82 @@ def _pack_source_refs(indicator: dict[str, Any]) -> tuple[str, ...]:
         return ()
     refs = provenance.get("source_ids", ())
     return tuple(str(item) for item in refs if isinstance(item, str))[:64]
+
+
+_SENSITIVE_URL_QUERY = re.compile(
+    r"(?i)[?&](?:x-amz-[^=]+|x-goog-[^=]+|signature|sig|access_token|api[_-]?key|"
+    r"token|secret|password|authorization|credential)="
+)
+
+
+def _confirmed_ioc_context(
+    indicator: dict[str, Any], artifact: ProductionArtifact
+) -> ConfirmedIOCContextV1 | None:
+    if indicator.get("indicator_status") != "confirmed_ioc":
+        return None
+    raw_value = indicator.get("value")
+    try:
+        artifact_type = ArtifactType(str(indicator.get("artifact_type", "")))
+        if not isinstance(raw_value, str):
+            return None
+        value = normalize_indicator_value(raw_value, artifact_type)
+    except (TypeError, ValueError):
+        return None
+
+    indicator_type: Literal["md5", "sha1", "sha256", "ipv4", "domain", "url"]
+    if artifact_type is ArtifactType.HASH:
+        if len(value) == 32:
+            indicator_type = "md5"
+        elif len(value) == 40:
+            indicator_type = "sha1"
+        elif len(value) == 64:
+            indicator_type = "sha256"
+        else:
+            return None
+        if re.fullmatch(r"[0-9a-f]+", value) is None:
+            return None
+    elif artifact_type is ArtifactType.IP:
+        try:
+            if ipaddress.ip_address(value).version != 4:
+                return None
+        except ValueError:
+            return None
+        indicator_type = "ipv4"
+    elif artifact_type is ArtifactType.DOMAIN:
+        if not value or len(value) > 253:
+            return None
+        indicator_type = "domain"
+    elif artifact_type is ArtifactType.URL:
+        parts = urlsplit(value)
+        if (
+            not parts.scheme
+            or not parts.hostname
+            or parts.username is not None
+            or parts.password is not None
+            or _SENSITIVE_URL_QUERY.search(value)
+            or len(value) > 2_048
+        ):
+            return None
+        indicator_type = "url"
+    else:
+        return None
+
+    raw_source_ids = indicator.get("source_document_ids", ())
+    if not isinstance(raw_source_ids, list | tuple) or len(raw_source_ids) > 16:
+        return None
+    try:
+        source_document_ids = tuple(UUID(str(item)) for item in raw_source_ids)
+    except (TypeError, ValueError):
+        return None
+    if not source_document_ids:
+        return None
+    return ConfirmedIOCContextV1(
+        indicator_type=indicator_type,
+        value=value,
+        extraction_artifact_id=artifact.id,
+        extraction_artifact_version=artifact.version,
+        source_document_ids=source_document_ids,
+    )
 
 
 def _extract_narrative_hashes(payload: Any, *, limit: int = _MAX_ARTICLE_HASHES) -> set[str]:

@@ -5,6 +5,7 @@ from uuid import uuid4
 
 import pytest
 
+from cti_app.application.investigation_acquisition_tools import VT_DOWNLOAD_SAMPLE_SCHEMA
 from cti_app.application.investigation_contracts import (
     AgentTurnDecisionV1,
     ArticleClaimV1,
@@ -19,7 +20,8 @@ from cti_app.application.investigation_contracts import (
     parse_investigation_context,
     validate_decision_hypothesis_references,
 )
-from cti_app.application.investigation_tools import ToolEffect
+from cti_app.application.investigation_rule_tools import RULE_PROPOSE_SCHEMA, RULE_REVISE_SCHEMA
+from cti_app.application.investigation_tools import ToolEffect, validate_json_schema
 from cti_app.domain.investigation import AgentNextAction
 from cti_app.domain.investigation_state import (
     DecisionValidationCode as DomainDecisionValidationCode,
@@ -47,6 +49,272 @@ def _investigation(*, evidence=()):
         blocked_capabilities=(),
         budget_remaining={"vt_units": 4, "shodan_credits": None},
     )
+
+
+def test_compact_decision_parses_explicit_operator_request_acknowledgements() -> None:
+    request_id = uuid4()
+    decision = parse_agent_turn_decision(
+        "@@DECISION@@\nGOAL: Address the operator request.\n"
+        "SUMMARY: The requested check is complete.\nNEXT: finish\n"
+        f"ADDRESSED_REQUESTS: {request_id}\n@@END@@"
+    )
+
+    assert decision.addressed_request_ids == (request_id,)
+
+
+def test_compact_tool_arguments_follow_registered_json_schema_types() -> None:
+    schemas = {
+        ("shodan.count", "1"): {
+            "type": "object",
+            "properties": {
+                "justification": {"type": "string"},
+                "evidence_refs": {"type": "array", "items": {"type": "string"}},
+            },
+        },
+        ("vt.download_sample", "1"): VT_DOWNLOAD_SAMPLE_SCHEMA,
+        ("rule.propose", "1"): RULE_PROPOSE_SCHEMA,
+    }
+    wire = """@@DECISION@@
+GOAL: Preserve typed arguments.
+SUMMARY: Strings keep punctuation while structured arguments stay typed.
+NEXT: continue
+@@END@@
+@@TOOL@@
+NAME: shodan.count
+VERSION: 1
+PURPOSE: Count the matching host.
+ARG justification: Verify one pass, then compare the result with the article.
+ARG evidence_refs: []
+@@END@@
+@@TOOL@@
+NAME: vt.download_sample
+VERSION: 1
+PURPOSE: Download the documented sample.
+ARG sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+ARG purpose: Review the sample; then preserve its source context.
+ARG evidence_refs: "synthetic, reference", second
+@@END@@
+@@TOOL@@
+NAME: rule.propose
+VERSION: 1
+PURPOSE: Propose a bounded rule.
+ARG meta: {"classification":"trojan","description":"synthetic metadata"}
+@@END@@"""
+
+    decision = parse_agent_turn_decision(wire, tool_schemas=schemas)
+
+    calls = {item.tool_name: item.arguments for item in decision.proposed_tool_calls}
+    assert calls["shodan.count"]["justification"] == (
+        "Verify one pass, then compare the result with the article."
+    )
+    assert calls["shodan.count"]["evidence_refs"] == []
+    assert calls["vt.download_sample"]["purpose"] == (
+        "Review the sample; then preserve its source context."
+    )
+    assert calls["vt.download_sample"]["evidence_refs"] == ["synthetic, reference", "second"]
+    assert calls["rule.propose"]["meta"] == {
+        "classification": "trojan",
+        "description": "synthetic metadata",
+    }
+
+
+def test_compact_rule_motifs_accept_multiline_json_for_real_rule_schemas() -> None:
+    candidate_id = str(uuid4())
+    evidence_id = str(uuid4())
+    motif_schema = RULE_REVISE_SCHEMA["properties"]["motifs"]["items"]["properties"]
+    motif = {
+        "kind": motif_schema["kind"]["enum"][0],
+        "value": 'synthetic ] } "quoted" pattern',
+        "provenance_kind": motif_schema["provenance_kind"]["enum"][0],
+        "provenance_id": "synthetic-source",
+        "observation_refs": [evidence_id],
+    }
+    motifs = json.dumps([motif], indent=2)
+    condition = RULE_PROPOSE_SCHEMA["properties"]["condition"]["enum"][0]
+    wire = f"""@@DECISION@@
+GOAL: Preserve multiline rule arguments.
+SUMMARY: Both real rule schemas accept a structured motif array.
+NEXT: continue
+@@END@@
+@@TOOL@@
+NAME: rule.propose
+VERSION: 1
+PURPOSE: Propose a synthetic detection condition.
+ARG condition: {condition}
+ARG motifs: {motifs}
+@@END@@
+@@TOOL@@
+NAME: rule.revise
+VERSION: 1
+PURPOSE: Revise the synthetic candidate.
+ARG candidate_id: {candidate_id}
+ARG parent_version: 1
+ARG condition: {condition}
+ARG motifs: {motifs}
+@@END@@"""
+
+    decision = parse_agent_turn_decision(
+        wire,
+        tool_schemas={
+            ("rule.propose", "1"): RULE_PROPOSE_SCHEMA,
+            ("rule.revise", "1"): RULE_REVISE_SCHEMA,
+        },
+    )
+
+    calls = {item.tool_name: item.arguments for item in decision.proposed_tool_calls}
+    assert calls["rule.propose"]["motifs"] == [motif]
+    assert calls["rule.revise"]["motifs"] == [motif]
+    assert calls["rule.revise"]["candidate_id"] == candidate_id
+    validate_json_schema(calls["rule.propose"], RULE_PROPOSE_SCHEMA)
+    validate_json_schema(calls["rule.revise"], RULE_REVISE_SCHEMA)
+
+
+def test_compact_rejects_unclosed_json_argument_before_next_arg_or_end() -> None:
+    for boundary in ("ARG condition: all", "@@END@@", "@@FINDING@@"):
+        wire = (
+            "@@DECISION@@\nGOAL: Reject the incomplete argument.\n"
+            "SUMMARY: An incomplete JSON value must not be partially accepted.\n"
+            "NEXT: finish\n@@END@@\n@@TOOL@@\nNAME: rule.revise\nVERSION: 1\n"
+            "PURPOSE: Revise a synthetic candidate.\nARG motifs: [\n  {\n"
+            f"{boundary}"
+        )
+        with pytest.raises(ValueError, match=r"TOOL .*ARG motifs.*not closed"):
+            parse_agent_turn_decision(
+                wire,
+                tool_schemas={("rule.revise", "1"): RULE_REVISE_SCHEMA},
+            )
+
+
+def test_compact_multiline_json_argument_has_a_line_bound() -> None:
+    motifs = (
+        "[\n"
+        + ",\n".join(
+            json.dumps({"kind": "literal", "value": f"synthetic-{index}"}, indent=2)
+            for index in range(32)
+        )
+        + "\n]"
+    )
+    wire = (
+        "@@DECISION@@\nGOAL: Keep structured arguments bounded.\n"
+        "SUMMARY: This oversized line sequence must be rejected.\nNEXT: finish\n@@END@@\n"
+        "@@TOOL@@\nNAME: rule.revise\nVERSION: 1\nPURPOSE: Revise a candidate.\n"
+        f"ARG motifs: {motifs}\n@@END@@"
+    )
+
+    with pytest.raises(
+        ValueError, match=r"TOOL rule\.revise\.ARG motifs JSON value exceeds 128 lines"
+    ):
+        parse_agent_turn_decision(wire)
+
+
+def test_compact_json_argument_has_a_byte_bound() -> None:
+    oversized = '{"value":"' + ("x" * (32 * 1024)) + '"}'
+    wire = (
+        "@@DECISION@@\nGOAL: Keep structured arguments byte bounded.\n"
+        "SUMMARY: This JSON value exceeds the per-argument limit.\nNEXT: finish\n@@END@@\n"
+        "@@TOOL@@\nNAME: rule.revise\nVERSION: 1\nPURPOSE: Revise a candidate.\n"
+        f"ARG motifs: {oversized}\n@@END@@"
+    )
+
+    with pytest.raises(
+        ValueError, match=r"TOOL rule\.revise\.ARG motifs JSON value exceeds 32768 bytes"
+    ):
+        parse_agent_turn_decision(wire)
+
+
+@pytest.mark.parametrize(
+    ("block", "message"),
+    [
+        (
+            "@@TOOL@@\nNAME: article.get_claims\nPURPOSE: Read claims.\nARG claim_ids: C1\n@@END@@",
+            "TOOL",
+        ),
+        (
+            "@@FINDING@@\nKIND: capability\nASSESSMENT: qualified\n@@END@@",
+            "FINDING",
+        ),
+        (
+            "@@NOTE@@\nANCHOR: lead:0001\nSTATE: observed\nRELATION: confirms\n"
+            "TEXT: A synthetic observation.\nFINDINGS: invalid-uuid\n@@END@@",
+            "NOTE",
+        ),
+    ],
+)
+def test_rejected_tool_finding_and_note_blocks_reject_the_whole_decision(block, message) -> None:
+    wire = (
+        "@@DECISION@@\nGOAL: Keep the entire response atomic.\n"
+        "SUMMARY: No decision with a rejected block may be partially accepted.\n"
+        f"NEXT: finish\n@@END@@\n{block}"
+    )
+
+    with pytest.raises(ValueError, match=message):
+        parse_agent_turn_decision(wire)
+
+
+def test_opinion_finding_refs_accept_whitespace_separated_uuids_and_reject_bad_refs() -> None:
+    finding_refs = (uuid4(), uuid4())
+    prefix = (
+        "@@DECISION@@\nGOAL: Preserve all opinion citations.\n"
+        "SUMMARY: The references are separated by whitespace.\nNEXT: finish\n@@END@@\n"
+        "@@OPINION@@\nTYPE: key_findings\nTEXT: A synthetic inference.\n"
+        f"FINDINGS: {finding_refs[0]} {finding_refs[1]}\n"
+        "QUALIFICATION: inference\nCERTAINTY: 0.6\n@@END@@"
+    )
+
+    parsed = parse_agent_turn_decision(prefix)
+
+    assert parsed.opinion_delta is not None
+    assert parsed.opinion_delta.blocks[0].finding_refs == finding_refs
+    with pytest.raises(ValueError, match=r"OPINION\.FINDING_REFS.*invalid UUID"):
+        parse_agent_turn_decision(prefix.replace(f"{finding_refs[1]}", "not-a-uuid"))
+
+
+def test_compact_decision_parses_structured_anchored_notes() -> None:
+    finding_id = uuid4()
+    evidence_id = uuid4()
+    decision = parse_agent_turn_decision(
+        "@@DECISION@@\nGOAL: Record a note at a verified paragraph.\n"
+        "SUMMARY: The cited observation supports this local statement.\nNEXT: continue\n"
+        "@@END@@\n@@NOTE@@\nANCHOR: lead:0001\nSTATE: observed\n"
+        "RELATION: confirms\nTEXT: The paragraph describes the same loader stage.\n"
+        f"FINDINGS: {finding_id}\nEVIDENCE: {evidence_id}\n@@END@@"
+    )
+
+    assert len(decision.opinion_delta.notes) == 1
+    note = decision.opinion_delta.notes[0]
+    assert note.anchor == "lead:0001"
+    assert note.finding_refs == (finding_id,)
+    assert note.evidence_refs == (evidence_id,)
+
+
+def test_compact_opinion_certainty_accepts_numeric_prefix_and_rejects_verbal_only() -> None:
+    finding_id = uuid4()
+    evidence_id = uuid4()
+    prefix = (
+        "@@DECISION@@\nGOAL: Draft a qualified opinion.\nSUMMARY: Keep uncertainty explicit.\n"
+        "NEXT: finish\n@@END@@\n@@OPINION@@\nTYPE: key_findings\n"
+        "TEXT: The synthetic finding remains qualified.\n"
+        f"FINDINGS: {finding_id}\nEVIDENCE: {evidence_id}\n"
+        "QUALIFICATION: inference\nCERTAINTY: 0.6 (moderate confidence)\n@@END@@"
+    )
+    verbal = prefix.replace("0.6 (moderate confidence)", "moderate confidence")
+
+    parsed = parse_agent_turn_decision(prefix)
+
+    assert parsed.opinion_delta is not None
+    assert parsed.opinion_delta.blocks[0].certainty == 0.6
+    with pytest.raises(ValueError, match=r"line \d+: OPINION\.CERTAINTY must be a number"):
+        parse_agent_turn_decision(verbal)
+
+
+def test_compact_decision_rejects_malformed_anchored_note_fields() -> None:
+    with pytest.raises(ValueError, match="Invalid agent turn decision"):
+        parse_agent_turn_decision(
+            "@@DECISION@@\nGOAL: Record a note.\nSUMMARY: Verify the fields.\n"
+            "NEXT: continue\n@@END@@\n@@NOTE@@\nANCHOR: lead:0001\n"
+            "STATE: observed\nRELATION: confirms\nTEXT: Missing required evidence.\n"
+            "FINDINGS: not-a-uuid\n@@END@@"
+        )
 
 
 def test_full_context_has_versioned_schema_and_canonical_serialization() -> None:
@@ -178,6 +446,180 @@ def test_legacy_decision_json_without_hypothesis_refs_is_readable_and_replayable
     assert first.finding_proposals[0].hypothesis_refs == ()
     assert first.canonical_bytes() == replayed.canonical_bytes()
     assert validate_decision_hypothesis_references(first, known_hypothesis_ids=set()) is None
+
+
+def test_compact_agent_turn_wire_parses_all_decision_blocks() -> None:
+    observation_id = uuid4()
+    wire = f"""Preamble ignored by the parser.
+@@DECISION@@
+GOAL: Check claim C1 against the observation.
+SUMMARY: The observation confirms one part of the claim.
+NEXT: continue
+HYPOTHESES: H1, H2
+@@END@@
+@@TOOL@@
+NAME: article.get_claims
+VERSION: 1
+PURPOSE: Compare the cited claims.
+ARG claim_ids: ["C1", "C2"]
+ARG query: loader family
+@@END@@
+@@FINDING@@
+KIND: claim_verification
+ASSESSMENT: supported
+STATEMENT: The observation supports the claim.
+OBSERVATIONS: {observation_id}
+CLAIMS: C1; C2
+HYPOTHESES: H1
+NOVELTY: new_to_article
+SCOPE: Current sample only.
+LIMITATIONS: One observation, small sample
+@@END@@
+@@OPINION@@
+TYPE: key_findings
+TEXT: The observation supports claim C1.
+FINDINGS: {observation_id}
+EVIDENCE: {observation_id}
+QUALIFICATION: inference
+CERTAINTY: 0.8
+UNRESOLVED: Attribution remains open.
+@@END@@
+Postface ignored by the parser.
+"""
+
+    decision = parse_agent_turn_decision(wire)
+
+    assert decision.goal == "Check claim C1 against the observation."
+    assert decision.reasoning_summary == "The observation confirms one part of the claim."
+    assert decision.hypothesis_refs == ("H1", "H2")
+    assert decision.proposed_tool_calls[0].arguments == {
+        "claim_ids": ["C1", "C2"],
+        "query": "loader family",
+    }
+    finding = decision.finding_proposals[0]
+    assert finding.observation_refs == (observation_id,)
+    assert finding.claim_refs == ("C1", "C2")
+    assert finding.hypothesis_refs == ("H1",)
+    assert decision.opinion_delta is not None
+    assert decision.opinion_delta.blocks[0].block_type.value == "key_findings"
+    assert decision.opinion_delta.unresolved_points == ("Attribution remains open.",)
+
+
+def test_compact_agent_turn_wire_accepts_minimal_and_tolerant_variants() -> None:
+    wire = """Bridge preamble.
+```text
+@@decision@@
+goal: Verify a bounded claim.
+summary: First summary line
+second summary line continues the value.
+next: CONTINUE
+hypotheses: H1, H2; H3
+H4
+```"""
+
+    decision = parse_agent_turn_decision(wire)
+    minimal = parse_agent_turn_decision(
+        "@@DECISION@@\nGOAL: Finish\nSUMMARY: No further evidence is needed.\nNEXT: finish"
+    )
+
+    assert decision.reasoning_summary == (
+        "First summary line\nsecond summary line continues the value."
+    )
+    assert decision.hypothesis_refs == ("H1", "H2", "H3", "H4")
+    assert decision.next_action is AgentNextAction.CONTINUE
+    assert minimal.proposed_tool_calls == ()
+    assert minimal.finding_proposals == ()
+    assert minimal.opinion_delta is None
+
+
+def test_adopted_turn_zero_json_and_fenced_legacy_json_remain_readable() -> None:
+    adopted_turn_zero = (
+        '{"schema":"agent-turn-decision.v1","reasoning_summary":"…","goal":"…",'
+        '"hypothesis_refs":[],"proposed_tool_calls":[{"tool_name":"article.get_claims",'
+        '"schema_version":"1","arguments":{"claim_ids":["S3P4.1","S4P4.1"]},'
+        '"purpose":"…"}],"finding_proposals":[],"opinion_delta":null,'
+        '"next_action":"continue"}'
+    )
+
+    direct = parse_agent_turn_decision(adopted_turn_zero)
+    fenced = parse_agent_turn_decision(f"```json\n{adopted_turn_zero}\n```")
+
+    assert direct.canonical_bytes() == fenced.canonical_bytes()
+    assert direct.proposed_tool_calls[0].arguments["claim_ids"] == ["S3P4.1", "S4P4.1"]
+
+
+@pytest.mark.parametrize(
+    ("wire", "message"),
+    [
+        (
+            "@@DECISION@@\nGOAL: Check\nSUMMARY: Continue\nNEXT: teleport",
+            "NEXT",
+        ),
+        (
+            "@@DECISION@@\nGOAL: Check\nSUMMARY: Continue\nNEXT: continue\n"
+            "@@DECISION@@\nGOAL: Again\nSUMMARY: Again\nNEXT: finish",
+            "duplicate @@DECISION@@",
+        ),
+        (
+            "@@DECISION@@\nGOAL: Check\nSUMMARY: Continue\nNEXT: continue\n"
+            "@@TOOL@@\nPURPOSE: Missing a name\n@@END@@",
+            "TOOL.NAME",
+        ),
+    ],
+)
+def test_compact_agent_turn_wire_rejects_unusable_required_values(wire: str, message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        parse_agent_turn_decision(wire)
+
+
+@pytest.mark.parametrize(
+    "wire",
+    [
+        "@@DECISION@@\nGOAL: Check\nSUMMARY: Report\nNEXT: finish\n"
+        "@@TOOL@@\nNAME: x\nVERSION: 1\nPURPOSE: Read\nARG access_token: private\n@@END@@",
+        "@@DECISION@@\nGOAL: Check\nSUMMARY: Report\nNEXT: finish\n"
+        "@@TOOL@@\nNAME: x\nVERSION: 1\nPURPOSE: Read\nARG api_key: private\n@@END@@",
+        "@@DECISION@@\nGOAL: Check\nSUMMARY: https://x.invalid/a?X-Amz-Signature="
+        "secret\nNEXT: finish",
+    ],
+)
+def test_compact_agent_turn_wire_rejects_secret_fields_and_signed_urls(wire: str) -> None:
+    with pytest.raises(ValueError, match=r"secret|signed URL"):
+        parse_agent_turn_decision(wire)
+
+
+def test_malformed_tool_rejects_the_whole_decision_with_a_targeted_error() -> None:
+    wire = """@@DECISION@@
+GOAL: Finish safely.
+SUMMARY: The malformed proposal must not be partially retained.
+NEXT: finish
+@@END@@
+@@TOOL@@
+NAME: article.get_claims
+VERSION: 1
+PURPOSE: Read claims.
+ARG claim_ids: [not valid JSON
+@@END@@"""
+
+    with pytest.raises(ValueError, match=r"TOOL article\.get_claims\.ARG claim_ids.*not closed"):
+        parse_agent_turn_decision(wire)
+
+
+def test_malformed_finding_field_rejects_the_whole_decision_with_a_targeted_error() -> None:
+    wire = """@@DECISION@@
+GOAL: Finish.
+SUMMARY: Keep the valid decision.
+NEXT: finish
+@@END@@
+@@FINDING@@
+KIND: claim_verification
+ASSESSMENT: inconclusive
+STATEMENT: The source is incomplete.
+NOVELTY: invented_value
+@@END@@"""
+
+    with pytest.raises(ValueError, match=r"FINDING block rejected: FINDING\.NOVELTY"):
+        parse_agent_turn_decision(wire)
 
 
 def test_hypothesis_references_have_stable_typed_rejection_codes() -> None:

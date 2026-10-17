@@ -14,6 +14,7 @@ from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.identity import LocalIdentityProvider
 from cti_app.application.sample_acquisition import (
     SampleAcquisitionCapabilityDisabledError,
+    SampleAcquisitionDownloadError,
     SampleAcquisitionPolicy,
     SampleAcquisitionPolicyDeniedError,
     VirusTotalSampleAcquisitionService,
@@ -110,6 +111,20 @@ class _FakeSampleAcquisitionAttemptRepository:
             ):
                 return attempt
         return None
+
+    async def find_latest_error(
+        self, investigation_id: UUID, requested_hash: str
+    ) -> SampleAcquisitionAttempt | None:
+        return next(
+            (
+                attempt
+                for attempt in reversed(self._db.attempts)
+                if attempt.investigation_id == investigation_id
+                and attempt.requested_hash == requested_hash
+                and attempt.outcome is SampleAcquisitionOutcome.ERROR
+            ),
+            None,
+        )
 
     async def append(self, attempt: SampleAcquisitionAttempt) -> None:
         # Emulates the DB's partial unique index: at most one SUCCESS row
@@ -570,7 +585,7 @@ async def test_budget_is_not_refunded_when_the_vt_call_fails_after_being_consume
     )
     service = _service(tmp_path, db, port)
 
-    with pytest.raises(VirusTotalHttpError):
+    with pytest.raises(SampleAcquisitionDownloadError) as caught:
         await service.acquire(
             investigation_id=investigation.id,
             subject_id=investigation.subject_id,
@@ -583,7 +598,9 @@ async def test_budget_is_not_refunded_when_the_vt_call_fails_after_being_consume
     assert db.investigations[investigation.id].budget.consumed_vt_read_units == 1
     assert len(db.samples) == 0
     error_attempt = next(a for a in db.attempts if a.outcome is SampleAcquisitionOutcome.ERROR)
-    assert error_attempt.error_code == "virustotal_not_found"
+    assert error_attempt.error_code == "virustotal_download_route_not_found"
+    assert caught.value.code == error_attempt.error_code
+    assert caught.value.ambiguous is False
     failure_events = [e for e in db.provenance if e.aggregate_id == investigation.id]
     assert len(failure_events) == 1
 

@@ -275,11 +275,26 @@ class ShodanHttpAdapter(ShodanPort, ShodanCountPort):
                     )
                 if status in {401, 403}:
                     detail = "unauthorized" if status == 401 else "forbidden"
-                    raise ShodanCapabilityDisabledError(
-                        "La capacité Shodan n'est pas autorisée par les identifiants configurés.",
+                    key = self._api_key.get_secret_value()
+                    upstream_message = _extract_upstream_message(
+                        await _read_error_prefix(response), key
+                    )
+                    message = (
+                        "La capacité Shodan n'est pas autorisée par les identifiants configurés."
+                    )
+                    if upstream_message:
+                        message = f"{message} Réponse amont : {upstream_message}"
+                    error = ShodanCapabilityDisabledError(
+                        message,
                         code=f"shodan_upstream_{detail}",
                         status_code=status,
+                        upstream_message=upstream_message,
                     )
+                    if path != "/api-info" and status == 403:
+                        account = await self._api_info()
+                        if account is not None:
+                            error.query_credits, error.plan = account
+                    raise error
                 if status == 402:
                     raise ShodanQuotaError(
                         "Le quota de crédits Shodan est épuisé.",
@@ -342,7 +357,9 @@ class ShodanHttpAdapter(ShodanPort, ShodanCountPort):
             credits
             if isinstance(credits, int) and not isinstance(credits, bool) and credits >= 0
             else None,
-            plan.strip() if isinstance(plan, str) and plan.strip() else None,
+            _safe_provider_text(plan, self._api_key.get_secret_value(), max_chars=50)
+            if isinstance(plan, str) and plan.strip() and self._api_key is not None
+            else None,
         )
 
 
@@ -660,6 +677,46 @@ async def _read_bounded(response: httpx.Response, maximum: int) -> bytes:
             raise ShodanResponseTooLargeError("La réponse Shodan dépasse la limite configurée.")
         chunks.append(chunk)
     return b"".join(chunks)
+
+
+async def _read_error_prefix(response: httpx.Response, maximum: int = 4096) -> bytes:
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in response.aiter_bytes(chunk_size=1024):
+        remaining = maximum - size
+        if remaining <= 0:
+            break
+        prefix = chunk[:remaining]
+        chunks.append(prefix)
+        size += len(prefix)
+        if len(prefix) < len(chunk):
+            break
+    return b"".join(chunks)
+
+
+def _safe_provider_text(value: object, api_key: str, *, max_chars: int) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value
+    for secret in {api_key, quote(api_key, safe=""), quote_plus(api_key, safe="")}:
+        if secret:
+            text = text.replace(secret, "[REDACTED]")
+    text = "".join(
+        character if character >= " " and character != "\x7f" else " " for character in text
+    )
+    text = " ".join(text.split())
+    return text[:max_chars] or None
+
+
+def _extract_upstream_message(body: bytes, api_key: str) -> str | None:
+    try:
+        payload = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        payload = None
+    detail = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(detail, str):
+        detail = body.decode("utf-8", errors="replace")
+    return _safe_provider_text(detail, api_key, max_chars=200)
 
 
 def _retry_after(value: str | None) -> float | None:

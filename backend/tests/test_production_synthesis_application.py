@@ -1174,12 +1174,14 @@ def test_plain_text_validator_accepts_technical_placeholders_and_wildcard_globs(
         "A custom element <widget data-mode=compact>.",
         "A self-closing element <widget/>.",
         '<a href="https://example.com">link</a>',
+        "A [link](https://example.com) is present.",
         '<img src="x.png" alt="image">',
         "<!-- comment -->",
         "# Markdown heading",
         "* item in a Markdown list",
         "*Markdown emphasis*",
         "**Markdown emphasis**",
+        "The literal `RuntimeBroker.exe` remains plain source text.",
     ),
 )
 def test_plain_text_validator_still_rejects_markup_and_markdown(text: str) -> None:
@@ -1457,6 +1459,379 @@ def test_proposal_requires_technical_literal_to_be_covered_by_claim_refs():
     assert unsupported.value.reason == (
         "synthesis_unknown_technical_value:claim=C009:literal_kind=domain:"
         "literal_value=evil.example:reason=not_supported_by_cited_handles"
+    )
+
+
+@pytest.mark.parametrize(
+    ("artifact_type", "artifact_value", "claim_value"),
+    (
+        (ArtifactType.FILENAME, "RuntimeBroker.exe", "RuntimeBroker.exe"),
+        (ArtifactType.FILENAME, "RuntimeBroker.exe.config", "RuntimeBroker.exe.config"),
+        (ArtifactType.FILEPATH, r"C:\Windows\System32\RuntimeBroker.exe", "RuntimeBroker.exe"),
+        (ArtifactType.FILENAME, "FlightManager.csproj", "FlightManager.csproj"),
+        (ArtifactType.FILENAME, "payload.dll", "payload.dll"),
+    ),
+)
+def test_extracted_file_artifacts_are_not_validated_as_domains(
+    artifact_type: ArtifactType, artifact_value: str, claim_value: str
+) -> None:
+    subject_id, source_id = uuid4(), uuid4()
+    source = make_source(
+        source_id,
+        facts=(make_fact(source_id, "FooRAT"),),
+        indicators=(
+            replace(make_indicator(source_id, artifact_value), artifact_type=artifact_type),
+        ),
+    )
+    extraction = make_extraction(subject_id, (source,))
+    pack = build_synthesis_evidence_pack(make_snapshot(subject_id), extraction)
+    fact_handle = next(
+        str(record["handle"])
+        for record in pack.narrative_evidence
+        if record["kind"] == EvidenceKind.FACT.value
+    )
+    claim_text = f"FooRAT a été lancé sous le nom {claim_value}."
+
+    lead, sections = validate_synthesis_proposal(
+        make_proposal(claim_text, fact_handle), pack, extraction
+    )
+
+    assert lead[0].text == claim_text
+    assert sections[0].paragraphs[0].evidence_refs == (pack.resolve_handle(fact_handle),)
+
+
+def test_unextracted_zip_tld_is_still_validated_as_a_domain() -> None:
+    subject_id, source_id = uuid4(), uuid4()
+    extraction = make_extraction(
+        subject_id,
+        (make_source(source_id, facts=(make_fact(source_id, "FooRAT"),)),),
+    )
+    pack = build_synthesis_evidence_pack(make_snapshot(subject_id), extraction)
+    fact_handle = str(pack.narrative_evidence[0]["handle"])
+
+    with pytest.raises(SynthesisProposalControlError) as unknown:
+        validate_synthesis_proposal(
+            make_wire_proposal_with_section_claim(
+                "Le domaine foo.zip héberge FooRAT.", fact_handle
+            ),
+            pack,
+            extraction,
+        )
+
+    assert unknown.value.reason == (
+        "synthesis_unknown_technical_value:claim=C009:literal_kind=domain:"
+        "literal_value=foo.zip:reason=not_in_extraction"
+    )
+
+
+def test_free_text_domain_does_not_cancel_filename_disambiguation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subject_id, source_id = uuid4(), uuid4()
+    file_fact = make_fact(
+        source_id,
+        "RuntimeBroker.exe and RuntimeBroker.exe.config launch AppDomainManager hijacking",
+    )
+    cited_fact = make_fact(source_id, "FooRAT was observed in the report")
+    source = make_source(
+        source_id,
+        facts=(file_fact, cited_fact),
+        indicators=(
+            replace(
+                make_indicator(source_id, "RuntimeBroker.exe"), artifact_type=ArtifactType.FILENAME
+            ),
+            replace(
+                make_indicator(source_id, "RuntimeBroker.exe.config"),
+                artifact_type=ArtifactType.FILENAME,
+            ),
+        ),
+    )
+    extraction = make_extraction(subject_id, (source,))
+    pack = build_synthesis_evidence_pack(make_snapshot(subject_id), extraction)
+    cited_handle = next(
+        str(record["handle"])
+        for record in pack.narrative_evidence
+        if record["kind"] == EvidenceKind.FACT.value and record["value"] == cited_fact.value
+    )
+    free_text_ref = next(
+        ref
+        for ref, payload in extraction_evidence_elements(extraction)
+        if ref.kind is EvidenceKind.FACT and payload["value"] == file_fact.value
+    )
+    original_validate_grounded_text = synthesis_module._validate_grounded_text
+    literal = ("domain", "runtimebroker.exe")
+    observed_file_artifact_domains: set[str] = set()
+
+    def inspect_grounding_inputs(
+        text: str,
+        claim_id: str | None,
+        refs: tuple[ExtractionEvidenceRefV1, ...],
+        entries: Mapping[ExtractionEvidenceRefV1, Mapping[str, Any]],
+        known_technical: set[tuple[str, str]],
+        technical_support: Mapping[tuple[str, str], set[ExtractionEvidenceRefV1]],
+        file_artifact_domains: set[str],
+    ) -> None:
+        assert literal in known_technical
+        assert free_text_ref in technical_support[literal]
+        observed_file_artifact_domains.update(file_artifact_domains)
+        original_validate_grounded_text(
+            text,
+            claim_id,
+            refs,
+            entries,
+            known_technical,
+            technical_support,
+            file_artifact_domains,
+        )
+
+    monkeypatch.setattr(synthesis_module, "_validate_grounded_text", inspect_grounding_inputs)
+    claim_text = "FooRAT a été lancée sous le nom RuntimeBroker.exe."
+
+    lead, sections = validate_synthesis_proposal(
+        make_proposal(claim_text, cited_handle), pack, extraction
+    )
+
+    assert lead[0].text == claim_text
+    assert sections[0].paragraphs[0].text == claim_text
+    assert literal[1] in observed_file_artifact_domains
+
+
+def test_extracted_configuration_xml_literal_is_allowed_in_synthesis_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subject_id, source_id = uuid4(), uuid4()
+    configuration_fact = make_fact(
+        source_id,
+        'RuntimeBroker.exe and RuntimeBroker.exe.config contain <etwEnable enabled="false"/>.',
+    )
+    cited_fact = make_fact(source_id, "FooRAT was observed in the report")
+    source = make_source(
+        source_id,
+        facts=(configuration_fact, cited_fact),
+        indicators=(
+            replace(
+                make_indicator(source_id, "RuntimeBroker.exe"),
+                artifact_type=ArtifactType.FILENAME,
+            ),
+        ),
+    )
+    extraction = make_extraction(subject_id, (source,))
+    pack = build_synthesis_evidence_pack(make_snapshot(subject_id), extraction)
+    cited_handle = next(
+        str(record["handle"])
+        for record in pack.narrative_evidence
+        if record["kind"] == EvidenceKind.FACT.value and record["value"] == cited_fact.value
+    )
+    free_text_ref = next(
+        ref
+        for ref, payload in extraction_evidence_elements(extraction)
+        if ref.kind is EvidenceKind.FACT and payload["value"] == configuration_fact.value
+    )
+    claim_text = (
+        "FooRAT a été lancée sous le nom RuntimeBroker.exe avec le paramètre "
+        '<etwEnable enabled="false"/>.'
+    )
+    original_validate_grounded_text = synthesis_module._validate_grounded_text
+    literal = ("domain", "runtimebroker.exe")
+    observed_file_artifact_domains: set[str] = set()
+
+    def inspect_grounding_inputs(
+        text: str,
+        claim_id: str | None,
+        refs: tuple[ExtractionEvidenceRefV1, ...],
+        entries: Mapping[ExtractionEvidenceRefV1, Mapping[str, Any]],
+        known_technical: set[tuple[str, str]],
+        technical_support: Mapping[tuple[str, str], set[ExtractionEvidenceRefV1]],
+        file_artifact_domains: set[str],
+    ) -> None:
+        assert literal in known_technical
+        assert free_text_ref in technical_support[literal]
+        observed_file_artifact_domains.update(file_artifact_domains)
+        original_validate_grounded_text(
+            text,
+            claim_id,
+            refs,
+            entries,
+            known_technical,
+            technical_support,
+            file_artifact_domains,
+        )
+
+    monkeypatch.setattr(synthesis_module, "_validate_grounded_text", inspect_grounding_inputs)
+
+    lead, sections = validate_synthesis_proposal(
+        make_proposal(claim_text, cited_handle), pack, extraction
+    )
+
+    assert lead[0].text == claim_text
+    assert sections[0].paragraphs[0].text == claim_text
+    assert literal[1] in observed_file_artifact_domains
+
+    case_variant_text = claim_text.replace("<etwEnable", "<ETWEnable")
+    with pytest.raises(SynthesisProposalControlError) as case_variant:
+        validate_synthesis_proposal(
+            make_proposal(case_variant_text, cited_handle), pack, extraction
+        )
+    assert case_variant.value.reason == "plain_text_violation"
+
+    backticked_text = claim_text.replace(
+        '<etwEnable enabled="false"/>', '`<etwEnable enabled="false"/>`'
+    )
+    with pytest.raises(SynthesisProposalControlError) as backticked:
+        validate_synthesis_proposal(make_proposal(backticked_text, cited_handle), pack, extraction)
+    assert backticked.value.reason == "plain_text_violation"
+
+
+def test_other_extracted_configuration_xml_literal_is_allowed_in_synthesis_text() -> None:
+    subject_id, source_id = uuid4(), uuid4()
+    configuration_fact = make_fact(
+        source_id,
+        'The configuration contains <add key="debug" value="false"/>.',
+    )
+    cited_fact = make_fact(source_id, "FooRAT was observed in the report")
+    source = make_source(source_id, facts=(configuration_fact, cited_fact))
+    extraction = make_extraction(subject_id, (source,))
+    pack = build_synthesis_evidence_pack(make_snapshot(subject_id), extraction)
+    cited_handle = next(
+        str(record["handle"])
+        for record in pack.narrative_evidence
+        if record["kind"] == EvidenceKind.FACT.value and record["value"] == cited_fact.value
+    )
+    claim_text = 'FooRAT used <add key="debug" value="false"/>.'
+
+    lead, sections = validate_synthesis_proposal(
+        make_proposal(claim_text, cited_handle), pack, extraction
+    )
+
+    assert lead[0].text == claim_text
+    assert sections[0].paragraphs[0].text == claim_text
+
+
+@pytest.mark.parametrize(
+    "fragment",
+    (
+        pytest.param("<script>alert(1)</script>", id="script"),
+        pytest.param("<img src=x onerror=1>", id="image-event-handler"),
+        pytest.param("<b>x</b>", id="bold-formatting"),
+        pytest.param('<a href="x">', id="link"),
+        pytest.param("<!-- x -->", id="comment"),
+        pytest.param("<![CDATA[x]]>", id="cdata"),
+        pytest.param('<?xml version="1.0"?>', id="processing-instruction"),
+        pytest.param("<!DOCTYPE html>", id="doctype"),
+        pytest.param('<runtime onclick="x"/>', id="event-attribute"),
+        pytest.param('<runtime style="color:red"/>', id="style-attribute"),
+        pytest.param('<runtime src="x"/>', id="src-attribute"),
+        pytest.param('<runtime href="x"/>', id="href-attribute"),
+        pytest.param('<runtime srcdoc="x"/>', id="srcdoc-attribute"),
+        pytest.param('<runtime value="javascript:alert(1)"/>', id="javascript-value"),
+        pytest.param('<runtime value="data:text/html,x"/>', id="data-value"),
+        pytest.param("<runtime" + ("x" * 200) + "/> ", id="oversized-token"),
+        pytest.param("<runtime\n/>", id="newline-in-token"),
+    ),
+)
+def test_extracted_active_or_formatting_markup_is_still_rejected(fragment: str) -> None:
+    subject_id, source_id = uuid4(), uuid4()
+    extracted_fact = make_fact(source_id, f"The source contains {fragment}.")
+    cited_fact = make_fact(source_id, "FooRAT was observed in the report")
+    source = make_source(source_id, facts=(extracted_fact, cited_fact))
+    extraction = make_extraction(subject_id, (source,))
+    pack = build_synthesis_evidence_pack(make_snapshot(subject_id), extraction)
+    cited_handle = next(
+        str(record["handle"])
+        for record in pack.narrative_evidence
+        if record["kind"] == EvidenceKind.FACT.value and record["value"] == cited_fact.value
+    )
+
+    with pytest.raises(SynthesisProposalControlError) as invalid:
+        validate_synthesis_proposal(
+            make_proposal(f"FooRAT was observed with {fragment}.", cited_handle),
+            pack,
+            extraction,
+        )
+
+    assert invalid.value.reason == "plain_text_violation", fragment
+
+
+def test_unextracted_other_configuration_xml_literal_is_rejected() -> None:
+    subject_id, source_id = uuid4(), uuid4()
+    source = make_source(
+        source_id,
+        facts=(make_fact(source_id, "FooRAT was observed in the report"),),
+    )
+    extraction = make_extraction(subject_id, (source,))
+    pack = build_synthesis_evidence_pack(make_snapshot(subject_id), extraction)
+    cited_handle = str(pack.narrative_evidence[0]["handle"])
+
+    with pytest.raises(SynthesisProposalControlError) as invalid:
+        validate_synthesis_proposal(
+            make_proposal('FooRAT used <add key="debug" value="false"/>.', cited_handle),
+            pack,
+            extraction,
+        )
+
+    assert invalid.value.reason == "plain_text_violation"
+
+
+def test_unextracted_configuration_xml_literal_is_still_rejected() -> None:
+    subject_id, source_id = uuid4(), uuid4()
+    source = make_source(
+        source_id,
+        facts=(make_fact(source_id, "FooRAT was observed in the report"),),
+        indicators=(
+            replace(
+                make_indicator(source_id, "RuntimeBroker.exe"),
+                artifact_type=ArtifactType.FILENAME,
+            ),
+        ),
+    )
+    extraction = make_extraction(subject_id, (source,))
+    pack = build_synthesis_evidence_pack(make_snapshot(subject_id), extraction)
+    cited_handle = str(pack.narrative_evidence[0]["handle"])
+
+    with pytest.raises(SynthesisProposalControlError) as invalid:
+        validate_synthesis_proposal(
+            make_proposal(
+                "FooRAT a été lancée sous le nom RuntimeBroker.exe avec le paramètre "
+                '<etwEnable enabled="false"/>.',
+                cited_handle,
+            ),
+            pack,
+            extraction,
+        )
+
+    assert invalid.value.reason == "plain_text_violation"
+
+
+def test_domain_indicator_keeps_handle_requirement_when_name_is_also_a_file() -> None:
+    subject_id, source_id = uuid4(), uuid4()
+    source = make_source(
+        source_id,
+        facts=(make_fact(source_id, "FooRAT"),),
+        indicators=(
+            replace(make_indicator(source_id, "foo.zip"), artifact_type=ArtifactType.FILENAME),
+            make_indicator(source_id, "foo.zip"),
+        ),
+    )
+    extraction = make_extraction(subject_id, (source,))
+    pack = build_synthesis_evidence_pack(make_snapshot(subject_id), extraction)
+    fact_handle = next(
+        str(record["handle"])
+        for record in pack.narrative_evidence
+        if record["kind"] == EvidenceKind.FACT.value
+    )
+
+    with pytest.raises(SynthesisProposalControlError) as unsupported:
+        validate_synthesis_proposal(
+            make_wire_proposal_with_section_claim(
+                "Le domaine foo.zip héberge FooRAT.", fact_handle
+            ),
+            pack,
+            extraction,
+        )
+
+    assert unsupported.value.reason == (
+        "synthesis_unknown_technical_value:claim=C009:literal_kind=domain:"
+        "literal_value=foo.zip:reason=not_supported_by_cited_handles"
     )
 
 

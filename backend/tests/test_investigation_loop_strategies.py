@@ -1,3 +1,5 @@
+import json
+from dataclasses import replace
 from uuid import UUID, uuid4, uuid5
 
 import pytest
@@ -151,10 +153,9 @@ async def test_two_agent_strategies_choose_distinct_tool_orders_and_draft_findin
     assert all(
         "current_stage" not in prompt for prompt in (*a_transport.prompts, *b_transport.prompts)
     )
-    assert any(
-        '"view":"delta"' in prompt
-        for prompt in (*a_transport.prompts[1:], *b_transport.prompts[1:])
-    )
+    # Each Bridge turn now runs in an independent Temporary Chat and therefore
+    # carries a bounded full context, including the article and current state.
+    assert all('"view":"full"' in prompt for prompt in (*a_transport.prompts, *b_transport.prompts))
     assert fixture_a.handoff.modified_artifacts == []
     assert fixture_b.handoff.modified_artifacts == []
     assert all("yara" not in name.lower() for name in (*a_order, *b_order))
@@ -346,7 +347,8 @@ async def test_unknown_hypothesis_reference_is_rejected_before_tool_or_finding_e
                 findings=(proposal,),
                 hypothesis_refs=("known-hypothesis",),
             )
-        ],
+        ]
+        * 3,
         tools=(("vt.search", "vt"),),
     )
     initial = await fixture.start(
@@ -359,10 +361,76 @@ async def test_unknown_hypothesis_reference_is_rejected_before_tool_or_finding_e
     assert result.hypotheses == initial.hypotheses
     assert fixture.execution_order == []
     assert await fixture.findings.list_for_investigation(initial.investigation_id) == ()
-    assert any(
-        "bridge_invalid_output:decision_rejected:unknown_hypothesis_reference" in action
-        for action in result.recent_actions
+    assert any("unknown_hypothesis_reference" in action for action in result.recent_actions)
+    assert (
+        fixture.bridge_transport.submission_count == BridgeInvestigator.MAX_CORRECTIVE_ATTEMPTS + 1
     )
+
+
+@pytest.mark.asyncio
+async def test_unknown_hypothesis_reference_is_corrected_before_tool_execution() -> None:
+    call = _tool_call("vt.search", "synthetic-indicator", "check one passive indicator")
+    invalid = _decision(
+        goal="check a proposed hypothesis",
+        next_action="finish",
+        tools=(call,),
+        hypothesis_refs=("new-hypothesis-label",),
+    )
+    corrected = _decision(
+        goal="check the indicator without inventing a hypothesis",
+        next_action="finish",
+        tools=(call,),
+    )
+    fixture = _Fixture(responses=[invalid, corrected], tools=(("vt.search", "vt"),))
+    initial = await fixture.start()
+
+    result = await fixture.service.run(initial.investigation_id)
+
+    assert result.stop_reason is StopReason.AGENT_FINISHED
+    assert fixture.bridge_transport.submission_count == 2
+    assert fixture.execution_order == ["vt.search"]
+    assert "decision_rejected:unknown_hypothesis_reference" in fixture.bridge_transport.prompts[1]
+    assert "known hypothesis ids: none" in fixture.bridge_transport.prompts[1].lower()
+
+
+@pytest.mark.asyncio
+async def test_only_explicitly_addressed_operator_requests_are_consumed() -> None:
+    fixture = _Fixture(responses=[], tools=())
+    initial = await fixture.start()
+    first_request_id = uuid4()
+    second_request_id = uuid4()
+    first_action = "user-request:" + json.dumps(
+        {"request_id": str(first_request_id), "text": "Check the synthetic host.", "target": None},
+        sort_keys=True,
+    )
+    second_action = "user-request:" + json.dumps(
+        {
+            "request_id": str(second_request_id),
+            "text": "Compare the synthetic domain.",
+            "target": None,
+        },
+        sort_keys=True,
+    )
+    with_requests = replace(
+        initial,
+        version=initial.version + 1,
+        recent_actions=(first_action, second_action),
+    )
+    await fixture.states.save_if_version(with_requests, expected_version=initial.version)
+    fixture.bridge_transport = ScriptedTurnTransport(
+        [
+            "@@DECISION@@\nGOAL: Address one operator request.\n"
+            "SUMMARY: The first request was handled.\nNEXT: finish\n"
+            f"ADDRESSED_REQUESTS: {first_request_id}\n@@END@@"
+        ]
+    )
+    fixture.bridge = BridgeInvestigator(fixture.bridge_transport)
+    fixture.service._bridge = fixture.bridge
+
+    result = await fixture.service.run(initial.investigation_id)
+
+    assert first_action not in result.recent_actions
+    assert second_action in result.recent_actions
 
 
 @pytest.mark.asyncio

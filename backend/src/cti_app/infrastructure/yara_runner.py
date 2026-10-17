@@ -8,7 +8,7 @@ import sys
 import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
-from importlib.util import find_spec
+from functools import cached_property
 from pathlib import Path
 
 from cti_app.application.rule_workbench import YaraEnginePort, YaraSampleInput
@@ -50,13 +50,35 @@ class IsolatedYaraRunner(YaraEnginePort):
         self.limits = limits or YaraRunnerLimits()
         self._worker_path = Path(__file__).with_name("yara_runner_worker.py")
 
+    @cached_property
+    def _availability_failure_reason(self) -> str | None:
+        """Run one bounded real-worker match to verify compile and match support."""
+        if not self._worker_path.is_file():
+            return "yara_worker_missing"
+        sample_bytes = b"autowork-yara-availability-probe"
+        sample = YaraSampleInput(sample_sha256=_sha256(sample_bytes), data=sample_bytes)
+        rule = (
+            "rule autowork_availability_probe { strings: $marker = "
+            '"autowork-yara-availability-probe" condition: $marker }'
+        )
+        try:
+            result = self.match(rule, (sample,))
+        except Exception:
+            return "yara_probe_failed"
+        if result.status is not YaraExecutionStatus.OK:
+            return f"yara_probe_{result.status.value.lower()}"
+        if sample.sample_sha256 not in result.matches_sha256:
+            return "yara_probe_match_missing"
+        return None
+
     @property
     def available(self) -> bool:
-        """Whether the isolated worker and its Python YARA engine are installed."""
-        try:
-            return self._worker_path.is_file() and find_spec("yara") is not None
-        except (ImportError, ValueError):
-            return False
+        """Whether the isolated worker compiles and matches a small synthetic sample."""
+        return self._availability_failure_reason is None
+
+    @property
+    def unavailable_reason(self) -> str | None:
+        return self._availability_failure_reason
 
     def compile(self, source: str) -> YaraEngineResult:
         return self._run_worker("compile", source, ())

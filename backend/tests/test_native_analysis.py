@@ -321,7 +321,8 @@ async def test_tool_schema_and_adapter_reject_active_operations_before_provider_
     )
 
     assert result.status is ToolInvocationStatus.FAILED
-    assert result.message.startswith("Invalid tool arguments:")
+    assert result.error_code == "invalid_tool_arguments"
+    assert result.message.startswith("invalid_tool_arguments:")
     direct_result = await tool_adapter.execute(arguments, context)
     assert direct_result.status is ToolInvocationStatus.POLICY_DENIED
     assert runner.requests == []

@@ -41,7 +41,11 @@ from cti_app.application.subject_production import SubjectProductionService
 from cti_app.application.typst_paths import typst_bundle_paths
 from cti_app.application.typst_rendering import TypstRenderer
 from cti_app.application.virustotal import VirusTotalTransportError
-from cti_app.domain.analyst_opinion import AnalystOpinionStatus
+from cti_app.domain.analyst_opinion import (
+    AnalystOpinionStatus,
+    OpinionBlockType,
+    OpinionClaimQualification,
+)
 from cti_app.domain.classification import TLP
 from cti_app.domain.investigation import (
     EvidenceKind,
@@ -94,13 +98,14 @@ class _AmbiguousDownloadVirusTotal(HashCheckedVirusTotal):
         super().__init__(material=material)
         self.download_entered = asyncio.Event()
         self.release_download = asyncio.Event()
+        self.partial_bytes_written = 0
 
     async def file_download(self, file_hash: str, *, sink: Any) -> None:
-        del sink
         self.download_calls += 1
         self.downloaded_hashes.append(file_hash)
         self.download_entered.set()
         await self.release_download.wait()
+        self.partial_bytes_written = sink.write(b"synthetic partial sample bytes")
         raise VirusTotalTransportError("simulated local proxy timeout")
 
 
@@ -482,7 +487,7 @@ async def _new_article_findings(
                 "limitations": ["Indexed observations do not prove incident-time activity."],
             },
         ],
-        "next_action": "finish",
+        "next_action": "continue",
     }
 
 
@@ -789,6 +794,49 @@ async def test_w18_supervised_first_run_recovers_without_replaying_confirmed_eff
     material = sample_material
     vt = _AmbiguousDownloadVirusTotal(material=material)
     shodan = FakeShodanPort()
+    investigation_id_ref: dict[str, UUID] = {}
+
+    async def final_article_response(
+        observations: tuple[EvidenceObservation, ...],
+    ) -> Mapping[str, Any]:
+        async with uow_factory() as uow:
+            findings = tuple(
+                await uow.investigation_findings.list_for_investigation(investigation_id_ref["id"])
+            )
+        supported = tuple(
+            item
+            for item in findings
+            if item.assessment is FindingAssessment.SUPPORTED and item.observation_refs
+        )
+        if not supported:
+            return await _new_article_findings(observations, material=material)
+        evidence_refs = tuple(
+            sorted(
+                {ref for finding in supported for ref in finding.observation_refs},
+                key=lambda ref: ref.hex,
+            )
+        )
+        response = decision(
+            "Draft the final fact block from the persisted VT and Shodan findings.",
+            next_action="finish",
+        )
+        response["opinion_delta"] = {
+            "blocks": [
+                {
+                    "block_type": OpinionBlockType.KEY_FINDINGS.value,
+                    "text": (
+                        "The bounded VT search returned an article-relative candidate, and the "
+                        "passive Shodan query returned two indexed services."
+                    ),
+                    "finding_refs": [str(item.id) for item in supported],
+                    "evidence_refs": [str(item) for item in evidence_refs],
+                    "qualification": OpinionClaimQualification.FACT.value,
+                    "certainty": 0.9,
+                }
+            ]
+        }
+        return response
+
     transport = ScriptedInvestigationTransport(
         [
             decision(
@@ -801,9 +849,7 @@ async def test_w18_supervised_first_run_recovers_without_replaying_confirmed_eff
         investigation_id=UUID(int=0),
         material=material,
         inject_analysis_at_turn=None,
-        final_response_builder=lambda observations: _new_article_findings(
-            observations, material=material
-        ),
+        final_response_builder=final_article_response,
     )
     # The transport is rebound after the canonical investigation identity is created.
     base_settings = investigation_settings(providers=True)
@@ -837,6 +883,7 @@ async def test_w18_supervised_first_run_recovers_without_replaying_confirmed_eff
     )
     assert start_response.status_code == 200, start_response.text
     investigation_id = UUID(start_response.json()["investigation"]["id"])
+    investigation_id_ref["id"] = investigation_id
     transport._investigation_id = investigation_id
     approved_g2 = await driver.client.post(
         f"/api/investigations/{investigation_id}/envelope/approve",
@@ -1030,6 +1077,7 @@ async def test_w18_supervised_first_run_recovers_without_replaying_confirmed_eff
     assert shodan.calls == [], "the third pivot must not be sent after the durable interrupt"
     assert vt.calls["intelligence_search"] == 1
     assert vt.download_calls == 1
+    assert vt.partial_bytes_written > 0, "the fixture must fail after writing sample bytes"
     async with uow_factory() as uow:
         invocations_at_stop = tuple(
             await uow.tool_invocations.list_for_investigation(investigation_id)
@@ -1119,7 +1167,9 @@ async def test_w18_supervised_first_run_recovers_without_replaying_confirmed_eff
     await run_http_job(app, uow_factory, registry, dispatcher, UUID(resumed.json()["job_id"]))
     status_after_resume = await _read_operator_status(driver.client, uow_factory, investigation_id)
     assert status_after_resume["stop_reason"] == StopReason.AGENT_FINISHED.value
-    assert transport.submission_count == 3, "one pivot, resume-continuation and final Bridge turn"
+    assert transport.submission_count == 4, (
+        "one initial pivot turn, resume-continuation, findings turn, and opinion turn"
+    )
     assert transport.submission_count == len(transport._by_key)
     assert vt.calls["intelligence_search"] == 1
     assert vt.download_calls == 1, "an ambiguous acquisition must never be submitted twice"

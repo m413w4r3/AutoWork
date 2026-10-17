@@ -84,6 +84,16 @@ class MemoryDetectionCandidates(DetectionCandidateRepository):
     async def list_for_candidate(self, candidate_id: UUID) -> tuple[DetectionCandidateVersion, ...]:
         return tuple(self.versions.get(candidate_id, ()))
 
+    async def list_for_investigation(
+        self, investigation_id: UUID
+    ) -> tuple[DetectionCandidateVersion, ...]:
+        return tuple(
+            version
+            for versions in self.versions.values()
+            for version in versions
+            if version.investigation_id == investigation_id
+        )
+
     async def append_version(
         self,
         version: DetectionCandidateVersion,

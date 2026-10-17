@@ -148,6 +148,10 @@ class DetectionReviewService:
             )
             decisions = tuple(await uow.analyst_decisions.list_for_investigation(investigation_id))
             candidate_repository = cast(Any, uow).detection_candidates
+            persisted_versions = tuple(
+                await candidate_repository.list_for_investigation(investigation_id)
+            )
+            version_by_id = {str(version.id): version for version in persisted_versions}
             version_ids = {
                 observation.object_id
                 for observation in observations
@@ -165,11 +169,12 @@ class DetectionReviewService:
                     AnalystDecisionType.DETECTION_REJECT,
                 }
             )
+            version_ids.update(version_by_id)
 
             comparisons = await self._read_comparisons(observations)
             result: list[DetectionReviewVersion] = []
             for raw_id in sorted(version_ids):
-                version = await candidate_repository.get(UUID(raw_id))
+                version = version_by_id.get(raw_id) or await candidate_repository.get(UUID(raw_id))
                 if version is None or version.investigation_id != investigation_id:
                     continue
                 reports = await self._read_test_reports(version, observations)

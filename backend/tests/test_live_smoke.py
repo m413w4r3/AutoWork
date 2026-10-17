@@ -288,6 +288,28 @@ async def test_open_clients_follow_the_configuration() -> None:
         assert clients.vt is not None and clients.shodan is not None
 
 
+@pytest.mark.asyncio
+async def test_live_smoke_keeps_download_and_retrohunt_routes_unavailable() -> None:
+    configured = Settings(
+        _env_file=None,  # type: ignore[call-arg]
+        virustotal_proxy_url="http://proxy.invalid:3128",
+        virustotal_file_download_enabled=True,
+        virustotal_retrohunt_enabled=True,
+        virustotal_download_allowed_hosts="downloads.example.test",
+    )
+    async with AsyncExitStack() as stack:
+        clients = await open_live_smoke_clients(configured, stack)
+
+    assert clients.vt is not None
+    assert not clients.vt._capabilities.file_download
+    assert not clients.vt._capabilities.retrohunt
+    assert clients.vt._routing_policy.route_for(VirusTotalCapability.FILE_DOWNLOAD) is None
+    assert not any(
+        "retrohunt" in endpoint.operation
+        for endpoint in build_live_smoke_plan(configured).endpoints
+    )
+
+
 def _load_script() -> Any:
     path = Path(__file__).resolve().parents[2] / "scripts" / "ops" / "live_smoke.py"
     spec = importlib.util.spec_from_file_location("live_smoke_script", path)

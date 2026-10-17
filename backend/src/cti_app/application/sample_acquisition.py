@@ -27,7 +27,9 @@ from cti_app.application.identity import IdentityProvider
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.virustotal import (
     VirusTotalCapabilities,
+    VirusTotalDownloadHashMismatchError,
     VirusTotalError,
+    VirusTotalHttpError,
     VirusTotalPort,
     file_hash_family,
     normalize_file_hash,
@@ -64,6 +66,35 @@ class SampleAcquisitionPolicyDeniedError(SampleAcquisitionError):
 
 class SampleAcquisitionInvestigationNotFoundError(SampleAcquisitionError):
     code = "sample_acquisition_investigation_not_found"
+
+
+class SampleAcquisitionDownloadError(SampleAcquisitionError):
+    """A download failure classified by whether any bytes may have arrived."""
+
+    def __init__(
+        self,
+        *,
+        code: str,
+        ambiguous: bool,
+        provider_called: bool,
+        refusal_reason: str | None = None,
+    ) -> None:
+        self.code = code[:64]
+        self.ambiguous = ambiguous
+        self.provider_called = provider_called
+        self.refusal_reason = refusal_reason
+        message = (
+            "VirusTotal download outcome needs reconciliation."
+            if ambiguous
+            else "VirusTotal download failed before receiving sample bytes."
+        )
+        super().__init__(message)
+
+
+class SampleAcquisitionBudgetExceededError(SampleAcquisitionError):
+    """A deterministic local budget refusal before any provider request."""
+
+    code = "investigation_loop_budget_exceeded"
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,11 +190,16 @@ class VirusTotalSampleAcquisitionService:
                     raise SampleAcquisitionInvestigationNotFoundError(
                         "L'investigation demandée est introuvable."
                     )
-                investigation.consume_budget(LoopBudgetCategory.VT_READ_UNITS)
-                await uow.analyst_investigations.save(investigation)
-                if reason is SampleAcquisitionReason.HIT_REVIEW:
-                    investigation.consume_budget(LoopBudgetCategory.HITS_ACQUIRED)
+                try:
+                    investigation.consume_budget(LoopBudgetCategory.VT_READ_UNITS)
                     await uow.analyst_investigations.save(investigation)
+                    if reason is SampleAcquisitionReason.HIT_REVIEW:
+                        investigation.consume_budget(LoopBudgetCategory.HITS_ACQUIRED)
+                        await uow.analyst_investigations.save(investigation)
+                except ValueError as exc:
+                    raise SampleAcquisitionBudgetExceededError(
+                        "Investigation-local sample acquisition budget is exhausted."
+                    ) from exc
                 await uow.commit()
             budget_committed = True
 
@@ -176,6 +212,9 @@ class VirusTotalSampleAcquisitionService:
                 policy=policy,
                 actor_id=actor_id,
             )
+        except SampleAcquisitionBudgetExceededError:
+            # No provider call was made; do not record this as a provider failure.
+            raise
         except (VirusTotalError, SampleAcquisitionError) as exc:
             error_code = getattr(exc, "code", "sample_acquisition_error")
             await self._record_failure(
@@ -211,7 +250,53 @@ class VirusTotalSampleAcquisitionService:
         try:
             # Hash verification against the requested family happens inside
             # the port implementation, while the flow is still streaming.
-            await self._port.file_download(normalized_hash, sink=spool)
+            try:
+                await self._port.file_download(normalized_hash, sink=spool)
+            except Exception as exc:
+                bytes_written = max(0, spool.tell())
+                preflight_codes = {
+                    "virustotal_download_host_not_allowed",
+                    "virustotal_unexpected_redirect",
+                    "virustotal_download_too_large",
+                    "virustotal_capability_disabled",
+                    "virustotal_route_unavailable",
+                    "virustotal_transport_not_configured",
+                }
+                if isinstance(exc, VirusTotalDownloadHashMismatchError):
+                    code = exc.code
+                    ambiguous = True
+                    refusal_reason = None
+                elif bytes_written:
+                    code = "virustotal_download_interrupted_after_bytes"
+                    ambiguous = True
+                    refusal_reason = None
+                elif isinstance(exc, VirusTotalHttpError) and exc.status_code == 404:
+                    code = "virustotal_download_route_not_found"
+                    ambiguous = False
+                    refusal_reason = "provider_download_route_not_found"
+                elif isinstance(exc, VirusTotalHttpError) and exc.status_code in {401, 403}:
+                    code = "virustotal_download_authorization_refused"
+                    ambiguous = False
+                    refusal_reason = "provider_download_authorization_refused"
+                elif isinstance(exc, VirusTotalError) and exc.code in preflight_codes:
+                    code = exc.code
+                    ambiguous = False
+                    refusal_reason = None
+                else:
+                    code = "virustotal_download_failed_before_bytes"
+                    ambiguous = False
+                    refusal_reason = None
+                provider_called = not (
+                    isinstance(exc, VirusTotalError)
+                    and exc.status_code is None
+                    and exc.code in preflight_codes
+                )
+                raise SampleAcquisitionDownloadError(
+                    code=code,
+                    ambiguous=ambiguous,
+                    provider_called=provider_called,
+                    refusal_reason=refusal_reason,
+                ) from exc
             spool.seek(0)
             blob = await self._catalog.ingest(
                 spool,

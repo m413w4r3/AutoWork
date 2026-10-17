@@ -22,7 +22,7 @@ from cti_app.application.investigation_governance import (
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.sample_acquisition import VirusTotalSampleAcquisitionService
-from cti_app.application.virustotal import VirusTotalCapabilities
+from cti_app.application.virustotal import VirusTotalCapabilities, VirusTotalHttpError
 from cti_app.domain.classification import TLP
 from cti_app.domain.editions import Edition
 from cti_app.domain.entities import Subject
@@ -61,6 +61,21 @@ class _HashCheckedPort:
         assert hashlib.sha256(self.payload).hexdigest() == file_hash
         self.calls += 1
         sink.write(self.payload)
+
+
+class _RouteRefusedPort:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def file_download(self, file_hash: str, *, sink: Any) -> None:
+        del file_hash, sink
+        self.calls += 1
+        raise VirusTotalHttpError(
+            "synthetic download route absent",
+            code="virustotal_not_found",
+            status_code=404,
+            route="/files/{hash}/download_url",
+        )
 
 
 class _PostgresEvidenceRecorder:
@@ -175,6 +190,94 @@ async def test_g2_acquisition_quarantine_and_g3_decisions_persist_in_postgres(
                 "member_validate",
             }
             assert attempts is not None and attempts.sample_id == result.sample_id
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_definitive_download_refusal_is_cached_and_budget_is_resolved_in_postgres(
+    migrated_postgres_url: str,
+    tmp_path: Path,
+) -> None:
+    engine = create_postgres_engine(migrated_postgres_url)
+    session_factory = create_session_factory(engine)
+    investigation = await _make_investigation(session_factory)
+    uow_factory = cast(UnitOfWorkFactory, lambda: SqlAlchemyUnitOfWork(session_factory))
+    port = _RouteRefusedPort()
+    catalog = BlobCatalogService(
+        FilesystemBlobStore(tmp_path / "refused-download-storage"), uow_factory
+    )
+    acquisition = VirusTotalSampleAcquisitionService(
+        port,
+        VirusTotalCapabilities(file_download=True),
+        catalog,
+        uow_factory,
+        LocalIdentityProvider(),
+    )
+    envelope_service = InvestigationEnvelopeService(uow_factory)
+    requested_sha256 = "a" * 64
+    try:
+        await envelope_service.approve(
+            InvestigationEnvelopeProposal(
+                investigation_id=investigation.id,
+                allowed_providers=("vt",),
+                budget=InvestigationBudget(
+                    limits={BudgetDimension.VT_UNITS: 4, BudgetDimension.DOWNLOADS: 2}
+                ),
+                acquire_hits_allowed=True,
+                disclosure=DisclosureBounds(
+                    tlp=TLPLevel.CLEAR,
+                    do_not_submit=False,
+                    external_llm_allowed=False,
+                ),
+            ),
+            actor_id="analyst:integration",
+            reason="Approve bounded synthetic download failure coverage.",
+            correlation_id=f"g2:download-refusal:{investigation.id}",
+        )
+        hits = HitAcquisitionService(
+            uow_factory,
+            acquisition=acquisition,
+            recorder=cast(Any, _PostgresEvidenceRecorder(uow_factory)),
+        )
+        association = await hits.register_hit(
+            investigation.id, requested_sha256, SampleOrigin.VT_PIVOT
+        )
+
+        first = await hits.acquire_hit(
+            association.id,
+            purpose="Review a synthetic VT hit.",
+            operation_key="synthetic:download:first",
+        )
+        replay = await hits.acquire_hit(
+            association.id,
+            purpose="Retry the same synthetic VT hit.",
+            operation_key="synthetic:download:second",
+        )
+
+        assert first.status is ToolInvocationStatus.UNAVAILABLE
+        assert first.error_code == "virustotal_download_route_not_found"
+        assert first.budget_consumed == {
+            BudgetDimension.VT_UNITS: 1,
+            BudgetDimension.DOWNLOADS: 0,
+        }
+        assert replay.status is ToolInvocationStatus.UNAVAILABLE
+        assert replay.cached is True
+        assert replay.budget_consumed == {}
+        assert port.calls == 1
+
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            latest_error = await uow.sample_acquisition_attempts.find_latest_error(
+                investigation.id, requested_sha256
+            )
+            stored_envelope = await uow.investigation_envelopes.get(investigation.id)
+            assert latest_error is not None
+            assert latest_error.error_code == "virustotal_download_route_not_found"
+            assert stored_envelope is not None
+            assert stored_envelope.budget.consumed[BudgetDimension.VT_UNITS] == 1
+            assert stored_envelope.budget.consumed[BudgetDimension.DOWNLOADS] == 0
+            assert stored_envelope.budget.reserved[BudgetDimension.VT_UNITS] == 0
+            assert stored_envelope.budget.reserved[BudgetDimension.DOWNLOADS] == 0
     finally:
         await engine.dispose()
 

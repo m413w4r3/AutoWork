@@ -16,6 +16,7 @@ from typing import Self
 from uuid import UUID
 
 from cti_app.domain.blobs import BlobRecord
+from cti_app.domain.investigation_state import InvestigationWorkingState
 from cti_app.domain.model_conversations import ModelConversation, ModelConversationTurn
 from cti_app.domain.model_runs import ModelRun
 from tests.model_support import InMemoryModelRunRepository
@@ -109,6 +110,28 @@ class InMemoryModelConversationTurnRepository:
         self._state[turn.id] = deepcopy(turn)
 
 
+class InMemoryInvestigationStateRepository:
+    def __init__(self, state: dict[UUID, InvestigationWorkingState]) -> None:
+        self._state = state
+
+    async def get(self, investigation_id: UUID) -> InvestigationWorkingState | None:
+        value = self._state.get(investigation_id)
+        return deepcopy(value) if value is not None else None
+
+    async def save_if_version(
+        self, state: InvestigationWorkingState, *, expected_version: int | None
+    ) -> InvestigationWorkingState:
+        current = self._state.get(state.investigation_id)
+        if (
+            current is None
+            or current.version != expected_version
+            or state.version != current.version + 1
+        ):
+            raise ValueError("Investigation state version changed")
+        self._state[state.investigation_id] = deepcopy(state)
+        return deepcopy(state)
+
+
 class _KnownIdRepository:
     """Stands in for `subjects`/`editions`: `ModelConversationService.create`
     only checks these exist when an id is given, and never reads their
@@ -127,6 +150,9 @@ class InMemoryConversationUnitOfWork:
         self.model_runs = InMemoryModelRunRepository(factory.model_runs)
         self.model_conversations = InMemoryModelConversationRepository(factory.conversations)
         self.model_conversation_turns = InMemoryModelConversationTurnRepository(factory.turns)
+        self.investigation_states = InMemoryInvestigationStateRepository(
+            factory.investigation_states
+        )
         self.subjects = _KnownIdRepository(factory.known_subject_ids)
         self.editions = _KnownIdRepository(factory.known_edition_ids)
 
@@ -159,6 +185,7 @@ class InMemoryConversationUnitOfWorkFactory:
         self.model_runs: dict[UUID, ModelRun] = {}
         self.conversations: dict[UUID, ModelConversation] = {}
         self.turns: dict[UUID, ModelConversationTurn] = {}
+        self.investigation_states: dict[UUID, InvestigationWorkingState] = {}
         self.known_subject_ids = known_subject_ids or set()
         self.known_edition_ids = known_edition_ids or set()
 

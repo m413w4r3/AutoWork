@@ -204,6 +204,20 @@ class _AcquisitionAttempts:
             None,
         )
 
+    async def find_latest_error(
+        self, investigation_id: UUID, requested_hash: str
+    ) -> SampleAcquisitionAttempt | None:
+        return next(
+            (
+                item
+                for item in reversed(self.db.attempts)
+                if item.investigation_id == investigation_id
+                and item.requested_hash == requested_hash
+                and item.outcome is SampleAcquisitionOutcome.ERROR
+            ),
+            None,
+        )
+
     async def append(self, attempt: SampleAcquisitionAttempt) -> None:
         if attempt.outcome is SampleAcquisitionOutcome.SUCCESS and any(
             current.outcome is SampleAcquisitionOutcome.SUCCESS

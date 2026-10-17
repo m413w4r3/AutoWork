@@ -21,8 +21,14 @@ from cti_app.application.investigation_persistence import (
 )
 from cti_app.application.investigation_rule_tools import (
     JSON_SCHEMA_2020_12,
+    RULE_COMPARE_SCHEMA,
+    RULE_GET_SCHEMA,
+    RULE_PROPOSE_SCHEMA,
+    RULE_REVISE_SCHEMA,
+    RULE_TEST_SCHEMA,
     RULE_WORKBENCH_CAPABILITY,
     QuarantineRuleCorpusBytes,
+    _version_summary,
     register_rule_tools,
     rule_tool_capabilities,
 )
@@ -30,6 +36,7 @@ from cti_app.application.investigation_tools import (
     InMemoryToolRegistry,
     RegistryToolDispatcher,
     ToolExecutionContext,
+    validate_json_schema,
 )
 from cti_app.application.rule_workbench import (
     RuleCorpusBytesUnavailable,
@@ -202,10 +209,33 @@ class _MemoryEvidence:
 
 
 class _MemoryInventory(_MemoryCorpusBytes):
-    def __init__(self, samples: Mapping[str, bytes], *, goodware=(), holdout=()) -> None:
+    def __init__(
+        self, samples: Mapping[str, bytes], *, goodware=(), holdout=(), manual_imports=()
+    ) -> None:
         super().__init__(samples)
         self.goodware = tuple(goodware)
         self.holdout = tuple(holdout)
+        self._manual_imports = tuple(manual_imports)
+
+    async def manual_rule_corpus_imports(self, investigation_id: UUID):
+        from cti_app.domain.rule_workbench import (
+            RuleCorpusInventoryItem,
+            RuleSampleProvenance,
+            RuleTestCorpusRole,
+        )
+
+        del investigation_id
+        goodware = tuple(
+            RuleCorpusInventoryItem(
+                sample_sha256=sample_sha256,
+                role=RuleTestCorpusRole.GOODWARE,
+                provenance=RuleSampleProvenance.REAL,
+                size_bytes=len(self.samples.get(sample_sha256, b"")),
+                source_description="Operator-imported benign test fixture.",
+            )
+            for sample_sha256 in self.goodware
+        )
+        return (*goodware, *self._manual_imports)
 
 
 @dataclass
@@ -218,6 +248,7 @@ class _ToolHarness:
     engine: Any
     registry: InMemoryToolRegistry
     dispatcher: RegistryToolDispatcher
+    rule_tools: Any
     context: ToolExecutionContext
 
 
@@ -226,13 +257,17 @@ def _harness(
     samples: Mapping[str, bytes],
     goodware: Sequence[str] = (),
     holdout: Sequence[str] = (),
+    manual_imports: Sequence[Any] = (),
+    article_claims: Any | None = None,
     engine: Any | None = None,
     evidence_repository: InMemoryEvidenceObservationRepository | None = None,
 ) -> _ToolHarness:
     investigation_id = uuid4()
     candidates = InMemoryDetectionCandidateRepository()
     association_repository = InMemorySampleAssociationRepository()
-    bytes_port = _MemoryInventory(samples, goodware=goodware, holdout=holdout)
+    bytes_port = _MemoryInventory(
+        samples, goodware=goodware, holdout=holdout, manual_imports=manual_imports
+    )
     evidence = _MemoryEvidence(evidence_repository)
     selected_engine = engine or _DeterministicYaraEngine()
     workbench = RuleWorkbench(
@@ -252,7 +287,7 @@ def _harness(
         evidence_payloads=evidence,
     )
     registry = InMemoryToolRegistry()
-    register_rule_tools(
+    rule_tools = register_rule_tools(
         registry,
         workbench=workbench,
         candidates=candidates,
@@ -261,6 +296,7 @@ def _harness(
         recorder=evidence,
         evidence_observations=evidence.repository,
         evidence_payloads=evidence,
+        article_claims=article_claims,
     )
     budget = InvestigationBudget(
         limits={BudgetDimension.TOOL_SECONDS: 600},
@@ -294,6 +330,7 @@ def _harness(
         engine=selected_engine,
         registry=registry,
         dispatcher=RegistryToolDispatcher(registry),
+        rule_tools=rule_tools,
         context=context,
     )
     return harness
@@ -380,6 +417,12 @@ async def test_tool_schemas_capabilities_and_approval_are_closed() -> None:
         assert definition.input_schema["$schema"] == JSON_SCHEMA_2020_12
         assert definition.input_schema["additionalProperties"] is False
     assert harness.registry.get("rule.approve", "1") is None
+    test_candidate_description = RULE_TEST_SCHEMA["properties"]["candidate_id"]["description"]
+    assert "candidate_id returned by rule.propose" in test_candidate_description
+    assert "rule_deltas" in RULE_REVISE_SCHEMA["properties"]["candidate_id"]["description"]
+    assert RULE_PROPOSE_SCHEMA["properties"]["meta"]["default"] == {}
+    assert "Optional JSON object" in RULE_PROPOSE_SCHEMA["properties"]["meta"]["description"]
+    assert "ARG meta:" in RULE_REVISE_SCHEMA["properties"]["meta"]["description"]
     revise_registration = harness.registry.get("rule.revise", "1")
     assert revise_registration is not None
     assert "status" not in revise_registration[0].input_schema["properties"]
@@ -391,6 +434,128 @@ async def test_tool_schemas_capabilities_and_approval_are_closed() -> None:
     )
     assert invalid.status is ToolInvocationStatus.FAILED
     assert harness.engine.compile_count == 0
+
+
+def test_optional_rule_tool_arguments_accept_empty_wire_values() -> None:
+    candidate_id = str(uuid4())
+    validate_json_schema(
+        {
+            "candidate_id": "",
+            "condition": "all",
+            "motifs": "",
+            "feature_refs": [],
+            "meta": "",
+        },
+        RULE_PROPOSE_SCHEMA,
+    )
+    validate_json_schema(
+        {
+            "candidate_id": candidate_id,
+            "parent_version": 1,
+            "condition": "",
+            "motifs": "",
+            "meta": {},
+        },
+        RULE_REVISE_SCHEMA,
+    )
+    validate_json_schema(
+        {"candidate_id": candidate_id, "version": ""},
+        RULE_TEST_SCHEMA,
+    )
+    validate_json_schema(
+        {"candidate_id": candidate_id, "version": "", "include_history": ""},
+        RULE_GET_SCHEMA,
+    )
+    validate_json_schema(
+        {"candidate_id": candidate_id, "version_a": 1, "version_b": 2},
+        RULE_COMPARE_SCHEMA,
+    )
+
+
+@pytest.mark.asyncio
+async def test_non_json_meta_returns_actionable_example_without_creating_candidate() -> None:
+    harness = _harness(samples={})
+    observation_ref = await _source_observation(harness, "MetaExampleMarker")
+    candidate_id = uuid4()
+
+    result = await _call(
+        harness,
+        "rule.propose",
+        {
+            "candidate_id": str(candidate_id),
+            "condition": "all",
+            "motifs": [_motif("MetaExampleMarker", observation_ref)],
+            "meta": "not JSON",
+        },
+    )
+
+    assert result.status is ToolInvocationStatus.FAILED
+    assert 'ARG meta: {"description": "..."}' in result.message
+    assert await harness.candidates.list_for_candidate(candidate_id) == ()
+
+
+@pytest.mark.asyncio
+async def test_json_encoded_meta_object_is_accepted() -> None:
+    harness = _harness(samples={})
+    observation_ref = await _source_observation(harness, "EncodedMetaMarker")
+
+    result = await _call(
+        harness,
+        "rule.propose",
+        {
+            "condition": "all",
+            "motifs": [_motif("EncodedMetaMarker", observation_ref)],
+            "meta": '{"description": "synthetic metadata"}',
+        },
+    )
+
+    assert result.status is ToolInvocationStatus.UNAVAILABLE
+    assert result.error_code is None
+    assert result.output["candidate_id"]
+
+
+def test_rule_version_summary_without_report_is_explicitly_untested() -> None:
+    version = SimpleNamespace(
+        id=uuid4(),
+        candidate_id=uuid4(),
+        investigation_id=uuid4(),
+        version=1,
+        version_label="v1",
+        parent_version_id=None,
+        source="rule candidate { condition: true }",
+        source_sha256="a" * 64,
+        status=DetectionCandidateStatus.CANDIDATE,
+        test_refs=(),
+        motif_provenance=(),
+    )
+
+    summary = _version_summary(version, ())
+
+    assert summary["validation_status"] == "untested"
+    assert summary["latest_test_report"] is None
+
+
+@pytest.mark.asyncio
+async def test_rule_get_marks_version_without_report_untested() -> None:
+    from cti_app.domain.investigation import DetectionCandidateVersion
+
+    harness = _harness(samples={})
+    source = "rule untested { condition: true }"
+    candidate_id = uuid4()
+    version = DetectionCandidateVersion(
+        investigation_id=harness.investigation_id,
+        candidate_id=candidate_id,
+        source=source,
+        source_sha256=_sha256(source.encode()),
+        motif_provenance=(),
+    )
+    await harness.candidates.append_version(version, expected_previous_id=None)
+
+    result = await _call(harness, "rule.get", {"candidate_id": str(candidate_id)})
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    assert result.output["versions"][0]["validation_status"] == "untested"
+    assert result.output["versions"][0]["latest_test_report"] is None
 
 
 @pytest.mark.asyncio
@@ -604,6 +769,8 @@ async def test_dispatcher_replay_returns_cached_rule_test_without_recompilation(
     assert first.status is ToolInvocationStatus.PARTIAL
     assert second == first
     assert harness.engine.compile_count == before + 1
+    # With no operator-supplied benign bytes, the run records a partial
+    # evaluation instead of implying negative-corpus coverage.
     assert proposed.status is ToolInvocationStatus.PARTIAL
 
 
@@ -710,6 +877,7 @@ async def test_noisy_rule_does_not_block_real_loop_opinion_draft() -> None:
             engine=engine,
             registry=fixture.registry,
             dispatcher=RegistryToolDispatcher(fixture.registry),
+            rule_tools=None,
             context=local_context,
         ),
         "SharedChainMarker",
@@ -786,11 +954,14 @@ async def test_investigation_chain_can_finish_without_any_rule_tool() -> None:
     _operation, observation_id = _operation_and_observation_id(state.investigation_id, chain_call)
     proposal = _proposal(
         "infection_chain",
-        "supported",
+        "qualified",
         "The loader observation identifies payload retrieval as the next stage.",
         observation_id,
     )
     finding_id = _finding_id(state.investigation_id, proposal)
+    opinion = _opinion_delta(finding_id, observation_id)
+    opinion["blocks"][0]["qualification"] = "inference"
+    opinion["blocks"][0]["certainty"] = 0.6
     fixture.bridge_transport = ScriptedTurnTransport(
         [
             _decision(
@@ -798,7 +969,7 @@ async def test_investigation_chain_can_finish_without_any_rule_tool() -> None:
                 next_action="finish",
                 tools=(chain_call,),
                 findings=(proposal,),
-                opinion=_opinion_delta(finding_id, observation_id),
+                opinion=opinion,
             )
         ]
     )
@@ -877,3 +1048,292 @@ async def test_quarantine_corpus_bytes_are_hash_checked_and_read_bounded() -> No
     record.descriptor = oversized_descriptor
     with pytest.raises(RuleCorpusBytesUnavailable):
         await reader.get_bytes_for_sample(sha256)
+
+
+@pytest.mark.asyncio
+async def test_goodware_feature_baseline_is_not_reported_as_tested_goodware_bytes() -> None:
+    from cti_app.application.investigation_rule_tools import _RuleTools
+    from cti_app.domain.rule_workbench import RuleTestCorpusRole
+
+    baseline_hash = "a" * 64
+    investigation_id = uuid4()
+
+    class Associations:
+        async def list_for_investigation(self, _investigation_id):
+            return ()
+
+    class BaselineOnlyInventory:
+        async def goodware_sample_sha256s(self, _investigation_id):
+            return (baseline_hash,)
+
+        async def holdout_sample_sha256s(self, _investigation_id):
+            return ()
+
+    tools = _RuleTools(
+        workbench=None,
+        candidates=None,
+        associations=Associations(),
+        corpus_bytes=None,
+        recorder=None,
+        evidence_observations=None,
+        evidence_payloads=None,
+        corpus_inventory=BaselineOnlyInventory(),
+        feature_provider=None,
+        max_tool_seconds=30,
+    )
+
+    corpus = await tools._build_corpus(investigation_id)
+
+    assert not any(case.role is RuleTestCorpusRole.GOODWARE for case in corpus.cases)
+    assert "no goodware binaries" in corpus.coverage_statement.casefold()
+
+
+@pytest.mark.asyncio
+async def test_synthetic_positive_and_real_goodware_report_provenance() -> None:
+    from cti_app.domain.rule_workbench import (
+        RuleCorpusInventoryItem,
+        RuleSampleProvenance,
+        RuleTestCorpusRole,
+    )
+
+    positive = (
+        b"<configuration><runtime><appDomainManagerAssembly>"
+        b"SyntheticManager, Version=1</appDomainManagerAssembly></runtime></configuration>"
+    )
+    goodware = (
+        b"<configuration><startup><supportedRuntime version='v4.0'/></startup></configuration>"
+    )
+    positive_sha, goodware_sha = _sha256(positive), _sha256(goodware)
+    imported_positive = RuleCorpusInventoryItem(
+        sample_sha256=positive_sha,
+        role=RuleTestCorpusRole.CONFIRMED_POSITIVE,
+        provenance=RuleSampleProvenance.SYNTHETIC,
+        size_bytes=len(positive),
+        source_description="Synthetic configuration from the cited article fragment.",
+    )
+    harness = _harness(
+        samples={positive_sha: positive, goodware_sha: goodware},
+        goodware=(goodware_sha,),
+        manual_imports=(imported_positive,),
+    )
+    motif = "appDomainManagerAssembly"
+    observation_ref = await _source_observation(harness, motif)
+
+    _output, result_status, _observation_refs = await harness.rule_tools.propose(
+        {
+            "condition": "any",
+            "motifs": [_motif(motif, observation_ref)],
+        },
+        harness.context,
+    )
+
+    assert result_status is ToolInvocationStatus.SUCCEEDED
+    assert await harness.associations.list_for_investigation(harness.investigation_id) == ()
+    rule_reports = [
+        item
+        for item in await harness.evidence.repository.list_for_investigation(
+            harness.investigation_id
+        )
+        if item.source == "AutoWork RuleWorkbench"
+    ]
+    payload = await harness.evidence.read_json(rule_reports[-1].blob_id)
+    assert payload["validation_status"] == "real_partial"
+    assert payload["false_positive_count"] == 0
+    assert payload["false_negative_count"] == 0
+    assert payload["provenance_counts_by_role"]["confirmed_positive"] == {
+        "real": 0,
+        "synthetic": 1,
+    }
+    assert payload["provenance_counts_by_role"]["goodware"] == {"real": 1, "synthetic": 0}
+    assert "positives: 1 synthetic" in payload["coverage_statement"].casefold()
+
+
+@pytest.mark.asyncio
+async def test_article_claim_rule_test_and_revise_supports_non_pe_files() -> None:
+    pytest.importorskip("yara")
+    from cti_app.domain.rule_workbench import (
+        RuleCorpusInventoryItem,
+        RuleSampleProvenance,
+        RuleTestCorpusRole,
+    )
+    from cti_app.infrastructure.yara_runner import IsolatedYaraRunner
+
+    positive = (
+        b'<?xml version="1.0"?><configuration><runtime>'
+        b'<etwEnable enabled="false"/><appDomainManagerAssembly '
+        b'assemblyName="Telemetry" appDomainManagerType="Telemetry.Loader"/>'
+        b"</runtime></configuration>"
+    )
+    benign = (
+        b'<?xml version="1.0"?><configuration><runtime>'
+        b'<gcServer enabled="true"/><assemblyBinding xmlns="urn:schemas-microsoft-com:asm.v1"/>'
+        b"</runtime></configuration>"
+    )
+    positive_sha256 = _sha256(positive)
+    benign_sha256 = _sha256(benign)
+    imports = (
+        RuleCorpusInventoryItem(
+            sample_sha256=positive_sha256,
+            role=RuleTestCorpusRole.CONFIRMED_POSITIVE,
+            provenance=RuleSampleProvenance.SYNTHETIC,
+            size_bytes=len(positive),
+            source_description="Synthetic .NET XML reflects the quoted article configuration.",
+        ),
+    )
+
+    class ArticleClaims:
+        calls = 0
+
+        async def get_claims(self, investigation_id, claim_ids):
+            self.calls += 1
+            claims = (
+                SimpleNamespace(
+                    id="L1.1",
+                    statement="The article fragment cites etwEnable enabled=false.",
+                    source_refs=("article:paragraph:0004",),
+                ),
+                SimpleNamespace(
+                    id="L1.2",
+                    statement="The fragment names appDomainManagerAssembly and its Type.",
+                    source_refs=("article:paragraph:0004",),
+                ),
+            )
+            return tuple(claim for claim in claims if claim.id in claim_ids)
+
+    article_claims = ArticleClaims()
+    engine = IsolatedYaraRunner()
+    if not engine.available:
+        pytest.skip("the isolated YARA worker is unavailable in this environment")
+    harness = _harness(
+        samples={positive_sha256: positive, benign_sha256: benign},
+        goodware=(benign_sha256,),
+        manual_imports=imports,
+        article_claims=article_claims,
+        engine=engine,
+    )
+    assert await harness.associations.list_for_investigation(harness.investigation_id) == ()
+    candidate_id = uuid4()
+    motifs = [
+        {
+            "kind": "string",
+            "value": "etwEnable",
+            "provenance_kind": "manual",
+            "provenance_id": "article-fragment:runtime-config",
+            "article_claim_refs": ["L1.1"],
+        },
+        {
+            "kind": "string",
+            "value": "appDomainManagerAssembly",
+            "provenance_kind": "manual",
+            "provenance_id": "article-fragment:app-domain-manager",
+            "article_claim_refs": ["L1.2"],
+        },
+    ]
+
+    proposed = await _call(
+        harness,
+        "rule.propose",
+        {"candidate_id": str(candidate_id), "motifs": motifs, "condition": "all"},
+    )
+
+    assert proposed.status is ToolInvocationStatus.SUCCEEDED
+    assert proposed.output["report"]["validation_status"] == "real_partial"
+    assert proposed.output["report"]["false_positive_count"] == 0
+    assert proposed.output["report"]["false_negative_count"] == 0
+    assert proposed.output["report"]["provenance_counts_by_role"] == {
+        "confirmed_positive": {"real": 0, "synthetic": 1},
+        "goodware": {"real": 1, "synthetic": 0},
+        "out_of_cluster_candidate": {"real": 0, "synthetic": 0},
+        "holdout": {"real": 0, "synthetic": 0},
+    }
+    assert "positives: 1 synthetic" in proposed.output["report"]["coverage_statement"]
+    assert article_claims.calls == 1
+
+    tested = await _call(harness, "rule.test", {"candidate_id": str(candidate_id)})
+    assert tested.output["report"]["false_positive_count"] == 0
+    assert tested.output["report"]["false_negative_count"] == 0
+    assert tested.output["report"]["validation_status"] == "real_partial"
+
+    revised = await _call(
+        harness,
+        "rule.revise",
+        {
+            "candidate_id": str(candidate_id),
+            "parent_version": 1,
+            "motifs": [motifs[0]],
+        },
+    )
+    assert revised.output.get("version") == "v2", revised.output
+    assert revised.output["report"]["validation_status"] == "real_partial"
+    assert article_claims.calls == 1
+    assert await harness.associations.list_for_investigation(harness.investigation_id) == ()
+
+
+@pytest.mark.asyncio
+async def test_unexpected_rule_operation_error_returns_stable_non_sensitive_reason(caplog) -> None:
+    from cti_app.application.investigation_rule_tools import _RuleToolAdapter
+
+    class ExplodingService:
+        max_tool_seconds = 30
+
+        async def execute(self, _tool_name, _arguments, _context):
+            try:
+                raise ValueError("database URL and operator payload must stay private")
+            except ValueError as cause:
+                raise RuntimeError("local operation failed") from cause
+
+    context = ToolExecutionContext(
+        investigation_id=uuid4(),
+        envelope=None,
+        budget=InvestigationBudget(limits={BudgetDimension.TOOL_SECONDS: 30}),
+        idempotency_key="synthetic-rule-operation",
+    )
+
+    result = await _RuleToolAdapter(ExplodingService(), "rule.propose").execute({}, context)
+
+    assert result.status is ToolInvocationStatus.FAILED
+    assert result.output["reason"] == "local_rule_operation_failed:RuntimeError:ValueError"
+    assert "database URL" not in str(result.output)
+    assert "database URL" not in result.message
+    assert "RuntimeError" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_rule_with_only_synthetic_positive_cases_is_synthetic_only() -> None:
+    from cti_app.domain.rule_workbench import (
+        RuleCorpusInventoryItem,
+        RuleSampleProvenance,
+        RuleTestCorpusRole,
+    )
+
+    sample = b"<configuration><appDomainManagerAssembly /></configuration>"
+    sample_sha256 = _sha256(sample)
+    harness = _harness(
+        samples={sample_sha256: sample},
+        manual_imports=(
+            RuleCorpusInventoryItem(
+                sample_sha256=sample_sha256,
+                role=RuleTestCorpusRole.CONFIRMED_POSITIVE,
+                provenance=RuleSampleProvenance.SYNTHETIC,
+                size_bytes=len(sample),
+                source_description="Synthetic XML from a cited article fragment.",
+            ),
+        ),
+    )
+    observation_ref = await _source_observation(harness, "appDomainManagerAssembly")
+
+    result = await _call(
+        harness,
+        "rule.propose",
+        {
+            "candidate_id": str(uuid4()),
+            "condition": "all",
+            "motifs": [_motif("appDomainManagerAssembly", observation_ref)],
+        },
+    )
+
+    assert result.output["report"]["validation_status"] == "synthetic_only"
+    assert result.output["report"]["provenance_counts_by_role"]["confirmed_positive"] == {
+        "real": 0,
+        "synthetic": 1,
+    }

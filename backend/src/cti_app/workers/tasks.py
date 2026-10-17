@@ -83,8 +83,8 @@ from cti_app.infrastructure.quarantined_capture_source import ProductionQuaranti
 from cti_app.infrastructure.shodan import create_shodan_http_adapter, create_shodan_http_client
 from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
 from cti_app.infrastructure.virustotal import (
-    VirusTotalHttpAdapter,
     create_virustotal_direct_http_client,
+    create_virustotal_http_adapter,
     create_virustotal_http_client,
 )
 from cti_app.integrations.model_factory import (
@@ -186,33 +186,14 @@ async def _execute_job(job_id: UUID) -> int | None:
             vt_proxy_client = httpx.AsyncClient()
         if settings.virustotal_api_key and settings.virustotal_file_report_legacy_fallback_enabled:
             vt_direct_client = create_virustotal_direct_http_client(settings)
-        vt_adapter = VirusTotalHttpAdapter(
+        vt_adapter = create_virustotal_http_adapter(
             client=vt_proxy_client,
-            base_url=settings.virustotal_base_url,
-            fallback_base_url=settings.virustotal_fallback_base_url,
-            legacy_base_url=settings.virustotal_legacy_base_url,
-            direct_client=vt_direct_client,
-            api_key=(
-                settings.virustotal_api_key.get_secret_value()
-                if vt_direct_client is not None and settings.virustotal_api_key is not None
-                else None
-            ),
+            settings=settings,
             capabilities=vt_capabilities,
-            file_report_proxy_fallback_enabled=(
-                settings.virustotal_file_report_proxy_fallback_enabled
-            ),
-            file_report_legacy_fallback_enabled=(
-                settings.virustotal_file_report_legacy_fallback_enabled
-            ),
+            direct_client=vt_direct_client,
             routing_policy=(
                 None if settings.virustotal_proxy_url else VirusTotalRoutingPolicy(routes={})
             ),
-            max_response_bytes=settings.virustotal_max_response_bytes,
-            default_page_size=settings.virustotal_default_page_size,
-            max_page_size=settings.virustotal_max_page_size,
-            max_pages=settings.virustotal_max_pages,
-            max_results=settings.virustotal_max_results,
-            file_download_enabled=settings.virustotal_file_download_enabled,
         )
         blob_store = MinioBlobStore(
             Minio(

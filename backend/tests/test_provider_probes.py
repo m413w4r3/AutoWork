@@ -91,6 +91,10 @@ async def test_offline_preflight_passes_six_mocked_provider_contracts_only() -> 
     assert all(probe.status is ProviderProbeStatus.PASS for probe in report.probes)
     assert all(probe.mode is ProviderProbeMode.OFFLINE_SIMULATED for probe in report.probes)
     assert all(probe.http_status == 200 for probe in report.probes)
+    assert not any(
+        probe.operation in {"file_download", "retrohunt", "retrohunt_submit"}
+        for probe in report.probes
+    )
 
 
 @pytest.mark.asyncio

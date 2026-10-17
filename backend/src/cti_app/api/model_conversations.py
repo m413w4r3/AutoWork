@@ -5,6 +5,7 @@ from uuid import UUID
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 
+from cti_app.application.identity import IdentityProvider
 from cti_app.application.model_conversations import (
     ModelConversationError,
     ModelConversationService,
@@ -51,6 +52,25 @@ class ReconcileRequest(BaseModel):
     available: bool
 
 
+class VisibleTurnAdoptRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_sha256: str = Field(..., min_length=64, max_length=64, pattern="^[0-9a-f]{64}$")
+
+
+class TurnAbandonRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(..., min_length=1, max_length=1000)
+
+
+class VisibleTurnPreviewView(BaseModel):
+    turn_id: UUID
+    sha256: str
+    characters: int
+    text: str
+
+
 class ConversationView(BaseModel):
     id: UUID
     provider: str
@@ -91,6 +111,7 @@ class TurnView(BaseModel):
     started_at: datetime
     finished_at: datetime | None
     error: dict[str, object] | None
+    recovery: dict[str, object] | None = None
     input_text: str | None = None
     output_text: str | None = None
 
@@ -187,6 +208,86 @@ async def add_turn(
         _raise(exc)
 
 
+@router.post(
+    "/{conversation_id}/turns/{turn_id}/reconciliation/visible/preview",
+    response_model=VisibleTurnPreviewView,
+)
+async def preview_visible_turn_reconciliation(
+    conversation_id: UUID,
+    turn_id: UUID,
+    request: Request,
+    subject_id: UUID = Query(...),
+) -> VisibleTurnPreviewView:
+    try:
+        await _actor_id(request)
+        preview = await _service(request).preview_visible_recovery(
+            conversation_id, turn_id, context_subject_id=subject_id
+        )
+        return VisibleTurnPreviewView.model_validate(preview)
+    except Exception as exc:
+        _raise(exc)
+
+
+@router.post(
+    "/{conversation_id}/turns/{turn_id}/reconciliation/visible/adopt",
+    response_model=TurnView,
+)
+async def adopt_visible_turn_reconciliation(
+    conversation_id: UUID,
+    turn_id: UUID,
+    payload: VisibleTurnAdoptRequest,
+    request: Request,
+    subject_id: UUID = Query(...),
+) -> TurnView:
+    try:
+        turn = await _service(request).adopt_visible_recovery(
+            conversation_id,
+            turn_id,
+            expected_sha256=payload.expected_sha256,
+            actor_id=await _actor_id(request),
+            context_subject_id=subject_id,
+        )
+        contents = await _service(request).turns(conversation_id, context_subject_id=subject_id)
+        content = next((item for item in contents if item.turn.id == turn.id), None)
+        return _turn_view(
+            turn,
+            input_text=content.input_text if content else None,
+            output_text=content.output_text if content else None,
+        )
+    except Exception as exc:
+        _raise(exc)
+
+
+@router.post(
+    "/{conversation_id}/turns/{turn_id}/reconciliation/abandon",
+    response_model=TurnView,
+)
+async def abandon_turn_reconciliation(
+    conversation_id: UUID,
+    turn_id: UUID,
+    payload: TurnAbandonRequest,
+    request: Request,
+    subject_id: UUID = Query(...),
+) -> TurnView:
+    try:
+        turn = await _service(request).abandon_investigation_turn(
+            conversation_id,
+            turn_id,
+            reason=payload.reason,
+            actor_id=await _actor_id(request),
+            context_subject_id=subject_id,
+        )
+        contents = await _service(request).turns(conversation_id, context_subject_id=subject_id)
+        content = next((item for item in contents if item.turn.id == turn.id), None)
+        return _turn_view(
+            turn,
+            input_text=content.input_text if content else None,
+            output_text=content.output_text if content else None,
+        )
+    except Exception as exc:
+        _raise(exc)
+
+
 @router.post("/{conversation_id}/archive", response_model=ConversationView)
 async def archive_conversation(
     conversation_id: UUID, request: Request, subject_id: UUID | None = None
@@ -220,6 +321,11 @@ async def reconcile_conversation(
 
 def _service(request: Request) -> ModelConversationService:
     return cast(ModelConversationService, request.app.state.model_conversation_service)
+
+
+async def _actor_id(request: Request) -> str:
+    provider: IdentityProvider = request.app.state.identity_provider
+    return (await provider.current()).actor_id
 
 
 def _conversation_view(value: ModelConversation) -> ConversationView:
@@ -263,6 +369,11 @@ def _turn_view(
         started_at=value.started_at,
         finished_at=value.finished_at,
         error=error,
+        recovery=(
+            value.error_details.get("recovery")
+            if value.error_details and isinstance(value.error_details.get("recovery"), dict)
+            else None
+        ),
         input_text=input_text,
         output_text=output_text,
     )

@@ -445,6 +445,8 @@ class _DownloadSampleAdapter:
                 ToolInvocationStatus.FAILED,
                 message=f"Hit acquisition input was rejected ({type(exc).__name__}).",
                 budget_consumed={},
+                exception_class=type(exc).__name__,
+                error_code=getattr(exc, "code", None) or "hit_acquisition_rejected",
             )
         return _acquisition_tool_result(result)
 
@@ -617,6 +619,14 @@ def _acquisition_tool_result(result: HitAcquisitionResult) -> ToolResult:
     if result.novelty is not None:
         output["novelty"] = result.novelty.novelty.value
         output["novelty_scope"] = result.novelty.scope
+    if result.error_code is not None:
+        output["error_code"] = result.error_code
+    if result.reason is not None:
+        output["reason"] = result.reason
+    if result.confirmed_non_execution:
+        output["confirmed_non_execution"] = True
+    if result.cached:
+        output["cached"] = True
     return ToolResult(
         status=result.status,
         observation_refs=result.observation_refs,
@@ -625,6 +635,8 @@ def _acquisition_tool_result(result: HitAcquisitionResult) -> ToolResult:
         suggested_alternatives=result.suggested_alternatives,
         output=output,
         message=result.message,
+        exception_class=result.exception_class,
+        error_code=result.error_code,
     )
 
 

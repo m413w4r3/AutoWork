@@ -30,6 +30,7 @@ from cti_app.application.virustotal import (
     VirusTotalRouteStep,
     VirusTotalRoutingPolicy,
 )
+from cti_app.config import Settings
 from cti_app.domain.investigation import TLPLevel
 from cti_app.domain.virustotal import (
     VirusTotalCapability,
@@ -38,7 +39,7 @@ from cti_app.domain.virustotal import (
     VirusTotalTransportKind,
 )
 from cti_app.infrastructure.shodan import ShodanHttpAdapter
-from cti_app.infrastructure.virustotal import VirusTotalHttpAdapter
+from cti_app.infrastructure.virustotal import create_virustotal_http_adapter
 
 logger = logging.getLogger(__name__)
 
@@ -199,9 +200,9 @@ async def offline_preflight() -> ProviderPreflightReport:
             trust_env=False,
         ) as shodan_client,
     ):
-        vt = VirusTotalHttpAdapter(
+        vt = create_virustotal_http_adapter(
             client=vt_client,
-            base_url=_VT_BASE_URL,
+            settings=Settings(_env_file=None, virustotal_base_url=_VT_BASE_URL),
             capabilities=VirusTotalCapabilities(
                 file_report=True,
                 file_relationships=True,

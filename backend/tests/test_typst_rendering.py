@@ -538,6 +538,41 @@ def test_v5_projection_maps_semantic_spans_to_closed_typst_helpers(tmp_path: Pat
     assert "semantic-actor" in {span["style"] for span in table["semantic_caption"]}
 
 
+def test_v5_typst_projection_keeps_extracted_xml_parameter_as_literal_text(
+    tmp_path: Path,
+) -> None:
+    renderer, bundle = _renderer(tmp_path)
+    base = _full_document()
+    literal = '<etwEnable enabled="false"/>'
+    paragraph_text = f"La configuration contient {literal}."
+    base = replace(
+        base,
+        lead=(replace(base.lead[0], text=paragraph_text), *base.lead[1:]),
+    )
+    annotator = SemanticAnnotator(EnglishTermDetector(()))
+    semantic_text = SemanticTextV1(
+        schema_version=SEMANTIC_ANNOTATION_SCHEMA_VERSION,
+        policy_version=SEMANTIC_ANNOTATION_POLICY_VERSION,
+        paragraphs=tuple(
+            annotator.annotate_paragraph(
+                anchor=anchor,
+                text=text,
+                entities=(),
+            )
+            for anchor, text in publication_document_text_anchors(base).items()
+        ),
+    )
+    document = PublicationDocumentV5(document=base, semantic_text=semantic_text)
+
+    render_data_bytes = renderer.render(document, bundle).render_data_bytes
+    render_data = json.loads(render_data_bytes)
+    paragraph = render_data["content_sections"][1]["blocks"][0]
+
+    assert paragraph["text"] == paragraph_text
+    assert "".join(span["text"] for span in paragraph["semantic_spans"]) == paragraph_text
+    assert json.dumps(literal, ensure_ascii=False).encode("utf-8")[1:-1] in render_data_bytes
+
+
 def test_long_iocs_and_semantic_literals_get_render_only_break_opportunities(
     tmp_path: Path,
 ) -> None:

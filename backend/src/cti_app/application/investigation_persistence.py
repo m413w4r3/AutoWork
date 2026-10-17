@@ -81,6 +81,10 @@ class SampleAssociationRepository(Protocol):
 class DetectionCandidateRepository(Protocol):
     async def get(self, version_id: UUID) -> DetectionCandidateVersion | None: ...
 
+    async def list_for_investigation(
+        self, investigation_id: UUID
+    ) -> tuple[DetectionCandidateVersion, ...]: ...
+
     async def list_for_candidate(
         self, candidate_id: UUID
     ) -> tuple[DetectionCandidateVersion, ...]: ...
@@ -179,7 +183,6 @@ class InMemoryToolInvocationRepository:
                     or existing.tool_name != invocation.tool_name
                     or existing.schema_version != invocation.schema_version
                     or existing.normalized_parameters != invocation.normalized_parameters
-                    or existing.purpose != invocation.purpose
                 ):
                     raise ValueError(
                         "An operation key cannot identify different invocation content"
@@ -332,7 +335,26 @@ class InMemoryDetectionCandidateRepository:
         return self._items.get(version_id)
 
     async def list_for_candidate(self, candidate_id: UUID) -> tuple[DetectionCandidateVersion, ...]:
-        return tuple(item for item in self._items.values() if item.candidate_id == candidate_id)
+        return tuple(
+            sorted(
+                (item for item in self._items.values() if item.candidate_id == candidate_id),
+                key=lambda item: (item.version, item.id.hex),
+            )
+        )
+
+    async def list_for_investigation(
+        self, investigation_id: UUID
+    ) -> tuple[DetectionCandidateVersion, ...]:
+        return tuple(
+            sorted(
+                (
+                    item
+                    for item in self._items.values()
+                    if item.investigation_id == investigation_id
+                ),
+                key=lambda item: (item.candidate_id.hex, item.version, item.id.hex),
+            )
+        )
 
     async def append_version(
         self, version: DetectionCandidateVersion, *, expected_previous_id: UUID | None

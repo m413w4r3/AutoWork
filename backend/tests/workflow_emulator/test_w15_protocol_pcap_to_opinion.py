@@ -409,6 +409,42 @@ class _W15ProtocolBridge(ScriptedInvestigationTransport):
         network_refs = [str(item) for item in (*inspection_refs, *segment_refs)]
         protocol_refs = [str(item) for item in (*segment_refs, *verification_refs[-1:])]
         observation_by_id = {str(item.id): item for item in observations}
+        async with self._uow_factory() as uow:
+            findings = tuple(
+                await uow.investigation_findings.list_for_investigation(self._investigation_id)
+            )
+        supported_findings = tuple(
+            item
+            for item in findings
+            if item.assessment is FindingAssessment.SUPPORTED and item.observation_refs
+        )
+        if supported_findings:
+            evidence_refs = tuple(
+                sorted(
+                    {ref for item in supported_findings for ref in item.observation_refs},
+                    key=lambda ref: ref.hex,
+                )
+            )
+            response = _scripted_decision(
+                "Draft the final fact block from the persisted protocol findings.",
+                next_action="finish",
+            )
+            response["opinion_delta"] = {
+                "blocks": [
+                    {
+                        "block_type": OpinionBlockType.KEY_FINDINGS.value,
+                        "text": (
+                            "Two training captures support the measured framing; the holdout "
+                            "contradicts opcode 01, and the TLS application data remains opaque."
+                        ),
+                        "finding_refs": [str(item.id) for item in supported_findings],
+                        "evidence_refs": [str(item) for item in evidence_refs],
+                        "qualification": OpinionClaimQualification.FACT.value,
+                        "certainty": 0.9,
+                    }
+                ]
+            }
+            return response
         return _scripted_decision(
             "Retain the measured message framing and state transitions; keep the opcode result "
             "qualified because the third flow contradicted the training hypothesis.",
@@ -451,7 +487,7 @@ class _W15ProtocolBridge(ScriptedInvestigationTransport):
                     ),
                 },
             ),
-            next_action="finish",
+            next_action="continue",
         )
 
     async def submit(self, **kwargs: Any):
@@ -578,7 +614,7 @@ class _W15ProtocolBridge(ScriptedInvestigationTransport):
                     ),
                 ),
             )
-        elif turn_index == 8:
+        elif turn_index in {8, 9}:
             response = await self._final_response(tuple(before))
         else:
             raise AssertionError(f"Unexpected W15 Bridge turn index {turn_index}")
@@ -837,7 +873,7 @@ async def test_w15_protocol_pcap_to_opinion_with_real_d2_typst_and_multibatch_pd
                 assert envelope.json()["approved"] is True
                 await run_http_job(app, uow_factory, registry, dispatcher, UUID(started["job_id"]))
 
-                assert len(transport.prompts) == 9, len(transport.prompts)
+                assert len(transport.prompts) == 10, len(transport.prompts)
                 assert transport.received_prompts == transport.prompts
                 for index in range(len(transport.prompts) - 1):
                     before_ids = set(transport.observations_before_turn[index])

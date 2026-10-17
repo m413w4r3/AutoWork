@@ -922,6 +922,64 @@ _MARKDOWN_OR_HTML = re.compile(
     r"(?P<html_tag><\s*/?\s*[A-Za-z][^>]*>)|<!--|\*\*|__|(?<!\w)\*(?=\S)|(?<!\w)_(?=\S))",
     re.MULTILINE,
 )
+_FORBIDDEN_XML_MARKUP = re.compile(r"<!--|<!\[CDATA\[|<\?|<!DOCTYPE\b", re.IGNORECASE)
+_XML_TAG_NAME = re.compile(r"<\s*/?\s*([A-Za-z][A-Za-z0-9_.:-]*)")
+_FORBIDDEN_XML_ATTRIBUTE = re.compile(r"(?i)(?:^|[\s/])(?:on[^\s=]*|style|src|href|srcdoc)\s*=")
+_UNSAFE_XML_URI_SCHEME = re.compile(r"(?i)(?:javascript|data)\s*:")
+_ACTIVE_OR_FORMATTING_XML_TAGS = frozenset(
+    {
+        "script",
+        "style",
+        "iframe",
+        "frame",
+        "frameset",
+        "object",
+        "embed",
+        "applet",
+        "link",
+        "meta",
+        "base",
+        "svg",
+        "math",
+        "form",
+        "input",
+        "button",
+        "textarea",
+        "select",
+        "img",
+        "video",
+        "audio",
+        "source",
+        "a",
+        "b",
+        "i",
+        "u",
+        "em",
+        "strong",
+        "br",
+        "p",
+        "div",
+        "span",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "ul",
+        "ol",
+        "li",
+        "table",
+        "tr",
+        "td",
+        "th",
+        "pre",
+        "code",
+        "html",
+        "head",
+        "body",
+    }
+)
 _MARKDOWN_TABLE_SEPARATOR = re.compile(
     r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$",
     re.MULTILINE,
@@ -1911,12 +1969,51 @@ def _invalid_proposal(reason: str) -> None:
     raise SynthesisProposalControlError(SynthesisProposalErrorCode.OUTPUT_INVALID, reason)
 
 
-def _contains_markdown_or_html(value: str) -> bool:
+def _is_safe_extracted_xml_tag(token: str, evidence_texts: tuple[str, ...]) -> bool:
+    """Allow only short, inert XML tag tokens copied exactly from extraction text."""
+    if len(token) > 200 or "\n" in token or "\r" in token:
+        return False
+    if _FORBIDDEN_XML_MARKUP.search(token):
+        return False
+    tag_match = _XML_TAG_NAME.match(token)
+    if tag_match is None:
+        return False
+    tag_parts = tag_match.group(1).casefold().split(":")
+    if any(part in _ACTIVE_OR_FORMATTING_XML_TAGS for part in tag_parts):
+        return False
+    if _FORBIDDEN_XML_ATTRIBUTE.search(token) or _UNSAFE_XML_URI_SCHEME.search(token):
+        return False
+    return any(token in evidence_text for evidence_text in evidence_texts)
+
+
+def _is_attached_technical_placeholder(value: str, span: tuple[int, int]) -> bool:
+    start, _end = span
+    return start >= 2 and value[start - 1] in "_-." and value[start - 2].isalnum()
+
+
+def _contains_markdown_or_html(
+    value: str, *, extracted_evidence_texts: tuple[str, ...] | None = None
+) -> bool:
+    if _FORBIDDEN_XML_MARKUP.search(value):
+        return True
     literal_exceptions = technical_literal_markup_exception_spans(value)
     placeholders = frozenset(literal_exceptions)
-    for match in _MARKDOWN_OR_HTML.finditer(value):
-        if match.lastgroup == "html_tag" and match.span() in placeholders:
-            continue
+    validation_value = value
+    if extracted_evidence_texts is not None:
+        for start, end in reversed(literal_exceptions):
+            if value[start:end].startswith("<") and _is_attached_technical_placeholder(
+                value, (start, end)
+            ):
+                validation_value = (
+                    f"{validation_value[:start]}{'x' * (end - start)}{validation_value[end:]}"
+                )
+    for match in _MARKDOWN_OR_HTML.finditer(validation_value):
+        if match.lastgroup == "html_tag":
+            if extracted_evidence_texts is not None:
+                if _is_safe_extracted_xml_tag(match.group(), extracted_evidence_texts):
+                    continue
+            elif match.span() in placeholders:
+                continue
         if match.group() == "*" and any(
             start <= match.start() < end for start, end in literal_exceptions
         ):
@@ -2012,11 +2109,13 @@ def _proposal_from_payload(value: Any) -> SynthesisProposalV1:
     )
 
 
-def _validate_plain_text(value: str) -> None:
+def _validate_plain_text(
+    value: str, *, extracted_evidence_texts: tuple[str, ...] | None = None
+) -> None:
     stripped = value.strip()
     if (
         stripped.startswith(("---", "+++"))
-        or _contains_markdown_or_html(value)
+        or _contains_markdown_or_html(value, extracted_evidence_texts=extracted_evidence_texts)
         or _MARKDOWN_TABLE_SEPARATOR.search(value)
         or _MARKDOWN_TABLE_ROW.search(value)
         or _SOURCE_MARKER.search(value)
@@ -2273,9 +2372,13 @@ def _validate_grounded_text(
     entries: Mapping[ExtractionEvidenceRefV1, Mapping[str, Any]],
     known_technical: set[tuple[str, str]],
     technical_support: Mapping[tuple[str, str], set[ExtractionEvidenceRefV1]],
+    file_artifact_domains: set[str],
 ) -> None:
     ref_set = set(refs)
     for literal in _technical_literals(text):
+        # Typed filename/path evidence disambiguates matching domain-shaped names.
+        if literal[0] == "domain" and literal[1] in file_artifact_domains:
+            continue
         if literal not in known_technical:
             raise SynthesisProposalControlError(
                 SynthesisProposalErrorCode.UNKNOWN_TECHNICAL_VALUE,
@@ -2332,7 +2435,57 @@ def validate_synthesis_proposal(
             raise ValueError("Expected a ProductionExtractionV1")
         parsed = _proposal_from_payload(proposal)
         entries = _all_evidence_entries(extraction)
+        extracted_evidence_texts = tuple(
+            payload[field]
+            for payload in entries.values()
+            for field in ("value", "evidence_quote")
+            if isinstance(payload.get(field), str)
+        )
         current_refs = set(entries)
+        file_artifact_domains: set[str] = set()
+        explicit_domain_literals: set[str] = set()
+
+        def add_explicit_domain_literal(literal: tuple[str, str]) -> None:
+            if literal[0] == "domain":
+                explicit_domain_literals.update(
+                    alias_value
+                    for kind, alias_value in _technical_literal_aliases(literal)
+                    if kind == "domain"
+                )
+
+        def add_typed_domain_hosts(value: str) -> None:
+            for literal in _technical_literals(value):
+                if literal[0] == "domain":
+                    add_explicit_domain_literal(literal)
+                elif literal[0] == "url":
+                    explicit_domain_literals.update(
+                        alias_value
+                        for kind, alias_value in _technical_literal_aliases(literal)
+                        if kind == "domain"
+                    )
+                elif literal[0] == "email":
+                    email_host = literal[1].rsplit("@", 1)[-1]
+                    for host_literal in _technical_literals(email_host):
+                        add_explicit_domain_literal(host_literal)
+
+        for ref, payload in entries.items():
+            artifact_type = payload.get("artifact_type")
+            if ref.kind is not EvidenceKind.INDICATOR:
+                continue
+            artifact_value = payload.get("value")
+            if not isinstance(artifact_value, str):
+                continue
+            if artifact_type in {"filename", "filepath"}:
+                filename = artifact_value.rstrip("/\\").rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+                file_artifact_domains.update(
+                    value for kind, value in _technical_literals(filename) if kind == "domain"
+                )
+                continue
+            if artifact_type in {"domain", "url", "email"}:
+                add_typed_domain_hosts(artifact_value)
+        for source in extraction.sources:
+            add_typed_domain_hosts(source.canonical_url)
+        file_artifact_domains.difference_update(explicit_domain_literals)
 
         removed_refs: set[ExtractionEvidenceRefV1] = set()
         removed_handles: set[str] = set()
@@ -2383,7 +2536,7 @@ def validate_synthesis_proposal(
             section_kind: str,
             allow_technical: bool,
         ) -> SynthesisParagraphV1:
-            _validate_plain_text(claim.text)
+            _validate_plain_text(claim.text, extracted_evidence_texts=extracted_evidence_texts)
             refs = _resolve_claim_refs(
                 claim, evidence_pack, current_refs, removed_refs, removed_handles
             )
@@ -2417,6 +2570,7 @@ def validate_synthesis_proposal(
                 entries,
                 known_technical,
                 technical_support_mutable,
+                file_artifact_domains,
             )
             return SynthesisParagraphV1(text=claim.text, evidence_refs=refs)
 

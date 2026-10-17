@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import unicodedata
+import xml.etree.ElementTree as ET
 from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
@@ -30,6 +31,20 @@ from cti_app.domain.publication import (
     ArtifactType,
     PublicationIndicatorGroupV1,
     PublicationIndicatorV1,
+)
+from cti_app.domain.publication_document import (
+    PublicationDocumentV5,
+    PublicationTableColumnV1,
+    PublicationTableRowV1,
+    publication_document_text_anchors,
+)
+from cti_app.domain.semantic_annotation import (
+    SEMANTIC_ANNOTATION_POLICY_VERSION,
+    SEMANTIC_ANNOTATION_SCHEMA_VERSION,
+    SemanticParagraphV1,
+    SemanticRole,
+    SemanticTextSpanV1,
+    SemanticTextV1,
 )
 from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
 from tests.test_publication_builder_v4 import _cited_technical_context_case
@@ -354,6 +369,208 @@ async def test_real_typst_article_preserves_copyable_technical_literals(
     assert "Narrow hash column" in extracted
     assert "Registre Windows" in extracted
     assert len(reader.pages) >= 1
+
+
+@pytest.mark.asyncio
+async def test_real_typst_wraps_long_tokens_without_overlapping_narrow_table_cells(
+    tmp_path: Path,
+    typst_binary: str,
+    font_bundle_root: Path,
+) -> None:
+    typst_root = _REPOSITORY_ROOT / "chpTypst"
+    bundle = load_template_bundle(typst_root)
+    paragraph_text = (
+        "Technical literal: Blackwood.Cheese.xml and "
+        r"HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+    )
+    rows = (
+        (
+            "PsProxy.dll",
+            (
+                "Moteur sans état ne disposant pas de capacités autonomes de persistance "
+                "ou de communication réseau."
+            ),
+            "Utilisation de System.Management.Automation.dll avec un runspace personnalisé.",
+            "Clé facultative et Blackwood.Cheese.xml, partagée via PowerShell.exe.",
+        ),
+        (
+            "Blackwood.dll",
+            "Chargeur de modules et de composants additionnels.",
+            r"Création de HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run.",
+            "Option facultative fournie par l'opérateur.",
+        ),
+        (
+            "Sample.exe",
+            "Composant de démonstration avec une fonction courte.",
+            "Consultation d'une ressource hébergée sur Internet.",
+            _COPYABLE_LONG_URL,
+        ),
+        (
+            "Hash.dll",
+            "Valeur d'empreinte conservée sans modification.",
+            "Calcul de la somme de contrôle SHA-256.",
+            _COPYABLE_HASH,
+        ),
+    )
+    base = _copyable_ioc_document()
+    table = base.tables[0]
+    component_table = replace(
+        table,
+        columns=(
+            PublicationTableColumnV1("component", "Composant"),
+            PublicationTableColumnV1("function", "Fonction"),
+            PublicationTableColumnV1("mechanism", "Mécanisme technique"),
+            PublicationTableColumnV1("dependency", "Dépendance ou particularité"),
+        ),
+        rows=tuple(PublicationTableRowV1(row, table.rows[0].evidence_refs) for row in rows),
+    )
+    first_lead = replace(base.lead[0], text=paragraph_text)
+    base = replace(base, lead=(first_lead, *base.lead[1:]), tables=(component_table,))
+
+    technical_literals = (
+        "PsProxy.dll",
+        "Blackwood.dll",
+        "System.Management.Automation.dll",
+        r"HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+        "Blackwood.Cheese.xml",
+        _COPYABLE_LONG_URL,
+        _COPYABLE_HASH,
+    )
+    semantic_paragraphs = []
+    for anchor, text in publication_document_text_anchors(base).items():
+        matches = sorted(
+            (position, literal)
+            for literal in technical_literals
+            if (position := text.find(literal)) >= 0
+        )
+        spans: list[SemanticTextSpanV1] = []
+        cursor = 0
+        for position, literal in matches:
+            if position < cursor:
+                continue
+            if position > cursor:
+                spans.append(SemanticTextSpanV1(SemanticRole.TEXT, text[cursor:position]))
+            spans.append(SemanticTextSpanV1(SemanticRole.TECHNICAL_LITERAL, literal))
+            cursor = position + len(literal)
+        if cursor < len(text):
+            spans.append(SemanticTextSpanV1(SemanticRole.TEXT, text[cursor:]))
+        if not spans:
+            spans.append(SemanticTextSpanV1(SemanticRole.TEXT, text))
+        semantic_paragraphs.append(SemanticParagraphV1(anchor, tuple(spans)))
+    document = PublicationDocumentV5(
+        document=base,
+        semantic_text=SemanticTextV1(
+            schema_version=SEMANTIC_ANNOTATION_SCHEMA_VERSION,
+            policy_version=SEMANTIC_ANNOTATION_POLICY_VERSION,
+            paragraphs=tuple(semantic_paragraphs),
+        ),
+    )
+    source = TypstRenderer().render(document, bundle)
+    render_data = json.loads(source.render_data_bytes)
+    table = next(
+        block
+        for section in render_data["content_sections"]
+        for block in section["blocks"]
+        if block["type"] == "table"
+    )
+    assert 1.0 <= table["column_weights"][0] <= 1.2
+
+    workspace_root = tmp_path / "long-token-article-workspace"
+    _build_runtime_workspace(_REPOSITORY_ROOT, workspace_root, render_data=render_data)
+    font_snapshot = load_font_bundle_snapshot(font_bundle_root, _FONT_BUNDLE_LOCK)
+    font_root = tmp_path / "long-token-article-fonts"
+    font_root.mkdir()
+    compiled = await TypstSubprocessCompiler(binary=typst_binary).compile(
+        TypstCompileRequest(
+            workspace_root=workspace_root,
+            entrypoint_relative_path="RENDERER/publication.typ",
+            font_paths=materialize_font_bundle(font_snapshot, font_root),
+        )
+    )
+    reader = PdfReader(BytesIO(compiled.content), strict=True)
+    extracted = "\n".join(page.extract_text() or "" for page in reader.pages)
+    normalized_extracted = "".join(
+        character
+        for character in extracted
+        if not character.isspace() and unicodedata.category(character) != "Cf"
+    )
+    for exact_value in (
+        "PsProxy.dll",
+        "Blackwood.dll",
+        "System.Management.Automation.dll",
+        r"HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+        "Blackwood.Cheese.xml",
+        _COPYABLE_LONG_URL,
+        _COPYABLE_HASH,
+    ):
+        assert exact_value in normalized_extracted
+    assert "Composant" in extracted
+
+    pdftotext = shutil.which("pdftotext")
+    assert pdftotext is not None, "pdftotext is required to check rendered word coordinates"
+    pdf_path = tmp_path / "long-token-article.pdf"
+    pdf_path.write_bytes(compiled.content)
+    with anyio.fail_after(10):
+        bbox = await anyio.run_process(
+            (pdftotext, "-bbox", str(pdf_path), "-"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+    root = ET.fromstring(bbox.stdout.decode("utf-8", errors="replace"))
+    words = [
+        (
+            element.text or "",
+            float(element.attrib["xMin"]),
+            float(element.attrib["yMin"]),
+            float(element.attrib["xMax"]),
+            float(element.attrib["yMax"]),
+        )
+        for element in root.iter()
+        if element.tag.rsplit("}", 1)[-1] == "word"
+    ]
+
+    def find_word(value: str) -> tuple[str, float, float, float, float]:
+        matches = [word for word in words if word[0] == value]
+        assert matches, f"rendered PDF is missing word {value!r}"
+        return matches[0]
+
+    function_header = find_word("Fonction")
+    assert any(
+        word[0] == "Composant"
+        and abs(word[2] - function_header[2]) <= 1.5
+        and word[1] < function_header[1]
+        for word in words
+    ), "the first-column header should fit on one line after token wrapping"
+    first_header_x = min(
+        word[1]
+        for word in words
+        if abs(word[2] - function_header[2]) <= 1.5 and word[1] < function_header[1]
+    )
+    header_starts = [
+        first_header_x,
+        function_header[1],
+        find_word("Mécanisme")[1],
+        find_word("Dépendance")[1],
+    ]
+    row_heads = (
+        ("Moteur", "Utilisation", "Clé"),
+        ("Chargeur", "Création", "Option"),
+    )
+    for heads in row_heads:
+        for column_index, right_head in enumerate(heads):
+            neighbor = find_word(right_head)
+            left_words = [
+                word
+                for word in words
+                if abs(word[2] - neighbor[2]) <= 1.5
+                and header_starts[column_index] - 0.5 <= word[1] < neighbor[1]
+            ]
+            assert left_words, f"could not inspect the preceding cell before {right_head!r}"
+            crossing = [word[0] for word in left_words if word[3] > neighbor[1] + 0.2]
+            assert not crossing, (
+                f"text in the cell before {right_head!r} crosses into its column: {crossing!r}"
+            )
 
 
 @pytest.mark.asyncio

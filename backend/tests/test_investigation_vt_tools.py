@@ -635,7 +635,17 @@ async def test_quota_authorization_and_transport_errors_map_to_local_tool_status
     )
     unauthorized = await _dispatch(unauthorized_tools, "vt.file_report", {"file_hash": _SEED_HASH})
     assert unauthorized.status is ToolInvocationStatus.UNAVAILABLE
-    assert unauthorized.output["reason"] == "capability_unavailable"
+    assert unauthorized.output["reason"] == "provider_authorization_refused"
+
+    unauthorized_401_tools = _tool_set()
+    unauthorized_401_tools.vt.errors["file_report"] = VirusTotalHttpError(
+        "synthetic unauthorized response", status_code=401
+    )
+    unauthorized_401 = await _dispatch(
+        unauthorized_401_tools, "vt.file_report", {"file_hash": _SEED_HASH}
+    )
+    assert unauthorized_401.status is ToolInvocationStatus.UNAVAILABLE
+    assert unauthorized_401.output["reason"] == "provider_authorization_refused"
 
     transport_tools = _tool_set()
     transport_tools.vt.errors["file_report"] = VirusTotalTransportError("offline")
@@ -1164,6 +1174,9 @@ async def test_vertical_file_report_search_article_novelty_finding_and_opinion()
     assert finding.novelty is not None and finding.novelty.value == "new_to_article"
     assert "Non documenté dans cet article." in finding.limitations
     assert "pas une absence mondiale" in " ".join(finding.limitations)
+    assert any(
+        "@@OPINION@@" in (item.output_text or "") for item in harness.transport._by_key.values()
+    )
     opinion = await harness.opinions.get(uuid5(_OPINION_NAMESPACE, str(harness.investigation_id)))
     assert opinion is not None
     assert opinion.blocks[0].finding_refs == (finding.id,)

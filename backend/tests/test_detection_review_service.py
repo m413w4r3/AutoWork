@@ -60,6 +60,11 @@ class _Candidates:
     async def get(self, version_id: UUID) -> DetectionCandidateVersion | None:
         return self.version if self.version.id == version_id else None
 
+    async def list_for_investigation(
+        self, investigation_id: UUID
+    ) -> tuple[DetectionCandidateVersion, ...]:
+        return (self.version,) if self.version.investigation_id == investigation_id else ()
+
 
 class _Observations:
     def __init__(self, observations: tuple[EvidenceObservation, ...] = ()) -> None:
@@ -203,11 +208,20 @@ class _Fixture:
             "proposal_source_sha256": SOURCE_SHA256,
             "source_sha256": SOURCE_SHA256,
             "execution_status": "succeeded",
+            "validation_status": "real_partial",
             "engine_version": "yara 4.test",
             "candidate_status": "tested",
             "selection_bias": "synthetic test corpus",
             "coverage_statement": "two synthetic cases",
             "corpus_sha256": "3" * 64,
+            "provenance_counts_by_role": {
+                "confirmed_positive": {"real": 0, "synthetic": 1},
+                "goodware": {"real": 1, "synthetic": 0},
+            },
+            "false_positive_count": len(goodware_matches),
+            "false_positive_sha256s": goodware_matches,
+            "false_negative_count": 0,
+            "false_negative_sha256s": [],
             "corpus_sha256s_by_role": {
                 "confirmed_positive": [hashes[0]],
                 "out_of_cluster_candidate": [],
@@ -218,6 +232,10 @@ class _Fixture:
                 {
                     "role": "confirmed_positive",
                     "corpus_sha256s": [hashes[0]],
+                    "provenance_counts": {"real": 0, "synthetic": 1},
+                    "test_cases": [
+                        {"sha256": hashes[0], "provenance": "synthetic", "outcome": "match"}
+                    ],
                     "matches": [hashes[0]],
                     "non_matches": [],
                     "non_measurable": [],
@@ -226,6 +244,14 @@ class _Fixture:
                 {
                     "role": "goodware",
                     "corpus_sha256s": [hashes[1]],
+                    "provenance_counts": {"real": 1, "synthetic": 0},
+                    "test_cases": [
+                        {
+                            "sha256": hashes[1],
+                            "provenance": "real",
+                            "outcome": "match" if noisy else "non_match",
+                        }
+                    ],
                     "matches": goodware_matches,
                     "non_matches": [] if noisy else [hashes[1]],
                     "non_measurable": [],
@@ -267,6 +293,17 @@ async def test_approval_requires_an_exact_test_report_and_article_base() -> None
 
     assert error.value.code is DetectionReviewErrorCode.TEST_REPORT_NOT_FOUND
     assert fixture.uow.commits == 0
+
+
+@pytest.mark.asyncio
+async def test_detection_inventory_includes_candidate_without_test_report() -> None:
+    fixture = _Fixture(with_report=False)
+
+    versions = await fixture.service.list_for_investigation(INVESTIGATION_ID)
+
+    assert len(versions) == 1
+    assert versions[0].version.id == fixture.version.id
+    assert versions[0].test_reports == ()
 
 
 @pytest.mark.asyncio

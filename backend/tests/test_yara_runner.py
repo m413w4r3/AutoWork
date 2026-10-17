@@ -14,7 +14,7 @@ import pytest
 
 import cti_app.infrastructure.yara_runner as yara_runner_module
 from cti_app.application.rule_workbench import YaraSampleInput
-from cti_app.domain.rule_workbench import YaraExecutionStatus
+from cti_app.domain.rule_workbench import YaraEngineResult, YaraExecutionStatus
 from cti_app.infrastructure.yara_runner import IsolatedYaraRunner, YaraRunnerLimits
 
 
@@ -41,6 +41,38 @@ def test_isolated_worker_compiles_and_matches_synthetic_fixture() -> None:
     assert compiled.engine_version == "4.5.0"
     assert result.status is YaraExecutionStatus.OK
     assert result.matches_sha256 == (match.sample_sha256,)
+
+
+def test_available_runs_and_caches_a_match_probe_through_the_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    worker = tmp_path / "worker.py"
+    worker.write_text("# synthetic worker marker\n", encoding="utf-8")
+    runner = IsolatedYaraRunner()
+    monkeypatch.setattr(runner, "_worker_path", worker)
+    calls: list[tuple[str, str, tuple[YaraSampleInput, ...]]] = []
+
+    def run_worker(
+        operation: str, source: str, samples: tuple[YaraSampleInput, ...]
+    ) -> YaraEngineResult:
+        calls.append((operation, source, samples))
+        return YaraEngineResult(
+            status=YaraExecutionStatus.OK,
+            engine_version="4.5.0",
+            matches_sha256=tuple(sample.sample_sha256 for sample in samples),
+            message="",
+        )
+
+    monkeypatch.setattr(runner, "_run_worker", run_worker)
+
+    assert runner.available is True
+    assert runner.available is True
+    assert len(calls) == 1
+    operation, source, samples = calls[0]
+    assert operation == "match"
+    assert "condition:" in source
+    assert len(samples) == 1
+    assert samples[0].data == b"autowork-yara-availability-probe"
 
 
 def test_compile_error_is_typed_with_source_line() -> None:

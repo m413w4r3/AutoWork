@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import hashlib
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 from uuid import UUID
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.persistence import UnitOfWork
@@ -57,15 +60,33 @@ class _Blobs:
 
 class _Observations:
     def __init__(
-        self, values: list[VirusTotalObservation], *, log: list[tuple[str, int]], owner: int
+        self,
+        values: list[VirusTotalObservation],
+        *,
+        log: list[tuple[str, int]],
+        owner: int,
+        fail: bool = False,
     ) -> None:
         self.values = values
         self._log = log
         self._owner = owner
+        self._fail = fail
 
     async def add(self, value: VirusTotalObservation) -> None:
+        if self._fail:
+            raise IntegrityError(
+                "synthetic insert",
+                {},
+                _SyntheticConstraintViolation("ck_vt_observation_capability"),
+            )
         self.values.append(value)
         self._log.append(("observation", self._owner))
+
+
+class _SyntheticConstraintViolation(Exception):
+    def __init__(self, constraint_name: str) -> None:
+        super().__init__("synthetic database constraint failure")
+        self.constraint_name = constraint_name
 
 
 class _Views:
@@ -98,7 +119,10 @@ class _Uow:
         owner = factory.uow_sequence
         self.blobs = _Blobs(factory.blobs)
         self.virustotal_observations = _Observations(
-            factory.observations, log=factory.vt_writes, owner=owner
+            factory.observations,
+            log=factory.vt_writes,
+            owner=owner,
+            fail=factory.fail_observation_add,
         )
         self.virustotal_file_views = _Views(
             factory.views, log=factory.vt_writes, owner=owner, fail=factory.fail_view_add
@@ -134,7 +158,12 @@ class _Uow:
 
 class _Factory:
     def __init__(
-        self, *, fail_view_add: bool = False, fail_commit: bool = False, succeed_commits: int = 0
+        self,
+        *,
+        fail_view_add: bool = False,
+        fail_observation_add: bool = False,
+        fail_commit: bool = False,
+        succeed_commits: int = 0,
     ) -> None:
         self.blobs: dict[UUID, BlobRecord] = {}
         self.observations: list[VirusTotalObservation] = []
@@ -142,6 +171,7 @@ class _Factory:
         self.committed_observations: list[VirusTotalObservation] = []
         self.committed_views: list[VirusTotalFileView] = []
         self.fail_view_add = fail_view_add
+        self.fail_observation_add = fail_observation_add
         self.fail_commit = fail_commit
         self.succeed_commits = succeed_commits
         self.commit_attempts = 0
@@ -577,6 +607,52 @@ async def test_proxy_and_v3_provenance_is_recorded_without_secrets(tmp_path: Pat
     )
     assert observations[0].safe_parameters["transport"] == "direct"
     assert observations[0].safe_parameters["api_generation"] == "legacy_v2"
+
+
+@pytest.mark.asyncio
+async def test_observation_write_failure_logs_safe_constraint_and_keeps_raw_blob(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    factory = _Factory(fail_observation_add=True)
+    store = FilesystemBlobStore(tmp_path / "blobs")
+    service = VirusTotalObservationService(BlobCatalogService(store, factory), factory)
+    body = b'{"data":[{"id":"synthetic-object"}]}'
+    page = VirusTotalPage(
+        items=(),
+        next_cursor=None,
+        observed_count=1,
+        stopped_due_to_limit=False,
+        exhaustive=True,
+        raw_json_pages=(body,),
+        http_statuses=(200,),
+        limit_used=1,
+        transport=VirusTotalTransportKind.PROXY,
+        api_generation=VirusTotalEndpointVariant.V3,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="cti_app.application.virustotal_persistence"):
+        with pytest.raises(IntegrityError):
+            await service.store_file_relationship(
+                page,
+                file_hash="f" * 64,
+                relation="dropped_files",
+                observed_at=datetime.now(UTC),
+            )
+
+    warning = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "vt_observation_persistence_failed"
+    )
+    assert warning.exception_class == "IntegrityError"
+    assert warning.constraint_name == "ck_vt_observation_capability"
+    assert warning.operation == "file_relationship"
+    assert warning.capability == "file_relationships"
+    assert warning.raw_response_archived is True
+    assert len(factory.blobs) == 1
+    archived = next(iter(factory.blobs.values()))
+    assert archived.descriptor.sha256 == hashlib.sha256(body).hexdigest()
+    assert body.decode() not in caplog.text
 
 
 def test_invalid_raw_sha256_is_rejected_by_the_domain() -> None:

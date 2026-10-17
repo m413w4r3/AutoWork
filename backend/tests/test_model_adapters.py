@@ -582,6 +582,43 @@ async def test_bridge_http_error_preserves_submission_boundary_and_safe_diagnost
     assert error.diagnostics == {"user_turns_before": 1}
 
 
+async def test_bridge_server_error_explicitly_before_submission_is_confirmed_pre_submission() -> (
+    None
+):
+    request = httpx.Request("POST", "https://bridge.test/v1/responses")
+    response = httpx.Response(
+        503,
+        request=request,
+        json={
+            "detail": {
+                "code": "bridge_server_error",
+                "message": "Le payload du composer n'est pas prêt avant soumission.",
+                "retryable": True,
+            }
+        },
+    )
+
+    error = _bridge_http_error(response, attempts=1)
+
+    assert error.code == "bridge_server_error"
+    assert error.retryable is True
+    assert error.submission_state == "pre_submission"
+
+
+async def test_bridge_server_error_without_explicit_non_submission_remains_uncertain() -> None:
+    request = httpx.Request("POST", "https://bridge.test/v1/responses")
+    response = httpx.Response(
+        503,
+        request=request,
+        json={"detail": {"code": "bridge_server_error", "message": "Service unavailable."}},
+    )
+
+    error = _bridge_http_error(response, attempts=1)
+
+    assert error.retryable is True
+    assert error.submission_state is None
+
+
 async def test_bridge_archive_requires_archived_true_on_http_2xx() -> None:
     conversation_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
     requests: list[httpx.Request] = []

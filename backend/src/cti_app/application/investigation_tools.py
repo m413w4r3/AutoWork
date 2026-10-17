@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
@@ -20,6 +21,7 @@ from pydantic import (
     create_model,
 )
 
+from cti_app.application.evidence_recorder import sanitize_evidence_text
 from cti_app.domain.investigation import (
     BudgetDimension,
     BudgetExceeded,
@@ -192,6 +194,8 @@ class ToolResult:
     suggested_alternatives: tuple[str, ...] = ()
     output: Mapping[str, Any] = field(default_factory=dict)
     message: str = ""
+    exception_class: str | None = None
+    error_code: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.status, ToolInvocationStatus):
@@ -471,8 +475,18 @@ def validate_json_schema(arguments: Mapping[str, Any], schema: Mapping[str, Any]
     try:
         TypeAdapter(_schema_type(schema, "arguments")).validate_python(thawed, strict=True)
         _check_constraints(thawed, schema, "arguments")
-    except (ValidationError, ValueError, TypeError, re.error) as exc:
+    except ValidationError as exc:
+        raise _ToolArgumentValidationError(
+            str(exc), tuple(exc.errors(include_url=False, include_context=False))
+        ) from exc
+    except (ValueError, TypeError, re.error) as exc:
         raise ValueError(str(exc)) from exc
+
+
+class _ToolArgumentValidationError(ValueError):
+    def __init__(self, message: str, issues: tuple[Mapping[str, Any], ...]) -> None:
+        super().__init__(message)
+        self.issues = issues
 
 
 class RegistryToolDispatcher:
@@ -507,7 +521,6 @@ class RegistryToolDispatcher:
                         "tool_name": tool_name,
                         "schema_version": schema_version,
                         "arguments": arguments,
-                        "purpose": purpose,
                     }
                 )
             except (TypeError, ValueError):
@@ -567,7 +580,26 @@ class RegistryToolDispatcher:
         try:
             validate_json_schema(arguments, thaw_json(definition.input_schema))
         except ValueError as exc:
-            return self._local_result(ToolInvocationStatus.FAILED, f"Invalid tool arguments: {exc}")
+            validation_errors = _tool_argument_validation_details(
+                arguments,
+                thaw_json(definition.input_schema),
+                exc,
+            )
+            summary = "; ".join(
+                f"{item['argument']}: expected {item['expected']}, received "
+                f"{item['received']} ({item['value']})"
+                for item in validation_errors
+            )
+            return ToolResult(
+                status=ToolInvocationStatus.FAILED,
+                output={
+                    "error_code": "invalid_tool_arguments",
+                    "validation_errors": validation_errors,
+                },
+                message=f"invalid_tool_arguments: {summary or 'arguments do not match the schema'}",
+                exception_class=type(exc).__name__,
+                error_code="invalid_tool_arguments",
+            )
 
         try:
             context.budget.reserve(operation_key, thaw_json(definition.cost_model))
@@ -586,6 +618,11 @@ class RegistryToolDispatcher:
             context.budget.commit(operation_key)
             result = self._local_result(
                 ToolInvocationStatus.FAILED, f"Tool execution failed: {type(exc).__name__}"
+            )
+            result = replace(
+                result,
+                exception_class=type(exc).__name__,
+                error_code=getattr(exc, "code", None) or "tool_execution_failed",
             )
             self._completed[operation_key] = (identity, result)
             return result
@@ -659,6 +696,94 @@ class RegistryToolDispatcher:
             output=output,
             message=message,
         )
+
+
+def _tool_argument_validation_details(
+    arguments: Mapping[str, Any], schema: Mapping[str, Any], error: ValueError
+) -> list[dict[str, str]]:
+    issues = getattr(error, "issues", ())
+    details: list[dict[str, str]] = []
+    for issue in issues[:4]:
+        location = tuple(issue.get("loc", ()))
+        argument = ".".join(str(part) for part in location) or "arguments"
+        expected_schema: Mapping[str, Any] = schema
+        value: Any = arguments
+        missing = issue.get("type") == "missing"
+        extra = issue.get("type") == "extra_forbidden"
+        for part in location:
+            if isinstance(part, int):
+                child = expected_schema.get("items", {})
+                expected_schema = child if isinstance(child, Mapping) else {}
+                value = (
+                    value[part] if isinstance(value, (tuple, list)) and part < len(value) else None
+                )
+            else:
+                properties = expected_schema.get("properties", {})
+                child = properties.get(str(part), {}) if isinstance(properties, Mapping) else {}
+                if extra:
+                    value = f"unexpected property {part}"
+                    expected_schema = {}
+                else:
+                    expected_schema = child if isinstance(child, Mapping) else {}
+                    if isinstance(value, Mapping):
+                        value = value.get(part)
+        expected = (
+            "no additional properties" if extra else str(expected_schema.get("type", "valid value"))
+        )
+        if missing:
+            received = "missing"
+            preview = "<missing>"
+        elif extra:
+            received = "extra property"
+            preview = sanitize_evidence_text(value, max_chars=120)
+        else:
+            received = _json_value_type(value)
+            preview = sanitize_evidence_text(_json_value_preview(value), max_chars=120)
+        details.append(
+            {
+                "argument": sanitize_evidence_text(argument, max_chars=96),
+                "expected": sanitize_evidence_text(expected, max_chars=64),
+                "received": received,
+                "value": preview,
+            }
+        )
+    if not details:
+        # Constraint errors such as an overlong string do not always carry a
+        # Pydantic issue location. Keep their message generic and value-free.
+        details.append(
+            {
+                "argument": "arguments",
+                "expected": "registered schema constraints",
+                "received": "invalid value",
+                "value": "[omitted]",
+            }
+        )
+    return details
+
+
+def _json_value_type(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, Mapping):
+        return "object"
+    if isinstance(value, (list, tuple)):
+        return "array"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    return type(value).__name__
+
+
+def _json_value_preview(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+    except (TypeError, ValueError):
+        return type(value).__name__
 
 
 __all__ = [

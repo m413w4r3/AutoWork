@@ -30,6 +30,9 @@ class ShodanError(RuntimeError):
         retryable: bool | None = None,
         status_code: int | None = None,
         retry_after: float | None = None,
+        upstream_message: str | None = None,
+        plan: str | None = None,
+        query_credits: int | None = None,
     ) -> None:
         super().__init__(message)
         if code is not None:
@@ -38,6 +41,9 @@ class ShodanError(RuntimeError):
             self.retryable = retryable
         self.status_code = status_code
         self.retry_after = retry_after
+        self.upstream_message = upstream_message
+        self.plan = plan
+        self.query_credits = query_credits
 
 
 class ShodanCapabilityDisabledError(ShodanError):

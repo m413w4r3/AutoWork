@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 from cti_app.domain.investigation import (
     EvidenceObservation,
@@ -127,6 +127,12 @@ class OpinionBlock:
 
 
 _OPINION_ANCHOR = re.compile(r"^[a-z][a-z0-9:_-]{0,127}$")
+_INVESTIGATION_OPINION_NAMESPACE = UUID("f141ae8e-999c-4a7f-b07d-5ffb0bd7b86d")
+
+
+def investigation_opinion_id(investigation_id: UUID) -> UUID:
+    """Return the stable opinion identity shared by investigation readers and writers."""
+    return uuid5(_INVESTIGATION_OPINION_NAMESPACE, str(investigation_id))
 
 
 @dataclass(frozen=True, slots=True)

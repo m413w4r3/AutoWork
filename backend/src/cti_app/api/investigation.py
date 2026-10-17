@@ -18,8 +18,10 @@ from cti_app.application.analyst_handoff import (
     AnalystHandoffPolicy,
     AnalystPostSynthesisService,
     analyst_handoff_policy_from_sources,
+    current_verified_extraction_inputs,
     loop_budget_from_settings,
 )
+from cti_app.application.bridge_investigator import make_investigation_turn_idempotency_key
 from cti_app.application.diagram_compilation import DiagramCompilationError
 from cti_app.application.identity import IdentityProvider
 from cti_app.application.investigation_composition import (
@@ -57,7 +59,11 @@ from cti_app.application.protocol_diagram_projection import (
     ProtocolDiagramProjectionError,
     compile_protocol_render_preview,
 )
-from cti_app.application.research_context_builder import USER_REQUEST_ACTION_PREFIX
+from cti_app.application.research_context_builder import (
+    MAX_OPERATOR_REQUEST_BYTES,
+    MAX_OPERATOR_REQUESTS,
+    USER_REQUEST_ACTION_PREFIX,
+)
 from cti_app.domain.analyst_opinion import AnalystOpinionV1
 from cti_app.domain.investigation import (
     BudgetDimension,
@@ -69,7 +75,13 @@ from cti_app.domain.investigation import (
     TLPLevel,
     ToolInvocationStatus,
 )
-from cti_app.domain.investigation_state import InvestigationWorkingState, StopReason
+from cti_app.domain.investigation_state import (
+    InvestigationWorkingState,
+    StopReason,
+    investigation_abandoned_turn_id,
+    investigation_bridge_attempt,
+    investigation_orphaned_turn_id,
+)
 from cti_app.domain.jobs import INVESTIGATION_RUN_JOB_KIND, Job, JobStatus
 from cti_app.domain.production import (
     AnalystInvestigation,
@@ -88,6 +100,7 @@ router = APIRouter(prefix="/api", tags=["investigations"])
 _SHA256 = r"^[0-9a-f]{64}$"
 _OPINION_NAMESPACE = UUID("f141ae8e-999c-4a7f-b07d-5ffb0bd7b86d")
 _USER_REQUEST_NAMESPACE = UUID("92e23e22-b681-49c9-87dd-a7fd13398c05")
+_USER_REQUEST_MARKER_PREFIX = "api:user-request:"
 _SIMILARITY_BUCKET = "investigation-sample-similarity"
 _PROTOCOL_MODEL_BUCKET = "network-protocol-models"
 
@@ -336,6 +349,7 @@ class InvestigationOperatorStatusResponse(BaseModel):
     investigation_version: int
     working_state_version: int
     working_state_sha256: str
+    deduplicated_findings: int
     job_generation: int
     active_job_ids: list[UUID]
     active_job_statuses: list[str]
@@ -346,6 +360,9 @@ class InvestigationOperatorStatusResponse(BaseModel):
     last_context_sha256: str | None
     last_decision_sha256: str | None
     bridge_conversation_id: UUID
+    bridge_conversation_id_scope: str
+    bridge_external_target: dict[str, Any]
+    last_error: dict[str, Any] | None
     last_operation: dict[str, Any] | None
     invocations: list[dict[str, Any]]
     ambiguous_invocations: list[dict[str, Any]]
@@ -371,7 +388,9 @@ async def start_investigation(
     uow_factory = _uow_factory(request)
     composition_factory = _composition_factory(request)
     identity = await _identity(request)
-    await _ensure_handoff_if_missing(request, subject_id, payload)
+    extraction_artifacts, extraction_items = await _ensure_handoff_if_missing(
+        request, subject_id, payload
+    )
     async with uow_factory() as uow:
         run = await uow.production_runs.get(payload.production_run_id)
         artifact = await uow.production_artifacts.get(payload.synthesis_artifact_id)
@@ -400,8 +419,8 @@ async def start_investigation(
             state = await composition.service.start(
                 run=run,
                 synthesis=artifact,
-                extraction_artifacts=(),
-                extraction_items=(),
+                extraction_artifacts=extraction_artifacts,
+                extraction_items=extraction_items,
                 policy=AnalystHandoffPolicy(
                     tlp=snapshot.tlp,
                     do_not_submit=snapshot.do_not_submit,
@@ -443,7 +462,7 @@ async def _ensure_handoff_if_missing(
     request: Request,
     subject_id: UUID,
     payload: InvestigationStartRequest,
-) -> None:
+) -> tuple[tuple[ProductionArtifact, ...], tuple[Any, ...]]:
     """Create the canonical post-synthesis handoff before resolving article context.
 
     The article snapshot adapter intentionally requires an existing input pack. The
@@ -464,7 +483,11 @@ async def _ensure_handoff_if_missing(
         if existing is not None:
             if existing.synthesis_artifact_id != artifact.id:
                 raise _http_error(409, "investigation_handoff_mismatch")
-            return
+            return await current_verified_extraction_inputs(
+                uow=uow,
+                run=run,
+                artifact_store=factory.artifact_store,
+            )
         if artifact.canonical_blob_id is None:
             raise _http_error(409, "synthesis_not_verified")
         try:
@@ -496,6 +519,11 @@ async def _ensure_handoff_if_missing(
                 external_llm_allowed=policy.external_llm_allowed
                 and bool(input_snapshot.core_sources),
             )
+        extraction_artifacts, extraction_items = await current_verified_extraction_inputs(
+            uow=uow,
+            run=run,
+            artifact_store=factory.artifact_store,
+        )
         handoff = AnalystPostSynthesisService(
             uow_factory,
             factory.artifact_store,
@@ -505,14 +533,15 @@ async def _ensure_handoff_if_missing(
             await handoff.ensure_for_verified_synthesis(
                 run=run,
                 synthesis=artifact,
-                extraction_artifacts=(),
-                extraction_items=(),
+                extraction_artifacts=extraction_artifacts,
+                extraction_items=extraction_items,
                 policy=policy,
                 uow=uow,
             )
             await uow.commit()
         except ValueError as exc:
             raise _http_error(409, "investigation_handoff_conflict", str(exc)) from exc
+        return extraction_artifacts, extraction_items
 
 
 @router.get("/investigations/{investigation_id}", response_model=InvestigationView)
@@ -575,6 +604,26 @@ async def get_investigation_operator_status(
                 kind=INVESTIGATION_RUN_JOB_KIND,
             )
         )
+        pending_bridge_turn = None
+        if state.pending_context_sha256 is not None:
+            attempt = investigation_bridge_attempt(state.recent_actions, state.turn_index)
+            key = make_investigation_turn_idempotency_key(
+                investigation_id=investigation_id,
+                turn_index=state.turn_index,
+                context_sha256=state.pending_context_sha256,
+                attempt=attempt,
+            )
+            pending_bridge_turn = await uow.model_conversation_turns.get_by_idempotency_key(key)
+            if pending_bridge_turn is None:
+                abandoned_turn_id = investigation_abandoned_turn_id(
+                    state.recent_actions, state.turn_index, attempt
+                )
+                if abandoned_turn_id is None:
+                    abandoned_turn_id = investigation_orphaned_turn_id(
+                        state.recent_actions, state.turn_index, attempt
+                    )
+                if abandoned_turn_id is not None:
+                    pending_bridge_turn = await uow.model_conversation_turns.get(abandoned_turn_id)
         view = build_investigation_operator_view(
             investigation=investigation,
             state=state,
@@ -589,7 +638,17 @@ async def get_investigation_operator_status(
             opinion=opinion,
             jobs=jobs,
             available_tools=composition.available_tools,
-            unavailable_tools=composition.unavailable_tools,
+            unavailable_tools=_unavailable_tool_diagnostics(request, composition),
+            pending_bridge_turn_id=(pending_bridge_turn.id if pending_bridge_turn else None),
+            pending_bridge_turn_status=(
+                pending_bridge_turn.status.value if pending_bridge_turn else None
+            ),
+            pending_bridge_turn_error_code=(
+                pending_bridge_turn.error_code if pending_bridge_turn else None
+            ),
+            pending_bridge_turn_key=(
+                pending_bridge_turn.idempotency_key if pending_bridge_turn else None
+            ),
         )
         return InvestigationOperatorStatusResponse.model_validate(view.payload)
 
@@ -1129,6 +1188,11 @@ async def request_targeted_investigation(
         else:
             if payload.expected_version is not None and state.version != payload.expected_version:
                 raise _http_error(409, "stale_investigation_version")
+            pending_request_actions = tuple(
+                item for item in state.recent_actions if item.startswith(USER_REQUEST_ACTION_PREFIX)
+            )
+            if len(pending_request_actions) >= MAX_OPERATOR_REQUESTS:
+                raise _http_error(409, "investigation_user_request_limit_reached")
             user_request = {
                 "request_id": str(request_id),
                 "text": payload.text,
@@ -1140,12 +1204,46 @@ async def request_targeted_investigation(
                 separators=(",", ":"),
                 sort_keys=True,
             )
+            pending_bytes = sum(len(item.encode("utf-8")) for item in pending_request_actions)
+            if pending_bytes + len(action.encode("utf-8")) > MAX_OPERATOR_REQUEST_BYTES:
+                raise _http_error(409, "investigation_user_request_limit_reached")
+            protected_request_ids = {
+                str(request_id),
+                *(
+                    parsed_request_id
+                    for item in pending_request_actions
+                    if (parsed_request_id := _user_request_id(item)) is not None
+                ),
+            }
+            all_actions = (*state.recent_actions, action, marker)
+            protected_actions = tuple(
+                item
+                for item in all_actions
+                if item.startswith(USER_REQUEST_ACTION_PREFIX)
+                or (
+                    item.startswith(_USER_REQUEST_MARKER_PREFIX)
+                    and item.rsplit(":", 1)[-1] in protected_request_ids
+                )
+            )
+            protected_set = set(protected_actions)
+            history_actions = tuple(item for item in all_actions if item not in protected_set)
+            history_limit = max(0, 32 - len(protected_actions))
+            if history_limit:
+                history_actions = history_actions[-history_limit:]
+            else:
+                history_actions = ()
+            recent_actions = (*history_actions, *protected_actions)
             updated = replace(
                 state,
                 version=state.version + 1,
-                recent_actions=(*state.recent_actions, action, marker),
+                recent_actions=recent_actions,
             )
-            await uow.investigation_states.save_if_version(updated, expected_version=state.version)
+            try:
+                await uow.investigation_states.save_if_version(
+                    updated, expected_version=state.version
+                )
+            except (VersionConflictError, InvestigationStateVersionConflict) as exc:
+                raise _http_error(409, "stale_investigation_version") from exc
             state = updated
         jobs = await uow.jobs.list_for_aggregate(
             INVESTIGATION_RUN_AGGREGATE_TYPE,
@@ -1184,7 +1282,9 @@ async def request_targeted_investigation(
                 AnalystInvestigationStatus.EXHAUSTED,
             }:
                 try:
-                    state = await composition.service.resume(investigation_id)
+                    state = await composition.service.resume(
+                        investigation_id, owner_job_terminal=True
+                    )
                 except (VersionConflictError, InvestigationStateVersionConflict) as exc:
                     raise _http_error(409, "stale_investigation_version") from exc
             job, _ = await _submit_run_job(
@@ -1262,7 +1362,9 @@ async def resume_investigation(
         composition = _composition_factory(request).build(uow, investigation_id)
         try:
             state = await composition.service.resume(
-                investigation_id, expected_version=payload.expected_version
+                investigation_id,
+                expected_version=payload.expected_version,
+                owner_job_terminal=True,
             )
             marker = f"api:resume:{key_hash}:{generation}"
             state = await _save_idempotency_marker(uow, state, marker)
@@ -1481,6 +1583,16 @@ async def _submit_run_job(
 
 def _run_idempotency_key(investigation_id: UUID, generation: int) -> str:
     return f"investigation:{investigation_id}:run:{generation}"
+
+
+def _user_request_id(action: str) -> UUID | None:
+    if not action.startswith(USER_REQUEST_ACTION_PREFIX):
+        return None
+    try:
+        payload = json.loads(action[len(USER_REQUEST_ACTION_PREFIX) :])
+        return UUID(str(payload.get("request_id", "")))
+    except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+        return None
 
 
 def _hash_key(value: str) -> str:
@@ -2157,6 +2269,67 @@ def _observation_evidence_view(observation: Any) -> dict[str, Any]:
 def _data_url(mime_type: str, content: bytes) -> str:
     encoded = base64.b64encode(content).decode("ascii")
     return f"data:{mime_type};base64,{encoded}"
+
+
+def _unavailable_tool_diagnostics(
+    request: Request, composition: InvestigationComposition
+) -> tuple[str, ...]:
+    runtime = getattr(request.app.state, "investigation_runtime_composition", None)
+    ports = getattr(runtime, "ports", None)
+    statuses = getattr(ports, "statuses", ())
+    reasons = {
+        str(item.family): item.reason
+        for item in statuses
+        if getattr(item, "family", None) is not None
+    }
+
+    aliases = {
+        "acquisition": "virustotal",
+        "local_commands": "local_command_execution",
+        "rule_workbench": "rule_workbench",
+    }
+    prefixes = (
+        ("vt.retrohunt.", "retrohunt"),
+        ("vt.", "virustotal"),
+        ("shodan.", "shodan"),
+        ("local.", "local_command_execution"),
+        ("rule.", "rule_workbench"),
+        ("ghidra.", "ghidra"),
+        ("network.", "network_capture"),
+        ("features.", "sample_similarity"),
+        ("samples.", "sample_similarity"),
+    )
+    exact = {
+        "sample.analyze": "local_analysis",
+        "sample.extract_obfuscated_strings": "floss_extraction",
+        "sample.extract_configuration": "configuration_extraction",
+        "sandbox.report.import": "behavior_report_import",
+        "signatures.candidates": "sample_similarity",
+        "native.inspect": "native_analysis",
+    }
+
+    def family_for_tool(name: str) -> str:
+        if name in aliases:
+            return aliases[name]
+        if name in exact:
+            return exact[name]
+        return next((family for prefix, family in prefixes if name.startswith(prefix)), name)
+
+    def reason_code(value: object) -> str:
+        if (
+            isinstance(value, str)
+            and 0 < len(value) <= 96
+            and value[0].islower()
+            and value.isascii()
+            and all(character in "abcdefghijklmnopqrstuvwxyz0123456789_:.-" for character in value)
+        ):
+            return value
+        return "dependency_status_unavailable"
+
+    return tuple(
+        f"{name}:{reason_code(reasons.get(family_for_tool(name)))}"
+        for name in composition.unavailable_tools
+    )
 
 
 def _composition_factory(request: Request) -> InvestigationCompositionFactory:

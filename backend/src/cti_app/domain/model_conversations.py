@@ -202,6 +202,7 @@ class ModelConversationTurn:
         output_blob_reference: str,
         output_sha256: str,
         external_turn_id: str | None,
+        recovery_audit: dict[str, Any] | None = None,
         now: datetime | None = None,
     ) -> None:
         """Close a turn from an already-adopted exact ModelRun output."""
@@ -213,8 +214,27 @@ class ModelConversationTurn:
         self.status = ConversationTurnStatus.SUCCEEDED
         self.error_code = None
         self.error_message = None
-        self.error_details = None
+        self.error_details = {"recovery": dict(recovery_audit)} if recovery_audit else None
         self.finished_at = now or datetime.now(UTC)
+
+    def abandon_uncertain_submission(self, *, actor_id: str, reason: str) -> None:
+        """Record an explicit operator disposition without asserting Bridge state."""
+        if self.status is not ConversationTurnStatus.NEEDS_REVIEW:
+            raise ValueError("Only a conversation turn needing review can be abandoned")
+        timestamp = datetime.now(UTC)
+        self.status = ConversationTurnStatus.FAILED
+        self.error_code = "operator_abandoned"
+        self.error_message = "L'opérateur a abandonné cette tentative ambiguë."
+        self.error_details = {
+            "operator_abandonment": {
+                "actor_id": actor_id,
+                "reason": " ".join(reason.split())[:512],
+                "disposition": "operator_asserted_not_executed",
+                "external_turn_id": None,
+                "abandoned_at": timestamp.isoformat(),
+            }
+        }
+        self.finished_at = timestamp
 
     def fail(
         self,
@@ -238,4 +258,19 @@ class ModelConversationTurn:
         self.error_code = code[:64]
         self.error_message = " ".join(message.replace("\x00", "").split())[:500]
         self.error_details = details
+        self.finished_at = now or datetime.now(UTC)
+
+    def mark_orphaned(self, *, now: datetime | None = None) -> None:
+        """Seal an ownerless Bridge turn while preserving its uncertain outcome."""
+        if self.status not in {
+            ConversationTurnStatus.RUNNING,
+            ConversationTurnStatus.NEEDS_REVIEW,
+        }:
+            raise ValueError("Only an unresolved conversation turn can be marked orphaned")
+        previous = dict(self.error_details or {})
+        previous["orphaned_running_turn"] = True
+        self.status = ConversationTurnStatus.NEEDS_REVIEW
+        self.error_code = "orphaned_running_turn"
+        self.error_message = "Le job propriétaire est terminé sans sortie Bridge persistée."
+        self.error_details = previous
         self.finished_at = now or datetime.now(UTC)

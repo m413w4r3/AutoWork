@@ -9,8 +9,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# Debian's tshark package also supplies capinfos. Noninteractive installs keep
+# wireshark-common's optional packet-capture permission disabled without a prompt.
 RUN apt-get update \
-    && apt-get install --no-install-recommends --yes ca-certificates curl poppler-utils unzip xz-utils \
+    && DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends --yes \
+        ca-certificates curl poppler-utils unzip xz-utils bubblewrap tshark \
     && rm -rf /var/lib/apt/lists/*
 
 COPY infra/d2.lock /usr/local/share/autowork/d2.lock
@@ -39,7 +42,11 @@ COPY scripts/ops/live_smoke.py /app/scripts/ops/live_smoke.py
 COPY backend/pyproject.toml backend/uv.lock backend/README.md backend/alembic.ini ./
 COPY backend/migrations ./migrations
 COPY backend/src ./src
-RUN uv sync --frozen --no-dev --no-group analysis
+RUN uv sync --frozen --no-dev --no-group analysis \
+    && if ! uv sync --frozen --no-dev --no-group analysis --group analysis-runtime; then \
+        echo "WARNING: yara-python unavailable; YARA-backed rule tools will report unavailable"; \
+        uv sync --frozen --no-dev --no-group analysis --no-group analysis-runtime; \
+    fi
 
 ENV PATH="/app/.venv/bin:$PATH" \
     FONT_BUNDLE_ROOT=/usr/local/share/autowork/typst-fonts

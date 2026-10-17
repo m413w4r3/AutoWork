@@ -45,6 +45,36 @@ async def test_detection_api_lists_exact_versions_reports_and_false_positive_sta
     assert version["test_reports"][0]["corpus_sha256"] == "3" * 64
     assert version["test_reports"][0]["known_false_positive_status"] == "present"
     assert version["test_reports"][0]["known_false_positives"] == ["2" * 64]
+    report = version["test_reports"][0]
+    assert report["validation_status"] == "real_partial"
+    assert report["provenance_counts_by_role"] == {
+        "confirmed_positive": {"real": 0, "synthetic": 1},
+        "goodware": {"real": 1, "synthetic": 0},
+    }
+    assert report["false_positive_count"] == 1
+    assert report["false_positive_sha256s"] == ["2" * 64]
+    positive_case = report["roles"][0]["test_cases"][0]
+    assert positive_case == {
+        "sha256": "1" * 64,
+        "provenance": "synthetic",
+        "outcome": "match",
+    }
+
+
+@pytest.mark.asyncio
+async def test_detection_api_marks_version_without_report_untested() -> None:
+    fixture = _Fixture(with_report=False)
+    app = _app(fixture)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get(
+            f"/api/investigations/{fixture.version.investigation_id}/detections"
+        )
+
+    assert response.status_code == 200
+    assert response.json()["versions"][0]["validation_status"] == "untested"
+    assert response.json()["versions"][0]["test_reports"] == []
 
 
 @pytest.mark.asyncio

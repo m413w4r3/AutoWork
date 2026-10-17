@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import httpx
@@ -9,11 +11,17 @@ import pytest
 from httpx import ASGITransport
 
 from cti_app.application.blobs import BlobCatalogService
-from cti_app.application.bridge_investigator import ScriptedTurnTransport
+from cti_app.application.bridge_investigator import (
+    ScriptedTurnTransport,
+    TurnSubmission,
+    TurnSubmissionStatus,
+)
 from cti_app.application.production_artifact_store import ProductionArtifactStore
-from cti_app.domain.analyst_opinion import OpinionBlockType
+from cti_app.application.virustotal import VirusTotalCapabilities
+from cti_app.domain.analyst_opinion import OpinionBlockType, OpinionClaimQualification
 from cti_app.domain.editorial import AnalystDecisionType
 from cti_app.domain.investigation import (
+    BudgetDimension,
     FindingAssessment,
     FindingKind,
     NoveltyClass,
@@ -26,6 +34,7 @@ from cti_app.domain.publication_document import (
     publication_document_from_json,
 )
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
+from cti_app.infrastructure.virustotal import VirusTotalHttpAdapter
 from tests.workflow_emulator.investigation_support import (
     DEFAULT_IOC as _IOC,
 )
@@ -46,6 +55,9 @@ from tests.workflow_emulator.investigation_support import (
 )
 from tests.workflow_emulator.investigation_support import (
     ScriptedInvestigationTransport as _VerticalScriptedTransport,
+)
+from tests.workflow_emulator.investigation_support import (
+    approve_envelope_http as _approve_envelope_http,
 )
 from tests.workflow_emulator.investigation_support import (
     build_investigation_app as _build_app,
@@ -74,8 +86,20 @@ from tests.workflow_emulator.investigation_support import (
 from tests.workflow_emulator.investigation_support import (
     start_investigation_http as _start_http,
 )
+from tests.workflow_emulator.investigation_support import (
+    vertical_final_findings as _vertical_final_findings,
+)
 
 pytestmark = pytest.mark.integration
+
+
+class _PartialDownloadFailureStream(httpx.AsyncByteStream):
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield b"partial-synthetic-sample"
+        raise httpx.ReadError("synthetic connection ended after partial bytes")
+
+    async def aclose(self) -> None:
+        return None
 
 
 @pytest.mark.asyncio
@@ -90,6 +114,49 @@ async def test_real_postgres_http_bridge_vertical_investigation_and_v6_publicati
     assert seeded.seed_observation is not None
     vt = _HashCheckedVirusTotal(include_candidate=True)
     shodan = FakeShodanPort()
+
+    async def final_response_builder(observations):
+        async with uow_factory() as uow:
+            findings = tuple(
+                await uow.investigation_findings.list_for_investigation(seeded.investigation.id)
+            )
+        supported_findings = tuple(
+            item
+            for item in findings
+            if item.assessment is FindingAssessment.SUPPORTED and item.observation_refs
+        )
+        if not supported_findings:
+            response = await _vertical_final_findings(observations, material=vt.material)
+            response["next_action"] = "continue"
+            return response
+
+        evidence_refs = tuple(
+            sorted(
+                {ref for item in supported_findings for ref in item.observation_refs},
+                key=lambda ref: ref.hex,
+            )
+        )
+        response = _decision(
+            "Draft a cited opinion block from the persisted supported findings.",
+            next_action="finish",
+        )
+        response["opinion_delta"] = {
+            "blocks": [
+                {
+                    "block_type": OpinionBlockType.KEY_FINDINGS.value,
+                    "text": (
+                        "The bounded VT search returned an article-relative candidate, supported "
+                        "by the persisted sample observation."
+                    ),
+                    "finding_refs": [str(item.id) for item in supported_findings],
+                    "evidence_refs": [str(item) for item in evidence_refs],
+                    "qualification": OpinionClaimQualification.FACT.value,
+                    "certainty": 0.9,
+                }
+            ]
+        }
+        return response
+
     transport = _VerticalScriptedTransport(
         [
             _decision(
@@ -142,7 +209,7 @@ async def test_real_postgres_http_bridge_vertical_investigation_and_v6_publicati
         uow_factory=uow_factory,
         investigation_id=seeded.investigation.id,
         material=vt.material,
-        include_external_pivot=True,
+        final_response_builder=final_response_builder,
     )
     settings = _settings(providers=True, local_analysis=True)
     composition_factory = _composition_factory(
@@ -196,7 +263,15 @@ async def test_real_postgres_http_bridge_vertical_investigation_and_v6_publicati
 
         state_view = await client.get(f"/api/investigations/{investigation_id}")
         assert state_view.status_code == 200, state_view.text
-        assert state_view.json()["status"] == "completed"
+        state_payload = state_view.json()
+        assert state_payload["status"] == "completed", (
+            f"status={state_payload['status']} stop_reason={state_payload['stop_reason']} "
+            f"findings={len(state_payload['findings'])} "
+            f"opinion_draft={state_payload['opinion_draft'] is not None} "
+            f"bridge_submissions={transport.submission_count}"
+        )
+        assert state_payload["stop_reason"] == "agent_finished"
+        assert state_payload["opinion_draft"] is not None
         sample_list = await client.get(f"/api/investigations/{investigation_id}/samples")
         assert sample_list.status_code == 200, sample_list.text
         assert len(sample_list.json()) == 1
@@ -258,16 +333,17 @@ async def test_real_postgres_http_bridge_vertical_investigation_and_v6_publicati
             )
         assert await blob_catalog.read(acquired.blob_id, max_bytes=1024) == _S2_BYTES
         assert vt.calls["file_report"] == 1
+
         assert vt.calls["intelligence_search"] == 1
         assert vt.download_calls == 1
         assert shodan.calls == [("host", (_IOC,))]
-        assert transport.submission_count == 6
+        assert transport.submission_count == 7
 
         # Re-dispatching the succeeded durable job does not download again or submit
         # another Bridge turn.
         await _run_http_job(app, uow_factory, registry, dispatcher, UUID(started["job_id"]))
         assert vt.download_calls == 1
-        assert transport.submission_count == 6
+        assert transport.submission_count == 7
 
         qualification = await client.post(
             f"/api/investigations/{investigation_id}/samples/{association.id}/qualify",
@@ -356,6 +432,477 @@ async def test_real_postgres_http_bridge_vertical_investigation_and_v6_publicati
     assert parsed.base_publication == base_document
     assert await _read_composition(uow_factory, seeded.edition.id) == before_composition
     assert await _read_manifest(uow_factory, seeded.edition.id) == before_manifest
+
+
+@pytest.mark.asyncio
+async def test_postgres_bridge_pre_submission_exhaustion_resumes_with_new_attempt(
+    uow_factory, tmp_path: Path
+) -> None:
+    blob_catalog = BlobCatalogService(
+        FilesystemBlobStore(tmp_path / "pre-submit-blob-storage"), uow_factory
+    )
+    artifact_store = ProductionArtifactStore(blob_catalog)
+    seeded = await _seed_verified_article(
+        uow_factory,
+        artifact_store,
+        suffix=uuid4().hex[:10],
+        include_seed=False,
+    )
+    failure = TurnSubmission(
+        TurnSubmissionStatus.UNAVAILABLE,
+        detail="composer not ready before submission",
+        error_code="bridge_server_error",
+        submission_state="pre_submission",
+        retryable=True,
+    )
+    transport = ScriptedTurnTransport(
+        [
+            failure,
+            failure,
+            failure,
+            _decision(
+                "The composer recovered; finish this synthetic investigation.",
+                next_action="finish",
+            ),
+        ]
+    )
+    settings = _settings(providers=False)
+    factory = _composition_factory(
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+        settings=settings,
+        transport=transport,
+    )
+    app, registry, dispatcher = _build_app(
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+        composition_factory=factory,
+    )
+
+    async with httpx.AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        started = await _start_http(client, seeded)
+        investigation_id = seeded.investigation.id
+        approved = await _approve_envelope_http(
+            client,
+            investigation_id,
+            providers=(),
+            budget_limits={"bridge_turns": 4, "vt_units": 0, "shodan_credits": 0, "downloads": 0},
+            allow_acquisition=False,
+        )
+        assert approved.status_code == 200, approved.text
+        await _run_http_job(app, uow_factory, registry, dispatcher, UUID(started["job_id"]))
+
+        stopped = await client.get(f"/api/investigations/{investigation_id}")
+        assert stopped.status_code == 200, stopped.text
+        assert stopped.json()["status"] == "awaiting_review"
+        assert stopped.json()["stop_reason"] == "submission_needs_review"
+        assert transport.submission_count == 3
+        operator_status = await client.get(
+            f"/api/investigations/{investigation_id}/operator-status"
+        )
+        assert operator_status.status_code == 200, operator_status.text
+        assert operator_status.json()["last_operation"]["status"] == (
+            "pre_submission_retry_exhausted"
+        )
+        assert operator_status.json()["next_idempotent_action"]["code"] == ("resume_investigation")
+        async with uow_factory() as uow:
+            envelope = await uow.investigation_envelopes.get(investigation_id)
+        assert envelope is not None
+        assert envelope.budget.consumed[BudgetDimension.BRIDGE_TURNS] == 0
+
+        resumed = await client.post(
+            f"/api/investigations/{investigation_id}/resume",
+            json={"expected_version": stopped.json()["version"]},
+            headers={"Idempotency-Key": f"pre-submit-resume-{investigation_id}"},
+        )
+        assert resumed.status_code == 200, resumed.text
+        await _run_http_job(
+            app,
+            uow_factory,
+            registry,
+            dispatcher,
+            UUID(resumed.json()["job_id"]),
+        )
+
+        completed = await client.get(f"/api/investigations/{investigation_id}")
+        assert completed.status_code == 200, completed.text
+        assert completed.json()["status"] == "completed"
+        assert completed.json()["stop_reason"] == "agent_finished"
+        assert transport.submission_count == 4
+        assert any(key.endswith(":attempt=3") for key in transport._by_key)
+        async with uow_factory() as uow:
+            final_envelope = await uow.investigation_envelopes.get(investigation_id)
+        assert final_envelope is not None
+        assert final_envelope.budget.consumed[BudgetDimension.BRIDGE_TURNS] == 1
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_tool_path_classifies_vt_download_route_404_as_unavailable(
+    uow_factory, tmp_path: Path
+) -> None:
+    blob_catalog = BlobCatalogService(
+        FilesystemBlobStore(tmp_path / "download-refusal-blobs"), uow_factory
+    )
+    artifact_store = ProductionArtifactStore(blob_catalog)
+    seeded = await _seed_verified_article(uow_factory, artifact_store, suffix=uuid4().hex[:10])
+    assert seeded.seed_observation is not None
+    request_paths: list[str] = []
+
+    def not_found(request: httpx.Request) -> httpx.Response:
+        request_paths.append(request.url.path)
+        return httpx.Response(404, json={"error": "NotFoundError"}, request=request)
+
+    vt_client = httpx.AsyncClient(transport=httpx.MockTransport(not_found))
+    vt = VirusTotalHttpAdapter(
+        client=vt_client,
+        base_url="https://www.virustotal.com/api/v3",
+        capabilities=VirusTotalCapabilities(file_download=True),
+        file_download_enabled=True,
+    )
+    material = _HashCheckedVirusTotal(include_candidate=False).material
+    transport = _VerticalScriptedTransport(
+        [
+            _decision(
+                "Try one G2-approved synthetic sample download.",
+                tool_call={
+                    "tool_name": "vt.download_sample",
+                    "schema_version": "1",
+                    "arguments": {
+                        "sha256": _S2_HASH,
+                        "purpose": "Test the synthetic download route refusal.",
+                        "evidence_refs": [str(seeded.seed_observation.id)],
+                    },
+                    "purpose": "Acquire the article-absent synthetic sample under G2.",
+                },
+            ),
+            _decision("Finish after the definitive provider refusal.", next_action="finish"),
+        ],
+        uow_factory=uow_factory,
+        investigation_id=seeded.investigation.id,
+        material=material,
+    )
+    factory = _composition_factory(
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+        settings=_settings(providers=True),
+        transport=transport,
+        virustotal=cast(Any, vt),
+    )
+    app, registry, dispatcher = _build_app(
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+        composition_factory=factory,
+    )
+
+    try:
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            started = await _start_http(client, seeded)
+            investigation_id = seeded.investigation.id
+            approved = await client.post(
+                f"/api/investigations/{investigation_id}/envelope/approve",
+                json={
+                    "allowed_providers": ["vt"],
+                    "budget_limits": {
+                        "bridge_turns": 4,
+                        "vt_units": 4,
+                        "shodan_credits": 0,
+                        "downloads": 1,
+                    },
+                    "acquire_hits_allowed": True,
+                    "max_acquire_volume": 1,
+                    "disclosure": {
+                        "tlp": "clear",
+                        "do_not_submit": False,
+                        "external_llm_allowed": True,
+                    },
+                    "reason": "Approve one bounded synthetic VT download.",
+                    "correlation_id": f"g2:{investigation_id}",
+                },
+                headers={"Idempotency-Key": f"g2-download-refusal-{investigation_id}"},
+            )
+            assert approved.status_code == 200, approved.text
+            await _run_http_job(app, uow_factory, registry, dispatcher, UUID(started["job_id"]))
+
+        async with uow_factory() as uow:
+            invocations = tuple(
+                await uow.tool_invocations.list_for_investigation(seeded.investigation.id)
+            )
+            envelope = await uow.investigation_envelopes.get(seeded.investigation.id)
+        invocation = next(item for item in invocations if item.tool_name == "vt.download_sample")
+        assert request_paths == [
+            f"/api/v3/files/{_S2_HASH}/download",
+            f"/api/v3/files/{_S2_HASH}/download_url",
+        ]
+        assert invocation.status is ToolInvocationStatus.UNAVAILABLE
+        assert invocation.response_refs
+        assert invocation.consumed_budget
+        assert envelope is not None
+        assert not any(item.status.value == "reserved" for item in envelope.budget.reservations)
+    finally:
+        await vt_client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("max_vt_units", "consumed_vt_units", "max_hits", "consumed_hits"),
+    [(1, 1, 20, 1), (24, 0, 1, 1)],
+    ids=["vt-units-exhausted", "hit-count-exhausted"],
+)
+async def test_real_postgres_exhausted_loop_acquisition_budget_is_not_ambiguous(
+    uow_factory,
+    tmp_path: Path,
+    max_vt_units: int,
+    consumed_vt_units: int,
+    max_hits: int,
+    consumed_hits: int,
+) -> None:
+    artifact_store = ProductionArtifactStore(
+        BlobCatalogService(FilesystemBlobStore(tmp_path / "loop-budget-blobs"), uow_factory)
+    )
+    seeded = await _seed_verified_article(uow_factory, artifact_store, suffix=uuid4().hex[:10])
+    assert seeded.seed_observation is not None
+    async with uow_factory() as uow:
+        persisted = await uow.analyst_investigations.get(seeded.investigation.id)
+        assert persisted is not None
+        persisted.budget.max_hits_acquired = max_hits
+        persisted.budget.consumed_hits_acquired = consumed_hits
+        persisted.budget.max_vt_read_units = max_vt_units
+        persisted.budget.consumed_vt_read_units = consumed_vt_units
+        persisted.version += 1
+        await uow.analyst_investigations.save(persisted)
+        await uow.commit()
+    async with uow_factory() as uow:
+        persisted_after_save = await uow.analyst_investigations.get(seeded.investigation.id)
+        assert persisted_after_save is not None
+        assert persisted_after_save.budget.max_hits_acquired == max_hits
+        assert persisted_after_save.budget.consumed_hits_acquired == consumed_hits
+        assert persisted_after_save.budget.max_vt_read_units == max_vt_units
+        assert persisted_after_save.budget.consumed_vt_read_units == consumed_vt_units
+
+    request_paths: list[str] = []
+
+    def not_found(request: httpx.Request) -> httpx.Response:
+        request_paths.append(request.url.path)
+        return httpx.Response(404, json={"error": "NotFoundError"}, request=request)
+
+    vt_client = httpx.AsyncClient(transport=httpx.MockTransport(not_found))
+    vt = VirusTotalHttpAdapter(
+        client=vt_client,
+        base_url="https://www.virustotal.com/api/v3",
+        capabilities=VirusTotalCapabilities(file_download=True),
+        file_download_enabled=True,
+    )
+    transport = _VerticalScriptedTransport(
+        [
+            _decision(
+                "Request one sample under the approved envelope.",
+                tool_call={
+                    "tool_name": "vt.download_sample",
+                    "schema_version": "1",
+                    "arguments": {
+                        "sha256": _S2_HASH,
+                        "purpose": "Attempt one bounded synthetic sample acquisition.",
+                        "evidence_refs": [str(seeded.seed_observation.id)],
+                    },
+                    "purpose": "Test local acquisition-budget exhaustion under G2.",
+                },
+            ),
+            _decision("Finish after the local budget refusal.", next_action="finish"),
+        ],
+        uow_factory=uow_factory,
+        investigation_id=seeded.investigation.id,
+        material=_HashCheckedVirusTotal(include_candidate=False).material,
+    )
+    factory = _composition_factory(
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+        settings=_settings(providers=True),
+        transport=transport,
+        virustotal=cast(Any, vt),
+    )
+    app, registry, dispatcher = _build_app(
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+        composition_factory=factory,
+    )
+
+    try:
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            started = await _start_http(client, seeded)
+            investigation_id = seeded.investigation.id
+            assert UUID(started["investigation"]["id"]) == investigation_id
+            async with uow_factory() as uow:
+                persisted_before_job = await uow.analyst_investigations.get(investigation_id)
+            assert persisted_before_job is not None
+            assert persisted_before_job.budget.max_hits_acquired == max_hits
+            assert persisted_before_job.budget.consumed_hits_acquired == consumed_hits
+            assert persisted_before_job.budget.max_vt_read_units == max_vt_units
+            assert persisted_before_job.budget.consumed_vt_read_units == consumed_vt_units
+            approved = await client.post(
+                f"/api/investigations/{investigation_id}/envelope/approve",
+                json={
+                    "allowed_providers": ["vt"],
+                    "budget_limits": {
+                        "bridge_turns": 4,
+                        "vt_units": 4,
+                        "shodan_credits": 0,
+                        "downloads": 1,
+                    },
+                    "acquire_hits_allowed": True,
+                    "max_acquire_volume": 1,
+                    "disclosure": {
+                        "tlp": "clear",
+                        "do_not_submit": False,
+                        "external_llm_allowed": True,
+                    },
+                    "reason": "Approve one bounded synthetic VT download.",
+                    "correlation_id": f"g2:{investigation_id}",
+                },
+                headers={"Idempotency-Key": f"g2-loop-budget-{investigation_id}"},
+            )
+            assert approved.status_code == 200, approved.text
+            await _run_http_job(app, uow_factory, registry, dispatcher, UUID(started["job_id"]))
+
+        async with uow_factory() as uow:
+            invocations = tuple(
+                await uow.tool_invocations.list_for_investigation(seeded.investigation.id)
+            )
+            envelope = await uow.investigation_envelopes.get(seeded.investigation.id)
+            persisted = await uow.analyst_investigations.get(seeded.investigation.id)
+        invocation = next(item for item in invocations if item.tool_name == "vt.download_sample")
+        assert request_paths == [], (
+            f"provider request ran with persisted VT budget="
+            f"{persisted.budget.max_vt_read_units if persisted is not None else None}/"
+            f"{persisted.budget.consumed_vt_read_units if persisted is not None else None}"
+        )
+        assert invocation.status is ToolInvocationStatus.UNAVAILABLE
+        assert invocation.response_refs
+        assert all(amount == 0 for amount in invocation.consumed_budget.values())
+        assert envelope is not None
+        assert not any(item.status.value == "reserved" for item in envelope.budget.reservations)
+        assert persisted is not None
+        assert persisted.budget.consumed_vt_read_units == consumed_vt_units
+        assert persisted.budget.consumed_hits_acquired == consumed_hits
+    finally:
+        await vt_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_ambiguous_download_logs_safe_terminal_diagnostics(
+    uow_factory, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    artifact_store = ProductionArtifactStore(
+        BlobCatalogService(FilesystemBlobStore(tmp_path / "partial-download-blobs"), uow_factory)
+    )
+    seeded = await _seed_verified_article(uow_factory, artifact_store, suffix=uuid4().hex[:10])
+    assert seeded.seed_observation is not None
+
+    def partial_response(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=_PartialDownloadFailureStream(), request=request)
+
+    vt_client = httpx.AsyncClient(transport=httpx.MockTransport(partial_response))
+    vt = VirusTotalHttpAdapter(
+        client=vt_client,
+        base_url="https://www.virustotal.com/api/v3",
+        capabilities=VirusTotalCapabilities(file_download=True),
+        file_download_enabled=True,
+    )
+    transport = _VerticalScriptedTransport(
+        [
+            _decision(
+                "Request a synthetic sample download that will fail after partial bytes.",
+                tool_call={
+                    "tool_name": "vt.download_sample",
+                    "schema_version": "1",
+                    "arguments": {
+                        "sha256": _S2_HASH,
+                        "purpose": "Exercise ambiguous partial-stream reconciliation.",
+                        "evidence_refs": [str(seeded.seed_observation.id)],
+                    },
+                    "purpose": "Test the ambiguous sample path through the real tool stack.",
+                },
+            )
+        ],
+        uow_factory=uow_factory,
+        investigation_id=seeded.investigation.id,
+        material=_HashCheckedVirusTotal(include_candidate=False).material,
+    )
+    factory = _composition_factory(
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+        settings=_settings(providers=True),
+        transport=transport,
+        virustotal=cast(Any, vt),
+    )
+    app, registry, dispatcher = _build_app(
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+        composition_factory=factory,
+    )
+    caplog.set_level("WARNING", logger="cti_app.application.investigation_service")
+
+    try:
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            started = await _start_http(client, seeded)
+            investigation_id = seeded.investigation.id
+            approved = await client.post(
+                f"/api/investigations/{investigation_id}/envelope/approve",
+                json={
+                    "allowed_providers": ["vt"],
+                    "budget_limits": {
+                        "bridge_turns": 4,
+                        "vt_units": 4,
+                        "shodan_credits": 0,
+                        "downloads": 1,
+                    },
+                    "acquire_hits_allowed": True,
+                    "max_acquire_volume": 1,
+                    "disclosure": {
+                        "tlp": "clear",
+                        "do_not_submit": False,
+                        "external_llm_allowed": True,
+                    },
+                    "reason": "Approve one bounded synthetic VT download.",
+                    "correlation_id": f"g2:{investigation_id}",
+                },
+                headers={"Idempotency-Key": f"g2-partial-download-{investigation_id}"},
+            )
+            assert approved.status_code == 200, approved.text
+            await _run_http_job(app, uow_factory, registry, dispatcher, UUID(started["job_id"]))
+
+        async with uow_factory() as uow:
+            invocations = tuple(
+                await uow.tool_invocations.list_for_investigation(seeded.investigation.id)
+            )
+            envelope = await uow.investigation_envelopes.get(seeded.investigation.id)
+        invocation = next(item for item in invocations if item.tool_name == "vt.download_sample")
+        assert invocation.status is ToolInvocationStatus.NEEDS_REVIEW
+        assert invocation.consumed_budget == {}
+        assert envelope is not None
+        assert any(item.status.value == "reserved" for item in envelope.budget.reservations)
+
+        warning = next(
+            record
+            for record in caplog.records
+            if getattr(record, "event", None) == "investigation_tool_invocation_terminal_failure"
+        )
+        assert warning.levelname == "WARNING"
+        assert warning.tool_name == "vt.download_sample"
+        assert warning.exception_class == "SampleAcquisitionDownloadError"
+        assert warning.error_code == "virustotal_download_interrupted_after_bytes"
+        assert warning.investigation_id == str(seeded.investigation.id)
+        assert warning.invocation_id == str(invocation.id)
+        assert _S2_HASH not in warning.getMessage()
+    finally:
+        await vt_client.aclose()
 
 
 @pytest.mark.asyncio
@@ -490,3 +1037,204 @@ async def test_unapproved_envelope_denies_external_tool_and_loop_continues_postg
     assert transport.submission_count == 2
     assert "request_permission" in transport.prompts[1]
     assert "article.get_claims" in transport.prompts[1]
+
+
+@pytest.mark.parametrize(
+    "injection_point",
+    ("before_context_save", "after_bridge_submission", "before_tool", "after_tool"),
+)
+@pytest.mark.asyncio
+async def test_operator_request_racing_investigation_turn_is_rebased_without_replay(
+    uow_factory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, injection_point: str
+) -> None:
+    """A concurrent operator request must survive any durable turn boundary."""
+    blob_catalog = BlobCatalogService(
+        FilesystemBlobStore(tmp_path / f"request-race-{injection_point}"), uow_factory
+    )
+    artifact_store = ProductionArtifactStore(blob_catalog)
+    seeded = await _seed_verified_article(uow_factory, artifact_store, suffix=uuid4().hex[:10])
+    assert seeded.seed_observation is not None
+    vt = _HashCheckedVirusTotal(include_candidate=False)
+    transport = _VerticalScriptedTransport(
+        [
+            _decision(
+                "Read the synthetic seed report.",
+                tool_call={
+                    "tool_name": "vt.file_report",
+                    "schema_version": "1",
+                    "arguments": {"file_hash": seeded.seed_observation.object_id},
+                    "purpose": "Check the documented synthetic seed.",
+                },
+            ),
+            _decision("Finish after the requested evidence check.", next_action="finish"),
+        ],
+        uow_factory=uow_factory,
+        investigation_id=seeded.investigation.id,
+        material=vt.material,
+        inject_analysis_at_turn=None,
+    )
+    factory = _composition_factory(
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+        settings=_settings(providers=True),
+        transport=transport,
+        virustotal=vt,
+    )
+    app, registry, dispatcher = _build_app(
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+        composition_factory=factory,
+    )
+    async with httpx.AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        started = await _start_http(client, seeded)
+        investigation_id = seeded.investigation.id
+        approved = await _approve_envelope_http(
+            client,
+            investigation_id,
+            providers=("vt",),
+            budget_limits={
+                "bridge_turns": 4,
+                "vt_units": 4,
+                "shodan_credits": 0,
+                "downloads": 0,
+            },
+            allow_acquisition=False,
+        )
+        assert approved.status_code == 200, approved.text
+
+        injected = False
+
+        async def inject_request() -> None:
+            nonlocal injected
+            if injected:
+                return
+            injected = True
+            async with uow_factory() as uow:
+                state = await uow.investigation_states.get(investigation_id)
+                assert state is not None
+                expected_version = state.version
+            response = await client.post(
+                f"/api/investigations/{investigation_id}/requests",
+                json={
+                    "expected_version": expected_version,
+                    "text": "Check this synthetic provider result before finishing.",
+                },
+                headers={"Idempotency-Key": f"request-race-{injection_point}"},
+            )
+            assert response.status_code == 200, response.text
+
+        if injection_point == "before_context_save":
+            async with uow_factory() as uow:
+                repository_type = type(uow.investigation_states)
+            original_save_if_version = repository_type.save_if_version
+
+            async def save_with_request(repository, updated, *, expected_version):
+                if (
+                    not injected
+                    and updated.pending_context_snapshot_id is not None
+                    and updated.pending_context_sha256 is not None
+                ):
+                    await inject_request()
+                return await original_save_if_version(
+                    repository, updated, expected_version=expected_version
+                )
+
+            monkeypatch.setattr(repository_type, "save_if_version", save_with_request)
+        elif injection_point == "after_bridge_submission":
+            original_submit = transport.submit
+
+            async def submit_then_request(**kwargs):
+                result = await original_submit(**kwargs)
+                await inject_request()
+                return result
+
+            monkeypatch.setattr(transport, "submit", submit_then_request)
+        elif injection_point in {"before_tool", "after_tool"}:
+            original_file_report = vt.file_report
+
+            async def report_with_request(file_hash: str):
+                if injection_point == "before_tool":
+                    await inject_request()
+                result = await original_file_report(file_hash)
+                if injection_point == "after_tool":
+                    await inject_request()
+                return result
+
+            monkeypatch.setattr(vt, "file_report", report_with_request)
+
+        await _run_http_job(app, uow_factory, registry, dispatcher, UUID(started["job_id"]))
+
+        async with uow_factory() as uow:
+            job = await uow.jobs.get(UUID(started["job_id"]))
+            state = await uow.investigation_states.get(investigation_id)
+            invocations = await uow.tool_invocations.list_for_investigation(investigation_id)
+        assert job is not None and job.status.value == "succeeded"
+        assert state is not None and injected
+        assert len([item for item in invocations if item.tool_name == "vt.file_report"]) == 1
+        assert vt.calls["file_report"] == 1
+        assert transport.submission_count == 2
+        assert "Check this synthetic provider result before finishing." in transport.prompts[1]
+
+
+@pytest.mark.asyncio
+async def test_unresolved_investigation_state_conflict_schedules_retryable_job(
+    uow_factory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifact_store = ProductionArtifactStore(
+        BlobCatalogService(FilesystemBlobStore(tmp_path / "repeated-state-conflicts"), uow_factory)
+    )
+    seeded = await _seed_verified_article(uow_factory, artifact_store, suffix=uuid4().hex[:10])
+    transport = ScriptedTurnTransport(
+        [_decision("Finish this synthetic investigation.", next_action="finish")]
+    )
+    factory = _composition_factory(
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+        settings=_settings(providers=False),
+        transport=transport,
+    )
+    app, registry, _dispatcher = _build_app(
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+        composition_factory=factory,
+    )
+    async with httpx.AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        started = await _start_http(client, seeded)
+        investigation_id = seeded.investigation.id
+        async with uow_factory() as uow:
+            repository_type = type(uow.investigation_states)
+        original_save_if_version = repository_type.save_if_version
+        conflict_count = 0
+
+        async def repeatedly_conflicting_save(repository, updated, *, expected_version):
+            nonlocal conflict_count
+            if updated.pending_context_snapshot_id is not None and conflict_count < 4:
+                conflict_count += 1
+                from cti_app.application.investigation_state import (
+                    InvestigationStateVersionConflict,
+                )
+
+                raise InvestigationStateVersionConflict("Synthetic persistent CAS conflict")
+            return await original_save_if_version(
+                repository, updated, expected_version=expected_version
+            )
+
+        monkeypatch.setattr(repository_type, "save_if_version", repeatedly_conflicting_save)
+        from cti_app.application.jobs import JobExecutor
+
+        await JobExecutor(uow_factory, registry).execute(UUID(started["job_id"]))
+
+    async with uow_factory() as uow:
+        job = await uow.jobs.get(UUID(started["job_id"]))
+        state = await uow.investigation_states.get(investigation_id)
+    assert conflict_count == 4
+    assert job is not None and job.status.value == "queued"
+    assert job.error_code == "investigation_state_conflict"
+    assert job.next_retry_at is not None
+    assert state is not None
+    assert state.pending_context_snapshot_id is None
+    assert transport.submission_count == 0

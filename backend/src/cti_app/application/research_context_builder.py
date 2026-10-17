@@ -1,7 +1,8 @@
-"""Build bounded full/delta Bridge contexts from canonical investigation data."""
+"""Build bounded, self-contained Bridge contexts from canonical investigation data."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Mapping, Sequence
@@ -10,23 +11,31 @@ from typing import Any, Protocol
 from uuid import UUID
 
 from cti_app.application.investigation_contracts import (
+    MAX_CONTEXT_CONFIRMED_IOC_BYTES,
+    MAX_CONTEXT_CONFIRMED_IOCS,
     ArticleClaimV1,
     ArticleContextV1,
-    ContextChangeV1,
+    ConfirmedIOCContextV1,
     ContextInvestigationV1,
     EvidenceSummaryV1,
     FindingSummaryV1,
+    IndicatorInventoryV1,
     InvestigationContextV1,
-    InvestigationDeltaV1,
     InvestigationSourceV1,
     InvestigationUserRequestV1,
+    OpinionNoteSummaryV1,
+    PublicationAnchorV1,
+    ToolCoverageEntryV1,
     ToolSummaryV1,
 )
 from cti_app.application.investigation_persistence import (
+    AnalystOpinionRepository,
     EvidenceObservationRepository,
     FindingRepository,
     SampleAssociationRepository,
+    ToolInvocationRepository,
 )
+from cti_app.application.investigation_pivots import available_investigation_pivots
 from cti_app.application.investigation_tools import (
     InMemoryToolRegistry,
     ToolConfidentiality,
@@ -36,24 +45,51 @@ from cti_app.application.investigation_tools import (
     ToolRegistry,
     ToolResult,
 )
+from cti_app.domain.analyst_opinion import AnalystOpinionV1, investigation_opinion_id
 from cti_app.domain.investigation import (
+    DetectionCandidateVersion,
+    EvidenceKind,
     EvidenceObservation,
     FindingAssessment,
     InvestigationFinding,
+    ToolInvocation,
     ToolInvocationStatus,
+    canonical_json_bytes,
+    thaw_json,
 )
 from cti_app.domain.investigation_state import (
     Hypothesis,
-    HypothesisStatus,
     InvestigationWorkingState,
 )
+from cti_app.domain.rule_workbench import RuleTestCorpusRole, RuleValidationStatus
 
-MAX_ARTICLE_NARRATIVE_CHARS = 12_000
+MAX_ARTICLE_NARRATIVE_CHARS = 8_000
 MAX_CONTEXT_HYPOTHESES = 16
 MAX_CONTEXT_EVIDENCE = 16
-MAX_CONTEXT_FINDINGS = 24
+MAX_CONTEXT_EVIDENCE_CHARS = 600
+MAX_CONTEXT_EVIDENCE_INDEX = 200
+MAX_CONTEXT_EVIDENCE_INDEX_BYTES = 24 * 1024
+MAX_CONTEXT_TOOL_COVERAGE = 200
+MAX_CONTEXT_TOOL_COVERAGE_BYTES = 48 * 1024
+MAX_CONTEXT_OPINION_NOTES = 24
+MAX_CONTEXT_OPINION_NOTE_BYTES = 12 * 1024
+PROVIDER_AUTHORIZATION_REFUSAL_OBJECT_TYPE = "provider_authorization_refusal"
+PROVIDER_AUTHORIZATION_REFUSAL_THRESHOLD = 2
+PROVIDER_DOWNLOAD_ROUTE_REFUSAL_OBJECT_TYPE = "provider_download_route_refused"
+PROVIDER_DOWNLOAD_AUTH_REFUSAL_OBJECT_TYPE = "provider_download_authorization_refused"
+PROVIDER_DOWNLOAD_REFUSAL_THRESHOLD = 2
+MAX_CONTEXT_FINDINGS = 200
+MAX_CONTEXT_FINDING_BYTES = 48 * 1024
+MAX_CONTEXT_FINDING_STATEMENT_CHARS = 420
+MAX_CONTEXT_PUBLICATION_ANCHORS = 128
+MAX_CONTEXT_PUBLICATION_ANCHOR_BYTES = 20 * 1024
 MAX_CONTEXT_TOOLS = 64
+MAX_CONTEXT_RULE_CORPUS_IMPORTS = 64
+MAX_CONTEXT_RULE_CANDIDATES = 16
+INVESTIGATION_MAX_CONTEXT_BYTES = 256 * 1024
 USER_REQUEST_ACTION_PREFIX = "user-request:"
+MAX_OPERATOR_REQUESTS = 8
+MAX_OPERATOR_REQUEST_BYTES = 32_768
 _SECRET_KEY = re.compile(
     r"(?:api[_-]?key|private[_-]?key|client[_-]?secret|access[_-]?token|"
     r"bearer|token|secret|password|authorization|credential|cookie|signature)",
@@ -81,6 +117,8 @@ class ArticleSnapshot:
     do_not_submit: bool = True
     external_llm_allowed: bool = False
     narrative_hashes: tuple[str, ...] = ()
+    confirmed_iocs: tuple[ConfirmedIOCContextV1, ...] = ()
+    confirmed_iocs_truncated: bool = False
 
     def __post_init__(self) -> None:
         if (self.base_publication_artifact_id is None) != (self.base_publication_sha256 is None):
@@ -111,6 +149,73 @@ class ArticleSnapshotPort(Protocol):
 
 class EvidenceSummaryPort(Protocol):
     async def summary(self, observation: EvidenceObservation) -> Mapping[str, Any] | str | None: ...
+
+
+class RuleCorpusContextInventoryPort(Protocol):
+    async def manual_rule_corpus_imports(self, investigation_id: UUID) -> Sequence[Any]: ...
+
+    async def rule_candidate_versions(
+        self, investigation_id: UUID
+    ) -> Sequence[DetectionCandidateVersion]: ...
+
+
+class CanonicalEvidenceSummaryPort:
+    """Read bounded, structured facts from canonical evidence blobs."""
+
+    def __init__(self, artifact_store: Any) -> None:
+        self._artifact_store = artifact_store
+
+    async def summary(self, observation: EvidenceObservation) -> Mapping[str, Any] | None:
+        reader = getattr(self._artifact_store, "read_bytes", None)
+        if not callable(reader):
+            return None
+        try:
+            raw = await reader(observation.blob_id, max_bytes=128 * 1024)
+            if hashlib.sha256(raw).hexdigest() != observation.sha256:
+                return None
+            payload = json.loads(raw)
+        except Exception:
+            return None
+        if not isinstance(payload, Mapping):
+            return None
+        schema = payload.get("schema")
+        if schema == "investigation-tool-observation.v1":
+            result = payload.get("result")
+            return result if isinstance(result, Mapping) else None
+        if schema == "virustotal-investigation-summary.v1":
+            return payload
+        if schema == "shodan-observation.v1":
+            summary = payload.get("summary")
+            return summary if isinstance(summary, Mapping) else None
+        if schema == "investigation-yara-test.v1":
+            return {
+                key: payload[key]
+                for key in (
+                    "source_sha256",
+                    "validation_status",
+                    "execution_status",
+                    "coverage_statement",
+                    "provenance_counts_by_role",
+                    "false_positive_count",
+                    "false_negative_count",
+                )
+                if key in payload
+            }
+        return None
+
+
+class InvestigationContextTooLarge(ValueError):
+    code = "investigation_context_too_large"
+
+    def __init__(self, actual_bytes: int, max_bytes: int = INVESTIGATION_MAX_CONTEXT_BYTES) -> None:
+        self.actual_bytes = actual_bytes
+        self.max_bytes = max_bytes
+        super().__init__(f"{self.code}: {actual_bytes} bytes exceeds {max_bytes} bytes")
+
+
+def ensure_investigation_context_size(context_bytes: bytes) -> None:
+    if len(context_bytes) > INVESTIGATION_MAX_CONTEXT_BYTES:
+        raise InvestigationContextTooLarge(len(context_bytes), INVESTIGATION_MAX_CONTEXT_BYTES)
 
 
 class InvestigationReadPort(Protocol):
@@ -286,12 +391,18 @@ class ResearchContextBuilder:
         findings: FindingRepository,
         registry: ToolRegistry | None = None,
         evidence_summaries: EvidenceSummaryPort | None = None,
+        invocations: ToolInvocationRepository | None = None,
+        opinions: AnalystOpinionRepository | None = None,
+        rule_corpus_inventory: RuleCorpusContextInventoryPort | None = None,
     ) -> None:
         self.article_snapshots = article_snapshots
         self._observations = observations
         self._findings = findings
         self._registry = registry
         self._evidence_summaries = evidence_summaries
+        self._invocations = invocations
+        self._opinions = opinions
+        self._rule_corpus_inventory = rule_corpus_inventory
 
     async def build(
         self,
@@ -324,54 +435,92 @@ class ResearchContextBuilder:
         )
         all_observation_ids = {item.id for item in observations}
         all_finding_ids = {item.id for item in findings}
-        new_observations = tuple(
-            item for item in observations if item.id not in state.last_seen_evidence_ids
+        # Every Bridge turn is an independent Temporary Chat. Include the newest
+        # bounded evidence on every turn so the prompt remains self-contained.
+        evidence_summary = await self._evidence_context(tuple(reversed(observations)))
+        tool_invocations = (
+            tuple(await self._invocations.list_for_investigation(investigation_id))
+            if self._invocations is not None
+            else ()
         )
-        if state.turn_index:
-            # The delta window is bounded: present the freshest evidence first so a
-            # tool result produced by the previous turn is never queued behind an
-            # older backlog. Older unseen evidence follows on later turns.
-            new_observations = tuple(reversed(new_observations))
-        new_findings = tuple(
-            item for item in findings if item.id not in state.last_seen_finding_ids
+        tool_coverage, tool_coverage_truncated = await self._tool_coverage(
+            tool_invocations, observations
         )
-        evidence_summary = await self._evidence_context(
-            new_observations if state.turn_index else observations
+        derived_blocked = await provider_authorization_blocked_capabilities(
+            investigation_id=investigation_id,
+            invocations=tool_invocations,
+            observations=observations,
         )
-        finding_summary = self._finding_context(
-            new_findings if state.turn_index else findings,
+        derived_blocked = tuple(
+            sorted(
+                set(derived_blocked).union(
+                    provider_download_blocked_capabilities(
+                        investigation_id=investigation_id,
+                        invocations=tool_invocations,
+                        observations=observations,
+                    )
+                )
+            )
+        )
+        all_blocked = tuple(sorted(set(blocked_capabilities).union(derived_blocked)))
+        blocked_providers = {
+            item.split(":", 1)[0]
+            for item in all_blocked
+            if ": provider authorization refused" in item
+        }
+        blocked_capability_keys = {
+            item.split(":", 1)[0] for item in all_blocked if item.startswith("vt.file_download:")
+        }
+        finding_summary, findings_truncated = self._finding_context(
+            findings,
             observation_ids=all_observation_ids,
+        )
+        evidence_index, evidence_index_truncated = self._evidence_index(observations)
+        current_opinion = (
+            await self._opinions.get(investigation_opinion_id(investigation_id))
+            if self._opinions is not None
+            else None
+        )
+        opinion_notes, opinion_notes_truncated = self._opinion_note_index(
+            current_opinion,
+            finding_ids=all_finding_ids,
+            observation_ids=all_observation_ids,
+        )
+        rule_corpus_deltas = await self._rule_corpus_inventory_context(
+            investigation_id, observations
         )
         tools = tuple(
             ToolSummaryV1(
                 name=item.name,
                 schema_version=item.schema_version,
                 effect=item.effect,
+                arguments_schema=thaw_json(item.input_schema),
             )
             for item in sorted(
-                self._available_tools(tool_context, registry),
+                (
+                    definition
+                    for definition in self._available_tools(tool_context, registry)
+                    if definition.capability_key.split(".", 1)[0] not in blocked_providers
+                    and definition.capability_key not in blocked_capability_keys
+                ),
                 key=lambda definition: (definition.name, definition.schema_version),
             )[:MAX_CONTEXT_TOOLS]
         )
-        hypotheses_for_context = state.hypotheses
-        if state.turn_index:
-            hypotheses_for_context = tuple(
-                sorted(
-                    (
-                        item
-                        for item in state.hypotheses
-                        if item.status in {HypothesisStatus.OPEN, HypothesisStatus.REFUTED}
-                    ),
-                    key=lambda item: item.id,
-                )
-            )
         hypothesis_payload = tuple(
             self._hypothesis_payload(
                 item,
                 observation_ids=all_observation_ids,
                 finding_ids=all_finding_ids,
             )
-            for item in hypotheses_for_context[:MAX_CONTEXT_HYPOTHESES]
+            for item in state.hypotheses[:MAX_CONTEXT_HYPOTHESES]
+        )
+        indicator_inventory = self._indicator_inventory(snapshot)
+        available_pivots, available_pivots_truncated = available_investigation_pivots(
+            inventory=indicator_inventory.items,
+            tools=tools,
+            tool_coverage=tool_coverage,
+            invocations=tool_invocations,
+            observations=observations,
         )
         user_requests = self._user_requests_from_actions(state.recent_actions)
         previous_actions = tuple(
@@ -379,82 +528,202 @@ class ResearchContextBuilder:
             for action in state.recent_actions
             if not action.startswith(USER_REQUEST_ACTION_PREFIX)
         )
-        if state.turn_index == 0:
-            previous_actions = (
-                *previous_actions,
-                *(
-                    {"summary": _truncate(_safe_untrusted(f"User requested: {item.text}"), 1_000)}
-                    for item in user_requests
-                ),
-            )
         investigation_context = ContextInvestigationV1(
             agenda=tuple(
                 _truncate(_safe_untrusted(item.question), 500) for item in state.agenda.items
             ),
             hypotheses=hypothesis_payload,
             new_evidence=evidence_summary,
+            evidence_index=evidence_index,
+            evidence_index_truncated=evidence_index_truncated,
             findings=finding_summary,
+            findings_truncated=findings_truncated,
+            opinion_notes=opinion_notes,
+            opinion_notes_truncated=opinion_notes_truncated,
             sample_deltas=(),
-            rule_deltas=(),
+            rule_deltas=rule_corpus_deltas,
             previous_actions=previous_actions[-8:],
-            user_requests=user_requests,
-            blocked_capabilities=tuple(
-                item[:128] for item in sorted(set(blocked_capabilities))[:64]
-            ),
+            user_requests=(),
+            tool_coverage=tool_coverage,
+            tool_coverage_truncated=tool_coverage_truncated,
+            blocked_capabilities=tuple(item[:128] for item in all_blocked[:64]),
             budget_remaining=_safe_budget_names(budget_remaining),
         )
-        if state.turn_index == 0:
-            return InvestigationContextV1(
-                view="full",
-                investigation_id=investigation_id,
-                source=snapshot.source,
-                article=self._full_article(snapshot),
-                investigation=investigation_context,
-                available_tools=tools,
-            )
-
-        changes = [
-            ContextChangeV1(
-                kind=f"finding:{finding.assessment.value}",
-                identity=str(finding.id),
-                summary=_truncate(_safe_untrusted(finding.statement), 1_200),
-            )
-            for finding in self._order_findings(new_findings)[:MAX_CONTEXT_FINDINGS]
-        ]
-        changes.extend(
-            ContextChangeV1(
-                kind=observation.kind.value,
-                identity=str(observation.id),
-                summary=_truncate(
-                    _safe_untrusted(_evidence_summary_for(observation, evidence_summary)), 1_200
-                ),
-            )
-            for observation in new_observations[:MAX_CONTEXT_EVIDENCE]
-        )
-        changes.extend(
-            ContextChangeV1(
-                kind="action",
-                identity=str(index),
-                summary=_truncate(_safe_untrusted(action), 300),
-            )
-            for index, action in enumerate(
-                item
-                for item in state.recent_actions[-16:]
-                if not item.startswith(USER_REQUEST_ACTION_PREFIX)
-            )
-        )
-        return InvestigationContextV1(
-            view="delta",
+        context = InvestigationContextV1(
+            view="full",
             investigation_id=investigation_id,
             source=snapshot.source,
+            article=self._full_article(snapshot),
             investigation=investigation_context,
-            delta=InvestigationDeltaV1(
-                changes=tuple(changes[:32]),
-                stable_hypotheses=hypothesis_payload,
-                user_requests=user_requests,
-            ),
+            operator_requests=user_requests,
+            indicator_inventory=indicator_inventory,
+            available_pivots=available_pivots,
+            available_pivots_truncated=available_pivots_truncated,
             available_tools=tools,
         )
+        ensure_investigation_context_size(context.canonical_bytes())
+        return context
+
+    async def _rule_corpus_inventory_context(
+        self,
+        investigation_id: UUID,
+        observations: Sequence[EvidenceObservation],
+    ) -> tuple[dict[str, Any], ...]:
+        provider = self._rule_corpus_inventory
+        if provider is None:
+            return ()
+        rows: list[dict[str, Any]] = []
+        try:
+            items = tuple(await provider.manual_rule_corpus_imports(investigation_id))
+        except Exception:
+            rows.append(
+                {
+                    "kind": "operator_rule_corpus_inventory",
+                    "status": "unavailable",
+                    "summary": "Operator-imported rule corpus inventory is unavailable.",
+                }
+            )
+            items = ()
+        rows.extend(
+            {
+                "kind": "operator_rule_corpus_sample",
+                "sha256": item.sample_sha256,
+                "role": item.role.value,
+                "provenance": item.provenance.value,
+                "size_bytes": item.size_bytes,
+                "source_description": _safe_untrusted(
+                    _truncate(_sanitize(item.source_description), 512)
+                ),
+            }
+            for item in sorted(items, key=lambda item: item.sample_sha256)[
+                :MAX_CONTEXT_RULE_CORPUS_IMPORTS
+            ]
+        )
+        if len(items) > MAX_CONTEXT_RULE_CORPUS_IMPORTS:
+            rows.append(
+                {
+                    "kind": "operator_rule_corpus_inventory_truncated",
+                    "omitted_count": len(items) - MAX_CONTEXT_RULE_CORPUS_IMPORTS,
+                }
+            )
+
+        candidate_reader = getattr(provider, "rule_candidate_versions", None)
+        if callable(candidate_reader):
+            try:
+                versions = tuple(await candidate_reader(investigation_id))
+            except Exception:
+                rows.append(
+                    {
+                        "kind": "rule_candidate_inventory",
+                        "status": "unavailable",
+                        "summary": "Rule candidate inventory is unavailable.",
+                    }
+                )
+            else:
+                latest_by_candidate: dict[UUID, DetectionCandidateVersion] = {}
+                for version in versions:
+                    if version.investigation_id != investigation_id:
+                        continue
+                    previous = latest_by_candidate.get(version.candidate_id)
+                    if previous is None or (version.version, version.id.hex) > (
+                        previous.version,
+                        previous.id.hex,
+                    ):
+                        latest_by_candidate[version.candidate_id] = version
+                ordered = sorted(
+                    latest_by_candidate.values(),
+                    key=lambda item: (item.created_at, item.candidate_id.hex),
+                    reverse=True,
+                )
+                for version in ordered[:MAX_CONTEXT_RULE_CANDIDATES]:
+                    latest_report = await self._latest_rule_test_report(version, observations)
+                    rows.append(
+                        {
+                            "kind": "rule_candidate",
+                            "candidate_id": str(version.candidate_id),
+                            "version": version.version,
+                            "version_id": str(version.id),
+                            "status": version.status.value,
+                            "validation_status": (
+                                latest_report["validation_status"]
+                                if latest_report is not None
+                                else RuleValidationStatus.UNTESTED.value
+                            ),
+                            "latest_test_report": latest_report,
+                            "source_sha256": version.source_sha256,
+                            "source_excerpt": _safe_untrusted_excerpt(version.source, 2_000),
+                        }
+                    )
+                if len(ordered) > MAX_CONTEXT_RULE_CANDIDATES:
+                    rows.append(
+                        {
+                            "kind": "rule_candidate_inventory_truncated",
+                            "omitted_count": len(ordered) - MAX_CONTEXT_RULE_CANDIDATES,
+                        }
+                    )
+        return tuple(rows)
+
+    async def _latest_rule_test_report(
+        self,
+        version: DetectionCandidateVersion,
+        observations: Sequence[EvidenceObservation],
+    ) -> dict[str, Any] | None:
+        summaries = self._evidence_summaries
+        if summaries is None:
+            return None
+        matching = sorted(
+            (
+                observation
+                for observation in observations
+                if observation.kind is EvidenceKind.YARA_MATCH
+                and observation.object_type == "detection_candidate_version"
+                and observation.object_id == str(version.id)
+            ),
+            key=lambda item: (item.observed_at, item.id.hex),
+        )
+        latest: dict[str, Any] | None = None
+        for observation in matching:
+            try:
+                summary = await summaries.summary(observation)
+            except Exception:
+                continue
+            if (
+                not isinstance(summary, Mapping)
+                or summary.get("source_sha256") != version.source_sha256
+            ):
+                continue
+            try:
+                validation_status = RuleValidationStatus(summary["validation_status"]).value
+            except (KeyError, TypeError, ValueError):
+                validation_status = RuleValidationStatus.UNTESTED.value
+            provenance_counts = summary.get("provenance_counts_by_role")
+            normalized_counts: dict[str, dict[str, int]] = {}
+            if isinstance(provenance_counts, Mapping):
+                for role in RuleTestCorpusRole:
+                    counts = provenance_counts.get(role.value)
+                    if not isinstance(counts, Mapping):
+                        continue
+                    normalized = {
+                        provenance: value
+                        for provenance in ("real", "synthetic")
+                        if isinstance((value := counts.get(provenance)), int)
+                        and not isinstance(value, bool)
+                        and value >= 0
+                    }
+                    if normalized:
+                        normalized_counts[role.value] = normalized
+            execution_status = summary.get("execution_status")
+            latest = {
+                "observation_id": str(observation.id),
+                "validation_status": validation_status,
+                "execution_status": (
+                    str(execution_status)[:40] if isinstance(execution_status, str) else None
+                ),
+                "provenance_counts_by_role": normalized_counts,
+                "false_positive_count": _nonnegative_int(summary.get("false_positive_count")),
+                "false_negative_count": _nonnegative_int(summary.get("false_negative_count")),
+            }
+        return latest
 
     @staticmethod
     def _user_requests_from_actions(
@@ -469,14 +738,36 @@ class ResearchContextBuilder:
                 if not isinstance(payload, dict):
                     continue
                 payload["request_id"] = UUID(str(payload.get("request_id", "")))
-                payload["text"] = _truncate(_safe_untrusted(str(payload.get("text", ""))), 2_000)
+                payload["text"] = _safe_operator_instruction(
+                    str(payload.get("text", "")), maximum=2_000
+                )
                 target = payload.get("target")
                 if isinstance(target, dict):
-                    target["value"] = _truncate(_safe_untrusted(str(target.get("value", ""))), 256)
+                    target["value"] = _safe_operator_instruction(
+                        str(target.get("value", "")), maximum=256
+                    )
                 parsed.append(InvestigationUserRequestV1.model_validate(payload))
             except (TypeError, ValueError, json.JSONDecodeError):
                 continue
         return tuple(parsed[-32:])
+
+    @staticmethod
+    def _indicator_inventory(snapshot: ArticleSnapshot) -> IndicatorInventoryV1:
+        items: list[ConfirmedIOCContextV1] = []
+        encoded_bytes = 0
+        truncated = snapshot.confirmed_iocs_truncated
+        for raw_item in snapshot.confirmed_iocs:
+            item = ConfirmedIOCContextV1.model_validate(raw_item, strict=True)
+            item_bytes = len(canonical_json_bytes(item.model_dump(mode="json")))
+            if (
+                len(items) >= MAX_CONTEXT_CONFIRMED_IOCS
+                or encoded_bytes + item_bytes > MAX_CONTEXT_CONFIRMED_IOC_BYTES
+            ):
+                truncated = True
+                continue
+            items.append(item)
+            encoded_bytes += item_bytes
+        return IndicatorInventoryV1(items=tuple(items), truncated=truncated)
 
     async def _evidence_context(
         self, observations: tuple[EvidenceObservation, ...]
@@ -487,66 +778,180 @@ class ResearchContextBuilder:
             if self._evidence_summaries is not None:
                 summary = await self._evidence_summaries.summary(observation)
             if isinstance(summary, Mapping):
-                text = _safe_untrusted(json.dumps(_sanitize(summary), ensure_ascii=False))
+                raw_text = json.dumps(_sanitize(summary), ensure_ascii=False)
             elif isinstance(summary, str):
-                text = _safe_untrusted(summary)
+                raw_text = summary
             else:
-                text = _safe_untrusted(
+                raw_text = (
                     f"{observation.source} observed {observation.object_type} "
                     f"{observation.object_id}"
                 )
+            text = _safe_untrusted(_truncate(raw_text, MAX_CONTEXT_EVIDENCE_CHARS))
             result.append(
                 EvidenceSummaryV1(
                     evidence_id=observation.id,
                     kind=observation.kind,
-                    summary=_truncate(text, 1_000),
+                    summary=text,
                 )
             )
         # Reserve room for contradictions before confirming findings are added.
         return tuple(result)
+
+    @staticmethod
+    def _evidence_index(
+        observations: tuple[EvidenceObservation, ...],
+    ) -> tuple[tuple[EvidenceSummaryV1, ...], bool]:
+        result: list[EvidenceSummaryV1] = []
+        encoded_bytes = 2
+        truncated = len(observations) > MAX_CONTEXT_EVIDENCE_INDEX
+        for observation in sorted(observations, key=lambda item: str(item.id)):
+            summary = _safe_untrusted(
+                _truncate(
+                    f"{observation.source} recorded {observation.kind.value} for "
+                    f"{observation.object_type} {observation.object_id}",
+                    96,
+                )
+            )
+            item = EvidenceSummaryV1(
+                evidence_id=observation.id,
+                kind=observation.kind,
+                summary=summary,
+            )
+            item_bytes = len(canonical_json_bytes(item.model_dump(mode="json"))) + 1
+            if (
+                len(result) >= MAX_CONTEXT_EVIDENCE_INDEX
+                or encoded_bytes + item_bytes > MAX_CONTEXT_EVIDENCE_INDEX_BYTES
+            ):
+                truncated = True
+                continue
+            result.append(item)
+            encoded_bytes += item_bytes
+        return tuple(result), truncated
+
+    @staticmethod
+    def _opinion_note_index(
+        opinion: AnalystOpinionV1 | None,
+        *,
+        finding_ids: set[UUID],
+        observation_ids: set[UUID],
+    ) -> tuple[tuple[OpinionNoteSummaryV1, ...], bool]:
+        if opinion is None:
+            return (), False
+        result: list[OpinionNoteSummaryV1] = []
+        encoded_bytes = 2
+        notes = sorted(opinion.observations, key=lambda item: (item.anchor, str(item.id)))
+        truncated = len(notes) > MAX_CONTEXT_OPINION_NOTES
+        for note in notes:
+            item = OpinionNoteSummaryV1(
+                note_id=note.id,
+                anchor=note.anchor,
+                state=note.state,
+                relation=note.relation,
+                text=_truncate(_safe_untrusted(note.text), 400),
+                finding_refs=tuple(
+                    sorted(set(note.finding_refs).intersection(finding_ids), key=str)[:16]
+                ),
+                evidence_refs=tuple(
+                    sorted(set(note.evidence_refs).intersection(observation_ids), key=str)[:16]
+                ),
+            )
+            item_bytes = len(canonical_json_bytes(item.model_dump(mode="json"))) + 1
+            if (
+                len(result) >= MAX_CONTEXT_OPINION_NOTES
+                or encoded_bytes + item_bytes > MAX_CONTEXT_OPINION_NOTE_BYTES
+            ):
+                truncated = True
+                continue
+            result.append(item)
+            encoded_bytes += item_bytes
+        return tuple(result), truncated
+
+    async def _tool_coverage(
+        self,
+        invocations: tuple[ToolInvocation, ...],
+        observations: tuple[EvidenceObservation, ...],
+    ) -> tuple[tuple[ToolCoverageEntryV1, ...], bool]:
+        if not invocations:
+            return (), False
+        observation_by_id = {item.id: item for item in observations}
+        candidates = invocations[-MAX_CONTEXT_TOOL_COVERAGE:]
+        truncated = len(invocations) > len(candidates)
+        entries: list[ToolCoverageEntryV1] = []
+        encoded_bytes = 2
+        for invocation in reversed(candidates):
+            linked_observations = tuple(
+                observation_by_id[ref]
+                for ref in reversed(invocation.response_refs[-4:])
+                if ref in observation_by_id
+            )
+            observation = linked_observations[0] if linked_observations else None
+            facts: Mapping[str, Any] | str | None = None
+            if observation is not None and self._evidence_summaries is not None:
+                for candidate_observation in linked_observations:
+                    candidate_facts = await self._evidence_summaries.summary(candidate_observation)
+                    if candidate_facts is not None:
+                        observation = candidate_observation
+                        facts = candidate_facts
+                        break
+            summary = _tool_coverage_summary(invocation, observation, facts)
+            entry = ToolCoverageEntryV1(
+                invocation_id=invocation.id,
+                tool_name=_truncate(_safe_untrusted(invocation.tool_name), 128),
+                parameter_key=_coverage_parameter_key(invocation),
+                status=invocation.status,
+                observation_id=observation.id if observation is not None else None,
+                summary=summary,
+            )
+            item_bytes = len(canonical_json_bytes(entry.model_dump(mode="json"))) + 1
+            if encoded_bytes + item_bytes > MAX_CONTEXT_TOOL_COVERAGE_BYTES:
+                truncated = True
+                continue
+            entries.append(entry)
+            encoded_bytes += item_bytes
+        return tuple(reversed(entries)), truncated
 
     def _finding_context(
         self,
         findings: tuple[InvestigationFinding, ...],
         *,
         observation_ids: set[UUID],
-    ) -> tuple[FindingSummaryV1, ...]:
-        result = []
-        for finding in self._order_findings(findings)[:MAX_CONTEXT_FINDINGS]:
+    ) -> tuple[tuple[FindingSummaryV1, ...], bool]:
+        result: list[FindingSummaryV1] = []
+        encoded_bytes = 2
+        truncated = len(findings) > MAX_CONTEXT_FINDINGS
+        for finding in self._order_findings(findings):
             valid_refs = tuple(ref for ref in finding.observation_refs if ref in observation_ids)
-            result.append(
-                FindingSummaryV1(
-                    finding_id=finding.id,
-                    kind=finding.kind,
-                    assessment=(
-                        FindingAssessment.INCONCLUSIVE
-                        if finding.assessment is FindingAssessment.SUPPORTED
-                        and (not valid_refs or len(valid_refs) != len(finding.observation_refs))
-                        else finding.assessment
-                    ),
-                    statement=_truncate(_safe_untrusted(finding.statement), 1_000),
-                    observation_refs=valid_refs[:16],
-                    claim_refs=finding.claim_refs[:16],
-                )
+            item = FindingSummaryV1(
+                finding_id=finding.id,
+                kind=finding.kind,
+                assessment=(
+                    FindingAssessment.INCONCLUSIVE
+                    if finding.assessment is FindingAssessment.SUPPORTED
+                    and (not valid_refs or len(valid_refs) != len(finding.observation_refs))
+                    else finding.assessment
+                ),
+                statement=_safe_untrusted(
+                    _truncate(finding.statement, MAX_CONTEXT_FINDING_STATEMENT_CHARS)
+                ),
+                observation_refs=tuple(sorted(set(valid_refs), key=str)[:128]),
+                claim_refs=tuple(sorted(set(finding.claim_refs))[:128]),
             )
-        return tuple(result)
+            item_bytes = len(canonical_json_bytes(item.model_dump(mode="json"))) + 1
+            if (
+                len(result) >= MAX_CONTEXT_FINDINGS
+                or encoded_bytes + item_bytes > MAX_CONTEXT_FINDING_BYTES
+            ):
+                truncated = True
+                continue
+            result.append(item)
+            encoded_bytes += item_bytes
+        return tuple(result), truncated
 
     @staticmethod
     def _order_findings(
         findings: Sequence[InvestigationFinding],
     ) -> tuple[InvestigationFinding, ...]:
-        # Refutations, qualifications, and open questions survive context bounds first.
-        rank = {
-            FindingAssessment.REFUTED: 0,
-            FindingAssessment.QUALIFIED: 1,
-            FindingAssessment.INCONCLUSIVE: 2,
-            FindingAssessment.SUPPORTED: 3,
-        }
-        return tuple(
-            sorted(
-                findings, key=lambda item: (rank[item.assessment], item.created_at, str(item.id))
-            )
-        )
+        return tuple(sorted(findings, key=lambda item: str(item.id)))
 
     @staticmethod
     def _hypothesis_payload(
@@ -575,6 +980,21 @@ class ResearchContextBuilder:
     @staticmethod
     def _full_article(snapshot: ArticleSnapshot) -> ArticleContextV1:
         article = snapshot.article
+        publication_anchors: list[PublicationAnchorV1] = []
+        anchor_bytes = 2
+        anchors_truncated = article.publication_anchors_truncated
+        for anchor in sorted(article.publication_anchors, key=lambda item: item.anchor):
+            excerpt = _safe_untrusted(_truncate(anchor.excerpt, 96))
+            item = PublicationAnchorV1(anchor=anchor.anchor, excerpt=excerpt)
+            item_bytes = len(canonical_json_bytes(item.model_dump(mode="json"))) + 1
+            if (
+                len(publication_anchors) >= MAX_CONTEXT_PUBLICATION_ANCHORS
+                or anchor_bytes + item_bytes > MAX_CONTEXT_PUBLICATION_ANCHOR_BYTES
+            ):
+                anchors_truncated = True
+                continue
+            publication_anchors.append(item)
+            anchor_bytes += item_bytes
         return ArticleContextV1(
             short_summary=_truncate(
                 _safe_untrusted(article.short_summary), MAX_ARTICLE_NARRATIVE_CHARS
@@ -582,7 +1002,7 @@ class ResearchContextBuilder:
             claims=tuple(
                 ArticleClaimV1(
                     id=item.id,
-                    statement=_truncate(_safe_untrusted(item.statement), 1_200),
+                    statement=_truncate(_safe_untrusted(item.statement), 900),
                     source_refs=tuple(
                         ref
                         for ref in item.source_refs[:8]
@@ -600,12 +1020,14 @@ class ResearchContextBuilder:
                 and re.fullmatch(r"(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})", sample)
             ),
             known_chain=tuple(
-                {"summary": _truncate(json.dumps(_sanitize(item), ensure_ascii=False), 600)}
+                {"summary": _truncate(json.dumps(_sanitize(item), ensure_ascii=False), 360)}
                 for item in _prioritize_context_rows(article.known_chain)[:32]
             ),
             open_questions=tuple(
-                _truncate(_safe_untrusted(item), 800) for item in article.open_questions[:16]
+                _truncate(_safe_untrusted(item), 560) for item in article.open_questions[:16]
             ),
+            publication_anchors=tuple(publication_anchors),
+            publication_anchors_truncated=anchors_truncated,
         )
 
     def _available_tools(
@@ -784,6 +1206,27 @@ def _safe_untrusted(value: str) -> str:
     return f"[UNTRUSTED ARTICLE OR TOOL DATA]\n{sanitized}\n[END UNTRUSTED DATA]"
 
 
+def _safe_untrusted_excerpt(value: str, maximum: int) -> str:
+    prefix = "[UNTRUSTED ARTICLE OR TOOL DATA]\n"
+    suffix = "\n[END UNTRUSTED DATA]"
+    body = _truncate(_sanitize(value), max(0, maximum - len(prefix) - len(suffix)))
+    return f"{prefix}{body}{suffix}"
+
+
+def _nonnegative_int(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _safe_operator_instruction(value: str, *, maximum: int) -> str:
+    def redact_signed_url(match: re.Match[str]) -> str:
+        return "[signed URL omitted]" if _SIGNED_QUERY.search(match.group(0)) else match.group(0)
+
+    sanitized = _SIGNED_URL.sub(redact_signed_url, str(value))
+    sanitized = _SECRET_VALUE.sub(r"\1=[redacted]", sanitized)
+    sanitized = _BEARER_VALUE.sub("Bearer [redacted]", sanitized)
+    return _truncate(sanitized, maximum)
+
+
 def _safe_budget_names(values: Mapping[str, int | None]) -> dict[str, int | None]:
     """Keep budget dimensions visible without triggering secret-field filters."""
     result: dict[str, int | None] = {}
@@ -813,6 +1256,192 @@ def _evidence_summary_for(
     return f"{observation.kind.value}: {observation.object_type} {observation.object_id}"
 
 
+async def provider_authorization_blocked_capabilities(
+    *,
+    investigation_id: UUID,
+    invocations: Sequence[ToolInvocation],
+    observations: Sequence[EvidenceObservation],
+) -> tuple[str, ...]:
+    """Return provider blocks after two persisted authorization refusals."""
+    observation_by_id = {item.id: item for item in observations}
+    counts: dict[str, int] = {}
+    for invocation in invocations:
+        if (
+            invocation.investigation_id != investigation_id
+            or invocation.status is not ToolInvocationStatus.UNAVAILABLE
+        ):
+            continue
+        provider = invocation.tool_name.split(".", 1)[0].lower()
+        if provider not in {"shodan", "vt"}:
+            continue
+        if any(
+            (observation := observation_by_id.get(ref)) is not None
+            and observation.object_type == PROVIDER_AUTHORIZATION_REFUSAL_OBJECT_TYPE
+            for ref in invocation.response_refs
+        ):
+            counts[provider] = counts.get(provider, 0) + 1
+    return tuple(
+        f"{provider}: provider authorization refused"
+        for provider, count in sorted(counts.items())
+        if count >= PROVIDER_AUTHORIZATION_REFUSAL_THRESHOLD
+    )
+
+
+def provider_download_blocked_capabilities(
+    *,
+    investigation_id: UUID,
+    invocations: Sequence[ToolInvocation],
+    observations: Sequence[EvidenceObservation],
+) -> tuple[str, ...]:
+    """Block only VT sample downloads after two same-cause refusals on distinct hashes."""
+    observation_by_id = {item.id: item for item in observations}
+    hashes_by_reason: dict[str, set[str]] = {}
+    reason_details = {
+        PROVIDER_DOWNLOAD_ROUTE_REFUSAL_OBJECT_TYPE: (
+            "vt.file_download: provider download route unavailable"
+        ),
+        PROVIDER_DOWNLOAD_AUTH_REFUSAL_OBJECT_TYPE: (
+            "vt.file_download: provider authorization refused"
+        ),
+    }
+    for invocation in invocations:
+        if (
+            invocation.investigation_id != investigation_id
+            or invocation.tool_name != "vt.download_sample"
+            or invocation.status is not ToolInvocationStatus.UNAVAILABLE
+        ):
+            continue
+        parameters = thaw_json(invocation.normalized_parameters)
+        requested_hash = parameters.get("sha256") if isinstance(parameters, Mapping) else None
+        identity = requested_hash if isinstance(requested_hash, str) else str(invocation.id)
+        for ref in invocation.response_refs:
+            observation = observation_by_id.get(ref)
+            if observation is not None and observation.object_type in reason_details:
+                hashes_by_reason.setdefault(observation.object_type, set()).add(identity)
+    return tuple(
+        reason_details[object_type]
+        for object_type in sorted(reason_details)
+        if len(hashes_by_reason.get(object_type, ())) >= PROVIDER_DOWNLOAD_REFUSAL_THRESHOLD
+    )
+
+
+def _coverage_parameter_key(invocation: ToolInvocation) -> str:
+    parameters = thaw_json(invocation.normalized_parameters)
+    if not isinstance(parameters, Mapping):
+        return "parameters: unavailable"
+    preferred_names = (
+        "file_hash",
+        "hash",
+        "sha256",
+        "sha1",
+        "md5",
+        "ip",
+        "ip_address",
+        "domain",
+        "url",
+        "host",
+        "query",
+    )
+    for name in preferred_names:
+        value = parameters.get(name)
+        if isinstance(value, str) and value.strip():
+            safe_value = _truncate(_safe_untrusted(value), 240)
+            return f"{name}: {safe_value}"
+    encoded = json.dumps(_sanitize(parameters), ensure_ascii=False, sort_keys=True)
+    return f"parameters: {_truncate(_safe_untrusted(encoded), 240)}"
+
+
+def _tool_coverage_summary(
+    invocation: ToolInvocation,
+    observation: EvidenceObservation | None,
+    facts: Mapping[str, Any] | str | None,
+) -> str:
+    if (
+        observation is not None
+        and observation.object_type == PROVIDER_AUTHORIZATION_REFUSAL_OBJECT_TYPE
+    ):
+        return "Provider authorization was refused."
+    if (
+        observation is not None
+        and observation.object_type == PROVIDER_DOWNLOAD_ROUTE_REFUSAL_OBJECT_TYPE
+    ):
+        return "VirusTotal download route unavailable; do not retry downloads."
+    if (
+        observation is not None
+        and observation.object_type == PROVIDER_DOWNLOAD_AUTH_REFUSAL_OBJECT_TYPE
+    ):
+        return "VirusTotal download authorization refused; do not retry downloads."
+    if observation is not None and observation.kind is EvidenceKind.NEGATIVE_RESULT:
+        return "The provider returned an explicit no-result observation."
+
+    values: Mapping[str, Any] = facts if isinstance(facts, Mapping) else {}
+    if invocation.tool_name.startswith("vt."):
+        nested = values.get("summary")
+        if isinstance(nested, Mapping):
+            values = nested
+        stats = values.get("last_analysis_stats")
+        parts: list[str] = []
+        if isinstance(stats, Mapping):
+            counts = {
+                key: value
+                for key, value in stats.items()
+                if isinstance(key, str)
+                and isinstance(value, int)
+                and not isinstance(value, bool)
+                and value >= 0
+            }
+            detections = counts.get("malicious", 0) + counts.get("suspicious", 0)
+            total = counts.get(
+                "total", sum(value for key, value in counts.items() if key != "total")
+            )
+            if total:
+                parts.append(f"{detections}/{total} detections")
+        name = _first_safe_fact(values, ("meaningful_name", "name"), 96)
+        file_type = _first_safe_fact(values, ("type_description", "type"), 72)
+        if name:
+            parts.append(f"file {name}")
+        if file_type:
+            parts.append(f"type {file_type}")
+        if parts:
+            return _truncate(_safe_untrusted("VT: " + "; ".join(parts)), 400)
+    if invocation.tool_name.startswith("shodan."):
+        nested = values.get("summary")
+        if isinstance(nested, Mapping):
+            values = nested
+        ports = values.get("ports")
+        parts = []
+        if isinstance(ports, (tuple, list)):
+            safe_ports = [
+                str(value)
+                for value in ports[:16]
+                if isinstance(value, int) and not isinstance(value, bool) and 0 < value <= 65_535
+            ]
+            if safe_ports:
+                parts.append("ports " + ",".join(safe_ports))
+        organization = _first_safe_fact(values, ("organization", "org"), 96)
+        if organization:
+            parts.append("organization " + organization)
+        if parts:
+            return _truncate(_safe_untrusted("Shodan: " + "; ".join(parts)), 400)
+    if observation is not None:
+        return _truncate(
+            _safe_untrusted(
+                f"{observation.source} recorded {observation.kind.value} "
+                f"for {observation.object_type} {observation.object_id}."
+            ),
+            400,
+        )
+    return f"{invocation.tool_name} returned {invocation.status.value}."
+
+
+def _first_safe_fact(values: Mapping[str, Any], names: tuple[str, ...], maximum: int) -> str | None:
+    for name in names:
+        value = values.get(name)
+        if isinstance(value, str) and value.strip():
+            return _truncate(_safe_untrusted(value), maximum)
+    return None
+
+
 def _prioritize_context_rows(
     rows: Sequence[Mapping[str, Any]],
 ) -> tuple[Mapping[str, Any], ...]:
@@ -830,8 +1459,11 @@ def _prioritize_context_rows(
 
 
 __all__ = [
+    "MAX_OPERATOR_REQUESTS",
+    "MAX_OPERATOR_REQUEST_BYTES",
     "ArticleSnapshot",
     "ArticleSnapshotPort",
+    "CanonicalEvidenceSummaryPort",
     "EvidenceSummaryPort",
     "InvestigationGraphReadPort",
     "InvestigationReadPort",
@@ -839,4 +1471,6 @@ __all__ = [
     "RepositoryInvestigationReadPort",
     "ResearchContextBuilder",
     "SampleFeaturePackPort",
+    "provider_authorization_blocked_capabilities",
+    "provider_download_blocked_capabilities",
 ]

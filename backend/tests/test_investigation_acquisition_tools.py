@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from uuid import UUID, uuid4
 
 import pytest
@@ -24,14 +25,17 @@ from cti_app.application.investigation_tools import (
     ToolExecutionContext,
     validate_json_schema,
 )
+from cti_app.application.virustotal import VirusTotalHttpError
 from cti_app.domain.analysis import SampleFeatureSetV1, SampleFormat
 from cti_app.domain.classification import TLP
 from cti_app.domain.investigation import (
     BudgetDimension,
+    BudgetReservationStatus,
     EvidenceKind,
     SampleOrigin,
     ToolInvocationStatus,
 )
+from cti_app.domain.investigation_state import StopReason
 from tests.investigation_c2_fakes import (
     FakeDatabase,
     FakeUow,
@@ -41,6 +45,7 @@ from tests.investigation_c2_fakes import (
     make_investigation,
     make_sample_acquisition_service,
 )
+from tests.test_investigation_service import _decision, _Fixture
 
 
 def _register(database: FakeDatabase, hits: HitAcquisitionService):
@@ -51,6 +56,16 @@ def _register(database: FakeDatabase, hits: HitAcquisitionService):
         qualifications=SampleQualificationService(lambda: FakeUow(database)),
     )
     return registry
+
+
+class _RouteRefusedPort(FakeVirusTotalPort):
+    async def file_download(self, file_hash: str, *, sink) -> None:
+        self.download_calls.append(file_hash)
+        raise VirusTotalHttpError(
+            "synthetic route absent",
+            code="virustotal_not_found",
+            status_code=404,
+        )
 
 
 @pytest.mark.asyncio
@@ -141,6 +156,168 @@ async def test_tool_capabilities_and_unavailable_analysis_are_explicit() -> None
 
 
 @pytest.mark.asyncio
+async def test_invalid_download_arguments_are_definitive_local_failures() -> None:
+    database = FakeDatabase()
+    investigation = make_investigation()
+    database.investigations[investigation.id] = investigation
+    envelope = await InvestigationEnvelopeService(lambda: FakeUow(database)).approve(
+        make_approved_proposal(investigation),
+        actor_id="analyst:synthetic",
+        reason="Approve bounded synthetic VT access.",
+        correlation_id="g2:invalid-download-arguments",
+    )
+    port = FakeVirusTotalPort(b"synthetic payload")
+    hits = HitAcquisitionService(
+        lambda: FakeUow(database),
+        acquisition=make_sample_acquisition_service(database, port),
+        recorder=make_evidence_recorder(database),
+    )
+    registry = _register(database, hits)
+    dispatcher = RegistryToolDispatcher(registry)
+    valid_hash = hashlib.sha256(b"synthetic payload").hexdigest()
+    cases = (
+        {"sha256": valid_hash, "purpose": ["first", "second"], "evidence_refs": []},
+        {"sha256": valid_hash, "purpose": "Review this sample."},
+        {
+            "sha256": valid_hash,
+            "purpose": "Review this sample.",
+            "evidence_refs": [],
+            "unexpected": True,
+        },
+    )
+
+    for index, arguments in enumerate(cases):
+        result = await dispatcher.dispatch(
+            ToolExecutionContext(
+                investigation_id=investigation.id,
+                envelope=envelope,
+                budget=envelope.budget,
+                idempotency_key=f"invalid-download-{index}",
+                available_capabilities=frozenset({VT_FILE_DOWNLOAD_CAPABILITY}),
+            ),
+            tool_name="vt.download_sample",
+            schema_version="1",
+            arguments=arguments,
+            purpose="Validate the real acquisition schema.",
+            operation_key=f"invalid-download-{index}",
+        )
+        assert result.status is ToolInvocationStatus.FAILED
+        assert result.error_code == "invalid_tool_arguments"
+        assert result.output["validation_errors"]
+
+    assert port.download_calls == []
+
+
+@pytest.mark.asyncio
+async def test_invalid_download_retry_is_bounded() -> None:
+    database = FakeDatabase()
+    fixture = _Fixture(
+        responses=[
+            _decision(
+                goal="Validate sample arguments.",
+                next_action="continue",
+                tools=(
+                    {
+                        "tool_name": "vt.download_sample",
+                        "schema_version": "1",
+                        "arguments": {
+                            "sha256": "a" * 64,
+                            "purpose": ["first phrase", "second phrase"],
+                            "evidence_refs": [],
+                        },
+                        "purpose": "Request the synthetic sample.",
+                    },
+                ),
+            ),
+            _decision(
+                goal="Retry the same invalid sample arguments.",
+                next_action="continue",
+                tools=(
+                    {
+                        "tool_name": "vt.download_sample",
+                        "schema_version": "1",
+                        "arguments": {
+                            "sha256": "a" * 64,
+                            "purpose": ["first phrase", "second phrase"],
+                            "evidence_refs": [],
+                        },
+                        "purpose": "Request the synthetic sample.",
+                    },
+                ),
+            ),
+            _decision(
+                goal="Repeat the same invalid request after two local rejections.",
+                next_action="continue",
+                tools=(
+                    {
+                        "tool_name": "vt.download_sample",
+                        "schema_version": "1",
+                        "arguments": {
+                            "sha256": "a" * 64,
+                            "purpose": ["first phrase", "second phrase"],
+                            "evidence_refs": [],
+                        },
+                        "purpose": "Request the synthetic sample.",
+                    },
+                ),
+            ),
+            _decision(
+                goal="Finish after the repeated rejection is reported.",
+                next_action="finish",
+            ),
+        ],
+        tools=(
+            (
+                "vt.download_sample",
+                "vt",
+                ToolEffect.ACQUIRE,
+                VT_FILE_DOWNLOAD_CAPABILITY,
+                {BudgetDimension.VT_UNITS: 1, BudgetDimension.DOWNLOADS: 1},
+            ),
+        ),
+        no_progress_limit=6,
+    )
+    fixture.envelope = replace(fixture.envelope, acquire_hits_allowed=True)
+    database.investigations[fixture.investigation_id] = make_investigation()
+    port = FakeVirusTotalPort(b"synthetic sample")
+    hits = HitAcquisitionService(
+        lambda: FakeUow(database),
+        acquisition=make_sample_acquisition_service(database, port),
+        recorder=make_evidence_recorder(database),
+    )
+    actual_registry = _register(database, hits)
+    definition, adapter = actual_registry.get("vt.download_sample", "1")
+    fixture.registry.unregister("vt.download_sample", "1")
+    fixture.registry.register(definition, adapter)
+
+    initial = await fixture.start()
+    state = await fixture.service.run(initial.investigation_id)
+
+    invocations = await fixture.invocations.list_for_investigation(fixture.investigation_id)
+    assert state.stop_reason is StopReason.AGENT_FINISHED
+    assert len(invocations) == 2, [
+        (item.operation_key, item.normalized_parameters, item.status, item.response_refs)
+        for item in invocations
+    ]
+    assert all(item.status is ToolInvocationStatus.FAILED for item in invocations)
+    assert all(item.response_refs == () for item in invocations)
+    assert all(item.consumed_budget == {} for item in invocations)
+    envelope = await fixture.envelopes.get(fixture.investigation_id)
+    assert envelope is not None
+    reservations = {item.operation_key: item for item in envelope.budget.reservations}
+    assert all(
+        reservations[item.operation_key].status is BudgetReservationStatus.RELEASED
+        for item in invocations
+    )
+    assert port.download_calls == []
+    assert len(fixture.bridge_transport.prompts) == 4
+    assert "invalid_tool_arguments" in fixture.bridge_transport.prompts[1]
+    assert "purpose" in fixture.bridge_transport.prompts[1]
+    assert "expected string" in fixture.bridge_transport.prompts[1]
+    assert "failed definitively twice" in fixture.bridge_transport.prompts[3]
+
+
+@pytest.mark.asyncio
 async def test_download_tool_requests_permission_outside_g2_envelope() -> None:
     database = FakeDatabase()
     investigation = make_investigation()
@@ -195,6 +372,63 @@ async def test_download_tool_requests_permission_outside_g2_envelope() -> None:
     # The existing dispatcher rejects ACQUIRE before reaching the adapter.
     assert dispatched_result.status is ToolInvocationStatus.POLICY_DENIED
     assert port.download_calls == []
+
+
+@pytest.mark.asyncio
+async def test_download_tool_returns_safe_definitive_failure_and_cached_replay() -> None:
+    database = FakeDatabase()
+    investigation = make_investigation()
+    database.investigations[investigation.id] = investigation
+    envelope_service = InvestigationEnvelopeService(lambda: FakeUow(database))
+    envelope = await envelope_service.approve(
+        make_approved_proposal(investigation),
+        actor_id="analyst:synthetic",
+        reason="Approve bounded synthetic VT acquisition.",
+        correlation_id="g2:synthetic-route-refusal",
+    )
+    content = b"synthetic sample for download route refusal"
+    port = _RouteRefusedPort(content)
+    hits = HitAcquisitionService(
+        lambda: FakeUow(database),
+        acquisition=make_sample_acquisition_service(database, port),
+        recorder=make_evidence_recorder(database),
+    )
+    registry = _register(database, hits)
+    _definition, adapter = registry.get("vt.download_sample", "1")
+    arguments = {
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "purpose": "Review a synthetic hit",
+        "evidence_refs": [],
+    }
+
+    first = await adapter.execute(
+        arguments,
+        ToolExecutionContext(
+            investigation_id=investigation.id,
+            envelope=envelope,
+            budget=envelope.budget,
+            idempotency_key="synthetic-download-attempt-1",
+            available_capabilities=frozenset({VT_FILE_DOWNLOAD_CAPABILITY}),
+        ),
+    )
+    second = await adapter.execute(
+        arguments,
+        ToolExecutionContext(
+            investigation_id=investigation.id,
+            envelope=envelope,
+            budget=envelope.budget,
+            idempotency_key="synthetic-download-attempt-2",
+            available_capabilities=frozenset({VT_FILE_DOWNLOAD_CAPABILITY}),
+        ),
+    )
+
+    assert first.status is ToolInvocationStatus.UNAVAILABLE
+    assert first.output["error_code"] == "virustotal_download_route_not_found"
+    assert first.output["reason"] == "provider_download_route_not_found"
+    assert first.output["confirmed_non_execution"] is True
+    assert "synthetic route absent" not in first.message
+    assert second.output["cached"] is True
+    assert port.download_calls == [arguments["sha256"]]
 
 
 @pytest.mark.asyncio

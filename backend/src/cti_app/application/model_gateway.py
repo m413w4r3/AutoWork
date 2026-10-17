@@ -562,6 +562,7 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
         *,
         provenance: str,
         actor_id: str,
+        recovery_reason: str | None = None,
         source_model_run_id: UUID | None = None,
         external_turn_id: str | None = None,
         bridge_response_id: str | None = None,
@@ -623,6 +624,7 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                 output_chars=len(content.decode(errors="replace")),
                 provenance=provenance,
                 actor_id=actor_id,
+                reason=recovery_reason,
                 bridge_response_id=bridge_response_id,
                 source_model_run_id=source_model_run_id,
             )
@@ -656,6 +658,16 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                             output_blob_reference=reference,
                             output_sha256=digest,
                             external_turn_id=external_turn_id,
+                            recovery_audit=(
+                                {
+                                    "provenance": provenance,
+                                    "actor_id": actor_id,
+                                    "reason": recovery_reason,
+                                    "sha256": digest,
+                                }
+                                if recovery_reason is not None
+                                else None
+                            ),
                         )
                         conversation.finish_turn(
                             turn.id,

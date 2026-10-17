@@ -18,6 +18,8 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
+from cti_app.domain.virustotal import VirusTotalCapability
+
 from .base import Base
 from .classification import TLP_VALUES_SQL
 
@@ -455,9 +457,8 @@ class VirusTotalObservationRow(Base):
         CheckConstraint("page_order >= 0", name="ck_vt_observation_page_order"),
         CheckConstraint(
             "capability IN ("
-            "'file_report','file_relationships','intelligence_search',"
-            "'file_download','submissions','behaviour_pcap','retrohunt'"
-            ")",
+            + ",".join(f"'{capability.value}'" for capability in VirusTotalCapability)
+            + ")",
             name="ck_vt_observation_capability",
         ),
         CheckConstraint("raw_sha256 ~ '^[0-9a-f]{64}$'", name="ck_vt_observation_raw_sha256"),

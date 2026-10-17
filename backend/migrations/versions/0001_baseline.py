@@ -405,6 +405,8 @@ def upgrade() -> None:
     # identity: the durable ModelRun owns provider recovery.
     # AnalystDecisionRow's CHECK values and structured details column are
     # created from the production model metadata in this mutable baseline.
+    # The VirusTotal observation capability CHECK is generated from the
+    # VirusTotalCapability enum in the ORM model metadata below.
     # The investigation_run job's aggregate CHECK (ck_jobs_investigation_run_aggregate)
     # is declared by the jobs ORM model and therefore created here.
     Base.metadata.create_all(bind=op.get_bind(), checkfirst=False)

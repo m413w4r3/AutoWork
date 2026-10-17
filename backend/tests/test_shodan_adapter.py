@@ -320,6 +320,62 @@ async def test_forbidden_status_also_marks_capability_unavailable() -> None:
 
 
 @pytest.mark.asyncio
+async def test_forbidden_error_preserves_safe_upstream_message_and_account_details() -> None:
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request.url.path)
+        if request.url.path == "/api-info":
+            return _json_response(request, b'{"plan":"oss","query_credits":0}')
+        return _json_response(
+            request,
+            b'{"error":"Requires membership or higher to access"}',
+            status=403,
+        )
+
+    adapter, client = _adapter(handler)
+    try:
+        with pytest.raises(ShodanCapabilityDisabledError) as caught:
+            await adapter.host("203.0.113.10")
+    finally:
+        await client.aclose()
+
+    assert caught.value.upstream_message == "Requires membership or higher to access"
+    assert "Requires membership or higher to access" in str(caught.value)
+    assert caught.value.plan == "oss"
+    assert caught.value.query_credits == 0
+    assert requests == ["/shodan/host/203.0.113.10", "/api-info"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"error":"line one\\nline two"}',
+        b"raw error " + b"x" * 8_000,
+        (b'{"error":"' + API_KEY.encode() + b'"}'),
+    ],
+)
+async def test_forbidden_upstream_message_is_sanitized_and_bounded(body: bytes) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api-info":
+            return httpx.Response(403, content=b"not-json", request=request)
+        return httpx.Response(403, content=body, request=request)
+
+    adapter, client = _adapter(handler)
+    try:
+        with pytest.raises(ShodanCapabilityDisabledError) as caught:
+            await adapter.host("203.0.113.10")
+    finally:
+        await client.aclose()
+
+    assert caught.value.upstream_message is not None
+    assert len(caught.value.upstream_message) <= 200
+    assert "\\n" not in caught.value.upstream_message
+    assert API_KEY not in caught.value.upstream_message
+
+
+@pytest.mark.asyncio
 async def test_disabled_or_unconfigured_capability_fails_before_http() -> None:
     calls = 0
 

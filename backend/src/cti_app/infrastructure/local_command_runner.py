@@ -66,6 +66,10 @@ class NetworkIsolationStatus(StrEnum):
 class NamespaceFailureReason(StrEnum):
     BWRAP_NOT_INSTALLED = "bwrap_not_installed"
     BWRAP_PROBE_FAILED = "bwrap_probe_failed"
+    BWRAP_PROBE_NETWORK_SOCKET_ALLOWED = "bwrap_probe_network_socket_allowed"
+    BWRAP_PROBE_NETWORK_SOCKET_UNEXPECTED_ERROR = "bwrap_probe_network_socket_unexpected_error"
+    BWRAP_PROBE_FILESYSTEM_NOT_CONFINED = "bwrap_probe_filesystem_not_confined"
+    BWRAP_PROBE_SAMPLE_MOUNT_UNREADABLE = "bwrap_probe_sample_mount_unreadable"
     BWRAP_PREVIOUSLY_FAILED = "bwrap_previously_failed"
     UNSHARE_NOT_INSTALLED = "unshare_not_installed"
     UNSHARE_PROBE_FAILED = "unshare_probe_failed"
@@ -660,10 +664,11 @@ def _detect_network_namespace(timeout_seconds: float) -> _NamespaceDetection:
         launcher = (NetworkIsolationStatus.BWRAP_NET.value, bwrap)
         if _namespace_launcher_failed(launcher):
             reasons.append(_namespace_launcher_failure_reason(launcher))
-        elif _probe_bwrap_namespace(bwrap, environment, timeout_seconds):
-            return _NamespaceDetection(NetworkIsolationStatus.BWRAP_NET, launcher)
         else:
-            reasons.append(NamespaceFailureReason.BWRAP_PROBE_FAILED)
+            probe_failure = _probe_bwrap_namespace(bwrap, environment, timeout_seconds)
+            if probe_failure is None:
+                return _NamespaceDetection(NetworkIsolationStatus.BWRAP_NET, launcher)
+            reasons.append(probe_failure)
     else:
         reasons.append(NamespaceFailureReason.BWRAP_NOT_INSTALLED)
 
@@ -687,8 +692,29 @@ def _detect_network_namespace(timeout_seconds: float) -> _NamespaceDetection:
 
 def _probe_bwrap_namespace(
     executable: str, environment: dict[str, str], timeout_seconds: float
-) -> bool:
-    """Exercise bwrap with the run's mounts and the exact seccomp BPF program."""
+) -> NamespaceFailureReason | None:
+    """Measure network-syscall denial and an unmounted host path with runner mounts."""
+    probe_program = "\n".join(
+        (
+            "import errno, socket",
+            "try:",
+            "    socket.socket()",
+            "except OSError as error:",
+            "    if error.errno not in (errno.EPERM, errno.EACCES): raise SystemExit(11)",
+            "else:",
+            "    raise SystemExit(10)",
+            "try:",
+            "    open('/etc/passwd', 'rb').close()",
+            "except OSError:",
+            "    pass",
+            "else:",
+            "    raise SystemExit(12)",
+            "try:",
+            "    if open('/analysis/sample.bin', 'rb').read(1) != b'p': raise SystemExit(13)",
+            "except OSError:",
+            "    raise SystemExit(13)",
+        )
+    )
     try:
         with tempfile.TemporaryDirectory(prefix="cti-bwrap-probe-") as temporary:
             directory = Path(temporary)
@@ -702,16 +728,31 @@ def _probe_bwrap_namespace(
                 seccomp_fd = filter_file.fileno()
                 command = _bwrap_command(
                     executable,
-                    ["/usr/bin/true", "-b", str(sample_path), str(rule_path)],
+                    [getattr(sys, "_base_executable", None) or sys.executable, "-c", probe_program],
                     sample_path,
                     rule_path,
                     seccomp_fd=seccomp_fd,
                 )
-                return _probe_namespace(
-                    command, environment, timeout_seconds, pass_fds=(seccomp_fd,)
+                result = subprocess.run(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=timeout_seconds,
+                    env=environment,
+                    shell=False,
+                    check=False,
+                    pass_fds=(seccomp_fd,),
                 )
-    except OSError:
-        return False
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return NamespaceFailureReason.BWRAP_PROBE_FAILED
+    return {
+        0: None,
+        10: NamespaceFailureReason.BWRAP_PROBE_NETWORK_SOCKET_ALLOWED,
+        11: NamespaceFailureReason.BWRAP_PROBE_NETWORK_SOCKET_UNEXPECTED_ERROR,
+        12: NamespaceFailureReason.BWRAP_PROBE_FILESYSTEM_NOT_CONFINED,
+        13: NamespaceFailureReason.BWRAP_PROBE_SAMPLE_MOUNT_UNREADABLE,
+    }.get(result.returncode, NamespaceFailureReason.BWRAP_PROBE_FAILED)
 
 
 def _namespace_launcher_failed(launcher: tuple[str, str] | None) -> bool:

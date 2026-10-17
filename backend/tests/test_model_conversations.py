@@ -1,16 +1,31 @@
+import asyncio
+import hashlib
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 from uuid import uuid4
 
 import pytest
+from fastapi import FastAPI
+from httpx import ASGITransport, AsyncClient
 
+from cti_app.api.model_conversations import router as model_conversation_router
 from cti_app.application.blobs import BlobCatalogService
+from cti_app.application.bridge_investigator import (
+    ModelConversationTurnTransport,
+    TurnSubmissionStatus,
+    make_investigation_conversation_id,
+    make_investigation_turn_idempotency_key,
+)
+from cti_app.application.identity import Identity
 from cti_app.application.model_conversations import (
     ConversationNeedsReviewError,
     ConversationPolicyError,
     ConversationSessionCloseError,
+    ModelConversationReconciliationError,
     ModelConversationService,
+    _needs_review_error,
 )
 from cti_app.application.model_gateway import (
     AdapterResult,
@@ -27,6 +42,12 @@ from cti_app.application.model_gateway import (
     sanitize_model_request,
 )
 from cti_app.application.production_reconciliation import _verified_external_turn_id
+from cti_app.domain.investigation import AgendaItem, InvestigationAgenda
+from cti_app.domain.investigation_state import (
+    InvestigationWorkingState,
+    StopReason,
+    investigation_bridge_attempt,
+)
 from cti_app.domain.model_conversations import (
     ConversationMode,
     ConversationPolicy,
@@ -35,6 +56,7 @@ from cti_app.domain.model_conversations import (
     ConversationTransport,
     ConversationTurnStatus,
     ModelConversation,
+    ModelConversationTurn,
 )
 from cti_app.domain.model_runs import (
     ModelBackend,
@@ -263,6 +285,79 @@ class _ScriptedBridgeAdapter:
         raise ModelGatewayError("Scripted bridge adapter does not support background resume")
 
 
+class _FailOnceBeforeSubmissionAdapter(_ScriptedBridgeAdapter):
+    async def invoke(
+        self, request: SafeModelRequest, *, role: ModelRole, output_schema: Any = None
+    ) -> AdapterResult:
+        if not self.calls:
+            self.calls.append(request)
+            raise BridgeTransportError(
+                "bridge_server_error",
+                "Composer payload was not ready before submission.",
+                retryable=True,
+                submission_state="pre_submission",
+            )
+        del role, output_schema
+        self.calls.append(request)
+        return AdapterResult(
+            status=AdapterResultStatus.COMPLETED,
+            provider=self.provider,
+            requested_model=self.requested_model,
+            actual_model_version=self.requested_model,
+            usage=ModelUsage(input_tokens=3, output_tokens=5, total_tokens=8),
+            output_text=self._answer,
+        )
+
+
+@pytest.mark.asyncio
+async def test_model_transport_recovers_persisted_confirmed_pre_submission_failure(
+    tmp_path: Path,
+) -> None:
+    adapter = _FailOnceBeforeSubmissionAdapter(
+        "@@DECISION@@\nGOAL: Finish the synthetic investigation.\n"
+        "SUMMARY: The retry was submitted once.\nNEXT: finish\n@@END@@"
+    )
+    subject_id = uuid4()
+    service, conversation_uow = _build_service(
+        adapter,
+        tmp_path,
+        known_subject_ids={subject_id},
+    )
+    transport = ModelConversationTurnTransport(service)
+    investigation_id = uuid4()
+    context_sha256 = hashlib.sha256(b"persisted pre-submit prompt").hexdigest()
+    args = {
+        "investigation_id": investigation_id,
+        "subject_id": subject_id,
+        "turn_index": 6,
+        "context_sha256": context_sha256,
+        "prompt": "A stable synthetic investigation prompt.",
+        "external_llm_allowed": True,
+    }
+
+    first = await transport.submit(**args)
+    replay = await transport.submit(**args)
+    assert first.status is TurnSubmissionStatus.UNAVAILABLE
+    assert first.submission_state == "pre_submission"
+    assert first.retryable is True
+    assert replay.status is TurnSubmissionStatus.UNAVAILABLE
+    assert replay.submission_state == "pre_submission"
+    assert replay.retryable is True
+    assert len(adapter.calls) == 1
+
+    resumed = await transport.submit_with_attempt(**args, attempt=1)
+
+    assert resumed.status is TurnSubmissionStatus.SUCCEEDED
+    assert resumed.idempotency_key.endswith(":attempt=1")
+    assert resumed.idempotency_key != first.idempotency_key
+    assert len(adapter.calls) == 2
+    stored_turns = tuple(conversation_uow.turns.values())
+    assert {item.status for item in stored_turns} == {
+        ConversationTurnStatus.FAILED,
+        ConversationTurnStatus.SUCCEEDED,
+    }
+
+
 class _RecordingSessionCloser:
     def __init__(self) -> None:
         self.calls: list[Any] = []
@@ -304,6 +399,8 @@ def _build_service(
     tmp_path: Path,
     *,
     conversation_session_closer: Any = None,
+    visible_recovery_transport: Any = None,
+    known_subject_ids: set[Any] | None = None,
 ) -> tuple[ModelConversationService, InMemoryConversationUnitOfWorkFactory]:
     router = ModelRouter(
         openai_research=adapter,
@@ -311,7 +408,7 @@ def _build_service(
         qwen=FakeModelAdapter(),
         fake=FakeModelAdapter(),
     )
-    conversation_uow = InMemoryConversationUnitOfWorkFactory()
+    conversation_uow = InMemoryConversationUnitOfWorkFactory(known_subject_ids=known_subject_ids)
     blob_store = FilesystemBlobStore(tmp_path)
     output_store = BlobModelOutputStore(
         BlobCatalogService(blob_store, conversation_uow)  # type: ignore[arg-type]
@@ -322,6 +419,7 @@ def _build_service(
         gateway,
         blob_store,
         conversation_session_closer=conversation_session_closer,
+        visible_recovery_transport=visible_recovery_transport,
     )
     return service, conversation_uow
 
@@ -337,6 +435,249 @@ async def _fresh_conversation(service: ModelConversationService) -> ModelConvers
         expected_profile=None,
         requested_model=None,
     )
+
+
+@pytest.mark.asyncio
+async def test_cancelled_bridge_submission_is_persisted_as_needs_review(tmp_path: Path) -> None:
+    entered = asyncio.Event()
+
+    class _BlockingAdapter(_ScriptedBridgeAdapter):
+        async def invoke(
+            self, request: SafeModelRequest, *, role: ModelRole, output_schema: Any = None
+        ) -> AdapterResult:
+            del role, output_schema
+            self.calls.append(request)
+            entered.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    adapter = _BlockingAdapter("unused")
+    service, state = _build_service(adapter, tmp_path)
+    conversation = await _fresh_conversation(service)
+    task = asyncio.create_task(
+        service.add_turn(
+            conversation.id,
+            message="A synthetic investigation question",
+            mode=ConversationMode.FRESH,
+            external_llm_allowed=True,
+            idempotency_key="synthetic-cancelled-turn",
+            correlation_id="synthetic-cancelled-correlation",
+        )
+    )
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    turn = next(iter(state.turns.values()))
+    run = state.model_runs[turn.model_run_id]
+    persisted_conversation = await service.get(conversation.id)
+    assert turn.status is ConversationTurnStatus.NEEDS_REVIEW
+    assert turn.error_code == "operator_interrupted"
+    assert run.status is ModelRunStatus.NEEDS_REVIEW
+    assert persisted_conversation.status is ConversationStatus.NEEDS_REVIEW
+
+
+@pytest.mark.asyncio
+async def test_orphaned_running_turn_is_reviewed_before_distinct_retry(tmp_path: Path) -> None:
+    entered = asyncio.Event()
+
+    class _FirstCallInterruptedAdapter(_ScriptedBridgeAdapter):
+        async def invoke(
+            self, request: SafeModelRequest, *, role: ModelRole, output_schema: Any = None
+        ) -> AdapterResult:
+            del role, output_schema
+            self.calls.append(request)
+            if len(self.calls) == 1:
+                entered.set()
+                await asyncio.Event().wait()
+            context = request.conversation
+            return AdapterResult(
+                status=AdapterResultStatus.COMPLETED,
+                provider=self.provider,
+                requested_model=self.requested_model,
+                actual_model_version=self.requested_model,
+                usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+                output_text="synthetic retry response",
+                conversation=(
+                    ConversationResult(
+                        id=str(context.id),
+                        mode=context.mode,
+                        external_locator=None,
+                        turn_id="synthetic-response",
+                        verified=True,
+                    )
+                    if context is not None
+                    else None
+                ),
+            )
+
+    investigation_id = uuid4()
+    subject_id = uuid4()
+    context_sha256 = "e" * 64
+    adapter = _FirstCallInterruptedAdapter("unused")
+    service, state = _build_service(adapter, tmp_path, known_subject_ids={subject_id})
+    conversation_id = make_investigation_conversation_id(investigation_id)
+    conversation = await service.get_or_create(
+        conversation_id,
+        provider=ModelProvider.OPENAI,
+        transport=ConversationTransport.CHATGPT_BRIDGE,
+        purpose=ConversationPurpose.PIVOT_RESEARCH,
+        title="Synthetic investigation",
+        edition_id=None,
+        subject_id=subject_id,
+        expected_profile=None,
+        requested_model=None,
+    )
+    state.investigation_states[investigation_id] = InvestigationWorkingState(
+        investigation_id=investigation_id,
+        agenda=InvestigationAgenda(
+            (
+                AgendaItem("Synthetic question", 0.8, 1),
+                AgendaItem("Second synthetic question", 0.7, 2),
+            )
+        ),
+        pending_context_snapshot_id=uuid4(),
+        pending_context_sha256=context_sha256,
+        stop_reason=StopReason.USER_INTERRUPT,
+    )
+    key = make_investigation_turn_idempotency_key(
+        investigation_id=investigation_id,
+        turn_index=0,
+        context_sha256=context_sha256,
+    )
+    task = asyncio.create_task(
+        service.add_turn(
+            conversation.id,
+            message="Canonical synthetic investigation prompt",
+            mode=ConversationMode.FRESH,
+            external_llm_allowed=True,
+            stateless_external=True,
+            idempotency_key=key,
+            correlation_id=f"investigation:{investigation_id}:turn:0:{key[:16]}",
+        )
+    )
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # Model process death skips the cancellation finalizer. Recreate the
+    # durable running rows before the recovered job re-enters this key.
+    orphaned_turn = next(iter(state.turns.values()))
+    orphaned_turn.status = ConversationTurnStatus.RUNNING
+    orphaned_turn.error_code = None
+    orphaned_turn.error_message = None
+    orphaned_turn.error_details = None
+    orphaned_turn.finished_at = None
+    orphaned_run = state.model_runs[orphaned_turn.model_run_id]
+    orphaned_run.status = ModelRunStatus.RUNNING
+    orphaned_run.error_code = None
+    orphaned_run.error_message = None
+    orphaned_run.error_details = None
+    orphaned_run.finished_at = None
+    state.conversations[conversation.id].status = ConversationStatus.BUSY
+    stale_replay = await ModelConversationTurnTransport(service).submit(
+        investigation_id=investigation_id,
+        subject_id=subject_id,
+        turn_index=0,
+        context_sha256=context_sha256,
+        prompt="Canonical synthetic investigation prompt",
+        external_llm_allowed=True,
+    )
+    assert stale_replay.status.value == "needs_review"
+    sealed_turn = state.turns[orphaned_turn.id]
+    assert sealed_turn.status is ConversationTurnStatus.NEEDS_REVIEW
+    assert sealed_turn.error_code == "orphaned_running_turn"
+    assert len(adapter.calls) == 1
+
+    recovered = await service.reconcile_orphaned_investigation_turn(
+        investigation_id=investigation_id,
+        turn_index=0,
+        context_sha256=context_sha256,
+        attempt=0,
+        owner_job_terminal=True,
+    )
+    retry_attempt = investigation_bridge_attempt(
+        state.investigation_states[investigation_id].recent_actions, 0
+    )
+    calls_before_retry = len(adapter.calls)
+    retried = await ModelConversationTurnTransport(service).submit(
+        investigation_id=investigation_id,
+        subject_id=subject_id,
+        turn_index=0,
+        context_sha256=context_sha256,
+        prompt="Canonical synthetic investigation prompt",
+        external_llm_allowed=True,
+        attempt=retry_attempt,
+    )
+    turns = await service.turns(conversation.id, context_subject_id=subject_id)
+
+    assert recovered == "orphaned_running_turn"
+    assert retry_attempt == 1
+    assert turns[0].turn.status is ConversationTurnStatus.NEEDS_REVIEW
+    assert turns[0].turn.error_code == "orphaned_running_turn"
+    assert turns[1].turn.idempotency_key != key
+    assert retried.status.value == "succeeded"
+    assert len(adapter.calls) - calls_before_retry == 1
+    assert len(adapter.calls) == 2
+    explicitly_abandoned = await service.abandon_investigation_turn(
+        conversation.id,
+        turns[0].turn.id,
+        reason="Operator reviewed the orphaned synthetic attempt",
+        actor_id="operator:synthetic",
+        context_subject_id=subject_id,
+    )
+    assert explicitly_abandoned.error_code == "operator_abandoned"
+    assert (
+        investigation_bridge_attempt(state.investigation_states[investigation_id].recent_actions, 0)
+        == 2
+    )
+
+
+@pytest.mark.asyncio
+async def test_model_unavailable_without_running_turn_is_not_orphaned(tmp_path: Path) -> None:
+    investigation_id = uuid4()
+    subject_id = uuid4()
+    adapter = _ScriptedBridgeAdapter("unused")
+    service, state = _build_service(adapter, tmp_path, known_subject_ids={subject_id})
+    conversation_id = make_investigation_conversation_id(investigation_id)
+    conversation = await service.get_or_create(
+        conversation_id,
+        provider=ModelProvider.OPENAI,
+        transport=ConversationTransport.CHATGPT_BRIDGE,
+        purpose=ConversationPurpose.PIVOT_RESEARCH,
+        title="Synthetic unavailable investigation",
+        edition_id=None,
+        subject_id=subject_id,
+        expected_profile=None,
+        requested_model=None,
+    )
+    pending_sha256 = "f" * 64
+    state.investigation_states[investigation_id] = InvestigationWorkingState(
+        investigation_id=investigation_id,
+        agenda=InvestigationAgenda(
+            (
+                AgendaItem("Synthetic question", 0.8, 1),
+                AgendaItem("Second synthetic question", 0.7, 2),
+            )
+        ),
+        pending_context_snapshot_id=uuid4(),
+        pending_context_sha256=pending_sha256,
+        stop_reason=StopReason.MODEL_UNAVAILABLE,
+    )
+
+    disposition = await service.reconcile_orphaned_investigation_turn(
+        investigation_id=investigation_id,
+        turn_index=0,
+        context_sha256=pending_sha256,
+        attempt=0,
+        owner_job_terminal=True,
+    )
+
+    assert disposition == "none"
+    assert state.conversations[conversation.id].status is ConversationStatus.PENDING
+    assert state.investigation_states[investigation_id].recent_actions == ()
 
 
 async def test_continue_uses_parent_external_turn_id_not_external_locator(
@@ -373,6 +714,200 @@ async def test_continue_uses_parent_external_turn_id_not_external_locator(
     assert adapter.calls[1].conversation is not None
     assert adapter.calls[1].conversation.expected_turn_id == "external-turn-1"
     assert not hasattr(adapter.calls[1].conversation, "external_locator")
+
+
+class _StatelessInvestigationAdapter(_ScriptedBridgeAdapter):
+    def __init__(self, answer: str) -> None:
+        super().__init__(answer)
+
+    async def invoke(
+        self, request: SafeModelRequest, *, role: ModelRole, output_schema: Any = None
+    ) -> AdapterResult:
+        del role, output_schema
+        self.calls.append(request)
+        assert request.conversation is None
+        return AdapterResult(
+            status=AdapterResultStatus.COMPLETED,
+            provider=self.provider,
+            requested_model=self.requested_model,
+            actual_model_version=self.requested_model,
+            usage=ModelUsage(input_tokens=3, output_tokens=5, total_tokens=8),
+            output_text=self._answer,
+            conversation=None,
+        )
+
+
+async def test_investigation_turns_keep_local_chain_without_external_identity(
+    tmp_path: Path,
+) -> None:
+    investigation_id = uuid4()
+    subject_id = uuid4()
+    adapter = _StatelessInvestigationAdapter("A valid final answer")
+    service, state = _build_service(adapter, tmp_path)
+    state.known_subject_ids.add(subject_id)
+    transport = ModelConversationTurnTransport(service)
+
+    first = await transport.submit(
+        investigation_id=investigation_id,
+        subject_id=subject_id,
+        turn_index=0,
+        context_sha256="a" * 64,
+        prompt="Full context for turn zero",
+        external_llm_allowed=True,
+    )
+    second = await transport.submit(
+        investigation_id=investigation_id,
+        subject_id=subject_id,
+        turn_index=1,
+        context_sha256="b" * 64,
+        prompt="Full context for turn one",
+        external_llm_allowed=True,
+    )
+
+    local_conversation_id = first.conversation_id
+    assert first.status.value == "succeeded"
+    assert second.status.value == "succeeded"
+    assert local_conversation_id is not None
+    turns = await service.turns(local_conversation_id)
+    assert [item.turn.sequence for item in turns] == [1, 2]
+    assert turns[0].turn.parent_turn_id is None
+    assert turns[1].turn.parent_turn_id == turns[0].turn.id
+    assert [item.turn.external_turn_id for item in turns] == [None, None]
+    assert [item.turn.idempotency_key for item in turns] == [
+        first.idempotency_key,
+        second.idempotency_key,
+    ]
+    assert [item.turn.correlation_id for item in turns] == [
+        f"investigation:{investigation_id}:turn:0:{first.idempotency_key[:16]}",
+        f"investigation:{investigation_id}:turn:1:{second.idempotency_key[:16]}",
+    ]
+    assert all(call.conversation is None for call in adapter.calls)
+    assert state.turns[turns[0].turn.id].external_turn_id is None
+    conversation = await service.get(local_conversation_id)
+    assert conversation.head_turn_id == turns[1].turn.id
+    assert conversation.turn_count == 2
+
+
+@pytest.mark.asyncio
+async def test_resume_reuses_captured_bridge_output_without_provider_replay(tmp_path: Path) -> None:
+    investigation_id = uuid4()
+    subject_id = uuid4()
+    context_sha256 = "f" * 64
+    adapter = _StatelessInvestigationAdapter("Synthetic captured response")
+    service, state = _build_service(adapter, tmp_path, known_subject_ids={subject_id})
+    state.investigation_states[investigation_id] = InvestigationWorkingState(
+        investigation_id=investigation_id,
+        agenda=InvestigationAgenda(
+            (
+                AgendaItem("Synthetic question", 0.8, 1),
+                AgendaItem("Second synthetic question", 0.7, 2),
+            )
+        ),
+        pending_context_snapshot_id=uuid4(),
+        pending_context_sha256=context_sha256,
+        stop_reason=StopReason.USER_INTERRUPT,
+    )
+    transport = ModelConversationTurnTransport(service)
+    first = await transport.submit(
+        investigation_id=investigation_id,
+        subject_id=subject_id,
+        turn_index=0,
+        context_sha256=context_sha256,
+        prompt="Canonical synthetic investigation prompt",
+        external_llm_allowed=True,
+    )
+
+    disposition = await service.reconcile_orphaned_investigation_turn(
+        investigation_id=investigation_id,
+        turn_index=0,
+        context_sha256=context_sha256,
+        attempt=0,
+        owner_job_terminal=True,
+    )
+    replay = await transport.submit(
+        investigation_id=investigation_id,
+        subject_id=subject_id,
+        turn_index=0,
+        context_sha256=context_sha256,
+        prompt="Canonical synthetic investigation prompt",
+        external_llm_allowed=True,
+    )
+
+    assert first.status.value == "succeeded"
+    assert disposition == "captured_output"
+    assert replay.output_text == "Synthetic captured response"
+    assert len(adapter.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_orphan_with_provider_response_identity_stays_in_review(tmp_path: Path) -> None:
+    class _KnownResponseAdapter(_ScriptedBridgeAdapter):
+        async def invoke(
+            self, request: SafeModelRequest, *, role: ModelRole, output_schema: Any = None
+        ) -> AdapterResult:
+            del role, output_schema
+            self.calls.append(request)
+            return AdapterResult(
+                status=AdapterResultStatus.NEEDS_REVIEW,
+                provider=self.provider,
+                requested_model=self.requested_model,
+                actual_model_version=self.requested_model,
+                response_id="synthetic-response-identity",
+                usage=ModelUsage(input_tokens=1, output_tokens=0, total_tokens=1),
+                metadata={"reason": "synthetic_ambiguous_response", "output_chars": 0},
+            )
+
+    investigation_id = uuid4()
+    subject_id = uuid4()
+    context_sha256 = "9" * 64
+    adapter = _KnownResponseAdapter("unused")
+    service, state = _build_service(adapter, tmp_path, known_subject_ids={subject_id})
+    conversation_id = make_investigation_conversation_id(investigation_id)
+    await service.get_or_create(
+        conversation_id,
+        provider=ModelProvider.OPENAI,
+        transport=ConversationTransport.CHATGPT_BRIDGE,
+        purpose=ConversationPurpose.PIVOT_RESEARCH,
+        title="Synthetic investigation",
+        edition_id=None,
+        subject_id=subject_id,
+        expected_profile=None,
+        requested_model=None,
+    )
+    state.investigation_states[investigation_id] = InvestigationWorkingState(
+        investigation_id=investigation_id,
+        agenda=InvestigationAgenda(
+            (
+                AgendaItem("Synthetic question", 0.8, 1),
+                AgendaItem("Second synthetic question", 0.7, 2),
+            )
+        ),
+        pending_context_snapshot_id=uuid4(),
+        pending_context_sha256=context_sha256,
+        stop_reason=StopReason.USER_INTERRUPT,
+    )
+    transport = ModelConversationTurnTransport(service)
+    first = await transport.submit(
+        investigation_id=investigation_id,
+        subject_id=subject_id,
+        turn_index=0,
+        context_sha256=context_sha256,
+        prompt="Canonical synthetic investigation prompt",
+        external_llm_allowed=True,
+    )
+
+    disposition = await service.reconcile_orphaned_investigation_turn(
+        investigation_id=investigation_id,
+        turn_index=0,
+        context_sha256=context_sha256,
+        attempt=0,
+        owner_job_terminal=True,
+    )
+
+    assert first.status.value == "needs_review"
+    assert disposition == "needs_review"
+    assert state.investigation_states[investigation_id].recent_actions == ()
+    assert len(adapter.calls) == 1
 
 
 async def test_keep_leaves_conversation_ready_and_never_closes_session(
@@ -854,6 +1389,28 @@ async def test_stateless_recovery_creates_no_conversational_identity(
     assert state.model_runs[run_id].status.value == "succeeded"
 
 
+def test_external_turn_identity_review_message_acknowledges_visible_answer() -> None:
+    run = SimpleNamespace(
+        error_details={
+            "reason": "external_turn_identity_unavailable",
+            "output_chars": 1_610,
+            "recovery_preview_available": False,
+        },
+        error_code="external_turn_identity_unavailable",
+        error_message="ChatGPT s'est arrêté sans produire de réponse finale",
+        id=uuid4(),
+        response_id="bridge-run-1",
+        submission_state=SimpleNamespace(value="result_obtained"),
+    )
+
+    error = _needs_review_error(SimpleNamespace(run=run, metadata={}))
+
+    assert error.reason == "external_turn_identity_unavailable"
+    assert "réponse finale visible" in str(error).lower()
+    assert "identité de tour externe non vérifiable" in str(error).lower()
+    assert "s'est arrêté sans produire" not in str(error)
+
+
 class _StalledVisibleAnswerAdapter(_ScriptedBridgeAdapter):
     """Reproduit l'incident : ChatGPT a répondu à l'écran, le bridge rend
     `needs_review` avec `active_signal_stalled` et un candidat récupérable."""
@@ -970,6 +1527,143 @@ async def test_explicit_unavailable_recovery_is_never_upgraded_by_output_chars(
     assert len(adapter.calls) == 1
 
 
+class _VisibleTurnRecovery:
+    def __init__(self, payload: dict[str, Any] | None) -> None:
+        self.payload = payload
+        self.calls: list[str] = []
+
+    async def preview_visible_recovery(self, bridge_run_id: str) -> dict[str, Any]:
+        self.calls.append(bridge_run_id)
+        if self.payload is None:
+            raise RuntimeError("visible recovery unavailable")
+        return {"bridge_run_id": bridge_run_id, **self.payload}
+
+
+async def _create_needs_review_turn(
+    service: ModelConversationService,
+    conversation: ModelConversation,
+    *,
+    key: str = "visible-turn-key",
+) -> ModelConversationTurn:
+    with pytest.raises(ConversationNeedsReviewError):
+        await service.add_turn(
+            conversation.id,
+            message="Question récupérable",
+            mode=ConversationMode.FRESH,
+            external_llm_allowed=True,
+            idempotency_key=key,
+            correlation_id="corr-visible-turn",
+            context_subject_id=conversation.subject_id,
+        )
+    return cast(ModelConversationTurn, next(iter(service._uow_factory.turns.values())))  # type: ignore[attr-defined]
+
+
+async def test_visible_turn_preview_and_adoption_preserve_missing_external_identity(
+    tmp_path: Path,
+) -> None:
+    text = "Réponse Bridge déjà visible"
+    recovery = _VisibleTurnRecovery({"text": text, "turn_id": "placeholder-request-0"})
+    adapter = _StalledVisibleAnswerAdapter(text)
+    service, state = _build_service(adapter, tmp_path, visible_recovery_transport=recovery)
+    conversation = await _fresh_conversation(service)
+    turn = await _create_needs_review_turn(service, conversation)
+
+    preview = await service.preview_visible_recovery(
+        conversation.id, turn.id, context_subject_id=None
+    )
+
+    assert preview == {
+        "turn_id": turn.id,
+        "sha256": hashlib.sha256(text.encode()).hexdigest(),
+        "characters": len(text),
+        "text": text,
+    }
+    adopted = await service.adopt_visible_recovery(
+        conversation.id,
+        turn.id,
+        expected_sha256=preview["sha256"],
+        actor_id="operator:test",
+        context_subject_id=None,
+    )
+    run = state.model_runs[turn.model_run_id]
+
+    assert adopted.status is ConversationTurnStatus.SUCCEEDED
+    assert adopted.external_turn_id is None
+    assert adopted.output_sha256 == preview["sha256"]
+    assert run.status is ModelRunStatus.SUCCEEDED
+    assert run.submission_state.value == "result_obtained"
+    assert run.error_details["recovery"] == {
+        "provenance": "visible_recovery",
+        "actor_id": "operator:test",
+        "reason": "operator_confirmed_visible_sha256",
+        "sha256": preview["sha256"],
+        "source_model_run_id": None,
+        "adopted_at": run.error_details["recovery"]["adopted_at"],
+    }
+    assert len(adapter.calls) == 1
+
+
+async def test_visible_turn_adoption_rejects_wrong_hash_and_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    text = "Réponse exacte"
+    recovery = _VisibleTurnRecovery({"text": text})
+    adapter = _StalledVisibleAnswerAdapter(text)
+    service, state = _build_service(adapter, tmp_path, visible_recovery_transport=recovery)
+    conversation = await _fresh_conversation(service)
+    turn = await _create_needs_review_turn(service, conversation, key="visible-idempotent-key")
+
+    with pytest.raises(ModelConversationReconciliationError) as mismatch:
+        await service.adopt_visible_recovery(
+            conversation.id,
+            turn.id,
+            expected_sha256="0" * 64,
+            actor_id="operator:test",
+            context_subject_id=None,
+        )
+    assert mismatch.value.code == "conversation_reconciliation_hash_mismatch"
+    assert state.turns[turn.id].status is ConversationTurnStatus.NEEDS_REVIEW
+
+    digest = hashlib.sha256(text.encode()).hexdigest()
+    first = await service.adopt_visible_recovery(
+        conversation.id,
+        turn.id,
+        expected_sha256=digest,
+        actor_id="operator:test",
+        context_subject_id=None,
+    )
+    second = await service.adopt_visible_recovery(
+        conversation.id,
+        turn.id,
+        expected_sha256=digest,
+        actor_id="operator:replay",
+        context_subject_id=None,
+    )
+
+    assert first.id == second.id == turn.id
+    assert state.turns[turn.id].status is ConversationTurnStatus.SUCCEEDED
+    assert len(state.model_runs[turn.model_run_id].output_references) == 1
+    assert len(recovery.calls) == 2  # mismatch and first adoption; replay is local only
+
+
+async def test_visible_turn_preview_refuses_unavailable_recovery_without_mutation(
+    tmp_path: Path,
+) -> None:
+    recovery = _VisibleTurnRecovery(None)
+    adapter = _StalledVisibleAnswerAdapter("Visible text, no durable preview")
+    service, state = _build_service(adapter, tmp_path, visible_recovery_transport=recovery)
+    conversation = await _fresh_conversation(service)
+    turn = await _create_needs_review_turn(service, conversation, key="preview-unavailable-key")
+
+    with pytest.raises(ModelConversationReconciliationError) as unavailable:
+        await service.preview_visible_recovery(conversation.id, turn.id, context_subject_id=None)
+
+    assert unavailable.value.code == "conversation_reconciliation_visible_unavailable"
+    assert state.turns[turn.id].status is ConversationTurnStatus.NEEDS_REVIEW
+    assert state.model_runs[turn.model_run_id].status is ModelRunStatus.NEEDS_REVIEW
+    assert len(adapter.calls) == 1
+
+
 async def test_adopting_the_stalled_candidate_never_sends_a_second_prompt(
     tmp_path: Path,
 ) -> None:
@@ -1018,3 +1712,180 @@ async def test_placeholder_turn_id_is_rejected_as_a_durable_identity() -> None:
 
     assert _verified_external_turn_id(placeholder) is None
     assert _verified_external_turn_id("assistant-42") == "assistant-42"
+
+
+async def test_abandoning_investigation_turn_records_next_attempt_without_reusing_key(
+    tmp_path: Path,
+) -> None:
+    class _StatelessAmbiguousAdapter(_ScriptedBridgeAdapter):
+        async def invoke(
+            self, request: SafeModelRequest, *, role: ModelRole, output_schema: Any = None
+        ) -> AdapterResult:
+            self.calls.append(request)
+            del role, output_schema
+            assert request.conversation is None
+            return AdapterResult(
+                status=AdapterResultStatus.NEEDS_REVIEW,
+                provider=self.provider,
+                requested_model=self.requested_model,
+                actual_model_version=self.requested_model,
+                response_id="resp_retry_attempt",
+                usage=ModelUsage(input_tokens=3, output_tokens=0, total_tokens=3),
+                metadata={
+                    "reason": "external_turn_identity_unavailable",
+                    "output_chars": 24,
+                    "recovery_preview_available": True,
+                    "submission_state": "post_submission",
+                },
+            )
+
+    investigation_id = uuid4()
+    subject_id = uuid4()
+    context_sha256 = "c" * 64
+    adapter = _StatelessAmbiguousAdapter("unused")
+    service, state = _build_service(adapter, tmp_path, known_subject_ids={subject_id})
+    conversation_id = make_investigation_conversation_id(investigation_id)
+    conversation = await service.get_or_create(
+        conversation_id,
+        provider=ModelProvider.OPENAI,
+        transport=ConversationTransport.CHATGPT_BRIDGE,
+        purpose=ConversationPurpose.PIVOT_RESEARCH,
+        title=f"Investigation {investigation_id}",
+        edition_id=None,
+        subject_id=subject_id,
+        expected_profile=None,
+        requested_model=None,
+    )
+    agenda = InvestigationAgenda(
+        (
+            AgendaItem("First question", 0.9, 1),
+            AgendaItem("Second question", 0.8, 2),
+        )
+    )
+    state.investigation_states[investigation_id] = InvestigationWorkingState(
+        investigation_id=investigation_id,
+        agenda=agenda,
+        pending_context_snapshot_id=uuid4(),
+        pending_context_sha256=context_sha256,
+        stop_reason=StopReason.MODEL_UNAVAILABLE,
+    )
+    abandoned_key = make_investigation_turn_idempotency_key(
+        investigation_id=investigation_id,
+        turn_index=0,
+        context_sha256=context_sha256,
+    )
+    with pytest.raises(ConversationNeedsReviewError):
+        await service.add_turn(
+            conversation.id,
+            message="Canonical investigation prompt",
+            mode=ConversationMode.FRESH,
+            external_llm_allowed=True,
+            idempotency_key=abandoned_key,
+            correlation_id=f"investigation:{investigation_id}:turn:0:{abandoned_key[:16]}",
+            context_subject_id=subject_id,
+            stateless_external=True,
+        )
+    turn = next(iter(state.turns.values()))
+    turn.error_code = "operator_interrupted"
+    state.model_runs[turn.model_run_id].error_code = "operator_interrupted"
+
+    class _IdentityProvider:
+        async def current(self) -> Identity:
+            return Identity("operator:synthetic")
+
+    app = FastAPI()
+    app.include_router(model_conversation_router)
+    app.state.model_conversation_service = service
+    app.state.identity_provider = _IdentityProvider()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            f"/api/model-conversations/{conversation.id}/turns/{turn.id}"
+            f"/reconciliation/abandon?subject_id={subject_id}",
+            json={"reason": "Operator confirmed no execution occurred"},
+        )
+    assert response.status_code == 200, response.text
+    abandoned = state.turns[turn.id]
+    persisted_state = state.investigation_states[investigation_id]
+    next_attempt = investigation_bridge_attempt(persisted_state.recent_actions, 0)
+    retry_key = make_investigation_turn_idempotency_key(
+        investigation_id=investigation_id,
+        turn_index=0,
+        context_sha256=context_sha256,
+        attempt=next_attempt,
+    )
+    retry = await ModelConversationTurnTransport(service).submit(
+        investigation_id=investigation_id,
+        subject_id=subject_id,
+        turn_index=0,
+        context_sha256=context_sha256,
+        prompt="Canonical investigation prompt",
+        external_llm_allowed=True,
+        attempt=next_attempt,
+    )
+    replay = await service.abandon_investigation_turn(
+        conversation.id,
+        turn.id,
+        reason="Operator confirmed no execution occurred",
+        actor_id="operator:synthetic",
+        context_subject_id=subject_id,
+    )
+
+    assert abandoned.status is ConversationTurnStatus.FAILED
+    assert abandoned.error_code == "operator_abandoned"
+    assert state.model_runs[turn.model_run_id].status is ModelRunStatus.FAILED
+    assert state.model_runs[turn.model_run_id].submission_state.value == "external_state_unknown"
+    assert next_attempt == 1
+    assert retry_key != abandoned_key
+    assert retry_key.endswith(":attempt=1")
+    assert retry.status.value == "needs_review", retry
+    assert retry.idempotency_key == retry_key
+    persisted_turns = await service.turns(conversation.id, context_subject_id=subject_id)
+    assert len(persisted_turns) == 2
+    assert persisted_turns[1].turn.sequence == 2
+    assert persisted_turns[1].turn.parent_turn_id == abandoned.id
+    assert len(adapter.calls) == 2
+    assert replay.id == abandoned.id
+
+
+async def test_visible_turn_reconciliation_routes_use_local_preview_and_actor(
+    tmp_path: Path,
+) -> None:
+    text = "Route-level visible response"
+    recovery = _VisibleTurnRecovery({"text": text})
+    adapter = _StalledVisibleAnswerAdapter(text)
+    service, state = _build_service(adapter, tmp_path, visible_recovery_transport=recovery)
+    conversation = await _fresh_conversation(service)
+    turn = await _create_needs_review_turn(service, conversation, key="api-visible-turn-key")
+    subject_id = uuid4()
+
+    class _IdentityProvider:
+        async def current(self) -> Identity:
+            return Identity("operator:route-test")
+
+    app = FastAPI()
+    app.include_router(model_conversation_router)
+    app.state.model_conversation_service = service
+    app.state.identity_provider = _IdentityProvider()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        preview_response = await client.post(
+            f"/api/model-conversations/{conversation.id}/turns/{turn.id}"
+            f"/reconciliation/visible/preview?subject_id={subject_id}"
+        )
+        assert preview_response.status_code == 200
+        preview = preview_response.json()
+        adopt_response = await client.post(
+            f"/api/model-conversations/{conversation.id}/turns/{turn.id}"
+            f"/reconciliation/visible/adopt?subject_id={subject_id}",
+            json={"expected_sha256": preview["sha256"]},
+        )
+
+    assert adopt_response.status_code == 200
+    adopted = adopt_response.json()
+    assert adopted["status"] == "succeeded"
+    assert adopted["external_turn_id"] is None
+    assert adopted["output_text"] == text
+    assert adopted["recovery"]["actor_id"] == "operator:route-test"
+    assert adopted["recovery"]["provenance"] == "visible_recovery"
+    assert adopted["recovery"]["sha256"] == preview["sha256"]
+    assert state.turns[turn.id].status is ConversationTurnStatus.SUCCEEDED
+    assert len(adapter.calls) == 1

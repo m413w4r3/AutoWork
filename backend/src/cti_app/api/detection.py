@@ -18,6 +18,7 @@ from cti_app.application.detection_review_service import (
 from cti_app.application.identity import IdentityProvider
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.domain.editorial import AnalystDecision
+from cti_app.domain.rule_workbench import RuleValidationStatus
 
 router = APIRouter(prefix="/api", tags=["detection-review"])
 
@@ -97,8 +98,18 @@ def _report_view(report: DetectionTestReport) -> dict[str, Any]:
         "corpus_sha256s_by_role": report.payload.get("corpus_sha256s_by_role", {}),
         "engine_version": report.payload.get("engine_version"),
         "execution_status": report.payload.get("execution_status"),
+        "validation_status": report.payload.get("validation_status", "untested"),
         "selection_bias": report.payload.get("selection_bias"),
         "coverage_statement": report.payload.get("coverage_statement"),
+        "provenance_counts_by_role": report.payload.get("provenance_counts_by_role", {}),
+        "false_positive_count": report.payload.get(
+            "false_positive_count", len(report.known_false_positives)
+        ),
+        "false_positive_sha256s": report.payload.get(
+            "false_positive_sha256s", list(report.known_false_positives)
+        ),
+        "false_negative_count": report.payload.get("false_negative_count", 0),
+        "false_negative_sha256s": report.payload.get("false_negative_sha256s", []),
         "roles": report.payload.get("roles", []),
         "limitations": report.payload.get("limitations", []),
         "known_false_positives": list(report.known_false_positives),
@@ -133,6 +144,19 @@ def _decision_view(decision: AnalystDecision | None) -> dict[str, Any] | None:
 
 def _version_view(item: DetectionReviewVersion) -> dict[str, Any]:
     version = item.version
+    matching_reports = tuple(
+        report
+        for report in item.test_reports
+        if report.payload.get("source_sha256") == version.source_sha256
+    )
+    try:
+        validation_status = RuleValidationStatus(
+            matching_reports[-1].payload.get("validation_status", "untested")
+            if matching_reports
+            else "untested"
+        ).value
+    except (TypeError, ValueError):
+        validation_status = RuleValidationStatus.UNTESTED.value
     return {
         "candidate_id": str(version.candidate_id),
         "version_id": str(version.id),
@@ -144,6 +168,7 @@ def _version_view(item: DetectionReviewVersion) -> dict[str, Any]:
         "source": version.source,
         "source_sha256": version.source_sha256,
         "status": item.status.value,
+        "validation_status": validation_status,
         "created_at": version.created_at.isoformat(),
         "test_reports": [_report_view(report) for report in item.test_reports],
         "latest_decision": _decision_view(item.latest_decision),

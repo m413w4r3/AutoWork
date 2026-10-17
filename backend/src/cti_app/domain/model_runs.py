@@ -254,6 +254,31 @@ class ModelRun:
         self.finished_at = timestamp
         self.updated_at = timestamp
 
+    def mark_orphaned_running_turn(self, *, now: datetime | None = None) -> None:
+        """Move a Bridge run paired with an ownerless turn to explicit review."""
+        if self.status not in {
+            ModelRunStatus.RUNNING,
+            ModelRunStatus.WAITING_BACKGROUND,
+            ModelRunStatus.NEEDS_REVIEW,
+            ModelRunStatus.FAILED,
+        }:
+            raise ValueError("ModelRun is not eligible for orphaned-turn review")
+        timestamp = now or datetime.now(UTC)
+        if self.submission_state in {
+            ModelSubmissionState.SUBMISSION_IN_PROGRESS,
+            ModelSubmissionState.EXTERNAL_STATE_UNKNOWN,
+        }:
+            self.submission_state = ModelSubmissionState.EXTERNAL_STATE_UNKNOWN
+        self.status = ModelRunStatus.NEEDS_REVIEW
+        self.error_code = "orphaned_running_turn"
+        self.error_message = "Le job propriétaire s'est terminé sans sortie Bridge persistée."
+        self.error_details = {
+            **(self.error_details or {}),
+            "recovery": "distinct_attempt_after_terminal_owner",
+        }
+        self.finished_at = timestamp
+        self.updated_at = timestamp
+
     def adopt_recovery(
         self,
         *,
@@ -262,6 +287,7 @@ class ModelRun:
         output_chars: int,
         provenance: str,
         actor_id: str,
+        reason: str | None = None,
         bridge_response_id: str | None = None,
         source_model_run_id: UUID | None = None,
         now: datetime | None = None,
@@ -278,12 +304,16 @@ class ModelRun:
             raise ValueError("Recovered response identity does not match the ModelRun")
         timestamp = now or datetime.now(UTC)
         previous = dict(self.error_details or {})
-        previous["recovery"] = {
+        recovery = {
             "provenance": provenance,
             "actor_id": actor_id,
             "adopted_at": timestamp.isoformat(),
             "source_model_run_id": str(source_model_run_id) if source_model_run_id else None,
         }
+        if reason is not None:
+            recovery["reason"] = reason[:512]
+            recovery["sha256"] = output_sha256
+        previous["recovery"] = recovery
         self.status = ModelRunStatus.SUCCEEDED
         self.submission_state = ModelSubmissionState.RESULT_OBTAINED
         self.response_id = bridge_response_id or self.response_id
@@ -296,6 +326,31 @@ class ModelRun:
         self.error_details = previous
         self.duration_ms = max(0, int((timestamp - self.started_at).total_seconds() * 1000))
         self.usage = self.usage or ModelUsage(estimated=True)
+        self.finished_at = timestamp
+        self.updated_at = timestamp
+
+    def abandon_uncertain_submission(self, *, actor_id: str, reason: str) -> None:
+        """Close this local attempt after explicit operator abandonment.
+
+        The external outcome remains unknown; the operator's disposition is
+        recorded separately and callers must use a new idempotency identity.
+        """
+        if self.status is not ModelRunStatus.NEEDS_REVIEW:
+            raise ValueError("Only a ModelRun needing review can be abandoned")
+        timestamp = datetime.now(UTC)
+        self.status = ModelRunStatus.FAILED
+        self.error_code = "operator_abandoned"
+        self.error_message = "L'opérateur a abandonné cette tentative ambiguë."
+        self.error_details = {
+            **(self.error_details or {}),
+            "operator_abandonment": {
+                "actor_id": actor_id,
+                "reason": " ".join(reason.split())[:512],
+                "disposition": "operator_asserted_not_executed",
+                "external_outcome": self.submission_state.value,
+                "abandoned_at": timestamp.isoformat(),
+            },
+        }
         self.finished_at = timestamp
         self.updated_at = timestamp
 

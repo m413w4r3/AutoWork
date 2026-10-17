@@ -85,6 +85,8 @@ _INDICATOR_KEYS = {
 _BREAKABLE_SEMANTIC_ROLES = frozenset({"ioc", "path", "command", "technical_literal"})
 _TYPOGRAPHIC_BREAK_INTERVAL = 8
 _TYPOGRAPHIC_BREAK_THRESHOLD = 32
+_TABLE_TYPOGRAPHIC_BREAK_INTERVAL = 6
+_TECHNICAL_BREAK_SEPARATORS = frozenset(".\\/-_")
 _TABLE_SEMANTIC_STYLE_BY_STYLE = {
     "semantic-command": "semantic-table-command",
     "semantic-ioc": "semantic-table-ioc",
@@ -123,23 +125,32 @@ _OBSERVATION_RELATION_LABELS = {
 }
 
 
-def _breakable_typst_display_text(value: str) -> dict[str, Any]:
+def _breakable_typst_display_text(
+    value: str,
+    *,
+    interval: int = _TYPOGRAPHIC_BREAK_INTERVAL,
+    break_at_technical_separators: bool = False,
+) -> dict[str, Any]:
     """Keep exact text and add wrap points only inside long unbroken tokens."""
     tokens = re.findall(r"\s+|\S+", value)
-    if not any(
-        not token.isspace() and len(token) > _TYPOGRAPHIC_BREAK_THRESHOLD for token in tokens
-    ):
+
+    def should_break(token: str) -> bool:
+        if token.isspace() or len(token) <= interval:
+            return False
+        return len(token) > _TYPOGRAPHIC_BREAK_THRESHOLD or (
+            break_at_technical_separators
+            and any(character in _TECHNICAL_BREAK_SEPARATORS for character in token)
+        )
+
+    if not any(should_break(token) for token in tokens):
         return {"text": value, "break_chunks": []}
 
     chunks: list[str] = []
     break_after: list[bool] = []
     for token in tokens:
         pieces = (
-            [
-                token[index : index + _TYPOGRAPHIC_BREAK_INTERVAL]
-                for index in range(0, len(token), _TYPOGRAPHIC_BREAK_INTERVAL)
-            ]
-            if not token.isspace() and len(token) > _TYPOGRAPHIC_BREAK_THRESHOLD
+            [token[index : index + interval] for index in range(0, len(token), interval)]
+            if should_break(token)
             else [token]
         )
         for index, piece in enumerate(pieces):
@@ -189,7 +200,16 @@ def _table_cell_typst_spans(value: str) -> list[dict[str, Any]]:
             pass
         else:
             style = "semantic-table-ioc"
-    return [{"style": style, **_breakable_typst_display_text(value)}]
+    return [
+        {
+            "style": style,
+            **_breakable_typst_display_text(
+                value,
+                interval=_TABLE_TYPOGRAPHIC_BREAK_INTERVAL,
+                break_at_technical_separators=True,
+            ),
+        }
+    ]
 
 
 def _table_cell_render_spans(
@@ -201,7 +221,11 @@ def _table_cell_render_spans(
     return [
         {
             "style": _TABLE_SEMANTIC_STYLE_BY_STYLE.get(span["style"], span["style"]),
-            **_breakable_typst_display_text(span["text"]),
+            **_breakable_typst_display_text(
+                span["text"],
+                interval=_TABLE_TYPOGRAPHIC_BREAK_INTERVAL,
+                break_at_technical_separators=True,
+            ),
         }
         for span in semantic_cell_spans
     ]
@@ -1056,12 +1080,13 @@ def _table_block(table: PublicationTableV1) -> dict[str, Any]:
 
 
 def _table_column_weights(table: PublicationTableV1) -> list[float]:
-    """Use bounded, content-derived Typst fractions so wider fields get more room."""
+    """Use bounded Typst fractions that leave room for column labels and wider fields."""
     weights: list[float] = []
     for index, column in enumerate(table.columns):
         values = [column.label, *(row.cells[index] for row in table.rows)]
         longest = max((len(value.strip()) for value in values), default=1)
-        weight = min(2.4, max(0.8, longest / 16))
+        label_floor = len(column.label.strip()) / 8
+        weight = min(2.4, max(0.8, label_floor, longest / 16))
         weights.append(round(weight, 2))
     return weights
 

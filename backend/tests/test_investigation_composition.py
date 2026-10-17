@@ -6,7 +6,11 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from cti_app.application.bridge_investigator import TurnSubmission, TurnSubmissionStatus
+from cti_app.application.bridge_investigator import (
+    BridgeInvestigator,
+    TurnSubmission,
+    TurnSubmissionStatus,
+)
 from cti_app.application.investigation_composition import (
     OPTIONAL_CAPABILITIES,
     InvestigationToolDependencies,
@@ -75,6 +79,39 @@ class _BlockedTransport:
             status=TurnSubmissionStatus.BLOCKED,
             idempotency_key="blocked-at-approval-gate",
         )
+
+
+@pytest.mark.asyncio
+async def test_permission_aware_transport_forwards_orphan_reconciliation() -> None:
+    class _OrphanAwareTransport(_BlockedTransport):
+        def __init__(self) -> None:
+            self.reconciliation_calls: list[dict[str, object]] = []
+
+        async def reconcile_orphaned_investigation_turn(self, **kwargs: object) -> str:
+            self.reconciliation_calls.append(kwargs)
+            return "orphaned_running_turn"
+
+    underlying = _OrphanAwareTransport()
+    bridge = BridgeInvestigator(_PermissionAwareInvestigationTransport(underlying))
+    investigation_id = uuid4()
+    disposition = await bridge.reconcile_orphaned_turn(
+        investigation_id=investigation_id,
+        turn_index=20,
+        context_sha256="a" * 64,
+        attempt=0,
+        owner_job_terminal=True,
+    )
+
+    assert disposition == "orphaned_running_turn"
+    assert underlying.reconciliation_calls == [
+        {
+            "investigation_id": investigation_id,
+            "turn_index": 20,
+            "context_sha256": "a" * 64,
+            "attempt": 0,
+            "owner_job_terminal": True,
+        }
+    ]
 
 
 def _unit_of_work():

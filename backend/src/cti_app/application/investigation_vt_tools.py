@@ -297,7 +297,7 @@ class _VirusTotalAdapter:
             return self._result(
                 state,
                 ToolInvocationStatus.UNAVAILABLE,
-                reason="capability_unavailable",
+                reason="provider_authorization_refused",
                 message="VirusTotal does not authorize this operation for the configured account.",
             )
         except (VirusTotalCapabilityDisabledError, VirusTotalRouteUnavailableError):
@@ -315,6 +315,13 @@ class _VirusTotalAdapter:
                 message="The VirusTotal route is not configured.",
             )
         except VirusTotalHttpError as exc:
+            if exc.status_code in {401, 403}:
+                return self._result(
+                    state,
+                    ToolInvocationStatus.UNAVAILABLE,
+                    reason="provider_authorization_refused",
+                    message="VirusTotal refused authorization for this provider capability.",
+                )
             if _explicit_not_found(exc):
                 observation = await self._record_negative(
                     context,

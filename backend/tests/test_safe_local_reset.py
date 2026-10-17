@@ -326,6 +326,87 @@ def test_reset_rechecks_run_marker_after_stopping_stack(tmp_path: Path) -> None:
     assert marker.read_text(encoding="utf-8") == "run evidence"
 
 
+def test_database_probe_removes_temporary_postgres_container(tmp_path: Path) -> None:
+    commands: list[Sequence[str]] = []
+
+    def runner(command: Sequence[str], _root: Path) -> reset.CommandResult:
+        commands.append(command)
+        if command[-4:] == ["ps", "--status", "running", "--services"]:
+            return reset.CommandResult(0, stdout="")
+        if command[-2:] == ["exec", "postgres"]:
+            pytest.fail("unexpected shortened exec command")
+        if "exec" in command:
+            return reset.CommandResult(
+                0,
+                stderr="NOTICE: AUTOWORK_RESET_STATUS=0|0|0|0|f\n",
+            )
+        return reset.CommandResult(0)
+
+    probe = reset._database_status_probe(
+        root=tmp_path,
+        compose_prefix=("docker", "compose", "-p", "cti-bulletin"),
+        runner=runner,
+        postgres_user="cti_app",
+        postgres_database="cti_app",
+        dry_run=False,
+    )
+
+    assert probe() == reset.DatabaseResetStatus()
+    assert commands[1][-3:] == ["up", "-d", "postgres"]
+    assert commands[-2][-2:] == ["stop", "postgres"]
+    assert commands[-1][-3:] == ["rm", "-f", "postgres"]
+
+
+def test_root_owned_workspace_is_reclaimed_through_local_docker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "var/workspaces/editions"
+    workspace.mkdir(parents=True)
+    (workspace / "fixture.txt").write_text("remove", encoding="utf-8")
+    original_rmtree = reset.shutil.rmtree
+    attempts = 0
+    commands: list[Sequence[str]] = []
+
+    def rmtree(path: Path) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise PermissionError(path)
+        original_rmtree(path)
+
+    def runner(command: Sequence[str], _root: Path) -> reset.CommandResult:
+        commands.append(command)
+        return reset.CommandResult(0)
+
+    monkeypatch.setattr(reset.shutil, "rmtree", rmtree)
+
+    reset._remove_local_directory(
+        path=workspace,
+        root=tmp_path,
+        docker_command=("docker",),
+        runner=runner,
+    )
+
+    assert workspace.exists()
+    assert list(workspace.iterdir()) == []
+    assert commands == [
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--mount",
+            f"type=bind,src={workspace},dst=/target",
+            reset.LOCAL_CLEANUP_IMAGE,
+            "chown",
+            "-R",
+            f"{reset.os.getuid()}:{reset.os.getgid()}",
+            "/target",
+        ]
+    ]
+
+
 def test_clean_reset_only_removes_prevalidated_targets_when_db_is_empty(tmp_path: Path) -> None:
     plan = reset.validate_reset_configuration(
         _compose_config(tmp_path), root=tmp_path, project_name="cti-bulletin"

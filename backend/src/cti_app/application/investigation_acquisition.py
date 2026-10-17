@@ -16,7 +16,9 @@ from cti_app.application.article_novelty import (
 from cti_app.application.evidence_recorder import EvidenceRecorder
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.sample_acquisition import (
+    SampleAcquisitionBudgetExceededError,
     SampleAcquisitionCapabilityDisabledError,
+    SampleAcquisitionDownloadError,
     SampleAcquisitionPolicy,
     SampleAcquisitionPolicyDeniedError,
     VirusTotalSampleAcquisitionService,
@@ -46,6 +48,19 @@ _ACQUISITION_COST = {
 }
 _HIT_ORIGINS = frozenset({SampleOrigin.VT_PIVOT, SampleOrigin.RELATIONSHIP, SampleOrigin.BEHAVIOR})
 _SUGGESTED_ALTERNATIVES = ("vt.file_report", "vt.relationships", "vt.intelligence_search")
+_DEFINITIVE_DOWNLOAD_ERROR_CODES = frozenset(
+    {
+        "virustotal_download_route_not_found",
+        "virustotal_download_authorization_refused",
+        "virustotal_download_failed_before_bytes",
+        "virustotal_download_host_not_allowed",
+        "virustotal_unexpected_redirect",
+        "virustotal_download_too_large",
+        "virustotal_capability_disabled",
+        "virustotal_route_unavailable",
+        "virustotal_transport_not_configured",
+    }
+)
 
 
 class HitAcquisitionError(RuntimeError):
@@ -72,6 +87,11 @@ class HitAcquisitionResult:
     suggested_alternatives: tuple[str, ...] = ()
     message: str = ""
     budget_consumed: dict[BudgetDimension, int] | None = None
+    error_code: str | None = None
+    reason: str | None = None
+    confirmed_non_execution: bool = False
+    cached: bool = False
+    exception_class: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +176,9 @@ class HitAcquisitionService:
             prior = await uow.sample_acquisition_attempts.find_successful(
                 association.investigation_id, association.sample_sha256
             )
+            latest_error = await uow.sample_acquisition_attempts.find_latest_error(
+                association.investigation_id, association.sample_sha256
+            )
 
         if current is None:
             return _needs_review(association, "No approved G2 envelope exists.")
@@ -222,6 +245,19 @@ class HitAcquisitionService:
                 ),
                 budget_consumed={},
             )
+        if latest_error is not None and latest_error.error_code in _DEFINITIVE_DOWNLOAD_ERROR_CODES:
+            return HitAcquisitionResult(
+                status=ToolInvocationStatus.UNAVAILABLE,
+                association=association,
+                novelty=novelty,
+                suggested_alternatives=_SUGGESTED_ALTERNATIVES,
+                message="VirusTotal file download was already refused for this hash; do not retry.",
+                budget_consumed={},
+                error_code=latest_error.error_code,
+                reason=_download_failure_reason(latest_error.error_code),
+                confirmed_non_execution=True,
+                cached=True,
+            )
         if any(
             sample.expected_hash == association.sample_sha256
             or sample.source_object_id == association.sample_sha256
@@ -278,6 +314,68 @@ class HitAcquisitionService:
                     do_not_submit=active_envelope.disclosure.do_not_submit,
                     external_llm_allowed=active_envelope.disclosure.external_llm_allowed,
                 ),
+            )
+        except SampleAcquisitionBudgetExceededError as exc:
+            active_envelope = await self._finish_operation_budget(
+                active_envelope,
+                key,
+                managed_by_dispatcher,
+                succeeded=False,
+                persist=envelope is None,
+            )
+            return HitAcquisitionResult(
+                status=ToolInvocationStatus.UNAVAILABLE,
+                association=association,
+                novelty=novelty,
+                suggested_alternatives=_SUGGESTED_ALTERNATIVES,
+                message=(
+                    "Investigation-local acquisition budget is exhausted; no download was made."
+                ),
+                budget_consumed={BudgetDimension.VT_UNITS: 0, BudgetDimension.DOWNLOADS: 0},
+                error_code=exc.code,
+                reason="investigation_budget_exhausted",
+                confirmed_non_execution=True,
+                exception_class=type(exc).__name__,
+            )
+        except SampleAcquisitionDownloadError as exc:
+            consumed = {
+                BudgetDimension.VT_UNITS: int(exc.provider_called),
+                BudgetDimension.DOWNLOADS: 0,
+            }
+            active_envelope = await self._finish_operation_budget(
+                active_envelope,
+                key,
+                managed_by_dispatcher,
+                succeeded=False,
+                persist=envelope is None,
+                consumed_budget=consumed,
+            )
+            definitive = not exc.ambiguous
+            return HitAcquisitionResult(
+                status=(
+                    ToolInvocationStatus.UNAVAILABLE
+                    if definitive
+                    else ToolInvocationStatus.NEEDS_REVIEW
+                ),
+                association=association,
+                novelty=novelty,
+                request_permission=False,
+                suggested_alternatives=_SUGGESTED_ALTERNATIVES,
+                message=(
+                    "VirusTotal file download is unavailable for this request."
+                    if definitive
+                    else "VirusTotal download may have delivered partial or unverifiable bytes; "
+                    "operator reconciliation is required."
+                ),
+                budget_consumed=consumed if definitive else {},
+                error_code=exc.code,
+                reason=(
+                    exc.refusal_reason or _download_failure_reason(exc.code)
+                    if definitive
+                    else "provider_download_outcome_ambiguous"
+                ),
+                confirmed_non_execution=definitive,
+                exception_class=type(exc).__name__,
             )
         except SampleAcquisitionPolicyDeniedError as exc:
             active_envelope = await self._finish_operation_budget(
@@ -455,12 +553,14 @@ class HitAcquisitionService:
         *,
         succeeded: bool,
         persist: bool,
+        consumed_budget: dict[BudgetDimension, int] | None = None,
     ) -> InvestigationEnvelope:
         _finish_budget(
             envelope.budget,
             operation_key,
             managed_by_dispatcher,
             succeeded=succeeded,
+            consumed_budget=consumed_budget,
         )
         if persist and not managed_by_dispatcher:
             return await self._save_envelope_budget(
@@ -560,15 +660,24 @@ def _finish_budget(
     managed_by_dispatcher: bool,
     *,
     succeeded: bool,
+    consumed_budget: dict[BudgetDimension, int] | None = None,
 ) -> None:
     if managed_by_dispatcher:
         return
     consumed = (
         _ACQUISITION_COST
         if succeeded
-        else {BudgetDimension.VT_UNITS: 1, BudgetDimension.DOWNLOADS: 0}
+        else consumed_budget or {BudgetDimension.VT_UNITS: 1, BudgetDimension.DOWNLOADS: 0}
     )
     budget.commit(operation_key, consumed)
+
+
+def _download_failure_reason(error_code: str) -> str:
+    if error_code == "virustotal_download_route_not_found":
+        return "provider_download_route_not_found"
+    if error_code == "virustotal_download_authorization_refused":
+        return "provider_download_authorization_refused"
+    return "provider_download_failed_before_bytes"
 
 
 __all__ = [

@@ -119,10 +119,12 @@ from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.research_context_builder import (
     ArticleSnapshotPort,
+    CanonicalEvidenceSummaryPort,
     InvestigationGraphReadPort,
     RepositoryInvestigationGraphReadPort,
     RepositoryInvestigationReadPort,
     ResearchContextBuilder,
+    RuleCorpusContextInventoryPort,
     SampleFeaturePackPort,
 )
 from cti_app.application.retrohunt import RETROHUNT_CAPABILITY, RetrohuntService
@@ -627,6 +629,27 @@ class _PermissionAwareInvestigationTransport:
     def __init__(self, transport: InvestigationTurnTransport) -> None:
         self._transport = transport
 
+    async def reconcile_orphaned_investigation_turn(
+        self,
+        *,
+        investigation_id: UUID,
+        turn_index: int,
+        context_sha256: str,
+        attempt: int,
+        owner_job_terminal: bool,
+    ) -> str | None:
+        reconcile = getattr(self._transport, "reconcile_orphaned_investigation_turn", None)
+        if not callable(reconcile):
+            return None
+        disposition = await reconcile(
+            investigation_id=investigation_id,
+            turn_index=turn_index,
+            context_sha256=context_sha256,
+            attempt=attempt,
+            owner_job_terminal=owner_job_terminal,
+        )
+        return disposition if isinstance(disposition, str) else None
+
     async def submit(
         self,
         *,
@@ -644,6 +667,44 @@ class _PermissionAwareInvestigationTransport:
             context_sha256=context_sha256,
             prompt=prompt,
             external_llm_allowed=external_llm_allowed,
+        )
+        if result.status is not TurnSubmissionStatus.BLOCKED:
+            return result
+        return TurnSubmission(
+            status=TurnSubmissionStatus.NEEDS_REVIEW,
+            idempotency_key=result.idempotency_key,
+            conversation_id=result.conversation_id,
+            detail=result.detail or "Model submission requires an approval decision.",
+        )
+
+    async def submit_with_attempt(
+        self,
+        *,
+        investigation_id: UUID,
+        subject_id: UUID,
+        turn_index: int,
+        context_sha256: str,
+        prompt: str,
+        external_llm_allowed: bool,
+        attempt: int,
+    ) -> TurnSubmission:
+        submit_attempt = getattr(self._transport, "submit_with_attempt", None)
+        if not callable(submit_attempt):
+            return TurnSubmission(
+                status=TurnSubmissionStatus.UNAVAILABLE,
+                detail="The configured transport cannot create a distinct retry attempt.",
+            )
+        result = cast(
+            TurnSubmission,
+            await submit_attempt(
+                investigation_id=investigation_id,
+                subject_id=subject_id,
+                turn_index=turn_index,
+                context_sha256=context_sha256,
+                prompt=prompt,
+                external_llm_allowed=external_llm_allowed,
+                attempt=attempt,
+            ),
         )
         if result.status is not TurnSubmissionStatus.BLOCKED:
             return result
@@ -972,6 +1033,16 @@ def build_investigation_composition(
         observations=uow.evidence_observations,
         findings=uow.investigation_findings,
         registry=registry,
+        evidence_summaries=CanonicalEvidenceSummaryPort(artifact_store),
+        invocations=uow.tool_invocations,
+        opinions=uow.analyst_opinions,
+        rule_corpus_inventory=(
+            cast(RuleCorpusContextInventoryPort, base_dependencies.rule_corpus_bytes)
+            if callable(
+                getattr(base_dependencies.rule_corpus_bytes, "manual_rule_corpus_imports", None)
+            )
+            else None
+        ),
     )
     graph: InvestigationGraphReadPort = RepositoryInvestigationGraphReadPort(
         investigation_id=investigation_id,
@@ -1074,32 +1145,56 @@ def build_investigation_composition(
         if settings.virustotal_file_download_enabled and dependencies.acquisition is not None:
             enabled.add("vt.file_download")
 
-    if (
+    detection_candidates = getattr(uow, "detection_candidates", None)
+    rule_get_ports_available = all(
+        port is not None
+        for port in (
+            detection_candidates,
+            getattr(uow, "evidence_observations", None),
+            getattr(artifact_store, "read_json", None),
+        )
+    )
+    rule_workbench_available = (
         settings.rule_workbench_enabled
         and dependencies.rule_workbench is not None
         and dependencies.rule_corpus_bytes is not None
-        and getattr(uow, "detection_candidates", None) is not None
-    ):
+        and detection_candidates is not None
+    )
+    if rule_workbench_available or rule_get_ports_available:
         rule_tools = register_rule_tools(
             registry,
-            workbench=dependencies.rule_workbench,
-            candidates=uow.detection_candidates,
-            associations=uow.sample_associations,
-            corpus_bytes=dependencies.rule_corpus_bytes,
-            recorder=recorder,
-            evidence_observations=uow.evidence_observations,
-            evidence_payloads=cast(EvidencePayloadReader, artifact_store),
-            corpus_inventory=cast(Any, dependencies.rule_corpus_bytes),
+            tool_names=None if rule_workbench_available else ("rule.get",),
+            workbench=dependencies.rule_workbench if rule_workbench_available else None,
+            candidates=detection_candidates,
+            associations=uow.sample_associations if rule_workbench_available else None,
+            corpus_bytes=dependencies.rule_corpus_bytes if rule_workbench_available else None,
+            recorder=recorder if rule_workbench_available else None,
+            evidence_observations=(uow.evidence_observations if rule_get_ports_available else None),
+            evidence_payloads=(
+                cast(EvidencePayloadReader, artifact_store) if rule_get_ports_available else None
+            ),
+            corpus_inventory=(
+                cast(Any, dependencies.rule_corpus_bytes) if rule_workbench_available else None
+            ),
+            article_claims=(
+                cast(Any, dependencies.article_snapshots) if rule_workbench_available else None
+            ),
         )
         enabled.update(
             rule_tool_capabilities(
-                workbench=dependencies.rule_workbench,
-                candidates=uow.detection_candidates,
-                associations=uow.sample_associations,
-                corpus_bytes=dependencies.rule_corpus_bytes,
-                recorder=recorder,
-                evidence_observations=uow.evidence_observations,
-                evidence_payloads=cast(EvidencePayloadReader, artifact_store),
+                workbench=dependencies.rule_workbench if rule_workbench_available else None,
+                candidates=detection_candidates,
+                associations=uow.sample_associations if rule_workbench_available else None,
+                corpus_bytes=dependencies.rule_corpus_bytes if rule_workbench_available else None,
+                recorder=recorder if rule_workbench_available else None,
+                evidence_observations=(
+                    uow.evidence_observations if rule_get_ports_available else None
+                ),
+                evidence_payloads=(
+                    cast(EvidencePayloadReader, artifact_store)
+                    if rule_get_ports_available
+                    else None
+                ),
             )
         )
 

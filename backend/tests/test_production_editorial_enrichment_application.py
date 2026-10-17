@@ -3364,6 +3364,29 @@ class _RecordingWriter:
         )
 
 
+class _LineageCheckingWriter(_RecordingWriter):
+    def __init__(self, *, fail_first_store: bool = False) -> None:
+        super().__init__()
+        self.fail_first_store = fail_first_store
+
+    async def store_editorial_enrichment_result(self, **kwargs: object) -> ProductionArtifact:
+        expected_hash = compute_editorial_enrichment_input_hash(
+            extraction=kwargs["extraction"],  # type: ignore[arg-type]
+            synthesis=kwargs["synthesis"],  # type: ignore[arg-type]
+            evidence_pack_hash=kwargs["evidence_pack_hash"],  # type: ignore[arg-type]
+            access_policy_hash=kwargs["access_policy_hash"],  # type: ignore[arg-type]
+            projection_hash=kwargs.get("projection_hash"),  # type: ignore[arg-type]
+            source_figure_inventory_hash=kwargs.get("source_figure_inventory_hash"),  # type: ignore[arg-type]
+            resource_search_enabled=kwargs.get("resource_search_enabled", False),  # type: ignore[arg-type]
+        )
+        if kwargs["input_hash"] != expected_hash:
+            raise ValueError("editorial_enrichment_lineage_mismatch")
+        if self.fail_first_store:
+            self.fail_first_store = False
+            raise RuntimeError("simulated_storage_failure")
+        return await super().store_editorial_enrichment_result(**kwargs)
+
+
 class _ReuseStub:
     def __init__(self, result: ProductionArtifactReuseResult | None = None) -> None:
         self.result = result
@@ -6540,6 +6563,41 @@ async def test_targeted_repair_is_single_call_versioned_and_reused_on_replay() -
     assert stored_call["metadata_extra"]["editorial_enrichment_wire_details"]["rejections"]  # type: ignore[index]
     enrichment = stored_call["enrichment"]
     assert "editorial_enrichment_repair_blocks_repaired:1" in enrichment.warnings  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_resource_search_setting_is_preserved_through_enrichment_storage() -> None:
+    valid_wire = _proposal_to_wire(_proposal("E001"))
+    table = _top_wire_block(valid_wire, "TABLE T001")
+    invalid_table = table.replace("PURPOSE_EVIDENCE: E001", "PURPOSE_EVIDENCE: E999", 1)
+    first_pass = "\n\n".join((invalid_table, _top_wire_block(valid_wire, "DIAGRAM D001")))
+
+    def respond(request: ModelRequest) -> ModelExecution:
+        if request.prompt_template_id == "production-editorial-enrichment-repair":
+            return _succeeded_text(request, table)
+        return _succeeded_text(request, first_pass)
+
+    world = _world(_RecordingGateway(respond))
+    writer = _LineageCheckingWriter(fail_first_store=True)
+    world.writer = writer
+    world.service._editorial_enrichment_service = writer
+    world.service._resource_search_enabled = True
+
+    with pytest.raises(RuntimeError, match="simulated_storage_failure"):
+        await _execute(world)
+    assert len(world.gateway.calls) == 3
+
+    result = await _execute(world)
+
+    assert result.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
+    assert result.model_calls == 0
+    assert [request.prompt_template_id for request, _schema in world.gateway.calls] == [
+        "production-editorial-enrichment",
+        "production-editorial-enrichment-repair",
+        "production-semantic-annotation",
+    ]
+    assert len(world.gateway.calls) == 3
+    assert len(writer.calls) == 1
 
 
 @pytest.mark.asyncio

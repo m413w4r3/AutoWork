@@ -121,6 +121,59 @@ def test_api_and_worker_roots_share_real_runtime_assembly_without_infrastructure
     json.loads(serialized)
 
 
+def test_behavior_report_import_status_tracks_the_parser_dependency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(runtime_ports, "BehaviorReportImporter", lambda: None)
+
+    runtime = build_investigation_runtime_composition_factory(
+        **_runtime_inputs(Settings.model_construct())
+    )
+
+    assert _status_map(runtime)["behavior_report_import"] == {
+        "status": "unavailable",
+        "reason": "behavior_report_importer_unavailable",
+    }
+    assert runtime.ports.optional_tool_ports.behavior_report_importer is None
+
+
+def test_runtime_records_precise_yara_probe_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _FailedYaraProbe:
+        available = False
+        unavailable_reason = "yara_probe_match_missing"
+
+    monkeypatch.setattr(runtime_ports, "IsolatedYaraRunner", _FailedYaraProbe)
+    settings = Settings.model_construct(rule_workbench_enabled=True)
+
+    runtime = build_investigation_runtime_composition_factory(**_runtime_inputs(settings))
+
+    assert _status_map(runtime)["rule_workbench"] == {
+        "status": "unavailable",
+        "reason": "yara_probe_match_missing",
+    }
+
+
+def test_runtime_records_the_specific_bwrap_probe_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _UnconfinedRunner:
+        filesystem_confined = False
+        namespace_reason = "bwrap_probe_filesystem_not_confined"
+
+    monkeypatch.setattr(runtime_ports, "LocalCommandRunner", lambda **_kwargs: _UnconfinedRunner())
+    settings = Settings.model_construct(
+        local_analysis_enabled=True,
+        local_analysis_require_filesystem_confinement=True,
+    )
+
+    runtime = build_investigation_runtime_composition_factory(**_runtime_inputs(settings))
+
+    assert _status_map(runtime)["local_command_execution"] == {
+        "status": "unavailable",
+        "reason": "bwrap_probe_filesystem_not_confined",
+    }
+
+
 class _SyntheticCommandService:
     def __init__(self, *, confined: bool) -> None:
         self.filesystem_confined = confined

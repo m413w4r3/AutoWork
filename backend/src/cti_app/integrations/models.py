@@ -338,6 +338,16 @@ def _bridge_http_error(
         pass
     if default_phase == "preflight":
         submission_state = "pre_submission"
+    elif (
+        submission_state is None
+        and server_code == "bridge_server_error"
+        and _explicit_non_submission_message(server_message)
+    ):
+        # Older Bridge server responses can predate the structured
+        # `submission_state` field. Treat only clear declarations that nothing
+        # was submitted as pre-submission; generic 5xx/UI timeouts remain
+        # ambiguous and continue to require reconciliation.
+        submission_state = "pre_submission"
     if (
         server_code
         in {
@@ -437,6 +447,25 @@ def _bridge_http_error(
         conversation_id=conversation_id,
         reason=reason,
         verified_no_answer=verified_no_answer,
+    )
+
+
+def _explicit_non_submission_message(message: str | None) -> bool:
+    if not message:
+        return False
+    normalized = " ".join(message.casefold().replace("\u2019", "'").split())
+    return any(
+        phrase in normalized
+        for phrase in (
+            "not submitted",
+            "nothing was submitted",
+            "before submission",
+            "prior to submission",
+            "avant soumission",
+            "avant la soumission",
+            "rien n'a été soumis",
+            "aucune soumission",
+        )
     )
 
 

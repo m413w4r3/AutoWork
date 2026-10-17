@@ -4,11 +4,12 @@ import json
 from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4, uuid5
 
 import pytest
 
+from cti_app.api.investigation import InvestigationOperatorStatusResponse
 from cti_app.application.analyst_handoff import AnalystHandoffPolicy
 from cti_app.application.bridge_investigator import (
     BridgeInvestigator,
@@ -16,12 +17,23 @@ from cti_app.application.bridge_investigator import (
     TurnSubmission,
     TurnSubmissionStatus,
 )
-from cti_app.application.investigation_contracts import ArticleClaimV1, ArticleContextV1
+from cti_app.application.investigation_composition import (
+    build_investigation_composition,
+    investigation_tool_dependencies_from_settings,
+)
+from cti_app.application.investigation_contracts import (
+    ArticleClaimV1,
+    ArticleContextV1,
+    FindingProposalV1,
+    PublicationAnchorV1,
+)
+from cti_app.application.investigation_operator_view import build_investigation_operator_view
 from cti_app.application.investigation_persistence import (
     InMemoryAnalystOpinionRepository,
     InMemoryEvidenceObservationRepository,
     InMemoryFindingRepository,
     InMemoryInvestigationEnvelopeRepository,
+    InMemorySampleAssociationRepository,
     InMemoryToolInvocationRepository,
     VersionConflictError,
 )
@@ -29,7 +41,9 @@ from cti_app.application.investigation_service import (
     InvestigationService,
     InvocationReconciliationOutcome,
     ProductionArtifactContextSnapshotRepository,
+    ProductionArtifactObservationWriter,
     _envelope_reduced_since,
+    bridge_budget_operation_key,
 )
 from cti_app.application.investigation_state import (
     InMemoryInvestigationContextSnapshotRepository,
@@ -43,17 +57,25 @@ from cti_app.application.investigation_tools import (
     ToolEffect,
     ToolResult,
 )
+from cti_app.application.model_conversations import ModelConversationService
+from cti_app.application.persistence import UnitOfWorkFactory
+from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.research_context_builder import (
     USER_REQUEST_ACTION_PREFIX,
     ArticleSnapshot,
     ResearchContextBuilder,
 )
+from cti_app.config import Settings
 from cti_app.domain.analyst_opinion import (
+    AnalystOpinionStatus,
+    AnalystOpinionV1,
+    OpinionBlock,
     OpinionBlockType,
     OpinionClaimQualification,
 )
 from cti_app.domain.investigation import (
     BudgetDimension,
+    BudgetReservationStatus,
     DisclosureBounds,
     EvidenceKind,
     EvidenceObservation,
@@ -61,6 +83,7 @@ from cti_app.domain.investigation import (
     FindingKind,
     InvestigationBudget,
     InvestigationEnvelope,
+    InvestigationFinding,
     NoveltyClass,
     TLPLevel,
     ToolInvocation,
@@ -68,7 +91,12 @@ from cti_app.domain.investigation import (
     canonical_json_bytes,
     tool_operation_key,
 )
-from cti_app.domain.investigation_state import Hypothesis, HypothesisStatus, StopReason
+from cti_app.domain.investigation_state import (
+    Hypothesis,
+    HypothesisStatus,
+    StopReason,
+    investigation_bridge_attempt,
+)
 from cti_app.domain.production import (
     AnalystInvestigation,
     AnalystInvestigationStatus,
@@ -143,6 +171,20 @@ def test_envelope_reduction_uses_only_domain_fields() -> None:
     assert _envelope_reduced_since(baseline, reduced) is True
     assert _envelope_reduced_since(baseline, extended) is False
     assert _envelope_reduced_since(baseline, None) is True
+
+
+def test_tool_operation_identity_ignores_explanatory_purpose() -> None:
+    investigation_id = uuid4()
+    common = {
+        "investigation_id": investigation_id,
+        "tool_name": "vt.file_report",
+        "schema_version": "1",
+        "normalized_parameters": {"file_hash": "a" * 64},
+    }
+
+    assert tool_operation_key(**common, purpose="check the sample") == tool_operation_key(
+        **common, purpose="verify the same hash"
+    )
 
 
 class _InvestigationRepository:
@@ -230,7 +272,19 @@ class _ObservationWriter:
             source=invocation.tool_name,
             source_version=invocation.schema_version,
             observed_at=datetime.now(UTC),
-            object_type=str(result.output.get("object_type", "tool_call")),
+            object_type=(
+                "provider_authorization_refusal"
+                if result.output.get("reason") == "provider_authorization_refused"
+                else {
+                    "provider_download_route_not_found": "provider_download_route_refused",
+                    "provider_download_authorization_refused": (
+                        "provider_download_authorization_refused"
+                    ),
+                }.get(
+                    result.output.get("reason"),
+                    str(result.output.get("object_type", "tool_call")),
+                )
+            ),
             object_id=str(result.output.get("object_id", invocation.operation_key)),
             limitations=("Fake tool output is untrusted test data.",),
             invocation_ref=invocation.id,
@@ -278,6 +332,7 @@ class _FakeTool:
         self.calls = []
         self.contexts = []
         self.after_execute = None
+        self.result: ToolResult | None = None
         self.observation_object_type = None
         self.observation_object_id = None
 
@@ -294,7 +349,7 @@ class _FakeTool:
             output["object_type"] = self.observation_object_type
         if self.observation_object_id is not None:
             output["object_id"] = self.observation_object_id
-        return ToolResult(
+        return self.result or ToolResult(
             status=ToolInvocationStatus.SUCCEEDED,
             output=output,
         )
@@ -359,6 +414,7 @@ class _Fixture:
         tools=(),
         no_progress_limit=3,
         narrative_hashes=(),
+        publication_anchors=(),
     ):
         self.run_id = uuid4()
         self.subject_id = uuid4()
@@ -388,6 +444,7 @@ class _Fixture:
                 documented_samples=("a" * 64,),
                 known_chain=(),
                 open_questions=("Which stage retrieves the payload?",),
+                publication_anchors=tuple(publication_anchors),
             ),
             base_publication_artifact_id=self.publication_id,
             base_publication_sha256="3" * 64,
@@ -425,10 +482,15 @@ class _Fixture:
         self.execution_order = []
         providers = set()
         capabilities = set()
-        for name, provider in tools:
+        for tool_spec in tools:
+            name, provider, *configuration = tool_spec
+            effect = configuration[0] if configuration else ToolEffect.EXTERNAL_READ
+            capability = configuration[1] if len(configuration) > 1 else f"{provider}.read"
+            cost_model = (
+                configuration[2] if len(configuration) > 2 else {BudgetDimension.VT_UNITS: 1}
+            )
             tool = _FakeTool(name, self.execution_order)
             self.tools[name] = tool
-            capability = f"{provider}.read"
             definition = ToolDefinition(
                 name=name,
                 schema_version="1",
@@ -438,8 +500,8 @@ class _Fixture:
                     "required": ["query"],
                     "additionalProperties": False,
                 },
-                effect=ToolEffect.EXTERNAL_READ,
-                cost_model={BudgetDimension.VT_UNITS: 1},
+                effect=effect,
+                cost_model=cost_model,
                 confidentiality=ToolConfidentiality.INTERNAL,
                 limitations=("Passive fake fixture",),
                 capability_key=capability,
@@ -454,6 +516,8 @@ class _Fixture:
             article_snapshots=_ArticlePort(self.snapshot),
             observations=self.observations,
             findings=self.findings,
+            invocations=self.invocations,
+            opinions=self.opinions,
         )
         self.service = InvestigationService(
             post_synthesis=self.handoff,
@@ -474,6 +538,7 @@ class _Fixture:
             no_progress_limit=no_progress_limit,
             commit_uow=self._commit,
         )
+
         self.envelope = InvestigationEnvelope(
             investigation_id=self.investigation_id,
             allowed_providers=tuple(sorted(providers)),
@@ -513,6 +578,44 @@ class _Fixture:
             envelope=self.envelope,
             hypotheses=tuple(hypotheses),
         )
+
+
+def _compose_fixture_service(fixture: _Fixture) -> Any:
+    sample_associations = InMemorySampleAssociationRepository()
+    uow = SimpleNamespace(
+        analyst_investigations=fixture.investigations,
+        investigation_states=fixture.states,
+        investigation_envelopes=fixture.envelopes,
+        tool_invocations=fixture.invocations,
+        evidence_observations=fixture.observations,
+        investigation_findings=fixture.findings,
+        sample_associations=sample_associations,
+        analyst_opinions=fixture.opinions,
+    )
+    settings = Settings.model_construct(investigation_no_progress_limit=3)
+    artifact_store = cast(ProductionArtifactStore, SimpleNamespace())
+    dependencies = investigation_tool_dependencies_from_settings(
+        settings,
+        investigation_id=fixture.investigation_id,
+        article_snapshots=fixture.context_builder.article_snapshots,
+        observations=fixture.observations,
+        findings=fixture.findings,
+        sample_associations=sample_associations,
+        artifact_store=artifact_store,
+    )
+    composition = build_investigation_composition(
+        uow,
+        uow_factory=cast(UnitOfWorkFactory, lambda: None),
+        artifact_store=artifact_store,
+        model_conversations=cast(ModelConversationService, SimpleNamespace()),
+        settings=settings,
+        investigation_id=fixture.investigation_id,
+        tool_dependencies=dependencies,
+        turn_transport=fixture.bridge_transport,
+    )
+    composition.service.post_synthesis = fixture.handoff
+    composition.service._context_snapshots = fixture.context_snapshots
+    return composition.service
 
 
 def _tool_call(name, query, purpose):
@@ -621,7 +724,6 @@ async def test_production_context_snapshot_adapter_round_trips_immutable_json() 
 async def test_budget_exhaustion_is_a_local_stop_without_model_error() -> None:
     fixture = _Fixture(responses=[], bridge_turn_budget=0, tools=())
     state = await fixture.start()
-
     result = await fixture.service.run(state.investigation_id)
 
     assert result.stop_reason is StopReason.BUDGET_EXHAUSTED
@@ -629,6 +731,146 @@ async def test_budget_exhaustion_is_a_local_stop_without_model_error() -> None:
     assert (
         await fixture.investigations.get(state.investigation_id)
     ).status is AnalystInvestigationStatus.EXHAUSTED
+
+
+@pytest.mark.asyncio
+async def test_oversized_full_context_stops_before_snapshot_or_bridge_submission(
+    monkeypatch,
+) -> None:
+    fixture = _Fixture(
+        responses=[_decision(goal="finish", next_action="finish")],
+        tools=(),
+    )
+    monkeypatch.setattr(
+        "cti_app.application.research_context_builder.INVESTIGATION_MAX_CONTEXT_BYTES",
+        1,
+    )
+    state = await fixture.start()
+
+    result = await fixture.service.run(state.investigation_id)
+
+    assert result.stop_reason is StopReason.BUDGET_EXHAUSTED
+    assert fixture.bridge_transport.attempt_count == 0
+    persisted = await fixture.states.get(state.investigation_id)
+    assert persisted is not None
+    assert persisted.recent_actions[-1].startswith("investigation_context_too_large:")
+    assert persisted.pending_context_snapshot_id is None
+
+
+@pytest.mark.asyncio
+async def test_operator_view_explains_local_conversation_and_context_limit_code() -> None:
+    from cti_app.application.bridge_investigator import make_investigation_conversation_id
+    from cti_app.application.investigation_operator_view import (
+        build_investigation_operator_view,
+    )
+
+    fixture = _Fixture(responses=[], tools=())
+    state = await fixture.start()
+    pending = state.with_pending_context(uuid4(), "a" * 64).conclude(
+        StopReason.SUBMISSION_NEEDS_REVIEW
+    )
+    context_limited = state.with_context_limit_failure(
+        actual_bytes=300_000, max_bytes=262_144
+    ).conclude(StopReason.BUDGET_EXHAUSTED)
+    investigation = await fixture.investigations.get(fixture.investigation_id)
+
+    pending_view = build_investigation_operator_view(
+        investigation=investigation,
+        state=pending,
+        synthesis_sha256=fixture.snapshot.synthesis_sha256,
+        envelope=None,
+        invocations=(),
+        observations=(),
+        opinion=None,
+        jobs=(),
+        available_tools=(),
+        unavailable_tools=(),
+    )
+    needs_review_turn_id = uuid4()
+    review_turn_view = build_investigation_operator_view(
+        investigation=investigation,
+        state=pending,
+        synthesis_sha256=fixture.snapshot.synthesis_sha256,
+        envelope=None,
+        invocations=(),
+        observations=(),
+        opinion=None,
+        jobs=(),
+        available_tools=(),
+        unavailable_tools=(),
+        pending_bridge_turn_id=needs_review_turn_id,
+        pending_bridge_turn_status="needs_review",
+        pending_bridge_turn_key="turn-key",
+    )
+    adopted_turn_view = build_investigation_operator_view(
+        investigation=investigation,
+        state=pending,
+        synthesis_sha256=fixture.snapshot.synthesis_sha256,
+        envelope=None,
+        invocations=(),
+        observations=(),
+        opinion=None,
+        jobs=(),
+        available_tools=(),
+        unavailable_tools=(),
+        pending_bridge_turn_id=needs_review_turn_id,
+        pending_bridge_turn_status="succeeded",
+    )
+    abandoned_turn_view = build_investigation_operator_view(
+        investigation=investigation,
+        state=pending,
+        synthesis_sha256=fixture.snapshot.synthesis_sha256,
+        envelope=None,
+        invocations=(),
+        observations=(),
+        opinion=None,
+        jobs=(),
+        available_tools=(),
+        unavailable_tools=(),
+        pending_bridge_turn_id=needs_review_turn_id,
+        pending_bridge_turn_status="failed",
+        pending_bridge_turn_error_code="operator_abandoned",
+    )
+    limit_view = build_investigation_operator_view(
+        investigation=investigation,
+        state=context_limited,
+        synthesis_sha256=fixture.snapshot.synthesis_sha256,
+        envelope=None,
+        invocations=(),
+        observations=(),
+        opinion=None,
+        jobs=(),
+        available_tools=(),
+        unavailable_tools=(),
+    )
+
+    assert pending_view.payload["bridge_conversation_id"] == make_investigation_conversation_id(
+        fixture.investigation_id
+    )
+    assert pending_view.payload["bridge_conversation_id_scope"] == "local_autowork_record_only"
+    assert pending_view.payload["bridge_external_target"] == {
+        "mode": "stateless",
+        "lifecycle": "temporary_chat_per_turn",
+    }
+    assert review_turn_view.payload["next_idempotent_action"]["code"] == (
+        "reconcile_model_conversation_turn"
+    )
+    assert review_turn_view.payload["next_idempotent_action"]["adopt_path"].endswith(
+        "/reconciliation/visible/adopt"
+    )
+    assert adopted_turn_view.payload["next_idempotent_action"]["code"] == ("resume_investigation")
+    assert abandoned_turn_view.payload["next_idempotent_action"]["code"] == ("resume_investigation")
+    assert pending_view.payload["last_operation"]["conversation_id_scope"] == (
+        "local_autowork_record_only"
+    )
+    response_payload = InvestigationOperatorStatusResponse.model_validate(
+        pending_view.payload
+    ).model_dump()
+    assert set(response_payload) == set(pending_view.payload)
+    assert limit_view.payload["last_error"] == {
+        "code": "investigation_context_too_large",
+        "details": "300000>262144",
+    }
 
 
 @pytest.mark.parametrize(
@@ -875,16 +1117,13 @@ async def test_unavailable_tool_does_not_abort_later_agent_decision() -> None:
 
     assert result.stop_reason is StopReason.AGENT_FINISHED
     assert fixture.bridge_transport.submission_count == 2
-    invocation = await fixture.invocations.get_by_operation_key(
-        tool_operation_key(
-            investigation_id=state.investigation_id,
-            tool_name="vt.search",
-            schema_version="1",
-            normalized_parameters=unavailable["arguments"],
-            purpose=unavailable["purpose"],
-        )
-    )
-    assert invocation is not None
+    matching_invocations = [
+        item
+        for item in await fixture.invocations.list_for_investigation(state.investigation_id)
+        if item.tool_name == "vt.search" and item.normalized_parameters == unavailable["arguments"]
+    ]
+    assert len(matching_invocations) == 1
+    invocation = matching_invocations[0]
     assert invocation.status is ToolInvocationStatus.UNAVAILABLE
 
 
@@ -922,6 +1161,1081 @@ async def test_two_tools_in_one_turn_use_latest_envelope_and_commit_both_budgets
         )
         assert reservation.status.value == "committed"
         assert reservation.committed_amounts[BudgetDimension.VT_UNITS] == 1
+
+
+@pytest.mark.asyncio
+async def test_repeated_tool_parameters_across_turns_reuse_observation_and_budget() -> None:
+    first = _tool_call("vt.search", "synthetic:sample", "look for related samples")
+    second = _tool_call("vt.search", "synthetic:sample", "check the same sample again")
+    fixture = _Fixture(
+        responses=[
+            _decision(goal="look for related samples", next_action="continue", tools=(first,)),
+            _decision(goal="check the same sample again", next_action="continue", tools=(second,)),
+            _decision(goal="finish after reviewing the existing result", next_action="finish"),
+        ],
+        tools=(("vt.search", "vt"),),
+    )
+    state = await fixture.start()
+
+    result = await fixture.service.run(state.investigation_id)
+
+    envelope = await fixture.envelopes.get(state.investigation_id)
+    invocations = await fixture.invocations.list_for_investigation(state.investigation_id)
+    observation_id = invocations[0].response_refs[0]
+    assert result.stop_reason is StopReason.AGENT_FINISHED
+    assert len(fixture.tools["vt.search"].calls) == 1
+    assert len(invocations) == 1
+    assert envelope is not None
+    assert envelope.budget.consumed[BudgetDimension.VT_UNITS] == 1
+    assert all(item.status.value != "reserved" for item in envelope.budget.reservations)
+    assert (
+        len(
+            [
+                item
+                for item in envelope.budget.reservations
+                if BudgetDimension.VT_UNITS in item.amounts
+            ]
+        )
+        == 1
+    )
+    assert str(observation_id) in fixture.bridge_transport.prompts[2]
+    assert "already executed" in fixture.bridge_transport.prompts[2].lower()
+
+
+@pytest.mark.asyncio
+async def test_provider_auth_refusal_archives_a_typed_observation_with_prior_refs() -> None:
+    investigation_id = uuid4()
+    observations = InMemoryEvidenceObservationRepository()
+    writer = ProductionArtifactObservationWriter(_ContextBlobStore(), observations)
+    invocation = ToolInvocation(
+        investigation_id=investigation_id,
+        operation_key="synthetic-provider-auth-operation",
+        tool_name="shodan.host",
+        schema_version="1",
+        normalized_parameters={"ip": "203.0.113.58"},
+        purpose="synthetic provider check",
+    )
+    result = ToolResult(
+        status=ToolInvocationStatus.UNAVAILABLE,
+        observation_refs=(uuid4(),),
+        output={"reason": "provider_authorization_refused"},
+    )
+
+    archived = await writer.archive(invocation, result)
+
+    assert len(archived) == 1
+    assert archived[0].object_type == "provider_authorization_refusal"
+    assert archived[0].source == "shodan.host"
+
+
+@pytest.mark.asyncio
+async def test_download_route_refusal_archives_scoped_untrusted_observation() -> None:
+    investigation_id = uuid4()
+    observations = InMemoryEvidenceObservationRepository()
+    writer = ProductionArtifactObservationWriter(_ContextBlobStore(), observations)
+    invocation = ToolInvocation(
+        investigation_id=investigation_id,
+        operation_key="synthetic-download-route-refusal",
+        tool_name="vt.download_sample",
+        schema_version="1",
+        normalized_parameters={"sha256": "e" * 64},
+        purpose="synthetic sample acquisition",
+    )
+    result = ToolResult(
+        status=ToolInvocationStatus.UNAVAILABLE,
+        output={
+            "reason": "provider_download_route_not_found",
+            "error_code": "virustotal_download_route_not_found",
+            "confirmed_non_execution": True,
+        },
+    )
+
+    archived = await writer.archive(invocation, result)
+
+    assert len(archived) == 1
+    assert archived[0].object_type == "provider_download_route_refused"
+    assert archived[0].source == "vt.download_sample"
+    assert await observations.get(archived[0].id) == archived[0]
+
+
+@pytest.mark.asyncio
+async def test_download_refusals_flow_through_service_budget_and_blocked_context() -> None:
+    first_call = _tool_call(
+        "vt.download_sample", "synthetic-hash-one", "review first synthetic hit"
+    )
+    second_call = _tool_call(
+        "vt.download_sample", "synthetic-hash-two", "review second synthetic hit"
+    )
+    fixture = _Fixture(
+        responses=[
+            _decision(
+                goal="review two sample acquisition attempts",
+                next_action="continue",
+                tools=(first_call, second_call),
+            ),
+            _decision(goal="finish after repeated route refusals", next_action="finish"),
+        ],
+        tools=(
+            (
+                "vt.download_sample",
+                "vt",
+                ToolEffect.ACQUIRE,
+                "vt.file_download",
+                {
+                    BudgetDimension.VT_UNITS: 1,
+                    BudgetDimension.DOWNLOADS: 1,
+                },
+            ),
+        ),
+    )
+    fixture.envelope = replace(fixture.envelope, acquire_hits_allowed=True)
+    fixture.tools["vt.download_sample"].result = ToolResult(
+        status=ToolInvocationStatus.UNAVAILABLE,
+        budget_consumed={BudgetDimension.VT_UNITS: 1, BudgetDimension.DOWNLOADS: 0},
+        output={
+            "error_code": "virustotal_download_route_not_found",
+            "reason": "provider_download_route_not_found",
+            "confirmed_non_execution": True,
+        },
+        message="The provider download route is unavailable.",
+    )
+    state = await fixture.start()
+
+    stopped = await fixture.service.run(state.investigation_id)
+
+    invocations = await fixture.invocations.list_for_investigation(state.investigation_id)
+    observations = await fixture.observations.list_for_investigation(state.investigation_id)
+    envelope = await fixture.envelopes.get(state.investigation_id)
+    assert stopped.stop_reason is StopReason.AGENT_FINISHED
+    assert len(invocations) == 2
+    assert all(item.status is ToolInvocationStatus.UNAVAILABLE for item in invocations)
+    assert len(observations) == 2
+    assert {item.object_type for item in observations} == {"provider_download_route_refused"}
+    assert envelope is not None
+    assert envelope.budget.consumed[BudgetDimension.VT_UNITS] == 2
+    assert envelope.budget.consumed[BudgetDimension.DOWNLOADS] == 0
+    for invocation in invocations:
+        reservation = next(
+            item
+            for item in envelope.budget.reservations
+            if item.operation_key == invocation.operation_key
+        )
+        assert reservation.status is BudgetReservationStatus.COMMITTED
+        assert reservation.committed_amounts == {
+            BudgetDimension.VT_UNITS: 1,
+            BudgetDimension.DOWNLOADS: 0,
+        }
+    assert (
+        "vt.file_download: provider download route unavailable"
+        in (fixture.bridge_transport.prompts[-1])
+    )
+
+
+@pytest.mark.asyncio
+async def test_two_shodan_authorization_refusals_block_later_calls_in_the_same_turn() -> None:
+    calls = tuple(
+        _tool_call("shodan.host", f"synthetic:{index}", f"check synthetic host {index}")
+        for index in range(3)
+    )
+    fixture = _Fixture(
+        responses=[
+            _decision(goal="check three hosts", next_action="continue", tools=calls),
+            _decision(goal="finish after provider refusal", next_action="finish"),
+        ],
+        tools=(("shodan.host", "shodan"),),
+    )
+    tool = fixture.tools["shodan.host"]
+    original_execute = tool.execute
+
+    async def refuse_first_two(arguments, context):
+        tool.calls.append(dict(arguments))
+        tool.contexts.append(context)
+        fixture.execution_order.append(tool.name)
+        if len(tool.calls) <= 2:
+            return ToolResult(
+                status=ToolInvocationStatus.UNAVAILABLE,
+                output={"reason": "provider_authorization_refused"},
+            )
+        return await original_execute(arguments, context)
+
+    tool.execute = refuse_first_two
+    state = await fixture.start()
+
+    result = await fixture.service.run(state.investigation_id)
+
+    invocations = await fixture.invocations.list_for_investigation(state.investigation_id)
+    assert result.stop_reason is StopReason.AGENT_FINISHED
+    assert len(tool.calls) == 2
+    assert len(invocations) == 2
+    assert all(item.status is ToolInvocationStatus.UNAVAILABLE for item in invocations)
+    assert "shodan: provider authorization refused" in fixture.bridge_transport.prompts[1]
+
+
+@pytest.mark.asyncio
+async def test_different_tool_parameters_remain_distinct_operations() -> None:
+    first = _tool_call("vt.search", "synthetic:first", "search first sample")
+    second = _tool_call("vt.search", "synthetic:second", "search second sample")
+    fixture = _Fixture(
+        responses=[
+            _decision(goal="search first sample", next_action="continue", tools=(first,)),
+            _decision(goal="search second sample", next_action="continue", tools=(second,)),
+            _decision(goal="finish", next_action="finish"),
+        ],
+        tools=(("vt.search", "vt"),),
+    )
+    state = await fixture.start()
+
+    result = await fixture.service.run(state.investigation_id)
+
+    envelope = await fixture.envelopes.get(state.investigation_id)
+    assert result.stop_reason is StopReason.AGENT_FINISHED
+    assert len(fixture.tools["vt.search"].calls) == 2
+    assert envelope is not None
+    assert envelope.budget.consumed[BudgetDimension.VT_UNITS] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("effect", "expected_invocations"),
+    (
+        (ToolEffect.EXTERNAL_READ, 1),
+        (ToolEffect.EXTERNAL_SUBMIT, 2),
+    ),
+)
+async def test_identical_operations_are_deduplicated_only_for_read_effects(
+    effect: ToolEffect,
+    expected_invocations: int,
+) -> None:
+    first = _tool_call("vt.synthetic", "synthetic:target", "inspect target")
+    second = _tool_call("vt.synthetic", "synthetic:target", "inspect target again")
+    fixture = _Fixture(
+        responses=[
+            _decision(goal="inspect the target", next_action="continue", tools=(first,)),
+            _decision(goal="repeat the target operation", next_action="continue", tools=(second,)),
+            _decision(goal="finish", next_action="finish"),
+        ],
+        tools=(("vt.synthetic", "vt", effect),),
+    )
+    state = await fixture.start()
+
+    result = await fixture.service.run(state.investigation_id)
+
+    invocations = await fixture.invocations.list_for_investigation(state.investigation_id)
+    assert result.stop_reason is StopReason.AGENT_FINISHED
+    assert len(fixture.tools["vt.synthetic"].calls) == expected_invocations
+    assert len(invocations) == expected_invocations
+    assert len({item.operation_key for item in invocations}) == expected_invocations
+
+
+@pytest.mark.asyncio
+async def test_semantically_identical_findings_are_idempotent_and_counted() -> None:
+    first_statement = "The loader  starts a child process."
+    replay_statement = "The loader starts a child process."
+    fixture = _Fixture(
+        responses=[],
+        tools=(),
+    )
+    state = await fixture.start()
+    observation = EvidenceObservation(
+        investigation_id=state.investigation_id,
+        kind=EvidenceKind.VT_FILE_REPORT,
+        blob_id=uuid4(),
+        sha256="d" * 64,
+        source="vt.file_report",
+        source_version="1",
+        observed_at=datetime.now(UTC),
+        object_type="file",
+        object_id="a" * 64,
+    )
+    await fixture.observations.append_if_absent(observation)
+    fixture.bridge_transport._responses.extend(
+        [
+            _decision(
+                goal="record a finding",
+                next_action="continue",
+                findings=(
+                    _proposal(
+                        FindingKind.CAPABILITY.value,
+                        FindingAssessment.QUALIFIED.value,
+                        first_statement,
+                        observation.id,
+                        claim_refs=("C1",),
+                    ),
+                ),
+            ),
+            _decision(
+                goal="repeat the same finding",
+                next_action="continue",
+                findings=(
+                    _proposal(
+                        FindingKind.CAPABILITY.value,
+                        FindingAssessment.QUALIFIED.value,
+                        replay_statement,
+                        observation.id,
+                        claim_refs=("C1",),
+                    ),
+                ),
+            ),
+            _decision(goal="finish", next_action="finish"),
+        ]
+    )
+
+    await fixture.service.run(state.investigation_id)
+
+    findings = await fixture.findings.list_for_investigation(state.investigation_id)
+    persisted_state = await fixture.states.get(state.investigation_id)
+    assert len(findings) == 1
+    assert findings[0].statement == first_statement
+    assert persisted_state.deduplicated_findings == 1
+    investigation = await fixture.investigations.get(state.investigation_id)
+    operator_view = build_investigation_operator_view(
+        investigation=investigation,
+        state=persisted_state,
+        synthesis_sha256=fixture.snapshot.synthesis_sha256,
+        envelope=await fixture.envelopes.get(state.investigation_id),
+        invocations=(),
+        observations=(observation,),
+        opinion=None,
+        jobs=(),
+        available_tools=(),
+        unavailable_tools=(),
+    )
+    response = InvestigationOperatorStatusResponse.model_validate(operator_view.payload)
+    assert response.deduplicated_findings == 1
+
+
+@pytest.mark.asyncio
+async def test_findings_with_same_references_but_different_statements_are_preserved() -> None:
+    fixture = _Fixture(responses=[], tools=())
+    state = await fixture.start()
+    observation = EvidenceObservation(
+        investigation_id=state.investigation_id,
+        kind=EvidenceKind.VT_FILE_REPORT,
+        blob_id=uuid4(),
+        sha256="e" * 64,
+        source="vt.file_report",
+        source_version="1",
+        observed_at=datetime.now(UTC),
+        object_type="file",
+        object_id="b" * 64,
+    )
+    await fixture.observations.append_if_absent(observation)
+    common = {
+        "kind": FindingKind.CAPABILITY,
+        "assessment": FindingAssessment.QUALIFIED,
+        "observation_refs": (observation.id,),
+        "claim_refs": ("C1",),
+    }
+
+    await fixture.service._persist_findings(
+        investigation_id=state.investigation_id,
+        proposals=(
+            FindingProposalV1(statement="The loader starts a child process.", **common),
+            FindingProposalV1(statement="The loader persists a service entry.", **common),
+        ),
+        decision_trace="two distinct synthetic findings",
+    )
+
+    findings = await fixture.findings.list_for_investigation(state.investigation_id)
+    assert {item.statement for item in findings} == {
+        "The loader starts a child process.",
+        "The loader persists a service entry.",
+    }
+
+
+@pytest.mark.asyncio
+async def test_finish_with_supported_findings_requires_a_versioned_opinion_draft() -> None:
+    fixture = _Fixture(
+        responses=[
+            "@@DECISION@@\nGOAL: Finish the review.\nSUMMARY: Findings are ready.\n"
+            "NEXT: finish\n@@END@@",
+            "@@DECISION@@\nGOAL: Draft the conclusion.\nSUMMARY: The supported finding is cited.\n"
+            "NEXT: finish\n@@END@@\n@@OPINION@@\nTYPE: key_findings\n"
+            "TEXT: The supported observation shows the loader starts a child process.\n"
+            "FINDINGS: {finding_id}\nEVIDENCE: {observation_id}\n"
+            "QUALIFICATION: fact\nCERTAINTY: 0.8\n@@END@@",
+        ],
+        tools=(),
+    )
+    state = await fixture.start()
+    observation = EvidenceObservation(
+        investigation_id=state.investigation_id,
+        kind=EvidenceKind.VT_FILE_REPORT,
+        blob_id=uuid4(),
+        sha256="f" * 64,
+        source="vt.file_report",
+        source_version="1",
+        observed_at=datetime.now(UTC),
+        object_type="file",
+        object_id="c" * 64,
+    )
+    await fixture.observations.append_if_absent(observation)
+    finding = InvestigationFinding(
+        investigation_id=state.investigation_id,
+        kind=FindingKind.CAPABILITY,
+        assessment=FindingAssessment.SUPPORTED,
+        statement="The loader starts a child process.",
+        observation_refs=(observation.id,),
+        claim_refs=("C1",),
+    )
+    await fixture.findings.append_version(finding, expected_previous_id=None)
+    fixture.bridge_transport._responses[1] = fixture.bridge_transport._responses[1].format(
+        finding_id=finding.id, observation_id=observation.id
+    )
+
+    result = await fixture.service.run(state.investigation_id)
+
+    opinion = await fixture.opinions.get(uuid5(_OPINION_NAMESPACE, str(state.investigation_id)))
+    assert result.stop_reason is StopReason.AGENT_FINISHED
+    assert len(fixture.bridge_transport.prompts) == 2
+    assert "opinion_draft_required" in fixture.bridge_transport.prompts[1].lower()
+    assert opinion is not None
+    assert opinion.version == 1
+
+
+@pytest.mark.asyncio
+async def test_finish_with_qualified_findings_requires_a_cited_opinion_draft() -> None:
+    fixture = _Fixture(
+        responses=[],
+        tools=(),
+    )
+    state = await fixture.start()
+    observation = EvidenceObservation(
+        investigation_id=state.investigation_id,
+        kind=EvidenceKind.VT_FILE_REPORT,
+        blob_id=uuid4(),
+        sha256="e" * 64,
+        source="vt.file_report",
+        source_version="1",
+        observed_at=datetime.now(UTC),
+        object_type="file",
+        object_id="f" * 64,
+    )
+    await fixture.observations.append_if_absent(observation)
+    finding = InvestigationFinding(
+        investigation_id=state.investigation_id,
+        kind=FindingKind.CAPABILITY,
+        assessment=FindingAssessment.QUALIFIED,
+        statement="The synthetic sample has a loader-like behavior, with limited scope.",
+        observation_refs=(observation.id,),
+        claim_refs=("C1",),
+    )
+    await fixture.findings.append_version(finding, expected_previous_id=None)
+    finish = _decision(goal="Finish the qualified analysis.", next_action="finish")
+    opinion = _opinion_delta(finding.id, observation.id)
+    opinion["blocks"][0]["qualification"] = "inference"
+    opinion["blocks"][0]["certainty"] = 0.4
+    corrected = _decision(
+        goal="Draft the qualified conclusion.", next_action="finish", opinion=opinion
+    )
+    fixture.bridge_transport._responses.extend([finish, corrected])
+
+    result = await fixture.service.run(state.investigation_id)
+
+    draft = await fixture.opinions.get(uuid5(_OPINION_NAMESPACE, str(state.investigation_id)))
+    assert result.stop_reason is StopReason.AGENT_FINISHED
+    assert fixture.bridge_transport.submission_count == 2
+    assert "non-inconclusive findings" in fixture.bridge_transport.prompts[1].lower()
+    assert draft is not None and draft.renderable_blocks
+    assert draft.renderable_blocks[0].qualification is OpinionClaimQualification.INFERENCE
+
+
+async def _inject_untested_rule_candidate(
+    fixture: _Fixture,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    candidate_id: UUID,
+    version: int = 2,
+) -> None:
+    original_build = fixture.context_builder.build
+    candidate = {
+        "kind": "rule_candidate",
+        "candidate_id": str(candidate_id),
+        "version": version,
+        "version_id": str(uuid4()),
+        "status": "active",
+        "validation_status": "untested",
+        "latest_test_report": None,
+        "source_sha256": "a" * 64,
+        "source_excerpt": "rule synthetic",
+    }
+
+    async def build(**kwargs: Any) -> Any:
+        context = await original_build(**kwargs)
+        investigation = context.investigation.model_copy(update={"rule_deltas": (candidate,)})
+        return context.model_copy(update={"investigation": investigation})
+
+    monkeypatch.setattr(fixture.context_builder, "build", build)
+
+
+def _register_rule_test_tool(fixture: _Fixture) -> _FakeTool:
+    tool = cast(_FakeTool, fixture.tools["rule.test"])
+    assert fixture.registry.unregister("rule.test", "1")
+    fixture.registry.register(
+        ToolDefinition(
+            name="rule.test",
+            schema_version="1",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "candidate_id": {"type": "string", "format": "uuid"},
+                    "version": {"type": "integer", "minimum": 1},
+                },
+                "required": ["candidate_id", "version"],
+                "additionalProperties": False,
+            },
+            effect=ToolEffect.LOCAL_READ,
+            cost_model={},
+            confidentiality=ToolConfidentiality.INTERNAL,
+            limitations=("Synthetic rule test tool.",),
+            capability_key="rule.read",
+        ),
+        tool,
+    )
+    return tool
+
+
+@pytest.mark.asyncio
+async def test_finish_requires_rule_test_for_available_untested_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _Fixture(
+        responses=[],
+        tools=(
+            (
+                "rule.test",
+                "rule",
+                ToolEffect.LOCAL_READ,
+                "rule.read",
+                {},
+            ),
+        ),
+    )
+    tool = _register_rule_test_tool(fixture)
+    state = await fixture.start()
+    candidate_id = uuid4()
+    await _inject_untested_rule_candidate(fixture, monkeypatch, candidate_id=candidate_id)
+    fixture.bridge_transport._responses.extend(
+        [
+            _decision(goal="Finish now.", next_action="finish"),
+            _decision(
+                goal="Test the untested rule candidate before finishing.",
+                next_action="finish",
+                tools=(
+                    {
+                        "tool_name": "rule.test",
+                        "schema_version": "1",
+                        "arguments": {
+                            "candidate_id": str(candidate_id),
+                            "version": 2,
+                        },
+                        "purpose": "test the listed untested candidate version",
+                    },
+                ),
+            ),
+        ]
+    )
+
+    result = await fixture.service.run(state.investigation_id)
+
+    invocations = await fixture.invocations.list_for_investigation(state.investigation_id)
+    assert result.stop_reason is StopReason.AGENT_FINISHED
+    assert len(tool.calls) == 1
+    assert tool.calls[0] == {"candidate_id": str(candidate_id), "version": 2}
+    assert len(fixture.bridge_transport.prompts) == 2
+    assert "rule_test_required" in fixture.bridge_transport.prompts[1]
+    assert any(item.status is ToolInvocationStatus.SUCCEEDED for item in invocations)
+
+
+@pytest.mark.asyncio
+async def test_finish_records_limit_when_untested_rule_tool_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _Fixture(
+        responses=[_decision(goal="Finish with the available evidence.", next_action="finish")],
+        tools=(),
+    )
+    state = await fixture.start()
+    await _inject_untested_rule_candidate(fixture, monkeypatch, candidate_id=uuid4())
+
+    result = await fixture.service.run(state.investigation_id)
+
+    persisted = await fixture.states.get(state.investigation_id)
+    assert result.stop_reason is StopReason.AGENT_FINISHED
+    assert persisted is not None
+    assert any(action.startswith("rule_test_unavailable:") for action in persisted.recent_actions)
+
+
+@pytest.mark.asyncio
+async def test_finish_records_limit_when_rule_test_refuses_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _Fixture(
+        responses=[],
+        tools=(
+            (
+                "rule.test",
+                "rule",
+                ToolEffect.LOCAL_READ,
+                "rule.read",
+                {},
+            ),
+        ),
+    )
+    tool = _register_rule_test_tool(fixture)
+    tool.result = ToolResult(
+        status=ToolInvocationStatus.UNAVAILABLE,
+        message="Synthetic rule test capability unavailable.",
+    )
+    state = await fixture.start()
+    candidate_id = uuid4()
+    await _inject_untested_rule_candidate(fixture, monkeypatch, candidate_id=candidate_id)
+    fixture.bridge_transport._responses.append(
+        _decision(
+            goal="Attempt the listed rule test before finishing.",
+            next_action="finish",
+            tools=(
+                {
+                    "tool_name": "rule.test",
+                    "schema_version": "1",
+                    "arguments": {"candidate_id": str(candidate_id), "version": 2},
+                    "purpose": "attempt the exact candidate version test",
+                },
+            ),
+        )
+    )
+
+    result = await fixture.service.run(state.investigation_id)
+
+    persisted = await fixture.states.get(state.investigation_id)
+    invocations = await fixture.invocations.list_for_investigation(state.investigation_id)
+    assert result.stop_reason is StopReason.AGENT_FINISHED
+    assert persisted is not None
+    assert any(action.startswith("rule_test_unavailable:") for action in persisted.recent_actions)
+    assert any(item.status is ToolInvocationStatus.UNAVAILABLE for item in invocations)
+
+
+@pytest.mark.asyncio
+async def test_finish_without_findings_does_not_require_an_opinion() -> None:
+    fixture = _Fixture(
+        responses=[_decision(goal="Finish the empty investigation.", next_action="finish")],
+        tools=(),
+    )
+    state = await fixture.start()
+
+    result = await fixture.service.run(state.investigation_id)
+
+    assert result.stop_reason is StopReason.AGENT_FINISHED
+    assert fixture.bridge_transport.submission_count == 1
+    assert (
+        await fixture.opinions.get(uuid5(_OPINION_NAMESPACE, str(state.investigation_id))) is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_rejected_opinion_attempt_requires_correction_even_with_existing_draft() -> None:
+    fixture = _Fixture(responses=[], tools=())
+    state = await fixture.start()
+    observation = EvidenceObservation(
+        investigation_id=state.investigation_id,
+        kind=EvidenceKind.VT_FILE_REPORT,
+        blob_id=uuid4(),
+        sha256="d" * 64,
+        source="vt.file_report",
+        source_version="1",
+        observed_at=datetime.now(UTC),
+        object_type="file",
+        object_id="a" * 64,
+    )
+    await fixture.observations.append_if_absent(observation)
+    finding = InvestigationFinding(
+        investigation_id=state.investigation_id,
+        kind=FindingKind.CAPABILITY,
+        assessment=FindingAssessment.SUPPORTED,
+        statement="The synthetic loader starts a child process.",
+        observation_refs=(observation.id,),
+        claim_refs=("C1",),
+    )
+    await fixture.findings.append_version(finding, expected_previous_id=None)
+    opinion_id = uuid5(_OPINION_NAMESPACE, str(state.investigation_id))
+    prior_opinion = AnalystOpinionV1(
+        id=opinion_id,
+        version=1,
+        investigation_id=state.investigation_id,
+        synthesis_artifact_id=fixture.synthesis.id,
+        synthesis_sha256=fixture.snapshot.synthesis_sha256,
+        base_publication_artifact_id=fixture.publication_id,
+        base_publication_sha256=fixture.snapshot.base_publication_sha256,
+        blocks=(
+            OpinionBlock(
+                block_type=OpinionBlockType.KEY_FINDINGS,
+                text="The existing synthetic observation supports this conclusion.",
+                finding_refs=(finding.id,),
+                evidence_refs=(observation.id,),
+                qualification=OpinionClaimQualification.FACT,
+                certainty=0.9,
+            ),
+        ),
+        author_id="synthetic-analyst",
+        status=AnalystOpinionStatus.DRAFT,
+    )
+    await fixture.opinions.append_version(prior_opinion, expected_version=0)
+    rejected_opinion = {
+        "blocks": [
+            {
+                "block_type": OpinionBlockType.KEY_FINDINGS.value,
+                "text": "An unsupported synthetic conclusion.",
+                "finding_refs": [str(uuid4())],
+                "evidence_refs": [str(observation.id)],
+                "qualification": OpinionClaimQualification.FACT.value,
+                "certainty": 0.8,
+            }
+        ],
+        "unresolved_points": [],
+    }
+    fixture.bridge_transport._responses.extend(
+        [
+            _decision(
+                goal="Replace the draft with an unsupported claim.",
+                next_action="finish",
+                opinion=rejected_opinion,
+            ),
+            _decision(goal="Finish with the existing reviewed evidence.", next_action="finish"),
+        ]
+    )
+
+    result = await fixture.service.run(state.investigation_id)
+
+    assert result.stop_reason is StopReason.AGENT_FINISHED
+    assert fixture.bridge_transport.submission_count == 2
+    assert "opinion_validation_rejected" in fixture.bridge_transport.prompts[1]
+
+
+@pytest.mark.asyncio
+async def test_notes_are_visible_deduplicated_by_anchor_and_replaced_in_place() -> None:
+    fixture = _Fixture(
+        responses=[],
+        tools=(),
+        publication_anchors=(
+            PublicationAnchorV1(anchor="lead:0001", excerpt="Synthetic anchored paragraph."),
+        ),
+    )
+    state = await fixture.start()
+    observation = EvidenceObservation(
+        investigation_id=state.investigation_id,
+        kind=EvidenceKind.VT_FILE_REPORT,
+        blob_id=uuid4(),
+        sha256="c" * 64,
+        source="vt.file_report",
+        source_version="1",
+        observed_at=datetime.now(UTC),
+        object_type="file",
+        object_id="b" * 64,
+    )
+    await fixture.observations.append_if_absent(observation)
+    finding = InvestigationFinding(
+        investigation_id=state.investigation_id,
+        kind=FindingKind.CAPABILITY,
+        assessment=FindingAssessment.SUPPORTED,
+        statement="A synthetic loader uses the observed capability.",
+        observation_refs=(observation.id,),
+        claim_refs=("C1",),
+    )
+    await fixture.findings.append_version(finding, expected_previous_id=None)
+
+    def response(*, next_action: str, note_text: str, relation: str) -> str:
+        return "\n".join(
+            (
+                "@@DECISION@@",
+                "GOAL: Maintain the anchored synthetic observation.",
+                "SUMMARY: Keep the note tied to its exact publication paragraph.",
+                f"NEXT: {next_action}",
+                "@@END@@",
+                "@@OPINION@@",
+                "TYPE: key_findings",
+                "TEXT: The synthetic observation supports one loader capability.",
+                f"FINDINGS: {finding.id}",
+                f"EVIDENCE: {observation.id}",
+                "QUALIFICATION: fact",
+                "CERTAINTY: 0.9",
+                "@@END@@",
+                "@@NOTE@@",
+                "ANCHOR: lead:0001",
+                "STATE: observed",
+                f"RELATION: {relation}",
+                f"TEXT: {note_text}",
+                f"FINDINGS: {finding.id}",
+                f"EVIDENCE: {observation.id}",
+                "@@END@@",
+            )
+        )
+
+    fixture.bridge_transport._responses.extend(
+        [
+            response(
+                next_action="continue",
+                note_text="The sample shows a loader.",
+                relation="confirms",
+            ),
+            response(
+                next_action="continue",
+                note_text="The sample shows a loader.",
+                relation="qualifies",
+            ),
+            response(
+                next_action="finish",
+                note_text="The sample shows one loader stage.",
+                relation="qualifies",
+            ),
+        ]
+    )
+
+    result = await _compose_fixture_service(fixture).run(state.investigation_id)
+
+    opinion = await fixture.opinions.get(uuid5(_OPINION_NAMESPACE, str(state.investigation_id)))
+    assert result.stop_reason is StopReason.AGENT_FINISHED
+    assert fixture.bridge_transport.submission_count == 3
+    assert "The sample shows a loader." in fixture.bridge_transport.prompts[1]
+    assert "Do not repeat an existing note" in fixture.bridge_transport.prompts[1]
+    assert opinion is not None
+    assert len(opinion.observations) == 1
+    assert opinion.observations[0].text == "The sample shows one loader stage."
+
+
+@pytest.mark.asyncio
+async def test_compact_bridge_turn_persists_deduplicated_findings_opinion_and_note() -> None:
+    fixture = _Fixture(
+        responses=[],
+        tools=(),
+        publication_anchors=(
+            PublicationAnchorV1(anchor="lead:0001", excerpt="The report documents the loader."),
+        ),
+    )
+    state = await fixture.start()
+    observation = EvidenceObservation(
+        investigation_id=state.investigation_id,
+        kind=EvidenceKind.VT_FILE_REPORT,
+        blob_id=uuid4(),
+        sha256="a" * 64,
+        source="vt.file_report",
+        source_version="1",
+        observed_at=datetime.now(UTC),
+        object_type="file",
+        object_id="d" * 64,
+    )
+    await fixture.observations.append_if_absent(observation)
+    finding = InvestigationFinding(
+        investigation_id=state.investigation_id,
+        kind=FindingKind.CAPABILITY,
+        assessment=FindingAssessment.SUPPORTED,
+        statement="The synthetic loader starts a child process.",
+        observation_refs=(observation.id,),
+        claim_refs=("C1",),
+    )
+    await fixture.findings.append_version(finding, expected_previous_id=None)
+    fixture.bridge_transport._responses.append(
+        "\n".join(
+            (
+                "@@DECISION@@",
+                "GOAL: Summarize the documented loader behavior.",
+                "SUMMARY: Two equivalent proposals refer to one supported finding.",
+                "NEXT: finish",
+                "@@END@@",
+                "@@FINDING@@",
+                "KIND: capability",
+                "ASSESSMENT: supported",
+                "STATEMENT: The synthetic loader starts a child process.",
+                f"SUBJECT_REF: {observation.object_id}",
+                f"OBSERVATIONS: {observation.id}",
+                "CLAIMS: C1",
+                "@@END@@",
+                "@@FINDING@@",
+                "KIND: capability",
+                "ASSESSMENT: supported",
+                "STATEMENT: The synthetic loader starts a   child process.",
+                f"SUBJECT_REF: {observation.object_id}",
+                f"OBSERVATIONS: {observation.id}",
+                "CLAIMS: C1",
+                "@@END@@",
+                "@@OPINION@@",
+                "TYPE: key_findings",
+                "TEXT: The synthetic observation supports the loader capability.",
+                f"FINDINGS: {finding.id}",
+                f"EVIDENCE: {observation.id}",
+                "QUALIFICATION: fact",
+                "CERTAINTY: 0.8",
+                "@@END@@",
+                "@@NOTE@@",
+                "ANCHOR: lead:0001",
+                "STATE: observed",
+                "RELATION: confirms",
+                "TEXT: The loader capability is supported by the cited observation.",
+                f"FINDINGS: {finding.id}",
+                f"EVIDENCE: {observation.id}",
+                "@@END@@",
+                "@@NOTE@@",
+                "ANCHOR: lead:9999",
+                "STATE: observed",
+                "RELATION: confirms",
+                "TEXT: An unknown synthetic anchor must be rejected.",
+                f"FINDINGS: {finding.id}",
+                f"EVIDENCE: {observation.id}",
+                "@@END@@",
+            )
+        )
+    )
+
+    composition_service = _compose_fixture_service(fixture)
+    result = await composition_service.run(state.investigation_id)
+
+    findings = await fixture.findings.list_for_investigation(state.investigation_id)
+    opinion = await fixture.opinions.get(uuid5(_OPINION_NAMESPACE, str(state.investigation_id)))
+    persisted_state = await fixture.states.get(state.investigation_id)
+    assert result.stop_reason is StopReason.AGENT_FINISHED
+    assert "lead:0001" in fixture.bridge_transport.prompts[0]
+    assert len(findings) == 1
+    assert findings[0].id == finding.id
+    assert persisted_state.deduplicated_findings == 2
+    assert opinion is not None
+    assert opinion.version == 1
+    assert sum(block.block_type is OpinionBlockType.KEY_FINDINGS for block in opinion.blocks) == 1
+    assert len(opinion.observations) == 1
+    assert opinion.observations[0].anchor == "lead:0001"
+    assert any(
+        action.startswith("note_validation_rejected:") for action in persisted_state.recent_actions
+    )
+
+
+@pytest.mark.asyncio
+async def test_finish_opinion_correction_loop_stops_after_bounded_retries() -> None:
+    finish_response = (
+        "@@DECISION@@\nGOAL: Finish the review.\nSUMMARY: Findings are ready.\n"
+        "NEXT: finish\n@@END@@"
+    )
+    fixture = _Fixture(responses=[finish_response] * 4, tools=())
+    state = await fixture.start()
+    observation = EvidenceObservation(
+        investigation_id=state.investigation_id,
+        kind=EvidenceKind.VT_FILE_REPORT,
+        blob_id=uuid4(),
+        sha256="b" * 64,
+        source="vt.file_report",
+        source_version="1",
+        observed_at=datetime.now(UTC),
+        object_type="file",
+        object_id="e" * 64,
+    )
+    await fixture.observations.append_if_absent(observation)
+    await fixture.findings.append_version(
+        InvestigationFinding(
+            investigation_id=state.investigation_id,
+            kind=FindingKind.CAPABILITY,
+            assessment=FindingAssessment.SUPPORTED,
+            statement="A synthetic loader starts a child process.",
+            observation_refs=(observation.id,),
+        ),
+        expected_previous_id=None,
+    )
+
+    result = await fixture.service.run(state.investigation_id)
+
+    persisted_state = await fixture.states.get(state.investigation_id)
+    assert result.stop_reason is StopReason.SUBMISSION_NEEDS_REVIEW
+    assert len(fixture.bridge_transport.prompts) == 3
+    assert (
+        sum(
+            action.startswith("opinion_draft_required:")
+            for action in persisted_state.recent_actions
+        )
+        == 2
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "terminal_status",
+    [ToolInvocationStatus.EMPTY, ToolInvocationStatus.UNAVAILABLE],
+)
+async def test_final_empty_or_unavailable_result_is_replayed_without_another_call(
+    terminal_status: ToolInvocationStatus,
+) -> None:
+    first = _tool_call("vt.search", "synthetic:terminal", "check terminal sample result")
+    second = _tool_call("vt.search", "synthetic:terminal", "ask about same terminal result")
+    fixture = _Fixture(
+        responses=[
+            _decision(goal="check the sample", next_action="continue", tools=(first,)),
+            _decision(goal="reuse the result", next_action="continue", tools=(second,)),
+            _decision(goal="finish", next_action="finish"),
+        ],
+        tools=(("vt.search", "vt"),),
+    )
+    tool = fixture.tools["vt.search"]
+
+    async def terminal_execute(arguments, context):
+        tool.calls.append(dict(arguments))
+        tool.contexts.append(context)
+        fixture.execution_order.append(tool.name)
+        output = (
+            {"reason": "not_configured"}
+            if terminal_status is ToolInvocationStatus.UNAVAILABLE
+            else {"summary": "Synthetic provider reported no matching records."}
+        )
+        return ToolResult(status=terminal_status, output=output)
+
+    tool.execute = terminal_execute
+    state = await fixture.start()
+
+    result = await fixture.service.run(state.investigation_id)
+
+    invocations = await fixture.invocations.list_for_investigation(state.investigation_id)
+    assert result.stop_reason is StopReason.AGENT_FINISHED
+    assert len(tool.calls) == 1
+    assert len(invocations) == 1
+    assert invocations[0].status is terminal_status
+    assert "already executed" in fixture.bridge_transport.prompts[2].lower()
+
+
+@pytest.mark.asyncio
+async def test_confirmed_transient_failure_is_retried_with_a_new_operation_attempt() -> None:
+    call = _tool_call("vt.search", "synthetic:retry", "retry a rejected local attempt")
+    fixture = _Fixture(
+        responses=[
+            _decision(goal="try the sample lookup", next_action="continue", tools=(call,)),
+            _decision(goal="retry the rejected lookup", next_action="continue", tools=(call,)),
+            _decision(goal="finish", next_action="finish"),
+        ],
+        tools=(("vt.search", "vt"),),
+    )
+    tool = fixture.tools["vt.search"]
+    original_execute = tool.execute
+    attempts = 0
+
+    async def fail_once(arguments, context):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return ToolResult(
+                status=ToolInvocationStatus.FAILED,
+                output={"reason": "subject_slot_limit"},
+            )
+        return await original_execute(arguments, context)
+
+    tool.execute = fail_once
+    state = await fixture.start()
+
+    result = await fixture.service.run(state.investigation_id)
+
+    invocations = await fixture.invocations.list_for_investigation(state.investigation_id)
+    envelope = await fixture.envelopes.get(state.investigation_id)
+    assert result.stop_reason is StopReason.AGENT_FINISHED
+    assert len(tool.calls) == 1
+    assert [item.status for item in invocations] == [
+        ToolInvocationStatus.FAILED,
+        ToolInvocationStatus.SUCCEEDED,
+    ]
+    assert len({item.operation_key for item in invocations}) == 2
+    assert envelope is not None
+    assert envelope.budget.consumed[BudgetDimension.VT_UNITS] == 1
 
 
 @pytest.mark.asyncio
@@ -1124,6 +2438,110 @@ async def test_interrupt_during_bridge_wait_preserves_turn_for_resume() -> None:
     assert resumed.stop_reason is StopReason.AGENT_FINISHED
     assert fixture.bridge_transport.submission_count == 1
     assert fixture.tools["vt.search"].calls == [call["arguments"]]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_bridge_wait_commits_budget_reservation() -> None:
+    fixture = _Fixture(responses=[_decision(goal="synthetic question", next_action="finish")])
+    state = await fixture.start()
+    entered = asyncio.Event()
+
+    async def blocked_submit(**_kwargs):
+        entered.set()
+        await asyncio.Event().wait()
+
+    fixture.bridge_transport.submit = blocked_submit
+    worker = asyncio.create_task(fixture.service.run(state.investigation_id))
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    await fixture.service.interrupt(state.investigation_id)
+    worker.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await worker
+
+    envelope = await fixture.envelopes.get(state.investigation_id)
+    reservation = next(
+        item
+        for item in envelope.budget.reservations
+        if item.operation_key.startswith(f"bridge:{state.investigation_id}:")
+    )
+    assert reservation.status is BudgetReservationStatus.COMMITTED
+    assert reservation.committed_amounts[BudgetDimension.BRIDGE_TURNS] == 1
+    assert envelope.budget.reserved[BudgetDimension.BRIDGE_TURNS] == 0
+
+
+@pytest.mark.asyncio
+async def test_resume_seals_orphaned_turn_before_clearing_pending_checkpoint() -> None:
+    fixture = _Fixture(responses=[])
+    state = await fixture.start()
+
+    class _RecoveringTransport(ScriptedTurnTransport):
+        def __init__(self):
+            super().__init__([])
+            self.recovery_calls = []
+
+        async def reconcile_orphaned_investigation_turn(self, **kwargs):
+            self.recovery_calls.append(kwargs)
+            current = await fixture.states.get(state.investigation_id)
+            updated = replace(
+                current,
+                version=current.version + 1,
+                recent_actions=(
+                    *current.recent_actions,
+                    "bridge_turn_orphaned:0:next_attempt=1:turn_id=synthetic-turn",
+                ),
+            )
+            await fixture.states.save_if_version(updated, expected_version=current.version)
+            return "orphaned_running_turn"
+
+    transport = _RecoveringTransport()
+    fixture.service._bridge = BridgeInvestigator(transport)
+    pending = replace(
+        state,
+        version=state.version + 1,
+        pending_context_snapshot_id=uuid4(),
+        pending_context_sha256="d" * 64,
+        stop_reason=StopReason.USER_INTERRUPT,
+    )
+    await fixture.states.save_if_version(pending, expected_version=state.version)
+    envelope = await fixture.envelopes.get(state.investigation_id)
+    orphaned_budget = InvestigationBudget(limits=envelope.budget.limits)
+    reservation_key = bridge_budget_operation_key(
+        investigation_id=state.investigation_id,
+        turn_index=0,
+        context_sha256="d" * 64,
+    )
+    orphaned_budget.reserve(
+        reservation_key,
+        {
+            BudgetDimension.BRIDGE_TURNS: 1,
+            BudgetDimension.CONTEXT_BYTES: 100,
+            BudgetDimension.CONTEXT_TOKENS: 25,
+        },
+    )
+    await fixture.envelopes.save_if_version(
+        replace(envelope, version=envelope.version + 1, budget=orphaned_budget),
+        expected_version=envelope.version,
+    )
+
+    resumed = await fixture.service.resume(
+        state.investigation_id,
+        expected_version=pending.version,
+        owner_job_terminal=True,
+    )
+
+    assert len(transport.recovery_calls) == 1
+    assert transport.recovery_calls[0]["owner_job_terminal"] is True
+    assert resumed.stop_reason is None
+    assert resumed.pending_context_sha256 == "d" * 64
+    assert investigation_bridge_attempt(resumed.recent_actions, 0) == 1
+    recovered_envelope = await fixture.envelopes.get(state.investigation_id)
+    reservation = next(
+        item
+        for item in recovered_envelope.budget.reservations
+        if item.operation_key == reservation_key
+    )
+    assert reservation.status is BudgetReservationStatus.RELEASED
+    assert recovered_envelope.budget.reserved[BudgetDimension.BRIDGE_TURNS] == 0
 
 
 @pytest.mark.asyncio
@@ -1344,6 +2762,84 @@ async def test_reconciliation_uses_cas_and_commits_or_releases_ambiguous_budget(
         assert reservation.status.value == "released"
         assert latest_envelope.budget.consumed[BudgetDimension.VT_UNITS] == 0
     await fixture.service.resume(state.investigation_id)
+
+
+@pytest.mark.asyncio
+async def test_confirmed_nonexecution_commits_only_consumed_provider_budget() -> None:
+    fixture = _Fixture(responses=[], tools=(("vt.download_sample", "vt", ToolEffect.ACQUIRE),))
+    state = await fixture.start()
+    operation_key = "synthetic-definitive-download-refusal"
+    reserved = {BudgetDimension.VT_UNITS: 1, BudgetDimension.DOWNLOADS: 1}
+    envelope = await fixture.envelopes.get(state.investigation_id)
+    envelope.budget.reserve(operation_key, reserved)
+    await fixture.envelopes.save_if_version(
+        replace(envelope, version=envelope.version + 1), expected_version=envelope.version
+    )
+
+    result = ToolResult(
+        status=ToolInvocationStatus.UNAVAILABLE,
+        budget_consumed={BudgetDimension.VT_UNITS: 1, BudgetDimension.DOWNLOADS: 0},
+        output={
+            "confirmed_non_execution": True,
+            "reason": "provider_download_route_not_found",
+        },
+    )
+    await fixture.service._complete_tool_reservation(
+        investigation_id=state.investigation_id,
+        operation_key=operation_key,
+        result=result,
+        reserved_amounts=reserved,
+        uncertain=False,
+    )
+
+    latest_envelope = await fixture.envelopes.get(state.investigation_id)
+    reservation = next(
+        item for item in latest_envelope.budget.reservations if item.operation_key == operation_key
+    )
+    assert reservation.status is BudgetReservationStatus.COMMITTED
+    assert reservation.committed_amounts == {
+        BudgetDimension.VT_UNITS: 1,
+        BudgetDimension.DOWNLOADS: 0,
+    }
+    assert latest_envelope.budget.consumed[BudgetDimension.VT_UNITS] == 1
+    assert latest_envelope.budget.consumed[BudgetDimension.DOWNLOADS] == 0
+
+
+@pytest.mark.asyncio
+async def test_confirmed_nonexecution_without_provider_call_releases_reservation() -> None:
+    fixture = _Fixture(responses=[], tools=(("vt.download_sample", "vt", ToolEffect.ACQUIRE),))
+    state = await fixture.start()
+    operation_key = "synthetic-cached-download-refusal"
+    reserved = {BudgetDimension.VT_UNITS: 1, BudgetDimension.DOWNLOADS: 1}
+    envelope = await fixture.envelopes.get(state.investigation_id)
+    envelope.budget.reserve(operation_key, reserved)
+    await fixture.envelopes.save_if_version(
+        replace(envelope, version=envelope.version + 1), expected_version=envelope.version
+    )
+
+    await fixture.service._complete_tool_reservation(
+        investigation_id=state.investigation_id,
+        operation_key=operation_key,
+        result=ToolResult(
+            status=ToolInvocationStatus.UNAVAILABLE,
+            budget_consumed={BudgetDimension.VT_UNITS: 0, BudgetDimension.DOWNLOADS: 0},
+            output={
+                "confirmed_non_execution": True,
+                "cached": True,
+                "reason": "provider_download_route_not_found",
+            },
+        ),
+        reserved_amounts=reserved,
+        uncertain=False,
+    )
+
+    latest_envelope = await fixture.envelopes.get(state.investigation_id)
+    reservation = next(
+        item for item in latest_envelope.budget.reservations if item.operation_key == operation_key
+    )
+    assert reservation.status is BudgetReservationStatus.RELEASED
+    assert latest_envelope.budget.consumed[BudgetDimension.VT_UNITS] == 0
+    assert latest_envelope.budget.consumed[BudgetDimension.DOWNLOADS] == 0
 
 
 @pytest.mark.asyncio
@@ -1631,6 +3127,191 @@ async def test_removed_external_permission_marks_model_unavailable_without_call(
 
 
 @pytest.mark.asyncio
+async def test_exhausted_confirmed_pre_submission_retries_resume_as_a_distinct_attempt(
+    monkeypatch,
+) -> None:
+    failure = TurnSubmission(
+        TurnSubmissionStatus.UNAVAILABLE,
+        detail="composer not ready before submission",
+        error_code="bridge_server_error",
+        submission_state="pre_submission",
+        retryable=True,
+    )
+    fixture = _Fixture(
+        responses=[failure, failure, failure],
+        tools=(),
+        bridge_turn_budget=4,
+    )
+    initial = await fixture.start()
+    complete_reservation = fixture.service._complete_bridge_reservation
+    legacy_committed_keys = []
+
+    async def complete_legacy_committed_reservation(
+        investigation_id,
+        operation_key,
+        budget,
+        *,
+        blocked,
+        confirmed_non_submission=False,
+    ):
+        if confirmed_non_submission:
+            # Model an older worker that committed this key before the durable
+            # Bridge error contract exposed that no request had been submitted.
+            budget.commit(operation_key)
+            legacy_committed_keys.append(operation_key)
+        await complete_reservation(
+            investigation_id,
+            operation_key,
+            budget,
+            blocked=blocked,
+            confirmed_non_submission=confirmed_non_submission,
+        )
+
+    monkeypatch.setattr(
+        fixture.service,
+        "_complete_bridge_reservation",
+        complete_legacy_committed_reservation,
+    )
+
+    stopped = await fixture.service.run(initial.investigation_id)
+
+    assert stopped.stop_reason is StopReason.SUBMISSION_NEEDS_REVIEW
+    assert fixture.bridge_transport.submission_count == 3
+    assert fixture.envelope.budget.consumed[BudgetDimension.BRIDGE_TURNS] == 0
+    assert len(legacy_committed_keys) == 1
+    assert investigation_bridge_attempt(stopped.recent_actions, stopped.turn_index) == 3
+    investigation = await fixture.investigations.get(initial.investigation_id)
+    assert investigation is not None
+    stopped_view = build_investigation_operator_view(
+        investigation=investigation,
+        state=stopped,
+        synthesis_sha256=fixture.snapshot.synthesis_sha256,
+        envelope=await fixture.envelopes.get(initial.investigation_id),
+        invocations=(),
+        observations=(),
+        opinion=None,
+        jobs=(),
+        available_tools=(),
+        unavailable_tools=(),
+    )
+    assert stopped_view.payload["last_operation"]["status"] == "pre_submission_retry_exhausted"
+    assert stopped_view.payload["next_idempotent_action"]["code"] == "resume_investigation"
+
+    fixture.bridge_transport._responses.append(
+        _decision(goal="Finish after the Bridge composer recovered.", next_action="finish")
+    )
+    resumed = await fixture.service.resume(initial.investigation_id)
+    completed = await fixture.service.run(initial.investigation_id)
+
+    assert resumed.stop_reason is None
+    assert completed.stop_reason is StopReason.AGENT_FINISHED
+    assert fixture.bridge_transport.submission_count == 4
+    assert any(key.endswith(":attempt=3") for key in fixture.bridge_transport._by_key)
+    assert fixture.envelope.budget.consumed[BudgetDimension.BRIDGE_TURNS] == 1
+
+
+@pytest.mark.asyncio
+async def test_unclassified_bridge_failure_is_not_retried() -> None:
+    fixture = _Fixture(
+        responses=[
+            TurnSubmission(
+                TurnSubmissionStatus.UNAVAILABLE,
+                detail="transport result is uncertain",
+                error_code="bridge_server_error",
+                retryable=True,
+            ),
+            _decision(goal="Must not be called automatically.", next_action="finish"),
+        ],
+        tools=(),
+    )
+    initial = await fixture.start()
+
+    stopped = await fixture.service.run(initial.investigation_id)
+
+    assert stopped.stop_reason is StopReason.SUBMISSION_NEEDS_REVIEW
+    assert fixture.bridge_transport.submission_count == 1
+
+
+@pytest.mark.asyncio
+async def test_resume_from_legacy_model_unavailable_retries_confirmed_failed_attempt() -> None:
+    fixture = _Fixture(
+        responses=[TurnSubmission(TurnSubmissionStatus.NEEDS_REVIEW, detail="old checkpoint")],
+        tools=(),
+        bridge_turn_budget=4,
+    )
+    initial = await fixture.start()
+    old_stop = await fixture.service.run(initial.investigation_id)
+    assert old_stop.stop_reason is StopReason.SUBMISSION_NEEDS_REVIEW
+    assert old_stop.pending_context_sha256 is not None
+    assert len(fixture.bridge_transport._by_key) == 1
+    prior_key = next(iter(fixture.bridge_transport._by_key))
+
+    # Recreate the deployed legacy state: a previous resume converted the
+    # investigation stop to model_unavailable while retaining a failed Bridge
+    # checkpoint. The turn itself explicitly proves no submission occurred.
+    legacy_state = replace(
+        old_stop,
+        version=old_stop.version + 1,
+        stop_reason=StopReason.MODEL_UNAVAILABLE,
+    )
+    await fixture.states.save_if_version(legacy_state, expected_version=old_stop.version)
+    investigation = await fixture.investigations.get(initial.investigation_id)
+    assert investigation is not None
+    investigation.status = AnalystInvestigationStatus.EXHAUSTED
+    await fixture.investigations.save(investigation)
+    fixture.bridge_transport._by_key[prior_key] = TurnSubmission(
+        TurnSubmissionStatus.UNAVAILABLE,
+        detail="composer not ready before submission",
+        error_code="bridge_server_error",
+        submission_state="pre_submission",
+        retryable=True,
+    )
+    fixture.bridge_transport._responses.append(
+        _decision(goal="Finish after a safe distinct retry.", next_action="finish")
+    )
+
+    resumed = await fixture.service.resume(initial.investigation_id, owner_job_terminal=True)
+    completed = await fixture.service.run(initial.investigation_id)
+
+    assert resumed.stop_reason is None
+    assert completed.stop_reason is StopReason.AGENT_FINISHED
+    assert fixture.bridge_transport.submission_count == 2
+    assert any(key.endswith(":attempt=1") for key in fixture.bridge_transport._by_key)
+    assert fixture.envelope.budget.consumed[BudgetDimension.BRIDGE_TURNS] == 1
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_pre_submission_backoff_releases_bridge_budget(monkeypatch) -> None:
+    fixture = _Fixture(
+        responses=[
+            TurnSubmission(
+                TurnSubmissionStatus.UNAVAILABLE,
+                detail="composer not ready before submission",
+                error_code="bridge_server_error",
+                submission_state="pre_submission",
+                retryable=True,
+            )
+        ],
+        tools=(),
+        bridge_turn_budget=2,
+    )
+    initial = await fixture.start()
+
+    async def cancel_backoff(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr("cti_app.application.bridge_investigator.asyncio.sleep", cancel_backoff)
+    with pytest.raises(asyncio.CancelledError):
+        await fixture.service.run(initial.investigation_id)
+
+    envelope = await fixture.envelopes.get(initial.investigation_id)
+    assert envelope is not None
+    assert envelope.budget.consumed[BudgetDimension.BRIDGE_TURNS] == 0
+    assert envelope.budget.reserved[BudgetDimension.BRIDGE_TURNS] == 0
+    assert envelope.budget.reservations[0].status.value == "released"
+
+
+@pytest.mark.asyncio
 async def test_ambiguous_bridge_resume_reuses_submission_identity() -> None:
     fixture = _Fixture(
         responses=[
@@ -1675,6 +3356,7 @@ async def test_crash_replay_does_not_execute_succeeded_tool_twice() -> None:
         observation_id,
         subject_ref="203.0.113.9",
     )
+    opinion = _opinion_delta(_finding_id(state.investigation_id, proposal), observation_id)
     # Use a new idempotent scripted response with the evidence reference known before execution.
     fixture.bridge_transport = ScriptedTurnTransport(
         [
@@ -1683,6 +3365,7 @@ async def test_crash_replay_does_not_execute_succeeded_tool_twice() -> None:
                 next_action="finish",
                 tools=(call,),
                 findings=(proposal,),
+                opinion=opinion,
             )
         ]
     )

@@ -5,6 +5,7 @@ import {
   useReviewDetection,
   type DetectionTestReport,
   type DetectionVersionReview,
+  type RuleValidationStatus,
 } from "../../api/detection";
 import {
   type BudgetDimension,
@@ -56,6 +57,13 @@ const SAMPLE_ORIGIN_LABELS: Record<
   relationship: "Relation observée",
   behavior: "Comportement",
   manual: "Ajout manuel",
+};
+
+const RULE_VALIDATION_STATUS_LABELS: Record<RuleValidationStatus, string> = {
+  untested: "Non testée",
+  synthetic_only: "Testée uniquement sur fichiers synthétiques",
+  real_partial: "Évaluation partielle sur fichiers réels",
+  real_validated: "Évaluée sur échantillons réels",
 };
 
 const SAMPLE_QUALIFICATION_LABELS: Record<
@@ -734,6 +742,10 @@ function DetectionVersionCard({
           Version {version.version} · {version.status}
         </h3>
         <p>
+          <strong>Validation du corpus :</strong>{" "}
+          {RULE_VALIDATION_STATUS_LABELS[version.validation_status]}
+        </p>
+        <p>
           Candidate {version.candidate_id} · version {version.version_id} ·
           SHA-256 <code>{version.source_sha256}</code>
         </p>
@@ -841,7 +853,10 @@ function DetectionVersionCard({
 function DetectionTestReportView({ report }: { report: DetectionTestReport }) {
   return (
     <section aria-label={`Rapport de test ${report.observation_id}`}>
-      <h4>Essais · {report.execution_status ?? "état inconnu"}</h4>
+      <h4>
+        Essais · {report.execution_status ?? "état inconnu"} · validation :{" "}
+        {report.validation_status}
+      </h4>
       {report.engine_version ? <p>Moteur : {report.engine_version}</p> : null}
       {report.coverage_statement ? <p>{report.coverage_statement}</p> : null}
       {report.selection_bias ? (
@@ -856,6 +871,19 @@ function DetectionTestReportView({ report }: { report: DetectionTestReport }) {
             {roleReport.errors.length > 0
               ? ` · ${roleReport.errors.length} erreur(s)`
               : ""}
+            {roleReport.provenance_counts
+              ? ` · ${roleReport.provenance_counts.real} réel(s), ${roleReport.provenance_counts.synthetic} synthétique(s)`
+              : ""}
+            {roleReport.test_cases?.length ? (
+              <ul>
+                {roleReport.test_cases.map((testCase) => (
+                  <li key={testCase.sha256}>
+                    <code>{testCase.sha256}</code> · {testCase.provenance} ·{" "}
+                    {testCase.outcome}
+                  </li>
+                ))}
+              </ul>
+            ) : null}
           </li>
         ))}
       </ul>

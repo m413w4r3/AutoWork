@@ -16,6 +16,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 EXPECTED_PROJECT = "cti-bulletin"
+LOCAL_CLEANUP_IMAGE = "postgres:16-alpine"
 VOLUME_KEYS = ("postgres_data", "redis_data", "minio_data")
 CLEAN_DIRECTORIES = (
     Path("var/diagnostics/runs"),
@@ -345,11 +346,61 @@ def safe_local_reset(
         )
     for path in plan.clean_directories:
         if path.exists():
-            shutil.rmtree(path)
+            _remove_local_directory(
+                path=path,
+                root=root,
+                docker_command=compose_prefix[:1],
+                runner=runner,
+            )
     for path in plan.clean_files:
         if path.exists():
             path.write_text("", encoding="utf-8")
     return ("Données applicatives locales effacées.",)
+
+
+def _remove_local_directory(
+    *,
+    path: Path,
+    root: Path,
+    docker_command: Sequence[str],
+    runner: CommandRunner,
+) -> None:
+    try:
+        shutil.rmtree(path)
+        return
+    except PermissionError:
+        # Backend and worker run as root in Compose and can leave bind-mounted
+        # workspace directories owned by root. Reclaim only the prevalidated
+        # target through the already-verified local Docker endpoint.
+        _run_checked(
+            runner,
+            [
+                *docker_command,
+                "run",
+                "--rm",
+                "--network",
+                "none",
+                "--mount",
+                f"type=bind,src={path},dst=/target",
+                LOCAL_CLEANUP_IMAGE,
+                "chown",
+                "-R",
+                f"{os.getuid()}:{os.getgid()}",
+                "/target",
+            ],
+            root,
+            f"récupération des droits du chemin local {path.relative_to(root)}",
+        )
+    try:
+        for child in path.iterdir():
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+    except OSError as exc:
+        raise ResetRefusedError(
+            f"Refus du reset : impossible de nettoyer {path.relative_to(root)}."
+        ) from exc
 
 
 def _has_volume_mount(
@@ -569,6 +620,12 @@ def _database_status_probe(
                     [*compose_prefix, "stop", "postgres"],
                     root,
                     "arrêt du PostgreSQL temporaire",
+                )
+                _run_checked(
+                    runner,
+                    [*compose_prefix, "rm", "-f", "postgres"],
+                    root,
+                    "suppression du conteneur PostgreSQL temporaire",
                 )
         output = dsn_result.stdout + "\n" + dsn_result.stderr
         status_line = next(

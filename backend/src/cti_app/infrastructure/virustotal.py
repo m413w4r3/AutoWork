@@ -70,6 +70,23 @@ from cti_app.domain.virustotal import (
 logger = logging.getLogger(__name__)
 _MAX_ERROR_BODY_BYTES = 64 * 1024
 
+VIRUSTOTAL_ADAPTER_SETTINGS_BY_ARGUMENT = {
+    "base_url": "virustotal_base_url",
+    "fallback_base_url": "virustotal_fallback_base_url",
+    "legacy_base_url": "virustotal_legacy_base_url",
+    "file_report_proxy_fallback_enabled": "virustotal_file_report_proxy_fallback_enabled",
+    "file_report_legacy_fallback_enabled": "virustotal_file_report_legacy_fallback_enabled",
+    "max_response_bytes": "virustotal_max_response_bytes",
+    "default_page_size": "virustotal_default_page_size",
+    "max_page_size": "virustotal_max_page_size",
+    "max_pages": "virustotal_max_pages",
+    "max_results": "virustotal_max_results",
+    "file_download_enabled": "virustotal_file_download_enabled",
+    "download_allowed_hosts": "virustotal_download_allowed_hosts",
+    "download_max_bytes": "virustotal_download_max_bytes",
+    "download_timeout_seconds": "virustotal_download_timeout_seconds",
+}
+
 
 def create_virustotal_http_client(settings: Settings) -> httpx.AsyncClient:
     """Create the proxy-only client; its caller owns and closes its lifecycle."""
@@ -192,16 +209,23 @@ class VirusTotalHttpAdapter(VirusTotalPort):
         if (direct_client is None) != (api_key is None):
             raise ValueError("direct_client et api_key doivent être fournis ensemble")
         self._capabilities = capabilities
-        self._routing_policy = routing_policy or _default_routing_policy(
-            base_url=self._base_url,
-            fallback_base_url=self._fallback_base_url,
-            legacy_base_url=self._legacy_base_url,
-            direct_client=self._direct_client,
-            api_key=self._api_key,
-            proxy_fallback_enabled=file_report_proxy_fallback_enabled,
-            legacy_fallback_enabled=file_report_legacy_fallback_enabled,
-            file_download_enabled=file_download_enabled,
-        )
+        if routing_policy is None:
+            self._routing_policy = _default_routing_policy(
+                base_url=self._base_url,
+                fallback_base_url=self._fallback_base_url,
+                legacy_base_url=self._legacy_base_url,
+                direct_client=self._direct_client,
+                api_key=self._api_key,
+                proxy_fallback_enabled=file_report_proxy_fallback_enabled,
+                legacy_fallback_enabled=file_report_legacy_fallback_enabled,
+                file_download_enabled=file_download_enabled,
+            )
+        elif file_download_enabled:
+            self._routing_policy = routing_policy
+        else:
+            routes = dict(routing_policy.routes)
+            routes.pop(VirusTotalCapability.FILE_DOWNLOAD, None)
+            self._routing_policy = VirusTotalRoutingPolicy(routes=routes)
         self._max_response_bytes = _positive(max_response_bytes, "max_response_bytes")
         self._default_page_size = _bounded(default_page_size, 1, max_page_size, "default_page_size")
         self._max_page_size = _positive(max_page_size, "max_page_size")
@@ -686,6 +710,38 @@ class VirusTotalHttpAdapter(VirusTotalPort):
     def _require(self, capability: VirusTotalCapability) -> None:
         if not self._capabilities.is_enabled(capability):
             raise VirusTotalCapabilityDisabledError("La capability VirusTotal est désactivée.")
+
+
+def create_virustotal_http_adapter(
+    *,
+    client: httpx.AsyncClient,
+    settings: Settings,
+    capabilities: VirusTotalCapabilities,
+    direct_client: httpx.AsyncClient | None = None,
+    api_key: str | None = None,
+    routing_policy: VirusTotalRoutingPolicy | None = None,
+) -> VirusTotalHttpAdapter:
+    """Bind adapter policy and limits to the validated runtime settings."""
+    arguments = {
+        argument: getattr(settings, field_name)
+        for argument, field_name in VIRUSTOTAL_ADAPTER_SETTINGS_BY_ARGUMENT.items()
+    }
+    arguments["download_allowed_hosts"] = frozenset(
+        host for host in settings.virustotal_download_allowed_hosts.split(",") if host
+    )
+    resolved_api_key = api_key
+    if direct_client is None:
+        resolved_api_key = None
+    elif resolved_api_key is None and settings.virustotal_api_key is not None:
+        resolved_api_key = settings.virustotal_api_key.get_secret_value()
+    return VirusTotalHttpAdapter(
+        client=client,
+        capabilities=capabilities,
+        direct_client=direct_client,
+        api_key=resolved_api_key,
+        routing_policy=routing_policy,
+        **arguments,
+    )
 
 
 def _default_routing_policy(

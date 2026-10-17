@@ -13,7 +13,7 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 import httpx
 import pytest
@@ -28,6 +28,8 @@ from cti_app.application.edition_rendering import EditionRenderService
 from cti_app.application.edition_typst_rendering import EditionTypstRenderer
 from cti_app.application.evidence_recorder import ProductionEvidenceRecorder
 from cti_app.application.identity import LocalIdentityProvider
+from cti_app.application.investigation_contracts import FindingProposalV1
+from cti_app.application.investigation_service import _FINDING_NAMESPACE
 from cti_app.application.media_assets import MediaAssetStore
 from cti_app.application.network_capture_import import NetworkCaptureImportService
 from cti_app.application.network_protocol_model import NetworkProtocolWorkbench
@@ -808,37 +810,74 @@ class _PilotBridge(ScriptedInvestigationTransport):
                     "selection": "all proposal citations were reread from archived observations",
                 }
             )
-            return decision(
+            final_statement = (
+                "Les observations établissent des flux TCP et un cadrage de messages candidat; "
+                "elles ne démontrent ni exécution du sample ni exfiltration."
+            )
+            final_subject = next(
+                item.object_id for item in observations if item.object_type == "ipv4"
+            )
+            final_scope = "Échantillon inerte, deux PCAP importés et observation passive datée."
+            final_limitations = (
+                "Les octets observés ne suffisent pas à établir la sémantique des messages.",
+                "La charge TLS demeure opaque; aucun payload n'a été décodé.",
+                "Les entrées synthétiques ne décrivent aucune campagne réelle.",
+            )
+            final_proposal = {
+                "kind": FindingKind.CLAIM_VERIFICATION.value,
+                "assessment": FindingAssessment.QUALIFIED.value,
+                "statement": final_statement,
+                "subject_ref": final_subject,
+                "observation_refs": refs,
+                "claim_refs": ["L1.1"],
+                "hypothesis_refs": [],
+                "novelty": NoveltyClass.NOT_CONFIRMED.value,
+                "scope": final_scope,
+                "limitations": list(final_limitations),
+            }
+            identity = FindingProposalV1(
+                kind=FindingKind.CLAIM_VERIFICATION,
+                assessment=FindingAssessment.QUALIFIED,
+                statement=final_statement,
+                subject_ref=final_subject,
+                observation_refs=tuple(UUID(item) for item in refs),
+                claim_refs=("L1.1",),
+                hypothesis_refs=(),
+                novelty=NoveltyClass.NOT_CONFIRMED,
+                scope=final_scope,
+                limitations=final_limitations,
+            )
+            finding_id = uuid5(
+                _FINDING_NAMESPACE,
+                f"{self._investigation_id}:"
+                f"{hashlib.sha256(identity.persistent_identity_bytes()).hexdigest()}",
+            )
+            final = decision(
                 "Finish with a sourced correction of L1.1: static analysis and passive protocol "
                 "evidence do not establish execution or exfiltration.",
                 next_action=AgentNextAction.FINISH.value,
-                finding_proposals=[
+                finding_proposals=[final_proposal],
+            )
+            final["opinion_delta"] = {
+                "blocks": [
                     {
-                        "kind": FindingKind.CLAIM_VERIFICATION.value,
-                        "assessment": FindingAssessment.QUALIFIED.value,
-                        "statement": (
-                            "Les observations établissent des flux TCP et un cadrage de messages "
-                            "candidat; elles ne démontrent ni exécution du sample ni exfiltration."
+                        "block_type": OpinionBlockType.KEY_FINDINGS.value,
+                        "text": (
+                            "The passive observations support a qualified description of the "
+                            "protocol framing; they do not establish the claimed execution or "
+                            "exfiltration."
                         ),
-                        "subject_ref": next(
-                            item.object_id for item in observations if item.object_type == "ipv4"
-                        ),
-                        "observation_refs": refs,
-                        "claim_refs": ["L1.1"],
-                        "hypothesis_refs": [],
-                        "novelty": NoveltyClass.NOT_CONFIRMED.value,
-                        "scope": (
-                            "Échantillon inerte, deux PCAP importés et observation passive datée."
-                        ),
-                        "limitations": [
-                            "Les octets observés ne suffisent pas à établir "
-                            "la sémantique des messages.",
-                            "La charge TLS demeure opaque; aucun payload n'a été décodé.",
-                            "Les entrées synthétiques ne décrivent aucune campagne réelle.",
-                        ],
+                        "finding_refs": [str(finding_id)],
+                        "evidence_refs": refs,
+                        "qualification": OpinionClaimQualification.INFERENCE.value,
+                        "certainty": 0.6,
                     }
                 ],
-            )
+                "unresolved_points": [
+                    "Message semantics and the opaque TLS payload remain unverified."
+                ],
+            }
+            return final
 
         raise AssertionError(
             "Pilot Bridge found no state-derived next action; inspect persisted observations "

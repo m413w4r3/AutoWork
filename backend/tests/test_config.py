@@ -140,7 +140,9 @@ def test_virustotal_settings_are_optional_and_bounded(monkeypatch: pytest.Monkey
     assert settings.virustotal_proxy_url is None
     assert settings.virustotal_retrohunt_enabled is False
     assert settings.virustotal_retrohunt_proxy_enabled is False
-    assert settings.virustotal_base_url == "https://www.virustotal.com/api/v3"
+    # Requests go through the VirusTotal proxy, which is reached over plain HTTP;
+    # the https URL is only the real-API fallback route (VIRUSTOTAL_FALLBACK_BASE_URL).
+    assert settings.virustotal_base_url == "http://www.virustotal.com/api/v3"
     assert settings.virustotal_retrohunt_max_result_pages == 20
     assert settings.virustotal_retrohunt_max_results == 1000
     monkeypatch.setenv("VIRUSTOTAL_RETROHUNT_ENABLED", "true")
@@ -162,13 +164,37 @@ def test_compose_propagates_critical_settings_to_api_and_worker_from_a_fake_env(
     critical_fields = {
         name
         for name in Settings.model_fields
-        if name.startswith(("virustotal_", "shodan_", "openai_bridge_", "investigation_"))
+        if name.startswith(
+            (
+                "virustotal_",
+                "shodan_",
+                "openai_bridge_",
+                "investigation_",
+                "local_analysis_",
+                "rule_workbench_",
+                "mwcp_",
+                "ghidra_",
+                "native_analysis_",
+            )
+        )
     } | {"operator_api_token", "postgres_dsn"}
     expected_keys = {name.upper() for name in critical_fields}
     compose_keys = {
         name
         for name in backend_env
-        if name.startswith(("VIRUSTOTAL_", "SHODAN_", "OPENAI_BRIDGE_", "INVESTIGATION_"))
+        if name.startswith(
+            (
+                "VIRUSTOTAL_",
+                "SHODAN_",
+                "OPENAI_BRIDGE_",
+                "INVESTIGATION_",
+                "LOCAL_ANALYSIS_",
+                "RULE_WORKBENCH_",
+                "MWCP_",
+                "GHIDRA_",
+                "NATIVE_ANALYSIS_",
+            )
+        )
         or name in {"OPERATOR_API_TOKEN", "POSTGRES_DSN"}
     }
     assert compose_keys == expected_keys
@@ -232,7 +258,7 @@ def test_compose_propagates_critical_settings_to_api_and_worker_from_a_fake_env(
         assert secret not in rendered_settings
 
 
-_COMPOSE_VARIABLE = re.compile(r"\$\{([A-Z0-9_]+)(?:(:-|-)([^{}]*))?\}")
+_COMPOSE_VARIABLE = re.compile(r"\$\{([A-Z0-9_]+)(?:(:-|-)([^}]*))?\}")
 
 
 def _parse_fake_dotenv(path: Path) -> dict[str, str]:
@@ -294,6 +320,32 @@ def test_local_analysis_and_ghidra_are_disabled_with_bounded_settings(
     monkeypatch.setenv("GHIDRA_MAX_RESPONSE_BYTES", "0")
     with pytest.raises(ValidationError):
         Settings(_env_file=None)
+
+
+def test_investigation_runtime_settings_are_documented_with_safe_defaults() -> None:
+    prefixes = (
+        "local_analysis_",
+        "rule_workbench_",
+        "mwcp_",
+        "ghidra_",
+        "native_analysis_",
+    )
+    expected = {name.upper() for name in Settings.model_fields if name.startswith(prefixes)}
+    repo_root = Path(__file__).resolve().parents[2]
+    compose = yaml.safe_load((repo_root / "compose.yaml").read_text(encoding="utf-8"))
+    backend_env = compose["services"]["backend"]["environment"]
+    example_names = set(_parse_fake_dotenv(repo_root / ".env.example"))
+
+    assert expected <= set(backend_env)
+    assert expected <= example_names
+    defaults = Settings(_env_file=None)
+    assert defaults.local_analysis_enabled is False
+    assert defaults.local_analysis_require_filesystem_confinement is False
+    assert defaults.rule_workbench_enabled is False
+    assert defaults.mwcp_parser_versions == {}
+    assert defaults.ghidra_enabled is False
+    assert defaults.native_analysis_enabled is False
+    assert defaults.native_analysis_provider == "none"
 
 
 def test_production_jitter_bounds_allow_zero_but_reject_inverted_ranges(

@@ -12,10 +12,20 @@ export type DetectionCandidateStatus =
 
 export type DetectionTestRole =
   "confirmed_positive" | "out_of_cluster_candidate" | "goodware" | "holdout";
+export type RuleValidationStatus =
+  "untested" | "synthetic_only" | "real_partial" | "real_validated";
+
+export interface DetectionTestCase {
+  sha256: string;
+  provenance: "real" | "synthetic";
+  outcome: string;
+}
 
 export interface DetectionTestRoleReport {
   role: DetectionTestRole;
   corpus_sha256s: string[];
+  provenance_counts?: { real: number; synthetic: number };
+  test_cases?: DetectionTestCase[];
   matches: string[];
   non_matches: string[];
   non_measurable: string[];
@@ -34,12 +44,20 @@ export interface DetectionTestReport {
   corpus_sha256s_by_role: Partial<Record<DetectionTestRole, string[]>>;
   engine_version: string | null;
   execution_status: string | null;
+  validation_status: RuleValidationStatus;
   selection_bias: string | null;
   coverage_statement: string | null;
+  provenance_counts_by_role: Partial<
+    Record<DetectionTestRole, { real: number; synthetic: number }>
+  >;
+  false_positive_count: number;
+  false_positive_sha256s: string[];
+  false_negative_count: number;
+  false_negative_sha256s: string[];
   roles: DetectionTestRoleReport[];
   limitations: string[];
   known_false_positives: string[];
-  known_false_positive_status: "present" | "none_observed";
+  known_false_positive_status: "present" | "none_observed" | "not_tested";
   goodware_case_count: number;
 }
 
@@ -65,6 +83,7 @@ export interface DetectionVersionReview {
   source: string;
   source_sha256: string;
   status: DetectionCandidateStatus;
+  validation_status: RuleValidationStatus;
   created_at: string;
   test_reports: DetectionTestReport[];
   latest_decision: DetectionDecisionView | null;
