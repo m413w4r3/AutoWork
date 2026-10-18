@@ -250,7 +250,7 @@ class Settings(BaseSettings):
     # catalogue, a minimal environment, resource limits, and network syscall
     # filtering; these settings only widen its bounded defaults.
     local_analysis_enabled: bool = False
-    local_analysis_require_filesystem_confinement: bool = False
+    local_analysis_require_filesystem_confinement: bool = True
     local_analysis_timeout_seconds: float = Field(default=30.0, gt=0, le=600)
     local_analysis_max_output_bytes: int = Field(default=1_000_000, gt=0, le=20_000_000)
     local_analysis_cpu_limit_seconds: int = Field(default=30, ge=1, le=600)
@@ -263,28 +263,32 @@ class Settings(BaseSettings):
     local_analysis_max_sample_bytes: int = Field(
         default=200 * 1024 * 1024, gt=0, le=2 * 1024 * 1024 * 1024
     )
+    # The confined worker is a separate, non-root Compose service. It is probed
+    # before its families become visible; the profile and version pins are not
+    # secrets and must match the worker image at runtime.
+    analysis_worker_enabled: bool = False
+    analysis_worker_probe_timeout_seconds: float = Field(default=8.0, gt=0, le=30)
+    analysis_worker_job_timeout_seconds: float = Field(default=120.0, gt=0, le=600)
+    analysis_worker_poll_interval_seconds: float = Field(default=0.25, gt=0, le=5)
+    analysis_worker_result_max_bytes: int = Field(default=1_000_000, gt=0, le=20_000_000)
+    analysis_worker_expected_isolation_profile: str = Field(
+        default="bookworm-internal-v1", min_length=1, max_length=128
+    )
 
     # MWCP runs only parsers listed here (parser id -> pinned parser version);
     # an empty allowlist keeps configuration extraction unavailable.
     mwcp_parser_versions: dict[str, str] = Field(default_factory=dict)
 
-    # GhidraMCP's concrete HTTP transport and paths were not locally verifiable
-    # for this lot. Empty paths deliberately keep the adapter unavailable until
-    # a deployer confirms and configures each read endpoint.
+    # Ghidra runs as the optional isolated headless service. The client admits
+    # it only after the fixed service contract and both runtime versions attest.
     ghidra_enabled: bool = False
-    ghidra_base_url: str = "http://127.0.0.1:8787"
+    ghidra_base_url: str = "http://ghidra:8787"
     ghidra_connect_timeout_seconds: float = Field(default=3.0, gt=0, le=60)
-    ghidra_read_timeout_seconds: float = Field(default=60.0, gt=0, le=600)
+    ghidra_read_timeout_seconds: float = Field(default=150.0, gt=0, le=600)
+    ghidra_max_sample_bytes: int = Field(default=200 * 1024 * 1024, gt=0, le=2 * 1024 * 1024 * 1024)
     ghidra_max_response_bytes: int = Field(default=2 * 1024 * 1024, gt=0, le=20 * 1024 * 1024)
-    ghidra_expected_version: str | None = None
-    ghidra_expected_plugin_version: str | None = None
-    ghidra_allowed_hosts: str = ""
-    ghidra_functions_path: str = ""
-    ghidra_imports_path: str = ""
-    ghidra_xrefs_to_path: str = ""
-    ghidra_xrefs_from_path: str = ""
-    ghidra_decompile_function_path: str = ""
-    ghidra_search_path: str = ""
+    ghidra_expected_version: str = Field(default="12.1.4", min_length=1, max_length=64)
+    ghidra_expected_java_version: str = Field(default="21.0.12.1", min_length=1, max_length=64)
 
     # Native inspection is opt-in and advertises one closed, read-only catalog.
     # The REA worker client is supplied by the deployment and must independently
@@ -297,7 +301,7 @@ class Settings(BaseSettings):
     native_analysis_rea_expected_version: str | None = Field(
         default=None, min_length=1, max_length=128
     )
-    native_analysis_timeout_seconds: float = Field(default=30.0, gt=0, le=600)
+    native_analysis_timeout_seconds: float = Field(default=150.0, gt=0, le=600)
     native_analysis_max_response_bytes: int = Field(default=64 * 1024, ge=256, le=2 * 1024 * 1024)
     native_analysis_max_output_bytes: int = Field(default=32 * 1024, ge=256, le=64 * 1024)
 
@@ -318,6 +322,13 @@ class Settings(BaseSettings):
     analysis_max_strings: int = Field(default=10_000, ge=1, le=1_000_000)
     analysis_max_sample_bytes: int = Field(default=200 * 1024 * 1024, gt=0)
     analysis_capa_rules_path: Path = Path("rules/capa")
+    analysis_capa_expected_version: str = Field(default="9.4.0", min_length=1, max_length=64)
+    analysis_smda_expected_version: str = Field(default="4.5.0", min_length=1, max_length=64)
+    analysis_capa_ruleset_revision: str = Field(
+        default="2af9fbfc1c9b4634dbeb76b5d34fca9389fa7f80", min_length=7, max_length=64
+    )
+    analysis_tshark_expected_version: str = Field(default="4.0.17", min_length=1, max_length=64)
+    analysis_capinfos_expected_version: str = Field(default="4.0.17", min_length=1, max_length=64)
     analysis_capa_timeout_seconds: float = Field(default=60.0, gt=0, le=3600)
     analysis_capa_max_output_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
     analysis_capa_max_memory_bytes: int = Field(default=512 * 1024 * 1024, gt=0)

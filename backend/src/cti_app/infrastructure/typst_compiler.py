@@ -67,12 +67,16 @@ class TypstProcessRunner(Protocol):
 
 
 def typst_process_environment() -> dict[str, str]:
-    """Return PATH and fixed locale values, matching the D2 runner policy."""
-    return {
+    """Return the compiler environment, including a caller-pinned temporary root."""
+    environment = {
         "PATH": os.environ.get("PATH", os.defpath),
         "LANG": TYPST_PROCESS_LOCALE,
         "LC_ALL": TYPST_PROCESS_LOCALE,
     }
+    temporary_root = os.environ.get("TMPDIR")
+    if temporary_root is not None:
+        environment["TMPDIR"] = temporary_root
+    return environment
 
 
 class AsyncioTypstProcessRunner:

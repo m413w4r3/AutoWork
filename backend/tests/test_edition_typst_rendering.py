@@ -211,10 +211,11 @@ def test_edition_renders_v6_opinion_between_synthesis_and_annex(tmp_path: Path) 
 
     with_opinion = data["publications"][0]["content_sections"]
     section_types = [section["type"] for section in with_opinion]
-    assert section_types[:3] == ["references", "synthesis", "analyst_opinion"]
+    assert section_types[:4] == ["references", "synthesis", "chronology", "analyst_opinion"]
     assert section_types.index("analyst_opinion") < section_types.index("technical_annex")
-    assert with_opinion[2]["heading"] == "Avis de l'analyste"
-    assert with_opinion[2]["blocks"][0]["text"] == "Le constat supplémentaire est corroboré."
+    opinion_section = next(item for item in with_opinion if item["type"] == "analyst_opinion")
+    assert opinion_section["heading"] == "Avis de l'analyste"
+    assert opinion_section["blocks"][0]["text"] == "Le constat supplémentaire est corroboré."
     assert "analyst_opinion" not in {
         section["type"] for section in data["publications"][1]["content_sections"]
     }
@@ -258,8 +259,12 @@ def test_edition_uses_shared_reader_facing_figure_source_projection(tmp_path: Pa
         if block["type"] == "figure"
     )
     assert figure_block["source_note"] == "example.test — Bitcoin wallet recovery — p. 1"
+    assert "source_url" not in figure_block
     assert "provenance" not in figure_block
+    assert figure_block["sha256"] == figure.sha256
+    assert figure_block["attribution"] != figure.provenance
     assert "HTML image" not in json.dumps(figure_block)
+    assert "65d67fad-2db8-4e50-a6a0-6fd09e790000" not in json.dumps(figure_block)
 
 
 def test_orders_two_and_three_articles_by_position_not_title_or_input_order(
@@ -586,7 +591,7 @@ def test_shared_publication_projection_is_pure_and_complete(tmp_path: Path) -> N
 def test_repository_edition_manifest_snapshots_expected_assets() -> None:
     bundle = load_template_bundle(_CHP_TYPST_ROOT, manifest_name=_EDITION_MANIFEST)
 
-    assert bundle.template_version == "chp-edition-v17-protocol-figure-pins"
+    assert bundle.template_version == "chp-edition-v23-caption-spacing-graph-wrap"
     assert {file.relative_path for file in bundle.files} == {
         "RENDERER/edition.typ",
         "RENDERER/edition_helpers.typ",

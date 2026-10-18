@@ -13,8 +13,10 @@ import httpx
 import pytest
 from pydantic import SecretStr
 
+import cti_app.infrastructure.local_command_runner as local_command_runner_module
 from cti_app.api import main as api_main
 from cti_app.application.capabilities import CAPA_ANALYSIS_JOB_KIND
+from cti_app.application.confined_analysis import CONFINED_ANALYSIS_JOB_KIND
 from cti_app.application.identity import (
     LocalIdentityProvider,
     StaticTokenIdentityProvider,
@@ -26,7 +28,6 @@ from cti_app.application.investigation_local_tools import (
     LOCAL_RUN_COMMAND,
     local_tool_capabilities,
 )
-from cti_app.application.jobs import UnknownJobKindError
 from cti_app.application.local_analysis import (
     LocalCommandCatalog,
     LocalCommandId,
@@ -67,7 +68,11 @@ class _SampleBytes:
 
 class _RecordingLocalCommandRunner(LocalCommandRunner):
     def __init__(self) -> None:
-        super().__init__(network_sandbox_probe_seconds=0.2, require_filesystem_confinement=True)
+        with local_command_runner_module._NAMESPACE_LAUNCHERS_LOCK:
+            local_command_runner_module._FAILED_NAMESPACE_LAUNCHERS.clear()
+            local_command_runner_module._FAILED_NAMESPACE_LAUNCHER_REASONS.clear()
+        local_command_runner_module._detect_network_namespace.cache_clear()
+        super().__init__(network_sandbox_probe_seconds=2.0, require_filesystem_confinement=True)
         self.last_bwrap_argv: list[str] | None = None
 
     def _wrap_network_namespace(
@@ -88,6 +93,14 @@ class _RecordingLocalCommandRunner(LocalCommandRunner):
 def test_strict_mode_hides_execution_tools_without_measured_filesystem_confinement(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        "cti_app.infrastructure.local_command_runner._detect_network_namespace",
+        lambda _timeout: _NamespaceDetection(
+            NetworkIsolationStatus.SECCOMP_ONLY,
+            None,
+            (NamespaceFailureReason.NO_NETWORK_NAMESPACE_AVAILABLE,),
+        ),
+    )
     monkeypatch.setenv("LOCAL_ANALYSIS_REQUIRE_FILESYSTEM_CONFINEMENT", "1")
     settings = Settings(
         _env_file=None,
@@ -149,21 +162,24 @@ def test_strict_runtime_disables_every_unconfined_local_executor(
     ports = runtime.optional_tool_ports
 
     assert statuses["local_command_execution"].reason == "no_network_namespace_available"
-    assert statuses["rule_workbench"].reason == "filesystem_confinement_unavailable"
-    assert statuses["capa_analysis"].reason == "filesystem_confinement_unavailable"
-    assert statuses["smda_analysis"].reason == "filesystem_confinement_unavailable"
-    assert statuses["floss_extraction"].reason == "filesystem_confinement_required"
-    assert statuses["configuration_extraction"].reason == "filesystem_confinement_required"
-    assert statuses["local_analysis"].state.value == "available"
+    assert statuses["rule_workbench"].reason == "analysis_worker_disabled_by_configuration"
+    assert statuses["rule_workbench"].execution_mode == "unavailable"
+    assert statuses["local_filesystem_confinement"].reason == "no_network_namespace_available"
+    assert statuses["capa_analysis"].state.value == "unavailable"
+    assert statuses["smda_analysis"].state.value == "unavailable"
+    assert statuses["floss_extraction"].reason == "analysis_worker_disabled_by_configuration"
+    assert (
+        statuses["configuration_extraction"].reason == "analysis_worker_disabled_by_configuration"
+    )
+    assert statuses["local_analysis"].state.value == "unavailable"
     assert ports.local_commands is not None
     assert ports.local_command_catalog is not None
     assert ports.local_command_catalog.available_commands() == ()
     assert ports.yara_engine is None
     assert ports.sample_capabilities_analysis is None
     assert ports.sample_code_features is None
-    assert ports.floss_extraction is not None and not ports.floss_extraction.available
-    assert ports.configuration_extraction is not None
-    assert not ports.configuration_extraction.available
+    assert ports.floss_extraction is None
+    assert ports.configuration_extraction is None
 
 
 def test_tshark_catalog_is_offline_read_only_and_has_no_arbitrary_lua_option() -> None:
@@ -208,7 +224,7 @@ def test_bwrap_command_uses_pid_namespaces_and_keeps_seccomp_fd() -> None:
 
 
 @pytest.mark.asyncio
-async def test_strict_analysis_worker_does_not_construct_or_register_capa(
+async def test_analysis_worker_registers_capa_behind_its_container_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = Settings(local_analysis_require_filesystem_confinement=True)
@@ -234,18 +250,25 @@ async def test_strict_analysis_worker_does_not_construct_or_register_capa(
     monkeypatch.setattr(analysis_tasks, "MinioBlobStore", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(analysis_tasks, "BlobCatalogService", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(analysis_tasks, "StaticAnalysisService", lambda *_args, **_kwargs: object())
-    monkeypatch.setattr(
-        analysis_tasks,
-        "CapabilitiesService",
-        lambda *_args, **_kwargs: pytest.fail("strict mode must not construct capa"),
-    )
+    monkeypatch.setattr(analysis_tasks, "CapabilitiesService", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(analysis_tasks, "JobExecutor", _Executor)
 
     await analysis_tasks._execute_analysis_job(uuid4())
 
     assert _Executor.registry is not None
-    with pytest.raises(UnknownJobKindError):
-        cast(Any, _Executor.registry).validate(CAPA_ANALYSIS_JOB_KIND, {"sample_id": uuid4()})
+    assert cast(Any, _Executor.registry).validate(CAPA_ANALYSIS_JOB_KIND, {"sample_id": uuid4()})
+    confined_parameters = {
+        "investigation_id": uuid4(),
+        "association_id": uuid4(),
+        "sample_id": uuid4(),
+        "artifact_id": uuid4(),
+        "artifact_sha256": "a" * 64,
+        "operation_key": "confined-analysis:" + "b" * 64,
+        "tool": "sample_analysis",
+        "timeout_seconds": 30,
+        "max_output_bytes": 1024,
+    }
+    assert cast(Any, _Executor.registry).validate(CONFINED_ANALYSIS_JOB_KIND, confined_parameters)
 
 
 @pytest.mark.asyncio
@@ -258,10 +281,10 @@ async def test_real_bwrap_runs_only_catalogued_readers_on_an_inert_sample() -> N
     # limits are enforced independently by the bootstrap and stream readers.
     assert which("bwrap") is not None, "bubblewrap is required for this confinement test"
     runner = _RecordingLocalCommandRunner()
-    assert runner.filesystem_confined, (
-        "bwrap is installed but its network/filesystem confinement probe failed; "
-        "check user namespaces/AppArmor rather than accepting seccomp-only fallback"
-    )
+    if not runner.filesystem_confined:
+        pytest.skip(
+            f"host kernel does not permit measured bwrap isolation: {runner.namespace_reason}"
+        )
     assert runner.network_isolation == "bwrap-net"
 
     payload = b"SAFE_INERT_SYNTHETIC_SAMPLE_MARKER\x00" * 8
@@ -320,7 +343,10 @@ async def test_real_bwrap_hides_host_proc_and_seccomp_denies_socket(
 ) -> None:
     assert which("bwrap") is not None, "bubblewrap is required for this confinement test"
     runner = _RecordingLocalCommandRunner()
-    assert runner.filesystem_confined
+    if not runner.filesystem_confined:
+        pytest.skip(
+            f"host kernel does not permit measured bwrap isolation: {runner.namespace_reason}"
+        )
 
     monkeypatch.setenv("AUTOWORK_HOST_PROC_SENTINEL", "must-not-reach-sandbox")
     host_worker_pid = os.getpid()

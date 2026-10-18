@@ -841,7 +841,7 @@ def test_direct_v4_composition_is_deliberate_and_shares_chp_visual_modules() -> 
         "ioc-list",
     }
     assert "source-list" not in production_helpers_imports[shared_helpers]
-    assert production_helpers_imports[colors] == {"grey"}
+    assert production_helpers_imports[colors] == {"accent", "grey"}
     style_imports = _resolved_imports(document_style)
     assert style_imports[header_footer] == {"report-header", "report-footer"}
     assert style_imports[colors] == {"purple"}
@@ -1312,6 +1312,7 @@ async def test_real_typst_render_shows_diagram_and_archived_figure_captions(
 }
 """
     helper_shim = """
+#let code-font-families = ("Cascadia Mono", "Cascadia Code", "Cascadia Mono PL", "Cascadia Code PL")
 #let section-title(body) = body
 #let timeline(events) = events
 #let styled-table(item) = item
@@ -1525,6 +1526,7 @@ async def test_real_typst_frontmatter_and_120_original_iocs_flow_across_pages(
         semantic_text=source_document.semantic_text,
         references=source_document.references,
         original_indicators=(PublicationIndicatorGroupV1(ArtifactType.DOMAIN, indicators),),
+        ioc_details=source_document.ioc_details,
     )
     template_bundle = load_template_bundle(_CHP_TYPST_ROOT)
     render_source = TypstRenderer().render(publication, template_bundle)
@@ -1550,7 +1552,7 @@ async def test_real_typst_frontmatter_and_120_original_iocs_flow_across_pages(
     assert len(reader.pages) >= 2
     assert "[Example actor] Décrit une activité documentée" in text
     assert "RÉFÉRENCES" in text
-    assert text.count("IOC") == 2
+    assert text.count("IOC") == 3
     reserve_heading = "IOC originaux à lien non démontré"
     assert reserve_heading in text
     reserve_position = text.index(reserve_heading)

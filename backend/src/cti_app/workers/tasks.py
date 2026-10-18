@@ -9,6 +9,7 @@ from minio import Minio
 from cti_app.application.analyst_vt_enrichment import VirusTotalSeedEnrichmentService
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.collection import SubjectCollectionService
+from cti_app.application.confined_analysis import CONFINED_ANALYSIS_JOB_KIND
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.discovery.cumulative.chatgpt_planner import ChatGptMergePlanner
 from cti_app.application.discovery.cumulative.jobs import (
@@ -132,6 +133,7 @@ DURABLE_RESUME_JOB_KINDS = frozenset(
         INVESTIGATION_RUN_JOB_KIND,
         *(stage_job_kind(stage) for stage in production_stages()),
         production_reconciliation_resume_job_kind(),
+        CONFINED_ANALYSIS_JOB_KIND,
     }
 )
 
@@ -152,8 +154,13 @@ def execute_job(job_id: str) -> None:
 @dramatiq.actor(max_retries=0)
 def recover_abandoned_jobs() -> None:
     """Requeue jobs whose running worker stopped updating its heartbeat."""
-    for job_id in asyncio.run(_recover_abandoned_jobs()):
-        execute_job.send(str(job_id))
+    for job_id, kind in asyncio.run(_recover_abandoned_jobs()):
+        if kind == CONFINED_ANALYSIS_JOB_KIND:
+            from cti_app.workers.analysis_tasks import execute_analysis_job
+
+            execute_analysis_job.send(str(job_id))
+        else:
+            execute_job.send(str(job_id))
 
 
 async def _execute_job(job_id: UUID) -> int | None:
@@ -225,6 +232,7 @@ async def _execute_job(job_id: UUID) -> int | None:
             shodan_adapter = create_shodan_http_adapter(client=shodan_client, settings=settings)
         if settings.ghidra_enabled:
             ghidra_adapter = create_ghidra_mcp_http_adapter(settings)
+            await ghidra_adapter.probe()
         seed_enrichment = VirusTotalSeedEnrichmentService(
             vt_adapter,
             vt_observations,
@@ -416,7 +424,7 @@ async def _execute_job(job_id: UUID) -> int | None:
         await engine.dispose()
 
 
-async def _recover_abandoned_jobs() -> list[UUID]:
+async def _recover_abandoned_jobs() -> list[tuple[UUID, str]]:
     settings = get_settings()
     engine = create_postgres_engine(settings.postgres_dsn)
     session_factory = create_session_factory(engine)
@@ -430,6 +438,6 @@ async def _recover_abandoned_jobs() -> list[UUID]:
             timedelta(seconds=settings.job_heartbeat_timeout_seconds),
             resume_current_attempt_kinds=DURABLE_RESUME_JOB_KINDS,
         )
-        return [job.id for job in jobs if job.status is JobStatus.QUEUED]
+        return [(job.id, job.kind) for job in jobs if job.status is JobStatus.QUEUED]
     finally:
         await engine.dispose()

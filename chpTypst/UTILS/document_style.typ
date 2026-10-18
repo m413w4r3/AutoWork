@@ -1,5 +1,31 @@
 #import "colors.typ": purple
 #import "header_footer.typ": report-header, report-footer
+#import "helpers.typ": code-font-families
+
+#let render-raw-code-line(line, max-columns: 72) = {
+  let clusters = line.clusters()
+  let start = 0
+  while start < clusters.len() {
+    let end = calc.min(start + max-columns, clusters.len())
+    if end < clusters.len() {
+      let whitespace-end = none
+      for (index, cluster) in clusters.slice(start, end).enumerate() {
+        if cluster == " " or cluster == "\t" {
+          whitespace-end = start + index + 1
+        }
+      }
+      if whitespace-end != none and whitespace-end > start {
+        end = whitespace-end
+      }
+    }
+    text(clusters.slice(start, end).join(""))
+    if end < clusters.len() {
+      linebreak()
+    }
+    start = end
+  }
+  linebreak()
+}
 
 #let apply-document-style(body, country: none, period: none, draft-watermark: none) = {
   set text(
@@ -29,15 +55,19 @@
   show raw.where(block: false): set text(size: 10pt)
   show raw.where(block: true): it => pad(x: 2%, block(
     width: 100%,
+    breakable: true,
     fill: black,
     inset: (x: 10pt, y: 1pt),
     outset: (y: 5pt),
     radius: 2pt,
   )[
-    #set text(fill: white)
-    #it
+    #set text(font: code-font-families, fill: white, size: 8.8pt)
+    #set par(leading: 0.95em, spacing: 0pt)
+    #for line in it.text.split("\n") {
+      render-raw-code-line(line)
+    }
   ])
-  show raw: set text(font: "Cascadia Mono")
+  show raw: set text(font: code-font-families)
 
   set par(justify: true)
 

@@ -6,8 +6,17 @@ import json
 import re
 from collections.abc import Mapping
 from urllib.parse import urlsplit, urlunsplit
+from uuid import UUID
 
+from cti_app.application.confined_analysis import (
+    ConfinedAnalysisArtifactKind,
+    ConfinedAnalysisExecutionPort,
+    ConfinedAnalysisRequest,
+    ConfinedAnalysisTool,
+)
 from cti_app.application.local_analysis import LocalCommandCatalog, LocalCommandService
+from cti_app.application.persistence import UnitOfWorkFactory
+from cti_app.application.sample_acquisition import SAMPLES_QUARANTINE_BUCKET
 from cti_app.domain.configuration_extraction import (
     ConfigurationExtractionV1,
     ConfigurationKeyValue,
@@ -16,7 +25,7 @@ from cti_app.domain.configuration_extraction import (
     NetworkIndicatorKind,
 )
 from cti_app.domain.extraction import ExtractionProvenance, ExtractionStatus
-from cti_app.domain.local_analysis import LocalCommandId, LocalCommandStatus
+from cti_app.domain.local_analysis import LocalCommandStatus
 
 _PARAMETERS = {"analysis": "mwcp.json.v1", "output_format": "json"}
 _SECRET_KEY = re.compile(
@@ -34,16 +43,26 @@ class MwcpAdapter:
 
     def __init__(
         self,
-        command_service: LocalCommandService,
-        command_catalog: LocalCommandCatalog,
+        command_service: LocalCommandService | None = None,
+        command_catalog: LocalCommandCatalog | None = None,
         *,
         parser_versions: Mapping[str, str],
         enabled: bool,
+        confined_analysis: ConfinedAnalysisExecutionPort | None = None,
+        uow_factory: UnitOfWorkFactory | None = None,
+        timeout_seconds: float = 120,
+        max_output_bytes: int = 1_000_000,
+        max_sample_bytes: int = 200 * 1024 * 1024,
     ) -> None:
         self._service = command_service
         self._catalog = command_catalog
         self._parser_versions = dict(parser_versions)
         self._enabled = enabled
+        self._confined_analysis = confined_analysis
+        self._uow_factory = uow_factory
+        self._timeout_seconds = timeout_seconds
+        self._max_output_bytes = max_output_bytes
+        self._max_sample_bytes = max_sample_bytes
 
     @property
     def allowed_parsers(self) -> Mapping[str, str]:
@@ -57,16 +76,34 @@ class MwcpAdapter:
     def unavailable_reason(self) -> str | None:
         if not self._enabled:
             return "mwcp_disabled"
+        if self._confined_analysis is None or self._uow_factory is None:
+            return "analysis_worker_unavailable"
+        if not self._confined_analysis.available:
+            return self._confined_analysis.available_reason or "analysis_worker_unavailable"
+        family = self._confined_analysis.family_statuses.get("mwcp")
+        if family is None or not family.available:
+            return family.available_reason if family is not None else "mwcp_unattested"
         if not self._parser_versions:
             return "parser_allowlist_empty"
-        if not self._service.filesystem_confined:
-            return "filesystem_confinement_required"
-        capability = self._catalog.get(LocalCommandId.MWCP)
-        if capability is None or not capability.available:
-            return "binary_unavailable"
+        for parser_id, configured_version in self._parser_versions.items():
+            parser_family = self._confined_analysis.family_statuses.get(f"mwcp_parser:{parser_id}")
+            if parser_family is None or not parser_family.available:
+                return (
+                    parser_family.available_reason
+                    if parser_family is not None
+                    else "parser_version_unattested"
+                )
+            if parser_family.version != configured_version:
+                return "parser_version_unattested"
         return None
 
-    async def extract(self, sample_sha256: str, *, parser_id: str) -> ConfigurationExtractionV1:
+    async def extract(
+        self,
+        sample_sha256: str,
+        *,
+        parser_id: str,
+        investigation_id: UUID | None = None,
+    ) -> ConfigurationExtractionV1:
         parser_version = self._parser_versions.get(parser_id)
         if parser_version is None:
             return _empty_result(
@@ -77,53 +114,78 @@ class MwcpAdapter:
                 detail_code="parser_not_allowlisted",
                 raw_output_sha256=None,
             )
-        result = await self._service.run(
-            LocalCommandId.MWCP, sample_sha256, {"parser_id": parser_id}
+        if investigation_id is None or not self.available:
+            return _empty_result(
+                sample_sha256,
+                parser_id=parser_id,
+                parser_version=parser_version,
+                status=ExtractionStatus.UNAVAILABLE,
+                detail_code=self.unavailable_reason or "analysis_worker_unavailable",
+                raw_output_sha256=None,
+            )
+        assert self._confined_analysis is not None and self._uow_factory is not None
+        async with self._uow_factory() as uow:
+            blob = await uow.blobs.get_by_address(SAMPLES_QUARANTINE_BUCKET, sample_sha256)
+        if blob is None or blob.descriptor.sha256 != sample_sha256:
+            return _empty_result(
+                sample_sha256,
+                parser_id=parser_id,
+                parser_version=parser_version,
+                status=ExtractionStatus.UNAVAILABLE,
+                detail_code="sample_bytes_unavailable",
+                raw_output_sha256=None,
+            )
+        if blob.descriptor.size > self._max_sample_bytes:
+            return _empty_result(
+                sample_sha256,
+                parser_id=parser_id,
+                parser_version=parser_version,
+                status=ExtractionStatus.POLICY_DENIED,
+                detail_code="sample_too_large",
+                raw_output_sha256=None,
+            )
+        response = await self._confined_analysis.execute(
+            ConfinedAnalysisRequest(
+                investigation_id=investigation_id,
+                artifact_id=blob.id,
+                sha256=sample_sha256,
+                artifact_kind=ConfinedAnalysisArtifactKind.CORPUS_SAMPLE,
+                tool=ConfinedAnalysisTool.MWCP,
+                timeout_seconds=self._timeout_seconds,
+                max_output_bytes=self._max_output_bytes,
+                analysis_parameters={
+                    "parser_id": parser_id,
+                    "parser_version": parser_version,
+                },
+            )
         )
-        raw_prefix = result.raw_output_prefix
-        if raw_prefix is None:
-            raw_prefix = result.output.encode("utf-8", errors="replace")
+        worker_result = (response.payload or {}).get("result", {})
+        if not isinstance(worker_result, Mapping):
+            worker_result = {}
+        report = worker_result.get("report", {})
         try:
-            payload = json.loads(raw_prefix.decode("utf-8")) if raw_prefix else {}
-            values, indicators, normalization_truncated = _normalize_configuration(payload)
-            parse_failed = False
-        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError, RecursionError):
-            values, indicators, normalization_truncated, parse_failed = (
-                (),
-                (),
-                False,
-                bool(raw_prefix),
-            )
-
-        raw_sha256 = result.raw_output_sha256 or hashlib.sha256(raw_prefix).hexdigest()
-        complete = result.raw_output_complete or (
-            result.raw_output_sha256 is None
-            and result.status in {LocalCommandStatus.SUCCEEDED, LocalCommandStatus.EMPTY}
+            values, indicators, normalization_truncated = _normalize_configuration(report)
+        except (TypeError, ValueError, RecursionError):
+            values, indicators, normalization_truncated = (), (), True
+        raw_sha256 = worker_result.get("output_sha256")
+        if not isinstance(raw_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", raw_sha256) is None:
+            raw_sha256 = None
+        truncated = bool(worker_result.get("truncated")) or normalization_truncated
+        worker_status = str(worker_result.get("status", "FAILED")).upper()
+        status = (
+            ExtractionStatus.EMPTY
+            if response.status.value == "succeeded"
+            and worker_status == "SUCCEEDED"
+            and not values
+            and not indicators
+            else ExtractionStatus.SUCCEEDED
+            if response.status.value == "succeeded"
+            and worker_status == "SUCCEEDED"
+            and not truncated
+            else ExtractionStatus.PARTIAL
+            if worker_status in {"PARTIAL", "OUTPUT_LIMIT", "TIMEOUT"} or truncated
+            else ExtractionStatus.FAILED
         )
-        truncated = (
-            result.status
-            in {
-                LocalCommandStatus.OUTPUT_TRUNCATED,
-                LocalCommandStatus.TIMEOUT,
-            }
-            or not complete
-            or parse_failed
-            or normalization_truncated
-        )
-        status = _status(result.status, empty=not values and not indicators)
-        if parse_failed:
-            status = (
-                ExtractionStatus.PARTIAL
-                if result.status is LocalCommandStatus.OUTPUT_TRUNCATED
-                or result.status is LocalCommandStatus.TIMEOUT
-                else ExtractionStatus.FAILED
-            )
-        elif (
-            result.status is LocalCommandStatus.OUTPUT_TRUNCATED
-            and status is ExtractionStatus.SUCCEEDED
-        ):
-            status = ExtractionStatus.PARTIAL
-
         parameters_sha256 = hashlib.sha256(
             json.dumps(
                 {**_PARAMETERS, "parser_id": parser_id}, sort_keys=True, separators=(",", ":")
@@ -139,16 +201,25 @@ class MwcpAdapter:
             network_indicators=indicators,
             provenance=ExtractionProvenance(
                 tool_id="dc3-mwcp",
-                tool_version=result.executable_version or "unavailable",
+                tool_version=parser_version,
                 parameters_sha256=parameters_sha256,
                 raw_output_sha256=raw_sha256,
-                raw_output_bytes=result.raw_output_bytes or len(raw_prefix),
-                raw_output_complete=complete,
+                raw_output_bytes=int(worker_result.get("output_bytes", 0)),
+                raw_output_complete=raw_sha256 is not None and not truncated,
                 output_truncated=truncated,
-                exit_code=result.exit_code,
+                exit_code=worker_result.get("exit_code")
+                if isinstance(worker_result.get("exit_code"), int)
+                else None,
             ),
             truncated=truncated,
-            detail_code=result.detail_code or ("invalid_mwcp_json" if parse_failed else None),
+            detail_code=response.available_reason,
+        )
+
+    async def extract_confined(
+        self, sample_sha256: str, *, parser_id: str, investigation_id: UUID
+    ) -> ConfigurationExtractionV1:
+        return await self.extract(
+            sample_sha256, parser_id=parser_id, investigation_id=investigation_id
         )
 
 

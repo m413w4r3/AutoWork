@@ -49,6 +49,7 @@ D2_VERTICAL_AFTER_LABEL_CHARACTERS = 44
 D2_COMPILATION_TIMEOUT_SECONDS = 10
 D2_MAX_STDOUT_BYTES = 2 * 1024 * 1024
 D2_MAX_STDERR_BYTES = 64 * 1024
+D2_MAX_STDIN_BYTES = 256 * 1024
 D2_PROCESS_LOCALE = "C.UTF-8"
 D2_EXIT_POLL_SECONDS = 0.01
 D2_EXIT_REAP_TIMEOUT_SECONDS = 5.0
@@ -773,6 +774,30 @@ class D2DiagramCompiler:
 
     async def compile(self, diagram: DiagramSpecV1) -> CompiledDiagram:
         source_bytes = encode_d2_source(diagram)
+        compiled = await self.compile_source(diagram_key=diagram.key, source_bytes=source_bytes)
+        rendered_svg = _add_group_label_tabs(compiled.media_bytes, diagram)
+        validate_d2_svg(rendered_svg)
+        return CompiledDiagram(
+            diagram_key=diagram.key,
+            source_format=D2_SOURCE_FORMAT,
+            source_bytes=source_bytes,
+            source_sha256=hashlib.sha256(source_bytes).hexdigest(),
+            media_type=D2_MEDIA_TYPE,
+            media_bytes=rendered_svg,
+            media_sha256=hashlib.sha256(rendered_svg).hexdigest(),
+            compiler=D2_COMPILER,
+            compiler_version=D2_COMPILER_VERSION,
+            compiler_policy_version=DIAGRAM_COMPILATION_POLICY_VERSION,
+        )
+
+    async def compile_source(self, *, diagram_key: str, source_bytes: bytes) -> CompiledDiagram:
+        """Compile deterministic application-generated D2 source without model adaptation."""
+        if not diagram_key.strip() or not source_bytes or len(source_bytes) > D2_MAX_STDIN_BYTES:
+            raise ValueError("D2 source identity and bounded source bytes are required")
+        try:
+            source_bytes.decode(D2_SOURCE_ENCODING)
+        except UnicodeDecodeError as exc:
+            raise ValueError("D2 source must be UTF-8") from exc
         source_sha256 = hashlib.sha256(source_bytes).hexdigest()
         await self._verify_version()
         result = await self._runner.run(
@@ -795,16 +820,14 @@ class D2DiagramCompiler:
         )
         _raise_process_failure(result)
         validate_d2_svg(result.stdout)
-        rendered_svg = _add_group_label_tabs(result.stdout, diagram)
-        validate_d2_svg(rendered_svg)
         return CompiledDiagram(
-            diagram_key=diagram.key,
+            diagram_key=diagram_key,
             source_format=D2_SOURCE_FORMAT,
             source_bytes=source_bytes,
             source_sha256=source_sha256,
             media_type=D2_MEDIA_TYPE,
-            media_bytes=rendered_svg,
-            media_sha256=hashlib.sha256(rendered_svg).hexdigest(),
+            media_bytes=result.stdout,
+            media_sha256=hashlib.sha256(result.stdout).hexdigest(),
             compiler=D2_COMPILER,
             compiler_version=D2_COMPILER_VERSION,
             compiler_policy_version=DIAGRAM_COMPILATION_POLICY_VERSION,

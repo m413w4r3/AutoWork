@@ -20,7 +20,9 @@ from cti_app.application.typst_rendering import (
     load_template_bundle,
     project_publication_to_typst_model,
 )
+from cti_app.domain.discovery import SourceRole
 from cti_app.domain.media_assets import MediaAssetKind
+from cti_app.domain.production import ProductionEvidenceBasis
 from cti_app.domain.production_editorial_enrichment import (
     ChartKind,
     EnrichmentPlacementKind,
@@ -44,6 +46,8 @@ from cti_app.domain.publication_document import (
     PublicationChartV1,
     PublicationDocumentV4,
     PublicationDocumentV5,
+    PublicationIOCDetailV1,
+    PublicationIOCDisposition,
     publication_document_text_anchors,
 )
 from cti_app.domain.semantic_annotation import (
@@ -237,9 +241,7 @@ def test_minimal_document_has_complete_empty_sections_and_is_deterministic(tmp_p
     assert first.source_bytes == second.source_bytes
     assert first.render_data_sha256 == second.render_data_sha256
     assert first.media_refs == ()
-    assert data["schema_version"] == (
-        "typst-publication-model-v22-draft-watermark-analyst-notes-synthesis-context"
-    )
+    assert data["schema_version"] == "typst-publication-model-v24-canonical-investigation-figures"
     references, synthesis = data["content_sections"]
     assert references["type"] == "references"
     assert references["timeline"] == []
@@ -524,9 +526,7 @@ def test_v5_projection_maps_semantic_spans_to_closed_typst_helpers(tmp_path: Pat
     styles = {span["style"] for span in paragraph["semantic_spans"]}
     semantic_cells = table["semantic_cells"]
 
-    assert data["schema_version"] == (
-        "typst-publication-model-v22-draft-watermark-analyst-notes-synthesis-context"
-    )
+    assert data["schema_version"] == "typst-publication-model-v24-canonical-investigation-figures"
     assert table["column_weights"] == _table_column_weights(base.tables[0])
     assert all(0.8 <= weight <= 2.4 for weight in table["column_weights"])
     assert paragraph["text"] == lead_text
@@ -634,7 +634,27 @@ def test_long_iocs_and_semantic_literals_get_render_only_break_opportunities(
             for anchor, text in publication_document_text_anchors(base).items()
         ),
     )
-    document = PublicationDocumentV5(document=base, semantic_text=semantic_text)
+    base = replace(
+        base,
+        additional_source_ids=base.additional_source_ids | frozenset({_SOURCE_ID}),
+    )
+    ioc_detail = PublicationIOCDetailV1(
+        artifact_type=ArtifactType.HASH,
+        value=long_hash,
+        normalized_value=long_hash,
+        source_role=SourceRole.PRIMARY,
+        context="Hash file observé dans la source.",
+        evidence_quote=f"SHA-256 : {long_hash}",
+        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+        source_document_ids=(_SOURCE_ID,),
+        disposition=PublicationIOCDisposition.RETAINED,
+        disposition_reason="IOC retenu dans le document publié.",
+    )
+    document = PublicationDocumentV5(
+        document=base,
+        semantic_text=semantic_text,
+        ioc_details=(ioc_detail,),
+    )
 
     data = json.loads(renderer.render(document, bundle).render_data_bytes)
     synthesis = data["content_sections"][1]
@@ -645,16 +665,18 @@ def test_long_iocs_and_semantic_literals_get_render_only_break_opportunities(
     )
     spans = {span["style"]: span for span in lead["semantic_spans"]}
 
-    def expected_chunks(value: str) -> list[str]:
-        return [value[index : index + 8] for index in range(0, len(value), 8)]
-
-    assert data["content_sections"][2]["indicators"]["hashes"] == [
-        {
-            "text": long_hash,
-            "break_chunks": expected_chunks(long_hash),
-            "break_after": [True] * (len(expected_chunks(long_hash)) - 1),
-        }
+    technical_annex = next(
+        section for section in data["content_sections"] if section["type"] == "technical_annex"
+    )
+    ioc_row = technical_annex["ioc_rows"][0]
+    assert ioc_row["value"] == long_hash
+    assert len(ioc_row["value_spans"]) == 1
+    ioc_value_span = ioc_row["value_spans"][0]
+    assert ioc_value_span["text"] == long_hash
+    assert ioc_value_span["break_chunks"] == [
+        long_hash[index : index + 6] for index in range(0, len(long_hash), 6)
     ]
+    assert ioc_value_span["break_after"] == [True] * ((len(long_hash) + 5) // 6 - 1)
     for style, value in (
         ("semantic-ioc", long_hash),
         ("semantic-path", long_path),
@@ -860,7 +882,7 @@ def test_figure_reader_source_hides_pipeline_locators_and_media_refs_deduplicate
             EnrichmentPlacementKind.AFTER_LEAD,
             asset_id=shared_asset_id,
         ),
-        source_url="https://www.example.test/source-image.png",
+        source_url="https://secret.example/image.png",
         provenance=technical_provenance,
         locator=replace(
             _figure_at(
@@ -914,11 +936,18 @@ def test_figure_reader_source_hides_pipeline_locators_and_media_refs_deduplicate
     ]
     assert figure_blocks[0]["source_note"] == ("example.test — Bitcoin wallet recovery — p. 1")
     assert figure_blocks[1]["source_note"] == "example.test"
-    assert figure_blocks[2]["source_note"] is None
+    assert figure_blocks[2]["source_note"] == "example.test"
+    assert figure_blocks[0]["attribution"] == "Example Lab"
+    assert figure_blocks[0]["caption"] == "Caption one"
+    assert figure_blocks[0]["sha256"] == first.sha256
+    assert figure_blocks[0]["byte_size"] == first.byte_size
     render_data = rendered.render_data_bytes.decode("utf-8")
     assert "provenance" not in render_data
     assert "locator" not in render_data
-    assert "secret.example" not in render_data
+    assert all("source_url" not in block for block in figure_blocks)
+    assert all("provenance" not in block for block in figure_blocks)
+    assert "https://secret.example/image.png" not in render_data
+    assert "secret.example/image.png" not in render_data
     assert "65d67fad-2db8-4e50-a6a0-6fd09e790000" not in render_data
     assert "/html[1]" not in render_data
     assert "HTML image" not in render_data

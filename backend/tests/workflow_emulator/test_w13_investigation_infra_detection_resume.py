@@ -825,6 +825,15 @@ async def test_w13_d5_rule_v1_v2_review_and_manifest_bound_archive(
             composition_factory=factory,
             include_detection=True,
         )
+        async with uow_factory() as uow:
+            composition = factory.build(uow, seeded.investigation.id)
+            worker = composition.tool_dependencies.confined_analysis_execution
+            assert "rule.propose" in composition.available_tools, {
+                "rule_workbench_enabled": factory.settings.rule_workbench_enabled,
+                "corpus_configured": composition.tool_dependencies.rule_corpus_bytes is not None,
+                "workbench_configured": composition.tool_dependencies.rule_workbench is not None,
+                "yara": str(worker.family_statuses.get("yara")) if worker is not None else None,
+            }
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://w13-d5"
         ) as client:
@@ -862,11 +871,24 @@ async def test_w13_d5_rule_v1_v2_review_and_manifest_bound_archive(
                 invocations = tuple(
                     await uow.tool_invocations.list_for_investigation(seeded.investigation.id)
                 )
+                observations = tuple(
+                    await uow.evidence_observations.list_for_investigation(seeded.investigation.id)
+                )
                 findings_rows = await uow.investigation_findings.list_for_investigation(
                     seeded.investigation.id
                 )
             assert first_sha in {item.sample_sha256 for item in associations}
-            assert second_sha in {item.sample_sha256 for item in associations}
+            rule_reports = [
+                await artifact_store.read_json(item.blob_id)
+                for item in observations
+                if item.kind is EvidenceKind.YARA_MATCH
+                and item.object_type == "detection_candidate_version"
+            ]
+            assert second_sha in {item.sample_sha256 for item in associations}, (
+                "calls="
+                + " | ".join(f"{item.tool_name}:{item.status.value}" for item in invocations)
+                + f"; rule_reports={rule_reports[:1]}"
+            )
             # The dynamic planner completes v1 and v2 in this job. rule.test adds
             # report observations; it does not append a candidate version.
             assert len(versions) == 2
@@ -979,6 +1001,14 @@ async def test_w13_d5_rule_v1_v2_review_and_manifest_bound_archive(
                 assert v6 is not None and v6.canonical_blob_id is not None
                 v6_blob = await uow.blobs.get(v6.canonical_blob_id)
             assert v6_blob is not None
+            published_v6 = await artifact_store.read_json(v6.canonical_blob_id)
+            published_detection = published_v6.get("detection")
+            assert published_detection is not None
+            assert published_detection["version_id"] == str(versions[1].id)
+            assert published_detection["source_sha256"] == versions[1].source_sha256
+            assert published_detection["source"] == versions[1].source
+            assert published_detection["rule_validation_status"] != "real_validated"
+            assert published_detection["validation_status"] == "candidate"
 
             initial_manifest = await read_manifest(uow_factory, edition.id)
             archive_service = EditionRuleArchiveService(uow_factory, artifact_store)

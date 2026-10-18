@@ -86,15 +86,15 @@ from cti_app.domain.publication_document import (
 )
 from cti_app.domain.semantic_annotation import SemanticRole, SemanticTextSpanV1
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
+from cti_app.infrastructure.confined_tshark import ConfinedTsharkAdapter
 from cti_app.infrastructure.d2_diagram_compiler import D2DiagramCompiler
 from cti_app.infrastructure.investigation_runtime_ports import (
     build_investigation_runtime_composition_factory,
     describe_tool_inventory,
 )
-from cti_app.infrastructure.local_command_runner import LocalCommandRunner
 from cti_app.infrastructure.quarantined_capture_source import ProductionQuarantinedCaptureSource
-from cti_app.infrastructure.tshark_adapter import TsharkAdapter
 from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
+from tests.confined_worker_harness import build_confined_worker_harness
 from tests.integration.test_edition_multibatch_publication_postgres import _compose_three_runs
 from tests.shodan_support import FakeShodanPort
 from tests.workflow_emulator import invariants
@@ -133,14 +133,6 @@ from tests.workflow_emulator.test_w15_protocol_pcap_to_opinion import (
 )
 
 pytestmark = [pytest.mark.integration, pytest.mark.workflow_full]
-
-
-class _PilotConfinedLocalCommandRunner(LocalCommandRunner):
-    """Run the bounded local capture commands over the test's inert bytes."""
-
-    @property
-    def filesystem_confined(self) -> bool:
-        return True
 
 
 def _call(name: str, arguments: Mapping[str, object], purpose: str) -> dict[str, object]:
@@ -1176,13 +1168,15 @@ async def test_workflow_full_supervised_first_run_dynamic_pilot(
                 "mwcp_parser_versions": {"pilot-unavailable-parser": "fixture-not-installed"},
             }
         )
-        network_limits = NetworkExtractionLimitsV1()
-        tshark = TsharkAdapter(
-            runner=_PilotConfinedLocalCommandRunner(
-                max_sample_bytes=network_limits.max_capture_bytes
-            ),
-            limits=network_limits,
+        worker = build_confined_worker_harness(
+            settings=settings,
+            uow_factory=uow_factory,
+            artifact_store=artifact_store,
+            required_families=("sample_analysis", "tshark", "capinfos"),
         )
+        settings = worker.settings
+        network_limits = NetworkExtractionLimitsV1()
+        tshark = ConfinedTsharkAdapter(worker.port, limits=network_limits)
         vt = HashCheckedVirusTotal(material=material, include_candidate=False)
         shodan = FakeShodanPort()
         runtime = build_investigation_runtime_composition_factory(
@@ -1208,7 +1202,7 @@ async def test_workflow_full_supervised_first_run_dynamic_pilot(
                 settings=settings,
                 investigation_id=investigation_id,
             ),
-            tshark=tshark,
+            confined_analysis_execution=worker.port,
         )
         inventory = describe_tool_inventory(runtime)
         inventory_path = output_root / "runtime-port-inventory.json"
@@ -1218,9 +1212,13 @@ async def test_workflow_full_supervised_first_run_dynamic_pilot(
         )
         families = inventory["families"]
         assert isinstance(families, Mapping)
-        for family in ("native_analysis", "floss_extraction", "configuration_extraction"):
+        for family in ("native_analysis", "configuration_extraction"):
             item = families[family]
             assert isinstance(item, Mapping) and item["status"] == "unavailable"
+        floss_family = families["floss_extraction"]
+        assert isinstance(floss_family, Mapping)
+        assert floss_family["status"] == "available"
+        assert floss_family["execution_mode"] == "analysis-worker"
         assert isinstance(families["network_capture"], Mapping)
         assert families["network_capture"]["status"] == "available"
 
@@ -1570,7 +1568,8 @@ async def test_workflow_full_supervised_first_run_dynamic_pilot(
                 for item in invocation_by_name["sample.analyze"]
                 for ref in item.response_refs
                 if ref in evidence_by_id
-                and evidence_by_id[ref].source == "autowork.static_analysis"
+                and evidence_by_id[ref].kind is EvidenceKind.BINARY_ANALYSIS
+                and evidence_by_id[ref].source == "autowork.analysis_worker"
             )
             shodan_observation_ids = tuple(invocation_by_name["shodan.host"][0].response_refs)
             similarity_observation_ids = tuple(comparison_invocation.response_refs)

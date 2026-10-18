@@ -7,8 +7,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Protocol
 from uuid import UUID, uuid4
 
+from cti_app.application.diagram_compilation import CompiledDiagram
+from cti_app.application.investigation_figures import build_investigation_graph_figure
 from cti_app.application.media_assets import MediaAssetStore
 from cti_app.application.persistence import PublicationRenderUnitOfWorkFactory
 from cti_app.application.production_artifact_store import (
@@ -49,16 +52,20 @@ from cti_app.application.typst_render_output import (
 from cti_app.application.typst_rendering import (
     TemplateBundleInvalidError,
     TypstDraftPreviewDocument,
+    TypstMediaRef,
     TypstRenderer,
     TypstRenderSource,
     TypstTemplateBundle,
     load_template_bundle,
 )
 from cti_app.domain.analyst_opinion import AnalystOpinionV1
+from cti_app.domain.investigation_graph import InvestigationGraph
+from cti_app.domain.media_assets import MediaAssetKind
 from cti_app.domain.production import ProductionArtifactStage, ProductionArtifactStatus
 from cti_app.domain.production_synthesis import ProductionSynthesisV1
 from cti_app.domain.publication_document import (
     PublicationDocumentV5,
+    PublicationDocumentV6,
     publication_document_from_json,
     serialize_publication_document,
 )
@@ -70,7 +77,12 @@ from cti_app.domain.publication_render import (
 from cti_app.domain.typst_render import TypstRenderFormat, TypstRenderStatus
 
 PUBLICATION_RENDERER = "typst"
-PUBLICATION_RENDERER_VERSION = "publication-v9-typst-v6-draft-preview-synthesis-context"
+PUBLICATION_RENDERER_VERSION = "publication-v10-typst-v6-canonical-investigation-figures"
+
+
+class InfrastructureGraphDiagramCompiler(Protocol):
+    async def compile_source(self, *, diagram_key: str, source_bytes: bytes) -> CompiledDiagram: ...
+
 
 PUBLICATION_RENDER_BUCKETS = TypstRenderBuckets(
     source="publication-renders-source",
@@ -168,6 +180,7 @@ class PublicationRenderService:
         chp_typst_root: Path,
         font_bundle_root: Path,
         typst_fonts_lock_path: Path,
+        graph_diagram_compiler: InfrastructureGraphDiagramCompiler | None = None,
         mapping_cache: TypstMappingSidecarCache | None = None,
         wait_poll_interval_seconds: float = 0.1,
         wait_timeout_seconds: float = 60.0,
@@ -178,6 +191,11 @@ class PublicationRenderService:
         self._renderer = renderer
         self._media_asset_store = media_asset_store
         self._compiler = compiler
+        if graph_diagram_compiler is None:
+            from cti_app.infrastructure.d2_diagram_compiler import D2DiagramCompiler
+
+            graph_diagram_compiler = D2DiagramCompiler()
+        self._graph_diagram_compiler = graph_diagram_compiler
         self._preview_executor = TypstRenderExecutor(
             media_asset_store=media_asset_store,
             compiler=compiler,
@@ -204,10 +222,17 @@ class PublicationRenderService:
         document: PublicationDocumentV5,
         opinion: AnalystOpinionV1,
         synthesis: ProductionSynthesisV1 | None = None,
+        *,
+        infrastructure_graph: InvestigationGraph | None = None,
     ) -> CompiledTypstDocument:
         """Compile an ephemeral, watermarked draft without creating render state."""
         try:
-            projection = TypstDraftPreviewDocument(document, opinion, synthesis)
+            projection = TypstDraftPreviewDocument(
+                document,
+                opinion,
+                synthesis,
+                infrastructure_graph,
+            )
         except ValueError as exc:
             raise PublicationRenderDocumentInvalidError(str(exc)) from exc
         try:
@@ -220,7 +245,17 @@ class PublicationRenderService:
         except (TemplateBundleInvalidError, FontBundleInvalidError) as exc:
             raise PublicationRenderTemplateInvalidError(str(exc)) from exc
         try:
-            render_source = self._renderer.render(projection, template_bundle)
+            graph_media_ref = await self._compile_infrastructure_graph(
+                document, infrastructure_graph
+            )
+            if graph_media_ref is None:
+                render_source = self._renderer.render(projection, template_bundle)
+            else:
+                render_source = self._renderer.render(
+                    projection,
+                    template_bundle,
+                    infrastructure_graph_media_ref=graph_media_ref,
+                )
             executed = await self._preview_executor.execute(
                 render_source=render_source,
                 template_bundle=template_bundle,
@@ -344,6 +379,11 @@ class PublicationRenderService:
         publication_content_sha256 = hashlib.sha256(
             ProductionArtifactStore.canonical_json_bytes(serialize_publication_document(document))
         ).hexdigest()
+        graph_media_ref: TypstMediaRef | None = None
+        if isinstance(document, PublicationDocumentV6):
+            graph_media_ref = await self._compile_infrastructure_graph(
+                document.base_publication, document.infrastructure_graph
+            )
         try:
             template_bundle = load_template_bundle(self._chp_typst_root)
             font_bundle = load_font_bundle_snapshot(
@@ -400,6 +440,11 @@ class PublicationRenderService:
                     document,
                     template_bundle,
                     target_artifact_identities=target_artifact_identities,
+                    **(
+                        {"infrastructure_graph_media_ref": graph_media_ref}
+                        if graph_media_ref is not None
+                        else {}
+                    ),
                 )
             except TemplateBundleInvalidError as exc:
                 raise PublicationRenderTemplateInvalidError(str(exc)) from exc
@@ -411,4 +456,40 @@ class PublicationRenderService:
             template_bundle=template_bundle,
             font_bundle=font_bundle,
             build_source=build_source,
+        )
+
+    async def _compile_infrastructure_graph(
+        self,
+        publication: PublicationDocumentV5,
+        graph: InvestigationGraph | None,
+    ) -> TypstMediaRef | None:
+        if graph is None:
+            return None
+        figure = build_investigation_graph_figure(publication, graph)
+        if figure is None:
+            return None
+        source_bytes = str(figure["d2_source"]).encode("utf-8")
+        try:
+            compiled = await self._graph_diagram_compiler.compile_source(
+                diagram_key=str(figure["figure_id"]), source_bytes=source_bytes
+            )
+        except Exception as exc:
+            raise PublicationRenderFailedError(
+                "Unable to compile the canonical infrastructure graph with D2"
+            ) from exc
+        if compiled.source_sha256 != figure["d2_source_sha256"]:
+            raise PublicationRenderDocumentInvalidError(
+                "Compiled infrastructure graph source does not match its pinned identity"
+            )
+        manifest = await self._media_asset_store.store_diagram(
+            compiled,
+            source=(f"investigation:{graph.investigation_id}:infrastructure_graph:{graph.sha256}"),
+        )
+        return TypstMediaRef(
+            asset_id=manifest.asset_id,
+            expected_kind=MediaAssetKind.DIAGRAM_SVG,
+            expected_mime_type=manifest.mime_type,
+            expected_sha256=manifest.sha256,
+            expected_byte_size=manifest.byte_size,
+            media_path=f"media/{manifest.asset_id}.svg",
         )

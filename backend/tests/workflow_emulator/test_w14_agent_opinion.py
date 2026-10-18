@@ -772,7 +772,9 @@ async def test_w14_a_similarity_rule_revision_and_new_article_sample(
                     await uow.investigation_findings.list_for_investigation(seeded.investigation.id)
                 )
 
-            assert {sha_a, sha_b, sha_c} <= {item.sample_sha256 for item in associations}
+            assert {sha_a, sha_b, sha_c} <= {item.sample_sha256 for item in associations}, (
+                " | ".join(f"{item.tool_name}:{item.status.value}" for item in invocations)
+            )
             association_c = next(item for item in associations if item.sample_sha256 == sha_c)
             assert association_c.qualification is SampleQualification.CANDIDATE
             # v1 is measured "tested" on A/B; v2 also matches C, an out-of-cluster
@@ -1259,7 +1261,9 @@ async def test_w14_d_evidence_bounded_opinion_without_yara(
                 static_observation = next(
                     item
                     for item in observations
-                    if item.source == "autowork.static_analysis" and item.object_id == sample_sha
+                    if item.kind is EvidenceKind.BINARY_ANALYSIS
+                    and item.source == "autowork.analysis_worker"
+                    and item.object_id == sample_sha
                 )
                 behavior_observation = next(
                     item
@@ -1379,7 +1383,10 @@ async def test_w14_d_evidence_bounded_opinion_without_yara(
                 investigation = await uow.analyst_investigations.get(seeded.investigation.id)
 
             static_observation = next(
-                item for item in observations if item.source == "autowork.static_analysis"
+                item
+                for item in observations
+                if item.kind is EvidenceKind.BINARY_ANALYSIS
+                and item.source == "autowork.analysis_worker"
             )
             behavior_observation = next(
                 item for item in observations if item.source == "autowork.sandbox-report.operator"
@@ -1876,7 +1883,9 @@ async def test_w14_e_retrohunt_subject_slots_replay_and_concurrent_investigation
                 invocations = tuple(
                     await uow.tool_invocations.list_for_investigation(seeded.investigation.id)
                 )
-            assert len(versions) == 1 and versions[0].version == 1
+            assert len(versions) == 1 and versions[0].version == 1, " | ".join(
+                f"{item.tool_name}:{item.status.value}" for item in invocations
+            )
             test_reports = [
                 await driver.artifact_store.read_json(item.blob_id)
                 for item in observations

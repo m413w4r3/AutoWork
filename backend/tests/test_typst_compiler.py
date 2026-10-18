@@ -34,6 +34,7 @@ from cti_app.infrastructure.typst_compiler import (
     TypstProcessResult,
     TypstProcessStatus,
     TypstSubprocessCompiler,
+    typst_process_environment,
 )
 
 
@@ -43,6 +44,14 @@ def _valid_pdf() -> bytes:
     output = BytesIO()
     writer.write(output)
     return output.getvalue()
+
+
+def test_typst_process_environment_preserves_configured_tmpdir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+
+    assert typst_process_environment()["TMPDIR"] == str(tmp_path)
 
 
 class FakeTypstProcessRunner:

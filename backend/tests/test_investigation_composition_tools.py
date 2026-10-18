@@ -97,9 +97,9 @@ def test_composition_keeps_built_in_local_capability_without_optional_ports() ->
         "evidence.get",
         "graph.neighbors",
         "sample.get_feature_pack",
-        "sample.analyze",
         "sample.set_qualification",
     }
+    assert "sample.analyze" in composition.unavailable_tools
     assert composition.available_capabilities == frozenset({"investigation.local_read"})
     assert all(
         not name.startswith(("vt.", "shodan.", "rule.")) for name in composition.available_tools

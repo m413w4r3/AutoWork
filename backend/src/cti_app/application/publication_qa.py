@@ -11,7 +11,10 @@ from cti_app.application.publication_builder import (
     build_publication_document_v4,
     build_publication_document_v5,
 )
-from cti_app.application.typst_rendering import project_publication_to_typst_model
+from cti_app.application.typst_rendering import (
+    project_publication_to_typst_model,
+    publication_content_section_types,
+)
 from cti_app.domain.production import ProductionInputSnapshot
 from cti_app.domain.production_editorial_enrichment import EditorialEnrichmentV1
 from cti_app.domain.production_extraction import ProductionExtractionV1
@@ -19,7 +22,7 @@ from cti_app.domain.production_references import (
     ProductionReferenceCorpusV1,
     production_source_criticality,
 )
-from cti_app.domain.production_relevance import RelevanceProjectionV1
+from cti_app.domain.production_relevance import RelevanceClassification, RelevanceProjectionV1
 from cti_app.domain.production_synthesis import (
     ProductionSynthesisV1,
     is_valid_editorial_title,
@@ -66,6 +69,7 @@ class PublicationQaErrorCode(StrEnum):
     V6_INVARIANT_INVALID = "publication_qa_v6_invariant_invalid"
     BASE_PROJECTION_MISMATCH = "publication_qa_v6_base_projection_mismatch"
     SECTION_ORDER_INVALID = "publication_qa_section_order_invalid"
+    DETECTION_STATUS_INCONSISTENT = "publication_qa_detection_status_inconsistent"
     PUBLICATION_QA_FAILED = "publication_qa_failed"
 
 
@@ -335,11 +339,7 @@ def qa_publication_v5(
         checks["references_then_synthesis"] = False
     else:
         section_types = [section["type"] for section in render_model.content_sections]
-        expected_types = ["references", "synthesis"]
-        if v6 is not None and v6.rendered_opinion is not None:
-            expected_types.append("analyst_opinion")
-        if publication.indicators or (v5 and v5.original_indicators):
-            expected_types.append("technical_annex")
+        expected_types = list(publication_content_section_types(publication))
         checks["references_then_synthesis"] = section_types == expected_types
         annex = next(
             (
@@ -380,6 +380,12 @@ def qa_publication_v5(
         )
         if not checks["ioc_groups_separated"]:
             errors.append("Subject IOCs and unlinked original IOCs are not clearly separated")
+        checks["ioc_details_scope"] = not v5 or all(
+            item.relevance_classification is not RelevanceClassification.OUT_OF_SCOPE
+            for item in v5.ioc_details
+        )
+        if not checks["ioc_details_scope"]:
+            errors.append("An out-of-scope IOC detail is included in the publication")
         synthesis_section = next(
             (
                 section
@@ -459,7 +465,18 @@ def qa_publication_v6(**kwargs: Any) -> dict[str, Any]:
     publication = kwargs.get("publication")
     if not isinstance(publication, PublicationDocumentV6):
         raise PublicationQaValidationError(PublicationQaErrorCode.DOCUMENT_NOT_V6)
-    return qa_publication_v5(**kwargs)
+    result = qa_publication_v5(**kwargs)
+    detection_is_coherent = (
+        publication.detection is None or publication.detection.validation_status_is_coherent
+    )
+    result["checks"]["detection_validation_status"] = detection_is_coherent
+    if not detection_is_coherent:
+        result["errors"].append(
+            "Published detection status differs from its canonical rule validation status"
+        )
+        result["error_codes"].append(PublicationQaErrorCode.DETECTION_STATUS_INCONSISTENT.value)
+        result["passed"] = False
+    return result
 
 
 # Keep the old consumer name for frozen V4 documents. The validation function

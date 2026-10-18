@@ -9,8 +9,10 @@ from enum import StrEnum
 from typing import Protocol
 from uuid import UUID
 
+from cti_app.application.investigation_graph_source import InvestigationGraphSource
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.publication_detection import build_publication_detection
 from cti_app.domain.analyst_opinion import (
     AnalystOpinionStatus,
     AnalystOpinionV1,
@@ -19,6 +21,7 @@ from cti_app.domain.analyst_opinion import (
     verify_opinion_citations,
 )
 from cti_app.domain.investigation import EvidenceObservation, InvestigationFinding
+from cti_app.domain.investigation_graph import InvestigationGraph
 from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
@@ -27,6 +30,7 @@ from cti_app.domain.production import (
 from cti_app.domain.publication_document import (
     PublicationAnalystOpinionBlockV1,
     PublicationAnalystOpinionSectionV1,
+    PublicationDetectionV1,
     PublicationDocumentV5,
     PublicationDocumentV6,
     PublicationDocumentV6ErrorCode,
@@ -106,6 +110,9 @@ def augment_publication_with_opinion(
     base_publication_document: PublicationDocumentV5,
     opinion: AnalystOpinionV1,
     citation_context: OpinionCitationContext,
+    *,
+    infrastructure_graph: InvestigationGraph | None = None,
+    detection: PublicationDetectionV1 | None = None,
 ) -> PublicationDocumentV6:
     """Return a V6 wrapper without changing either immutable input."""
     if not isinstance(base_publication_document, PublicationDocumentV5):
@@ -198,6 +205,8 @@ def augment_publication_with_opinion(
             provenance=provenance,
             analyst_opinion=opinion,
             rendered_opinion=section,
+            infrastructure_graph=infrastructure_graph,
+            detection=detection,
         )
     except PublicationDocumentV6ValidationError as exc:
         code = {
@@ -227,10 +236,14 @@ class PublicationAugmentationArtifactService:
         uow_factory: UnitOfWorkFactory,
         artifact_store: ProductionArtifactStore,
         preview_renderer: PublicationPreviewRenderer | None = None,
+        graph_source: InvestigationGraphSource | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._artifact_store = artifact_store
         self._preview_renderer = preview_renderer
+        self._graph_source = graph_source or InvestigationGraphSource(
+            artifact_reader=artifact_store
+        )
 
     async def publish(
         self,
@@ -340,10 +353,25 @@ class PublicationAugmentationArtifactService:
                     PublicationAugmentationErrorCode.BASE_IDENTITY_MISMATCH
                 )
 
+            infrastructure_graph = await self._graph_source.project(
+                investigation_id=opinion.investigation_id,
+                publication=base_document,
+                observations=citation_context.observations,
+                findings=citation_context.findings,
+            )
+            detection = await build_publication_detection(
+                uow,
+                self._artifact_store,
+                investigation_id=opinion.investigation_id,
+                subject_id=investigation.subject_id,
+                opinion=opinion,
+            )
             augmented = augment_publication_with_opinion(
                 base_document,
                 opinion,
                 citation_context,
+                infrastructure_graph=infrastructure_graph,
+                detection=detection,
             )
             payload = serialize_publication_document(augmented)
             canonical_bytes = ProductionArtifactStore.canonical_json_bytes(payload)

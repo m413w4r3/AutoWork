@@ -205,6 +205,36 @@ def test_bwrap_probe_measures_network_and_filesystem_restrictions(
     assert options["pass_fds"] == (int(command[command.index("--seccomp") + 1]),)
 
 
+def test_bwrap_probe_reports_kernel_user_namespace_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    filter_path = tmp_path / "filter"
+    filter_path.write_bytes(b"synthetic filter handle")
+    monkeypatch.setattr(
+        local_runner_module,
+        "_network_seccomp_filter_file",
+        lambda: filter_path.open("rb"),
+    )
+    monkeypatch.setattr(
+        local_runner_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: type(
+            "Completed",
+            (),
+            {
+                "returncode": 1,
+                "stderr": b"bwrap: No permissions to create a new namespace",
+            },
+        )(),
+    )
+
+    reason = local_runner_module._probe_bwrap_namespace(
+        "/test/bwrap", {"PATH": "/usr/bin:/bin"}, 0.5
+    )
+
+    assert reason is NamespaceFailureReason.BWRAP_USERNS_REFUSED_BY_KERNEL
+
+
 @pytest.mark.asyncio
 async def test_required_filesystem_confinement_refuses_execution_when_unavailable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -376,7 +406,10 @@ async def test_pe_header_is_recognized_and_elf_tools_refuse_other_types() -> Non
     catalog = LocalCommandCatalog()
     service = LocalCommandService(
         samples,
-        LocalCommandRunner(network_sandbox_probe_seconds=0.2),
+        LocalCommandRunner(
+            network_sandbox_probe_seconds=0.2,
+            require_filesystem_confinement=False,
+        ),
         catalog,
         enabled=True,
     )
@@ -393,7 +426,10 @@ async def test_unknown_command_and_options_are_policy_denied_before_sample_read(
     samples = _Samples(_elf_fixture())
     service = LocalCommandService(
         samples,
-        LocalCommandRunner(network_sandbox_probe_seconds=0.2),
+        LocalCommandRunner(
+            network_sandbox_probe_seconds=0.2,
+            require_filesystem_confinement=False,
+        ),
         LocalCommandCatalog(),
         enabled=True,
     )
@@ -419,7 +455,10 @@ async def test_sample_hash_mismatch_and_missing_binary_are_local_results() -> No
     missing_catalog = LocalCommandCatalog(specs=(spec,), which=lambda _: None)
     service = LocalCommandService(
         samples,
-        LocalCommandRunner(network_sandbox_probe_seconds=0.2),
+        LocalCommandRunner(
+            network_sandbox_probe_seconds=0.2,
+            require_filesystem_confinement=False,
+        ),
         missing_catalog,
         enabled=True,
     )
@@ -489,7 +528,10 @@ async def test_output_limit_is_reported_as_truncated(tmp_path: Path) -> None:
     payload = b"not an executable"
     service = LocalCommandService(
         _Samples(payload),
-        LocalCommandRunner(network_sandbox_probe_seconds=0.2),
+        LocalCommandRunner(
+            network_sandbox_probe_seconds=0.2,
+            require_filesystem_confinement=False,
+        ),
         catalog,
         enabled=True,
     )
@@ -516,7 +558,10 @@ async def test_timeout_is_bounded(tmp_path: Path) -> None:
     payload = b"safe"
     service = LocalCommandService(
         _Samples(payload),
-        LocalCommandRunner(network_sandbox_probe_seconds=0.2),
+        LocalCommandRunner(
+            network_sandbox_probe_seconds=0.2,
+            require_filesystem_confinement=False,
+        ),
         catalog,
         enabled=True,
     )
@@ -551,7 +596,10 @@ async def test_process_has_no_proxy_or_key_environment_and_socket_calls_are_bloc
     payload = b"safe"
     service = LocalCommandService(
         _Samples(payload),
-        LocalCommandRunner(network_sandbox_probe_seconds=0.2),
+        LocalCommandRunner(
+            network_sandbox_probe_seconds=0.2,
+            require_filesystem_confinement=False,
+        ),
         catalog,
         enabled=True,
     )
@@ -658,6 +706,6 @@ async def test_unavailable_isolation_never_executes_the_tool(
     result = await service.run(LocalCommandId.FILE, _sha256(payload))
 
     assert result.status is LocalCommandStatus.UNAVAILABLE
-    assert result.detail_code == "isolation_unavailable"
+    assert result.detail_code == "filesystem_confinement_unavailable"
     assert not marker.exists()
     local_runner_module._detect_network_namespace.cache_clear()

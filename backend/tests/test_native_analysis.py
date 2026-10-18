@@ -34,12 +34,12 @@ from cti_app.application.native_analysis import (
 )
 from cti_app.config import Settings
 from cti_app.domain.investigation import InvestigationBudget, ToolInvocationStatus
-from cti_app.domain.local_analysis import GhidraOperation
 from cti_app.domain.native_analysis import (
     NativeAnalysisOperation,
     NativeAnalysisProvider,
     NativeAnalysisRequestV1,
 )
+from cti_app.ghidra_service.contract import CONTRACT_VERSION
 from cti_app.infrastructure.ghidra_mcp import GhidraMcpHttpAdapter
 from cti_app.infrastructure.rea_adapter import (
     REA_READ_ONLY_CATALOG,
@@ -479,42 +479,73 @@ def test_registration_exposes_one_tool_with_only_the_closed_native_enum() -> Non
 
 
 @pytest.mark.asyncio
-async def test_legacy_ghidra_adapter_is_wrapped_without_changing_http_contract() -> None:
+async def test_ghidra_headless_adapter_is_wrapped_with_canonical_sample_transfer() -> None:
+    sample = b"verified-native-analysis-sample"
+    sample_sha256 = hashlib.sha256(sample).hexdigest()
     seen: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(request)
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "contract_version": CONTRACT_VERSION,
+                    "ghidra_version": "12.1.4",
+                    "java_version": "21.0.12.1",
+                    "status": "ok",
+                    "available_reason": None,
+                },
+            )
         return httpx.Response(
             200,
             json={
-                "ghidra_version": "11.3",
-                "plugin_version": "0.4.0",
+                "schema_version": "ghidra-service-result.v1",
+                "contract_version": CONTRACT_VERSION,
+                "ghidra_version": "12.1.4",
+                "java_version": "21.0.12.1",
+                "operation": "xrefs_to",
+                "sample_sha256": sample_sha256,
                 "data": {"xrefs": [{"address": "0x30"}, {"address": "0x20"}]},
+                "truncated": False,
             },
         )
 
-    legacy = GhidraMcpHttpAdapter(
+    async def sample_bytes_loader(requested_sha256: str) -> bytes:
+        assert requested_sha256 == sample_sha256
+        return sample
+
+    client = GhidraMcpHttpAdapter(
         enabled=True,
-        endpoint_paths={GhidraOperation.XREF_TO: "/read/xrefs-to"},
-        expected_version="11.3",
-        expected_plugin_version="0.4.0",
+        expected_version="12.1.4",
+        sample_bytes_loader=sample_bytes_loader,
         transport=httpx.MockTransport(handler),
     )
+    assert await client.probe()
     wrapper = GhidraMcpNativeAnalysisAdapter(
-        legacy,
+        client,
         enabled=True,
         catalog_version=NATIVE_ANALYSIS_CATALOG_VERSION,
     )
     try:
-        result = await wrapper.inspect(_request("callers", address="401000", limit=10))
+        request = build_native_analysis_request(
+            {
+                "sample_sha256": sample_sha256,
+                "operation": "callers",
+                "address": "401000",
+                "limit": 10,
+            }
+        )
+        result = await wrapper.inspect(request)
     finally:
-        await legacy.aclose()
+        await client.aclose()
 
     assert result.provider is NativeAnalysisProvider.GHIDRA_MCP
-    assert result.provider_version == "11.3"
-    assert result.provider_plugin_version == "0.4.0"
+    assert result.provider_version == "12.1.4"
+    assert result.provider_plugin_version == CONTRACT_VERSION
     assert [item["address"] for item in result.data["xrefs"]] == ["0x20", "0x30"]
-    assert seen[0].method == "GET"
-    assert seen[0].url.path == "/read/xrefs-to"
-    assert seen[0].url.params["address"] == "0x401000"
-    assert seen[0].url.params["sample_sha256"] == SAMPLE_SHA256
+    assert seen[0].method == "GET" and seen[0].url.path == "/v1/probe"
+    assert seen[1].method == "POST" and seen[1].url.path == "/v1/analyze"
+    assert seen[1].url.params["operation"] == "xrefs_to"
+    assert seen[1].url.params["address"] == "0x401000"
+    assert seen[1].content == sample

@@ -255,10 +255,10 @@ def _parse_rea_response(
 
 
 class GhidraMcpNativeAnalysisAdapter(NativeAnalysisPort):
-    """Versioned port wrapper around the historical Ghidra adapter.
+    """Versioned native-analysis wrapper around the isolated Ghidra service.
 
-    The wrapped ``GhidraMcpHttpAdapter`` remains the owner of its existing HTTP
-    behavior and endpoint policy. Unsupported catalog entries return unavailable.
+    Unsupported catalog entries remain unavailable; the wrapped client owns the
+    service attestation and the verified canonical-byte transfer.
     """
 
     _OPERATIONS: Mapping[NativeAnalysisOperation, GhidraOperation] = {
@@ -301,7 +301,7 @@ class GhidraMcpNativeAnalysisAdapter(NativeAnalysisPort):
 
     @property
     def available(self) -> bool:
-        return self._enabled and self._adapter is not None
+        return bool(self._enabled and self._adapter is not None and self._adapter.available)
 
     async def inspect(self, request: NativeAnalysisRequestV1) -> NativeAnalysisObservationV1:
         adapter = self._adapter
@@ -368,7 +368,7 @@ class GhidraMcpNativeAnalysisAdapter(NativeAnalysisPort):
 
 def build_native_analysis_port(
     settings: Settings,
-    runner: ReaReadOnlyRunner | None = None,
+    runner: ReaReadOnlyRunner | GhidraMcpHttpAdapter | None = None,
 ) -> NativeAnalysisPort:
     """Build the configured versioned port; REA still needs a verified worker client.
 
@@ -380,7 +380,7 @@ def build_native_analysis_port(
     if not settings.native_analysis_enabled or provider is NativeAnalysisProvider.NONE:
         return UnavailableNativeAnalysisPort(provider)
     if provider is NativeAnalysisProvider.REA:
-        if runner is None:
+        if runner is None or isinstance(runner, GhidraMcpHttpAdapter):
             return UnavailableNativeAnalysisPort(
                 provider,
                 reason=NativeAnalysisRunnerNotConfigured(
@@ -397,7 +397,11 @@ def build_native_analysis_port(
             max_output_bytes=settings.native_analysis_max_output_bytes,
         )
 
-    ghidra = create_ghidra_mcp_http_adapter(settings)
+    ghidra = (
+        runner
+        if isinstance(runner, GhidraMcpHttpAdapter)
+        else create_ghidra_mcp_http_adapter(settings)
+    )
     return GhidraMcpNativeAnalysisAdapter(
         ghidra,
         enabled=settings.native_analysis_enabled and settings.ghidra_enabled,

@@ -236,6 +236,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         shodan_adapter = create_shodan_http_adapter(client=shodan_client, settings=settings)
     if settings.ghidra_enabled:
         ghidra_adapter = create_ghidra_mcp_http_adapter(settings)
+        await ghidra_adapter.probe()
     blob_store = MinioBlobStore(
         Minio(
             settings.s3_endpoint,

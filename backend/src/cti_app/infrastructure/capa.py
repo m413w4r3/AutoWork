@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, StrictInt, StrictStr
 
 from cti_app.infrastructure.analysis_subprocess import (
     AnalysisSubprocessResult,
@@ -31,7 +31,9 @@ class CapaMeta(BaseModel):
     model_config = ConfigDict(extra="ignore")
     name: StrictStr
     namespace: StrictStr | None
-    attack: list[CapaAttackSpec] = Field(alias="att&ck")
+    attack: list[CapaAttackSpec] = Field(
+        default_factory=list, validation_alias=AliasChoices("att&ck", "attack")
+    )
     mbc: list[CapaMbcSpec]
 
 
@@ -48,7 +50,7 @@ class CapaMbcSpec(BaseModel):
 class CapaAddress(BaseModel):
     model_config = ConfigDict(extra="ignore")
     type: StrictStr
-    value: StrictInt | list[StrictInt] | None
+    value: StrictInt | list[StrictInt] | None = None
 
 
 class CapaRule(BaseModel):
@@ -93,6 +95,18 @@ def parse_capa_output(payload: bytes) -> tuple[tuple[dict[str, Any], ...], tuple
     try:
         parsed = CapaOutput.model_validate_json(payload)
     except Exception as exc:
+        errors = getattr(exc, "errors", None)
+        if callable(errors):
+            try:
+                first = errors(include_input=False, include_url=False)[0]
+                location = ".".join(str(part) for part in first.get("loc", ())) or "root"
+                detail = str(first.get("type", "validation_error"))
+                message = str(first.get("msg", "invalid output"))[:240]
+                return (), (
+                    f"invalid capa JSON: {type(exc).__name__} at {location} ({detail}): {message}",
+                )
+            except (IndexError, TypeError, ValueError):
+                pass
         return (), (f"invalid capa JSON: {type(exc).__name__}",)
     capabilities: list[dict[str, Any]] = []
     for rule_id, rule in parsed.rules.items():

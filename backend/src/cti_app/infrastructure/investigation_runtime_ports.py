@@ -21,6 +21,7 @@ from cti_app.application.blob_storage import BlobStore
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.capabilities import CapabilitiesService
 from cti_app.application.code_features import CodeFeatureService
+from cti_app.application.confined_analysis import ConfinedAnalysisExecutionPort
 from cti_app.application.goodware import GoodwareMeasurementService
 from cti_app.application.identity import LocalIdentityProvider
 from cti_app.application.investigation_composition import (
@@ -55,12 +56,18 @@ from cti_app.application.virustotal import (
 )
 from cti_app.application.virustotal_persistence import VirusTotalObservationService
 from cti_app.config import Settings
+from cti_app.domain.network_protocol import NetworkExtractionLimitsV1
 from cti_app.domain.virustotal import (
     VirusTotalCapability,
     VirusTotalEndpointVariant,
     VirusTotalTransportKind,
 )
+from cti_app.infrastructure.confined_analysis_dispatch import (
+    build_confined_analysis_execution_port,
+)
+from cti_app.infrastructure.confined_tshark import ConfinedTsharkAdapter
 from cti_app.infrastructure.floss_adapter import FlossAdapter
+from cti_app.infrastructure.ghidra_mcp import GhidraMcpHttpAdapter
 from cti_app.infrastructure.local_command_runner import LocalCommandRunner
 from cti_app.infrastructure.mwcp_adapter import MwcpAdapter
 from cti_app.infrastructure.rea_adapter import (
@@ -86,6 +93,11 @@ class RuntimePortStatus:
     family: str
     state: RuntimePortState
     reason: str | None = None
+    execution_mode: str | None = None
+
+    @property
+    def available_reason(self) -> str | None:
+        return self.reason
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,15 +124,11 @@ def _local_command_catalog(
     filesystem_confined: bool,
 ) -> LocalCommandCatalog:
     """Hide executable commands when strict filesystem isolation is unproven."""
-    specs = (
-        tuple(
-            replace(spec, requires_filesystem_confinement=True)
-            for spec in default_local_command_specs()
-        )
-        if settings.local_analysis_require_filesystem_confinement
-        else None
+    specs = tuple(
+        replace(spec, requires_filesystem_confinement=True)
+        for spec in default_local_command_specs()
     )
-    if settings.local_analysis_require_filesystem_confinement and not filesystem_confined:
+    if not filesystem_confined:
         # The tool schema is built from this catalogue. Returning no executables
         # removes local.run_command from the registry instead of exposing a tool
         # that only fails after an operator or Bridge asks to execute it.
@@ -144,8 +152,12 @@ def _local_command_catalog(
 
 
 def _allow_unconfined_analysis_processes(settings: Settings) -> bool:
-    """capa, SMDA, and the isolated YARA worker do not use the bwrap runner."""
-    return not settings.local_analysis_require_filesystem_confinement
+    """Permit the legacy local YARA runner only after measuring bwrap confinement."""
+    probe = LocalCommandRunner(
+        max_sample_bytes=settings.local_analysis_max_sample_bytes,
+        require_filesystem_confinement=True,
+    )
+    return bool(probe.filesystem_confined)
 
 
 def build_investigation_runtime_ports(
@@ -166,6 +178,7 @@ def build_investigation_runtime_ports(
     tshark: TsharkAdapter | None = None,
     retrohunt_http_client: httpx.AsyncClient | None = None,
     confined_rea_runner: ReaReadOnlyRunner | None = None,
+    confined_analysis_execution: ConfinedAnalysisExecutionPort | None = None,
 ) -> InvestigationRuntimePorts:
     statuses: list[RuntimePortStatus] = []
 
@@ -212,12 +225,19 @@ def build_investigation_runtime_ports(
                 # make API/worker startup fail or guess a different endpoint.
                 retrohunt_provider = None
 
-    def record(family: str, wired: bool, reason: str | None = None) -> None:
+    def record(
+        family: str,
+        wired: bool,
+        reason: str | None = None,
+        *,
+        execution_mode: str | None = None,
+    ) -> None:
         statuses.append(
             RuntimePortStatus(
                 family,
                 RuntimePortState.AVAILABLE if wired else RuntimePortState.UNAVAILABLE,
                 None if wired else reason,
+                execution_mode,
             )
         )
 
@@ -234,25 +254,44 @@ def build_investigation_runtime_ports(
     floss: FlossAdapter | None = None
     mwcp: MwcpAdapter | None = None
     behavior_report_importer: BehaviorReportImporter | None = BehaviorReportImporter()
+    if confined_analysis_execution is None:
+        confined_analysis_execution = build_confined_analysis_execution_port(
+            settings,
+            uow_factory=uow_factory,
+            blob_catalog=blob_catalog,
+        )
+    assert confined_analysis_execution is not None
+    worker_statuses = confined_analysis_execution.family_statuses
+    worker_extraction_available = any(
+        status is not None and status.available
+        for status in (worker_statuses.get("floss"), worker_statuses.get("mwcp"))
+    )
 
     if (
         settings.local_analysis_enabled
         or settings.ghidra_enabled
         or settings.rule_workbench_enabled
+        or worker_extraction_available
     ):
         quarantine_bytes = QuarantineRuleCorpusBytes(
             uow_factory,
             blob_store,
             maximum_sample_bytes=max(
                 settings.local_analysis_max_sample_bytes,
-                64 * 1024 * 1024 if settings.rule_workbench_enabled else 1,
+                settings.ghidra_max_sample_bytes if settings.ghidra_enabled else 1,
+                64 * 1024 * 1024
+                if settings.rule_workbench_enabled or worker_extraction_available
+                else 1,
             ),
         )
+    if settings.ghidra_enabled and isinstance(ghidra_adapter, GhidraMcpHttpAdapter):
+        assert quarantine_bytes is not None
+        ghidra_adapter.set_sample_bytes_loader(quarantine_bytes.get_bytes_for_sample)
     if settings.local_analysis_enabled or settings.ghidra_enabled:
         assert quarantine_bytes is not None
         local_command_runner = LocalCommandRunner(
             max_sample_bytes=settings.local_analysis_max_sample_bytes,
-            require_filesystem_confinement=(settings.local_analysis_require_filesystem_confinement),
+            require_filesystem_confinement=True,
         )
         local_command_catalog = _local_command_catalog(
             settings,
@@ -268,7 +307,11 @@ def build_investigation_runtime_ports(
             enabled=settings.local_analysis_enabled,
             max_sample_bytes=settings.local_analysis_max_sample_bytes,
         )
-    if settings.local_analysis_enabled:
+    local_filesystem_confined = bool(
+        local_command_service is not None
+        and getattr(local_command_service, "filesystem_confined", False)
+    )
+    if settings.local_analysis_enabled and local_filesystem_confined:
         assert local_command_service is not None and local_command_catalog is not None
         static_analysis = StaticAnalysisService(
             blob_catalog,
@@ -277,29 +320,34 @@ def build_investigation_runtime_ports(
             string_min_length=settings.analysis_string_min_length,
             max_strings=settings.analysis_max_strings,
         )
-        if _allow_unconfined_analysis_processes(settings):
-            capabilities_analysis = CapabilitiesService(
-                blob_catalog,
-                uow_factory,
-                rules_path=settings.analysis_capa_rules_path,
-                timeout_seconds=settings.analysis_capa_timeout_seconds,
-                max_output_bytes=settings.analysis_capa_max_output_bytes,
-                max_memory_bytes=settings.analysis_capa_max_memory_bytes,
-            )
-            code_features = CodeFeatureService(blob_catalog, uow_factory, SmdaAdapter())
+        capabilities_analysis = CapabilitiesService(
+            blob_catalog,
+            uow_factory,
+            rules_path=settings.analysis_capa_rules_path,
+            timeout_seconds=settings.analysis_capa_timeout_seconds,
+            max_output_bytes=settings.analysis_capa_max_output_bytes,
+            max_memory_bytes=settings.analysis_capa_max_memory_bytes,
+        )
+        code_features = CodeFeatureService(blob_catalog, uow_factory, SmdaAdapter())
+    if settings.local_analysis_enabled:
         goodware_measurement = GoodwareMeasurementService(
             blob_store,
             uow_factory,
             cache_root=settings.goodware_cache_root,
         )
-        # Both adapters re-evaluate their own confinement/binary/allowlist state on
-        # every call, so a degraded executor never presents itself as available.
-        floss = FlossAdapter(local_command_service, local_command_catalog, enabled=True)
+    if worker_extraction_available and quarantine_bytes is not None:
+        floss = FlossAdapter(
+            enabled=True,
+            confined_analysis=confined_analysis_execution,
+            uow_factory=uow_factory,
+            max_sample_bytes=settings.analysis_max_sample_bytes,
+        )
         mwcp = MwcpAdapter(
-            local_command_service,
-            local_command_catalog,
             parser_versions=settings.mwcp_parser_versions,
             enabled=True,
+            confined_analysis=confined_analysis_execution,
+            uow_factory=uow_factory,
+            max_sample_bytes=settings.analysis_max_sample_bytes,
         )
     if settings.rule_workbench_enabled and _allow_unconfined_analysis_processes(settings):
         candidate_yara_engine = IsolatedYaraRunner()
@@ -312,7 +360,12 @@ def build_investigation_runtime_ports(
         network_quarantine is not None or network_quarantine_factory is not None
     )
     if network_source_configured and tshark is None:
-        tshark = TsharkAdapter()
+        tshark = ConfinedTsharkAdapter(
+            confined_analysis_execution,
+            limits=NetworkExtractionLimitsV1(),
+            timeout_seconds=settings.analysis_worker_job_timeout_seconds,
+            max_output_bytes=settings.analysis_worker_result_max_bytes,
+        )
 
     acquisition_service = (
         VirusTotalSampleAcquisitionService(
@@ -327,14 +380,22 @@ def build_investigation_runtime_ports(
     )
 
     floss_available = bool(floss is not None and floss.available)
+    floss_worker_status = worker_statuses.get("floss")
     floss_reason = (
         getattr(floss, "unavailable_reason", None)
         if floss is not None
-        else ("local_analysis_disabled")
+        else floss_worker_status.available_reason
+        if floss_worker_status is not None
+        else confined_analysis_execution.available_reason or "analysis_worker_unavailable"
     )
     mwcp_available = bool(mwcp is not None and mwcp.available)
+    mwcp_worker_status = worker_statuses.get("mwcp")
     mwcp_reason = (
-        getattr(mwcp, "unavailable_reason", None) if mwcp is not None else "local_analysis_disabled"
+        getattr(mwcp, "unavailable_reason", None)
+        if mwcp is not None
+        else mwcp_worker_status.available_reason
+        if mwcp_worker_status is not None
+        else confined_analysis_execution.available_reason or "analysis_worker_unavailable"
     )
     network_available = bool(network_source_configured and tshark is not None and tshark.available)
     network_reason = (
@@ -342,7 +403,12 @@ def build_investigation_runtime_ports(
         if network_available
         else "no_operator_capture_source"
         if not network_source_configured
-        else "tshark_or_filesystem_confinement_unavailable"
+        else getattr(tshark, "available_reason", None)
+        or (
+            "tshark_or_filesystem_confinement_unavailable"
+            if not isinstance(tshark, ConfinedTsharkAdapter)
+            else "analysis_worker_tshark_unavailable"
+        )
     )
     if not retrohunt_enabled:
         retrohunt_available, retrohunt_reason = False, "retrohunt_disabled_by_configuration"
@@ -352,7 +418,14 @@ def build_investigation_runtime_ports(
             provider=retrohunt_provider,
             routing_policy=vt_routing_policy,
         )
-    native_port = build_native_analysis_port(settings, runner=confined_rea_runner)
+    native_runner = confined_rea_runner
+    if settings.native_analysis_provider == "ghidra_mcp" and isinstance(
+        ghidra_adapter, GhidraMcpHttpAdapter
+    ):
+        # The composition factory already forwards this process-level collaborator
+        # through its runner dependency. Keep the same attested client and byte loader.
+        native_runner = cast(ReaReadOnlyRunner, ghidra_adapter)
+    native_port = build_native_analysis_port(settings, runner=native_runner)
 
     vt_enabled = any(
         (
@@ -370,21 +443,55 @@ def build_investigation_runtime_ports(
         "virustotal_not_configured" if vt_adapter is None else "virustotal_capabilities_disabled",
     )
     record("shodan", shodan_adapter is not None, "shodan_not_configured")
-    record("ghidra", ghidra_adapter is not None, "ghidra_disabled")
+    ghidra_available = bool(getattr(ghidra_adapter, "available", False))
+    ghidra_reason = (
+        None
+        if ghidra_available
+        else "ghidra_disabled_by_configuration"
+        if not settings.ghidra_enabled
+        else getattr(ghidra_adapter, "available_reason", None) or "ghidra_service_unavailable"
+    )
+    record("ghidra", ghidra_available, ghidra_reason)
+    record(
+        "local_filesystem_confinement",
+        local_filesystem_confined,
+        None
+        if local_filesystem_confined
+        else getattr(local_command_runner, "namespace_reason", None)
+        or "local_analysis_disabled_or_unconfined",
+        execution_mode="local-bwrap-measured",
+    )
+    sample_worker_status = worker_statuses.get("sample_analysis")
+    sample_worker_available = bool(sample_worker_status and sample_worker_status.available)
+    record(
+        "confined_analysis_worker",
+        confined_analysis_execution.available,
+        confined_analysis_execution.available_reason or "analysis_worker_unavailable",
+        execution_mode="analysis-worker",
+    )
     record(
         "local_analysis",
-        bool(settings.local_analysis_enabled and static_analysis is not None),
-        "local_analysis_disabled"
-        if not settings.local_analysis_enabled
-        else "sample_analysis_services_unavailable",
+        sample_worker_available,
+        None
+        if sample_worker_available
+        else sample_worker_status.available_reason
+        if sample_worker_status is not None
+        else confined_analysis_execution.available_reason or "sample_analysis_unavailable",
+        execution_mode="analysis-worker",
+    )
+    record(
+        "sample_analysis",
+        sample_worker_available,
+        None
+        if sample_worker_available
+        else sample_worker_status.available_reason
+        if sample_worker_status is not None
+        else confined_analysis_execution.available_reason or "sample_analysis_unavailable",
+        execution_mode="analysis-worker",
     )
     if not settings.local_analysis_enabled:
         local_command_reason = "local_analysis_disabled"
-    elif (
-        settings.local_analysis_require_filesystem_confinement
-        and local_command_service is not None
-        and not local_command_service.filesystem_confined
-    ):
+    elif local_command_service is not None and not local_command_service.filesystem_confined:
         local_command_reason = (
             getattr(local_command_runner, "namespace_reason", None)
             or "filesystem_confinement_unavailable"
@@ -397,41 +504,70 @@ def build_investigation_runtime_ports(
             settings.local_analysis_enabled
             and local_command_service is not None
             and local_command_catalog is not None
-            and (
-                not settings.local_analysis_require_filesystem_confinement
-                or local_command_service.filesystem_confined
-            )
+            and local_command_service.filesystem_confined
             and local_command_catalog.available_commands()
         ),
         local_command_reason,
     )
+    yara_worker_status = worker_statuses.get("yara")
+    yara_worker_available = bool(yara_worker_status and yara_worker_status.available)
     record(
         "rule_workbench",
-        yara_engine is not None,
+        settings.rule_workbench_enabled and (yara_engine is not None or yara_worker_available),
         "rule_workbench_disabled"
         if not settings.rule_workbench_enabled
-        else "filesystem_confinement_unavailable"
-        if not _allow_unconfined_analysis_processes(settings)
-        else yara_probe_reason or "yara_engine_or_worker_unavailable",
+        else yara_worker_status.available_reason
+        if not yara_worker_available and yara_worker_status is not None
+        else "yara_engine_or_worker_unavailable"
+        if not yara_worker_available and yara_engine is None
+        else yara_probe_reason,
+        execution_mode=(
+            "analysis-worker"
+            if yara_worker_available
+            else "local-bwrap-measured"
+            if yara_engine is not None
+            else "unavailable"
+        ),
     )
-    if settings.local_analysis_require_filesystem_confinement:
+    for worker_family, family_name in (
+        ("static", "static_analysis"),
+        ("capa", "capa_analysis"),
+        ("smda", "smda_analysis"),
+        ("tshark", "analysis_worker_tshark"),
+        ("capinfos", "analysis_worker_capinfos"),
+        ("floss", "analysis_worker_floss"),
+        ("mwcp", "analysis_worker_mwcp"),
+        ("yara", "analysis_worker_yara"),
+    ):
+        worker_status = worker_statuses.get(worker_family)
+        worker_available = bool(worker_status and worker_status.available)
         record(
-            "capa_analysis",
-            capabilities_analysis is not None,
-            None if capabilities_analysis is not None else "filesystem_confinement_unavailable",
-        )
-        record(
-            "smda_analysis",
-            code_features is not None,
-            None if code_features is not None else "filesystem_confinement_unavailable",
+            family_name,
+            worker_available,
+            None
+            if worker_available
+            else worker_status.available_reason
+            if worker_status is not None
+            else confined_analysis_execution.available_reason or "analysis_worker_unavailable",
+            execution_mode="analysis-worker",
         )
     record(
         "sample_similarity",
         blob_catalog is not None,
         "similarity_artifact_store_not_configured",
     )
-    record("floss_extraction", floss_available, floss_reason)
-    record("configuration_extraction", mwcp_available, mwcp_reason)
+    record(
+        "floss_extraction",
+        floss_available,
+        floss_reason,
+        execution_mode="analysis-worker",
+    )
+    record(
+        "configuration_extraction",
+        mwcp_available,
+        mwcp_reason,
+        execution_mode="analysis-worker",
+    )
     behavior_report_import_available = callable(getattr(behavior_report_importer, "parse", None))
     record(
         "behavior_report_import",
@@ -439,7 +575,36 @@ def build_investigation_runtime_ports(
         None if behavior_report_import_available else "behavior_report_importer_unavailable",
     )
     record("retrohunt", retrohunt_available, retrohunt_reason)
-    record("network_capture", network_available, network_reason)
+    network_execution_mode = (
+        getattr(tshark, "execution_mode", "local-bwrap-measured") if network_available else None
+    )
+    record(
+        "network_capture",
+        network_available,
+        network_reason,
+        execution_mode=network_execution_mode,
+    )
+    record(
+        "network_capture_inspect",
+        network_available,
+        network_reason,
+        execution_mode=network_execution_mode,
+    )
+    record(
+        "network_stream_reassemble",
+        network_source_configured,
+        None if network_source_configured else "no_operator_capture_source",
+    )
+    record(
+        "network_messages_segment",
+        network_source_configured,
+        None if network_source_configured else "no_operator_capture_source",
+    )
+    record(
+        "network_protocol",
+        network_source_configured,
+        None if network_source_configured else "no_operator_capture_source",
+    )
     record(
         "native_analysis",
         native_port.available,
@@ -473,7 +638,8 @@ def build_investigation_runtime_ports(
         network_quarantine=network_quarantine,
         network_quarantine_factory=network_quarantine_factory,
         tshark=tshark,
-        confined_rea_runner=confined_rea_runner,
+        confined_rea_runner=native_runner,
+        confined_analysis_execution=confined_analysis_execution,
     )
     return InvestigationRuntimePorts(optional_tool_ports=ports, statuses=tuple(statuses))
 
@@ -498,6 +664,7 @@ def build_investigation_runtime_composition_factory(
     tshark: TsharkAdapter | None = None,
     retrohunt_http_client: httpx.AsyncClient | None = None,
     confined_rea_runner: ReaReadOnlyRunner | None = None,
+    confined_analysis_execution: ConfinedAnalysisExecutionPort | None = None,
 ) -> InvestigationRuntimeComposition:
     """Build the same production composition used by both API and worker roots."""
     ports = build_investigation_runtime_ports(
@@ -517,6 +684,7 @@ def build_investigation_runtime_composition_factory(
         tshark=tshark,
         retrohunt_http_client=retrohunt_http_client,
         confined_rea_runner=confined_rea_runner,
+        confined_analysis_execution=confined_analysis_execution,
     )
     return InvestigationRuntimeComposition(
         composition_factory=InvestigationCompositionFactory(
@@ -553,14 +721,77 @@ def describe_tool_inventory(
         for name, version in (("tshark", tshark_version), ("capinfos", capinfos_version)):
             binaries[name] = {"available": version is not None, "version": version}
 
+    families = {
+        item.family: {
+            "status": item.state.value,
+            "reason": item.reason,
+            **(
+                {
+                    "available_reason": item.available_reason,
+                    "execution_mode": item.execution_mode,
+                }
+                if item.execution_mode is not None
+                else {}
+            ),
+        }
+        for item in ports.statuses
+    }
+    worker = ports.optional_tool_ports.confined_analysis_execution
+    if worker is not None:
+        inventory_families = {
+            "static_analysis": "static",
+            "capa_analysis": "capa",
+            "smda_analysis": "smda",
+            "sample_analysis": "sample_analysis",
+            "floss_extraction": "floss",
+            "configuration_extraction": "mwcp",
+            "rule_workbench": "yara",
+            "analysis_worker_tshark": "tshark",
+            "analysis_worker_capinfos": "capinfos",
+            "analysis_worker_floss": "floss",
+            "analysis_worker_mwcp": "mwcp",
+            "analysis_worker_yara": "yara",
+        }
+        for inventory_name, worker_name in inventory_families.items():
+            item = families.get(inventory_name)
+            worker_family = worker.family_statuses.get(worker_name)
+            if item is None or worker_family is None:
+                continue
+            item["version"] = worker_family.version
+            if worker_family.available_reason is not None:
+                item["available_reason"] = worker_family.available_reason
+    worker_details: dict[str, object] = {
+        "status": "unavailable",
+        "available_reason": "analysis_worker_unavailable",
+        "reachable": False,
+        "confined": False,
+        "dependencies_ready": False,
+        "isolation_profile": None,
+        "versions": {},
+        "families": {},
+    }
+    if worker is not None:
+        attestation = worker.attestation
+        worker_details = {
+            "status": "available" if worker.available else "unavailable",
+            "available_reason": worker.available_reason,
+            "reachable": attestation.reachable,
+            "confined": attestation.confined,
+            "dependencies_ready": attestation.dependencies_ready,
+            "isolation_profile": attestation.isolation_profile,
+            "versions": dict(attestation.versions),
+            "families": {
+                name: {
+                    "available": item.available,
+                    "version": item.version,
+                    "available_reason": item.available_reason,
+                }
+                for name, item in worker.family_statuses.items()
+            },
+        }
     return {
-        "families": {
-            item.family: {
-                "status": item.state.value,
-                "reason": item.reason,
-            }
-            for item in ports.statuses
-        },
+        "families": families,
+        "analysis_worker": worker_details,
         "binaries": binaries,
     }
 

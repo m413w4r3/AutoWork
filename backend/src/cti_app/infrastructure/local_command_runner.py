@@ -66,6 +66,7 @@ class NetworkIsolationStatus(StrEnum):
 class NamespaceFailureReason(StrEnum):
     BWRAP_NOT_INSTALLED = "bwrap_not_installed"
     BWRAP_PROBE_FAILED = "bwrap_probe_failed"
+    BWRAP_USERNS_REFUSED_BY_KERNEL = "bwrap_userns_refused_by_kernel"
     BWRAP_PROBE_NETWORK_SOCKET_ALLOWED = "bwrap_probe_network_socket_allowed"
     BWRAP_PROBE_NETWORK_SOCKET_UNEXPECTED_ERROR = "bwrap_probe_network_socket_unexpected_error"
     BWRAP_PROBE_FILESYSTEM_NOT_CONFINED = "bwrap_probe_filesystem_not_confined"
@@ -737,7 +738,7 @@ def _probe_bwrap_namespace(
                     command,
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
                     timeout=timeout_seconds,
                     env=environment,
                     shell=False,
@@ -746,6 +747,17 @@ def _probe_bwrap_namespace(
                 )
     except (OSError, subprocess.SubprocessError, ValueError):
         return NamespaceFailureReason.BWRAP_PROBE_FAILED
+    stderr = getattr(result, "stderr", b"")
+    if isinstance(stderr, bytes):
+        diagnostic = stderr[:4096].decode("utf-8", "replace").casefold()
+    else:
+        diagnostic = str(stderr)[:4096].casefold()
+    if "namespace" in diagnostic and (
+        "no permissions" in diagnostic
+        or "operation not permitted" in diagnostic
+        or ("user namespace" in diagnostic and "not allowed" in diagnostic)
+    ):
+        return NamespaceFailureReason.BWRAP_USERNS_REFUSED_BY_KERNEL
     return {
         0: None,
         10: NamespaceFailureReason.BWRAP_PROBE_NETWORK_SOCKET_ALLOWED,

@@ -9,6 +9,7 @@ from typing import Protocol
 from uuid import UUID
 
 from cti_app.application.analyst_opinion_service import OpinionError, OpinionErrorCode
+from cti_app.application.investigation_graph_source import InvestigationGraphSource
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.typst_compilation import CompiledTypstDocument
@@ -17,6 +18,7 @@ from cti_app.domain.analyst_opinion import (
     AnalystOpinionV1,
     verify_opinion_citations,
 )
+from cti_app.domain.investigation_graph import InvestigationGraph
 from cti_app.domain.production import ProductionArtifactStage, ProductionArtifactStatus
 from cti_app.domain.production_synthesis import (
     ProductionSynthesisV1,
@@ -35,6 +37,8 @@ class DraftOpinionPdfRenderer(Protocol):
         document: PublicationDocumentV5,
         opinion: AnalystOpinionV1,
         synthesis: ProductionSynthesisV1,
+        *,
+        infrastructure_graph: InvestigationGraph | None = None,
     ) -> CompiledTypstDocument: ...
 
 
@@ -57,10 +61,14 @@ class AnalystOpinionPreviewService:
         uow_factory: UnitOfWorkFactory,
         artifact_store: ProductionArtifactStore,
         renderer: DraftOpinionPdfRenderer,
+        graph_source: InvestigationGraphSource | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._artifact_store = artifact_store
         self._renderer = renderer
+        self._graph_source = graph_source or InvestigationGraphSource(
+            artifact_reader=artifact_store
+        )
 
     async def preview_pdf(
         self,
@@ -152,7 +160,23 @@ class AnalystOpinionPreviewService:
                 citation_violations=citation_violations,
             )
 
-        compiled = await self._renderer.render_draft_preview(document, opinion, parsed_synthesis)
+        infrastructure_graph = await self._graph_source.project(
+            investigation_id=opinion.investigation_id,
+            publication=document,
+            observations=observations,
+            findings=findings,
+        )
+        if infrastructure_graph is None:
+            compiled = await self._renderer.render_draft_preview(
+                document, opinion, parsed_synthesis
+            )
+        else:
+            compiled = await self._renderer.render_draft_preview(
+                document,
+                opinion,
+                parsed_synthesis,
+                infrastructure_graph=infrastructure_graph,
+            )
         content = compiled.content
         renderer_sha256 = compiled.sha256
         pdf_sha256 = hashlib.sha256(content).hexdigest()

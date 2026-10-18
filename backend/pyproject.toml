@@ -28,6 +28,8 @@ dependencies = [
 [dependency-groups]
 analysis = [
   "flare-capa==9.4.0",
+  "flare-floss==3.1.1",
+  "mwcp==3.16.1",
   "ppdeep==20260221",
   "py-tlsh==5.0.0",
   "smda==4.5.0",

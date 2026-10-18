@@ -11,6 +11,11 @@ from uuid import UUID
 
 from cti_app.application.capabilities import CapabilitiesService
 from cti_app.application.code_features import CodeFeatureService
+from cti_app.application.confined_analysis import (
+    ConfinedAnalysisExecutionPort,
+    ConfinedAnalysisRequest,
+    ConfinedAnalysisTool,
+)
 from cti_app.application.evidence_recorder import EvidenceRecorder, sanitize_evidence_text
 from cti_app.application.goodware import GoodwareMeasurementService
 from cti_app.application.investigation_acquisition import (
@@ -46,8 +51,9 @@ _ACQUISITION_COST = {
     BudgetDimension.DOWNLOADS: 1,
 }
 VT_FILE_DOWNLOAD_CAPABILITY = "vt.file_download"
-LOCAL_ANALYSIS_CAPABILITY = "investigation.local_read"
 LOCAL_QUALIFICATION_CAPABILITY = "investigation.local_read"
+SAMPLE_ANALYSIS_CAPABILITY = "investigation.sample_analysis"
+LOCAL_ANALYSIS_CAPABILITY = SAMPLE_ANALYSIS_CAPABILITY
 _MAX_STRINGS = 128
 _MAX_STRING_CHARS = 512
 _MAX_ANALYSIS_OUTPUT = 256
@@ -127,7 +133,7 @@ class SampleAnalyzer(Protocol):
 
 
 class LocalSampleAnalysisService:
-    """Compose existing static, SMDA, capa and goodware services for a quarantine sample."""
+    """Run sample analysis in the attested worker and record its canonical evidence."""
 
     def __init__(
         self,
@@ -139,6 +145,9 @@ class LocalSampleAnalysisService:
         code_features: CodeFeatureService | None = None,
         capabilities: CapabilitiesService | None = None,
         goodware: GoodwareMeasurementService | None = None,
+        confined_analysis: ConfinedAnalysisExecutionPort | None = None,
+        analysis_timeout_seconds: float = 120,
+        max_output_bytes: int = 1_000_000,
     ) -> None:
         self._hits = hits
         self._uow_factory = uow_factory
@@ -147,6 +156,9 @@ class LocalSampleAnalysisService:
         self._code_features = code_features
         self._capabilities = capabilities
         self._goodware = goodware
+        self._confined_analysis = confined_analysis
+        self._analysis_timeout_seconds = analysis_timeout_seconds
+        self._max_output_bytes = max_output_bytes
 
     async def analyze(
         self,
@@ -154,215 +166,175 @@ class LocalSampleAnalysisService:
         association_id: UUID,
         invocation_ref: UUID | None,
     ) -> SampleAnalysisOutcome:
-        if not any(
-            (self._static_analysis, self._code_features, self._capabilities, self._goodware)
-        ):
-            return SampleAnalysisOutcome(
-                ToolInvocationStatus.UNAVAILABLE,
-                (),
-                {"association_id": str(association_id)},
-                "No local sample analysis service is configured.",
-            )
         sample = await self._hits.resolve_quarantined_sample(association_id)
-        summary: dict[str, Any] = {
-            "schema": "sample-analysis.v1",
-            "sample_sha256": sample.sha256,
-            "extractors": {},
-            "bounds": {
-                "max_strings": _MAX_STRINGS,
-                "max_string_chars": _MAX_STRING_CHARS,
-                "max_payload_strings": _MAX_STRINGS,
-            },
-            "limitations": [
-                "Analysis is local and static; it does not show runtime execution.",
-                "Extractor output is untrusted and bounded before it is archived.",
-                "Analysis does not qualify this sample as a cluster member.",
-            ],
-        }
-        strings: list[dict[str, Any]] = []
-        statuses: list[ToolInvocationStatus] = []
-        static_features: Any | None = None
-        code_feature_set: Any | None = None
-        capability_set: Any | None = None
-
-        if self._static_analysis is not None:
-            try:
-                static_features = await self._static_analysis.analyze(sample.sample_id)
-                static_json = static_features.as_json()
-                raw_strings = static_json.get("strings", ())
-                strings = _bounded_strings(raw_strings)
-                summary["extractors"]["static"] = {
-                    "version": static_features.extractor_version,
-                    "parameters_sha256": static_features.parameters_sha256,
-                    "max_sample_bytes": getattr(self._static_analysis, "_max_sample_bytes", None),
-                    "string_min_length": getattr(self._static_analysis, "_string_min_length", None),
-                    "max_strings": getattr(self._static_analysis, "_max_strings", None),
-                }
-                summary["static_analysis"] = {
-                    "format": static_features.format.value,
-                    "size": static_features.size,
-                    "sha256": static_features.sha256,
-                    "sections": len(static_features.sections),
-                    "imports": len(static_features.imports),
-                    "exports": len(static_features.exports),
-                    "strings_observed": len(raw_strings),
-                    "strings_recorded": len(strings),
-                    "partial_errors": list(static_features.partial_errors[:16]),
-                }
-                statuses.append(ToolInvocationStatus.SUCCEEDED)
-            except Exception as exc:
-                summary["static_analysis"] = {"status": "failed", "error_type": type(exc).__name__}
-                statuses.append(ToolInvocationStatus.FAILED)
-
-        if self._code_features is not None:
-            parameter_payload = {
-                "analysis": "investigation-smda.v1",
-                "code_ngram_sizes": [4, 6, 8],
-                "code_ngram_max_per_sample": 100_000,
-            }
-            parameter_hash = hashlib.sha256(
-                json.dumps(parameter_payload, sort_keys=True, separators=(",", ":")).encode()
-            ).hexdigest()
-            try:
-                code_feature_set = await self._code_features.extract(
-                    sample_id=sample.sample_id,
-                    parameters_sha256=parameter_hash,
-                    code_ngram_sizes=(4, 6, 8),
-                    code_ngram_max_per_sample=100_000,
+        if self._confined_analysis is not None:
+            family = self._confined_analysis.family_statuses.get("sample_analysis")
+            if family is not None and family.available:
+                result = await self._confined_analysis.execute(
+                    ConfinedAnalysisRequest(
+                        investigation_id=sample.investigation_id,
+                        association_id=sample.association_id,
+                        sample_id=sample.sample_id,
+                        artifact_id=sample.blob_id,
+                        sha256=sample.sha256,
+                        tool=ConfinedAnalysisTool.SAMPLE_ANALYSIS,
+                        timeout_seconds=self._analysis_timeout_seconds,
+                        max_output_bytes=self._max_output_bytes,
+                    )
                 )
-                summary["extractors"]["smda"] = {
-                    "version": code_feature_set.tool_version,
-                    "escaper_compatibility_version": code_feature_set.escaper_compatibility_version,
-                    "intel_pic_hash_escape_version": code_feature_set.intel_pic_hash_escape_version,
-                    "parameters_sha256": parameter_hash,
-                    "max_ngrams": 100_000,
-                }
-                summary["code_features"] = {
-                    "status": code_feature_set.status.value,
-                    "architecture": code_feature_set.architecture,
-                    "ngram_count": len(code_feature_set.ngrams),
-                    "packing": code_feature_set.as_json()["packing"],
-                    "errors": list(code_feature_set.errors[:16]),
-                }
-                statuses.append(
-                    ToolInvocationStatus.SUCCEEDED
-                    if code_feature_set.status.value == "SUCCEEDED"
-                    else ToolInvocationStatus.PARTIAL
-                )
-            except Exception as exc:
-                summary["code_features"] = {"status": "failed", "error_type": type(exc).__name__}
-                statuses.append(ToolInvocationStatus.FAILED)
-
-        if self._capabilities is not None:
-            try:
-                capability_set = await self._capabilities.analyze(sample.sample_id)
-                summary["extractors"]["capa"] = {
-                    "version": capability_set.tool_version,
-                    "ruleset_sha256": capability_set.ruleset_sha256,
-                    "parameters_sha256": capability_set.parameters_sha256,
-                }
-                summary["capa"] = {
-                    "status": capability_set.status.value,
-                    "capabilities": [
-                        item.rule_id for item in capability_set.capabilities[:_MAX_ANALYSIS_OUTPUT]
-                    ],
-                    "capabilities_observed": len(capability_set.capabilities),
-                    "errors": list(capability_set.errors[:16]),
-                }
-                statuses.append(
-                    ToolInvocationStatus.SUCCEEDED
-                    if capability_set.status.value.upper() == "SUCCEEDED"
-                    else ToolInvocationStatus.PARTIAL
-                )
-            except Exception as exc:
-                summary["capa"] = {"status": "failed", "error_type": type(exc).__name__}
-                statuses.append(ToolInvocationStatus.FAILED)
-
-        goodware_summary = await self._goodware_summary(
-            sample.investigation_id,
-            static_features=static_features,
-            code_feature_set=code_feature_set,
-            capability_set=capability_set,
-        )
-        summary["goodware"] = goodware_summary
-        baseline_id = goodware_summary.get("baseline_id")
-        if isinstance(baseline_id, str):
-            summary["extractors"]["goodware"] = {"baseline_id": baseline_id}
-        if self._code_features is None or not goodware_summary.get("available"):
-            statuses.append(ToolInvocationStatus.PARTIAL)
-        string_refs: tuple[UUID, ...] = ()
-        if strings:
-            string_observation = await self._recorder.record_json(
-                investigation_id=sample.investigation_id,
-                kind=EvidenceKind.BINARY_STRING,
-                payload={
-                    "schema": "sample-strings.v1",
-                    "sample_sha256": sample.sha256,
-                    "extractor_version": (
-                        static_features.extractor_version
-                        if static_features is not None
-                        else "unknown"
+                if result.status is not ToolInvocationStatus.SUCCEEDED:
+                    return SampleAnalysisOutcome(
+                        result.status,
+                        (),
+                        {
+                            "association_id": str(association_id),
+                            "sample_id": str(sample.sample_id),
+                            "sample_sha256": sample.sha256,
+                            "available_reason": result.available_reason,
+                        },
+                        result.available_reason or "Confined analysis did not complete.",
+                    )
+                if result.result_blob_id is None or result.result_sha256 is None:
+                    return SampleAnalysisOutcome(
+                        ToolInvocationStatus.FAILED,
+                        (),
+                        {"available_reason": "analysis_result_reference_invalid"},
+                        "Confined analysis did not return a canonical result artefact.",
+                    )
+                observation = await self._recorder.record_existing_blob(
+                    investigation_id=sample.investigation_id,
+                    kind=EvidenceKind.BINARY_ANALYSIS,
+                    blob_id=result.result_blob_id,
+                    sha256=result.result_sha256,
+                    source="autowork.analysis_worker",
+                    source_version="confined-analysis-result.v1",
+                    object_type="sample",
+                    object_id=sample.sha256,
+                    limitations=(
+                        "Analysis ran in the attested, network-isolated analysis-worker.",
+                        "Extractor output is untrusted and bounded before it is archived.",
+                        "Analysis does not qualify this sample as a cluster member.",
                     ),
-                    "bounds": {"max_items": _MAX_STRINGS, "max_chars_per_item": _MAX_STRING_CHARS},
-                    "strings": strings,
-                    "truncated": len(getattr(static_features, "strings", ())) > len(strings),
-                },
-                source="autowork.static_analysis",
-                source_version=(
-                    static_features.extractor_version if static_features is not None else "unknown"
-                ),
-                object_type="sample",
-                object_id=sample.sha256,
-                limitations=(
-                    "Extracted strings are untrusted data and may be incomplete.",
-                    "A string match alone does not establish execution or attribution.",
-                ),
-                invocation_ref=invocation_ref,
-                idempotency_key=f"sample-strings:{sample.investigation_id}:{sample.sha256}",
-            )
-            string_refs = (string_observation.id,)
-
-        analysis_observation = await self._recorder.record_json(
-            investigation_id=sample.investigation_id,
-            kind=EvidenceKind.BINARY_ANALYSIS,
-            payload=summary,
-            source="autowork.local_sample_analysis",
-            source_version=_extractor_version_summary(summary),
-            object_type="sample",
-            object_id=sample.sha256,
-            limitations=tuple(summary["limitations"]),
-            invocation_ref=invocation_ref,
-            idempotency_key=(
-                f"sample-analysis:{sample.investigation_id}:{sample.sha256}:"
-                f"{_extractor_version_summary(summary)}"
-            ),
-        )
-        refs = (*string_refs, analysis_observation.id)
-        final_status = (
-            ToolInvocationStatus.FAILED
-            if statuses and all(item is ToolInvocationStatus.FAILED for item in statuses)
-            else ToolInvocationStatus.PARTIAL
-            if ToolInvocationStatus.FAILED in statuses or ToolInvocationStatus.PARTIAL in statuses
-            else ToolInvocationStatus.SUCCEEDED
-        )
+                    invocation_ref=invocation_ref,
+                    idempotency_key=result.operation_key,
+                )
+                worker_result = (result.payload or {}).get("result", {})
+                if not isinstance(worker_result, Mapping):
+                    worker_result = {}
+                worker_families = worker_result.get("families", {})
+                if not isinstance(worker_families, Mapping):
+                    worker_families = {}
+                static_result = worker_families.get("static", {})
+                if not isinstance(static_result, Mapping):
+                    static_result = {}
+                strings_value = static_result.get("strings", ())
+                strings = _bounded_strings(
+                    tuple(item for item in strings_value if isinstance(item, Mapping))
+                    if isinstance(strings_value, Sequence)
+                    else ()
+                )
+                goodware_summary = await self._goodware_summary(
+                    sample.investigation_id,
+                    static_features=static_result,
+                    code_feature_set=None,
+                    capability_set=None,
+                )
+                extractor_results = {
+                    name: dict(family_result)
+                    for name, family_result in worker_families.items()
+                    if isinstance(name, str) and isinstance(family_result, Mapping)
+                }
+                extractors = {
+                    name: {
+                        "version": family_result.get("version"),
+                        "status": family_result.get("status"),
+                    }
+                    for name, family_result in extractor_results.items()
+                }
+                strings_observation = None
+                if strings:
+                    strings_observation = await self._recorder.record_json(
+                        investigation_id=sample.investigation_id,
+                        kind=EvidenceKind.BINARY_STRING,
+                        payload={
+                            "schema": "sample-strings.v1",
+                            "sample_sha256": sample.sha256,
+                            "extractor_version": static_result.get("version", "unknown"),
+                            "bounds": {
+                                "max_items": _MAX_STRINGS,
+                                "max_chars_per_item": _MAX_STRING_CHARS,
+                            },
+                            "strings": strings,
+                            "truncated": (
+                                static_result.get("strings_observed", len(strings)) > len(strings)
+                                if isinstance(
+                                    static_result.get("strings_observed", len(strings)), int
+                                )
+                                else False
+                            ),
+                        },
+                        source="autowork.analysis_worker.static",
+                        source_version=str(static_result.get("version", "unknown")),
+                        object_type="sample",
+                        object_id=sample.sha256,
+                        limitations=(
+                            "Extracted strings are untrusted data and may be incomplete.",
+                            "A string match alone does not establish execution or attribution.",
+                        ),
+                        invocation_ref=invocation_ref,
+                        idempotency_key=(
+                            f"sample-strings:{sample.investigation_id}:{sample.sha256}"
+                        ),
+                    )
+                worker_status = str(worker_result.get("status", "PARTIAL")).upper()
+                if worker_status == "FAILED":
+                    outcome_status = ToolInvocationStatus.FAILED
+                elif worker_status == "SUCCEEDED" and goodware_summary.get("available"):
+                    outcome_status = ToolInvocationStatus.SUCCEEDED
+                else:
+                    outcome_status = ToolInvocationStatus.PARTIAL
+                observation_refs = (
+                    *((strings_observation.id,) if strings_observation is not None else ()),
+                    observation.id,
+                )
+                return SampleAnalysisOutcome(
+                    outcome_status,
+                    observation_refs,
+                    {
+                        "association_id": str(association_id),
+                        "sample_id": str(sample.sample_id),
+                        "sample_sha256": sample.sha256,
+                        "qualification": SampleQualification.CANDIDATE.value,
+                        "extractors": extractors,
+                        "code_features": extractor_results.get("smda", {}).get("code_features"),
+                        "goodware": goodware_summary,
+                        "strings_recorded": len(strings),
+                        "result_blob_id": str(result.result_blob_id),
+                        "result_sha256": result.result_sha256,
+                        "operation_key": result.operation_key,
+                        "analysis": worker_result,
+                        "available_reason": None,
+                        "limitations": [
+                            "Analysis ran in the attested, network-isolated analysis-worker.",
+                            "Analysis does not qualify this sample as a cluster member.",
+                        ],
+                    },
+                    "Confined analysis evidence was recorded; membership remains candidate.",
+                )
         return SampleAnalysisOutcome(
-            status=final_status,
-            observation_refs=refs,
-            output={
+            ToolInvocationStatus.UNAVAILABLE,
+            (),
+            {
                 "association_id": str(association_id),
                 "sample_id": str(sample.sample_id),
                 "sample_sha256": sample.sha256,
-                "qualification": SampleQualification.CANDIDATE.value,
-                "extractors": summary["extractors"],
-                "goodware": goodware_summary,
-                "strings_recorded": len(strings),
-                "limitations": summary["limitations"],
+                "available_reason": (
+                    self._confined_analysis.available_reason
+                    if self._confined_analysis is not None
+                    else "analysis_worker_unavailable"
+                ),
             },
-            message=(
-                "Analysis observations were recorded; membership remains candidate."
-                if final_status is not ToolInvocationStatus.FAILED
-                else "Every configured local analysis service failed."
-            ),
+            "Sample analysis requires the attested analysis-worker execution port.",
         )
 
     async def _goodware_summary(
@@ -380,7 +352,32 @@ class LocalSampleAnalysisService:
         if baseline_id is None:
             return {"available": False, "reason": "no_baseline_bound_to_investigation"}
         features: list[tuple[str, str]] = []
-        if static_features is not None:
+        if isinstance(static_features, Mapping):
+            raw_strings = static_features.get("strings", ())
+            if isinstance(raw_strings, Sequence):
+                features.extend(
+                    ("string", str(item.get("value", "")).casefold())
+                    for item in raw_strings[:_MAX_ANALYSIS_OUTPUT]
+                    if isinstance(item, Mapping) and item.get("value")
+                )
+            raw_exports = static_features.get("exports", ())
+            if isinstance(raw_exports, Sequence):
+                features.extend(
+                    ("export", str(item).casefold())
+                    for item in raw_exports[:_MAX_ANALYSIS_OUTPUT]
+                    if isinstance(item, str) and item
+                )
+            raw_opcodes = static_features.get("opcode_fragment16", ())
+            if isinstance(raw_opcodes, Sequence):
+                features.extend(
+                    ("opcode_fragment16", str(item).casefold())
+                    for item in raw_opcodes[:_MAX_ANALYSIS_OUTPUT]
+                    if isinstance(item, str) and item
+                )
+            imphash = static_features.get("imphash")
+            if isinstance(imphash, str) and imphash:
+                features.append(("imphash", imphash.casefold()))
+        elif static_features is not None:
             features.extend(
                 ("string", str(item.get("value", "")).casefold())
                 for item in static_features.strings[:_MAX_ANALYSIS_OUTPUT]
@@ -580,9 +577,9 @@ def register_acquisition_tools(
             confidentiality=ToolConfidentiality.RESTRICTED,
             limitations=(
                 "Only a sample already in quarantine can be analyzed.",
-                "The analysis is local, bounded, static and does not establish cluster membership.",
+                "The analysis is bounded and static; it does not establish cluster membership.",
             ),
-            capability_key=LOCAL_ANALYSIS_CAPABILITY,
+            capability_key=SAMPLE_ANALYSIS_CAPABILITY,
         ),
         _SampleAnalyzeAdapter(hits, analyzer),
     )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import date
 from typing import Any
 from uuid import UUID
 
@@ -10,16 +11,22 @@ from cti_app.application import publication_qa
 from cti_app.application.production_extraction import references_corpus_hash
 from cti_app.application.production_relevance import build_relevance_projection
 from cti_app.application.production_synthesis import canonical_extraction_hash
+from cti_app.application.publication_augmentation import augment_publication_with_opinion
 from cti_app.application.publication_builder import (
     build_publication_document_v4,
     build_publication_document_v5,
 )
-from cti_app.application.publication_qa import qa_publication_v4, qa_publication_v5
+from cti_app.application.publication_qa import (
+    qa_publication_v4,
+    qa_publication_v5,
+    qa_publication_v6,
+)
 from cti_app.application.typst_rendering import project_publication_to_typst_model
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.production import ExtractionProfile, ProductionEvidenceBasis
 from cti_app.domain.production_extraction import (
+    ExtractionEventV1,
     ExtractionIndicatorStatus,
     ExtractionIndicatorV1,
     encode_indicator_section_paths,
@@ -29,11 +36,13 @@ from cti_app.domain.production_references import (
     ProductionReferenceKind,
     ProductionReferenceTier,
 )
+from cti_app.domain.production_relevance import RelevanceClassification, RelevanceReasonCode
 from cti_app.domain.production_synthesis import (
     EvidenceKind,
     SynthesisParagraphV1,
     SynthesisSectionKind,
     SynthesisSectionV1,
+    SynthesisTimelineEntryV1,
     extraction_evidence_refs_v1,
 )
 from cti_app.domain.publication import (
@@ -44,9 +53,14 @@ from cti_app.domain.publication import (
 from cti_app.domain.publication_document import (
     PublicationDocumentV4,
     PublicationDocumentV5,
+    PublicationDocumentV6,
+    PublicationDocumentV6ProvenanceV1,
+    PublicationIOCDetailV1,
+    PublicationIOCDisposition,
     PublicationSourceV1,
     PublicationUncertaintyV1,
     parse_publication_document,
+    publication_document_v5_sha256,
     serialize_publication_document,
 )
 from cti_app.domain.semantic_annotation import SemanticParagraphV1, SemanticRole, SemanticTextSpanV1
@@ -61,6 +75,7 @@ from tests.test_publication_builder_v4 import (
     _technical_evidence_publication_case,
     _with_extra_source,
 )
+from tests.test_publication_document_v6 import _approved_opinion
 
 
 def _rich_inputs() -> tuple[dict[str, Any], PublicationDocumentV4]:
@@ -86,6 +101,134 @@ def _rich_inputs() -> tuple[dict[str, Any], PublicationDocumentV4]:
         "synthesis": synthesis,
         "editorial_enrichment": enrichment,
     }, publication
+
+
+def _timeline_publication_case() -> tuple[dict[str, Any], PublicationDocumentV5]:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    source = extraction.sources[0]
+    event = ExtractionEventV1(
+        event_date=date(2025, 1, 15),
+        date_text="15 January 2025",
+        text="The actor deployed a loader.",
+        context="",
+        evidence_quote="The actor deployed a loader.",
+        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+        source_document_ids=(source.source_document_id,),
+    )
+    extraction = replace(extraction, sources=(replace(source, events=(event,)),))
+    event_ref = next(
+        ref for ref in extraction_evidence_refs_v1(extraction) if ref.kind is EvidenceKind.EVENT
+    )
+    synthesis = replace(
+        synthesis,
+        extraction_hash=canonical_extraction_hash(extraction),
+        timeline=(
+            SynthesisTimelineEntryV1(
+                event_date=event.event_date,
+                date_text=event.date_text,
+                text=event.text,
+                evidence_refs=(event_ref,),
+            ),
+        ),
+    )
+    enrichment = _enrichment_with(extraction=extraction, synthesis=synthesis)
+    publication = build_publication_document_v5(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+    )
+    return {
+        "snapshot": snapshot,
+        "references": references,
+        "extraction": extraction,
+        "synthesis": synthesis,
+        "editorial_enrichment": enrichment,
+    }, publication
+
+
+def test_publication_section_order_matrix(monkeypatch: pytest.MonkeyPatch) -> None:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    enrichment = _enrichment_with(extraction=extraction, synthesis=synthesis)
+    inputs = {
+        "snapshot": snapshot,
+        "references": references,
+        "extraction": extraction,
+        "synthesis": synthesis,
+        "editorial_enrichment": enrichment,
+    }
+    v4 = build_publication_document_v4(**inputs)
+    v5_without_ioc_details = build_publication_document_v5(**inputs)
+    v5_with_ioc_details, v5_detail_inputs, *_ = _frontmatter_v6_case()
+    timeline_inputs, v5_with_chronology = _timeline_publication_case()
+
+    opinion, citation_context = _approved_opinion(v5_without_ioc_details)
+    v6_with_opinion = augment_publication_with_opinion(
+        v5_without_ioc_details, opinion, citation_context
+    )
+    v6_without_opinion = PublicationDocumentV6(
+        base_publication=v5_without_ioc_details,
+        provenance=PublicationDocumentV6ProvenanceV1(
+            base_publication_artifact_id=UUID(int=900),
+            base_publication_sha256=publication_document_v5_sha256(v5_without_ioc_details),
+        ),
+    )
+
+    cases = (
+        (v4, inputs, qa_publication_v4, ("references", "synthesis")),
+        (v5_without_ioc_details, inputs, qa_publication_v5, ("references", "synthesis")),
+        (
+            v5_with_ioc_details,
+            v5_detail_inputs,
+            qa_publication_v5,
+            ("references", "synthesis", "technical_annex"),
+        ),
+        (
+            v5_with_chronology,
+            timeline_inputs,
+            qa_publication_v5,
+            ("references", "synthesis", "chronology"),
+        ),
+        (
+            v6_without_opinion,
+            inputs,
+            qa_publication_v6,
+            ("references", "synthesis"),
+        ),
+        (
+            v6_with_opinion,
+            inputs,
+            qa_publication_v6,
+            ("references", "synthesis", "analyst_opinion"),
+        ),
+    )
+    for publication, case_inputs, qa, expected_types in cases:
+        assert (
+            tuple(
+                section["type"]
+                for section in project_publication_to_typst_model(publication).content_sections
+            )
+            == expected_types
+        )
+        assert qa(publication=publication, **case_inputs)["passed"] is True
+
+    timeline_model = project_publication_to_typst_model(v5_with_chronology)
+    monkeypatch.setattr(
+        publication_qa,
+        "project_publication_to_typst_model",
+        lambda _publication: replace(
+            timeline_model,
+            content_sections=(
+                timeline_model.content_sections[1],
+                *timeline_model.content_sections[:1],
+                *timeline_model.content_sections[2:],
+            ),
+        ),
+    )
+    rejected = qa_publication_v5(publication=v5_with_chronology, **timeline_inputs)
+    assert rejected["checks"]["references_then_synthesis"] is False
+    assert "Publication sections are not ordered" in rejected["errors"][-1]
 
 
 def _assert_failed(inputs: dict[str, Any], publication: PublicationDocumentV4) -> dict[str, Any]:
@@ -170,8 +313,37 @@ def test_v5_qa_excludes_other_case_iocs_from_publication() -> None:
 
     assert result["passed"] is True
     assert result["checks"]["ioc_groups_separated"] is True
+    assert result["checks"]["ioc_details_scope"] is True
     assert publication.indicators == ()
     assert publication.original_indicators == ()
+    assert all(item.value != "other-case.example" for item in publication.ioc_details)
+
+    out_of_scope_detail = PublicationIOCDetailV1(
+        artifact_type=ArtifactType.DOMAIN,
+        value="other-case.example",
+        normalized_value="other-case.example",
+        source_role=core.role,
+        context=indicator.context,
+        evidence_quote=indicator.evidence_quote,
+        evidence_basis=indicator.evidence_basis,
+        source_document_ids=(core.source_document_id,),
+        disposition=PublicationIOCDisposition.EXCLUDED,
+        disposition_reason=RelevanceReasonCode.INDICATOR_SECTION_OTHER_CASE.value,
+        relevance_classification=RelevanceClassification.OUT_OF_SCOPE,
+        relevance_reason_code=RelevanceReasonCode.INDICATOR_SECTION_OTHER_CASE,
+    )
+    leaked = replace(publication, ioc_details=(out_of_scope_detail,))
+    leaked_result = qa_publication_v5(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        relevance_projection=relevance_projection,
+        synthesis=synthesis,
+        editorial_enrichment=editorial_enrichment,
+        publication=leaked,
+    )
+    assert leaked_result["checks"]["ioc_details_scope"] is False
+    assert leaked_result["passed"] is False
 
 
 def test_context_source_round_trip_qa_and_typst_projection() -> None:
@@ -494,6 +666,7 @@ def test_v6_qa_requires_editorial_title_format() -> None:
             semantic_text=semantic_text,
             references=publication.references,
             original_indicators=publication.original_indicators,
+            ioc_details=publication.ioc_details,
         )
         rejected = qa_publication_v5(publication=invalid, **inputs)
 

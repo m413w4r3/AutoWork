@@ -8,10 +8,14 @@ from uuid import UUID, uuid4
 
 import httpx
 import pytest
+from pydantic import SecretStr
 
-from cti_app.application.behavior_report_import import BehaviorReportImporter
 from cti_app.application.blob_storage import BlobStore
 from cti_app.application.blobs import BlobCatalogService
+from cti_app.application.confined_analysis import (
+    ConfinedAnalysisFamilyStatus,
+    ConfinedAnalysisWorkerAttestation,
+)
 from cti_app.application.investigation_composition import (
     InvestigationToolDependencies,
     OptionalInvestigationToolPorts,
@@ -35,9 +39,7 @@ from cti_app.application.virustotal import (
     VirusTotalRoutingPolicy,
 )
 from cti_app.config import Settings
-from cti_app.domain.behavior_evidence import BehaviorEvidenceSource
 from cti_app.domain.investigation import SampleAssociation, SampleOrigin
-from cti_app.domain.local_analysis import LocalCommandId, LocalCommandResult, LocalCommandStatus
 from cti_app.domain.native_analysis import NativeAnalysisOperation, NativeAnalysisRequestV1
 from cti_app.domain.virustotal import (
     VirusTotalCapability,
@@ -137,20 +139,55 @@ def test_behavior_report_import_status_tracks_the_parser_dependency(
     assert runtime.ports.optional_tool_ports.behavior_report_importer is None
 
 
-def test_runtime_records_precise_yara_probe_failure(monkeypatch: pytest.MonkeyPatch) -> None:
-    class _FailedYaraProbe:
-        available = False
-        unavailable_reason = "yara_probe_match_missing"
-
-    monkeypatch.setattr(runtime_ports, "IsolatedYaraRunner", _FailedYaraProbe)
-    settings = Settings.model_construct(rule_workbench_enabled=True)
+def test_runtime_does_not_fall_back_to_local_yara_without_measured_confinement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        runtime_ports,
+        "LocalCommandRunner",
+        lambda **_kwargs: SimpleNamespace(filesystem_confined=False),
+    )
+    monkeypatch.setattr(
+        runtime_ports,
+        "IsolatedYaraRunner",
+        lambda: pytest.fail("local YARA runner must not start without measured confinement"),
+    )
+    settings = Settings.model_construct(rule_workbench_enabled=True, analysis_worker_enabled=False)
 
     runtime = build_investigation_runtime_composition_factory(**_runtime_inputs(settings))
 
-    assert _status_map(runtime)["rule_workbench"] == {
+    status = _status_map(runtime)["rule_workbench"]
+    assert status == {
         "status": "unavailable",
-        "reason": "yara_probe_match_missing",
+        "reason": "analysis_worker_disabled_by_configuration",
+        "available_reason": "analysis_worker_disabled_by_configuration",
+        "execution_mode": "unavailable",
+        "version": None,
     }
+
+
+def test_runtime_allows_local_yara_only_with_measured_confinement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _AvailableYaraRunner:
+        available = True
+        unavailable_reason = None
+
+    engine = _AvailableYaraRunner()
+    monkeypatch.setattr(
+        runtime_ports,
+        "LocalCommandRunner",
+        lambda **_kwargs: SimpleNamespace(filesystem_confined=True),
+    )
+    monkeypatch.setattr(runtime_ports, "IsolatedYaraRunner", lambda: engine)
+    settings = Settings.model_construct(rule_workbench_enabled=True, analysis_worker_enabled=False)
+
+    runtime = build_investigation_runtime_composition_factory(**_runtime_inputs(settings))
+
+    status = _status_map(runtime)["rule_workbench"]
+    assert runtime.ports.optional_tool_ports.yara_engine is engine
+    assert status["status"] == "available"
+    assert status["execution_mode"] == "local-bwrap-measured"
 
 
 def test_runtime_records_the_specific_bwrap_probe_failure(
@@ -174,122 +211,160 @@ def test_runtime_records_the_specific_bwrap_probe_failure(
     }
 
 
-class _SyntheticCommandService:
-    def __init__(self, *, confined: bool) -> None:
-        self.filesystem_confined = confined
-
-    async def run(
-        self,
-        command_id: LocalCommandId,
-        sample_sha256: str,
-        _options: Mapping[str, object] | None = None,
-    ) -> LocalCommandResult:
-        confined = self.filesystem_confined
-        return LocalCommandResult(
-            command_id=command_id,
-            status=LocalCommandStatus.EMPTY if confined else LocalCommandStatus.UNAVAILABLE,
-            sample_sha256=sample_sha256,
-            output="{}" if confined else "",
-            executable_version="synthetic-1.0" if confined else None,
-        )
-
-
-class _SyntheticCommandCatalog:
-    def __init__(self, *, available: bool) -> None:
-        self._capabilities = {
-            command_id: SimpleNamespace(
-                spec=SimpleNamespace(id=command_id),
-                executable_path="synthetic" if available else None,
-                version="synthetic-1.0" if available else None,
-                available=available,
-            )
-            for command_id in (LocalCommandId.FLOSS, LocalCommandId.MWCP)
-        }
-
-    def get(self, command_id: LocalCommandId) -> object | None:
-        return self._capabilities.get(command_id)
-
-    def all_commands(self) -> tuple[object, ...]:
-        return tuple(self._capabilities.values())
-
-    def available_commands(self) -> tuple[object, ...]:
-        return tuple(
-            capability for capability in self._capabilities.values() if capability.available
-        )
-
-
-@pytest.mark.asyncio
-async def test_configured_extraction_ports_run_synthetic_operations(
+def test_inventory_separates_unmeasured_local_confinement_from_worker_attestation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    catalog = _SyntheticCommandCatalog(available=True)
-    service = _SyntheticCommandService(confined=True)
-    monkeypatch.setattr(runtime_ports, "LocalCommandCatalog", lambda **_kwargs: catalog)
-    monkeypatch.setattr(runtime_ports, "LocalCommandService", lambda *_args, **_kwargs: service)
-    monkeypatch.setattr(runtime_ports, "LocalCommandRunner", lambda **_kwargs: object())
+    families = {
+        "sample_analysis": ConfinedAnalysisFamilyStatus(
+            "sample_analysis", True, "sample-analysis.v1"
+        ),
+        "static": ConfinedAnalysisFamilyStatus("static", True, "static-v1"),
+        "capa": ConfinedAnalysisFamilyStatus("capa", True, "9.4.0"),
+        "smda": ConfinedAnalysisFamilyStatus("smda", True, "4.5.0"),
+        "floss": ConfinedAnalysisFamilyStatus(
+            "floss", False, None, "analysis_family_not_supported_by_worker"
+        ),
+        "mwcp": ConfinedAnalysisFamilyStatus("mwcp", True, "3.16.1", "no_authorized_parser"),
+        "yara": ConfinedAnalysisFamilyStatus("yara", True, "4.5.0"),
+    }
+    attestation = ConfinedAnalysisWorkerAttestation(
+        reachable=True,
+        confined=True,
+        isolation_profile="bookworm-internal-v1",
+        versions={"capa": "9.4.0", "smda": "4.5.0", "mwcp": "3.16.1", "yara": "4.5.0"},
+        families=families,
+        dependencies_ready=True,
+    )
+    worker_port = SimpleNamespace(
+        available=True,
+        available_reason=None,
+        family_statuses=families,
+        isolation_profile="bookworm-internal-v1",
+        attestation=attestation,
+    )
+
+    class _UnconfinedRunner:
+        filesystem_confined = False
+        namespace_reason = "bwrap_userns_refused_by_kernel"
+
+    monkeypatch.setattr(runtime_ports, "LocalCommandRunner", lambda **_kwargs: _UnconfinedRunner())
+    monkeypatch.setattr(
+        runtime_ports,
+        "build_confined_analysis_execution_port",
+        lambda *_args, **_kwargs: worker_port,
+    )
+    runtime = build_investigation_runtime_composition_factory(
+        **_runtime_inputs(Settings.model_construct(local_analysis_enabled=True))
+    )
+
+    inventory = describe_tool_inventory(runtime)
+    inventory_families = cast(dict[str, dict[str, object]], inventory["families"])
+    worker = cast(dict[str, object], inventory["analysis_worker"])
+    worker_families = cast(dict[str, dict[str, object]], worker["families"])
+
+    assert inventory_families["local_filesystem_confinement"]["status"] == "unavailable"
+    assert inventory_families["local_filesystem_confinement"]["reason"] == (
+        "bwrap_userns_refused_by_kernel"
+    )
+    assert inventory_families["sample_analysis"] == {
+        "status": "available",
+        "reason": None,
+        "available_reason": None,
+        "execution_mode": "analysis-worker",
+        "version": "sample-analysis.v1",
+    }
+    assert worker["status"] == "available"
+    assert worker_families["floss"]["available"] is False
+    assert worker_families["floss"]["available_reason"] == (
+        "analysis_family_not_supported_by_worker"
+    )
+    assert worker_families["mwcp"] == {
+        "available": True,
+        "version": "3.16.1",
+        "available_reason": "no_authorized_parser",
+    }
+    assert inventory_families["analysis_worker_mwcp"]["execution_mode"] == "analysis-worker"
+    assert inventory_families["analysis_worker_mwcp"]["version"] == "3.16.1"
+    assert inventory_families["analysis_worker_mwcp"]["available_reason"] == (
+        "no_authorized_parser"
+    )
+
+
+def test_configured_extraction_ports_require_worker_attestations() -> None:
+    families = {
+        "floss": ConfinedAnalysisFamilyStatus("floss", True, "3.1.1"),
+        "mwcp": ConfinedAnalysisFamilyStatus("mwcp", True, "3.16.1"),
+        "mwcp_parser:test.parser": ConfinedAnalysisFamilyStatus(
+            "mwcp_parser:test.parser", True, "1.0"
+        ),
+    }
+    attestation = ConfinedAnalysisWorkerAttestation(
+        reachable=True,
+        confined=True,
+        isolation_profile="bookworm-internal-v1",
+        versions={"floss": "3.1.1", "mwcp": "3.16.1"},
+        families=families,
+        dependencies_ready=True,
+    )
+    worker = SimpleNamespace(
+        available=True,
+        available_reason=None,
+        family_statuses=families,
+        attestation=attestation,
+    )
+    settings = Settings.model_construct(
+        analysis_worker_enabled=True,
+        local_analysis_enabled=False,
+        mwcp_parser_versions={"test.parser": "1.0"},
+    )
+    runtime = build_investigation_runtime_composition_factory(
+        **_runtime_inputs(settings),  # type: ignore[arg-type]
+        confined_analysis_execution=worker,
+    )
+    ports = runtime.ports.optional_tool_ports
+    inventory = describe_tool_inventory(runtime)
+    inventory_families = cast(dict[str, dict[str, object]], inventory["families"])
+    worker_details = cast(dict[str, object], inventory["analysis_worker"])
+    worker_families = cast(dict[str, dict[str, object]], worker_details["families"])
+
+    assert ports.floss_extraction is not None and ports.floss_extraction.available
+    assert ports.configuration_extraction is not None
+    assert ports.configuration_extraction.available
+    assert inventory_families["floss_extraction"]["execution_mode"] == "analysis-worker"
+    assert inventory_families["floss_extraction"]["version"] == "3.1.1"
+    assert worker_families["mwcp_parser:test.parser"] == {
+        "available": True,
+        "version": "1.0",
+        "available_reason": None,
+    }
+
+
+def test_local_command_confinement_does_not_enable_floss_or_mwcp_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        runtime_ports,
+        "LocalCommandRunner",
+        lambda **_kwargs: SimpleNamespace(filesystem_confined=True, namespace_reason=None),
+    )
     settings = Settings.model_construct(
         local_analysis_enabled=True,
+        analysis_worker_enabled=False,
         mwcp_parser_versions={"test.parser": "1.0"},
     )
     runtime = build_investigation_runtime_composition_factory(
         **_runtime_inputs(settings)  # type: ignore[arg-type]
     )
     ports = runtime.ports.optional_tool_ports
-    binaries = cast(dict[str, object], describe_tool_inventory(runtime)["binaries"])
+    families = _status_map(runtime)
 
-    assert ports.floss_extraction is not None and ports.floss_extraction.available
-    assert ports.configuration_extraction is not None
-    assert ports.configuration_extraction.available
-    assert binaries["floss"] == {"available": True, "version": "synthetic-1.0"}
-    floss_result = await ports.floss_extraction.extract(_SAMPLE_SHA256, max_strings=8)
-    configuration_result = await ports.configuration_extraction.extract(
-        _SAMPLE_SHA256,
-        parser_id="test.parser",
+    assert ports.local_commands is not None
+    assert ports.floss_extraction is None
+    assert ports.configuration_extraction is None
+    assert families["floss_extraction"]["reason"] == ("analysis_worker_disabled_by_configuration")
+    assert families["configuration_extraction"]["reason"] == (
+        "analysis_worker_disabled_by_configuration"
     )
-    assert floss_result.sample_sha256 == _SAMPLE_SHA256
-    assert configuration_result.sample_sha256 == _SAMPLE_SHA256
-
-    report = json.dumps(
-        {
-            "target": {"file": {"sha256": _SAMPLE_SHA256}},
-            "behavior": {"events": [{"category": "process", "description": "synthetic"}]},
-        }
-    )
-    imported = BehaviorReportImporter().parse(
-        report,
-        source=BehaviorEvidenceSource.CAPE,
-        expected_sample_sha256=_SAMPLE_SHA256,
-    )
-    assert imported.sample_sha256 == _SAMPLE_SHA256
-
-
-@pytest.mark.asyncio
-async def test_missing_confinement_and_parser_allowlist_fail_closed(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    catalog = _SyntheticCommandCatalog(available=True)
-    service = _SyntheticCommandService(confined=False)
-    monkeypatch.setattr(runtime_ports, "LocalCommandCatalog", lambda **_kwargs: catalog)
-    monkeypatch.setattr(runtime_ports, "LocalCommandService", lambda *_args, **_kwargs: service)
-    monkeypatch.setattr(runtime_ports, "LocalCommandRunner", lambda **_kwargs: object())
-    settings = Settings.model_construct(local_analysis_enabled=True, mwcp_parser_versions={})
-    runtime = build_investigation_runtime_composition_factory(
-        **_runtime_inputs(settings)  # type: ignore[arg-type]
-    )
-    statuses = _status_map(runtime)
-    ports = runtime.ports.optional_tool_ports
-
-    assert statuses["floss_extraction"]["reason"] == "filesystem_confinement_required"
-    assert statuses["configuration_extraction"]["reason"] == "parser_allowlist_empty"
-    assert ports.floss_extraction is not None
-    assert ports.configuration_extraction is not None
-    floss_result = await ports.floss_extraction.extract(_SAMPLE_SHA256, max_strings=8)
-    configuration_result = await ports.configuration_extraction.extract(
-        _SAMPLE_SHA256,
-        parser_id="not-allowlisted",
-    )
-    assert floss_result.status.value == "unavailable"
-    assert configuration_result.status.value == "policy_denied"
 
 
 class _CaptureAdapter:
@@ -425,7 +500,10 @@ def test_network_capture_status_uses_the_supplied_source_and_real_tshark_state()
         tshark=_UnavailableCaptureAdapter(),  # type: ignore[arg-type]
     )
 
-    assert _status_map(present)["network_capture"] == {"status": "available", "reason": None}
+    present_status = _status_map(present)["network_capture"]
+    assert present_status["status"] == "available"
+    assert present_status["available_reason"] is None
+    assert present_status["execution_mode"] == "local-bwrap-measured"
     assert _status_map(unavailable)["network_capture"] == {
         "status": "unavailable",
         "reason": "tshark_or_filesystem_confinement_unavailable",
@@ -506,7 +584,8 @@ async def test_retrohunt_runtime_requires_opt_in_capability_and_proxy_route() ->
     )
     configured = {
         "virustotal_proxy_url": "http://proxy.test:8080",
-        "virustotal_api_key": "test-vt-key",
+        "virustotal_api_key": SecretStr("test-vt-key"),
+        "virustotal_base_url": "https://www.virustotal.com/api/v3",
     }
     configured_runtimes: list[InvestigationRuntimeComposition] = []
 

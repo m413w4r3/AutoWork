@@ -21,12 +21,14 @@ from cti_app.application.bridge_investigator import (
     TurnSubmissionStatus,
 )
 from cti_app.application.code_features import CodeFeatureService
+from cti_app.application.confined_analysis import ConfinedAnalysisExecutionPort
 from cti_app.application.detection_review_service import DetectionReviewService
 from cti_app.application.evidence_recorder import EvidenceRecorder, ProductionEvidenceRecorder
 from cti_app.application.goodware import GoodwareMeasurementService
 from cti_app.application.invariants import InvariantRegistryService
 from cti_app.application.investigation_acquisition import HitAcquisitionService
 from cti_app.application.investigation_acquisition_tools import (
+    SAMPLE_ANALYSIS_CAPABILITY,
     LocalSampleAnalysisService,
     SampleAnalyzer,
     register_acquisition_tools,
@@ -365,6 +367,7 @@ class InvestigationToolDependencies:
     sample_capabilities_analysis: Any | None = None
     sample_code_features: CodeFeatureService | None = None
     sample_goodware: GoodwareMeasurementService | None = None
+    confined_analysis_execution: ConfinedAnalysisExecutionPort | None = None
     available_capabilities: frozenset[str] = frozenset()
     sample_similarity: SampleSimilarityService | None = None
     invariant_registry: InvariantRegistryService | None = None
@@ -397,6 +400,7 @@ class OptionalInvestigationToolPorts:
     sample_capabilities_analysis: Any | None = None
     sample_code_features: CodeFeatureService | None = None
     sample_goodware: GoodwareMeasurementService | None = None
+    confined_analysis_execution: ConfinedAnalysisExecutionPort | None = None
     available_capabilities: frozenset[str] = frozenset()
     sample_similarity: SampleSimilarityService | None = None
     invariant_registry: InvariantRegistryService | None = None
@@ -488,10 +492,8 @@ def _register_extraction_tool_family(
     uow_factory: UnitOfWorkFactory,
     enabled: set[str],
 ) -> None:
-    floss = dependencies.floss_extraction if settings.local_analysis_enabled else None
-    configuration = (
-        dependencies.configuration_extraction if settings.local_analysis_enabled else None
-    )
+    floss = dependencies.floss_extraction
+    configuration = dependencies.configuration_extraction
     importer = dependencies.behavior_report_importer
     register_extraction_tools(
         registry,
@@ -779,6 +781,7 @@ def investigation_tool_dependencies_from_settings(
     sample_capabilities_analysis: Any | None = None,
     sample_code_features: CodeFeatureService | None = None,
     sample_goodware: GoodwareMeasurementService | None = None,
+    confined_analysis_execution: ConfinedAnalysisExecutionPort | None = None,
     sample_similarity: SampleSimilarityService | None = None,
     invariant_registry: InvariantRegistryService | None = None,
     floss_extraction: ObfuscatedStringExtractionPort | None = None,
@@ -870,12 +873,13 @@ def investigation_tool_dependencies_from_settings(
         ),
         sample_code_features=(sample_code_features if settings.local_analysis_enabled else None),
         sample_goodware=(sample_goodware if settings.local_analysis_enabled else None),
+        confined_analysis_execution=(
+            confined_analysis_execution if settings.analysis_worker_enabled else None
+        ),
         sample_similarity=sample_similarity,
         invariant_registry=invariant_registry,
-        floss_extraction=(floss_extraction if settings.local_analysis_enabled else None),
-        configuration_extraction=(
-            configuration_extraction if settings.local_analysis_enabled else None
-        ),
+        floss_extraction=floss_extraction,
+        configuration_extraction=configuration_extraction,
         behavior_report_importer=behavior_report_importer,
         retrohunt_provider=retrohunt_provider,
         vt_routing_policy=vt_routing_policy,
@@ -981,6 +985,7 @@ def build_investigation_composition(
         sample_capabilities_analysis=supplied("sample_capabilities_analysis"),
         sample_code_features=supplied("sample_code_features"),
         sample_goodware=supplied("sample_goodware"),
+        confined_analysis_execution=supplied("confined_analysis_execution"),
         sample_similarity=supplied("sample_similarity"),
         invariant_registry=supplied("invariant_registry"),
         floss_extraction=supplied("floss_extraction"),
@@ -1008,12 +1013,22 @@ def build_investigation_composition(
             ),
         )
 
+    confined_analysis = base_dependencies.confined_analysis_execution
+    confined_yara = (
+        confined_analysis.family_statuses.get("yara") if confined_analysis is not None else None
+    )
+    yara_execution_available = bool(
+        (
+            base_dependencies.yara_engine is not None
+            and getattr(base_dependencies.yara_engine, "available", True)
+        )
+        or (confined_yara is not None and confined_yara.available)
+    )
     if (
         settings.rule_workbench_enabled
         and base_dependencies.rule_workbench is None
         and base_dependencies.rule_corpus_bytes is not None
-        and base_dependencies.yara_engine is not None
-        and getattr(base_dependencies.yara_engine, "available", True)
+        and yara_execution_available
         and getattr(uow, "detection_candidates", None) is not None
     ):
         base_dependencies = replace(
@@ -1021,6 +1036,7 @@ def build_investigation_composition(
             rule_workbench=RuleWorkbench(
                 corpus_bytes=base_dependencies.rule_corpus_bytes,
                 yara_engine=base_dependencies.yara_engine,
+                confined_analysis=confined_analysis,
                 detection_candidates=uow.detection_candidates,
                 non_discriminant_patterns=NonDiscriminantPatternRegistry(()),
                 legitimate_services=load_legitimate_services(),
@@ -1119,14 +1135,17 @@ def build_investigation_composition(
             ),
         )
         analyzer: SampleAnalyzer | None = None
-        if settings.local_analysis_enabled and any(
-            (
-                dependencies.sample_static_analysis,
-                dependencies.sample_capabilities_analysis,
-                dependencies.sample_code_features,
-                dependencies.sample_goodware,
+        worker_analysis_available = bool(
+            dependencies.confined_analysis_execution is not None
+            and (
+                family := dependencies.confined_analysis_execution.family_statuses.get(
+                    "sample_analysis"
+                )
             )
-        ):
+            is not None
+            and family.available
+        )
+        if worker_analysis_available:
             analyzer = LocalSampleAnalysisService(
                 hits,
                 uow_factory,
@@ -1135,6 +1154,9 @@ def build_investigation_composition(
                 capabilities=dependencies.sample_capabilities_analysis,
                 code_features=dependencies.sample_code_features,
                 goodware=dependencies.sample_goodware,
+                confined_analysis=dependencies.confined_analysis_execution,
+                analysis_timeout_seconds=settings.analysis_worker_job_timeout_seconds,
+                max_output_bytes=settings.analysis_worker_result_max_bytes,
             )
         register_acquisition_tools(
             registry,
@@ -1144,6 +1166,8 @@ def build_investigation_composition(
         )
         if settings.virustotal_file_download_enabled and dependencies.acquisition is not None:
             enabled.add("vt.file_download")
+        if analyzer is not None:
+            enabled.add(SAMPLE_ANALYSIS_CAPABILITY)
 
     detection_candidates = getattr(uow, "detection_candidates", None)
     rule_get_ports_available = all(

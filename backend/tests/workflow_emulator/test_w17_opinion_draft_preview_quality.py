@@ -347,11 +347,12 @@ async def test_w17_real_typst_draft_preview_preserves_structure_and_limits(
         "Inférence de l'analyste",
         "ne démontre ni contrôle opérationnel ni attribution",
         "203.0.113.24",
-        "1/1",
     ):
         assert required.casefold() in normalized_text, f"W17 PDF text is missing {required!r}"
 
     assert rendered_pages
+    final_page_label = f"{len(rendered_pages)}/{len(rendered_pages)}"
+    assert final_page_label in normalized_text
     assert normalized_text.count("brouillon non approuvé") >= len(rendered_pages)
     source_paragraph = normalized_text.index(
         "le rapport mentionne alpha.example comme domaine observé"

@@ -1,5 +1,5 @@
 {
-  "template_version": "chp-article-v21-draft-preview-visible-notice",
+  "template_version": "chp-article-v27-caption-spacing-graph-wrap",
   "files": [
     "RENDERER/publication.typ",
     "RENDERER/publication_helpers.typ",

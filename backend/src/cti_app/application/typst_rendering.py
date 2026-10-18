@@ -14,6 +14,11 @@ from typing import Any, cast
 from urllib.parse import urlsplit
 from uuid import UUID
 
+from cti_app.application.investigation_figures import (
+    build_investigation_chain_figure,
+    build_investigation_graph_figure,
+    build_publication_timeline_figure,
+)
 from cti_app.application.pdf_mapping import MAPPING_RENDERER_VERSION, target_descriptor
 from cti_app.application.typst_bundle import hash_bundle_contents, resolve_bundle_files
 from cti_app.domain.analyst_opinion import (
@@ -23,6 +28,7 @@ from cti_app.domain.analyst_opinion import (
     AnalystOpinionV1,
     OpinionBlockType,
 )
+from cti_app.domain.investigation_graph import InvestigationGraph
 from cti_app.domain.media_assets import MediaAssetKind
 from cti_app.domain.production_editorial_enrichment import EnrichmentPlacementKind
 from cti_app.domain.production_synthesis import ProductionSynthesisV1
@@ -34,10 +40,14 @@ from cti_app.domain.publication import (
 from cti_app.domain.publication_document import (
     CanonicalPublicationDocument,
     PublicationChartV1,
+    PublicationDetectionReason,
+    PublicationDetectionStatus,
+    PublicationDetectionV1,
     PublicationDiagramV1,
     PublicationDocumentV4,
     PublicationDocumentV5,
     PublicationDocumentV6,
+    PublicationIOCDisposition,
     PublicationSourceFigureV1,
     PublicationTableV1,
     publication_document_text_anchors,
@@ -50,9 +60,7 @@ from cti_app.domain.semantic_annotation import (
     timeline_anchor,
 )
 
-_RENDER_DATA_SCHEMA_VERSION = (
-    "typst-publication-model-v22-draft-watermark-analyst-notes-synthesis-context"
-)
+_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v24-canonical-investigation-figures"
 _PUBLICATION_RENDERER_MANIFEST = "renderer-manifest.json"
 _FRENCH_MONTH_NAMES = (
     "janvier",
@@ -81,6 +89,11 @@ _INDICATOR_KEYS = {
     ArtifactType.URL: "urls",
     ArtifactType.EMAIL: "emails",
     ArtifactType.HASH: "hashes",
+}
+_IOC_DISPOSITION_LABELS = {
+    PublicationIOCDisposition.RETAINED: "Retenu",
+    PublicationIOCDisposition.UNCERTAIN: "Incertain",
+    PublicationIOCDisposition.EXCLUDED: "Écarté",
 }
 _BREAKABLE_SEMANTIC_ROLES = frozenset({"ioc", "path", "command", "technical_literal"})
 _TYPOGRAPHIC_BREAK_INTERVAL = 8
@@ -178,6 +191,153 @@ def _indicator_values(groups: tuple[Any, ...]) -> dict[str, list[dict[str, Any]]
     return result
 
 
+_DETECTION_REASON_LABELS = {
+    PublicationDetectionReason.CORPUS_EMPTY: "corpus de test vide",
+    PublicationDetectionReason.POSITIVES_MISSING: "positifs réels indisponibles",
+    PublicationDetectionReason.GOODWARE_MISSING: "corpus bénin vide",
+    PublicationDetectionReason.SAMPLE_BYTES_MISSING: "octets d'échantillon indisponibles",
+    PublicationDetectionReason.SYNTHETIC_POSITIVES: "positifs uniquement synthétiques",
+    PublicationDetectionReason.FALSE_NEGATIVES: "positifs réels non tous détectés",
+    PublicationDetectionReason.FALSE_POSITIVES: "faux positifs observés dans le corpus bénin",
+    PublicationDetectionReason.EXECUTION_INCOMPLETE: "tests incomplets",
+    PublicationDetectionReason.VALIDATED: "positifs réels et corpus bénin testés",
+}
+
+
+def _publication_detection_section(detection: PublicationDetectionV1) -> dict[str, Any]:
+    if not detection.validation_status_is_coherent:
+        raise ValueError("Published YARA validation status differs from its canonical report")
+    if detection.validation_status is PublicationDetectionStatus.VALIDATED:
+        banner = "VALIDÉE (positifs réels et corpus bénin testés)"
+        reason = None
+    else:
+        banner = "CANDIDATE — NON VALIDÉE"
+        reason = (
+            "non testée"
+            if detection.validation_status is PublicationDetectionStatus.UNTESTED
+            else _DETECTION_REASON_LABELS[detection.validation_reason]
+        )
+    code_lines = detection.source.splitlines()
+    if not code_lines:
+        code_lines = [""]
+    result: dict[str, Any] = {
+        "type": "detection",
+        "heading": "DÉTECTION",
+        "candidate_id": str(detection.candidate_id),
+        "version_id": str(detection.version_id),
+        "version": f"v{detection.version}",
+        "source_sha256": _breakable_typst_display_text(
+            detection.source_sha256, break_at_technical_separators=True
+        ),
+        "validation_status": detection.validation_status.value,
+        "validation_banner": banner,
+        "validation_reason": reason,
+        "rule_validation_status": detection.rule_validation_status.value,
+        "positive_real_count": detection.positive_real_count,
+        "positive_synthetic_count": detection.positive_synthetic_count,
+        "goodware_tested_count": detection.goodware_tested_count,
+        "false_positive_count": detection.false_positive_count,
+        "engine_version": detection.engine_version,
+        "coverage_statement": detection.coverage_statement,
+        "limitations": list(detection.limitations),
+        "created_date": _display_date(None, detection.created_at.date()),
+        "tested_date": (
+            _display_date(None, detection.tested_at.date())
+            if detection.tested_at is not None
+            else None
+        ),
+        "retrohunt_submitted": detection.retrohunt_submitted,
+        "code_lines": [
+            _breakable_typst_display_text(
+                line,
+                interval=48,
+                break_at_technical_separators=True,
+            )
+            for line in code_lines
+        ],
+    }
+    if detection.test_report_observation_id is not None:
+        result["test_report_observation_id"] = str(detection.test_report_observation_id)
+        result["test_report_sha256"] = _breakable_typst_display_text(
+            detection.test_report_sha256 or "", break_at_technical_separators=True
+        )
+    return result
+
+
+def publication_content_section_types(
+    value: CanonicalPublicationDocument | TypstDraftPreviewDocument,
+) -> tuple[str, ...]:
+    """Return the ordered sections projected from canonical publication data."""
+    draft_preview = value if isinstance(value, TypstDraftPreviewDocument) else None
+    publication_v6 = value if isinstance(value, PublicationDocumentV6) else None
+    publication_v5 = (
+        publication_v6.base_publication
+        if publication_v6 is not None
+        else draft_preview.base_publication
+        if draft_preview is not None
+        else value
+    )
+    if isinstance(publication_v5, PublicationDocumentV5):
+        document = publication_v5.document
+    elif isinstance(value, PublicationDocumentV4):
+        document = value
+    else:
+        raise ValueError("Unsupported canonical publication document")
+
+    section_types = ["references", "synthesis"]
+    timeline_figure = (
+        build_publication_timeline_figure(publication_v5)
+        if isinstance(publication_v5, PublicationDocumentV5)
+        else None
+    )
+    if draft_preview is not None and draft_preview.synthesis is not None:
+        has_chronology = bool(draft_preview.synthesis.timeline) or timeline_figure is not None
+        has_limitations = bool(draft_preview.synthesis.uncertainties)
+    else:
+        has_chronology = (
+            bool(publication_v5.timeline)
+            if isinstance(publication_v5, PublicationDocumentV5)
+            else False
+        )
+        has_chronology = has_chronology or timeline_figure is not None
+        has_limitations = False
+    if has_chronology:
+        section_types.append("chronology")
+
+    opinion = (
+        publication_v6.analyst_opinion
+        if publication_v6 is not None
+        else draft_preview.analyst_opinion
+        if draft_preview is not None
+        else None
+    )
+    has_rendered_opinion = (
+        publication_v6 is not None and publication_v6.rendered_opinion is not None
+    )
+    if has_limitations:
+        section_types.append("limitations")
+    if opinion is not None and (has_rendered_opinion or draft_preview is not None):
+        section_types.append("analyst_opinion")
+    if publication_v6 is not None and publication_v6.detection is not None:
+        section_types.append("detection")
+
+    original_indicator_groups = (
+        publication_v5.original_indicators
+        if isinstance(publication_v5, PublicationDocumentV5)
+        else ()
+    )
+    ioc_details = (
+        publication_v5.ioc_details if isinstance(publication_v5, PublicationDocumentV5) else ()
+    )
+    if (
+        any(group.indicators for group in document.indicators)
+        or any(group.indicators for group in original_indicator_groups)
+        or ioc_details
+    ):
+        section_types.append("technical_annex")
+    return tuple(section_types)
+
+
 def _table_cell_typst_spans(value: str) -> list[dict[str, Any]]:
     """Format exact technical table values and add invisible wrap points to long cells."""
     style = "semantic-plain"
@@ -269,6 +429,7 @@ class TypstDraftPreviewDocument:
     base_publication: PublicationDocumentV5
     analyst_opinion: AnalystOpinionV1
     synthesis: ProductionSynthesisV1 | None = None
+    infrastructure_graph: InvestigationGraph | None = None
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.base_publication, name)
@@ -282,6 +443,12 @@ class TypstDraftPreviewDocument:
             or self.synthesis.publication_language != self.base_publication.publication_language
         ):
             raise ValueError("Draft preview synthesis does not match the pinned publication")
+        if self.infrastructure_graph is not None and (
+            self.infrastructure_graph.investigation_id != self.analyst_opinion.investigation_id
+            or self.infrastructure_graph.publication_sha256
+            != self.analyst_opinion.base_publication_sha256
+        ):
+            raise ValueError("Draft preview infrastructure graph is not pinned to its V5 opinion")
         if publication_document_v5_sha256(self.base_publication) != (
             self.analyst_opinion.base_publication_sha256
         ):
@@ -319,6 +486,7 @@ class TypstRenderer:
         template_bundle: TypstTemplateBundle,
         *,
         target_artifact_identities: Mapping[str, Mapping[str, Any]] | None = None,
+        infrastructure_graph_media_ref: TypstMediaRef | None = None,
     ) -> TypstRenderSource:
         entrypoint = next(
             (
@@ -333,7 +501,9 @@ class TypstRenderer:
                 "Typst renderer manifest does not include RENDERER/publication.typ"
             )
         source_bytes = entrypoint.content
-        model = project_publication_to_typst_model(document)
+        model = project_publication_to_typst_model(
+            document, infrastructure_graph_media_ref=infrastructure_graph_media_ref
+        )
         target_descriptors: tuple[dict[str, Any], ...] = ()
         unmapped: tuple[dict[str, Any], ...] = ()
         article_title_target_id: str | None = None
@@ -465,6 +635,8 @@ def instrument_publication_targets(
 
 def project_publication_to_typst_model(
     value: CanonicalPublicationDocument | TypstDraftPreviewDocument,
+    *,
+    infrastructure_graph_media_ref: TypstMediaRef | None = None,
 ) -> TypstPublicationModelV2:
     """Project a canonical publication while keeping semantic content as data."""
     draft_preview = value if isinstance(value, TypstDraftPreviewDocument) else None
@@ -477,6 +649,13 @@ def project_publication_to_typst_model(
         else value
     )
     rendered_opinion = publication_v6.rendered_opinion if publication_v6 is not None else None
+    infrastructure_graph = (
+        publication_v6.infrastructure_graph
+        if publication_v6 is not None
+        else draft_preview.infrastructure_graph
+        if draft_preview is not None
+        else None
+    )
     opinion = (
         publication_v6.analyst_opinion
         if publication_v6 is not None
@@ -484,16 +663,19 @@ def project_publication_to_typst_model(
         if draft_preview is not None
         else None
     )
+    detection = publication_v6.detection if publication_v6 is not None else None
     if isinstance(publication_v5, PublicationDocumentV5):
         document = publication_v5.document
         semantic_by_anchor = {item.anchor: item for item in publication_v5.semantic_text.paragraphs}
         reference_entries = publication_v5.references
         original_indicator_groups = publication_v5.original_indicators
+        ioc_details = publication_v5.ioc_details
     elif isinstance(value, PublicationDocumentV4):
         document = value
         semantic_by_anchor = {}
         reference_entries = ()
         original_indicator_groups = ()
+        ioc_details = ()
     else:
         raise ValueError("Unsupported canonical publication document")
 
@@ -614,8 +796,15 @@ def project_publication_to_typst_model(
             chart.placement.section_index,
             block,
         )
+    sources_by_id = {source.source_document_id: source for source in document.sources}
     for figure in document.figures:
-        block = _figure_block(figure, media_ref)
+        source = sources_by_id.get(figure.source_document_id)
+        if source is None:
+            raise ValueError(
+                "Publication figure identifies an unknown source document: "
+                f"{figure.source_document_id}"
+            )
+        block = _figure_block(figure, source, media_ref)
         rich_block(block, "semantic_caption", f"figure:{figure.key}:caption", figure.caption)
         add_rich(
             figure.placement.kind,
@@ -701,7 +890,6 @@ def project_publication_to_typst_model(
             figure_number += 1
             block["figure_number"] = figure_number
 
-    sources_by_id = {source.source_document_id: source for source in document.sources}
     timeline: list[dict[str, Any]] = []
     for index, publication_timeline_entry in enumerate(document.timeline, start=1):
         timeline_row: dict[str, Any] = {
@@ -761,6 +949,50 @@ def project_publication_to_typst_model(
 
     indicators = _indicator_values(document.indicators)
     original_indicators = _indicator_values(original_indicator_groups)
+    ioc_rows = []
+    for item in ioc_details:
+        source_links = []
+        for source_id in item.source_document_ids:
+            source = sources_by_id.get(source_id)
+            if source is None:
+                raise ValueError(f"Publication IOC identifies an unknown source: {source_id}")
+            source_links.append(
+                {
+                    "label": source.title or source.publisher or source.canonical_url,
+                    "url": source.canonical_url,
+                }
+            )
+        ioc_rows.append(
+            {
+                "type": item.artifact_type.value,
+                "value": item.value,
+                "value_spans": _table_cell_typst_spans(item.value),
+                "source_role": item.source_role.value,
+                "context": item.context,
+                "evidence_quote": item.evidence_quote,
+                "source_urls": source_links,
+                "reliability": item.evidence_basis.value,
+                "status": item.disposition.value,
+                "status_label": _IOC_DISPOSITION_LABELS[item.disposition],
+                "status_reason": item.disposition_reason,
+                "relevance_classification": (
+                    item.relevance_classification.value
+                    if item.relevance_classification is not None
+                    else None
+                ),
+                "relevance_reason_code": (
+                    item.relevance_reason_code.value
+                    if item.relevance_reason_code is not None
+                    else None
+                ),
+                "first_observed": (
+                    item.first_observed.isoformat() if item.first_observed is not None else None
+                ),
+                "last_observed": (
+                    item.last_observed.isoformat() if item.last_observed is not None else None
+                ),
+            }
+        )
     original_publishers = sorted(
         {
             (sources_by_id[source_id].publisher or "").strip()
@@ -790,6 +1022,32 @@ def project_publication_to_typst_model(
         },
         {"type": "synthesis", "blocks": body_blocks},
     ]
+    timeline_figure = (
+        build_publication_timeline_figure(publication_v5)
+        if isinstance(publication_v5, PublicationDocumentV5)
+        else None
+    )
+    expected_section_types = publication_content_section_types(value)
+    if timeline_figure is not None:
+        timeline_figure["figure_number"] = figure_number + 1
+        timeline_figure["figure_id_spans"] = _breakable_typst_display_text(
+            timeline_figure["figure_id"], interval=8
+        )
+        timeline_figure["publication_sha256_spans"] = _breakable_typst_display_text(
+            timeline_figure["publication_sha256"], interval=8
+        )
+        for event in timeline_figure["events"]:
+            for source in event["sources"]:
+                source["url_spans"] = _breakable_typst_display_text(
+                    source["url"], interval=12, break_at_technical_separators=True
+                )
+                source["source_sha256_spans"] = _breakable_typst_display_text(
+                    source["source_sha256"], interval=8
+                )
+                source["evidence_sha256_spans"] = _breakable_typst_display_text(
+                    source["evidence_sha256"], interval=8
+                )
+
     if draft_preview is not None and draft_preview.synthesis is not None:
         chronology: list[dict[str, Any]] = []
         for synthesis_timeline_entry in draft_preview.synthesis.timeline:
@@ -814,11 +1072,80 @@ def project_publication_to_typst_model(
                     "source_urls": source_urls,
                 }
             )
-        if chronology:
-            content_sections.append(
-                {"type": "chronology", "heading": "Chronologie", "timeline": chronology}
+    elif isinstance(publication_v5, PublicationDocumentV5):
+        chronology = timeline
+    else:
+        chronology = []
+    if "chronology" in expected_section_types:
+        chronology_section: dict[str, Any] = {
+            "type": "chronology",
+            "heading": "Chronologie",
+            "timeline": chronology,
+        }
+        if timeline_figure is not None:
+            chronology_section["derived_timeline_figure"] = timeline_figure
+        content_sections.append(chronology_section)
+
+    investigation_chain_figure = (
+        build_investigation_chain_figure(publication_v6) if publication_v6 is not None else None
+    )
+    if investigation_chain_figure is not None:
+        investigation_chain_figure["figure_id_spans"] = _breakable_typst_display_text(
+            investigation_chain_figure["figure_id"], interval=8
+        )
+        investigation_chain_figure["opinion_sha256_spans"] = _breakable_typst_display_text(
+            investigation_chain_figure["opinion_sha256"], interval=8
+        )
+        investigation_chain_figure["base_publication_sha256_spans"] = _breakable_typst_display_text(
+            investigation_chain_figure["base_publication_sha256"], interval=8
+        )
+    infrastructure_graph_figure = (
+        build_investigation_graph_figure(publication_v5, infrastructure_graph)
+        if isinstance(publication_v5, PublicationDocumentV5)
+        else None
+    )
+    if infrastructure_graph_figure is not None:
+        for edge in infrastructure_graph_figure["edges"]:
+            edge["source_value_spans"] = _breakable_typst_display_text(
+                edge["source_value"], interval=32, break_at_technical_separators=True
             )
-        limitations = [
+            edge["target_value_spans"] = _breakable_typst_display_text(
+                edge["target_value"], interval=32, break_at_technical_separators=True
+            )
+            for reference in edge["evidence_refs"]:
+                reference["sha256_spans"] = _breakable_typst_display_text(
+                    reference["sha256"], interval=32, break_at_technical_separators=True
+                )
+        infrastructure_graph_figure["figure_id_spans"] = _breakable_typst_display_text(
+            infrastructure_graph_figure["figure_id"], interval=8
+        )
+        infrastructure_graph_figure["graph_sha256_spans"] = _breakable_typst_display_text(
+            infrastructure_graph_figure["graph_sha256"], interval=8
+        )
+        infrastructure_graph_figure["publication_sha256_spans"] = _breakable_typst_display_text(
+            infrastructure_graph_figure["publication_sha256"], interval=8
+        )
+        if infrastructure_graph_media_ref is not None:
+            if (
+                infrastructure_graph_media_ref.expected_kind is not MediaAssetKind.DIAGRAM_SVG
+                or infrastructure_graph_media_ref.expected_mime_type != "image/svg+xml"
+                or infrastructure_graph_media_ref.expected_sha256 is None
+                or infrastructure_graph_media_ref.expected_byte_size is None
+            ):
+                raise ValueError("Infrastructure graph media reference must be a pinned SVG")
+            resolved_graph_media_ref = media_ref(
+                asset_id=infrastructure_graph_media_ref.asset_id,
+                expected_kind=infrastructure_graph_media_ref.expected_kind,
+                expected_mime_type=infrastructure_graph_media_ref.expected_mime_type,
+                expected_sha256=infrastructure_graph_media_ref.expected_sha256,
+                expected_byte_size=infrastructure_graph_media_ref.expected_byte_size,
+            )
+            if resolved_graph_media_ref != infrastructure_graph_media_ref:
+                raise ValueError("Infrastructure graph media path is not canonical")
+            infrastructure_graph_figure["media_path"] = resolved_graph_media_ref.media_path
+            infrastructure_graph_figure["svg_sha256"] = resolved_graph_media_ref.expected_sha256
+    limitations = (
+        [
             {
                 "text": uncertainty.text,
                 "source_urls": sorted(
@@ -831,11 +1158,14 @@ def project_publication_to_typst_model(
             }
             for uncertainty in draft_preview.synthesis.uncertainties
         ]
-        if limitations:
-            content_sections.append(
-                {"type": "limitations", "heading": "Limites des preuves", "items": limitations}
-            )
-    if opinion is not None and (rendered_opinion is not None or draft_preview is not None):
+        if draft_preview is not None and draft_preview.synthesis is not None
+        else []
+    )
+    if "limitations" in expected_section_types:
+        content_sections.append(
+            {"type": "limitations", "heading": "Limites des preuves", "items": limitations}
+        )
+    if opinion is not None and "analyst_opinion" in expected_section_types:
         qualification_labels = {
             "fact": "Fait étayé",
             "inference": "Inférence",
@@ -871,6 +1201,18 @@ def project_publication_to_typst_model(
             if rendered_opinion is not None
             else opinion.protocol_figures
         )
+        next_figure_number = figure_number + (1 if timeline_figure is not None else 0)
+        if investigation_chain_figure is not None:
+            investigation_chain_figure["figure_number"] = (
+                next_figure_number + len(opinion_figures) + 1
+            )
+        if infrastructure_graph_figure is not None:
+            infrastructure_graph_figure["figure_number"] = (
+                next_figure_number
+                + len(opinion_figures)
+                + (1 if investigation_chain_figure is not None else 0)
+                + 1
+            )
         unresolved_points = (
             rendered_opinion.unresolved_points
             if rendered_opinion is not None
@@ -906,6 +1248,10 @@ def project_publication_to_typst_model(
             ],
             "unresolved_points": list(unresolved_points),
         }
+        if investigation_chain_figure is not None:
+            opinion_section["investigation_chain_figure"] = investigation_chain_figure
+        if infrastructure_graph_figure is not None:
+            opinion_section["infrastructure_graph_figure"] = infrastructure_graph_figure
         if opinion_figures:
             opinion_section["protocol_figures"] = [
                 {
@@ -929,18 +1275,21 @@ def project_publication_to_typst_model(
                     "compiler_version": figure.compiler_version,
                     "compiler_policy_version": figure.compiler_policy_version,
                     "field_evidence": [item.to_payload() for item in figure.field_evidence],
-                    "figure_number": figure_number + index,
+                    "figure_number": next_figure_number + index,
                 }
                 for index, figure in enumerate(opinion_figures, start=1)
             ]
         content_sections.append(opinion_section)
-    if any(indicators.values()) or any(original_indicators.values()):
+    if detection is not None and "detection" in expected_section_types:
+        content_sections.append(_publication_detection_section(detection))
+    if "technical_annex" in expected_section_types:
         content_sections.append(
             {
                 "type": "technical_annex",
                 "indicators": indicators,
                 "original_indicators": original_indicators,
                 "original_indicator_note": original_indicator_note,
+                "ioc_rows": ioc_rows,
             }
         )
 
@@ -1120,6 +1469,7 @@ _PROTOCOL_FIGURE_TITLES = {
 
 def _figure_block(
     figure: PublicationSourceFigureV1,
+    source: PublicationSourceV1,
     media_ref_factory: Callable[..., TypstMediaRef],
 ) -> dict[str, Any]:
     media = media_ref_factory(
@@ -1133,7 +1483,15 @@ def _figure_block(
         "type": "figure",
         "key": figure.key,
         "caption": figure.caption,
-        "source_note": _reader_facing_figure_source(figure),
+        "source_note": _reader_facing_figure_source(figure, source),
+        "attribution": (
+            _reader_facing_editorial_text(figure.provenance)
+            or _reader_facing_editorial_text(source.publisher)
+            or _reader_facing_editorial_text(source.title)
+        ),
+        "sha256": figure.sha256,
+        "sha256_spans": _breakable_typst_display_text(figure.sha256, interval=8),
+        "byte_size": figure.byte_size,
         "media_path": media.media_path,
     }
 
@@ -1147,20 +1505,34 @@ _INTERNAL_FIGURE_LOCATOR_TEXT = re.compile(
 )
 
 
-def _reader_facing_figure_source(figure: PublicationSourceFigureV1) -> str | None:
+def _reader_facing_editorial_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    if not cleaned or _INTERNAL_FIGURE_LOCATOR_TEXT.search(cleaned):
+        return None
+    return cleaned
+
+
+def _reader_facing_figure_source(
+    figure: PublicationSourceFigureV1,
+    source: PublicationSourceV1,
+) -> str | None:
     """Project technical figure metadata into a short, reader-facing source note."""
     parts: list[str] = []
     try:
-        host = urlsplit(figure.source_url).hostname
+        host = urlsplit(source.canonical_url).hostname
     except ValueError:
         host = None
     if host and not _INTERNAL_FIGURE_LOCATOR_TEXT.search(host):
         parts.append(host.removeprefix("www."))
+    elif (title := _reader_facing_editorial_text(source.title)) is not None:
+        parts.append(title)
 
     section = figure.locator.section
     if section is not None:
-        section = section.strip()
-        if section and not _INTERNAL_FIGURE_LOCATOR_TEXT.search(section):
+        section = _reader_facing_editorial_text(section)
+        if section is not None:
             parts.append(section)
 
     if figure.locator.page is not None:

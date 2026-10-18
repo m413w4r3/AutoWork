@@ -1,17 +1,14 @@
 from __future__ import annotations
 
 import hashlib
-import json
-import sys
 from collections.abc import Mapping
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
 import pytest
 
-import cti_app.infrastructure.local_command_runner as local_runner_module
+from cti_app.application.confined_analysis import ConfinedAnalysisFamilyStatus
 from cti_app.application.investigation_extraction_tools import (
     MWCP_TOOL,
     _configuration_value_json,
@@ -19,30 +16,74 @@ from cti_app.application.investigation_extraction_tools import (
     register_extraction_tools,
 )
 from cti_app.application.investigation_tools import InMemoryToolRegistry
-from cti_app.application.local_analysis import (
-    LocalCommandCatalog,
-    LocalCommandService,
-    extraction_command_specs,
-)
+from cti_app.application.sample_acquisition import SAMPLES_QUARANTINE_BUCKET
+from cti_app.domain.extraction import ExtractionStatus
 from cti_app.domain.investigation import ToolInvocationStatus
-from cti_app.domain.local_analysis import LocalCommandSpec
-from cti_app.infrastructure.local_command_runner import LocalCommandRunner
 from cti_app.infrastructure.mwcp_adapter import MwcpAdapter, _normalize_configuration
 
 
-class _Samples:
-    def __init__(self, payload: bytes) -> None:
-        self.payload = payload
+class _CanonicalBlobs:
+    def __init__(self, sample_sha256: str, size: int, *, exists: bool = True) -> None:
+        self.sample_sha256 = sample_sha256
+        self.blob = SimpleNamespace(
+            id=uuid4(),
+            descriptor=SimpleNamespace(
+                sha256=sample_sha256,
+                size=size,
+                logical_bucket=SAMPLES_QUARANTINE_BUCKET,
+            ),
+        )
+        self.exists = exists
 
-    async def get_sample_bytes(self, sample_sha256: str, *, max_bytes: int) -> bytes:
-        return self.payload
+    async def get_by_address(self, bucket: str, sha256: str) -> object | None:
+        if self.exists and bucket == SAMPLES_QUARANTINE_BUCKET and sha256 == self.sample_sha256:
+            return self.blob
+        return None
+
+
+class _Uow:
+    def __init__(self, blobs: _CanonicalBlobs) -> None:
+        self.blobs = blobs
+
+    async def __aenter__(self) -> _Uow:
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+
+class _WorkerPort:
+    available = True
+    available_reason = None
+
+    def __init__(self, result: Mapping[str, Any], parser_versions: Mapping[str, str]) -> None:
+        family_statuses = {"mwcp": ConfinedAnalysisFamilyStatus("mwcp", True, "3.16.1")}
+        family_statuses.update(
+            {
+                f"mwcp_parser:{parser_id}": ConfinedAnalysisFamilyStatus(
+                    f"mwcp_parser:{parser_id}", True, version
+                )
+                for parser_id, version in parser_versions.items()
+            }
+        )
+        self.family_statuses = family_statuses
+        self.result = dict(result)
+        self.requests: list[object] = []
+
+    async def execute(self, request: object) -> SimpleNamespace:
+        self.requests.append(request)
+        return SimpleNamespace(
+            status=ToolInvocationStatus.SUCCEEDED,
+            available_reason=None,
+            payload={"result": self.result},
+        )
 
 
 class _Associations:
     def __init__(self, sample_sha256: str) -> None:
         self.sample_sha256 = sample_sha256
 
-    async def list_for_investigation(self, investigation_id: object) -> tuple[object, ...]:
+    async def list_for_investigation(self, _investigation_id: object) -> tuple[object, ...]:
         return (SimpleNamespace(sample_sha256=self.sample_sha256),)
 
 
@@ -50,38 +91,14 @@ class _Recorder:
     def __init__(self) -> None:
         self.payloads: list[dict[str, Any]] = []
 
-    async def record_json(self, *, payload: Mapping[str, Any], **kwargs: object) -> SimpleNamespace:
+    async def record_json(
+        self, *, payload: Mapping[str, Any], **_kwargs: object
+    ) -> SimpleNamespace:
         self.payloads.append(dict(payload))
         return SimpleNamespace(id=uuid4())
 
 
-class _TestConfinedRunner(LocalCommandRunner):
-    """Explicit test-only shim for deterministic fake-binary executions."""
-
-    @property
-    def filesystem_confined(self) -> bool:
-        return True
-
-
-def _fake_mwcp(
-    path: Path,
-    output: str,
-    marker: Path,
-    *,
-    version: str = "fake-mwcp 2.0.0",
-) -> Path:
-    path.write_text(
-        "#!/bin/sh\n"
-        f"if [ \"$1\" = \"--version\" ]; then printf '%s\\n' '{version}'; exit 0; fi\n"
-        f": > '{marker}'\n"
-        f"printf '%s\\n' '{output}'\n",
-        encoding="utf-8",
-    )
-    path.chmod(0o755)
-    return path
-
-
-def _context(sample_sha256: str) -> SimpleNamespace:
+def _context() -> SimpleNamespace:
     return SimpleNamespace(
         investigation_id=uuid4(),
         idempotency_key="mwcp-test-invocation",
@@ -89,94 +106,79 @@ def _context(sample_sha256: str) -> SimpleNamespace:
     )
 
 
-def _test_bootstrap_argv(
-    command: list[str],
-    spec: LocalCommandSpec,
+def _worker_result(
+    parser_id: str,
+    parser_version: str,
+    report: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "status": "SUCCEEDED",
+        "parser_id": parser_id,
+        "parser_version": parser_version,
+        "mwcp_version": "3.16.1",
+        "output_sha256": hashlib.sha256(b"canonical mwcp json proof").hexdigest(),
+        "output_bytes": 128,
+        "exit_code": 0,
+        "report": dict(report),
+        "truncated": False,
+    }
+
+
+def _registered(
+    result: Mapping[str, Any],
+    parser_versions: Mapping[str, str],
+    sample_sha256: str,
     *,
-    install_network_filter_before_exec: bool = True,
-) -> list[str]:
-    source_root = Path(__file__).resolve().parents[1] / "src"
-    bootstrap = (
-        "import sys; "
-        f"sys.path[:0] = {[str(source_root), *sys.path]!r}; "
-        "from cti_app.infrastructure.local_command_runner import _sandbox_exec; "
-        "raise SystemExit(_sandbox_exec("
-        f"sys.argv[1:], install_network_filter={install_network_filter_before_exec!r}))"
-    )
-    return [
-        sys.executable,
-        "-c",
-        bootstrap,
-        str(spec.cpu_limit_seconds),
-        str(spec.memory_limit_bytes),
-        str(spec.file_size_limit_bytes),
-        "--",
-        *command,
-    ]
-
-
-@pytest.mark.asyncio
-async def test_mwcp_runs_only_allowlisted_parser_and_normalizes_typed_config(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    sample = b"harmless fixture"
-    sample_sha256 = hashlib.sha256(sample).hexdigest()
-    marker = tmp_path / "parser-executed"
-    raw_output = json.dumps(
-        {
-            "metadata": {"parser": "demo.config", "version": "1.4"},
-            "configuration": {
-                "c2": "HTTPS://C2.Example.COM/path?access_token=hidden",
-                "callback": "https://[2001:db8::1]/poll?token=hidden-ip-token",
-                "malformed_endpoint": "https://[malformed",
-                "port": 443,
-                "enabled": True,
-                "token": "do-not-persist",
-                "/home/analyst/private": "safe value",
-            },
-        },
-        separators=(",", ":"),
-    )
-    binary = _fake_mwcp(
-        tmp_path / "mwcp",
-        raw_output,
-        marker,
-        version="fake-mwcp 2.0 /home/analyst TOKEN=version-secret",
-    )
-    monkeypatch.setattr(local_runner_module, "_detect_network_namespace", lambda *_args: None)
-    monkeypatch.setattr(local_runner_module, "_sandbox_bootstrap_argv", _test_bootstrap_argv)
-    parser_versions = {"demo.config": "1.4"}
-    catalog = LocalCommandCatalog(
-        specs=extraction_command_specs(mwcp_parser_ids=tuple(parser_versions)),
-        which=lambda _name: str(binary),
-    )
-    service = LocalCommandService(
-        _Samples(sample),  # type: ignore[arg-type]
-        _TestConfinedRunner(require_filesystem_confinement=False),
-        catalog,
+    size: int = 16,
+    exists: bool = True,
+) -> tuple[InMemoryToolRegistry, MwcpAdapter, _Recorder, _WorkerPort]:
+    blobs = _CanonicalBlobs(sample_sha256, size, exists=exists)
+    worker = _WorkerPort(result, parser_versions)
+    adapter = MwcpAdapter(
+        parser_versions=parser_versions,
         enabled=True,
+        confined_analysis=worker,  # type: ignore[arg-type]
+        uow_factory=lambda: _Uow(blobs),  # type: ignore[arg-type]
     )
-    port = MwcpAdapter(service, catalog, parser_versions=parser_versions, enabled=True)
     recorder = _Recorder()
     registry = InMemoryToolRegistry()
     register_extraction_tools(
         registry,
         sample_associations=_Associations(sample_sha256),  # type: ignore[arg-type]
         recorder=recorder,  # type: ignore[arg-type]
-        configuration=port,
+        configuration=adapter,
     )
+    return registry, adapter, recorder, worker
+
+
+@pytest.mark.asyncio
+async def test_mwcp_uses_attested_worker_parser_and_normalizes_configuration() -> None:
+    sample_sha256 = hashlib.sha256(b"harmless fixture").hexdigest()
+    parser_versions = {"demo.config": "1.4"}
+    raw_report = {
+        "configuration": {
+            "c2": "HTTPS://C2.Example.COM/path?access_token=hidden",
+            "callback": "https://[2001:db8::1]/poll?token=hidden-ip-token",
+            "malformed_endpoint": "https://[malformed",
+            "port": 443,
+            "enabled": True,
+            "token": "do-not-persist",
+            "/home/analyst/private": "safe value",
+        }
+    }
+    result_payload = _worker_result("demo.config", "1.4", raw_report)
+    registry, port, recorder, worker = _registered(result_payload, parser_versions, sample_sha256)
+
+    assert port.available
     assert MWCP_TOOL in extraction_tool_capabilities(
         floss=None, configuration=port, report_import_enabled=False
     )
     definition, adapter = registry.get(MWCP_TOOL, "1")  # type: ignore[misc]
-
     result = await adapter.execute(
-        {"sample_sha256": sample_sha256, "parser_id": "demo.config"},
-        _context(sample_sha256),
+        {"sample_sha256": sample_sha256, "parser_id": "demo.config"}, _context()
     )
 
     assert result.status is ToolInvocationStatus.SUCCEEDED
-    assert marker.exists()
     assert definition.schema_version == "1"
     assert result.output["parser_id"] == "demo.config"
     assert result.output["parser_version"] == "1.4"
@@ -191,96 +193,53 @@ async def test_mwcp_runs_only_allowlisted_parser_and_normalizes_typed_config(
     assert "hidden" not in serialized
     assert "hidden-ip-token" not in serialized
     assert "do-not-persist" not in serialized
-    assert "version-secret" not in serialized
     assert "/home/analyst" not in serialized
-    assert (
-        recorder.payloads[0]["raw_output_sha256"]
-        == hashlib.sha256((raw_output + "\n").encode()).hexdigest()
-    )
+    assert recorder.payloads[0]["raw_output_sha256"] == result_payload["output_sha256"]
     assert (
         "An absent extraction does not establish the absence of configuration."
         in result.output["limitations"]
     )
+    request = worker.requests[0]
+    assert request.tool.value == "mwcp"
+    assert request.analysis_parameters == {
+        "parser_id": "demo.config",
+        "parser_version": "1.4",
+    }
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("parser_id", ["unauthorized.parser", 17, None])
-async def test_mwcp_rejects_parser_outside_operator_allowlist_before_execution(
-    parser_id: str | int | None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+async def test_mwcp_rejects_parser_outside_allowlist_before_worker_execution(
+    parser_id: str | int | None,
 ) -> None:
-    sample = b"safe"
-    sample_sha256 = hashlib.sha256(sample).hexdigest()
-    marker = tmp_path / "parser-executed"
-    binary = _fake_mwcp(tmp_path / "mwcp", '{"configuration":{}}', marker)
-    monkeypatch.setattr(local_runner_module, "_detect_network_namespace", lambda *_args: None)
-    monkeypatch.setattr(local_runner_module, "_sandbox_bootstrap_argv", _test_bootstrap_argv)
-    allowed = {"only.this.parser": "1.0"}
-    catalog = LocalCommandCatalog(
-        specs=extraction_command_specs(mwcp_parser_ids=tuple(allowed)),
-        which=lambda _name: str(binary),
-    )
-    service = LocalCommandService(
-        _Samples(sample),  # type: ignore[arg-type]
-        _TestConfinedRunner(require_filesystem_confinement=False),
-        catalog,
-        enabled=True,
-    )
-    port = MwcpAdapter(service, catalog, parser_versions=allowed, enabled=True)
-    registry = InMemoryToolRegistry()
-    recorder = _Recorder()
-    register_extraction_tools(
-        registry,
-        sample_associations=_Associations(sample_sha256),  # type: ignore[arg-type]
-        recorder=recorder,  # type: ignore[arg-type]
-        configuration=port,
-    )
+    sample_sha256 = hashlib.sha256(b"safe").hexdigest()
+    parser_versions = {"only.this.parser": "1.0"}
+    result_payload = _worker_result("only.this.parser", "1.0", {"configuration": {}})
+    registry, _port, recorder, worker = _registered(result_payload, parser_versions, sample_sha256)
     _definition, adapter = registry.get(MWCP_TOOL, "1")  # type: ignore[misc]
 
     result = await adapter.execute(
-        {"sample_sha256": sample_sha256, "parser_id": parser_id},
-        _context(sample_sha256),
+        {"sample_sha256": sample_sha256, "parser_id": parser_id}, _context()
     )
 
     assert result.status is ToolInvocationStatus.POLICY_DENIED
     assert result.output["reason"] == "parser_not_allowlisted"
-    assert not marker.exists()
+    assert worker.requests == []
     assert recorder.payloads == []
 
 
 @pytest.mark.asyncio
-async def test_mwcp_empty_extraction_states_configuration_absence_is_unproven(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    sample = b"safe"
-    sample_sha256 = hashlib.sha256(sample).hexdigest()
-    marker = tmp_path / "parser-executed"
-    binary = _fake_mwcp(tmp_path / "mwcp", '{"configuration":{}}', marker)
-    monkeypatch.setattr(local_runner_module, "_detect_network_namespace", lambda *_args: None)
-    monkeypatch.setattr(local_runner_module, "_sandbox_bootstrap_argv", _test_bootstrap_argv)
-    allowed = {"empty.parser": "2"}
-    catalog = LocalCommandCatalog(
-        specs=extraction_command_specs(mwcp_parser_ids=tuple(allowed)),
-        which=lambda _name: str(binary),
-    )
-    service = LocalCommandService(
-        _Samples(sample),  # type: ignore[arg-type]
-        _TestConfinedRunner(require_filesystem_confinement=False),
-        catalog,
-        enabled=True,
-    )
-    port = MwcpAdapter(service, catalog, parser_versions=allowed, enabled=True)
-    registry = InMemoryToolRegistry()
-    register_extraction_tools(
-        registry,
-        sample_associations=_Associations(sample_sha256),  # type: ignore[arg-type]
-        recorder=_Recorder(),  # type: ignore[arg-type]
-        configuration=port,
+async def test_mwcp_empty_extraction_does_not_prove_configuration_absence() -> None:
+    sample_sha256 = hashlib.sha256(b"safe").hexdigest()
+    parser_versions = {"empty.parser": "2"}
+    result_payload = _worker_result("empty.parser", "2", {"configuration": {}})
+    registry, _port, _recorder, _worker = _registered(
+        result_payload, parser_versions, sample_sha256
     )
     _definition, adapter = registry.get(MWCP_TOOL, "1")  # type: ignore[misc]
 
     result = await adapter.execute(
-        {"sample_sha256": sample_sha256, "parser_id": "empty.parser"},
-        _context(sample_sha256),
+        {"sample_sha256": sample_sha256, "parser_id": "empty.parser"}, _context()
     )
 
     assert result.status is ToolInvocationStatus.EMPTY
@@ -308,59 +267,23 @@ def test_mwcp_field_truncation_is_marked_and_counted() -> None:
 
 
 @pytest.mark.asyncio
-async def test_mwcp_binary_absence_is_capability_unavailable_not_failure() -> None:
-    sample = b"safe"
-    sample_sha256 = hashlib.sha256(sample).hexdigest()
+async def test_mwcp_refuses_oversized_bytes_and_unavailable_worker() -> None:
+    sample_sha256 = hashlib.sha256(b"safe fixture larger than bound").hexdigest()
     parser_versions = {"allowed.parser": "1.0"}
-    catalog = LocalCommandCatalog(
-        specs=extraction_command_specs(mwcp_parser_ids=tuple(parser_versions)),
-        which=lambda _name: None,
+    payload = _worker_result("allowed.parser", "1.0", {"configuration": {}})
+    _registry, oversized, _recorder, worker = _registered(
+        payload, parser_versions, sample_sha256, size=128
     )
-    service = LocalCommandService(
-        _Samples(sample),  # type: ignore[arg-type]
-        _TestConfinedRunner(require_filesystem_confinement=False),
-        catalog,
-        enabled=True,
+    oversized._max_sample_bytes = 4
+    denied = await oversized.extract(
+        sample_sha256, parser_id="allowed.parser", investigation_id=uuid4()
     )
-    port = MwcpAdapter(service, catalog, parser_versions=parser_versions, enabled=True)
+    assert denied.status is ExtractionStatus.POLICY_DENIED
+    assert denied.detail_code == "sample_too_large"
+    assert worker.requests == []
 
-    assert not port.available
-    assert MWCP_TOOL not in extraction_tool_capabilities(
-        floss=None, configuration=port, report_import_enabled=False
-    )
-    result = await port.extract(sample_sha256, parser_id="allowed.parser")
-    assert result.status.value == "unavailable"
-
-
-@pytest.mark.asyncio
-async def test_mwcp_is_unavailable_without_filesystem_confinement(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    sample = b"safe fixture"
-    sample_sha256 = hashlib.sha256(sample).hexdigest()
-    marker = tmp_path / "parser-executed"
-    binary = _fake_mwcp(tmp_path / "mwcp", '{"configuration":{}}', marker)
-    monkeypatch.setattr(local_runner_module, "_detect_network_namespace", lambda *_args: None)
-    parser_versions = {"allowed.parser": "1.0"}
-    catalog = LocalCommandCatalog(
-        specs=extraction_command_specs(mwcp_parser_ids=tuple(parser_versions)),
-        which=lambda _name: str(binary),
-    )
-    service = LocalCommandService(
-        _Samples(sample),
-        LocalCommandRunner(require_filesystem_confinement=False),
-        catalog,
-        enabled=True,
-    )
-    port = MwcpAdapter(service, catalog, parser_versions=parser_versions, enabled=True)
-
-    assert not port.available
-    assert port.unavailable_reason == "filesystem_confinement_required"
-    assert MWCP_TOOL not in extraction_tool_capabilities(
-        floss=None, configuration=port, report_import_enabled=False
-    )
-    result = await port.extract(sample_sha256, parser_id="allowed.parser")
-
-    assert result.status.value == "unavailable"
-    assert result.detail_code == "filesystem_confinement_required"
-    assert not marker.exists()
+    legacy = MwcpAdapter(parser_versions=parser_versions, enabled=True)
+    assert not legacy.available
+    assert legacy.unavailable_reason == "analysis_worker_unavailable"
+    unavailable = await legacy.extract(sample_sha256, parser_id="allowed.parser")
+    assert unavailable.status is ExtractionStatus.UNAVAILABLE

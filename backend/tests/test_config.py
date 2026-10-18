@@ -297,25 +297,25 @@ def test_local_analysis_and_ghidra_are_disabled_with_bounded_settings(
 ) -> None:
     settings = Settings(_env_file=None)
     assert settings.local_analysis_enabled is False
-    assert settings.local_analysis_require_filesystem_confinement is False
+    assert settings.local_analysis_require_filesystem_confinement is True
     assert settings.local_analysis_timeout_seconds == 30
     assert settings.local_analysis_max_output_bytes == 1_000_000
     assert settings.ghidra_enabled is False
-    assert settings.ghidra_base_url == "http://127.0.0.1:8787"
-    assert settings.ghidra_functions_path == ""
-    assert settings.ghidra_search_path == ""
+    assert settings.ghidra_base_url == "http://ghidra:8787"
+    assert settings.ghidra_max_sample_bytes == 200 * 1024 * 1024
+    assert settings.ghidra_expected_version == "12.1.4"
+    assert settings.ghidra_expected_java_version == "21.0.12.1"
 
     monkeypatch.setenv("LOCAL_ANALYSIS_ENABLED", "true")
     monkeypatch.setenv("LOCAL_ANALYSIS_REQUIRE_FILESYSTEM_CONFINEMENT", "true")
     monkeypatch.setenv("LOCAL_ANALYSIS_CPU_LIMIT_SECONDS", "45")
     monkeypatch.setenv("GHIDRA_ENABLED", "true")
-    monkeypatch.setenv("GHIDRA_FUNCTIONS_PATH", "/verified/functions")
     configured = Settings(_env_file=None)
     assert configured.local_analysis_enabled is True
     assert configured.local_analysis_require_filesystem_confinement is True
     assert configured.local_analysis_cpu_limit_seconds == 45
     assert configured.ghidra_enabled is True
-    assert configured.ghidra_functions_path == "/verified/functions"
+    assert configured.ghidra_expected_version == "12.1.4"
 
     monkeypatch.setenv("GHIDRA_MAX_RESPONSE_BYTES", "0")
     with pytest.raises(ValidationError):
@@ -340,7 +340,7 @@ def test_investigation_runtime_settings_are_documented_with_safe_defaults() -> N
     assert expected <= example_names
     defaults = Settings(_env_file=None)
     assert defaults.local_analysis_enabled is False
-    assert defaults.local_analysis_require_filesystem_confinement is False
+    assert defaults.local_analysis_require_filesystem_confinement is True
     assert defaults.rule_workbench_enabled is False
     assert defaults.mwcp_parser_versions == {}
     assert defaults.ghidra_enabled is False

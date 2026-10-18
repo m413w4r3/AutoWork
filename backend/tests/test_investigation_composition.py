@@ -165,7 +165,6 @@ def test_composition_announces_local_tools_and_only_configured_capabilities() ->
         "evidence.get",
         "graph.neighbors",
         "sample.get_feature_pack",
-        "sample.analyze",
         "sample.set_qualification",
     }
     assert composition.available_capabilities == frozenset({"investigation.local_read"})
@@ -178,26 +177,27 @@ def test_composition_announces_local_tools_and_only_configured_capabilities() ->
     assert {"rule.propose", "rule.test", "rule.get"}.issubset(set(composition.unavailable_tools))
 
 
-def test_composition_injects_code_features_and_goodware_into_sample_analysis() -> None:
+def test_composition_routes_sample_analysis_to_worker_when_local_analysis_is_disabled() -> None:
     investigation_id = uuid4()
-    code_features = SimpleNamespace()
-    goodware = SimpleNamespace()
+    worker = SimpleNamespace(
+        available=True,
+        family_statuses={"sample_analysis": SimpleNamespace(available=True)},
+    )
     composition = build_investigation_composition(
         _unit_of_work(),
         uow_factory=cast(UnitOfWorkFactory, lambda: None),
         artifact_store=cast(ProductionArtifactStore, SimpleNamespace()),
         model_conversations=cast(ModelConversationService, SimpleNamespace()),
         settings=Settings.model_construct(
-            local_analysis_enabled=True,
+            local_analysis_enabled=False,
+            analysis_worker_enabled=True,
             virustotal_file_download_enabled=True,
             investigation_max_hits_acquired=1,
         ),
         investigation_id=investigation_id,
         optional_tool_ports=OptionalInvestigationToolPorts(
             acquisition=SimpleNamespace(),
-            sample_static_analysis=SimpleNamespace(),
-            sample_code_features=code_features,
-            sample_goodware=goodware,
+            confined_analysis_execution=worker,
         ),
     )
 
@@ -205,8 +205,8 @@ def test_composition_injects_code_features_and_goodware_into_sample_analysis() -
     assert registered is not None
     _definition, adapter = registered
     assert adapter._analyzer is not None
-    assert adapter._analyzer._code_features is code_features
-    assert adapter._analyzer._goodware is goodware
+    assert adapter._analyzer._confined_analysis is worker
+    assert adapter._analyzer._static_analysis is None
 
 
 def test_tool_registrar_receives_dependencies_and_can_extend_registry() -> None:

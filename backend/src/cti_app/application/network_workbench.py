@@ -252,7 +252,16 @@ class NetworkWorkbench:
         investigation_id: UUID | None = None,
     ) -> NetworkInspectionOutcome:
         content, parsed = await self._load(reference, investigation_id=investigation_id)
-        result = await self.tshark.inspect(content, reference.sha256)
+        inspect_artifact = getattr(self.tshark, "inspect_artifact", None)
+        if callable(inspect_artifact):
+            assert investigation_id is not None
+            result = await inspect_artifact(
+                artifact_id=reference.blob_id,
+                investigation_id=investigation_id,
+                capture_sha256=reference.sha256,
+            )
+        else:
+            result = await self.tshark.inspect(content, reference.sha256)
         if result.status is LocalCommandStatus.UNAVAILABLE:
             return NetworkInspectionOutcome(
                 ToolInvocationStatus.UNAVAILABLE, None, result.detail_code or "unavailable"

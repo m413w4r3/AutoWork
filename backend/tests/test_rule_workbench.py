@@ -11,8 +11,10 @@ import pytest
 from cti_app.application.investigation_persistence import DetectionCandidateRepository
 from cti_app.application.rule_workbench import (
     RuleCorpusBytesUnavailable,
+    RuleValidationReason,
     RuleWorkbench,
     YaraSampleInput,
+    rule_validation_reason,
 )
 from cti_app.domain.goodware import (
     Banality,
@@ -42,9 +44,11 @@ from cti_app.domain.rule_workbench import (
     RuleMotifIssueCode,
     RuleMotifKind,
     RuleMotifProvenanceKind,
+    RuleSampleProvenance,
     RuleTestCase,
     RuleTestCorpusRole,
     RuleTestErrorCode,
+    RuleValidationStatus,
     YaraEngineResult,
     YaraExecutionStatus,
 )
@@ -423,6 +427,66 @@ async def test_compile_errors_are_typed_and_engine_unavailable_is_local() -> Non
         )[0].code
         is RuleTestErrorCode.ENGINE_UNAVAILABLE
     )
+
+
+@pytest.mark.asyncio
+async def test_validation_status_and_reason_are_stable_and_honest() -> None:
+    positive = b"AUTOWORK_RULE_VALIDATION_FIXTURE"
+    goodware = b"ordinary harmless content"
+    source = (
+        "rule autowork_validation_fixture { strings: $marker = "
+        '"AUTOWORK_RULE_VALIDATION_FIXTURE" condition: $marker }'
+    )
+    positive_hash = _sha256(positive)
+    goodware_hash = _sha256(goodware)
+    workbench = _workbench({positive_hash: positive, goodware_hash: goodware})
+
+    empty = await workbench.compile_and_test(
+        source,
+        (),
+        selection_bias="No samples were imported.",
+        coverage_statement="The validation corpus is empty.",
+    )
+    assert empty.validation_status is RuleValidationStatus.UNTESTED
+    assert rule_validation_reason(empty) is RuleValidationReason.CORPUS_EMPTY
+
+    synthetic = await workbench.compile_and_test(
+        source,
+        (
+            RuleTestCase(
+                sample_sha256=positive_hash,
+                role=RuleTestCorpusRole.CONFIRMED_POSITIVE,
+                provenance=RuleSampleProvenance.SYNTHETIC,
+            ),
+            RuleTestCase(
+                sample_sha256=goodware_hash,
+                role=RuleTestCorpusRole.GOODWARE,
+                provenance=RuleSampleProvenance.SYNTHETIC,
+            ),
+        ),
+        selection_bias="The fixtures are synthetic.",
+        coverage_statement="Only synthetic positive and goodware bytes were measured.",
+    )
+    assert synthetic.validation_status is RuleValidationStatus.SYNTHETIC_ONLY
+    assert rule_validation_reason(synthetic) is RuleValidationReason.SYNTHETIC_POSITIVES
+
+    missing_bytes = await _workbench({}).compile_and_test(
+        source,
+        (
+            RuleTestCase(
+                sample_sha256=positive_hash,
+                role=RuleTestCorpusRole.CONFIRMED_POSITIVE,
+            ),
+            RuleTestCase(
+                sample_sha256=goodware_hash,
+                role=RuleTestCorpusRole.GOODWARE,
+            ),
+        ),
+        selection_bias="Both declared samples are canonical real records.",
+        coverage_statement="Neither referenced byte stream is available for measurement.",
+    )
+    assert missing_bytes.validation_status is RuleValidationStatus.UNTESTED
+    assert rule_validation_reason(missing_bytes) is RuleValidationReason.SAMPLE_BYTES_MISSING
 
 
 @pytest.mark.asyncio

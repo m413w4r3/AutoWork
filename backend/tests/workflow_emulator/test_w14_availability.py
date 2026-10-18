@@ -19,6 +19,7 @@ from cti_app.domain.analyst_opinion import OpinionBlockType, OpinionClaimQualifi
 from cti_app.domain.behavior_evidence import BehaviorEvidenceSource
 from cti_app.domain.investigation import (
     AgentNextAction,
+    EvidenceKind,
     EvidenceObservation,
     FindingAssessment,
     FindingKind,
@@ -202,7 +203,9 @@ async def test_w14_f_optional_outages_preserve_proof_and_resume_without_replay(
                 static = next(
                     item
                     for item in observations
-                    if item.source == "autowork.static_analysis" and item.object_id == sample_sha
+                    if item.kind is EvidenceKind.BINARY_ANALYSIS
+                    and item.source == "autowork.analysis_worker"
+                    and item.object_id == sample_sha
                 )
                 imported = next(
                     item
@@ -353,7 +356,9 @@ async def test_w14_f_optional_outages_preserve_proof_and_resume_without_replay(
             static_observation = next(
                 item
                 for item in observations_before
-                if item.source == "autowork.static_analysis" and item.object_id == sample_sha
+                if item.kind is EvidenceKind.BINARY_ANALYSIS
+                and item.source == "autowork.analysis_worker"
+                and item.object_id == sample_sha
             )
             report_observation = next(
                 item
@@ -374,7 +379,13 @@ async def test_w14_f_optional_outages_preserve_proof_and_resume_without_replay(
                 ).hexdigest()
             )
             assert (
-                sum(item.source == "autowork.static_analysis" for item in observations_before) == 1
+                sum(
+                    item.kind is EvidenceKind.BINARY_ANALYSIS
+                    and item.source == "autowork.analysis_worker"
+                    and item.object_id == sample_sha
+                    for item in observations_before
+                )
+                == 1
             )
             assert (
                 sum(

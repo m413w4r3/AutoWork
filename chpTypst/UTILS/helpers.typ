@@ -2,6 +2,13 @@
 
 #set grid(gutter: 1em)
 
+#let code-font-families = (
+  "Cascadia Mono",
+  "Cascadia Code",
+  "Cascadia Mono PL",
+  "Cascadia Code PL",
+)
+
 // Rendered literal data stays exact. This tiny positive space creates a real
 // break opportunity without introducing a visible or extractable separator.
 #let display-text(item) = {
@@ -37,34 +44,34 @@
 #let semantic-english-term(body) = emph(body)
 #let semantic-technical(body) = text(size: 10pt, fill: purple-dark)[#body]
 #let semantic-technical-literal(body) = text(
-  font: "Cascadia Mono",
+  font: code-font-families,
   size: 9pt,
   fill: purple-dark,
   hyphenate: false,
 )[#body]
 #let semantic-table-technical(body) = text(
-  font: "Cascadia Mono",
+  font: code-font-families,
   size: 9pt,
   fill: purple-dark,
   hyphenate: false,
 )[#body]
-#let semantic-ioc(body) = text(font: "Cascadia Mono", size: 9pt, fill: accent, hyphenate: false)[#body]
+#let semantic-ioc(body) = text(font: code-font-families, size: 9pt, fill: accent, hyphenate: false)[#body]
 #let semantic-table-ioc(body) = text(
-  font: "Cascadia Mono",
+  font: code-font-families,
   size: 9pt,
   fill: accent,
   hyphenate: false,
 )[#body]
-#let semantic-path(body) = text(font: "Cascadia Mono", size: 9pt, hyphenate: false)[#body]
-#let semantic-table-path(body) = text(font: "Cascadia Mono", size: 9pt, hyphenate: false)[#body]
-#let semantic-command(body) = text(font: "Cascadia Mono", size: 9pt, fill: dark, hyphenate: false)[#body]
+#let semantic-path(body) = text(font: code-font-families, size: 9pt, hyphenate: false)[#body]
+#let semantic-table-path(body) = text(font: code-font-families, size: 9pt, hyphenate: false)[#body]
+#let semantic-command(body) = text(font: code-font-families, size: 9pt, fill: dark, hyphenate: false)[#body]
 #let semantic-table-command(body) = text(
-  font: "Cascadia Mono",
+  font: code-font-families,
   size: 9pt,
   fill: dark,
   hyphenate: false,
 )[#body]
-#let semantic-protocol-field(body) = text(font: "Cascadia Mono", size: 9pt, fill: purple-dark, hyphenate: false)[#body]
+#let semantic-protocol-field(body) = text(font: code-font-families, size: 9pt, fill: purple-dark, hyphenate: false)[#body]
 #let semantic-source(body) = text(size: 9pt, fill: accent)[#body]
 #let semantic-proof(body) = text(size: 9pt, fill: purple-dark)[#body]
 
@@ -118,7 +125,7 @@
   #upper(content)
 ]
 
-#let section-title(content) = block(sticky: true)[
+#let section-title(content, is-sticky: true) = block(sticky: is-sticky)[
   #v(4pt)
 
   #text(
@@ -428,10 +435,10 @@
 }
 
 #let ioc(content) = {
-  text(font: "Cascadia Mono")[#content]
+  text(font: code-font-families)[#content]
 }
 
-#let vt(body) = highlight( fill: luma(0%), radius: 2pt )[ #text( font: "Cascadia Mono", fill: white, size:11pt)[#body]]
+#let vt(body) = highlight( fill: luma(0%), radius: 2pt )[ #text( font: code-font-families, fill: white, size:11pt)[#body]]
 
 #let ioc-list(
   title: [IOC],
@@ -459,7 +466,7 @@
     for (index, item) in items.enumerate() {
       if index >= skip {
         block(breakable: false, above: 0pt, below: 0pt)[
-          #text(font: "Cascadia Mono", size: 8.75pt)[#display-text(item)]
+          #text(font: code-font-families, size: 8.75pt)[#display-text(item)]
         ]
         linebreak()
       }
@@ -469,7 +476,7 @@
   let ioc-first-lines(items, take) = {
     for (index, item) in items.enumerate() {
       if index < take {
-        text(font: "Cascadia Mono", size: 8.75pt)[#display-text(item)]
+        text(font: code-font-families, size: 8.75pt)[#display-text(item)]
         linebreak()
       }
     }

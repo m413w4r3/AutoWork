@@ -532,6 +532,7 @@ def test_rule_version_summary_without_report_is_explicitly_untested() -> None:
     summary = _version_summary(version, ())
 
     assert summary["validation_status"] == "untested"
+    assert summary["validation_reason"] == "corpus_empty"
     assert summary["latest_test_report"] is None
 
 
@@ -555,6 +556,7 @@ async def test_rule_get_marks_version_without_report_untested() -> None:
 
     assert result.status is ToolInvocationStatus.SUCCEEDED
     assert result.output["versions"][0]["validation_status"] == "untested"
+    assert result.output["versions"][0]["validation_reason"] == "corpus_empty"
     assert result.output["versions"][0]["latest_test_report"] is None
 
 

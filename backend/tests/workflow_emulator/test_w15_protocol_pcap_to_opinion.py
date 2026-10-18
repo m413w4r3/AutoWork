@@ -22,6 +22,14 @@ from cti_app.application.analyst_opinion_service import (
     AnalystOpinionService,
     OpinionRevisionEdits,
 )
+from cti_app.application.confined_analysis import (
+    ConfinedAnalysisFamilyStatus,
+    ConfinedAnalysisJobParameters,
+    ConfinedAnalysisRequest,
+    ConfinedAnalysisResult,
+    ConfinedAnalysisWorkerAttestation,
+    deterministic_confined_analysis_key,
+)
 from cti_app.application.edition_composition import EditionCompositionService
 from cti_app.application.edition_rendering import EditionRenderService
 from cti_app.application.edition_typst_rendering import EditionTypstRenderer
@@ -29,6 +37,7 @@ from cti_app.application.evidence_recorder import ProductionEvidenceRecorder
 from cti_app.application.investigation_composition import (
     OptionalInvestigationToolPorts,
 )
+from cti_app.application.jobs import JobExecutionContext
 from cti_app.application.media_assets import MediaAssetStore
 from cti_app.application.network_protocol_model import NetworkProtocolWorkbench
 from cti_app.application.network_workbench import (
@@ -50,9 +59,11 @@ from cti_app.domain.analyst_opinion import (
     OpinionBlockType,
     OpinionClaimQualification,
 )
+from cti_app.domain.blobs import BlobRecord
 from cti_app.domain.investigation import (
     FindingAssessment,
     FindingKind,
+    ToolInvocationStatus,
 )
 from cti_app.domain.network_protocol import (
     EvidenceStatus,
@@ -81,15 +92,15 @@ from cti_app.domain.publication_document import (
     publication_document_from_json,
     serialize_publication_document,
 )
+from cti_app.infrastructure.confined_tshark import ConfinedTsharkAdapter
 from cti_app.infrastructure.d2_diagram_compiler import D2DiagramCompiler
 from cti_app.infrastructure.database.repositories.pdf_inspection import (
     SqlAlchemyPdfInspectionSourceRepository,
 )
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
-from cti_app.infrastructure.local_command_runner import LocalCommandRunner
 from cti_app.infrastructure.pdf_inspection import PdfInspectionCache, PopplerSubprocess
-from cti_app.infrastructure.tshark_adapter import TsharkAdapter
 from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
+from cti_app.workers.analysis_tasks import build_confined_analysis_job_handler
 from tests.integration.test_edition_multibatch_publication_postgres import _compose_three_runs
 from tests.workflow_emulator import invariants
 from tests.workflow_emulator.driver import WorkflowDriver
@@ -127,12 +138,120 @@ class _CaptureQuarantine:
         return QuarantinedCapture(source_reference, content, hashlib.sha256(content).hexdigest())
 
 
-class _TestConfinedLocalCommandRunner(LocalCommandRunner):
-    """Allow only the known local tools to inspect these inert in-memory fixtures."""
+class _AnalysisWorkerBlobCatalog:
+    """Expose the canonical artifact store to the real in-process worker handler."""
+
+    def __init__(self, artifact_store: ProductionArtifactStore, uow_factory: Any) -> None:
+        self._artifact_store = artifact_store
+        self._uow_factory = uow_factory
+
+    async def read(self, blob_id: UUID, *, max_bytes: int) -> bytes:
+        return await self._artifact_store.read_bytes(blob_id, max_bytes=max_bytes)
+
+    async def ingest(self, source: Any, *, logical_bucket: str, mime_type: str) -> BlobRecord:
+        blob_id = await self._artifact_store.put_bytes(
+            source.read(), bucket=logical_bucket, mime_type=mime_type
+        )
+        async with self._uow_factory() as uow:
+            record = await uow.blobs.get(blob_id)
+        if record is None:
+            raise AssertionError("worker result blob was not registered in the canonical store")
+        return cast(BlobRecord, record)
+
+
+class _InProcessAnalysisWorkerPort:
+    """Invoke the registered worker handler in-process with locally installed binaries."""
+
+    def __init__(
+        self,
+        *,
+        artifact_store: ProductionArtifactStore,
+        uow_factory: Any,
+        settings: Any,
+    ) -> None:
+        self._blobs = _AnalysisWorkerBlobCatalog(artifact_store, uow_factory)
+        self._handler = build_confined_analysis_job_handler(
+            blobs=self._blobs, uow_factory=uow_factory, settings=settings
+        )
+        self._settings = settings
+        self._versions = {
+            "tshark": _tool_version("tshark", "--version", "TShark"),
+            "capinfos": _tool_version("capinfos", "-v", "Capinfos"),
+        }
+        self._families = {
+            name: ConfinedAnalysisFamilyStatus(name, True, version)
+            for name, version in self._versions.items()
+        }
+        self._attestation = ConfinedAnalysisWorkerAttestation(
+            reachable=True,
+            confined=True,
+            isolation_profile="test-in-process",
+            versions=self._versions,
+            families=self._families,
+            dependencies_ready=True,
+        )
 
     @property
-    def filesystem_confined(self) -> bool:
+    def available(self) -> bool:
         return True
+
+    @property
+    def available_reason(self) -> str | None:
+        return None
+
+    @property
+    def family_statuses(self) -> Mapping[str, ConfinedAnalysisFamilyStatus]:
+        return self._families
+
+    @property
+    def isolation_profile(self) -> str:
+        return "test-in-process"
+
+    @property
+    def attestation(self) -> ConfinedAnalysisWorkerAttestation:
+        return self._attestation
+
+    async def execute(self, request: ConfinedAnalysisRequest) -> ConfinedAnalysisResult:
+        operation_key = deterministic_confined_analysis_key(request, worker_versions=self._versions)
+        parameters = ConfinedAnalysisJobParameters(
+            investigation_id=request.investigation_id,
+            association_id=request.association_id,
+            sample_id=request.sample_id,
+            artifact_id=request.artifact_id,
+            artifact_sha256=request.sha256,
+            artifact_kind=request.artifact_kind,
+            operation_key=operation_key,
+            tool=request.tool,
+            timeout_seconds=request.timeout_seconds,
+            max_output_bytes=request.max_output_bytes,
+            arguments=request.arguments,
+        )
+        output_reference = await self._handler(parameters, cast(JobExecutionContext, object()))
+        blob_text = output_reference.removeprefix("confined-analysis-result://")
+        result_blob_id_text, result_sha256 = blob_text.split("/", 1)
+        result_blob_id = UUID(result_blob_id_text)
+        output = await self._blobs.read(
+            result_blob_id,
+            max_bytes=self._settings.analysis_worker_result_max_bytes,
+        )
+        assert hashlib.sha256(output).hexdigest() == result_sha256
+        return ConfinedAnalysisResult(
+            status=ToolInvocationStatus.SUCCEEDED,
+            operation_key=operation_key,
+            artifact_id=request.artifact_id,
+            input_sha256=request.sha256,
+            result_blob_id=result_blob_id,
+            result_sha256=result_sha256,
+            payload=json.loads(output),
+        )
+
+
+def _tool_version(binary: str, argument: str, product: str) -> str:
+    result = subprocess.run(
+        (binary, argument), capture_output=True, text=True, check=True, timeout=5
+    )
+    line = next((line for line in result.stdout.splitlines() if product in line), "")
+    return line.rsplit(" ", 1)[-1]
 
 
 def _tcp_frame(
@@ -173,6 +292,44 @@ def _tcp_frame(
     return bytes.fromhex("00112233445566778899aabb0800") + ip_header + tcp_header + payload
 
 
+def _udp_frame(*, source_port: int, destination_port: int, payload: bytes) -> bytes:
+    udp_header = struct.pack("!HHHH", source_port, destination_port, 8 + len(payload), 0)
+    ip_length = 20 + len(udp_header) + len(payload)
+    ip_header = struct.pack(
+        "!BBHHHBBH4s4s",
+        0x45,
+        0,
+        ip_length,
+        2,
+        0,
+        64,
+        17,
+        0,
+        ipaddress.IPv4Address("10.0.0.2").packed,
+        ipaddress.IPv4Address("192.0.2.53").packed,
+    )
+    return bytes.fromhex("00112233445566778899aabb0800") + ip_header + udp_header + payload
+
+
+def _dns_query(name: str) -> bytes:
+    encoded = (
+        b"".join(bytes((len(label),)) + label.encode("ascii") for label in name.split("."))
+        + b"\x00"
+    )
+    return struct.pack("!HHHHHH", 7, 0x0100, 1, 0, 0, 0) + encoded + struct.pack("!HH", 1, 1)
+
+
+def _tls_client_hello(server_name: str) -> bytes:
+    name = server_name.encode("ascii")
+    name_entry = b"\x00" + struct.pack("!H", len(name)) + name
+    server_names = struct.pack("!H", len(name_entry)) + name_entry
+    extension = b"\x00\x00" + struct.pack("!H", len(server_names)) + server_names
+    extensions = struct.pack("!H", len(extension)) + extension
+    hello_body = b"\x03\x03" + bytes(range(32)) + b"\x00\x00\x02\x13\x01\x01\x00" + extensions
+    handshake = b"\x01" + len(hello_body).to_bytes(3, "big") + hello_body
+    return b"\x16\x03\x01" + struct.pack("!H", len(handshake)) + handshake
+
+
 def _pcap(frames: Sequence[bytes]) -> bytes:
     data = bytearray(struct.pack("<IHHIIII", 0xA1B2C3D4, 2, 4, 0, 0, 65_535, 1))
     for index, frame in enumerate(frames):
@@ -195,8 +352,24 @@ def _synthetic_captures() -> tuple[bytes, bytes]:
     training_b = _protocol_messages(0x01, 0x02, b"EFGH")
     holdout = _protocol_messages(0x7F, 0x02, b"IJKL")
     encrypted_tls_record = b"\x17\x03\x03\x00\x04\xde\xad\xbe\xef"
+    dns_query = _dns_query("telemetry.example.test")
+    http_request = (
+        b"GET /beacon HTTP/1.1\r\nHost: c2.example.test\r\nUser-Agent: autowork-synthetic\r\n\r\n"
+    )
     first_capture = _pcap(
         (
+            _udp_frame(source_port=53000, destination_port=53, payload=dns_query),
+            _tcp_frame(
+                source_port=41006,
+                sequence=500,
+                payload=http_request,
+                destination_port=80,
+            ),
+            _tcp_frame(
+                source_port=41005,
+                sequence=450,
+                payload=_tls_client_hello("tls.example.test"),
+            ),
             _tcp_frame(source_port=41001, sequence=100, flags=0x02),
             _tcp_frame(source_port=41001, sequence=101, payload=training_a[:4], flags=0x18),
             _tcp_frame(source_port=41001, sequence=105, payload=training_a[4:], flags=0x18),
@@ -795,11 +968,17 @@ async def test_w15_protocol_pcap_to_opinion_with_real_d2_typst_and_multibatch_pd
             }
         )
         network_limits = NetworkExtractionLimitsV1()
-        tshark = TsharkAdapter(
-            runner=_TestConfinedLocalCommandRunner(
-                max_sample_bytes=network_limits.max_capture_bytes
-            ),
+        settings = investigation_settings(providers=False)
+        analysis_port = _InProcessAnalysisWorkerPort(
+            artifact_store=artifact_store,
+            uow_factory=uow_factory,
+            settings=settings,
+        )
+        tshark = ConfinedTsharkAdapter(
+            analysis_port,
             limits=network_limits,
+            timeout_seconds=settings.analysis_worker_job_timeout_seconds,
+            max_output_bytes=settings.analysis_worker_result_max_bytes,
         )
         invariants.require(
             tshark.available,
@@ -835,7 +1014,6 @@ async def test_w15_protocol_pcap_to_opinion_with_real_d2_typst_and_multibatch_pd
             artifact_store=artifact_store,
             references=(reference_a, reference_b),
         )
-        settings = investigation_settings(providers=False)
         base_factory = composition_factory(
             uow_factory=uow_factory,
             artifact_store=artifact_store,
@@ -846,6 +1024,7 @@ async def test_w15_protocol_pcap_to_opinion_with_real_d2_typst_and_multibatch_pd
             base_factory.optional_tool_ports or OptionalInvestigationToolPorts(),
             network_quarantine=quarantine,
             tshark=tshark,
+            confined_analysis_execution=analysis_port,
         )
         investigation_factory = replace(base_factory, optional_tool_ports=ports)
         app, registry, dispatcher = build_investigation_app(
@@ -926,6 +1105,11 @@ async def test_w15_protocol_pcap_to_opinion_with_real_d2_typst_and_multibatch_pd
                 report_b = reports[reference_b.sha256]
                 assert all(int(item["packet_count"]) >= 4 for item in reports.values())
                 assert all(item["conversations"] for item in reports.values())
+                report_a_text = json.dumps(report_a, ensure_ascii=True).casefold()
+                assert "telemetry.example.test" in report_a_text
+                assert "c2.example.test" in report_a_text
+                assert "/beacon" in report_a_text
+                assert "tls.example.test" in report_a_text
                 first_protocol_names = {
                     str(protocol["protocol"]).casefold() for protocol in report_a["protocols"]
                 }

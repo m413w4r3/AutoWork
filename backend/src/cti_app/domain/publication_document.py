@@ -21,7 +21,10 @@ from cti_app.domain.analyst_opinion import (
     OpinionProtocolFigureV1,
 )
 from cti_app.domain.discovery import SourceRole
+from cti_app.domain.investigation import DetectionCandidateStatus
+from cti_app.domain.investigation_graph import InvestigationGraph
 from cti_app.domain.media_assets import SUPPORTED_MEDIA_MIME_TYPES
+from cti_app.domain.production import ProductionEvidenceBasis
 from cti_app.domain.production_editorial_enrichment import (
     ChartKind,
     DiagramEdgeV1,
@@ -63,6 +66,7 @@ from cti_app.domain.production_references import (
     ProductionSourceCriticality,
     ProductionSourceCriticalityReason,
 )
+from cti_app.domain.production_relevance import RelevanceClassification, RelevanceReasonCode
 from cti_app.domain.production_synthesis import ExtractionEvidenceRefV1
 from cti_app.domain.publication import (
     ArtifactType,
@@ -79,6 +83,7 @@ from cti_app.domain.publication import (
     PublicationUncertaintyV1,
     indicator_source_ids,
 )
+from cti_app.domain.rule_workbench import RuleValidationStatus
 from cti_app.domain.semantic_annotation import (
     SemanticTextV1,
     semantic_text_from_json,
@@ -1235,6 +1240,173 @@ def order_publication_references(
     return tuple(sorted(references, key=order))
 
 
+class PublicationIOCDisposition(StrEnum):
+    RETAINED = "retained"
+    UNCERTAIN = "uncertain"
+    EXCLUDED = "excluded"
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationIOCDetailV1:
+    """One source-verified indicator with an explicit publication decision."""
+
+    artifact_type: ArtifactType
+    value: str
+    normalized_value: str
+    source_role: SourceRole
+    context: str
+    evidence_quote: str
+    evidence_basis: ProductionEvidenceBasis
+    source_document_ids: tuple[UUID, ...]
+    disposition: PublicationIOCDisposition
+    disposition_reason: str
+    relevance_classification: RelevanceClassification | None = None
+    relevance_reason_code: RelevanceReasonCode | None = None
+    first_observed: date | None = None
+    last_observed: date | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.artifact_type, ArtifactType):
+            raise ValueError("Publication IOC artifact type is invalid")
+        if not isinstance(self.source_role, SourceRole):
+            raise ValueError("Publication IOC source role is invalid")
+        if not isinstance(self.evidence_basis, ProductionEvidenceBasis):
+            raise ValueError("Publication IOC evidence basis is invalid")
+        if not isinstance(self.disposition, PublicationIOCDisposition):
+            raise ValueError("Publication IOC disposition is invalid")
+        for field_name in ("value", "normalized_value", "evidence_quote", "disposition_reason"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"Publication IOC {field_name} must be non-empty text")
+        if not isinstance(self.context, str):
+            raise ValueError("Publication IOC context must be text")
+        if not isinstance(self.source_document_ids, tuple) or not self.source_document_ids:
+            raise ValueError("Publication IOC source identities must be a non-empty tuple")
+        if any(not isinstance(item, UUID) for item in self.source_document_ids):
+            raise ValueError("Publication IOC source identities must be UUIDs")
+        source_ids = tuple(sorted(set(self.source_document_ids), key=str))
+        if len(source_ids) != len(self.source_document_ids):
+            raise ValueError("Publication IOC source identities must be unique")
+        object.__setattr__(self, "source_document_ids", source_ids)
+        if (self.relevance_classification is None) != (self.relevance_reason_code is None):
+            raise ValueError("Publication IOC relevance classification and reason must be paired")
+        if self.relevance_classification is not None and not isinstance(
+            self.relevance_classification, RelevanceClassification
+        ):
+            raise ValueError("Publication IOC relevance classification is invalid")
+        if self.relevance_reason_code is not None and not isinstance(
+            self.relevance_reason_code, RelevanceReasonCode
+        ):
+            raise ValueError("Publication IOC relevance reason is invalid")
+        for field_name in ("first_observed", "last_observed"):
+            value = getattr(self, field_name)
+            if value is not None and (not isinstance(value, date) or hasattr(value, "hour")):
+                raise ValueError(f"Publication IOC {field_name} must be a date or None")
+        if (
+            self.first_observed is not None
+            and self.last_observed is not None
+            and self.first_observed > self.last_observed
+        ):
+            raise ValueError("Publication IOC observation dates are reversed")
+
+
+def _publication_ioc_detail_sort_key(
+    item: PublicationIOCDetailV1,
+) -> tuple[str, str, str, tuple[str, ...], str, str]:
+    return (
+        item.artifact_type.value,
+        item.normalized_value.casefold(),
+        item.value,
+        tuple(map(str, item.source_document_ids)),
+        item.context.casefold(),
+        item.evidence_quote,
+    )
+
+
+def _publication_ioc_detail_to_json(item: PublicationIOCDetailV1) -> dict[str, Any]:
+    return {
+        "artifact_type": item.artifact_type.value,
+        "value": item.value,
+        "normalized_value": item.normalized_value,
+        "source_role": item.source_role.value,
+        "context": item.context,
+        "evidence_quote": item.evidence_quote,
+        "evidence_basis": item.evidence_basis.value,
+        "source_document_ids": [str(source_id) for source_id in item.source_document_ids],
+        "disposition": item.disposition.value,
+        "disposition_reason": item.disposition_reason,
+        "relevance_classification": (
+            item.relevance_classification.value
+            if item.relevance_classification is not None
+            else None
+        ),
+        "relevance_reason_code": (
+            item.relevance_reason_code.value if item.relevance_reason_code is not None else None
+        ),
+        "first_observed": item.first_observed.isoformat() if item.first_observed else None,
+        "last_observed": item.last_observed.isoformat() if item.last_observed else None,
+    }
+
+
+def _publication_ioc_detail_from_json(raw: Any) -> PublicationIOCDetailV1:
+    fields = frozenset(
+        {
+            "artifact_type",
+            "value",
+            "normalized_value",
+            "source_role",
+            "context",
+            "evidence_quote",
+            "evidence_basis",
+            "source_document_ids",
+            "disposition",
+            "disposition_reason",
+            "relevance_classification",
+            "relevance_reason_code",
+            "first_observed",
+            "last_observed",
+        }
+    )
+    item = json_object(raw, fields, "Publication IOC detail")
+    classification = item["relevance_classification"]
+    reason_code = item["relevance_reason_code"]
+    return PublicationIOCDetailV1(
+        artifact_type=json_enum(ArtifactType, item["artifact_type"], "Publication IOC type"),
+        value=json_text(item["value"], "Publication IOC value"),
+        normalized_value=json_text(item["normalized_value"], "Publication IOC normalized value"),
+        source_role=json_enum(SourceRole, item["source_role"], "Publication IOC source role"),
+        context=json_text(item["context"], "Publication IOC context"),
+        evidence_quote=json_text(item["evidence_quote"], "Publication IOC evidence quote"),
+        evidence_basis=json_enum(
+            ProductionEvidenceBasis, item["evidence_basis"], "Publication IOC evidence basis"
+        ),
+        source_document_ids=tuple(
+            json_uuid(value, "Publication IOC source identity")
+            for value in json_array(
+                item["source_document_ids"], "Publication IOC source identities"
+            )
+        ),
+        disposition=json_enum(
+            PublicationIOCDisposition, item["disposition"], "Publication IOC disposition"
+        ),
+        disposition_reason=json_text(
+            item["disposition_reason"], "Publication IOC disposition reason"
+        ),
+        relevance_classification=(
+            json_enum(RelevanceClassification, classification, "Publication IOC relevance")
+            if classification is not None
+            else None
+        ),
+        relevance_reason_code=(
+            json_enum(RelevanceReasonCode, reason_code, "Publication IOC relevance reason")
+            if reason_code is not None
+            else None
+        ),
+        first_observed=_date_from_json(item["first_observed"], "Publication IOC first observation"),
+        last_observed=_date_from_json(item["last_observed"], "Publication IOC last observation"),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class PublicationDocumentV5:
     """V4 content plus semantic text, dated source notes and original IOC groups."""
@@ -1243,6 +1415,7 @@ class PublicationDocumentV5:
     semantic_text: SemanticTextV1
     references: tuple[PublicationReferenceEntryV1, ...] = ()
     original_indicators: tuple[PublicationIndicatorGroupV1, ...] = ()
+    ioc_details: tuple[PublicationIOCDetailV1, ...] = ()
 
     @property
     def schema_version(self) -> str:
@@ -1264,6 +1437,10 @@ class PublicationDocumentV5:
             not isinstance(item, PublicationIndicatorGroupV1) for item in self.original_indicators
         ):
             raise ValueError("Original IOC groups have an invalid type")
+        if not isinstance(self.ioc_details, tuple) or any(
+            not isinstance(item, PublicationIOCDetailV1) for item in self.ioc_details
+        ):
+            raise ValueError("Publication IOC details have an invalid type")
         sources_by_id = {source.source_document_id: source for source in self.document.sources}
         if len(sources_by_id) != len(self.document.sources):
             raise ValueError("Publication sources must not repeat source identities")
@@ -1273,6 +1450,11 @@ class PublicationDocumentV5:
         reference_evidence_source_ids = {
             ref.source_document_id for item in self.references for ref in item.evidence_refs
         }
+        ioc_source_ids = {
+            source_id for item in self.ioc_details for source_id in item.source_document_ids
+        }
+        if not ioc_source_ids.issubset(sources_by_id):
+            raise ValueError("Publication IOC detail identifies an unknown source")
         if not reference_evidence_source_ids.issubset(sources_by_id):
             raise ValueError("Publication reference evidence identifies an unknown source")
         for source_id in reference_source_ids:
@@ -1313,6 +1495,7 @@ class PublicationDocumentV5:
             reference_source_ids
             | reference_evidence_source_ids
             | indicator_source_ids(self.original_indicators)
+            | ioc_source_ids
         ):
             raise ValueError(
                 "Publication source identities do not match references, their evidence, "
@@ -1325,6 +1508,11 @@ class PublicationDocumentV5:
             self,
             "original_indicators",
             tuple(sorted(self.original_indicators, key=lambda group: group.artifact_type.value)),
+        )
+        object.__setattr__(
+            self,
+            "ioc_details",
+            tuple(sorted(self.ioc_details, key=_publication_ioc_detail_sort_key)),
         )
         expected = publication_document_text_anchors(self.document, references=references)
         actual = {item.anchor: item.text for item in self.semantic_text.paragraphs}
@@ -1341,6 +1529,10 @@ class PublicationDocumentV5:
         payload["original_indicators"] = [
             _indicator_group_to_json(group) for group in self.original_indicators
         ]
+        if self.ioc_details:
+            payload["ioc_details"] = [
+                _publication_ioc_detail_to_json(item) for item in self.ioc_details
+            ]
         payload["rich_text"] = semantic_text_to_json(self.semantic_text)
         return payload
 
@@ -1366,6 +1558,8 @@ class PublicationDocumentV5:
                 "rich_text",
             }
         )
+        if isinstance(payload, Mapping) and "ioc_details" in payload:
+            root_keys |= {"ioc_details"}
         if isinstance(payload, Mapping) and "charts" in payload:
             root_keys |= {"charts"}
         document = json_object(
@@ -1383,14 +1577,21 @@ class PublicationDocumentV5:
             _indicator_group_from_json(raw, "Original IOC group")
             for raw in json_array(document["original_indicators"], "Original IOC groups")
         )
+        ioc_details = tuple(
+            _publication_ioc_detail_from_json(raw)
+            for raw in json_array(document.get("ioc_details", []), "Publication IOC details")
+        )
         additional_source_ids = {item.source_document_id for item in references}
         additional_source_ids.update(
             ref.source_document_id for item in references for ref in item.evidence_refs
         )
         additional_source_ids |= indicator_source_ids(original_indicators)
+        additional_source_ids.update(
+            source_id for item in ioc_details for source_id in item.source_document_ids
+        )
         base_payload = dict(document)
-        for key in ("references", "original_indicators", "rich_text"):
-            del base_payload[key]
+        for key in ("references", "original_indicators", "rich_text", "ioc_details"):
+            base_payload.pop(key, None)
         base_payload["schema_version"] = PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION
         base = PublicationDocumentV4._from_json(
             base_payload,
@@ -1402,6 +1603,7 @@ class PublicationDocumentV5:
             semantic_text=semantic_text_from_json(document["rich_text"]),
             references=references,
             original_indicators=original_indicators,
+            ioc_details=ioc_details,
         )
 
 
@@ -1410,6 +1612,7 @@ class PublicationDocumentV6ErrorCode(StrEnum):
     OPINION_INVALID = "publication_v6_opinion_invalid"
     OPINION_NOT_APPROVED = "publication_v6_opinion_not_approved"
     OPINION_EMPTY = "publication_v6_opinion_empty"
+    DETECTION_INVALID = "publication_v6_detection_invalid"
 
 
 class PublicationDocumentV6ValidationError(ValueError):
@@ -1554,6 +1757,252 @@ class PublicationAnalystOpinionSectionV1:
             )
 
 
+class PublicationDetectionStatus(StrEnum):
+    VALIDATED = "validated"
+    CANDIDATE = "candidate"
+    UNTESTED = "untested"
+
+
+class PublicationDetectionReason(StrEnum):
+    VALIDATED = "real_positives_and_goodware_tested"
+    CORPUS_EMPTY = "corpus_empty"
+    POSITIVES_MISSING = "real_positive_samples_missing"
+    GOODWARE_MISSING = "goodware_corpus_empty"
+    SAMPLE_BYTES_MISSING = "sample_bytes_missing_or_unverified"
+    SYNTHETIC_POSITIVES = "positive_samples_are_synthetic"
+    FALSE_NEGATIVES = "real_positive_samples_not_matched"
+    FALSE_POSITIVES = "goodware_false_positive_observed"
+    EXECUTION_INCOMPLETE = "analysis_incomplete"
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationDetectionV1:
+    """Canonical YARA rule and test snapshot pinned into one V6 publication."""
+
+    candidate_id: UUID
+    version_id: UUID
+    version: int
+    source: str
+    source_sha256: str
+    candidate_status: DetectionCandidateStatus
+    rule_validation_status: RuleValidationStatus
+    validation_status: PublicationDetectionStatus
+    validation_reason: PublicationDetectionReason
+    positive_real_count: int
+    positive_synthetic_count: int
+    goodware_tested_count: int
+    false_positive_count: int
+    engine_version: str | None
+    coverage_statement: str | None
+    limitations: tuple[str, ...]
+    created_at: datetime
+    tested_at: datetime | None
+    test_report_observation_id: UUID | None
+    test_report_sha256: str | None
+    retrohunt_submitted: bool | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.candidate_id, UUID) or not isinstance(self.version_id, UUID):
+            raise TypeError("Published detection identities must be UUIDs")
+        if isinstance(self.version, bool) or not isinstance(self.version, int) or self.version < 1:
+            raise ValueError("Published detection version must be positive")
+        validate_text(self.source, "Published YARA source")
+        if not self.source.strip():
+            raise ValueError("Published YARA source must not be empty")
+        validate_sha256(self.source_sha256, "Published YARA source SHA-256")
+        if hashlib.sha256(self.source.encode("utf-8")).hexdigest() != self.source_sha256:
+            raise ValueError("Published YARA source SHA-256 does not match source")
+        if not isinstance(self.candidate_status, DetectionCandidateStatus):
+            raise TypeError(
+                "Published detection candidate status must use DetectionCandidateStatus"
+            )
+        if not isinstance(self.rule_validation_status, RuleValidationStatus):
+            raise TypeError("Published rule validation status must use RuleValidationStatus")
+        if not isinstance(self.validation_status, PublicationDetectionStatus):
+            raise TypeError("Published detection status must use PublicationDetectionStatus")
+        if not isinstance(self.validation_reason, PublicationDetectionReason):
+            raise TypeError("Published detection reason must use PublicationDetectionReason")
+        for name in (
+            "positive_real_count",
+            "positive_synthetic_count",
+            "goodware_tested_count",
+            "false_positive_count",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if self.engine_version is not None:
+            validate_text(self.engine_version, "YARA engine version")
+        if self.coverage_statement is not None:
+            validate_text(self.coverage_statement, "YARA coverage statement")
+        object.__setattr__(self, "limitations", tuple(self.limitations))
+        if any(not isinstance(item, str) for item in self.limitations):
+            raise TypeError("Published detection limitations must be strings")
+        _aware_publication_datetime(self.created_at, "Published rule creation date")
+        if self.tested_at is not None:
+            _aware_publication_datetime(self.tested_at, "Published rule test date")
+        if (self.test_report_observation_id is None) != (self.test_report_sha256 is None):
+            raise ValueError("Published test report identity and hash must be supplied together")
+        if self.test_report_sha256 is not None:
+            validate_sha256(self.test_report_sha256, "Published test report SHA-256")
+        if self.retrohunt_submitted is not None and not isinstance(self.retrohunt_submitted, bool):
+            raise TypeError("Published Retrohunt state must be true, false, or unknown")
+
+    @property
+    def validation_status_is_coherent(self) -> bool:
+        expected_status = {
+            RuleValidationStatus.REAL_VALIDATED: PublicationDetectionStatus.VALIDATED,
+            RuleValidationStatus.UNTESTED: PublicationDetectionStatus.UNTESTED,
+            RuleValidationStatus.SYNTHETIC_ONLY: PublicationDetectionStatus.CANDIDATE,
+            RuleValidationStatus.REAL_PARTIAL: PublicationDetectionStatus.CANDIDATE,
+        }[self.rule_validation_status]
+        if self.validation_status is not expected_status:
+            return False
+        if self.rule_validation_status is RuleValidationStatus.REAL_VALIDATED:
+            return (
+                self.validation_reason is PublicationDetectionReason.VALIDATED
+                and self.positive_real_count > 0
+                and self.goodware_tested_count > 0
+                and self.false_positive_count == 0
+            )
+        return self.validation_reason is not PublicationDetectionReason.VALIDATED
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "schema": "publication-detection.v1",
+            "candidate_id": str(self.candidate_id),
+            "version_id": str(self.version_id),
+            "version": self.version,
+            "source": self.source,
+            "source_sha256": self.source_sha256,
+            "candidate_status": self.candidate_status.value,
+            "rule_validation_status": self.rule_validation_status.value,
+            "validation_status": self.validation_status.value,
+            "validation_reason": self.validation_reason.value,
+            "positive_real_count": self.positive_real_count,
+            "positive_synthetic_count": self.positive_synthetic_count,
+            "goodware_tested_count": self.goodware_tested_count,
+            "false_positive_count": self.false_positive_count,
+            "engine_version": self.engine_version,
+            "coverage_statement": self.coverage_statement,
+            "limitations": list(self.limitations),
+            "created_at": self.created_at.isoformat(),
+            "tested_at": self.tested_at.isoformat() if self.tested_at is not None else None,
+            "test_report_observation_id": (
+                str(self.test_report_observation_id)
+                if self.test_report_observation_id is not None
+                else None
+            ),
+            "test_report_sha256": self.test_report_sha256,
+            "retrohunt_submitted": self.retrohunt_submitted,
+        }
+
+    @classmethod
+    def from_payload(cls, raw: Any) -> PublicationDetectionV1:
+        fields = frozenset(
+            {
+                "schema",
+                "candidate_id",
+                "version_id",
+                "version",
+                "source",
+                "source_sha256",
+                "candidate_status",
+                "rule_validation_status",
+                "validation_status",
+                "validation_reason",
+                "positive_real_count",
+                "positive_synthetic_count",
+                "goodware_tested_count",
+                "false_positive_count",
+                "engine_version",
+                "coverage_statement",
+                "limitations",
+                "created_at",
+                "tested_at",
+                "test_report_observation_id",
+                "test_report_sha256",
+                "retrohunt_submitted",
+            }
+        )
+        item = json_object(raw, fields, "Publication detection")
+        if item["schema"] != "publication-detection.v1":
+            raise ValueError("Publication detection schema is unsupported")
+        raw_observation_id = item["test_report_observation_id"]
+        raw_tested_at = item["tested_at"]
+        return cls(
+            candidate_id=json_uuid(item["candidate_id"], "Detection candidate ID"),
+            version_id=json_uuid(item["version_id"], "Detection version ID"),
+            version=json_int(item["version"], "Detection version"),
+            source=json_text(item["source"], "YARA source"),
+            source_sha256=json_sha256(item["source_sha256"], "YARA source SHA-256"),
+            candidate_status=json_enum(
+                DetectionCandidateStatus, item["candidate_status"], "Detection candidate status"
+            ),
+            rule_validation_status=json_enum(
+                RuleValidationStatus, item["rule_validation_status"], "Rule validation status"
+            ),
+            validation_status=json_enum(
+                PublicationDetectionStatus, item["validation_status"], "Published detection status"
+            ),
+            validation_reason=json_enum(
+                PublicationDetectionReason, item["validation_reason"], "Published detection reason"
+            ),
+            positive_real_count=json_int(item["positive_real_count"], "Real positive count"),
+            positive_synthetic_count=json_int(
+                item["positive_synthetic_count"], "Synthetic positive count"
+            ),
+            goodware_tested_count=json_int(item["goodware_tested_count"], "Goodware test count"),
+            false_positive_count=json_int(item["false_positive_count"], "False positive count"),
+            engine_version=(
+                json_text(item["engine_version"], "YARA engine version")
+                if item["engine_version"] is not None
+                else None
+            ),
+            coverage_statement=(
+                json_text(item["coverage_statement"], "YARA coverage statement")
+                if item["coverage_statement"] is not None
+                else None
+            ),
+            limitations=tuple(
+                json_text(value, "YARA limitation")
+                for value in json_array(item["limitations"], "YARA limitations")
+            ),
+            created_at=_publication_datetime_from_json(item["created_at"], "YARA creation date"),
+            tested_at=(
+                _publication_datetime_from_json(raw_tested_at, "YARA test date")
+                if raw_tested_at is not None
+                else None
+            ),
+            test_report_observation_id=(
+                json_uuid(raw_observation_id, "YARA test report observation ID")
+                if raw_observation_id is not None
+                else None
+            ),
+            test_report_sha256=(
+                json_sha256(item["test_report_sha256"], "YARA test report SHA-256")
+                if item["test_report_sha256"] is not None
+                else None
+            ),
+            retrohunt_submitted=item["retrohunt_submitted"],
+        )
+
+
+def _aware_publication_datetime(value: datetime, label: str) -> None:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{label} must be timezone-aware")
+
+
+def _publication_datetime_from_json(value: Any, label: str) -> datetime:
+    text = json_text(value, label)
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError(f"{label} must be ISO-8601") from exc
+    _aware_publication_datetime(parsed, label)
+    return parsed
+
+
 @dataclass(frozen=True, slots=True)
 class PublicationDocumentV6:
     """Additive opinion wrapper around an immutable, exact V5 publication."""
@@ -1562,6 +2011,8 @@ class PublicationDocumentV6:
     provenance: PublicationDocumentV6ProvenanceV1
     analyst_opinion: AnalystOpinionV1 | None = None
     rendered_opinion: PublicationAnalystOpinionSectionV1 | None = None
+    infrastructure_graph: InvestigationGraph | None = None
+    detection: PublicationDetectionV1 | None = None
 
     @property
     def schema_version(self) -> str:
@@ -1582,17 +2033,31 @@ class PublicationDocumentV6:
 
         opinion = self.analyst_opinion
         section = self.rendered_opinion
+        graph = self.infrastructure_graph
+        detection = self.detection
+        if detection is not None and not isinstance(detection, PublicationDetectionV1):
+            raise PublicationDocumentV6ValidationError(
+                PublicationDocumentV6ErrorCode.DETECTION_INVALID
+            )
+        if graph is not None and not isinstance(graph, InvestigationGraph):
+            raise PublicationDocumentV6ValidationError(
+                PublicationDocumentV6ErrorCode.OPINION_INVALID
+            )
         provenance = self.provenance
         if opinion is None:
-            if section is not None or any(
-                value is not None
-                for value in (
-                    provenance.investigation_id,
-                    provenance.opinion_id,
-                    provenance.opinion_version,
-                    provenance.opinion_content_sha256,
-                    provenance.reviewer_id,
-                    provenance.approver_id,
+            if (
+                graph is not None
+                or section is not None
+                or any(
+                    value is not None
+                    for value in (
+                        provenance.investigation_id,
+                        provenance.opinion_id,
+                        provenance.opinion_version,
+                        provenance.opinion_content_sha256,
+                        provenance.reviewer_id,
+                        provenance.approver_id,
+                    )
                 )
             ):
                 raise PublicationDocumentV6ValidationError(
@@ -1643,6 +2108,13 @@ class PublicationDocumentV6:
                 else PublicationDocumentV6ErrorCode.OPINION_INVALID
             )
             raise PublicationDocumentV6ValidationError(code)
+        if graph is not None and (
+            graph.investigation_id != opinion.investigation_id
+            or graph.publication_sha256 != provenance.base_publication_sha256
+        ):
+            raise PublicationDocumentV6ValidationError(
+                PublicationDocumentV6ErrorCode.OPINION_INVALID
+            )
 
         expected_blocks = tuple(
             sorted(
@@ -1671,7 +2143,7 @@ class PublicationDocumentV6:
             )
 
     def _to_json(self) -> dict[str, Any]:
-        return {
+        payload = {
             "schema_version": self.schema_version,
             "base_publication": publication_document_v5_to_json(self.base_publication),
             "provenance": _publication_v6_provenance_to_json(self.provenance),
@@ -1684,20 +2156,28 @@ class PublicationDocumentV6:
                 else None
             ),
         }
+        if self.infrastructure_graph is not None:
+            payload["infrastructure_graph"] = self.infrastructure_graph.to_payload()
+        if self.detection is not None:
+            payload["detection"] = self.detection.to_payload()
+        return payload
 
     @classmethod
     def _from_json(cls, payload: Mapping[str, Any]) -> PublicationDocumentV6:
+        fields = {
+            "schema_version",
+            "base_publication",
+            "provenance",
+            "analyst_opinion",
+            "rendered_opinion",
+        }
+        if "infrastructure_graph" in payload:
+            fields.add("infrastructure_graph")
+        if "detection" in payload:
+            fields.add("detection")
         document = json_object(
             payload,
-            frozenset(
-                {
-                    "schema_version",
-                    "base_publication",
-                    "provenance",
-                    "analyst_opinion",
-                    "rendered_opinion",
-                }
-            ),
+            frozenset(fields),
             "PublicationDocumentV6",
         )
         if document["schema_version"] != PUBLICATION_DOCUMENT_V6_SCHEMA_VERSION:
@@ -1719,6 +2199,12 @@ class PublicationDocumentV6:
             else None,
             rendered_opinion=_rendered_opinion_from_json(raw_rendered)
             if raw_rendered is not None
+            else None,
+            infrastructure_graph=InvestigationGraph.from_payload(document["infrastructure_graph"])
+            if document.get("infrastructure_graph") is not None
+            else None,
+            detection=PublicationDetectionV1.from_payload(document["detection"])
+            if document.get("detection") is not None
             else None,
         )
 

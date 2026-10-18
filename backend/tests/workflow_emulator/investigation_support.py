@@ -26,7 +26,6 @@ from cti_app.application.investigation_jobs import make_investigation_runner
 from cti_app.application.jobs import JobExecutor, SynchronousJobDispatcher, create_job_registry
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.sample_acquisition import VirusTotalSampleAcquisitionService
-from cti_app.application.static_analysis import StaticAnalysisService
 from cti_app.application.virustotal import VirusTotalCapabilities
 from cti_app.application.virustotal_persistence import VirusTotalObservationService
 from cti_app.config import Settings
@@ -82,6 +81,10 @@ from cti_app.domain.semantic_annotation import (
     SemanticRole,
     SemanticTextSpanV1,
     SemanticTextV1,
+)
+from tests.confined_worker_harness import (
+    ConfinedRuleCorpusBytes,
+    build_confined_worker_harness,
 )
 from tests.integration.edition_codes import reserve_edition_code
 from tests.shodan_support import FakeShodanPort
@@ -723,6 +726,33 @@ def composition_factory(
     additional_ports: OptionalInvestigationToolPorts | None = None,
 ) -> InvestigationCompositionFactory:
     ports = OptionalInvestigationToolPorts()
+    needs_confined_worker = (
+        include_local_analysis
+        or settings.local_analysis_enabled
+        or settings.rule_workbench_enabled
+        or rule_corpus_bytes is not None
+        or yara_engine is not None
+    )
+    if needs_confined_worker:
+        required_families: list[str] = []
+        if include_local_analysis or settings.local_analysis_enabled:
+            required_families.append("sample_analysis")
+        if (
+            settings.rule_workbench_enabled
+            or rule_corpus_bytes is not None
+            or yara_engine is not None
+        ):
+            required_families.append("yara")
+        worker = build_confined_worker_harness(
+            settings=settings,
+            uow_factory=uow_factory,
+            artifact_store=artifact_store,
+            required_families=tuple(required_families),
+        )
+        settings = worker.settings
+        ports = replace(ports, confined_analysis_execution=worker.port)
+        if rule_corpus_bytes is not None:
+            rule_corpus_bytes = ConfinedRuleCorpusBytes(rule_corpus_bytes, artifact_store)
     if virustotal is not None:
         blob_catalog = artifact_store._catalog
         vt_capabilities = VirusTotalCapabilities(
@@ -753,21 +783,12 @@ def composition_factory(
             shodan_capabilities=ShodanCapabilities(host=True),
             shodan_budget_estimate=ShodanBudgetEstimate(host=1),
         )
-    if include_local_analysis:
-        ports = replace(
-            ports,
-            sample_static_analysis=StaticAnalysisService(
-                artifact_store._catalog,
-                uow_factory,
-                max_sample_bytes=1024 * 1024,
-                string_min_length=4,
-            ),
-        )
     if rule_corpus_bytes is not None or yara_engine is not None:
         ports = replace(
             ports,
             rule_corpus_bytes=rule_corpus_bytes,
-            yara_engine=yara_engine,
+            # Runtime rule execution is intentionally delegated to the worker port.
+            yara_engine=None,
         )
     if additional_ports is not None:
         overrides = {

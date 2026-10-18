@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
-import logging
 import re
 import unicodedata
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
-from typing import TypedDict, cast
+from typing import TypedDict
 from urllib.parse import urlsplit
 
 import httpx
@@ -21,8 +21,7 @@ from cti_app.application.local_analysis import (
 )
 from cti_app.config import Settings
 from cti_app.domain.local_analysis import GhidraObservation, GhidraOperation
-
-logger = logging.getLogger(__name__)
+from cti_app.ghidra_service.contract import CONTRACT_VERSION
 
 _SHA256 = re.compile(r"^[a-f0-9]{64}$")
 _ADDRESS = re.compile(r"^(?:0x)?[0-9a-fA-F]{1,16}$")
@@ -55,36 +54,52 @@ _FORBIDDEN_FIELDS = frozenset(
         "private_key",
     }
 )
+_OPERATION_NAMES = {
+    GhidraOperation.FUNCTIONS: "list_functions",
+    GhidraOperation.IMPORTS: "list_imports",
+    GhidraOperation.XREF_TO: "xrefs_to",
+    GhidraOperation.XREF_FROM: "xrefs_from",
+    GhidraOperation.DECOMPILE_FUNCTION: "decompile_function",
+    GhidraOperation.SEARCH: "search",
+}
 _MAX_COLLECTION_ITEMS = 100
-_MAX_STRING_CHARS = 4096
+_MAX_STRING_CHARS = 16_384
 _MAX_NORMALIZED_RESPONSE_BYTES = 64 * 1024
+_SampleBytesLoader = Callable[[str], Awaitable[bytes]]
 
 
 class GhidraMcpHttpAdapter:
-    """Local, read-only HTTP boundary for a deployment-specific GhidraMCP bridge."""
+    """HTTP client for the fixed, read-only AutoWork Ghidra headless service."""
 
     def __init__(
         self,
         *,
-        base_url: str = "http://127.0.0.1:8787",
-        endpoint_paths: Mapping[GhidraOperation, str] | None = None,
+        base_url: str = "http://ghidra:8787",
         enabled: bool = False,
-        allowed_hosts: tuple[str, ...] = (),
-        expected_version: str | None = None,
-        expected_plugin_version: str | None = None,
+        expected_version: str = "12.1.4",
+        expected_java_version: str = "21.0.12.1",
         connect_timeout_seconds: float = 3.0,
-        read_timeout_seconds: float = 60.0,
+        read_timeout_seconds: float = 150.0,
+        max_sample_bytes: int = 200 * 1024 * 1024,
         max_response_bytes: int = 2 * 1024 * 1024,
         max_observation_bytes: int = _MAX_NORMALIZED_RESPONSE_BYTES,
+        sample_bytes_loader: _SampleBytesLoader | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
-        self._base_url = _validate_base_url(base_url, allowed_hosts)
-        self._paths = _validate_endpoint_paths(endpoint_paths or {})
+        self._base_url = _validate_base_url(base_url)
+        if not expected_version.strip() or not expected_java_version.strip():
+            raise ValueError("Ghidra and Java versions must be pinned")
         self._enabled = enabled
         self._expected_version = expected_version
-        self._expected_plugin_version = expected_plugin_version
+        self._expected_java_version = expected_java_version
+        self._max_sample_bytes = _positive(max_sample_bytes, "max_sample_bytes")
         self._max_response_bytes = _positive(max_response_bytes, "max_response_bytes")
         self._max_observation_bytes = _positive(max_observation_bytes, "max_observation_bytes")
+        self._sample_bytes_loader = sample_bytes_loader
+        self._attested = False
+        self._attestation_reason: str | None = None
+        self._ghidra_version: str | None = None
+        self._java_version: str | None = None
         self._client = httpx.AsyncClient(
             transport=transport,
             timeout=httpx.Timeout(
@@ -96,9 +111,78 @@ class GhidraMcpHttpAdapter:
             trust_env=False,
             follow_redirects=False,
         )
+        self._probe_timeout_seconds = connect_timeout_seconds + 2.0
+
+    @property
+    def available(self) -> bool:
+        return self._enabled and self._attested and self._sample_bytes_loader is not None
+
+    @property
+    def available_reason(self) -> str | None:
+        if not self._enabled:
+            return "ghidra_disabled_by_configuration"
+        if self._sample_bytes_loader is None:
+            return "ghidra_canonical_sample_reader_not_configured"
+        if not self._attested:
+            return self._attestation_reason or "ghidra_not_attested"
+        return None
+
+    def set_sample_bytes_loader(self, loader: _SampleBytesLoader) -> None:
+        self._sample_bytes_loader = loader
 
     async def aclose(self) -> None:
         await self._client.aclose()
+
+    async def probe(self) -> bool:
+        """Attest the exact service, Ghidra, Java and contract versions once at startup."""
+        self._attested = False
+        self._attestation_reason = None
+        if not self._enabled:
+            self._attestation_reason = "ghidra_disabled_by_configuration"
+            return False
+        try:
+            body, status = await self._request_bounded(
+                "GET",
+                "/v1/probe",
+                request_timeout=self._probe_timeout_seconds,
+                max_body_bytes=4096,
+            )
+        except GhidraUnavailableError:
+            self._attestation_reason = "ghidra_attestation_invalid"
+            return False
+        except (httpx.HTTPError, TimeoutError, GhidraResponseTooLargeError):
+            self._attestation_reason = "ghidra_service_unreachable"
+            return False
+        try:
+            payload = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self._attestation_reason = "ghidra_attestation_invalid"
+            return False
+        if (
+            not isinstance(payload, dict)
+            or not isinstance(payload.get("contract_version"), str)
+            or not isinstance(payload.get("ghidra_version"), str)
+            or not isinstance(payload.get("java_version"), str)
+            or payload.get("status") not in {"ok", "unavailable"}
+        ):
+            self._attestation_reason = "ghidra_attestation_invalid"
+            return False
+        ghidra_version = _metadata(payload.get("ghidra_version"))
+        java_version = _metadata(payload.get("java_version"))
+        contract_version = payload.get("contract_version")
+        self._ghidra_version = ghidra_version
+        self._java_version = java_version
+        if contract_version != CONTRACT_VERSION:
+            self._attestation_reason = "ghidra_contract_version_mismatch"
+            return False
+        if ghidra_version != self._expected_version or java_version != self._expected_java_version:
+            self._attestation_reason = "ghidra_attestation_version_mismatch"
+            return False
+        if status != 200 or payload.get("status") != "ok":
+            self._attestation_reason = "ghidra_attestation_unavailable"
+            return False
+        self._attested = True
+        return True
 
     async def analyze(
         self,
@@ -113,16 +197,16 @@ class GhidraMcpHttpAdapter:
             normalized_operation = GhidraOperation(operation)
         except (TypeError, ValueError):
             raise GhidraPolicyDeniedError(
-                "Seules les opérations de lecture enregistrées sont autorisées."
+                "Only the fixed Ghidra read catalog is allowed."
             ) from None
         if not self._enabled:
-            raise GhidraUnavailableError("La capacité Ghidra est désactivée localement.")
-        if not _SHA256.fullmatch(sample_sha256):
-            raise GhidraPolicyDeniedError("Un SHA-256 valide est requis.")
-        path = self._paths.get(normalized_operation)
-        if path is None:
-            raise GhidraUnavailableError("Le chemin de cette capacité Ghidra n'est pas configuré.")
-        parameters: dict[str, str | int] = {"sample_sha256": sample_sha256}
+            raise GhidraUnavailableError("ghidra_disabled_by_configuration")
+        if not self._attested:
+            raise GhidraUnavailableError(self.available_reason or "ghidra_not_attested")
+        if self._sample_bytes_loader is None:
+            raise GhidraUnavailableError("ghidra_canonical_sample_reader_not_configured")
+        if not isinstance(sample_sha256, str) or not _SHA256.fullmatch(sample_sha256):
+            raise GhidraPolicyDeniedError("A lowercase SHA-256 is required.")
         normalized_address: str | None = None
         if normalized_operation in {
             GhidraOperation.XREF_TO,
@@ -130,58 +214,93 @@ class GhidraMcpHttpAdapter:
             GhidraOperation.DECOMPILE_FUNCTION,
         }:
             normalized_address = _normalize_address(address)
-            parameters["address"] = normalized_address
         elif address is not None:
-            raise GhidraPolicyDeniedError("Cette opération n'accepte pas d'adresse.")
+            raise GhidraPolicyDeniedError("This operation does not accept an address.")
+        normalized_query: str | None = None
         if normalized_operation is GhidraOperation.SEARCH:
             normalized_query = _normalize_query(query)
-            parameters["query"] = normalized_query
         elif query is not None:
-            raise GhidraPolicyDeniedError("Cette opération n'accepte pas de recherche libre.")
-        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
-            raise GhidraPolicyDeniedError("La limite de résultats est hors bornes.")
-        parameters["limit"] = limit
+            raise GhidraPolicyDeniedError("This operation does not accept a search query.")
+        max_limit = 1 if normalized_operation is GhidraOperation.DECOMPILE_FUNCTION else 100
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= max_limit:
+            raise GhidraPolicyDeniedError("The result limit is outside the fixed bounds.")
 
         try:
-            response_body, status_code = await self._get_bounded(path, parameters)
+            sample_bytes = await self._sample_bytes_loader(sample_sha256)
+        except Exception:
+            raise GhidraUnavailableError("canonical_sample_bytes_unavailable") from None
+        if not isinstance(sample_bytes, bytes) or not sample_bytes:
+            raise GhidraUnavailableError("canonical_sample_bytes_unavailable")
+        if len(sample_bytes) > self._max_sample_bytes:
+            raise GhidraPolicyDeniedError("canonical_sample_bytes_exceed_limit")
+        if hashlib.sha256(sample_bytes).hexdigest() != sample_sha256:
+            raise GhidraResponseError("canonical_sample_bytes_hash_mismatch")
+
+        operation_name = _OPERATION_NAMES[normalized_operation]
+        parameters: dict[str, str | int] = {"operation": operation_name}
+        if normalized_address is not None:
+            parameters["address"] = normalized_address
+        if normalized_query is not None:
+            parameters["query"] = normalized_query
+        parameters["limit"] = limit
+        try:
+            body, status = await self._request_bounded(
+                "POST",
+                "/v1/analyze",
+                params=parameters,
+                headers={
+                    "X-Ghidra-Contract": CONTRACT_VERSION,
+                    "X-Ghidra-SHA256": sample_sha256,
+                    "Content-Type": "application/octet-stream",
+                },
+                content=sample_bytes,
+            )
         except GhidraUnavailableError:
             raise
         except httpx.TimeoutException:
-            raise GhidraUnavailableError("L'endpoint Ghidra local a expiré.") from None
+            raise GhidraUnavailableError("ghidra_service_timeout") from None
         except httpx.HTTPError:
-            raise GhidraUnavailableError("L'endpoint Ghidra local est indisponible.") from None
-        if status_code < 200 or status_code >= 300:
-            raise GhidraUnavailableError("L'endpoint Ghidra local a refusé la lecture.")
+            raise GhidraUnavailableError("ghidra_service_unreachable") from None
+        if status == 422:
+            raise GhidraResponseError("ghidra_service_rejected_canonical_sha256")
+        if status == 413:
+            raise GhidraPolicyDeniedError("ghidra_service_sample_limit_exceeded")
+        if status < 200 or status >= 300:
+            raise GhidraUnavailableError("ghidra_service_refused_analysis")
         try:
-            payload = json.loads(response_body)
+            payload = json.loads(body)
         except (json.JSONDecodeError, UnicodeDecodeError):
-            raise GhidraResponseError("La réponse Ghidra n'est pas un objet JSON valide.") from None
+            raise GhidraResponseError("ghidra_service_response_invalid_json") from None
         if not isinstance(payload, dict):
-            raise GhidraResponseError("La réponse Ghidra doit être un objet JSON.")
-
-        ghidra_version = _version_value(
-            payload, ("ghidra_version", "ghidraVersion"), self._expected_version
+            raise GhidraResponseError("ghidra_service_response_not_object")
+        ghidra_version = _metadata(payload.get("ghidra_version"))
+        java_version = _metadata(payload.get("java_version"))
+        _check_attested_versions(
+            ghidra_version,
+            java_version,
+            self._expected_version,
+            self._expected_java_version,
         )
-        plugin_version = _version_value(
-            payload, ("plugin_version", "pluginVersion"), self._expected_plugin_version
-        )
-        _check_expected_version("Ghidra", ghidra_version, self._expected_version)
-        _check_expected_version("plugin", plugin_version, self._expected_plugin_version)
-        observation_data = payload.get("data", payload.get("result", payload))
-        normalized_data, truncated = _normalize_payload(
-            observation_data, self._max_observation_bytes
-        )
-        if not isinstance(normalized_data, dict):
-            normalized_data = {"result": normalized_data}
+        if (
+            payload.get("schema_version") != "ghidra-service-result.v1"
+            or payload.get("contract_version") != CONTRACT_VERSION
+            or payload.get("operation") != operation_name
+            or payload.get("sample_sha256") != sample_sha256
+        ):
+            raise GhidraResponseError("ghidra_service_response_identity_mismatch")
+        data, truncated = _normalize_payload(payload.get("data"), self._max_observation_bytes)
+        if not isinstance(data, dict):
+            data = {"result": data}
         return GhidraObservation(
             operation=normalized_operation,
             sample_sha256=sample_sha256,
             ghidra_version=ghidra_version,
-            plugin_version=plugin_version,
+            # Compatibility field: this is the AutoWork service contract, not a GUI plugin.
+            plugin_version=CONTRACT_VERSION,
             address=normalized_address,
             observed_at=datetime.now(UTC),
-            data=cast(dict[str, object], normalized_data),
-            truncated=truncated,
+            data=data,
+            truncated=bool(payload.get("truncated", False)) or truncated,
         )
 
     async def list_functions(self, sample_sha256: str, *, limit: int = 100) -> GhidraObservation:
@@ -214,152 +333,113 @@ class GhidraMcpHttpAdapter:
     ) -> GhidraObservation:
         return await self.analyze(GhidraOperation.SEARCH, sample_sha256, query=query, limit=limit)
 
-    async def _get_bounded(self, path: str, params: Mapping[str, str | int]) -> tuple[bytes, int]:
+    async def _request_bounded(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Mapping[str, str | int] | None = None,
+        headers: Mapping[str, str] | None = None,
+        content: bytes | None = None,
+        request_timeout: float | None = None,
+        max_body_bytes: int | None = None,
+    ) -> tuple[bytes, int]:
         url = f"{self._base_url}{path}"
-        try:
-            async with self._client.stream(
-                "GET", url, params=params, follow_redirects=False
-            ) as response:
-                status = response.status_code
-                if 300 <= status < 400:
-                    raise GhidraUnavailableError("Une redirection Ghidra a été refusée.")
-                if status < 200 or status >= 300:
-                    return b"", status
-                body = bytearray()
-                async for chunk in response.aiter_bytes():
-                    remaining = self._max_response_bytes - len(body)
-                    if len(chunk) > remaining:
-                        raise GhidraResponseTooLargeError(
-                            "La réponse Ghidra dépasse la taille maximale autorisée."
-                        )
-                    body.extend(chunk)
-                return bytes(body), status
-        except (GhidraUnavailableError, GhidraResponseTooLargeError):
-            raise
+        async with self._client.stream(
+            method,
+            url,
+            params=params,
+            headers=headers,
+            content=content,
+            follow_redirects=False,
+            timeout=request_timeout,
+        ) as response:
+            status = response.status_code
+            if 300 <= status < 400:
+                raise GhidraUnavailableError("Ghidra service redirects are refused.")
+            body = bytearray()
+            response_limit = self._max_response_bytes if max_body_bytes is None else max_body_bytes
+            async for chunk in response.aiter_bytes():
+                if len(chunk) > response_limit - len(body):
+                    raise GhidraResponseTooLargeError("Ghidra service response exceeds its limit.")
+                body.extend(chunk)
+            return bytes(body), status
 
 
 def create_ghidra_mcp_http_adapter(
     settings: Settings,
     *,
     transport: httpx.AsyncBaseTransport | None = None,
+    sample_bytes_loader: _SampleBytesLoader | None = None,
 ) -> GhidraMcpHttpAdapter:
-    """Bind Settings without assuming any unverified GhidraMCP endpoint paths."""
-    paths = {
-        GhidraOperation.FUNCTIONS: settings.ghidra_functions_path,
-        GhidraOperation.IMPORTS: settings.ghidra_imports_path,
-        GhidraOperation.XREF_TO: settings.ghidra_xrefs_to_path,
-        GhidraOperation.XREF_FROM: settings.ghidra_xrefs_from_path,
-        GhidraOperation.DECOMPILE_FUNCTION: settings.ghidra_decompile_function_path,
-        GhidraOperation.SEARCH: settings.ghidra_search_path,
-    }
-    allowed_hosts = tuple(
-        host.strip().lower() for host in settings.ghidra_allowed_hosts.split(",") if host.strip()
-    )
+    """Construct the fixed service client; no MCP route paths are configurable."""
     return GhidraMcpHttpAdapter(
         base_url=settings.ghidra_base_url,
-        endpoint_paths=paths,
         enabled=settings.ghidra_enabled,
-        allowed_hosts=allowed_hosts,
         expected_version=settings.ghidra_expected_version,
-        expected_plugin_version=settings.ghidra_expected_plugin_version,
+        expected_java_version=settings.ghidra_expected_java_version,
         connect_timeout_seconds=settings.ghidra_connect_timeout_seconds,
         read_timeout_seconds=settings.ghidra_read_timeout_seconds,
+        max_sample_bytes=settings.ghidra_max_sample_bytes,
         max_response_bytes=settings.ghidra_max_response_bytes,
+        sample_bytes_loader=sample_bytes_loader,
         transport=transport,
     )
 
 
-def _validate_base_url(base_url: str, allowed_hosts: tuple[str, ...]) -> str:
+def _validate_base_url(base_url: str) -> str:
     parts = urlsplit(base_url)
     if (
-        parts.scheme not in {"http", "https"}
+        parts.scheme != "http"
         or not parts.hostname
         or parts.username is not None
         or parts.password is not None
         or parts.query
         or parts.fragment
+        or parts.path not in {"", "/"}
     ):
-        raise GhidraPolicyDeniedError("L'URL Ghidra doit être une URL HTTP locale valide.")
+        raise GhidraPolicyDeniedError("The Ghidra base URL must be a plain internal HTTP URL.")
     hostname = parts.hostname.lower()
-    is_loopback = hostname == "localhost"
+    loopback = hostname == "localhost"
     try:
-        is_loopback = is_loopback or ipaddress.ip_address(hostname).is_loopback
+        loopback = loopback or ipaddress.ip_address(hostname).is_loopback
     except ValueError:
         pass
-    if not is_loopback and hostname not in allowed_hosts:
-        raise GhidraPolicyDeniedError("L'hôte Ghidra n'est pas loopback ni explicitement autorisé.")
-    if not is_loopback:
-        logger.warning(
-            "ghidra_non_loopback_host_allowed_for_isolated_deployment",
-            extra={"ghidra_host": hostname},
-        )
+    if not loopback and hostname != "ghidra":
+        raise GhidraPolicyDeniedError("The Ghidra service host must be loopback or compose ghidra.")
     if any(unicodedata.category(character) == "Cc" for character in base_url):
-        raise GhidraPolicyDeniedError("L'URL Ghidra contient un caractère de contrôle.")
-    return base_url.rstrip("/")
-
-
-def _validate_endpoint_paths(
-    paths: Mapping[GhidraOperation, str],
-) -> dict[GhidraOperation, str]:
-    validated: dict[GhidraOperation, str] = {}
-    for raw_operation, path in paths.items():
-        try:
-            operation = GhidraOperation(raw_operation)
-        except (TypeError, ValueError):
-            raise GhidraPolicyDeniedError(
-                "Une opération Ghidra non autorisée est configurée."
-            ) from None
-        if not path:
-            continue
-        parts = urlsplit(path)
-        if (
-            not path.startswith("/")
-            or parts.scheme
-            or parts.netloc
-            or parts.query
-            or parts.fragment
-            or any(segment == ".." for segment in parts.path.split("/"))
-            or any(unicodedata.category(character) == "Cc" for character in path)
-        ):
-            raise GhidraPolicyDeniedError("Le chemin Ghidra configuré est invalide.")
-        validated[operation] = path
-    return validated
+        raise GhidraPolicyDeniedError("The Ghidra base URL contains a control character.")
+    return f"http://{hostname}:{parts.port or 8787}"
 
 
 def _normalize_address(address: str | None) -> str:
     if not isinstance(address, str) or not _ADDRESS.fullmatch(address):
-        raise GhidraPolicyDeniedError("Une adresse hexadécimale est requise pour cette opération.")
+        raise GhidraPolicyDeniedError("A hexadecimal address is required for this operation.")
     return f"0x{int(address, 16):x}"
 
 
 def _normalize_query(query: str | None) -> str:
     if not isinstance(query, str):
-        raise GhidraPolicyDeniedError("Une requête localisée est requise.")
+        raise GhidraPolicyDeniedError("A search query is required.")
     normalized = query.strip()
     if (
         not normalized
-        or len(normalized) > 256
+        or len(normalized) > 512
         or any(unicodedata.category(character) == "Cc" for character in normalized)
     ):
-        raise GhidraPolicyDeniedError("La requête de recherche Ghidra est hors bornes.")
+        raise GhidraPolicyDeniedError("The Ghidra search query is outside the fixed bounds.")
     return normalized
 
 
-def _version_value(
-    payload: Mapping[str, object], keys: tuple[str, ...], expected: str | None
-) -> str:
-    for key in keys:
-        value = payload.get(key)
-        if isinstance(value, str) and value.strip():
-            return _sanitize_metadata(value.strip())
-    return _sanitize_metadata(expected.strip()) if expected and expected.strip() else "unverified"
+def _metadata(value: object) -> str:
+    return value.strip()[:128] if isinstance(value, str) and value.strip() else "unverified"
 
 
-def _check_expected_version(name: str, actual: str, expected: str | None) -> None:
-    if expected and actual != "unverified" and actual != expected:
-        raise GhidraVersionMismatchError(
-            f"La version {name} Ghidra ne correspond pas à la version attendue."
-        )
+def _check_attested_versions(
+    actual_ghidra: str, actual_java: str, expected_ghidra: str, expected_java: str
+) -> None:
+    if actual_ghidra != expected_ghidra or actual_java != expected_java:
+        raise GhidraVersionMismatchError("Ghidra service version attestation changed.")
 
 
 class _NormalizationState(TypedDict):
@@ -372,12 +452,7 @@ def _normalize_payload(value: object, max_bytes: int) -> tuple[object, bool]:
     normalized = _normalize_value(value, state, depth=0)
     if not isinstance(normalized, (dict, list)):
         normalized = {"value": normalized}
-    try:
-        encoded_length = len(
-            json.dumps(normalized, ensure_ascii=False, separators=(",", ":")).encode()
-        )
-    except (TypeError, ValueError):
-        raise GhidraResponseError("La réponse Ghidra contient une valeur non JSON.") from None
+    encoded_length = len(json.dumps(normalized, ensure_ascii=False, separators=(",", ":")).encode())
     if encoded_length > max_bytes:
         state["truncated"] = True
         normalized = {"truncated": True}
@@ -385,10 +460,10 @@ def _normalize_payload(value: object, max_bytes: int) -> tuple[object, bool]:
 
 
 def _normalize_value(value: object, state: _NormalizationState, *, depth: int) -> object:
-    if depth > 6:
+    if depth > 8:
         state["truncated"] = True
-        return "<depth-limit>"
-    if value is None or isinstance(value, bool) or isinstance(value, int | float):
+        return "[depth-limit]"
+    if value is None or isinstance(value, bool | int | float):
         return value
     if isinstance(value, str):
         cleaned = _URL_IN_TEXT.sub("<url-redacted>", value)
@@ -409,7 +484,7 @@ def _normalize_value(value: object, state: _NormalizationState, *, depth: int) -
             state["truncated"] = True
         state["remaining"] = max(0, remaining - len(cleaned.encode("utf-8")))
         return cleaned
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         output: dict[str, object] = {}
         for key, child in list(value.items())[:_MAX_COLLECTION_ITEMS]:
             if not isinstance(key, str) or key.lower() in _FORBIDDEN_FIELDS:
@@ -418,12 +493,11 @@ def _normalize_value(value: object, state: _NormalizationState, *, depth: int) -
             if state["remaining"] <= 0:
                 state["truncated"] = True
                 break
-            normalized_key = key[:128]
-            output[normalized_key] = _normalize_value(child, state, depth=depth + 1)
+            output[key[:128]] = _normalize_value(child, state, depth=depth + 1)
         if len(value) > _MAX_COLLECTION_ITEMS:
             state["truncated"] = True
         return output
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         output_list = []
         for child in value[:_MAX_COLLECTION_ITEMS]:
             if state["remaining"] <= 0:
@@ -434,17 +508,7 @@ def _normalize_value(value: object, state: _NormalizationState, *, depth: int) -
             state["truncated"] = True
         return output_list
     state["truncated"] = True
-    return "<unsupported-value>"
-
-
-def _sanitize_metadata(value: str) -> str:
-    sanitized = _URL_IN_TEXT.sub("<url-redacted>", value)
-    sanitized = _CREDENTIAL_ASSIGNMENT.sub("<credential-redacted>", sanitized)
-    sanitized = _BEARER_TOKEN.sub("Bearer <credential-redacted>", sanitized)
-    sanitized = _JWT_TOKEN.sub("<token-redacted>", sanitized)
-    sanitized = _LONG_TOKEN.sub("<token-redacted>", sanitized)
-    sanitized = _PRIVATE_KEY_BLOCK.sub("<private-key-redacted>", sanitized)
-    return sanitized[:128] or "unverified"
+    return "[unsupported-value]"
 
 
 def _positive(value: int, name: str) -> int:

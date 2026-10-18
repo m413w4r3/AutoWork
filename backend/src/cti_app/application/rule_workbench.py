@@ -7,9 +7,16 @@ import re
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Protocol, TypedDict
 from uuid import UUID, uuid4
 
+from cti_app.application.confined_analysis import (
+    ConfinedAnalysisArtifactKind,
+    ConfinedAnalysisExecutionPort,
+    ConfinedAnalysisRequest,
+    ConfinedAnalysisTool,
+)
 from cti_app.application.investigation_persistence import DetectionCandidateRepository
 from cti_app.domain.analysis import SampleFeatureSetV1
 from cti_app.domain.code_features import CodeFeatureSet, CodeFeatureStatus
@@ -52,6 +59,7 @@ from cti_app.domain.rule_workbench import (
     RuleTestError,
     RuleTestErrorCode,
     RuleTestReport,
+    RuleValidationStatus,
     RuleVersionComparison,
     YaraEngineResult,
     YaraExecutionStatus,
@@ -64,6 +72,48 @@ class RuleCorpusBytesUnavailable(LookupError):
 
 class RuleCorpusBytesPort(Protocol):
     async def get_bytes_for_sample(self, sample_sha256: str) -> bytes: ...
+
+    async def get_artifact_id_for_sample(self, sample_sha256: str) -> UUID: ...
+
+
+class RuleValidationReason(StrEnum):
+    """Stable API reason paired with RuleTestReport.validation_status for publication consumers."""
+
+    VALIDATED = "real_positives_and_goodware_tested"
+    CORPUS_EMPTY = "corpus_empty"
+    POSITIVES_MISSING = "real_positive_samples_missing"
+    GOODWARE_MISSING = "goodware_corpus_empty"
+    SAMPLE_BYTES_MISSING = "sample_bytes_missing_or_unverified"
+    SYNTHETIC_POSITIVES = "positive_samples_are_synthetic"
+    FALSE_NEGATIVES = "real_positive_samples_not_matched"
+    FALSE_POSITIVES = "goodware_false_positive_observed"
+    EXECUTION_INCOMPLETE = "analysis_incomplete"
+
+
+def rule_validation_reason(report: RuleTestReport) -> RuleValidationReason:
+    if report.validation_status is RuleValidationStatus.REAL_VALIDATED:
+        return RuleValidationReason.VALIDATED
+    if not any(role.test_cases for role in report.roles):
+        return RuleValidationReason.CORPUS_EMPTY
+    positives = next(
+        role for role in report.roles if role.role is RuleTestCorpusRole.CONFIRMED_POSITIVE
+    )
+    goodware = next(role for role in report.roles if role.role is RuleTestCorpusRole.GOODWARE)
+    if not positives.test_cases:
+        return RuleValidationReason.POSITIVES_MISSING
+    if not any(case.provenance.value == "real" for case in positives.test_cases):
+        return RuleValidationReason.SYNTHETIC_POSITIVES
+    if not any(case.provenance.value == "real" for case in goodware.test_cases):
+        return RuleValidationReason.GOODWARE_MISSING
+    if positives.non_measurable or goodware.non_measurable:
+        return RuleValidationReason.SAMPLE_BYTES_MISSING
+    if positives.errors or goodware.errors or report.execution_status is not YaraExecutionStatus.OK:
+        return RuleValidationReason.EXECUTION_INCOMPLETE
+    if report.false_negative_sha256s:
+        return RuleValidationReason.FALSE_NEGATIVES
+    if report.false_positive_sha256s:
+        return RuleValidationReason.FALSE_POSITIVES
+    return RuleValidationReason.SAMPLE_BYTES_MISSING
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -189,7 +239,8 @@ class RuleWorkbench:
         self,
         *,
         corpus_bytes: RuleCorpusBytesPort,
-        yara_engine: YaraEnginePort,
+        yara_engine: YaraEnginePort | None,
+        confined_analysis: ConfinedAnalysisExecutionPort | None = None,
         detection_candidates: DetectionCandidateRepository,
         non_discriminant_patterns: NonDiscriminantPatternRegistry,
         legitimate_services: LegitimateServiceRegistry,
@@ -197,6 +248,7 @@ class RuleWorkbench:
     ) -> None:
         self._corpus_bytes = corpus_bytes
         self._yara_engine = yara_engine
+        self._confined_analysis = confined_analysis
         self._detection_candidates = detection_candidates
         self._non_discriminant = non_discriminant_patterns
         self._legitimate_services = legitimate_services
@@ -602,7 +654,18 @@ class RuleWorkbench:
         *,
         selection_bias: str,
         coverage_statement: str,
+        investigation_id: UUID | None = None,
     ) -> RuleTestReport:
+        if self._confined_analysis is not None:
+            return await self._compile_and_test_confined(
+                rule_source,
+                corpus,
+                selection_bias=selection_bias,
+                coverage_statement=coverage_statement,
+                investigation_id=investigation_id,
+            )
+        if self._yara_engine is None:
+            raise RuntimeError("no YARA execution port is configured")
         source_sha256 = hashlib.sha256(rule_source.encode("utf-8")).hexdigest()
         cases = _canonical_corpus(corpus)
         by_role: dict[RuleTestCorpusRole, list[RuleTestCase]] = {
@@ -758,6 +821,155 @@ class RuleWorkbench:
             coverage_statement,
         )
 
+    async def _compile_and_test_confined(
+        self,
+        rule_source: str,
+        corpus: Sequence[RuleTestCase],
+        *,
+        selection_bias: str,
+        coverage_statement: str,
+        investigation_id: UUID | None,
+    ) -> RuleTestReport:
+        assert self._confined_analysis is not None
+        source_sha256 = hashlib.sha256(rule_source.encode("utf-8")).hexdigest()
+        cases = _canonical_corpus(corpus)
+        by_role: dict[RuleTestCorpusRole, list[RuleTestCase]] = {
+            role: [case for case in cases if case.role is role] for role in RuleTestCorpusRole
+        }
+        results: dict[RuleTestCorpusRole, _MutableRoleResult] = {
+            role: {"matches": set(), "non_matches": set(), "non_measurable": set(), "errors": []}
+            for role in RuleTestCorpusRole
+        }
+        family = self._confined_analysis.family_statuses.get("yara")
+        engine_version = family.version if family and family.version else "unavailable"
+        status = YaraExecutionStatus.ENGINE_UNAVAILABLE
+        if not cases or investigation_id is None:
+            return self._report(
+                source_sha256,
+                status,
+                engine_version,
+                by_role,
+                results,
+                selection_bias,
+                coverage_statement,
+            )
+        if len(cases) > self._policy.maximum_corpus_cases:
+            return self._limit_failure_report(
+                source_sha256,
+                engine_version,
+                by_role,
+                results,
+                selection_bias,
+                coverage_statement,
+                "corpus exceeds the configured case count",
+            )
+        if len(rule_source.encode("utf-8")) > min(self._policy.maximum_source_bytes, 256_000):
+            return self._limit_failure_report(
+                source_sha256,
+                engine_version,
+                by_role,
+                results,
+                selection_bias,
+                coverage_statement,
+                "rule source exceeds the configured worker limit",
+            )
+        resolver = getattr(self._corpus_bytes, "get_artifact_id_for_sample", None)
+        if not callable(resolver):
+            for case in cases:
+                results[case.role]["non_measurable"].add(case.sample_sha256)
+            return self._report(
+                source_sha256,
+                status,
+                engine_version,
+                by_role,
+                results,
+                selection_bias,
+                coverage_statement,
+            )
+
+        status = YaraExecutionStatus.OK
+        seen: set[str] = set()
+        for case in cases:
+            if case.sample_sha256 in seen:
+                continue
+            seen.add(case.sample_sha256)
+            try:
+                artifact_id = await resolver(case.sample_sha256)
+            except Exception:
+                for same_sample in cases:
+                    if same_sample.sample_sha256 == case.sample_sha256:
+                        results[same_sample.role]["non_measurable"].add(case.sample_sha256)
+                continue
+            response = await self._confined_analysis.execute(
+                ConfinedAnalysisRequest(
+                    investigation_id=investigation_id,
+                    artifact_id=artifact_id,
+                    sha256=case.sample_sha256,
+                    artifact_kind=ConfinedAnalysisArtifactKind.CORPUS_SAMPLE,
+                    tool=ConfinedAnalysisTool.YARA,
+                    timeout_seconds=30,
+                    max_output_bytes=64 * 1024,
+                    analysis_parameters={"rule_source": rule_source},
+                )
+            )
+            worker_result = (response.payload or {}).get("result", {})
+            if not isinstance(worker_result, Mapping):
+                worker_result = {}
+            try:
+                worker_status = YaraExecutionStatus(
+                    str(worker_result.get("status", "engine_crashed"))
+                )
+            except ValueError:
+                worker_status = YaraExecutionStatus.ENGINE_CRASHED
+            version = worker_result.get("version")
+            if isinstance(version, str) and version:
+                engine_version = version
+            if response.status.value != "succeeded" and worker_status is YaraExecutionStatus.OK:
+                worker_status = (
+                    YaraExecutionStatus.ENGINE_UNAVAILABLE
+                    if response.status.value == "unavailable"
+                    else YaraExecutionStatus.ENGINE_CRASHED
+                )
+            if worker_status is not YaraExecutionStatus.OK:
+                status = worker_status
+                message = str(
+                    worker_result.get("message") or response.available_reason or status.value
+                )
+                for same_sample in cases:
+                    if same_sample.sample_sha256 == case.sample_sha256:
+                        results[same_sample.role]["errors"].append(
+                            RuleTestError(
+                                code=_test_error_code(status),
+                                message=message[:1000],
+                                sample_sha256=case.sample_sha256,
+                                line=worker_result.get("line")
+                                if isinstance(worker_result.get("line"), int)
+                                else None,
+                            )
+                        )
+                if status is YaraExecutionStatus.COMPILE_ERROR:
+                    break
+                continue
+            matched = worker_result.get("matches") is True
+            for same_sample in cases:
+                if same_sample.sample_sha256 == case.sample_sha256:
+                    results[same_sample.role]["matches" if matched else "non_matches"].add(
+                        case.sample_sha256
+                    )
+        if status is YaraExecutionStatus.OK and not any(
+            result["matches"] or result["non_matches"] for result in results.values()
+        ):
+            status = YaraExecutionStatus.ENGINE_UNAVAILABLE
+        return self._report(
+            source_sha256,
+            status,
+            engine_version,
+            by_role,
+            results,
+            selection_bias,
+            coverage_statement,
+        )
+
     async def revise(
         self,
         parent_version: DetectionCandidateVersion | None,
@@ -851,6 +1063,7 @@ class RuleWorkbench:
             corpus,
             selection_bias=selection_bias,
             coverage_statement=coverage_statement,
+            investigation_id=investigation_id,
         )
         status = _candidate_status(report)
         motif_provenance = tuple(
@@ -960,12 +1173,14 @@ class RuleWorkbench:
             corpus,
             selection_bias=selection_bias,
             coverage_statement=coverage_statement,
+            investigation_id=version_a.investigation_id,
         )
         report_b = await self.compile_and_test(
             version_b.source,
             corpus,
             selection_bias=selection_bias,
             coverage_statement=coverage_statement,
+            investigation_id=version_b.investigation_id,
         )
         return report_a, report_b
 

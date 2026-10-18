@@ -797,7 +797,7 @@ async def test_render_uses_the_loaded_template_and_font_snapshots(
     assert PUBLICATION_RENDER_POLICY_VERSION == "typst-publication-v7-chapsvision-cited-context"
     assert (
         publication_rendering.PUBLICATION_RENDERER_VERSION
-        == "publication-v9-typst-v6-draft-preview-synthesis-context"
+        == "publication-v10-typst-v6-canonical-investigation-figures"
     )
     expected_templates = {file.relative_path: file.content for file in template_bundle.files}
     observed_templates = {

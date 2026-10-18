@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Final
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -92,6 +92,8 @@ from cti_app.domain.publication_document import (
     PublicationDiagramV1,
     PublicationDocumentV4,
     PublicationDocumentV5,
+    PublicationIOCDetailV1,
+    PublicationIOCDisposition,
     PublicationSourceFigureV1,
     PublicationTableColumnV1,
     PublicationTableRowV1,
@@ -130,6 +132,7 @@ class _PublicationContentProjection:
     uncertainties: tuple[PublicationUncertaintyV1, ...]
     indicators: tuple[PublicationIndicatorGroupV1, ...]
     original_indicators: tuple[PublicationIndicatorGroupV1, ...]
+    ioc_details: tuple[PublicationIOCDetailV1, ...]
     used_source_document_ids: frozenset[UUID]
 
 
@@ -269,27 +272,79 @@ def _project_publication_iocs(
     }
     main: _IocOccurrences = defaultdict(set)
     original: _IocOccurrences = defaultdict(set)
+    detail_candidates: list[tuple[PublicationIOCDetailV1, tuple[ArtifactType, str] | None]] = []
     legitimate_services = load_legitimate_services()
     for source in extraction.sources:
         for item in source.indicators:
+            evidence_ref = indicator_ref_by_identity[
+                (
+                    source.source_document_id,
+                    item.value,
+                    item.artifact_type.value,
+                    item.context,
+                    item.evidence_quote,
+                )
+            ]
+            decision = (
+                relevance_projection.classification_for(evidence_ref)
+                if relevance_projection is not None
+                else None
+            )
             if (
-                item.indicator_status is not ExtractionIndicatorStatus.CONFIRMED_IOC
-                or item.artifact_type not in PUBLICATION_IOC_ARTIFACT_TYPES
+                decision is not None
+                and decision.classification is RelevanceClassification.OUT_OF_SCOPE
             ):
+                # Keep the finding in the canonical extraction, but never publish
+                # indicators explicitly assigned to another case in any IOC view.
                 continue
             destination: _IocOccurrences | None = main
-            if relevance_projection is not None:
-                decision = relevance_projection.classification_for(
-                    indicator_ref_by_identity[
-                        (
-                            source.source_document_id,
-                            item.value,
-                            item.artifact_type.value,
-                            item.context,
-                            item.evidence_quote,
-                        )
-                    ]
+            if item.indicator_status is not ExtractionIndicatorStatus.CONFIRMED_IOC:
+                detail_candidates.append(
+                    (
+                        PublicationIOCDetailV1(
+                            artifact_type=item.artifact_type,
+                            value=item.value,
+                            normalized_value=item.value,
+                            source_role=source.role,
+                            context=item.context,
+                            evidence_quote=item.evidence_quote,
+                            evidence_basis=item.evidence_basis,
+                            source_document_ids=item.source_document_ids,
+                            disposition=PublicationIOCDisposition.UNCERTAIN,
+                            disposition_reason="contextual_indicator",
+                            relevance_classification=(
+                                decision.classification if decision else None
+                            ),
+                            relevance_reason_code=(decision.reason_code if decision else None),
+                        ),
+                        None,
+                    )
                 )
+                continue
+            if item.artifact_type not in PUBLICATION_IOC_ARTIFACT_TYPES:
+                detail_candidates.append(
+                    (
+                        PublicationIOCDetailV1(
+                            artifact_type=item.artifact_type,
+                            value=item.value,
+                            normalized_value=item.value,
+                            source_role=source.role,
+                            context=item.context,
+                            evidence_quote=item.evidence_quote,
+                            evidence_basis=item.evidence_basis,
+                            source_document_ids=item.source_document_ids,
+                            disposition=PublicationIOCDisposition.EXCLUDED,
+                            disposition_reason="unsupported_artifact_type",
+                            relevance_classification=(
+                                decision.classification if decision else None
+                            ),
+                            relevance_reason_code=(decision.reason_code if decision else None),
+                        ),
+                        None,
+                    )
+                )
+                continue
+            if decision is not None:
                 if (
                     decision.classification in _MAIN_IOC_CLASSIFICATIONS
                     and decision.reason_code in _MAIN_IOC_REASONS
@@ -308,27 +363,171 @@ def _project_publication_iocs(
                 else:
                     destination = None
             if destination is None:
+                assert decision is not None
+                disposition = (
+                    PublicationIOCDisposition.EXCLUDED
+                    if decision.classification is RelevanceClassification.OUT_OF_SCOPE
+                    else PublicationIOCDisposition.UNCERTAIN
+                )
+                detail_candidates.append(
+                    (
+                        PublicationIOCDetailV1(
+                            artifact_type=item.artifact_type,
+                            value=item.value,
+                            normalized_value=item.value,
+                            source_role=source.role,
+                            context=item.context,
+                            evidence_quote=item.evidence_quote,
+                            evidence_basis=item.evidence_basis,
+                            source_document_ids=item.source_document_ids,
+                            disposition=disposition,
+                            disposition_reason=decision.reason_code.value,
+                            relevance_classification=decision.classification,
+                            relevance_reason_code=decision.reason_code,
+                        ),
+                        None,
+                    )
+                )
                 continue
             try:
                 value = normalize_indicator_value(item.value, item.artifact_type)
             except ValueError as exc:
-                raise PublicationAssemblyValidationError(
-                    PublicationAssemblyErrorCode.VALIDATION_FAILED,
-                    "Confirmed IOC cannot be normalized for publication: "
-                    f"{item.artifact_type.value} from {source.source_document_id}",
-                ) from exc
+                raise ValueError(f"Confirmed IOC {item.value!r} cannot be normalized") from exc
             if item.artifact_type is ArtifactType.HASH and not _HASH_VALUE.fullmatch(value):
+                detail_candidates.append(
+                    (
+                        PublicationIOCDetailV1(
+                            artifact_type=item.artifact_type,
+                            value=item.value,
+                            normalized_value=value,
+                            source_role=source.role,
+                            context=item.context,
+                            evidence_quote=item.evidence_quote,
+                            evidence_basis=item.evidence_basis,
+                            source_document_ids=item.source_document_ids,
+                            disposition=PublicationIOCDisposition.EXCLUDED,
+                            disposition_reason="unsupported_hash_format",
+                            relevance_classification=(
+                                decision.classification if decision else None
+                            ),
+                            relevance_reason_code=(decision.reason_code if decision else None),
+                        ),
+                        None,
+                    )
+                )
                 continue
             if legitimate_services.match_indicator(item.artifact_type, value) is not None:
+                detail_candidates.append(
+                    (
+                        PublicationIOCDetailV1(
+                            artifact_type=item.artifact_type,
+                            value=item.value,
+                            normalized_value=value,
+                            source_role=source.role,
+                            context=item.context,
+                            evidence_quote=item.evidence_quote,
+                            evidence_basis=item.evidence_basis,
+                            source_document_ids=item.source_document_ids,
+                            disposition=PublicationIOCDisposition.EXCLUDED,
+                            disposition_reason="legitimate_service",
+                            relevance_classification=(
+                                decision.classification if decision else None
+                            ),
+                            relevance_reason_code=(decision.reason_code if decision else None),
+                        ),
+                        None,
+                    )
+                )
                 continue
             destination[(item.artifact_type, value)].update(item.source_document_ids)
+            # Analyst repair indicators may have no quoted source passage. Keep a
+            # confirmed IOC in its canonical group, but do not claim a sourced
+            # detail row without evidence text.
+            if item.evidence_quote.strip():
+                detail_candidates.append(
+                    (
+                        PublicationIOCDetailV1(
+                            artifact_type=item.artifact_type,
+                            value=item.value,
+                            normalized_value=value,
+                            source_role=source.role,
+                            context=item.context,
+                            evidence_quote=item.evidence_quote,
+                            evidence_basis=item.evidence_basis,
+                            source_document_ids=item.source_document_ids,
+                            disposition=(
+                                PublicationIOCDisposition.RETAINED
+                                if destination is main
+                                else PublicationIOCDisposition.UNCERTAIN
+                            ),
+                            disposition_reason=(
+                                "subject_relation_demonstrated"
+                                if destination is main
+                                else "subject_link_not_demonstrated"
+                            ),
+                            relevance_classification=(
+                                decision.classification if decision else None
+                            ),
+                            relevance_reason_code=(decision.reason_code if decision else None),
+                        ),
+                        (item.artifact_type, value),
+                    )
+                )
     for identity in main:
         original.pop(identity, None)
 
+    main_identities = frozenset(main)
+    original_identities = frozenset(original)
+    resolved_details: list[PublicationIOCDetailV1] = []
+    for detail, detail_identity in detail_candidates:
+        if detail_identity in main_identities:
+            detail = replace(
+                detail,
+                disposition=PublicationIOCDisposition.RETAINED,
+                disposition_reason="subject_relation_demonstrated",
+            )
+        elif detail_identity in original_identities:
+            detail = replace(
+                detail,
+                disposition=PublicationIOCDisposition.UNCERTAIN,
+                disposition_reason="subject_link_not_demonstrated",
+            )
+        resolved_details.append(detail)
+
+    details_by_identity: dict[
+        tuple[ArtifactType, str, tuple[UUID, ...], str, str], PublicationIOCDetailV1
+    ] = {}
+    for detail in resolved_details:
+        details_by_identity.setdefault(
+            (
+                detail.artifact_type,
+                detail.normalized_value,
+                detail.source_document_ids,
+                detail.context,
+                detail.evidence_quote,
+            ),
+            detail,
+        )
+    ioc_details = tuple(
+        sorted(
+            details_by_identity.values(),
+            key=lambda item: (
+                item.artifact_type.value,
+                item.normalized_value.casefold(),
+                item.value,
+                tuple(map(str, item.source_document_ids)),
+                item.context.casefold(),
+                item.evidence_quote,
+            ),
+        )
+    )
+
     indicators = _indicator_groups(main)
     original_indicators = _indicator_groups(original)
-    used_source_document_ids = narrative.used_source_document_ids | indicator_source_ids(
-        indicators + original_indicators
+    used_source_document_ids = (
+        narrative.used_source_document_ids
+        | indicator_source_ids(indicators + original_indicators)
+        | frozenset(source_id for item in ioc_details for source_id in item.source_document_ids)
     )
     return _PublicationContentProjection(
         lead=narrative.lead,
@@ -337,6 +536,7 @@ def _project_publication_iocs(
         uncertainties=narrative.uncertainties,
         indicators=indicators,
         original_indicators=original_indicators,
+        ioc_details=ioc_details,
         used_source_document_ids=used_source_document_ids,
     )
 
@@ -406,7 +606,7 @@ def _validate_publication_lineage(
 
 # V12 changes only PUBLICATION: generic legitimate-service hosts are filtered
 # from IOC groups. Upstream artifacts remain valid.
-ASSEMBLY_POLICY_VERSION: Final[str] = "12-legitimate-service-ioc-filter"
+ASSEMBLY_POLICY_VERSION: Final[str] = "13-complete-ioc-provenance-ledger"
 
 
 def _canonical_digest(payload: dict[str, Any]) -> str:
@@ -955,6 +1155,9 @@ def build_publication_document_v5(
         for indicator in group.indicators
         for source_id in indicator.source_document_ids
     )
+    additional_source_ids.update(
+        source_id for item in projection.ioc_details for source_id in item.source_document_ids
+    )
     used_source_document_ids = projection.used_source_document_ids | additional_source_ids
     used_source_document_ids |= {
         ref.source_document_id for ref in editorial_enrichment_evidence_refs(editorial_enrichment)
@@ -999,4 +1202,5 @@ def build_publication_document_v5(
         semantic_text=semantic_text,
         references=reference_entries,
         original_indicators=projection.original_indicators,
+        ioc_details=projection.ioc_details,
     )

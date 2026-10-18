@@ -40,7 +40,9 @@ from cti_app.application.rule_corpus_import import list_manual_rule_corpus_impor
 from cti_app.application.rule_workbench import (
     RuleCorpusBytesPort,
     RuleCorpusBytesUnavailable,
+    RuleValidationReason,
     RuleWorkbench,
+    rule_validation_reason,
 )
 from cti_app.application.sample_acquisition import SAMPLES_QUARANTINE_BUCKET
 from cti_app.domain.analysis import SampleFeatureSetV1
@@ -419,6 +421,27 @@ class QuarantineRuleCorpusBytes(RuleCorpusBytesPort):
         ):
             raise ValueError("quarantined sample bytes failed their size or SHA-256 check")
         return payload
+
+    async def get_artifact_id_for_sample(self, sample_sha256: str) -> UUID:
+        if (
+            not isinstance(sample_sha256, str)
+            or re.fullmatch(_SHA256_PATTERN, sample_sha256) is None
+        ):
+            raise RuleCorpusBytesUnavailable("sample SHA-256 is invalid")
+        async with self._uow_factory() as uow:
+            record = await uow.blobs.get_by_address(SAMPLES_QUARANTINE_BUCKET, sample_sha256)
+        if record is None:
+            raise RuleCorpusBytesUnavailable("sample bytes are not present in quarantine")
+        descriptor = record.descriptor
+        if (
+            descriptor.logical_bucket != SAMPLES_QUARANTINE_BUCKET
+            or descriptor.sha256 != sample_sha256
+            or descriptor.size > self._maximum_sample_bytes
+        ):
+            raise RuleCorpusBytesUnavailable(
+                "sample artifact identity is outside the bounded corpus"
+            )
+        return record.id
 
     async def goodware_sample_sha256s(self, investigation_id: UUID) -> Sequence[str]:
         # Goodware baselines contain feature fingerprints, not benign file bytes.
@@ -1035,6 +1058,7 @@ class _RuleTools:
             corpus.cases,
             selection_bias=corpus.selection_bias,
             coverage_statement=corpus.coverage_statement,
+            investigation_id=context.investigation_id,
         )
         evaluation = _status_for_report(report, corpus)
         candidate_status = _candidate_status(report, corpus)
@@ -1055,6 +1079,7 @@ class _RuleTools:
                 "source_sha256": selected.source_sha256,
                 "candidate_status": candidate_status.value,
                 "validation_status": report.validation_status.value,
+                "validation_reason": rule_validation_reason(report).value,
                 "report": _report_summary(report, observation.id, corpus),
             },
             evaluation,
@@ -1191,6 +1216,7 @@ class _RuleTools:
             corpus.cases,
             selection_bias=corpus.selection_bias,
             coverage_statement=corpus.coverage_statement,
+            investigation_id=context.investigation_id,
         )
         status = _candidate_status(report, corpus)
         measurable = sum(len(role.matches) + len(role.non_matches) for role in report.roles)
@@ -1296,6 +1322,7 @@ class _RuleTools:
             "source_sha256": result.report.source_sha256,
             "candidate_status": result.candidate_status.value,
             "validation_status": result.report.validation_status.value,
+            "validation_reason": rule_validation_reason(result.report).value,
             "execution_status": result.report.execution_status.value,
             "evaluation_status": result.status.value,
             "report": _report_summary(result.report, result.observation.id, result.corpus),
@@ -1582,6 +1609,7 @@ def _report_payload(
         "source_sha256": report.source_sha256,
         "execution_status": report.execution_status.value,
         "validation_status": report.validation_status.value,
+        "validation_reason": rule_validation_reason(report).value,
         "engine_version": report.engine_version[:200],
         "candidate_status": candidate_status.value,
         "selection_bias": corpus.selection_bias,
@@ -1635,6 +1663,7 @@ def _report_summary(
         "source_sha256": report.source_sha256,
         "execution_status": report.execution_status.value,
         "validation_status": report.validation_status.value,
+        "validation_reason": rule_validation_reason(report).value,
         "engine_version": report.engine_version[:200],
         "corpus_sha256": report.corpus_sha256,
         "coverage_statement": report.coverage_statement,
@@ -1715,6 +1744,7 @@ def _comparison_summary(
 def _version_summary(
     version: DetectionCandidateVersion, reports: Sequence[Mapping[str, Any]]
 ) -> dict[str, Any]:
+    """Expose stable validation status/reason fields for rule.get and publication consumers."""
     matching_reports = tuple(
         report for report in reports if report.get("source_sha256") == version.source_sha256
     )
@@ -1725,6 +1755,24 @@ def _version_summary(
         ).value
     except (TypeError, ValueError):
         validation_status = RuleValidationStatus.UNTESTED.value
+    fallback_reasons = {
+        RuleValidationStatus.UNTESTED.value: RuleValidationReason.CORPUS_EMPTY.value,
+        RuleValidationStatus.SYNTHETIC_ONLY.value: RuleValidationReason.SYNTHETIC_POSITIVES.value,
+        RuleValidationStatus.REAL_VALIDATED.value: RuleValidationReason.VALIDATED.value,
+    }
+    try:
+        validation_reason = RuleValidationReason(
+            latest_report.get(
+                "validation_reason",
+                fallback_reasons.get(
+                    validation_status, RuleValidationReason.EXECUTION_INCOMPLETE.value
+                ),
+            )
+            if latest_report
+            else RuleValidationReason.CORPUS_EMPTY.value
+        ).value
+    except (TypeError, ValueError):
+        validation_reason = RuleValidationReason.EXECUTION_INCOMPLETE.value
     return {
         "version_id": str(version.id),
         "version": version.version_label,
@@ -1732,9 +1780,11 @@ def _version_summary(
         "source_sha256": version.source_sha256,
         "status": version.status.value,
         "validation_status": validation_status,
+        "validation_reason": validation_reason,
         "latest_test_report": (
             {
                 "validation_status": validation_status,
+                "validation_reason": validation_reason,
                 "execution_status": latest_report.get("execution_status"),
                 "provenance_counts_by_role": latest_report.get("provenance_counts_by_role", {}),
                 "false_positive_count": latest_report.get("false_positive_count", 0),

@@ -4,10 +4,19 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping
+from uuid import UUID
 
+from cti_app.application.confined_analysis import (
+    ConfinedAnalysisArtifactKind,
+    ConfinedAnalysisExecutionPort,
+    ConfinedAnalysisRequest,
+    ConfinedAnalysisTool,
+)
 from cti_app.application.local_analysis import LocalCommandCatalog, LocalCommandService
+from cti_app.application.persistence import UnitOfWorkFactory
+from cti_app.application.sample_acquisition import SAMPLES_QUARANTINE_BUCKET
 from cti_app.domain.extraction import ExtractionProvenance, ExtractionStatus
-from cti_app.domain.local_analysis import LocalCommandId, LocalCommandStatus
+from cti_app.domain.local_analysis import LocalCommandStatus
 from cti_app.domain.string_extraction import (
     ExtractedString,
     ExtractedStringType,
@@ -25,18 +34,28 @@ _TYPE_NAMES = {
 
 
 class FlossAdapter:
-    """FLOSS adapter backed by the catalogue and confined local command service."""
+    """FLOSS result adapter; sample bytes are read only by analysis-worker."""
 
     def __init__(
         self,
-        command_service: LocalCommandService,
-        command_catalog: LocalCommandCatalog,
+        command_service: LocalCommandService | None = None,
+        command_catalog: LocalCommandCatalog | None = None,
         *,
         enabled: bool,
+        confined_analysis: ConfinedAnalysisExecutionPort | None = None,
+        uow_factory: UnitOfWorkFactory | None = None,
+        timeout_seconds: float = 120,
+        max_output_bytes: int = 1_000_000,
+        max_sample_bytes: int = 200 * 1024 * 1024,
     ) -> None:
         self._service = command_service
         self._catalog = command_catalog
         self._enabled = enabled
+        self._confined_analysis = confined_analysis
+        self._uow_factory = uow_factory
+        self._timeout_seconds = timeout_seconds
+        self._max_output_bytes = max_output_bytes
+        self._max_sample_bytes = max_sample_bytes
 
     @property
     def available(self) -> bool:
@@ -46,58 +65,90 @@ class FlossAdapter:
     def unavailable_reason(self) -> str | None:
         if not self._enabled:
             return "floss_disabled"
-        if not self._service.filesystem_confined:
-            return "filesystem_confinement_required"
-        capability = self._catalog.get(LocalCommandId.FLOSS)
-        if capability is None or not capability.available:
-            return "binary_unavailable"
-        return None
+        if self._confined_analysis is None or self._uow_factory is None:
+            return "analysis_worker_unavailable"
+        if not self._confined_analysis.available:
+            return self._confined_analysis.available_reason or "analysis_worker_unavailable"
+        family = self._confined_analysis.family_statuses.get("floss")
+        return (
+            None
+            if family is not None and family.available
+            else (family.available_reason if family is not None else "floss_unattested")
+        )
 
     @property
     def version(self) -> str | None:
-        capability = self._catalog.get(LocalCommandId.FLOSS)
-        return capability.version if self.available and capability is not None else None
+        if not self.available or self._confined_analysis is None:
+            return None
+        family = self._confined_analysis.family_statuses.get("floss")
+        return family.version if family is not None else None
 
-    async def extract(self, sample_sha256: str, *, max_strings: int) -> StringExtractionV1:
-        result = await self._service.run(
-            LocalCommandId.FLOSS, sample_sha256, {"max_strings": max_strings}
+    async def extract(
+        self,
+        sample_sha256: str,
+        *,
+        max_strings: int,
+        investigation_id: UUID | None = None,
+    ) -> StringExtractionV1:
+        if investigation_id is None or not self.available:
+            return self._unavailable(sample_sha256, max_strings)
+        assert self._confined_analysis is not None and self._uow_factory is not None
+        async with self._uow_factory() as uow:
+            blob = await uow.blobs.get_by_address(SAMPLES_QUARANTINE_BUCKET, sample_sha256)
+        if blob is None or blob.descriptor.sha256 != sample_sha256:
+            return self._unavailable(sample_sha256, max_strings, reason="sample_bytes_unavailable")
+        if blob.descriptor.size > self._max_sample_bytes:
+            return self._unavailable(
+                sample_sha256,
+                max_strings,
+                reason="sample_too_large",
+                status=ExtractionStatus.POLICY_DENIED,
+            )
+        response = await self._confined_analysis.execute(
+            ConfinedAnalysisRequest(
+                investigation_id=investigation_id,
+                artifact_id=blob.id,
+                sha256=sample_sha256,
+                artifact_kind=ConfinedAnalysisArtifactKind.CORPUS_SAMPLE,
+                tool=ConfinedAnalysisTool.FLOSS,
+                timeout_seconds=self._timeout_seconds,
+                max_output_bytes=self._max_output_bytes,
+                analysis_parameters={"max_strings": str(max_strings)},
+            )
         )
-        raw_prefix = result.raw_output_prefix
-        if raw_prefix is None:
-            raw_prefix = result.output.encode("utf-8", errors="replace")
-        strings: tuple[ExtractedString, ...] = ()
-        strings_observed = 0
-        parse_failed = False
-        try:
-            payload = json.loads(raw_prefix.decode("utf-8")) if raw_prefix else {}
-            strings, strings_observed = _parse_floss_payload(payload, max_strings=max_strings)
-        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError, RecursionError):
-            parse_failed = bool(raw_prefix)
-
-        raw_sha256 = result.raw_output_sha256 or hashlib.sha256(raw_prefix).hexdigest()
-        complete = result.raw_output_complete or (
-            result.raw_output_sha256 is None
-            and result.status in {LocalCommandStatus.SUCCEEDED, LocalCommandStatus.EMPTY}
+        worker_result = (response.payload or {}).get("result", {})
+        if not isinstance(worker_result, Mapping):
+            worker_result = {}
+        strings = tuple(
+            ExtractedString(
+                value=str(item.get("value", "")),
+                kind=ExtractedStringType(str(item.get("kind", "static"))),
+                encoding=item.get("encoding") if isinstance(item.get("encoding"), str) else None,
+                offset=item.get("offset") if isinstance(item.get("offset"), int) else None,
+                address=item.get("address") if isinstance(item.get("address"), str) else None,
+                function=item.get("function") if isinstance(item.get("function"), str) else None,
+                context=item.get("context") if isinstance(item.get("context"), str) else None,
+                evidence_path=(
+                    item.get("evidence_path")
+                    if isinstance(item.get("evidence_path"), str)
+                    else None
+                ),
+            )
+            for item in worker_result.get("strings", ())
+            if isinstance(item, Mapping) and isinstance(item.get("value"), str) and item["value"]
         )
-        output_truncated = (
-            result.status
-            in {
-                LocalCommandStatus.OUTPUT_TRUNCATED,
-                LocalCommandStatus.TIMEOUT,
-            }
-            or not complete
+        result_status = str(worker_result.get("status", "FAILED")).upper()
+        status = (
+            ExtractionStatus.TIMEOUT
+            if result_status in {"TIMEOUT", "TIMED_OUT"}
+            else ExtractionStatus.EMPTY
+            if response.status.value == "succeeded" and result_status == "SUCCEEDED" and not strings
+            else ExtractionStatus.SUCCEEDED
+            if response.status.value == "succeeded" and result_status == "SUCCEEDED"
+            else ExtractionStatus.PARTIAL
+            if result_status in {"PARTIAL", "OUTPUT_LIMIT"}
+            else ExtractionStatus.FAILED
         )
-        extraction_truncated = (
-            output_truncated
-            or strings_observed > len(strings)
-            or any(item.truncated_fields for item in strings)
-        )
-        status = _status(result.status, empty=not strings)
-        if parse_failed:
-            status = ExtractionStatus.PARTIAL if output_truncated else ExtractionStatus.FAILED
-        elif extraction_truncated and status is ExtractionStatus.SUCCEEDED:
-            status = ExtractionStatus.PARTIAL
-
         parameters_sha256 = hashlib.sha256(
             json.dumps(
                 {**_PARAMETERS, "max_strings": max_strings}, sort_keys=True, separators=(",", ":")
@@ -110,17 +161,64 @@ class FlossAdapter:
             strings=strings,
             provenance=ExtractionProvenance(
                 tool_id="floss",
-                tool_version=result.executable_version or self.version or "unavailable",
+                tool_version=str(worker_result.get("version") or self.version or "unknown"),
                 parameters_sha256=parameters_sha256,
-                raw_output_sha256=raw_sha256,
-                raw_output_bytes=result.raw_output_bytes or len(raw_prefix),
-                raw_output_complete=complete,
-                output_truncated=output_truncated,
-                exit_code=result.exit_code,
+                raw_output_sha256=(
+                    worker_result.get("output_sha256")
+                    if isinstance(worker_result.get("output_sha256"), str)
+                    else None
+                ),
+                raw_output_bytes=int(worker_result.get("output_bytes", 0)),
+                raw_output_complete=(
+                    isinstance(worker_result.get("output_sha256"), str)
+                    and not bool(worker_result.get("truncated"))
+                ),
+                output_truncated=bool(worker_result.get("truncated")),
+                exit_code=worker_result.get("exit_code")
+                if isinstance(worker_result.get("exit_code"), int)
+                else None,
             ),
-            strings_observed=max(strings_observed, len(strings)),
-            truncated=extraction_truncated or parse_failed,
-            detail_code=result.detail_code or ("invalid_floss_json" if parse_failed else None),
+            strings_observed=max(int(worker_result.get("strings_observed", 0)), len(strings)),
+            truncated=bool(worker_result.get("truncated")),
+            detail_code=response.available_reason,
+        )
+
+    async def extract_confined(
+        self, sample_sha256: str, *, max_strings: int, investigation_id: UUID
+    ) -> StringExtractionV1:
+        return await self.extract(
+            sample_sha256, max_strings=max_strings, investigation_id=investigation_id
+        )
+
+    def _unavailable(
+        self,
+        sample_sha256: str,
+        max_strings: int,
+        *,
+        reason: str = "analysis_worker_unavailable",
+        status: ExtractionStatus = ExtractionStatus.UNAVAILABLE,
+    ) -> StringExtractionV1:
+        parameters_sha256 = hashlib.sha256(
+            json.dumps(
+                {**_PARAMETERS, "max_strings": max_strings}, sort_keys=True, separators=(",", ":")
+            ).encode("ascii")
+        ).hexdigest()
+        return StringExtractionV1(
+            schema_version="1",
+            sample_sha256=sample_sha256,
+            status=status,
+            strings=(),
+            provenance=ExtractionProvenance(
+                tool_id="floss",
+                tool_version=self.version or "unavailable",
+                parameters_sha256=parameters_sha256,
+                raw_output_sha256=None,
+                raw_output_bytes=0,
+                raw_output_complete=False,
+                output_truncated=False,
+            ),
+            strings_observed=0,
+            detail_code=reason,
         )
 
 
@@ -129,6 +227,9 @@ def _parse_floss_payload(
 ) -> tuple[tuple[ExtractedString, ...], int]:
     if not isinstance(payload, Mapping):
         raise ValueError("FLOSS JSON root must be an object")
+    strings_root = payload.get("strings")
+    if isinstance(strings_root, Mapping):
+        payload = {**payload, **strings_root}
     result: list[ExtractedString] = []
     sections = (
         ("strings", ExtractedStringType.STATIC),

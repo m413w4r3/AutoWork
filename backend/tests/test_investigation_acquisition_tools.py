@@ -1,11 +1,20 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import replace
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
 
+from cti_app.application.confined_analysis import (
+    ConfinedAnalysisFamilyStatus,
+    ConfinedAnalysisRequest,
+    ConfinedAnalysisResult,
+    ConfinedAnalysisTool,
+    ConfinedAnalysisWorkerAttestation,
+)
 from cti_app.application.investigation_acquisition import HitAcquisitionService
 from cti_app.application.investigation_acquisition_tools import (
     LOCAL_ANALYSIS_CAPABILITY,
@@ -26,8 +35,6 @@ from cti_app.application.investigation_tools import (
     validate_json_schema,
 )
 from cti_app.application.virustotal import VirusTotalHttpError
-from cti_app.domain.analysis import SampleFeatureSetV1, SampleFormat
-from cti_app.domain.classification import TLP
 from cti_app.domain.investigation import (
     BudgetDimension,
     BudgetReservationStatus,
@@ -46,6 +53,67 @@ from tests.investigation_c2_fakes import (
     make_sample_acquisition_service,
 )
 from tests.test_investigation_service import _decision, _Fixture
+
+
+class _AttestedAnalysisWorker:
+    def __init__(self, worker_result: dict[str, Any]) -> None:
+        self.available = True
+        self.available_reason = None
+        self.isolation_profile = "analysis-worker-v1"
+        self.family_statuses = {
+            "sample_analysis": ConfinedAnalysisFamilyStatus(
+                "sample_analysis", True, "static+capa+smda"
+            )
+        }
+        self.attestation = ConfinedAnalysisWorkerAttestation(
+            reachable=True,
+            confined=True,
+            isolation_profile=self.isolation_profile,
+            versions={"static": "static-v1", "capa": "9.4.0", "smda": "smda-v1"},
+            families=self.family_statuses,
+        )
+        self.worker_result = worker_result
+        self.requests: list[ConfinedAnalysisRequest] = []
+
+    async def execute(self, request: ConfinedAnalysisRequest) -> ConfinedAnalysisResult:
+        self.requests.append(request)
+        encoded = json.dumps(
+            self.worker_result, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        ).encode()
+        operation_digest = hashlib.sha256(
+            f"{request.sha256}:{request.tool.value}".encode()
+        ).hexdigest()
+        return ConfinedAnalysisResult(
+            ToolInvocationStatus.SUCCEEDED,
+            f"confined-analysis:{operation_digest}",
+            request.artifact_id,
+            request.sha256,
+            result_blob_id=uuid4(),
+            result_sha256=hashlib.sha256(encoded).hexdigest(),
+            payload={"result": self.worker_result},
+        )
+
+
+def _worker_sample_result(*, status: str, string_value: str) -> dict[str, Any]:
+    return {
+        "status": status,
+        "families": {
+            "static": {
+                "status": "SUCCEEDED",
+                "version": "static-v1",
+                "strings_observed": 1,
+                "strings": [{"value": string_value, "encoding": "ascii", "offset": 4}],
+            },
+            "capa": {"status": "SUCCEEDED", "version": "9.4.0", "capabilities": []},
+            "smda": {
+                "status": "SUCCEEDED",
+                "version": "smda-v1",
+                "architecture": "x86",
+                "code_features": {"packing": {"packed": False}, "ngrams": []},
+            },
+            "floss": {"status": "SUCCEEDED", "version": "3.1.1", "strings": []},
+        },
+    }
 
 
 def _register(database: FakeDatabase, hits: HitAcquisitionService):
@@ -516,43 +584,15 @@ async def test_sample_analyze_records_bounded_binary_observations() -> None:
     association = await hits.register_hit(investigation.id, sha256, SampleOrigin.VT_PIVOT)
     acquired = await hits.acquire_hit(association.id, purpose="Review candidate fixture")
     assert acquired.sample_id is not None
-
-    class ExistingStaticService:
-        async def analyze(self, sample_id: UUID) -> SampleFeatureSetV1:
-            sample = database.samples[sample_id]
-            blob = database.blobs[sample.blob_id]
-            return SampleFeatureSetV1(
-                sample_id=sample_id,
-                blob_id=sample.blob_id,
-                extractor_version="static-v1",
-                parameters_sha256="a" * 64,
-                format=SampleFormat.UNKNOWN,
-                size=len(content),
-                md5=hashlib.md5(content).hexdigest(),
-                sha1=hashlib.sha1(content).hexdigest(),
-                sha256=blob.descriptor.sha256,
-                strings=({"value": "harmless static analysis fixture", "kind": "ascii"},),
-                sections=(),
-                imports=(),
-                exports=(),
-                resources=(),
-                signature=None,
-                imphash=None,
-                ssdeep=None,
-                tlsh=None,
-                rich_header_hash=None,
-                opcode_fragment16=(),
-                partial_errors=(),
-                tlp=TLP.CLEAR,
-                do_not_submit=True,
-                external_llm_allowed=False,
-            )
+    worker = _AttestedAnalysisWorker(
+        _worker_sample_result(status="PARTIAL", string_value="harmless static analysis fixture")
+    )
 
     analyzer = LocalSampleAnalysisService(
         hits,
         lambda: FakeUow(database),
         recorder,
-        static_analysis=ExistingStaticService(),
+        confined_analysis=worker,  # type: ignore[arg-type]
     )
     registry = InMemoryToolRegistry()
     register_acquisition_tools(
@@ -585,6 +625,11 @@ async def test_sample_analyze_records_bounded_binary_observations() -> None:
     assert result.status is ToolInvocationStatus.PARTIAL
     assert result.output["sample_sha256"] == sha256
     assert result.output["qualification"] == "candidate"
+    assert len(worker.requests) == 1
+    assert worker.requests[0].tool is ConfinedAnalysisTool.SAMPLE_ANALYSIS
+    assert worker.requests[0].sha256 == sha256
+    assert result.output["extractors"]["static"]["version"] == "static-v1"
+    assert result.output["strings_recorded"] == 1
     assert result.output["goodware"]["available"] is False
     assert {
         item.kind
@@ -624,53 +669,6 @@ async def test_sample_analyze_injects_code_features_and_goodware_measurement() -
     acquired = await hits.acquire_hit(association.id, purpose="Review candidate fixture")
     assert acquired.sample_id is not None
 
-    class ExistingStaticService:
-        async def analyze(self, sample_id: UUID) -> SampleFeatureSetV1:
-            sample = database.samples[sample_id]
-            blob = database.blobs[sample.blob_id]
-            return SampleFeatureSetV1(
-                sample_id=sample_id,
-                blob_id=sample.blob_id,
-                extractor_version="static-v1",
-                parameters_sha256="a" * 64,
-                format=SampleFormat.UNKNOWN,
-                size=len(content),
-                md5=hashlib.md5(content).hexdigest(),
-                sha1=hashlib.sha1(content).hexdigest(),
-                sha256=blob.descriptor.sha256,
-                strings=({"value": "fixture string", "kind": "ascii"},),
-                sections=(),
-                imports=(),
-                exports=(),
-                resources=(),
-                signature=None,
-                imphash=None,
-                ssdeep=None,
-                tlsh=None,
-                rich_header_hash=None,
-                opcode_fragment16=(),
-                partial_errors=(),
-                tlp=TLP.CLEAR,
-                do_not_submit=True,
-                external_llm_allowed=False,
-            )
-
-    class ExistingCodeFeatureSet:
-        tool_version = "smda-v1"
-        escaper_compatibility_version = "escaper-v1"
-        intel_pic_hash_escape_version = "pic-v1"
-        status = type("Status", (), {"value": "SUCCEEDED"})()
-        architecture = "x86"
-        ngrams = ()
-        errors = ()
-
-        def as_json(self):
-            return {"packing": {"packed": False}}
-
-    class ExistingCodeFeatureService:
-        async def extract(self, **_kwargs):
-            return ExistingCodeFeatureSet()
-
     baseline_id = uuid4()
 
     class BaselineLookup:
@@ -695,13 +693,15 @@ async def test_sample_analyze_injects_code_features_and_goodware_measurement() -
             return {self.features[0]: 4} if self.features else {}
 
     goodware = ExistingGoodwareService()
+    worker = _AttestedAnalysisWorker(
+        _worker_sample_result(status="SUCCEEDED", string_value="fixture string")
+    )
     analyzer = LocalSampleAnalysisService(
         hits,
         lambda: AnalysisUow(database),
         make_evidence_recorder(database),
-        static_analysis=ExistingStaticService(),
-        code_features=ExistingCodeFeatureService(),
         goodware=goodware,
+        confined_analysis=worker,  # type: ignore[arg-type]
     )
     registry = InMemoryToolRegistry()
     register_acquisition_tools(
@@ -733,10 +733,12 @@ async def test_sample_analyze_injects_code_features_and_goodware_measurement() -
 
     assert result.status is ToolInvocationStatus.SUCCEEDED
     assert result.output["extractors"]["smda"]["version"] == "smda-v1"
+    assert result.output["code_features"]["packing"]["packed"] is False
     assert result.output["goodware"]["available"] is True
     assert result.output["goodware"]["features_present_in_goodware"] == 1
+    assert worker.requests[0].tool is ConfinedAnalysisTool.SAMPLE_ANALYSIS
     assert goodware.prepared == baseline_id
-    assert goodware.features
+    assert goodware.features == (("string", "fixture string"),)
     analysis_observation = next(
         database.observations[reference]
         for reference in result.observation_refs
