@@ -39,12 +39,6 @@ from tests.workflow_emulator.investigation_support import (
     DEFAULT_IOC as _IOC,
 )
 from tests.workflow_emulator.investigation_support import (
-    DEFAULT_SAMPLE_BYTES as _S2_BYTES,
-)
-from tests.workflow_emulator.investigation_support import (
-    DEFAULT_SAMPLE_HASH as _S2_HASH,
-)
-from tests.workflow_emulator.investigation_support import (
     DEFAULT_SEED_HASH as _SEED_HASH,
 )
 from tests.workflow_emulator.investigation_support import (
@@ -55,6 +49,9 @@ from tests.workflow_emulator.investigation_support import (
 )
 from tests.workflow_emulator.investigation_support import (
     ScriptedInvestigationTransport as _VerticalScriptedTransport,
+)
+from tests.workflow_emulator.investigation_support import (
+    SyntheticSampleMaterial as _SyntheticSampleMaterial,
 )
 from tests.workflow_emulator.investigation_support import (
     approve_envelope_http as _approve_envelope_http,
@@ -102,6 +99,17 @@ class _PartialDownloadFailureStream(httpx.AsyncByteStream):
         return None
 
 
+def _unique_sample_material() -> _SyntheticSampleMaterial:
+    """Keep hash-indexed PostgreSQL state isolated between integration cases."""
+    generated = _SyntheticSampleMaterial.unique()
+    return _SyntheticSampleMaterial(
+        seed_hash=_SEED_HASH,
+        sample_bytes=generated.sample_bytes,
+        sample_hash=generated.sample_hash,
+        ip=_IOC,
+    )
+
+
 @pytest.mark.asyncio
 async def test_real_postgres_http_bridge_vertical_investigation_and_v6_publication(
     uow_factory, tmp_path: Path
@@ -112,7 +120,9 @@ async def test_real_postgres_http_bridge_vertical_investigation_and_v6_publicati
     artifact_store = ProductionArtifactStore(blob_catalog)
     seeded = await _seed_verified_article(uow_factory, artifact_store, suffix=uuid4().hex[:10])
     assert seeded.seed_observation is not None
-    vt = _HashCheckedVirusTotal(include_candidate=True)
+    material = _unique_sample_material()
+    candidate_hash = material.sample_hash
+    vt = _HashCheckedVirusTotal(material=material, include_candidate=True)
     shodan = FakeShodanPort()
 
     async def final_response_builder(observations):
@@ -187,7 +197,7 @@ async def test_real_postgres_http_bridge_vertical_investigation_and_v6_publicati
                     "tool_name": "vt.download_sample",
                     "schema_version": "1",
                     "arguments": {
-                        "sha256": _S2_HASH,
+                        "sha256": candidate_hash,
                         "purpose": "Inspect S2 returned by the cited VT pivot.",
                         "evidence_refs": [str(seeded.seed_observation.id)],
                     },
@@ -276,7 +286,7 @@ async def test_real_postgres_http_bridge_vertical_investigation_and_v6_publicati
         assert sample_list.status_code == 200, sample_list.text
         assert len(sample_list.json()) == 1
         sample_view = sample_list.json()[0]
-        assert sample_view["sample_sha256"] == _S2_HASH
+        assert sample_view["sample_sha256"] == candidate_hash
         assert sample_view["qualification"] == "candidate"
 
         async with uow_factory() as uow:
@@ -284,7 +294,7 @@ async def test_real_postgres_http_bridge_vertical_investigation_and_v6_publicati
             assert association is not None
             assert association.qualification is SampleQualification.CANDIDATE
             attempts = await uow.sample_acquisition_attempts.find_successful(
-                investigation_id, _S2_HASH
+                investigation_id, candidate_hash
             )
             assert attempts is not None and attempts.sample_id is not None
             acquired = await uow.samples.get(attempts.sample_id)
@@ -292,7 +302,7 @@ async def test_real_postgres_http_bridge_vertical_investigation_and_v6_publicati
             assert acquired.state.value == "review_candidate"
             quarantine_blob = await uow.blobs.get(acquired.blob_id)
             assert quarantine_blob is not None
-            assert quarantine_blob.descriptor.sha256 == _S2_HASH
+            assert quarantine_blob.descriptor.sha256 == candidate_hash
             observations = await uow.evidence_observations.list_for_investigation(investigation_id)
             findings = await uow.investigation_findings.list_for_investigation(investigation_id)
             decisions = await uow.analyst_decisions.list_for_investigation(investigation_id)
@@ -331,7 +341,7 @@ async def test_real_postgres_http_bridge_vertical_investigation_and_v6_publicati
             assert any(
                 item.decision_type is AnalystDecisionType.PIVOT_APPROVE for item in decisions
             )
-        assert await blob_catalog.read(acquired.blob_id, max_bytes=1024) == _S2_BYTES
+        assert await blob_catalog.read(acquired.blob_id, max_bytes=1024) == material.sample_bytes
         assert vt.calls["file_report"] == 1
 
         assert vt.calls["intelligence_search"] == 1
@@ -352,7 +362,7 @@ async def test_real_postgres_http_bridge_vertical_investigation_and_v6_publicati
                 "qualification": "confirmed",
                 "reason": "The analyst reviewed S2 and its cited quarantine evidence.",
                 "evidence_refs": [
-                    str(item.id) for item in observations if item.object_id == _S2_HASH
+                    str(item.id) for item in observations if item.object_id == candidate_hash
                 ],
                 "correlation_id": f"g3:{association.id}",
             },
@@ -518,12 +528,22 @@ async def test_postgres_bridge_pre_submission_exhaustion_resumes_with_new_attemp
             headers={"Idempotency-Key": f"pre-submit-resume-{investigation_id}"},
         )
         assert resumed.status_code == 200, resumed.text
+        requested = await client.post(
+            f"/api/investigations/{investigation_id}/requests",
+            json={
+                "text": "Retry this investigation after the simulated composer recovery.",
+                "expected_version": resumed.json()["investigation"]["version"],
+            },
+            headers={"Idempotency-Key": f"pre-submit-request-{investigation_id}"},
+        )
+        assert requested.status_code == 200, requested.text
+        assert requested.json()["job_id"] == resumed.json()["job_id"]
         await _run_http_job(
             app,
             uow_factory,
             registry,
             dispatcher,
-            UUID(resumed.json()["job_id"]),
+            UUID(requested.json()["job_id"]),
         )
 
         completed = await client.get(f"/api/investigations/{investigation_id}")
@@ -549,6 +569,7 @@ async def test_real_postgres_tool_path_classifies_vt_download_route_404_as_unava
     seeded = await _seed_verified_article(uow_factory, artifact_store, suffix=uuid4().hex[:10])
     assert seeded.seed_observation is not None
     request_paths: list[str] = []
+    material = _unique_sample_material()
 
     def not_found(request: httpx.Request) -> httpx.Response:
         request_paths.append(request.url.path)
@@ -560,8 +581,9 @@ async def test_real_postgres_tool_path_classifies_vt_download_route_404_as_unava
         base_url="https://www.virustotal.com/api/v3",
         capabilities=VirusTotalCapabilities(file_download=True),
         file_download_enabled=True,
+        download_allowed_hosts=frozenset({"vtsamples.commondatastorage.googleapis.com"}),
+        download_allowed_ports=frozenset({443}),
     )
-    material = _HashCheckedVirusTotal(include_candidate=False).material
     transport = _VerticalScriptedTransport(
         [
             _decision(
@@ -570,7 +592,7 @@ async def test_real_postgres_tool_path_classifies_vt_download_route_404_as_unava
                     "tool_name": "vt.download_sample",
                     "schema_version": "1",
                     "arguments": {
-                        "sha256": _S2_HASH,
+                        "sha256": material.sample_hash,
                         "purpose": "Test the synthetic download route refusal.",
                         "evidence_refs": [str(seeded.seed_observation.id)],
                     },
@@ -632,14 +654,22 @@ async def test_real_postgres_tool_path_classifies_vt_download_route_404_as_unava
                 await uow.tool_invocations.list_for_investigation(seeded.investigation.id)
             )
             envelope = await uow.investigation_envelopes.get(seeded.investigation.id)
+            failed_attempt = await uow.sample_acquisition_attempts.find_latest_error(
+                seeded.investigation.id, material.sample_hash
+            )
         invocation = next(item for item in invocations if item.tool_name == "vt.download_sample")
         assert request_paths == [
-            f"/api/v3/files/{_S2_HASH}/download",
-            f"/api/v3/files/{_S2_HASH}/download_url",
+            f"/api/v3/files/{material.sample_hash}/download",
+            f"/api/v3/files/{material.sample_hash}/download_url",
         ]
         assert invocation.status is ToolInvocationStatus.UNAVAILABLE
         assert invocation.response_refs
         assert invocation.consumed_budget
+        # This bare error object cannot be attributed to VT or its proxy. Its
+        # plain ledger code (rather than an opaque refusal-cache marker) keeps
+        # this 404 diagnostic and retryable after the route/config changes.
+        assert failed_attempt is not None
+        assert failed_attempt.error_code == "virustotal_download_404_origin_unknown"
         assert envelope is not None
         assert not any(item.status.value == "reserved" for item in envelope.budget.reservations)
     finally:
@@ -684,6 +714,7 @@ async def test_real_postgres_exhausted_loop_acquisition_budget_is_not_ambiguous(
         assert persisted_after_save.budget.consumed_vt_read_units == consumed_vt_units
 
     request_paths: list[str] = []
+    material = _unique_sample_material()
 
     def not_found(request: httpx.Request) -> httpx.Response:
         request_paths.append(request.url.path)
@@ -695,6 +726,8 @@ async def test_real_postgres_exhausted_loop_acquisition_budget_is_not_ambiguous(
         base_url="https://www.virustotal.com/api/v3",
         capabilities=VirusTotalCapabilities(file_download=True),
         file_download_enabled=True,
+        download_allowed_hosts=frozenset({"vtsamples.commondatastorage.googleapis.com"}),
+        download_allowed_ports=frozenset({443}),
     )
     transport = _VerticalScriptedTransport(
         [
@@ -704,7 +737,7 @@ async def test_real_postgres_exhausted_loop_acquisition_budget_is_not_ambiguous(
                     "tool_name": "vt.download_sample",
                     "schema_version": "1",
                     "arguments": {
-                        "sha256": _S2_HASH,
+                        "sha256": material.sample_hash,
                         "purpose": "Attempt one bounded synthetic sample acquisition.",
                         "evidence_refs": [str(seeded.seed_observation.id)],
                     },
@@ -715,7 +748,7 @@ async def test_real_postgres_exhausted_loop_acquisition_budget_is_not_ambiguous(
         ],
         uow_factory=uow_factory,
         investigation_id=seeded.investigation.id,
-        material=_HashCheckedVirusTotal(include_candidate=False).material,
+        material=material,
     )
     factory = _composition_factory(
         uow_factory=uow_factory,
@@ -802,6 +835,7 @@ async def test_real_postgres_ambiguous_download_logs_safe_terminal_diagnostics(
     )
     seeded = await _seed_verified_article(uow_factory, artifact_store, suffix=uuid4().hex[:10])
     assert seeded.seed_observation is not None
+    material = _unique_sample_material()
 
     def partial_response(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, stream=_PartialDownloadFailureStream(), request=request)
@@ -812,6 +846,8 @@ async def test_real_postgres_ambiguous_download_logs_safe_terminal_diagnostics(
         base_url="https://www.virustotal.com/api/v3",
         capabilities=VirusTotalCapabilities(file_download=True),
         file_download_enabled=True,
+        download_allowed_hosts=frozenset({"vtsamples.commondatastorage.googleapis.com"}),
+        download_allowed_ports=frozenset({443}),
     )
     transport = _VerticalScriptedTransport(
         [
@@ -821,7 +857,7 @@ async def test_real_postgres_ambiguous_download_logs_safe_terminal_diagnostics(
                     "tool_name": "vt.download_sample",
                     "schema_version": "1",
                     "arguments": {
-                        "sha256": _S2_HASH,
+                        "sha256": material.sample_hash,
                         "purpose": "Exercise ambiguous partial-stream reconciliation.",
                         "evidence_refs": [str(seeded.seed_observation.id)],
                     },
@@ -831,7 +867,7 @@ async def test_real_postgres_ambiguous_download_logs_safe_terminal_diagnostics(
         ],
         uow_factory=uow_factory,
         investigation_id=seeded.investigation.id,
-        material=_HashCheckedVirusTotal(include_candidate=False).material,
+        material=material,
     )
     factory = _composition_factory(
         uow_factory=uow_factory,
@@ -900,7 +936,7 @@ async def test_real_postgres_ambiguous_download_logs_safe_terminal_diagnostics(
         assert warning.error_code == "virustotal_download_interrupted_after_bytes"
         assert warning.investigation_id == str(seeded.investigation.id)
         assert warning.invocation_id == str(invocation.id)
-        assert _S2_HASH not in warning.getMessage()
+        assert material.sample_hash not in warning.getMessage()
     finally:
         await vt_client.aclose()
 

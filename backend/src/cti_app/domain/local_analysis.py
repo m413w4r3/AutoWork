@@ -10,8 +10,11 @@ from enum import StrEnum
 class LocalCommandId(StrEnum):
     FILE = "file"
     STRINGS = "strings"
+    XXD = "xxd"
+    SHA256SUM = "sha256sum"
     READELF = "readelf"
     OBJDUMP = "objdump"
+    MONODIS = "monodis"
     YARA = "yara"
     # L4: optional extractors remain outside the generic local.run_command catalogue.
     FLOSS = "floss"
@@ -45,6 +48,12 @@ class LocalOptionKind(StrEnum):
     INTEGER = "integer"
     ENUM = "enum"
     STRING_LIST = "string_list"
+    STRING = "string"
+
+
+LOCAL_COMMAND_MAX_RANGE_BYTES = 1 * 1024 * 1024
+LOCAL_COMMAND_MAX_XXD_RANGE_BYTES = 4096
+LOCAL_COMMAND_MAX_MONODIS_RANGE_BYTES = 8 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +66,7 @@ class LocalCommandOptionSpec:
     maximum: int | None = None
     max_items: int | None = None
     max_item_length: int | None = None
+    optional: bool = False
 
 
 @dataclass(frozen=True, slots=True)

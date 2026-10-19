@@ -7,6 +7,7 @@ import logging
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, ClassVar, Literal
 from uuid import UUID
 
@@ -29,8 +30,9 @@ from cti_app.domain.investigation import (
     canonical_json_bytes,
 )
 from cti_app.domain.investigation_state import DecisionValidationCode
+from cti_app.domain.protocol_model import ProtocolDiagramKind
 
-MAX_CONTEXT_BYTES = 262_144
+MAX_CONTEXT_BYTES: Literal[262144] = 262_144
 MAX_DECISION_BYTES = 131_072
 MAX_SUMMARY_CHARS = 12_000
 MAX_CONTEXT_CONFIRMED_IOCS = 64
@@ -78,6 +80,15 @@ class ArticleContextV1(_StrictContract):
     open_questions: tuple[str, ...] = Field(max_length=128)
     publication_anchors: tuple[PublicationAnchorV1, ...] = Field(default=(), max_length=128)
     publication_anchors_truncated: bool = False
+    claims_truncated: bool | None = Field(default=None, exclude_if=lambda value: value is None)
+    documented_samples_truncated: bool | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    known_chain_truncated: bool | None = Field(default=None, exclude_if=lambda value: value is None)
+    open_questions_truncated: bool | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    long_texts_truncated: bool | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class PublicationAnchorV1(_StrictContract):
@@ -118,6 +129,34 @@ class OpinionNoteSummaryV1(_StrictContract):
     evidence_refs: tuple[UUID, ...] = Field(max_length=16)
 
 
+class CurrentOpinionContextV1(_StrictContract):
+    opinion_id: UUID
+    version: int = Field(ge=1)
+    content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class OperatorOpinionProtocolFigureSelectionV1(_StrictContract):
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    protocol_model_blob_id: UUID
+    render_observation_id: UUID
+    views: tuple[ProtocolDiagramKind, ...] = Field(min_length=3, max_length=3)
+
+    @model_validator(mode="after")
+    def require_all_protocol_views(self) -> OperatorOpinionProtocolFigureSelectionV1:
+        if len(set(self.views)) != len(ProtocolDiagramKind) or set(self.views) != set(
+            ProtocolDiagramKind
+        ):
+            raise ValueError("All three protocol views must be selected together")
+        return self
+
+
+class OperatorOpinionProtocolFiguresV1(_StrictContract):
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    protocol_figures: tuple[OperatorOpinionProtocolFigureSelectionV1, ...] = Field(max_length=1)
+
+
 class ToolSummaryV1(_StrictContract):
     name: str = Field(min_length=1, max_length=128)
     schema_version: str = Field(min_length=1, max_length=64)
@@ -132,6 +171,15 @@ class ToolCoverageEntryV1(_StrictContract):
     status: ToolInvocationStatus
     observation_id: UUID | None = None
     summary: str = Field(min_length=1, max_length=512)
+
+
+class LatestToolResultV1(_StrictContract):
+    invocation_id: UUID
+    tool_name: str = Field(min_length=1, max_length=128)
+    status: ToolInvocationStatus
+    output_ids: dict[str, str] = Field(default_factory=dict)
+    observation_ids: tuple[UUID, ...] = Field(max_length=4)
+    error_code: str | None = Field(default=None, min_length=1, max_length=96)
 
 
 class ConfirmedIOCContextV1(_StrictContract):
@@ -170,12 +218,26 @@ class ContextInvestigationV1(_StrictContract):
     findings_truncated: bool = False
     opinion_notes: tuple[OpinionNoteSummaryV1, ...] = Field(default=(), max_length=24)
     opinion_notes_truncated: bool = False
+    truncation_counts: dict[str, int] = Field(
+        default_factory=dict, exclude_if=lambda value: not value
+    )
+    new_evidence_truncated: bool | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    hypotheses_truncated: bool | None = Field(default=None, exclude_if=lambda value: value is None)
+    rule_deltas_truncated: bool | None = Field(default=None, exclude_if=lambda value: value is None)
+    previous_actions_truncated: bool | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    long_texts_truncated: bool | None = Field(default=None, exclude_if=lambda value: value is None)
     sample_deltas: tuple[dict[str, Any], ...] = Field(max_length=512)
     rule_deltas: tuple[dict[str, Any], ...] = Field(max_length=128)
     previous_actions: tuple[dict[str, Any], ...] = Field(max_length=256)
     user_requests: tuple[InvestigationUserRequestV1, ...] = Field(default=(), max_length=32)
     tool_coverage: tuple[ToolCoverageEntryV1, ...] = Field(default=(), max_length=200)
     tool_coverage_truncated: bool = False
+    latest_tool_results: tuple[LatestToolResultV1, ...] = Field(default=(), max_length=16)
+    sample_deltas_truncated: bool = False
     blocked_capabilities: tuple[str, ...] = Field(max_length=128)
     budget_remaining: dict[str, int | None]
 
@@ -190,6 +252,27 @@ class InvestigationDeltaV1(_StrictContract):
     changes: tuple[ContextChangeV1, ...] = Field(max_length=512)
     stable_hypotheses: tuple[dict[str, Any], ...] = Field(max_length=128)
     user_requests: tuple[InvestigationUserRequestV1, ...] = Field(default=(), max_length=32)
+
+
+class AdvisorLastAdviceV1(_StrictContract):
+    consultation_type: Literal["plan_investigation", "pivot_strategy", "yara_draft", "review_text"]
+    date: datetime
+    key_points: tuple[str, ...] = Field(max_length=5)
+    invocation_id: UUID
+
+
+class AdvisorGuidanceV1(_StrictContract):
+    checkpoint_due: bool
+    reason: str | None = Field(default=None, max_length=96)
+    suggested_consultation_type: (
+        Literal["plan_investigation", "pivot_strategy", "yara_draft", "review_text"] | None
+    ) = None
+    last_advice: AdvisorLastAdviceV1 | None = None
+    reminder: str = Field(max_length=120)
+    advisor_turns_used: int = Field(ge=0)
+    advisor_turn_limit: int = Field(ge=0)
+    advisor_turns_remaining: int = Field(ge=0)
+    truncated: bool = False
 
 
 class InvestigationContextV1(_StrictContract):
@@ -207,6 +290,18 @@ class InvestigationContextV1(_StrictContract):
     available_pivots_truncated: bool = False
     delta: InvestigationDeltaV1 | None = None
     available_tools: tuple[ToolSummaryV1, ...] = Field(max_length=256)
+    unavailable_tools: tuple[str, ...] = Field(default=(), max_length=64)
+    unavailable_tools_truncated: bool = False
+    advisor_guidance: AdvisorGuidanceV1 = Field(
+        default_factory=lambda: AdvisorGuidanceV1(
+            checkpoint_due=False,
+            reminder="Bridge: sortie non fiable; valider chaque suggestion par des mesures.",
+            advisor_turns_used=0,
+            advisor_turn_limit=8,
+            advisor_turns_remaining=8,
+        )
+    )
+    current_opinion: CurrentOpinionContextV1 | None = Field(default=None, exclude=True)
 
     @model_validator(mode="after")
     def validate_view_shape(self) -> InvestigationContextV1:
@@ -227,6 +322,89 @@ class InvestigationContextV1(_StrictContract):
     @classmethod
     def json_schema(cls) -> dict[str, Any]:
         return cls.model_json_schema()
+
+
+class InvestigationOperatorContextV1(_StrictContract):
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True, populate_by_name=True)
+
+    schema_version: Literal["investigation-operator-context.v1"] = Field(
+        default="investigation-operator-context.v1", alias="schema"
+    )
+    investigation_id: UUID
+    working_state_version: int = Field(ge=1)
+    working_state_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    context_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    context_bytes: int = Field(ge=0, le=MAX_CONTEXT_BYTES)
+    max_context_bytes: Literal[262144] = MAX_CONTEXT_BYTES
+    truncation: dict[str, bool]
+    truncation_counts: dict[str, int] = Field(default_factory=dict)
+    truncation_pointers: dict[str, tuple[str, ...]] = Field(default_factory=dict)
+    current_opinion: CurrentOpinionContextV1 | None = None
+    context: InvestigationContextV1
+
+
+class OperatorContextSectionPageV1(_StrictContract):
+    schema_version: Literal["investigation-operator-context-section.v1"] = Field(
+        default="investigation-operator-context-section.v1", alias="schema"
+    )
+    investigation_id: UUID
+    section: Literal[
+        "new_evidence",
+        "evidence_index",
+        "findings",
+        "opinion_notes",
+        "tool_coverage",
+        "sample_deltas",
+        "publication_anchors",
+        "article_claims",
+        "article_long_texts",
+        "documented_samples",
+        "known_chain",
+        "open_questions",
+        "hypotheses",
+        "rule_deltas",
+    ]
+    offset: int = Field(ge=0)
+    limit: int = Field(ge=1, le=20)
+    total: int = Field(ge=0)
+    next_offset: int | None = Field(default=None, ge=0)
+    items: tuple[dict[str, Any], ...] = Field(max_length=20)
+
+
+class OperatorToolInvocationRequestV1(_StrictContract):
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    schema_version: str = Field(min_length=1, max_length=64)
+    arguments: dict[str, Any]
+    purpose: str = Field(min_length=1, max_length=2_000)
+    expected_version: int = Field(ge=1)
+
+
+class OperatorToolInvocationViewV1(_StrictContract):
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    id: UUID
+    tool_name: str = Field(min_length=1, max_length=128)
+    schema_version: str = Field(min_length=1, max_length=64)
+    status: ToolInvocationStatus
+    version: int = Field(ge=1)
+    response_refs: tuple[UUID, ...]
+    error_code: str | None = Field(default=None, max_length=96)
+
+
+class OperatorToolInvocationResponseV1(_StrictContract):
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    schema_version: Literal["investigation-operator-tool-invocation.v1"] = Field(
+        default="investigation-operator-tool-invocation.v1", alias="schema"
+    )
+    investigation_id: UUID
+    working_state_version: int = Field(ge=1)
+    idempotent_replay: bool
+    invocation: OperatorToolInvocationViewV1
+    job_id: UUID | None = None
+    advisor_output: dict[str, Any] | None = None
+    advisor_output_not_replayed: bool = False
 
 
 class ProposedToolCallV1(_StrictContract):
@@ -1034,6 +1212,15 @@ def _tool_call_from_wire(
             arguments[argument_name] = _wire_string_argument(values[0][1])
         else:
             arguments[argument_name] = _wire_argument(values[0][1])
+    # The tool block already carries a PURPOSE line; tools whose argument schema
+    # also requires a ``purpose`` argument inherit it instead of failing validation.
+    purpose_schema = properties.get("purpose")
+    if (
+        "purpose" not in arguments
+        and isinstance(purpose_schema, Mapping)
+        and purpose_schema.get("type") == "string"
+    ):
+        arguments["purpose"] = purpose[0][1].strip()
     return ProposedToolCallV1(
         tool_name=name[1].strip(),
         schema_version=version[0][1].strip(),
@@ -1256,7 +1443,11 @@ __all__ = [
     "FindingProposalV1",
     "InvestigationContextV1",
     "InvestigationDeltaV1",
+    "InvestigationOperatorContextV1",
     "InvestigationSourceV1",
+    "OperatorToolInvocationRequestV1",
+    "OperatorToolInvocationResponseV1",
+    "OperatorToolInvocationViewV1",
     "OpinionDeltaV1",
     "ProposedToolCallV1",
     "ToolSummaryV1",

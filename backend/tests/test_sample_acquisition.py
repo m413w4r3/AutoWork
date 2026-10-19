@@ -598,8 +598,8 @@ async def test_budget_is_not_refunded_when_the_vt_call_fails_after_being_consume
     assert db.investigations[investigation.id].budget.consumed_vt_read_units == 1
     assert len(db.samples) == 0
     error_attempt = next(a for a in db.attempts if a.outcome is SampleAcquisitionOutcome.ERROR)
-    assert error_attempt.error_code == "virustotal_download_route_not_found"
-    assert caught.value.code == error_attempt.error_code
+    assert error_attempt.error_code == "virustotal_download_404_origin_unknown"
+    assert caught.value.code == "virustotal_download_404_origin_unknown"
     assert caught.value.ambiguous is False
     failure_events = [e for e in db.provenance if e.aggregate_id == investigation.id]
     assert len(failure_events) == 1
@@ -688,7 +688,7 @@ async def test_adapter_rejects_signed_host_outside_the_allowlist_before_download
 
 
 @pytest.mark.asyncio
-async def test_adapter_refuses_a_redirect_from_the_signed_download() -> None:
+async def test_adapter_refuses_a_redirect_to_a_host_outside_the_allowlist() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/download"):
             return httpx.Response(404, request=request)
@@ -701,10 +701,10 @@ async def test_adapter_refuses_a_redirect_from_the_signed_download() -> None:
             302, headers={"location": "https://elsewhere.example.test/x"}, request=request
         )
 
-    from cti_app.application.virustotal import VirusTotalUnexpectedRedirectError
+    from cti_app.application.virustotal import VirusTotalDownloadHostNotAllowedError
 
     adapter = _adapter(handler, download_handler, allowed_hosts=frozenset({"signed.example.test"}))
-    with pytest.raises(VirusTotalUnexpectedRedirectError):
+    with pytest.raises(VirusTotalDownloadHostNotAllowedError):
         await adapter.file_download("d" * 64, sink=io_bytes_sink())
 
 

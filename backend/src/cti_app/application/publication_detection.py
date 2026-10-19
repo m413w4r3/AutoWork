@@ -124,6 +124,11 @@ async def build_publication_detection(
         payload = await evidence_payloads.read_json(observation.blob_id)
         if not isinstance(payload, Mapping):
             raise PublicationDetectionDataError("YARA report payload is not a JSON object")
+        if (
+            payload.get("schema") != "investigation-yara-test.v1"
+            or payload.get("operation") != "test"
+        ):
+            continue
         if payload.get("source_sha256") != selected.source_sha256:
             raise PublicationDetectionDataError(
                 "YARA report source hash does not match its canonical rule version"
@@ -186,13 +191,13 @@ def _validation_fields(
     payload: Mapping[str, Any] | None,
 ) -> tuple[RuleValidationStatus, PublicationDetectionReason]:
     if payload is None:
-        return RuleValidationStatus.UNTESTED, PublicationDetectionReason.CORPUS_EMPTY
+        return RuleValidationStatus.UNTESTED, PublicationDetectionReason.EXPLICIT_TEST_REQUIRED
     try:
         status = RuleValidationStatus(payload.get("validation_status", "untested"))
     except (TypeError, ValueError):
         status = RuleValidationStatus.UNTESTED
     fallback_reasons = {
-        RuleValidationStatus.UNTESTED: RuleValidationReason.CORPUS_EMPTY,
+        RuleValidationStatus.UNTESTED: RuleValidationReason.EXPLICIT_TEST_REQUIRED,
         RuleValidationStatus.SYNTHETIC_ONLY: RuleValidationReason.SYNTHETIC_POSITIVES,
         RuleValidationStatus.REAL_VALIDATED: RuleValidationReason.VALIDATED,
     }

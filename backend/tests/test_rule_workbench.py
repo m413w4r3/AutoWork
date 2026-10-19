@@ -4,10 +4,15 @@ import hashlib
 import socket
 from collections.abc import Sequence
 from dataclasses import FrozenInstanceError
+from typing import Any, ClassVar
 from uuid import UUID, uuid4
 
 import pytest
 
+from cti_app.application.confined_analysis import (
+    ConfinedAnalysisFamilyStatus,
+    ConfinedAnalysisResult,
+)
 from cti_app.application.investigation_persistence import DetectionCandidateRepository
 from cti_app.application.rule_workbench import (
     RuleCorpusBytesUnavailable,
@@ -31,6 +36,7 @@ from cti_app.domain.invariants import (
 from cti_app.domain.investigation import (
     DetectionCandidateStatus,
     DetectionCandidateVersion,
+    ToolInvocationStatus,
 )
 from cti_app.domain.legitimate_services import (
     LegitimateServiceCategory,
@@ -156,6 +162,84 @@ def _workbench(
         non_discriminant_patterns=non_discriminant or NonDiscriminantPatternRegistry(()),
         legitimate_services=legitimate or LegitimateServiceRegistry(()),
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "file_status",
+    (
+        YaraExecutionStatus.ENGINE_CRASHED,
+        YaraExecutionStatus.TIMEOUT,
+        YaraExecutionStatus.RESOURCE_EXCEEDED,
+    ),
+)
+async def test_confined_rule_test_marks_one_failed_file_non_measurable(
+    file_status: YaraExecutionStatus,
+) -> None:
+    problematic = b"one file that the isolated worker cannot measure"
+    goodware = b"a separate measurable file"
+    problematic_sha256 = _sha256(problematic)
+    goodware_sha256 = _sha256(goodware)
+    artifacts = {problematic_sha256: uuid4(), goodware_sha256: uuid4()}
+    investigation_id = uuid4()
+
+    class CorpusArtifactIds:
+        async def get_artifact_id_for_sample(self, sample_sha256: str) -> UUID:
+            return artifacts[sample_sha256]
+
+    class ConfinedYara:
+        family_statuses: ClassVar[dict[str, ConfinedAnalysisFamilyStatus]] = {
+            "yara": ConfinedAnalysisFamilyStatus("yara", True, "4.5.0")
+        }
+
+        async def execute(self, request: Any) -> ConfinedAnalysisResult:
+            status = file_status.value if request.sha256 == problematic_sha256 else "ok"
+            message = "per-file YARA limit reached" if request.sha256 == problematic_sha256 else ""
+            return ConfinedAnalysisResult(
+                status=ToolInvocationStatus.SUCCEEDED,
+                operation_key="confined-analysis:test",
+                artifact_id=request.artifact_id,
+                input_sha256=request.sha256,
+                payload={
+                    "result": {
+                        "status": status,
+                        "version": "4.5.0",
+                        "matches": False,
+                        "message": message,
+                    }
+                },
+            )
+
+    workbench = RuleWorkbench(
+        corpus_bytes=CorpusArtifactIds(),  # type: ignore[arg-type]
+        yara_engine=None,
+        confined_analysis=ConfinedYara(),  # type: ignore[arg-type]
+        detection_candidates=MemoryDetectionCandidates(),
+        non_discriminant_patterns=NonDiscriminantPatternRegistry(()),
+        legitimate_services=LegitimateServiceRegistry(()),
+    )
+
+    report = await workbench.compile_and_test(
+        "rule harmless { condition: true }",
+        (
+            RuleTestCase(
+                sample_sha256=problematic_sha256,
+                role=RuleTestCorpusRole.CONFIRMED_POSITIVE,
+            ),
+            RuleTestCase(sample_sha256=goodware_sha256, role=RuleTestCorpusRole.GOODWARE),
+        ),
+        investigation_id=investigation_id,
+        selection_bias="One isolated-file failure is paired with measurable goodware.",
+        coverage_statement="The worker measured one file and could not measure one file.",
+    )
+
+    positive = next(
+        role for role in report.roles if role.role is RuleTestCorpusRole.CONFIRMED_POSITIVE
+    )
+    assert report.execution_status is YaraExecutionStatus.OK
+    assert positive.non_measurable == (problematic_sha256,)
+    assert positive.errors[0].code.value == file_status.value
+    assert positive.errors[0].message == "per-file YARA limit reached"
 
 
 @pytest.mark.asyncio

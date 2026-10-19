@@ -110,6 +110,28 @@ class CapabilitiesService:
                     capabilities=tuple(Capability(**value) for value in values),
                     errors=errors,
                 )
+        return await self.persist_worker_result(result)
+
+    async def persist_worker_result(self, result: CapabilitySet) -> CapabilitySet:
+        """Persist a capa result produced inside the attested analysis worker."""
+        async with self._uow_factory() as uow:
+            sample = await uow.samples.get(result.sample_id)
+            if sample is None:
+                raise EntityNotFoundError(f"Sample {result.sample_id} does not exist")
+            if (
+                result.tool_name != "capa"
+                or not result.tool_version
+                or not result.parameters_sha256
+            ):
+                raise ValueError("worker capability result identity is invalid")
+            existing = await uow.capability_sets.get(
+                result.sample_id,
+                result.tool_version,
+                result.ruleset_sha256,
+                result.parameters_sha256,
+            )
+            if existing is not None:
+                return existing
         descriptor = await self._blobs.ingest(
             BytesIO(json.dumps(result.as_json(), sort_keys=True).encode()),
             logical_bucket="capability-sets",
@@ -119,7 +141,10 @@ class CapabilitiesService:
             inserted = await uow.capability_sets.add_if_absent(result, descriptor.id)
             if not inserted:
                 existing = await uow.capability_sets.get(
-                    sample_id, "9.4.0", result.ruleset_sha256, parameter_hash
+                    result.sample_id,
+                    result.tool_version,
+                    result.ruleset_sha256,
+                    result.parameters_sha256,
                 )
                 if existing is None:
                     raise RuntimeError("capability set conflict without row")

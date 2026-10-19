@@ -4,7 +4,7 @@ import re
 import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, BinaryIO, Protocol
+from typing import TYPE_CHECKING, Any, BinaryIO, Literal, Protocol
 
 from cti_app.domain.retrohunt import (
     RetrohuntProviderJob,
@@ -23,6 +23,9 @@ from cti_app.domain.virustotal import (
     VirusTotalTransportKind,
 )
 
+if TYPE_CHECKING:
+    from cti_app.application.sample_acquisition import SampleAcquisitionResponseOrigin
+
 
 class VirusTotalError(RuntimeError):
     code = "virustotal_error"
@@ -32,7 +35,18 @@ class VirusTotalError(RuntimeError):
     error_code: str | None = None
     error_message: str | None = None
     route: str | None = None
+    route_path: str | None = None
     operation: VirusTotalOperation | None = None
+    transport: str | None = None
+    content_type_class: str | None = None
+    location_host: str | None = None
+    bytes_read: int | None = None
+    correlation_id: str | None = None
+    issuer: str | None = None
+    fingerprint: str | None = None
+    route_missing: bool = False
+    fallback_decision: str | None = None
+    response_origin: SampleAcquisitionResponseOrigin | None = None
 
     def __init__(
         self,
@@ -45,7 +59,18 @@ class VirusTotalError(RuntimeError):
         error_code: str | None = None,
         error_message: str | None = None,
         route: str | None = None,
+        route_path: str | None = None,
         operation: VirusTotalOperation | None = None,
+        transport: str | None = None,
+        content_type_class: str | None = None,
+        location_host: str | None = None,
+        bytes_read: int | None = None,
+        correlation_id: str | None = None,
+        issuer: str | None = None,
+        fingerprint: str | None = None,
+        route_missing: bool = False,
+        fallback_decision: str | None = None,
+        response_origin: SampleAcquisitionResponseOrigin | None = None,
     ) -> None:
         super().__init__(message)
         if code is not None:
@@ -57,7 +82,19 @@ class VirusTotalError(RuntimeError):
         self.error_code = error_code
         self.error_message = error_message
         self.route = route
+        self.route_path = route_path
         self.operation = operation
+        self.transport = transport
+        self.content_type_class = content_type_class
+        self.location_host = location_host
+        self.bytes_read = bytes_read
+        self.correlation_id = correlation_id
+        self.issuer = issuer
+        self.fingerprint = fingerprint
+        self.route_missing = route_missing
+        self.fallback_decision = fallback_decision
+        if response_origin is not None:
+            self.response_origin = response_origin
 
 
 class VirusTotalConfigurationError(VirusTotalError):
@@ -120,6 +157,30 @@ class VirusTotalDownloadTooLargeError(VirusTotalError):
 
 class VirusTotalDownloadHashMismatchError(VirusTotalError):
     code = "virustotal_download_hash_mismatch"
+
+
+class VirusTotalDownloadEmptyError(VirusTotalError):
+    code = "virustotal_download_empty"
+
+
+class VirusTotalDownloadNotBinaryError(VirusTotalError):
+    code = "virustotal_download_not_binary"
+
+
+class VirusTotalDownloadLengthMismatchError(VirusTotalError):
+    code = "virustotal_download_length_mismatch"
+
+
+class VirusTotalDownloadTruncatedError(VirusTotalError):
+    code = "virustotal_download_truncated"
+
+
+class VirusTotalSignedUrlExpiredError(VirusTotalError):
+    code = "virustotal_signed_url_expired"
+
+
+class VirusTotalDownloadRedirectLimitError(VirusTotalError):
+    code = "virustotal_download_redirect_limit"
 
 
 class VirusTotalHttpError(VirusTotalError):
@@ -257,6 +318,16 @@ class VirusTotalFileReport:
 
 
 @dataclass(frozen=True, slots=True)
+class VirusTotalObjectReport:
+    kind: Literal["ip_addresses", "domains", "urls"]
+    object_id: str
+    raw_json: bytes
+    http_status: int
+    transport: VirusTotalTransportKind
+    api_generation: VirusTotalEndpointVariant
+
+
+@dataclass(frozen=True, slots=True)
 class VirusTotalPage:
     items: tuple[dict[str, Any], ...]
     next_cursor: str | None
@@ -306,8 +377,16 @@ class VirusTotalDownloadResult:
 class VirusTotalPort(Protocol):
     async def file_report(self, file_hash: str) -> VirusTotalFileReport: ...
 
+    async def object_report(
+        self, kind: Literal["ip_addresses", "domains", "urls"], object_id: str
+    ) -> VirusTotalObjectReport: ...
+
     async def file_download(
         self, file_hash: str, *, sink: BinaryIO
+    ) -> VirusTotalDownloadResult: ...
+
+    async def behaviour_pcap(
+        self, sandbox_id: str, *, sink: BinaryIO
     ) -> VirusTotalDownloadResult: ...
 
     async def file_relationship(

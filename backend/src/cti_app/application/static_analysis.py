@@ -72,6 +72,22 @@ class StaticAnalysisService:
             max_strings=self._max_strings,
             min_string_length=self._string_min_length,
         )
+        return await self.persist_worker_result(features)
+
+    async def persist_worker_result(self, features: SampleFeatureSetV1) -> SampleFeatureSetV1:
+        """Persist a feature pack produced inside the attested analysis worker."""
+        async with self._uow_factory() as uow:
+            sample = await uow.samples.get(features.sample_id)
+            blob = await uow.blobs.get(features.blob_id)
+            if sample is None or sample.blob_id != features.blob_id or blob is None:
+                raise ValueError("worker feature pack does not match the canonical sample")
+            if features.sha256 != blob.descriptor.sha256:
+                raise ValueError("worker feature pack SHA-256 does not match the canonical sample")
+            existing = await uow.sample_feature_sets.get(
+                features.sample_id, features.extractor_version, features.parameters_sha256
+            )
+            if existing is not None:
+                return existing
         descriptor = await self._blobs.ingest(
             BytesIO(json.dumps(features.as_json(), sort_keys=True).encode()),
             logical_bucket="sample-features",
@@ -80,12 +96,16 @@ class StaticAnalysisService:
         async with self._uow_factory() as uow:
             inserted = await uow.sample_feature_sets.add_if_absent(features, descriptor.id)
             if not inserted:
-                existing = await uow.sample_feature_sets.get(sample_id, "static-v1", parameter_hash)
+                existing = await uow.sample_feature_sets.get(
+                    features.sample_id,
+                    features.extractor_version,
+                    features.parameters_sha256,
+                )
                 if existing is None:
                     raise RuntimeError("feature set conflict without row")
                 return existing
             await uow.sample_feature_sets.index(features)
-            current = await uow.samples.get(sample_id)
+            current = await uow.samples.get(features.sample_id)
             if current is not None:
                 for name in ("imphash", "ssdeep", "tlsh", "rich_header_hash"):
                     value = getattr(features, name)
@@ -96,15 +116,15 @@ class StaticAnalysisService:
                             await uow.provenance.append(
                                 ProvenanceEvent(
                                     aggregate_type="sample",
-                                    aggregate_id=sample.id,
+                                    aggregate_id=current.id,
                                     event_type="sample.local_similarity_divergence",
                                     payload={
                                         "field": name,
                                         "vt_value": current_value,
                                         "local_value": value,
                                     },
-                                    tlp=sample.tlp,
-                                    subject_id=sample.subject_id,
+                                    tlp=current.tlp,
+                                    subject_id=current.subject_id,
                                     actor_id="system:analysis-worker",
                                 )
                             )

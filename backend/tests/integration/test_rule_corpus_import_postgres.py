@@ -8,6 +8,13 @@ from uuid import UUID, uuid4
 import pytest
 
 from cti_app.application.blobs import BlobCatalogService
+from cti_app.application.confined_analysis import (
+    ConfinedAnalysisFamilyStatus,
+    ConfinedAnalysisResult,
+)
+from cti_app.application.evidence_recorder import ProductionEvidenceRecorder
+from cti_app.application.investigation_acquisition import HitAcquisitionService
+from cti_app.application.investigation_acquisition_tools import LocalSampleAnalysisService
 from cti_app.application.investigation_rule_tools import QuarantineRuleCorpusBytes
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.rule_corpus_import import (
@@ -16,7 +23,14 @@ from cti_app.application.rule_corpus_import import (
 )
 from cti_app.domain.classification import TLP
 from cti_app.domain.editions import Edition
-from cti_app.domain.entities import Subject
+from cti_app.domain.entities import SampleOrigin, SampleState, Subject
+from cti_app.domain.investigation import (
+    SampleOrigin as AssociationSampleOrigin,
+)
+from cti_app.domain.investigation import (
+    SampleQualification,
+    ToolInvocationStatus,
+)
 from cti_app.domain.production import (
     AnalystInputPack,
     AnalystInvestigation,
@@ -32,6 +46,59 @@ from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 from tests.integration.edition_codes import reserve_edition_code
 
 pytestmark = pytest.mark.integration
+
+
+class _PostgresEvidenceRecorder:
+    def __init__(self, uow_factory, artifact_store) -> None:
+        self._uow_factory = uow_factory
+        self._artifact_store = artifact_store
+
+    async def record_existing_blob(self, **kwargs):
+        async with self._uow_factory() as uow:
+            recorder = ProductionEvidenceRecorder(self._artifact_store, uow.evidence_observations)
+            observation = await recorder.record_existing_blob(**kwargs)
+            await uow.commit()
+            return observation
+
+    async def record_json(self, **kwargs):
+        async with self._uow_factory() as uow:
+            recorder = ProductionEvidenceRecorder(self._artifact_store, uow.evidence_observations)
+            observation = await recorder.record_json(**kwargs)
+            await uow.commit()
+            return observation
+
+
+class _ImportedSampleAnalysisWorker:
+    def __init__(self) -> None:
+        self.family_statuses = {
+            "sample_analysis": ConfinedAnalysisFamilyStatus(
+                "sample_analysis", True, "static-test-v1"
+            )
+        }
+        self.requests = []
+
+    async def execute(self, request):
+        self.requests.append(request)
+        return ConfinedAnalysisResult(
+            status=ToolInvocationStatus.SUCCEEDED,
+            operation_key=f"confined-analysis:{request.sha256}",
+            artifact_id=request.artifact_id,
+            input_sha256=request.sha256,
+            result_blob_id=request.artifact_id,
+            result_sha256=request.sha256,
+            payload={
+                "result": {
+                    "status": "SUCCEEDED",
+                    "families": {
+                        "static": {
+                            "version": "static-test-v1",
+                            "status": "SUCCEEDED",
+                            "strings": [{"value": "harmless imported fixture"}],
+                        }
+                    },
+                }
+            },
+        )
 
 
 @pytest.mark.asyncio
@@ -147,6 +214,10 @@ async def test_operator_import_is_persisted_once_in_quarantine_and_read_back_ver
     assert replay.idempotent_replay
     assert replay.observation_id == imported.observation_id
     assert replay.blob_id == imported.blob_id
+    assert replay.sample_id == imported.sample_id
+    assert replay.association_id == imported.association_id
+    assert imported.sample_id is not None
+    assert imported.association_id is not None
     inventory = await list_manual_rule_corpus_imports(uow_factory, investigation.id)
     assert len(inventory) == 1
     assert inventory[0].sample_sha256 == sha256
@@ -156,13 +227,54 @@ async def test_operator_import_is_persisted_once_in_quarantine_and_read_back_ver
 
     reader = QuarantineRuleCorpusBytes(uow_factory, blob_store)
     assert await reader.get_bytes_for_sample(sha256) == content
+    hits = HitAcquisitionService(
+        uow_factory,
+        acquisition=None,
+        recorder=_PostgresEvidenceRecorder(uow_factory, artifact_store),
+    )
+    resolved = await hits.resolve_quarantined_sample(imported.association_id)
+    assert resolved.sample_id == imported.sample_id
+    assert resolved.sha256 == sha256
+    worker = _ImportedSampleAnalysisWorker()
+    analyzer = LocalSampleAnalysisService(
+        hits,
+        uow_factory,
+        _PostgresEvidenceRecorder(uow_factory, artifact_store),
+        confined_analysis=worker,  # type: ignore[arg-type]
+    )
+    analyzed = await analyzer.analyze(
+        association_id=imported.association_id,
+        invocation_ref=None,
+    )
+    assert analyzed.status is ToolInvocationStatus.PARTIAL
+    assert analyzed.output["sample_id"] == str(imported.sample_id)
+    assert analyzed.output["sample_sha256"] == sha256
+    assert worker.requests[0].artifact_id == imported.blob_id
+    assert worker.requests[0].sha256 == sha256
     async with uow_factory() as uow:
         observation = await uow.evidence_observations.get(imported.observation_id)
         assert observation is not None
         assert observation.source == "operator.rule-corpus"
         assert observation.object_type == "manual_rule_corpus_import"
         assert observation.kind.value == "other"
-        assert await uow.sample_associations.list_for_investigation(investigation.id) == ()
+        associations = await uow.sample_associations.list_for_investigation(investigation.id)
+        assert len(associations) == 1
+        assert associations[0].id == imported.association_id
+        assert associations[0].origin is AssociationSampleOrigin.MANUAL
+        assert associations[0].qualification is SampleQualification.CANDIDATE
+        sample = await uow.samples.get(imported.sample_id)
+        assert sample is not None
+        assert sample.origin == "operator_import"
+        assert sample.source_service == "operator_import"
+        assert sample.origin_kind is SampleOrigin.MANUAL
+        assert sample.state is SampleState.QUARANTINED
+        assert sample.do_not_submit is True
+        assert sample.external_llm_allowed is False
+        assert any(
+            event.event_type == "sample_imported_by_operator"
+            and event.payload["provenance"] == "operator_import"
+            for event in await uow.provenance.list_for_aggregate("sample", sample.id)
+        )
 
 
 @pytest.mark.asyncio
@@ -543,11 +655,9 @@ async def test_postgres_rule_propose_test_and_revise_use_imported_non_pe_corpus(
         candidate_id = proposed.output["candidate_id"]
         assert proposed.output["version"] == "v1"
         assert proposed.output["candidate_status"] == "candidate"
-        assert proposed.output["validation_status"] == "real_partial"
-        assert proposed.output["report"]["execution_status"] == "ok"
-        assert proposed.output["report"]["validation_status"] == "real_partial"
-        assert proposed.output["report"]["false_negative_count"] == 1
-        assert proposed.output["report"]["false_positive_count"] == 0
+        assert proposed.output["validation_status"] == "untested"
+        assert proposed.output["compile_check"]["status"] == "ok"
+        assert "report" not in proposed.output
         replay_without_meta = await call(
             "rule.propose",
             {"candidate_id": candidate_id, "motifs": motifs, "condition": "all"},
@@ -598,6 +708,8 @@ async def test_postgres_rule_propose_test_and_revise_use_imported_non_pe_corpus(
             "real": 0,
             "synthetic": 2,
         }
+        assert report["revision_recommendation"] == "revise_false_negative"
+        assert "confirmed-positive byte sample was missed" in report["revision_guidance"]
 
         revised = await call(
             "rule.revise",
@@ -610,12 +722,21 @@ async def test_postgres_rule_propose_test_and_revise_use_imported_non_pe_corpus(
             },
             "rule-revise",
         )
-        revised_report = revised.output["report"]
         assert revised.status is ToolInvocationStatus.SUCCEEDED
         assert revised.output["version"] == "v2"
-        assert revised.output["candidate_status"] == "tested"
-        assert revised.output["validation_status"] == "real_partial"
-        assert revised_report["execution_status"] == "ok"
+        assert revised.output["candidate_status"] == "candidate"
+        assert revised.output["validation_status"] == "untested"
+        assert revised.output["compile_check"]["status"] == "ok"
+        assert "report" not in revised.output
+
+        revised_test = await call(
+            "rule.test",
+            {"candidate_id": candidate_id, "version": 2},
+            "rule-test-v2",
+        )
+        revised_report = revised_test.output["report"]
+        assert revised_test.status is ToolInvocationStatus.SUCCEEDED
+        assert revised_test.output["validation_status"] == "real_partial"
         assert revised_report["false_negative_count"] == 0
         assert revised_report["false_positive_count"] == 0
         revised_positive = next(
@@ -688,5 +809,7 @@ async def test_postgres_rule_propose_test_and_revise_use_imported_non_pe_corpus(
         assert second_proposed.status is ToolInvocationStatus.SUCCEEDED
         assert second_proposed.output["candidate_id"] != candidate_id
         assert second_proposed.output["version"] == "v1"
-        assert second_proposed.output["execution_status"] == "ok"
+        assert second_proposed.output["validation_status"] == "untested"
+        assert second_proposed.output["compile_check"]["status"] == "ok"
+        assert "report" not in second_proposed.output
         await second_uow.commit()

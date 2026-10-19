@@ -1,29 +1,40 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
 import logging
 import re
 import ssl
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from enum import StrEnum
-from typing import Any, BinaryIO
-from urllib.parse import quote, urlsplit
+from typing import Any, BinaryIO, Literal
+from urllib.parse import quote, urljoin, urlsplit
+from uuid import uuid4
 
 import httpx
 
+from cti_app.application.sample_acquisition import (
+    SampleAcquisitionCacheScope,
+    SampleAcquisitionResponseOrigin,
+)
 from cti_app.application.virustotal import (
     FileRelationship,
     VirusTotalCapabilities,
     VirusTotalCapabilityDisabledError,
     VirusTotalConfigurationError,
+    VirusTotalDownloadEmptyError,
     VirusTotalDownloadHashMismatchError,
     VirusTotalDownloadHostNotAllowedError,
+    VirusTotalDownloadLengthMismatchError,
+    VirusTotalDownloadNotBinaryError,
+    VirusTotalDownloadRedirectLimitError,
     VirusTotalDownloadResult,
     VirusTotalDownloadTooLargeError,
+    VirusTotalDownloadTruncatedError,
     VirusTotalError,
     VirusTotalFile,
     VirusTotalFileReport,
@@ -31,6 +42,7 @@ from cti_app.application.virustotal import (
     VirusTotalInvalidInputError,
     VirusTotalJsonError,
     VirusTotalNotAuthorizedError,
+    VirusTotalObjectReport,
     VirusTotalOperationRoute,
     VirusTotalPage,
     VirusTotalPayloadError,
@@ -44,13 +56,14 @@ from cti_app.application.virustotal import (
     VirusTotalRouteUnavailableError,
     VirusTotalRoutingPolicy,
     VirusTotalSearchResult,
+    VirusTotalSignedUrlExpiredError,
     VirusTotalTransportError,
     VirusTotalUnexpectedRedirectError,
     file_hash_family,
     normalize_file_hash,
     validate_search_query,
 )
-from cti_app.config import Settings
+from cti_app.config import VIRUSTOTAL_DOWNLOAD_REQUIRED_CDN_HOST, Settings
 from cti_app.domain.retrohunt import (
     RetrohuntProviderJob,
     RetrohuntProviderResults,
@@ -68,7 +81,20 @@ from cti_app.domain.virustotal import (
 )
 
 logger = logging.getLogger(__name__)
+
+
 _MAX_ERROR_BODY_BYTES = 64 * 1024
+_DOWNLOAD_FINGERPRINT_CONFIG_VERSION = "vt-download-transport-v2"
+VIRUSTOTAL_PROXY_QUERY_SENTINEL_NAME = "x"
+VIRUSTOTAL_PROXY_QUERY_SENTINEL_VALUE = "1"
+_PROXY_QUERY_SENTINEL_HOOK_MARKER = "_cti_vt_proxy_query_sentinel_hook"
+_PCAP_MAGIC = (
+    b"\xd4\xc3\xb2\xa1",
+    b"\xa1\xb2\xc3\xd4",
+    b"\x4d\x3c\xb2\xa1",
+    b"\xa1\xb2\x3c\x4d",
+    b"\x0a\x0d\x0d\x0a",
+)
 
 VIRUSTOTAL_ADAPTER_SETTINGS_BY_ARGUMENT = {
     "base_url": "virustotal_base_url",
@@ -82,7 +108,12 @@ VIRUSTOTAL_ADAPTER_SETTINGS_BY_ARGUMENT = {
     "max_pages": "virustotal_max_pages",
     "max_results": "virustotal_max_results",
     "file_download_enabled": "virustotal_file_download_enabled",
+    "file_download_legacy_fallback_enabled": "virustotal_file_download_legacy_fallback_enabled",
+    "proxy_query_sentinel_enabled": "virustotal_proxy_query_sentinel_enabled",
+    "behaviour_pcap_enabled": "virustotal_behaviour_pcap_enabled",
     "download_allowed_hosts": "virustotal_download_allowed_hosts",
+    "download_allowed_ports": "virustotal_download_allowed_ports",
+    "download_max_redirects": "virustotal_download_max_redirects",
     "download_max_bytes": "virustotal_download_max_bytes",
     "download_timeout_seconds": "virustotal_download_timeout_seconds",
 }
@@ -91,7 +122,7 @@ VIRUSTOTAL_ADAPTER_SETTINGS_BY_ARGUMENT = {
 def create_virustotal_http_client(settings: Settings) -> httpx.AsyncClient:
     """Create the proxy-only client; its caller owns and closes its lifecycle."""
     proxy, verify, timeout = _virustotal_proxy_options(settings)
-    return httpx.AsyncClient(
+    client = httpx.AsyncClient(
         proxy=proxy,
         verify=verify,
         timeout=timeout,
@@ -99,6 +130,7 @@ def create_virustotal_http_client(settings: Settings) -> httpx.AsyncClient:
         headers={"accept": "application/json"},
         trust_env=False,
     )
+    return _configure_proxy_query_sentinel(client, settings.virustotal_proxy_query_sentinel_enabled)
 
 
 def configure_virustotal_proxy_http_client(
@@ -122,6 +154,26 @@ def configure_virustotal_proxy_http_client(
     client.timeout = timeout
     client.follow_redirects = False
     client.headers["accept"] = "application/json"
+    _configure_proxy_query_sentinel(client, settings.virustotal_proxy_query_sentinel_enabled)
+    return client
+
+
+def _configure_proxy_query_sentinel(client: httpx.AsyncClient, enabled: bool) -> httpx.AsyncClient:
+    """Install the proxy-only queryless-request workaround on a shared client."""
+    hooks = client.event_hooks.setdefault("request", [])
+    hooks[:] = [
+        hook for hook in hooks if not getattr(hook, _PROXY_QUERY_SENTINEL_HOOK_MARKER, False)
+    ]
+    if enabled:
+
+        async def add_proxy_query_sentinel(request: httpx.Request) -> None:
+            if not request.url.query:
+                request.url = request.url.copy_merge_params(
+                    {VIRUSTOTAL_PROXY_QUERY_SENTINEL_NAME: VIRUSTOTAL_PROXY_QUERY_SENTINEL_VALUE}
+                )
+
+        setattr(add_proxy_query_sentinel, _PROXY_QUERY_SENTINEL_HOOK_MARKER, True)
+        hooks.append(add_proxy_query_sentinel)
     return client
 
 
@@ -152,7 +204,10 @@ def create_virustotal_direct_http_client(settings: Settings) -> httpx.AsyncClien
     """
     if settings.virustotal_api_key is None:
         raise VirusTotalConfigurationError("La clé API directe VirusTotal n'est pas configurée.")
-    if not settings.virustotal_file_report_legacy_fallback_enabled:
+    if not (
+        settings.virustotal_file_report_legacy_fallback_enabled
+        or settings.virustotal_file_download_legacy_fallback_enabled
+    ):
         raise VirusTotalConfigurationError(
             "Aucune route directe VirusTotal n'est activée explicitement."
         )
@@ -191,7 +246,12 @@ class VirusTotalHttpAdapter(VirusTotalPort):
         max_pages: int = 10,
         max_results: int = 1000,
         file_download_enabled: bool = False,
+        file_download_legacy_fallback_enabled: bool = False,
+        proxy_query_sentinel_enabled: bool = True,
+        behaviour_pcap_enabled: bool = False,
         download_allowed_hosts: frozenset[str] = frozenset(),
+        download_allowed_ports: frozenset[int] = frozenset({443}),
+        download_max_redirects: int = 3,
         download_max_bytes: int = 200 * 1024 * 1024,
         download_timeout_seconds: float = 120.0,
         download_client_factory: Callable[[], httpx.AsyncClient] | None = None,
@@ -209,6 +269,9 @@ class VirusTotalHttpAdapter(VirusTotalPort):
         if (direct_client is None) != (api_key is None):
             raise ValueError("direct_client et api_key doivent être fournis ensemble")
         self._capabilities = capabilities
+        self._file_download_enabled = file_download_enabled
+        self._proxy_query_sentinel_enabled = proxy_query_sentinel_enabled
+        self._behaviour_pcap_enabled = behaviour_pcap_enabled
         if routing_policy is None:
             self._routing_policy = _default_routing_policy(
                 base_url=self._base_url,
@@ -219,19 +282,30 @@ class VirusTotalHttpAdapter(VirusTotalPort):
                 proxy_fallback_enabled=file_report_proxy_fallback_enabled,
                 legacy_fallback_enabled=file_report_legacy_fallback_enabled,
                 file_download_enabled=file_download_enabled,
+                behaviour_pcap_enabled=behaviour_pcap_enabled,
             )
         elif file_download_enabled:
             self._routing_policy = routing_policy
         else:
             routes = dict(routing_policy.routes)
             routes.pop(VirusTotalCapability.FILE_DOWNLOAD, None)
+            if not behaviour_pcap_enabled:
+                routes.pop(VirusTotalCapability.BEHAVIOUR_PCAP, None)
+            self._routing_policy = VirusTotalRoutingPolicy(routes=routes)
+        if routing_policy is not None and file_download_enabled and not behaviour_pcap_enabled:
+            routes = dict(self._routing_policy.routes)
+            routes.pop(VirusTotalCapability.BEHAVIOUR_PCAP, None)
             self._routing_policy = VirusTotalRoutingPolicy(routes=routes)
         self._max_response_bytes = _positive(max_response_bytes, "max_response_bytes")
         self._default_page_size = _bounded(default_page_size, 1, max_page_size, "default_page_size")
         self._max_page_size = _positive(max_page_size, "max_page_size")
         self._max_pages = _positive(max_pages, "max_pages")
         self._max_results = _positive(max_results, "max_results")
-        self._download_allowed_hosts = download_allowed_hosts
+        self._download_allowed_hosts = frozenset(host.lower() for host in download_allowed_hosts)
+        self._download_allowed_ports = frozenset(download_allowed_ports)
+        self._download_max_redirects = _bounded(
+            download_max_redirects, 0, 10, "download_max_redirects"
+        )
         self._download_max_bytes = _positive(download_max_bytes, "download_max_bytes")
         self._download_timeout_seconds = _positive_float(
             download_timeout_seconds, "download_timeout_seconds"
@@ -241,6 +315,106 @@ class VirusTotalHttpAdapter(VirusTotalPort):
         # headerless, non-redirecting client — never the proxy or direct
         # client, which may carry credentials.
         self._download_client_factory = download_client_factory
+        self._file_download_legacy_fallback_enabled = file_download_legacy_fallback_enabled
+        self.acquisition_route_fingerprint = _download_route_fingerprint(
+            base_url=self._base_url,
+            routing_policy=self._routing_policy,
+            file_download_enabled=file_download_enabled,
+            file_download_legacy_fallback_enabled=file_download_legacy_fallback_enabled,
+            allowed_hosts=download_allowed_hosts,
+            allowed_ports=download_allowed_ports,
+            max_redirects=self._download_max_redirects,
+            max_bytes=self._download_max_bytes,
+            timeout_seconds=self._download_timeout_seconds,
+            proxy_query_sentinel_enabled=self._proxy_query_sentinel_enabled,
+        )
+        download_route = self._routing_policy.route_for(VirusTotalCapability.FILE_DOWNLOAD)
+        route_steps = (
+            []
+            if download_route is None
+            else [
+                {"transport": step.transport.value, "variant": step.variant.value}
+                for step in download_route.steps()
+            ]
+        )
+        self._sample_acquisition_route_fingerprint = _fingerprint_json(
+            {
+                "route": route_steps,
+                "path": "/files/{hash}/download",
+                "proxy_query_sentinel_enabled": self._proxy_query_sentinel_enabled,
+            }
+        )
+        self._sample_acquisition_configuration_fingerprint = _fingerprint_json(
+            {
+                "version": _DOWNLOAD_FINGERPRINT_CONFIG_VERSION,
+                "base_host": (urlsplit(self._base_url).hostname or "").lower(),
+                "fallback_base_host": (
+                    (urlsplit(self._fallback_base_url).hostname or "").lower()
+                    if self._fallback_base_url
+                    else None
+                ),
+                "legacy_base_host": (
+                    (urlsplit(self._legacy_base_url).hostname or "").lower()
+                    if self._legacy_base_url
+                    else None
+                ),
+                "enabled": file_download_enabled,
+                "legacy_fallback_enabled": file_download_legacy_fallback_enabled,
+                "proxy_query_sentinel_enabled": self._proxy_query_sentinel_enabled,
+                "allowed_hosts": sorted(self._download_allowed_hosts),
+                "allowed_ports": sorted(self._download_allowed_ports),
+                "max_redirects": self._download_max_redirects,
+                "max_bytes": self._download_max_bytes,
+                "timeout_seconds": self._download_timeout_seconds,
+            }
+        )
+        account_identity = (
+            hashlib.sha256(self._api_key.encode("utf-8")).hexdigest()
+            if self._api_key
+            else "proxy-account-unattributed"
+        )
+        self._sample_acquisition_account_capability_fingerprint = _fingerprint_json(
+            {
+                "account_identity": account_identity,
+                "capabilities": sorted(
+                    capability.value
+                    for capability in VirusTotalCapability
+                    if self._capabilities.is_enabled(capability)
+                ),
+            }
+        )
+        self._sample_acquisition_transport = (
+            "+".join(
+                sorted(
+                    {
+                        f"{step.transport.value}-{step.variant.value}"
+                        for step in download_route.steps()
+                    }
+                )
+            )
+            if download_route is not None
+            else "unconfigured"
+        )
+
+    @property
+    def sample_acquisition_cache_scope(self) -> SampleAcquisitionCacheScope:
+        """Stable, non-secret refusal-cache scope for the configured download route.
+
+        The provider account component is a one-way credential fingerprint when
+        a direct key exists; proxy-owned account identity is explicitly marked
+        unattributed. Route and configuration are separate opaque fingerprints.
+        Neither this scope nor ``acquisition_route_fingerprint`` contains query
+        strings, credentials, or signed URLs.
+        """
+        return SampleAcquisitionCacheScope(
+            provider="virustotal",
+            account_capability_fingerprint=(
+                self._sample_acquisition_account_capability_fingerprint
+            ),
+            route_fingerprint=self._sample_acquisition_route_fingerprint,
+            transport=self._sample_acquisition_transport,
+            configuration_fingerprint=self._sample_acquisition_configuration_fingerprint,
+        )
 
     async def file_report(self, file_hash: str) -> VirusTotalFileReport:
         self._require(VirusTotalCapability.FILE_REPORT)
@@ -264,10 +438,56 @@ class VirusTotalHttpAdapter(VirusTotalPort):
         )
 
     async def file_download(self, file_hash: str, *, sink: BinaryIO) -> VirusTotalDownloadResult:
-        self._require(VirusTotalCapability.FILE_DOWNLOAD)
-        normalized = normalize_file_hash(file_hash)
-        family = file_hash_family(normalized)
-        route = self._resolve_route(VirusTotalCapability.FILE_DOWNLOAD)
+        """Download and verify bytes using the allowlisted route contract.
+
+        Redirects are followed manually with a fresh credential-free client and
+        the public ``acquisition_route_fingerprint`` records the normalized
+        route/configuration scope (config version, base host, route, limits,
+        allowlists, and fallback flags). ``sample_acquisition_cache_scope``
+        exposes separate non-secret account/capability, route, transport, and
+        configuration fingerprints for durable refusal scoping. Download
+        errors carry ``response_origin`` as Lot C's
+        ``SampleAcquisitionResponseOrigin``: PROVIDER/PROXY are heuristic
+        attributions based on VT JSON/error and proxy headers, SIGNED_CDN marks
+        that separate hop, and UNKNOWN is not cacheable as a durable refusal.
+        The issuer heuristic is diagnostic and does not prove authorship. Error
+        metadata also carries a correlation id, the historical route label, and
+        a normalized ``route_path`` without query parameters. A 404
+        is diagnostic metadata, never evidence
+        that the file is absent; v2 is considered only after explicit proxy
+        route-missing evidence for both v3 endpoints and the opt-in flag.
+        """
+        correlation_id = uuid4().hex
+        fingerprint = self.acquisition_route_fingerprint
+        if (
+            self._file_download_enabled
+            and self._routing_policy.route_for(VirusTotalCapability.FILE_DOWNLOAD) is None
+        ):
+            raise VirusTotalRouteUnavailableError(
+                "La route VT v3 de téléchargement n'est pas configurée.",
+                route="proxy:v3",
+                route_path="/files/{hash}/download",
+                transport="proxy-v3",
+                correlation_id=correlation_id,
+                fingerprint=fingerprint,
+                response_origin=SampleAcquisitionResponseOrigin.UNKNOWN,
+            )
+        try:
+            self._require(VirusTotalCapability.FILE_DOWNLOAD)
+            normalized = normalize_file_hash(file_hash)
+            family = file_hash_family(normalized)
+            route = self._resolve_route(VirusTotalCapability.FILE_DOWNLOAD)
+        except VirusTotalError as caught_error:
+            _annotate_error(
+                caught_error,
+                transport="proxy-v3",
+                route="proxy:v3",
+                route_path="/files/{hash}/download",
+                correlation_id=correlation_id,
+                fingerprint=fingerprint,
+                response_origin=SampleAcquisitionResponseOrigin.UNKNOWN,
+            )
+            raise
 
         async def direct_download(step: VirusTotalRouteStep) -> VirusTotalDownloadResult:
             client, base_url = self._resolve_transport(step)
@@ -278,46 +498,439 @@ class VirusTotalHttpAdapter(VirusTotalPort):
                 expected_hash=normalized,
                 expected_family=family,
                 max_bytes=self._download_max_bytes,
+                allowed_hosts=self._download_allowed_hosts,
+                allowed_ports=self._download_allowed_ports,
+                max_redirects=self._download_max_redirects,
+                download_client_factory=self._download_client,
+                proxy_query_sentinel_enabled=self._proxy_query_sentinel_enabled,
                 operation=VirusTotalOperation.FILE_DOWNLOAD,
                 route=_route_name(step),
+                capability=VirusTotalCapability.FILE_DOWNLOAD.value,
+                correlation_id=correlation_id,
+                fingerprint=fingerprint,
+                fallback_decision_on_404="request_download_url",
+                secret_values=(self._api_key,) if self._api_key else (),
             )
 
+        direct_error: VirusTotalHttpError | None = None
         try:
-            direct_result, _ = await self._execute_route(route, direct_download)
-            return direct_result
-        except VirusTotalHttpError as error:
-            if error.status_code != 404:
-                raise
+            async with asyncio.timeout(self._download_timeout_seconds):
+                try:
+                    direct_result, _ = await self._execute_route(route, direct_download)
+                    return direct_result
+                except VirusTotalHttpError as direct_caught_error:
+                    if direct_caught_error.status_code != 404:
+                        raise
+                    direct_error = direct_caught_error
 
-        async def download_ticket(step: VirusTotalRouteStep) -> VirusTotalRawResponse:
-            client, base_url = self._resolve_transport(step)
-            return await self._get(
-                f"/files/{normalized}/download_url",
-                client=client,
-                base_url=base_url,
+                async def download_ticket(step: VirusTotalRouteStep) -> VirusTotalRawResponse:
+                    client, base_url = self._resolve_transport(step)
+                    return await self._get(
+                        f"/files/{normalized}/download_url",
+                        client=client,
+                        base_url=base_url,
+                        operation=VirusTotalOperation.FILE_DOWNLOAD,
+                        route=_route_name(step),
+                        capability=VirusTotalCapability.FILE_DOWNLOAD.value,
+                        correlation_id=correlation_id,
+                        fingerprint=fingerprint,
+                        fallback_decision="direct-v2-if-both-route-missing-404s",
+                        secret_values=(self._api_key,) if self._api_key else (),
+                    )
+
+                try:
+                    ticket, step = await self._execute_route(route, download_ticket)
+                except VirusTotalHttpError as ticket_caught_error:
+                    if (
+                        ticket_caught_error.status_code == 404
+                        and direct_error is not None
+                        and direct_error.route_missing
+                        and ticket_caught_error.route_missing
+                        and self._file_download_legacy_fallback_enabled
+                    ):
+                        if (
+                            self._direct_client is None
+                            or self._api_key is None
+                            or not self._legacy_base_url
+                        ):
+                            ticket_caught_error.fallback_decision = (
+                                "direct-v2-unavailable-local-configuration"
+                            )
+                            _log_vt_exchange(
+                                correlation_id=correlation_id,
+                                capability=VirusTotalCapability.FILE_DOWNLOAD.value,
+                                route="direct:legacy_v2",
+                                transport="direct-v2",
+                                status_code=None,
+                                content_type_class=None,
+                                location_host=None,
+                                bytes_read=0,
+                                error_code="virustotal_route_unavailable",
+                                fallback_decision=ticket_caught_error.fallback_decision,
+                                fingerprint=fingerprint,
+                            )
+                            raise VirusTotalRouteUnavailableError(
+                                "Le repli v2 est activé mais sa route directe est incomplète.",
+                                route="direct:legacy_v2",
+                                route_path="/file/download",
+                                status_code=404,
+                                transport="direct-v2",
+                                bytes_read=0,
+                                correlation_id=correlation_id,
+                                fingerprint=fingerprint,
+                                fallback_decision=ticket_caught_error.fallback_decision,
+                            ) from None
+                        _log_vt_exchange(
+                            correlation_id=correlation_id,
+                            capability=VirusTotalCapability.FILE_DOWNLOAD.value,
+                            route="/file/download",
+                            transport="direct-v2",
+                            status_code=None,
+                            content_type_class=None,
+                            location_host=None,
+                            bytes_read=0,
+                            error_code=None,
+                            fallback_decision="attempt_direct_v2_after_two_route_missing_404s",
+                            fingerprint=fingerprint,
+                        )
+                        return await _stream_route_download(
+                            self._direct_client,
+                            f"{self._legacy_base_url}/file/download",
+                            params={"apikey": self._api_key, "hash": normalized},
+                            sink=sink,
+                            expected_hash=normalized,
+                            expected_family=family,
+                            max_bytes=self._download_max_bytes,
+                            allowed_hosts=self._download_allowed_hosts,
+                            allowed_ports=self._download_allowed_ports,
+                            max_redirects=self._download_max_redirects,
+                            download_client_factory=self._download_client,
+                            proxy_query_sentinel_enabled=False,
+                            operation=VirusTotalOperation.FILE_DOWNLOAD,
+                            route="direct:legacy_v2",
+                            capability=VirusTotalCapability.FILE_DOWNLOAD.value,
+                            correlation_id=correlation_id,
+                            fingerprint=fingerprint,
+                            fallback_decision_on_404="none",
+                            secret_values=(self._api_key,),
+                        )
+                    ticket_caught_error.fallback_decision = (
+                        "no_v2_fallback_unattributed_or_not_route_missing"
+                    )
+                    raise
+
+                try:
+                    payload = _json_object(ticket.body)
+                except VirusTotalError as caught_error:
+                    _annotate_error(
+                        caught_error,
+                        transport=_transport_name(step),
+                        route=_route_name(step),
+                        route_path="/files/{hash}/download_url",
+                        correlation_id=correlation_id,
+                        fingerprint=fingerprint,
+                        bytes_read=len(ticket.body),
+                        content_type_class="json",
+                    )
+                    raise
+                signed_url = payload.get("data")
+                if not isinstance(signed_url, str) or not signed_url:
+                    error = VirusTotalPayloadError(
+                        "VirusTotal n'a pas renvoyé d'URL de téléchargement signée."
+                    )
+                    _annotate_error(
+                        error,
+                        transport=_transport_name(step),
+                        route=_route_name(step),
+                        route_path="/files/{hash}/download_url",
+                        correlation_id=correlation_id,
+                        fingerprint=fingerprint,
+                        bytes_read=len(ticket.body),
+                        content_type_class="json",
+                    )
+                    _log_vt_exchange(
+                        correlation_id=correlation_id,
+                        capability=VirusTotalCapability.FILE_DOWNLOAD.value,
+                        route="/files/{hash}/download_url",
+                        transport=_transport_name(step),
+                        status_code=ticket.status_code,
+                        content_type_class="json",
+                        location_host=None,
+                        bytes_read=len(ticket.body),
+                        error_code=error.code,
+                        fallback_decision="signed_ticket_invalid",
+                        fingerprint=fingerprint,
+                    )
+                    raise error
+                try:
+                    _validate_signed_download_url(
+                        signed_url,
+                        self._download_allowed_hosts,
+                        self._download_allowed_ports,
+                    )
+                except VirusTotalError as caught_error:
+                    _annotate_error(
+                        caught_error,
+                        transport="signed-cdn",
+                        route=_route_name(step),
+                        route_path="/files/{hash}/download",
+                        location_host=_url_host(signed_url),
+                        correlation_id=correlation_id,
+                        fingerprint=fingerprint,
+                        bytes_read=0,
+                    )
+                    _log_vt_exchange(
+                        correlation_id=correlation_id,
+                        capability=VirusTotalCapability.FILE_DOWNLOAD.value,
+                        route="/files/{hash}/download",
+                        transport="signed-cdn",
+                        status_code=None,
+                        content_type_class=None,
+                        location_host=_url_host(signed_url),
+                        bytes_read=0,
+                        error_code=caught_error.code,
+                        fallback_decision="signed_ticket_host_rejected",
+                        fingerprint=fingerprint,
+                    )
+                    raise
+                return await _stream_signed_download(
+                    signed_url,
+                    sink=sink,
+                    expected_hash=normalized,
+                    expected_family=family,
+                    max_bytes=self._download_max_bytes,
+                    allowed_hosts=self._download_allowed_hosts,
+                    allowed_ports=self._download_allowed_ports,
+                    max_redirects=self._download_max_redirects,
+                    client_factory=self._download_client,
+                    operation=VirusTotalOperation.FILE_DOWNLOAD,
+                    route="signed-cdn",
+                    capability=VirusTotalCapability.FILE_DOWNLOAD.value,
+                    correlation_id=correlation_id,
+                    fingerprint=fingerprint,
+                    secret_values=(self._api_key,) if self._api_key else (),
+                )
+        except TimeoutError:
+            timeout_error = VirusTotalTransportError(
+                "Le téléchargement VirusTotal a expiré.",
+                code="virustotal_download_timeout",
+                retryable=True,
                 operation=VirusTotalOperation.FILE_DOWNLOAD,
-                route=_route_name(step),
+                route="/files/{hash}/download",
+                transport="proxy-v3",
+                correlation_id=correlation_id,
+                fingerprint=fingerprint,
+                response_origin=SampleAcquisitionResponseOrigin.UNKNOWN,
             )
+            _log_vt_exchange(
+                correlation_id=correlation_id,
+                capability=VirusTotalCapability.FILE_DOWNLOAD.value,
+                route="/files/{hash}/download",
+                transport="proxy-v3",
+                status_code=None,
+                content_type_class=None,
+                location_host=None,
+                bytes_read=0,
+                error_code=timeout_error.code,
+                fallback_decision="none",
+                fingerprint=fingerprint,
+            )
+            raise timeout_error from None
+        except VirusTotalError as caught_error:
+            _annotate_error(
+                caught_error,
+                correlation_id=correlation_id,
+                fingerprint=fingerprint,
+                route=caught_error.route or "proxy:v3",
+                route_path=caught_error.route_path or "/files/{hash}/download",
+                response_origin=SampleAcquisitionResponseOrigin.UNKNOWN,
+            )
+            raise
 
-        ticket, step = await self._execute_route(route, download_ticket)
-        payload = _json_object(ticket.body)
-        signed_url = payload.get("data")
-        if not isinstance(signed_url, str) or not signed_url:
-            raise VirusTotalPayloadError(
-                "VirusTotal n'a pas renvoyé d'URL de téléchargement signée."
+    async def behaviour_pcap(self, sandbox_id: str, *, sink: BinaryIO) -> VirusTotalDownloadResult:
+        correlation_id = uuid4().hex
+        fingerprint = self.acquisition_route_fingerprint
+        if (
+            self._behaviour_pcap_enabled
+            and self._routing_policy.route_for(VirusTotalCapability.BEHAVIOUR_PCAP) is None
+        ):
+            raise VirusTotalRouteUnavailableError(
+                "La route VT v3 de PCAP sandbox n'est pas configurée.",
+                route="proxy:v3",
+                route_path="/file_behaviours/{sandbox_id}/pcap",
+                transport="proxy-v3",
+                correlation_id=correlation_id,
+                fingerprint=fingerprint,
+                response_origin=SampleAcquisitionResponseOrigin.UNKNOWN,
             )
-        _validate_signed_download_url(signed_url, self._download_allowed_hosts)
-        # The signed URL itself is never logged, persisted, or re-derived.
-        return await _stream_signed_download(
-            signed_url,
-            sink=sink,
-            expected_hash=normalized,
-            expected_family=family,
-            max_bytes=self._download_max_bytes,
-            client=self._download_client(),
-            operation=VirusTotalOperation.FILE_DOWNLOAD,
-            route=f"signed:{step.variant.value}",
-        )
+        try:
+            self._require(VirusTotalCapability.BEHAVIOUR_PCAP)
+            if not isinstance(sandbox_id, str) or not sandbox_id.strip():
+                raise VirusTotalInvalidInputError("L'identifiant sandbox VirusTotal est vide.")
+            route = self._resolve_route(VirusTotalCapability.BEHAVIOUR_PCAP)
+        except VirusTotalError as caught_error:
+            _annotate_error(
+                caught_error,
+                transport="proxy-v3",
+                route="proxy:v3",
+                route_path="/file_behaviours/{sandbox_id}/pcap",
+                correlation_id=correlation_id,
+                fingerprint=fingerprint,
+                response_origin=SampleAcquisitionResponseOrigin.UNKNOWN,
+            )
+            raise
+        step = route.primary
+        client, base_url = self._resolve_transport(step)
+        normalized_id = quote(sandbox_id.strip(), safe="")
+        try:
+            async with asyncio.timeout(self._download_timeout_seconds):
+                return await _stream_route_download(
+                    client,
+                    f"{base_url}/file_behaviours/{normalized_id}/pcap",
+                    sink=sink,
+                    expected_hash=None,
+                    expected_family=None,
+                    expected_magic=_PCAP_MAGIC,
+                    max_bytes=self._download_max_bytes,
+                    allowed_hosts=self._download_allowed_hosts,
+                    allowed_ports=self._download_allowed_ports,
+                    max_redirects=self._download_max_redirects,
+                    download_client_factory=self._download_client,
+                    proxy_query_sentinel_enabled=self._proxy_query_sentinel_enabled,
+                    follow_redirects=True,
+                    operation=None,
+                    route=_route_name(step),
+                    capability=VirusTotalCapability.BEHAVIOUR_PCAP.value,
+                    correlation_id=correlation_id,
+                    fingerprint=fingerprint,
+                    secret_values=(self._api_key,) if self._api_key else (),
+                )
+        except TimeoutError:
+            raise VirusTotalTransportError(
+                "Le téléchargement PCAP VirusTotal a expiré.",
+                code="virustotal_download_timeout",
+                retryable=True,
+                route=_route_name(step),
+                route_path="/file_behaviours/{sandbox_id}/pcap",
+                transport=_transport_name(step),
+                correlation_id=correlation_id,
+                fingerprint=fingerprint,
+                response_origin=SampleAcquisitionResponseOrigin.UNKNOWN,
+            ) from None
+        except VirusTotalError as caught_error:
+            _annotate_error(
+                caught_error,
+                correlation_id=correlation_id,
+                fingerprint=fingerprint,
+                route=caught_error.route or "proxy:v3",
+                route_path=(caught_error.route_path or "/file_behaviours/{sandbox_id}/pcap"),
+                response_origin=SampleAcquisitionResponseOrigin.UNKNOWN,
+            )
+            raise
+
+    async def object_report(
+        self,
+        kind: Literal["ip_addresses", "domains", "urls"] | str,
+        object_id: str,
+    ) -> VirusTotalObjectReport:
+        if kind not in {"ip_addresses", "domains", "urls"}:
+            raise VirusTotalInvalidInputError("Le type de rapport VirusTotal est invalide.")
+        if not isinstance(object_id, str) or not object_id.strip():
+            raise VirusTotalInvalidInputError("L'identifiant du rapport VirusTotal est vide.")
+        self._require(VirusTotalCapability.FILE_REPORT)
+        configured_route = self._resolve_route(VirusTotalCapability.FILE_REPORT)
+        if configured_route.primary.transport is not VirusTotalTransportKind.PROXY or (
+            configured_route.primary.variant is not VirusTotalEndpointVariant.V3
+        ):
+            raise VirusTotalRouteUnavailableError(
+                "Les rapports d'objet exigent une route proxy VT v3.",
+                route=f"/{kind}/{{id}}",
+            )
+        if kind == "urls":
+            normalized_id = (
+                base64.urlsafe_b64encode(object_id.strip().encode("utf-8"))
+                .decode("ascii")
+                .rstrip("=")
+            )
+        else:
+            normalized_id = object_id.strip()
+        safe_id = quote(normalized_id, safe="")
+        path = f"/{kind}/{safe_id}"
+        route_name = _route_name(configured_route.primary)
+        correlation_id = uuid4().hex
+        fingerprint = self.acquisition_route_fingerprint
+        projections = {
+            "ip_addresses": (
+                "comments,communicating_files,downloaded_files,graphs,historical_ssl_certificates,"
+                "historical_whois,related_comments,related_references,related_threat_actors,"
+                "referrer_files,resolutions,urls"
+            ),
+            "domains": (
+                "caa_records,cname_records,comments,communicating_files,downloaded_files,graphs,"
+                "historical_ssl_certificates,historical_whois,immediate_parent,mx_records,ns_records,"
+                "parent,referrer_files,related_comments,related_references,related_threat_actors,"
+                "resolutions,soa_records,siblings,subdomains,urls,user_votes"
+            ),
+            "urls": (
+                "comments,communicating_files,downloaded_files,graphs,related_comments,"
+                "related_references,related_threat_actors"
+            ),
+        }
+        projection = projections.get(kind)
+        client, base_url = self._resolve_transport(configured_route.primary)
+        try:
+            try:
+                response = await self._get(
+                    path,
+                    params={"relationships": projection} if projection else None,
+                    client=client,
+                    base_url=base_url,
+                    route=route_name,
+                    capability="object_report",
+                    correlation_id=correlation_id,
+                    fingerprint=fingerprint,
+                    fallback_decision="retry_without_relationships_on_400_403",
+                )
+            except VirusTotalHttpError as error:
+                if projection is None or error.status_code not in {400, 403}:
+                    raise
+                response = await self._get(
+                    path,
+                    client=client,
+                    base_url=base_url,
+                    route=route_name,
+                    capability="object_report",
+                    correlation_id=correlation_id,
+                    fingerprint=fingerprint,
+                    fallback_decision="retry_without_relationships",
+                )
+            payload = _json_object(response.body)
+            data = payload.get("data")
+            expected_type = {"ip_addresses": "ip_address", "domains": "domain", "urls": "url"}[kind]
+            if (
+                not isinstance(data, dict)
+                or data.get("type") != expected_type
+                or not isinstance(data.get("id"), str)
+                or not isinstance(data.get("attributes"), dict)
+            ):
+                raise VirusTotalPayloadError("Le schéma du rapport objet VirusTotal est invalide.")
+            return VirusTotalObjectReport(
+                kind=kind,  # type: ignore[arg-type]
+                object_id=data["id"],
+                raw_json=response.body,
+                http_status=response.status_code,
+                transport=configured_route.primary.transport,
+                api_generation=configured_route.primary.variant,
+            )
+        except VirusTotalError as caught_error:
+            _annotate_error(
+                caught_error,
+                transport="proxy-v3",
+                route=_normalize_route(path),
+                correlation_id=correlation_id,
+                fingerprint=fingerprint,
+            )
+            raise
 
     def _download_client(self) -> httpx.AsyncClient:
         if self._download_client_factory is not None:
@@ -617,88 +1230,187 @@ class VirusTotalHttpAdapter(VirusTotalPort):
         base_url: str | None = None,
         operation: VirusTotalOperation | None = None,
         route: str | None = "proxy:v3",
+        capability: str | None = None,
+        correlation_id: str | None = None,
+        fingerprint: str | None = None,
+        fallback_decision: str | None = None,
+        secret_values: tuple[str | None, ...] = (),
     ) -> VirusTotalRawResponse:
+        correlation_id = correlation_id or uuid4().hex
+        normalized_route = _normalize_route(path)
+        route_label = route or "proxy:v3"
+        transport = _transport_name_from_label(route_label)
+        response: httpx.Response | None = None
+        content_type_class: str | None = None
+        location_host: str | None = None
+        bytes_read = 0
         try:
-            response = await (client or self._client).get(
-                f"{base_url or self._base_url}{path}", params=params
+            request_params = _proxy_query_params(
+                params,
+                transport=transport,
+                sentinel_enabled=self._proxy_query_sentinel_enabled,
             )
+            response = await (client or self._client).get(
+                f"{base_url or self._base_url}{path}",
+                params=request_params,
+                follow_redirects=False,
+            )
+            content_type_class = _content_type_class(response.headers.get("Content-Type"))
+            location_host = _url_host(response.headers.get("Location"))
             if 300 <= response.status_code < 400:
                 raise VirusTotalUnexpectedRedirectError(
                     "VirusTotal a renvoyé une redirection inattendue.",
                     status_code=response.status_code,
                     operation=operation,
-                    route=route,
+                    transport=transport,
+                    route=route_label,
+                    route_path=normalized_route,
+                    content_type_class=content_type_class,
+                    location_host=location_host,
+                    correlation_id=correlation_id,
+                    fingerprint=fingerprint or self.acquisition_route_fingerprint,
+                    fallback_decision=fallback_decision,
                 )
             if response.status_code >= 400:
                 retry_after = _retry_after(response.headers.get("Retry-After"))
                 body = response.content[:_MAX_ERROR_BODY_BYTES]
+                bytes_read = len(body)
                 raise _http_error(
                     response.status_code,
                     retry_after,
                     body=body,
                     operation=operation,
-                    route=route,
+                    route=route_label,
+                    route_path=normalized_route,
+                    transport=transport,
+                    content_type_class=content_type_class,
+                    location_host=location_host,
+                    bytes_read=bytes_read,
+                    correlation_id=correlation_id,
+                    fingerprint=fingerprint or self.acquisition_route_fingerprint,
+                    issuer=_response_issuer(response.headers, body),
+                    fallback_decision=fallback_decision,
+                    secret_values=secret_values + ((self._api_key,) if self._api_key else ()),
                 )
             body = await _read_bounded(response, self._max_response_bytes)
+            bytes_read = len(body)
+            _log_vt_exchange(
+                correlation_id=correlation_id,
+                capability=capability or _operation_capability(operation),
+                route=normalized_route,
+                transport=transport,
+                status_code=response.status_code,
+                content_type_class=content_type_class,
+                location_host=location_host,
+                bytes_read=bytes_read,
+                error_code=None,
+                fallback_decision=fallback_decision or "none",
+                fingerprint=fingerprint or self.acquisition_route_fingerprint,
+            )
             return VirusTotalRawResponse(body=body, status_code=response.status_code)
-        except VirusTotalError:
+        except VirusTotalError as caught_error:
+            _set_error_route(caught_error, route_label, normalized_route)
+            _annotate_error(
+                caught_error,
+                transport=transport,
+                content_type_class=content_type_class,
+                location_host=location_host,
+                bytes_read=bytes_read,
+                correlation_id=correlation_id,
+                fingerprint=fingerprint or self.acquisition_route_fingerprint,
+                fallback_decision=fallback_decision,
+            )
+            _log_vt_exchange(
+                correlation_id=correlation_id,
+                capability=capability or _operation_capability(operation),
+                route=normalized_route,
+                transport=transport,
+                status_code=(
+                    response.status_code if response is not None else caught_error.status_code
+                ),
+                content_type_class=content_type_class,
+                location_host=location_host,
+                bytes_read=bytes_read,
+                error_code=caught_error.code,
+                fallback_decision=fallback_decision or "none",
+                fingerprint=fingerprint or self.acquisition_route_fingerprint,
+            )
             raise
-        except httpx.ConnectTimeout as exc:
-            raise VirusTotalTransportError(
+        except httpx.ConnectTimeout:
+            error = VirusTotalTransportError(
                 "Le proxy VirusTotal a expiré pendant la connexion.",
                 code="virustotal_connect_timeout",
                 retryable=True,
                 operation=operation,
-                route=route,
-            ) from exc
-        except httpx.ReadTimeout as exc:
-            raise VirusTotalTransportError(
+            )
+        except httpx.ReadTimeout:
+            error = VirusTotalTransportError(
                 "VirusTotal a expiré pendant la lecture.",
                 code="virustotal_read_timeout",
                 retryable=True,
                 operation=operation,
-                route=route,
-            ) from exc
-        except httpx.ProxyError as exc:
-            raise VirusTotalTransportError(
+            )
+        except httpx.ProxyError:
+            error = VirusTotalTransportError(
                 "La connexion au proxy VirusTotal a échoué.",
                 code="virustotal_proxy_error",
                 retryable=True,
                 operation=operation,
-                route=route,
-            ) from exc
+            )
         except httpx.ConnectError as exc:
             if _is_tls_error(exc):
-                raise VirusTotalTransportError(
+                error = VirusTotalTransportError(
                     "La vérification TLS de VirusTotal a échoué.",
                     code="virustotal_tls_error",
                     retryable=False,
                     operation=operation,
-                    route=route,
-                ) from exc
-            raise VirusTotalTransportError(
-                "La connexion au proxy VirusTotal a échoué.",
-                code="virustotal_connection_error",
-                retryable=True,
-                operation=operation,
-                route=route,
-            ) from exc
-        except httpx.TimeoutException as exc:
-            raise VirusTotalTransportError(
+                )
+            else:
+                error = VirusTotalTransportError(
+                    "La connexion au proxy VirusTotal a échoué.",
+                    code="virustotal_connection_error",
+                    retryable=True,
+                    operation=operation,
+                )
+        except httpx.TimeoutException:
+            error = VirusTotalTransportError(
                 "La requête VirusTotal a expiré.",
                 code="virustotal_timeout",
                 retryable=True,
                 operation=operation,
-                route=route,
-            ) from exc
-        except httpx.TransportError as exc:
-            raise VirusTotalTransportError(
+            )
+        except httpx.TransportError:
+            error = VirusTotalTransportError(
                 "Le transport VirusTotal a échoué.",
                 code="virustotal_transport_error",
                 retryable=True,
                 operation=operation,
-                route=route,
-            ) from exc
+            )
+        _set_error_route(error, route_label, normalized_route)
+        _annotate_error(
+            error,
+            transport=transport,
+            content_type_class=content_type_class,
+            location_host=location_host,
+            bytes_read=bytes_read,
+            correlation_id=correlation_id,
+            fingerprint=fingerprint or self.acquisition_route_fingerprint,
+            fallback_decision=fallback_decision,
+        )
+        _log_vt_exchange(
+            correlation_id=correlation_id,
+            capability=capability or _operation_capability(operation),
+            route=normalized_route,
+            transport=transport,
+            status_code=None,
+            content_type_class=content_type_class,
+            location_host=location_host,
+            bytes_read=bytes_read,
+            error_code=error.code,
+            fallback_decision=fallback_decision or "none",
+            fingerprint=fingerprint or self.acquisition_route_fingerprint,
+        )
+        raise error from None
 
     def _page_limit(self, value: int | None) -> int:
         if value is None:
@@ -729,6 +1441,104 @@ def create_virustotal_http_adapter(
     arguments["download_allowed_hosts"] = frozenset(
         host for host in settings.virustotal_download_allowed_hosts.split(",") if host
     )
+    arguments["download_allowed_ports"] = frozenset(
+        int(port) for port in settings.virustotal_download_allowed_ports.split(",") if port
+    )
+    effective_routing_policy = routing_policy or _default_routing_policy(
+        base_url=settings.virustotal_base_url,
+        fallback_base_url=settings.virustotal_fallback_base_url,
+        legacy_base_url=settings.virustotal_legacy_base_url,
+        direct_client=direct_client,
+        api_key=(
+            api_key
+            if api_key is not None
+            else settings.virustotal_api_key.get_secret_value()
+            if settings.virustotal_api_key is not None and direct_client is not None
+            else None
+        ),
+        proxy_fallback_enabled=settings.virustotal_file_report_proxy_fallback_enabled,
+        legacy_fallback_enabled=settings.virustotal_file_report_legacy_fallback_enabled,
+        file_download_enabled=settings.virustotal_file_download_enabled,
+        behaviour_pcap_enabled=settings.virustotal_behaviour_pcap_enabled,
+    )
+    proxy_ready = bool(settings.virustotal_proxy_url and settings.virustotal_base_url)
+    direct_ready = bool(
+        direct_client is not None
+        and (api_key is not None or settings.virustotal_api_key is not None)
+        and settings.virustotal_legacy_base_url
+    )
+    route_opt_ins = {
+        VirusTotalCapability.FILE_REPORT: settings.virustotal_file_report_enabled,
+        VirusTotalCapability.FILE_RELATIONSHIPS: settings.virustotal_object_relationships_enabled,
+        VirusTotalCapability.INTELLIGENCE_SEARCH: settings.virustotal_intelligence_search_enabled,
+        VirusTotalCapability.FILE_DOWNLOAD: settings.virustotal_file_download_enabled,
+        VirusTotalCapability.BEHAVIOUR_REPORTS: settings.virustotal_behaviour_reports_enabled,
+        VirusTotalCapability.BEHAVIOUR_PCAP: settings.virustotal_behaviour_pcap_enabled,
+    }
+    configured_routes = {}
+    for capability, route in effective_routing_policy.routes.items():
+        if capability in route_opt_ins and not route_opt_ins[capability]:
+            continue
+        transport_ready = (
+            proxy_ready
+            if route.primary.transport is VirusTotalTransportKind.PROXY
+            else direct_ready
+        )
+        if not transport_ready:
+            continue
+        if capability is VirusTotalCapability.FILE_DOWNLOAD and (
+            VIRUSTOTAL_DOWNLOAD_REQUIRED_CDN_HOST not in arguments["download_allowed_hosts"]
+            or not arguments["download_allowed_ports"]
+        ):
+            continue
+        configured_routes[capability] = route
+    effective_routing_policy = VirusTotalRoutingPolicy(routes=configured_routes)
+
+    def primary_route_ready(capability: VirusTotalCapability) -> bool:
+        route = effective_routing_policy.route_for(capability)
+        if route is None:
+            return False
+        return (
+            proxy_ready
+            if route.primary.transport is VirusTotalTransportKind.PROXY
+            else direct_ready
+        )
+
+    effective_capabilities = VirusTotalCapabilities(
+        file_report=(
+            capabilities.file_report
+            and settings.virustotal_file_report_enabled
+            and primary_route_ready(VirusTotalCapability.FILE_REPORT)
+        ),
+        file_relationships=(
+            capabilities.file_relationships
+            and settings.virustotal_object_relationships_enabled
+            and primary_route_ready(VirusTotalCapability.FILE_RELATIONSHIPS)
+        ),
+        intelligence_search=(
+            capabilities.intelligence_search
+            and settings.virustotal_intelligence_search_enabled
+            and primary_route_ready(VirusTotalCapability.INTELLIGENCE_SEARCH)
+        ),
+        file_download=(
+            capabilities.file_download
+            and settings.virustotal_file_download_enabled
+            and VIRUSTOTAL_DOWNLOAD_REQUIRED_CDN_HOST in arguments["download_allowed_hosts"]
+            and bool(arguments["download_allowed_ports"])
+            and primary_route_ready(VirusTotalCapability.FILE_DOWNLOAD)
+        ),
+        submissions=capabilities.submissions,
+        behaviour_reports=(
+            capabilities.behaviour_reports
+            and settings.virustotal_behaviour_reports_enabled
+            and primary_route_ready(VirusTotalCapability.BEHAVIOUR_REPORTS)
+        ),
+        behaviour_pcap=(
+            settings.virustotal_behaviour_pcap_enabled
+            and primary_route_ready(VirusTotalCapability.BEHAVIOUR_PCAP)
+        ),
+        retrohunt=capabilities.retrohunt,
+    )
     resolved_api_key = api_key
     if direct_client is None:
         resolved_api_key = None
@@ -736,10 +1546,10 @@ def create_virustotal_http_adapter(
         resolved_api_key = settings.virustotal_api_key.get_secret_value()
     return VirusTotalHttpAdapter(
         client=client,
-        capabilities=capabilities,
+        capabilities=effective_capabilities,
         direct_client=direct_client,
         api_key=resolved_api_key,
-        routing_policy=routing_policy,
+        routing_policy=effective_routing_policy,
         **arguments,
     )
 
@@ -754,6 +1564,7 @@ def _default_routing_policy(
     proxy_fallback_enabled: bool,
     legacy_fallback_enabled: bool,
     file_download_enabled: bool = False,
+    behaviour_pcap_enabled: bool = False,
 ) -> VirusTotalRoutingPolicy:
     """Build the deny-by-default policy this adapter ships with.
 
@@ -795,11 +1606,297 @@ def _default_routing_policy(
     }
     if file_download_enabled:
         routes[VirusTotalCapability.FILE_DOWNLOAD] = proxy_only
+    if behaviour_pcap_enabled:
+        routes[VirusTotalCapability.BEHAVIOUR_PCAP] = proxy_only
     return VirusTotalRoutingPolicy(routes=routes)
 
 
 def _route_name(step: VirusTotalRouteStep) -> str:
     return f"{step.transport.value}:{step.variant.value}"
+
+
+def _transport_name(step: VirusTotalRouteStep) -> str:
+    if step.transport is VirusTotalTransportKind.PROXY:
+        return "proxy-v3"
+    if step.variant is VirusTotalEndpointVariant.LEGACY_V2:
+        return "direct-v2"
+    return "direct-v3"
+
+
+def _transport_name_from_label(label: str | None) -> str:
+    normalized = (label or "proxy:v3").lower()
+    if normalized in {"signed-cdn", "signed:cdn"}:
+        return "signed-cdn"
+    if normalized.startswith("direct:") and "legacy" in normalized:
+        return "direct-v2"
+    if normalized.startswith("direct:"):
+        return "direct-v3"
+    return "proxy-v3"
+
+
+def _proxy_query_params(
+    params: Mapping[str, Any] | None,
+    *,
+    transport: str,
+    sentinel_enabled: bool,
+) -> Mapping[str, Any] | None:
+    if transport == "proxy-v3" and sentinel_enabled and not params:
+        return {VIRUSTOTAL_PROXY_QUERY_SENTINEL_NAME: VIRUSTOTAL_PROXY_QUERY_SENTINEL_VALUE}
+    return params
+
+
+def _normalize_route(value: str) -> str:
+    """Return a route template without query strings or object identifiers."""
+    path = urlsplit(value).path
+    for prefix in ("/api/v3", "/vtapi/v2"):
+        if path == prefix:
+            path = "/"
+            break
+        if path.startswith(f"{prefix}/"):
+            path = path[len(prefix) :]
+            break
+    parts = path.split("/")
+    collections = {
+        "files": "{hash}",
+        "file_behaviours": "{sandbox_id}",
+        "ip_addresses": "{ip}",
+        "domains": "{domain}",
+        "urls": "{url_id}",
+        "users": "{user_id}",
+        "retrohunt_jobs": "{job_id}",
+    }
+    for index, part in enumerate(parts[:-1]):
+        replacement = collections.get(part)
+        if replacement is not None and parts[index + 1]:
+            parts[index + 1] = replacement
+    return "/".join(parts) or "/"
+
+
+def _content_type_class(value: str | None) -> str:
+    if not value:
+        return "missing"
+    media_type = value.partition(";")[0].strip().lower()
+    if media_type == "text/html" or media_type.endswith("/html"):
+        return "html"
+    if media_type == "application/json" or media_type.endswith("+json"):
+        return "json"
+    if media_type in {
+        "application/octet-stream",
+        "application/pcap",
+        "application/vnd.tcpdump.pcap",
+    }:
+        return "binary"
+    if media_type.startswith("text/"):
+        return "text"
+    return "other" if media_type else "missing"
+
+
+def _sniff_binary_error(prefix: bytes, content_type_class: str) -> str | None:
+    candidate = prefix.lstrip(b"\xef\xbb\xbf\x00\t\r\n ").lower()
+    if content_type_class == "html" or candidate.startswith(
+        (b"<!doctype html", b"<html", b"<head", b"<body")
+    ):
+        return "html"
+    if content_type_class == "json" or candidate.startswith((b"{", b"[")):
+        return "json"
+    return None
+
+
+def _content_length(value: str | None) -> int | object | None:
+    if value is None:
+        return None
+    if not value.isascii() or not value.isdecimal():
+        return _INVALID_CONTENT_LENGTH
+    return int(value)
+
+
+def _url_host(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        return urlsplit(value).hostname
+    except ValueError:
+        return None
+
+
+def _response_issuer(headers: Mapping[str, str], body: bytes) -> str:
+    """Heuristic only: an intervening proxy can rewrite provider responses."""
+    lowered = {name.lower(): value.lower() for name, value in headers.items()}
+    if "via" in lowered or "x-proxy-error" in lowered:
+        return "proxy-likely"
+    server = lowered.get("server", "")
+    if any(token in server for token in ("nginx", "envoy", "haproxy", "varnish", "squid")):
+        return "proxy-likely"
+    try:
+        payload = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        payload = None
+    if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
+        return "upstream-vt-likely"
+    if "virustotal" in server:
+        return "upstream-vt-likely"
+    return "unknown"
+
+
+def _is_route_missing_error(error: VirusTotalHttpError) -> bool:
+    if error.status_code != 404 or error.issuer != "proxy-likely":
+        return False
+    marker = f"{error.error_code or ''} {error.error_message or ''}".lower().replace("_", " ")
+    return any(
+        text in marker
+        for text in (
+            "route not found",
+            "route missing",
+            "no route",
+            "endpoint not found",
+            "unknown route",
+            "cannot get",
+        )
+    )
+
+
+def _strip_cdn_client_credentials(client: httpx.AsyncClient) -> None:
+    """Strip credentials and cookies before an ephemeral signed-host request."""
+    if getattr(client, "_trust_env", True) and isinstance(client._transport, httpx.MockTransport):
+        # An injected MockTransport has no proxy mounts or network path to inherit.
+        client._trust_env = False
+    if getattr(client, "_trust_env", True) is not False:
+        raise VirusTotalConfigurationError(
+            "Le client CDN signé doit être créé avec trust_env=False."
+        )
+    client.headers.pop("x-apikey", None)
+    client.headers.pop("authorization", None)
+    client.headers.pop("cookie", None)
+    client.cookies.clear()
+    client._auth = None
+    client.params = httpx.QueryParams()
+
+
+def _annotate_error(error: VirusTotalError, **values: Any) -> None:
+    for name, value in values.items():
+        current = getattr(error, name, None)
+        if value is not None and (
+            current is None or (name == "response_origin" and current == "unknown")
+        ):
+            setattr(error, name, value)
+
+
+def _set_error_route(error: VirusTotalError, route_label: str, route_path: str) -> None:
+    """Keep the historical route label and attach the normalized wire path."""
+    error.route = route_label
+    error.route_path = route_path
+
+
+def _operation_capability(operation: VirusTotalOperation | None) -> str:
+    if operation is None:
+        return "unknown"
+    return {
+        VirusTotalOperation.FILE_REPORT: VirusTotalCapability.FILE_REPORT.value,
+        VirusTotalOperation.FILE_DOWNLOAD: VirusTotalCapability.FILE_DOWNLOAD.value,
+        VirusTotalOperation.FILE_RELATIONSHIP: VirusTotalCapability.FILE_RELATIONSHIPS.value,
+        VirusTotalOperation.OBJECT_RELATIONSHIP: VirusTotalCapability.FILE_RELATIONSHIPS.value,
+        VirusTotalOperation.BEHAVIOURS: VirusTotalCapability.BEHAVIOUR_REPORTS.value,
+        VirusTotalOperation.INTELLIGENCE_SEARCH: VirusTotalCapability.INTELLIGENCE_SEARCH.value,
+    }.get(operation, "unknown")
+
+
+def _log_vt_exchange(
+    *,
+    correlation_id: str,
+    capability: str,
+    route: str,
+    transport: str,
+    status_code: int | None,
+    content_type_class: str | None,
+    location_host: str | None,
+    bytes_read: int,
+    error_code: str | None,
+    fallback_decision: str,
+    fingerprint: str | None,
+) -> None:
+    logger.info(
+        "vt_http_exchange",
+        extra={
+            "event": "vt_http_exchange",
+            "correlation_id": correlation_id,
+            "provider": "virustotal",
+            "capability": capability,
+            "route": route,
+            "transport": transport,
+            "status_code": status_code,
+            "content_type_class": content_type_class,
+            "location_host": location_host,
+            "bytes_read": bytes_read,
+            "error_code": error_code,
+            "fallback_decision": fallback_decision,
+            "fingerprint": fingerprint,
+        },
+    )
+
+
+def _download_route_fingerprint(
+    *,
+    base_url: str,
+    routing_policy: VirusTotalRoutingPolicy,
+    file_download_enabled: bool,
+    file_download_legacy_fallback_enabled: bool,
+    allowed_hosts: frozenset[str],
+    allowed_ports: frozenset[int],
+    max_redirects: int,
+    max_bytes: int,
+    timeout_seconds: float,
+    proxy_query_sentinel_enabled: bool,
+) -> str:
+    base_host = (urlsplit(base_url).hostname or "").lower()
+    route = routing_policy.route_for(VirusTotalCapability.FILE_DOWNLOAD)
+    steps = (
+        []
+        if route is None
+        else [
+            {"transport": step.transport.value, "variant": step.variant.value}
+            for step in route.steps()
+        ]
+    )
+    contract = {
+        "version": _DOWNLOAD_FINGERPRINT_CONFIG_VERSION,
+        "base_host": base_host,
+        "route": steps,
+        "file_download_enabled": file_download_enabled,
+        "file_download_legacy_fallback_enabled": file_download_legacy_fallback_enabled,
+        "proxy_query_sentinel_enabled": proxy_query_sentinel_enabled,
+        "allowed_hosts": sorted(allowed_hosts),
+        "allowed_ports": sorted(allowed_ports),
+        "max_redirects": max_redirects,
+        "max_bytes": max_bytes,
+        "timeout_seconds": timeout_seconds,
+    }
+    return _fingerprint_json(contract)
+
+
+def _fingerprint_json(contract: Mapping[str, Any]) -> str:
+    material = json.dumps(contract, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(material).hexdigest()
+
+
+def _sample_acquisition_response_origin(
+    transport: str | None, issuer: str | None
+) -> SampleAcquisitionResponseOrigin:
+    """Map diagnostic transport heuristics to Lot C's cache safety boundary.
+
+    Provider/proxy attribution is heuristic (JSON VT error shape, server/via
+    headers, and explicit proxy markers); it does not prove who authored a
+    response. Signed CDN responses are attributed only to that separate hop.
+    """
+    if transport == "signed-cdn":
+        return SampleAcquisitionResponseOrigin.SIGNED_CDN
+    if issuer == "proxy-likely":
+        return SampleAcquisitionResponseOrigin.PROXY
+    if issuer == "upstream-vt-likely":
+        return SampleAcquisitionResponseOrigin.PROVIDER
+    return SampleAcquisitionResponseOrigin.UNKNOWN
+
+
+_INVALID_CONTENT_LENGTH = object()
 
 
 def _validate_base_url(value: str) -> str:
@@ -840,9 +1937,19 @@ def _positive_float(value: float, name: str) -> float:
     return value
 
 
-def _validate_signed_download_url(url: str, allowed_hosts: frozenset[str]) -> None:
-    parsed = urlsplit(url)
-    if parsed.scheme != "https":
+def _validate_signed_download_url(
+    url: str,
+    allowed_hosts: frozenset[str],
+    allowed_ports: frozenset[int],
+) -> None:
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port if parsed.port is not None else 443
+    except ValueError:
+        raise VirusTotalDownloadHostNotAllowedError(
+            "L'URL de téléchargement signée est invalide."
+        ) from None
+    if parsed.scheme.lower() != "https":
         raise VirusTotalDownloadHostNotAllowedError(
             "L'URL de téléchargement signée doit être HTTPS."
         )
@@ -851,9 +1958,13 @@ def _validate_signed_download_url(url: str, allowed_hosts: frozenset[str]) -> No
             "L'URL de téléchargement signée ne doit pas contenir d'identifiants."
         )
     hostname = parsed.hostname
-    if not hostname or hostname not in allowed_hosts:
+    if not hostname or hostname.lower() not in allowed_hosts:
         raise VirusTotalDownloadHostNotAllowedError(
             "L'hôte de l'URL de téléchargement signée n'est pas autorisé."
+        )
+    if port not in allowed_ports:
+        raise VirusTotalDownloadHostNotAllowedError(
+            "Le port de l'URL de téléchargement signée n'est pas autorisé."
         )
 
 
@@ -864,139 +1975,924 @@ async def _stream_signed_download(
     expected_hash: str,
     expected_family: str,
     max_bytes: int,
-    client: httpx.AsyncClient,
-    operation: VirusTotalOperation,
+    allowed_hosts: frozenset[str],
+    allowed_ports: frozenset[int],
+    max_redirects: int,
+    client_factory: Callable[[], httpx.AsyncClient],
+    operation: VirusTotalOperation | None,
     route: str,
+    capability: str,
+    correlation_id: str,
+    fingerprint: str,
+    secret_values: tuple[str | None, ...] = (),
 ) -> VirusTotalDownloadResult:
-    # A dedicated, ephemeral, headerless client: it must never carry
-    # x-apikey or any other VT client authentication header, and it never
-    # follows redirects away from the validated signed host.
-    async with client:
+    return await _stream_route_download(
+        None,
+        url,
+        sink=sink,
+        expected_hash=expected_hash,
+        expected_family=expected_family,
+        max_bytes=max_bytes,
+        allowed_hosts=allowed_hosts,
+        allowed_ports=allowed_ports,
+        max_redirects=max_redirects,
+        download_client_factory=client_factory,
+        operation=operation,
+        route=route,
+        capability=capability,
+        correlation_id=correlation_id,
+        fingerprint=fingerprint,
+        initial_signed=True,
+        secret_values=secret_values,
+    )
+
+
+async def _stream_route_download(
+    client: httpx.AsyncClient | None,
+    url: str,
+    *,
+    sink: BinaryIO,
+    expected_hash: str | None,
+    expected_family: str | None,
+    expected_magic: tuple[bytes, ...] | None = None,
+    max_bytes: int,
+    allowed_hosts: frozenset[str],
+    allowed_ports: frozenset[int],
+    max_redirects: int,
+    download_client_factory: Callable[[], httpx.AsyncClient],
+    params: Mapping[str, str] | None = None,
+    proxy_query_sentinel_enabled: bool = False,
+    follow_redirects: bool = True,
+    operation: VirusTotalOperation | None,
+    route: str,
+    capability: str,
+    correlation_id: str,
+    fingerprint: str,
+    fallback_decision_on_404: str = "none",
+    initial_signed: bool = False,
+    secret_values: tuple[str | None, ...] = (),
+) -> VirusTotalDownloadResult:
+    current_url = url
+    redirects_followed = 0
+    current_is_signed = initial_signed
+    base_transport = _transport_name_from_label(route)
+    normalized_route = _normalize_route(urlsplit(url).path)
+
+    while True:
+        ephemeral_client: httpx.AsyncClient | None = None
+        active_client = client
+        current_transport = "signed-cdn" if current_is_signed else base_transport
+        if current_is_signed or redirects_followed > 0:
+            ephemeral_client = download_client_factory()
+            _strip_cdn_client_credentials(ephemeral_client)
+            active_client = ephemeral_client
+        if active_client is None:
+            raise VirusTotalRouteUnavailableError(
+                "Le transport de téléchargement VirusTotal n'est pas configuré.",
+                route=route,
+                route_path=normalized_route,
+                transport=current_transport,
+                correlation_id=correlation_id,
+                fingerprint=fingerprint,
+            )
+
+        next_url: str | None = None
+        location_host: str | None = None
+        response: httpx.Response | None = None
         try:
-            async with client.stream("GET", url) as response:
-                return await _stream_verified_response(
-                    response,
-                    sink=sink,
-                    expected_hash=expected_hash,
-                    expected_family=expected_family,
-                    max_bytes=max_bytes,
-                    operation=operation,
-                    route=route,
-                )
-        except VirusTotalError:
+            request_params = params if redirects_followed == 0 and not initial_signed else None
+            request_params = _proxy_query_params(
+                request_params,
+                transport=current_transport,
+                sentinel_enabled=proxy_query_sentinel_enabled,
+            )
+            async with active_client.stream(
+                "GET",
+                current_url,
+                params=request_params,
+                headers={"accept-encoding": "identity"},
+                follow_redirects=False,
+            ) as response:
+                location_host = _url_host(response.headers.get("Location"))
+                content_type_class = _content_type_class(response.headers.get("Content-Type"))
+                if 300 <= response.status_code < 400:
+                    if not follow_redirects:
+                        redirect_error = VirusTotalUnexpectedRedirectError(
+                            "La route VT ne peut pas rediriger cet artefact.",
+                            status_code=response.status_code,
+                            operation=operation,
+                            transport=current_transport,
+                            route=normalized_route,
+                            content_type_class=content_type_class,
+                            location_host=location_host,
+                            bytes_read=0,
+                            correlation_id=correlation_id,
+                            fingerprint=fingerprint,
+                        )
+                        _log_vt_exchange(
+                            correlation_id=correlation_id,
+                            capability=capability,
+                            route=normalized_route,
+                            transport=current_transport,
+                            status_code=response.status_code,
+                            content_type_class=content_type_class,
+                            location_host=location_host,
+                            bytes_read=0,
+                            error_code=redirect_error.code,
+                            fallback_decision="redirect_rejected",
+                            fingerprint=fingerprint,
+                        )
+                        raise redirect_error
+                    if redirects_followed >= max_redirects:
+                        limit_error = VirusTotalDownloadRedirectLimitError(
+                            "Le téléchargement VirusTotal a dépassé la limite de redirections.",
+                            status_code=response.status_code,
+                            operation=operation,
+                            transport=current_transport,
+                            route=normalized_route,
+                            content_type_class=content_type_class,
+                            location_host=location_host,
+                            bytes_read=0,
+                            correlation_id=correlation_id,
+                            fingerprint=fingerprint,
+                        )
+                        _log_vt_exchange(
+                            correlation_id=correlation_id,
+                            capability=capability,
+                            route=normalized_route,
+                            transport=current_transport,
+                            status_code=response.status_code,
+                            content_type_class=content_type_class,
+                            location_host=location_host,
+                            bytes_read=0,
+                            error_code=limit_error.code,
+                            fallback_decision="redirect_limit_reached",
+                            fingerprint=fingerprint,
+                        )
+                        raise limit_error
+                    location = response.headers.get("Location")
+                    if not location:
+                        missing_location_error = VirusTotalUnexpectedRedirectError(
+                            "La redirection VirusTotal ne contient pas de destination.",
+                            status_code=response.status_code,
+                            operation=operation,
+                            transport=current_transport,
+                            route=normalized_route,
+                            content_type_class=content_type_class,
+                            location_host=None,
+                            bytes_read=0,
+                            correlation_id=correlation_id,
+                            fingerprint=fingerprint,
+                        )
+                        _log_vt_exchange(
+                            correlation_id=correlation_id,
+                            capability=capability,
+                            route=normalized_route,
+                            transport=current_transport,
+                            status_code=response.status_code,
+                            content_type_class=content_type_class,
+                            location_host=None,
+                            bytes_read=0,
+                            error_code=missing_location_error.code,
+                            fallback_decision="redirect_missing_location",
+                            fingerprint=fingerprint,
+                        )
+                        raise missing_location_error
+                    try:
+                        next_url = urljoin(current_url, location)
+                        _validate_signed_download_url(next_url, allowed_hosts, allowed_ports)
+                    except (ValueError, VirusTotalError) as destination_error:
+                        if isinstance(destination_error, VirusTotalError):
+                            _annotate_error(
+                                destination_error,
+                                operation=operation,
+                                transport=current_transport,
+                                route=normalized_route,
+                                status_code=response.status_code,
+                                content_type_class=content_type_class,
+                                location_host=_url_host(location),
+                                bytes_read=0,
+                                correlation_id=correlation_id,
+                                fingerprint=fingerprint,
+                            )
+                            _log_vt_exchange(
+                                correlation_id=correlation_id,
+                                capability=capability,
+                                route=normalized_route,
+                                transport=current_transport,
+                                status_code=response.status_code,
+                                content_type_class=content_type_class,
+                                location_host=_url_host(location),
+                                bytes_read=0,
+                                error_code=destination_error.code,
+                                fallback_decision="redirect_destination_rejected",
+                                fingerprint=fingerprint,
+                            )
+                            raise
+                        host_error = VirusTotalDownloadHostNotAllowedError(
+                            "La destination de redirection VirusTotal est invalide.",
+                            status_code=response.status_code,
+                        )
+                        _annotate_error(
+                            host_error,
+                            operation=operation,
+                            transport=current_transport,
+                            route=normalized_route,
+                            content_type_class=content_type_class,
+                            location_host=_url_host(location),
+                            correlation_id=correlation_id,
+                            fingerprint=fingerprint,
+                        )
+                        raise host_error from None
+                    _log_vt_exchange(
+                        correlation_id=correlation_id,
+                        capability=capability,
+                        route=normalized_route,
+                        transport=current_transport,
+                        status_code=response.status_code,
+                        content_type_class=content_type_class,
+                        location_host=_url_host(next_url),
+                        bytes_read=0,
+                        error_code=None,
+                        fallback_decision="follow_signed_redirect",
+                        fingerprint=fingerprint,
+                    )
+                else:
+                    try:
+                        result = await _stream_verified_response(
+                            response,
+                            sink=sink,
+                            expected_hash=expected_hash,
+                            expected_family=expected_family,
+                            expected_magic=expected_magic,
+                            max_bytes=max_bytes,
+                            operation=operation,
+                            route=normalized_route,
+                            transport=current_transport,
+                            capability=capability,
+                            correlation_id=correlation_id,
+                            fingerprint=fingerprint,
+                            fallback_decision=(
+                                fallback_decision_on_404 if response.status_code == 404 else "none"
+                            ),
+                            signed=current_transport == "signed-cdn",
+                            secret_values=secret_values,
+                        )
+                        return result
+                    except VirusTotalHttpError as caught_error:
+                        caught_error.route_missing = _is_route_missing_error(caught_error)
+                        raise
+        except VirusTotalError as caught_error:
+            _set_error_route(caught_error, route, normalized_route)
             raise
-        except httpx.TimeoutException as exc:
-            raise VirusTotalTransportError(
+        except httpx.ReadError:
+            read_error = VirusTotalDownloadTruncatedError(
+                "Le flux VirusTotal s'est interrompu avant sa fin.",
+                operation=operation,
+                transport=current_transport,
+                route=route,
+                route_path=normalized_route,
+                correlation_id=correlation_id,
+                fingerprint=fingerprint,
+            )
+            _log_vt_exchange(
+                correlation_id=correlation_id,
+                capability=capability,
+                route=normalized_route,
+                transport=current_transport,
+                status_code=response.status_code if response is not None else None,
+                content_type_class=(
+                    _content_type_class(response.headers.get("Content-Type"))
+                    if response is not None
+                    else None
+                ),
+                location_host=location_host,
+                bytes_read=0,
+                error_code=read_error.code,
+                fallback_decision="none",
+                fingerprint=fingerprint,
+            )
+            raise read_error from None
+        except httpx.TimeoutException:
+            timeout_error = VirusTotalTransportError(
                 "Le téléchargement VirusTotal a expiré.",
                 code="virustotal_download_timeout",
                 retryable=True,
                 operation=operation,
+                transport=current_transport,
                 route=route,
-            ) from exc
-        except httpx.TransportError as exc:
-            raise VirusTotalTransportError(
-                "Le flux de téléchargement VirusTotal a échoué ou a été tronqué.",
+                route_path=normalized_route,
+                correlation_id=correlation_id,
+                fingerprint=fingerprint,
+            )
+            _log_vt_exchange(
+                correlation_id=correlation_id,
+                capability=capability,
+                route=normalized_route,
+                transport=current_transport,
+                status_code=response.status_code if response is not None else None,
+                content_type_class=(
+                    _content_type_class(response.headers.get("Content-Type"))
+                    if response is not None
+                    else None
+                ),
+                location_host=location_host,
+                bytes_read=0,
+                error_code=timeout_error.code,
+                fallback_decision="none",
+                fingerprint=fingerprint,
+            )
+            raise timeout_error from None
+        except httpx.TransportError:
+            transport_error = VirusTotalTransportError(
+                "Le transport du téléchargement VirusTotal a échoué.",
                 code="virustotal_download_transport_error",
                 retryable=True,
                 operation=operation,
+                transport=current_transport,
                 route=route,
-            ) from exc
-
-
-async def _stream_route_download(
-    client: httpx.AsyncClient,
-    url: str,
-    *,
-    sink: BinaryIO,
-    expected_hash: str,
-    expected_family: str,
-    max_bytes: int,
-    operation: VirusTotalOperation,
-    route: str,
-) -> VirusTotalDownloadResult:
-    try:
-        async with client.stream("GET", url) as response:
-            return await _stream_verified_response(
-                response,
-                sink=sink,
-                expected_hash=expected_hash,
-                expected_family=expected_family,
-                max_bytes=max_bytes,
-                operation=operation,
-                route=route,
+                route_path=normalized_route,
+                correlation_id=correlation_id,
+                fingerprint=fingerprint,
             )
-    except VirusTotalError:
-        raise
-    except httpx.TimeoutException as exc:
-        raise VirusTotalTransportError(
-            "Le téléchargement VirusTotal a expiré.",
-            code="virustotal_download_timeout",
-            retryable=True,
-            operation=operation,
-            route=route,
-        ) from exc
-    except httpx.TransportError as exc:
-        raise VirusTotalTransportError(
-            "Le flux de téléchargement VirusTotal a échoué ou a été tronqué.",
-            code="virustotal_download_transport_error",
-            retryable=True,
-            operation=operation,
-            route=route,
-        ) from exc
+            _log_vt_exchange(
+                correlation_id=correlation_id,
+                capability=capability,
+                route=normalized_route,
+                transport=current_transport,
+                status_code=response.status_code if response is not None else None,
+                content_type_class=(
+                    _content_type_class(response.headers.get("Content-Type"))
+                    if response is not None
+                    else None
+                ),
+                location_host=location_host,
+                bytes_read=0,
+                error_code=transport_error.code,
+                fallback_decision="none",
+                fingerprint=fingerprint,
+            )
+            raise transport_error from None
+        finally:
+            if ephemeral_client is not None:
+                await ephemeral_client.aclose()
+
+        if next_url is not None:
+            current_url = next_url
+            redirects_followed += 1
+            current_is_signed = True
+            continue
 
 
 async def _stream_verified_response(
     response: httpx.Response,
     *,
     sink: BinaryIO,
-    expected_hash: str,
-    expected_family: str,
+    expected_hash: str | None,
+    expected_family: str | None,
+    expected_magic: tuple[bytes, ...] | None = None,
     max_bytes: int,
-    operation: VirusTotalOperation,
+    operation: VirusTotalOperation | None,
     route: str,
+    transport: str,
+    capability: str,
+    correlation_id: str,
+    fingerprint: str,
+    fallback_decision: str,
+    signed: bool = False,
+    secret_values: tuple[str | None, ...] = (),
 ) -> VirusTotalDownloadResult:
+    status_code = response.status_code
+    content_type_class = _content_type_class(response.headers.get("Content-Type"))
+    location_host = _url_host(response.headers.get("Location"))
+    issuer = "unknown"
+    error: VirusTotalError
     if 300 <= response.status_code < 400:
-        raise VirusTotalUnexpectedRedirectError(
+        error = VirusTotalUnexpectedRedirectError(
             "Le téléchargement VirusTotal a été redirigé.",
             status_code=response.status_code,
             operation=operation,
+            transport=transport,
             route=route,
+            content_type_class=content_type_class,
+            location_host=location_host,
+            correlation_id=correlation_id,
+            fingerprint=fingerprint,
         )
+        _log_vt_exchange(
+            correlation_id=correlation_id,
+            capability=capability,
+            route=route,
+            transport=transport,
+            status_code=status_code,
+            content_type_class=content_type_class,
+            location_host=location_host,
+            bytes_read=0,
+            error_code=error.code,
+            fallback_decision=fallback_decision,
+            fingerprint=fingerprint,
+        )
+        raise error
     if response.status_code >= 400:
         body = await _read_error_prefix(response)
-        raise _http_error(
-            response.status_code,
-            _retry_after(response.headers.get("Retry-After")),
-            body=body,
-            operation=operation,
+        issuer = _response_issuer(response.headers, body)
+        if signed and response.status_code in {401, 403, 404}:
+            error = VirusTotalSignedUrlExpiredError(
+                "L'URL signée de téléchargement a expiré ou a été refusée.",
+                status_code=response.status_code,
+                operation=operation,
+                transport=transport,
+                route=route,
+                content_type_class=content_type_class,
+                location_host=location_host,
+                bytes_read=len(body),
+                correlation_id=correlation_id,
+                issuer=issuer,
+                response_origin=SampleAcquisitionResponseOrigin.SIGNED_CDN,
+                fingerprint=fingerprint,
+            )
+        else:
+            error = _http_error(
+                response.status_code,
+                _retry_after(response.headers.get("Retry-After")),
+                body=body,
+                operation=operation,
+                route=route,
+                transport=transport,
+                content_type_class=content_type_class,
+                location_host=location_host,
+                bytes_read=len(body),
+                correlation_id=correlation_id,
+                issuer=issuer,
+                fingerprint=fingerprint,
+                fallback_decision=fallback_decision,
+                secret_values=secret_values,
+            )
+        _log_vt_exchange(
+            correlation_id=correlation_id,
+            capability=capability,
             route=route,
+            transport=transport,
+            status_code=status_code,
+            content_type_class=content_type_class,
+            location_host=location_host,
+            bytes_read=len(body),
+            error_code=error.code,
+            fallback_decision=fallback_decision,
+            fingerprint=fingerprint,
         )
+        raise error
+    if status_code == 204:
+        error = VirusTotalDownloadEmptyError(
+            "La route de téléchargement VirusTotal a renvoyé un contenu vide.",
+            status_code=status_code,
+            operation=operation,
+            transport=transport,
+            route=route,
+            content_type_class=content_type_class,
+            bytes_read=0,
+            correlation_id=correlation_id,
+            fingerprint=fingerprint,
+        )
+        _log_vt_exchange(
+            correlation_id=correlation_id,
+            capability=capability,
+            route=route,
+            transport=transport,
+            status_code=status_code,
+            content_type_class=content_type_class,
+            location_host=location_host,
+            bytes_read=0,
+            error_code=error.code,
+            fallback_decision=fallback_decision,
+            fingerprint=fingerprint,
+        )
+        raise error
+    if status_code < 200 or status_code >= 300:
+        error = VirusTotalHttpError(
+            "La route de téléchargement VirusTotal a renvoyé un statut inattendu.",
+            code="virustotal_download_http_status_unexpected",
+            status_code=status_code,
+            operation=operation,
+            transport=transport,
+            route=route,
+            content_type_class=content_type_class,
+            location_host=location_host,
+            bytes_read=0,
+            correlation_id=correlation_id,
+            fingerprint=fingerprint,
+        )
+        _log_vt_exchange(
+            correlation_id=correlation_id,
+            capability=capability,
+            route=route,
+            transport=transport,
+            status_code=status_code,
+            content_type_class=content_type_class,
+            location_host=location_host,
+            bytes_read=0,
+            error_code=error.code,
+            fallback_decision=fallback_decision,
+            fingerprint=fingerprint,
+        )
+        raise error
+    if content_type_class in {"html", "json"}:
+        error = VirusTotalDownloadNotBinaryError(
+            "La route de téléchargement VirusTotal a renvoyé une page HTML ou JSON.",
+            status_code=status_code,
+            operation=operation,
+            transport=transport,
+            route=route,
+            content_type_class=content_type_class,
+            bytes_read=0,
+            correlation_id=correlation_id,
+            fingerprint=fingerprint,
+        )
+        _log_vt_exchange(
+            correlation_id=correlation_id,
+            capability=capability,
+            route=route,
+            transport=transport,
+            status_code=status_code,
+            content_type_class=content_type_class,
+            location_host=location_host,
+            bytes_read=0,
+            error_code=error.code,
+            fallback_decision=fallback_decision,
+            fingerprint=fingerprint,
+        )
+        raise error
     md5 = hashlib.md5()
     sha1 = hashlib.sha1()
     sha256 = hashlib.sha256()
     size = 0
-    async for chunk in response.aiter_bytes():
+    content_length = _content_length(response.headers.get("Content-Length"))
+    prefix = bytearray()
+    prefix_flushed = False
+    sniff_length = 16
+    async for chunk in _iter_verified_download_chunks(
+        response,
+        operation=operation,
+        route=route,
+        transport=transport,
+        capability=capability,
+        correlation_id=correlation_id,
+        fingerprint=fingerprint,
+        fallback_decision=fallback_decision,
+    ):
         size += len(chunk)
         if size > max_bytes:
-            raise VirusTotalDownloadTooLargeError(
+            error = VirusTotalDownloadTooLargeError(
                 "Le téléchargement VirusTotal dépasse la limite configurée.",
+                status_code=status_code,
                 operation=operation,
                 route=route,
+                transport=transport,
+                content_type_class=content_type_class,
+                bytes_read=size,
+                correlation_id=correlation_id,
+                fingerprint=fingerprint,
             )
+            _log_vt_exchange(
+                correlation_id=correlation_id,
+                capability=capability,
+                route=route,
+                transport=transport,
+                status_code=status_code,
+                content_type_class=content_type_class,
+                location_host=location_host,
+                bytes_read=size,
+                error_code=error.code,
+                fallback_decision=fallback_decision,
+                fingerprint=fingerprint,
+            )
+            raise error
         md5.update(chunk)
         sha1.update(chunk)
         sha256.update(chunk)
-        sink.write(chunk)
-    computed = {"md5": md5.hexdigest(), "sha1": sha1.hexdigest(), "sha256": sha256.hexdigest()}
-    if computed[expected_family] != expected_hash:
-        raise VirusTotalDownloadHashMismatchError(
-            "Les octets téléchargés ne correspondent pas au hash demandé.",
+        if not prefix_flushed:
+            needed = max(0, sniff_length - len(prefix))
+            prefix.extend(chunk[:needed])
+            remainder = chunk[needed:]
+            if len(prefix) >= sniff_length:
+                error_class = _sniff_binary_error(bytes(prefix), content_type_class)
+                if error_class is not None:
+                    error = VirusTotalDownloadNotBinaryError(
+                        "La réponse VirusTotal contient du JSON ou du HTML, "
+                        "pas des octets binaires.",
+                        status_code=status_code,
+                        operation=operation,
+                        route=route,
+                        transport=transport,
+                        content_type_class=error_class,
+                        bytes_read=size,
+                        correlation_id=correlation_id,
+                        fingerprint=fingerprint,
+                    )
+                    _log_vt_exchange(
+                        correlation_id=correlation_id,
+                        capability=capability,
+                        route=route,
+                        transport=transport,
+                        status_code=status_code,
+                        content_type_class=error_class,
+                        location_host=location_host,
+                        bytes_read=size,
+                        error_code=error.code,
+                        fallback_decision=fallback_decision,
+                        fingerprint=fingerprint,
+                    )
+                    raise error
+                if expected_magic is not None and not any(
+                    bytes(prefix).startswith(magic) for magic in expected_magic
+                ):
+                    error = VirusTotalPayloadError(
+                        "Le contenu reçu n'a pas une signature PCAP ou PCAPNG reconnue.",
+                        code="virustotal_pcap_magic_invalid",
+                        status_code=status_code,
+                        operation=operation,
+                        route=route,
+                        transport=transport,
+                        content_type_class=content_type_class,
+                        bytes_read=size,
+                        correlation_id=correlation_id,
+                        fingerprint=fingerprint,
+                    )
+                    _log_vt_exchange(
+                        correlation_id=correlation_id,
+                        capability=capability,
+                        route=route,
+                        transport=transport,
+                        status_code=status_code,
+                        content_type_class=content_type_class,
+                        location_host=location_host,
+                        bytes_read=size,
+                        error_code=error.code,
+                        fallback_decision=fallback_decision,
+                        fingerprint=fingerprint,
+                    )
+                    raise error
+                sink.write(prefix)
+                sink.write(remainder)
+                prefix_flushed = True
+            elif remainder:
+                # The initial prefix is kept in memory until enough bytes exist
+                # to distinguish JSON/HTML and validate a PCAP magic number.
+                prefix.extend(remainder)
+        else:
+            sink.write(chunk)
+
+    if not prefix_flushed:
+        prefix_bytes = bytes(prefix)
+        error_class = _sniff_binary_error(prefix_bytes, content_type_class)
+        if error_class is not None:
+            error = VirusTotalDownloadNotBinaryError(
+                "La réponse VirusTotal contient du JSON ou du HTML, pas des octets de fichier.",
+                status_code=status_code,
+                operation=operation,
+                route=route,
+                transport=transport,
+                content_type_class=error_class,
+                bytes_read=size,
+                correlation_id=correlation_id,
+                fingerprint=fingerprint,
+            )
+            _log_vt_exchange(
+                correlation_id=correlation_id,
+                capability=capability,
+                route=route,
+                transport=transport,
+                status_code=status_code,
+                content_type_class=error_class,
+                location_host=location_host,
+                bytes_read=size,
+                error_code=error.code,
+                fallback_decision=fallback_decision,
+                fingerprint=fingerprint,
+            )
+            raise error
+        if expected_magic is not None and not any(
+            prefix_bytes.startswith(magic) for magic in expected_magic
+        ):
+            error = VirusTotalPayloadError(
+                "Le contenu reçu n'a pas une signature PCAP ou PCAPNG reconnue.",
+                code="virustotal_pcap_magic_invalid",
+                status_code=status_code,
+                operation=operation,
+                route=route,
+                transport=transport,
+                content_type_class=content_type_class,
+                bytes_read=size,
+                correlation_id=correlation_id,
+                fingerprint=fingerprint,
+            )
+            _log_vt_exchange(
+                correlation_id=correlation_id,
+                capability=capability,
+                route=route,
+                transport=transport,
+                status_code=status_code,
+                content_type_class=content_type_class,
+                location_host=location_host,
+                bytes_read=size,
+                error_code=error.code,
+                fallback_decision=fallback_decision,
+                fingerprint=fingerprint,
+            )
+            raise error
+        if prefix:
+            sink.write(prefix)
+
+    if size == 0:
+        error_type: type[VirusTotalError] = (
+            VirusTotalDownloadTruncatedError
+            if content_length not in {None, 0}
+            else VirusTotalDownloadEmptyError
+        )
+        error = error_type(
+            "Le téléchargement VirusTotal n'a renvoyé aucun octet exploitable.",
+            status_code=status_code,
             operation=operation,
             route=route,
+            transport=transport,
+            content_type_class=content_type_class,
+            bytes_read=0,
+            correlation_id=correlation_id,
+            fingerprint=fingerprint,
         )
+        _log_vt_exchange(
+            correlation_id=correlation_id,
+            capability=capability,
+            route=route,
+            transport=transport,
+            status_code=status_code,
+            content_type_class=content_type_class,
+            location_host=location_host,
+            bytes_read=0,
+            error_code=error.code,
+            fallback_decision=fallback_decision,
+            fingerprint=fingerprint,
+        )
+        raise error
+    if content_length is _INVALID_CONTENT_LENGTH or (
+        content_length is not None and content_length != size
+    ):
+        error_type = (
+            VirusTotalDownloadTruncatedError
+            if isinstance(content_length, int) and content_length > size
+            else VirusTotalDownloadLengthMismatchError
+        )
+        error = error_type(
+            "La longueur annoncée par la réponse VirusTotal ne correspond pas aux octets lus.",
+            status_code=status_code,
+            operation=operation,
+            route=route,
+            transport=transport,
+            content_type_class=content_type_class,
+            bytes_read=size,
+            correlation_id=correlation_id,
+            fingerprint=fingerprint,
+        )
+        _log_vt_exchange(
+            correlation_id=correlation_id,
+            capability=capability,
+            route=route,
+            transport=transport,
+            status_code=status_code,
+            content_type_class=content_type_class,
+            location_host=location_host,
+            bytes_read=size,
+            error_code=error.code,
+            fallback_decision=fallback_decision,
+            fingerprint=fingerprint,
+        )
+        raise error
+    computed = {"md5": md5.hexdigest(), "sha1": sha1.hexdigest(), "sha256": sha256.hexdigest()}
+    if expected_hash is not None and expected_family is not None:
+        if computed[expected_family] != expected_hash:
+            error = VirusTotalDownloadHashMismatchError(
+                "Les octets téléchargés ne correspondent pas au hash demandé.",
+                status_code=status_code,
+                operation=operation,
+                route=route,
+                transport=transport,
+                content_type_class=content_type_class,
+                bytes_read=size,
+                correlation_id=correlation_id,
+                fingerprint=fingerprint,
+            )
+            _log_vt_exchange(
+                correlation_id=correlation_id,
+                capability=capability,
+                route=route,
+                transport=transport,
+                status_code=status_code,
+                content_type_class=content_type_class,
+                location_host=location_host,
+                bytes_read=size,
+                error_code=error.code,
+                fallback_decision=fallback_decision,
+                fingerprint=fingerprint,
+            )
+            raise error
+    _log_vt_exchange(
+        correlation_id=correlation_id,
+        capability=capability,
+        route=route,
+        transport=transport,
+        status_code=status_code,
+        content_type_class=content_type_class,
+        location_host=location_host,
+        bytes_read=size,
+        error_code=None,
+        fallback_decision=fallback_decision,
+        fingerprint=fingerprint,
+    )
     return VirusTotalDownloadResult(
         md5=computed["md5"], sha1=computed["sha1"], sha256=computed["sha256"], size=size
     )
+
+
+async def _iter_verified_download_chunks(
+    response: httpx.Response,
+    *,
+    operation: VirusTotalOperation | None,
+    route: str,
+    transport: str,
+    capability: str,
+    correlation_id: str,
+    fingerprint: str,
+    fallback_decision: str,
+) -> AsyncIterator[bytes]:
+    """Yield payload chunks and retain the actual byte count on stream errors."""
+    bytes_read = 0
+    try:
+        async for chunk in response.aiter_bytes():
+            bytes_read += len(chunk)
+            yield chunk
+    except httpx.ReadError:
+        error: VirusTotalError = VirusTotalDownloadTruncatedError(
+            "Le flux VirusTotal s'est interrompu avant sa fin.",
+            status_code=response.status_code,
+            operation=operation,
+            transport=transport,
+            route=route,
+            content_type_class=_content_type_class(response.headers.get("Content-Type")),
+            location_host=_url_host(response.headers.get("Location")),
+            bytes_read=bytes_read,
+            correlation_id=correlation_id,
+            fingerprint=fingerprint,
+        )
+        decision = "stream_interrupted"
+    except httpx.TimeoutException:
+        error = VirusTotalTransportError(
+            "La lecture du flux VirusTotal a expiré.",
+            code="virustotal_download_timeout",
+            retryable=True,
+            status_code=response.status_code,
+            operation=operation,
+            transport=transport,
+            route=route,
+            content_type_class=_content_type_class(response.headers.get("Content-Type")),
+            location_host=_url_host(response.headers.get("Location")),
+            bytes_read=bytes_read,
+            correlation_id=correlation_id,
+            fingerprint=fingerprint,
+        )
+        decision = "stream_timeout"
+    except httpx.TransportError:
+        error = VirusTotalTransportError(
+            "Le transport du flux VirusTotal a échoué.",
+            code="virustotal_download_transport_error",
+            retryable=True,
+            status_code=response.status_code,
+            operation=operation,
+            transport=transport,
+            route=route,
+            content_type_class=_content_type_class(response.headers.get("Content-Type")),
+            location_host=_url_host(response.headers.get("Location")),
+            bytes_read=bytes_read,
+            correlation_id=correlation_id,
+            fingerprint=fingerprint,
+        )
+        decision = "stream_transport_error"
+    else:
+        return
+
+    _log_vt_exchange(
+        correlation_id=correlation_id,
+        capability=capability,
+        route=route,
+        transport=transport,
+        status_code=response.status_code,
+        content_type_class=_content_type_class(response.headers.get("Content-Type")),
+        location_host=_url_host(response.headers.get("Location")),
+        bytes_read=bytes_read,
+        error_code=error.code,
+        fallback_decision=decision or fallback_decision,
+        fingerprint=fingerprint,
+    )
+    raise error from None
 
 
 def _bounded(value: int, lower: int, upper: int, name: str) -> int:
@@ -1190,6 +3086,16 @@ def _http_error(
     body: bytes = b"",
     operation: VirusTotalOperation | None = None,
     route: str | None = None,
+    route_path: str | None = None,
+    transport: str | None = None,
+    content_type_class: str | None = None,
+    location_host: str | None = None,
+    bytes_read: int | None = None,
+    correlation_id: str | None = None,
+    fingerprint: str | None = None,
+    issuer: str | None = None,
+    fallback_decision: str | None = None,
+    secret_values: tuple[str | None, ...] = (),
 ) -> VirusTotalHttpError:
     raw_code: str | None = None
     raw_message: str | None = None
@@ -1202,21 +3108,61 @@ def _http_error(
         if isinstance(raw_error, dict):
             code_value = raw_error.get("code")
             message_value = raw_error.get("message")
-            raw_code = _safe_error_detail(code_value, 160) if isinstance(code_value, str) else None
-            raw_message = (
-                _safe_error_detail(message_value, 1024) if isinstance(message_value, str) else None
+            raw_code = (
+                _safe_error_detail(code_value, 160, secret_values)
+                if isinstance(code_value, str)
+                else None
             )
+            raw_message = (
+                _safe_error_detail(message_value, 1024, secret_values)
+                if isinstance(message_value, str)
+                else None
+            )
+        if raw_message is None:
+            fallback_message = payload.get("message", payload.get("detail"))
+            if isinstance(fallback_message, str):
+                raw_message = _safe_error_detail(fallback_message, 1024, secret_values)
     normalized = f"{raw_code or ''} {raw_message or ''}".lower().replace("_", " ").replace("-", " ")
+    issuer = issuer or _response_issuer({}, body)
+    route_missing = (
+        status == 404
+        and issuer == "proxy-likely"
+        and any(
+            marker in normalized
+            for marker in (
+                "route not found",
+                "route missing",
+                "no route",
+                "endpoint not found",
+                "unknown route",
+                "cannot get",
+            )
+        )
+    )
+    metadata: dict[str, Any] = {
+        "status_code": status,
+        "retry_after": retry_after,
+        "error_code": raw_code,
+        "error_message": raw_message,
+        "operation": operation,
+        "route": route,
+        "route_path": route_path or route,
+        "transport": transport,
+        "content_type_class": content_type_class,
+        "location_host": location_host,
+        "bytes_read": bytes_read,
+        "correlation_id": correlation_id,
+        "issuer": issuer,
+        "fingerprint": fingerprint,
+        "route_missing": route_missing,
+        "fallback_decision": fallback_decision,
+        "response_origin": _sample_acquisition_response_origin(transport, issuer),
+    }
     if status == 429 or "quota" in normalized or "rate limit" in normalized:
         return VirusTotalQuotaExceededError(
             "VirusTotal a signalé une limite de quota ou de débit.",
             retryable=status == 429,
-            status_code=status,
-            retry_after=retry_after,
-            error_code=raw_code,
-            error_message=raw_message,
-            operation=operation,
-            route=route,
+            **metadata,
         )
     if status == 403 or any(
         phrase in normalized
@@ -1224,17 +3170,21 @@ def _http_error(
     ):
         return VirusTotalNotAuthorizedError(
             "VirusTotal n'autorise pas cette opération avec le plan actuel.",
-            status_code=status,
-            retry_after=retry_after,
-            error_code=raw_code,
-            error_message=raw_message,
-            operation=operation,
-            route=route,
+            **metadata,
         )
     mapping = {
         401: ("virustotal_upstream_unauthorized", False),
         403: ("virustotal_upstream_forbidden", False),
-        404: ("virustotal_not_found", False),
+        404: (
+            "virustotal_proxy_route_not_found"
+            if route_missing
+            else "virustotal_http_404_unattributed"
+            if operation is VirusTotalOperation.FILE_DOWNLOAD and issuer != "upstream-vt-likely"
+            else "virustotal_upstream_not_found"
+            if operation is VirusTotalOperation.FILE_DOWNLOAD
+            else "virustotal_not_found",
+            False,
+        ),
         407: ("virustotal_proxy_auth_required", False),
         429: ("virustotal_rate_limited", True),
     }
@@ -1243,23 +3193,27 @@ def _http_error(
         "VirusTotal ou le proxy a refusé la requête.",
         code=code,
         retryable=retryable,
-        status_code=status,
-        retry_after=retry_after,
-        error_code=raw_code,
-        error_message=raw_message,
-        operation=operation,
-        route=route,
+        **metadata,
     )
 
 
-def _safe_error_detail(value: str, maximum: int) -> str:
+def _safe_error_detail(value: str, maximum: int, secret_values: tuple[str | None, ...] = ()) -> str:
     bounded = value[:maximum]
     bounded = re.sub(r"https?://[^\s\"'<>]+", "[redacted-url]", bounded, flags=re.IGNORECASE)
-    return re.sub(
-        r"(?i)\b(?:x-apikey|api[_ -]?key)(?:\s*[:=]\s*|\s+)[^\s,;]+",
-        "[redacted-key]",
+    bounded = re.sub(
+        r"(?i)(\b(?:x-apikey|apikey|api[_ -]key)(?:\s*[:=]\s*|\s+))[^\s,;&\"'<>]+",
+        r"\1[REDACTED]",
         bounded,
     )
+    bounded = re.sub(
+        r"(?i)(\b(?:x-)?apikey\b(?:\s*[:=]\s*|\s+))[a-f0-9]{32,}",
+        r"\1[REDACTED]",
+        bounded,
+    )
+    for secret in secret_values:
+        if secret:
+            bounded = re.sub(re.escape(secret), "[redacted-key]", bounded, flags=re.IGNORECASE)
+    return bounded
 
 
 def _retry_after(value: str | None) -> float | None:

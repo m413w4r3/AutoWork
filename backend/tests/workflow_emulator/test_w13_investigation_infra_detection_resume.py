@@ -28,6 +28,8 @@ from cti_app.domain.investigation import (
     EvidenceObservation,
     FindingAssessment,
     FindingKind,
+    SampleOrigin,
+    SampleQualification,
     ToolInvocationStatus,
 )
 from cti_app.domain.production import (
@@ -58,7 +60,9 @@ from tests.workflow_emulator.investigation_support import (
     composition_factory,
     decision,
     investigation_settings,
+    persist_sample_association_fixture,
     publish_opinion_http,
+    qualify_sample_http,
     read_composition,
     read_manifest,
     revise_opinion_http,
@@ -611,9 +615,11 @@ async def test_w13_d5_rule_v1_v2_review_and_manifest_bound_archive(
         marker_v2 = f"BetaVariantMarker{token[10:20]}"
         first_bytes = b"MZ\x00W13-rule-v1:" + marker_v1.encode() + b":synthetic-inert"
         second_bytes = b"MZ\x00W13-rule-v2:" + marker_v2.encode() + b":synthetic-inert"
+        confirmed_positive_bytes = b"MZ\x00W13-controlled-positive:" + marker_v2.encode()
         goodware_bytes = b"synthetic-goodware:" + marker_v1.encode() + b":not-malware"
         first_sha = hashlib.sha256(first_bytes).hexdigest()
         second_sha = hashlib.sha256(second_bytes).hexdigest()
+        confirmed_positive_sha = hashlib.sha256(confirmed_positive_bytes).hexdigest()
         goodware_sha = hashlib.sha256(goodware_bytes).hexdigest()
         material = replace(material, sample_bytes=first_bytes, sample_hash=first_sha)
         candidate_id = uuid4()
@@ -622,7 +628,12 @@ async def test_w13_d5_rule_v1_v2_review_and_manifest_bound_archive(
             extra_samples={second_sha: second_bytes},
         )
         corpus = _ControlledRuleCorpus(
-            {first_sha: first_bytes, second_sha: second_bytes, goodware_sha: goodware_bytes},
+            {
+                first_sha: first_bytes,
+                second_sha: second_bytes,
+                confirmed_positive_sha: confirmed_positive_bytes,
+                goodware_sha: goodware_bytes,
+            },
             (goodware_sha,),
         )
         seeded = await seed_investigation_for_existing_article(
@@ -636,6 +647,37 @@ async def test_w13_d5_rule_v1_v2_review_and_manifest_bound_archive(
             material=material,
             article_claim=f"C1: article A describes the verified seed {material.seed_hash}.",
         )
+        confirmed_positive = await persist_sample_association_fixture(
+            uow_factory,
+            artifact_store,
+            investigation_id=seeded.investigation.id,
+            subject_id=subjects["A"].id,
+            sample_bytes=confirmed_positive_bytes,
+            origin=SampleOrigin.MANUAL,
+            logical_name="w13-controlled-positive.bin",
+        )
+        confirmation_blob, confirmation_sha = await artifact_store.put_canonical_json(
+            {
+                "sample_sha256": confirmed_positive_sha,
+                "control": "known-positive fixture contains the v2 marker and is missed by v1",
+            },
+            bucket="w13-rule-positive-controls",
+        )
+        confirmation_observation = EvidenceObservation(
+            investigation_id=seeded.investigation.id,
+            kind=EvidenceKind.BINARY_ANALYSIS,
+            blob_id=confirmation_blob,
+            sha256=confirmation_sha,
+            source="w13-controlled-positive-fixture",
+            source_version="1",
+            observed_at=datetime.now(UTC),
+            object_type="sample",
+            object_id=confirmed_positive_sha,
+            limitations=("Synthetic controlled positive; inert fixture bytes only.",),
+        )
+        async with uow_factory() as uow:
+            await uow.evidence_observations.append_if_absent(confirmation_observation)
+            await uow.commit()
 
         async def dynamic_rule_turn(observations):
             async with uow_factory() as uow:
@@ -851,6 +893,16 @@ async def test_w13_d5_rule_v1_v2_review_and_manifest_bound_archive(
                 acquire=True,
                 max_volume=2,
             )
+            qualification = await qualify_sample_http(
+                client,
+                seeded.investigation.id,
+                confirmed_positive.id,
+                expected_version=confirmed_positive.version,
+                qualification=SampleQualification.CONFIRMED,
+                evidence_refs=(confirmation_observation.id,),
+            )
+            assert qualification.status_code == 200, qualification.text
+            assert qualification.json()["association"]["qualification"] == "confirmed"
             await driver._perform(
                 "run_d5_v1_rule_job",
                 lambda: run_http_job(
@@ -894,11 +946,15 @@ async def test_w13_d5_rule_v1_v2_review_and_manifest_bound_archive(
             assert len(versions) == 2
             assert [item.version for item in versions] == [1, 2]
             assert versions[0].source_sha256 != versions[1].source_sha256
-            assert versions[0].status.value == "rejected"
-            assert any(
-                item.tool_name == "rule.propose" and item.status is ToolInvocationStatus.SUCCEEDED
-                for item in invocations
+            assert [item.status.value for item in versions] == ["candidate", "candidate"]
+            proposal_invocation = next(
+                item for item in invocations if item.tool_name == "rule.propose"
             )
+            assert proposal_invocation.status in {
+                ToolInvocationStatus.SUCCEEDED,
+                ToolInvocationStatus.PARTIAL,
+            }
+            assert proposal_invocation.normalized_parameters["candidate_id"] == str(candidate_id)
             assert any(
                 item.tool_name == "rule.test" and item.status is ToolInvocationStatus.SUCCEEDED
                 for item in invocations
@@ -946,13 +1002,20 @@ async def test_w13_d5_rule_v1_v2_review_and_manifest_bound_archive(
                 goodware_sha in report["known_false_positives"]
                 for report in v1_view["test_reports"]
             )
-            assert v1_view["status"] == "rejected"
+            # The immutable version record stays a candidate; its explicit test
+            # report carries the rejected status and controlled false negative.
+            assert v1_view["status"] == "candidate"
             rejected_v1_report = next(
                 report
-                for report in v1_view["test_reports"]
-                if goodware_sha in report["known_false_positives"]
+                for report in rule_reports
+                if report.get("operation") == "test"
+                and report.get("version_id") == str(versions[0].id)
+                and confirmed_positive_sha in report.get("false_negative_sha256s", [])
             )
             assert rejected_v1_report["validation_status"] == "real_partial"
+            assert confirmed_positive_sha in rejected_v1_report["false_negative_sha256s"]
+            assert rejected_v1_report["revision_recommendation"] == "revise_false_negative"
+            assert rejected_v1_report["candidate_status"] == "rejected"
             goodware_report = next(
                 item for item in rejected_v1_report["roles"] if item["role"] == "goodware"
             )

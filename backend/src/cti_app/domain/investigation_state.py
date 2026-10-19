@@ -8,7 +8,11 @@ from enum import StrEnum
 from typing import Any, ClassVar
 from uuid import UUID
 
-from cti_app.domain.investigation import InvestigationAgenda, canonical_json_bytes
+from cti_app.domain.investigation import (
+    InvestigationAgenda,
+    InvestigationExecutionMode,
+    canonical_json_bytes,
+)
 
 
 class DecisionValidationCode(StrEnum):
@@ -81,6 +85,7 @@ class InvestigationWorkingState:
     recent_actions: tuple[str, ...] = ()
     base_publication_artifact_id: UUID | None = None
     base_publication_sha256: str | None = None
+    execution_mode: InvestigationExecutionMode = InvestigationExecutionMode.BRIDGE_LED
 
     def __post_init__(self) -> None:
         if (
@@ -92,6 +97,8 @@ class InvestigationWorkingState:
             raise ValueError("Investigation state counters are invalid")
         if self.stop_reason is not None and not isinstance(self.stop_reason, StopReason):
             raise TypeError("stop_reason must use StopReason")
+        if not isinstance(self.execution_mode, InvestigationExecutionMode):
+            raise TypeError("execution_mode must use InvestigationExecutionMode")
         if (self.base_publication_artifact_id is None) != (self.base_publication_sha256 is None):
             raise ValueError("Base publication identity and SHA-256 must be supplied together")
         if (self.pending_context_snapshot_id is None) != (self.pending_context_sha256 is None):
@@ -145,6 +152,7 @@ class InvestigationWorkingState:
                 else None
             ),
             "base_publication_sha256": self.base_publication_sha256,
+            "execution_mode": self.execution_mode.value,
         }
 
     def canonical_bytes(self) -> bytes:
@@ -179,6 +187,15 @@ class InvestigationWorkingState:
             last_seen_finding_ids=tuple(dict.fromkeys(finding_ids)),
             recent_actions=(*self.recent_actions, *action_summaries)[-32:],
             stop_reason=None,
+        )
+
+    def with_operator_tool_action(self, action: str) -> InvestigationWorkingState:
+        if not action.startswith("operator_tool:") or len(action) > 256:
+            raise ValueError("Operator tool action summary is invalid")
+        return replace(
+            self,
+            version=self.version + 1,
+            recent_actions=(*self.recent_actions, action)[-32:],
         )
 
     def with_pending_context(

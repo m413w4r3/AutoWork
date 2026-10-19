@@ -16,6 +16,7 @@ from cti_app.domain.analyst_opinion import AnalystOpinionV1
 from cti_app.domain.investigation import (
     BudgetDimension,
     InvestigationEnvelope,
+    InvestigationExecutionMode,
     ToolInvocation,
     ToolInvocationStatus,
     canonical_json_bytes,
@@ -38,12 +39,14 @@ class InvestigationOperatorErrorCode(StrEnum):
 
 class OperatorNextAction(StrEnum):
     WAIT_FOR_WORKER = "wait_for_worker"
+    OPERATOR_ACTION_REQUIRED = "operator_action_required"
     INSPECT_BRIDGE_TURN = "inspect_bridge_turn"
     RECONCILE_MODEL_CONVERSATION_TURN = "reconcile_model_conversation_turn"
     RECONCILE_TOOL_INVOCATION = "reconcile_tool_invocation"
     REQUEST_G2_DECISION = "request_g2_decision"
     CREATE_NEW_INVESTIGATION = "create_new_investigation"
     RESUME_INVESTIGATION = "resume_investigation"
+    ADVISOR_CHECKPOINT_DUE = "advisor_checkpoint_due"
     NO_ACTION = "no_action"
 
 
@@ -64,6 +67,7 @@ def build_investigation_operator_view(
     jobs: tuple[Job, ...],
     available_tools: tuple[str, ...],
     unavailable_tools: tuple[str, ...],
+    advisor_guidance: dict[str, Any] | None = None,
     g2_revoked: bool = False,
     g2_reapproval_supported: bool = False,
     pending_bridge_turn_id: UUID | None = None,
@@ -71,6 +75,17 @@ def build_investigation_operator_view(
     pending_bridge_turn_error_code: str | None = None,
     pending_bridge_turn_key: str | None = None,
 ) -> InvestigationOperatorView:
+    guidance = advisor_guidance or {
+        "checkpoint_due": False,
+        "reason": None,
+        "suggested_consultation_type": None,
+        "last_advice": None,
+        "reminder": "Bridge: sortie non fiable; valider chaque suggestion par des mesures.",
+        "advisor_turns_used": 0,
+        "advisor_turn_limit": 8,
+        "advisor_turns_remaining": 8,
+        "truncated": False,
+    }
     ordered_jobs = tuple(sorted(jobs, key=lambda item: (item.created_at, item.id.hex)))
     generation = max(
         (int(job.input_parameters.get("run_generation", 0)) for job in ordered_jobs),
@@ -255,6 +270,7 @@ def build_investigation_operator_view(
         envelope_version=envelope.version if envelope else 0,
         g2_revoked=g2_revoked,
         g2_reapproval_supported=g2_reapproval_supported,
+        advisor_guidance=guidance,
     )
     return InvestigationOperatorView(
         payload={
@@ -266,6 +282,7 @@ def build_investigation_operator_view(
             "base_publication_artifact_id": state.base_publication_artifact_id,
             "base_publication_sha256": state.base_publication_sha256,
             "investigation_status": investigation.status.value,
+            "execution_mode": state.execution_mode.value,
             "investigation_version": investigation.version,
             "working_state_version": state.version,
             "working_state_sha256": state.sha256,
@@ -282,8 +299,16 @@ def build_investigation_operator_view(
             "bridge_conversation_id": bridge_conversation_id,
             "bridge_conversation_id_scope": "local_autowork_record_only",
             "bridge_external_target": {
-                "mode": "stateless",
-                "lifecycle": "temporary_chat_per_turn",
+                "mode": (
+                    "disabled"
+                    if state.execution_mode is InvestigationExecutionMode.OPERATOR_LED
+                    else "stateless"
+                ),
+                "lifecycle": (
+                    "no_automatic_turns"
+                    if state.execution_mode is InvestigationExecutionMode.OPERATOR_LED
+                    else "temporary_chat_per_turn"
+                ),
             },
             "last_error": last_error,
             "last_operation": last_operation,
@@ -321,6 +346,11 @@ def build_investigation_operator_view(
                 "available": list(available_tools),
                 "unavailable": list(unavailable_tools),
             },
+            "tool_inventory": {
+                "available": list(available_tools),
+                "unavailable": list(unavailable_tools),
+            },
+            "advisor_guidance": guidance,
             "next_idempotent_action": next_action,
         }
     )
@@ -366,6 +396,7 @@ def _next_action(
     envelope_version: int,
     g2_revoked: bool,
     g2_reapproval_supported: bool,
+    advisor_guidance: dict[str, Any],
 ) -> dict[str, Any]:
     prefix = f"/api/investigations/{investigation.id}"
     if active_jobs:
@@ -386,6 +417,27 @@ def _next_action(
             "expected_version": invocation.version,
             "accepted_outcomes": ["executed_with_result", "not_executed", "abandon"],
             "requires_idempotency_key": True,
+        }
+    if state.execution_mode is InvestigationExecutionMode.OPERATOR_LED:
+        suggested = advisor_guidance.get("suggested_consultation_type")
+        if advisor_guidance.get("checkpoint_due") and isinstance(suggested, str):
+            return {
+                "code": OperatorNextAction.ADVISOR_CHECKPOINT_DUE.value,
+                "reason": advisor_guidance.get("reason"),
+                "blocking": False,
+                "tool_name": "advisor.consult",
+                "method": "POST",
+                "path": f"{prefix}/operator/tools/advisor.consult",
+                "arguments": {"consultation_type": suggested},
+                "purpose": "Bounded advisor checkpoint; validate suggestions before acting.",
+                "expected_version": state.version,
+                "requires_idempotency_key": True,
+            }
+        return {
+            "code": OperatorNextAction.OPERATOR_ACTION_REQUIRED.value,
+            "method": "GET",
+            "path": f"{prefix}/operator/context",
+            "expected_version": state.version,
         }
     retry_exhausted_action = any(
         item.startswith(f"bridge_turn_pre_submission_retry_exhausted:{state.turn_index}:")

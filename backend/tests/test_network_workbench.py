@@ -5,6 +5,7 @@ import hashlib
 import ipaddress
 import shutil
 import struct
+from collections.abc import Callable
 from uuid import UUID, uuid5
 
 import pytest
@@ -159,8 +160,9 @@ def _pcap(
     *,
     timestamps: tuple[tuple[int, int], ...] | None = None,
     original_lengths: tuple[int, ...] | None = None,
+    link_type: int = 1,
 ) -> bytes:
-    data = bytearray(struct.pack("<IHHIIII", 0xA1B2C3D4, 2, 4, 0, 0, 65_535, 1))
+    data = bytearray(struct.pack("<IHHIIII", 0xA1B2C3D4, 2, 4, 0, 0, 65_535, link_type))
     times = timestamps or tuple(
         (1 + index * 100_000 // 1_000_000, index * 100_000 % 1_000_000)
         for index in range(len(frames))
@@ -253,9 +255,9 @@ def _ambiguous_message_overlap_capture() -> bytes:
     return _pcap(frames)
 
 
-def _pcapng_one_frame(frame: bytes) -> bytes:
+def _pcapng_one_frame(frame: bytes, *, link_type: int = 1) -> bytes:
     section = struct.pack("<IIIHHqI", 0x0A0D0D0A, 28, 0x1A2B3C4D, 1, 0, -1, 28)
-    interface = struct.pack("<IIHHII", 1, 20, 1, 0, 65_535, 20)
+    interface = struct.pack("<IIHHII", 1, 20, link_type, 0, 65_535, 20)
     padded = frame + b"\x00" * ((4 - len(frame) % 4) % 4)
     block_length = 32 + len(padded)
     packet = (
@@ -337,6 +339,43 @@ def test_native_pcap_reader_reports_packet_metadata_and_pcapng() -> None:
     next_generation = read_capture(_pcapng_one_frame(frame))
     assert next_generation.format is NetworkCaptureFormat.PCAPNG
     assert next_generation.packets[0].payload == b"abc"
+
+
+@pytest.mark.parametrize(
+    ("link_type", "encapsulate", "expected_format"),
+    (
+        (101, lambda frame: frame[14:], NetworkCaptureFormat.PCAP),
+        (
+            113,
+            lambda frame: struct.pack("!HHH8sH", 0, 1, 6, b"\x00" * 8, 0x0800) + frame[14:],
+            NetworkCaptureFormat.PCAP,
+        ),
+        (
+            276,
+            lambda frame: struct.pack("!HHIHBB8s", 0x0800, 0, 1, 1, 0, 6, b"\x00" * 8) + frame[14:],
+            NetworkCaptureFormat.PCAPNG,
+        ),
+    ),
+)
+def test_pcap_reader_extracts_raw_and_linux_cooked_tcp(
+    link_type: int,
+    encapsulate: Callable[[bytes], bytes],
+    expected_format: NetworkCaptureFormat,
+) -> None:
+    frame = _tcp_frame(sequence=10, payload=b"cooked")
+    cooked_frame = encapsulate(frame)
+    capture = (
+        _pcapng_one_frame(cooked_frame, link_type=link_type)
+        if expected_format is NetworkCaptureFormat.PCAPNG
+        else _pcap((cooked_frame,), link_type=link_type)
+    )
+
+    parsed = read_capture(capture)
+
+    assert parsed.format is expected_format
+    assert parsed.packets[0].link_type == link_type
+    assert parsed.packets[0].transport.value == "tcp"
+    assert parsed.packets[0].payload == b"cooked"
 
 
 @pytest.mark.asyncio

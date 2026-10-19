@@ -74,6 +74,7 @@ from cti_app.application.http_collection import (
 )
 from cti_app.application.identity import (
     PROTECTED_APP_ENVIRONMENTS,
+    IdentityScope,
     LocalIdentityProvider,
     StaticTokenIdentityProvider,
     is_human_actor_id,
@@ -602,8 +603,17 @@ def create_app() -> FastAPI:
     application = FastAPI(title="CTI Bulletin API", version="0.1.0", lifespan=lifespan)
     settings = get_settings()
     identity_provider = (
-        StaticTokenIdentityProvider(settings.operator_api_token.get_secret_value())
-        if settings.operator_api_token is not None
+        StaticTokenIdentityProvider(
+            settings.operator_api_token.get_secret_value()
+            if settings.operator_api_token is not None
+            else None,
+            operator_client_token=(
+                settings.operator_client_api_token.get_secret_value()
+                if settings.operator_client_api_token is not None
+                else None
+            ),
+        )
+        if settings.operator_api_token is not None or settings.operator_client_api_token is not None
         else LocalIdentityProvider()
     )
     if identity_provider.mode == "local":
@@ -622,15 +632,24 @@ def create_app() -> FastAPI:
             return await call_next(request)
 
         provider = request.app.state.identity_provider
-        if isinstance(provider, StaticTokenIdentityProvider) and not provider.verify_authorization(
-            request.headers.get("authorization")
+        if isinstance(provider, StaticTokenIdentityProvider):
+            identity = provider.identity_for_authorization(request.headers.get("authorization"))
+            if identity is None:
+                return JSONResponse(
+                    status_code=401,
+                    headers={"WWW-Authenticate": "Bearer"},
+                    content={"detail": {"code": "operator_token_required"}},
+                )
+        else:
+            identity = await provider.current()
+        request.state.identity = identity
+        if identity.has_scope(IdentityScope.OPERATOR_CLIENT) and not _operator_client_route_allowed(
+            request.method, request.url.path
         ):
             return JSONResponse(
-                status_code=401,
-                headers={"WWW-Authenticate": "Bearer"},
-                content={"detail": {"code": "operator_token_required"}},
+                status_code=403,
+                content={"detail": {"code": "operator_client_scope_denied"}},
             )
-        identity = await provider.current()
         provider_mode = getattr(provider, "mode", "custom")
         if environment_is_protected and provider_mode == "local":
             server = request.scope.get("server")
@@ -648,7 +667,9 @@ def create_app() -> FastAPI:
                     status_code=503,
                     content={"detail": {"code": "local_identity_requires_loopback_bind"}},
                 )
-        if not is_human_actor_id(identity.actor_id):
+        if not identity.has_scope(IdentityScope.OPERATOR_CLIENT) and not is_human_actor_id(
+            identity.actor_id
+        ):
             return JSONResponse(
                 status_code=403,
                 content={"detail": {"code": "human_operator_identity_required"}},
@@ -659,7 +680,11 @@ def create_app() -> FastAPI:
     @application.get("/api/identity/status")
     async def operator_identity_status(request: Request) -> dict[str, object]:
         provider = request.app.state.identity_provider
-        identity = await provider.current()
+        identity = getattr(request.state, "identity", None)
+        if identity is None and isinstance(provider, StaticTokenIdentityProvider):
+            identity = provider.identity_for_authorization(request.headers.get("authorization"))
+        if identity is None:
+            identity = await provider.current()
         mode_value = getattr(provider, "mode", "custom")
         mode = (
             mode_value
@@ -667,7 +692,9 @@ def create_app() -> FastAPI:
             else "custom"
         )
         verified = bool(getattr(provider, "verified", False))
-        human_identity = is_human_actor_id(identity.actor_id)
+        human_identity = not identity.has_scope(
+            IdentityScope.OPERATOR_CLIENT
+        ) and is_human_actor_id(identity.actor_id)
         server = request.scope.get("server")
         server_host = server[0] if isinstance(server, tuple) and server else None
         bind_host = server_host if isinstance(server_host, str) else settings.api_bind_host
@@ -745,6 +772,32 @@ def create_app() -> FastAPI:
     application.include_router(detection_router)
     application.include_router(analyst_opinion_router)
     return application
+
+
+def _operator_client_route_allowed(method: str, path: str) -> bool:
+    parts = path.strip("/").split("/")
+    if len(parts) < 3 or parts[:2] != ["api", "investigations"]:
+        return False
+    if method == "GET" and len(parts) == 4 and parts[3] == "operator-status":
+        return True
+    if method == "GET" and len(parts) == 3:
+        return True
+    if method == "GET" and len(parts) == 5 and parts[3:] == ["operator", "context"]:
+        return True
+    if (
+        method == "GET"
+        and len(parts) == 6
+        and parts[3:5] == ["operator", "observations"]
+        and parts[5]
+    ):
+        return True
+    return bool(
+        method == "POST"
+        and len(parts) == 6
+        and parts[3:5] == ["operator", "tools"]
+        and parts[5]
+        and parts[5] != "sample.set_qualification"
+    )
 
 
 app = create_app()

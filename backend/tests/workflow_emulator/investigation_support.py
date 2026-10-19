@@ -25,8 +25,20 @@ from cti_app.application.investigation_composition import (
 from cti_app.application.investigation_jobs import make_investigation_runner
 from cti_app.application.jobs import JobExecutor, SynchronousJobDispatcher, create_job_registry
 from cti_app.application.production_artifact_store import ProductionArtifactStore
-from cti_app.application.sample_acquisition import VirusTotalSampleAcquisitionService
-from cti_app.application.virustotal import VirusTotalCapabilities
+from cti_app.application.sample_acquisition import (
+    SAMPLES_QUARANTINE_BUCKET,
+    SampleAcquisitionCacheScope,
+    VirusTotalSampleAcquisitionService,
+)
+from cti_app.application.virustotal import (
+    VirusTotalCapabilities,
+    VirusTotalCapability,
+    VirusTotalEndpointVariant,
+    VirusTotalOperationRoute,
+    VirusTotalRouteStep,
+    VirusTotalRoutingPolicy,
+    VirusTotalTransportKind,
+)
 from cti_app.application.virustotal_persistence import VirusTotalObservationService
 from cti_app.config import Settings
 from cti_app.domain.classification import TLP
@@ -170,6 +182,17 @@ class HashCheckedVirusTotal(FakeVirusTotalPort):
             ]
             if include_candidate
             else []
+        )
+
+    @property
+    def sample_acquisition_cache_scope(self) -> SampleAcquisitionCacheScope:
+        """Stable, credential-free cache scope for the synthetic proxy route."""
+        return SampleAcquisitionCacheScope(
+            provider="virustotal",
+            account_capability_fingerprint="workflow-fixture-account-unattributed-v1",
+            route_fingerprint="workflow-fixture-vt-proxy-v3-download-v1",
+            transport="proxy-v3",
+            configuration_fingerprint="workflow-fixture-vt-config-v1",
         )
 
     async def object_relationship(
@@ -701,10 +724,14 @@ def investigation_settings(
         investigation_max_vt_read_units=24,
         investigation_max_shodan_credits=4,
         investigation_max_hits_acquired=1,
+        virustotal_proxy_url="http://vt-proxy.fixture.invalid:8080",
+        virustotal_base_url="http://www.virustotal.com/api/v3",
         virustotal_file_report_enabled=True,
         virustotal_object_relationships_enabled=relationships,
         virustotal_intelligence_search_enabled=True,
         virustotal_file_download_enabled=True,
+        virustotal_download_allowed_hosts="vtsamples.commondatastorage.googleapis.com",
+        virustotal_download_allowed_ports="443",
         shodan_api_key=SecretStr("synthetic-no-network-key"),
         shodan_host_enabled=True,
         local_analysis_enabled=local_analysis,
@@ -773,6 +800,22 @@ def composition_factory(
             ),
             virustotal_observations=VirusTotalObservationService(blob_catalog, uow_factory),
             vt_capabilities=vt_capabilities,
+            vt_routing_policy=VirusTotalRoutingPolicy(
+                routes={
+                    capability: VirusTotalOperationRoute(
+                        primary=VirusTotalRouteStep(
+                            transport=VirusTotalTransportKind.PROXY,
+                            variant=VirusTotalEndpointVariant.V3,
+                        )
+                    )
+                    for capability in (
+                        VirusTotalCapability.FILE_REPORT,
+                        VirusTotalCapability.FILE_RELATIONSHIPS,
+                        VirusTotalCapability.INTELLIGENCE_SEARCH,
+                        VirusTotalCapability.FILE_DOWNLOAD,
+                    )
+                }
+            ),
         )
     if shodan is not None:
         from cti_app.application.shodan import ShodanBudgetEstimate, ShodanCapabilities
@@ -831,7 +874,7 @@ async def persist_sample_association_fixture(
     if sample_bytes is not None:
         blob_id = await artifact_store.put_bytes(
             sample_bytes,
-            bucket="workflow-quarantined-samples",
+            bucket=SAMPLES_QUARANTINE_BUCKET,
             mime_type="application/octet-stream",
         )
         sample = Sample(

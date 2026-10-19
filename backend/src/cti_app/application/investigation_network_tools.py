@@ -26,14 +26,21 @@ from cti_app.application.network_workbench import (
 )
 from cti_app.domain.investigation import BudgetDimension, EvidenceKind, ToolInvocationStatus
 from cti_app.domain.network_protocol import NetworkCaptureFormat, NetworkCaptureRefV1
+from cti_app.infrastructure.confined_suricata import (
+    ConfinedSuricataAdapter,
+    validate_suricata_rule_source,
+)
 from cti_app.infrastructure.tshark_adapter import TsharkAdapter
 
 NETWORK_CAPTURE_INSPECT = "network.capture.inspect"
 NETWORK_STREAM_REASSEMBLE = "network.stream.reassemble"
 NETWORK_MESSAGES_SEGMENT = "network.messages.segment"
+NETWORK_SURICATA_VALIDATE_RULES = "network.suricata_validate_rules"
+NETWORK_SURICATA_REPLAY = "network.suricata_replay"
 NETWORK_TOOL_NAMES = frozenset(
     {NETWORK_CAPTURE_INSPECT, NETWORK_STREAM_REASSEMBLE, NETWORK_MESSAGES_SEGMENT}
 )
+NETWORK_SURICATA_TOOL_NAMES = frozenset({NETWORK_SURICATA_VALIDATE_RULES, NETWORK_SURICATA_REPLAY})
 _FLOW_ID = re.compile(r"^[0-9a-f]{24}$")
 _MAX_TOOL_SECONDS = 120
 
@@ -52,11 +59,15 @@ _CAPTURE_REF_SCHEMA: dict[str, Any] = {
 
 def network_tool_capabilities(tshark: TsharkAdapter) -> frozenset[str]:
     """Discover L5 registry keys without importing or starting optional tools."""
-    return (
+    names = set(
         NETWORK_TOOL_NAMES
         if tshark.available
-        else frozenset({NETWORK_STREAM_REASSEMBLE, NETWORK_MESSAGES_SEGMENT})
+        else {NETWORK_STREAM_REASSEMBLE, NETWORK_MESSAGES_SEGMENT}
     )
+    suricata = _suricata_adapter(tshark)
+    if suricata is not None and suricata.available:
+        names.update(NETWORK_SURICATA_TOOL_NAMES)
+    return frozenset(names)
 
 
 def register_network_tools(
@@ -68,7 +79,7 @@ def register_network_tools(
 ) -> None:
     if not 1 <= tool_seconds <= _MAX_TOOL_SECONDS:
         raise ValueError(f"tool_seconds must be between 1 and {_MAX_TOOL_SECONDS}")
-    definitions: tuple[tuple[str, Mapping[str, Any], ToolEffect, str], ...] = (
+    definitions: list[tuple[str, Mapping[str, Any], ToolEffect, str]] = [
         (
             NETWORK_CAPTURE_INSPECT,
             _capture_schema("Inspect a quarantined PCAP/PCAPNG capture without network access"),
@@ -87,12 +98,39 @@ def register_network_tools(
             ToolEffect.LOCAL_COMPUTE,
             "A candidate is never reported as decoded unless its bytes and support are measured.",
         ),
-    )
-    adapters: tuple[ToolAdapter, ...] = (
+    ]
+    adapters: list[ToolAdapter] = [
         _CaptureInspectAdapter(workbench, recorder, tool_seconds),
         _StreamReassembleAdapter(workbench, recorder, tool_seconds),
         _MessagesSegmentAdapter(workbench, recorder, tool_seconds),
-    )
+    ]
+    suricata = _suricata_adapter(workbench.tshark, timeout_seconds=tool_seconds)
+    if suricata is not None and suricata.available:
+        definitions.extend(
+            (
+                (
+                    NETWORK_SURICATA_VALIDATE_RULES,
+                    _suricata_schema(
+                        "Validate a versioned offline Suricata ruleset for an associated capture"
+                    ),
+                    ToolEffect.LOCAL_COMPUTE,
+                    "Runs Suricata configuration and rules validation with -T; "
+                    "does not read packet contents.",
+                ),
+                (
+                    NETWORK_SURICATA_REPLAY,
+                    _suricata_schema("Replay an associated quarantined PCAP offline with Suricata"),
+                    ToolEffect.LOCAL_COMPUTE,
+                    "Runs one offline -r replay and archives bounded EVE JSON as a canonical blob.",
+                ),
+            )
+        )
+        adapters.extend(
+            (
+                _SuricataToolAdapter(workbench, recorder, tool_seconds, suricata, replay=False),
+                _SuricataToolAdapter(workbench, recorder, tool_seconds, suricata, replay=True),
+            )
+        )
     for (name, schema, effect, limitation), adapter in zip(definitions, adapters, strict=True):
         registry.register(
             ToolDefinition(
@@ -138,6 +176,29 @@ class _NetworkToolAdapter:
             return NetworkCaptureRefV1(blob_id, sha256, size_bytes, capture_format)
         except (KeyError, TypeError, ValueError) as exc:
             raise NetworkAnalysisError("capture_ref_invalid") from exc
+
+    async def _accept_capture(
+        self,
+        reference: NetworkCaptureRefV1,
+        context: ToolExecutionContext,
+    ) -> NetworkCaptureRefV1:
+        resolver = getattr(self.workbench.quarantine, "is_bound_to_investigation", None)
+        if not callable(resolver) or not resolver(context.investigation_id):
+            return reference
+        accepted = await self.workbench.accept_quarantined_capture(
+            f"sha256:{reference.sha256}",
+            investigation_id=context.investigation_id,
+            idempotency_key=(
+                f"network-capture-adoption:{context.investigation_id}:{reference.sha256}"
+            ),
+        )
+        if (
+            accepted.sha256 != reference.sha256
+            or accepted.size_bytes != reference.size_bytes
+            or accepted.format is not reference.format
+        ):
+            raise NetworkAnalysisError("capture_ref_identity_mismatch")
+        return accepted
 
     async def _record(
         self,
@@ -201,7 +262,9 @@ class _CaptureInspectAdapter(_NetworkToolAdapter):
     ) -> ToolResult:
         started = time.monotonic()
         try:
-            reference = self._capture_ref(arguments.get("capture_ref"))
+            reference = await self._accept_capture(
+                self._capture_ref(arguments.get("capture_ref")), context
+            )
             outcome = await self.workbench.inspect(
                 reference, investigation_id=context.investigation_id
             )
@@ -266,7 +329,9 @@ class _StreamReassembleAdapter(_NetworkToolAdapter):
     ) -> ToolResult:
         started = time.monotonic()
         try:
-            reference = self._capture_ref(arguments.get("capture_ref"))
+            reference = await self._accept_capture(
+                self._capture_ref(arguments.get("capture_ref")), context
+            )
             flow_id = _flow_id(arguments.get("flow_id"))
             outcome = await self.workbench.reassemble(
                 reference, flow_id, investigation_id=context.investigation_id
@@ -325,7 +390,9 @@ class _MessagesSegmentAdapter(_NetworkToolAdapter):
     ) -> ToolResult:
         started = time.monotonic()
         try:
-            reference = self._capture_ref(arguments.get("capture_ref"))
+            reference = await self._accept_capture(
+                self._capture_ref(arguments.get("capture_ref")), context
+            )
             flow_id = _flow_id(arguments.get("flow_id"))
             outcome = await self.workbench.segment(
                 reference, flow_id, investigation_id=context.investigation_id
@@ -379,6 +446,170 @@ class _MessagesSegmentAdapter(_NetworkToolAdapter):
         )
 
 
+class _SuricataToolAdapter(_NetworkToolAdapter):
+    def __init__(
+        self,
+        workbench: NetworkWorkbench,
+        recorder: EvidenceRecorder,
+        reserved_seconds: int,
+        suricata: ConfinedSuricataAdapter,
+        *,
+        replay: bool,
+    ) -> None:
+        super().__init__(workbench, recorder, reserved_seconds)
+        self.suricata = suricata
+        self.replay = replay
+        self.name = NETWORK_SURICATA_REPLAY if replay else NETWORK_SURICATA_VALIDATE_RULES
+
+    async def execute(
+        self, arguments: Mapping[str, Any], context: ToolExecutionContext
+    ) -> ToolResult:
+        started = time.monotonic()
+        try:
+            reference = await self._accept_capture(
+                self._capture_ref(arguments.get("capture_ref")), context
+            )
+            parameters = self._candidate_parameters(arguments.get("candidate"))
+            outcome = (
+                await self.workbench.replay_suricata(
+                    reference,
+                    investigation_id=context.investigation_id,
+                    adapter=self.suricata,
+                    analysis_parameters=parameters,
+                )
+                if self.replay
+                else await self.workbench.validate_suricata_rules(
+                    reference,
+                    investigation_id=context.investigation_id,
+                    adapter=self.suricata,
+                    analysis_parameters=parameters,
+                )
+            )
+        except NetworkCaptureRejected as exc:
+            status = (
+                ToolInvocationStatus.UNAVAILABLE
+                if exc.reason.value == "blob_unavailable"
+                else ToolInvocationStatus.POLICY_DENIED
+            )
+            return self._tool_result(
+                context, status=status, started=started, output={"detail_code": exc.reason.value}
+            )
+        except (NetworkAnalysisError, ValueError) as exc:
+            detail = exc.code if isinstance(exc, NetworkAnalysisError) else str(exc)
+            return self._tool_result(
+                context,
+                status=ToolInvocationStatus.POLICY_DENIED,
+                started=started,
+                output={"detail_code": detail[:160]},
+            )
+
+        if outcome.status is ToolInvocationStatus.UNAVAILABLE:
+            return self._tool_result(
+                context,
+                status=ToolInvocationStatus.UNAVAILABLE,
+                started=started,
+                output={
+                    "engine_status": "unavailable",
+                    "available_reason": outcome.available_reason or "analysis_tool_unavailable",
+                },
+            )
+        if outcome.payload is None:
+            return self._tool_result(
+                context,
+                status=outcome.status,
+                started=started,
+                output={
+                    "detail_code": outcome.available_reason or "suricata_result_unavailable",
+                },
+            )
+        envelope = outcome.payload or {}
+        engine = envelope.get("result") if isinstance(envelope, Mapping) else None
+        if not isinstance(engine, Mapping):
+            engine = {}
+        engine_status = str(engine.get("status", "FAILED"))
+        status = {
+            "SUCCEEDED": ToolInvocationStatus.SUCCEEDED,
+            "PARTIAL": ToolInvocationStatus.PARTIAL,
+            "unavailable": ToolInvocationStatus.UNAVAILABLE,
+            "POLICY_DENIED": ToolInvocationStatus.POLICY_DENIED,
+        }.get(engine_status, ToolInvocationStatus.FAILED)
+        if status is ToolInvocationStatus.UNAVAILABLE:
+            return self._tool_result(
+                context,
+                status=status,
+                started=started,
+                output={
+                    "engine_status": "unavailable",
+                    "available_reason": engine.get("available_reason", "analysis_tool_unavailable"),
+                },
+            )
+        payload = {
+            "schema": "SuricataObservationV1",
+            "capture_blob_id": str(reference.blob_id),
+            "capture_sha256": reference.sha256,
+            "operation_key": outcome.operation_key,
+            "tool": self.name,
+            "engine": dict(engine),
+        }
+        object_id = ":".join(
+            str(value)
+            for value in (
+                reference.sha256,
+                engine.get("ruleset_revision", "fixed"),
+                engine.get("rule_sha256", "unknown"),
+            )
+        )
+        observation_id = await self._record(
+            context,
+            source=self.name,
+            object_type="suricata_observation",
+            object_id=object_id,
+            payload=payload,
+        )
+        return self._tool_result(
+            context,
+            status=status,
+            started=started,
+            observation_refs=(observation_id,),
+            output={
+                "engine_status": engine_status.lower(),
+                "engine": dict(engine),
+                "observation_ref": str(observation_id),
+            },
+        )
+
+    @staticmethod
+    def _candidate_parameters(value: object) -> dict[str, str]:
+        if value is None:
+            return {}
+        if not isinstance(value, Mapping) or set(value) != {
+            "candidate_id",
+            "candidate_version",
+            "rule_source",
+        }:
+            raise ValueError("suricata_candidate_invalid")
+        candidate_id = value["candidate_id"]
+        candidate_version = value["candidate_version"]
+        rule_source = value["rule_source"]
+        if (
+            not isinstance(candidate_id, str)
+            or isinstance(candidate_version, bool)
+            or not isinstance(candidate_version, int)
+            or not isinstance(rule_source, str)
+        ):
+            raise ValueError("suricata_candidate_invalid")
+        rule_source = validate_suricata_rule_source(
+            rule_source,
+            candidate_id=candidate_id,
+            candidate_version=str(candidate_version),
+        )
+        return {
+            "candidate_id": candidate_id,
+            "candidate_version": str(candidate_version),
+            "rule_source": rule_source,
+        }
+
+
 def _capture_schema(description: str) -> dict[str, Any]:
     return {
         "type": "object",
@@ -390,6 +621,40 @@ def _capture_schema(description: str) -> dict[str, Any]:
         "additionalProperties": False,
         "description": description,
     }
+
+
+def _suricata_schema(description: str) -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "capture_ref": _CAPTURE_REF_SCHEMA,
+            "candidate": {
+                "type": "object",
+                "properties": {
+                    "candidate_id": {
+                        "type": "string",
+                        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$",
+                    },
+                    "candidate_version": {"type": "integer", "minimum": 1, "maximum": 100_000},
+                    "rule_source": {"type": "string", "minLength": 1, "maxLength": 65_536},
+                },
+                "required": ["candidate_id", "candidate_version", "rule_source"],
+                "additionalProperties": False,
+            },
+        },
+        "required": ["capture_ref"],
+        "additionalProperties": False,
+        "description": description,
+    }
+
+
+def _suricata_adapter(
+    tshark: TsharkAdapter, *, timeout_seconds: int = 60
+) -> ConfinedSuricataAdapter | None:
+    execution = getattr(tshark, "execution", None)
+    if execution is None or not hasattr(execution, "family_statuses"):
+        return None
+    return ConfinedSuricataAdapter(execution, timeout_seconds=min(timeout_seconds, 60))
 
 
 def _flow_schema(description: str) -> dict[str, Any]:

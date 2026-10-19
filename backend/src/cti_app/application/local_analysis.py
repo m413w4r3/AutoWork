@@ -9,6 +9,9 @@ from hashlib import sha256
 from typing import Protocol
 
 from cti_app.domain.local_analysis import (
+    LOCAL_COMMAND_MAX_MONODIS_RANGE_BYTES,
+    LOCAL_COMMAND_MAX_RANGE_BYTES,
+    LOCAL_COMMAND_MAX_XXD_RANGE_BYTES,
     GhidraObservation,
     GhidraOperation,
     LocalAnalysisFileType,
@@ -215,6 +218,14 @@ class LocalCommandService:
         normalized_options, error = normalize_command_options(capability.spec, options or {})
         if error is not None:
             return _result(normalized_id, LocalCommandStatus.POLICY_DENIED, sample_sha256, error)
+        range_error = _validate_local_command_range_options(normalized_id, normalized_options)
+        if range_error is not None:
+            return _result(
+                normalized_id,
+                LocalCommandStatus.POLICY_DENIED,
+                sample_sha256,
+                range_error,
+            )
 
         try:
             sample_bytes = await self._samples.get_sample_bytes(
@@ -232,6 +243,18 @@ class LocalCommandService:
             return _result(
                 normalized_id, LocalCommandStatus.FAILED, sample_sha256, "sample_hash_mismatch"
             )
+        range_end = _command_range_end(normalized_options)
+        if (
+            normalized_id in {LocalCommandId.STRINGS, LocalCommandId.XXD, LocalCommandId.SHA256SUM}
+            and range_end is not None
+            and range_end > len(sample_bytes)
+        ):
+            return _result(
+                normalized_id,
+                LocalCommandStatus.POLICY_DENIED,
+                sample_sha256,
+                "range_out_of_bounds",
+            )
 
         sample_type = detect_file_type(sample_bytes)
         if sample_type not in capability.spec.accepted_file_types:
@@ -241,11 +264,22 @@ class LocalCommandService:
                 sample_sha256,
                 "unsupported_file_type",
             )
+        command_bytes = sample_bytes
+        command_options = normalized_options
+        if normalized_id is LocalCommandId.STRINGS and range_end is not None:
+            offset = normalized_options["offset"]
+            assert isinstance(offset, int)
+            command_bytes = sample_bytes[offset:range_end]
+            command_options = {
+                name: value
+                for name, value in normalized_options.items()
+                if name not in {"offset", "length"}
+            }
         return await self._runner.run(
             capability,
             sample_sha256=sample_sha256,
-            sample_bytes=sample_bytes,
-            options=normalized_options,
+            sample_bytes=command_bytes,
+            options=command_options,
         )
 
     def estimate_budget(self, command_id: LocalCommandId | str) -> LocalCommandBudgetEstimate:
@@ -293,6 +327,22 @@ def default_local_command_specs() -> tuple[LocalCommandSpec, ...]:
             "strings",
             (
                 LocalCommandOptionSpec(
+                    "offset",
+                    LocalOptionKind.INTEGER,
+                    None,
+                    minimum=0,
+                    maximum=0xFFFFFFFFFFFFFFFF,
+                    optional=True,
+                ),
+                LocalCommandOptionSpec(
+                    "length",
+                    LocalOptionKind.INTEGER,
+                    None,
+                    minimum=1,
+                    maximum=LOCAL_COMMAND_MAX_RANGE_BYTES,
+                    optional=True,
+                ),
+                LocalCommandOptionSpec(
                     "min_length", LocalOptionKind.INTEGER, 4, minimum=1, maximum=256
                 ),
                 LocalCommandOptionSpec(
@@ -306,6 +356,62 @@ def default_local_command_specs() -> tuple[LocalCommandSpec, ...]:
             384 * 1024 * 1024,
             1 * 1024 * 1024,
             LocalCommandOutputKind.LINES,
+        ),
+        LocalCommandSpec(
+            LocalCommandId.XXD,
+            "xxd",
+            (
+                LocalCommandOptionSpec(
+                    "offset",
+                    LocalOptionKind.INTEGER,
+                    None,
+                    minimum=0,
+                    maximum=0xFFFFFFFFFFFFFFFF,
+                ),
+                LocalCommandOptionSpec(
+                    "length",
+                    LocalOptionKind.INTEGER,
+                    None,
+                    minimum=1,
+                    maximum=LOCAL_COMMAND_MAX_XXD_RANGE_BYTES,
+                ),
+            ),
+            any_file,
+            10,
+            64 * 1024,
+            5,
+            256 * 1024 * 1024,
+            1 * 1024 * 1024,
+            LocalCommandOutputKind.TEXT,
+        ),
+        LocalCommandSpec(
+            LocalCommandId.SHA256SUM,
+            "sha256sum",
+            (
+                LocalCommandOptionSpec(
+                    "offset",
+                    LocalOptionKind.INTEGER,
+                    None,
+                    minimum=0,
+                    maximum=0xFFFFFFFFFFFFFFFF,
+                    optional=True,
+                ),
+                LocalCommandOptionSpec(
+                    "length",
+                    LocalOptionKind.INTEGER,
+                    None,
+                    minimum=1,
+                    maximum=LOCAL_COMMAND_MAX_RANGE_BYTES,
+                    optional=True,
+                ),
+            ),
+            any_file,
+            10,
+            16_384,
+            5,
+            256 * 1024 * 1024,
+            1 * 1024 * 1024,
+            LocalCommandOutputKind.TEXT,
         ),
         LocalCommandSpec(
             LocalCommandId.READELF,
@@ -335,6 +441,22 @@ def default_local_command_specs() -> tuple[LocalCommandSpec, ...]:
                     LocalOptionKind.ENUM,
                     "file_header",
                     allowed_values=("file_header", "sections", "private_headers", "disassemble"),
+                ),
+                LocalCommandOptionSpec(
+                    "offset",
+                    LocalOptionKind.INTEGER,
+                    None,
+                    minimum=0,
+                    maximum=0xFFFFFFFFFFFFFFFF,
+                    optional=True,
+                ),
+                LocalCommandOptionSpec(
+                    "length",
+                    LocalOptionKind.INTEGER,
+                    None,
+                    minimum=1,
+                    maximum=LOCAL_COMMAND_MAX_RANGE_BYTES,
+                    optional=True,
                 ),
             ),
             native,
@@ -370,6 +492,57 @@ def default_local_command_specs() -> tuple[LocalCommandSpec, ...]:
             512 * 1024 * 1024,
             1 * 1024 * 1024,
             LocalCommandOutputKind.MATCHES,
+        ),
+        LocalCommandSpec(
+            LocalCommandId.MONODIS,
+            "monodis",
+            (
+                LocalCommandOptionSpec(
+                    "operation",
+                    LocalOptionKind.ENUM,
+                    "methods",
+                    allowed_values=("userstrings", "typedef", "methods", "cil"),
+                ),
+                LocalCommandOptionSpec(
+                    "method_name",
+                    LocalOptionKind.STRING,
+                    None,
+                    max_item_length=128,
+                    optional=True,
+                ),
+                LocalCommandOptionSpec(
+                    "method_rid",
+                    LocalOptionKind.INTEGER,
+                    None,
+                    minimum=1,
+                    maximum=0xFFFFFF,
+                    optional=True,
+                ),
+                LocalCommandOptionSpec(
+                    "offset",
+                    LocalOptionKind.INTEGER,
+                    None,
+                    minimum=0,
+                    maximum=0xFFFFFFFFFFFFFFFF,
+                    optional=True,
+                ),
+                LocalCommandOptionSpec(
+                    "length",
+                    LocalOptionKind.INTEGER,
+                    None,
+                    minimum=1,
+                    maximum=LOCAL_COMMAND_MAX_MONODIS_RANGE_BYTES,
+                    optional=True,
+                ),
+            ),
+            frozenset({LocalAnalysisFileType.PE}),
+            30,
+            16 * 1024,
+            25,
+            512 * 1024 * 1024,
+            64 * 1024 * 1024,
+            LocalCommandOutputKind.TEXT,
+            requires_filesystem_confinement=True,
         ),
     )
 
@@ -444,12 +617,17 @@ def normalize_command_options(
         return {}, "option_not_allowed"
     normalized: dict[str, object] = {}
     for name, option_spec in allowed.items():
-        if name not in options:
+        supplied = name in options
+        if not supplied:
             if option_spec.default is None:
-                return {}, "required_option_missing"
+                if not option_spec.optional:
+                    return {}, "required_option_missing"
             value = option_spec.default
         else:
             value = options[name]
+        if value is None and option_spec.optional and not supplied:
+            normalized[name] = None
+            continue
         if option_spec.kind is LocalOptionKind.BOOLEAN:
             if type(value) is not bool:
                 return {}, "invalid_boolean_option"
@@ -463,6 +641,17 @@ def normalize_command_options(
         elif option_spec.kind is LocalOptionKind.ENUM:
             if not isinstance(value, str) or value not in option_spec.allowed_values:
                 return {}, "enum_option_not_allowed"
+        elif option_spec.kind is LocalOptionKind.STRING:
+            if (
+                not isinstance(value, str)
+                or not value
+                or _not_utf8(value)
+                or (
+                    option_spec.max_item_length is not None
+                    and len(value) > option_spec.max_item_length
+                )
+            ):
+                return {}, "string_option_invalid"
         elif option_spec.kind is LocalOptionKind.STRING_LIST:
             if not isinstance(value, (list, tuple)):
                 return {}, "invalid_string_list_option"
@@ -484,6 +673,89 @@ def normalize_command_options(
             value = tuple(value)
         normalized[name] = value
     return normalized, None
+
+
+def _validate_local_command_range_options(
+    command_id: LocalCommandId,
+    options: Mapping[str, object],
+    *,
+    max_range_bytes: int = LOCAL_COMMAND_MAX_RANGE_BYTES,
+) -> str | None:
+    offset = options.get("offset")
+    length = options.get("length")
+    has_offset = offset is not None
+    has_length = length is not None
+    if command_id is LocalCommandId.MONODIS:
+        operation = options.get("operation")
+        method_name = options.get("method_name")
+        method_rid = options.get("method_rid")
+        has_name = isinstance(method_name, str)
+        has_rid = type(method_rid) is int
+        if has_offset != has_length:
+            return "range_options_must_be_paired"
+        if operation == "cil":
+            if has_name == has_rid:
+                return "method_selector_required"
+            if has_name and (
+                not isinstance(method_name, str)
+                or re.fullmatch(r"[A-Za-z_$<>][A-Za-z0-9_.$<>+`-]{0,127}", method_name) is None
+            ):
+                return "method_selector_invalid"
+        elif has_name or has_rid:
+            return "method_selector_not_allowed"
+        if has_offset:
+            if type(offset) is not int or type(length) is not int:
+                return "invalid_bounded_range"
+            if offset < 0 or length < 1 or length > LOCAL_COMMAND_MAX_MONODIS_RANGE_BYTES:
+                return (
+                    "range_exceeds_limit"
+                    if type(length) is int and length > LOCAL_COMMAND_MAX_MONODIS_RANGE_BYTES
+                    else "invalid_bounded_range"
+                )
+            if offset + length > 0xFFFFFFFFFFFFFFFF:
+                return "invalid_bounded_range"
+        return None
+    if command_id is LocalCommandId.SHA256SUM:
+        if has_offset != has_length:
+            return "range_options_must_be_paired"
+        if not has_offset:
+            return None
+    elif command_id is LocalCommandId.STRINGS:
+        if has_offset != has_length:
+            return "range_options_must_be_paired"
+        if not has_offset:
+            return None
+    elif command_id is LocalCommandId.OBJDUMP:
+        if options.get("mode") == "disassemble":
+            if not has_offset or not has_length:
+                return "bounded_range_required"
+        elif has_offset or has_length:
+            return "option_not_allowed"
+        else:
+            return None
+    elif command_id is LocalCommandId.XXD:
+        if not has_offset or not has_length:
+            return "bounded_range_required"
+    else:
+        return None
+    if type(offset) is not int or type(length) is not int:
+        return "invalid_bounded_range"
+    maximum = (
+        LOCAL_COMMAND_MAX_XXD_RANGE_BYTES if command_id is LocalCommandId.XXD else max_range_bytes
+    )
+    if offset < 0 or length < 1 or length > maximum:
+        return "range_exceeds_limit" if length > maximum else "invalid_bounded_range"
+    if offset + length > 0xFFFFFFFFFFFFFFFF:
+        return "invalid_bounded_range"
+    return None
+
+
+def _command_range_end(options: Mapping[str, object]) -> int | None:
+    offset = options.get("offset")
+    length = options.get("length")
+    if type(offset) is int and type(length) is int:
+        return offset + length
+    return None
 
 
 def detect_file_type(sample_bytes: bytes) -> LocalAnalysisFileType:

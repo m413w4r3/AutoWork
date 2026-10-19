@@ -57,6 +57,7 @@ testpaths = ["tests"]
 pythonpath = ["src"]
 markers = [
   "integration: requires a temporary PostgreSQL database",
+  "image: exercises tools installed in the analysis-worker image",
   "workflow_fast: deterministic workflow emulation with READY production runs inserted",
   "workflow_full: deterministic workflow emulation through real production jobs",
 ]

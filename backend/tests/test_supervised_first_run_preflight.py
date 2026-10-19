@@ -454,12 +454,14 @@ def test_runtime_inventory_uses_worker_factory_without_provider_requests(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     for name in (
-        "VIRUSTOTAL_PROXY_URL",
         "VIRUSTOTAL_API_KEY",
         "SHODAN_API_KEY",
         "OPERATOR_API_TOKEN",
     ):
         monkeypatch.delenv(name, raising=False)
+    # A disabled proxy route must make VT unavailable; this test supplies a
+    # non-contacted route so it can assert that the worker factory wires it.
+    monkeypatch.setenv("VIRUSTOTAL_PROXY_URL", "http://proxy.test:8080")
     monkeypatch.setenv("VIRUSTOTAL_FILE_REPORT_ENABLED", "true")
     monkeypatch.setenv("VIRUSTOTAL_FILE_REPORT_LEGACY_FALLBACK_ENABLED", "false")
     monkeypatch.setenv("VIRUSTOTAL_RETROHUNT_ENABLED", "false")

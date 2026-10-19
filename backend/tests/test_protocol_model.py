@@ -7,6 +7,7 @@ import struct
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4, uuid5
 
@@ -14,17 +15,20 @@ import pytest
 
 from cti_app.application.investigation_protocol_tools import (
     NETWORK_PROTOCOL_COMPARE,
+    NETWORK_PROTOCOL_DOCUMENT,
     NETWORK_PROTOCOL_HYPOTHESIZE,
     NETWORK_PROTOCOL_RENDER,
     NETWORK_PROTOCOL_VERIFY,
     PROTOCOL_TOOL_NAMES,
     ProductionProtocolModelStore,
     ProtocolModelNotInInvestigation,
+    RepositoryProtocolDocumentEvidenceResolver,
     protocol_tool_capabilities,
     register_protocol_tools,
 )
 from cti_app.application.investigation_tools import (
     InMemoryToolRegistry,
+    RegistryToolDispatcher,
     ToolExecutionContext,
 )
 from cti_app.application.network_protocol_model import (
@@ -841,6 +845,7 @@ def test_protocol_tools_register_exact_capability_keys_and_strict_input_schemas(
         NETWORK_PROTOCOL_HYPOTHESIZE,
         NETWORK_PROTOCOL_VERIFY,
         NETWORK_PROTOCOL_RENDER,
+        NETWORK_PROTOCOL_DOCUMENT,
     }
     workbench, _ = _workbench(_base_capture())
     registry = InMemoryToolRegistry()
@@ -849,6 +854,7 @@ def test_protocol_tools_register_exact_capability_keys_and_strict_input_schemas(
         service=NetworkProtocolWorkbench(workbench),
         recorder=_EvidenceRecorder(),
         model_store=_ProtocolModelStore(),
+        document_evidence=SimpleNamespace(),
     )
     for name in PROTOCOL_TOOL_NAMES:
         registration = registry.get(name, "1")
@@ -857,6 +863,173 @@ def test_protocol_tools_register_exact_capability_keys_and_strict_input_schemas(
         assert definition.capability_key == name
         assert definition.input_schema["additionalProperties"] is False
         assert definition.confidentiality.value == "restricted"
+
+
+@pytest.mark.asyncio
+async def test_documented_protocol_tool_cites_and_renders_without_capture() -> None:
+    observation = EvidenceObservation(
+        investigation_id=_INVESTIGATION_ID,
+        kind=EvidenceKind.OTHER,
+        blob_id=uuid4(),
+        sha256=hashlib.sha256(b"documented protocol fact").hexdigest(),
+        source="article.fact",
+        source_version="1",
+        observed_at=datetime.now(UTC),
+        object_type="article_fact",
+        object_id="handshake-sequence",
+    )
+    investigation = SimpleNamespace(
+        id=_INVESTIGATION_ID,
+        subject_id=uuid4(),
+        synthesis_artifact_id=uuid4(),
+    )
+
+    class _InvestigationRepository:
+        async def get(self, investigation_id: UUID):
+            return investigation if investigation_id == investigation.id else None
+
+    class _ObservationRepository:
+        async def list_for_investigation(self, investigation_id: UUID):
+            return (observation,) if investigation_id == observation.investigation_id else ()
+
+    class _FindingRepository:
+        async def list_for_investigation(self, _investigation_id: UUID):
+            return ()
+
+    class _ArticleSnapshots:
+        async def resolve(self, _synthesis_artifact_id: UUID):
+            return SimpleNamespace(article=SimpleNamespace(claims=()))
+
+    resolver = RepositoryProtocolDocumentEvidenceResolver(
+        investigations=_InvestigationRepository(),
+        observations=_ObservationRepository(),
+        findings=_FindingRepository(),
+        article_snapshots=_ArticleSnapshots(),
+    )
+    recorder = _EvidenceRecorder()
+    store = _ProtocolModelStore()
+    registry = InMemoryToolRegistry()
+    register_protocol_tools(
+        registry,
+        service=None,
+        recorder=recorder,
+        model_store=store,
+        document_evidence=resolver,
+        tool_seconds=5,
+    )
+    context = ToolExecutionContext(
+        investigation_id=_INVESTIGATION_ID,
+        envelope=None,
+        budget=InvestigationBudget({BudgetDimension.TOOL_SECONDS: 30}),
+        idempotency_key="document-protocol-model",
+        available_capabilities=frozenset({NETWORK_PROTOCOL_DOCUMENT, NETWORK_PROTOCOL_RENDER}),
+    )
+    citation = {"kind": "observation", "ref": str(observation.id)}
+    arguments = {
+        "model": {
+            "protocol": "Sample handshake",
+            "transport": "unknown",
+            "client_server_orientation": "unresolved",
+            "evidence_refs": [citation],
+            "messages": [
+                {
+                    "message_id": "hello",
+                    "name": "ClientHello",
+                    "ordinal": 1,
+                    "direction": "unresolved",
+                    "evidence_refs": [citation],
+                }
+            ],
+            "states": [
+                {"state_id": "new", "name": "New", "evidence_refs": [citation]},
+                {"state_id": "ready", "name": "Ready", "evidence_refs": [citation]},
+            ],
+            "fields": [
+                {
+                    "field_id": "opcode",
+                    "message_id": "hello",
+                    "name": "operation code",
+                    "evidence_refs": [citation],
+                }
+            ],
+            "transitions": [
+                {
+                    "transition_id": "new-to-ready",
+                    "from_state": "new",
+                    "to_state": "ready",
+                    "message_id": "hello",
+                    "trigger": "ClientHello",
+                    "evidence_refs": [citation],
+                }
+            ],
+        }
+    }
+    dispatcher = RegistryToolDispatcher(registry)
+    documented = await dispatcher.dispatch(
+        context,
+        tool_name=NETWORK_PROTOCOL_DOCUMENT,
+        schema_version="1",
+        arguments=arguments,
+        purpose="document protocol facts without a capture",
+        operation_key="documented-protocol-create",
+    )
+    assert documented.status is ToolInvocationStatus.SUCCEEDED
+    blob_id = UUID(documented.output["protocol_model_blob_id"])
+    assert documented.output["validation_status"] == "documented_not_observed"
+    assert store.model is not None
+    assert ProtocolModelV1.from_dict(store.model.to_dict()) == store.model
+    assert store.model.capture_sha256s == ()
+    assert store.model.conversations == ()
+    assert store.model.messages[0].min_length is None
+    assert store.model.fields[0].offset is None
+    assert store.model.fields[0].length is None
+    assert store.model.fields[0].expected_hex is None
+    assert store.model.fields[0].evidence[0].documented_source_sha256 == observation.sha256
+    duplicate = await dispatcher.dispatch(
+        context,
+        tool_name=NETWORK_PROTOCOL_DOCUMENT,
+        schema_version="1",
+        arguments=arguments,
+        purpose="document protocol facts without a capture",
+        operation_key="documented-protocol-create",
+    )
+    assert duplicate.status is ToolInvocationStatus.SUCCEEDED
+    assert store.put_calls == 1
+
+    rendered = await dispatcher.dispatch(
+        context,
+        tool_name=NETWORK_PROTOCOL_RENDER,
+        schema_version="1",
+        arguments={"model_blob_id": str(blob_id)},
+        purpose="render documentary protocol views",
+        operation_key="documented-protocol-render",
+    )
+    assert rendered.status is ToolInvocationStatus.SUCCEEDED
+    assert rendered.output["protocol_model_blob_id"] == str(blob_id)
+    views = rendered.output["diagrams"]
+    assert {item["kind"] for item in views} == {item.value for item in ProtocolDiagramKind}
+    assert all(
+        "documenté, non observé" in item["title"].casefold()
+        and "documenté, non observé" in " ".join(item["limitations"]).casefold()
+        for item in views
+    )
+
+    missing = {
+        "model": {
+            **arguments["model"],
+            "evidence_refs": [{"kind": "observation", "ref": str(uuid4())}],
+        }
+    }
+    rejected = await dispatcher.dispatch(
+        context,
+        tool_name=NETWORK_PROTOCOL_DOCUMENT,
+        schema_version="1",
+        arguments=missing,
+        purpose="reject an uncited documentary model",
+        operation_key="documented-protocol-missing-citation",
+    )
+    assert rejected.status is ToolInvocationStatus.POLICY_DENIED
+    assert rejected.output["detail_code"] == "observation_not_found"
 
 
 @pytest.mark.asyncio

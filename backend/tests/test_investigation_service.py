@@ -83,6 +83,7 @@ from cti_app.domain.investigation import (
     FindingKind,
     InvestigationBudget,
     InvestigationEnvelope,
+    InvestigationExecutionMode,
     InvestigationFinding,
     NoveltyClass,
     TLPLevel,
@@ -491,12 +492,15 @@ class _Fixture:
             )
             tool = _FakeTool(name, self.execution_order)
             self.tools[name] = tool
+            properties = {"query": {"type": "string", "maxLength": 500}}
+            if name == "sample.analyze":
+                properties["association_id"] = {"type": "string", "minLength": 36, "maxLength": 36}
             definition = ToolDefinition(
                 name=name,
                 schema_version="1",
                 input_schema={
                     "type": "object",
-                    "properties": {"query": {"type": "string", "maxLength": 500}},
+                    "properties": properties,
                     "required": ["query"],
                     "additionalProperties": False,
                 },
@@ -566,7 +570,7 @@ class _Fixture:
             item.operation_key for item in current if item.status is ToolInvocationStatus.RUNNING
         )
 
-    async def start(self, *, hypotheses=()):
+    async def start(self, *, hypotheses=(), execution_mode=None):
         return await self.service.start(
             run=self.run,
             synthesis=self.synthesis,
@@ -577,6 +581,7 @@ class _Fixture:
             ),
             envelope=self.envelope,
             hypotheses=tuple(hypotheses),
+            execution_mode=execution_mode,
         )
 
 
@@ -1428,6 +1433,43 @@ async def test_identical_operations_are_deduplicated_only_for_read_effects(
 
 
 @pytest.mark.asyncio
+async def test_operator_view_proposes_advisor_checkpoint_as_nonblocking_action() -> None:
+    fixture = _Fixture(responses=[], tools=())
+    initial_state = await fixture.start()
+    state = replace(
+        initial_state,
+        execution_mode=InvestigationExecutionMode.OPERATOR_LED,
+    )
+    investigation = await fixture.investigations.get(state.investigation_id)
+    guidance = {
+        "checkpoint_due": True,
+        "reason": "tool_threshold_reached",
+        "suggested_consultation_type": "pivot_strategy",
+    }
+
+    view = build_investigation_operator_view(
+        investigation=investigation,
+        state=state,
+        synthesis_sha256=fixture.snapshot.synthesis_sha256,
+        envelope=await fixture.envelopes.get(state.investigation_id),
+        invocations=(),
+        observations=(),
+        opinion=None,
+        jobs=(),
+        available_tools=("advisor.consult",),
+        unavailable_tools=(),
+        advisor_guidance=guidance,
+    )
+
+    action = view.payload["next_idempotent_action"]
+    assert action["code"] == "advisor_checkpoint_due"
+    assert action["blocking"] is False
+    assert action["tool_name"] == "advisor.consult"
+    assert action["arguments"] == {"consultation_type": "pivot_strategy"}
+    assert action["requires_idempotency_key"] is True
+
+
+@pytest.mark.asyncio
 async def test_semantically_identical_findings_are_idempotent_and_counted() -> None:
     first_statement = "The loader  starts a child process."
     replay_statement = "The loader starts a child process."
@@ -1808,11 +1850,214 @@ async def test_finish_records_limit_when_rule_test_refuses_candidate(
     result = await fixture.service.run(state.investigation_id)
 
     persisted = await fixture.states.get(state.investigation_id)
-    invocations = await fixture.invocations.list_for_investigation(state.investigation_id)
     assert result.stop_reason is StopReason.AGENT_FINISHED
     assert persisted is not None
     assert any(action.startswith("rule_test_unavailable:") for action in persisted.recent_actions)
-    assert any(item.status is ToolInvocationStatus.UNAVAILABLE for item in invocations)
+
+
+@pytest.mark.asyncio
+async def test_finish_requires_analysis_of_an_acquired_sample_before_finishing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    association_id = uuid4()
+    sample_sha256 = "a" * 64
+    fixture = _Fixture(
+        responses=[],
+        tools=(
+            (
+                "sample.analyze",
+                "local",
+                ToolEffect.LOCAL_COMPUTE,
+                "investigation.sample_analysis",
+                {},
+            ),
+        ),
+    )
+    state = await fixture.start()
+    original_build = fixture.context_builder.build
+
+    async def build(**kwargs: Any) -> Any:
+        context = await original_build(**kwargs)
+        invocations = await fixture.invocations.list_for_investigation(state.investigation_id)
+        analyzed = any(
+            invocation.tool_name == "sample.analyze"
+            and invocation.status in {ToolInvocationStatus.SUCCEEDED, ToolInvocationStatus.PARTIAL}
+            for invocation in invocations
+        )
+        sample = {
+            "association_id": str(association_id),
+            "sample_id": str(uuid4()),
+            "sha256": sample_sha256,
+            "sha256_short": sample_sha256[:12],
+            "byte_size": 128,
+            "detected_type": None,
+            "provenance": "vt_download",
+            "qualification": "candidate",
+            "analysis_status": "analyzed" if analyzed else "not_analyzed",
+            "analysis_engines": ["static@fixture-v1"] if analyzed else [],
+            "observation_ids": [str(invocation.id) for invocation in invocations if analyzed],
+        }
+        investigation = context.investigation.model_copy(update={"sample_deltas": (sample,)})
+        return context.model_copy(update={"investigation": investigation})
+
+    monkeypatch.setattr(fixture.context_builder, "build", build)
+    unsupported_blocked_reason = _decision(goal="Finish the analysis.", next_action="finish")
+    unsupported_blocked_reason["reasoning_summary"] = "BLOCKED_REASON: engine_unavailable"
+    fixture.bridge_transport._responses.extend(
+        [
+            unsupported_blocked_reason,
+            _decision(
+                goal="Analyze the downloaded sample, then finish.",
+                next_action="finish",
+                tools=(
+                    {
+                        "tool_name": "sample.analyze",
+                        "schema_version": "1",
+                        "arguments": {
+                            "association_id": str(association_id),
+                            "query": "analyze the acquired association",
+                        },
+                        "purpose": "run local static analysis on the acquired sample",
+                    },
+                ),
+            ),
+        ]
+    )
+
+    result = await fixture.service.run(state.investigation_id)
+
+    assert result.stop_reason is StopReason.AGENT_FINISHED
+    assert fixture.bridge_transport.submission_count == 2
+    assert len(fixture.tools["sample.analyze"].calls) == 1
+    assert str(association_id) in fixture.bridge_transport.prompts[0]
+    assert "finish_gate" in fixture.bridge_transport.prompts[1]
+
+
+@pytest.mark.asyncio
+async def test_finish_gate_accepts_engine_unavailable_only_after_tool_reports_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    association_id = uuid4()
+    sample_sha256 = "c" * 64
+    fixture = _Fixture(
+        responses=[],
+        tools=(
+            (
+                "sample.analyze",
+                "local",
+                ToolEffect.LOCAL_COMPUTE,
+                "investigation.sample_analysis",
+                {},
+            ),
+        ),
+    )
+    state = await fixture.start()
+    unavailable = ToolInvocation(
+        investigation_id=state.investigation_id,
+        operation_key="sample-analysis-unavailable",
+        tool_name="sample.analyze",
+        schema_version="1",
+        normalized_parameters={"association_id": str(association_id)},
+        purpose="Attempt local analysis of the quarantined sample.",
+        status=ToolInvocationStatus.UNAVAILABLE,
+    )
+    await fixture.invocations.add_if_absent(unavailable)
+    original_build = fixture.context_builder.build
+
+    async def build(**kwargs: Any) -> Any:
+        context = await original_build(**kwargs)
+        sample = {
+            "association_id": str(association_id),
+            "sample_id": str(uuid4()),
+            "sha256": sample_sha256,
+            "sha256_short": sample_sha256[:12],
+            "byte_size": 64,
+            "detected_type": None,
+            "provenance": "vt_download",
+            "qualification": "candidate",
+            "analysis_status": "not_analyzed",
+            "analysis_engines": [],
+            "observation_ids": [],
+        }
+        return context.model_copy(
+            update={
+                "investigation": context.investigation.model_copy(
+                    update={"sample_deltas": (sample,)}
+                )
+            }
+        )
+
+    monkeypatch.setattr(fixture.context_builder, "build", build)
+    blocked_finish = _decision(
+        goal="Finish with an explicit engine limitation.", next_action="finish"
+    )
+    blocked_finish["reasoning_summary"] = "BLOCKED_REASON: engine_unavailable"
+    fixture.bridge_transport._responses.append(blocked_finish)
+
+    result = await fixture.service.run(state.investigation_id)
+
+    assert result.stop_reason is StopReason.AGENT_FINISHED
+    assert fixture.bridge_transport.submission_count == 1
+    assert not any(action.startswith("finish_gate_refused:") for action in result.recent_actions)
+
+
+@pytest.mark.asyncio
+async def test_finish_gate_allows_finish_after_bounded_consecutive_refusals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    association_id = uuid4()
+    fixture = _Fixture(
+        responses=[],
+        tools=(
+            (
+                "sample.analyze",
+                "local",
+                ToolEffect.LOCAL_COMPUTE,
+                "investigation.sample_analysis",
+                {},
+            ),
+        ),
+    )
+    state = await fixture.start()
+    original_build = fixture.context_builder.build
+
+    async def build(**kwargs: Any) -> Any:
+        context = await original_build(**kwargs)
+        sample = {
+            "association_id": str(association_id),
+            "sample_id": str(uuid4()),
+            "sha256": "b" * 64,
+            "sha256_short": "b" * 12,
+            "byte_size": 32,
+            "detected_type": None,
+            "provenance": "vt_download",
+            "qualification": "candidate",
+            "analysis_status": "not_analyzed",
+            "analysis_engines": [],
+            "observation_ids": [],
+        }
+        return context.model_copy(
+            update={
+                "investigation": context.investigation.model_copy(
+                    update={"sample_deltas": (sample,)}
+                )
+            }
+        )
+
+    monkeypatch.setattr(fixture.context_builder, "build", build)
+    fixture.bridge_transport._responses.extend(
+        _decision(goal=f"Finish attempt {index}.", next_action="finish") for index in range(3)
+    )
+
+    result = await fixture.service.run(state.investigation_id)
+
+    persisted = await fixture.states.get(state.investigation_id)
+    assert result.stop_reason is StopReason.AGENT_FINISHED
+    assert fixture.bridge_transport.submission_count == 3
+    assert persisted is not None
+    assert (
+        sum(action.startswith("finish_gate_refused:") for action in persisted.recent_actions) == 2
+    )
 
 
 @pytest.mark.asyncio
@@ -3124,6 +3369,12 @@ async def test_removed_external_permission_marks_model_unavailable_without_call(
     assert result.stop_reason is StopReason.MODEL_UNAVAILABLE
     assert fixture.bridge_transport.attempt_count == 0
     assert fixture.bridge_transport.submission_count == 0
+    policy_action = next(
+        action
+        for action in result.recent_actions
+        if action.startswith("bridge_submission_blocked:external_llm_policy:")
+    )
+    assert "snapshot_external_allowed=0" in policy_action
 
 
 @pytest.mark.asyncio
@@ -3294,6 +3545,13 @@ async def test_cancel_during_pre_submission_backoff_releases_bridge_budget(monke
         ],
         tools=(),
         bridge_turn_budget=2,
+    )
+    fixture.service._bridge = BridgeInvestigator(
+        fixture.bridge_transport,
+        minimum_submission_interval_seconds=0,
+        submission_jitter_fraction=0,
+        pre_submission_retry_base_seconds=0.05,
+        pre_submission_retry_max_seconds=0.05,
     )
     initial = await fixture.start()
 

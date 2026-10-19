@@ -210,7 +210,11 @@ class LocalCommandRunner:
         with tempfile.TemporaryDirectory(prefix="cti-local-analysis-") as temporary:
             directory = Path(temporary)
             sample_path = directory / "sample.bin"
-            sample_path.write_bytes(sample_bytes)
+            command_bytes = sample_bytes
+            if spec.id is LocalCommandId.SHA256SUM and options.get("offset") is not None:
+                start = cast(int, options["offset"])
+                command_bytes = sample_bytes[start : start + cast(int, options["length"])]
+            sample_path.write_bytes(command_bytes)
             sample_path.chmod(0o400)
             rule_path: Path | None = None
             if spec.id is LocalCommandId.YARA:
@@ -519,6 +523,19 @@ def _build_argv(
         argv = [executable, flag, path]
     elif spec.id is LocalCommandId.STRINGS:
         argv = [executable, "-a", "-n", str(options["min_length"]), path]
+    elif spec.id is LocalCommandId.XXD:
+        argv = [
+            executable,
+            "-g",
+            "1",
+            "-s",
+            str(options["offset"]),
+            "-l",
+            str(options["length"]),
+            path,
+        ]
+    elif spec.id is LocalCommandId.SHA256SUM:
+        argv = [executable, path]
     elif spec.id is LocalCommandId.READELF:
         flag = {
             "header": "-h",

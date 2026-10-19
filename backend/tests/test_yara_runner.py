@@ -91,6 +91,13 @@ def test_limits_return_resource_exceeded_without_starting_engine() -> None:
     assert result.status is YaraExecutionStatus.RESOURCE_EXCEEDED
 
 
+def test_strings_per_rule_limit_is_positive_and_bounded() -> None:
+    with pytest.raises(ValueError, match="positive"):
+        YaraRunnerLimits(maximum_strings_per_rule=0)
+    with pytest.raises(ValueError, match="<= 10000"):
+        YaraRunnerLimits(maximum_strings_per_rule=10_001)
+
+
 def test_unavailable_engine_is_a_local_typed_result(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -170,6 +177,10 @@ def test_worker_installs_network_barrier_before_importing_yara_with_eperm(
         TimeoutError = type("TimeoutError", (Exception,), {})
 
         @staticmethod
+        def set_config(**_kwargs: object) -> None:
+            return None
+
+        @staticmethod
         def compile(*_args: object, **_kwargs: object) -> object:
             return object()
 
@@ -191,7 +202,16 @@ def test_worker_installs_network_barrier_before_importing_yara_with_eperm(
     with ThreadPoolExecutor(max_workers=1) as executor:
         return_code = executor.submit(
             worker.main,
-            ["worker", "compile", str(source_path), "134217728", "5", "65536", "2"],
+            [
+                "worker",
+                "compile",
+                str(source_path),
+                "134217728",
+                "5",
+                "65536",
+                "2",
+                "10000",
+            ],
         ).result(timeout=5)
 
     assert return_code == 0
@@ -224,7 +244,7 @@ def test_worker_fails_closed_when_network_barrier_installation_fails(
     monkeypatch.setattr(worker, "_emit", lambda status, **kwargs: events.append((status, kwargs)))
     monkeypatch.setattr(builtins, "__import__", guarded_import)
 
-    worker.main(["worker", "compile", str(source_path), "134217728", "5", "65536", "2"])
+    worker.main(["worker", "compile", str(source_path), "134217728", "5", "65536", "2", "10000"])
 
     assert events[0][0] == "engine_unavailable"
     assert imported_yara is False

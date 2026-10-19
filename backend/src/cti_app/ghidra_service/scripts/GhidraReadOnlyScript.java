@@ -103,16 +103,37 @@ public class GhidraReadOnlyScript extends GhidraScript {
     private String decompile(String rawAddress) throws Exception {
         Address address = currentProgram.getAddressFactory().getAddress(stripPrefix(rawAddress));
         Function function = address == null ? null : currentProgram.getFunctionManager().getFunctionAt(address);
-        if (function == null) return "{\"function\":null}";
+        if (function == null) {
+            return "{\"status\":\"unsupported_function\",\"reason\":"
+                + json("function_not_found_at_address") + ",\"function\":null}";
+        }
+        if (function.isExternal() || function.getBody().isEmpty()) {
+            return "{\"status\":\"unsupported_function\",\"reason\":"
+                + json("function_body_not_available") + ",\"function\":"
+                + json(function.getName()) + "}";
+        }
         DecompInterface decompiler = new DecompInterface();
         try {
-            decompiler.openProgram(currentProgram);
+            if (!decompiler.openProgram(currentProgram)) {
+                return "{\"status\":\"decompile_failed\",\"reason\":"
+                    + json("decompiler_program_open_failed") + ",\"function\":"
+                    + json(function.getName()) + "}";
+            }
             DecompileResults result = decompiler.decompileFunction(function, 45, monitor);
-            String code = result.decompileCompleted() && result.getDecompiledFunction() != null
-                ? result.getDecompiledFunction().getC()
-                : "";
+            if (!result.decompileCompleted() || result.getDecompiledFunction() == null) {
+                String reason = result.isTimedOut() ? "decompiler_timed_out" : "decompiler_failed";
+                return "{\"status\":\"decompile_failed\",\"reason\":" + json(reason)
+                    + ",\"function\":" + json(function.getName()) + "}";
+            }
+            String code = result.getDecompiledFunction().getC();
+            if (code == null || code.isBlank()) {
+                return "{\"status\":\"decompile_failed\",\"reason\":"
+                    + json("empty_decompilation") + ",\"function\":"
+                    + json(function.getName()) + "}";
+            }
             if (code.length() > 16000) code = code.substring(0, 16000);
-            return "{\"function\":{\"name\":" + json(function.getName())
+            return "{\"status\":\"succeeded\",\"reason\":null,\"function\":{\"name\":"
+                + json(function.getName())
                 + ",\"address\":" + json(function.getEntryPoint().toString())
                 + ",\"decompilation\":" + json(code) + "}}";
         } finally {

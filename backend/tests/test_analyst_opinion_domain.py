@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from datetime import UTC, datetime
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -16,6 +16,7 @@ from cti_app.domain.analyst_opinion import (
     OpinionBlock,
     OpinionBlockType,
     OpinionClaimQualification,
+    normalize_opinion_text,
     opinion_blocks_with_observations,
     verify_opinion_citations,
 )
@@ -98,6 +99,36 @@ def test_single_block_opinion_hash_is_canonical_and_reproducible() -> None:
     assert verify_opinion_citations(opinion, (finding,), (observation,)) == ()
 
 
+def test_legacy_opinion_hash_omits_empty_protocol_figures() -> None:
+    opinion = AnalystOpinionV1(
+        id=UUID(int=1),
+        version=1,
+        investigation_id=UUID(int=2),
+        synthesis_artifact_id=UUID(int=3),
+        synthesis_sha256="1" * 64,
+        base_publication_artifact_id=UUID(int=4),
+        base_publication_sha256="2" * 64,
+        blocks=(
+            OpinionBlock(
+                block_type=OpinionBlockType.KEY_FINDINGS,
+                text="The analyzed sample contains a second-stage loader.",
+                finding_refs=(UUID(int=5),),
+                evidence_refs=(UUID(int=6),),
+                qualification=OpinionClaimQualification.FACT,
+                certainty=0.91,
+            ),
+        ),
+        unresolved_points=(),
+        author_id="analyst:author",
+        created_at=datetime(2026, 10, 19, tzinfo=UTC),
+    )
+
+    assert "protocol_figures" not in opinion.content_payload()
+    assert opinion.content_sha256 == (
+        "2a0b3840fec56e859518abb1b2639f11454dc8d285fc0f288d635d24b62fd6f1"
+    )
+
+
 def test_nonexistent_citations_are_reported_for_factual_blocks() -> None:
     opinion = _opinion(
         (
@@ -157,6 +188,31 @@ def test_empty_blocks_are_not_rendered_and_only_one_populated_block_is_valid() -
     )
     assert len(opinion.blocks) == 2
     assert len(opinion.renderable_blocks) == 1
+
+
+def test_opinion_display_normalization_never_changes_the_persisted_hashed_text() -> None:
+    raw_claim = (
+        "Le chargement du projet pouvait amorcer l'exécution.: l'affirmation doit être nuancée."
+    )
+    raw_reserves = (
+        "• Observation mesurée.\n"
+        "  Réserves : donnée datée.; aucun lien établi.; mesure non qualifiée.."
+    )
+    claim = OpinionBlock(block_type=OpinionBlockType.CLAIM_VERIFICATION, text=raw_claim)
+    reserves = OpinionBlock(block_type=OpinionBlockType.KEY_FINDINGS, text=raw_reserves)
+
+    # The domain object keeps the exact text that content_sha256 covers.
+    assert claim.text == raw_claim
+    assert reserves.text == raw_reserves
+
+    shown_claim = normalize_opinion_text(claim.block_type, claim.text)
+    shown_reserves = normalize_opinion_text(reserves.block_type, reserves.text)
+    assert shown_claim == (
+        "Le chargement du projet pouvait amorcer l'exécution. L'affirmation doit être nuancée."
+    )
+    assert ".." not in shown_reserves
+    assert ";." not in shown_reserves
+    assert "donnée datée; aucun lien établi; mesure non qualifiée." in shown_reserves
 
 
 def test_reviewed_opinion_requires_reviewer_identity_and_valid_hash() -> None:

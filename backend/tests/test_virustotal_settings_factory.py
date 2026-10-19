@@ -27,11 +27,17 @@ from cti_app.infrastructure.virustotal import (
 def test_adapter_factory_passes_normalized_download_settings() -> None:
     settings = Settings(
         _env_file=None,
+        virustotal_proxy_url="http://proxy.test:8080",
         virustotal_base_url="https://www.virustotal.com/api/v3",
         virustotal_file_download_enabled=True,
-        virustotal_download_allowed_hosts=" WWW.VIRUSTOTAL.COM, ,cdn.example.test ",
+        virustotal_download_allowed_hosts=(
+            " WWW.VIRUSTOTAL.COM, ,vtsamples.commondatastorage.googleapis.com,cdn.example.test "
+        ),
         virustotal_download_max_bytes=321_000,
         virustotal_download_timeout_seconds=17.5,
+        virustotal_download_allowed_ports="443,8443",
+        virustotal_download_max_redirects=4,
+        virustotal_file_download_legacy_fallback_enabled=True,
     )
     client = httpx.AsyncClient()
     try:
@@ -41,10 +47,18 @@ def test_adapter_factory_passes_normalized_download_settings() -> None:
             capabilities=VirusTotalCapabilities(file_download=True),
         )
         assert adapter._download_allowed_hosts == frozenset(
-            {"www.virustotal.com", "cdn.example.test"}
+            {
+                "www.virustotal.com",
+                "vtsamples.commondatastorage.googleapis.com",
+                "cdn.example.test",
+            }
         )
         assert adapter._download_max_bytes == 321_000
         assert adapter._download_timeout_seconds == 17.5
+        assert adapter._download_allowed_ports == frozenset({443, 8443})
+        assert adapter._download_max_redirects == 4
+        assert adapter._file_download_legacy_fallback_enabled is True
+        assert adapter._proxy_query_sentinel_enabled is True
         assert adapter._routing_policy.route_for(VirusTotalCapability.FILE_DOWNLOAD) is not None
     finally:
         import asyncio
@@ -99,6 +113,68 @@ def test_download_route_stays_absent_when_flag_is_disabled() -> None:
             capabilities=VirusTotalCapabilities(file_download=True),
         )
         assert adapter._routing_policy.route_for(VirusTotalCapability.FILE_DOWNLOAD) is None
+    finally:
+        import asyncio
+
+        asyncio.run(client.aclose())
+
+
+def test_download_route_stays_absent_without_plausible_signed_cdn_host() -> None:
+    settings = Settings(
+        _env_file=None,
+        virustotal_proxy_url="http://proxy.test:8080",
+        virustotal_file_download_enabled=True,
+        virustotal_download_allowed_hosts="cdn.example.test",
+        virustotal_download_allowed_ports="443",
+    )
+    client = httpx.AsyncClient()
+    try:
+        adapter = create_virustotal_http_adapter(
+            client=client,
+            settings=settings,
+            capabilities=VirusTotalCapabilities(file_download=True),
+        )
+        assert adapter._capabilities.file_download is False
+        assert adapter._routing_policy.route_for(VirusTotalCapability.FILE_DOWNLOAD) is None
+    finally:
+        import asyncio
+
+        asyncio.run(client.aclose())
+
+
+def test_proxy_query_sentinel_and_download_cdn_have_safe_settings_defaults() -> None:
+    settings = Settings(_env_file=None)
+
+    assert settings.virustotal_proxy_query_sentinel_enabled is True
+    assert settings.virustotal_download_allowed_hosts == (
+        "vtsamples.commondatastorage.googleapis.com"
+    )
+
+
+def test_behaviour_pcap_setting_is_authoritative_for_api_and_worker_composition() -> None:
+    settings = Settings(
+        _env_file=None,
+        virustotal_proxy_url="http://proxy.test:8080",
+        virustotal_behaviour_pcap_enabled=True,
+    )
+    route = VirusTotalOperationRoute(
+        primary=VirusTotalRouteStep(
+            transport=VirusTotalTransportKind.PROXY,
+            variant=VirusTotalEndpointVariant.V3,
+        )
+    )
+    client = httpx.AsyncClient()
+    try:
+        adapter = create_virustotal_http_adapter(
+            client=client,
+            settings=settings,
+            capabilities=VirusTotalCapabilities(),
+            routing_policy=VirusTotalRoutingPolicy(
+                routes={VirusTotalCapability.BEHAVIOUR_PCAP: route}
+            ),
+        )
+        assert adapter._capabilities.behaviour_pcap is True
+        assert adapter._routing_policy.route_for(VirusTotalCapability.BEHAVIOUR_PCAP) == route
     finally:
         import asyncio
 

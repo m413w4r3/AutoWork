@@ -443,7 +443,7 @@ async def test_download_tool_requests_permission_outside_g2_envelope() -> None:
 
 
 @pytest.mark.asyncio
-async def test_download_tool_returns_safe_definitive_failure_and_cached_replay() -> None:
+async def test_download_tool_does_not_cache_a_404_with_unknown_response_origin() -> None:
     database = FakeDatabase()
     investigation = make_investigation()
     database.investigations[investigation.id] = investigation
@@ -491,12 +491,12 @@ async def test_download_tool_returns_safe_definitive_failure_and_cached_replay()
     )
 
     assert first.status is ToolInvocationStatus.UNAVAILABLE
-    assert first.output["error_code"] == "virustotal_download_route_not_found"
-    assert first.output["reason"] == "provider_download_route_not_found"
+    assert first.output["error_code"] == "virustotal_download_404_origin_unknown"
+    assert first.output["reason"] == "provider_download_404_origin_unknown"
     assert first.output["confirmed_non_execution"] is True
     assert "synthetic route absent" not in first.message
-    assert second.output["cached"] is True
-    assert port.download_calls == [arguments["sha256"]]
+    assert second.output.get("cached", False) is False
+    assert port.download_calls == [arguments["sha256"], arguments["sha256"]]
 
 
 @pytest.mark.asyncio
@@ -629,6 +629,12 @@ async def test_sample_analyze_records_bounded_binary_observations() -> None:
     assert worker.requests[0].tool is ConfinedAnalysisTool.SAMPLE_ANALYSIS
     assert worker.requests[0].sha256 == sha256
     assert result.output["extractors"]["static"]["version"] == "static-v1"
+    assert result.output["engines_executed"] == ("capa", "floss", "smda", "static")
+    assert result.output["engine_statuses"]["static"] == "SUCCEEDED"
+    assert result.output["partial_reason"] == (
+        "analysis_worker_status:partial; "
+        "goodware_measurement_unavailable:goodware_measurement_service_unavailable"
+    )
     assert result.output["strings_recorded"] == 1
     assert result.output["goodware"]["available"] is False
     assert {

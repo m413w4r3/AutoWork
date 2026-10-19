@@ -39,6 +39,7 @@ from cti_app.domain.investigation import (
     InvestigationAgenda,
     InvestigationBudget,
     InvestigationEnvelope,
+    InvestigationExecutionMode,
     InvestigationFinding,
     MotifProvenance,
     NoveltyClass,
@@ -1005,11 +1006,16 @@ def _working_state_from_row(row: InvestigationWorkingStateRow) -> InvestigationW
                 else None
             ),
             base_publication_sha256=payload["base_publication_sha256"],
+            execution_mode=InvestigationExecutionMode(
+                payload.get("execution_mode", InvestigationExecutionMode.BRIDGE_LED.value)
+            ),
         )
     except (AttributeError, KeyError, TypeError, ValueError) as exc:
         raise ValueError("Persisted investigation state is invalid") from exc
+    normalized_payload = dict(payload)
+    normalized_payload.setdefault("execution_mode", InvestigationExecutionMode.BRIDGE_LED.value)
     if (
-        state.to_payload() != payload
+        state.to_payload() != normalized_payload
         or state.investigation_id != row.investigation_id
         or state.version != row.version
         or state.turn_index != row.turn_index

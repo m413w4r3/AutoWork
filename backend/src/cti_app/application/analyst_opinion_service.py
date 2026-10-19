@@ -7,13 +7,27 @@ import json
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 from uuid import UUID, uuid5
 
+from cti_app.application.investigation_contracts import (
+    OperatorOpinionProtocolFigureSelectionV1,
+    OperatorOpinionProtocolFiguresV1,
+)
+from cti_app.application.investigation_tools import (
+    ToolConfidentiality,
+    ToolDefinition,
+    ToolEffect,
+    ToolExecutionContext,
+    ToolRegistry,
+    ToolResult,
+)
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.research_context_builder import ArticleSnapshotPort
 from cti_app.domain.analyst_opinion import (
+    AnalystObservationRelation,
+    AnalystObservationState,
     AnalystObservationV1,
     AnalystOpinionStatus,
     AnalystOpinionV1,
@@ -37,6 +51,7 @@ from cti_app.domain.investigation import (
     InvestigationFinding,
     NoveltyClass,
     TLPLevel,
+    ToolInvocationStatus,
 )
 from cti_app.domain.production import (
     AnalystInvestigation,
@@ -44,6 +59,7 @@ from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionArtifactStatus,
 )
+from cti_app.domain.protocol_model import ProtocolDiagramKind
 from cti_app.domain.publication_document import (
     PublicationDocumentV5,
     publication_document_from_json,
@@ -53,6 +69,11 @@ from cti_app.domain.publication_document import (
 
 _OPINION_NAMESPACE = UUID("f141ae8e-999c-4a7f-b07d-5ffb0bd7b86d")
 _DECISION_NAMESPACE = UUID("6fd4bf30-7369-4c64-9bf4-d5bd17c67ce2")
+_OPERATOR_NOTE_NAMESPACE = UUID("a6088d45-c437-4d6c-9d7b-0cc75a789410")
+OPERATOR_OPINION_SCHEMA_VERSION = "operator-opinion.v1"
+_OPERATOR_BLOCK_TYPES = tuple(
+    item for item in OpinionBlockType if item is not OpinionBlockType.ANALYST_OBSERVATIONS
+)
 
 
 _CONFIRMED_VERDICTS = frozenset({"confirmed", "confirmé"})
@@ -76,6 +97,9 @@ class OpinionErrorCode(StrEnum):
     INVALID_OBSERVATION_ANCHOR = "invalid_observation_anchor"
     INVALID_STATE = "invalid_opinion_state"
     IDEMPOTENCY_CONFLICT = "idempotency_conflict"
+    PROTOCOL_FIGURES_INVALID = "invalid_protocol_figures"
+    PROTOCOL_FIGURES_NOT_IN_INVESTIGATION = "protocol_figures_not_in_investigation"
+    PROTOCOL_FIGURES_UNAVAILABLE = "protocol_figures_unavailable"
 
 
 class OpinionError(ValueError):
@@ -246,6 +270,8 @@ class AnalystOpinionService:
         self,
         investigation_id: UUID,
         selection: OpinionCompositionSelection | Mapping[str, object] | None = None,
+        *,
+        protocol_figures: tuple[OpinionProtocolFigureV1, ...] | None = None,
     ) -> AnalystOpinionV1:
         normalized = self._normalize_selection(selection)
         opinion_id = uuid5(_OPINION_NAMESPACE, str(investigation_id))
@@ -296,7 +322,13 @@ class AnalystOpinionService:
                 base_publication_sha256=base_sha256,
                 blocks=blocks,
                 unresolved_points=unresolved,
-                protocol_figures=current.protocol_figures if current is not None else (),
+                protocol_figures=(
+                    protocol_figures
+                    if protocol_figures is not None
+                    else current.protocol_figures
+                    if current is not None
+                    else ()
+                ),
                 author_id=current.author_id if current is not None else self._author_id,
                 status=AnalystOpinionStatus.DRAFT,
             )
@@ -992,13 +1024,561 @@ class AnalystOpinionService:
             raise OpinionError(OpinionErrorCode.INVALID_SELECTION) from exc
 
 
+class OperatorProtocolFigureAttachmentBuilder:
+    """Validate observed protocol render provenance and compile opinion attachments."""
+
+    def __init__(
+        self,
+        *,
+        uow_factory: UnitOfWorkFactory,
+        artifact_store: ProductionArtifactStore,
+    ) -> None:
+        self._uow_factory = uow_factory
+        self._artifact_store = artifact_store
+
+    async def build(
+        self,
+        investigation_id: UUID,
+        selection: OperatorOpinionProtocolFigureSelectionV1,
+    ) -> tuple[tuple[OpinionProtocolFigureV1, ...], tuple[UUID, ...]]:
+        from cti_app.application.diagram_compilation import DiagramCompilationError
+        from cti_app.application.media_assets import MediaAssetStore
+        from cti_app.application.network_protocol_model import render_protocol_model
+        from cti_app.application.protocol_diagram_projection import (
+            ProtocolDiagramProjectionError,
+            compile_protocol_render_result,
+            opinion_protocol_figures,
+        )
+        from cti_app.domain.protocol_model import ProtocolModelV1
+        from cti_app.infrastructure.d2_diagram_compiler import D2DiagramCompiler
+
+        if set(selection.views) != set(ProtocolDiagramKind):
+            raise OpinionError(OpinionErrorCode.PROTOCOL_FIGURES_INVALID)
+
+        async with self._uow_factory() as uow:
+            investigation = await uow.analyst_investigations.get(investigation_id)
+            blob = await uow.blobs.get(selection.protocol_model_blob_id)
+            observations = tuple(
+                await uow.evidence_observations.list_for_investigation(investigation_id)
+            )
+            model_observations = tuple(
+                item
+                for item in observations
+                if blob is not None
+                and item.object_type == "protocol_model"
+                and item.object_id == blob.descriptor.sha256
+            )
+            render_observation = next(
+                (item for item in observations if item.id == selection.render_observation_id),
+                None,
+            )
+            if (
+                investigation is None
+                or blob is None
+                or blob.descriptor.logical_bucket != "network-protocol-models"
+                or not model_observations
+                or render_observation is None
+                or render_observation.source != "network.protocol.render"
+                or render_observation.object_type != "protocol_diagram_specs"
+            ):
+                raise OpinionError(OpinionErrorCode.PROTOCOL_FIGURES_NOT_IN_INVESTIGATION)
+            production_run_id = investigation.production_run_id
+            subject_id = investigation.subject_id
+            blob_sha256 = blob.descriptor.sha256
+
+        try:
+            model = ProtocolModelV1.from_dict(
+                await self._artifact_store.read_json(selection.protocol_model_blob_id)
+            )
+        except Exception as exc:
+            raise OpinionError(OpinionErrorCode.PROTOCOL_FIGURES_INVALID) from exc
+        if (
+            model.investigation_id != investigation_id
+            or model.subject_id != str(subject_id)
+            or model.canonical_sha256 != blob_sha256
+        ):
+            raise OpinionError(OpinionErrorCode.PROTOCOL_FIGURES_NOT_IN_INVESTIGATION)
+
+        render_result = render_protocol_model(model)
+        if (
+            render_observation.object_id != render_result.canonical_sha256
+            or render_observation.sha256 != render_result.canonical_sha256
+            or render_result.model_sha256 != model.canonical_sha256
+        ):
+            raise OpinionError(OpinionErrorCode.PROTOCOL_FIGURES_INVALID)
+
+        try:
+            rendered = await compile_protocol_render_result(
+                render_result,
+                compiler=D2DiagramCompiler(),
+                media_asset_store=MediaAssetStore(self._artifact_store, self._uow_factory),
+                production_run_id=production_run_id,
+            )
+            figures = opinion_protocol_figures(rendered)
+        except (DiagramCompilationError, ProtocolDiagramProjectionError) as exc:
+            raise OpinionError(OpinionErrorCode.PROTOCOL_FIGURES_UNAVAILABLE) from exc
+        return figures, tuple(dict.fromkeys((model_observations[0].id, render_observation.id)))
+
+
+class OperatorOpinionToolAdapter:
+    """Create and revise draft opinion content from typed, cited operator input."""
+
+    def __init__(
+        self,
+        *,
+        service: AnalystOpinionService,
+        investigations: Any,
+        article_snapshots: ArticleSnapshotPort,
+        protocol_figure_builder: OperatorProtocolFigureAttachmentBuilder | None = None,
+    ) -> None:
+        self._service = service
+        self._investigations = investigations
+        self._article_snapshots = article_snapshots
+        self._protocol_figure_builder = protocol_figure_builder
+
+    async def execute(
+        self, arguments: Mapping[str, Any], context: ToolExecutionContext
+    ) -> ToolResult:
+        action = str(arguments["action"])
+        try:
+            if action == "compose":
+                return await self._compose(arguments, context)
+            if action == "revise":
+                return await self._revise(arguments, context)
+            return await self._note(arguments, context)
+        except OpinionError as exc:
+            code = exc.code.value
+            return ToolResult(
+                ToolInvocationStatus.FAILED,
+                error_code=code,
+                output={"error_code": code},
+                message=code,
+            )
+        except (TypeError, ValueError) as exc:
+            code = "invalid_note_anchor" if "anchor" in str(exc).casefold() else "invalid_opinion"
+            return ToolResult(
+                ToolInvocationStatus.FAILED,
+                error_code=code,
+                output={"error_code": code},
+                message=code,
+            )
+
+    async def _compose(
+        self, arguments: Mapping[str, Any], context: ToolExecutionContext
+    ) -> ToolResult:
+        current = (await self._service.get_draft(context.investigation_id)).opinion
+        if current is not None and current.status is not AnalystOpinionStatus.DRAFT:
+            return _operator_opinion_failure("opinion_draft_required")
+        raw = arguments["selection"]
+        if not isinstance(raw, Mapping):
+            return _operator_opinion_failure("invalid_opinion_selection")
+        selection = OpinionCompositionSelection(
+            finding_ids=tuple(UUID(str(item)) for item in raw.get("finding_ids", ())),
+            claim_ids=tuple(str(item) for item in raw.get("claim_ids", ())),
+            block_types=tuple(OpinionBlockType(str(item)) for item in raw.get("block_types", ())),
+        )
+        protocol_figures, figure_observation_refs = await self._protocol_figures(
+            context.investigation_id, arguments.get("protocol_figures")
+        )
+        opinion = await self._service.compose_from_findings(
+            context.investigation_id,
+            selection,
+            protocol_figures=protocol_figures,
+        )
+        return _operator_opinion_result(
+            opinion,
+            message="Opinion composed as a draft.",
+            additional_observation_refs=figure_observation_refs,
+        )
+
+    async def _revise(
+        self, arguments: Mapping[str, Any], context: ToolExecutionContext
+    ) -> ToolResult:
+        opinion_id = UUID(str(arguments["opinion_id"]))
+        current = (await self._service.get_draft(context.investigation_id)).opinion
+        if (
+            current is None
+            or current.id != opinion_id
+            or current.status is not AnalystOpinionStatus.DRAFT
+        ):
+            return _operator_opinion_failure("opinion_draft_required")
+        protocol_figures, figure_observation_refs = await self._protocol_figures(
+            context.investigation_id, arguments.get("protocol_figures")
+        )
+        blocks = tuple(_operator_opinion_block(item) for item in arguments["blocks"])
+        edits = OpinionRevisionEdits(
+            blocks=blocks,
+            unresolved_points=tuple(str(item) for item in arguments["unresolved_points"]),
+            protocol_figures=protocol_figures,
+        )
+        opinion = await self._service.revise(
+            opinion_id,
+            int(arguments["expected_opinion_version"]),
+            edits,
+            "operator:claude-client",
+            expected_sha256=str(arguments["expected_opinion_sha256"]),
+        )
+        return _operator_opinion_result(
+            opinion,
+            message="Opinion revised as a draft.",
+            additional_observation_refs=figure_observation_refs,
+        )
+
+    async def _protocol_figures(
+        self, investigation_id: UUID, raw: object
+    ) -> tuple[tuple[OpinionProtocolFigureV1, ...] | None, tuple[UUID, ...]]:
+        if raw is None:
+            return None, ()
+        try:
+            selections: list[OperatorOpinionProtocolFigureSelectionV1] = []
+            if not isinstance(raw, (list, tuple)):
+                raise ValueError("protocol_figures must be a list")
+            for item in raw:
+                if not isinstance(item, Mapping) or set(item) != {
+                    "protocol_model_blob_id",
+                    "render_observation_id",
+                    "views",
+                }:
+                    raise ValueError("protocol figure selection has invalid fields")
+                views = item["views"]
+                if not isinstance(views, (list, tuple)):
+                    raise ValueError("protocol figure views must be a list")
+                selections.append(
+                    OperatorOpinionProtocolFigureSelectionV1(
+                        protocol_model_blob_id=UUID(str(item["protocol_model_blob_id"])),
+                        render_observation_id=UUID(str(item["render_observation_id"])),
+                        views=tuple(ProtocolDiagramKind(str(view)) for view in views),
+                    )
+                )
+            request = OperatorOpinionProtocolFiguresV1(protocol_figures=tuple(selections))
+        except (TypeError, ValueError) as exc:
+            raise OpinionError(OpinionErrorCode.PROTOCOL_FIGURES_INVALID) from exc
+        if not request.protocol_figures:
+            return None, ()
+        if self._protocol_figure_builder is None:
+            raise OpinionError(OpinionErrorCode.PROTOCOL_FIGURES_UNAVAILABLE)
+        return await self._protocol_figure_builder.build(
+            investigation_id, request.protocol_figures[0]
+        )
+
+    async def _note(
+        self, arguments: Mapping[str, Any], context: ToolExecutionContext
+    ) -> ToolResult:
+        investigation = await self._investigations.get(context.investigation_id)
+        if investigation is None:
+            return _operator_opinion_failure("investigation_not_found")
+        snapshot = await self._article_snapshots.resolve(investigation.synthesis_artifact_id)
+        anchor = str(arguments["anchor"])
+        valid_anchors = {item.anchor for item in snapshot.article.publication_anchors}
+        if anchor not in valid_anchors:
+            return _operator_opinion_failure("invalid_note_anchor")
+
+        current = (await self._service.get_draft(context.investigation_id)).opinion
+        if current is None or current.status is not AnalystOpinionStatus.DRAFT:
+            return _operator_opinion_failure("opinion_draft_required")
+        if current.version != int(
+            arguments["expected_opinion_version"]
+        ) or current.content_sha256 != str(arguments["expected_opinion_sha256"]):
+            return _operator_opinion_failure("stale_opinion_version")
+
+        note = AnalystObservationV1(
+            id=uuid5(_OPERATOR_NOTE_NAMESPACE, context.idempotency_key),
+            anchor=anchor,
+            text=str(arguments["text"]),
+            state=AnalystObservationState(str(arguments["state"])),
+            relation=AnalystObservationRelation(str(arguments["relation"])),
+            finding_refs=tuple(UUID(str(item)) for item in arguments["finding_refs"]),
+            evidence_refs=tuple(UUID(str(item)) for item in arguments["evidence_refs"]),
+        )
+        notes = (*[item for item in current.observations if item.anchor != anchor], note)
+        opinion = await self._service.revise(
+            current.id,
+            current.version,
+            OpinionRevisionEdits(
+                blocks=current.blocks,
+                unresolved_points=current.unresolved_points,
+                protocol_figures=current.protocol_figures,
+                observations=notes,
+            ),
+            "operator:claude-client",
+            expected_sha256=current.content_sha256,
+        )
+        return _operator_opinion_result(opinion, message="Anchored note saved in the draft.")
+
+
+def register_operator_opinion_tools(
+    registry: ToolRegistry,
+    *,
+    service: AnalystOpinionService,
+    investigations: Any,
+    article_snapshots: ArticleSnapshotPort,
+    protocol_figure_builder: OperatorProtocolFigureAttachmentBuilder | None = None,
+) -> None:
+    adapter = OperatorOpinionToolAdapter(
+        service=service,
+        investigations=investigations,
+        article_snapshots=article_snapshots,
+        protocol_figure_builder=protocol_figure_builder,
+    )
+    uuid_schema = {
+        "type": "string",
+        "pattern": r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+    }
+    string_list = {
+        "type": "array",
+        "maxItems": 128,
+        "items": {"type": "string", "minLength": 1, "maxLength": 128},
+    }
+    uuid_list = {"type": "array", "maxItems": 128, "items": uuid_schema}
+    blocks_schema = {
+        "type": "array",
+        "maxItems": 32,
+        "items": {
+            "type": "object",
+            "properties": {
+                "block_type": {
+                    "type": "string",
+                    "enum": [item.value for item in _OPERATOR_BLOCK_TYPES],
+                },
+                "text": {"type": "string", "maxLength": 12000},
+                "finding_refs": uuid_list,
+                "evidence_refs": uuid_list,
+                "qualification": {
+                    "type": "string",
+                    "enum": [item.value for item in OpinionClaimQualification],
+                },
+                "certainty": {"type": "number", "minimum": 0, "maximum": 1},
+            },
+            "required": [
+                "block_type",
+                "text",
+                "finding_refs",
+                "evidence_refs",
+                "qualification",
+                "certainty",
+            ],
+            "additionalProperties": False,
+        },
+    }
+    protocol_figures_schema = {
+        "type": "array",
+        "maxItems": 1,
+        "description": (
+            "Optionnel : joindre les trois vues D2 d'un modèle de protocole déjà rendu dans cette "
+            "enquête. Indiquez son protocol_model_blob_id, le render_observation_id renvoyé par "
+            "network.protocol.render, et les trois vues sequence, state_machine et message_format "
+            "ensemble. Un modèle documenté reste marqué « documenté, non observé »."
+        ),
+        "items": {
+            "type": "object",
+            "properties": {
+                "protocol_model_blob_id": uuid_schema,
+                "render_observation_id": uuid_schema,
+                "views": {
+                    "type": "array",
+                    "minItems": 3,
+                    "maxItems": 3,
+                    "uniqueItems": True,
+                    "items": {
+                        "type": "string",
+                        "enum": [item.value for item in ProtocolDiagramKind],
+                    },
+                    "description": (
+                        "Les vues sequence, state_machine et message_format "
+                        "doivent être fournies ensemble."
+                    ),
+                },
+            },
+            "required": ["protocol_model_blob_id", "render_observation_id", "views"],
+            "additionalProperties": False,
+        },
+    }
+    registry.register(
+        ToolDefinition(
+            name="opinion.compose",
+            schema_version=OPERATOR_OPINION_SCHEMA_VERSION,
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "action": {"const": "compose"},
+                    "protocol_figures": protocol_figures_schema,
+                    "selection": {
+                        "type": "object",
+                        "properties": {
+                            "finding_ids": uuid_list,
+                            "claim_ids": string_list,
+                            "block_types": {
+                                "type": "array",
+                                "maxItems": 7,
+                                "items": {
+                                    "type": "string",
+                                    "enum": [item.value for item in _OPERATOR_BLOCK_TYPES],
+                                },
+                            },
+                        },
+                        "required": ["finding_ids", "claim_ids", "block_types"],
+                        "additionalProperties": False,
+                    },
+                },
+                "required": ["action", "selection"],
+                "additionalProperties": False,
+            },
+            effect=ToolEffect.LOCAL_COMPUTE,
+            cost_model={},
+            confidentiality=ToolConfidentiality.CONFIDENTIAL,
+            limitations=("Composition creates an unapproved draft only.",),
+            capability_key="operator.write",
+        ),
+        adapter,
+    )
+    registry.register(
+        ToolDefinition(
+            name="opinion.revise",
+            schema_version=OPERATOR_OPINION_SCHEMA_VERSION,
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "action": {"const": "revise"},
+                    "opinion_id": uuid_schema,
+                    "expected_opinion_version": {"type": "integer", "minimum": 1},
+                    "expected_opinion_sha256": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
+                    "blocks": blocks_schema,
+                    "unresolved_points": {
+                        "type": "array",
+                        "maxItems": 128,
+                        "items": {"type": "string", "maxLength": 2000},
+                    },
+                    "protocol_figures": protocol_figures_schema,
+                },
+                "required": [
+                    "action",
+                    "opinion_id",
+                    "expected_opinion_version",
+                    "expected_opinion_sha256",
+                    "blocks",
+                    "unresolved_points",
+                ],
+                "additionalProperties": False,
+            },
+            effect=ToolEffect.LOCAL_COMPUTE,
+            cost_model={},
+            confidentiality=ToolConfidentiality.CONFIDENTIAL,
+            limitations=("Revisions remain unapproved and must cite persisted findings/evidence.",),
+            capability_key="operator.write",
+        ),
+        adapter,
+    )
+    registry.register(
+        ToolDefinition(
+            name="opinion.note",
+            schema_version=OPERATOR_OPINION_SCHEMA_VERSION,
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "action": {"const": "note"},
+                    "anchor": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "state": {
+                        "type": "string",
+                        "enum": [item.value for item in AnalystObservationState],
+                    },
+                    "relation": {
+                        "type": "string",
+                        "enum": [item.value for item in AnalystObservationRelation],
+                    },
+                    "text": {"type": "string", "minLength": 1, "maxLength": 6000},
+                    "expected_opinion_version": {"type": "integer", "minimum": 1},
+                    "expected_opinion_sha256": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
+                    "finding_refs": {"type": "array", "maxItems": 16, "items": uuid_schema},
+                    "evidence_refs": {"type": "array", "maxItems": 16, "items": uuid_schema},
+                },
+                "required": [
+                    "action",
+                    "anchor",
+                    "state",
+                    "relation",
+                    "text",
+                    "expected_opinion_version",
+                    "expected_opinion_sha256",
+                    "finding_refs",
+                    "evidence_refs",
+                ],
+                "additionalProperties": False,
+            },
+            effect=ToolEffect.LOCAL_COMPUTE,
+            cost_model={},
+            confidentiality=ToolConfidentiality.CONFIDENTIAL,
+            limitations=("Notes are anchored drafts and never create evidence observations.",),
+            capability_key="operator.write",
+        ),
+        adapter,
+    )
+
+
+def _operator_opinion_block(value: object) -> OpinionBlock:
+    if not isinstance(value, Mapping):
+        raise ValueError("Opinion block is invalid")
+    block_type = OpinionBlockType(str(value["block_type"]))
+    if block_type is OpinionBlockType.ANALYST_OBSERVATIONS:
+        raise ValueError("Analyst observation blocks are written through the note tool")
+    return OpinionBlock(
+        block_type=block_type,
+        text=str(value["text"]),
+        finding_refs=tuple(UUID(str(item)) for item in value["finding_refs"]),
+        evidence_refs=tuple(UUID(str(item)) for item in value["evidence_refs"]),
+        qualification=OpinionClaimQualification(str(value["qualification"])),
+        certainty=float(value["certainty"]),
+    )
+
+
+def _operator_opinion_failure(code: str) -> ToolResult:
+    return ToolResult(
+        ToolInvocationStatus.FAILED,
+        output={"error_code": code},
+        error_code=code,
+        message=code,
+    )
+
+
+def _operator_opinion_result(
+    opinion: AnalystOpinionV1,
+    *,
+    message: str,
+    additional_observation_refs: tuple[UUID, ...] = (),
+) -> ToolResult:
+    evidence_refs = tuple(
+        dict.fromkeys(ref for block in opinion.blocks for ref in block.evidence_refs)
+    )
+    evidence_refs = tuple(
+        dict.fromkeys(
+            (
+                *evidence_refs,
+                *(ref for note in opinion.observations for ref in note.evidence_refs),
+                *additional_observation_refs,
+            )
+        )
+    )
+    return ToolResult(
+        ToolInvocationStatus.SUCCEEDED,
+        observation_refs=evidence_refs,
+        output={
+            "opinion_id": str(opinion.id),
+            "opinion_version": opinion.version,
+            "status": opinion.status.value,
+            "content_sha256": opinion.content_sha256,
+        },
+        message=message,
+    )
+
+
 __all__ = [
     "AnalystOpinionDraftView",
     "AnalystOpinionService",
     "ClaimKnowledgeProvider",
     "FindingServiceClaimKnowledgeProvider",
+    "OperatorOpinionToolAdapter",
     "OpinionCompositionSelection",
     "OpinionError",
     "OpinionErrorCode",
     "OpinionRevisionEdits",
+    "register_operator_opinion_tools",
 ]

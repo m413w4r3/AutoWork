@@ -143,6 +143,12 @@ def test_httpx_and_httpcore_records_redact_query_urls_and_credentials(
             "application response",
             extra={"summary": "Authorization: Bearer application-secret"},
         )
+        echoed_proxy_key = "0123456789abcdef" * 4
+        logging.getLogger("cti_app.test").error(
+            "%s",
+            f"VT body: Domain \"b'drivegoogel.cam&apikey={echoed_proxy_key}'\"; "
+            f"adjacent=apikey {echoed_proxy_key}",
+        )
 
         rendered = "\n".join(
             record.getMessage()
@@ -160,9 +166,11 @@ def test_httpx_and_httpcore_records_redact_query_urls_and_credentials(
             "google-secret",
             "123456",
             "application-secret",
+            echoed_proxy_key,
         ):
             assert secret not in rendered
         assert "apikey=[REDACTED]" in rendered
+        assert "apikey [REDACTED]" in rendered
         assert "safe=visible" in rendered
         assert "X-Amz-Signature=[REDACTED]" in rendered
         assert "X-Goog-Credential=[REDACTED]" in rendered

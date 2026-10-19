@@ -8,7 +8,7 @@ adapters themselves (``unavailable_reason``) and by the tool registry.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import cast
@@ -19,15 +19,18 @@ import httpx
 from cti_app.application.behavior_report_import import BehaviorReportImporter
 from cti_app.application.blob_storage import BlobStore
 from cti_app.application.blobs import BlobCatalogService
+from cti_app.application.bridge_investigator import ModelConversationTurnTransport
 from cti_app.application.capabilities import CapabilitiesService
 from cti_app.application.code_features import CodeFeatureService
-from cti_app.application.confined_analysis import ConfinedAnalysisExecutionPort
+from cti_app.application.confined_analysis import (
+    ConfinedAnalysisExecutionPort,
+    ConfinedAnalysisFamilyStatus,
+)
 from cti_app.application.goodware import GoodwareMeasurementService
 from cti_app.application.identity import LocalIdentityProvider
 from cti_app.application.investigation_composition import (
     InvestigationCompositionFactory,
     OptionalInvestigationToolPorts,
-    QuarantineSampleBytesAdapter,
 )
 from cti_app.application.investigation_rule_tools import QuarantineRuleCorpusBytes
 from cti_app.application.local_analysis import (
@@ -55,7 +58,7 @@ from cti_app.application.virustotal import (
     VirusTotalRoutingPolicy,
 )
 from cti_app.application.virustotal_persistence import VirusTotalObservationService
-from cti_app.config import Settings
+from cti_app.config import VIRUSTOTAL_DOWNLOAD_REQUIRED_CDN_HOST, Settings
 from cti_app.domain.network_protocol import NetworkExtractionLimitsV1
 from cti_app.domain.virustotal import (
     VirusTotalCapability,
@@ -65,6 +68,7 @@ from cti_app.domain.virustotal import (
 from cti_app.infrastructure.confined_analysis_dispatch import (
     build_confined_analysis_execution_port,
 )
+from cti_app.infrastructure.confined_local_commands import ConfinedLocalCommands
 from cti_app.infrastructure.confined_tshark import ConfinedTsharkAdapter
 from cti_app.infrastructure.floss_adapter import FlossAdapter
 from cti_app.infrastructure.ghidra_mcp import GhidraMcpHttpAdapter
@@ -121,28 +125,26 @@ def _unavailable_binary(_name: str) -> None:
 def _local_command_catalog(
     settings: Settings,
     *,
-    filesystem_confined: bool,
+    family_statuses: Mapping[str, ConfinedAnalysisFamilyStatus],
 ) -> LocalCommandCatalog:
-    """Hide executable commands when strict filesystem isolation is unproven."""
+    """Expose only commands attested in the confined analysis worker."""
     specs = tuple(
         replace(spec, requires_filesystem_confinement=True)
         for spec in default_local_command_specs()
     )
-    if not filesystem_confined:
-        # The tool schema is built from this catalogue. Returning no executables
-        # removes local.run_command from the registry instead of exposing a tool
-        # that only fails after an operator or Bridge asks to execute it.
-        return LocalCommandCatalog(
-            specs=specs,
-            which=_unavailable_binary,
-            timeout_seconds=settings.local_analysis_timeout_seconds,
-            max_output_bytes=settings.local_analysis_max_output_bytes,
-            cpu_limit_seconds=settings.local_analysis_cpu_limit_seconds,
-            memory_limit_bytes=settings.local_analysis_memory_limit_bytes,
-            file_size_limit_bytes=settings.local_analysis_file_size_limit_bytes,
-        )
+    local_commands = family_statuses.get("local_command")
+    yara = family_statuses.get("yara")
+
+    def worker_binary(name: str) -> str | None:
+        if name == "yara":
+            return "/usr/bin/yara" if yara is not None and yara.available else None
+        if local_commands is not None and local_commands.available:
+            return f"/usr/bin/{name}"
+        return None
+
     return LocalCommandCatalog(
         specs=specs,
+        which=worker_binary,
         timeout_seconds=settings.local_analysis_timeout_seconds,
         max_output_bytes=settings.local_analysis_max_output_bytes,
         cpu_limit_seconds=settings.local_analysis_cpu_limit_seconds,
@@ -181,6 +183,72 @@ def build_investigation_runtime_ports(
     confined_analysis_execution: ConfinedAnalysisExecutionPort | None = None,
 ) -> InvestigationRuntimePorts:
     statuses: list[RuntimePortStatus] = []
+
+    vt_route_status = {
+        capability: _vt_proxy_route_status(settings, vt_adapter, capability)
+        for capability in (
+            VirusTotalCapability.FILE_REPORT,
+            VirusTotalCapability.FILE_RELATIONSHIPS,
+            VirusTotalCapability.INTELLIGENCE_SEARCH,
+            VirusTotalCapability.FILE_DOWNLOAD,
+            VirusTotalCapability.BEHAVIOUR_REPORTS,
+            VirusTotalCapability.BEHAVIOUR_PCAP,
+        )
+    }
+    download_route_ready, download_route_reason = vt_route_status[
+        VirusTotalCapability.FILE_DOWNLOAD
+    ]
+    pcap_route_ready, pcap_route_reason = vt_route_status[VirusTotalCapability.BEHAVIOUR_PCAP]
+    download_hosts = {
+        host.strip().lower()
+        for host in settings.virustotal_download_allowed_hosts.split(",")
+        if host.strip()
+    }
+    download_ports = {
+        port.strip()
+        for port in settings.virustotal_download_allowed_ports.split(",")
+        if port.strip()
+    }
+    download_storage_ready = bool(blob_store is not None and blob_catalog is not None)
+    acquisition_budget_ready = settings.investigation_max_hits_acquired > 0
+    effective_download = bool(
+        vt_capabilities.file_download
+        and settings.virustotal_file_download_enabled
+        and vt_adapter is not None
+        and download_route_ready
+        and VIRUSTOTAL_DOWNLOAD_REQUIRED_CDN_HOST in download_hosts
+        and download_ports
+        and download_storage_ready
+        and acquisition_budget_ready
+    )
+    effective_pcap = bool(
+        settings.virustotal_behaviour_pcap_enabled and vt_adapter is not None and pcap_route_ready
+    )
+    vt_capabilities = replace(
+        vt_capabilities,
+        file_report=(
+            vt_capabilities.file_report
+            and settings.virustotal_file_report_enabled
+            and vt_route_status[VirusTotalCapability.FILE_REPORT][0]
+        ),
+        file_relationships=(
+            vt_capabilities.file_relationships
+            and settings.virustotal_object_relationships_enabled
+            and vt_route_status[VirusTotalCapability.FILE_RELATIONSHIPS][0]
+        ),
+        intelligence_search=(
+            vt_capabilities.intelligence_search
+            and settings.virustotal_intelligence_search_enabled
+            and vt_route_status[VirusTotalCapability.INTELLIGENCE_SEARCH][0]
+        ),
+        file_download=effective_download,
+        behaviour_reports=(
+            vt_capabilities.behaviour_reports
+            and settings.virustotal_behaviour_reports_enabled
+            and vt_route_status[VirusTotalCapability.BEHAVIOUR_REPORTS][0]
+        ),
+        behaviour_pcap=effective_pcap,
+    )
 
     retrohunt_enabled = bool(settings.virustotal_retrohunt_enabled)
     retrohunt_available: bool
@@ -295,21 +363,22 @@ def build_investigation_runtime_ports(
         )
         local_command_catalog = _local_command_catalog(
             settings,
-            filesystem_confined=bool(getattr(local_command_runner, "filesystem_confined", False)),
+            family_statuses=worker_statuses,
         )
-        local_command_service = LocalCommandService(
-            QuarantineSampleBytesAdapter(
-                quarantine_bytes,
+        local_command_service = cast(
+            LocalCommandService,
+            ConfinedLocalCommands(
+                execution=confined_analysis_execution,
+                catalog=local_command_catalog,
+                uow_factory=uow_factory,
+                settings=settings,
+                enabled=settings.local_analysis_enabled,
                 max_sample_bytes=settings.local_analysis_max_sample_bytes,
             ),
-            local_command_runner,
-            local_command_catalog,
-            enabled=settings.local_analysis_enabled,
-            max_sample_bytes=settings.local_analysis_max_sample_bytes,
         )
     local_filesystem_confined = bool(
-        local_command_service is not None
-        and getattr(local_command_service, "filesystem_confined", False)
+        local_command_runner is not None
+        and getattr(local_command_runner, "filesystem_confined", False)
     )
     if settings.local_analysis_enabled and local_filesystem_confined:
         assert local_command_service is not None and local_command_catalog is not None
@@ -375,7 +444,7 @@ def build_investigation_runtime_ports(
             uow_factory,
             LocalIdentityProvider("system:investigation"),
         )
-        if vt_adapter is not None
+        if vt_adapter is not None and vt_capabilities.file_download
         else None
     )
 
@@ -437,11 +506,74 @@ def build_investigation_runtime_ports(
             vt_capabilities.behaviour_pcap,
         )
     )
+    if vt_adapter is None:
+        vt_reason = "virustotal_adapter_not_configured"
+    elif vt_enabled:
+        vt_reason = None
+    else:
+        configured_capabilities = (
+            (settings.virustotal_file_report_enabled, VirusTotalCapability.FILE_REPORT),
+            (
+                settings.virustotal_object_relationships_enabled,
+                VirusTotalCapability.FILE_RELATIONSHIPS,
+            ),
+            (
+                settings.virustotal_intelligence_search_enabled,
+                VirusTotalCapability.INTELLIGENCE_SEARCH,
+            ),
+            (settings.virustotal_behaviour_reports_enabled, VirusTotalCapability.BEHAVIOUR_REPORTS),
+            (settings.virustotal_file_download_enabled, VirusTotalCapability.FILE_DOWNLOAD),
+            (settings.virustotal_behaviour_pcap_enabled, VirusTotalCapability.BEHAVIOUR_PCAP),
+        )
+        vt_reason = next(
+            (
+                vt_route_status[capability][1]
+                for enabled, capability in configured_capabilities
+                if enabled and vt_route_status[capability][1] is not None
+            ),
+            "virustotal_capabilities_disabled",
+        )
     record(
         "virustotal",
         vt_adapter is not None and vt_enabled,
-        "virustotal_not_configured" if vt_adapter is None else "virustotal_capabilities_disabled",
+        vt_reason,
     )
+    if not settings.virustotal_file_download_enabled:
+        download_reason = "virustotal_file_download_disabled"
+    elif vt_adapter is None:
+        download_reason = "virustotal_adapter_not_configured"
+    elif not download_hosts:
+        download_reason = "virustotal_download_allowed_hosts_empty"
+    elif VIRUSTOTAL_DOWNLOAD_REQUIRED_CDN_HOST not in download_hosts:
+        download_reason = "virustotal_download_cdn_host_not_allowlisted"
+    elif not download_route_ready:
+        download_reason = download_route_reason or "virustotal_download_route_unavailable"
+    elif not download_ports:
+        download_reason = "virustotal_download_allowed_ports_empty"
+    elif not download_storage_ready:
+        download_reason = "quarantine_storage_unavailable"
+    elif not acquisition_budget_ready:
+        download_reason = "acquisition_budget_disabled"
+    elif not vt_capabilities.file_download:
+        download_reason = "virustotal_file_download_capability_disabled"
+    else:
+        download_reason = None
+    record(
+        "virustotal_file_download",
+        acquisition_service is not None,
+        download_reason,
+    )
+    if not settings.virustotal_behaviour_pcap_enabled:
+        pcap_reason = "virustotal_behaviour_pcap_disabled"
+    elif vt_adapter is None:
+        pcap_reason = "virustotal_adapter_not_configured"
+    elif not pcap_route_ready:
+        pcap_reason = pcap_route_reason or "virustotal_behaviour_pcap_route_unavailable"
+    elif not vt_capabilities.behaviour_pcap:
+        pcap_reason = "virustotal_behaviour_pcap_capability_disabled"
+    else:
+        pcap_reason = None
+    record("virustotal_behaviour_pcap", vt_capabilities.behaviour_pcap, pcap_reason)
     record("shodan", shodan_adapter is not None, "shodan_not_configured")
     ghidra_available = bool(getattr(ghidra_adapter, "available", False))
     ghidra_reason = (
@@ -491,13 +623,20 @@ def build_investigation_runtime_ports(
     )
     if not settings.local_analysis_enabled:
         local_command_reason = "local_analysis_disabled"
-    elif local_command_service is not None and not local_command_service.filesystem_confined:
-        local_command_reason = (
-            getattr(local_command_runner, "namespace_reason", None)
-            or "filesystem_confinement_unavailable"
-        )
     else:
-        local_command_reason = "no_local_command_available"
+        local_command_status = worker_statuses.get("local_command")
+        if not confined_analysis_execution.available:
+            local_command_reason = (
+                confined_analysis_execution.available_reason or "analysis_worker_unavailable"
+            )
+        elif local_command_status is not None and not local_command_status.available:
+            local_command_reason = (
+                local_command_status.available_reason or "local_command_worker_unavailable"
+            )
+        elif local_command_service is None or not local_command_catalog:
+            local_command_reason = "no_local_command_available"
+        else:
+            local_command_reason = None
     record(
         "local_command_execution",
         bool(
@@ -508,6 +647,7 @@ def build_investigation_runtime_ports(
             and local_command_catalog.available_commands()
         ),
         local_command_reason,
+        execution_mode="analysis-worker",
     )
     yara_worker_status = worker_statuses.get("yara")
     yara_worker_available = bool(yara_worker_status and yara_worker_status.available)
@@ -693,9 +833,34 @@ def build_investigation_runtime_composition_factory(
             model_conversations=model_conversations,
             settings=settings,
             optional_tool_ports=ports.optional_tool_ports,
+            turn_transport=(
+                ModelConversationTurnTransport(model_conversations)
+                if _bridge_turn_transport_configured(settings)
+                else None
+            ),
         ),
         ports=ports,
     )
+
+
+def _bridge_turn_transport_configured(settings: Settings) -> bool:
+    """Fail closed unless Bridge routing and endpoint configuration are explicit."""
+    base_url = getattr(settings, "openai_bridge_base_url", "")
+    api_key = getattr(settings, "openai_bridge_api_key", None)
+    forced_adapter = getattr(settings, "model_force_adapter", "auto")
+    research_route = getattr(settings, "model_route_web_research", "chatgpt_bridge")
+    if not isinstance(base_url, str) or not base_url.strip():
+        return False
+    # The loopback URL is only a default. Require either credentials or a
+    # non-default endpoint so a constructed ModelConversationService is not
+    # mistaken for a configured Bridge transport.
+    endpoint_configured = base_url.rstrip("/") != "http://127.0.0.1:8001/v1"
+    api_key_value = getattr(api_key, "get_secret_value", lambda: api_key)()
+    transport_configured = bool(api_key_value) or endpoint_configured
+    route_uses_bridge = forced_adapter in {"chatgpt_bridge", "openai"} or (
+        forced_adapter == "auto" and research_route == "chatgpt_bridge"
+    )
+    return transport_configured and route_uses_bridge
 
 
 def describe_tool_inventory(
@@ -840,6 +1005,28 @@ def _configured_retrohunt_routing_policy(settings: Settings) -> VirusTotalRoutin
         )
     )
     return VirusTotalRoutingPolicy(routes={VirusTotalCapability.RETROHUNT: route})
+
+
+def _vt_proxy_route_status(
+    settings: Settings,
+    adapter: VirusTotalPort | None,
+    capability: VirusTotalCapability,
+) -> tuple[bool, str | None]:
+    if adapter is None:
+        return False, "virustotal_adapter_not_configured"
+    if not settings.virustotal_proxy_url or not settings.virustotal_base_url:
+        return False, "virustotal_proxy_route_not_configured"
+    routing_policy = getattr(adapter, "_routing_policy", None)
+    if routing_policy is None:
+        return False, "virustotal_route_not_verified"
+    route = routing_policy.route_for(capability)
+    if route is None:
+        return False, "virustotal_route_not_configured"
+    if route.primary.transport is not VirusTotalTransportKind.PROXY:
+        return False, "virustotal_proxy_route_required"
+    if route.primary.variant is not VirusTotalEndpointVariant.V3:
+        return False, "virustotal_v3_route_required"
+    return True, None
 
 
 def _native_port_unavailable_reason(port: object) -> str | None:

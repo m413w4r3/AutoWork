@@ -14,7 +14,8 @@ _PCAP_MAGICS = {
     b"\xa1\xb2\x3c\x4d": (">", 1),
 }
 _PCAPNG_SECTION = b"\x0a\x0d\x0d\x0a"
-_SUPPORTED_LINK_TYPES = frozenset({1, 12, 101})
+# Ethernet, raw IP, Linux cooked capture v1, and Linux cooked capture v2.
+_SUPPORTED_LINK_TYPES = frozenset({1, 12, 101, 113, 276})
 
 
 class PcapReaderError(ValueError):
@@ -290,6 +291,24 @@ def _decode_transport(
             return None
         ether_type = int.from_bytes(frame[12:14], "big")
         offset = 14
+    elif link_type == 113:  # Linux cooked capture v1 (SLL)
+        if len(frame) < 16:
+            return None
+        ether_type = int.from_bytes(frame[14:16], "big")
+        offset = 16
+    elif link_type == 276:  # Linux cooked capture v2 (SLL2)
+        if len(frame) < 20:
+            return None
+        ether_type = int.from_bytes(frame[:2], "big")
+        offset = 20
+    else:
+        offset = 0
+        if not frame:
+            return None
+        version = frame[0] >> 4
+        ether_type = 0x0800 if version == 4 else 0x86DD if version == 6 else 0
+
+    if link_type in {1, 113, 276}:
         vlan_count = 0
         while ether_type in {0x8100, 0x88A8, 0x9100} and vlan_count < 4:
             if len(frame) < offset + 4:
@@ -297,12 +316,6 @@ def _decode_transport(
             ether_type = int.from_bytes(frame[offset + 2 : offset + 4], "big")
             offset += 4
             vlan_count += 1
-    else:
-        offset = 0
-        if not frame:
-            return None
-        version = frame[0] >> 4
-        ether_type = 0x0800 if version == 4 else 0x86DD if version == 6 else 0
 
     if ether_type == 0x0800:
         parsed = _decode_ipv4(frame, offset)

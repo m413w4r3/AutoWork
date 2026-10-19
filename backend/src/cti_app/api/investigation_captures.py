@@ -33,6 +33,8 @@ class CaptureImportResponse(BaseModel):
     sha256: str
     size_bytes: int
     format: str
+    sample_id: UUID
+    association_id: UUID
 
 
 def _import_service(request: Request) -> NetworkCaptureImportService:
@@ -136,6 +138,8 @@ async def import_investigation_capture(
         sha256=imported.sha256,
         size_bytes=imported.size_bytes,
         format=imported.format.value,
+        sample_id=imported.sample_id,
+        association_id=imported.association_id,
     )
 
 

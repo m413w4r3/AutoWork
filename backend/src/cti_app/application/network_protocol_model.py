@@ -399,6 +399,8 @@ class NetworkProtocolWorkbench:
         traces: Sequence[ProtocolTraceRequestV1],
         investigation_id: UUID | None = None,
     ) -> ProtocolModelV1:
+        if model.validation_status is ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED:
+            raise ProtocolTraceError("documentary_model_cannot_be_capture_verified")
         requests = _bounded_traces(traces, require_holdout=True)
         observed = await self._load_traces(
             requests, investigation_id=investigation_id or model.investigation_id
@@ -905,7 +907,9 @@ def _verify_model(model: ProtocolModelV1, traces: Sequence[_ObservedTrace]) -> P
                     )
                 continue
             if (
-                not expected_definition.min_length
+                expected_definition.min_length is not None
+                and expected_definition.max_length is not None
+                and not expected_definition.min_length
                 <= actual.length
                 <= expected_definition.max_length
             ):
@@ -1116,6 +1120,8 @@ def _verify_model(model: ProtocolModelV1, traces: Sequence[_ObservedTrace]) -> P
 
 
 def _render_model(model: ProtocolModelV1) -> ProtocolRenderResultV1:
+    if model.validation_status is ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED:
+        return _render_documented_model(model)
     sequence_nodes: dict[str, ProtocolDiagramNodeV1] = {}
     sequence_edges: list[ProtocolDiagramEdgeV1] = []
     message_by_id = {item.message_id: item for item in model.messages}
@@ -1324,6 +1330,148 @@ def render_protocol_model(model: ProtocolModelV1) -> ProtocolRenderResultV1:
     return _render_model(model)
 
 
+def _render_documented_model(model: ProtocolModelV1) -> ProtocolRenderResultV1:
+    """Render documented semantics without inventing capture coordinates."""
+    label_status = ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED
+    source_message = {item.message_id: item.name for item in model.messages}
+    sequence_nodes = tuple(
+        ProtocolDiagramNodeV1(
+            node_id=f"documented-message-{item.message_id}",
+            label=(
+                f"{item.ordinal}. {item.name} · direction "
+                f"{', '.join(direction.value for direction in item.directions) or 'unknown'} · "
+                f"sources {_documentary_source_labels(item.evidence)}"
+            ),
+            role="documented_message",
+            validation_status=label_status,
+            evidence=item.evidence,
+        )
+        for item in sorted(model.messages, key=lambda entry: (entry.ordinal, entry.message_id))
+    )
+    sequence = ProtocolDiagramSpecV1(
+        schema_version="ProtocolDiagramSpecV1",
+        kind=ProtocolDiagramKind.SEQUENCE,
+        status=(
+            ProtocolDiagramStatus.READY
+            if sequence_nodes
+            else ProtocolDiagramStatus.INSUFFICIENT_EVIDENCE
+        ),
+        title="Message sequence · documenté, non observé",
+        nodes=sequence_nodes,
+        edges=(),
+        fields=(),
+        limitations=(
+            "Documenté, non observé. L'ordre affiché vient des faits cités; "
+            "aucune capture réseau n'a été consultée.",
+            "Les rôles et directions inconnus restent inconnus.",
+        ),
+    )
+
+    states_by_id = {item.state_id: item for item in model.states}
+    state_nodes = {
+        item.state_id: ProtocolDiagramNodeV1(
+            node_id=item.state_id,
+            label=f"{item.name} · sources {_documentary_source_labels(item.evidence)}",
+            role="documented_state",
+            validation_status=item.validation_status,
+            evidence=item.evidence,
+        )
+        for item in model.states
+    }
+    state_edges = tuple(
+        ProtocolDiagramEdgeV1(
+            source_id=item.from_state,
+            target_id=item.to_state,
+            label=(
+                f"{item.trigger}: {source_message[item.message_id]} · "
+                f"sources {_documentary_source_labels(item.evidence)}"
+            ),
+            order=None,
+            frame_numbers=(),
+            timing_ms=None,
+            validation_status=item.validation_status,
+            evidence=item.evidence,
+        )
+        for item in model.transitions
+        if item.from_state in states_by_id and item.to_state in states_by_id
+    )
+    state_diagram = ProtocolDiagramSpecV1(
+        schema_version="ProtocolDiagramSpecV1",
+        kind=ProtocolDiagramKind.STATE_MACHINE,
+        status=(
+            ProtocolDiagramStatus.READY
+            if state_nodes
+            else ProtocolDiagramStatus.INSUFFICIENT_EVIDENCE
+        ),
+        title="State machine · documenté, non observé",
+        nodes=tuple(state_nodes.values()),
+        edges=state_edges,
+        fields=(),
+        limitations=(
+            "Documenté, non observé. Les états et transitions proviennent "
+            "uniquement des sources citées.",
+            "Aucun échange réseau ni changement d'état n'a été observé dans une capture.",
+        ),
+    )
+
+    format_fields = tuple(
+        ProtocolDiagramFieldV1(
+            field_id=item.field_id,
+            name=item.name,
+            offset=None,
+            length=None,
+            endianness="unknown",
+            encoding=None,
+            condition=None,
+            encrypted_opaque=False,
+            validation_status=item.validation_status,
+            evidence=item.evidence,
+        )
+        for item in model.fields
+    )
+    format_diagram = ProtocolDiagramSpecV1(
+        schema_version="ProtocolDiagramSpecV1",
+        kind=ProtocolDiagramKind.MESSAGE_FORMAT,
+        status=(
+            ProtocolDiagramStatus.READY
+            if format_fields
+            else ProtocolDiagramStatus.INSUFFICIENT_EVIDENCE
+        ),
+        title="Message format · documenté, non observé",
+        nodes=(),
+        edges=(),
+        fields=format_fields,
+        limitations=(
+            "Documenté, non observé. Les positions, tailles et valeurs d'octets "
+            "non citées sont inconnues.",
+            "Aucun offset, frame ou octet n'est fourni par ce modèle documentaire.",
+        ),
+    )
+    statements = tuple(
+        f"{item.name} est documenté, non observé; sources "
+        f"{_documentary_source_labels(item.evidence)}."
+        for item in model.messages
+    ) + tuple(
+        f"Le champ {item.name} est documenté, non observé; offset et longueur inconnus; "
+        f"sources {_documentary_source_labels(item.evidence)}."
+        for item in model.fields
+    )
+    return ProtocolRenderResultV1(
+        schema_version="ProtocolRenderResultV1",
+        model_sha256=model.canonical_sha256,
+        diagrams=(sequence, state_diagram, format_diagram),
+        factual_statements=statements,
+    )
+
+
+def _documentary_source_labels(evidence: Sequence[ProtocolEvidenceRefV1]) -> str:
+    return ", ".join(
+        f"{item.documented_ref_kind}:{item.documented_ref_id}"
+        for item in evidence
+        if item.documented_ref_kind and item.documented_ref_id
+    )
+
+
 def _bounded_traces(
     traces: Sequence[ProtocolTraceRequestV1], *, require_holdout: bool
 ) -> tuple[ProtocolTraceRequestV1, ...]:
@@ -1391,6 +1539,8 @@ def _unique_evidence(
 ) -> tuple[ProtocolEvidenceRefV1, ...]:
     by_key: dict[tuple[str, str, str, int | None, int | None], ProtocolEvidenceRefV1] = {}
     for item in evidence:
+        assert item.capture_sha256 is not None
+        assert item.stream_id is not None
         key = (
             item.capture_sha256,
             item.stream_id,
@@ -1457,6 +1607,9 @@ def _message_observation_key(
     message: _ObservedMessage,
 ) -> tuple[str, str, str, int, int]:
     evidence = message.evidence
+    assert evidence.capture_sha256 is not None
+    assert evidence.flow_id is not None
+    assert evidence.stream_id is not None
     return (
         evidence.capture_sha256,
         evidence.flow_id,
@@ -1545,6 +1698,8 @@ def _finding(
     detail: str,
     evidence: tuple[ProtocolEvidenceRefV1, ...],
 ) -> ProtocolVerificationFindingV1:
+    assert evidence[0].capture_sha256 is not None
+    assert evidence[0].flow_id is not None
     identity = hashlib.sha256(
         "|".join(
             (

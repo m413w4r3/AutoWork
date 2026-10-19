@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import struct
+from dataclasses import replace
 from types import SimpleNamespace
 from uuid import UUID, uuid5
 
@@ -11,6 +12,7 @@ from fastapi import FastAPI
 
 from cti_app.api.investigation_captures import router
 from cti_app.application.blob_storage import BlobReadLimitExceededError
+from cti_app.application.investigation_acquisition import HitAcquisitionService
 from cti_app.application.network_capture_import import (
     CaptureInvestigationNotFoundError,
     NetworkCaptureImportService,
@@ -20,7 +22,13 @@ from cti_app.application.network_workbench import (
     QuarantineCaptureTooLargeError,
 )
 from cti_app.domain.blobs import BlobDescriptor, BlobRecord
-from cti_app.domain.investigation import EvidenceObservation
+from cti_app.domain.classification import TLP
+from cti_app.domain.entities import ProvenanceEvent, Sample, SampleState
+from cti_app.domain.investigation import (
+    EvidenceObservation,
+    SampleAssociation,
+    SampleQualification,
+)
 from cti_app.domain.network_protocol import NetworkCaptureFormat, NetworkCaptureRejection
 from cti_app.infrastructure.quarantined_capture_source import (
     ProductionQuarantinedCaptureSource,
@@ -119,20 +127,94 @@ class _BlobCatalog:
     async def get(self, blob_id: UUID) -> BlobRecord | None:
         return self.records.get(blob_id)
 
+    async def get_by_address(self, logical_bucket: str, sha256: str) -> BlobRecord | None:
+        blob_id = self.addresses.get((logical_bucket, sha256))
+        return self.records.get(blob_id) if blob_id is not None else None
+
 
 class _InvestigationRepository:
     def __init__(self, ids: set[UUID]) -> None:
         self.ids = ids
 
     async def get(self, investigation_id: UUID):
-        return object() if investigation_id in self.ids else None
+        return (
+            SimpleNamespace(subject_id=UUID("cc9c602f-c889-48c1-8395-d6031d5f0830"))
+            if investigation_id in self.ids
+            else None
+        )
+
+
+class _SubjectRepository:
+    async def get(self, subject_id: UUID):
+        return SimpleNamespace(id=subject_id, tlp=TLP.AMBER)
+
+
+class _SampleRepository:
+    def __init__(self) -> None:
+        self.samples: dict[UUID, Sample] = {}
+
+    async def get_by_subject_and_blob(self, subject_id: UUID, blob_id: UUID) -> Sample | None:
+        return next(
+            (
+                sample
+                for sample in self.samples.values()
+                if sample.subject_id == subject_id and sample.blob_id == blob_id
+            ),
+            None,
+        )
+
+    async def add(self, sample: Sample) -> None:
+        self.samples[sample.id] = sample
+
+    async def get(self, sample_id: UUID) -> Sample | None:
+        return self.samples.get(sample_id)
+
+    async def list_for_subject(self, subject_id: UUID) -> tuple[Sample, ...]:
+        return tuple(item for item in self.samples.values() if item.subject_id == subject_id)
+
+
+class _SampleAssociationRepository:
+    def __init__(self) -> None:
+        self.associations: dict[UUID, SampleAssociation] = {}
+
+    async def list_for_investigation(self, investigation_id: UUID):
+        return tuple(
+            item for item in self.associations.values() if item.investigation_id == investigation_id
+        )
+
+    async def append_version(self, association: SampleAssociation, *, expected_version: int):
+        assert expected_version == 0
+        self.associations[association.id] = association
+        return association
+
+    async def get(self, association_id: UUID) -> SampleAssociation | None:
+        return self.associations.get(association_id)
+
+
+class _ProvenanceRepository:
+    def __init__(self) -> None:
+        self.events: list[ProvenanceEvent] = []
+
+    async def list_for_aggregate(self, aggregate_type: str, aggregate_id: UUID):
+        return tuple(
+            event
+            for event in self.events
+            if event.aggregate_type == aggregate_type and event.aggregate_id == aggregate_id
+        )
+
+    async def append(self, event: ProvenanceEvent) -> None:
+        self.events.append(event)
 
 
 class _UnitOfWork:
     def __init__(self, harness: _Harness) -> None:
         self.analyst_investigations = _InvestigationRepository(harness.investigation_ids)
+        self.subjects = _SubjectRepository()
         self.evidence_observations = harness.evidence
         self.blobs = harness.blobs
+        self.samples = harness.samples
+        self.sample_associations = harness.sample_associations
+        self.provenance = harness.provenance
         self.commits = 0
 
     async def __aenter__(self) -> _UnitOfWork:
@@ -158,6 +240,9 @@ class _Harness:
         self.investigation_ids = {_INVESTIGATION_ID}
         self.evidence = _EvidenceRepository()
         self.blobs = _BlobCatalog()
+        self.samples = _SampleRepository()
+        self.sample_associations = _SampleAssociationRepository()
+        self.provenance = _ProvenanceRepository()
         self.uow_factory = _UnitOfWorkFactory(self)
         self.settings = SimpleNamespace(network_capture_max_bytes=max_bytes)
         self.service = NetworkCaptureImportService(
@@ -249,8 +334,33 @@ async def test_duplicate_import_reuses_one_blob_and_one_evidence_observation() -
     assert first.source_reference == second.source_reference
     assert len(harness.blobs.records) == 1
     assert len(harness.evidence.observations) == 1
+    assert first.sample_id == second.sample_id
+    assert first.association_id == second.association_id
+    assert len(harness.samples.samples) == 1
+    assert len(harness.sample_associations.associations) == 1
+    sample = harness.samples.samples[first.sample_id]
+    assert sample.state is SampleState.QUARANTINED
+    assert sample.origin == "operator_import"
+    assert sample.source_service == "operator_import"
+    assert sample.do_not_submit is True
+    assert sample.external_llm_allowed is False
+    association = harness.sample_associations.associations[first.association_id]
+    assert association.origin.value == "manual"
+    assert association.qualification is SampleQualification.CANDIDATE
+    provenance = harness.provenance.events
+    assert len(provenance) == 1
+    assert provenance[0].payload["provenance"] == "operator_import"
+    assert provenance[0].payload["import_source"] == "network_capture"
     observation = harness.evidence.observations[next(iter(harness.evidence.observations))]
     assert "analyst:unit-test" in observation.limitations[1]
+    resolved = await HitAcquisitionService(
+        harness.uow_factory,
+        acquisition=None,
+        recorder=object(),  # type: ignore[arg-type]
+    ).resolve_quarantined_sample(first.association_id)
+    assert resolved.sample_id == first.sample_id
+    assert resolved.blob_id == first.blob_id
+    assert resolved.sha256 == first.sha256
 
 
 @pytest.mark.asyncio
@@ -297,6 +407,29 @@ async def test_quarantine_source_rejects_another_investigation_and_wrong_sha() -
     with pytest.raises(NetworkCaptureRejected) as wrong_sha:
         await source.read_quarantined_capture(f"sha256:{'f' * 64}", max_bytes=1024)
     assert wrong_sha.value.reason is NetworkCaptureRejection.CAPTURE_NOT_ASSOCIATED
+
+
+@pytest.mark.asyncio
+async def test_quarantine_source_rejects_untyped_virustotal_capture_observation() -> None:
+    harness = _Harness()
+    imported = await _import(harness)
+    observation_id, observation = next(iter(harness.evidence.observations.items()))
+    harness.evidence.observations[observation_id] = replace(
+        observation,
+        source="VirusTotal",
+        source_version="virustotal.v1",
+    )
+    source = ProductionQuarantinedCaptureSource(
+        uow_factory=harness.uow_factory,  # type: ignore[arg-type]
+        blob_catalog=harness.blobs,  # type: ignore[arg-type]
+        settings=harness.settings,  # type: ignore[arg-type]
+        investigation_id=_INVESTIGATION_ID,
+    )
+
+    with pytest.raises(NetworkCaptureRejected) as rejected:
+        await source.read_quarantined_capture(imported.source_reference, max_bytes=1024)
+
+    assert rejected.value.reason is NetworkCaptureRejection.CAPTURE_NOT_ASSOCIATED
 
 
 @pytest.mark.asyncio
@@ -408,6 +541,8 @@ async def test_import_route_exposes_capabilities_and_imports_uploaded_content() 
     assert capabilities.json()["sha256_header"] == "X-Content-SHA256"
     assert response.status_code == 201
     assert response.json()["schema_version"] == "network-capture-import.v1"
+    assert response.json()["sample_id"]
+    assert response.json()["association_id"]
     expected_reference = f"sha256:{hashlib.sha256(_PCAP_HEADER).hexdigest()}"
     assert response.json()["source_reference"] == expected_reference
 

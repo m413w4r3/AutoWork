@@ -1766,6 +1766,7 @@ class PublicationDetectionStatus(StrEnum):
 class PublicationDetectionReason(StrEnum):
     VALIDATED = "real_positives_and_goodware_tested"
     CORPUS_EMPTY = "corpus_empty"
+    EXPLICIT_TEST_REQUIRED = "explicit_rule_test_required"
     POSITIVES_MISSING = "real_positive_samples_missing"
     GOODWARE_MISSING = "goodware_corpus_empty"
     SAMPLE_BYTES_MISSING = "sample_bytes_missing_or_unverified"

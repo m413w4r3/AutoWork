@@ -222,6 +222,8 @@ class ToolExecutionContext:
     budget: InvestigationBudget
     idempotency_key: str
     available_capabilities: frozenset[str] = frozenset()
+    blocked_capabilities: tuple[str, ...] = ()
+    unavailable_tool_reasons: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.idempotency_key.strip():
@@ -234,6 +236,96 @@ class ToolExecutionContext:
                     "Tool execution budget must be the budget approved in its envelope"
                 )
         object.__setattr__(self, "available_capabilities", frozenset(self.available_capabilities))
+        object.__setattr__(self, "blocked_capabilities", tuple(self.blocked_capabilities))
+        reasons = dict(self.unavailable_tool_reasons)
+        if any(
+            not isinstance(name, str)
+            or not name
+            or not isinstance(reason, str)
+            or re.fullmatch(r"[a-z][a-z0-9_.:-]{0,95}", reason) is None
+            for name, reason in reasons.items()
+        ):
+            raise ValueError("Unavailable tool reasons must be bounded reason codes")
+        object.__setattr__(self, "unavailable_tool_reasons", freeze_json(reasons))
+
+
+def tool_unavailability_reason(
+    definition: ToolDefinition, context: ToolExecutionContext
+) -> str | None:
+    """Return the shared availability decision used by listing and dispatch."""
+    if definition.capability_key not in context.available_capabilities:
+        return context.unavailable_tool_reasons.get(
+            definition.name, f"capability_unavailable:{definition.capability_key}"
+        )
+    provider = definition.capability_key.split(".", 1)[0]
+    for blocked in context.blocked_capabilities:
+        key, separator, detail = blocked.partition(":")
+        if not separator:
+            continue
+        if key == definition.capability_key or (
+            key == provider and "provider authorization refused" in detail
+        ):
+            normalized = "_".join(detail.strip().lower().split())
+            if (
+                len(normalized) <= 96
+                and normalized
+                and normalized[0] in "abcdefghijklmnopqrstuvwxyz"
+                and all(char in "abcdefghijklmnopqrstuvwxyz0123456789_.:-" for char in normalized)
+            ):
+                return normalized
+            return "capability_blocked"
+    return None
+
+
+def registry_tool_context(
+    registry: ToolRegistry, context: ToolExecutionContext
+) -> ToolExecutionContext:
+    reasons = dict(getattr(registry, "unavailable_tool_reasons", {}))
+    reasons.update(context.unavailable_tool_reasons)
+    if reasons == dict(context.unavailable_tool_reasons):
+        return context
+    return replace(context, unavailable_tool_reasons=reasons)
+
+
+@dataclass(frozen=True, slots=True)
+class ToolAvailability:
+    available: tuple[ToolDefinition, ...]
+    unavailable: tuple[tuple[str, str], ...]
+
+    @property
+    def available_names(self) -> tuple[str, ...]:
+        return tuple(sorted({definition.name for definition in self.available}))
+
+    @property
+    def unavailable_diagnostics(self) -> tuple[str, ...]:
+        return tuple(f"{name}:{reason}" for name, reason in self.unavailable)
+
+
+def project_tool_availability(
+    registry: ToolRegistry,
+    context: ToolExecutionContext,
+    *,
+    known_tool_names: tuple[str, ...] = (),
+) -> ToolAvailability:
+    """Project one context through the registry for prompts, dispatch and operator status."""
+    context = registry_tool_context(registry, context)
+    registered = registry.list_registered()
+    available: list[ToolDefinition] = []
+    unavailable: dict[str, str] = {}
+    for definition in registered:
+        reason = tool_unavailability_reason(definition, context)
+        if reason is None:
+            available.append(definition)
+        else:
+            unavailable[definition.name] = reason
+    catalog_names = tuple(getattr(registry, "known_tool_names", ()))
+    for name in (*catalog_names, *known_tool_names):
+        if name not in unavailable and name not in {item.name for item in available}:
+            unavailable[name] = context.unavailable_tool_reasons.get(name, "dependency_unavailable")
+    return ToolAvailability(
+        available=tuple(sorted(available, key=lambda item: (item.name, item.schema_version))),
+        unavailable=tuple(sorted(unavailable.items())),
+    )
 
 
 class ToolAdapter(Protocol):
@@ -249,6 +341,8 @@ class ToolRegistry(Protocol):
 
     def list_available(self, context: ToolExecutionContext) -> tuple[ToolDefinition, ...]: ...
 
+    def list_registered(self) -> tuple[ToolDefinition, ...]: ...
+
     def get(self, name: str, schema_version: str) -> tuple[ToolDefinition, ToolAdapter] | None: ...
 
 
@@ -257,6 +351,16 @@ class InMemoryToolRegistry:
 
     def __init__(self) -> None:
         self._tools: dict[tuple[str, str], tuple[ToolDefinition, ToolAdapter]] = {}
+        self.known_tool_names: tuple[str, ...] = ()
+        self.unavailable_tool_reasons: Mapping[str, str] = {}
+
+    def set_availability_catalog(
+        self,
+        names: tuple[str, ...],
+        reasons: Mapping[str, str],
+    ) -> None:
+        self.known_tool_names = tuple(dict.fromkeys(names))
+        self.unavailable_tool_reasons = freeze_json(dict(reasons))
 
     def register(self, definition: ToolDefinition, adapter: ToolAdapter) -> None:
         key = (definition.name, definition.schema_version)
@@ -277,11 +381,15 @@ class InMemoryToolRegistry:
         return bool(keys)
 
     def list_available(self, context: ToolExecutionContext) -> tuple[ToolDefinition, ...]:
+        context = registry_tool_context(self, context)
         return tuple(
             definition
             for definition, _adapter in self._tools.values()
-            if definition.capability_key in context.available_capabilities
+            if tool_unavailability_reason(definition, context) is None
         )
+
+    def list_registered(self) -> tuple[ToolDefinition, ...]:
+        return tuple(definition for definition, _adapter in self._tools.values())
 
     def get(self, name: str, schema_version: str) -> tuple[ToolDefinition, ToolAdapter] | None:
         return self._tools.get((name, schema_version))
@@ -528,7 +636,10 @@ class RegistryToolDispatcher:
                     ToolInvocationStatus.FAILED, "Tool arguments must contain only JSON values."
                 )
             return await self._dispatch_once(
-                replace(context, idempotency_key=operation_key),
+                replace(
+                    registry_tool_context(self._registry, context),
+                    idempotency_key=operation_key,
+                ),
                 tool_name=tool_name,
                 schema_version=schema_version,
                 arguments=arguments,
@@ -559,14 +670,27 @@ class RegistryToolDispatcher:
         alternatives = self._suggested_alternatives(context, exclude_name=tool_name)
         registered = self._registry.get(tool_name, schema_version)
         if registered is None:
-            return self._local_result(
-                ToolInvocationStatus.UNAVAILABLE, "Tool is not registered.", alternatives
+            has_other_schema = any(
+                item.name == tool_name for item in self._registry.list_registered()
             )
-        definition, adapter = registered
-        if definition.capability_key not in context.available_capabilities:
+            unavailable_reason = (
+                "tool_schema_version_unavailable"
+                if has_other_schema
+                else context.unavailable_tool_reasons.get(tool_name)
+            )
             return self._local_result(
                 ToolInvocationStatus.UNAVAILABLE,
-                f"Capability {definition.capability_key} is unavailable.",
+                f"Tool is unavailable: {unavailable_reason}."
+                if unavailable_reason is not None
+                else "Tool is not registered.",
+                alternatives,
+            )
+        definition, adapter = registered
+        unavailable_reason = tool_unavailability_reason(definition, context)
+        if unavailable_reason is not None:
+            return self._local_result(
+                ToolInvocationStatus.UNAVAILABLE,
+                f"Tool is unavailable: {unavailable_reason}.",
                 alternatives,
             )
         policy_status = self._policy_status(definition, context.envelope)

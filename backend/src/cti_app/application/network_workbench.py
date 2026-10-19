@@ -5,10 +5,10 @@ from __future__ import annotations
 import hashlib
 import re
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from itertools import pairwise
-from typing import Protocol
+from typing import Any, Protocol
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -279,6 +279,40 @@ class NetworkWorkbench:
         report, truncated = self._capture_report(reference, parsed, flows, result, versions)
         status = ToolInvocationStatus.PARTIAL if truncated else ToolInvocationStatus.SUCCEEDED
         return NetworkInspectionOutcome(status, report)
+
+    async def validate_suricata_rules(
+        self,
+        reference: NetworkCaptureRefV1,
+        *,
+        investigation_id: UUID,
+        adapter: Any,
+        analysis_parameters: Mapping[str, str] | None = None,
+    ) -> Any:
+        """Validate a versioned or frozen rule set against this capture's evidence identity."""
+        await self._load(reference, investigation_id=investigation_id)
+        return await adapter.validate_rules(
+            artifact_id=reference.blob_id,
+            investigation_id=investigation_id,
+            capture_sha256=reference.sha256,
+            analysis_parameters=analysis_parameters,
+        )
+
+    async def replay_suricata(
+        self,
+        reference: NetworkCaptureRefV1,
+        *,
+        investigation_id: UUID,
+        adapter: Any,
+        analysis_parameters: Mapping[str, str] | None = None,
+    ) -> Any:
+        """Replay only canonical, investigation-associated capture bytes offline."""
+        await self._load(reference, investigation_id=investigation_id)
+        return await adapter.replay(
+            artifact_id=reference.blob_id,
+            investigation_id=investigation_id,
+            capture_sha256=reference.sha256,
+            analysis_parameters=analysis_parameters,
+        )
 
     async def reassemble(
         self,

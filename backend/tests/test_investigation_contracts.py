@@ -16,6 +16,8 @@ from cti_app.application.investigation_contracts import (
     InvestigationContextV1,
     InvestigationDeltaV1,
     InvestigationSourceV1,
+    OperatorOpinionProtocolFigureSelectionV1,
+    OperatorOpinionProtocolFiguresV1,
     parse_agent_turn_decision,
     parse_investigation_context,
     validate_decision_hypothesis_references,
@@ -26,6 +28,7 @@ from cti_app.domain.investigation import AgentNextAction
 from cti_app.domain.investigation_state import (
     DecisionValidationCode as DomainDecisionValidationCode,
 )
+from cti_app.domain.protocol_model import ProtocolDiagramKind
 
 
 def _source() -> InvestigationSourceV1:
@@ -49,6 +52,25 @@ def _investigation(*, evidence=()):
         blocked_capabilities=(),
         budget_remaining={"vt_units": 4, "shodan_credits": None},
     )
+
+
+def test_operator_opinion_protocol_figure_contract_requires_the_three_views_together() -> None:
+    selection = OperatorOpinionProtocolFigureSelectionV1(
+        protocol_model_blob_id=uuid4(),
+        render_observation_id=uuid4(),
+        views=tuple(ProtocolDiagramKind),
+    )
+    request = OperatorOpinionProtocolFiguresV1(protocol_figures=(selection,))
+
+    assert request.protocol_figures == (selection,)
+    with pytest.raises(ValueError, match="All three protocol views"):
+        OperatorOpinionProtocolFigureSelectionV1(
+            protocol_model_blob_id=uuid4(),
+            render_observation_id=uuid4(),
+            views=(ProtocolDiagramKind.SEQUENCE,) * 3,
+        )
+    with pytest.raises(ValueError):
+        OperatorOpinionProtocolFiguresV1(protocol_figures=(selection, selection))
 
 
 def test_compact_decision_parses_explicit_operator_request_acknowledgements() -> None:
@@ -728,3 +750,50 @@ def test_context_rejects_signed_url_values() -> None:
             investigation=_investigation(),
             available_tools=(),
         )
+
+
+def test_tool_block_purpose_fills_a_missing_required_purpose_argument() -> None:
+    sha = "a" * 64
+    evidence = str(uuid4())
+    wire = f"""@@DECISION@@
+GOAL: Acquire a documented sample.
+SUMMARY: Download the sample for static analysis.
+NEXT: continue
+@@END@@
+@@TOOL@@
+NAME: vt.download_sample
+VERSION: 1
+PURPOSE: Static defensive analysis of the documented sample.
+ARG sha256: {sha}
+ARG evidence_refs: ["{evidence}"]
+@@END@@"""
+
+    decision = parse_agent_turn_decision(
+        wire, tool_schemas={("vt.download_sample", "1"): VT_DOWNLOAD_SAMPLE_SCHEMA}
+    )
+
+    arguments = decision.proposed_tool_calls[0].arguments
+    assert arguments["purpose"] == "Static defensive analysis of the documented sample."
+    validate_json_schema(arguments, VT_DOWNLOAD_SAMPLE_SCHEMA)
+
+
+def test_explicit_purpose_argument_is_not_overridden_by_the_block_purpose() -> None:
+    wire = f"""@@DECISION@@
+GOAL: Acquire a documented sample.
+SUMMARY: Download the sample.
+NEXT: continue
+@@END@@
+@@TOOL@@
+NAME: vt.download_sample
+VERSION: 1
+PURPOSE: Block level purpose.
+ARG sha256: {"b" * 64}
+ARG purpose: Explicit argument purpose.
+ARG evidence_refs: ["{uuid4()}"]
+@@END@@"""
+
+    decision = parse_agent_turn_decision(
+        wire, tool_schemas={("vt.download_sample", "1"): VT_DOWNLOAD_SAMPLE_SCHEMA}
+    )
+
+    assert decision.proposed_tool_calls[0].arguments["purpose"] == "Explicit argument purpose."

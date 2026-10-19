@@ -73,6 +73,8 @@ from cti_app.domain.rule_workbench import (
     RuleTestReport,
     RuleValidationStatus,
     RuleVersionComparison,
+    YaraEngineResult,
+    YaraExecutionStatus,
 )
 
 JSON_SCHEMA_2020_12 = "https://json-schema.org/draft/2020-12/schema"
@@ -368,7 +370,11 @@ class _EmptyRuleCorpusInventory:
 class QuarantineRuleCorpusBytes(RuleCorpusBytesPort):
     """Resolve exact sample bytes from quarantine and bound goodware source blobs."""
 
-    _READABLE_BUCKETS = (SAMPLES_QUARANTINE_BUCKET, "goodware-baselines")
+    _READABLE_BUCKETS = (
+        SAMPLES_QUARANTINE_BUCKET,
+        "network-captures-quarantine",
+        "goodware-baselines",
+    )
 
     def __init__(
         self,
@@ -429,12 +435,17 @@ class QuarantineRuleCorpusBytes(RuleCorpusBytesPort):
         ):
             raise RuleCorpusBytesUnavailable("sample SHA-256 is invalid")
         async with self._uow_factory() as uow:
-            record = await uow.blobs.get_by_address(SAMPLES_QUARANTINE_BUCKET, sample_sha256)
+            record = None
+            for bucket in (SAMPLES_QUARANTINE_BUCKET, "network-captures-quarantine"):
+                record = await uow.blobs.get_by_address(bucket, sample_sha256)
+                if record is not None:
+                    break
         if record is None:
             raise RuleCorpusBytesUnavailable("sample bytes are not present in quarantine")
         descriptor = record.descriptor
         if (
-            descriptor.logical_bucket != SAMPLES_QUARANTINE_BUCKET
+            descriptor.logical_bucket
+            not in {SAMPLES_QUARANTINE_BUCKET, "network-captures-quarantine"}
             or descriptor.sha256 != sample_sha256
             or descriptor.size > self._maximum_sample_bytes
         ):
@@ -480,14 +491,9 @@ class _RuleCorpusSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
-class _CreatedRuleVersion:
-    candidate_id: UUID
-    version: DetectionCandidateVersion | None
-    report: RuleTestReport
-    observation: EvidenceObservation
-    status: ToolInvocationStatus
-    candidate_status: DetectionCandidateStatus
-    corpus: _RuleCorpusSnapshot
+class _CreatedRuleCandidate:
+    version: DetectionCandidateVersion
+    compile_check: YaraEngineResult
 
 
 class _ToolUnavailable(RuntimeError):
@@ -583,6 +589,23 @@ def register_rule_tools(
                     "ni les octets.",
                     *(
                         (
+                            "rule.propose et rule.revise ne font qu'un contrôle de compilation; "
+                            "seul un appel explicite à rule.test produit un statut de validation.",
+                        )
+                        if name in {"rule.propose", "rule.revise"}
+                        else ()
+                    ),
+                    *(
+                        (
+                            "rule.test rapporte le corpus et ses résultats mesurables; une "
+                            "révision exige un faux négatif mesuré sur un positif confirmé; "
+                            "conservez sa provenance réelle ou synthétique.",
+                        )
+                        if name == "rule.test"
+                        else ()
+                    ),
+                    *(
+                        (
                             "meta est facultatif et doit être un objet JSON; omettez-le ou "
                             "utilisez "
                             '{} pour aucune méta. Exemple: ARG meta: {"description": "..."}.',
@@ -618,40 +641,73 @@ class _RuleToolAdapter(ToolAdapter):
         self, arguments: Mapping[str, Any], context: ToolExecutionContext
     ) -> ToolResult:
         started = time.monotonic()
+        exception_class: str | None = None
+        error_code: str | None = None
         try:
             output, status, observation_refs = await self._service.execute(
                 self._tool_name, arguments, context
             )
             message = ""
         except _ToolUnavailable as exc:
-            output = {"reason": str(exc)}
+            error_code = "rule_workbench_unavailable"
+            output = {"error_code": error_code, "reason": _bounded_reason(str(exc))}
             status = ToolInvocationStatus.UNAVAILABLE
             observation_refs = ()
-            message = "Rule workbench capability is unavailable for this operation."
+            message = (
+                f"Rule workbench operation is unavailable ({error_code}). "
+                "Check the listed capability and report this code if it remains unavailable."
+            )
+            exception_class = _bounded_exception_chain(exc)
         except (ValueError, TypeError, KeyError) as exc:
-            output = {"reason": _safe_error_code(exc)}
+            error_code = _safe_error_code(exc)
+            output = {"error_code": error_code, "reason": error_code}
             status = ToolInvocationStatus.FAILED
             observation_refs = ()
-            message = "Rule tool arguments or rule data failed local validation."
+            message = (
+                f"Rule tool input failed local validation ({error_code}). "
+                "Correct the named argument or motif and retry."
+            )
+            exception_class = _bounded_exception_chain(exc)
         except _ToolFailed as exc:
-            output = {"reason": str(exc)}
+            error_code = _bounded_reason(str(exc))
+            output = {"error_code": error_code, "reason": error_code}
             status = ToolInvocationStatus.FAILED
             observation_refs = ()
-            message = exc.agent_message or "Rule workbench could not complete this local operation."
+            message = exc.agent_message or (
+                f"Rule workbench rejected this operation ({error_code}). "
+                "Correct the stated input or precondition, then retry the operation."
+            )
+            exception_class = _bounded_exception_chain(exc)
             _logger.warning(
-                "rule tool %s failed locally: %s",
-                self._tool_name,
-                _safe_error_code(exc),
-                exc_info=exc.__cause__ is not None,
+                "investigation rule tool operation failed locally",
+                extra={
+                    "event": "investigation_tool_rule_operation_failure",
+                    "tool_name": self._tool_name,
+                    "exception_class": exception_class,
+                    "error_code": error_code,
+                },
             )
         except Exception as exc:
-            output = {"reason": _unexpected_operation_error_code(exc)}
+            error_code = "local_rule_operation_failed"
+            cause_summary = _unexpected_operation_error_code(exc)
+            output = {"error_code": error_code, "reason": cause_summary}
             status = ToolInvocationStatus.FAILED
             observation_refs = ()
-            message = "Rule workbench could not complete this local operation."
-            # The agent only sees a generic message; keep the real cause in worker logs.
+            message = (
+                f"Rule workbench operation failed locally ({error_code}). "
+                "Check the candidate index for a persisted version before retrying; if the failure "
+                "persists, report this code."
+            )
+            exception_class = _bounded_exception_chain(exc)
             _logger.warning(
-                "rule tool %s raised %s", self._tool_name, type(exc).__name__, exc_info=True
+                "investigation rule tool operation failed unexpectedly",
+                extra={
+                    "event": "investigation_tool_rule_operation_failure",
+                    "tool_name": self._tool_name,
+                    "exception_class": exception_class,
+                    "error_code": error_code,
+                    "cause_summary": cause_summary,
+                },
             )
         consumed_seconds = min(
             math.ceil(max(0.0, time.monotonic() - started)),
@@ -668,6 +724,8 @@ class _RuleToolAdapter(ToolAdapter):
             budget_consumed=budget,
             output=output,
             message=message,
+            exception_class=exception_class,
+            error_code=error_code,
         )
 
 
@@ -936,6 +994,7 @@ class _RuleTools:
                 or latest.motif_provenance != expected_provenance
             ):
                 raise _ToolFailed("candidate_id_already_exists_with_different_proposal")
+            latest_test = await self._latest_explicit_test_report(context, latest)
             return (
                 {
                     "candidate_id": str(latest.candidate_id),
@@ -946,6 +1005,16 @@ class _RuleTools:
                     ),
                     "source_sha256": latest.source_sha256,
                     "candidate_status": latest.status.value,
+                    "validation_status": (
+                        _rule_validation_status(latest_test)
+                        if latest_test is not None
+                        else RuleValidationStatus.UNTESTED.value
+                    ),
+                    "validation_reason": (
+                        latest_test.get("validation_reason")
+                        if latest_test is not None
+                        else RuleValidationReason.EXPLICIT_TEST_REQUIRED.value
+                    ),
                     "evaluation_status": ToolInvocationStatus.SUCCEEDED.value,
                     "observation_refs": [],
                     "replayed": True,
@@ -955,7 +1024,6 @@ class _RuleTools:
             )
         if all_versions:
             raise _ToolFailed("candidate_id_already_exists")
-        corpus = await self._build_corpus(context.investigation_id)
         result = await self._create_version(
             context,
             candidate_id=candidate_id,
@@ -963,11 +1031,14 @@ class _RuleTools:
             motifs=generated,
             condition=condition,
             meta=meta,
-            corpus=corpus,
-            operation="propose",
         )
         output = self._version_output(result)
-        return output, result.status, (result.observation.id,)
+        status = (
+            ToolInvocationStatus.SUCCEEDED
+            if result.compile_check.status is YaraExecutionStatus.OK
+            else ToolInvocationStatus.PARTIAL
+        )
+        return output, status, ()
 
     async def revise(
         self, arguments: Mapping[str, Any], context: ToolExecutionContext
@@ -983,6 +1054,23 @@ class _RuleTools:
             raise _ToolFailed("parent_must_be_latest")
         if parent.status is DetectionCandidateStatus.APPROVED:
             raise _ToolFailed("approved_versions_are_immutable")
+        previous_test = await self._latest_explicit_test_report(context, parent)
+        if previous_test is None:
+            raise _ToolFailed(
+                "rule_revision_requires_test",
+                agent_message=(
+                    "Run rule.test for this exact candidate and version before revising it. "
+                    "A proposal compile check is not a test."
+                ),
+            )
+        if not _report_demonstrates_false_negative(previous_test):
+            raise _ToolFailed(
+                "rule_revision_not_justified",
+                agent_message=(
+                    "Aucune révision justifiée : le dernier rule.test ne démontre aucun faux "
+                    "négatif parmi les positifs confirmés du corpus contrôlé."
+                ),
+            )
         raw_motifs = _empty_optional_value(arguments.get("motifs"))
         motifs = _motifs_from_json(raw_motifs) if raw_motifs is not None else None
         condition = _empty_optional_value(arguments.get("condition"))
@@ -999,7 +1087,6 @@ class _RuleTools:
         meta = _normalize_meta(arguments.get("meta"))
         if meta is None:
             meta = _meta_from_source(parent.source)
-        corpus = await self._build_corpus(context.investigation_id)
         result = await self._create_version(
             context,
             candidate_id=candidate_id,
@@ -1007,11 +1094,14 @@ class _RuleTools:
             motifs=motifs,
             condition=condition,
             meta=meta,
-            corpus=corpus,
-            operation="revise",
         )
         output = self._version_output(result)
-        return output, result.status, (result.observation.id,)
+        status = (
+            ToolInvocationStatus.SUCCEEDED
+            if result.compile_check.status is YaraExecutionStatus.OK
+            else ToolInvocationStatus.PARTIAL
+        )
+        return output, status, ()
 
     async def revise_with_added_motifs(
         self,
@@ -1043,7 +1133,22 @@ class _RuleTools:
             raise _ToolFailed("revision_adds_no_new_motifs")
         revised_arguments = dict(arguments)
         revised_arguments["motifs"] = [_motif_payload(item) for item in combined.values()]
-        return await self.revise(revised_arguments, context)
+        try:
+            return await self.revise(revised_arguments, context)
+        except _ToolFailed as exc:
+            code = _bounded_reason(str(exc))
+            return (
+                {
+                    "error_code": code,
+                    "message": exc.agent_message
+                    or (
+                        "Rule revision was refused. Check the candidate version and its "
+                        "explicit test report before retrying."
+                    ),
+                },
+                ToolInvocationStatus.FAILED,
+                (),
+            )
 
     async def test(
         self, arguments: Mapping[str, Any], context: ToolExecutionContext
@@ -1199,9 +1304,7 @@ class _RuleTools:
         motifs: Sequence[RuleMotif],
         condition: str,
         meta: Mapping[str, str | int | bool] | None,
-        corpus: _RuleCorpusSnapshot,
-        operation: str,
-    ) -> _CreatedRuleVersion:
+    ) -> _CreatedRuleCandidate:
         assert self.workbench is not None and self.candidates is not None
         validation = self.workbench.validate_motifs(motifs, meta=meta)
         if not validation.valid:
@@ -1211,69 +1314,27 @@ class _RuleTools:
         build = self.workbench.build_rule(motifs, condition, meta)
         if not build.valid or build.source is None:
             raise _ToolFailed("rule_build_failed")
-        report = await self.workbench.compile_and_test(
-            build.source,
-            corpus.cases,
-            selection_bias=corpus.selection_bias,
-            coverage_statement=corpus.coverage_statement,
-            investigation_id=context.investigation_id,
-        )
-        status = _candidate_status(report, corpus)
-        measurable = sum(len(role.matches) + len(role.non_matches) for role in report.roles)
-        evaluation = _status_for_report(report, corpus)
-        if evaluation is ToolInvocationStatus.UNAVAILABLE:
-            observation = await self._record_report(
-                context,
-                report,
-                corpus,
-                candidate_id=candidate_id,
-                version=None,
-                candidate_status=status,
-                operation=operation,
-                proposal_sha256=report.source_sha256,
+        compile_check = self.workbench.compile_check(build.source)
+        if compile_check.status is YaraExecutionStatus.COMPILE_ERROR:
+            line = f" at line {compile_check.line}" if compile_check.line else ""
+            raise _ToolFailed(
+                "rule_syntax_invalid",
+                agent_message=(
+                    f"Generated YARA syntax did not compile{line}. Correct the motif or "
+                    "condition and propose again."
+                ),
             )
-            return _CreatedRuleVersion(
-                candidate_id, None, report, observation, evaluation, status, corpus
-            )
-        if report.execution_status.value not in {"ok", "compile_error"}:
-            observation = await self._record_report(
-                context,
-                report,
-                corpus,
-                candidate_id=candidate_id,
-                version=None,
-                candidate_status=status,
-                operation=operation,
-                proposal_sha256=report.source_sha256,
-            )
-            return _CreatedRuleVersion(
-                candidate_id,
-                None,
-                report,
-                observation,
-                ToolInvocationStatus.UNAVAILABLE,
-                status,
-                corpus,
-            )
-        if measurable == 0 and report.execution_status.value == "ok":
-            observation = await self._record_report(
-                context,
-                report,
-                corpus,
-                candidate_id=candidate_id,
-                version=None,
-                candidate_status=status,
-                operation=operation,
-                proposal_sha256=report.source_sha256,
-            )
-            return _CreatedRuleVersion(
-                candidate_id,
-                None,
-                report,
-                observation,
-                ToolInvocationStatus.UNAVAILABLE,
-                status,
-                corpus,
+        if compile_check.status is YaraExecutionStatus.ENGINE_UNAVAILABLE:
+            if not self.workbench.has_confined_test_runner:
+                raise _ToolUnavailable("rule_compile_check_unavailable")
+        elif compile_check.status is not YaraExecutionStatus.OK:
+            line = f" at line {compile_check.line}" if compile_check.line else ""
+            raise _ToolFailed(
+                "rule_compile_check_failed",
+                agent_message=(
+                    f"YARA compile check could not complete{line} "
+                    f"({compile_check.status.value}). Retry once, then report this limitation."
+                ),
             )
         version_number = 1 if parent is None else parent.version + 1
         parent_id = parent.id if parent is not None else None
@@ -1281,7 +1342,7 @@ class _RuleTools:
             investigation_id=context.investigation_id,
             candidate_id=candidate_id,
             source=build.source,
-            source_sha256=report.source_sha256,
+            source_sha256=hashlib.sha256(build.source.encode("utf-8")).hexdigest(),
             motif_provenance=tuple(
                 MotifProvenance(
                     motif=motif.value,
@@ -1293,61 +1354,102 @@ class _RuleTools:
                     key=lambda item: (item.kind.value, item.value.casefold(), item.provenance_id),
                 )
             ),
-            status=status,
+            status=DetectionCandidateStatus.CANDIDATE,
             version=version_number,
             parent_version_id=parent_id,
-            test_refs=tuple(dict.fromkeys(case.id for case in corpus.cases)),
+            test_refs=(),
         )
         stored = await self.candidates.append_version(version, expected_previous_id=parent_id)
-        observation = await self._record_report(
-            context,
-            report,
-            corpus,
-            candidate_id=candidate_id,
-            version=stored,
-            candidate_status=status,
-            operation=operation,
-        )
-        return _CreatedRuleVersion(
-            candidate_id, stored, report, observation, evaluation, status, corpus
-        )
+        return _CreatedRuleCandidate(version=stored, compile_check=compile_check)
 
     def _version_output(
         self,
-        result: _CreatedRuleVersion,
+        result: _CreatedRuleCandidate,
     ) -> Mapping[str, Any]:
         version = result.version
-        output: dict[str, Any] = {
-            "candidate_id": str(result.candidate_id),
-            "source_sha256": result.report.source_sha256,
-            "candidate_status": result.candidate_status.value,
-            "validation_status": result.report.validation_status.value,
-            "validation_reason": rule_validation_reason(result.report).value,
-            "execution_status": result.report.execution_status.value,
-            "evaluation_status": result.status.value,
-            "report": _report_summary(result.report, result.observation.id, result.corpus),
-            "observation_refs": [str(result.observation.id)],
+        return {
+            "candidate_id": str(version.candidate_id),
+            "version_id": str(version.id),
+            "version": version.version_label,
+            "parent_version_id": (
+                str(version.parent_version_id) if version.parent_version_id else None
+            ),
+            "source_sha256": version.source_sha256,
+            "candidate_status": version.status.value,
+            "validation_status": RuleValidationStatus.UNTESTED.value,
+            "validation_reason": RuleValidationReason.EXPLICIT_TEST_REQUIRED.value,
+            "evaluation_status": (
+                ToolInvocationStatus.SUCCEEDED.value
+                if result.compile_check.status is YaraExecutionStatus.OK
+                else ToolInvocationStatus.PARTIAL.value
+            ),
+            "compile_check": {
+                "status": result.compile_check.status.value,
+                "engine_version": result.compile_check.engine_version[:200],
+                "line": result.compile_check.line,
+                "purpose": "syntax_only; rule.test has not run",
+            },
+            "observation_refs": [],
         }
-        if version is not None:
-            output.update(
-                {
-                    "version_id": str(version.id),
-                    "version": version.version_label,
-                    "parent_version_id": (
-                        str(version.parent_version_id) if version.parent_version_id else None
-                    ),
-                }
-            )
-        return output
+
+    async def _latest_explicit_test_report(
+        self, context: ToolExecutionContext, version: DetectionCandidateVersion
+    ) -> Mapping[str, Any] | None:
+        if self.evidence_observations is None or self.evidence_payloads is None:
+            return None
+        observations = await self.evidence_observations.list_for_investigation(
+            context.investigation_id
+        )
+        matching = sorted(
+            (
+                observation
+                for observation in observations
+                if observation.kind is EvidenceKind.YARA_MATCH
+                and observation.object_type == "detection_candidate_version"
+                and observation.object_id == str(version.id)
+            ),
+            key=lambda item: (item.observed_at, item.id.hex),
+            reverse=True,
+        )
+        for observation in matching:
+            try:
+                payload = await self.evidence_payloads.read_json(observation.blob_id)
+            except Exception:
+                continue
+            if (
+                isinstance(payload, Mapping)
+                and payload.get("schema") == "investigation-yara-test.v1"
+                and payload.get("operation") == "test"
+                and payload.get("candidate_id") == str(version.candidate_id)
+                and payload.get("version_id") == str(version.id)
+                and payload.get("source_sha256") == version.source_sha256
+            ):
+                return payload
+        return None
 
     async def _build_corpus(self, investigation_id: UUID) -> _RuleCorpusSnapshot:
         assert self.associations is not None
+        limitations: list[str] = []
+        manual_import_reader = getattr(self.corpus_inventory, "manual_rule_corpus_imports", None)
+        try:
+            manual_imports = tuple(
+                await manual_import_reader(investigation_id)
+                if callable(manual_import_reader)
+                else ()
+            )
+        except Exception:
+            manual_imports = ()
+            limitations.append("L'inventaire des imports manuels du corpus n'a pas pu être lu.")
+        manual_import_hashes = {item.sample_sha256 for item in manual_imports}
+
         associations = await self.associations.list_for_investigation(investigation_id)
         by_hash: dict[str, list[SampleAssociation]] = {}
         for association in associations:
             by_hash.setdefault(association.sample_sha256, []).append(association)
         cases: dict[tuple[RuleTestCorpusRole, str], RuleTestCase] = {}
         for sample_sha256, matches in by_hash.items():
+            if sample_sha256 in manual_import_hashes:
+                continue
             confirmed = any(item.qualification is SampleQualification.CONFIRMED for item in matches)
             documented_seed = any(
                 item.origin is SampleOrigin.SEED
@@ -1361,17 +1463,6 @@ class _RuleTools:
             )
             cases[(role, sample_sha256)] = _rule_case(investigation_id, role, sample_sha256)
 
-        limitations: list[str] = []
-        manual_import_reader = getattr(self.corpus_inventory, "manual_rule_corpus_imports", None)
-        try:
-            manual_imports = tuple(
-                await manual_import_reader(investigation_id)
-                if callable(manual_import_reader)
-                else ()
-            )
-        except Exception:
-            manual_imports = ()
-            limitations.append("L'inventaire des imports manuels du corpus n'a pas pu être lu.")
         manual_goodware_present = any(
             item.role is RuleTestCorpusRole.GOODWARE for item in manual_imports
         )
@@ -1605,6 +1696,7 @@ def _report_payload(
     corpus: _RuleCorpusSnapshot,
     candidate_status: DetectionCandidateStatus,
 ) -> dict[str, Any]:
+    revision_recommendation, revision_guidance = _revision_guidance(report)
     return {
         "source_sha256": report.source_sha256,
         "execution_status": report.execution_status.value,
@@ -1620,6 +1712,9 @@ def _report_payload(
         "false_positive_sha256s": list(report.false_positive_sha256s),
         "false_negative_count": len(report.false_negative_sha256s),
         "false_negative_sha256s": list(report.false_negative_sha256s),
+        "non_measurable_count": sum(len(role.non_measurable) for role in report.roles),
+        "revision_recommendation": revision_recommendation,
+        "revision_guidance": revision_guidance,
         "corpus_sha256s_by_role": {
             role.value: list(hashes) for role, hashes in corpus.hashes_by_role().items()
         },
@@ -1659,6 +1754,7 @@ def _report_summary(
     observation_id: UUID | None,
     corpus: _RuleCorpusSnapshot | None,
 ) -> dict[str, Any]:
+    revision_recommendation, revision_guidance = _revision_guidance(report)
     result: dict[str, Any] = {
         "source_sha256": report.source_sha256,
         "execution_status": report.execution_status.value,
@@ -1672,6 +1768,12 @@ def _report_summary(
         "false_positive_sha256s": list(report.false_positive_sha256s),
         "false_negative_count": len(report.false_negative_sha256s),
         "false_negative_sha256s": list(report.false_negative_sha256s),
+        "non_measurable_count": sum(len(role.non_measurable) for role in report.roles),
+        "revision_recommendation": revision_recommendation,
+        "revision_guidance": revision_guidance,
+        "corpus_sha256s_by_role": {
+            role.role.value: list(role.corpus_sha256s) for role in report.roles
+        },
         "roles": [
             {
                 "role": role.role.value,
@@ -1698,6 +1800,71 @@ def _report_summary(
     if corpus is not None:
         result["limitations"] = list(corpus.limitations)
     return result
+
+
+def _revision_guidance(report: RuleTestReport) -> tuple[str, str]:
+    measurable = sum(len(role.matches) + len(role.non_matches) for role in report.roles)
+    if report.execution_status is not YaraExecutionStatus.OK or measurable == 0:
+        return (
+            "not_assessable",
+            "A revision decision is not measurable from this test; verify corpus bytes and "
+            "rerun rule.test.",
+        )
+    if _confirmed_positive_false_negative_hashes(report):
+        return (
+            "revise_false_negative",
+            "A confirmed-positive byte sample was missed; revise only to address this measured "
+            "false negative and preserve the sample provenance in the report.",
+        )
+    return (
+        "none_justified",
+        "Aucune révision justifiée : aucun faux négatif n'est démontré dans le corpus contrôlé.",
+    )
+
+
+def _confirmed_positive_false_negative_hashes(report: RuleTestReport) -> frozenset[str]:
+    false_negatives = set(report.false_negative_sha256s)
+    return frozenset(
+        case.sample_sha256
+        for role in report.roles
+        if role.role is RuleTestCorpusRole.CONFIRMED_POSITIVE
+        for case in role.test_cases
+        if case.sample_sha256 in false_negatives and case.sample_sha256 in role.non_matches
+    )
+
+
+def _report_demonstrates_false_negative(payload: Mapping[str, Any]) -> bool:
+    false_negatives = payload.get("false_negative_sha256s")
+    if not isinstance(false_negatives, Sequence) or isinstance(false_negatives, str | bytes):
+        return False
+    hashes = {item for item in false_negatives if isinstance(item, str)}
+    roles = payload.get("roles")
+    if not isinstance(roles, Sequence) or isinstance(roles, str | bytes):
+        return False
+    for role in roles:
+        if (
+            not isinstance(role, Mapping)
+            or role.get("role") != RuleTestCorpusRole.CONFIRMED_POSITIVE.value
+        ):
+            continue
+        cases = role.get("test_cases")
+        if not isinstance(cases, Sequence) or isinstance(cases, str | bytes):
+            continue
+        if any(
+            isinstance(case, Mapping)
+            and case.get("outcome") == "no_match"
+            and case.get("sha256") in hashes
+            for case in cases
+        ):
+            return True
+    return False
+
+
+def _rule_validation_status(payload: Mapping[str, Any]) -> str:
+    try:
+        return RuleValidationStatus(payload.get("validation_status", "untested")).value
+    except (TypeError, ValueError):
+        return RuleValidationStatus.UNTESTED.value
 
 
 def _case_outcome(role: RuleRoleTestReport, sample_sha256: str) -> str:
@@ -1746,7 +1913,10 @@ def _version_summary(
 ) -> dict[str, Any]:
     """Expose stable validation status/reason fields for rule.get and publication consumers."""
     matching_reports = tuple(
-        report for report in reports if report.get("source_sha256") == version.source_sha256
+        report
+        for report in reports
+        if report.get("operation") == "test"
+        and report.get("source_sha256") == version.source_sha256
     )
     latest_report = matching_reports[-1] if matching_reports else None
     try:
@@ -1756,7 +1926,7 @@ def _version_summary(
     except (TypeError, ValueError):
         validation_status = RuleValidationStatus.UNTESTED.value
     fallback_reasons = {
-        RuleValidationStatus.UNTESTED.value: RuleValidationReason.CORPUS_EMPTY.value,
+        RuleValidationStatus.UNTESTED.value: RuleValidationReason.EXPLICIT_TEST_REQUIRED.value,
         RuleValidationStatus.SYNTHETIC_ONLY.value: RuleValidationReason.SYNTHETIC_POSITIVES.value,
         RuleValidationStatus.REAL_VALIDATED.value: RuleValidationReason.VALIDATED.value,
     }
@@ -1769,7 +1939,7 @@ def _version_summary(
                 ),
             )
             if latest_report
-            else RuleValidationReason.CORPUS_EMPTY.value
+            else RuleValidationReason.EXPLICIT_TEST_REQUIRED.value
         ).value
     except (TypeError, ValueError):
         validation_reason = RuleValidationReason.EXECUTION_INCOMPLETE.value
@@ -1786,9 +1956,14 @@ def _version_summary(
                 "validation_status": validation_status,
                 "validation_reason": validation_reason,
                 "execution_status": latest_report.get("execution_status"),
+                "corpus_sha256": latest_report.get("corpus_sha256"),
+                "corpus_sha256s_by_role": latest_report.get("corpus_sha256s_by_role", {}),
                 "provenance_counts_by_role": latest_report.get("provenance_counts_by_role", {}),
                 "false_positive_count": latest_report.get("false_positive_count", 0),
                 "false_negative_count": latest_report.get("false_negative_count", 0),
+                "non_measurable_count": latest_report.get("non_measurable_count", 0),
+                "revision_recommendation": latest_report.get("revision_recommendation"),
+                "revision_guidance": latest_report.get("revision_guidance"),
             }
             if latest_report is not None
             else None
@@ -1993,6 +2168,27 @@ def _safe_error_code(exc: Exception) -> str:
     if isinstance(exc, ValueError):
         return "invalid_rule_input"
     return "local_rule_operation_failed"
+
+
+def _bounded_reason(value: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9_.:-]", "_", value)[:96]
+    return normalized or "unspecified"
+
+
+def _bounded_exception_chain(exc: BaseException) -> str:
+    names: list[str] = []
+    current = exc
+    seen: set[int] = set()
+    for _ in range(4):
+        if id(current) in seen:
+            break
+        seen.add(id(current))
+        names.append(_safe_exception_type_name(current))
+        cause = current.__cause__ or current.__context__
+        if cause is None:
+            break
+        current = cause
+    return ":".join(names)[:96] or "UnknownError"
 
 
 def _unexpected_operation_error_code(exc: Exception) -> str:

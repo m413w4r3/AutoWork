@@ -23,12 +23,15 @@ class RuleCorpusImportResponse(BaseModel):
     schema_version: str = "manual-rule-corpus-import.v1"
     investigation_id: UUID
     observation_id: UUID
+    sample_id: UUID
+    association_id: UUID
     sha256: str
     size_bytes: int
     intended_role: RuleTestCorpusRole
     provenance: RuleSampleProvenance
     reason: str
     source_description: str
+    source: str = "operator_import"
     idempotent_replay: bool
     local_only: bool = True
     executed: bool = False
@@ -185,6 +188,8 @@ async def import_rule_corpus_file(
     return RuleCorpusImportResponse(
         investigation_id=imported.investigation_id,
         observation_id=imported.observation_id,
+        sample_id=imported.sample_id,
+        association_id=imported.association_id,
         sha256=imported.sha256,
         size_bytes=imported.size_bytes,
         intended_role=imported.intended_role,

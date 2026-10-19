@@ -27,6 +27,11 @@ class ToolInvocationStatus(StrEnum):
     PARTIAL = "partial"
 
 
+class InvestigationExecutionMode(StrEnum):
+    BRIDGE_LED = "bridge_led"
+    OPERATOR_LED = "operator_led"
+
+
 class EvidenceKind(StrEnum):
     VT_FILE_REPORT = "vt_file_report"
     VT_RELATIONSHIP = "vt_relationship"

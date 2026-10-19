@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Protocol
 from uuid import UUID
 
@@ -160,6 +160,39 @@ class LocalSampleAnalysisService:
         self._analysis_timeout_seconds = analysis_timeout_seconds
         self._max_output_bytes = max_output_bytes
 
+    async def describe(self, association_id: UUID) -> Mapping[str, Any]:
+        """Return quarantine metadata without reading the sample bytes."""
+        sample = await self._hits.resolve_quarantined_sample(association_id)
+        async with self._uow_factory() as uow:
+            association = await uow.sample_associations.get(association_id)
+            blob = await uow.blobs.get(sample.blob_id)
+            stored_sample = await uow.samples.get(sample.sample_id)
+        if (
+            association is None
+            or association.investigation_id != sample.investigation_id
+            or association.sample_sha256 != sample.sha256
+            or blob is None
+            or blob.descriptor.sha256 != sample.sha256
+        ):
+            return {}
+        mime_type = blob.descriptor.mime_type
+        detected_type = (
+            mime_type
+            if mime_type.casefold() not in {"application/octet-stream", "binary/octet-stream"}
+            else None
+        )
+        provenance = (
+            "operator_import"
+            if stored_sample is not None and stored_sample.source_service == "operator_import"
+            else "vt_download"
+        )
+        return {
+            "byte_size": blob.descriptor.size,
+            "detected_type": detected_type,
+            "provenance": provenance,
+            "qualification": association.qualification.value,
+        }
+
     async def analyze(
         self,
         *,
@@ -293,6 +326,15 @@ class LocalSampleAnalysisService:
                     outcome_status = ToolInvocationStatus.SUCCEEDED
                 else:
                     outcome_status = ToolInvocationStatus.PARTIAL
+                partial_reason = (
+                    _sample_analysis_partial_reason(
+                        worker_status=worker_status,
+                        worker_families=extractor_results,
+                        goodware_summary=goodware_summary,
+                    )
+                    if outcome_status is ToolInvocationStatus.PARTIAL
+                    else None
+                )
                 observation_refs = (
                     *((strings_observation.id,) if strings_observation is not None else ()),
                     observation.id,
@@ -306,9 +348,14 @@ class LocalSampleAnalysisService:
                         "sample_sha256": sample.sha256,
                         "qualification": SampleQualification.CANDIDATE.value,
                         "extractors": extractors,
+                        "engines_executed": sorted(extractors),
+                        "engine_statuses": {
+                            name: family.get("status") for name, family in extractors.items()
+                        },
                         "code_features": extractor_results.get("smda", {}).get("code_features"),
                         "goodware": goodware_summary,
                         "strings_recorded": len(strings),
+                        "partial_reason": partial_reason,
                         "result_blob_id": str(result.result_blob_id),
                         "result_sha256": result.result_sha256,
                         "operation_key": result.operation_key,
@@ -415,9 +462,34 @@ class LocalSampleAnalysisService:
         }
 
 
+def _sample_analysis_partial_reason(
+    *,
+    worker_status: str,
+    worker_families: Mapping[str, Mapping[str, Any]],
+    goodware_summary: Mapping[str, Any],
+) -> str:
+    reasons: list[str] = []
+    if worker_status not in {"SUCCEEDED", "SUCCESS", "COMPLETE"}:
+        reasons.append(f"analysis_worker_status:{worker_status.lower()}")
+    for family_name, family_result in worker_families.items():
+        status_value = str(family_result.get("status", "unknown")).lower()
+        if status_value not in {"succeeded", "success", "complete", "ok"}:
+            detail = family_result.get("available_reason") or family_result.get("reason")
+            suffix = f" ({sanitize_evidence_text(detail, max_chars=160)})" if detail else ""
+            reasons.append(f"{family_name}:{status_value}{suffix}")
+    if goodware_summary.get("available") is not True:
+        detail = goodware_summary.get("reason") or goodware_summary.get("error_type")
+        reasons.append(
+            "goodware_measurement_unavailable"
+            + (f":{sanitize_evidence_text(detail, max_chars=160)}" if detail else "")
+        )
+    return "; ".join(reasons)[:512] or "analysis_partial_reason_unavailable"
+
+
 class _DownloadSampleAdapter:
-    def __init__(self, hits: HitAcquisitionService) -> None:
+    def __init__(self, hits: HitAcquisitionService, analyzer: SampleAnalyzer | None = None) -> None:
         self._hits = hits
+        self._analyzer = analyzer
 
     async def execute(
         self, arguments: Mapping[str, Any], context: ToolExecutionContext
@@ -445,7 +517,21 @@ class _DownloadSampleAdapter:
                 exception_class=type(exc).__name__,
                 error_code=getattr(exc, "code", None) or "hit_acquisition_rejected",
             )
-        return _acquisition_tool_result(result)
+        tool_result = _acquisition_tool_result(result)
+        describe = getattr(self._analyzer, "describe", None)
+        if result.status is ToolInvocationStatus.SUCCEEDED and callable(describe):
+            try:
+                metadata = await describe(result.association.id)
+            except Exception:
+                metadata = None
+            if isinstance(metadata, Mapping):
+                output = dict(tool_result.output)
+                for key in ("byte_size", "detected_type", "provenance", "qualification"):
+                    value = metadata.get(key)
+                    if value is not None:
+                        output[key] = value
+                tool_result = replace(tool_result, output=output)
+        return tool_result
 
 
 class _SampleAnalyzeAdapter:
@@ -479,10 +565,22 @@ class _SampleAnalyzeAdapter:
                 ToolInvocationStatus.FAILED,
                 message=f"Sample analysis input was rejected ({type(exc).__name__}).",
             )
+        output = dict(outcome.output)
+        describe = getattr(self._analyzer, "describe", None)
+        if callable(describe):
+            try:
+                metadata = await describe(association.id)
+            except Exception:
+                metadata = None
+            if isinstance(metadata, Mapping):
+                for key in ("byte_size", "detected_type", "provenance", "qualification"):
+                    value = metadata.get(key)
+                    if value is not None:
+                        output.setdefault(key, value)
         return ToolResult(
             status=outcome.status,
             observation_refs=outcome.observation_refs,
-            output=outcome.output,
+            output=output,
             suggested_alternatives=(
                 ("vt.file_report", "vt.relationships")
                 if outcome.status
@@ -559,13 +657,15 @@ def register_acquisition_tools(
             cost_model=_ACQUISITION_COST,
             confidentiality=ToolConfidentiality.RESTRICTED,
             limitations=(
-                "Downloads use VirusTotal's existing hash-verified quarantine path.",
+                "New bytes use VirusTotal's hash-verified quarantine path; verified reuse of a "
+                "same-subject quarantined Sample does not call VirusTotal.",
+                "On success the output includes association_id; pass that value to sample.analyze.",
                 "Acquisition leaves membership in candidate state; it is not G3.",
                 "A request outside G2 returns needs_review and asks for permission.",
             ),
             capability_key=VT_FILE_DOWNLOAD_CAPABILITY,
         ),
-        _DownloadSampleAdapter(hits),
+        _DownloadSampleAdapter(hits, analyzer),
     )
     registry.register(
         ToolDefinition(

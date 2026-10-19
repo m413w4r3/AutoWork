@@ -30,11 +30,11 @@ class SubprocessRunner(Protocol):
 class CapaMeta(BaseModel):
     model_config = ConfigDict(extra="ignore")
     name: StrictStr
-    namespace: StrictStr | None
+    namespace: StrictStr | None = None
     attack: list[CapaAttackSpec] = Field(
         default_factory=list, validation_alias=AliasChoices("att&ck", "attack")
     )
-    mbc: list[CapaMbcSpec]
+    mbc: list[CapaMbcSpec] = Field(default_factory=list)
 
 
 class CapaAttackSpec(BaseModel):
@@ -150,20 +150,37 @@ class CapaRunner:
         memory_limit_bytes: int,
     ) -> tuple[str, AnalysisSubprocessResult]:
         rules_path = _absolute_path(rules_path)
-        with tempfile.NamedTemporaryFile(prefix="cti-capa-", delete=False) as handle:
-            handle.write(sample)
-            sample_path = handle.name
-        try:
+        with tempfile.TemporaryDirectory(prefix="cti-capa-", dir="/tmp") as name:
+            workspace = Path(name)
+            home = workspace / "home"
+            config_home = home / ".config"
+            cache_home = home / ".cache"
+            for directory in (config_home, cache_home):
+                directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            sample_path = workspace / "sample.bin"
+            sample_path.write_bytes(sample)
             result = await self._runner(
-                ["capa", "-r", str(rules_path), "--json", sample_path],
+                [
+                    "/usr/bin/env",
+                    f"HOME={home}",
+                    f"XDG_CONFIG_HOME={config_home}",
+                    f"XDG_CACHE_HOME={cache_home}",
+                    "capa",
+                    "-r",
+                    str(rules_path),
+                    "--json",
+                    str(sample_path),
+                ],
                 timeout_seconds=timeout_seconds,
                 output_limit=output_limit,
                 memory_limit_bytes=memory_limit_bytes,
-                environment={"PATH": os.environ.get("PATH", ""), "LANG": "C", "LC_ALL": "C"},
+                environment={
+                    "HOME": str(home),
+                    "XDG_CONFIG_HOME": str(config_home),
+                    "XDG_CACHE_HOME": str(cache_home),
+                    "PATH": os.environ.get("PATH", ""),
+                    "LANG": "C",
+                    "LC_ALL": "C",
+                },
             )
             return "9.4.0", result
-        finally:
-            try:
-                os.unlink(sample_path)
-            except FileNotFoundError:
-                pass

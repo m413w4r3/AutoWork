@@ -1552,20 +1552,22 @@ async def test_real_typst_frontmatter_and_120_original_iocs_flow_across_pages(
     assert len(reader.pages) >= 2
     assert "[Example actor] Décrit une activité documentée" in text
     assert "RÉFÉRENCES" in text
-    assert text.count("IOC") == 3
+    assert text.count("IOC") == 2
+    assert "Technical IOC feed" not in text
     reserve_heading = "IOC originaux à lien non démontré"
     assert reserve_heading in text
     reserve_position = text.index(reserve_heading)
-    assert text.index("core.example") < reserve_position
+    assert text.index("core[.]example") < reserve_position
     assert "Le lien avec le sujet" in text and "pas démontré" in text
     assert "10 janvier 2026" in text
     assert "https://a.example/report" in text
     assert "Date de publication non précisée" in text
-    assert all(f"original-{index:03d}.example" in compact_text for index in range(120))
+    assert all(f"original-{index:03d}[.]example" in compact_text for index in range(120))
     main_list_text = text[:reserve_position]
     reserve_list_text = text[reserve_position:]
     assert all(f"original-{index:03d}.example" not in main_list_text for index in range(120))
-    assert all(f"original-{index:03d}.example" in reserve_list_text for index in range(120))
+    assert all(f"original-{index:03d}[.]example" in main_list_text for index in range(120))
+    assert all(f"original-{index:03d}[.]example" not in reserve_list_text for index in range(120))
 
     output_dir = anyio.Path(
         os.environ.get("AUTOWORK_REVIEW_ARTIFACT_DIR", str(tmp_path / "review"))

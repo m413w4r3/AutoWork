@@ -16,7 +16,10 @@ from pydantic import SecretStr
 import cti_app.infrastructure.local_command_runner as local_command_runner_module
 from cti_app.api import main as api_main
 from cti_app.application.capabilities import CAPA_ANALYSIS_JOB_KIND
-from cti_app.application.confined_analysis import CONFINED_ANALYSIS_JOB_KIND
+from cti_app.application.confined_analysis import (
+    CONFINED_ANALYSIS_JOB_KIND,
+    ConfinedAnalysisFamilyStatus,
+)
 from cti_app.application.identity import (
     LocalIdentityProvider,
     StaticTokenIdentityProvider,
@@ -109,7 +112,7 @@ def test_strict_mode_hides_execution_tools_without_measured_filesystem_confineme
         mwcp_parser_versions={"safe.parser": "1.0"},
     )
     assert settings.local_analysis_require_filesystem_confinement is True
-    catalog = _local_command_catalog(settings, filesystem_confined=False)
+    catalog = _local_command_catalog(settings, family_statuses={})
 
     assert catalog.available_commands() == ()
     assert LOCAL_RUN_COMMAND not in local_tool_capabilities(catalog, ghidra_enabled=False)
@@ -122,7 +125,14 @@ def test_strict_confined_catalog_never_runs_unconfined_version_probes(
     monkeypatch.setenv("LOCAL_ANALYSIS_REQUIRE_FILESYSTEM_CONFINEMENT", "1")
     settings = Settings(_env_file=None, local_analysis_enabled=True)
 
-    catalog = _local_command_catalog(settings, filesystem_confined=True)
+    catalog = _local_command_catalog(
+        settings,
+        family_statuses={
+            "local_command": ConfinedAnalysisFamilyStatus(
+                "local_command", True, "local-command-catalog-v1"
+            )
+        },
+    )
     file_capability = catalog.get(LocalCommandId.FILE)
 
     assert file_capability is not None and file_capability.available
@@ -161,7 +171,10 @@ def test_strict_runtime_disables_every_unconfined_local_executor(
     statuses = {status.family: status for status in runtime.statuses}
     ports = runtime.optional_tool_ports
 
-    assert statuses["local_command_execution"].reason == "no_network_namespace_available"
+    assert statuses["local_command_execution"].reason == (
+        "analysis_worker_disabled_by_configuration"
+    )
+    assert statuses["local_command_execution"].execution_mode == "analysis-worker"
     assert statuses["rule_workbench"].reason == "analysis_worker_disabled_by_configuration"
     assert statuses["rule_workbench"].execution_mode == "unavailable"
     assert statuses["local_filesystem_confinement"].reason == "no_network_namespace_available"
@@ -578,6 +591,66 @@ async def test_static_operator_token_authenticates_without_becoming_identity_or_
     provider = StaticTokenIdentityProvider(token)
     assert provider.verify_authorization(f"Bearer {token}")
     assert not provider.verify_authorization("Bearer wrong-token")
+
+
+@pytest.mark.asyncio
+async def test_operator_client_token_has_a_separate_scope_and_cannot_make_human_decisions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    human_token = "human-token-for-supervised-pilot-2026"
+    client_token = "operator-client-token-for-pilot-2026"
+    monkeypatch.setattr(
+        api_main,
+        "get_settings",
+        lambda: Settings(
+            app_env="pilot",
+            api_bind_host="0.0.0.0",
+            operator_api_token=SecretStr(human_token),
+            operator_client_api_token=SecretStr(client_token),
+        ),
+    )
+    application = api_main.create_app()
+    identity_provider = application.state.identity_provider
+    assert identity_provider.identity_for_authorization(f"Bearer {client_token}").actor_id == (
+        "operator:operator-client"
+    )
+    assert identity_provider.identity_for_authorization(f"Bearer {human_token}").actor_id == (
+        "operator:static-token"
+    )
+
+    investigation_id = "00000000-0000-0000-0000-000000000101"
+    association_id = "00000000-0000-0000-0000-000000000102"
+    opinion_id = "00000000-0000-0000-0000-000000000103"
+    denied_paths = (
+        f"/api/investigations/{investigation_id}/envelope/approve",
+        f"/api/investigations/{investigation_id}/envelope/extend",
+        f"/api/investigations/{investigation_id}/envelope/revoke",
+        f"/api/opinions/{opinion_id}/approve",
+        f"/api/opinions/{opinion_id}/publish",
+        f"/api/investigations/{investigation_id}/samples/{association_id}/qualify",
+        f"/api/investigations/{investigation_id}/operator/tools/sample.set_qualification",
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application), base_url="http://testserver"
+    ) as client:
+        status = await client.get(
+            "/api/identity/status",
+            headers={"Authorization": f"Bearer {client_token}"},
+        )
+        denied = [
+            await client.post(
+                path,
+                headers={"Authorization": f"Bearer {client_token}"},
+            )
+            for path in denied_paths
+        ]
+
+    assert status.json()["human_identity"] is False
+    assert status.json()["approvals_allowed"] is False
+    assert all(response.status_code == 403 for response in denied)
+    assert all(
+        response.json()["detail"]["code"] == "operator_client_scope_denied" for response in denied
+    )
 
 
 def test_backend_image_has_only_the_investigation_runtime_analysis_dependencies() -> None:

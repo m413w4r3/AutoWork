@@ -47,6 +47,7 @@ class NetworkTransport(StrEnum):
     TCP = "tcp"
     UDP = "udp"
     OTHER = "other"
+    UNKNOWN = "unknown"
 
 
 class StreamDirection(StrEnum):

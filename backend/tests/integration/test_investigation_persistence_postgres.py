@@ -50,6 +50,7 @@ from cti_app.domain.investigation import (
     InvestigationAgenda,
     InvestigationBudget,
     InvestigationEnvelope,
+    InvestigationExecutionMode,
     InvestigationFinding,
     MotifProvenance,
     NoveltyClass,
@@ -153,7 +154,17 @@ async def test_investigation_repositories_have_memory_postgres_parity(
             assert state_row.stop_reason is None
             assert state_row.state["no_progress_streak"] == 1
             assert state_row.state["hypotheses"][0]["status"] == "supported"
+            assert (
+                state_row.state["execution_mode"] == InvestigationExecutionMode.OPERATOR_LED.value
+            )
+            legacy_payload = dict(state_row.state)
+            legacy_payload.pop("execution_mode")
+            state_row.state = legacy_payload
             await uow.commit()
+            uow._session.expire_all()
+            legacy_state = await uow.investigation_states.get(investigation.id)
+            assert legacy_state is not None
+            assert legacy_state.execution_mode is InvestigationExecutionMode.BRIDGE_LED
 
             observation = await uow.evidence_observations.get(
                 (await uow.evidence_observations.list_for_investigation(investigation.id))[0].id
@@ -182,6 +193,7 @@ async def _assert_repository_contract(
             )
         ),
         hypotheses=(hypothesis,),
+        execution_mode=InvestigationExecutionMode.OPERATOR_LED,
     )
     state_repository = persistence.investigation_states
     assert (

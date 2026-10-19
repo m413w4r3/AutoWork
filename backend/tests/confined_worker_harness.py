@@ -201,6 +201,11 @@ def build_confined_worker_harness(
         "analysis_smda_expected_version": detected_versions.get("smda"),
         "analysis_tshark_expected_version": detected_versions.get("tshark"),
         "analysis_capinfos_expected_version": detected_versions.get("capinfos"),
+        "analysis_local_file_expected_version": detected_versions.get("local_file"),
+        "analysis_local_binutils_expected_version": detected_versions.get("local_strings"),
+        "analysis_local_xxd_expected_version": detected_versions.get("local_xxd"),
+        "analysis_local_coreutils_expected_version": detected_versions.get("local_sha256sum"),
+        "analysis_local_monodis_expected_version": detected_versions.get("local_monodis"),
     }
     worker_settings = base_settings.model_copy(
         update={key: value for key, value in expected_versions.items() if value is not None}

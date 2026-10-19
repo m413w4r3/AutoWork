@@ -7,10 +7,11 @@ import json
 import logging
 import re
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
 from io import BytesIO
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid5
 
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.evidence_recorder import ProductionEvidenceRecorder, sanitize_evidence_text
@@ -19,8 +20,10 @@ from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.sample_acquisition import SAMPLES_QUARANTINE_BUCKET
 from cti_app.config import Settings
-from cti_app.domain.investigation import EvidenceKind, EvidenceObservation
-from cti_app.domain.production import AnalystInvestigationStatus
+from cti_app.domain.entities import ProvenanceEvent, Sample, SampleOrigin, SampleState
+from cti_app.domain.investigation import EvidenceKind, EvidenceObservation, SampleAssociation
+from cti_app.domain.investigation import SampleOrigin as AssociationSampleOrigin
+from cti_app.domain.production import AnalystInvestigation, AnalystInvestigationStatus
 from cti_app.domain.rule_workbench import (
     RuleCorpusInventoryItem,
     RuleSampleProvenance,
@@ -31,6 +34,7 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _IMPORT_SOURCE = "operator.rule-corpus"
 _IMPORT_VERSION = "manual-rule-corpus-import.v1"
 _IMPORT_OBJECT_TYPE = "manual_rule_corpus_import"
+_OPERATOR_IMPORT_ASSOCIATION_NAMESPACE = UUID("b7bcc71a-5fb4-4e18-93d6-a82b8aa813dc")
 _METADATA_PREFIX = "manual_rule_corpus_metadata:"
 _HARD_MAX_UPLOAD_BYTES = 64 * 1024 * 1024
 _TERMINAL_STATUSES = frozenset(
@@ -73,6 +77,8 @@ class ImportedRuleCorpusFile:
     reason: str
     source_description: str
     operator_id: str
+    sample_id: UUID
+    association_id: UUID
     idempotent_replay: bool = False
 
     @property
@@ -171,10 +177,21 @@ class ManualRuleCorpusImportService:
                 prior = parse_manual_rule_corpus_metadata(prior_observation)
                 if prior is None:
                     raise ValueError("Existing rule-corpus import metadata is unreadable")
+                sample, association = await self._ensure_imported_sample(
+                    uow,
+                    investigation=investigation,
+                    blob=record,
+                    sha256=actual_sha256,
+                    metadata=prior,
+                    object_id=object_id,
+                )
+                await uow.commit()
                 imported = _import_from_observation(
                     prior_observation,
                     size_bytes=record.descriptor.size,
                     metadata=prior,
+                    sample_id=sample.id,
+                    association_id=association.id,
                     idempotent_replay=True,
                 )
                 _audit_import(imported)
@@ -229,6 +246,14 @@ class ManualRuleCorpusImportService:
                 limitations=limitations,
                 idempotency_key=f"rule-corpus-import:{investigation_id}:{actual_sha256}:{role.value}",
             )
+            sample, association = await self._ensure_imported_sample(
+                uow,
+                investigation=investigation,
+                blob=blob,
+                sha256=actual_sha256,
+                metadata=metadata,
+                object_id=object_id,
+            )
             await uow.commit()
 
         imported = ImportedRuleCorpusFile(
@@ -242,9 +267,103 @@ class ManualRuleCorpusImportService:
             reason=clean_reason,
             source_description=clean_source_description,
             operator_id=clean_operator_id,
+            sample_id=sample.id,
+            association_id=association.id,
         )
         _audit_import(imported)
         return imported
+
+    @staticmethod
+    async def _ensure_imported_sample(
+        uow: Any,
+        *,
+        investigation: AnalystInvestigation,
+        blob: Any,
+        sha256: str,
+        metadata: dict[str, Any],
+        object_id: str,
+    ) -> tuple[Sample, SampleAssociation]:
+        if (
+            blob.descriptor.sha256 != sha256
+            or blob.descriptor.logical_bucket != SAMPLES_QUARANTINE_BUCKET
+        ):
+            raise ValueError("Operator-imported bytes are not the verified quarantine blob")
+        subject = await uow.subjects.get(investigation.subject_id)
+        if subject is None:
+            raise ValueError("The imported investigation subject does not exist")
+
+        sample = await uow.samples.get_by_subject_and_blob(subject.id, blob.id)
+        if sample is None:
+            sample = Sample(
+                subject_id=subject.id,
+                blob_id=blob.id,
+                original_name=sha256,
+                origin="operator_import",
+                acquired_at=datetime.now(UTC),
+                license_restriction=None,
+                tlp=subject.tlp,
+                do_not_submit=True,
+                external_llm_allowed=False,
+                origin_kind=SampleOrigin.MANUAL,
+                state=SampleState.QUARANTINED,
+                source_service="operator_import",
+                source_object_id=sha256,
+                expected_hash=sha256,
+            )
+            await uow.samples.add(sample)
+        elif sample.state not in {SampleState.QUARANTINED, SampleState.REVIEW_CANDIDATE}:
+            raise ValueError("An operator import cannot reuse a sample outside quarantine")
+
+        association = next(
+            (
+                item
+                for item in await uow.sample_associations.list_for_investigation(investigation.id)
+                if item.sample_sha256 == sha256
+            ),
+            None,
+        )
+        if association is None:
+            association = SampleAssociation(
+                id=uuid5(
+                    _OPERATOR_IMPORT_ASSOCIATION_NAMESPACE,
+                    f"{investigation.id}:{sha256}",
+                ),
+                investigation_id=investigation.id,
+                sample_sha256=sha256,
+                origin=AssociationSampleOrigin.MANUAL,
+            )
+            association = await uow.sample_associations.append_version(
+                association, expected_version=0
+            )
+
+        existing_events = await uow.provenance.list_for_aggregate("sample", sample.id)
+        if not any(
+            event.event_type == "sample_imported_by_operator"
+            and event.payload.get("investigation_id") == str(investigation.id)
+            and event.payload.get("import_source") == "rule_corpus"
+            and event.payload.get("import_object_id") == object_id
+            for event in existing_events
+        ):
+            await uow.provenance.append(
+                ProvenanceEvent(
+                    aggregate_type="sample",
+                    aggregate_id=sample.id,
+                    subject_id=sample.subject_id,
+                    event_type="sample_imported_by_operator",
+                    payload={
+                        "provenance": "operator_import",
+                        "import_source": "rule_corpus",
+                        "investigation_id": str(investigation.id),
+                        "import_object_id": object_id,
+                        "operator_id": metadata["operator_id"],
+                        "intended_role": metadata["intended_role"],
+                        "declared_corpus_provenance": metadata["provenance"],
+                    },
+                    tlp=sample.tlp,
+                    actor_id=metadata["operator_id"],
+                )
+            )
+        return sample, association
 
     @staticmethod
     async def _find_existing_import(
@@ -342,6 +461,8 @@ def _import_from_observation(
     *,
     size_bytes: int,
     metadata: dict[str, Any],
+    sample_id: UUID,
+    association_id: UUID,
     idempotent_replay: bool,
 ) -> ImportedRuleCorpusFile:
     if metadata["size_bytes"] != size_bytes:
@@ -357,6 +478,8 @@ def _import_from_observation(
         reason=metadata["reason"],
         source_description=metadata["source_description"],
         operator_id=metadata["operator_id"],
+        sample_id=sample_id,
+        association_id=association_id,
         idempotent_replay=idempotent_replay,
     )
 

@@ -8,6 +8,8 @@ import struct
 import subprocess
 from collections.abc import Mapping
 from io import BytesIO
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 from uuid import UUID, uuid4
 
@@ -24,6 +26,8 @@ from cti_app.application.confined_analysis import (
     ConfinedAnalysisWorkerAttestation,
     deterministic_confined_analysis_key,
 )
+from cti_app.application.investigation_network_tools import _CaptureInspectAdapter
+from cti_app.application.investigation_tools import ToolExecutionContext
 from cti_app.application.jobs import JobExecutionContext
 from cti_app.application.network_workbench import (
     NetworkWorkbench,
@@ -32,12 +36,29 @@ from cti_app.application.network_workbench import (
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.config import Settings
 from cti_app.domain.blobs import BlobDescriptor, BlobRecord
-from cti_app.domain.investigation import ToolInvocationStatus
-from cti_app.domain.network_protocol import NetworkExtractionLimitsV1
+from cti_app.domain.investigation import (
+    BudgetDimension,
+    EvidenceKind,
+    InvestigationBudget,
+    ToolInvocationStatus,
+)
+from cti_app.domain.network_protocol import (
+    NetworkCaptureFormat,
+    NetworkCaptureRefV1,
+    NetworkExtractionLimitsV1,
+)
+from cti_app.infrastructure.analysis_subprocess import (
+    AnalysisSubprocessResult,
+    AnalysisSubprocessStatus,
+)
 from cti_app.infrastructure.confined_tshark import ConfinedTsharkAdapter
+from cti_app.infrastructure.pcap_reader import read_capture
+from cti_app.infrastructure.quarantined_capture_source import ProductionQuarantinedCaptureSource
 from cti_app.workers.analysis_tasks import build_confined_analysis_job_handler
 from cti_app.workers.confined_analysis import (
     ConfinedAnalysisArtifactMismatch,
+    _run_readonly_command,
+    _run_suricata,
     _validate_command_arguments,
 )
 
@@ -147,10 +168,17 @@ class _EvidenceRecorder:
                     "blob_id": values["blob_id"],
                     "sha256": values["sha256"],
                     "source": values["source"],
+                    "source_version": values.get("source_version"),
                     "object_type": values["object_type"],
+                    "object_id": values["object_id"],
                 },
             )()
         )
+
+
+class _ToolEvidenceRecorder:
+    async def record_json(self, **_values: Any) -> Any:
+        return SimpleNamespace(id=uuid4())
 
 
 class _InProcessWorkerPort:
@@ -333,6 +361,72 @@ def _synthetic_pcap() -> bytes:
     return bytes(data)
 
 
+def _pcapng_block(block_type: int, body: bytes) -> bytes:
+    body += b"\x00" * (-len(body) % 4)
+    block_length = 12 + len(body)
+    return struct.pack("<II", block_type, block_length) + body + struct.pack("<I", block_length)
+
+
+def _synthetic_pcapng() -> bytes:
+    section = _pcapng_block(
+        0x0A0D0D0A,
+        b"\x4d\x3c\x2b\x1a" + struct.pack("<HHq", 1, 0, -1),
+    )
+    interface = _pcapng_block(1, struct.pack("<HHI", 1, 0, 65_535))
+    frames = (
+        _udp_frame(53000, 53, _dns_query("telemetry.example.test")),
+        _tcp_frame(
+            source_port=41000,
+            destination_port=80,
+            payload=(
+                b"GET /beacon HTTP/1.1\r\nHost: c2.example.test\r\n"
+                b"User-Agent: autowork-synthetic\r\n\r\n"
+            ),
+        ),
+        _tcp_frame(
+            source_port=41001,
+            destination_port=443,
+            payload=_tls_client_hello("tls.example.test"),
+        ),
+        _tcp_frame(
+            source_port=41002,
+            destination_port=9000,
+            payload=b"\x00\x05\x01ABCD\x00\x05\x02EFGH",
+        ),
+    )
+    packets = b"".join(
+        _pcapng_block(
+            6,
+            struct.pack("<IIIII", 0, 0, index + 1, len(frame), len(frame)) + frame,
+        )
+        for index, frame in enumerate(frames)
+    )
+    return section + interface + packets
+
+
+def _empty_pcap() -> bytes:
+    return struct.pack("<IHHIIII", 0xA1B2C3D4, 2, 4, 0, 0, 65_535, 1)
+
+
+@pytest.mark.parametrize(
+    ("capture_format", "capture_factory", "expected_packet_count"),
+    (
+        (NetworkCaptureFormat.PCAP, _synthetic_pcap, 4),
+        (NetworkCaptureFormat.PCAPNG, _synthetic_pcapng, 4),
+        (NetworkCaptureFormat.PCAP, _empty_pcap, 0),
+    ),
+)
+def test_synthetic_capture_fixtures_are_valid_and_packet_bounded(
+    capture_format: NetworkCaptureFormat,
+    capture_factory: Any,
+    expected_packet_count: int,
+) -> None:
+    parsed = read_capture(capture_factory(), max_packets=10)
+
+    assert parsed.format is capture_format
+    assert len(parsed.packets) == expected_packet_count
+
+
 def _missing_tools() -> tuple[str, ...]:
     return tuple(name for name in ("tshark", "capinfos") if shutil.which(name) is None)
 
@@ -386,6 +480,221 @@ async def test_canonical_pcap_runs_through_worker_handler_and_extracts_network_i
     assert worker_port.attestation.reachable
     assert all(status.available for status in worker_port.family_statuses.values())
     assert len(database.observations) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(_missing_tools(), reason="real TShark and capinfos are required")
+@pytest.mark.parametrize(
+    ("capture_format", "capture_factory", "expected_packet_count"),
+    (
+        (NetworkCaptureFormat.PCAP, _synthetic_pcap, 4),
+        (NetworkCaptureFormat.PCAPNG, _synthetic_pcapng, 4),
+        (NetworkCaptureFormat.PCAP, _empty_pcap, 0),
+    ),
+)
+async def test_vt_sandbox_pcap_inspects_through_tool_and_confined_worker(
+    capture_format: NetworkCaptureFormat,
+    capture_factory: Any,
+    expected_packet_count: int,
+) -> None:
+    database = _MemoryDatabase()
+    uow_factory = cast(UnitOfWorkFactory, database.uow)
+    settings = Settings(_env_file=None)
+    payload = capture_factory()
+    blob = await database.blobs.ingest(
+        BytesIO(payload),
+        logical_bucket="network-captures-quarantine",
+        mime_type=(
+            "application/vnd.tcpdump.pcapng"
+            if capture_format is NetworkCaptureFormat.PCAPNG
+            else "application/vnd.tcpdump.pcap"
+        ),
+    )
+    sha256 = blob.descriptor.sha256
+    database.observations.append(
+        SimpleNamespace(
+            investigation_id=database.investigation_id,
+            kind=EvidenceKind.OTHER,
+            blob_id=blob.id,
+            sha256=sha256,
+            source="VirusTotal",
+            source_version="vt-sandbox-pcap.v1",
+            object_type="network_capture",
+            object_id=sha256,
+        )
+    )
+    quarantine = ProductionQuarantinedCaptureSource(
+        uow_factory=uow_factory,
+        blob_catalog=database.blobs,  # type: ignore[arg-type]
+        settings=settings,
+        investigation_id=database.investigation_id,
+    )
+    worker_port = _InProcessWorkerPort(
+        blobs=database.blobs,
+        uow_factory=uow_factory,
+        settings=settings,
+    )
+    limits = NetworkExtractionLimitsV1(max_packets=20, max_output_bytes=64 * 1024)
+    adapter = ConfinedTsharkAdapter(worker_port, limits=limits, max_output_bytes=64 * 1024)
+    workbench = NetworkWorkbench(
+        quarantine=quarantine,
+        blobs=_CaptureBlobStore(database.blobs),
+        tshark=adapter,
+        recorder=_EvidenceRecorder(database),
+        limits=limits,
+    )
+    tool = _CaptureInspectAdapter(workbench, _ToolEvidenceRecorder(), 60)
+    context = ToolExecutionContext(
+        investigation_id=database.investigation_id,
+        envelope=None,
+        budget=InvestigationBudget(limits={BudgetDimension.TOOL_SECONDS: 60}),
+        idempotency_key="vt-pcap-confined-inspection",
+    )
+    result = await tool.execute(
+        {
+            "capture_ref": NetworkCaptureRefV1(
+                blob_id=blob.id,
+                sha256=sha256,
+                size_bytes=len(payload),
+                format=capture_format,
+            ).to_dict()
+        },
+        context,
+    )
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    report = result.output["report"]
+    assert isinstance(report, Mapping)
+    assert report["packet_count"] == expected_packet_count
+    dns = report["dns_observations"]
+    if expected_packet_count:
+        assert any(item["value"] == "telemetry.example.test" for item in dns)
+    else:
+        assert dns == ()
+    assert worker_port.attestation.reachable
+
+
+@pytest.mark.asyncio
+async def test_tshark_confined_command_builds_a_supported_closed_dissector_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: list[list[str]] = []
+    protocol_table = (
+        b"Frame\tFrame\tframe\n"
+        b"Ethernet\tEthernet\teth\n"
+        b"Internet Protocol Version 4\tIPv4\tip\n"
+        b"Internet Protocol Version 6\tIPv6\tipv6\n"
+        b"Transmission Control Protocol\tTCP\ttcp\n"
+        b"User Datagram Protocol\tUDP\tudp\n"
+        b"Domain Name System\tDNS\tdns\n"
+        b"Hypertext Transfer Protocol\tHTTP\thttp\n"
+        b"Hypertext Transfer Protocol 2\tHTTP2\thttp2\n"
+        b"Transport Layer Security\tTLS\ttls\n"
+        b"Data\tData\tdata\n"
+        b"Linux cooked capture\tLinux cooked capture\tsll\n"
+        b"Private Fixture\tPrivate Fixture\tprivate_fixture\n"
+        b"MIPv6 Option\tAccess Network Identifier\tmip6.options.acc_net_id\tT\tT\tT\n"
+    )
+
+    async def run(argv: list[str], **_kwargs: Any) -> AnalysisSubprocessResult:
+        commands.append(argv)
+        if argv[1:3] == ["-G", "protocols"]:
+            return AnalysisSubprocessResult(
+                AnalysisSubprocessStatus.SUCCEEDED, 0, protocol_table, b""
+            )
+        return AnalysisSubprocessResult(AnalysisSubprocessStatus.SUCCEEDED, 0, b"", b"")
+
+    monkeypatch.setattr(
+        "cti_app.workers.confined_analysis.shutil.which", lambda _name: "/usr/bin/tshark"
+    )
+    monkeypatch.setattr("cti_app.workers.confined_analysis._TSHARK_DISSECTION_PROFILES", {})
+    monkeypatch.setattr("cti_app.workers.confined_analysis.run_analysis_subprocess", run)
+    payload = _synthetic_pcap()
+    parameters = ConfinedAnalysisJobParameters(
+        investigation_id=uuid4(),
+        artifact_id=uuid4(),
+        artifact_sha256=hashlib.sha256(payload).hexdigest(),
+        operation_key="confined-analysis:" + "c" * 64,
+        tool=ConfinedAnalysisTool.TSHARK,
+        artifact_kind=ConfinedAnalysisArtifactKind.CAPTURE,
+        timeout_seconds=10,
+        max_output_bytes=64 * 1024,
+    )
+
+    result = await _run_readonly_command(
+        "tshark",
+        ("-T", "fields", "-e", "frame.number"),
+        payload,
+        parameters,
+        Settings(_env_file=None),
+    )
+
+    assert result["status"] == "SUCCEEDED"
+    assert len(commands) == 2
+    command = commands[-1]
+    assert "--only-protocols" not in command
+    assert command[command.index("--disable-protocol") + 1] == "ALL"
+    assert command[command.index("--enable-protocol") + 1].split(",") == sorted(
+        {
+            "frame",
+            "eth",
+            "sll",
+            "ip",
+            "ipv6",
+            "tcp",
+            "udp",
+            "dns",
+            "http",
+            "http2",
+            "tls",
+            "data",
+        }
+    )
+    assert "sll2" not in command[command.index("--enable-protocol") + 1]
+    assert "--disable-heuristic" not in command
+
+
+@pytest.mark.asyncio
+async def test_suricata_replay_returns_empty_result_without_starting_engine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rule_source = 'alert dns any any -> any any (msg:"empty fixture"; sid:9900001; rev:1;)'
+    (tmp_path / "autowork.rules").write_text(rule_source, encoding="utf-8")
+    ruleset_sha256 = hashlib.sha256(rule_source.encode("utf-8")).hexdigest()
+    settings = Settings(
+        _env_file=None,
+        analysis_suricata_rules_path=tmp_path,
+        analysis_suricata_ruleset_sha256=ruleset_sha256,
+    )
+
+    async def must_not_start(*_args: Any, **_kwargs: Any) -> AnalysisSubprocessResult:
+        pytest.fail("Suricata must not be started for an empty capture")
+
+    monkeypatch.setattr("cti_app.workers.confined_analysis.shutil.which", lambda _name: "/suricata")
+    monkeypatch.setattr(
+        "cti_app.workers.confined_analysis._probe_suricata_version", lambda _executable: "7.0.10"
+    )
+    monkeypatch.setattr("cti_app.workers.confined_analysis.run_analysis_subprocess", must_not_start)
+    payload = _empty_pcap()
+    parameters = ConfinedAnalysisJobParameters(
+        investigation_id=uuid4(),
+        artifact_id=uuid4(),
+        artifact_sha256=hashlib.sha256(payload).hexdigest(),
+        operation_key="confined-analysis:" + "d" * 64,
+        tool=ConfinedAnalysisTool.SURICATA_REPLAY,
+        artifact_kind=ConfinedAnalysisArtifactKind.CAPTURE,
+        timeout_seconds=10,
+        max_output_bytes=64 * 1024,
+    )
+
+    result = await _run_suricata(parameters, payload, blobs=object(), settings=settings)
+
+    assert result["status"] == "SUCCEEDED"
+    assert result["empty_capture"] is True
+    assert result["capture_packet_count"] == 0
+    assert result["event_counts"] == {"alert": 0, "flow": 0, "dns": 0, "tls": 0}
+    assert result["events"] == []
 
 
 def test_tshark_command_rejects_non_allowlisted_fields_and_lua_extensions() -> None:

@@ -11,11 +11,11 @@ from cti_app.application.article_novelty import (
     NoveltyCandidate,
     NoveltyCandidateKind,
     NoveltyClassification,
-    NoveltyReasonCode,
 )
 from cti_app.application.evidence_recorder import EvidenceRecorder
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.sample_acquisition import (
+    SAMPLES_QUARANTINE_BUCKET,
     SampleAcquisitionBudgetExceededError,
     SampleAcquisitionCapabilityDisabledError,
     SampleAcquisitionDownloadError,
@@ -29,6 +29,7 @@ from cti_app.application.virustotal import (
     normalize_file_hash,
 )
 from cti_app.domain.classification import TLP
+from cti_app.domain.entities import ProvenanceEvent, Sample
 from cti_app.domain.investigation import (
     BudgetDimension,
     BudgetExceeded,
@@ -42,25 +43,13 @@ from cti_app.domain.investigation import (
 from cti_app.domain.production import SampleAcquisitionOutcome, SampleAcquisitionReason
 
 _ASSOCIATION_NAMESPACE = UUID("a3bcb4cf-7403-43a6-ad9b-8da838b282b1")
+_NETWORK_CAPTURE_QUARANTINE_BUCKET = "network-captures-quarantine"
 _ACQUISITION_COST = {
     BudgetDimension.VT_UNITS: 1,
     BudgetDimension.DOWNLOADS: 1,
 }
 _HIT_ORIGINS = frozenset({SampleOrigin.VT_PIVOT, SampleOrigin.RELATIONSHIP, SampleOrigin.BEHAVIOR})
 _SUGGESTED_ALTERNATIVES = ("vt.file_report", "vt.relationships", "vt.intelligence_search")
-_DEFINITIVE_DOWNLOAD_ERROR_CODES = frozenset(
-    {
-        "virustotal_download_route_not_found",
-        "virustotal_download_authorization_refused",
-        "virustotal_download_failed_before_bytes",
-        "virustotal_download_host_not_allowed",
-        "virustotal_unexpected_redirect",
-        "virustotal_download_too_large",
-        "virustotal_capability_disabled",
-        "virustotal_route_unavailable",
-        "virustotal_transport_not_configured",
-    }
-)
 
 
 class HitAcquisitionError(RuntimeError):
@@ -173,12 +162,31 @@ class HitAcquisitionService:
             await _verify_evidence_refs(uow, association.investigation_id, evidence_refs)
             current = await uow.investigation_envelopes.get(association.investigation_id)
             subject_samples = await uow.samples.list_for_subject(investigation.subject_id)
+            quarantine_blob = await uow.blobs.get_by_address(
+                SAMPLES_QUARANTINE_BUCKET, association.sample_sha256
+            )
+            quarantine_blob_present = (
+                quarantine_blob is not None
+                and quarantine_blob.descriptor.sha256 == association.sample_sha256
+                and quarantine_blob.descriptor.logical_bucket == SAMPLES_QUARANTINE_BUCKET
+            )
             prior = await uow.sample_acquisition_attempts.find_successful(
                 association.investigation_id, association.sample_sha256
             )
             latest_error = await uow.sample_acquisition_attempts.find_latest_error(
                 association.investigation_id, association.sample_sha256
             )
+            prior_sample = None
+            if prior is not None and prior.sample_id is not None:
+                prior_sample = await uow.samples.get(prior.sample_id)
+            subject_sample_candidates: list[Sample] = []
+            for subject_sample in subject_samples:
+                candidate_blob = await uow.blobs.get(subject_sample.blob_id)
+                if subject_sample.expected_hash == association.sample_sha256 or (
+                    candidate_blob is not None
+                    and candidate_blob.descriptor.sha256 == association.sample_sha256
+                ):
+                    subject_sample_candidates.append(subject_sample)
 
         if current is None:
             return _needs_review(association, "No approved G2 envelope exists.")
@@ -189,6 +197,96 @@ class HitAcquisitionService:
         active_envelope = envelope or current
         if active_envelope.investigation_id != association.investigation_id:
             raise ValueError("Envelope and sample association belong to different investigations")
+
+        if prior is not None:
+            if prior.sample_id is None or prior_sample is None:
+                return _needs_review(
+                    association,
+                    "A prior success ledger entry has no Sample; restore and reconcile its "
+                    "quarantine record before retrying.",
+                )
+            compatibility_message = _subject_sample_policy_conflict(prior_sample, active_envelope)
+            verified = (
+                compatibility_message is None
+                and self._acquisition is not None
+                and await self._acquisition.verify_quarantined_sample_bytes(
+                    sample_id=prior_sample.id,
+                    subject_id=investigation.subject_id,
+                    requested_sha256=association.sample_sha256,
+                )
+            )
+            if compatibility_message is not None:
+                return _needs_review(association, compatibility_message)
+            if not verified:
+                return _needs_review(
+                    association,
+                    "The prior quarantined Sample needs SHA-256 verification: restore the blob "
+                    "if missing, then verify its bytes and Sample metadata before retrying.",
+                )
+            refs = await self._record_acquired_sample(
+                association=association,
+                sample_id=prior_sample.id,
+                reused=True,
+            )
+            return HitAcquisitionResult(
+                status=ToolInvocationStatus.SUCCEEDED,
+                association=association,
+                sample_id=prior_sample.id,
+                reused_existing_sample=True,
+                observation_refs=refs,
+                novelty=await self._classify_with_evidence_refs(association, refs),
+                message=(
+                    "This investigation already acquired this hash; its verified quarantine "
+                    "Sample was reused without another download."
+                ),
+                budget_consumed={BudgetDimension.VT_UNITS: 0, BudgetDimension.DOWNLOADS: 0},
+            )
+
+        if subject_sample_candidates:
+            if len(subject_sample_candidates) != 1:
+                return _needs_review(
+                    association,
+                    "Multiple same-subject Samples claim this hash; resolve the duplicate "
+                    "quarantined records and verify which original source is authoritative.",
+                )
+            subject_sample = subject_sample_candidates[0]
+            compatibility_message = _subject_sample_policy_conflict(subject_sample, active_envelope)
+            if compatibility_message is not None:
+                return _needs_review(association, compatibility_message)
+            verified = (
+                self._acquisition is not None
+                and await self._acquisition.verify_quarantined_sample_bytes(
+                    sample_id=subject_sample.id,
+                    subject_id=investigation.subject_id,
+                    requested_sha256=association.sample_sha256,
+                )
+            )
+            if not verified:
+                return _needs_review(
+                    association,
+                    "Same-subject quarantine candidate needs SHA-256 verification: restore the "
+                    + "blob if missing, then verify its bytes and Sample metadata before retrying.",
+                )
+            refs = await self._record_acquired_sample(
+                association=association,
+                sample_id=subject_sample.id,
+                reused=True,
+                reused_from_subject_sample=True,
+            )
+            return HitAcquisitionResult(
+                status=ToolInvocationStatus.SUCCEEDED,
+                association=association,
+                sample_id=subject_sample.id,
+                reused_existing_sample=True,
+                observation_refs=refs,
+                novelty=await self._classify_with_evidence_refs(association, refs),
+                message=(
+                    "Reused the verified quarantine Sample already owned by this subject; "
+                    "no VirusTotal download was made."
+                ),
+                budget_consumed={BudgetDimension.VT_UNITS: 0, BudgetDimension.DOWNLOADS: 0},
+            )
+
         acquisition_tlp = _sample_tlp(active_envelope)
         if active_envelope.disclosure.do_not_submit or acquisition_tlp is None:
             return HitAcquisitionResult(
@@ -215,59 +313,32 @@ class HitAcquisitionService:
                 budget_consumed={},
             )
 
-        novelty = await self._classify_without_evidence(association)
-        if novelty is not None and novelty.reason.code is NoveltyReasonCode.ALREADY_DOCUMENTED:
-            return HitAcquisitionResult(
-                status=ToolInvocationStatus.EMPTY,
-                association=association,
-                novelty=novelty,
-                message=(
-                    "The sample is already present in this article snapshot; no download was made."
-                ),
-                budget_consumed={},
-            )
-        if prior is not None and prior.sample_id is not None:
-            refs = await self._record_acquired_sample(
-                association=association,
-                sample_id=prior.sample_id,
-                reused=True,
-            )
-            return HitAcquisitionResult(
-                status=ToolInvocationStatus.SUCCEEDED,
-                association=association,
-                sample_id=prior.sample_id,
-                reused_existing_sample=True,
-                observation_refs=refs,
-                novelty=novelty,
-                message=(
-                    "The investigation already acquired this hash; "
-                    "its quarantined sample was reused."
-                ),
-                budget_consumed={},
-            )
-        if latest_error is not None and latest_error.error_code in _DEFINITIVE_DOWNLOAD_ERROR_CODES:
+        cached_refusal = (
+            self._acquisition.cached_refusal(latest_error.error_code, association.sample_sha256)
+            if latest_error is not None
+            else None
+        )
+        if cached_refusal is not None:
             return HitAcquisitionResult(
                 status=ToolInvocationStatus.UNAVAILABLE,
                 association=association,
-                novelty=novelty,
                 suggested_alternatives=_SUGGESTED_ALTERNATIVES,
-                message="VirusTotal file download was already refused for this hash; do not retry.",
+                message="VirusTotal refused this hash on the current authorized route.",
                 budget_consumed={},
-                error_code=latest_error.error_code,
-                reason=_download_failure_reason(latest_error.error_code),
+                error_code=self._acquisition.refusal_error_code(cached_refusal),
+                reason=self._acquisition.refusal_reason(cached_refusal),
                 confirmed_non_execution=True,
                 cached=True,
             )
-        if any(
-            sample.expected_hash == association.sample_sha256
-            or sample.source_object_id == association.sample_sha256
-            for sample in subject_samples
-        ):
+
+        if quarantine_blob_present:
             return _needs_review(
                 association,
-                "A subject-level sample has this hash but is not linked to this investigation; "
-                "an explicit investigation association is required.",
+                "Quarantined bytes exist without a linked Sample for this subject; verify "
+                "subject ownership and reconcile their provenance before requesting acquisition.",
             )
+
+        novelty = await self._classify_without_evidence(association)
 
         key = operation_key or f"vt.download_sample:{association.investigation_id}:{association.id}"
         budget = active_envelope.budget
@@ -485,21 +556,59 @@ class HitAcquisitionService:
             association = await uow.sample_associations.get(association_id)
             if association is None:
                 raise HitNotFoundError("Sample association does not exist")
-            attempt = await uow.sample_acquisition_attempts.find_successful(
-                association.investigation_id, association.sample_sha256
+            investigation = await uow.analyst_investigations.get(association.investigation_id)
+            if investigation is None:
+                raise HitNotFoundError("Investigation does not exist")
+            imported_samples = await uow.samples.list_for_subject(investigation.subject_id)
+            sample = next(
+                (
+                    item
+                    for item in imported_samples
+                    if item.expected_hash == association.sample_sha256
+                    and item.origin == "operator_import"
+                    and item.source_service == "operator_import"
+                ),
+                None,
             )
-            if attempt is None or attempt.sample_id is None:
-                raise HitNotFoundError("No quarantined sample is linked to this investigation")
-            sample = await uow.samples.get(attempt.sample_id)
             if sample is None:
-                raise HitNotFoundError("Quarantined sample does not exist")
+                attempt = await uow.sample_acquisition_attempts.find_successful(
+                    association.investigation_id, association.sample_sha256
+                )
+                sample = (
+                    await uow.samples.get(attempt.sample_id)
+                    if attempt is not None and attempt.sample_id is not None
+                    else None
+                )
+            blob = await uow.blobs.get(sample.blob_id) if sample is not None else None
+            if blob is None or blob.descriptor.sha256 != association.sample_sha256:
+                blob = await uow.blobs.get_by_address(
+                    SAMPLES_QUARANTINE_BUCKET, association.sample_sha256
+                )
+                if blob is not None:
+                    sample = await uow.samples.get_by_subject_and_blob(
+                        investigation.subject_id, blob.id
+                    )
+            if sample is None:
+                raise HitNotFoundError("No quarantined sample is linked to this investigation")
             if getattr(sample.state, "value", sample.state) not in {
                 "quarantined",
                 "review_candidate",
             }:
                 raise HitAcquisitionError("Analysis is limited to quarantined samples")
-            blob = await uow.blobs.get(sample.blob_id)
-            if blob is None or blob.descriptor.sha256 != association.sample_sha256:
+            if (
+                blob is None
+                or blob.descriptor.sha256 != association.sample_sha256
+                or blob.descriptor.logical_bucket
+                not in {
+                    SAMPLES_QUARANTINE_BUCKET,
+                    *(
+                        (_NETWORK_CAPTURE_QUARANTINE_BUCKET,)
+                        if sample.origin == "operator_import"
+                        and sample.source_service == "operator_import"
+                        else ()
+                    ),
+                }
+            ):
                 raise HitAcquisitionError("Quarantine blob hash does not match the association")
             return QuarantinedSampleRef(
                 investigation_id=association.investigation_id,
@@ -575,32 +684,81 @@ class HitAcquisitionService:
         association: SampleAssociation,
         sample_id: UUID,
         reused: bool,
+        reused_from_subject_sample: bool = False,
     ) -> tuple[UUID, ...]:
         async with self._uow_factory() as uow:
             sample = await uow.samples.get(sample_id)
             if sample is None:
                 raise HitNotFoundError("Acquired sample does not exist")
             blob = await uow.blobs.get(sample.blob_id)
-            if blob is None or blob.descriptor.sha256 != association.sample_sha256:
+            if (
+                blob is None
+                or blob.descriptor.sha256 != association.sample_sha256
+                or blob.descriptor.logical_bucket != SAMPLES_QUARANTINE_BUCKET
+            ):
                 raise HitAcquisitionError(
                     "Quarantined blob hash does not match the requested SHA-256"
                 )
+            if reused_from_subject_sample:
+                events = await uow.provenance.list_for_aggregate("sample", sample.id)
+                already_recorded = any(
+                    event.event_type == "reused_from_subject_sample"
+                    and event.payload.get("investigation_id") == str(association.investigation_id)
+                    and event.payload.get("association_id") == str(association.id)
+                    for event in events
+                )
+                if not already_recorded:
+                    await uow.provenance.append(
+                        ProvenanceEvent(
+                            aggregate_type="sample",
+                            aggregate_id=sample.id,
+                            subject_id=sample.subject_id,
+                            event_type="reused_from_subject_sample",
+                            payload={
+                                "provenance": "reused_from_subject_sample",
+                                "investigation_id": str(association.investigation_id),
+                                "association_id": str(association.id),
+                                "sample_id": str(sample.id),
+                                "sample_origin": sample.origin,
+                                "sample_origin_kind": sample.origin_kind.value,
+                                "source_service": sample.source_service,
+                                "source_object_id": sample.source_object_id,
+                                "sha256": association.sample_sha256,
+                                "new_download": False,
+                            },
+                            tlp=sample.tlp,
+                        )
+                    )
+                    await uow.commit()
+        is_subject_reuse = reused_from_subject_sample
         observation = await self._recorder.record_existing_blob(
             investigation_id=association.investigation_id,
             kind=EvidenceKind.OTHER,
             blob_id=sample.blob_id,
             sha256=blob.descriptor.sha256,
-            source="virustotal.sample_download",
-            source_version="sample-acquisition.v1",
+            source=(
+                "investigation.subject_sample_reuse"
+                if is_subject_reuse
+                else "virustotal.sample_download"
+            ),
+            source_version=(
+                "sample-subject-reuse.v1" if is_subject_reuse else "sample-acquisition.v1"
+            ),
             object_type="sample",
             object_id=association.sample_sha256,
             limitations=(
                 "The sample is quarantined and untrusted.",
-                "Acquisition and static analysis do not validate cluster membership.",
+                (
+                    "The Sample was already quarantined for this subject; no VirusTotal "
+                    "download occurred for this investigation."
+                    if is_subject_reuse
+                    else "Acquisition and static analysis do not validate cluster membership."
+                ),
             ),
             idempotency_key=(
                 f"sample-acquisition:{association.investigation_id}:"
-                f"{association.sample_sha256}:{'reused' if reused else 'acquired'}"
+                f"{association.sample_sha256}:"
+                f"{'subject-reuse' if is_subject_reuse else 'reused' if reused else 'acquired'}"
             ),
         )
         return (observation.id,)
@@ -640,6 +798,47 @@ def _sample_tlp(envelope: InvestigationEnvelope) -> TLP | None:
         return TLP.CLEAR
     if level is TLPLevel.GREEN:
         return TLP.GREEN
+    return None
+
+
+def _subject_sample_policy_conflict(sample: Sample, envelope: InvestigationEnvelope) -> str | None:
+    target_level = envelope.disclosure.tlp
+    if target_level is None:
+        return (
+            "The investigation has no approved TLP bound; set a disclosure classification "
+            "before reuse."
+        )
+    target_tlp = {
+        TLPLevel.WHITE: TLP.CLEAR,
+        TLPLevel.CLEAR: TLP.CLEAR,
+        TLPLevel.GREEN: TLP.GREEN,
+        TLPLevel.AMBER: TLP.AMBER,
+        TLPLevel.RED: TLP.RED,
+    }[target_level]
+    rank = {
+        TLP.CLEAR: 0,
+        TLP.GREEN: 1,
+        TLP.AMBER: 2,
+        TLP.AMBER_STRICT: 3,
+        TLP.RED: 4,
+    }
+    if rank[sample.tlp] > rank[target_tlp]:
+        return (
+            f"The quarantined Sample is classified {sample.tlp.value}, above this investigation's "
+            f"{target_level.value} disclosure bound; align the approved TLP before reuse."
+        )
+    if envelope.disclosure.do_not_submit and not sample.do_not_submit:
+        return (
+            "The Sample's source policy is incompatible: it does not prohibit submission while "
+            "this investigation "
+            "requires do_not_submit; reconcile the disclosure bounds before reuse."
+        )
+    if not envelope.disclosure.external_llm_allowed and sample.external_llm_allowed:
+        return (
+            "The Sample's source policy is incompatible: it allows external LLM access while "
+            "this investigation "
+            "prohibits it; reconcile the disclosure bounds before reuse."
+        )
     return None
 
 

@@ -22,6 +22,7 @@ _SENSITIVE_HEADER = re.compile(
     r"(?i)(\b(?:x-apikey|authorization)\b\s*[:=]\s*)"
     r"(?:\"[^\"]*\"|'[^']*'|[^,\r\n;}&]+)"
 )
+_APIKEY_ADJACENT_HEX = re.compile(r"(?i)(\b(?:x-)?apikey\b(?:\s*[=:]\s*|\s+))([a-f0-9]{32,})")
 _BEARER_VALUE = re.compile(r"(?i)\bBearer\s+[^\s,\"'<>;)}]+")
 _SECRET_REDACTING_FACTORY_MARKER = "_cti_secret_redacting_factory"
 
@@ -29,6 +30,7 @@ _SECRET_REDACTING_FACTORY_MARKER = "_cti_secret_redacting_factory"
 def _redact_sensitive_text(value: str) -> str:
     value = _SENSITIVE_QUERY_PARAMETER.sub(r"\1\2=[REDACTED]", value)
     value = _SENSITIVE_HEADER.sub(r"\1[REDACTED]", value)
+    value = _APIKEY_ADJACENT_HEX.sub(r"\1[REDACTED]", value)
     return _BEARER_VALUE.sub("Bearer [REDACTED]", value)
 
 

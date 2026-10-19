@@ -65,7 +65,11 @@ from cti_app.application.typst_paths import typst_bundle_paths
 from cti_app.application.virustotal import VirusTotalCapabilities, VirusTotalRoutingPolicy
 from cti_app.application.virustotal_persistence import VirusTotalObservationService
 from cti_app.application.workspace import SubjectWorkspaceMaterializer
-from cti_app.config import Settings, get_settings
+from cti_app.config import (
+    VIRUSTOTAL_DOWNLOAD_REQUIRED_CDN_HOST,
+    Settings,
+    get_settings,
+)
 from cti_app.domain.jobs import INVESTIGATION_RUN_JOB_KIND, JobStatus
 from cti_app.domain.production_pipeline import production_stages
 from cti_app.infrastructure.analytic_chart_renderer import AnalyticChartRenderer
@@ -108,13 +112,27 @@ _configure_worker_logging()
 
 
 def virustotal_capabilities_from_settings(settings: Settings) -> VirusTotalCapabilities:
-    """Translate explicit Settings opt-ins into the shared VT capability set."""
+    """Translate VT opt-ins only when the configured proxy route is plausible."""
+    proxy_route_configured = bool(settings.virustotal_proxy_url and settings.virustotal_base_url)
     return VirusTotalCapabilities(
-        file_report=settings.virustotal_file_report_enabled,
-        file_relationships=settings.virustotal_object_relationships_enabled,
-        intelligence_search=settings.virustotal_intelligence_search_enabled,
-        file_download=settings.virustotal_file_download_enabled,
-        behaviour_reports=settings.virustotal_behaviour_reports_enabled,
+        file_report=settings.virustotal_file_report_enabled and proxy_route_configured,
+        file_relationships=(
+            settings.virustotal_object_relationships_enabled and proxy_route_configured
+        ),
+        intelligence_search=(
+            settings.virustotal_intelligence_search_enabled and proxy_route_configured
+        ),
+        file_download=(
+            settings.virustotal_file_download_enabled
+            and proxy_route_configured
+            and VIRUSTOTAL_DOWNLOAD_REQUIRED_CDN_HOST
+            in settings.virustotal_download_allowed_hosts.split(",")
+            and bool(settings.virustotal_download_allowed_ports.strip())
+        ),
+        behaviour_reports=(
+            settings.virustotal_behaviour_reports_enabled and proxy_route_configured
+        ),
+        behaviour_pcap=(settings.virustotal_behaviour_pcap_enabled and proxy_route_configured),
         retrohunt=settings.virustotal_retrohunt_proxy_enabled,
     )
 
@@ -191,7 +209,10 @@ async def _execute_job(job_id: UUID) -> int | None:
             vt_proxy_client = create_virustotal_http_client(settings)
         else:
             vt_proxy_client = httpx.AsyncClient()
-        if settings.virustotal_api_key and settings.virustotal_file_report_legacy_fallback_enabled:
+        if settings.virustotal_api_key and (
+            settings.virustotal_file_report_legacy_fallback_enabled
+            or settings.virustotal_file_download_legacy_fallback_enabled
+        ):
             vt_direct_client = create_virustotal_direct_http_client(settings)
         vt_adapter = create_virustotal_http_adapter(
             client=vt_proxy_client,

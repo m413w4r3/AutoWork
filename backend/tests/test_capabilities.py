@@ -17,9 +17,11 @@ class FakeSubprocessRunner:
     def __init__(self, result: AnalysisSubprocessResult) -> None:
         self.result = result
         self.argv = []
+        self.kwargs = []
 
     async def __call__(self, argv, **kwargs):
         self.argv.append(list(argv))
+        self.kwargs.append(dict(kwargs))
         return self.result
 
 
@@ -70,6 +72,27 @@ def test_parser_normalizes_and_ignores_upstream_extra_fields() -> None:
     assert values[0]["function_addresses"] == ("0x1", "0x2")
 
 
+def test_parser_accepts_capa_rules_without_an_optional_namespace() -> None:
+    payload = (
+        b'{"rules":{"allocate memory":{"meta":{"name":"Allocate memory"},'
+        b'"source":"fixture","matches":[]}}}'
+    )
+
+    values, errors = parse_capa_output(payload)
+
+    assert errors == ()
+    assert values == (
+        {
+            "rule_id": "allocate memory",
+            "name": "Allocate memory",
+            "namespace": "",
+            "attack": (),
+            "mbc": (),
+            "function_addresses": (),
+        },
+    )
+
+
 @pytest.mark.asyncio
 async def test_runner_uses_fake_subprocess_and_explicit_rules(tmp_path: Path) -> None:
     fake = FakeSubprocessRunner(
@@ -85,8 +108,18 @@ async def test_runner_uses_fake_subprocess_and_explicit_rules(tmp_path: Path) ->
     )
     assert version == "9.4.0"
     assert result.status is AnalysisSubprocessStatus.SUCCEEDED
-    assert fake.argv[0][0:2] == ["capa", "-r"]
+    argv = fake.argv[0]
+    env_index = next(index for index, item in enumerate(argv) if Path(item).name == "env")
+    assert argv[env_index + 1].startswith("HOME=")
+    assert argv[env_index + 2].startswith("XDG_CONFIG_HOME=")
+    assert argv[env_index + 3].startswith("XDG_CACHE_HOME=")
+    assert argv[env_index + 4 : env_index + 6] == ["capa", "-r"]
     assert str(tmp_path) in fake.argv[0]
+    assert fake.kwargs[0]["environment"]["PATH"]
+    environment = fake.kwargs[0]["environment"]
+    assert Path(environment["HOME"]).is_relative_to(Path("/tmp"))
+    assert environment["XDG_CONFIG_HOME"].startswith(environment["HOME"])
+    assert environment["XDG_CACHE_HOME"].startswith(environment["HOME"])
 
 
 class _CapabilitySets:

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
+import struct
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -39,6 +41,7 @@ from cti_app.application.investigation_tools import (
     validate_json_schema,
 )
 from cti_app.application.investigation_vt_tools import (
+    BEHAVIOUR_PCAP_SCHEMA,
     BEHAVIOUR_SCHEMA,
     FILE_REPORT_SCHEMA,
     INTELLIGENCE_SEARCH_SCHEMA,
@@ -49,10 +52,12 @@ from cti_app.application.investigation_vt_tools import (
 from cti_app.application.research_context_builder import ArticleSnapshot, ResearchContextBuilder
 from cti_app.application.virustotal import (
     VirusTotalCapabilities,
+    VirusTotalDownloadResult,
     VirusTotalFile,
     VirusTotalFileReport,
     VirusTotalHttpError,
     VirusTotalNotAuthorizedError,
+    VirusTotalObjectReport,
     VirusTotalPage,
     VirusTotalQuotaExceededError,
     VirusTotalSearchResult,
@@ -75,6 +80,7 @@ from cti_app.domain.investigation import (
     canonical_json_bytes,
     tool_operation_key,
 )
+from cti_app.domain.network_protocol import NetworkCaptureFormat, NetworkCaptureRefV1
 from cti_app.domain.production import (
     AnalystInvestigation,
     LoopBudget,
@@ -190,15 +196,20 @@ class FakeVirusTotalPort:
     def __init__(self) -> None:
         self.calls = {
             "file_report": 0,
+            "object_report": 0,
             "object_relationship": 0,
             "intelligence_search": 0,
             "behaviours": 0,
+            "behaviour_pcap": 0,
         }
         self.errors: dict[str, Exception] = {}
         self.report: VirusTotalFileReport | None = None
+        self.object_reports: dict[tuple[str, str], VirusTotalObjectReport] = {}
         self.relationship_pages: list[VirusTotalPage] = []
         self.search_pages: list[VirusTotalSearchResult] = []
         self.behaviour_pages: list[VirusTotalPage] = []
+        self.pcap_bytes = b""
+        self.pcap_sha256_override: str | None = None
 
     def _raise(self, operation: str) -> None:
         error = self.errors.get(operation)
@@ -212,6 +223,11 @@ class FakeVirusTotalPort:
 
     async def file_download(self, *args: Any, **kwargs: Any) -> Any:
         raise AssertionError("Sample download is outside this tool lot")
+
+    async def object_report(self, kind: str, object_id: str) -> VirusTotalObjectReport:
+        self.calls["object_report"] += 1
+        self._raise("object_report")
+        return self.object_reports[(kind, object_id)]
 
     async def file_relationship(self, *args: Any, **kwargs: Any) -> VirusTotalPage:
         raise AssertionError("Relationships must use the structured object operation")
@@ -256,6 +272,17 @@ class FakeVirusTotalPort:
         self._raise("behaviours")
         return self.behaviour_pages.pop(0) if self.behaviour_pages else _page()
 
+    async def behaviour_pcap(self, sandbox_id: str, *, sink: Any) -> VirusTotalDownloadResult:
+        self.calls["behaviour_pcap"] += 1
+        self._raise("behaviour_pcap")
+        sink.write(self.pcap_bytes)
+        return VirusTotalDownloadResult(
+            md5=hashlib.md5(self.pcap_bytes).hexdigest(),
+            sha1=hashlib.sha1(self.pcap_bytes).hexdigest(),
+            sha256=self.pcap_sha256_override or hashlib.sha256(self.pcap_bytes).hexdigest(),
+            size=len(self.pcap_bytes),
+        )
+
 
 class _FakeEvidenceBlobStore:
     def __init__(self) -> None:
@@ -267,11 +294,15 @@ class _FakeEvidenceBlobStore:
         self.payloads[blob_id] = payload
         return blob_id, hashlib.sha256(encoded).hexdigest()
 
+    async def read_json(self, blob_id: UUID) -> dict[str, Any]:
+        return self.payloads[blob_id]
+
 
 class FakeVirusTotalObservationService:
     def __init__(self) -> None:
         self.raw_blobs: dict[UUID, bytes] = {}
         self.raw_observations: list[VirusTotalObservation] = []
+        self.imported_pcaps: list[dict[str, Any]] = []
 
     def _observation(
         self,
@@ -434,6 +465,43 @@ class FakeVirusTotalObservationService:
             exhaustive=page.exhaustive,
         )
 
+    async def store_behaviour_pcap(
+        self,
+        content: bytes,
+        *,
+        investigation_id: UUID,
+        file_hash: str,
+        sandbox_id: str,
+        expected_sha256: str,
+        max_bytes: int,
+        observed_at: datetime,
+        idempotency_key: str,
+    ) -> Any:
+        digest = hashlib.sha256(content).hexdigest()
+        assert digest == expected_sha256
+        assert len(content) <= max_bytes
+        self.imported_pcaps.append(
+            {
+                "investigation_id": investigation_id,
+                "file_hash": file_hash,
+                "sandbox_id": sandbox_id,
+                "sha256": digest,
+                "content": content,
+                "idempotency_key": idempotency_key,
+            }
+        )
+        return SimpleNamespace(
+            capture_ref=NetworkCaptureRefV1(
+                blob_id=uuid4(),
+                sha256=digest,
+                size_bytes=len(content),
+                format=NetworkCaptureFormat.PCAP,
+            ),
+            sample_id=uuid4(),
+            association_id=uuid4(),
+            evidence_id=uuid4(),
+        )
+
 
 @dataclass
 class _ToolSet:
@@ -445,6 +513,16 @@ class _ToolSet:
     evidence: InMemoryEvidenceObservationRepository
     findings: InMemoryFindingRepository
     blob_store: _FakeEvidenceBlobStore
+
+
+async def _article_snapshot_for_test(_investigation_id: UUID) -> Any:
+    return SimpleNamespace(
+        confirmed_iocs=(
+            SimpleNamespace(indicator_type="ipv4", value="8.8.8.8"),
+            SimpleNamespace(indicator_type="domain", value="example.com"),
+            SimpleNamespace(indicator_type="url", value="https://example.com/path"),
+        )
+    )
 
 
 def _tool_set(
@@ -459,6 +537,7 @@ def _tool_set(
         file_relationships=True,
         intelligence_search=True,
         behaviour_reports=True,
+        behaviour_pcap=True,
     )
     vt = FakeVirusTotalPort()
     vt_observations = FakeVirusTotalObservationService()
@@ -474,6 +553,10 @@ def _tool_set(
         recorder=recorder,
         evidence_observations=evidence,
         findings=findings,
+        article_snapshot_resolver=_article_snapshot_for_test,
+        capabilities=selected,
+        evidence_payloads=blob_store,
+        max_capture_bytes=1024 * 1024,
         max_pages=max_pages,
     )
     investigation_id = uuid4()
@@ -542,7 +625,15 @@ def test_tool_schemas_are_2020_12_and_validate_registered_shapes() -> None:
             intelligence_search=True,
             behaviour_reports=True,
         )
-    ) == frozenset({"vt.file_report", "vt.relationships", "vt.intelligence_search", "vt.behaviour"})
+    ) == frozenset(
+        {
+            "vt.file_report",
+            "vt.object_report",
+            "vt.relationships",
+            "vt.intelligence_search",
+            "vt.behaviour",
+        }
+    )
     schemas = (
         FILE_REPORT_SCHEMA,
         RELATIONSHIPS_SCHEMA,
@@ -562,6 +653,9 @@ def test_tool_schemas_are_2020_12_and_validate_registered_shapes() -> None:
         INTELLIGENCE_SEARCH_SCHEMA,
     )
     validate_json_schema({"file_hash": _SEED_HASH}, BEHAVIOUR_SCHEMA)
+    validate_json_schema(
+        {"file_hash": _SEED_HASH, "sandbox_id": "sandbox-report-123"}, BEHAVIOUR_PCAP_SCHEMA
+    )
 
 
 @pytest.mark.asyncio
@@ -668,6 +762,208 @@ async def test_explicit_not_found_and_successful_empty_results_are_negative_evid
             not_found_tools.context.investigation_id
         )
     )
+
+
+@pytest.mark.asyncio
+async def test_object_report_is_available_for_verified_investigation_iocs() -> None:
+    tools = _tool_set()
+    raw = json.dumps(
+        {
+            "data": {
+                "id": "8.8.8.8",
+                "type": "ip_address",
+                "attributes": {
+                    "reputation": 12,
+                    "last_analysis_stats": {"malicious": 1, "harmless": 9},
+                    "signed_url": "https://example.test/download?token=secret",
+                },
+            }
+        }
+    ).encode()
+    tools.vt.object_reports[("ip_addresses", "8.8.8.8")] = VirusTotalObjectReport(
+        kind="ip_addresses",
+        object_id="8.8.8.8",
+        raw_json=raw,
+        http_status=200,
+        transport=VirusTotalTransportKind.PROXY,
+        api_generation=VirusTotalEndpointVariant.V3,
+    )
+
+    result = await _dispatch(
+        tools,
+        "vt.object_report",
+        {"object_type": "ip_addresses", "object_id": "8.8.8.8"},
+    )
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    assert tools.vt.calls["object_report"] == 1
+    assert result.output["object_type"] == "ip_address"
+    assert result.output["object_id"] == "8.8.8.8"
+    assert result.output["reputation"] == 12
+    assert "signed_url" not in result.output
+    observations = await tools.evidence.list_for_investigation(tools.context.investigation_id)
+    assert len(observations) == 2
+    assert {item.object_id for item in observations} == {"8.8.8.8"}
+
+
+@pytest.mark.asyncio
+async def test_object_report_rejects_an_ioc_not_in_the_investigation() -> None:
+    tools = _tool_set()
+
+    result = await _dispatch(
+        tools,
+        "vt.object_report",
+        {"object_type": "domains", "object_id": "attacker.example"},
+    )
+
+    assert result.status is ToolInvocationStatus.POLICY_DENIED
+    assert result.output["reason"] == "ioc_not_in_investigation"
+    assert tools.vt.calls["object_report"] == 0
+
+
+@pytest.mark.asyncio
+async def test_url_object_report_uses_the_investigation_ioc_and_hides_the_url() -> None:
+    tools = _tool_set()
+    url = "https://example.com/path"
+    encoded_id = base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
+    raw = json.dumps(
+        {
+            "data": {
+                "id": encoded_id,
+                "type": "url",
+                "attributes": {"reputation": -2},
+            }
+        }
+    ).encode()
+    tools.vt.object_reports[("urls", url)] = VirusTotalObjectReport(
+        kind="urls",
+        object_id=encoded_id,
+        raw_json=raw,
+        http_status=200,
+        transport=VirusTotalTransportKind.PROXY,
+        api_generation=VirusTotalEndpointVariant.V3,
+    )
+
+    result = await _dispatch(tools, "vt.object_report", {"object_type": "urls", "object_id": url})
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    assert result.output["object_id"].startswith("url-sha256:")
+    assert url not in repr(result.output)
+
+
+def test_behaviour_pcap_is_not_registered_without_the_runtime_flag() -> None:
+    tools = _tool_set(capabilities=VirusTotalCapabilities(file_report=True, behaviour_reports=True))
+
+    assert tools.registry.get("vt.behaviour_pcap", "1") is None
+    assert "vt.behaviour_pcap" not in tools.context.available_capabilities
+
+
+@pytest.mark.asyncio
+async def test_behaviour_pcap_transport_error_is_specific_and_confirmed_non_execution() -> None:
+    tools = _tool_set()
+    tools.vt.errors["behaviour_pcap"] = VirusTotalTransportError(
+        "offline", code="virustotal_download_timeout"
+    )
+    registered = tools.registry.get("vt.behaviour_pcap", "1")
+    assert registered is not None
+    _definition, adapter = registered
+
+    async def saved_report_contains_capture(_investigation_id, _file_hash, _sandbox_id):
+        return True
+
+    adapter._saved_report_contains_capture = saved_report_contains_capture
+    result = await adapter.execute({"file_hash": _SEED_HASH, "sandbox_id": "Zenbox"}, tools.context)
+
+    assert result.status is ToolInvocationStatus.UNAVAILABLE
+    assert result.output["reason"] == "pcap_transport_timeout"
+    assert result.output["confirmed_non_execution"] is True
+
+
+def _minimal_pcap() -> bytes:
+    frame = b"\x00" * 14
+    global_header = struct.pack("<IHHIIII", 0xA1B2C3D4, 2, 4, 0, 0, 65_535, 1)
+    packet_header = struct.pack("<IIII", 1, 0, len(frame), len(frame))
+    return global_header + packet_header + frame
+
+
+@pytest.mark.asyncio
+async def test_behaviour_pcap_requires_saved_report_then_imports_quarantined_capture() -> None:
+    tools = _tool_set()
+    tools.vt.behaviour_pages.append(
+        _page(
+            (
+                {
+                    "id": "sandbox-report-123",
+                    "type": "file_behaviour",
+                    "attributes": {"has_pcap": True, "sandbox_name": "sandbox-a"},
+                },
+            )
+        )
+    )
+    behavior = await _dispatch(tools, "vt.behaviour", {"file_hash": _SEED_HASH})
+    assert behavior.status is ToolInvocationStatus.SUCCEEDED
+    tools.vt.pcap_bytes = _minimal_pcap()
+
+    result = await _dispatch(
+        tools,
+        "vt.behaviour_pcap",
+        {"file_hash": _SEED_HASH, "sandbox_id": "sandbox-report-123"},
+    )
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    assert tools.vt.calls["behaviour_pcap"] == 1
+    assert len(tools.vt_observations.imported_pcaps) == 1
+    imported = tools.vt_observations.imported_pcaps[0]
+    assert imported["file_hash"] == _SEED_HASH
+    assert imported["sandbox_id"] == "sandbox-report-123"
+    assert result.output["capture_ref"]["sha256"] == imported["sha256"]
+    assert result.output["active_c2_observed"] is False
+    assert any("pas une observation d'un C2 actif" in item for item in result.output["limitations"])
+
+
+@pytest.mark.asyncio
+async def test_behaviour_pcap_does_not_fetch_an_unpersisted_sandbox_id() -> None:
+    tools = _tool_set()
+
+    result = await _dispatch(
+        tools,
+        "vt.behaviour_pcap",
+        {"file_hash": _SEED_HASH, "sandbox_id": "invented-sandbox"},
+    )
+
+    assert result.status is ToolInvocationStatus.POLICY_DENIED
+    assert result.output["reason"] == "behaviour_report_not_persisted"
+    assert tools.vt.calls["behaviour_pcap"] == 0
+
+
+@pytest.mark.asyncio
+async def test_behaviour_pcap_rejects_a_port_hash_mismatch_before_quarantine() -> None:
+    tools = _tool_set()
+    tools.vt.behaviour_pages.append(
+        _page(
+            (
+                {
+                    "id": "sandbox-report-123",
+                    "type": "file_behaviour",
+                    "attributes": {"has_pcap": True},
+                },
+            )
+        )
+    )
+    await _dispatch(tools, "vt.behaviour", {"file_hash": _SEED_HASH})
+    tools.vt.pcap_bytes = _minimal_pcap()
+    tools.vt.pcap_sha256_override = "f" * 64
+
+    result = await _dispatch(
+        tools,
+        "vt.behaviour_pcap",
+        {"file_hash": _SEED_HASH, "sandbox_id": "sandbox-report-123"},
+    )
+
+    assert result.status is ToolInvocationStatus.UNAVAILABLE
+    assert result.output["reason"] == "pcap_invalid_response"
+    assert result.output["confirmed_non_execution"] is True
+    assert tools.vt_observations.imported_pcaps == []
 
     empty_tools = _tool_set()
     empty_tools.vt.relationship_pages = [_page()]

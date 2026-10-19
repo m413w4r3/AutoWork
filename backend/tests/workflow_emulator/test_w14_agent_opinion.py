@@ -439,11 +439,13 @@ async def test_w14_a_similarity_rule_revision_and_new_article_sample(
         bytes_a = b"MZ\x00W14-sample-A:" + marker_common.encode() + b":relocated-A"
         bytes_b = b"MZ\x00W14-sample-B:" + marker_common.encode() + b":relocated-B"
         bytes_c = b"MZ\x00W14-sample-C:" + marker_c.encode() + b":new-stage"
+        bytes_d = b"MZ\x00W14-controlled-positive-D:" + marker_c.encode() + b":confirmed"
         goodware_bytes = b"synthetic-goodware-W14-no-family-marker"
         holdout_bytes = b"synthetic-holdout-W14-no-family-marker"
         sha_a = hashlib.sha256(bytes_a).hexdigest()
         sha_b = hashlib.sha256(bytes_b).hexdigest()
         sha_c = hashlib.sha256(bytes_c).hexdigest()
+        sha_d = hashlib.sha256(bytes_d).hexdigest()
         goodware_sha = hashlib.sha256(goodware_bytes).hexdigest()
         holdout_sha = hashlib.sha256(holdout_bytes).hexdigest()
         base = SyntheticSampleMaterial.unique()
@@ -473,6 +475,15 @@ async def test_w14_a_similarity_rule_revision_and_new_article_sample(
             origin=SampleOrigin.MANUAL,
             logical_name="sample-b-inert.bin",
         )
+        association_d = await persist_sample_association_fixture(
+            uow_factory,
+            driver.artifact_store,
+            investigation_id=seeded.investigation.id,
+            subject_id=seeded.subject.id,
+            sample_bytes=bytes_d,
+            origin=SampleOrigin.MANUAL,
+            logical_name="sample-d-controlled-positive.bin",
+        )
         vt = HashCheckedVirusTotal(material=material)
         rule_candidate_id = uuid4()
         baseline_id = uuid4()
@@ -484,6 +495,7 @@ async def test_w14_a_similarity_rule_revision_and_new_article_sample(
                 sha_a: _feature_pack(sha_a, strings=((marker_common, 0x240),)),
                 sha_b: _feature_pack(sha_b, strings=((marker_common, 0x318),)),
                 sha_c: _feature_pack(sha_c, strings=((marker_c, 0x420),)),
+                sha_d: _feature_pack(sha_d, strings=((marker_c, 0x520),)),
             },
             baseline_id=baseline_id,
         )
@@ -492,14 +504,17 @@ async def test_w14_a_similarity_rule_revision_and_new_article_sample(
                 sha_a: bytes_a,
                 sha_b: bytes_b,
                 sha_c: bytes_c,
+                sha_d: bytes_d,
                 goodware_sha: goodware_bytes,
                 holdout_sha: holdout_bytes,
             },
             goodware=(goodware_sha,),
             holdout=(holdout_sha,),
         )
+        controlled_positive_d_confirmed = False
 
         async def plan(observations: tuple[EvidenceObservation, ...]) -> Mapping[str, Any]:
+            nonlocal controlled_positive_d_confirmed
             async with uow_factory() as uow:
                 associations = tuple(
                     await uow.sample_associations.list_for_investigation(seeded.investigation.id)
@@ -561,6 +576,33 @@ async def test_w14_a_similarity_rule_revision_and_new_article_sample(
                     ),
                 )
             rule_tests = [item for item in invocations if item.tool_name == "rule.test"]
+            if not controlled_positive_d_confirmed and any(
+                item.normalized_parameters.get("version") == 1 for item in rule_tests
+            ):
+                confirmation = await _persist_observation(
+                    uow_factory,
+                    driver.artifact_store,
+                    investigation_id=seeded.investigation.id,
+                    kind=EvidenceKind.BINARY_ANALYSIS,
+                    payload={
+                        "sample_sha256": sha_d,
+                        "control": "known-positive D contains marker_c and v1 misses it",
+                    },
+                    source="w14-controlled-positive-fixture",
+                    object_type="sample",
+                    object_id=sha_d,
+                )
+                qualified_d = await qualify_sample_http(
+                    client,
+                    seeded.investigation.id,
+                    association_d.id,
+                    expected_version=association_d.version,
+                    qualification=SampleQualification.CONFIRMED,
+                    evidence_refs=(confirmation.id,),
+                )
+                assert qualified_d.status_code == 200, qualified_d.text
+                assert qualified_d.json()["association"]["qualification"] == "confirmed"
+                controlled_positive_d_confirmed = True
             if not any(item.normalized_parameters.get("version") == 1 for item in rule_tests):
                 return decision(
                     "Compile and measure v1 against the two samples, synthetic benign-like "
@@ -777,11 +819,12 @@ async def test_w14_a_similarity_rule_revision_and_new_article_sample(
             )
             association_c = next(item for item in associations if item.sample_sha256 == sha_c)
             assert association_c.qualification is SampleQualification.CANDIDATE
-            # v1 is measured "tested" on A/B; v2 also matches C, an out-of-cluster
-            # candidate, which by policy keeps the version a candidate: C is never
-            # promoted to a confirmed member automatically.
+            # The first explicit v1 report is tested on A/B while D remains a
+            # candidate. Human G3 then confirms D, and the retest measures v1's
+            # false negative before v2 is proposed. Candidate version records stay
+            # immutable proposals; explicit reports carry their measured status.
             assert [(item.version, item.status.value) for item in versions] == [
-                (1, "tested"),
+                (1, "candidate"),
                 (2, "candidate"),
             ]
             assert {
@@ -830,8 +873,10 @@ async def test_w14_a_similarity_rule_revision_and_new_article_sample(
                 if item["version_id"] == str(versions[0].id)
                 and sha_c not in item["corpus_sha256s_by_role"].get("out_of_cluster_candidate", [])
             )
+            assert first_v1["candidate_status"] == "tested"
             roles_first_v1 = {item["role"]: item for item in first_v1["roles"]}
             assert {sha_a, sha_b} <= set(roles_first_v1["confirmed_positive"]["matches"])
+            assert sha_d in roles_first_v1["out_of_cluster_candidate"]["non_matches"]
             assert goodware_sha in roles_first_v1["goodware"]["non_matches"]
             first_goodware_case = roles_first_v1["goodware"]["test_cases"][0]
             assert first_goodware_case["provenance"] == RuleSampleProvenance.SYNTHETIC.value
@@ -844,6 +889,9 @@ async def test_w14_a_similarity_rule_revision_and_new_article_sample(
             )
             roles_v1 = {item["role"]: item for item in v1_after_c["roles"]}
             assert {sha_a, sha_b} <= set(roles_v1["confirmed_positive"]["matches"])
+            assert sha_d in roles_v1["confirmed_positive"]["non_matches"]
+            assert sha_d in v1_after_c["false_negative_sha256s"]
+            assert v1_after_c["revision_recommendation"] == "revise_false_negative"
             assert sha_c in roles_v1["out_of_cluster_candidate"]["non_matches"]
             assert goodware_sha in roles_v1["goodware"]["non_matches"]
             assert holdout_sha in roles_v1["holdout"]["non_matches"]
@@ -853,7 +901,7 @@ async def test_w14_a_similarity_rule_revision_and_new_article_sample(
                 if item["version_id"] == str(versions[1].id) and item["operation"] == "test"
             )
             roles_v2 = {item["role"]: item for item in v2_report["roles"]}
-            assert {sha_a, sha_b} <= set(roles_v2["confirmed_positive"]["matches"])
+            assert {sha_a, sha_b, sha_d} <= set(roles_v2["confirmed_positive"]["matches"])
             assert sha_c in roles_v2["out_of_cluster_candidate"]["matches"]
             assert goodware_sha in roles_v2["goodware"]["non_matches"]
             assert holdout_sha in roles_v2["holdout"]["non_matches"]

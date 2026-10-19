@@ -3,16 +3,30 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 from uuid import UUID, uuid5
 
+from cti_app.application.article_novelty import (
+    ArticleNoveltyService,
+    NoveltyCandidate,
+    NoveltyCandidateKind,
+)
 from cti_app.application.investigation_persistence import (
     EvidenceObservationRepository,
     FindingRepository,
     VersionConflictError,
+)
+from cti_app.application.investigation_tools import (
+    ToolConfidentiality,
+    ToolDefinition,
+    ToolEffect,
+    ToolExecutionContext,
+    ToolRegistry,
+    ToolResult,
 )
 from cti_app.application.research_context_builder import ArticleSnapshotPort
 from cti_app.domain.investigation import (
@@ -22,6 +36,7 @@ from cti_app.domain.investigation import (
     FindingKind,
     InvestigationFinding,
     NoveltyClass,
+    ToolInvocationStatus,
     canonical_json_bytes,
 )
 
@@ -37,6 +52,339 @@ _OBJECT_IDENTIFIED_KINDS = frozenset(
         FindingKind.DETECTION,
     }
 )
+OPERATOR_FINDING_SCHEMA_VERSION = "operator-finding.v1"
+_UUID_SCHEMA = {
+    "type": "string",
+    "pattern": r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+}
+_SUBJECT_SCOPE_PREFIX = "Subject reference: "
+
+
+class OperatorFindingToolAdapter:
+    """Write operator findings through the same versioned repository path."""
+
+    def __init__(
+        self,
+        *,
+        findings: FindingRepository,
+        observations: EvidenceObservationRepository,
+        investigations: Any,
+        article_snapshots: ArticleSnapshotPort,
+    ) -> None:
+        self._findings = findings
+        self._observations = observations
+        self._investigations = investigations
+        self._article_snapshots = article_snapshots
+
+    async def execute(
+        self, arguments: Mapping[str, Any], context: ToolExecutionContext
+    ) -> ToolResult:
+        try:
+            return await self._execute(arguments, context)
+        except VersionConflictError:
+            return ToolResult(
+                ToolInvocationStatus.FAILED,
+                error_code="stale_finding_version",
+                message="The finding already has a newer version.",
+            )
+        except (TypeError, ValueError) as exc:
+            message = str(exc).casefold()
+            code = (
+                "finding_observation_not_found"
+                if "observation" in message and "does not exist" in message
+                else "finding_observation_investigation_mismatch"
+                if "another investigation" in message
+                else "finding_claim_not_found"
+                if "claim references" in message or "claim does not belong" in message
+                else "finding_invalid"
+            )
+            return ToolResult(
+                ToolInvocationStatus.FAILED,
+                output={"error_code": code},
+                error_code=code,
+                message=code,
+            )
+
+    async def _execute(
+        self, arguments: Mapping[str, Any], context: ToolExecutionContext
+    ) -> ToolResult:
+        action = arguments["action"]
+        kind = FindingKind(arguments["kind"]) if action == "propose" else None
+        previous = None
+        if action == "revise":
+            finding_id = UUID(arguments["finding_id"])
+            previous = await self._findings.get(finding_id)
+            if previous is None or previous.investigation_id != context.investigation_id:
+                return ToolResult(
+                    ToolInvocationStatus.FAILED,
+                    error_code="finding_not_found",
+                    message="Finding does not belong to this investigation.",
+                )
+            if previous.version != arguments["expected_finding_version"]:
+                return ToolResult(
+                    ToolInvocationStatus.FAILED,
+                    error_code="stale_finding_version",
+                    message="The expected finding version is stale.",
+                )
+            kind = previous.kind
+
+        assert kind is not None
+        assessment = FindingAssessment(arguments["assessment"])
+        refs = tuple(UUID(item) for item in arguments["observation_refs"])
+        claim_refs = tuple(arguments["claim_refs"])
+        supplied_subject = arguments.get("subject_ref")
+        if action == "revise" and supplied_subject is None:
+            supplied_subject = _subject_from_scope(previous.scope if previous else "")
+        subject_ref = _normalize_subject_ref(supplied_subject)
+        evidence = await self._load_observations(context.investigation_id, refs)
+        limitations = tuple(arguments["limitations"])
+        assessment, limitations = constrain_supported_assessment(
+            kind=kind,
+            assessment=assessment,
+            subject_ref=subject_ref,
+            claim_refs=claim_refs,
+            observations=evidence,
+            limitations=limitations,
+        )
+        novelty = NoveltyClass(arguments["novelty"]) if arguments.get("novelty") else None
+        if kind is FindingKind.NEW_SAMPLE and not _is_sample_hash(subject_ref):
+            novelty = NoveltyClass.NOT_CONFIRMED
+            assessment = FindingAssessment.INCONCLUSIVE
+            limitations = (*limitations, "Un finding NEW_SAMPLE exige un hash d'objet valide.")
+        elif kind is FindingKind.NEW_SAMPLE or novelty is NoveltyClass.NEW_TO_ARTICLE:
+            classification = await self._classify_novelty(
+                context.investigation_id,
+                kind=kind,
+                assessment=assessment,
+                statement=arguments["statement"],
+                subject_ref=subject_ref,
+                claim_refs=claim_refs,
+                observation_refs=refs,
+            )
+            novelty = classification.novelty
+            limitations = tuple(dict.fromkeys((*limitations, *classification.limitations)))
+
+        scope = _scope_with_subject_ref(subject_ref, arguments["scope"])
+        service = FindingService(
+            findings=self._findings,
+            observations=self._observations,
+            article_snapshots=self._article_snapshots,
+        )
+        if action == "propose":
+            finding = await service.propose(
+                investigation_id=context.investigation_id,
+                kind=kind,
+                assessment=assessment,
+                statement=arguments["statement"],
+                observation_refs=refs,
+                claim_refs=claim_refs,
+                novelty=novelty,
+                scope=scope,
+                limitations=limitations,
+            )
+        else:
+            assert previous is not None
+            finding = await service.revise(
+                previous.id,
+                assessment=assessment,
+                statement=arguments["statement"],
+                observation_refs=refs,
+                claim_refs=claim_refs,
+                novelty=novelty,
+                scope=scope,
+                limitations=limitations,
+            )
+        return ToolResult(
+            ToolInvocationStatus.SUCCEEDED,
+            observation_refs=tuple(item.id for item in evidence),
+            output={
+                "finding_id": str(finding.id),
+                "finding_version": finding.version,
+                "assessment": finding.assessment.value,
+                "kind": finding.kind.value,
+            },
+            message="Operator finding saved as a versioned draft.",
+        )
+
+    async def _load_observations(
+        self, investigation_id: UUID, refs: tuple[UUID, ...]
+    ) -> tuple[EvidenceObservation, ...]:
+        items: list[EvidenceObservation] = []
+        for ref in refs:
+            item = await self._observations.get(ref)
+            if item is None:
+                raise ValueError(f"Observation {ref} does not exist")
+            if item.investigation_id != investigation_id:
+                raise ValueError(f"Observation {ref} belongs to another investigation")
+            items.append(item)
+        return tuple(items)
+
+    async def _classify_novelty(
+        self,
+        investigation_id: UUID,
+        *,
+        kind: FindingKind,
+        assessment: FindingAssessment,
+        statement: str,
+        subject_ref: str | None,
+        claim_refs: tuple[str, ...],
+        observation_refs: tuple[UUID, ...],
+    ) -> Any:
+        if kind is FindingKind.NEW_SAMPLE and subject_ref:
+            candidate_kind = NoveltyCandidateKind.SAMPLE
+            value, object_type, object_id = subject_ref, "sample", subject_ref
+        elif kind is FindingKind.CLAIM_VERIFICATION and claim_refs:
+            candidate_kind = NoveltyCandidateKind.CLAIM
+            value, object_type, object_id = statement, "claim", claim_refs[0]
+        elif subject_ref:
+            candidate_kind = NoveltyCandidateKind.IOC
+            value, object_type, object_id = subject_ref, kind.value, subject_ref
+        else:
+            candidate_kind = NoveltyCandidateKind.BEHAVIOUR
+            value, object_type, object_id = statement, kind.value, statement[:256]
+        return await ArticleNoveltyService(
+            observations=self._observations,
+            investigations=self._investigations,
+            article_snapshots=self._article_snapshots,
+        ).classify(
+            investigation_id=investigation_id,
+            candidate=NoveltyCandidate(
+                investigation_id=investigation_id,
+                kind=candidate_kind,
+                value=value,
+                object_type=object_type,
+                object_id=object_id,
+                details={"statement": statement},
+                claim_id=claim_refs[0]
+                if kind is FindingKind.CLAIM_VERIFICATION and claim_refs
+                else None,
+                claim_assessment=assessment if kind is FindingKind.CLAIM_VERIFICATION else None,
+                observation_refs=observation_refs,
+            ),
+        )
+
+
+def register_operator_finding_tools(
+    registry: ToolRegistry,
+    *,
+    findings: FindingRepository,
+    observations: EvidenceObservationRepository,
+    investigations: Any,
+    article_snapshots: ArticleSnapshotPort,
+) -> None:
+    adapter = OperatorFindingToolAdapter(
+        findings=findings,
+        observations=observations,
+        investigations=investigations,
+        article_snapshots=article_snapshots,
+    )
+    base_properties = {
+        "action": {"type": "string", "enum": ["propose", "revise"]},
+        "kind": {"type": "string", "enum": [item.value for item in FindingKind]},
+        "finding_id": _UUID_SCHEMA,
+        "expected_finding_version": {"type": "integer", "minimum": 1},
+        "assessment": {"type": "string", "enum": [item.value for item in FindingAssessment]},
+        "statement": {"type": "string", "minLength": 1, "maxLength": 8000},
+        "subject_ref": {"type": ["string", "null"], "maxLength": 256},
+        "observation_refs": {"type": "array", "maxItems": 128, "items": _UUID_SCHEMA},
+        "claim_refs": {
+            "type": "array",
+            "maxItems": 128,
+            "items": {"type": "string", "minLength": 1, "maxLength": 128},
+        },
+        "novelty": {
+            "type": ["string", "null"],
+            "enum": [*(item.value for item in NoveltyClass), None],
+        },
+        "scope": {"type": "string", "maxLength": 2000},
+        "limitations": {
+            "type": "array",
+            "maxItems": 128,
+            "items": {"type": "string", "maxLength": 2000},
+        },
+    }
+    common_required = [
+        "action",
+        "assessment",
+        "statement",
+        "subject_ref",
+        "observation_refs",
+        "claim_refs",
+        "novelty",
+        "scope",
+        "limitations",
+    ]
+    registry.register(
+        ToolDefinition(
+            name="finding.propose",
+            schema_version=OPERATOR_FINDING_SCHEMA_VERSION,
+            input_schema={
+                "type": "object",
+                "properties": {**base_properties, "action": {"const": "propose"}},
+                "required": ["action", "kind", *common_required],
+                "additionalProperties": False,
+            },
+            effect=ToolEffect.LOCAL_COMPUTE,
+            cost_model={},
+            confidentiality=ToolConfidentiality.CONFIDENTIAL,
+            limitations=("Findings remain drafts and cite persisted observations.",),
+            capability_key="operator.write",
+        ),
+        adapter,
+    )
+    registry.register(
+        ToolDefinition(
+            name="finding.revise",
+            schema_version=OPERATOR_FINDING_SCHEMA_VERSION,
+            input_schema={
+                "type": "object",
+                "properties": {**base_properties, "action": {"const": "revise"}},
+                "required": [
+                    "action",
+                    "finding_id",
+                    "expected_finding_version",
+                    *common_required[1:],
+                ],
+                "additionalProperties": False,
+            },
+            effect=ToolEffect.LOCAL_COMPUTE,
+            cost_model={},
+            confidentiality=ToolConfidentiality.CONFIDENTIAL,
+            limitations=("Finding revisions are append-only and remain drafts.",),
+            capability_key="operator.write",
+        ),
+        adapter,
+    )
+
+
+def _scope_with_subject_ref(subject_ref: str | None, scope: str) -> str:
+    clean = scope.strip()
+    if not subject_ref:
+        return clean
+    line = f"{_SUBJECT_SCOPE_PREFIX}{subject_ref}"
+    if clean.startswith(_SUBJECT_SCOPE_PREFIX):
+        clean = clean.split("\n", 1)[1] if "\n" in clean else ""
+    return f"{line}\n{clean}" if clean else line
+
+
+def _subject_from_scope(scope: str) -> str | None:
+    first, _, _rest = scope.partition("\n")
+    return first[len(_SUBJECT_SCOPE_PREFIX) :] if first.startswith(_SUBJECT_SCOPE_PREFIX) else None
+
+
+def _normalize_subject_ref(subject_ref: str | None) -> str | None:
+    if subject_ref is None:
+        return None
+    normalized = subject_ref.strip()
+    return normalized.lower() if _is_sample_hash(normalized) else normalized
+
+
+def _is_sample_hash(value: str | None) -> bool:
+    return (
+        value is not None
+        and len(value) in {32, 40, 64}
+        and all(char in "0123456789abcdefABCDEF" for char in value)
+    )
 
 
 def constrain_supported_assessment(

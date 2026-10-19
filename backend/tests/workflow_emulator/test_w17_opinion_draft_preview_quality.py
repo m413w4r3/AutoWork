@@ -293,6 +293,14 @@ async def test_w17_real_typst_draft_preview_preserves_structure_and_limits(
     chronology = next(item for item in model.content_sections if item["type"] == "chronology")
     assert chronology["timeline"][0]["display_date"] == "15 janvier 2025"
     assert chronology["timeline"][0]["source_urls"] == ["https://example.com/report"]
+    empty_opinion = replace(opinion, blocks=(), content_sha256="")
+    empty_model = project_publication_to_typst_model(
+        TypstDraftPreviewDocument(document, empty_opinion, synthesis)
+    )
+    empty_opinion_section = next(
+        item for item in empty_model.content_sections if item["type"] == "analyst_opinion"
+    )
+    assert empty_opinion_section["empty_message"] == "Aucun avis publié."
     assert any(group.artifact_type is ArtifactType.DOMAIN for group in document.indicators)
     assert synthesis.uncertainties
     assert any(item["type"] == "limitations" for item in model.content_sections)
@@ -350,6 +358,20 @@ async def test_w17_real_typst_draft_preview_preserves_structure_and_limits(
     ):
         assert required.casefold() in normalized_text, f"W17 PDF text is missing {required!r}"
 
+    reference_text = normalized_text.split("références", 1)[1].split("synthèse", 1)[0]
+    assert "•" in reference_text, "W17 references must render as a bulleted list"
+    assert "https://example.com/report" in reference_text
+    assert "1" in reference_text, "W17 source links must keep their numbered anchor"
+    chronology_text = normalized_text.split("chronologie", 1)[1].split("limites des preuves", 1)[0]
+    assert "1." in chronology_text, "W17 chronology must render as a numbered list"
+    assert "rapport. 1" in chronology_text
+    for table_heading in (
+        "type et valeur",
+        "contexte et observations",
+        "sources et décision de publication",
+    ):
+        assert table_heading in normalized_text, f"W17 IOC table is missing {table_heading!r}"
+
     assert rendered_pages
     final_page_label = f"{len(rendered_pages)}/{len(rendered_pages)}"
     assert final_page_label in normalized_text
@@ -360,3 +382,16 @@ async def test_w17_real_typst_draft_preview_preserves_structure_and_limits(
     anchored_note = normalized_text.index("une résolution dns isolée ajoute un indice")
     assert source_paragraph < anchored_note, "W17 analyst note must follow its anchored paragraph"
     assert len(compiled.content) > 2_000
+
+    empty_compiled = await service.render_draft_preview(document, empty_opinion, synthesis)
+    empty_pdf_path = tmp_path / "w17-empty-opinion-preview.pdf"
+    empty_text, _ = await asyncio.to_thread(
+        _inspect_rendered_pdf,
+        empty_compiled.content,
+        empty_pdf_path,
+        pdftotext,
+        pdftoppm,
+    )
+    normalized_empty_text = " ".join(empty_text.split()).casefold().replace("\u2019", "'")
+    assert "avis de l'analyste" in normalized_empty_text
+    assert "aucun avis publié" in normalized_empty_text

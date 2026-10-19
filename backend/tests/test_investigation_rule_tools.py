@@ -67,15 +67,6 @@ from cti_app.domain.rule_workbench import (
     YaraEngineResult,
     YaraExecutionStatus,
 )
-from tests.test_investigation_service import (
-    _decision,
-    _finding_id,
-    _Fixture,
-    _operation_and_observation_id,
-    _opinion_delta,
-    _proposal,
-    _tool_call,
-)
 
 _EVIDENCE_NAMESPACE = UUID("47bfec4f-9070-42d0-aef5-0eb84c8b57cd")
 
@@ -490,6 +481,7 @@ async def test_non_json_meta_returns_actionable_example_without_creating_candida
     )
 
     assert result.status is ToolInvocationStatus.FAILED
+    assert result.error_code == "invalid_meta"
     assert 'ARG meta: {"description": "..."}' in result.message
     assert await harness.candidates.list_for_candidate(candidate_id) == ()
 
@@ -509,9 +501,181 @@ async def test_json_encoded_meta_object_is_accepted() -> None:
         },
     )
 
-    assert result.status is ToolInvocationStatus.UNAVAILABLE
-    assert result.error_code is None
+    assert result.status is ToolInvocationStatus.SUCCEEDED
     assert result.output["candidate_id"]
+    assert result.output["version"] == "v1"
+    assert result.output["validation_status"] == "untested"
+    assert result.output["compile_check"]["status"] == "ok"
+    assert "report" not in result.output
+
+
+@pytest.mark.asyncio
+async def test_rule_propose_creates_untested_candidate_with_empty_corpus_and_object_meta() -> None:
+    harness = _harness(samples={})
+    observation_ref = await _source_observation(harness, "EmptyCorpusMarker")
+
+    proposed = await _call(
+        harness,
+        "rule.propose",
+        {
+            "condition": "all",
+            "motifs": [_motif("EmptyCorpusMarker", observation_ref)],
+            "meta": {"description": "compile only"},
+        },
+    )
+
+    assert proposed.status is ToolInvocationStatus.SUCCEEDED
+    assert proposed.output["candidate_id"]
+    assert proposed.output["version"] == "v1"
+    assert proposed.output["validation_status"] == "untested"
+    assert proposed.output["candidate_status"] == "candidate"
+    assert proposed.output["compile_check"]["status"] == "ok"
+    assert harness.engine.match_count == 0
+    versions = await harness.candidates.list_for_candidate(UUID(proposed.output["candidate_id"]))
+    assert len(versions) == 1
+
+
+@pytest.mark.asyncio
+async def test_rule_cycle_requires_test_and_reports_only_explicit_test_results() -> None:
+    from cti_app.domain.rule_workbench import (
+        RuleCorpusInventoryItem,
+        RuleSampleProvenance,
+        RuleTestCorpusRole,
+    )
+
+    positive = b"NewMarker belongs to the documented positive fixture"
+    goodware = b"ordinary benign configuration fixture"
+    positive_sha256 = _sha256(positive)
+    goodware_sha256 = _sha256(goodware)
+    harness = _harness(
+        samples={positive_sha256: positive, goodware_sha256: goodware},
+        manual_imports=(
+            RuleCorpusInventoryItem(
+                sample_sha256=positive_sha256,
+                role=RuleTestCorpusRole.CONFIRMED_POSITIVE,
+                provenance=RuleSampleProvenance.REAL,
+                size_bytes=len(positive),
+                source_description=(
+                    "Inert unit-test bytes tagged real to exercise operator-import provenance."
+                ),
+            ),
+            RuleCorpusInventoryItem(
+                sample_sha256=goodware_sha256,
+                role=RuleTestCorpusRole.GOODWARE,
+                provenance=RuleSampleProvenance.REAL,
+                size_bytes=len(goodware),
+                source_description=(
+                    "Inert unit-test bytes tagged real to exercise goodware provenance."
+                ),
+            ),
+        ),
+    )
+    original_ref = await _source_observation(harness, "OriginalMarker")
+    additional_ref = await _source_observation(harness, "NewMarker")
+    proposed = await _call(
+        harness,
+        "rule.propose",
+        {
+            "condition": "all",
+            "motifs": [_motif("OriginalMarker", original_ref)],
+        },
+    )
+    candidate_id = proposed.output["candidate_id"]
+    assert proposed.output["validation_status"] == "untested"
+    assert harness.engine.match_count == 0
+
+    revise_before_test = await _call(
+        harness,
+        "rule.revise",
+        {
+            "candidate_id": candidate_id,
+            "parent_version": 1,
+            "condition": "any",
+            "motifs": [_motif("NewMarker", additional_ref)],
+        },
+    )
+    assert revise_before_test.status is ToolInvocationStatus.FAILED
+    assert revise_before_test.error_code == "rule_revision_requires_test"
+    assert len(await harness.candidates.list_for_candidate(UUID(candidate_id))) == 1
+
+    first_test = await _call(harness, "rule.test", {"candidate_id": candidate_id, "version": 1})
+    assert first_test.output["report"]["false_negative_count"] == 1
+    assert first_test.output["report"]["revision_recommendation"] == "revise_false_negative"
+
+    revised = await _call(
+        harness,
+        "rule.revise",
+        {
+            "candidate_id": candidate_id,
+            "parent_version": 1,
+            "condition": "any",
+            "motifs": [
+                _motif("OriginalMarker", original_ref),
+                _motif("NewMarker", additional_ref),
+            ],
+        },
+    )
+    assert revised.output["version"] == "v2"
+    assert revised.output["validation_status"] == "untested"
+    assert revised.output["compile_check"]["status"] == "ok"
+    assert "report" not in revised.output
+
+    second_test = await _call(harness, "rule.test", {"candidate_id": candidate_id, "version": 2})
+    assert second_test.output["report"]["false_negative_count"] == 0
+    assert second_test.output["report"]["false_positive_count"] == 0
+    assert second_test.output["validation_status"] == "real_validated"
+    assert second_test.output["report"]["revision_recommendation"] == "none_justified"
+    unjustified_revision = await _call(
+        harness,
+        "rule.revise",
+        {
+            "candidate_id": candidate_id,
+            "parent_version": 2,
+            "condition": "any",
+            "motifs": [
+                _motif("OriginalMarker", original_ref),
+                _motif("NewMarker", additional_ref),
+                _motif("ThirdMarker", await _source_observation(harness, "ThirdMarker")),
+            ],
+        },
+    )
+    assert unjustified_revision.status is ToolInvocationStatus.FAILED
+    assert unjustified_revision.error_code == "rule_revision_not_justified"
+    assert "Aucune révision justifiée" in unjustified_revision.message
+
+
+@pytest.mark.asyncio
+async def test_rule_propose_returns_typed_compile_error_without_candidate() -> None:
+    class InvalidSyntaxEngine(_DeterministicYaraEngine):
+        def compile(self, source: str) -> YaraEngineResult:
+            del source
+            return YaraEngineResult(
+                status=YaraExecutionStatus.COMPILE_ERROR,
+                engine_version="fixture-yara-1",
+                message="untrusted engine detail containing source",
+                line=3,
+            )
+
+    harness = _harness(samples={}, engine=InvalidSyntaxEngine())
+    observation_ref = await _source_observation(harness, "CompileFailureMarker")
+    candidate_id = uuid4()
+
+    result = await _call(
+        harness,
+        "rule.propose",
+        {
+            "candidate_id": str(candidate_id),
+            "condition": "all",
+            "motifs": [_motif("CompileFailureMarker", observation_ref)],
+        },
+    )
+
+    assert result.status is ToolInvocationStatus.FAILED
+    assert result.error_code == "rule_syntax_invalid"
+    assert result.output["error_code"] == "rule_syntax_invalid"
+    assert "line 3" in result.message
+    assert "untrusted engine detail" not in str(result.output)
+    assert await harness.candidates.list_for_candidate(candidate_id) == ()
 
 
 def test_rule_version_summary_without_report_is_explicitly_untested() -> None:
@@ -529,10 +693,20 @@ def test_rule_version_summary_without_report_is_explicitly_untested() -> None:
         motif_provenance=(),
     )
 
-    summary = _version_summary(version, ())
+    summary = _version_summary(
+        version,
+        (
+            {
+                "schema": "investigation-yara-test.v1",
+                "operation": "propose",
+                "source_sha256": version.source_sha256,
+                "validation_status": "real_validated",
+            },
+        ),
+    )
 
     assert summary["validation_status"] == "untested"
-    assert summary["validation_reason"] == "corpus_empty"
+    assert summary["validation_reason"] == "explicit_rule_test_required"
     assert summary["latest_test_report"] is None
 
 
@@ -556,7 +730,7 @@ async def test_rule_get_marks_version_without_report_untested() -> None:
 
     assert result.status is ToolInvocationStatus.SUCCEEDED
     assert result.output["versions"][0]["validation_status"] == "untested"
-    assert result.output["versions"][0]["validation_reason"] == "corpus_empty"
+    assert result.output["versions"][0]["validation_reason"] == "explicit_rule_test_required"
     assert result.output["versions"][0]["latest_test_report"] is None
 
 
@@ -593,30 +767,37 @@ async def test_missing_engine_and_unreadable_bytes_are_local_unavailable_results
     )
     await _associate(unavailable_engine, sha256)
     source_ref = await _source_observation(unavailable_engine, "MarkerForTest")
+    unavailable_candidate_id = uuid4()
     unavailable = await _call(
         unavailable_engine,
         "rule.propose",
-        {"condition": "any", "motifs": [_motif("MarkerForTest", source_ref)]},
+        {
+            "candidate_id": str(unavailable_candidate_id),
+            "condition": "any",
+            "motifs": [_motif("MarkerForTest", source_ref)],
+        },
     )
     assert unavailable.status is ToolInvocationStatus.UNAVAILABLE
-    assert unavailable.output["execution_status"] == "engine_unavailable"
-    assert (
-        await unavailable_engine.candidates.list_for_candidate(
-            UUID(unavailable.output["candidate_id"])
-        )
-        == ()
-    )
+    assert unavailable.error_code == "rule_workbench_unavailable"
+    assert await unavailable_engine.candidates.list_for_candidate(unavailable_candidate_id) == ()
 
     missing_bytes = _harness(samples={})
     await _associate(missing_bytes, sha256)
     source_ref = await _source_observation(missing_bytes, "MarkerForTest")
-    non_measurable = await _call(
+    proposed = await _call(
         missing_bytes,
         "rule.propose",
         {"condition": "any", "motifs": [_motif("MarkerForTest", source_ref)]},
     )
+    assert proposed.status is ToolInvocationStatus.SUCCEEDED
+    assert proposed.output["validation_status"] == "untested"
+    non_measurable = await _call(
+        missing_bytes,
+        "rule.test",
+        {"candidate_id": proposed.output["candidate_id"]},
+    )
     assert non_measurable.status is ToolInvocationStatus.UNAVAILABLE
-    report_ref = UUID(non_measurable.output["observation_refs"][0])
+    report_ref = non_measurable.observation_refs[0]
     observation = await missing_bytes.evidence.repository.get(report_ref)
     assert observation is not None
     assert observation.kind is EvidenceKind.YARA_MATCH
@@ -662,9 +843,10 @@ async def test_v1_v2_retest_and_comparison_record_exact_corpus_observations() ->
     )
     assert v1_result.status is ToolInvocationStatus.SUCCEEDED
     assert v1_result.output["version"] == "v1"
-    assert v1_result.output["candidate_status"] == DetectionCandidateStatus.EXPERIMENTAL.value
+    assert v1_result.output["candidate_status"] == DetectionCandidateStatus.CANDIDATE.value
+    assert v1_result.output["validation_status"] == "untested"
     v1 = (await harness.candidates.list_for_candidate(candidate_id))[0]
-    assert v1.status is DetectionCandidateStatus.EXPERIMENTAL
+    assert v1.status is DetectionCandidateStatus.CANDIDATE
 
     added = await _associate(
         harness,
@@ -679,6 +861,14 @@ async def test_v1_v2_retest_and_comparison_record_exact_corpus_observations() ->
         reason="Synthetic fixture is part of the confirmed test cluster.",
     )
     await harness.associations.append_version(confirmed, expected_version=added.version)
+
+    v1_test = await _call(
+        harness,
+        "rule.test",
+        {"candidate_id": str(candidate_id), "version": 1},
+    )
+    assert v1_test.output["report"]["false_negative_count"] == 1
+    assert v1_test.output["report"]["revision_recommendation"] == "revise_false_negative"
 
     v2_result = await _call(
         harness,
@@ -696,9 +886,18 @@ async def test_v1_v2_retest_and_comparison_record_exact_corpus_observations() ->
     assert v2_result.status is ToolInvocationStatus.SUCCEEDED
     assert v2_result.output["version"] == "v2"
     assert v2_result.output["source_sha256"] != v1.source_sha256
+    assert v2_result.output["validation_status"] == "untested"
     v2 = (await harness.candidates.list_for_candidate(candidate_id))[-1]
     assert v2.parent_version_id == v1.id
-    assert v2.status is DetectionCandidateStatus.TESTED
+    assert v2.status is DetectionCandidateStatus.CANDIDATE
+
+    v2_test = await _call(
+        harness,
+        "rule.test",
+        {"candidate_id": str(candidate_id), "version": 2},
+    )
+    assert v2_test.output["report"]["false_negative_count"] == 0
+    assert v2_test.output["report"]["revision_recommendation"] == "none_justified"
 
     compared = await _call(
         harness,
@@ -715,11 +914,11 @@ async def test_v1_v2_retest_and_comparison_record_exact_corpus_observations() ->
     assert comparison_observation is not None
     assert comparison_observation.kind is EvidenceKind.YARA_MATCH
 
-    v1_observation = await harness.evidence.repository.get(v1_result.observation_refs[0])
+    v1_observation = await harness.evidence.repository.get(v1_test.observation_refs[0])
     assert v1_observation is not None and v1_observation.kind is EvidenceKind.YARA_MATCH
     v1_payload = harness.evidence.payloads[v1_observation.blob_id]
     role_hashes = v1_payload["corpus_sha256s_by_role"]
-    assert role_hashes["confirmed_positive"] == [first_sha]
+    assert role_hashes["confirmed_positive"] == sorted([first_sha, second_sha])
     assert role_hashes["goodware"] == [goodware_sha]
     assert role_hashes["holdout"] == [holdout_sha]
     for payload in harness.evidence.payloads.values():
@@ -773,7 +972,8 @@ async def test_dispatcher_replay_returns_cached_rule_test_without_recompilation(
     assert harness.engine.compile_count == before + 1
     # With no operator-supplied benign bytes, the run records a partial
     # evaluation instead of implying negative-corpus coverage.
-    assert proposed.status is ToolInvocationStatus.PARTIAL
+    assert proposed.status is ToolInvocationStatus.SUCCEEDED
+    assert proposed.output["validation_status"] == "untested"
 
 
 @pytest.mark.asyncio
@@ -801,7 +1001,11 @@ async def test_goodware_match_rejects_rule_without_an_approval_path() -> None:
 
     version = (await harness.candidates.list_for_candidate(candidate))[0]
     assert result.status is ToolInvocationStatus.SUCCEEDED
-    assert version.status is DetectionCandidateStatus.REJECTED
+    assert result.output["validation_status"] == "untested"
+    assert version.status is DetectionCandidateStatus.CANDIDATE
+    tested = await _call(harness, "rule.test", {"candidate_id": str(candidate)})
+    assert tested.output["candidate_status"] == DetectionCandidateStatus.REJECTED.value
+    assert tested.output["report"]["false_positive_count"] == 1
     assert harness.registry.get("rule.approve", "1") is None
     assert not any(
         item.status is DetectionCandidateStatus.APPROVED
@@ -811,6 +1015,16 @@ async def test_goodware_match_rejects_rule_without_an_approval_path() -> None:
 
 @pytest.mark.asyncio
 async def test_noisy_rule_does_not_block_real_loop_opinion_draft() -> None:
+    from tests.test_investigation_service import (
+        _decision,
+        _finding_id,
+        _Fixture,
+        _operation_and_observation_id,
+        _opinion_delta,
+        _proposal,
+        _tool_call,
+    )
+
     positive_bytes = b"synthetic chain payload with SharedChainMarker"
     goodware_bytes = b"ordinary synthetic application with SharedChainMarker"
     positive_sha, goodware_sha = _sha256(positive_bytes), _sha256(goodware_bytes)
@@ -894,6 +1108,12 @@ async def test_noisy_rule_does_not_block_real_loop_opinion_draft() -> None:
         },
         "purpose": "check a local candidate pattern",
     }
+    rule_test_call = {
+        "tool_name": "rule.test",
+        "schema_version": "1",
+        "arguments": {"candidate_id": str(candidate_id), "version": 1},
+        "purpose": "measure the exact proposed candidate version against its corpus",
+    }
     chain_call = _tool_call("chain.inspect", "loader downloads payload", "clarify infection chain")
     _chain_operation, chain_observation_id = _operation_and_observation_id(
         state.investigation_id, chain_call
@@ -916,6 +1136,11 @@ async def test_noisy_rule_does_not_block_real_loop_opinion_draft() -> None:
                 tools=(rule_call, chain_call),
             ),
             _decision(
+                goal="test the exact candidate version before finishing",
+                next_action="continue",
+                tools=(rule_test_call,),
+            ),
+            _decision(
                 goal="finish the infection-chain finding",
                 next_action="finish",
                 findings=(chain_finding,),
@@ -924,7 +1149,7 @@ async def test_noisy_rule_does_not_block_real_loop_opinion_draft() -> None:
                     chain_observation_id,
                     text=(
                         "The investigation clarifies payload retrieval; the noisy YARA "
-                        "candidate was rejected."
+                        "candidate was rejected by its explicit test."
                     ),
                 ),
             ),
@@ -935,8 +1160,23 @@ async def test_noisy_rule_does_not_block_real_loop_opinion_draft() -> None:
 
     result = await fixture.service.run(state.investigation_id)
 
+    invocations = await fixture.invocations.list_for_investigation(state.investigation_id)
+    rule_test_invocations = tuple(item for item in invocations if item.tool_name == "rule.test")
+    assert len(rule_test_invocations) == 1, invocations
+    assert rule_test_invocations[0].status in {
+        ToolInvocationStatus.SUCCEEDED,
+        ToolInvocationStatus.PARTIAL,
+    }
     rejected = (await candidates.list_for_candidate(candidate_id))[0]
-    assert rejected.status is DetectionCandidateStatus.REJECTED
+    assert rejected.status is DetectionCandidateStatus.CANDIDATE
+    test_reports = tuple(
+        payload
+        for payload in evidence.payloads.values()
+        if payload.get("operation") == "test" and payload.get("candidate_id") == str(candidate_id)
+    )
+    assert len(test_reports) == 1
+    assert test_reports[0]["candidate_status"] == DetectionCandidateStatus.REJECTED.value
+    assert test_reports[0]["false_positive_count"] == 1
     assert result.stop_reason.value == "agent_finished"
     opinions = list(fixture.opinions._items.values())
     assert len(opinions) == 1
@@ -948,6 +1188,16 @@ async def test_noisy_rule_does_not_block_real_loop_opinion_draft() -> None:
 
 @pytest.mark.asyncio
 async def test_investigation_chain_can_finish_without_any_rule_tool() -> None:
+    from tests.test_investigation_service import (
+        _decision,
+        _finding_id,
+        _Fixture,
+        _operation_and_observation_id,
+        _opinion_delta,
+        _proposal,
+        _tool_call,
+    )
+
     fixture = _Fixture(responses=[], tools=(("chain.inspect", "local"),))
     state = await fixture.start()
     chain_call = _tool_call(
@@ -1091,6 +1341,33 @@ async def test_goodware_feature_baseline_is_not_reported_as_tested_goodware_byte
 
 
 @pytest.mark.asyncio
+async def test_manual_import_role_takes_precedence_over_its_candidate_association() -> None:
+    from cti_app.domain.rule_workbench import (
+        RuleCorpusInventoryItem,
+        RuleSampleProvenance,
+        RuleTestCorpusRole,
+    )
+
+    content = b"operator-imported benign corpus fixture"
+    sample_sha256 = _sha256(content)
+    manual_import = RuleCorpusInventoryItem(
+        sample_sha256=sample_sha256,
+        role=RuleTestCorpusRole.GOODWARE,
+        provenance=RuleSampleProvenance.SYNTHETIC,
+        size_bytes=len(content),
+        source_description="Synthetic operator import used by this test.",
+    )
+    harness = _harness(samples={sample_sha256: content}, manual_imports=(manual_import,))
+    await _associate(harness, sample_sha256, origin=SampleOrigin.MANUAL)
+
+    corpus = await harness.rule_tools._build_corpus(harness.investigation_id)
+
+    assert len(corpus.cases) == 1
+    assert corpus.cases[0].sample_sha256 == sample_sha256
+    assert corpus.cases[0].role is RuleTestCorpusRole.GOODWARE
+
+
+@pytest.mark.asyncio
 async def test_synthetic_positive_and_real_goodware_report_provenance() -> None:
     from cti_app.domain.rule_workbench import (
         RuleCorpusInventoryItem,
@@ -1121,15 +1398,18 @@ async def test_synthetic_positive_and_real_goodware_report_provenance() -> None:
     motif = "appDomainManagerAssembly"
     observation_ref = await _source_observation(harness, motif)
 
-    _output, result_status, _observation_refs = await harness.rule_tools.propose(
-        {
-            "condition": "any",
-            "motifs": [_motif(motif, observation_ref)],
-        },
-        harness.context,
+    proposed = await _call(
+        harness,
+        "rule.propose",
+        {"condition": "any", "motifs": [_motif(motif, observation_ref)]},
     )
-
-    assert result_status is ToolInvocationStatus.SUCCEEDED
+    assert proposed.status is ToolInvocationStatus.SUCCEEDED
+    tested = await _call(
+        harness,
+        "rule.test",
+        {"candidate_id": proposed.output["candidate_id"]},
+    )
+    assert tested.output["validation_status"] == "real_partial"
     assert await harness.associations.list_for_investigation(harness.investigation_id) == ()
     rule_reports = [
         item
@@ -1239,22 +1519,17 @@ async def test_article_claim_rule_test_and_revise_supports_non_pe_files() -> Non
     )
 
     assert proposed.status is ToolInvocationStatus.SUCCEEDED
-    assert proposed.output["report"]["validation_status"] == "real_partial"
-    assert proposed.output["report"]["false_positive_count"] == 0
-    assert proposed.output["report"]["false_negative_count"] == 0
-    assert proposed.output["report"]["provenance_counts_by_role"] == {
-        "confirmed_positive": {"real": 0, "synthetic": 1},
-        "goodware": {"real": 1, "synthetic": 0},
-        "out_of_cluster_candidate": {"real": 0, "synthetic": 0},
-        "holdout": {"real": 0, "synthetic": 0},
-    }
-    assert "positives: 1 synthetic" in proposed.output["report"]["coverage_statement"]
+    assert proposed.output["validation_status"] == "untested"
+    assert proposed.output["compile_check"]["status"] == "ok"
+    assert "report" not in proposed.output
     assert article_claims.calls == 1
 
     tested = await _call(harness, "rule.test", {"candidate_id": str(candidate_id)})
     assert tested.output["report"]["false_positive_count"] == 0
     assert tested.output["report"]["false_negative_count"] == 0
     assert tested.output["report"]["validation_status"] == "real_partial"
+    assert tested.output["report"]["revision_recommendation"] == "none_justified"
+    assert "positives: 1 synthetic" in tested.output["report"]["coverage_statement"]
 
     revised = await _call(
         harness,
@@ -1265,9 +1540,11 @@ async def test_article_claim_rule_test_and_revise_supports_non_pe_files() -> Non
             "motifs": [motifs[0]],
         },
     )
-    assert revised.output.get("version") == "v2", revised.output
-    assert revised.output["report"]["validation_status"] == "real_partial"
+    assert revised.status is ToolInvocationStatus.FAILED
+    assert revised.error_code == "rule_revision_not_justified"
+    assert "Aucune révision justifiée" in revised.message
     assert article_claims.calls == 1
+    assert len(await harness.candidates.list_for_candidate(candidate_id)) == 1
     assert await harness.associations.list_for_investigation(harness.investigation_id) == ()
 
 
@@ -1295,9 +1572,51 @@ async def test_unexpected_rule_operation_error_returns_stable_non_sensitive_reas
 
     assert result.status is ToolInvocationStatus.FAILED
     assert result.output["reason"] == "local_rule_operation_failed:RuntimeError:ValueError"
+    assert result.output["error_code"] == "local_rule_operation_failed"
+    assert result.error_code == "local_rule_operation_failed"
+    assert result.exception_class == "RuntimeError:ValueError"
     assert "database URL" not in str(result.output)
     assert "database URL" not in result.message
-    assert "RuntimeError" in caplog.text
+    assert "Traceback" not in caplog.text
+    assert caplog.records[-1].event == "investigation_tool_rule_operation_failure"
+    assert caplog.records[-1].exception_class == "RuntimeError:ValueError"
+
+
+@pytest.mark.asyncio
+async def test_registry_dispatch_returns_bounded_rule_failure_code_and_cause(caplog) -> None:
+    harness = _harness(samples={})
+    observation_ref = await _source_observation(harness, "DispatcherFailureMarker")
+
+    async def fail_candidate_lookup(_candidate_id):
+        try:
+            raise ValueError("private database URL and host path")
+        except ValueError as cause:
+            raise RuntimeError("local operation failed") from cause
+
+    harness.candidates.list_for_candidate = fail_candidate_lookup
+    result = await _call(
+        harness,
+        "rule.propose",
+        {
+            "condition": "all",
+            "motifs": [_motif("DispatcherFailureMarker", observation_ref)],
+        },
+    )
+
+    assert result.status is ToolInvocationStatus.FAILED
+    assert result.error_code == "local_rule_operation_failed"
+    assert result.output["error_code"] == "local_rule_operation_failed"
+    assert result.output["reason"] == "local_rule_operation_failed:RuntimeError:ValueError"
+    assert "database URL" not in result.message
+    assert "private database URL" not in str(result.output)
+    assert "Traceback" not in caplog.text
+    failure_log = next(
+        record
+        for record in reversed(caplog.records)
+        if getattr(record, "event", None) == "investigation_tool_rule_operation_failure"
+    )
+    assert failure_log.error_code == "local_rule_operation_failed"
+    assert failure_log.exception_class == "RuntimeError:ValueError"
 
 
 @pytest.mark.asyncio
@@ -1324,7 +1643,7 @@ async def test_rule_with_only_synthetic_positive_cases_is_synthetic_only() -> No
     )
     observation_ref = await _source_observation(harness, "appDomainManagerAssembly")
 
-    result = await _call(
+    proposed = await _call(
         harness,
         "rule.propose",
         {
@@ -1334,8 +1653,14 @@ async def test_rule_with_only_synthetic_positive_cases_is_synthetic_only() -> No
         },
     )
 
-    assert result.output["report"]["validation_status"] == "synthetic_only"
-    assert result.output["report"]["provenance_counts_by_role"]["confirmed_positive"] == {
+    assert proposed.output["validation_status"] == "untested"
+    tested = await _call(
+        harness,
+        "rule.test",
+        {"candidate_id": proposed.output["candidate_id"]},
+    )
+    assert tested.output["report"]["validation_status"] == "synthetic_only"
+    assert tested.output["report"]["provenance_counts_by_role"]["confirmed_positive"] == {
         "real": 0,
         "synthetic": 1,
     }

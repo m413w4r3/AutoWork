@@ -10,11 +10,12 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import httpx
+import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport
 
 from cti_app.api.investigation import router
-from cti_app.application.identity import LocalIdentityProvider
+from cti_app.application.identity import Identity, IdentityScope, LocalIdentityProvider
 from cti_app.application.investigation_persistence import VersionConflictError
 from cti_app.application.investigation_state import InvestigationStateVersionConflict
 from cti_app.application.jobs import DuplicateJobError
@@ -25,6 +26,7 @@ from cti_app.domain.investigation import (
     EvidenceObservation,
     InvestigationAgenda,
     InvestigationEnvelope,
+    InvestigationExecutionMode,
     SampleAssociation,
     ToolInvocationStatus,
 )
@@ -311,7 +313,10 @@ class _InvestigationService:
         if existing is not None:
             return existing
         assert envelope is None
-        state = _working_state()
+        state = replace(
+            _working_state(),
+            execution_mode=(kwargs.get("execution_mode") or InvestigationExecutionMode.BRIDGE_LED),
+        )
         await self.uow.investigation_states.save_if_version(state, expected_version=None)
         self.uow._store.investigations[INVESTIGATION_ID].status = AnalystInvestigationStatus.RUNNING
         return state
@@ -394,7 +399,8 @@ class _CompositionFactory:
             investigation_max_hits_acquired=2,
         )
 
-    def build(self, uow: _Uow, _investigation_id: UUID):
+    def build(self, uow: _Uow, _investigation_id: UUID, *, operator_mode: bool = False):
+        del operator_mode
         return SimpleNamespace(
             service=_InvestigationService(uow),
             tool_dependencies=SimpleNamespace(article_snapshots=self.article_snapshots),
@@ -500,6 +506,163 @@ def _client(*, store: _Store | None = None, factory: _CompositionFactory | None 
     return _SyncASGIClient(app), store
 
 
+def test_operator_advisor_consult_returns_bounded_untrusted_text() -> None:
+    class OperatorIdentityProvider:
+        async def current(self):
+            return Identity(
+                actor_id="operator:claude-client",
+                scopes=frozenset({IdentityScope.OPERATOR_CLIENT}),
+            )
+
+    class InvocationService:
+        def __init__(self):
+            self.call = None
+
+        async def invoke(self, **kwargs):
+            self.call = kwargs
+            return SimpleNamespace(
+                investigation_id=INVESTIGATION_ID,
+                working_state_version=2,
+                error_code=None,
+                job_id=None,
+                idempotent_replay=False,
+                output={
+                    "kind": "advisor_consult",
+                    "status": "succeeded",
+                    "untrusted_data": True,
+                    "data": {},
+                },
+                invocation=SimpleNamespace(
+                    id=uuid4(),
+                    operation_key="operator-advisor-operation",
+                    tool_name="advisor.consult",
+                    schema_version="advisor-consult.v1",
+                    status=ToolInvocationStatus.SUCCEEDED,
+                    version=2,
+                    response_refs=(),
+                ),
+            )
+
+    class AdvisorTool:
+        def take_result(self, operation_key):
+            assert operation_key == "operator-advisor-operation"
+            return SimpleNamespace(
+                output={
+                    "advisor_status": "succeeded",
+                    "advisory_text": "[UNTRUSTED ADVISORY]\nReview the cited offsets.",
+                }
+            )
+
+    class OperatorFactory(_CompositionFactory):
+        def __init__(self, snapshot_port):
+            super().__init__(snapshot_port)
+            self.invocations = InvocationService()
+            self.advisor_tool = AdvisorTool()
+
+        def build(self, uow, investigation_id, *, operator_mode=False):
+            assert operator_mode is True
+            return SimpleNamespace(
+                operator_tool_invocations=self.invocations,
+                advisor_tool=self.advisor_tool,
+            )
+
+    factory = OperatorFactory(_SnapshotPort())
+    client, _store = _client(factory=factory)
+    client.app.state.identity_provider = OperatorIdentityProvider()
+    body = {
+        "schema_version": "advisor-consult.v1",
+        "arguments": {"consultation_type": "plan_investigation", "evidence_refs": []},
+        "purpose": "Request bounded planning guidance.",
+        "expected_version": 1,
+    }
+
+    response = client.post(
+        f"/api/investigations/{INVESTIGATION_ID}/operator/tools/advisor.consult",
+        json=body,
+        headers={"Idempotency-Key": "advisor-once"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert factory.invocations.call["tool_name"] == "advisor.consult"
+    assert response.json()["advisor_output"]["advisor_status"] == "succeeded"
+    assert "UNTRUSTED ADVISORY" in response.json()["advisor_output"]["advisory_text"]
+    assert response.json()["advisor_output_not_replayed"] is False
+    assert response.json()["output"]["untrusted_data"] is True
+
+
+def test_operator_observation_route_paginates_sanitized_canonical_json() -> None:
+    class OperatorIdentityProvider:
+        async def current(self):
+            return Identity(
+                actor_id="operator:claude-client",
+                scopes=frozenset({IdentityScope.OPERATOR_CLIENT}),
+            )
+
+    blob_id = uuid4()
+    observation_id = uuid4()
+    canonical = json.dumps(
+        {
+            "schema": "test-observation.v1",
+            "text": "operator evidence " * 3_000,
+            "signed": "https://evidence.example/report?X-Amz-Signature=private",
+            "api_key": "private-token",
+        },
+        separators=(",", ":"),
+    ).encode()
+    observation = SimpleNamespace(
+        id=observation_id,
+        investigation_id=INVESTIGATION_ID,
+        blob_id=blob_id,
+        sha256=hashlib.sha256(canonical).hexdigest(),
+    )
+    store = _Store()
+    store.observations.append(observation)
+
+    def uow_factory():
+        uow = _Uow(store)
+        uow.blobs = _Rows(
+            {
+                blob_id: SimpleNamespace(
+                    descriptor=SimpleNamespace(
+                        mime_type="application/json",
+                        logical_bucket="investigation-evidence",
+                    )
+                )
+            }
+        )
+        return uow
+
+    class ArtifactStore:
+        async def read_bytes(self, requested_blob_id, *, max_bytes):
+            assert requested_blob_id == blob_id
+            assert max_bytes == 8 * 1024 * 1024
+            return canonical
+
+    client, _store = _client(store=store)
+    client.app.state.uow_factory = uow_factory
+    client.app.state.production_artifact_store = ArtifactStore()
+    client.app.state.identity_provider = OperatorIdentityProvider()
+
+    first = client.get(
+        f"/api/investigations/{INVESTIGATION_ID}/operator/observations/{observation_id}",
+        params={"offset": 0, "length": 32_000},
+    )
+    first_page = first.json()
+    second = client.get(
+        f"/api/investigations/{INVESTIGATION_ID}/operator/observations/{observation_id}",
+        params={"offset": first_page["next_offset"], "length": 32_000},
+    )
+
+    assert first.status_code == second.status_code == 200
+    assert first_page["untrusted_data"] is True
+    assert first_page["next_offset"] == 32_000
+    combined = first_page["payload"] + second.json()["payload"]
+    assert "[URL omitted]" in combined
+    assert "private-token" not in combined
+    assert "X-Amz-Signature" not in combined
+    assert len(first_page["payload"]) <= 32_000
+
+
 def _start_body() -> dict[str, str]:
     return {
         "production_run_id": str(RUN_ID),
@@ -521,6 +684,16 @@ def test_start_is_idempotent_without_manufacturing_an_approval_envelope() -> Non
     assert second_body["idempotent_replay"] is True
     assert INVESTIGATION_ID not in store.envelopes.rows
     assert first_body["investigation"]["envelope_approved"] is False
+
+
+def test_start_accepts_explicit_operator_led_execution_mode() -> None:
+    client, _store = _client()
+    payload = {**_start_body(), "execution_mode": "operator_led"}
+
+    response = client.post(f"/api/subjects/{SUBJECT_ID}/investigations", json=payload)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["investigation"]["execution_mode"] == "operator_led"
 
 
 def test_operator_status_json_preserves_bridge_conversation_scope() -> None:
@@ -1059,3 +1232,18 @@ def test_read_projection_exposes_metadata_without_blobs_or_raw_outputs() -> None
     assert str(blob_id) not in encoded
     assert "raw-provider-secret" not in encoded
     assert "api_key" not in encoded
+
+
+def test_g2_can_authorize_the_bridge_advisor_provider_only_when_the_tool_exists() -> None:
+    from cti_app.api.investigation import _available_providers, _requested_providers
+
+    available = _available_providers(("vt.file_report", "advisor.consult"))
+    assert available == ("vt", "bridge")
+    assert _requested_providers(["VT", "bridge"], available) == ("vt", "bridge")
+    assert _available_providers(("vt.file_report",)) == ("vt",)
+    with pytest.raises(Exception) as unavailable:
+        _requested_providers(["bridge"], ("vt",))
+    assert "provider_unavailable" in str(getattr(unavailable.value, "detail", unavailable.value))
+    with pytest.raises(Exception) as unsupported:
+        _requested_providers(["other"], available)
+    assert "unsupported_provider" in str(getattr(unsupported.value, "detail", unsupported.value))

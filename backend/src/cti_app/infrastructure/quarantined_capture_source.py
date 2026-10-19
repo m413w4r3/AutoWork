@@ -19,9 +19,14 @@ from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.config import Settings
 from cti_app.domain.errors import EntityNotFoundError
 from cti_app.domain.investigation import EvidenceKind
-from cti_app.domain.network_protocol import NetworkCaptureRejection
+from cti_app.domain.network_protocol import (
+    NetworkCaptureRejection,
+    NetworkExtractionLimitsV1,
+)
+from cti_app.infrastructure.pcap_reader import PcapReaderError, read_capture
 
 _CAPTURE_REFERENCE = re.compile(r"^sha256:([0-9a-f]{64})$")
+_VT_SANDBOX_PCAP_SOURCE_VERSION = "vt-sandbox-pcap.v1"
 
 
 class ProductionQuarantinedCaptureSource:
@@ -39,6 +44,10 @@ class ProductionQuarantinedCaptureSource:
         self._blob_catalog = blob_catalog
         self._settings = settings
         self._investigation_id = investigation_id
+
+    def is_bound_to_investigation(self, investigation_id: UUID) -> bool:
+        """Report whether this resolver is scoped to the requested investigation."""
+        return investigation_id == self._investigation_id
 
     async def read_quarantined_capture(
         self, source_reference: str, *, max_bytes: int
@@ -64,9 +73,15 @@ class ProductionQuarantinedCaptureSource:
                     for item in observations
                     if item.kind is EvidenceKind.OTHER
                     and item.sha256 == sha256
-                    and item.source == "network.quarantine"
                     and item.object_type == "network_capture"
                     and item.object_id == sha256
+                    and (
+                        item.source == "network.quarantine"
+                        or (
+                            item.source == "VirusTotal"
+                            and item.source_version == _VT_SANDBOX_PCAP_SOURCE_VERSION
+                        )
+                    )
                 ),
                 None,
             )
@@ -97,4 +112,18 @@ class ProductionQuarantinedCaptureSource:
             raise QuarantineCaptureTooLargeError("Capture exceeds the requested read limit")
         if len(content) != descriptor.size or hashlib.sha256(content).hexdigest() != sha256:
             raise NetworkCaptureRejected(NetworkCaptureRejection.BLOB_HASH_MISMATCH)
+        try:
+            read_capture(
+                content,
+                max_packets=NetworkExtractionLimitsV1().max_packets,
+            )
+        except PcapReaderError as exc:
+            reason = (
+                NetworkCaptureRejection.INVALID_FORMAT
+                if exc.code in {"invalid_magic", "unsupported_link_type"}
+                else NetworkCaptureRejection.PACKET_LIMIT
+                if exc.code == "packet_limit"
+                else NetworkCaptureRejection.CORRUPT_CAPTURE
+            )
+            raise NetworkCaptureRejected(reason) from exc
         return QuarantinedCapture(source_reference, content, sha256)

@@ -7,6 +7,7 @@ import pytest
 
 from cti_app.application.bridge_investigator import (
     BridgeInvestigator,
+    BridgeSubmissionPacer,
     ModelConversationTurnTransport,
     ScriptedTurnTransport,
     TurnSubmission,
@@ -21,6 +22,19 @@ from cti_app.application.investigation_contracts import (
 )
 from cti_app.domain.investigation import AgentNextAction
 from cti_app.domain.model_conversations import ConversationTurnStatus
+
+
+class _ManualClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.delays: list[float] = []
+
+    def __call__(self) -> float:
+        return self.now
+
+    async def sleep(self, seconds: float) -> None:
+        self.delays.append(seconds)
+        self.now += seconds
 
 
 def _context(investigation_id):
@@ -98,6 +112,81 @@ async def test_turn_is_structured_and_replayed_by_deterministic_identity() -> No
     assert "BEGIN_CANONICAL_INVESTIGATION_CONTEXT" in transport.prompts[0]
     assert "only existing hypothesis IDs listed in the context" in transport.prompts[0]
     assert "do not create hypothesis labels" in transport.prompts[0].lower()
+
+
+@pytest.mark.asyncio
+async def test_bridge_pacer_applies_minimum_interval_and_bounded_jitter() -> None:
+    clock = _ManualClock()
+    random_values = iter((1.0, 0.0))
+    pacer = BridgeSubmissionPacer(
+        minimum_interval_seconds=20,
+        jitter_fraction=0.3,
+        clock=clock,
+        sleeper=clock.sleep,
+        rng=lambda: next(random_values),
+    )
+
+    await pacer.wait_for_next_submission()
+    await pacer.wait_for_next_submission()
+    await pacer.wait_for_next_submission()
+
+    assert clock.delays == [26, 20]
+
+
+@pytest.mark.asyncio
+async def test_pre_submission_retries_use_bounded_exponential_backoff() -> None:
+    investigation_id = uuid4()
+    context = _context(investigation_id)
+    failure = TurnSubmission(
+        TurnSubmissionStatus.UNAVAILABLE,
+        detail="composer not ready before submission",
+        error_code="bridge_server_error",
+        submission_state="pre_submission",
+        retryable=True,
+    )
+    success = {
+        "reasoning_summary": "The distinct attempt reached the simulated Bridge.",
+        "goal": "Finish the synthetic investigation.",
+        "hypothesis_refs": [],
+        "proposed_tool_calls": [],
+        "finding_proposals": [],
+        "opinion_delta": None,
+        "next_action": AgentNextAction.FINISH.value,
+    }
+    transport = ScriptedTurnTransport([failure, failure, failure, success])
+    clock = _ManualClock()
+    bridge = BridgeInvestigator(
+        transport,
+        minimum_submission_interval_seconds=0,
+        submission_jitter_fraction=0,
+        pre_submission_retry_base_seconds=2,
+        pre_submission_retry_max_seconds=3,
+        clock=clock,
+        sleeper=clock.sleep,
+        rng=lambda: 0.5,
+    )
+
+    exhausted = await bridge.turn(
+        investigation_id=investigation_id,
+        subject_id=context.source.subject_id,
+        turn_index=6,
+        context=context,
+        external_llm_allowed=True,
+    )
+    resumed = await bridge.turn(
+        investigation_id=investigation_id,
+        subject_id=context.source.subject_id,
+        turn_index=6,
+        context=context,
+        external_llm_allowed=True,
+        attempt=3,
+    )
+
+    assert exhausted.status is TurnSubmissionStatus.PRE_SUBMISSION_RETRY_EXHAUSTED
+    assert resumed.status is TurnSubmissionStatus.SUCCEEDED
+    assert transport.submission_count == 4
+    assert clock.delays == [2, 3]
+    assert any(key.endswith(":attempt=3") for key in transport._by_key)
 
 
 @pytest.mark.asyncio

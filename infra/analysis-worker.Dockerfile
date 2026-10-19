@@ -27,12 +27,32 @@ COPY --from=builder /app/.venv /app/.venv
 COPY backend/src ./src
 COPY backend/tools ./tools
 COPY --from=builder --chown=root:root /app/rules/capa /app/rules/capa
-RUN apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends tshark \
+# Suricata is not in bookworm main; the pinned 7.0.x build comes from bookworm-backports.
+RUN echo "deb http://deb.debian.org/debian bookworm-backports main" \
+        > /etc/apt/sources.list.d/bookworm-backports.list \
+    && apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
+        tshark file binutils xxd coreutils mono-utils=6.8.0.105+dfsg-3.3+deb12u1 \
+    && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
+        -t bookworm-backports suricata=1:7.0.10-1~bpo12+1 \
     && rm -rf /var/lib/apt/lists/* \
     && chmod -R a-w /app/rules/capa \
+    && file --version \
+    && strings --version \
+    && readelf --version \
+    && objdump --version \
+    && xxd -v \
+    && sha256sum --version \
+    && dpkg-query -W -f='${Version}\n' mono-utils \
+    && (monodis --help 2>&1 | grep -q -- "--userstrings") \
     && tshark --version \
-    && capinfos -v
+    && capinfos -v \
+    && mkdir -p /app/rules/suricata \
+    && printf '%s' 'alert tcp any any -> any any (msg:"AUTOWORK benign replay marker"; content:"AUTOWORK_SURICATA_BENIGN"; sid:9900001; rev:1;)' > /app/rules/suricata/autowork.rules \
+    && printf '%s\n' 'autowork-suricata-v1' > /app/rules/suricata/AUTOWORK_RULESET_REVISION \
+    && printf '%s\n' '66f69f0cf586a87f739d4f63c6bb9d23a7d303f8adf23c2773a31839ea7f9f59' > /app/rules/suricata/AUTOWORK_RULESET_SHA256 \
+    && chmod -R a-w /app/rules/suricata \
+    && suricata -V
 RUN useradd --system --uid 10001 analysis
 USER analysis
 ENV PATH="/app/.venv/bin:$PATH" \

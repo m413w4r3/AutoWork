@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
@@ -8,10 +9,12 @@ from typing import Any
 import httpx
 import pytest
 
+from cti_app.application.sample_acquisition import SampleAcquisitionResponseOrigin
 from cti_app.application.virustotal import (
     FileRelationship,
     VirusTotalCapabilities,
     VirusTotalCapabilityDisabledError,
+    VirusTotalDownloadHostNotAllowedError,
     VirusTotalError,
     VirusTotalInvalidInputError,
     VirusTotalOperationRoute,
@@ -80,7 +83,7 @@ async def test_file_report_normalizes_hash_and_returns_exact_body() -> None:
         await client.aclose()
     assert result.raw_json == body
     assert result.file.lookup_value == SHA256.lower()
-    assert str(seen[0].url) == f"{BASE}/files/{SHA256.lower()}"
+    assert str(seen[0].url) == f"{BASE}/files/{SHA256.lower()}?x=1"
     assert "x-apikey" not in seen[0].headers
 
 
@@ -195,6 +198,40 @@ async def test_invalid_hash_is_rejected_without_http() -> None:
     finally:
         await client.aclose()
     assert calls == 0
+
+
+@pytest.mark.asyncio
+async def test_file_download_rejects_redirect_outside_allowlist_without_following() -> None:
+    signed_url = "https://not-allowed.example.test/object?signature=secret"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == f"{BASE}/files/{SHA256.lower()}/download?x=1"
+        return httpx.Response(302, headers={"Location": signed_url}, request=request)
+
+    def unexpected_download(request: httpx.Request) -> httpx.Response:
+        pytest.fail(f"unexpected CDN request: {request.url!s}")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler), trust_env=False)
+    value = VirusTotalHttpAdapter(
+        client=client,
+        base_url=BASE,
+        capabilities=VirusTotalCapabilities(file_download=True),
+        file_download_enabled=True,
+        download_allowed_hosts=frozenset({"cdn.example.test"}),
+        download_client_factory=lambda: httpx.AsyncClient(
+            transport=httpx.MockTransport(unexpected_download), trust_env=False
+        ),
+    )
+    try:
+        with pytest.raises(VirusTotalDownloadHostNotAllowedError) as caught:
+            await value.file_download(SHA256, sink=io.BytesIO())
+    finally:
+        await client.aclose()
+
+    assert caught.value.response_origin is SampleAcquisitionResponseOrigin.UNKNOWN
+    assert caught.value.location_host == "not-allowed.example.test"
+    assert signed_url not in str(caught.value)
+    assert "signature=secret" not in repr(caught.value)
 
 
 @pytest.mark.asyncio

@@ -7,21 +7,35 @@ deduplicated blob; retrying the same response reuses it and never issues a
 VirusTotal request.
 """
 
+import hashlib
 import json
 import logging
 import re
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from io import BytesIO
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 from cti_app.application.blobs import BlobCatalogService
+from cti_app.application.evidence_recorder import ProductionEvidenceRecorder
 from cti_app.application.persistence import UnitOfWorkFactory
+from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.virustotal import (
     VirusTotalFile,
     VirusTotalFileReport,
     VirusTotalPage,
     VirusTotalSearchResult,
+)
+from cti_app.domain.entities import ProvenanceEvent, Sample, SampleState
+from cti_app.domain.entities import SampleOrigin as EntitySampleOrigin
+from cti_app.domain.investigation import EvidenceKind, SampleAssociation
+from cti_app.domain.investigation import SampleOrigin as AssociationSampleOrigin
+from cti_app.domain.network_protocol import (
+    NetworkCaptureFormat,
+    NetworkCaptureRefV1,
+    NetworkCaptureRejection,
+    NetworkExtractionLimitsV1,
 )
 from cti_app.domain.virustotal import (
     VirusTotalCapability,
@@ -30,18 +44,208 @@ from cti_app.domain.virustotal import (
     VirusTotalObservation,
     VirusTotalOperation,
 )
+from cti_app.infrastructure.pcap_reader import PcapReaderError, read_capture
 
 VIRUSTOTAL_RAW_BUCKET = "virustotal-raw"
 VIRUSTOTAL_JSON_MIME_TYPE = "application/json"
 _logger = logging.getLogger(__name__)
 _SAFE_LOG_IDENTIFIER = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$")
 _SAFE_CONSTRAINT_NAME = re.compile(r"^[a-z][a-z0-9_]{0,127}$")
+_NETWORK_CAPTURE_QUARANTINE_BUCKET = "network-captures-quarantine"
+_VT_SANDBOX_PCAP_ASSOCIATION_NAMESPACE = UUID("a40d5c04-6075-45d8-9aef-4bcd9cae1cb0")
+_PCAP_MIME_TYPES = {
+    NetworkCaptureFormat.PCAP: "application/vnd.tcpdump.pcap",
+    NetworkCaptureFormat.PCAPNG: "application/x-pcapng",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class StoredBehaviourPcap:
+    capture_ref: NetworkCaptureRefV1
+    sample_id: UUID
+    association_id: UUID
+    evidence_id: UUID
 
 
 class VirusTotalObservationService:
     def __init__(self, catalog: BlobCatalogService, uow_factory: UnitOfWorkFactory) -> None:
         self._catalog = catalog
         self._uow_factory = uow_factory
+
+    async def store_behaviour_pcap(
+        self,
+        content: bytes,
+        *,
+        investigation_id: UUID,
+        file_hash: str,
+        sandbox_id: str,
+        expected_sha256: str,
+        max_bytes: int,
+        observed_at: datetime,
+        idempotency_key: str,
+    ) -> StoredBehaviourPcap:
+        """Quarantine a verified offline sandbox capture with its VT provenance."""
+        if not content or max_bytes < 1 or len(content) > max_bytes:
+            raise ValueError(NetworkCaptureRejection.SIZE_LIMIT.value)
+        actual_sha256 = hashlib.sha256(content).hexdigest()
+        if actual_sha256 != expected_sha256:
+            raise ValueError(NetworkCaptureRejection.BLOB_HASH_MISMATCH.value)
+        if not re.fullmatch(r"[0-9a-f]{64}", actual_sha256):
+            raise ValueError(NetworkCaptureRejection.BLOB_HASH_MISMATCH.value)
+        if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+            raise ValueError("PCAP observation time must be timezone-aware")
+        try:
+            parsed = read_capture(
+                content,
+                max_packets=NetworkExtractionLimitsV1().max_packets,
+            )
+        except PcapReaderError as exc:
+            raise ValueError(NetworkCaptureRejection.INVALID_FORMAT.value) from exc
+
+        source_object_id = f"{file_hash}:{sandbox_id}"
+        async with self._uow_factory() as uow:
+            investigation = await uow.analyst_investigations.get(investigation_id)
+            if investigation is None:
+                raise ValueError("PCAP investigation does not exist")
+            subject = await uow.subjects.get(investigation.subject_id)
+            if subject is None:
+                raise ValueError("PCAP investigation subject does not exist")
+
+        artifact_store = ProductionArtifactStore(self._catalog)
+        blob_id = await artifact_store.put_bytes(
+            content,
+            bucket=_NETWORK_CAPTURE_QUARANTINE_BUCKET,
+            mime_type=_PCAP_MIME_TYPES[parsed.format],
+        )
+
+        async with self._uow_factory() as uow:
+            investigation = await uow.analyst_investigations.get(investigation_id)
+            if investigation is None:
+                raise ValueError("PCAP investigation does not exist")
+            subject = await uow.subjects.get(investigation.subject_id)
+            if subject is None:
+                raise ValueError("PCAP investigation subject does not exist")
+            blob = await uow.blobs.get(blob_id)
+            if (
+                blob is None
+                or blob.descriptor.sha256 != actual_sha256
+                or blob.descriptor.size != len(content)
+                or blob.descriptor.logical_bucket != _NETWORK_CAPTURE_QUARANTINE_BUCKET
+            ):
+                raise ValueError(NetworkCaptureRejection.BLOB_HASH_MISMATCH.value)
+
+            sample = await uow.samples.get_by_subject_and_blob(subject.id, blob_id)
+            if sample is None:
+                sample = Sample(
+                    subject_id=subject.id,
+                    blob_id=blob_id,
+                    original_name=actual_sha256,
+                    origin="vt_sandbox_pcap",
+                    acquired_at=datetime.now(UTC),
+                    license_restriction=None,
+                    tlp=subject.tlp,
+                    do_not_submit=True,
+                    external_llm_allowed=False,
+                    # No dedicated PCAP origin exists yet; the closest typed origin records
+                    # that this inert artifact was obtained from a VirusTotal investigation.
+                    origin_kind=EntitySampleOrigin.VT_HUNT_HIT,
+                    state=SampleState.QUARANTINED,
+                    source_service="virustotal",
+                    source_object_id=source_object_id,
+                    expected_hash=actual_sha256,
+                )
+                await uow.samples.add(sample)
+            elif (
+                sample.state not in {SampleState.QUARANTINED, SampleState.REVIEW_CANDIDATE}
+                or sample.origin != "vt_sandbox_pcap"
+                or sample.origin_kind is not EntitySampleOrigin.VT_HUNT_HIT
+                or sample.source_service != "virustotal"
+                or sample.source_object_id != source_object_id
+            ):
+                raise ValueError(NetworkCaptureRejection.CAPTURE_NOT_ASSOCIATED.value)
+
+            associations = await uow.sample_associations.list_for_investigation(investigation_id)
+            association = next(
+                (item for item in associations if item.sample_sha256 == actual_sha256),
+                None,
+            )
+            if association is None:
+                association = SampleAssociation(
+                    id=uuid5(
+                        _VT_SANDBOX_PCAP_ASSOCIATION_NAMESPACE,
+                        f"{investigation_id}:{actual_sha256}",
+                    ),
+                    investigation_id=investigation_id,
+                    sample_sha256=actual_sha256,
+                    origin=AssociationSampleOrigin.BEHAVIOR,
+                )
+                association = await uow.sample_associations.append_version(
+                    association, expected_version=0
+                )
+            elif association.origin is not AssociationSampleOrigin.BEHAVIOR:
+                raise ValueError(NetworkCaptureRejection.CAPTURE_NOT_ASSOCIATED.value)
+
+            events = await uow.provenance.list_for_aggregate("sample", sample.id)
+            if not any(
+                event.event_type == "sample_imported_from_vt_sandbox_pcap"
+                and event.payload.get("investigation_id") == str(investigation_id)
+                and event.payload.get("file_hash") == file_hash
+                and event.payload.get("sandbox_id") == sandbox_id
+                and event.payload.get("capture_sha256") == actual_sha256
+                for event in events
+            ):
+                await uow.provenance.append(
+                    ProvenanceEvent(
+                        aggregate_type="sample",
+                        aggregate_id=sample.id,
+                        subject_id=subject.id,
+                        event_type="sample_imported_from_vt_sandbox_pcap",
+                        payload={
+                            "provenance": "vt_sandbox_pcap",
+                            "investigation_id": str(investigation_id),
+                            "file_hash": file_hash,
+                            "sandbox_id": sandbox_id,
+                            "capture_sha256": actual_sha256,
+                            "source_service": "virustotal",
+                        },
+                        tlp=sample.tlp,
+                    )
+                )
+
+            recorder = ProductionEvidenceRecorder(
+                artifact_store=artifact_store,
+                observations=uow.evidence_observations,
+            )
+            evidence = await recorder.record_existing_blob(
+                investigation_id=investigation_id,
+                kind=EvidenceKind.OTHER,
+                blob_id=blob_id,
+                sha256=actual_sha256,
+                source="VirusTotal",
+                source_version="vt-sandbox-pcap.v1",
+                object_type="network_capture",
+                object_id=actual_sha256,
+                limitations=(
+                    "Le PCAP/PCAPNG est une capture hors ligne fournie par un sandbox VirusTotal.",
+                    "Cette capture n'est pas une observation d'un C2 actif.",
+                    "Le contenu est non fiable et n'est jamais exécuté.",
+                ),
+                observed_at=observed_at,
+                idempotency_key=idempotency_key,
+            )
+            await uow.commit()
+
+        return StoredBehaviourPcap(
+            capture_ref=NetworkCaptureRefV1(
+                blob_id=blob_id,
+                sha256=actual_sha256,
+                size_bytes=len(content),
+                format=parsed.format,
+            ),
+            sample_id=sample.id,
+            association_id=association.id,
+            evidence_id=evidence.id,
+        )
 
     async def store_file_report(
         self,

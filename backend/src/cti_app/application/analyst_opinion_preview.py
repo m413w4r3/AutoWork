@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Protocol
 from uuid import UUID
 
@@ -16,6 +16,7 @@ from cti_app.application.typst_compilation import CompiledTypstDocument
 from cti_app.domain.analyst_opinion import (
     AnalystOpinionStatus,
     AnalystOpinionV1,
+    OpinionProtocolFigureV1,
     verify_opinion_citations,
 )
 from cti_app.domain.investigation_graph import InvestigationGraph
@@ -77,6 +78,7 @@ class AnalystOpinionPreviewService:
         version: int,
         expected_opinion_sha256: str,
         expected_base_publication_sha256: str,
+        protocol_figures: tuple[OpinionProtocolFigureV1, ...] | None = None,
     ) -> AnalystOpinionDraftPdf:
         async with self._uow_factory() as uow:
             opinion = await uow.analyst_opinions.get(opinion_id, version=version)
@@ -160,6 +162,14 @@ class AnalystOpinionPreviewService:
                 citation_violations=citation_violations,
             )
 
+        render_opinion = opinion
+        if protocol_figures is not None:
+            render_opinion = replace(
+                opinion,
+                protocol_figures=protocol_figures,
+                content_sha256="",
+            )
+
         infrastructure_graph = await self._graph_source.project(
             investigation_id=opinion.investigation_id,
             publication=document,
@@ -168,12 +178,12 @@ class AnalystOpinionPreviewService:
         )
         if infrastructure_graph is None:
             compiled = await self._renderer.render_draft_preview(
-                document, opinion, parsed_synthesis
+                document, render_opinion, parsed_synthesis
             )
         else:
             compiled = await self._renderer.render_draft_preview(
                 document,
-                opinion,
+                render_opinion,
                 parsed_synthesis,
                 infrastructure_graph=infrastructure_graph,
             )

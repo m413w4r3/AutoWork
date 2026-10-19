@@ -3,6 +3,13 @@
 Établi par l'orchestrateur sur la stack déployée (`make up`, sans reset), à partir de l'inventaire runtime de l'API
 (`app.state.investigation_tool_inventory`) et de preuves d'exécution. Détail des lots : `nimbalyst-local/orchestration-2026-10-17.md`.
 
+## Correctif applicatif — 2026-10-18
+Cause confirmée : l'enregistrement de `sample.analyze`, des commandes locales et du workbench YARA dépendait encore du confinement `bwrap` mesuré dans le processus backend. Dans les conteneurs, user namespaces refusés rendaient cette condition fausse, bien que le worker isolé soit attesté.
+
+Le runtime utilise maintenant l'attestation par famille de `ConfinedAnalysisExecutionPort` pour enregistrer ces outils, FLOSS, TShark et Suricata. `sample.analyze` exécute static/capa/SMDA et leurs parsers dans `analysis-worker`; les packs static, capa et SMDA sont persistés dans leurs dépôts et blobs canoniques existants. Les compilations et tests YARA, ainsi que `local.run_command`, passent aussi par le worker. Si une famille n'est pas attestée, ses outils restent indisponibles avec le code de raison de cette famille; une sonde globale échouée reste indisponible.
+
+Validé par le test de composition (runner local non confiné, port du harnais worker attesté : registre, prompt et operator-status concordent) et par un test d'intégration PostgreSQL qui dispatch `sample.analyze` et vérifie les trois packs canoniques. La stack déployée n'a pas été relancée dans ce lot; l'orchestrateur doit reconstruire/redémarrer `analysis-worker` pour prendre le code modifié. Aucune dépendance ni image système supplémentaire n'a été ajoutée.
+
 ## Frontière d'isolation
 `bwrap` est installé dans les images backend/worker mais **inopérant en conteneur** (user namespaces refusés : `unshare_probe_failed`).
 Les conteneurs backend/worker (root) n'exécutent donc **aucun** octet non fiable. Toute analyse d'échantillon/capture est déléguée au

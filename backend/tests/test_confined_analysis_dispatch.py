@@ -55,6 +55,10 @@ from cti_app.domain.rule_workbench import (
     RuleTestCorpusRole,
     RuleValidationStatus,
 )
+from cti_app.infrastructure.analysis_subprocess import (
+    AnalysisSubprocessResult,
+    AnalysisSubprocessStatus,
+)
 from cti_app.infrastructure.confined_analysis_dispatch import (
     DramatiqConfinedAnalysisExecutionPort,
     _attestation_from_response,
@@ -62,6 +66,11 @@ from cti_app.infrastructure.confined_analysis_dispatch import (
 from cti_app.workers.analysis_tasks import build_confined_analysis_job_handler
 from cti_app.workers.confined_analysis import (
     ConfinedAnalysisArtifactMismatch,
+    _extract_monodis_method_body,
+    _parse_monodis_method_table,
+    _run_capa,
+    _run_floss,
+    _run_local_command,
     build_analysis_worker_probe_payload,
     execute_confined_analysis_job,
 )
@@ -79,6 +88,253 @@ from tests.investigation_c2_fakes import (
 )
 
 _MARKER = "SAFE_CONFined_ANALYSIS_FIXTURE"
+
+
+def _floss_parameters(*, max_output_bytes: int = 8_000_000) -> ConfinedAnalysisJobParameters:
+    return ConfinedAnalysisJobParameters(
+        investigation_id=uuid4(),
+        artifact_id=uuid4(),
+        artifact_sha256="a" * 64,
+        operation_key="confined-analysis:" + "b" * 64,
+        tool=ConfinedAnalysisTool.FLOSS,
+        timeout_seconds=30,
+        max_output_bytes=max_output_bytes,
+        analysis_parameters={"max_strings": "128"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_floss_output_limit_is_a_partial_result_with_a_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def limited(*_args, **_kwargs):
+        return AnalysisSubprocessResult(AnalysisSubprocessStatus.OUTPUT_LIMIT, None, b"{", b"")
+
+    monkeypatch.setattr("cti_app.workers.confined_analysis.shutil.which", lambda _name: "/floss")
+    monkeypatch.setattr("cti_app.workers.confined_analysis.run_analysis_subprocess", limited)
+
+    result = await _run_floss(
+        _floss_parameters(),
+        b"harmless static analysis fixture",
+        Settings(_env_file=None),
+    )
+
+    assert result["status"] == "PARTIAL"
+    assert result["truncated"] is True
+    assert result["available_reason"] == "floss_output_truncated"
+
+
+@pytest.mark.asyncio
+async def test_floss_zip_is_classified_as_unsupported_without_running_floss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import io
+    import zipfile
+
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as zipped:
+        zipped.writestr("readme.txt", "harmless fixture")
+
+    def should_not_run(*_args, **_kwargs):
+        pytest.fail("FLOSS must not be invoked for ZIP input")
+
+    monkeypatch.setattr("cti_app.workers.confined_analysis.shutil.which", lambda _name: "/floss")
+    monkeypatch.setattr("cti_app.workers.confined_analysis.run_analysis_subprocess", should_not_run)
+
+    result = await _run_floss(_floss_parameters(), archive.getvalue(), Settings(_env_file=None))
+
+    assert result["status"] == "UNSUPPORTED_FORMAT"
+    assert result["available_reason"] == "floss_unsupported_format_zip"
+
+
+def test_monodis_metadata_and_cil_rows_select_one_bounded_method() -> None:
+    method_table = """Method Table (1..3)
+########## .Fixture
+1: instance default void '.ctor' ()  (param: 1 impl_flags: cil managed )
+2: default int32 Target ()  (param: 1 impl_flags: cil managed )
+3: default int32 Target (int32 value)  (param: 1 impl_flags: cil managed )
+"""
+    methods = _parse_monodis_method_table(method_table)
+    assert methods[2] == (".Fixture", "Target")
+    assert methods[3] == (".Fixture", "Target")
+
+    disassembly = """// method line 2
+.method public static default int32 Target () cil managed
+{
+    IL_0000: ldc.i4.s 0x2a
+    IL_0002: ret
+} // end of method Fixture::Target
+
+// method line 3
+.method public static default int32 Target (int32 value) cil managed
+{
+    IL_0000: ldarg.0
+    IL_0001: ldc.i4.1
+    IL_0002: add
+    IL_0003: ret
+} // end of method Fixture::Target
+"""
+    body = _extract_monodis_method_body(disassembly, 3)
+    assert body is not None
+    assert "ldc.i4.1" in body
+    assert "ldc.i4.s 0x2a" not in body
+
+
+@pytest.mark.asyncio
+async def test_monodis_cil_uses_fixed_commands_and_returns_bounded_method_range(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+    method_table = (
+        b"Method Table (1..2)\n########## .Fixture\n"
+        b"2: default int32 Target ()  (param: 1 impl_flags: cil managed )\n"
+    )
+    disassembly = (
+        b"// method line 2\n.method public static default int32 Target () cil managed\n"
+        b"{\n    IL_0000: ldc.i4.s 0x2a\n    IL_0002: ret\n}\n"
+        b"} // end of method Fixture::Target\n"
+    )
+
+    async def run(argv, **_kwargs):
+        calls.append(list(argv))
+        output = method_table if "--method" in argv else disassembly
+        return AnalysisSubprocessResult(AnalysisSubprocessStatus.SUCCEEDED, 0, output, b"")
+
+    monkeypatch.setattr(
+        "cti_app.workers.confined_analysis.shutil.which", lambda name: f"/usr/bin/{name}"
+    )
+    monkeypatch.setattr(
+        "cti_app.workers.confined_analysis._monodis_package_version",
+        lambda: "6.8.0.105+dfsg-3.3+deb12u1",
+    )
+    monkeypatch.setattr("cti_app.workers.confined_analysis.run_analysis_subprocess", run)
+    parameters = ConfinedAnalysisJobParameters(
+        investigation_id=uuid4(),
+        artifact_id=uuid4(),
+        artifact_sha256="a" * 64,
+        operation_key="confined-analysis:" + "d" * 64,
+        tool=ConfinedAnalysisTool.LOCAL_COMMAND,
+        arguments=("monodis",),
+        timeout_seconds=30,
+        max_output_bytes=16 * 1024,
+        analysis_parameters={
+            "operation": "cil",
+            "method_rid": "2",
+            "offset": "8",
+            "length": "16",
+        },
+    )
+
+    result = await _run_local_command(parameters, _pe_fixture(), Settings(_env_file=None))
+
+    assert result["status"] == "SUCCEEDED"
+    assert result["operation"] == "cil"
+    assert result["method_rid"] == 2
+    assert result["method"] == "Fixture.Target"
+    assert result["offset"] == 8
+    assert result["length"] == 16
+    assert result["stdout"] == disassembly.decode()[8:24]
+    assert calls[0][1] == "--method"
+    assert calls[1][1] == "--show-method-tokens"
+    assert all(call[-1].endswith("/sample.bin") for call in calls)
+    assert all("/etc/passwd" not in " ".join(call) for call in calls)
+
+
+class _RecordingCapabilitiesService:
+    def __init__(self, *_args, **_kwargs) -> None:
+        self.persisted = []
+
+    async def persist_worker_result(self, feature_set) -> None:
+        self.persisted.append(feature_set)
+
+
+@pytest.mark.asyncio
+async def test_capa_reports_bounded_sanitized_subprocess_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    persisted = _RecordingCapabilitiesService()
+
+    async def fail_with_readonly_home(self, **_kwargs):
+        return (
+            "9.4.0",
+            AnalysisSubprocessResult(
+                AnalysisSubprocessStatus.NON_ZERO_EXIT,
+                12,
+                b"",
+                b"ERROR capa: [Errno 30] Read-only file system: '/home/analysis' "
+                b"access_token=secret-value",
+            ),
+        )
+
+    monkeypatch.setattr(
+        "cti_app.workers.confined_analysis.ruleset_manifest", lambda _path: "a" * 64
+    )
+    monkeypatch.setattr("cti_app.workers.confined_analysis.CapaRunner.run", fail_with_readonly_home)
+    monkeypatch.setattr(
+        "cti_app.workers.confined_analysis.CapabilitiesService",
+        lambda *_args, **_kwargs: persisted,
+    )
+    parameters = ConfinedAnalysisJobParameters(
+        investigation_id=uuid4(),
+        sample_id=uuid4(),
+        artifact_id=uuid4(),
+        artifact_sha256="a" * 64,
+        operation_key="confined-analysis:" + "b" * 64,
+        tool=ConfinedAnalysisTool.CAPA,
+        timeout_seconds=60,
+        max_output_bytes=100_000,
+    )
+
+    result = await _run_capa(
+        parameters, _pe_fixture(), object(), lambda: None, Settings(_env_file=None)
+    )
+
+    assert result["engine_status"] == "NON_ZERO_EXIT"
+    assert "Read-only file system" in result["available_reason"]
+    assert "/home/analysis" not in result["available_reason"]
+    assert "secret-value" not in result["available_reason"]
+    assert persisted.persisted[0].errors
+
+
+@pytest.mark.asyncio
+async def test_capa_classifies_zip_as_unsupported_format_without_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = BytesIO()
+    import zipfile
+
+    with zipfile.ZipFile(archive, "w") as zipped:
+        zipped.writestr("readme.txt", "harmless fixture")
+
+    async def should_not_run(self, **_kwargs):
+        pytest.fail("capa must not be invoked for ZIP input")
+
+    persisted = _RecordingCapabilitiesService()
+    monkeypatch.setattr(
+        "cti_app.workers.confined_analysis.ruleset_manifest", lambda _path: "a" * 64
+    )
+    monkeypatch.setattr("cti_app.workers.confined_analysis.CapaRunner.run", should_not_run)
+    monkeypatch.setattr(
+        "cti_app.workers.confined_analysis.CapabilitiesService",
+        lambda *_args, **_kwargs: persisted,
+    )
+    parameters = ConfinedAnalysisJobParameters(
+        investigation_id=uuid4(),
+        sample_id=uuid4(),
+        artifact_id=uuid4(),
+        artifact_sha256="a" * 64,
+        operation_key="confined-analysis:" + "c" * 64,
+        tool=ConfinedAnalysisTool.CAPA,
+        timeout_seconds=60,
+        max_output_bytes=100_000,
+    )
+
+    result = await _run_capa(
+        parameters, archive.getvalue(), object(), lambda: None, Settings(_env_file=None)
+    )
+
+    assert result["engine_status"] == "UNSUPPORTED_FORMAT"
+    assert result["available_reason"] == "capa_unsupported_format_zip"
 
 
 def _pe_fixture() -> bytes:
@@ -231,6 +487,68 @@ def _request(
         timeout_seconds=timeout_seconds,
         max_output_bytes=max_output_bytes,
     )
+
+
+@pytest.mark.parametrize(
+    "analysis_parameters",
+    (
+        {"operation": "userstrings"},
+        {"operation": "typedef"},
+        {"operation": "methods"},
+        {"operation": "cil", "method_name": "Main"},
+        {"operation": "cil", "method_rid": "1", "offset": "0", "length": "8192"},
+    ),
+)
+def test_monodis_request_and_durable_job_contract_accept_supported_operations(
+    analysis_parameters: dict[str, str],
+) -> None:
+    request = ConfinedAnalysisRequest(
+        investigation_id=uuid4(),
+        association_id=uuid4(),
+        sample_id=uuid4(),
+        artifact_id=uuid4(),
+        sha256="b" * 64,
+        tool=ConfinedAnalysisTool.LOCAL_COMMAND,
+        arguments=("monodis",),
+        analysis_parameters=analysis_parameters,
+        timeout_seconds=30,
+        max_output_bytes=16 * 1024,
+    )
+    parameters = ConfinedAnalysisJobParameters(
+        investigation_id=request.investigation_id,
+        association_id=request.association_id,
+        sample_id=request.sample_id,
+        artifact_id=request.artifact_id,
+        artifact_sha256=request.sha256,
+        operation_key="confined-analysis:" + "c" * 64,
+        tool=request.tool,
+        timeout_seconds=request.timeout_seconds,
+        max_output_bytes=request.max_output_bytes,
+        arguments=request.arguments,
+        analysis_parameters=dict(request.analysis_parameters),
+    )
+
+    assert parameters.analysis_parameters == analysis_parameters
+
+
+def test_monodis_request_contract_rejects_unpaired_range_and_path_selector() -> None:
+    base = {
+        "investigation_id": uuid4(),
+        "association_id": uuid4(),
+        "sample_id": uuid4(),
+        "artifact_id": uuid4(),
+        "sha256": "b" * 64,
+        "tool": ConfinedAnalysisTool.LOCAL_COMMAND,
+        "arguments": ("monodis",),
+        "timeout_seconds": 30,
+        "max_output_bytes": 16 * 1024,
+    }
+    for analysis_parameters in (
+        {"operation": "cil", "method_rid": "1", "offset": "0"},
+        {"operation": "cil", "method_name": "/etc/passwd"},
+    ):
+        with pytest.raises(ValueError):
+            ConfinedAnalysisRequest(**base, analysis_parameters=analysis_parameters)
 
 
 @dataclass
@@ -553,7 +871,7 @@ async def test_worker_rejects_result_that_cannot_fit_output_budget() -> None:
 
 
 @pytest.mark.asyncio
-async def test_tool_registry_dispatch_runs_capa_and_strings_in_process(
+async def test_tool_registry_dispatch_runs_capa_and_strings_through_worker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -804,9 +1122,16 @@ async def test_confined_rule_workbench_marks_worker_test_fixtures_synthetic() ->
         logical_bucket=SAMPLES_QUARANTINE_BUCKET,
         mime_type="application/octet-stream",
     )
+    empty_pcap_bytes = struct.pack("<IHHIIII", 0xA1B2C3D4, 2, 4, 0, 0, 65_535, 1)
+    empty_pcap = await blobs.ingest(
+        BytesIO(empty_pcap_bytes),
+        logical_bucket="network-captures-quarantine",
+        mime_type="application/vnd.tcpdump.pcap",
+    )
     artifacts = {
         positive.descriptor.sha256: positive.id,
         goodware.descriptor.sha256: goodware.id,
+        empty_pcap.descriptor.sha256: empty_pcap.id,
     }
     settings = Settings(_env_file=None, analysis_worker_enabled=True)
     jobs = _MemoryJobService()
@@ -876,6 +1201,11 @@ async def test_confined_rule_workbench_marks_worker_test_fixtures_synthetic() ->
                 role=RuleTestCorpusRole.GOODWARE,
                 provenance=RuleSampleProvenance.SYNTHETIC,
             ),
+            RuleTestCase(
+                sample_sha256=empty_pcap.descriptor.sha256,
+                role=RuleTestCorpusRole.CONFIRMED_POSITIVE,
+                provenance=RuleSampleProvenance.SYNTHETIC,
+            ),
         ),
         investigation_id=investigation.id,
         selection_bias="Synthetic positive and benign fixture bytes exercise the worker route.",
@@ -885,9 +1215,16 @@ async def test_confined_rule_workbench_marks_worker_test_fixtures_synthetic() ->
     assert report.execution_status.value == "ok"
     assert report.validation_status is RuleValidationStatus.SYNTHETIC_ONLY
     assert rule_validation_reason(report).value == "positive_samples_are_synthetic"
+    positive_report = next(
+        role for role in report.roles if role.role is RuleTestCorpusRole.CONFIRMED_POSITIVE
+    )
+    assert positive_report.non_measurable == (empty_pcap.descriptor.sha256,)
+    assert len(positive_report.errors) == 1
+    assert positive_report.errors[0].code.value == "invalid_sample"
+    assert "YARA" in positive_report.errors[0].message
     assert report.false_positive_sha256s == ()
     assert report.false_negative_sha256s == ()
-    assert jobs.submissions == 2
+    assert jobs.submissions == 3
 
 
 @pytest.mark.asyncio

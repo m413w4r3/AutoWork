@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -10,8 +11,10 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
+from pypdf import PdfReader
 
 from cti_app.application.edition_typst_rendering import EditionTypstRenderer
+from cti_app.application.network_protocol_model import render_protocol_model
 from cti_app.application.protocol_diagram_projection import (
     compile_protocol_render_result,
     opinion_protocol_figures,
@@ -23,13 +26,29 @@ from cti_app.application.typst_compilation import (
     materialize_font_bundle,
 )
 from cti_app.application.typst_rendering import (
+    TypstDraftPreviewDocument,
     TypstRenderer,
     load_template_bundle,
 )
-from cti_app.domain.analyst_opinion import OpinionProtocolFigureV1
+from cti_app.domain.analyst_opinion import AnalystOpinionStatus, OpinionProtocolFigureV1
 from cti_app.domain.errors import EntityNotFoundError
 from cti_app.domain.media_assets import MediaAssetManifest
-from cti_app.domain.protocol_model import ProtocolDiagramKind, ProtocolRenderResultV1
+from cti_app.domain.network_protocol import (
+    NetworkExtractionLimitsV1,
+    NetworkTransport,
+    StreamDirection,
+)
+from cti_app.domain.protocol_model import (
+    AssuranceLevel,
+    MessageDefinitionV1,
+    ProtocolDiagramKind,
+    ProtocolEvidenceRefV1,
+    ProtocolModelV1,
+    ProtocolRenderResultV1,
+    ProtocolStateV1,
+    ProtocolTransitionV1,
+    ProtocolValidationStatus,
+)
 from cti_app.infrastructure.d2_diagram_compiler import D2DiagramCompiler
 from cti_app.infrastructure.database.repositories.investigation import _opinion_from_row
 from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
@@ -353,6 +372,279 @@ async def test_real_article_and_edition_render_all_protocol_figures(
         article_pdf.content,
         edition_pdf.content,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(_D2_BINARY is None, reason="D2 compiler capability is unavailable")
+@pytest.mark.skipif(_TYPST_BINARY is None, reason="Typst compiler capability is unavailable")
+async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
+    tmp_path: Path,
+) -> None:
+    model_id = UUID(int=9910)
+    evidence = ProtocolEvidenceRefV1(
+        source="documented:claim:handshake-facts",
+        documented_ref_kind="claim",
+        documented_ref_id="handshake",
+        documented_source_sha256="a" * 64,
+    )
+    model = ProtocolModelV1(
+        schema_version="ProtocolModelV1",
+        subject_id=str(_base_v5().subject_id),
+        investigation_id=model_id,
+        family=None,
+        cluster=None,
+        family_assurance=AssuranceLevel.UNCONFIRMED,
+        sample_sha256s=(),
+        capture_sha256s=(),
+        report_ids=(),
+        model_version="documented-protocol-model.v1",
+        protocol="Sample handshake",
+        transport=NetworkTransport.UNKNOWN,
+        endpoints=(),
+        client_server_orientation="unresolved",
+        infection_state=None,
+        conversations=(),
+        messages=(
+            MessageDefinitionV1(
+                message_id="hello",
+                name="ClientHello",
+                ordinal=1,
+                directions=(StreamDirection.UNRESOLVED,),
+                min_length=None,
+                max_length=None,
+                field_ids=(),
+                validation_status=ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED,
+                evidence=(evidence,),
+            ),
+            MessageDefinitionV1(
+                message_id="server-hello",
+                name="ServerHello",
+                ordinal=2,
+                directions=(StreamDirection.UNRESOLVED,),
+                min_length=None,
+                max_length=None,
+                field_ids=(),
+                validation_status=ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED,
+                evidence=(evidence,),
+            ),
+            MessageDefinitionV1(
+                message_id="authenticate",
+                name="Authenticate",
+                ordinal=3,
+                directions=(StreamDirection.UNRESOLVED,),
+                min_length=None,
+                max_length=None,
+                field_ids=(),
+                validation_status=ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED,
+                evidence=(evidence,),
+            ),
+            MessageDefinitionV1(
+                message_id="ready",
+                name="ReadyNotice",
+                ordinal=4,
+                directions=(StreamDirection.UNRESOLVED,),
+                min_length=None,
+                max_length=None,
+                field_ids=(),
+                validation_status=ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED,
+                evidence=(evidence,),
+            ),
+        ),
+        fields=(),
+        transitions=(
+            ProtocolTransitionV1(
+                transition_id="new-to-negotiating",
+                from_state="new",
+                to_state="negotiating",
+                message_id="hello",
+                trigger="ClientHello",
+                hypotheses=(),
+                validation_status=ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED,
+                evidence=(evidence,),
+            ),
+            ProtocolTransitionV1(
+                transition_id="negotiating-to-ready",
+                from_state="negotiating",
+                to_state="ready",
+                message_id="authenticate",
+                trigger="Authenticate",
+                hypotheses=(),
+                validation_status=ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED,
+                evidence=(evidence,),
+            ),
+        ),
+        function_provenance=(),
+        validation_status=ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED,
+        verification_findings=(),
+        test_plan=(),
+        limits=NetworkExtractionLimitsV1(),
+        limitations=("Documenté, non observé.",),
+        extractor_versions=(("protocol-document", "1"),),
+        states=(
+            ProtocolStateV1(
+                state_id="new",
+                name="New",
+                validation_status=ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED,
+                evidence=(evidence,),
+            ),
+            ProtocolStateV1(
+                state_id="ready",
+                name="Ready",
+                validation_status=ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED,
+                evidence=(evidence,),
+            ),
+            ProtocolStateV1(
+                state_id="negotiating",
+                name="Negotiating",
+                validation_status=ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED,
+                evidence=(evidence,),
+            ),
+        ),
+        documentary_evidence=(evidence,),
+    )
+    result = render_protocol_model(model)
+    assert len(result.diagrams) == 3
+    assert len(result.diagrams[0].nodes) == 4
+    assert len(result.diagrams[1].nodes) == 3
+    assert all("documenté, non observé" in item.title.casefold() for item in result.diagrams)
+    assert all(
+        not item.edges or all(not edge.frame_numbers for edge in item.edges)
+        for item in result.diagrams
+    )
+
+    media_store, _blobs = _memory_media_store()
+    rendered = await compile_protocol_render_result(
+        result,
+        compiler=D2DiagramCompiler(binary=_D2_BINARY or "d2"),
+        media_asset_store=media_store,
+        production_run_id=UUID(int=9911),
+    )
+    figures = opinion_protocol_figures(rendered)
+    assert {item.kind for item in figures} == set(ProtocolDiagramKind)
+    assert all("documenté, non observé" in item.caption.casefold() for item in figures)
+    format_figure = next(
+        item for item in figures if item.kind is ProtocolDiagramKind.MESSAGE_FORMAT
+    )
+    assert OpinionProtocolFigureV1.from_payload(format_figure.to_payload()) == format_figure
+    format_view = next(
+        item for item in rendered if item.spec.kind is ProtocolDiagramKind.MESSAGE_FORMAT
+    )
+    assert any(
+        "champs sans offset ni longueur documentés" in item.label.casefold()
+        for item in format_view.diagram.nodes
+    )
+
+    base = _base_v5()
+    opinion, citation_context = _approved_opinion(base)
+    opinion_with_figures = replace(opinion, protocol_figures=figures, content_sha256="")
+    publication = augment_publication_with_opinion(base, opinion_with_figures, citation_context)
+    publication_bundle = load_template_bundle(_REPOSITORY_ROOT / "chpTypst")
+    source = TypstRenderer().render(publication, publication_bundle)
+    media_bytes: dict[UUID, bytes] = {}
+    for reference in source.media_refs:
+        try:
+            media_bytes[reference.asset_id] = await media_store.read(reference.asset_id)
+        except EntityNotFoundError:
+            continue
+    workspace = tmp_path / "documented-protocol-workspace"
+    _install_workspace(
+        source,
+        media_bytes,
+        workspace,
+        entrypoint="RENDERER/publication.typ",
+    )
+    pdf = await _compile_pdf(
+        typst_binary=_typst_binary(),
+        workspace_root=workspace,
+        font_root=tmp_path / "documented-protocol-fonts",
+        entrypoint="RENDERER/publication.typ",
+    )
+    pdf_path = tmp_path / "documented-protocol.pdf"
+    pdf_path.write_bytes(pdf.content)
+    extracted = (
+        await asyncio.to_thread(
+            subprocess.run,
+            ("pdftotext", str(pdf_path), "-"),
+            capture_output=True,
+            check=True,
+        )
+    ).stdout.decode("utf-8", errors="replace")
+    extracted = " ".join(extracted.split()).casefold()
+    assert extracted.count("documenté, non observé") >= 3
+    assert all(
+        title in extracted for title in ("séquence réseau", "machine à états", "format de message")
+    )
+
+    audit_root = Path(os.environ.get("TMPDIR", "/tmp")) / "lotL2" / "protocol"
+    audit_root.mkdir(parents=True, exist_ok=True)
+    publication_pdf_path = audit_root / "publication.pdf"
+    publication_pdf_path.write_bytes(pdf.content)
+
+    preview_opinion = replace(
+        opinion,
+        status=AnalystOpinionStatus.DRAFT,
+        reviewer_id=None,
+        protocol_figures=figures,
+        content_sha256="",
+    )
+    preview_source = TypstRenderer().render(
+        TypstDraftPreviewDocument(base, preview_opinion), publication_bundle
+    )
+    preview_media: dict[UUID, bytes] = {}
+    for reference in preview_source.media_refs:
+        preview_media[reference.asset_id] = await media_store.read(reference.asset_id)
+    preview_workspace = tmp_path / "documented-protocol-preview-workspace"
+    _install_workspace(
+        preview_source,
+        preview_media,
+        preview_workspace,
+        entrypoint="RENDERER/publication.typ",
+    )
+    preview_pdf = await _compile_pdf(
+        typst_binary=_typst_binary(),
+        workspace_root=preview_workspace,
+        font_root=tmp_path / "documented-protocol-preview-fonts",
+        entrypoint="RENDERER/publication.typ",
+    )
+    preview_pdf_path = audit_root / "preview.pdf"
+    preview_pdf_path.write_bytes(preview_pdf.content)
+
+    pdftotext = shutil.which("pdftotext")
+    pdftoppm = shutil.which("pdftoppm")
+    assert pdftotext is not None and pdftoppm is not None
+    for label, path in (("publication", publication_pdf_path), ("preview", preview_pdf_path)):
+        extracted = await asyncio.to_thread(
+            subprocess.run,
+            (pdftotext, "-layout", str(path), "-"),
+            capture_output=True,
+            check=True,
+            timeout=30,
+        )
+        pdf_text = " ".join(extracted.stdout.decode("utf-8", errors="replace").split())
+        lowered = pdf_text.casefold()
+        assert pdf_text.count("Modèle documenté, non observé") >= 3
+        assert "champs sans offset ni longueur documentés" in lowered
+        assert all(
+            title in lowered
+            for title in ("séquence réseau", "machine à états", "format de message")
+        )
+        assert "séquence réseau observée" not in lowered
+
+        output_directory = audit_root / label
+        output_directory.mkdir(parents=True, exist_ok=True)
+        for existing in output_directory.glob("*.png"):
+            existing.unlink()
+        raster_prefix = output_directory / "page"
+        await asyncio.to_thread(
+            subprocess.run,
+            (pdftoppm, "-png", "-r", "110", str(path), str(raster_prefix)),
+            capture_output=True,
+            check=True,
+            timeout=30,
+        )
+        rasters = tuple(output_directory.glob("page-*.png"))
+        assert len(rasters) == len(PdfReader(path, strict=True).pages)
+        assert all(image.stat().st_size > 1024 for image in rasters)
 
 
 def test_protocol_figures_are_persisted_in_the_exact_opinion_version() -> None:

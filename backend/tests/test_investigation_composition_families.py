@@ -378,6 +378,7 @@ PROTOCOL_TOOL_NAMES = frozenset(
         "network.protocol.hypothesize",
         "network.protocol.verify",
         "network.protocol.render",
+        "network.protocol.document",
     }
 )
 
@@ -433,6 +434,11 @@ def test_missing_filesystem_confinement_disables_only_capture_inspection() -> No
 def test_protocol_family_is_absent_without_a_network_workbench() -> None:
     composition = _build(replace(_all_family_ports(), network_quarantine=None))
 
-    assert not (NETWORK_TOOL_NAMES | PROTOCOL_TOOL_NAMES).intersection(composition.available_tools)
+    assert not (NETWORK_TOOL_NAMES | PROTOCOL_TOOL_NAMES).intersection(
+        composition.available_tools
+    ) - {"network.protocol.document", "network.protocol.render"}
+    assert {"network.protocol.document", "network.protocol.render"} <= set(
+        composition.available_tools
+    )
     assert "samples.compare" in composition.available_tools
     assert "native.inspect" in composition.available_tools

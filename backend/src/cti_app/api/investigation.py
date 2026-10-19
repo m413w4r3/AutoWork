@@ -5,14 +5,17 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
+import math
 import re
+from collections.abc import Mapping
 from dataclasses import replace
 from datetime import datetime
 from typing import Annotated, Any, cast
 from uuid import UUID, uuid5
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request, status
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from cti_app.application.analyst_handoff import (
     AnalystHandoffPolicy,
@@ -23,10 +26,19 @@ from cti_app.application.analyst_handoff import (
 )
 from cti_app.application.bridge_investigator import make_investigation_turn_idempotency_key
 from cti_app.application.diagram_compilation import DiagramCompilationError
-from cti_app.application.identity import IdentityProvider
+from cti_app.application.evidence_recorder import sanitize_evidence_text
+from cti_app.application.identity import IdentityProvider, IdentityScope
 from cti_app.application.investigation_composition import (
     InvestigationComposition,
     InvestigationCompositionFactory,
+)
+from cti_app.application.investigation_contracts import (
+    AdvisorGuidanceV1,
+    InvestigationOperatorContextV1,
+    OperatorContextSectionPageV1,
+    OperatorToolInvocationRequestV1,
+    OperatorToolInvocationResponseV1,
+    OperatorToolInvocationViewV1,
 )
 from cti_app.application.investigation_governance import (
     EnvelopeDecisionConflictError,
@@ -51,9 +63,18 @@ from cti_app.application.investigation_operator_view import (
     build_investigation_operator_view,
 )
 from cti_app.application.investigation_persistence import VersionConflictError
+from cti_app.application.investigation_service import InvestigationService
 from cti_app.application.investigation_state import InvestigationStateVersionConflict
+from cti_app.application.investigation_tools import (
+    ToolExecutionContext,
+    project_tool_availability,
+)
 from cti_app.application.jobs import DuplicateJobError
 from cti_app.application.network_protocol_model import render_protocol_model
+from cti_app.application.operator_advisor_guidance import build_advisor_guidance
+from cti_app.application.operator_tool_invocation import (
+    OperatorToolInvocationError,
+)
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.protocol_diagram_projection import (
     ProtocolDiagramProjectionError,
@@ -63,6 +84,9 @@ from cti_app.application.research_context_builder import (
     MAX_OPERATOR_REQUEST_BYTES,
     MAX_OPERATOR_REQUESTS,
     USER_REQUEST_ACTION_PREFIX,
+    CanonicalEvidenceSummaryPort,
+    InvestigationContextTooLarge,
+    blocked_capabilities_from_history,
 )
 from cti_app.domain.analyst_opinion import AnalystOpinionV1
 from cti_app.domain.investigation import (
@@ -70,6 +94,7 @@ from cti_app.domain.investigation import (
     DisclosureBounds,
     FindingAssessment,
     InvestigationBudget,
+    InvestigationExecutionMode,
     QualificationActorKind,
     SampleQualification,
     TLPLevel,
@@ -97,7 +122,9 @@ from cti_app.infrastructure.d2_diagram_compiler import D2DiagramCompiler
 from cti_app.logging import get_correlation_id
 
 router = APIRouter(prefix="/api", tags=["investigations"])
+_logger = logging.getLogger(__name__)
 _SHA256 = r"^[0-9a-f]{64}$"
+_BASE64_BLOB_TEXT = re.compile(r"^[A-Za-z0-9+/]{256,}={0,2}$")
 _OPINION_NAMESPACE = UUID("f141ae8e-999c-4a7f-b07d-5ffb0bd7b86d")
 _USER_REQUEST_NAMESPACE = UUID("92e23e22-b681-49c9-87dd-a7fd13398c05")
 _USER_REQUEST_MARKER_PREFIX = "api:user-request:"
@@ -111,6 +138,7 @@ class InvestigationStartRequest(BaseModel):
     production_run_id: UUID
     synthesis_artifact_id: UUID
     synthesis_sha256: str = Field(pattern=_SHA256)
+    execution_mode: InvestigationExecutionMode | None = None
 
 
 class InvestigationActionRequest(BaseModel):
@@ -238,6 +266,61 @@ class ObservationView(BaseModel):
     invocation_ref: UUID | None
 
 
+class OperatorObservationPayloadResponse(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    observation_id: UUID
+    sha256: str
+    offset: int
+    length: int
+    total_chars: int
+    next_offset: int | None
+    payload: str
+    untrusted_data: bool = True
+
+
+class OperatorToolInvocationApiResponseV1(OperatorToolInvocationResponseV1):
+    output: dict[str, Any]
+
+
+_OBSERVATION_SECRET_FIELD = re.compile(
+    r"(?i)(?:api[_-]?key|private[_-]?key|access[_-]?token|client[_-]?secret|"
+    r"authorization|credential|password|secret|signature|signed[_-]?url)"
+)
+_OBSERVATION_BINARY_FIELD = re.compile(
+    r"(?i)(?:raw[_-]?(?:bytes|binary|octets|file|sample|payload)|"
+    r"bytes[_-]?(?:raw|file|sample|payload))"
+)
+
+
+def _sanitize_observation_payload(value: Any, *, depth: int = 0) -> Any:
+    """Mask long encoded blobs while retaining bounded, readable evidence facts."""
+    if depth > 16:
+        return "[maximum depth omitted]"
+    if isinstance(value, dict):
+        safe: dict[str, Any] = {}
+        for key, item in list(value.items())[:128]:
+            safe_key = str(key)[:256]
+            if _OBSERVATION_SECRET_FIELD.search(safe_key) or _OBSERVATION_BINARY_FIELD.search(
+                safe_key
+            ):
+                continue
+            safe[safe_key] = _sanitize_observation_payload(item, depth=depth + 1)
+        return safe
+    if isinstance(value, list):
+        return [_sanitize_observation_payload(item, depth=depth + 1) for item in value[:512]]
+    if isinstance(value, str):
+        safe_text = sanitize_evidence_text(value, max_chars=8 * 1024 * 1024)
+        if _BASE64_BLOB_TEXT.fullmatch(safe_text):
+            return "[encoded binary content omitted]"
+        return safe_text
+    if isinstance(value, bytes | bytearray | memoryview):
+        return "[binary content omitted]"
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
 class SampleAssociationView(BaseModel):
     id: UUID
     sample_sha256: str
@@ -288,6 +371,7 @@ class InvestigationView(BaseModel):
     synthesis_artifact_id: UUID
     synthesis_sha256: str
     status: AnalystInvestigationStatus
+    execution_mode: InvestigationExecutionMode
     version: int
     stop_reason: StopReason | None
     agenda: list[AgendaItemView]
@@ -346,6 +430,7 @@ class InvestigationOperatorStatusResponse(BaseModel):
     base_publication_artifact_id: UUID | None
     base_publication_sha256: str | None
     investigation_status: str
+    execution_mode: InvestigationExecutionMode
     investigation_version: int
     working_state_version: int
     working_state_sha256: str
@@ -373,6 +458,8 @@ class InvestigationOperatorStatusResponse(BaseModel):
     budget: dict[str, Any]
     budget_reservations: list[dict[str, Any]]
     dependencies: dict[str, list[str]]
+    tool_inventory: dict[str, list[str]]
+    advisor_guidance: AdvisorGuidanceV1
     next_idempotent_action: dict[str, Any]
 
 
@@ -427,6 +514,7 @@ async def start_investigation(
                     external_llm_allowed=snapshot.external_llm_allowed,
                 ),
                 envelope=envelope,
+                execution_mode=payload.execution_mode,
                 uow=uow,
             )
             job, replay = await _submit_run_job(
@@ -559,6 +647,236 @@ async def get_investigation(investigation_id: UUID, request: Request) -> Investi
 
 
 @router.get(
+    "/investigations/{investigation_id}/operator/context",
+    response_model=InvestigationOperatorContextV1,
+)
+async def get_investigation_operator_context(
+    investigation_id: UUID,
+    request: Request,
+    expected_version: int | None = Query(default=None, ge=1),
+    expected_sha256: str | None = Query(default=None, pattern=_SHA256),
+) -> InvestigationOperatorContextV1:
+    await _require_operator_client(request)
+    async with _uow_factory(request)() as uow:
+        investigation = await uow.analyst_investigations.get(investigation_id)
+        if investigation is None:
+            raise _http_error(404, "investigation_not_found")
+        composition = _composition_factory(request).build(uow, investigation_id, operator_mode=True)
+        try:
+            return await composition.operator_tool_invocations.get_context(
+                expected_version=expected_version,
+                expected_sha256=expected_sha256,
+            )
+        except OperatorToolInvocationError as exc:
+            if exc.code == "operator_context_too_large":
+                _logger.error(
+                    "operator_context_too_large investigation_id=%s dominant_sections=%s",
+                    investigation_id,
+                    exc.details.get("dominant_sections", [])[:8],
+                )
+            raise _http_error(exc.status_code, exc.code, details=exc.details) from exc
+        except InvestigationContextTooLarge as exc:
+            _logger.error(
+                "operator_context_too_large investigation_id=%s dominant_sections=%s",
+                investigation_id,
+                exc.dominant_sections[:8],
+            )
+            raise _http_error(
+                413,
+                "operator_context_too_large",
+                details={"dominant_sections": list(exc.dominant_sections[:8])},
+            ) from exc
+        except ValidationError as exc:
+            errors = _bounded_validation_errors(exc)
+            _logger.error(
+                "operator_context_validation_failed investigation_id=%s errors=%s",
+                investigation_id,
+                errors,
+            )
+            raise _http_error(503, "operator_context_invalid") from exc
+        except (KeyError, ValueError) as exc:
+            _logger.warning(
+                "operator_context_unavailable investigation_id=%s error_type=%s error_code=%s",
+                investigation_id,
+                type(exc).__name__,
+                str(getattr(exc, "code", "invalid_value"))[:96],
+            )
+            raise _http_error(503, "operator_context_unavailable") from exc
+
+
+@router.get(
+    "/investigations/{investigation_id}/operator/context/section/{section}",
+    response_model=OperatorContextSectionPageV1,
+)
+async def get_investigation_operator_context_section(
+    investigation_id: UUID,
+    section: str,
+    request: Request,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=20, ge=1, le=20),
+    expected_version: int | None = Query(default=None, ge=1),
+    expected_sha256: str | None = Query(default=None, pattern=_SHA256),
+) -> OperatorContextSectionPageV1:
+    await _require_operator_client(request)
+    async with _uow_factory(request)() as uow:
+        investigation = await uow.analyst_investigations.get(investigation_id)
+        if investigation is None:
+            raise _http_error(404, "investigation_not_found")
+        composition = _composition_factory(request).build(uow, investigation_id, operator_mode=True)
+        try:
+            return await composition.operator_tool_invocations.get_context_section(
+                section,
+                offset=offset,
+                limit=limit,
+                expected_version=expected_version,
+                expected_sha256=expected_sha256,
+            )
+        except OperatorToolInvocationError as exc:
+            raise _http_error(exc.status_code, exc.code, details=exc.details) from exc
+        except ValidationError as exc:
+            errors = _bounded_validation_errors(exc)
+            _logger.error(
+                "operator_context_section_validation_failed "
+                "investigation_id=%s section=%s errors=%s",
+                investigation_id,
+                section[:64],
+                errors,
+            )
+            raise _http_error(503, "operator_context_section_invalid") from exc
+        except (KeyError, ValueError) as exc:
+            _logger.warning(
+                "operator_context_section_unavailable investigation_id=%s section=%s error_type=%s",
+                investigation_id,
+                section[:64],
+                type(exc).__name__,
+            )
+            raise _http_error(503, "operator_context_section_unavailable") from exc
+
+
+@router.post(
+    "/investigations/{investigation_id}/operator/tools/{tool_name}",
+    response_model=OperatorToolInvocationApiResponseV1,
+)
+async def invoke_investigation_operator_tool(
+    investigation_id: UUID,
+    tool_name: str,
+    payload: OperatorToolInvocationRequestV1,
+    request: Request,
+    idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=1, max_length=255)],
+) -> OperatorToolInvocationApiResponseV1:
+    await _require_operator_client(request)
+    async with _uow_factory(request)() as uow:
+        investigation = await uow.analyst_investigations.get(investigation_id)
+        if investigation is None:
+            raise _http_error(404, "investigation_not_found")
+        composition = _composition_factory(request).build(uow, investigation_id, operator_mode=True)
+        try:
+            result = await composition.operator_tool_invocations.invoke(
+                tool_name=tool_name,
+                schema_version=payload.schema_version,
+                arguments=payload.arguments,
+                purpose=payload.purpose,
+                expected_version=payload.expected_version,
+                idempotency_key=idempotency_key,
+            )
+        except OperatorToolInvocationError as exc:
+            raise _http_error(exc.status_code, exc.code) from exc
+        except (VersionConflictError, InvestigationStateVersionConflict) as exc:
+            raise _http_error(409, "stale_working_state") from exc
+        advisor_output = None
+        advisor_output_not_replayed = False
+        if tool_name == "advisor.consult" and composition.advisor_tool is not None:
+            captured = composition.advisor_tool.take_result(result.invocation.operation_key)
+            if captured is not None:
+                advisor_output = dict(captured.output)
+            elif (
+                result.idempotent_replay
+                and result.invocation.status is ToolInvocationStatus.SUCCEEDED
+            ):
+                advisor_output_not_replayed = True
+    return OperatorToolInvocationApiResponseV1(
+        investigation_id=result.investigation_id,
+        working_state_version=result.working_state_version,
+        idempotent_replay=result.idempotent_replay,
+        invocation=OperatorToolInvocationViewV1(
+            id=result.invocation.id,
+            tool_name=result.invocation.tool_name,
+            schema_version=result.invocation.schema_version,
+            status=result.invocation.status,
+            version=result.invocation.version,
+            response_refs=result.invocation.response_refs,
+            error_code=result.error_code,
+        ),
+        job_id=result.job_id,
+        advisor_output=advisor_output,
+        advisor_output_not_replayed=advisor_output_not_replayed,
+        output=dict(result.output),
+    )
+
+
+@router.get(
+    "/investigations/{investigation_id}/operator/observations/{observation_id}",
+    response_model=OperatorObservationPayloadResponse,
+)
+async def get_investigation_operator_observation(
+    investigation_id: UUID,
+    observation_id: UUID,
+    request: Request,
+    offset: int = Query(default=0, ge=0),
+    length: int = Query(default=16 * 1024, ge=1, le=32 * 1024),
+) -> OperatorObservationPayloadResponse:
+    await _require_operator_client(request)
+    async with _uow_factory(request)() as uow:
+        investigation = await uow.analyst_investigations.get(investigation_id)
+        if investigation is None:
+            raise _http_error(404, "investigation_not_found")
+        observation = await uow.evidence_observations.get(observation_id)
+        if observation is None or observation.investigation_id != investigation_id:
+            raise _http_error(404, "operator_observation_not_found")
+        blob = await uow.blobs.get(observation.blob_id)
+        descriptor = getattr(blob, "descriptor", None)
+        if (
+            descriptor is None
+            or descriptor.mime_type.split(";", 1)[0].strip().lower() != "application/json"
+        ):
+            raise _http_error(415, "operator_observation_not_json")
+        if descriptor.logical_bucket in {"samples-quarantine", "network-quarantine"}:
+            raise _http_error(415, "operator_observation_binary_forbidden")
+        try:
+            raw = await _artifact_store(request).read_bytes(
+                observation.blob_id, max_bytes=8 * 1024 * 1024
+            )
+        except (ValueError, KeyError) as exc:
+            raise _http_error(413, "operator_observation_too_large") from exc
+        if hashlib.sha256(raw).hexdigest() != observation.sha256:
+            raise _http_error(409, "operator_observation_integrity_failed")
+        try:
+            canonical = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise _http_error(422, "operator_observation_invalid_json") from exc
+        if not isinstance(canonical, dict):
+            raise _http_error(422, "operator_observation_invalid_payload")
+        sanitized = _sanitize_observation_payload(canonical)
+        payload_json = json.dumps(
+            sanitized, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        if len(payload_json.encode("utf-8")) > 8 * 1024 * 1024:
+            raise _http_error(413, "operator_observation_too_large")
+        page = payload_json[offset : offset + length]
+        next_offset = offset + len(page) if offset + len(page) < len(payload_json) else None
+        return OperatorObservationPayloadResponse(
+            observation_id=observation.id,
+            sha256=observation.sha256,
+            offset=offset,
+            length=len(page),
+            total_chars=len(payload_json),
+            next_offset=next_offset,
+            payload=page,
+            untrusted_data=True,
+        )
+
+
+@router.get(
     "/investigations/{investigation_id}/operator-status",
     response_model=InvestigationOperatorStatusResponse,
 )
@@ -582,7 +900,11 @@ async def get_investigation_operator_status(
         if state is None:
             raise _http_error(409, InvestigationOperatorErrorCode.INVESTIGATION_STATE_MISSING.value)
         composition_factory = _composition_factory(request)
-        composition = composition_factory.build(uow, investigation_id)
+        composition = composition_factory.build(
+            uow,
+            investigation_id,
+            operator_mode=state.execution_mode is InvestigationExecutionMode.OPERATOR_LED,
+        )
         try:
             snapshot = await composition.tool_dependencies.article_snapshots.resolve(
                 investigation.synthesis_artifact_id
@@ -595,6 +917,40 @@ async def get_investigation_operator_status(
         invocations = tuple(await uow.tool_invocations.list_for_investigation(investigation_id))
         observations = tuple(
             await uow.evidence_observations.list_for_investigation(investigation_id)
+        )
+        tool_inventory = await _operator_status_tool_inventory(
+            state=state,
+            composition=composition,
+            envelope=envelope,
+            invocations=invocations,
+            observations=observations,
+            external_llm_allowed=InvestigationService.external_llm_allowed(snapshot, envelope),
+        )
+        if tool_inventory is not None:
+            available_tool_names, unavailable_tool_diagnostics = tool_inventory
+        else:
+            # Compatibility for lightweight route fakes; production compositions always expose
+            # the registry and use the shared availability projection above.
+            available_tool_names = tuple(getattr(composition, "available_tools", ()))
+            unavailable_tool_diagnostics = _unavailable_tool_diagnostics(request, composition)
+        advisor_settings = composition_factory.settings
+        artifact_store = getattr(
+            getattr(composition, "tool_dependencies", None), "artifact_store", None
+        )
+        advisor_guidance = await build_advisor_guidance(
+            invocations=invocations,
+            observations=observations,
+            evidence_summaries=(
+                CanonicalEvidenceSummaryPort(artifact_store) if artifact_store is not None else None
+            ),
+            available_tools=available_tool_names,
+            checkpoint_tool_threshold=getattr(
+                advisor_settings, "operator_advisor_checkpoint_tool_threshold", 12
+            ),
+            advisor_turn_limit=getattr(
+                advisor_settings, "operator_advisor_max_turns_per_investigation", 8
+            ),
+            enabled=state.execution_mode is InvestigationExecutionMode.OPERATOR_LED,
         )
         opinion = await uow.analyst_opinions.get(uuid5(_OPINION_NAMESPACE, str(investigation_id)))
         jobs = tuple(
@@ -637,8 +993,9 @@ async def get_investigation_operator_status(
             observations=observations,
             opinion=opinion,
             jobs=jobs,
-            available_tools=composition.available_tools,
-            unavailable_tools=_unavailable_tool_diagnostics(request, composition),
+            available_tools=available_tool_names,
+            unavailable_tools=unavailable_tool_diagnostics,
+            advisor_guidance=advisor_guidance,
             pending_bridge_turn_id=(pending_bridge_turn.id if pending_bridge_turn else None),
             pending_bridge_turn_status=(
                 pending_bridge_turn.status.value if pending_bridge_turn else None
@@ -662,7 +1019,7 @@ async def get_investigation_envelope(
         investigation = await uow.analyst_investigations.get(investigation_id)
         if investigation is None:
             raise _http_error(404, "investigation_not_found")
-        composition = _composition_factory(request).build(uow, investigation_id)
+        composition = _composition_factory(request).build(uow, investigation_id, operator_mode=True)
         snapshot = await composition.tool_dependencies.article_snapshots.resolve(
             investigation.synthesis_artifact_id
         )
@@ -713,7 +1070,7 @@ async def approve_investigation_envelope(
         investigation = await uow.analyst_investigations.get(investigation_id)
         if investigation is None:
             raise _http_error(404, "investigation_not_found")
-        composition = _composition_factory(request).build(uow, investigation_id)
+        composition = _composition_factory(request).build(uow, investigation_id, operator_mode=True)
         snapshot = await composition.tool_dependencies.article_snapshots.resolve(
             investigation.synthesis_artifact_id
         )
@@ -775,7 +1132,7 @@ async def extend_investigation_envelope(
         investigation = await uow.analyst_investigations.get(investigation_id)
         if investigation is None:
             raise _http_error(404, "investigation_not_found")
-        composition = _composition_factory(request).build(uow, investigation_id)
+        composition = _composition_factory(request).build(uow, investigation_id, operator_mode=True)
         snapshot = await composition.tool_dependencies.article_snapshots.resolve(
             investigation.synthesis_artifact_id
         )
@@ -1691,6 +2048,7 @@ async def _investigation_view(
         synthesis_artifact_id=investigation.synthesis_artifact_id,
         synthesis_sha256=snapshot.synthesis_sha256,
         status=investigation.status,
+        execution_mode=state.execution_mode,
         version=state.version,
         stop_reason=state.stop_reason,
         agenda=[
@@ -1891,6 +2249,9 @@ def _available_providers(available_tools: tuple[str, ...]) -> tuple[str, ...]:
         providers.append("vt")
     if any(name.startswith("shodan.") for name in available_tools):
         providers.append("shodan")
+    if any(name.startswith("advisor.") for name in available_tools):
+        # The Bridge advisor is an external LLM provider that G2 must authorize explicitly.
+        providers.append("bridge")
     return tuple(providers)
 
 
@@ -1898,7 +2259,7 @@ def _requested_providers(
     requested: tuple[str, ...] | list[str], available: tuple[str, ...]
 ) -> tuple[str, ...]:
     providers = tuple(dict.fromkeys(item.strip().lower() for item in requested))
-    if any(item not in {"vt", "shodan"} for item in providers):
+    if any(item not in {"vt", "shodan", "bridge"} for item in providers):
         raise _http_error(422, "unsupported_provider")
     unavailable = sorted(set(providers).difference(available))
     if unavailable:
@@ -2271,9 +2632,97 @@ def _data_url(mime_type: str, content: bytes) -> str:
     return f"data:{mime_type};base64,{encoded}"
 
 
+async def _pending_prompt_tool_inventory(
+    state: InvestigationWorkingState,
+    *,
+    artifact_store: Any,
+) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
+    """Use the exact serialized inventory while that prompt is awaiting Bridge."""
+    snapshot_id = state.pending_context_snapshot_id
+    reader = getattr(artifact_store, "read_json", None)
+    if snapshot_id is None or not callable(reader):
+        return None
+    try:
+        stored = await reader(snapshot_id)
+    except Exception:
+        return None
+    context = stored.get("context") if isinstance(stored, dict) else None
+    if (
+        not isinstance(context, dict)
+        or context.get("schema") != "investigation-context.v1"
+        or context.get("investigation_id") != str(state.investigation_id)
+    ):
+        return None
+    raw_available = context.get("available_tools")
+    raw_unavailable = context.get("unavailable_tools", [])
+    if not isinstance(raw_available, list) or not isinstance(raw_unavailable, list):
+        return None
+    available_names: set[str] = set()
+    for item in raw_available:
+        name = item.get("name") if isinstance(item, dict) else None
+        if not isinstance(name, str) or re.fullmatch(r"[A-Za-z0-9._-]{1,128}", name) is None:
+            return None
+        available_names.add(name)
+    if any(
+        not isinstance(item, str)
+        or len(item) > 256
+        or re.fullmatch(r"[A-Za-z0-9._-]{1,128}:[A-Za-z0-9_.:-]{1,96}", item) is None
+        for item in raw_unavailable[:64]
+    ):
+        return None
+    return tuple(sorted(available_names)), tuple(raw_unavailable[:64])
+
+
+async def _operator_status_tool_inventory(
+    *,
+    state: InvestigationWorkingState,
+    composition: InvestigationComposition,
+    envelope: Any | None,
+    invocations: tuple[Any, ...],
+    observations: tuple[Any, ...],
+    external_llm_allowed: bool | None = None,
+) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
+    """Use the registry projection shared with prompt construction and dispatch."""
+    registry = getattr(composition, "registry", None)
+    available_capabilities = getattr(composition, "available_capabilities", None)
+    if registry is None or available_capabilities is None:
+        return None
+    context = ToolExecutionContext(
+        investigation_id=state.investigation_id,
+        envelope=envelope,
+        budget=envelope.budget if envelope is not None else InvestigationBudget(limits={}),
+        idempotency_key="operator-status-tool-availability",
+        available_capabilities=available_capabilities,
+    )
+    blocked_capabilities = await blocked_capabilities_from_history(
+        investigation_id=state.investigation_id,
+        invocations=invocations,
+        observations=observations,
+    )
+    if external_llm_allowed is False:
+        blocked_capabilities = (
+            *blocked_capabilities,
+            "bridge.advisor:external_llm_disclosure_denied",
+        )
+    context = replace(
+        context,
+        blocked_capabilities=blocked_capabilities,
+    )
+    availability = project_tool_availability(registry, context)
+    dependencies = getattr(composition, "tool_dependencies", None)
+    pending = await _pending_prompt_tool_inventory(
+        state,
+        artifact_store=getattr(dependencies, "artifact_store", None),
+    )
+    if pending is not None:
+        return pending
+    return availability.available_names, availability.unavailable_diagnostics[:64]
+
+
 def _unavailable_tool_diagnostics(
     request: Request, composition: InvestigationComposition
 ) -> tuple[str, ...]:
+    """Compatibility projection for route fakes predating the live registry contract."""
     runtime = getattr(request.app.state, "investigation_runtime_composition", None)
     ports = getattr(runtime, "ports", None)
     statuses = getattr(ports, "statuses", ())
@@ -2282,7 +2731,6 @@ def _unavailable_tool_diagnostics(
         for item in statuses
         if getattr(item, "family", None) is not None
     }
-
     aliases = {
         "acquisition": "virustotal",
         "local_commands": "local_command_execution",
@@ -2347,8 +2795,17 @@ def _uow_factory(request: Request) -> Any:
 
 
 async def _identity(request: Request) -> Any:
+    current = getattr(request.state, "identity", None)
+    if current is not None:
+        return current
     provider: IdentityProvider = request.app.state.identity_provider
     return await provider.current()
+
+
+async def _require_operator_client(request: Request) -> None:
+    identity = await _identity(request)
+    if not identity.has_scope(IdentityScope.OPERATOR_CLIENT):
+        raise _http_error(403, "operator_client_scope_required")
 
 
 async def _dispatch(request: Request, job: Job) -> None:
@@ -2358,10 +2815,29 @@ async def _dispatch(request: Request, job: Job) -> None:
     await dispatcher.dispatch(job.id)
 
 
-def _http_error(code_status: int, code: str, message: str | None = None) -> HTTPException:
-    detail: dict[str, str] = {"code": code}
+def _bounded_validation_errors(exc: ValidationError) -> list[dict[str, str]]:
+    errors = exc.errors(include_input=False, include_context=False)[:8]
+    return [
+        {
+            "loc": ".".join(str(item) for item in error.get("loc", ())[:6])[:160],
+            "type": str(error.get("type", "validation_error"))[:64],
+        }
+        for error in errors
+    ]
+
+
+def _http_error(
+    code_status: int,
+    code: str,
+    message: str | None = None,
+    *,
+    details: Mapping[str, Any] | None = None,
+) -> HTTPException:
+    detail: dict[str, Any] = {"code": code}
     if message:
         detail["message"] = message
+    if details:
+        detail["details"] = dict(details)
     return HTTPException(status_code=code_status, detail=detail)
 
 

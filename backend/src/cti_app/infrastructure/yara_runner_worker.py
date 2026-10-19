@@ -49,7 +49,7 @@ def _set_limits(memory_bytes: int, cpu_seconds: int, output_bytes: int) -> None:
 
 
 def main(arguments: list[str]) -> int:
-    if len(arguments) < 7:
+    if len(arguments) < 8:
         _emit("invalid_input", message="worker arguments are incomplete")
         return 0
     operation, source_argument = arguments[1], arguments[2]
@@ -58,10 +58,14 @@ def main(arguments: list[str]) -> int:
         cpu_seconds = int(arguments[4])
         output_bytes = int(arguments[5])
         timeout_seconds = float(arguments[6])
+        maximum_strings_per_rule = int(arguments[7])
     except ValueError:
         _emit("invalid_input", message="worker limits are invalid")
         return 0
-    sample_arguments = arguments[7:]
+    sample_arguments = arguments[8:]
+    if not 1 <= maximum_strings_per_rule <= 65_536:
+        _emit("invalid_input", message="YARA strings-per-rule limit is invalid")
+        return 0
     if operation not in {"compile", "match"}:
         _emit("invalid_input", message="worker operation is invalid")
         return 0
@@ -90,6 +94,15 @@ def main(arguments: list[str]) -> int:
         return 0
 
     engine_version = str(getattr(yara, "__version__", "unknown"))[:128]
+    try:
+        yara.set_config(max_strings_per_rule=maximum_strings_per_rule)
+    except Exception:
+        _emit(
+            "engine_unavailable",
+            engine_version=engine_version,
+            message="YARA max_strings_per_rule limit could not be applied",
+        )
+        return 0
     source_path = Path(source_argument)
     try:
         if not source_path.is_file():
@@ -158,7 +171,11 @@ def main(arguments: list[str]) -> int:
             return 0
         sample_path = Path(sample_path_text)
         try:
-            found = rules.match(filepath=str(sample_path), timeout=max(1, math.ceil(remaining)))
+            found = rules.match(
+                filepath=str(sample_path),
+                timeout=max(1, math.ceil(remaining)),
+                fast=True,
+            )
         except yara.TimeoutError:
             _emit(
                 "timeout",

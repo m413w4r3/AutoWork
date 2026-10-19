@@ -115,6 +115,23 @@ class CodeFeatureService:
                 packing=_packing_signals(payload, ()),
                 errors=(result.error,) if result.error else (),
             )
+        return await self.persist_worker_result(feature_set)
+
+    async def persist_worker_result(self, feature_set: CodeFeatureSet) -> CodeFeatureSet:
+        """Persist code features already extracted inside the attested analysis worker."""
+        async with self._uow_factory() as uow:
+            sample = await uow.samples.get(feature_set.sample_id)
+            if sample is None or sample.blob_id != feature_set.blob_id:
+                raise ValueError("worker code features do not match the canonical sample")
+            existing = await uow.code_feature_sets.get(
+                feature_set.sample_id,
+                feature_set.tool_version,
+                feature_set.escaper_compatibility_version,
+                feature_set.intel_pic_hash_escape_version,
+                feature_set.parameters_sha256,
+            )
+            if existing is not None:
+                return existing
         payload = json.dumps(feature_set.as_json(), separators=(",", ":"), sort_keys=True).encode()
         feature_blob = await self._blobs.ingest(
             BytesIO(payload), logical_bucket="code-feature-sets", mime_type="application/json"
@@ -126,11 +143,11 @@ class CodeFeatureService:
                 await uow.commit()
             else:
                 existing = await uow.code_feature_sets.get(
-                    sample_id,
+                    feature_set.sample_id,
                     feature_set.tool_version,
                     feature_set.escaper_compatibility_version,
                     feature_set.intel_pic_hash_escape_version,
-                    parameters_sha256,
+                    feature_set.parameters_sha256,
                 )
                 if existing is not None:
                     return existing

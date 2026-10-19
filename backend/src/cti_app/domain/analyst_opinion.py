@@ -102,6 +102,26 @@ class OpinionProtocolFieldEvidenceV1:
         }
 
 
+def normalize_opinion_text(block_type: OpinionBlockType, text: str) -> str:
+    """Display-only punctuation cleanup; never applied to the persisted, hashed text."""
+    if block_type is OpinionBlockType.CLAIM_VERIFICATION:
+        text = re.sub(
+            r"([.!?])\s*:\s*l'affirmation doit être nuancée\.?",
+            r"\1 L'affirmation doit être nuancée.",
+            text,
+            flags=re.IGNORECASE,
+        )
+    if block_type is OpinionBlockType.KEY_FINDINGS:
+
+        def normalize_reserves(match: re.Match[str]) -> str:
+            parts = [re.sub(r"[.!?;:\s]+$", "", item).strip() for item in match.group(2).split(";")]
+            parts = [item for item in parts if item]
+            return match.group(1) + "; ".join(parts) + ("." if parts else "")
+
+        text = re.sub(r"(?im)^([ \t]*Réserves[ \t]*:[ \t]*)([^\n]*)", normalize_reserves, text)
+    return text
+
+
 @dataclass(frozen=True, slots=True)
 class OpinionBlock:
     block_type: OpinionBlockType
@@ -526,7 +546,16 @@ def _protocol_evidence_from_payload(value: object) -> ProtocolEvidenceRefV1:
         "timestamp_start_ns",
         "timestamp_end_ns",
     }
-    if not isinstance(value, Mapping) or set(value) != expected:
+    documentary = {
+        "documented_ref_kind",
+        "documented_ref_id",
+        "documented_source_sha256",
+    }
+    if (
+        not isinstance(value, Mapping)
+        or not expected.issubset(value)
+        or set(value) - (expected | documentary)
+    ):
         raise ValueError("Protocol evidence payload has missing or unknown fields")
     frames = value["frame_numbers"]
     if not isinstance(frames, (list, tuple)):
@@ -539,9 +568,22 @@ def _protocol_evidence_from_payload(value: object) -> ProtocolEvidenceRefV1:
             raise ValueError("Protocol evidence numeric metadata is invalid")
         return raw
 
-    text_fields = ("capture_sha256", "flow_id", "stream_id", "direction", "source")
-    if any(not isinstance(value[name], str) for name in text_fields):
+    optional_text_fields = ("capture_sha256", "flow_id", "stream_id", "direction")
+    if any(
+        value[name] is not None and not isinstance(value[name], str)
+        for name in optional_text_fields
+    ) or not isinstance(value["source"], str):
         raise ValueError("Protocol evidence text metadata is invalid")
+    documentary_text_fields = (
+        "documented_ref_kind",
+        "documented_ref_id",
+        "documented_source_sha256",
+    )
+    if any(
+        name in value and value[name] is not None and not isinstance(value[name], str)
+        for name in documentary_text_fields
+    ):
+        raise ValueError("Protocol documentary evidence metadata is invalid")
     if any(isinstance(frame, bool) or not isinstance(frame, int) for frame in frames):
         raise ValueError("Protocol evidence frame numbers are invalid")
     observation_id = value["observation_id"]
@@ -551,7 +593,7 @@ def _protocol_evidence_from_payload(value: object) -> ProtocolEvidenceRefV1:
         capture_sha256=value["capture_sha256"],
         flow_id=value["flow_id"],
         stream_id=value["stream_id"],
-        direction=StreamDirection(value["direction"]),
+        direction=(StreamDirection(value["direction"]) if value["direction"] is not None else None),
         frame_numbers=tuple(frames),
         start_offset=optional_int(value["start_offset"]),
         end_offset=optional_int(value["end_offset"]),
@@ -559,6 +601,9 @@ def _protocol_evidence_from_payload(value: object) -> ProtocolEvidenceRefV1:
         observation_id=UUID(observation_id) if observation_id is not None else None,
         timestamp_start_ns=optional_int(value["timestamp_start_ns"]),
         timestamp_end_ns=optional_int(value["timestamp_end_ns"]),
+        documented_ref_kind=value.get("documented_ref_kind"),
+        documented_ref_id=value.get("documented_ref_id"),
+        documented_source_sha256=value.get("documented_source_sha256"),
     )
 
 

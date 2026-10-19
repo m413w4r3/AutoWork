@@ -6,13 +6,24 @@ from uuid import UUID
 
 import pytest
 
+from cti_app.application.investigation_acquisition import HitAcquisitionService
 from cti_app.application.investigation_persistence import InMemoryEvidenceObservationRepository
 from cti_app.application.sample_acquisition import SAMPLES_QUARANTINE_BUCKET
-from cti_app.domain.investigation import EvidenceKind
+from cti_app.domain.classification import TLP
+from cti_app.domain.entities import ProvenanceEvent, Sample, SampleOrigin, SampleState
+from cti_app.domain.investigation import (
+    EvidenceKind,
+    SampleAssociation,
+    SampleQualification,
+)
+from cti_app.domain.investigation import (
+    SampleOrigin as AssociationSampleOrigin,
+)
 from cti_app.domain.production import AnalystInvestigationStatus
 from cti_app.domain.rule_workbench import RuleTestCorpusRole
 
 _INVESTIGATION_ID = UUID("7c768c42-63c5-44a3-9e14-9a10c8712e7a")
+_SUBJECT_ID = UUID("7a7b2fa5-a5f1-427a-8f07-6fdaabbb1a39")
 
 
 class _BlobCatalog:
@@ -42,6 +53,17 @@ class _BlobCatalog:
     async def get(self, blob_id: UUID):
         return self.records.get(blob_id)
 
+    async def get_by_address(self, logical_bucket: str, sha256: str):
+        return next(
+            (
+                record
+                for record in self.records.values()
+                if record.descriptor.logical_bucket == logical_bucket
+                and record.descriptor.sha256 == sha256
+            ),
+            None,
+        )
+
 
 class _Investigations:
     def __init__(self, status: AnalystInvestigationStatus) -> None:
@@ -50,14 +72,89 @@ class _Investigations:
     async def get(self, investigation_id):
         if investigation_id != _INVESTIGATION_ID:
             return None
-        return SimpleNamespace(id=investigation_id, status=self.status)
+        return SimpleNamespace(id=investigation_id, subject_id=_SUBJECT_ID, status=self.status)
+
+
+class _Subjects:
+    async def get(self, subject_id):
+        if subject_id != _SUBJECT_ID:
+            return None
+        return SimpleNamespace(id=subject_id, tlp=TLP.AMBER)
+
+
+class _Samples:
+    def __init__(self) -> None:
+        self.items: dict[UUID, Sample] = {}
+
+    async def get(self, sample_id):
+        return self.items.get(sample_id)
+
+    async def add(self, sample):
+        self.items[sample.id] = sample
+
+    async def get_by_subject_and_blob(self, subject_id, blob_id):
+        return next(
+            (
+                sample
+                for sample in self.items.values()
+                if sample.subject_id == subject_id and sample.blob_id == blob_id
+            ),
+            None,
+        )
+
+    async def list_for_subject(self, subject_id):
+        return tuple(sample for sample in self.items.values() if sample.subject_id == subject_id)
+
+
+class _SampleAssociations:
+    def __init__(self) -> None:
+        self.items: dict[UUID, SampleAssociation] = {}
+
+    async def get(self, association_id):
+        return self.items.get(association_id)
+
+    async def list_for_investigation(self, investigation_id):
+        return tuple(
+            item for item in self.items.values() if item.investigation_id == investigation_id
+        )
+
+    async def append_version(self, association, *, expected_version):
+        assert expected_version == 0
+        self.items[association.id] = association
+        return association
+
+
+class _SampleAcquisitionAttempts:
+    async def find_successful(self, investigation_id, requested_hash):
+        del investigation_id, requested_hash
+        return None
+
+
+class _Provenance:
+    def __init__(self) -> None:
+        self.items: list[ProvenanceEvent] = []
+
+    async def append(self, event):
+        self.items.append(event)
+
+    async def list_for_aggregate(self, aggregate_type, aggregate_id):
+        return [
+            event
+            for event in self.items
+            if event.aggregate_type == aggregate_type and event.aggregate_id == aggregate_id
+        ]
 
 
 class _UnitOfWork:
     def __init__(self, harness: _Harness) -> None:
         self.analyst_investigations = _Investigations(harness.status)
+        self.subjects = _Subjects()
         self.evidence_observations = harness.observations
         self.blobs = harness.blobs
+        self.samples = harness.samples
+        self.sample_associations = harness.sample_associations
+        self.sample_acquisition_attempts = _SampleAcquisitionAttempts()
+        self.provenance = harness.provenance
         self.commits = 0
 
     async def __aenter__(self):
@@ -83,6 +180,9 @@ class _Harness:
         self.status = AnalystInvestigationStatus.RUNNING
         self.observations = InMemoryEvidenceObservationRepository()
         self.blobs = _BlobCatalog()
+        self.samples = _Samples()
+        self.sample_associations = _SampleAssociations()
+        self.provenance = _Provenance()
         self.uow_factory = _UnitOfWorkFactory(self)
         self.settings = SimpleNamespace(rule_corpus_import_max_bytes=max_bytes)
 
@@ -123,6 +223,32 @@ async def test_import_accepts_non_pe_xml_and_is_idempotent_by_role_and_content()
     assert imported.provenance.value == "synthetic"
     assert replay.observation_id == imported.observation_id
     assert replay.blob_id == imported.blob_id
+    assert imported.sample_id is not None
+    assert imported.association_id is not None
+    sample = harness.samples.items[imported.sample_id]
+    assert sample.origin == "operator_import"
+    assert sample.source_service == "operator_import"
+    assert sample.origin_kind is SampleOrigin.MANUAL
+    assert sample.state is SampleState.QUARANTINED
+    assert sample.expected_hash == imported.sha256
+    association = harness.sample_associations.items[imported.association_id]
+    assert association.origin is AssociationSampleOrigin.MANUAL
+    assert association.qualification is SampleQualification.CANDIDATE
+    assert not association.changes
+    assert any(
+        event.aggregate_id == sample.id
+        and event.event_type == "sample_imported_by_operator"
+        and event.payload["provenance"] == "operator_import"
+        for event in harness.provenance.items
+    )
+    resolved = await HitAcquisitionService(
+        harness.uow_factory, acquisition=None, recorder=object()
+    ).resolve_quarantined_sample(imported.association_id)
+    assert resolved.sample_id == imported.sample_id
+    assert resolved.sha256 == imported.sha256
+    assert harness.blobs.content[(SAMPLES_QUARANTINE_BUCKET, imported.sha256)] == content
+    assert replay.sample_id == imported.sample_id
+    assert replay.association_id == imported.association_id
     assert imported.logical_bucket == SAMPLES_QUARANTINE_BUCKET
     assert harness.blobs.ingest_count == 1
     observations = await harness.observations.list_for_investigation(_INVESTIGATION_ID)
@@ -217,9 +343,14 @@ def test_authenticated_multipart_route_imports_xml_and_replays_the_same_record()
     first_body = first.json()
     assert first_body["sha256"] == hashlib.sha256(content).hexdigest()
     assert first_body["provenance"] == "real"
+    assert first_body["source"] == "operator_import"
+    assert first_body["sample_id"]
+    assert first_body["association_id"]
     assert first_body["local_only"] is True
     assert first_body["executed"] is False
     assert replay.json()["observation_id"] == first_body["observation_id"]
+    assert replay.json()["sample_id"] == first_body["sample_id"]
+    assert replay.json()["association_id"] == first_body["association_id"]
     assert replay.json()["idempotent_replay"] is True
 
 

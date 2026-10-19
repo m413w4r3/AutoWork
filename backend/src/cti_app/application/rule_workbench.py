@@ -88,6 +88,7 @@ class RuleValidationReason(StrEnum):
     FALSE_NEGATIVES = "real_positive_samples_not_matched"
     FALSE_POSITIVES = "goodware_false_positive_observed"
     EXECUTION_INCOMPLETE = "analysis_incomplete"
+    EXPLICIT_TEST_REQUIRED = "explicit_rule_test_required"
 
 
 def rule_validation_reason(report: RuleTestReport) -> RuleValidationReason:
@@ -253,6 +254,38 @@ class RuleWorkbench:
         self._non_discriminant = non_discriminant_patterns
         self._legitimate_services = legitimate_services
         self._policy = policy or RuleWorkbenchPolicy()
+
+    def compile_check(self, rule_source: str) -> YaraEngineResult:
+        """Compile generated rule source without evaluating it against a corpus."""
+        if len(rule_source.encode("utf-8")) > self._policy.maximum_source_bytes:
+            return YaraEngineResult(
+                status=YaraExecutionStatus.RESOURCE_EXCEEDED,
+                engine_version="unavailable",
+                message="rule source exceeds the configured source size limit",
+            )
+        if self._yara_engine is None:
+            family = (
+                self._confined_analysis.family_statuses.get("yara")
+                if self._confined_analysis is not None
+                else None
+            )
+            return YaraEngineResult(
+                status=YaraExecutionStatus.ENGINE_UNAVAILABLE,
+                engine_version=family.version if family and family.version else "unavailable",
+                message="standalone compile check is unavailable",
+            )
+        try:
+            return self._yara_engine.compile(rule_source)
+        except Exception:
+            return YaraEngineResult(
+                status=YaraExecutionStatus.ENGINE_CRASHED,
+                engine_version="unknown",
+                message="YARA compiler failed unexpectedly",
+            )
+
+    @property
+    def has_confined_test_runner(self) -> bool:
+        return self._confined_analysis is not None
 
     def propose_from_features(
         self,
@@ -915,6 +948,24 @@ class RuleWorkbench:
             worker_result = (response.payload or {}).get("result", {})
             if not isinstance(worker_result, Mapping):
                 worker_result = {}
+            if (
+                response.status.value == "succeeded"
+                and worker_result.get("status") == "non_measurable"
+            ):
+                message = str(
+                    worker_result.get("message") or "The corpus member cannot be measured by YARA."
+                )
+                for same_sample in cases:
+                    if same_sample.sample_sha256 == case.sample_sha256:
+                        results[same_sample.role]["non_measurable"].add(case.sample_sha256)
+                        results[same_sample.role]["errors"].append(
+                            RuleTestError(
+                                code=RuleTestErrorCode.INVALID_SAMPLE,
+                                message=message[:1000],
+                                sample_sha256=case.sample_sha256,
+                            )
+                        )
+                continue
             try:
                 worker_status = YaraExecutionStatus(
                     str(worker_result.get("status", "engine_crashed"))
@@ -931,15 +982,21 @@ class RuleWorkbench:
                     else YaraExecutionStatus.ENGINE_CRASHED
                 )
             if worker_status is not YaraExecutionStatus.OK:
-                status = worker_status
                 message = str(
-                    worker_result.get("message") or response.available_reason or status.value
+                    worker_result.get("message") or response.available_reason or worker_status.value
                 )
                 for same_sample in cases:
                     if same_sample.sample_sha256 == case.sample_sha256:
+                        if worker_status in {
+                            YaraExecutionStatus.TIMEOUT,
+                            YaraExecutionStatus.RESOURCE_EXCEEDED,
+                            YaraExecutionStatus.ENGINE_CRASHED,
+                            YaraExecutionStatus.INVALID_INPUT,
+                        }:
+                            results[same_sample.role]["non_measurable"].add(case.sample_sha256)
                         results[same_sample.role]["errors"].append(
                             RuleTestError(
-                                code=_test_error_code(status),
+                                code=_test_error_code(worker_status),
                                 message=message[:1000],
                                 sample_sha256=case.sample_sha256,
                                 line=worker_result.get("line")
@@ -947,6 +1004,11 @@ class RuleWorkbench:
                                 else None,
                             )
                         )
+                if worker_status in {
+                    YaraExecutionStatus.COMPILE_ERROR,
+                    YaraExecutionStatus.ENGINE_UNAVAILABLE,
+                }:
+                    status = worker_status
                 if status is YaraExecutionStatus.COMPILE_ERROR:
                     break
                 continue
@@ -956,8 +1018,10 @@ class RuleWorkbench:
                     results[same_sample.role]["matches" if matched else "non_matches"].add(
                         case.sample_sha256
                     )
-        if status is YaraExecutionStatus.OK and not any(
-            result["matches"] or result["non_matches"] for result in results.values()
+        if (
+            status is YaraExecutionStatus.OK
+            and not any(result["matches"] or result["non_matches"] for result in results.values())
+            and not any(result["non_measurable"] for result in results.values())
         ):
             status = YaraExecutionStatus.ENGINE_UNAVAILABLE
         return self._report(

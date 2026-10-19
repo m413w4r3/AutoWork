@@ -25,6 +25,7 @@ class YaraRunnerLimits:
     maximum_samples: int = 256
     maximum_sample_bytes: int = 64 * 1024 * 1024
     maximum_total_sample_bytes: int = 256 * 1024 * 1024
+    maximum_strings_per_rule: int = 10_000
 
     def __post_init__(self) -> None:
         if self.timeout_seconds <= 0 or self.cpu_seconds <= 0:
@@ -37,10 +38,13 @@ class YaraRunnerLimits:
                 self.maximum_samples,
                 self.maximum_sample_bytes,
                 self.maximum_total_sample_bytes,
+                self.maximum_strings_per_rule,
             )
             <= 0
         ):
             raise ValueError("YARA runner size limits must be positive")
+        if self.maximum_strings_per_rule > 10_000:
+            raise ValueError("YARA strings-per-rule limit must be <= 10000")
 
 
 class IsolatedYaraRunner(YaraEnginePort):
@@ -165,6 +169,7 @@ class IsolatedYaraRunner(YaraEnginePort):
                     str(self.limits.cpu_seconds),
                     str(self.limits.maximum_output_bytes),
                     str(self.limits.timeout_seconds),
+                    str(self.limits.maximum_strings_per_rule),
                     *sample_arguments,
                 ]
                 minimal_env = {

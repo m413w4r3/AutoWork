@@ -13,6 +13,7 @@ from cti_app.application.bridge_investigator import (
 )
 from cti_app.application.investigation_composition import (
     OPTIONAL_CAPABILITIES,
+    InvestigationCompositionFactory,
     InvestigationToolDependencies,
     OptionalInvestigationToolPorts,
     _PermissionAwareInvestigationTransport,
@@ -28,16 +29,20 @@ from cti_app.application.investigation_persistence import (
 )
 from cti_app.application.investigation_state import InMemoryInvestigationStateRepository
 from cti_app.application.investigation_tools import (
+    RegistryToolDispatcher,
     ToolConfidentiality,
     ToolDefinition,
     ToolEffect,
+    ToolExecutionContext,
+    ToolInvocationStatus,
+    project_tool_availability,
 )
 from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.rule_workbench import RuleWorkbench
 from cti_app.config import Settings
-from cti_app.domain.investigation import BudgetDimension
+from cti_app.domain.investigation import BudgetDimension, InvestigationBudget
 
 
 class _ArticleSnapshots:
@@ -164,10 +169,18 @@ def test_composition_announces_local_tools_and_only_configured_capabilities() ->
         "article.get_claims",
         "evidence.get",
         "graph.neighbors",
+        "network.protocol.document",
+        "network.protocol.render",
         "sample.get_feature_pack",
         "sample.set_qualification",
     }
-    assert composition.available_capabilities == frozenset({"investigation.local_read"})
+    assert composition.available_capabilities == frozenset(
+        {
+            "investigation.local_read",
+            "network.protocol.document",
+            "network.protocol.render",
+        }
+    )
     assert composition.service._no_progress_limit == 7
     assert composition.tool_dependencies.virustotal is None
     assert composition.tool_dependencies.shodan is None
@@ -251,6 +264,116 @@ def test_tool_registrar_receives_dependencies_and_can_extend_registry() -> None:
 
 
 @pytest.mark.asyncio
+async def test_operator_inventory_capabilities_match_the_dispatcher() -> None:
+    investigation_id = uuid4()
+    composition = build_investigation_composition(
+        _unit_of_work(),
+        uow_factory=cast(UnitOfWorkFactory, lambda: None),
+        artifact_store=cast(ProductionArtifactStore, SimpleNamespace()),
+        model_conversations=cast(ModelConversationService, SimpleNamespace()),
+        settings=Settings.model_construct(),
+        investigation_id=investigation_id,
+        turn_transport=_BlockedTransport(),
+        operator_mode=True,
+    )
+    context = ToolExecutionContext(
+        investigation_id=investigation_id,
+        envelope=None,
+        budget=InvestigationBudget(limits={}),
+        idempotency_key="operator-tool-parity",
+        available_capabilities=composition.available_capabilities,
+    )
+    inventory = project_tool_availability(composition.registry, context)
+    expected = {
+        "finding.propose",
+        "finding.revise",
+        "opinion.compose",
+        "opinion.revise",
+        "opinion.note",
+        "advisor.consult",
+    }
+    assert expected.issubset(set(inventory.available_names))
+    assert composition.service.available_capabilities == composition.available_capabilities
+
+    dispatcher = RegistryToolDispatcher(composition.registry)
+    definitions = {
+        definition.name: definition for definition in composition.registry.list_registered()
+    }
+    for name in expected:
+        definition = definitions[name]
+        assert definition.capability_key in composition.service.available_capabilities
+        result = await dispatcher.dispatch(
+            context,
+            tool_name=name,
+            schema_version=definition.schema_version,
+            arguments={},
+            purpose="availability parity check",
+            operation_key=f"operator-tool-parity:{name}",
+        )
+        assert result.status is not ToolInvocationStatus.UNAVAILABLE
+
+
+@pytest.mark.asyncio
+async def test_advisor_inventory_and_dispatch_explain_missing_bridge_or_disclosure() -> None:
+    investigation_id = uuid4()
+
+    def compose(*, transport=None):
+        return build_investigation_composition(
+            _unit_of_work(),
+            uow_factory=cast(UnitOfWorkFactory, lambda: None),
+            artifact_store=cast(ProductionArtifactStore, SimpleNamespace()),
+            model_conversations=cast(ModelConversationService, SimpleNamespace()),
+            settings=Settings.model_construct(),
+            investigation_id=investigation_id,
+            turn_transport=transport,
+            operator_mode=True,
+        )
+
+    missing_bridge = compose()
+    context = ToolExecutionContext(
+        investigation_id=investigation_id,
+        envelope=None,
+        budget=InvestigationBudget(limits={}),
+        idempotency_key="advisor-no-bridge",
+        available_capabilities=missing_bridge.available_capabilities,
+    )
+    missing_bridge_inventory = project_tool_availability(missing_bridge.registry, context)
+    assert "advisor.consult" not in missing_bridge_inventory.available_names
+    assert "advisor.consult:bridge_transport_unavailable" in (
+        missing_bridge_inventory.unavailable_diagnostics
+    )
+
+    disclosed_transport = compose(transport=_BlockedTransport())
+    blocked_context = ToolExecutionContext(
+        investigation_id=investigation_id,
+        envelope=None,
+        budget=InvestigationBudget(limits={}),
+        idempotency_key="advisor-disclosure-denied",
+        available_capabilities=disclosed_transport.available_capabilities,
+        blocked_capabilities=("bridge.advisor:external_llm_disclosure_denied",),
+    )
+    blocked_inventory = project_tool_availability(disclosed_transport.registry, blocked_context)
+    assert "advisor.consult" not in blocked_inventory.available_names
+    assert "advisor.consult:external_llm_disclosure_denied" in (
+        blocked_inventory.unavailable_diagnostics
+    )
+    definition = next(
+        item
+        for item in disclosed_transport.registry.list_registered()
+        if item.name == "advisor.consult"
+    )
+    result = await RegistryToolDispatcher(disclosed_transport.registry).dispatch(
+        blocked_context,
+        tool_name=definition.name,
+        schema_version=definition.schema_version,
+        arguments={},
+        purpose="advisor availability parity",
+        operation_key="advisor-disclosure-denied",
+    )
+    assert result.status is ToolInvocationStatus.UNAVAILABLE
+
+
+@pytest.mark.asyncio
 async def test_blocked_model_turn_becomes_a_persistable_review_outcome() -> None:
     transport = _PermissionAwareInvestigationTransport(_BlockedTransport())
 
@@ -265,3 +388,199 @@ async def test_blocked_model_turn_becomes_a_persistable_review_outcome() -> None
 
     assert result.status is TurnSubmissionStatus.NEEDS_REVIEW
     assert result.idempotency_key == "blocked-at-approval-gate"
+
+
+@pytest.mark.asyncio
+async def test_api_factory_operator_writes_execute_through_live_composition_services() -> None:
+    import hashlib
+    from datetime import UTC, datetime
+
+    from cti_app.application.investigation_persistence import (
+        InMemoryEvidenceObservationRepository,
+        InMemoryFindingRepository,
+    )
+    from cti_app.domain.investigation import (
+        AgendaItem,
+        EvidenceKind,
+        EvidenceObservation,
+        FindingAssessment,
+        FindingKind,
+        InvestigationAgenda,
+        InvestigationExecutionMode,
+    )
+    from cti_app.domain.investigation_state import InvestigationWorkingState
+    from cti_app.domain.publication_document import publication_document_text_anchors
+    from tests.test_analyst_opinion_service import _base_v5, make_opinion_harness
+
+    harness = make_opinion_harness()
+    investigation_id = harness.investigation.id
+    observations = InMemoryEvidenceObservationRepository()
+    findings = InMemoryFindingRepository()
+    observation = EvidenceObservation(
+        investigation_id=investigation_id,
+        kind=EvidenceKind.BINARY_ANALYSIS,
+        blob_id=uuid4(),
+        sha256=hashlib.sha256(b"measured operator fixture").hexdigest(),
+        source="fixture-analysis",
+        source_version="1",
+        observed_at=datetime.now(UTC),
+        object_type="sample",
+        object_id="sample-a",
+    )
+    await observations.append_if_absent(observation)
+    harness.uow.evidence_observations = observations
+    harness.uow.investigation_findings = findings
+    harness.uow._state.observations = observations
+    harness.uow._state.findings = findings
+
+    class SnapshotPort:
+        def __init__(self) -> None:
+            base = _base_v5()
+            self.anchors = tuple(
+                publication_document_text_anchors(
+                    base.document,
+                    references=base.references,
+                )
+            )
+
+        async def resolve(self, _synthesis_artifact_id):
+            return SimpleNamespace(
+                subject_id=harness.investigation.subject_id,
+                production_run_id=harness.investigation.production_run_id,
+                synthesis_artifact_id=harness.investigation.synthesis_artifact_id,
+                synthesis_sha256="b" * 64,
+                article=SimpleNamespace(
+                    publication_anchors=tuple(
+                        SimpleNamespace(anchor=anchor) for anchor in self.anchors
+                    ),
+                    claims=(),
+                ),
+                external_llm_allowed=False,
+            )
+
+        async def get_claims(self, _investigation_id, claim_ids=()):
+            del claim_ids
+            return ()
+
+    snapshot = SnapshotPort()
+    state_repository = InMemoryInvestigationStateRepository()
+    invocation_repository = InMemoryToolInvocationRepository()
+    associations = InMemorySampleAssociationRepository()
+    no_envelope = SimpleNamespace(get=async_get_none)
+
+    def api_uow_factory():
+        unit = harness.uow_factory()
+        unit.evidence_observations = observations
+        unit.investigation_findings = findings
+        unit.investigation_states = state_repository
+        unit.tool_invocations = invocation_repository
+        unit.sample_associations = associations
+        unit.investigation_envelopes = no_envelope
+        return unit
+
+    harness.uow.investigation_states = state_repository
+    harness.uow.tool_invocations = invocation_repository
+    harness.uow.sample_associations = associations
+    harness.uow.investigation_envelopes = no_envelope
+    state = InvestigationWorkingState(
+        investigation_id=investigation_id,
+        agenda=InvestigationAgenda(
+            items=(
+                AgendaItem("Validate the measured capability", 0.9, 1),
+                AgendaItem("Identify remaining gaps", 0.8, 2),
+            )
+        ),
+        execution_mode=InvestigationExecutionMode.OPERATOR_LED,
+    )
+    await state_repository.save_if_version(state, expected_version=None)
+    dependencies = InvestigationToolDependencies(
+        investigation_id=investigation_id,
+        article_snapshots=snapshot,
+        observations=observations,
+        findings=findings,
+        sample_associations=associations,
+        feature_packs=SimpleNamespace(get_feature_pack=async_get_none),
+        artifact_store=harness.store,
+    )
+    factory = InvestigationCompositionFactory(
+        uow_factory=api_uow_factory,
+        artifact_store=harness.store,
+        model_conversations=SimpleNamespace(),
+        settings=Settings.model_construct(investigation_no_progress_limit=7),
+        tool_dependencies=dependencies,
+    )
+    api_composition = factory.build(harness.uow, investigation_id, operator_mode=True)
+    api_composition.operator_tool_invocations._observations = None
+    api_composition.operator_tool_invocations._evidence_summaries = None
+    assert {"finding.propose", "opinion.compose", "opinion.note"}.issubset(
+        set(api_composition.available_tools)
+    )
+
+    proposed = await api_composition.operator_tool_invocations.invoke(
+        tool_name="finding.propose",
+        schema_version="1",
+        arguments={
+            "action": "propose",
+            "kind": FindingKind.CAPABILITY.value,
+            "assessment": FindingAssessment.SUPPORTED.value,
+            "statement": "The measured sample exposes capability A.",
+            "subject_ref": "sample-a",
+            "observation_refs": [str(observation.id)],
+            "claim_refs": [],
+            "novelty": None,
+            "scope": "static analysis only",
+            "limitations": [],
+        },
+        purpose="validate operator write composition",
+        expected_version=1,
+        idempotency_key="factory-finding-propose",
+    )
+    assert proposed.invocation.status is ToolInvocationStatus.SUCCEEDED
+    assert proposed.invocation.schema_version == "operator-finding.v1"
+    finding_id = proposed.output["data"]["result"]["finding_id"]
+
+    composed = await api_composition.operator_tool_invocations.invoke(
+        tool_name="opinion.compose",
+        schema_version="1",
+        arguments={
+            "action": "compose",
+            "selection": {
+                "finding_ids": [finding_id],
+                "claim_ids": [],
+                "block_types": ["key_findings"],
+            },
+        },
+        purpose="compose an operator draft",
+        expected_version=proposed.working_state_version,
+        idempotency_key="factory-opinion-compose",
+    )
+    assert composed.invocation.status is ToolInvocationStatus.SUCCEEDED
+    assert composed.invocation.schema_version == "operator-opinion.v1"
+    opinion = composed.output["data"]["result"]
+
+    noted = await api_composition.operator_tool_invocations.invoke(
+        tool_name="opinion.note",
+        schema_version="1",
+        arguments={
+            "action": "note",
+            "anchor": next(
+                anchor for anchor in snapshot.anchors if anchor.startswith(("lead:", "section:"))
+            ),
+            "state": "inferred",
+            "relation": "qualifies",
+            "text": "The measured result is limited to static analysis.",
+            "expected_opinion_version": opinion["opinion_version"],
+            "expected_opinion_sha256": opinion["content_sha256"],
+            "finding_refs": [finding_id],
+            "evidence_refs": [str(observation.id)],
+        },
+        purpose="add a cited operator note",
+        expected_version=composed.working_state_version,
+        idempotency_key="factory-opinion-note",
+    )
+    assert noted.invocation.status is ToolInvocationStatus.SUCCEEDED
+    assert noted.invocation.schema_version == "operator-opinion.v1"
+
+
+async def async_get_none(*_args, **_kwargs):
+    return None

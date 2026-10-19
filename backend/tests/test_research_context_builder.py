@@ -1,7 +1,7 @@
 import hashlib
 import json
 from dataclasses import replace
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
@@ -12,8 +12,18 @@ from cti_app.application.analyst_handoff import (
     AnalystPostSynthesisService,
     current_verified_extraction_inputs,
 )
-from cti_app.application.bridge_investigator import render_investigation_prompt
+from cti_app.application.bridge_investigator import (
+    _minimal_schema_value,
+    render_investigation_prompt,
+)
 from cti_app.application.evidence_recorder import ProductionEvidenceRecorder
+from cti_app.application.investigation_acquisition_tools import (
+    SAMPLE_ANALYSIS_CAPABILITY,
+    SAMPLE_ANALYZE_SCHEMA,
+    VT_DOWNLOAD_SAMPLE_SCHEMA,
+    VT_FILE_DOWNLOAD_CAPABILITY,
+    register_acquisition_tools,
+)
 from cti_app.application.investigation_article_snapshot import (
     ProductionArticleSnapshotAdapter,
     _extract_narrative_hashes,
@@ -33,6 +43,7 @@ from cti_app.application.investigation_persistence import (
     InMemoryToolInvocationRepository,
 )
 from cti_app.application.investigation_pivots import available_investigation_pivots
+from cti_app.application.investigation_rule_tools import register_rule_tools
 from cti_app.application.investigation_tools import (
     InMemoryToolRegistry,
     RegistryToolDispatcher,
@@ -40,17 +51,27 @@ from cti_app.application.investigation_tools import (
     ToolDefinition,
     ToolEffect,
     ToolExecutionContext,
+    validate_json_schema,
 )
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.provider_probes import offline_preflight
 from cti_app.application.research_context_builder import (
     ArticleSnapshot,
     CanonicalEvidenceSummaryPort,
+    InvestigationContextTooLarge,
     RepositoryInvestigationGraphReadPort,
     ResearchContextBuilder,
     provider_authorization_blocked_capabilities,
 )
-from cti_app.domain.analyst_opinion import AnalystObservationRelation, AnalystObservationState
+from cti_app.domain.analyst_opinion import (
+    AnalystObservationRelation,
+    AnalystObservationState,
+    AnalystObservationV1,
+    AnalystOpinionV1,
+    OpinionBlock,
+    OpinionBlockType,
+    OpinionClaimQualification,
+)
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.investigation import (
     AgendaItem,
@@ -64,6 +85,7 @@ from cti_app.domain.investigation import (
     InvestigationAgenda,
     InvestigationBudget,
     InvestigationEnvelope,
+    InvestigationExecutionMode,
     InvestigationFinding,
     SampleAssociation,
     SampleOrigin,
@@ -216,6 +238,35 @@ async def test_canonical_evidence_summary_reads_only_sha_verified_bounded_facts(
 
     facts = await summaries.summary(observation)
     mismatched = await summaries.summary(replace(observation, sha256="e" * 64))
+    association_id = str(uuid4())
+    sample_id = str(uuid4())
+    download_result_payload = {
+        "schema": "investigation-tool-observation.v1",
+        "tool_name": "vt.download_sample",
+        "result": {
+            "association_id": association_id,
+            "sample_id": sample_id,
+            "sample_sha256": "f" * 64,
+            "qualification": "candidate",
+            "api_key": "must-not-reach-the-context",
+            "signed_url": "https://example.invalid/sample?signature=private",
+        },
+    }
+    download_blob_id, download_sha256 = await store.put_canonical_json(
+        download_result_payload, bucket="investigation-evidence"
+    )
+    download_result_observation = EvidenceObservation(
+        investigation_id=observation.investigation_id,
+        kind=EvidenceKind.OTHER,
+        blob_id=download_blob_id,
+        sha256=download_sha256,
+        source="AutoWork InvestigationToolDispatcher",
+        source_version="1",
+        observed_at=datetime.now(UTC),
+        object_type="tool_result",
+        object_id="vt.download_sample",
+    )
+    download_facts = await summaries.summary(download_result_observation)
     yara_payload = {
         "schema": "investigation-yara-test.v1",
         "validation_status": "synthetic_only",
@@ -243,6 +294,12 @@ async def test_canonical_evidence_summary_reads_only_sha_verified_bounded_facts(
 
     assert facts == payload
     assert mismatched is None
+    assert download_facts == {
+        "association_id": association_id,
+        "sample_id": sample_id,
+        "sample_sha256": "f" * 64,
+        "qualification": "candidate",
+    }
     assert yara_facts == {
         "validation_status": "synthetic_only",
         "coverage_statement": "positives: 1 synthetic; goodware: none",
@@ -250,6 +307,118 @@ async def test_canonical_evidence_summary_reads_only_sha_verified_bounded_facts(
         "false_positive_count": 0,
         "false_negative_count": 0,
     }
+
+
+@pytest.mark.asyncio
+async def test_operator_context_summarizes_pcap_and_keeps_revised_finding() -> None:
+    investigation_id = uuid4()
+    capture = b"\xd4\xc3\xb2\xa1" + b"PCAP-PAYLOAD-MUST-NOT-LEAK"
+    capture_sha256 = hashlib.sha256(capture).hexdigest()
+    capture_blob_id = uuid4()
+    observation = EvidenceObservation(
+        investigation_id=investigation_id,
+        kind=EvidenceKind.OTHER,
+        blob_id=capture_blob_id,
+        sha256=capture_sha256,
+        source="VirusTotal",
+        source_version="vt-sandbox-pcap.v1",
+        observed_at=datetime.now(UTC),
+        object_type="network_capture",
+        object_id=capture_sha256,
+    )
+    store = _MemoryCanonicalArtifactStore()
+
+    async def get_blob(blob_id):
+        assert blob_id == capture_blob_id
+        return SimpleNamespace(
+            descriptor=SimpleNamespace(
+                sha256=capture_sha256,
+                size=len(capture),
+                mime_type="application/vnd.tcpdump.pcap",
+            )
+        )
+
+    store._catalog = SimpleNamespace(
+        _uow_factory=lambda: _AsyncContext(SimpleNamespace(blobs=SimpleNamespace(get=get_blob)))
+    )
+
+    async def forbidden_read_bytes(_blob_id, *, max_bytes):
+        raise AssertionError("binary PCAP bytes must never be read into operator context")
+
+    store.read_bytes = forbidden_read_bytes
+    observations = InMemoryEvidenceObservationRepository()
+    await observations.append_if_absent(observation)
+    findings = InMemoryFindingRepository()
+    previous = InvestigationFinding(
+        investigation_id=investigation_id,
+        kind=FindingKind.NETWORK_BEHAVIOUR,
+        assessment=FindingAssessment.INCONCLUSIVE,
+        statement="Previous finding text.",
+        observation_refs=(observation.id,),
+    )
+    revised = InvestigationFinding(
+        investigation_id=investigation_id,
+        kind=previous.kind,
+        assessment=FindingAssessment.SUPPORTED,
+        statement="The VT sandbox PCAP contains a measured DNS request.",
+        observation_refs=(observation.id,),
+        id=uuid4(),
+        version=2,
+        supersedes=previous.id,
+    )
+    await findings.append_version(previous, expected_previous_id=None)
+    await findings.append_version(revised, expected_previous_id=previous.id)
+    snapshot = ArticleSnapshot(
+        subject_id=uuid4(),
+        production_run_id=uuid4(),
+        synthesis_artifact_id=uuid4(),
+        synthesis_sha256="a" * 64,
+        article=ArticleContextV1(
+            short_summary="Synthetic operator context.",
+            claims=(),
+            documented_samples=(),
+            known_chain=(),
+            open_questions=(),
+        ),
+    )
+    builder = ResearchContextBuilder(
+        article_snapshots=_SnapshotPort(snapshot),
+        observations=observations,
+        findings=findings,
+        registry=InMemoryToolRegistry(),
+        evidence_summaries=CanonicalEvidenceSummaryPort(store),
+    )
+    envelope = InvestigationEnvelope(
+        investigation_id=investigation_id,
+        allowed_providers=(),
+        budget=InvestigationBudget(),
+        acquire_hits_allowed=False,
+        disclosure=DisclosureBounds(tlp=TLPLevel.GREEN),
+        approval_decision_id=uuid4(),
+        approval_actor_id="analyst-1",
+    )
+    context = await builder.build(
+        investigation_id=investigation_id,
+        synthesis_artifact_id=snapshot.synthesis_artifact_id,
+        state=_state(investigation_id),
+        tool_context=ToolExecutionContext(
+            investigation_id=investigation_id,
+            envelope=envelope,
+            budget=envelope.budget,
+            idempotency_key="pcap-context",
+        ),
+        budget_remaining={},
+    )
+
+    rendered = context.canonical_bytes().decode("utf-8")
+    assert any(
+        "The VT sandbox PCAP contains a measured DNS request." in item.statement
+        for item in context.investigation.findings
+    )
+    assert capture_sha256 in rendered
+    assert str(len(capture)) in rendered
+    assert "network_capture" in rendered
+    assert "PCAP-PAYLOAD-MUST-NOT-LEAK" not in rendered
 
 
 @pytest.mark.asyncio
@@ -988,6 +1157,347 @@ async def test_context_exposes_exact_registered_tool_argument_schema() -> None:
 
 
 @pytest.mark.asyncio
+async def test_context_indexes_acquired_samples_and_recent_tool_results() -> None:
+    investigation_id = uuid4()
+    synthesis_artifact_id = uuid4()
+    sample_sha256 = "a" * 64
+    association_id = uuid4()
+    sample_id = uuid4()
+    downloaded_sample = EvidenceObservation(
+        investigation_id=investigation_id,
+        kind=EvidenceKind.OTHER,
+        blob_id=uuid4(),
+        sha256=sample_sha256,
+        source="virustotal.sample_download",
+        source_version="sample-acquisition.v1",
+        observed_at=datetime.now(UTC),
+        object_type="sample",
+        object_id=sample_sha256,
+    )
+    download_result = EvidenceObservation(
+        investigation_id=investigation_id,
+        kind=EvidenceKind.OTHER,
+        blob_id=uuid4(),
+        sha256="b" * 64,
+        source="AutoWork InvestigationToolDispatcher",
+        source_version="1",
+        observed_at=datetime.now(UTC),
+        object_type="tool_result",
+        object_id="vt.download_sample",
+    )
+    analysis_observation = EvidenceObservation(
+        investigation_id=investigation_id,
+        kind=EvidenceKind.BINARY_ANALYSIS,
+        blob_id=uuid4(),
+        sha256="c" * 64,
+        source="autowork.analysis_worker.static",
+        source_version="static-v1",
+        observed_at=datetime.now(UTC),
+        object_type="sample",
+        object_id=sample_sha256,
+    )
+    analysis_result = EvidenceObservation(
+        investigation_id=investigation_id,
+        kind=EvidenceKind.OTHER,
+        blob_id=uuid4(),
+        sha256="d" * 64,
+        source="AutoWork InvestigationToolDispatcher",
+        source_version="1",
+        observed_at=datetime.now(UTC),
+        object_type="tool_result",
+        object_id="sample.analyze",
+    )
+    observations = InMemoryEvidenceObservationRepository()
+    for observation in (downloaded_sample, download_result, analysis_observation, analysis_result):
+        await observations.append_if_absent(observation)
+    download_invocation = ToolInvocation(
+        investigation_id=investigation_id,
+        operation_key="download-operation",
+        tool_name="vt.download_sample",
+        schema_version="1",
+        normalized_parameters={"sha256": sample_sha256},
+        purpose="Download the documented sample.",
+        status=ToolInvocationStatus.SUCCEEDED,
+        response_refs=(downloaded_sample.id, download_result.id),
+    )
+    analysis_invocation = ToolInvocation(
+        investigation_id=investigation_id,
+        operation_key="analysis-operation",
+        tool_name="sample.analyze",
+        schema_version="1",
+        normalized_parameters={"association_id": str(association_id)},
+        purpose="Analyze the acquired sample.",
+        status=ToolInvocationStatus.PARTIAL,
+        response_refs=(analysis_observation.id, analysis_result.id),
+    )
+    invocations = InMemoryToolInvocationRepository()
+    await invocations.add_if_absent(download_invocation)
+    await invocations.add_if_absent(analysis_invocation)
+
+    class SampleSummaries:
+        async def summary(self, observation):
+            if observation.id == download_result.id:
+                return {
+                    "association_id": str(association_id),
+                    "sample_id": str(sample_id),
+                    "sample_sha256": sample_sha256,
+                    "qualification": "candidate",
+                    "provenance": "vt_download",
+                    "untrusted_text": "api_key=must-not-reach-the-prompt",
+                    "binary": "must-not-reach-the-prompt",
+                }
+            if observation.id == analysis_result.id:
+                return {
+                    "association_id": str(association_id),
+                    "sample_id": str(sample_id),
+                    "sample_sha256": sample_sha256,
+                    "extractors": {"static": {"version": "static-v1", "status": "succeeded"}},
+                }
+            return None
+
+        async def blob_metadata(self, blob_id):
+            if blob_id == downloaded_sample.blob_id:
+                return {"byte_size": 8_487_424, "mime_type": "application/octet-stream"}
+            return None
+
+    snapshot = ArticleSnapshot(
+        subject_id=uuid4(),
+        production_run_id=uuid4(),
+        synthesis_artifact_id=synthesis_artifact_id,
+        synthesis_sha256="e" * 64,
+        article=ArticleContextV1(
+            short_summary="Synthetic article.",
+            claims=(),
+            documented_samples=(),
+            known_chain=(),
+            open_questions=("Analyze the acquired sample.",),
+        ),
+    )
+    builder = ResearchContextBuilder(
+        article_snapshots=_SnapshotPort(snapshot),
+        observations=observations,
+        findings=InMemoryFindingRepository(),
+        invocations=invocations,
+        evidence_summaries=SampleSummaries(),
+    )
+
+    context = await builder.build(
+        investigation_id=investigation_id,
+        synthesis_artifact_id=synthesis_artifact_id,
+        state=_state(investigation_id),
+        tool_context=ToolExecutionContext(
+            investigation_id=investigation_id,
+            envelope=None,
+            budget=InvestigationBudget(),
+            idempotency_key="sample-context",
+        ),
+        budget_remaining={"bridge_turns": 2},
+    )
+    sample = context.investigation.sample_deltas[0]
+    result = context.investigation.latest_tool_results[-1]
+    prompt = render_investigation_prompt(context)
+
+    assert sample["association_id"] == str(association_id)
+    assert sample["sample_id"] == str(sample_id)
+    assert sample["sha256"] == sample_sha256
+    assert sample["sha256_short"] == sample_sha256[:12]
+    assert sample["byte_size"] == 8_487_424
+    assert sample["provenance"] == "vt_download"
+    assert sample["qualification"] == "candidate"
+    assert sample["analysis_status"] == "analyzed"
+    assert sample["analysis_engines"] == ["static@static-v1"]
+    assert str(analysis_observation.id) in sample["observation_ids"]
+    assert result.tool_name == "sample.analyze"
+    assert result.status is ToolInvocationStatus.PARTIAL
+    assert result.output_ids["association_id"] == str(association_id)
+    assert analysis_result.id in result.observation_ids
+    assert "ÉCHANTILLONS ACQUIS" in prompt
+    assert "DERNIERS RÉSULTATS D'OUTILS" in prompt
+    assert "must-not-reach-the-prompt" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_context_indexes_canonical_operator_imports_before_analysis() -> None:
+    investigation_id = uuid4()
+    synthesis_artifact_id = uuid4()
+    association_id = uuid4()
+    sample_id = uuid4()
+    sample_sha256 = "9" * 64
+    snapshot = ArticleSnapshot(
+        subject_id=uuid4(),
+        production_run_id=uuid4(),
+        synthesis_artifact_id=synthesis_artifact_id,
+        synthesis_sha256="8" * 64,
+        article=ArticleContextV1(
+            short_summary="Synthetic article.",
+            claims=(),
+            documented_samples=(),
+            known_chain=(),
+            open_questions=("Analyze the imported capture.",),
+        ),
+    )
+
+    class CanonicalSamples:
+        async def summary(self, _observation):
+            return None
+
+        async def sample_inventory(self, requested_investigation_id):
+            assert requested_investigation_id == investigation_id
+            return (
+                {
+                    "association_id": str(association_id),
+                    "sample_id": str(sample_id),
+                    "sha256": sample_sha256,
+                    "byte_size": 256,
+                    "detected_type": "application/vnd.tcpdump.pcap",
+                    "provenance": "operator_import",
+                    "qualification": "candidate",
+                },
+            )
+
+    builder = ResearchContextBuilder(
+        article_snapshots=_SnapshotPort(snapshot),
+        observations=InMemoryEvidenceObservationRepository(),
+        findings=InMemoryFindingRepository(),
+        evidence_summaries=CanonicalSamples(),
+    )
+    context = await builder.build(
+        investigation_id=investigation_id,
+        synthesis_artifact_id=synthesis_artifact_id,
+        state=_state(investigation_id),
+        tool_context=ToolExecutionContext(
+            investigation_id=investigation_id,
+            envelope=None,
+            budget=InvestigationBudget(),
+            idempotency_key="operator-import-context",
+        ),
+        budget_remaining={},
+    )
+
+    assert context.investigation.sample_deltas == (
+        {
+            "association_id": str(association_id),
+            "sample_id": str(sample_id),
+            "sha256": sample_sha256,
+            "sha256_short": sample_sha256[:12],
+            "byte_size": 256,
+            "detected_type": "application/vnd.tcpdump.pcap",
+            "provenance": "operator_import",
+            "qualification": "candidate",
+            "analysis_status": "not_analyzed",
+            "analysis_engines": [],
+            "observation_ids": [],
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_prompt_lists_schema_derived_required_arguments_and_examples() -> None:
+    investigation_id = uuid4()
+    synthesis_artifact_id = uuid4()
+    snapshot = ArticleSnapshot(
+        subject_id=uuid4(),
+        production_run_id=uuid4(),
+        synthesis_artifact_id=synthesis_artifact_id,
+        synthesis_sha256="f" * 64,
+        article=ArticleContextV1(
+            short_summary="Synthetic article.",
+            claims=(),
+            documented_samples=(),
+            known_chain=(),
+            open_questions=(),
+        ),
+    )
+    registry = InMemoryToolRegistry()
+    register_acquisition_tools(registry, hits=object(), qualifications=object())
+    register_rule_tools(
+        registry,
+        workbench=None,
+        candidates=None,
+        associations=None,
+        corpus_bytes=None,
+        recorder=None,
+    )
+    capabilities = {
+        VT_FILE_DOWNLOAD_CAPABILITY,
+        SAMPLE_ANALYSIS_CAPABILITY,
+        "investigation.local_read",
+        "rule.propose",
+        "rule.test",
+        "rule.revise",
+        "rule.compare",
+        "rule.get",
+    }
+    builder = ResearchContextBuilder(
+        article_snapshots=_SnapshotPort(snapshot),
+        observations=InMemoryEvidenceObservationRepository(),
+        findings=InMemoryFindingRepository(),
+        registry=registry,
+    )
+    context = await builder.build(
+        investigation_id=investigation_id,
+        synthesis_artifact_id=synthesis_artifact_id,
+        state=_state(investigation_id),
+        tool_context=ToolExecutionContext(
+            investigation_id=investigation_id,
+            envelope=None,
+            budget=InvestigationBudget(),
+            idempotency_key="schema-derived-prompt",
+            available_capabilities=frozenset(capabilities),
+        ),
+        budget_remaining={},
+    )
+    prompt = render_investigation_prompt(context)
+
+    schemas = {
+        tool.name: tool.arguments_schema
+        for tool in context.available_tools
+        if tool.name == "vt.download_sample"
+        or tool.name.startswith("sample.")
+        or tool.name.startswith("rule.")
+    }
+    assert "vt.download_sample" in schemas
+    assert "sample.analyze" in schemas
+    assert "rule.test" in schemas
+    for name, schema in schemas.items():
+        required = schema.get("required", [])
+        required_line = f"{name} required ARG keys: {', '.join(required)}"
+        example_prefix = f"{name} minimal ARG JSON: "
+        assert required_line in prompt
+        example_line = next(line for line in prompt.splitlines() if line.startswith(example_prefix))
+        example = json.loads(example_line.removeprefix(example_prefix))
+        assert set(example) == set(required)
+        validate_json_schema(example, schema)
+        if name == "vt.download_sample":
+            assert schema == VT_DOWNLOAD_SAMPLE_SCHEMA
+        if name == "sample.analyze":
+            assert schema == SAMPLE_ANALYZE_SCHEMA
+
+
+def test_schema_example_uses_distinct_values_for_unique_hash_arrays() -> None:
+    schema = {
+        "type": "object",
+        "properties": {
+            "sample_sha256s": {
+                "type": "array",
+                "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "minItems": 2,
+                "maxItems": 2,
+                "uniqueItems": True,
+            }
+        },
+        "required": ["sample_sha256s"],
+        "additionalProperties": False,
+    }
+
+    example = _minimal_schema_value(schema["properties"]["sample_sha256s"], key="sample_sha256s")
+
+    assert len(example) == 2
+    assert len(set(example)) == 2
+    validate_json_schema({"sample_sha256s": example}, schema)
+
+
+@pytest.mark.asyncio
 async def test_context_lists_exact_uncovered_passive_pivots_from_verified_inventory() -> None:
     investigation_id = uuid4()
     synthesis_artifact_id = uuid4()
@@ -1452,6 +1962,19 @@ async def test_context_lists_bounded_rule_candidates_and_marks_missing_reports_u
     )
     observations = InMemoryEvidenceObservationRepository()
     await observations.append_if_absent(report_observation)
+    proposal_observation = EvidenceObservation(
+        id=uuid4(),
+        investigation_id=investigation_id,
+        kind=EvidenceKind.YARA_MATCH,
+        blob_id=uuid4(),
+        sha256="c" * 64,
+        source="AutoWork RuleWorkbench",
+        source_version="investigation-rule-tools.v1",
+        observed_at=datetime.now(UTC),
+        object_type="detection_candidate_version",
+        object_id=str(versions[1].id),
+    )
+    await observations.append_if_absent(proposal_observation)
 
     class InventoryProvider:
         async def manual_rule_corpus_imports(self, requested_investigation_id):
@@ -1464,9 +1987,21 @@ async def test_context_lists_bounded_rule_candidates_and_marks_missing_reports_u
 
     class EvidenceSummaries:
         async def summary(self, observation):
+            if observation.id == proposal_observation.id:
+                return {
+                    "operation": "propose",
+                    "source_sha256": versions[1].source_sha256,
+                    "validation_status": "real_validated",
+                }
             assert observation.id == report_observation.id
             return {
+                "operation": "test",
                 "source_sha256": versions[-1].source_sha256,
+                "corpus_sha256": "d" * 64,
+                "corpus_sha256s_by_role": {
+                    "confirmed_positive": ["e" * 64, "f" * 64],
+                    "goodware": [f"{index:064x}" for index in range(8)],
+                },
                 "validation_status": "real_partial",
                 "execution_status": "ok",
                 "provenance_counts_by_role": {
@@ -1475,6 +2010,9 @@ async def test_context_lists_bounded_rule_candidates_and_marks_missing_reports_u
                 },
                 "false_positive_count": 1,
                 "false_negative_count": 1,
+                "non_measurable_count": 2,
+                "revision_recommendation": "revise_false_negative",
+                "revision_guidance": "A real controlled false negative was measured.",
             }
 
     provider = InventoryProvider()
@@ -1510,6 +2048,12 @@ async def test_context_lists_bounded_rule_candidates_and_marks_missing_reports_u
     }
     assert candidates[0]["latest_test_report"]["false_positive_count"] == 1
     assert candidates[0]["latest_test_report"]["false_negative_count"] == 1
+    assert candidates[0]["latest_test_report"]["non_measurable_count"] == 2
+    assert candidates[0]["latest_test_report"]["corpus_sha256"] == "d" * 64
+    assert candidates[0]["latest_test_report"]["corpus_sha256s_by_role"]["goodware"]["total"] == 8
+    assert candidates[0]["latest_test_report"]["revision_recommendation"] == (
+        "revise_false_negative"
+    )
     assert candidates[1]["validation_status"] == RuleValidationStatus.UNTESTED.value
     assert candidates[1]["latest_test_report"] is None
     assert len(candidates[0]["source_excerpt"]) <= 2_000
@@ -1896,6 +2440,431 @@ async def test_large_full_context_is_deterministically_bounded_and_keeps_iocs_fi
     assert any(
         item.assessment is FindingAssessment.REFUTED for item in context.investigation.findings
     )
+
+
+@pytest.mark.asyncio
+async def test_large_operator_led_context_is_reduced_deterministically() -> None:
+    investigation_id = uuid4()
+    synthesis_artifact_id = uuid4()
+    observations = InMemoryEvidenceObservationRepository()
+    invocations = InMemoryToolInvocationRepository()
+    timestamp = datetime(2026, 10, 18, tzinfo=UTC)
+    observation_ids = []
+    for index in range(220):
+        observation = EvidenceObservation(
+            investigation_id=investigation_id,
+            kind=EvidenceKind.OTHER,
+            blob_id=uuid4(),
+            sha256=hashlib.sha256(f"observation-{index}".encode()).hexdigest(),
+            source="vt.file_report",
+            source_version="1",
+            observed_at=timestamp + timedelta(seconds=index),
+            object_type="tool_result",
+            object_id=f"result-{index}",
+        )
+        observation_ids.append(observation.id)
+        await observations.append_if_absent(observation)
+        invocation = ToolInvocation(
+            investigation_id=investigation_id,
+            operation_key=f"large-context-{index}",
+            tool_name="vt.file_report",
+            schema_version="1",
+            normalized_parameters={"query": f"indicator-{index}-" + "x" * 300},
+            purpose=f"Review report {index}",
+            status=ToolInvocationStatus.SUCCEEDED,
+            response_refs=(observation.id,),
+            created_at=timestamp + timedelta(seconds=index),
+            updated_at=timestamp + timedelta(seconds=index),
+        )
+        await invocations.add_if_absent(invocation)
+
+    findings = InMemoryFindingRepository()
+    previous_id = None
+    current_version_id = None
+    for version in range(1, 16):
+        finding = InvestigationFinding(
+            investigation_id=investigation_id,
+            kind=FindingKind.CLAIM_VERIFICATION,
+            assessment=FindingAssessment.INCONCLUSIVE,
+            statement=f"Finding version {version}: " + "detail " * 50,
+            observation_refs=(),
+            id=UUID(int=version),
+            version=version,
+            supersedes=previous_id,
+            created_at=timestamp + timedelta(seconds=version),
+        )
+        await findings.append_version(finding, expected_previous_id=previous_id)
+        previous_id = current_version_id = finding.id
+
+    notes = tuple(
+        AnalystObservationV1(
+            id=UUID(int=10_000 + index),
+            anchor=f"note-{index}",
+            text=f"Current analyst note {index}: " + "detail " * 45,
+            state=AnalystObservationState.UNRESOLVED,
+            relation=AnalystObservationRelation.UNRESOLVED,
+        )
+        for index in range(30)
+    )
+    opinion_blocks = [
+        OpinionBlock(
+            block_type=block_type,
+            text=f"Opinion block {index}: " + "analysis " * 250,
+            qualification=OpinionClaimQualification.INFERENCE,
+        )
+        for index, block_type in enumerate(
+            (
+                OpinionBlockType.KEY_FINDINGS,
+                OpinionBlockType.ADDITIONAL_SAMPLES,
+                OpinionBlockType.INFECTION_CHAIN_AND_CAPABILITIES,
+                OpinionBlockType.NETWORK_AND_INFRASTRUCTURE,
+                OpinionBlockType.CLAIM_VERIFICATION,
+                OpinionBlockType.PROPOSED_DETECTIONS,
+                OpinionBlockType.UNCERTAINTIES_AND_NEXT_LEADS,
+            )
+        )
+    ]
+    opinion_blocks.append(
+        OpinionBlock(
+            block_type=OpinionBlockType.ANALYST_OBSERVATIONS,
+            text=json.dumps(
+                {
+                    "schema": "analyst-observations.v1",
+                    "items": [item.to_payload() for item in notes],
+                }
+            ),
+        )
+    )
+    opinion = AnalystOpinionV1(
+        investigation_id=investigation_id,
+        synthesis_artifact_id=synthesis_artifact_id,
+        synthesis_sha256="a" * 64,
+        base_publication_artifact_id=uuid4(),
+        base_publication_sha256="b" * 64,
+        blocks=tuple(opinion_blocks),
+        author_id="analyst-test",
+        id=UUID(int=99_001),
+        version=14,
+    )
+    article = ArticleContextV1(
+        short_summary="Operator-led investigation summary.",
+        claims=tuple(
+            ArticleClaimV1(
+                id=f"C{index}",
+                statement=f"Documented claim {index}: " + "source detail " * 75,
+                source_refs=(f"source-{index}",),
+            )
+            for index in range(16)
+        ),
+        documented_samples=(),
+        known_chain=tuple(
+            {"summary": f"Known step {index}: " + "detail " * 45} for index in range(32)
+        ),
+        open_questions=tuple(f"Question {index}: " + "detail " * 45 for index in range(16)),
+        publication_anchors=(PublicationAnchorV1(anchor="overview", excerpt="Verified anchor"),),
+    )
+    snapshot = ArticleSnapshot(
+        subject_id=uuid4(),
+        production_run_id=uuid4(),
+        synthesis_artifact_id=synthesis_artifact_id,
+        synthesis_sha256="a" * 64,
+        article=article,
+    )
+
+    class _LargeSummaryPort:
+        async def summary(self, _observation):
+            return {"summary": "Recent evidence detail " * 80}
+
+        async def sample_inventory(self, _investigation_id):
+            return (
+                {
+                    "association_id": str(UUID(int=90_001)),
+                    "sample_id": str(UUID(int=90_002)),
+                    "sha256": "c" * 64,
+                    "provenance": "operator_import",
+                    "qualification": "confirmed",
+                },
+            )
+
+    registry = InMemoryToolRegistry()
+    for index in range(48):
+        schema = {
+            "type": "object",
+            "description": f"Tool argument contract {index}. " + "schema detail " * 300,
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+            "additionalProperties": False,
+        }
+        registry.register(
+            ToolDefinition(
+                name=f"synthetic.tool_{index}",
+                schema_version="1",
+                input_schema=schema,
+                effect=ToolEffect.LOCAL_READ,
+                cost_model={},
+                confidentiality=ToolConfidentiality.PUBLIC,
+                limitations=(),
+                capability_key="synthetic.read",
+            ),
+            SimpleNamespace(),
+        )
+    registry.set_availability_catalog(
+        ("analysis.missing",), {"analysis.missing": "analysis_worker_disabled"}
+    )
+
+    builder = ResearchContextBuilder(
+        article_snapshots=_SnapshotPort(snapshot),
+        observations=observations,
+        findings=findings,
+        invocations=invocations,
+        opinions=_OpinionPort(opinion),
+        evidence_summaries=_LargeSummaryPort(),
+        registry=registry,
+    )
+    request_id = uuid4()
+    state = replace(
+        _state(investigation_id),
+        execution_mode=InvestigationExecutionMode.OPERATOR_LED,
+        recent_actions=(
+            "user-request:"
+            + json.dumps({"request_id": str(request_id), "text": "Prioritize sample analysis."}),
+        ),
+    )
+    envelope = InvestigationEnvelope(
+        investigation_id=investigation_id,
+        allowed_providers=(),
+        budget=InvestigationBudget(),
+        acquire_hits_allowed=False,
+        disclosure=DisclosureBounds(),
+        approval_decision_id=uuid4(),
+        approval_actor_id="analyst-test",
+    )
+
+    context = await builder.build(
+        investigation_id=investigation_id,
+        synthesis_artifact_id=synthesis_artifact_id,
+        state=state,
+        tool_context=ToolExecutionContext(
+            investigation_id=investigation_id,
+            envelope=envelope,
+            budget=envelope.budget,
+            idempotency_key="large-operator-context",
+            available_capabilities=frozenset({"synthetic.read"}),
+            unavailable_tool_reasons={"analysis.missing": "analysis_worker_disabled"},
+        ),
+        budget_remaining={},
+    )
+    repeated = await builder.build(
+        investigation_id=investigation_id,
+        synthesis_artifact_id=synthesis_artifact_id,
+        state=state,
+        tool_context=ToolExecutionContext(
+            investigation_id=investigation_id,
+            envelope=envelope,
+            budget=envelope.budget,
+            idempotency_key="large-operator-context-repeat",
+            available_capabilities=frozenset({"synthetic.read"}),
+            unavailable_tool_reasons={"analysis.missing": "analysis_worker_disabled"},
+        ),
+        budget_remaining={},
+    )
+    old_evidence_page_total, old_evidence_page = await builder.read_context_section(
+        section="evidence_index",
+        investigation_id=investigation_id,
+        state=state,
+        offset=200,
+        limit=20,
+    )
+    latest_notes_total, latest_notes_page = await builder.read_context_section(
+        section="opinion_notes",
+        investigation_id=investigation_id,
+        state=state,
+        offset=20,
+        limit=20,
+    )
+
+    assert len(context.canonical_bytes()) <= 262_144
+    assert context.canonical_bytes() == repeated.canonical_bytes()
+    assert context.source.synthesis_sha256 == "a" * 64
+    assert context.operator_requests[0].request_id == request_id
+    assert context.indicator_inventory.items == ()
+    assert context.investigation.sample_deltas[0]["association_id"] == str(UUID(int=90_001))
+    assert context.investigation.latest_tool_results[-1].tool_name == "vt.file_report"
+    assert context.investigation.latest_tool_results[-1].status is ToolInvocationStatus.SUCCEEDED
+    assert len(context.investigation.findings) == 1
+    assert context.investigation.findings[0].finding_id == current_version_id
+    assert notes[-1].id in {item.note_id for item in context.investigation.opinion_notes}
+    assert len(context.available_tools) == 48
+    assert "query" in context.available_tools[0].arguments_schema["properties"]
+    assert context.unavailable_tools == ("analysis.missing:analysis_worker_disabled",)
+    assert context.advisor_guidance.checkpoint_due is True
+    assert context.advisor_guidance.suggested_consultation_type == "plan_investigation"
+    assert len(context.canonical_bytes()) <= 262_144
+    assert context.article is not None
+    assert context.article.publication_anchors[0].anchor == "overview"
+    assert len(context.investigation.evidence_index) < 200
+    assert context.investigation.evidence_index_truncated is True
+    assert context.investigation.truncation_counts["evidence_index"] > 0
+    assert context.investigation.truncation_counts["findings_superseded"] == 14
+    assert old_evidence_page_total == 220
+    assert len(old_evidence_page) == 20
+    assert old_evidence_page[0]["evidence_id"] == str(observation_ids[19])
+    assert latest_notes_total == 30
+    assert latest_notes_page[-1]["note_id"] == str(notes[-1].id)
+    assert context.current_opinion is not None
+    assert context.current_opinion.opinion_id == opinion.id
+    assert context.current_opinion.version == 14
+    assert context.current_opinion.content_sha256 == opinion.content_sha256
+
+
+@pytest.mark.asyncio
+async def test_small_context_hash_includes_bounded_advisor_guidance() -> None:
+    investigation_id = UUID("00000000-0000-0000-0000-000000000101")
+    synthesis_artifact_id = UUID("00000000-0000-0000-0000-000000000102")
+    note = AnalystObservationV1(
+        id=UUID("00000000-0000-0000-0000-000000000103"),
+        anchor="overview",
+        text="A bounded unresolved note.",
+        state=AnalystObservationState.UNRESOLVED,
+        relation=AnalystObservationRelation.UNRESOLVED,
+    )
+    opinion = AnalystOpinionV1(
+        investigation_id=investigation_id,
+        synthesis_artifact_id=synthesis_artifact_id,
+        synthesis_sha256="a" * 64,
+        base_publication_artifact_id=UUID("00000000-0000-0000-0000-000000000104"),
+        base_publication_sha256="b" * 64,
+        blocks=(
+            OpinionBlock(
+                block_type=OpinionBlockType.ANALYST_OBSERVATIONS,
+                text=json.dumps(
+                    {"schema": "analyst-observations.v1", "items": [note.to_payload()]}
+                ),
+            ),
+        ),
+        author_id="analyst-test",
+        id=UUID("00000000-0000-0000-0000-000000000105"),
+        version=3,
+    )
+    snapshot = ArticleSnapshot(
+        subject_id=UUID("00000000-0000-0000-0000-000000000106"),
+        production_run_id=UUID("00000000-0000-0000-0000-000000000107"),
+        synthesis_artifact_id=synthesis_artifact_id,
+        synthesis_sha256="a" * 64,
+        article=ArticleContextV1(
+            short_summary="A stable small context.",
+            claims=(),
+            documented_samples=(),
+            known_chain=(),
+            open_questions=(),
+        ),
+    )
+    builder = ResearchContextBuilder(
+        article_snapshots=_SnapshotPort(snapshot),
+        observations=InMemoryEvidenceObservationRepository(),
+        findings=InMemoryFindingRepository(),
+        opinions=_OpinionPort(opinion),
+    )
+    envelope = InvestigationEnvelope(
+        investigation_id=investigation_id,
+        allowed_providers=(),
+        budget=InvestigationBudget(),
+        acquire_hits_allowed=False,
+        disclosure=DisclosureBounds(),
+        approval_decision_id=UUID("00000000-0000-0000-0000-000000000108"),
+        approval_actor_id="analyst-test",
+    )
+
+    context = await builder.build(
+        investigation_id=investigation_id,
+        synthesis_artifact_id=synthesis_artifact_id,
+        state=_state(investigation_id),
+        tool_context=ToolExecutionContext(
+            investigation_id=investigation_id,
+            envelope=envelope,
+            budget=envelope.budget,
+            idempotency_key="small-context-hash",
+        ),
+        budget_remaining={},
+    )
+
+    assert context.advisor_guidance.checkpoint_due is False
+    assert context.advisor_guidance.truncated is False
+    assert hashlib.sha256(context.canonical_bytes()).hexdigest() == (
+        "3f4b51e915615eafe8da05d78ec6df43f4e92bedc858d94c3f025f1ec7b7d4d7"
+    )
+
+
+@pytest.mark.asyncio
+async def test_builder_reports_dominant_sections_when_required_tools_cannot_fit() -> None:
+    investigation_id = UUID("00000000-0000-0000-0000-000000000201")
+    synthesis_artifact_id = UUID("00000000-0000-0000-0000-000000000202")
+    snapshot = ArticleSnapshot(
+        subject_id=UUID("00000000-0000-0000-0000-000000000203"),
+        production_run_id=UUID("00000000-0000-0000-0000-000000000204"),
+        synthesis_artifact_id=synthesis_artifact_id,
+        synthesis_sha256="a" * 64,
+        article=ArticleContextV1(
+            short_summary="A minimal article.",
+            claims=(),
+            documented_samples=(),
+            known_chain=(),
+            open_questions=(),
+        ),
+    )
+    registry = InMemoryToolRegistry()
+    for index in range(48):
+        registry.register(
+            ToolDefinition(
+                name=f"synthetic.large_tool_{index}",
+                schema_version="1",
+                input_schema={
+                    "type": "object",
+                    "description": "required schema " + "x" * 6_000,
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+                effect=ToolEffect.LOCAL_READ,
+                cost_model={},
+                confidentiality=ToolConfidentiality.PUBLIC,
+                limitations=(),
+                capability_key="synthetic.read",
+            ),
+            SimpleNamespace(),
+        )
+    builder = ResearchContextBuilder(
+        article_snapshots=_SnapshotPort(snapshot),
+        observations=InMemoryEvidenceObservationRepository(),
+        findings=InMemoryFindingRepository(),
+        registry=registry,
+    )
+    envelope = InvestigationEnvelope(
+        investigation_id=investigation_id,
+        allowed_providers=(),
+        budget=InvestigationBudget(),
+        acquire_hits_allowed=False,
+        disclosure=DisclosureBounds(),
+        approval_decision_id=UUID("00000000-0000-0000-0000-000000000205"),
+        approval_actor_id="analyst-test",
+    )
+
+    with pytest.raises(InvestigationContextTooLarge) as error:
+        await builder.build(
+            investigation_id=investigation_id,
+            synthesis_artifact_id=synthesis_artifact_id,
+            state=_state(investigation_id),
+            tool_context=ToolExecutionContext(
+                investigation_id=investigation_id,
+                envelope=envelope,
+                budget=envelope.budget,
+                idempotency_key="required-tools-too-large",
+                available_capabilities=frozenset({"synthetic.read"}),
+            ),
+            budget_remaining={},
+        )
+
+    assert error.value.actual_bytes > error.value.max_bytes
+    assert error.value.dominant_sections[0].startswith("available_tools:")
 
 
 @pytest.mark.asyncio

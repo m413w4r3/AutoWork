@@ -309,6 +309,34 @@ class _FailOnceBeforeSubmissionAdapter(_ScriptedBridgeAdapter):
         )
 
 
+class _FailNTimesBeforeSubmissionAdapter(_ScriptedBridgeAdapter):
+    def __init__(self, answer: str, *, failures: int) -> None:
+        super().__init__(answer)
+        self._failures_remaining = failures
+
+    async def invoke(
+        self, request: SafeModelRequest, *, role: ModelRole, output_schema: Any = None
+    ) -> AdapterResult:
+        self.calls.append(request)
+        if self._failures_remaining:
+            self._failures_remaining -= 1
+            raise BridgeTransportError(
+                "bridge_server_error",
+                "Composer payload was not ready before submission.",
+                retryable=True,
+                submission_state="pre_submission",
+            )
+        del role, output_schema
+        return AdapterResult(
+            status=AdapterResultStatus.COMPLETED,
+            provider=self.provider,
+            requested_model=self.requested_model,
+            actual_model_version=self.requested_model,
+            usage=ModelUsage(input_tokens=3, output_tokens=5, total_tokens=8),
+            output_text=self._answer,
+        )
+
+
 @pytest.mark.asyncio
 async def test_model_transport_recovers_persisted_confirmed_pre_submission_failure(
     tmp_path: Path,
@@ -356,6 +384,60 @@ async def test_model_transport_recovers_persisted_confirmed_pre_submission_failu
         ConversationTurnStatus.FAILED,
         ConversationTurnStatus.SUCCEEDED,
     }
+
+
+@pytest.mark.asyncio
+async def test_model_transport_resume_after_three_confirmed_failures_sends_attempt_four(
+    tmp_path: Path,
+) -> None:
+    adapter = _FailNTimesBeforeSubmissionAdapter(
+        "@@DECISION@@\nGOAL: Finish the synthetic investigation.\n"
+        "SUMMARY: The fourth distinct attempt succeeded.\nNEXT: finish\n@@END@@",
+        failures=3,
+    )
+    subject_id = uuid4()
+    service, conversation_uow = _build_service(
+        adapter,
+        tmp_path,
+        known_subject_ids={subject_id},
+    )
+    transport = ModelConversationTurnTransport(service)
+    investigation_id = uuid4()
+    context_sha256 = hashlib.sha256(b"persisted retry-exhaustion prompt").hexdigest()
+    args = {
+        "investigation_id": investigation_id,
+        "subject_id": subject_id,
+        "turn_index": 6,
+        "context_sha256": context_sha256,
+        "prompt": "A stable synthetic investigation prompt.",
+        "external_llm_allowed": True,
+    }
+
+    exhausted = [
+        await transport.submit(**args),
+        await transport.submit_with_attempt(**args, attempt=1),
+        await transport.submit_with_attempt(**args, attempt=2),
+    ]
+
+    assert all(item.status is TurnSubmissionStatus.UNAVAILABLE for item in exhausted)
+    assert all(item.submission_state == "pre_submission" for item in exhausted)
+    assert len({item.idempotency_key for item in exhausted}) == 3
+    assert (
+        await service.get(make_investigation_conversation_id(investigation_id))
+    ).status is ConversationStatus.UNAVAILABLE
+
+    resumed = await transport.submit_with_attempt(**args, attempt=3)
+
+    assert resumed.status is TurnSubmissionStatus.SUCCEEDED
+    assert resumed.idempotency_key.endswith(":attempt=3")
+    assert len(adapter.calls) == 4
+    assert resumed.conversation_id is not None
+    turns = await service.turns(resumed.conversation_id)
+    assert len({item.turn.idempotency_key for item in turns}) == 4
+    assert all(
+        item.status in {ConversationTurnStatus.FAILED, ConversationTurnStatus.SUCCEEDED}
+        for item in conversation_uow.turns.values()
+    )
 
 
 class _RecordingSessionCloser:

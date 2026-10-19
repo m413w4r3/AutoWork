@@ -218,6 +218,8 @@ async def test_publication_detection_freezes_canonical_test_report_and_retrohunt
         id=observation_id,
     )
     report = {
+        "schema": "investigation-yara-test.v1",
+        "operation": "test",
         "source_sha256": source_sha256,
         "validation_status": "synthetic_only",
         "validation_reason": "positive_samples_are_synthetic",
@@ -274,7 +276,7 @@ async def test_publication_detection_freezes_canonical_test_report_and_retrohunt
 
 
 @pytest.mark.asyncio
-async def test_publication_detection_without_report_is_unvalidated_and_has_no_retrohunt() -> None:
+async def test_publication_detection_requires_explicit_test() -> None:
     _snapshot, _references, _extraction, _synthesis, _enrichment, base = _base_inputs()
     opinion, _citation_context = _approved_opinion(base)
     source = _rule_source()
@@ -290,9 +292,31 @@ async def test_publication_detection_without_report_is_unvalidated_and_has_no_re
         id=uuid4(),
         created_at=datetime(2026, 10, 16, tzinfo=UTC),
     )
+    proposal_observation = EvidenceObservation(
+        investigation_id=opinion.investigation_id,
+        kind=EvidenceKind.YARA_MATCH,
+        blob_id=uuid4(),
+        sha256=hashlib.sha256(b"compile check is not a test").hexdigest(),
+        source="AutoWork RuleWorkbench",
+        source_version="rule-test.v1",
+        observed_at=datetime(2026, 10, 17, 10, 5, tzinfo=UTC),
+        object_type="detection_candidate_version",
+        object_id=str(version.id),
+    )
     result = await build_publication_detection(
-        _FakeUnitOfWork((version,), ()),
-        _FakePayloadReader({}),
+        _FakeUnitOfWork((version,), (proposal_observation,)),
+        _FakePayloadReader(
+            {
+                proposal_observation.blob_id: {
+                    "schema": "investigation-yara-test.v1",
+                    "operation": "propose",
+                    "source_sha256": version.source_sha256,
+                    "validation_status": "real_validated",
+                    "validation_reason": "real_positives_and_goodware_tested",
+                    "false_positive_count": 0,
+                }
+            }
+        ),
         investigation_id=opinion.investigation_id,
         subject_id=base.subject_id,
         opinion=opinion,
@@ -300,7 +324,7 @@ async def test_publication_detection_without_report_is_unvalidated_and_has_no_re
     assert result is not None
     assert result.rule_validation_status is RuleValidationStatus.UNTESTED
     assert result.validation_status is PublicationDetectionStatus.UNTESTED
-    assert result.validation_reason is PublicationDetectionReason.CORPUS_EMPTY
+    assert result.validation_reason is PublicationDetectionReason.EXPLICIT_TEST_REQUIRED
     assert result.tested_at is None
     assert result.engine_version is None
     assert result.retrohunt_submitted is False
@@ -407,7 +431,7 @@ async def test_real_typst_detection_band_reasons_and_rule_source_are_not_truncat
             _published_rule(
                 canonical_status=RuleValidationStatus.UNTESTED,
                 status=PublicationDetectionStatus.UNTESTED,
-                reason=PublicationDetectionReason.CORPUS_EMPTY,
+                reason=PublicationDetectionReason.EXPLICIT_TEST_REQUIRED,
                 positive_real_count=0,
                 positive_synthetic_count=0,
                 goodware_tested_count=0,
@@ -415,7 +439,7 @@ async def test_real_typst_detection_band_reasons_and_rule_source_are_not_truncat
                 tested=False,
             ),
             "CANDIDATE — NON VALIDÉE",
-            "non testée",
+            "test explicite requis",
         ),
     )
 

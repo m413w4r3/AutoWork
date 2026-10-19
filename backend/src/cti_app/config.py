@@ -9,6 +9,7 @@ from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _HOST_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$", re.ASCII)
+VIRUSTOTAL_DOWNLOAD_REQUIRED_CDN_HOST = "vtsamples.commondatastorage.googleapis.com"
 
 
 def _normalize_download_host_list(value: str) -> frozenset[str]:
@@ -27,6 +28,21 @@ def _normalize_download_host_list(value: str) -> frozenset[str]:
     return frozenset(hosts)
 
 
+def _normalize_download_port_list(value: str) -> frozenset[int]:
+    ports: set[int] = set()
+    for raw_port in value.split(","):
+        candidate = raw_port.strip()
+        if not candidate:
+            continue
+        if not candidate.isascii() or not candidate.isdecimal():
+            raise ValueError("virustotal_download_allowed_ports must contain numeric TCP ports")
+        port = int(candidate)
+        if not 1 <= port <= 65535:
+            raise ValueError("virustotal_download_allowed_ports contains an invalid TCP port")
+        ports.add(port)
+    return frozenset(ports)
+
+
 class Settings(BaseSettings):
     """Runtime configuration loaded exclusively from environment variables."""
 
@@ -40,6 +56,7 @@ class Settings(BaseSettings):
     app_env: str = "development"
     api_bind_host: str = "127.0.0.1"
     operator_api_token: SecretStr | None = None
+    operator_client_api_token: SecretStr | None = None
     log_level: str = "INFO"
     postgres_dsn: str = "postgresql+asyncpg://cti_app:local-postgres-only@postgres:5432/cti_app"
     redis_url: str = "redis://redis:6379/0"
@@ -82,6 +99,13 @@ class Settings(BaseSettings):
     production_cooldown_max_seconds: float = Field(default=1200.0, ge=0)
     openai_bridge_base_url: str = "http://127.0.0.1:8001/v1"
     openai_bridge_api_key: SecretStr | None = None
+    openai_bridge_min_submission_interval_seconds: float = Field(default=20.0, ge=0, le=3600)
+    openai_bridge_submission_jitter_fraction: float = Field(default=0.3, ge=0, le=0.3)
+    operator_advisor_checkpoint_tool_threshold: int = Field(default=12, ge=1, le=1000)
+    operator_advisor_min_consultation_interval_seconds: float = Field(default=20.0, ge=0, le=3600)
+    operator_advisor_max_turns_per_investigation: int = Field(default=8, ge=1, le=100)
+    openai_bridge_pre_submission_retry_base_seconds: float = Field(default=1.0, ge=0, le=300)
+    openai_bridge_pre_submission_retry_max_seconds: float = Field(default=8.0, ge=0, le=3600)
     openai_bridge_connect_timeout_seconds: float = Field(default=3.0, gt=0, le=30)
     openai_bridge_capabilities_timeout_seconds: float = Field(default=2.0, gt=0, le=2)
     # Legacy/default synchronous request budget. Research has a separate longer
@@ -172,6 +196,9 @@ class Settings(BaseSettings):
     # and the *_fallback_enabled flags below) — proxy stays the only transport
     # used unless a fallback is explicitly turned on.
     virustotal_proxy_url: str | None = None
+    # The configured proxy appends its own apikey with a raw '&'. Keep at least
+    # one harmless query parameter on otherwise queryless proxy-v3 requests.
+    virustotal_proxy_query_sentinel_enabled: bool = True
     # Retrohunt is an explicit opt-in and uses the same VirusTotal API v3 base,
     # proxy transport, and API key as ordinary VirusTotal requests.
     virustotal_retrohunt_enabled: bool = False
@@ -203,18 +230,28 @@ class Settings(BaseSettings):
     # capability flag alone does not enable the download route (see
     # application.virustotal.VirusTotalRoutingPolicy).
     virustotal_file_download_enabled: bool = False
+    virustotal_file_download_legacy_fallback_enabled: bool = False
+    virustotal_behaviour_pcap_enabled: bool = False
     virustotal_download_max_bytes: int = Field(
         default=200 * 1024 * 1024, gt=0, le=2 * 1024 * 1024 * 1024
     )
     virustotal_download_timeout_seconds: float = Field(default=120.0, gt=0, le=1800)
-    # Exact hostnames the signed download URL is allowed to target. Empty by
-    # default: deny-by-default until an operator explicitly configures it.
-    virustotal_download_allowed_hosts: str = ""
+    virustotal_download_max_redirects: int = Field(default=3, ge=0, le=10)
+    # Signed downloads currently use this exact VirusTotal CDN hostname.
+    virustotal_download_allowed_hosts: str = VIRUSTOTAL_DOWNLOAD_REQUIRED_CDN_HOST
+    # TCP ports are separately allowlisted; HTTPS's conventional port is the
+    # only default. Redirects on a nonstandard port require an explicit opt-in.
+    virustotal_download_allowed_ports: str = "443"
 
     @field_validator("virustotal_download_allowed_hosts")
     @classmethod
     def validate_download_allowed_hosts(cls, value: str) -> str:
         return ",".join(sorted(_normalize_download_host_list(value)))
+
+    @field_validator("virustotal_download_allowed_ports")
+    @classmethod
+    def validate_download_allowed_ports(cls, value: str) -> str:
+        return ",".join(str(port) for port in sorted(_normalize_download_port_list(value)))
 
     @property
     def virustotal_retrohunt_proxy_enabled(self) -> bool:
@@ -274,6 +311,32 @@ class Settings(BaseSettings):
     analysis_worker_expected_isolation_profile: str = Field(
         default="bookworm-internal-v1", min_length=1, max_length=128
     )
+    analysis_local_file_expected_version: str = Field(default="5.44", min_length=1, max_length=64)
+    analysis_local_binutils_expected_version: str = Field(
+        default="2.40", min_length=1, max_length=64
+    )
+    analysis_local_xxd_expected_version: str = Field(
+        default="2022-01-14", min_length=1, max_length=64
+    )
+    analysis_local_coreutils_expected_version: str = Field(
+        default="9.1", min_length=1, max_length=64
+    )
+    analysis_local_command_max_range_bytes: int = Field(default=1_048_576, gt=0, le=1_048_576)
+    analysis_suricata_expected_version: str = Field(default="7.0.10", min_length=1, max_length=64)
+    analysis_suricata_rules_path: Path = Path("/app/rules/suricata")
+    analysis_suricata_ruleset_revision: str = Field(
+        default="autowork-suricata-v1", min_length=1, max_length=128
+    )
+    analysis_suricata_ruleset_sha256: str = Field(
+        default="66f69f0cf586a87f739d4f63c6bb9d23a7d303f8adf23c2773a31839ea7f9f59",
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    analysis_suricata_timeout_seconds: float = Field(default=60.0, gt=0, le=120)
+    analysis_suricata_max_rule_bytes: int = Field(default=65_536, gt=0, le=65_536)
+    analysis_suricata_max_eve_bytes: int = Field(
+        default=16 * 1024 * 1024, gt=0, le=16 * 1024 * 1024
+    )
+    analysis_suricata_max_events: int = Field(default=24, gt=0, le=100)
 
     # MWCP runs only parsers listed here (parser id -> pinned parser version);
     # an empty allowlist keeps configuration extraction unavailable.
@@ -332,6 +395,21 @@ class Settings(BaseSettings):
     analysis_capa_timeout_seconds: float = Field(default=60.0, gt=0, le=3600)
     analysis_capa_max_output_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
     analysis_capa_max_memory_bytes: int = Field(default=512 * 1024 * 1024, gt=0)
+    analysis_yara_timeout_seconds: float = Field(default=30.0, gt=0, le=30)
+    analysis_yara_max_strings_per_rule: int = Field(default=10_000, gt=0, le=10_000)
+    analysis_floss_max_output_bytes: int = Field(
+        default=12 * 1024 * 1024, gt=0, le=16 * 1024 * 1024
+    )
+    analysis_local_monodis_expected_version: str = Field(
+        default="6.8.0.105+dfsg-3.3+deb12u1", min_length=1, max_length=128
+    )
+    analysis_local_monodis_max_sample_bytes: int = Field(
+        default=64 * 1024 * 1024, gt=0, le=200 * 1024 * 1024
+    )
+    analysis_local_monodis_max_output_bytes: int = Field(
+        default=8 * 1024 * 1024, gt=0, le=32 * 1024 * 1024
+    )
+    analysis_local_monodis_timeout_seconds: float = Field(default=30.0, gt=0, le=120)
     goodware_suspicious_count: int = Field(default=3, ge=1)
     goodware_banal_count: int = Field(default=10, ge=1)
     invariant_max_pattern_chars: int = Field(default=96, ge=1)
@@ -360,6 +438,22 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "OPERATOR_API_TOKEN must contain at least 32 ASCII non-whitespace characters"
                 )
+        if self.operator_client_api_token is not None:
+            client_token = self.operator_client_api_token.get_secret_value()
+            if (
+                len(client_token) < 32
+                or not client_token.isascii()
+                or any(character.isspace() for character in client_token)
+            ):
+                raise ValueError(
+                    "OPERATOR_CLIENT_API_TOKEN must contain at least 32 ASCII "
+                    "non-whitespace characters"
+                )
+            if (
+                self.operator_api_token is not None
+                and client_token == self.operator_api_token.get_secret_value()
+            ):
+                raise ValueError("OPERATOR_CLIENT_API_TOKEN must differ from OPERATOR_API_TOKEN")
         if self.production_subject_jitter_max_seconds < self.production_subject_jitter_min_seconds:
             raise ValueError("production subject jitter max must be >= min")
         if self.production_model_jitter_max_seconds < self.production_model_jitter_min_seconds:
@@ -368,6 +462,11 @@ class Settings(BaseSettings):
             raise ValueError("production cooldown max must be >= min")
         if self.job_bridge_ui_retry_max_seconds < self.job_bridge_ui_retry_base_seconds:
             raise ValueError("bridge UI retry max must be >= base")
+        if (
+            self.openai_bridge_pre_submission_retry_max_seconds
+            < self.openai_bridge_pre_submission_retry_base_seconds
+        ):
+            raise ValueError("Bridge pre-submission retry max must be >= base")
         # Preserve deployments using the former short total deadline, while
         # preventing it from cutting off active background work early.
         self.model_background_wait_timeout_seconds = max(

@@ -461,11 +461,13 @@ def test_settings_capability_composition_is_explicit_and_default_off() -> None:
     configured = virustotal_capabilities_from_settings(
         Settings(
             _env_file=None,
+            virustotal_proxy_url="http://proxy.test:8080",
             virustotal_file_report_enabled=True,
             virustotal_object_relationships_enabled=True,
             virustotal_intelligence_search_enabled=True,
             virustotal_behaviour_reports_enabled=True,
             virustotal_file_download_enabled=True,
+            virustotal_download_allowed_hosts="vtsamples.commondatastorage.googleapis.com",
         )
     )
     assert configured == VirusTotalCapabilities(

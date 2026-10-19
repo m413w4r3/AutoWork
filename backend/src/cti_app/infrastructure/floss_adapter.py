@@ -147,6 +147,8 @@ class FlossAdapter:
             if response.status.value == "succeeded" and result_status == "SUCCEEDED"
             else ExtractionStatus.PARTIAL
             if result_status in {"PARTIAL", "OUTPUT_LIMIT"}
+            else ExtractionStatus.UNAVAILABLE
+            if result_status == "UNSUPPORTED_FORMAT"
             else ExtractionStatus.FAILED
         )
         parameters_sha256 = hashlib.sha256(
@@ -180,7 +182,9 @@ class FlossAdapter:
             ),
             strings_observed=max(int(worker_result.get("strings_observed", 0)), len(strings)),
             truncated=bool(worker_result.get("truncated")),
-            detail_code=response.available_reason,
+            detail_code=worker_result.get("available_reason")
+            if isinstance(worker_result.get("available_reason"), str)
+            else response.available_reason,
         )
 
     async def extract_confined(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import sys
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
@@ -22,6 +23,8 @@ from cti_app.application.investigation_local_tools import (
     GHIDRA_TOOL_NAMES,
     GHIDRA_XREFS_SCHEMA,
     LOCAL_RUN_COMMAND,
+    _ghidra_arguments,
+    _local_command_schema,
     local_tool_capabilities,
     register_local_analysis_tools,
 )
@@ -90,6 +93,30 @@ _SAMPLE_SHA256 = hashlib.sha256(_SAMPLE_BYTES).hexdigest()
 _EVIDENCE_NAMESPACE = UUID("f84fd123-5fbf-49dc-a54d-e63af924558d")
 _FINDING_NAMESPACE = UUID("3e2a06e9-660e-44a7-9a9c-6db60a16ff55")
 _OPINION_NAMESPACE = UUID("f141ae8e-999c-4a7f-b07d-5ffb0bd7b86d")
+
+
+def test_local_run_command_schema_lists_hex_and_hash_operations() -> None:
+    catalog = LocalCommandCatalog(
+        specs=tuple(
+            replace(spec, requires_filesystem_confinement=True)
+            for spec in default_local_command_specs()
+        ),
+        which=lambda name: f"/usr/bin/{name}",
+    )
+
+    schema = _local_command_schema(catalog)
+    command_schema = schema["properties"]["command_id"]
+    options_schema = schema["properties"]["options"]["properties"]
+
+    assert {"xxd", "sha256sum"} <= set(command_schema["enum"])
+    assert "monodis" in command_schema["enum"]
+    assert "xxd" in command_schema["description"]
+    assert "sha256sum" in command_schema["description"]
+    assert "monodis" in command_schema["description"]
+    assert "4096" in options_schema["length"]["description"]
+    assert options_schema["operation"]["enum"] == ["userstrings", "typedef", "methods", "cil"]
+    assert options_schema["method_rid"]["minimum"] == 1
+    assert options_schema["method_name"]["maxLength"] == 128
 
 
 class _Samples:
@@ -187,6 +214,7 @@ class _ToolObservationWriter:
 class _Ghidra:
     def __init__(self, *, unavailable: bool = False) -> None:
         self.unavailable = unavailable
+        self.data: Mapping[str, Any] = {"name": "FUN_00401000", "decompilation": "return 0;"}
         self.calls: list[tuple[GhidraOperation, str, str | None, str | None, int]] = []
 
     async def analyze(
@@ -208,7 +236,7 @@ class _Ghidra:
             plugin_version="1.2.0",
             address=address,
             observed_at=datetime.now(UTC),
-            data={"name": "FUN_00401000", "decompilation": "return 0;"},
+            data=self.data,
         )
 
 
@@ -220,6 +248,7 @@ class _Harness:
         command_output: str = "ELF 64-bit LSB executable",
         ghidra_unavailable: bool = False,
         max_local_output_chars: int = 12_000,
+        strings_available: bool = False,
     ) -> None:
         self.investigation_id = uuid4()
         self.associations = _Associations(
@@ -232,7 +261,9 @@ class _Harness:
         self.samples = _Samples()
         self.command_catalog = LocalCommandCatalog(
             specs=default_local_command_specs(),
-            which=lambda binary: None if binary == "strings" else sys.executable,
+            which=lambda binary: (
+                None if binary == "strings" and not strings_available else sys.executable
+            ),
         )
         self.runner = _Runner(status=command_status, output=command_output)
         self.command_service = LocalCommandService(
@@ -324,8 +355,11 @@ def test_schemas_capabilities_and_dynamic_command_enum() -> None:
     assert local.input_schema["$schema"] == "https://json-schema.org/draft/2020-12/schema"
     assert tuple(local.input_schema["properties"]["command_id"]["enum"]) == (
         "file",
+        "monodis",
         "objdump",
         "readelf",
+        "sha256sum",
+        "xxd",
         "yara",
     )
     assert "local.run_command" in local_tool_capabilities(harness.command_catalog)
@@ -345,7 +379,58 @@ def test_schemas_capabilities_and_dynamic_command_enum() -> None:
         GHIDRA_SEARCH_SCHEMA,
     ):
         assert schema["$schema"] == "https://json-schema.org/draft/2020-12/schema"
+    assert GHIDRA_LIST_FUNCTIONS_SCHEMA["properties"]["limit"]["maximum"] == 100
+    assert GHIDRA_LIST_IMPORTS_SCHEMA["properties"]["limit"]["maximum"] == 100
     assert set(GHIDRA_TOOL_NAMES) <= _tool_names(harness.registry)
+
+
+@pytest.mark.asyncio
+async def test_ghidra_list_functions_accepts_and_forwards_a_bounded_limit() -> None:
+    harness = _Harness()
+    context = harness.context()
+
+    result = await _dispatch(
+        harness.registry,
+        context,
+        "ghidra.list_functions",
+        {"sample_sha256": _SAMPLE_SHA256, "limit": 25},
+    )
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    assert harness.ghidra.calls[-1][-1] == 25
+
+
+def test_ghidra_decompile_defaults_to_the_single_function_limit() -> None:
+    operation, address, query, limit, error = _ghidra_arguments(
+        "ghidra.decompile_function",
+        GhidraOperation.DECOMPILE_FUNCTION,
+        {"address": "00402068"},
+    )
+
+    assert error is None
+    assert operation is GhidraOperation.DECOMPILE_FUNCTION
+    assert address == "00402068"
+    assert query is None
+    assert limit == 1
+
+
+@pytest.mark.asyncio
+async def test_ghidra_decompile_returns_precise_unsupported_function_status() -> None:
+    harness = _Harness()
+    harness.ghidra.data = {
+        "status": "unsupported_function",
+        "reason": "function_body_not_available",
+    }
+
+    result = await _dispatch(
+        harness.registry,
+        harness.context(key="ghidra-unsupported-function"),
+        "ghidra.decompile_function",
+        {"sample_sha256": _SAMPLE_SHA256, "address": "00402068"},
+    )
+
+    assert result.status is ToolInvocationStatus.FAILED
+    assert result.output["reason"] == "function_body_not_available"
 
 
 @pytest.mark.asyncio
@@ -441,6 +526,15 @@ async def test_timeout_and_truncation_are_partial_with_an_explicit_marker(status
     )
     assert result.status is ToolInvocationStatus.PARTIAL
     assert "[TRUNCATED:" in result.output["output"]
+    if status is LocalCommandStatus.OUTPUT_TRUNCATED:
+        assert result.output["partial_reason"]["code"] == "output_byte_limit_reached"
+        assert result.output["partial_reason"]["bytes_read"] == len("partial output")
+        assert (
+            result.output["partial_reason"]["limit_bytes"]
+            == harness.command_catalog.get(LocalCommandId.FILE).spec.max_output_bytes
+        )
+    else:
+        assert result.output["partial_reason"]["code"] == "execution_time_limit_reached"
     observation = await harness.observations.get(result.observation_refs[0])
     assert observation is not None
     payload = harness.artifact_store.payloads[observation.blob_id]
@@ -450,6 +544,30 @@ async def test_timeout_and_truncation_are_partial_with_an_explicit_marker(status
     assert (
         observation.sha256
         == hashlib.sha256(ProductionArtifactStore.canonical_json_bytes(payload)).hexdigest()
+    )
+
+
+@pytest.mark.asyncio
+async def test_strings_partial_reports_the_output_byte_limit() -> None:
+    output = "bounded string " * 700
+    harness = _Harness(
+        command_status=LocalCommandStatus.OUTPUT_TRUNCATED,
+        command_output=output,
+        strings_available=True,
+    )
+    result = await _dispatch(
+        harness.registry,
+        harness.context(key="strings-output-limit"),
+        LOCAL_RUN_COMMAND,
+        _local_arguments(command_id="strings"),
+    )
+
+    assert result.status is ToolInvocationStatus.PARTIAL
+    assert result.output["partial_reason"]["code"] == "output_byte_limit_reached"
+    assert result.output["partial_reason"]["bytes_read"] == len(output.encode("utf-8"))
+    assert (
+        result.output["partial_reason"]["limit_bytes"]
+        == harness.command_catalog.get(LocalCommandId.STRINGS).spec.max_output_bytes
     )
 
 

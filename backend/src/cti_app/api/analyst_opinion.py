@@ -361,7 +361,8 @@ async def revise_opinion(
     if payload.protocol_model_blob_id is not None:
         selected_views = payload.protocol_views
         if selected_views is not None and (
-            not selected_views or len(set(selected_views)) != len(selected_views)
+            len(set(selected_views)) != len(selected_views)
+            or set(selected_views) != set(ProtocolDiagramKind)
         ):
             raise HTTPException(
                 status_code=422,
@@ -405,13 +406,25 @@ async def preview_opinion_pdf(
     version: int = Query(ge=1),
     opinion_sha256: str = Query(pattern=r"^[0-9a-f]{64}$"),
     base_publication_sha256: str = Query(pattern=r"^[0-9a-f]{64}$"),
+    protocol_model_blob_id: UUID | None = Query(default=None),
 ) -> Response:
     try:
+        protocol_figures = (
+            await _compile_opinion_protocol_figures(
+                request,
+                opinion_id=opinion_id,
+                blob_id=protocol_model_blob_id,
+                selected_views=None,
+            )
+            if protocol_model_blob_id is not None
+            else None
+        )
         preview = await _opinion_preview_service(request).preview_pdf(
             opinion_id,
             version=version,
             expected_opinion_sha256=opinion_sha256,
             expected_base_publication_sha256=base_publication_sha256,
+            protocol_figures=protocol_figures,
         )
     except OpinionError as exc:
         _raise_opinion_error(exc)
@@ -505,9 +518,8 @@ async def _compile_opinion_protocol_figures(
             detail={"code": "protocol_diagram_rendering_unavailable"},
         ) from exc
     figures = opinion_protocol_figures(rendered)
-    if selected_views is not None:
-        selected = set(selected_views)
-        figures = tuple(item for item in figures if item.kind in selected)
+    if selected_views is not None and set(selected_views) != set(ProtocolDiagramKind):
+        raise HTTPException(status_code=422, detail={"code": "invalid_protocol_views"})
     return figures
 
 

@@ -53,6 +53,7 @@ _STATUS_LABELS = {
     ProtocolValidationStatus.INFERRED: "INFERRED",
     ProtocolValidationStatus.UNRESOLVED: "UNRESOLVED",
     ProtocolValidationStatus.CONTRADICTED: "CONTRADICTED",
+    ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED: "DOCUMENTED, NOT OBSERVED",
 }
 _PROFILES = {
     ProtocolDiagramKind.SEQUENCE: DiagramProfile.PROTOCOL_SEQUENCE,
@@ -115,7 +116,15 @@ def project_protocol_diagram(spec: ProtocolDiagramSpecV1) -> DiagramSpecV1:
         nodes.append(
             DiagramNodeV1(
                 node_id="evidence-gap",
-                label="INSUFFICIENT EVIDENCE · No protocol scenario established",
+                label=(
+                    "Champs sans offset ni longueur documentés · Modèle documenté, non observé"
+                    if spec.kind is ProtocolDiagramKind.MESSAGE_FORMAT
+                    and _is_documented_view(spec)
+                    and not spec.fields
+                    else "DOCUMENTED, NOT OBSERVED · No documented element was supplied"
+                    if _is_documented_view(spec)
+                    else "INSUFFICIENT EVIDENCE · No protocol scenario established"
+                ),
                 evidence_refs=(),
                 role=DiagramNodeRole.PROTOCOL_NOTE,
             )
@@ -133,13 +142,18 @@ def project_protocol_diagram(spec: ProtocolDiagramSpecV1) -> DiagramSpecV1:
             )
         nodes.extend(_project_field(field, index) for index, field in enumerate(spec.fields, 1))
         edges.extend(_field_order_edges(spec.fields))
+        note_label = (
+            "DOCUMENTED, NOT OBSERVED · Byte positions and values are unknown"
+            if _is_documented_view(spec)
+            else (
+                "INFERRED · Derived layout example · metadata only · "
+                "encrypted payload bytes omitted"
+            )
+        )
         nodes.append(
             DiagramNodeV1(
                 node_id="derived-layout-example",
-                label=(
-                    "INFERRED · Derived layout example · metadata only · "
-                    "encrypted payload bytes omitted"
-                ),
+                label=note_label,
                 evidence_refs=(),
                 role=DiagramNodeRole.PROTOCOL_NOTE,
             )
@@ -164,12 +178,24 @@ def protocol_diagram_caption(spec: ProtocolDiagramSpecV1) -> str:
     """Return the human-readable status legend and bounded semantic limitations."""
     legend = (
         "Legend: OBSERVED green; INFERRED orange and dashed; "
-        "UNRESOLVED gray; CONTRADICTED red. Status is stated on each element."
+        "UNRESOLVED gray; CONTRADICTED red; DOCUMENTED, NOT OBSERVED blue. "
+        "Status is stated on each element."
     )
-    if spec.status is ProtocolDiagramStatus.INSUFFICIENT_EVIDENCE:
+    if _is_documented_view(spec):
+        body = (
+            "Modèle documenté, non observé. This view comes only from cited written facts. "
+            "No network traffic, frames, offsets, or byte values were observed."
+        )
+    elif spec.status is ProtocolDiagramStatus.INSUFFICIENT_EVIDENCE:
         body = "Insufficient evidence; no generic sequence or schema was inserted."
     else:
         body = "Protocol view projected only from the supplied semantic evidence."
+    if (
+        spec.kind is ProtocolDiagramKind.MESSAGE_FORMAT
+        and _is_documented_view(spec)
+        and not spec.fields
+    ):
+        body += " Champs sans offset ni longueur documentés."
     limitations = tuple(item.strip() for item in spec.limitations if item.strip())
     if limitations:
         body = f"{body} Limits: {'; '.join(limitations)}"
@@ -349,6 +375,13 @@ def _status(status: ProtocolValidationStatus) -> str:
     return _STATUS_LABELS[status]
 
 
+def _is_documented_view(spec: ProtocolDiagramSpecV1) -> bool:
+    marker = "documenté, non observé"
+    return marker in spec.title.casefold() or any(
+        marker in item.casefold() for item in spec.limitations
+    )
+
+
 def _status_label(status: ProtocolValidationStatus, text: str) -> str:
     return f"{_status(status)} · {text.strip()}" if text.strip() else _status(status)
 
@@ -486,7 +519,15 @@ def _field_evidence_label(evidence: tuple[ProtocolEvidenceRefV1, ...]) -> str:
     bounded, truncated = _bounded_field_evidence(evidence)
     citations: list[str] = []
     for reference in bounded:
-        citation = f"capture {reference.capture_sha256[:12]}"
+        if reference.documented_ref_kind and reference.documented_ref_id:
+            citation = (
+                f"{reference.documented_ref_kind}:{reference.documented_ref_id} "
+                f"sha256 {(reference.documented_source_sha256 or '')[:12]}"
+            )
+        elif reference.capture_sha256:
+            citation = f"capture {reference.capture_sha256[:12]}"
+        else:
+            continue
         if reference.frame_numbers:
             citation += " frames " + ", ".join(str(frame) for frame in reference.frame_numbers)
         elif reference.start_offset is not None and reference.end_offset is not None:

@@ -94,6 +94,133 @@ def _status_map(composition: InvestigationRuntimeComposition) -> dict[str, Any]:
     return describe_tool_inventory(composition)["families"]  # type: ignore[return-value]
 
 
+def test_virustotal_capabilities_and_status_require_a_verified_v3_route() -> None:
+    from cti_app.workers.tasks import virustotal_capabilities_from_settings
+
+    settings = Settings(
+        _env_file=None,
+        virustotal_proxy_url="http://proxy.test:8080",
+        virustotal_file_download_enabled=True,
+        virustotal_behaviour_pcap_enabled=True,
+        virustotal_download_allowed_hosts="vtsamples.commondatastorage.googleapis.com",
+    )
+    route = VirusTotalOperationRoute(
+        primary=VirusTotalRouteStep(
+            transport=VirusTotalTransportKind.PROXY,
+            variant=VirusTotalEndpointVariant.V3,
+        )
+    )
+    worker_capabilities = virustotal_capabilities_from_settings(settings)
+    assert worker_capabilities.file_download is True
+    assert worker_capabilities.behaviour_pcap is True
+
+    no_routes = VirusTotalRoutingPolicy()
+    adapter = SimpleNamespace(_routing_policy=no_routes)
+    assert runtime_ports._vt_proxy_route_status(
+        settings, adapter, VirusTotalCapability.FILE_DOWNLOAD
+    ) == (False, "virustotal_route_not_configured")
+
+    configured = VirusTotalRoutingPolicy(
+        routes={
+            VirusTotalCapability.FILE_DOWNLOAD: route,
+            VirusTotalCapability.BEHAVIOUR_PCAP: route,
+        }
+    )
+    adapter = SimpleNamespace(_routing_policy=configured)
+    assert runtime_ports._vt_proxy_route_status(
+        settings, adapter, VirusTotalCapability.FILE_DOWNLOAD
+    ) == (True, None)
+    assert runtime_ports._vt_proxy_route_status(
+        settings, adapter, VirusTotalCapability.BEHAVIOUR_PCAP
+    ) == (True, None)
+
+    inputs = _runtime_inputs(settings)
+    inputs["vt_adapter"] = SimpleNamespace(_routing_policy=no_routes)
+    inputs["vt_capabilities"] = VirusTotalCapabilities(file_download=True, behaviour_pcap=True)
+    runtime = build_investigation_runtime_composition_factory(**inputs)
+    statuses = _status_map(runtime)
+    assert statuses["virustotal"] == {
+        "status": "unavailable",
+        "reason": "virustotal_route_not_configured",
+    }
+    assert statuses["virustotal_file_download"] == {
+        "status": "unavailable",
+        "reason": "virustotal_route_not_configured",
+    }
+    assert statuses["virustotal_behaviour_pcap"] == {
+        "status": "unavailable",
+        "reason": "virustotal_route_not_configured",
+    }
+
+    configured_inputs = _runtime_inputs(settings)
+    configured_inputs["vt_adapter"] = SimpleNamespace(_routing_policy=configured)
+    configured_inputs["vt_capabilities"] = VirusTotalCapabilities()
+    configured_runtime = build_investigation_runtime_composition_factory(**configured_inputs)
+    configured_statuses = _status_map(configured_runtime)
+    assert configured_statuses["virustotal"] == {"status": "available", "reason": None}
+    assert configured_statuses["virustotal_behaviour_pcap"] == {
+        "status": "available",
+        "reason": None,
+    }
+
+    wrong_host_settings = Settings(
+        _env_file=None,
+        virustotal_proxy_url="http://proxy.test:8080",
+        virustotal_file_download_enabled=True,
+        virustotal_download_allowed_hosts="cdn.example.test",
+    )
+    wrong_host_inputs = _runtime_inputs(wrong_host_settings)
+    wrong_host_inputs["vt_adapter"] = SimpleNamespace(_routing_policy=no_routes)
+    wrong_host_inputs["vt_capabilities"] = VirusTotalCapabilities(file_download=True)
+    wrong_host_runtime = build_investigation_runtime_composition_factory(**wrong_host_inputs)
+    assert _status_map(wrong_host_runtime)["virustotal_file_download"] == {
+        "status": "unavailable",
+        "reason": "virustotal_download_cdn_host_not_allowlisted",
+    }
+
+
+def test_advisor_transport_requires_nonempty_bridge_config_and_bridge_route() -> None:
+    default = Settings.model_construct(
+        openai_bridge_base_url="http://127.0.0.1:8001/v1",
+        openai_bridge_api_key=None,
+        model_force_adapter="auto",
+        model_route_web_research="chatgpt_bridge",
+    )
+    assert runtime_ports._bridge_turn_transport_configured(default) is False
+
+    empty_key = Settings.model_construct(
+        openai_bridge_base_url="http://127.0.0.1:8001/v1",
+        openai_bridge_api_key=SecretStr(""),
+        model_force_adapter="auto",
+        model_route_web_research="chatgpt_bridge",
+    )
+    assert runtime_ports._bridge_turn_transport_configured(empty_key) is False
+
+    configured_key = Settings.model_construct(
+        openai_bridge_base_url="http://127.0.0.1:8001/v1",
+        openai_bridge_api_key=SecretStr("configured-for-test"),
+        model_force_adapter="auto",
+        model_route_web_research="chatgpt_bridge",
+    )
+    assert runtime_ports._bridge_turn_transport_configured(configured_key) is True
+
+    alternate_endpoint = Settings.model_construct(
+        openai_bridge_base_url="http://bridge.internal/v1",
+        openai_bridge_api_key=None,
+        model_force_adapter="chatgpt_bridge",
+        model_route_web_research="fake",
+    )
+    assert runtime_ports._bridge_turn_transport_configured(alternate_endpoint) is True
+
+    non_bridge_route = Settings.model_construct(
+        openai_bridge_base_url="http://bridge.internal/v1",
+        openai_bridge_api_key=SecretStr("configured-for-test"),
+        model_force_adapter="auto",
+        model_route_web_research="qwen",
+    )
+    assert runtime_ports._bridge_turn_transport_configured(non_bridge_route) is False
+
+
 @pytest.mark.parametrize("root_builder", _root_builders())
 def test_api_and_worker_roots_share_real_runtime_assembly_without_infrastructure(
     root_builder: Any,
@@ -190,7 +317,7 @@ def test_runtime_allows_local_yara_only_with_measured_confinement(
     assert status["execution_mode"] == "local-bwrap-measured"
 
 
-def test_runtime_records_the_specific_bwrap_probe_failure(
+def test_local_command_worker_stays_unavailable_when_worker_is_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class _UnconfinedRunner:
@@ -205,10 +332,13 @@ def test_runtime_records_the_specific_bwrap_probe_failure(
 
     runtime = build_investigation_runtime_composition_factory(**_runtime_inputs(settings))
 
-    assert _status_map(runtime)["local_command_execution"] == {
-        "status": "unavailable",
-        "reason": "bwrap_probe_filesystem_not_confined",
-    }
+    status = _status_map(runtime)["local_command_execution"]
+    assert status["status"] == "unavailable"
+    assert status["reason"] == "analysis_worker_disabled_by_configuration"
+    assert status["execution_mode"] == "analysis-worker"
+    assert _status_map(runtime)["local_filesystem_confinement"]["reason"] == (
+        "bwrap_probe_filesystem_not_confined"
+    )
 
 
 def test_inventory_separates_unmeasured_local_confinement_from_worker_attestation(
@@ -221,6 +351,9 @@ def test_inventory_separates_unmeasured_local_confinement_from_worker_attestatio
         "static": ConfinedAnalysisFamilyStatus("static", True, "static-v1"),
         "capa": ConfinedAnalysisFamilyStatus("capa", True, "9.4.0"),
         "smda": ConfinedAnalysisFamilyStatus("smda", True, "4.5.0"),
+        "local_command": ConfinedAnalysisFamilyStatus(
+            "local_command", True, "local-command-catalog-v1"
+        ),
         "floss": ConfinedAnalysisFamilyStatus(
             "floss", False, None, "analysis_family_not_supported_by_worker"
         ),
@@ -231,7 +364,18 @@ def test_inventory_separates_unmeasured_local_confinement_from_worker_attestatio
         reachable=True,
         confined=True,
         isolation_profile="bookworm-internal-v1",
-        versions={"capa": "9.4.0", "smda": "4.5.0", "mwcp": "3.16.1", "yara": "4.5.0"},
+        versions={
+            "capa": "9.4.0",
+            "smda": "4.5.0",
+            "mwcp": "3.16.1",
+            "yara": "4.5.0",
+            "local_file": "5.44",
+            "local_strings": "2.40",
+            "local_readelf": "2.40",
+            "local_objdump": "2.40",
+            "local_xxd": "2022-01-14",
+            "local_sha256sum": "9.1",
+        },
         families=families,
         dependencies_ready=True,
     )
@@ -266,6 +410,13 @@ def test_inventory_separates_unmeasured_local_confinement_from_worker_attestatio
     assert inventory_families["local_filesystem_confinement"]["reason"] == (
         "bwrap_userns_refused_by_kernel"
     )
+    assert inventory_families["local_command_execution"]["status"] == "available"
+    assert inventory_families["local_command_execution"]["execution_mode"] == "analysis-worker"
+    assert runtime.ports.optional_tool_ports.local_command_catalog is not None
+    assert {
+        item.spec.id.value
+        for item in runtime.ports.optional_tool_ports.local_command_catalog.available_commands()
+    } >= {"file", "strings", "readelf", "objdump"}
     assert inventory_families["sample_analysis"] == {
         "status": "available",
         "reason": None,
@@ -536,7 +687,19 @@ def test_network_quarantine_factory_is_bound_to_each_composition_investigation()
     assert calls == [UUID("0189a6c4-3b10-7d11-bf73-81293c592c77")]
     assert isinstance(composition.tool_dependencies, InvestigationToolDependencies)
     assert composition.tool_dependencies.network_quarantine is source
-    assert not any(name.startswith("network.") for name in composition.available_tools)
+    assert set(composition.available_tools).intersection(
+        {
+            "network.protocol.document",
+            "network.protocol.render",
+            "network.protocol.compare",
+            "network.protocol.hypothesize",
+            "network.protocol.verify",
+        }
+    ) == {"network.protocol.document", "network.protocol.render"}
+    assert not any(
+        name.startswith("network.") and not name.startswith("network.protocol.")
+        for name in composition.available_tools
+    )
 
 
 def test_rea_without_a_confined_runner_reports_the_adapter_reason() -> None:
@@ -655,7 +818,7 @@ async def test_retrohunt_runtime_requires_opt_in_capability_and_proxy_route() ->
 
         assert len(observed) == 1
         assert str(observed[0].url) == (
-            "https://www.virustotal.com/api/v3/intelligence/retrohunt_jobs/job-1"
+            "https://www.virustotal.com/api/v3/intelligence/retrohunt_jobs/job-1?x=1"
         )
         assert observed[0].headers["x-apikey"] == "test-vt-key"
     finally:

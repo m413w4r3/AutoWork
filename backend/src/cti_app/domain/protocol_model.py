@@ -25,6 +25,7 @@ class ProtocolValidationStatus(StrEnum):
     INFERRED = "inferred"
     UNRESOLVED = "unresolved"
     CONTRADICTED = "contradicted"
+    DOCUMENTED_NOT_OBSERVED = "documented_not_observed"
 
 
 class AssuranceLevel(StrEnum):
@@ -83,23 +84,59 @@ class _CanonicalContract:
 
 @dataclass(frozen=True, slots=True)
 class ProtocolEvidenceRefV1(_CanonicalContract):
-    capture_sha256: str
-    flow_id: str
-    stream_id: str
-    direction: StreamDirection
-    frame_numbers: tuple[int, ...]
-    start_offset: int | None
-    end_offset: int | None
-    source: str
+    capture_sha256: str | None = None
+    flow_id: str | None = None
+    stream_id: str | None = None
+    direction: StreamDirection | None = None
+    frame_numbers: tuple[int, ...] = ()
+    start_offset: int | None = None
+    end_offset: int | None = None
+    source: str = ""
     observation_id: UUID | None = None
     timestamp_start_ns: int | None = None
     timestamp_end_ns: int | None = None
+    documented_ref_kind: str | None = None
+    documented_ref_id: str | None = None
+    documented_source_sha256: str | None = None
 
     def __post_init__(self) -> None:
-        if not _SHA256.fullmatch(self.capture_sha256):
+        documented = self.documented_ref_kind is not None or self.documented_ref_id is not None
+        if documented:
+            if (
+                self.documented_ref_kind not in {"observation", "finding", "claim"}
+                or not self.documented_ref_id
+                or not self.source
+                or self.documented_source_sha256 is None
+                or not _SHA256.fullmatch(self.documented_source_sha256)
+            ):
+                raise ValueError("documented evidence requires a typed reference and source hash")
+            if (
+                any(
+                    value is not None
+                    for value in (
+                        self.capture_sha256,
+                        self.flow_id,
+                        self.stream_id,
+                        self.direction,
+                        self.start_offset,
+                        self.end_offset,
+                        self.observation_id,
+                        self.timestamp_start_ns,
+                        self.timestamp_end_ns,
+                    )
+                )
+                or self.frame_numbers
+            ):
+                raise ValueError("documented evidence cannot contain capture or byte coordinates")
+            if self.documented_ref_kind in {"observation", "finding"}:
+                UUID(self.documented_ref_id)
+            return
+        if self.documented_source_sha256 is not None:
+            raise ValueError("documented source hash requires a typed source reference")
+        if not isinstance(self.capture_sha256, str) or not _SHA256.fullmatch(self.capture_sha256):
             raise ValueError("evidence capture sha256 must be lowercase hexadecimal")
-        if not self.flow_id or not self.stream_id or not self.source:
-            raise ValueError("evidence flow, stream, and source are required")
+        if not self.flow_id or not self.stream_id or not self.source or self.direction is None:
+            raise ValueError("evidence flow, stream, direction, and source are required")
         if not self.frame_numbers and self.start_offset is None:
             raise ValueError("evidence must cite frames or a byte range")
         if any(isinstance(frame, bool) or frame < 1 for frame in self.frame_numbers):
@@ -160,8 +197,8 @@ class MessageDefinitionV1(_CanonicalContract):
     name: str
     ordinal: int
     directions: tuple[StreamDirection, ...]
-    min_length: int
-    max_length: int
+    min_length: int | None
+    max_length: int | None
     field_ids: tuple[str, ...]
     validation_status: ProtocolValidationStatus
     evidence: tuple[ProtocolEvidenceRefV1, ...]
@@ -170,10 +207,30 @@ class MessageDefinitionV1(_CanonicalContract):
     def __post_init__(self) -> None:
         if not self.message_id or not self.name or self.ordinal < 1:
             raise ValueError("message identity and positive ordinal are required")
-        if self.min_length < 0 or self.max_length < self.min_length:
+        if (self.min_length is None) != (self.max_length is None):
+            raise ValueError("message length bounds must be both known or both unknown")
+        if self.min_length is not None and (
+            self.max_length is None or self.min_length < 0 or self.max_length < self.min_length
+        ):
             raise ValueError("message length range is invalid")
+        if self.validation_status is ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED and (
+            self.min_length is not None or self.max_length is not None
+        ):
+            raise ValueError("documented messages cannot claim observed byte lengths")
         if not self.evidence:
             raise ValueError("each message definition requires evidence")
+
+
+@dataclass(frozen=True, slots=True)
+class ProtocolStateV1(_CanonicalContract):
+    state_id: str
+    name: str
+    validation_status: ProtocolValidationStatus
+    evidence: tuple[ProtocolEvidenceRefV1, ...]
+
+    def __post_init__(self) -> None:
+        if not self.state_id or not self.name or not self.evidence:
+            raise ValueError("protocol states require an identity, name, and cited evidence")
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,6 +274,14 @@ class FieldDefinitionV1(_CanonicalContract):
             raise ValueError("expected_hex length must match the field length")
         if self.encrypted_opaque and self.expected_hex is not None:
             raise ValueError("opaque encrypted fields cannot have decoded expected values")
+        if self.validation_status is ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED and (
+            self.offset is not None
+            or self.length is not None
+            or self.expected_hex is not None
+            or self.value_sha256s
+            or self.endianness not in {None, "unknown"}
+        ):
+            raise ValueError("documented fields cannot claim byte coordinates or observed values")
 
 
 @dataclass(frozen=True, slots=True)
@@ -320,6 +385,8 @@ class ProtocolModelV1(_CanonicalContract):
     limits: NetworkExtractionLimitsV1
     limitations: tuple[str, ...]
     extractor_versions: tuple[tuple[str, str], ...]
+    states: tuple[ProtocolStateV1, ...] = ()
+    documentary_evidence: tuple[ProtocolEvidenceRefV1, ...] = ()
 
     def __post_init__(self) -> None:
         if self.schema_version != "ProtocolModelV1":
@@ -354,6 +421,42 @@ class ProtocolModelV1(_CanonicalContract):
             field_id not in field_ids for message in self.messages for field_id in message.field_ids
         ):
             raise ValueError("message references an unknown field")
+        state_ids = {item.state_id for item in self.states}
+        if len(state_ids) != len(self.states):
+            raise ValueError("protocol state ids must be unique")
+        if self.validation_status is ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED and any(
+            transition.from_state not in state_ids or transition.to_state not in state_ids
+            for transition in self.transitions
+        ):
+            raise ValueError("documented transitions must cite explicitly documented states")
+        if self.validation_status is ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED:
+            if self.capture_sha256s or self.conversations or self.function_provenance:
+                raise ValueError("documentary models cannot contain capture or binary observations")
+            if not self.documentary_evidence or not all(
+                _is_documented_evidence(ref) for ref in self.documentary_evidence
+            ):
+                raise ValueError("documentary models require cited source evidence")
+            if any(
+                getattr(item, "validation_status", None)
+                is not ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED
+                or not all(_is_documented_evidence(ref) for ref in getattr(item, "evidence", ()))
+                for item in (*self.messages, *self.states, *self.fields, *self.transitions)
+            ):
+                raise ValueError(
+                    "every documentary protocol element requires cited documentary evidence"
+                )
+            if any(
+                item.offset is not None
+                or item.length is not None
+                or item.expected_hex is not None
+                or item.value_sha256s
+                for item in self.fields
+            ):
+                raise ValueError("documentary models cannot contain byte offsets or values")
+            if any(
+                item.min_length is not None or item.max_length is not None for item in self.messages
+            ):
+                raise ValueError("documentary models cannot contain observed message lengths")
 
     @classmethod
     def from_dict(cls, value: object) -> ProtocolModelV1:
@@ -386,7 +489,10 @@ class ProtocolModelV1(_CanonicalContract):
                 "limits",
                 "limitations",
                 "extractor_versions",
+                "states",
+                "documentary_evidence",
             },
+            optional_keys={"states", "documentary_evidence"},
         )
         return cls(
             schema_version=_str(data["schema_version"]),
@@ -421,6 +527,8 @@ class ProtocolModelV1(_CanonicalContract):
             limits=_limits_from_dict(data["limits"]),
             limitations=_str_tuple(data["limitations"]),
             extractor_versions=_versions_tuple(data["extractor_versions"]),
+            states=tuple(_state_from_dict(item) for item in _list(data.get("states", []))),
+            documentary_evidence=_evidence_tuple(data.get("documentary_evidence", [])),
         )
 
 
@@ -621,10 +729,32 @@ def _json_value(value: Any) -> Any:
     return value
 
 
-def _strict_object(value: object, keys: set[str]) -> dict[str, Any]:
-    if not isinstance(value, dict) or set(value) != keys:
+def _strict_object(
+    value: object,
+    keys: set[str],
+    *,
+    optional_keys: set[str] | frozenset[str] = frozenset(),
+) -> dict[str, Any]:
+    if (
+        not isinstance(value, dict)
+        or not optional_keys.issubset(keys)
+        or not (keys - optional_keys).issubset(value)
+        or set(value) - keys
+    ):
         raise ValueError("contract object has missing or unknown fields")
     return value
+
+
+def _is_documented_evidence(value: ProtocolEvidenceRefV1) -> bool:
+    return (
+        value.documented_ref_kind in {"observation", "finding", "claim"}
+        and value.documented_ref_id is not None
+        and value.documented_source_sha256 is not None
+        and value.capture_sha256 is None
+        and not value.frame_numbers
+        and value.start_offset is None
+        and value.end_offset is None
+    )
 
 
 def _str(value: object) -> str:
@@ -690,28 +820,35 @@ def _limits_from_dict(value: object) -> NetworkExtractionLimitsV1:
 
 
 def _evidence_from_dict(value: object) -> ProtocolEvidenceRefV1:
+    required = {
+        "capture_sha256",
+        "flow_id",
+        "stream_id",
+        "direction",
+        "frame_numbers",
+        "start_offset",
+        "end_offset",
+        "source",
+        "observation_id",
+        "timestamp_start_ns",
+        "timestamp_end_ns",
+    }
+    documentary = {
+        "documented_ref_kind",
+        "documented_ref_id",
+        "documented_source_sha256",
+    }
     data = _strict_object(
         value,
-        {
-            "capture_sha256",
-            "flow_id",
-            "stream_id",
-            "direction",
-            "frame_numbers",
-            "start_offset",
-            "end_offset",
-            "source",
-            "observation_id",
-            "timestamp_start_ns",
-            "timestamp_end_ns",
-        },
+        required | documentary,
+        optional_keys=documentary,
     )
     frames = _list(data["frame_numbers"])
     return ProtocolEvidenceRefV1(
-        capture_sha256=_str(data["capture_sha256"]),
-        flow_id=_str(data["flow_id"]),
-        stream_id=_str(data["stream_id"]),
-        direction=StreamDirection(_str(data["direction"])),
+        capture_sha256=_optional_str(data["capture_sha256"]),
+        flow_id=_optional_str(data["flow_id"]),
+        stream_id=_optional_str(data["stream_id"]),
+        direction=None if data["direction"] is None else StreamDirection(_str(data["direction"])),
         frame_numbers=tuple(_int(item) for item in frames),
         start_offset=None if data["start_offset"] is None else _int(data["start_offset"]),
         end_offset=None if data["end_offset"] is None else _int(data["end_offset"]),
@@ -725,6 +862,9 @@ def _evidence_from_dict(value: object) -> ProtocolEvidenceRefV1:
         timestamp_end_ns=(
             None if data["timestamp_end_ns"] is None else _int(data["timestamp_end_ns"])
         ),
+        documented_ref_kind=_optional_str(data.get("documented_ref_kind")),
+        documented_ref_id=_optional_str(data.get("documented_ref_id")),
+        documented_source_sha256=_optional_str(data.get("documented_source_sha256")),
     )
 
 
@@ -793,12 +933,22 @@ def _message_from_dict(value: object) -> MessageDefinitionV1:
         name=_str(data["name"]),
         ordinal=_int(data["ordinal"]),
         directions=tuple(StreamDirection(_str(item)) for item in _list(data["directions"])),
-        min_length=_int(data["min_length"]),
-        max_length=_int(data["max_length"]),
+        min_length=None if data["min_length"] is None else _int(data["min_length"]),
+        max_length=None if data["max_length"] is None else _int(data["max_length"]),
         field_ids=_str_tuple(data["field_ids"]),
         validation_status=ProtocolValidationStatus(_str(data["validation_status"])),
         evidence=_evidence_tuple(data["evidence"]),
         encrypted_opaque=_bool(data["encrypted_opaque"]),
+    )
+
+
+def _state_from_dict(value: object) -> ProtocolStateV1:
+    data = _strict_object(value, {"state_id", "name", "validation_status", "evidence"})
+    return ProtocolStateV1(
+        state_id=_str(data["state_id"]),
+        name=_str(data["name"]),
+        validation_status=ProtocolValidationStatus(_str(data["validation_status"])),
+        evidence=_evidence_tuple(data["evidence"]),
     )
 
 

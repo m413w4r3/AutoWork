@@ -76,7 +76,7 @@ def parse_analysis_request(path: str, headers: object) -> AnalysisRequest:
         limit = int(raw_limit)
     except (TypeError, ValueError):
         raise ContractError("limit_invalid") from None
-    if not 1 <= limit <= 100:
+    if not 1 <= limit <= 100 or (operation == "decompile_function" and limit != 1):
         raise ContractError("limit_out_of_bounds")
 
     contract_version = _header(headers, "X-Ghidra-Contract")

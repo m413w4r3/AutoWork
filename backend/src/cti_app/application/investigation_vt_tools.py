@@ -9,16 +9,17 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
 import ipaddress
 import json
 import math
 import re
 import time
 import unicodedata
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Buffer, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal, Protocol, cast
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -36,6 +37,7 @@ from cti_app.application.investigation_tools import (
     ToolRegistry,
     ToolResult,
 )
+from cti_app.application.research_context_builder import ArticleSnapshot
 from cti_app.application.virustotal import (
     VirusTotalCapabilities,
     VirusTotalCapabilityDisabledError,
@@ -45,6 +47,7 @@ from cti_app.application.virustotal import (
     VirusTotalHttpError,
     VirusTotalInvalidInputError,
     VirusTotalNotAuthorizedError,
+    VirusTotalObjectReport,
     VirusTotalPage,
     VirusTotalPort,
     VirusTotalQuotaExceededError,
@@ -63,6 +66,7 @@ from cti_app.domain.investigation import (
     TLPLevel,
     ToolInvocationStatus,
 )
+from cti_app.domain.network_protocol import NetworkCaptureRefV1, NetworkExtractionLimitsV1
 from cti_app.domain.virustotal import (
     VIRUSTOTAL_RELATIONSHIPS_BY_OBJECT_TYPE,
     VirusTotalObjectType,
@@ -87,6 +91,28 @@ _SIGNED_QUERY_KEYS = re.compile(
     r"access_token|api_key|key|expires|credential)="
 )
 _DOMAIN_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$", re.I)
+_SANDBOX_ID = re.compile(r"^[A-Za-z0-9._:-]{1,256}$")
+ArticleSnapshotResolver = Callable[[UUID], Awaitable[ArticleSnapshot]]
+
+
+class EvidencePayloadReader(Protocol):
+    async def read_json(self, blob_id: UUID) -> Mapping[str, Any]: ...
+
+
+class _CaptureSizeLimitExceeded(VirusTotalInvalidInputError):
+    pass
+
+
+class _BoundedCaptureSink(io.BytesIO):
+    def __init__(self, max_bytes: int) -> None:
+        super().__init__()
+        self.max_bytes = max_bytes
+
+    def write(self, content: Buffer) -> int:
+        content_size = len(memoryview(content))
+        if self.tell() + content_size > self.max_bytes:
+            raise _CaptureSizeLimitExceeded("VirusTotal sandbox PCAP exceeds its size limit.")
+        return super().write(content)
 
 
 def _object_schema(
@@ -102,6 +128,104 @@ def _object_schema(
     }
 
 
+def _json_object_payload(raw_json: bytes) -> Mapping[str, Any]:
+    try:
+        payload = json.loads(raw_json)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise VirusTotalInvalidInputError("VirusTotal object report is not valid JSON.") from exc
+    if not isinstance(payload, Mapping):
+        raise VirusTotalInvalidInputError("VirusTotal object report must be a JSON object.")
+    return payload
+
+
+def _is_confirmed_investigation_ioc(snapshot: ArticleSnapshot, kind: str, object_id: str) -> bool:
+    expected_indicator_type = {
+        "ip_addresses": "ipv4",
+        "domains": "domain",
+        "urls": "url",
+    }.get(kind)
+    if expected_indicator_type is None:
+        return False
+    for indicator in snapshot.confirmed_iocs:
+        if indicator.indicator_type != expected_indicator_type:
+            continue
+        try:
+            candidate = _normalize_object_id(
+                {
+                    "ip_addresses": VirusTotalObjectType.IP_ADDRESS,
+                    "domains": VirusTotalObjectType.DOMAIN,
+                    "urls": VirusTotalObjectType.URL,
+                }[kind],
+                indicator.value,
+            )
+        except (TypeError, ValueError):
+            continue
+        if candidate == object_id:
+            return True
+    return False
+
+
+def _object_report_summary(
+    report: VirusTotalObjectReport,
+    *,
+    object_type: VirusTotalObjectType,
+    object_id: str,
+    attributes: Mapping[str, Any],
+) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "object_type": object_type.value,
+        "object_id": object_id,
+        "report_id": object_id,
+        "http_status": report.http_status,
+        "attributes": {},
+    }
+    safe_attributes: dict[str, Any] = {}
+    for key in (
+        "reputation",
+        "last_analysis_date",
+        "last_modification_date",
+        "first_submission_date",
+        "last_submission_date",
+        "total_votes",
+        "times_submitted",
+    ):
+        value = attributes.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            safe_attributes[key] = value
+    stats = attributes.get("last_analysis_stats")
+    if isinstance(stats, Mapping):
+        safe_stats = {
+            sanitize_evidence_text(key, max_chars=80): value
+            for key, value in list(stats.items())[:32]
+            if isinstance(key, str)
+            and isinstance(value, int)
+            and not isinstance(value, bool)
+            and value >= 0
+        }
+        if safe_stats:
+            safe_attributes["last_analysis_stats"] = safe_stats
+    for key in ("country", "continent", "as_owner", "network", "registrar"):
+        value = attributes.get(key)
+        if isinstance(value, str) and value:
+            safe_attributes[key] = sanitize_evidence_text(value, max_chars=256)
+    categories = attributes.get("categories")
+    if isinstance(categories, Mapping):
+        safe_attributes["categories"] = {
+            sanitize_evidence_text(key, max_chars=128): sanitize_evidence_text(value, max_chars=256)
+            for key, value in list(categories.items())[:16]
+            if isinstance(key, str) and isinstance(value, str)
+        }
+    summary["attributes"] = safe_attributes
+    # Keep the commonly used reputation field at the top level for compact agent output.
+    if "reputation" in safe_attributes:
+        summary["reputation"] = safe_attributes["reputation"]
+    if "last_analysis_stats" in safe_attributes:
+        summary["last_analysis_stats"] = safe_attributes["last_analysis_stats"]
+    if "last_analysis_date" in safe_attributes:
+        summary["last_analysis_date"] = safe_attributes["last_analysis_date"]
+    return summary
+
+
 FILE_REPORT_SCHEMA = _object_schema(
     {
         "file_hash": {
@@ -113,6 +237,20 @@ FILE_REPORT_SCHEMA = _object_schema(
     },
     ("file_hash",),
     "VirusTotal file report",
+)
+
+OBJECT_REPORT_SCHEMA = _object_schema(
+    {
+        "object_type": {"type": "string", "enum": ["ip_addresses", "domains", "urls"]},
+        "object_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2_048,
+            "pattern": _NO_CONTROL,
+        },
+    },
+    ("object_type", "object_id"),
+    "VirusTotal IP, domain, or URL report",
 )
 
 RELATIONSHIPS_SCHEMA = _object_schema(
@@ -180,33 +318,95 @@ BEHAVIOUR_SCHEMA = _object_schema(
     "VirusTotal file behaviour reports",
 )
 
+BEHAVIOUR_PCAP_SCHEMA = _object_schema(
+    {
+        "file_hash": {
+            "type": "string",
+            "minLength": 32,
+            "maxLength": 64,
+            "pattern": _HASH_PATTERN,
+        },
+        "sandbox_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "pattern": r"^[A-Za-z0-9._:-]+$",
+        },
+    },
+    ("file_hash", "sandbox_id"),
+    "VirusTotal sandbox PCAP from a persisted behaviour report",
+)
+
 _CAPABILITY_NAMES = {
     "vt.file_report": "vt.file_report",
+    "vt.object_report": "vt.object_report",
     "vt.relationships": "vt.relationships",
     "vt.intelligence_search": "vt.intelligence_search",
     "vt.behaviour": "vt.behaviour",
+    "vt.behaviour_pcap": "vt.behaviour_pcap",
 }
 _ALTERNATIVE_CAPABILITIES = {
-    "vt.file_report": ("vt.relationships", "vt.intelligence_search", "vt.behaviour"),
-    "vt.relationships": ("vt.file_report", "vt.intelligence_search", "vt.behaviour"),
-    "vt.intelligence_search": ("vt.file_report", "vt.relationships", "vt.behaviour"),
-    "vt.behaviour": ("vt.file_report", "vt.relationships", "vt.intelligence_search"),
+    "vt.file_report": (
+        "vt.object_report",
+        "vt.relationships",
+        "vt.intelligence_search",
+        "vt.behaviour",
+        "vt.behaviour_pcap",
+    ),
+    "vt.object_report": (
+        "vt.file_report",
+        "vt.relationships",
+        "vt.intelligence_search",
+        "vt.behaviour",
+        "vt.behaviour_pcap",
+    ),
+    "vt.relationships": (
+        "vt.file_report",
+        "vt.object_report",
+        "vt.intelligence_search",
+        "vt.behaviour",
+        "vt.behaviour_pcap",
+    ),
+    "vt.intelligence_search": (
+        "vt.file_report",
+        "vt.object_report",
+        "vt.relationships",
+        "vt.behaviour",
+        "vt.behaviour_pcap",
+    ),
+    "vt.behaviour": (
+        "vt.file_report",
+        "vt.object_report",
+        "vt.relationships",
+        "vt.intelligence_search",
+        "vt.behaviour_pcap",
+    ),
+    "vt.behaviour_pcap": (
+        "vt.file_report",
+        "vt.object_report",
+        "vt.relationships",
+        "vt.intelligence_search",
+        "vt.behaviour",
+    ),
 }
 _VT_ALTERNATIVES = tuple(_ALTERNATIVE_CAPABILITIES)
 
 
 def virustotal_tool_capabilities(capabilities: VirusTotalCapabilities) -> frozenset[str]:
-    """Project D1 settings capabilities into the four investigation registry keys.
+    """Project D1 settings capabilities into the investigation registry keys.
 
     `file_relationships` enables `vt.relationships`; `behaviour_reports`
-    enables `vt.behaviour`. A capability does not imply that its configured
+    enables `vt.behaviour`, and `behaviour_pcap` enables `vt.behaviour_pcap`.
+    A capability does not imply that its configured
     route exists. The port reports a missing route locally before HTTP.
     """
     enabled = {
         "vt.file_report": capabilities.file_report,
+        "vt.object_report": capabilities.file_report,
         "vt.relationships": capabilities.file_relationships,
         "vt.intelligence_search": capabilities.intelligence_search,
         "vt.behaviour": capabilities.behaviour_reports,
+        "vt.behaviour_pcap": capabilities.behaviour_pcap,
     }
     return frozenset(name for name, is_enabled in enabled.items() if is_enabled)
 
@@ -517,6 +717,131 @@ class _FileReportAdapter(_VirusTotalAdapter):
             state.observation_refs.extend(refs)
             state.output.update(summary)
             state.output["pages"] = 1
+            state.output["provider_routes"] = sorted(state.routes)
+            state.output["limitations"] = list(limitations)
+            return self._result(state, ToolInvocationStatus.SUCCEEDED)
+
+        return await self._run(arguments, context, operation)
+
+
+class _ObjectReportAdapter(_VirusTotalAdapter):
+    def __init__(
+        self,
+        *,
+        article_snapshot_resolver: ArticleSnapshotResolver | None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.article_snapshot_resolver = article_snapshot_resolver
+
+    async def execute(
+        self, arguments: Mapping[str, Any], context: ToolExecutionContext
+    ) -> ToolResult:
+        async def operation(state: _ExecutionState) -> ToolResult:
+            kind = str(arguments["object_type"])
+            object_type = {
+                "ip_addresses": VirusTotalObjectType.IP_ADDRESS,
+                "domains": VirusTotalObjectType.DOMAIN,
+                "urls": VirusTotalObjectType.URL,
+            }.get(kind)
+            if object_type is None:
+                raise VirusTotalInvalidInputError("VirusTotal object report type is invalid.")
+            object_id = _normalize_object_id(object_type, str(arguments["object_id"]))
+            state_type, state_id = _evidence_object_anchor(object_type, object_id)
+            state.object_type = state_type
+            state.object_id = state_id
+            state.output.update(
+                {"object_type": object_type.value, "object_id": state_id, "provider_routes": []}
+            )
+            if self.article_snapshot_resolver is None:
+                return self._result(
+                    state,
+                    ToolInvocationStatus.UNAVAILABLE,
+                    reason="verified_ioc_inventory_unavailable",
+                    zero_cost=True,
+                )
+            try:
+                snapshot = await self.article_snapshot_resolver(context.investigation_id)
+            except Exception:
+                return self._result(
+                    state,
+                    ToolInvocationStatus.UNAVAILABLE,
+                    reason="verified_ioc_inventory_unavailable",
+                    zero_cost=True,
+                )
+            if not _is_confirmed_investigation_ioc(snapshot, kind, object_id):
+                return self._result(
+                    state,
+                    ToolInvocationStatus.POLICY_DENIED,
+                    reason="ioc_not_in_investigation",
+                    message=(
+                        "Les rapports VT objet sont limités aux IOC confirmés de cette "
+                        "investigation."
+                    ),
+                    zero_cost=True,
+                )
+
+            state.api_requests = 1
+            report_kind = cast(Literal["ip_addresses", "domains", "urls"], kind)
+            report = await self.virustotal.object_report(report_kind, object_id)
+            expected_report_id = (
+                base64.urlsafe_b64encode(object_id.encode("utf-8")).decode("ascii").rstrip("=")
+                if object_type is VirusTotalObjectType.URL
+                else object_id
+            )
+            if report.kind != kind or report.object_id != expected_report_id:
+                raise VirusTotalInvalidInputError(
+                    "VirusTotal returned a different object identity."
+                )
+            payload = _json_object_payload(report.raw_json)
+            data = payload.get("data")
+            expected_type = {
+                "ip_addresses": "ip_address",
+                "domains": "domain",
+                "urls": "url",
+            }[kind]
+            if (
+                not isinstance(data, Mapping)
+                or data.get("type") != expected_type
+                or data.get("id") != report.object_id
+                or not isinstance(data.get("attributes"), Mapping)
+            ):
+                raise VirusTotalInvalidInputError("VirusTotal object report identity is invalid.")
+
+            route = _route_label(report.transport.value, report.api_generation.value)
+            state.routes.add(route)
+            limitations = (
+                "Le rapport décrit uniquement les données accessibles à VirusTotal à la date "
+                "de collecte.",
+                "Les verdicts et attributs d'un objet distant sont des observations non fiables.",
+            )
+            summary = _object_report_summary(
+                report, object_type=object_type, object_id=state_id, attributes=data["attributes"]
+            )
+            raw_ref = await self.recorder.record_json(
+                investigation_id=context.investigation_id,
+                kind=EvidenceKind.OTHER,
+                payload={"schema": "virustotal-object-report-raw.v1", "report": payload},
+                source="VirusTotal",
+                source_version=route,
+                object_type=state_type,
+                object_id=state_id,
+                limitations=limitations,
+                idempotency_key=self._evidence_key(context, "object-report-raw", state_id),
+            )
+            summary_ref = await self.recorder.record_json(
+                investigation_id=context.investigation_id,
+                kind=EvidenceKind.OTHER,
+                payload={"schema": "virustotal-object-report.v1", **summary},
+                source="VirusTotal",
+                source_version=route,
+                object_type=state_type,
+                object_id=state_id,
+                limitations=limitations,
+                idempotency_key=self._evidence_key(context, "object-report-summary", state_id),
+            )
+            state.observation_refs.extend((raw_ref.id, summary_ref.id))
+            state.output.update(summary)
             state.output["provider_routes"] = sorted(state.routes)
             state.output["limitations"] = list(limitations)
             return self._result(state, ToolInvocationStatus.SUCCEEDED)
@@ -928,6 +1253,255 @@ class _BehaviourAdapter(_VirusTotalAdapter):
         return await self._run(arguments, context, operation)
 
 
+def _behaviour_pcap_failure_reason(error: BaseException) -> str:
+    if isinstance(error, _CaptureSizeLimitExceeded):
+        return "pcap_size_limit_exceeded"
+    code = getattr(error, "code", None)
+    known_codes = {
+        "virustotal_download_timeout": "pcap_transport_timeout",
+        "virustotal_unexpected_redirect": "pcap_redirect_refused",
+        "virustotal_download_host_not_allowed": "pcap_redirect_host_not_allowed",
+        "virustotal_download_redirect_limit": "pcap_redirect_limit_exceeded",
+        "virustotal_signed_url_expired": "pcap_signed_url_expired",
+        "virustotal_download_too_large": "pcap_size_limit_exceeded",
+        "virustotal_pcap_magic_invalid": "pcap_invalid_capture_format",
+        "virustotal_download_empty": "pcap_empty_capture",
+        "virustotal_download_length_mismatch": "pcap_length_mismatch",
+        "virustotal_download_truncated": "pcap_transport_truncated",
+    }
+    if isinstance(code, str) and code in known_codes:
+        return known_codes[code]
+    if isinstance(error, VirusTotalHttpError):
+        if error.status_code == 429:
+            return "pcap_provider_rate_limited"
+        if error.status_code in {401, 403}:
+            return "pcap_provider_authorization_refused"
+        if error.status_code == 404:
+            return "pcap_sandbox_not_found"
+        if error.status_code is not None and error.status_code >= 500:
+            return "pcap_provider_unavailable"
+        return "pcap_provider_http_error"
+    if isinstance(error, VirusTotalInvalidInputError | TypeError | ValueError):
+        return "pcap_invalid_response"
+    if isinstance(error, VirusTotalError):
+        if isinstance(code, str) and "transport" in code:
+            return "pcap_transport_error"
+        if isinstance(code, str) and ("route" in code or "capability" in code):
+            return "pcap_route_unavailable"
+        return "pcap_provider_failure"
+    return "pcap_invalid_response"
+
+
+def _pcap_redirect_host(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    host = value.strip().lower().rstrip(".")
+    label = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    return host if len(host) <= 253 and re.fullmatch(rf"{label}(?:\.{label})*", host) else None
+
+
+class _BehaviourPcapAdapter(_VirusTotalAdapter):
+    def __init__(
+        self,
+        *,
+        evidence_observations: EvidenceObservationRepository,
+        evidence_payloads: EvidencePayloadReader,
+        max_capture_bytes: int,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.evidence_observations = evidence_observations
+        self.evidence_payloads = evidence_payloads
+        self.max_capture_bytes = max_capture_bytes
+
+    async def execute(
+        self, arguments: Mapping[str, Any], context: ToolExecutionContext
+    ) -> ToolResult:
+        async def operation(state: _ExecutionState) -> ToolResult:
+            try:
+                file_hash = normalize_file_hash(str(arguments["file_hash"]))
+                sandbox_id = _normalize_sandbox_id(str(arguments["sandbox_id"]))
+            except VirusTotalInvalidInputError:
+                return self._result(
+                    state,
+                    ToolInvocationStatus.POLICY_DENIED,
+                    reason="invalid_input",
+                    message="The sandbox PCAP identifiers are invalid.",
+                    zero_cost=True,
+                )
+            state.object_type = "network_capture"
+            state.object_id = f"{file_hash}:{sandbox_id}"
+            state.output.update(
+                {
+                    "file_hash": file_hash,
+                    "sandbox_id": sandbox_id,
+                    "provider_routes": [],
+                }
+            )
+
+            try:
+                persisted = await self._saved_report_contains_capture(
+                    context.investigation_id, file_hash, sandbox_id
+                )
+            except Exception:
+                return self._result(
+                    state,
+                    ToolInvocationStatus.UNAVAILABLE,
+                    reason="behaviour_report_evidence_unavailable",
+                    zero_cost=True,
+                )
+            if persisted is None:
+                return self._result(
+                    state,
+                    ToolInvocationStatus.UNAVAILABLE,
+                    reason="behaviour_report_evidence_unavailable",
+                    zero_cost=True,
+                )
+            if not persisted:
+                return self._result(
+                    state,
+                    ToolInvocationStatus.POLICY_DENIED,
+                    reason="behaviour_report_not_persisted",
+                    message=(
+                        "Le PCAP est limité à un sandbox_id d'un rapport comportemental "
+                        "persisté dans cette investigation."
+                    ),
+                    zero_cost=True,
+                )
+
+            sink = _BoundedCaptureSink(self.max_capture_bytes)
+            state.api_requests = 1
+            try:
+                result = await self.virustotal.behaviour_pcap(sandbox_id, sink=sink)
+                content = sink.getvalue()
+                if (
+                    not content
+                    or isinstance(result.size, bool)
+                    or result.size != len(content)
+                    or result.size > self.max_capture_bytes
+                ):
+                    raise VirusTotalInvalidInputError(
+                        "VirusTotal sandbox PCAP size does not match the received bytes."
+                    )
+                sha256 = hashlib.sha256(content).hexdigest()
+                md5 = hashlib.md5(content, usedforsecurity=False).hexdigest()
+                sha1 = hashlib.sha1(content, usedforsecurity=False).hexdigest()
+                if result.sha256 != sha256 or result.md5 != md5 or result.sha1 != sha1:
+                    raise VirusTotalInvalidInputError(
+                        "VirusTotal sandbox PCAP hashes do not match the received bytes."
+                    )
+            except (VirusTotalError, TypeError, ValueError) as exc:
+                extra: dict[str, Any] = {"confirmed_non_execution": True}
+                status_code = getattr(exc, "status_code", None)
+                if isinstance(status_code, int):
+                    extra["http_status"] = status_code
+                code = getattr(exc, "code", None)
+                if isinstance(code, str) and re.fullmatch(r"[a-z0-9_]{1,80}", code):
+                    extra["provider_error_code"] = code
+                location_host = _pcap_redirect_host(getattr(exc, "location_host", None))
+                if location_host is not None:
+                    extra["redirect_host"] = location_host
+                return self._result(
+                    state,
+                    ToolInvocationStatus.UNAVAILABLE,
+                    reason=_behaviour_pcap_failure_reason(exc),
+                    message=(
+                        "The sandbox PCAP read did not complete; the operation cannot mutate "
+                        "VirusTotal state."
+                    ),
+                    extra=extra,
+                )
+
+            try:
+                stored = await self.observations.store_behaviour_pcap(
+                    content,
+                    investigation_id=context.investigation_id,
+                    file_hash=file_hash,
+                    sandbox_id=sandbox_id,
+                    expected_sha256=sha256,
+                    max_bytes=self.max_capture_bytes,
+                    observed_at=datetime.now(UTC),
+                    idempotency_key=self._evidence_key(context, "behaviour-pcap", state.object_id),
+                )
+            except (TypeError, ValueError):
+                raise
+            except Exception:
+                return self._result(
+                    state,
+                    ToolInvocationStatus.UNAVAILABLE,
+                    reason="network_capture_quarantine_unavailable",
+                )
+
+            capture_ref = stored.capture_ref
+            if (
+                not isinstance(capture_ref, NetworkCaptureRefV1)
+                or capture_ref.sha256 != sha256
+                or capture_ref.size_bytes != len(content)
+            ):
+                raise VirusTotalInvalidInputError(
+                    "The quarantined capture reference does not match its content."
+                )
+            state.pages = 1
+            evidence_id = getattr(stored, "evidence_id", None)
+            if isinstance(evidence_id, UUID):
+                state.observation_refs.append(evidence_id)
+            limitations = (
+                "Le PCAP/PCAPNG est une capture hors ligne fournie par un sandbox VirusTotal.",
+                "Cette capture n'est pas une observation d'un C2 actif.",
+                "Le contenu est non fiable et reste en quarantaine avant analyse TShark.",
+            )
+            state.output.update(
+                {
+                    "capture_ref": capture_ref.to_dict(),
+                    "sample_id": str(stored.sample_id),
+                    "association_id": str(stored.association_id),
+                    "evidence_id": str(evidence_id) if isinstance(evidence_id, UUID) else None,
+                    "active_c2_observed": False,
+                    "pages": 1,
+                    "limitations": list(limitations),
+                }
+            )
+            return self._result(state, ToolInvocationStatus.SUCCEEDED)
+
+        return await self._run(arguments, context, operation)
+
+    async def _saved_report_contains_capture(
+        self, investigation_id: UUID, file_hash: str, sandbox_id: str
+    ) -> bool | None:
+        observations = await self.evidence_observations.list_for_investigation(investigation_id)
+        candidates = tuple(
+            item
+            for item in observations
+            if item.kind is EvidenceKind.VT_BEHAVIOUR
+            and item.source == "VirusTotal"
+            and item.object_type == "file"
+            and item.object_id == file_hash
+        )
+        if not candidates:
+            return False
+        readable = False
+        for observation in candidates:
+            try:
+                payload = await self.evidence_payloads.read_json(observation.blob_id)
+            except Exception:
+                continue
+            readable = True
+            if (
+                payload.get("schema") != "virustotal-investigation-summary.v1"
+                or payload.get("file_hash") != file_hash
+            ):
+                continue
+            descriptors = payload.get("descriptors")
+            if isinstance(descriptors, list) and any(
+                isinstance(item, Mapping)
+                and item.get("sandbox_id") == sandbox_id
+                and item.get("has_pcap") is True
+                for item in descriptors
+            ):
+                return True
+        return False if readable else None
+
+
 def register_virustotal_tools(
     registry: ToolRegistry,
     *,
@@ -936,12 +1510,16 @@ def register_virustotal_tools(
     recorder: EvidenceRecorder,
     evidence_observations: EvidenceObservationRepository,
     findings: FindingRepository,
+    article_snapshot_resolver: ArticleSnapshotResolver | None = None,
+    capabilities: VirusTotalCapabilities | None = None,
+    evidence_payloads: EvidencePayloadReader | None = None,
+    max_capture_bytes: int = NetworkExtractionLimitsV1().max_capture_bytes,
     max_pages: int = 3,
     page_size: int = 40,
     max_results: int = 20,
     max_tool_seconds: int = 120,
 ) -> None:
-    """Register the four passive VT tools against shared ports and evidence stores.
+    """Register passive VT tools against shared ports and evidence stores.
 
     Page count, page size, output descriptors, and worst-case budget reservations
     are controlled by the backend. `evidence_observations` and `findings` are
@@ -956,6 +1534,12 @@ def register_virustotal_tools(
         raise ValueError("max_results must be between 1 and 50")
     if not 1 <= max_tool_seconds <= 600:
         raise ValueError("max_tool_seconds must be between 1 and 600")
+    if (
+        isinstance(max_capture_bytes, bool)
+        or not isinstance(max_capture_bytes, int)
+        or not 1 <= max_capture_bytes <= NetworkExtractionLimitsV1().max_capture_bytes
+    ):
+        raise ValueError("max_capture_bytes must be within the network capture limit")
 
     adapters: tuple[tuple[str, Mapping[str, Any], ToolAdapter, int], ...] = (
         (
@@ -971,6 +1555,23 @@ def register_virustotal_tools(
                 max_results=max_results,
                 max_tool_seconds=max_tool_seconds,
                 reserved_vt_units=1,
+            ),
+            1,
+        ),
+        (
+            "vt.object_report",
+            OBJECT_REPORT_SCHEMA,
+            _ObjectReportAdapter(
+                name="vt.object_report",
+                virustotal=virustotal,
+                observations=observations,
+                recorder=recorder,
+                max_pages=1,
+                page_size=1,
+                max_results=20,
+                max_tool_seconds=max_tool_seconds,
+                reserved_vt_units=1,
+                article_snapshot_resolver=article_snapshot_resolver,
             ),
             1,
         ),
@@ -1025,6 +1626,34 @@ def register_virustotal_tools(
             max_pages,
         ),
     )
+    if (
+        capabilities is not None
+        and capabilities.behaviour_pcap
+        and evidence_payloads is not None
+        and callable(getattr(virustotal, "behaviour_pcap", None))
+        and callable(getattr(observations, "store_behaviour_pcap", None))
+    ):
+        adapters += (
+            (
+                "vt.behaviour_pcap",
+                BEHAVIOUR_PCAP_SCHEMA,
+                _BehaviourPcapAdapter(
+                    name="vt.behaviour_pcap",
+                    virustotal=virustotal,
+                    observations=observations,
+                    recorder=recorder,
+                    max_pages=1,
+                    page_size=1,
+                    max_results=1,
+                    max_tool_seconds=max_tool_seconds,
+                    reserved_vt_units=1,
+                    evidence_observations=evidence_observations,
+                    evidence_payloads=evidence_payloads,
+                    max_capture_bytes=max_capture_bytes,
+                ),
+                1,
+            ),
+        )
     for name, schema, adapter, reserved_units in adapters:
         capability_key = _CAPABILITY_NAMES[name]
         registry.register(
@@ -1165,6 +1794,13 @@ def _normalize_domain(value: str) -> str:
     if any(not _DOMAIN_LABEL.fullmatch(label) for label in labels):
         raise VirusTotalInvalidInputError("VirusTotal domain identifier is invalid.")
     return ascii_domain
+
+
+def _normalize_sandbox_id(value: str) -> str:
+    candidate = value.strip()
+    if not _SANDBOX_ID.fullmatch(candidate):
+        raise VirusTotalInvalidInputError("VirusTotal sandbox identifier is invalid.")
+    return candidate
 
 
 def _normalize_url(value: str) -> str:
@@ -1367,7 +2003,15 @@ def _search_candidates(
 
 def _behaviour_descriptors(page: VirusTotalPage) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
-    for item in page.behaviour_summaries:
+    for index, item in enumerate(page.behaviour_summaries):
+        raw_item = page.items[index] if index < len(page.items) else {}
+        raw_identifier = raw_item.get("id") if isinstance(raw_item, Mapping) else None
+        try:
+            sandbox_id = (
+                _normalize_sandbox_id(raw_identifier) if isinstance(raw_identifier, str) else None
+            )
+        except VirusTotalInvalidInputError:
+            sandbox_id = None
         descriptor: dict[str, Any] = {
             "sandbox": sanitize_evidence_text(item.sandbox or "", max_chars=128),
             "date": _integer(item.date)
@@ -1383,6 +2027,47 @@ def _behaviour_descriptors(page: VirusTotalPage) -> list[dict[str, Any]]:
                 for section in item.available_sections[:16]
             ],
         }
+        if sandbox_id is not None:
+            descriptor["sandbox_id"] = sandbox_id
+        results.append(descriptor)
+    if results:
+        return results
+    for raw_item in page.items[:20]:
+        if not isinstance(raw_item, Mapping):
+            continue
+        raw_identifier = raw_item.get("id")
+        if not isinstance(raw_identifier, str):
+            continue
+        try:
+            sandbox_id = _normalize_sandbox_id(raw_identifier)
+        except VirusTotalInvalidInputError:
+            continue
+        raw_attributes = raw_item.get("attributes")
+        attributes = raw_attributes if isinstance(raw_attributes, Mapping) else {}
+        sandbox = attributes.get("sandbox_name", attributes.get("sandbox"))
+        date = attributes.get("analysis_date", attributes.get("date"))
+        tags = attributes.get("tags")
+        descriptor = {
+            "sandbox_id": sandbox_id,
+            "sandbox": sanitize_evidence_text(sandbox, max_chars=128)
+            if isinstance(sandbox, str)
+            else "",
+            "date": _integer(date)
+            if _integer(date) is not None
+            else sanitize_evidence_text(date, max_chars=64)
+            if isinstance(date, str)
+            else None,
+            "tags": [
+                sanitize_evidence_text(tag, max_chars=80)
+                for tag in tags[:12]
+                if isinstance(tag, str)
+            ]
+            if isinstance(tags, list)
+            else [],
+            "has_pcap": attributes.get("has_pcap") is True,
+            "has_html_report": attributes.get("has_html_report") is True,
+            "available_sections": [],
+        }
         results.append(descriptor)
     if results:
         return results
@@ -1390,6 +2075,7 @@ def _behaviour_descriptors(page: VirusTotalPage) -> list[dict[str, Any]]:
 
 
 __all__ = [
+    "BEHAVIOUR_PCAP_SCHEMA",
     "BEHAVIOUR_SCHEMA",
     "FILE_REPORT_SCHEMA",
     "INTELLIGENCE_SEARCH_SCHEMA",

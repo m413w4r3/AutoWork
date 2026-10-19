@@ -55,6 +55,10 @@ class FakeDatabase:
         self.attempts: list[SampleAcquisitionAttempt] = []
         self.samples: dict[UUID, Sample] = {}
         self.blobs: dict[UUID, FakeBlob] = {}
+        self.blob_bytes: dict[UUID, bytes] = {}
+        self.sample_feature_sets: dict[tuple[Any, ...], Any] = {}
+        self.capability_sets: dict[tuple[Any, ...], Any] = {}
+        self.code_feature_sets: dict[tuple[Any, ...], Any] = {}
         self.provenance: list[Any] = []
 
 
@@ -71,6 +75,29 @@ class FakeUow:
         self.sample_acquisition_attempts = _AcquisitionAttempts(self.db)
         self.samples = _Samples(self.db)
         self.blobs = _Blobs(self.db)
+        self.sample_feature_sets = _WorkerFeatureSets(
+            self.db.sample_feature_sets,
+            lambda item: (item.sample_id, item.extractor_version, item.parameters_sha256),
+        )
+        self.capability_sets = _WorkerFeatureSets(
+            self.db.capability_sets,
+            lambda item: (
+                item.sample_id,
+                item.tool_version,
+                item.ruleset_sha256,
+                item.parameters_sha256,
+            ),
+        )
+        self.code_feature_sets = _WorkerFeatureSets(
+            self.db.code_feature_sets,
+            lambda item: (
+                item.sample_id,
+                item.tool_version,
+                item.escaper_compatibility_version,
+                item.intel_pic_hash_escape_version,
+                item.parameters_sha256,
+            ),
+        )
         self.provenance = _Provenance(self.db)
         self.investigation_goodware_baselines = _GoodwareBaselines()
         return self
@@ -181,7 +208,7 @@ class _Observations:
     async def append_if_absent(self, observation: EvidenceObservation) -> EvidenceObservation:
         existing = self.db.observations.get(observation.id)
         if existing is not None and existing != observation:
-            raise ValueError("observation ID conflict")
+            return existing
         self.db.observations[observation.id] = observation
         return observation
 
@@ -263,10 +290,47 @@ class _Blobs:
     async def get(self, blob_id: UUID) -> FakeBlob | None:
         return self.db.blobs.get(blob_id)
 
+    async def get_by_address(self, logical_bucket: str, sha256: str) -> FakeBlob | None:
+        return next(
+            (
+                blob
+                for blob in self.db.blobs.values()
+                if blob.descriptor.logical_bucket == logical_bucket
+                and blob.descriptor.sha256 == sha256
+            ),
+            None,
+        )
+
+
+class _WorkerFeatureSets:
+    def __init__(self, rows: dict[tuple[Any, ...], Any], identity: Any) -> None:
+        self.rows = rows
+        self.identity = identity
+
+    async def get(self, *identity: Any) -> Any | None:
+        return self.rows.get(tuple(identity))
+
+    async def add_if_absent(self, feature_set: Any, _blob_id: UUID) -> bool:
+        key = self.identity(feature_set)
+        if key in self.rows:
+            return False
+        self.rows[key] = feature_set
+        return True
+
+    async def index(self, _feature_set: Any) -> None:
+        return None
+
 
 class _Provenance:
     def __init__(self, db: FakeDatabase) -> None:
         self.db = db
+
+    async def list_for_aggregate(self, aggregate_type: str, aggregate_id: UUID) -> tuple[Any, ...]:
+        return tuple(
+            event
+            for event in self.db.provenance
+            if event.aggregate_type == aggregate_type and event.aggregate_id == aggregate_id
+        )
 
     async def append(self, event: Any) -> None:
         self.db.provenance.append(event)
@@ -301,7 +365,16 @@ class FakeBlobCatalog:
             descriptor=FakeBlobDescriptor(logical_bucket, sha256, len(content)),
         )
         self.db.blobs[blob.id] = blob
+        self.db.blob_bytes[blob.id] = content
         return blob
+
+    async def read(self, blob_id: UUID, *, max_bytes: int) -> bytes:
+        content = self.db.blob_bytes.get(blob_id)
+        if content is None:
+            raise FileNotFoundError(blob_id)
+        if len(content) > max_bytes:
+            raise ValueError("fake blob exceeds read limit")
+        return content
 
 
 class FakeVirusTotalPort:
@@ -349,7 +422,7 @@ class FakeEvidenceRecorder:
         )
         self.kinds.append(observation.kind)
         if self.observations is not None:
-            await self.observations.append_if_absent(observation)
+            observation = await self.observations.append_if_absent(observation)
         return observation
 
 
@@ -391,6 +464,7 @@ def make_approved_proposal(
     acquire_hits_allowed: bool = True,
     tlp: TLPLevel | None = TLPLevel.CLEAR,
     do_not_submit: bool = False,
+    external_llm_allowed: bool = False,
     vt_units: int = 20,
     downloads: int = 10,
 ) -> Any:
@@ -409,7 +483,7 @@ def make_approved_proposal(
         disclosure=DisclosureBounds(
             tlp=tlp,
             do_not_submit=do_not_submit,
-            external_llm_allowed=False,
+            external_llm_allowed=external_llm_allowed,
         ),
     )
 

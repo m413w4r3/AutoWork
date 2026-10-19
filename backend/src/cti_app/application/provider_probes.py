@@ -202,7 +202,15 @@ async def offline_preflight() -> ProviderPreflightReport:
     ):
         vt = create_virustotal_http_adapter(
             client=vt_client,
-            settings=Settings(_env_file=None, virustotal_base_url=_VT_BASE_URL),
+            settings=Settings(
+                _env_file=None,
+                virustotal_base_url=_VT_BASE_URL,
+                virustotal_proxy_url="http://offline-proxy.test:8080",
+                virustotal_file_report_enabled=True,
+                virustotal_object_relationships_enabled=True,
+                virustotal_intelligence_search_enabled=True,
+                virustotal_behaviour_reports_enabled=True,
+            ),
             capabilities=VirusTotalCapabilities(
                 file_report=True,
                 file_relationships=True,

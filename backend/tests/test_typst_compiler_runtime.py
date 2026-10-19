@@ -15,6 +15,7 @@ import anyio
 import pytest
 from pypdf import PdfReader
 
+from cti_app.application.production_normalization import normalize_indicator_value
 from cti_app.application.typst_compilation import (
     TYPST_COMPILER_VERSION,
     TypstCompileRequest,
@@ -56,6 +57,10 @@ _FONT_BUNDLE_LOCK = _REPOSITORY_ROOT / "infra" / "typst-fonts.lock"
 _COPYABLE_HASH = "0123456789abcdef" * 4
 _COPYABLE_LONG_URL = "https://example.test/" + "a" * (200 - len("https://example.test/"))
 _COPYABLE_EXACT_URL = "https://micbucket.ams1.vultrobjects.com/Exclude/Telegram.exe"
+_COPYABLE_DEFANGED_LONG_URL = "hxxps://example[.]test/" + "a" * (200 - len("https://example.test/"))
+_COPYABLE_DEFANGED_EXACT_URL = (
+    "hxxps://micbucket[.]ams1[.]vultrobjects[.]com/Exclude/Telegram[.]exe"
+)
 _COPYABLE_WINDOWS_PATH = (
     r"C:\ProgramData\ssh-cache-default{8bda3848-495e-43f4-8d10-7d37a67f1604}\RuntimeSSH.exe"
 )
@@ -64,8 +69,8 @@ _COPYABLE_TABLE_URL = "https://example.test/" + "u" * 99
 _COPYABLE_DEFANGED_URL = "hxxps://a[.]b[.]c"
 _COPYABLE_VALUES = (
     _COPYABLE_HASH,
-    _COPYABLE_LONG_URL,
-    _COPYABLE_EXACT_URL,
+    _COPYABLE_DEFANGED_LONG_URL,
+    _COPYABLE_DEFANGED_EXACT_URL,
     _COPYABLE_WINDOWS_PATH,
     _COPYABLE_REGISTRY_PATH,
     _COPYABLE_TABLE_URL,
@@ -95,7 +100,7 @@ def _copyable_ioc_document():
             tuple(
                 PublicationIndicatorV1(
                     value=value,
-                    normalized_value=value.casefold(),
+                    normalized_value=normalize_indicator_value(value, artifact_type),
                     artifact_type=artifact_type,
                     source_document_ids=(_SOURCE_ID,),
                 )
@@ -518,40 +523,46 @@ async def test_real_typst_wraps_long_tokens_without_overlapping_narrow_table_cel
             check=True,
         )
     root = ET.fromstring(bbox.stdout.decode("utf-8", errors="replace"))
+    pages = [element for element in root.iter() if element.tag.rsplit("}", 1)[-1] == "page"]
     words = [
         (
+            page_index,
             element.text or "",
             float(element.attrib["xMin"]),
             float(element.attrib["yMin"]),
             float(element.attrib["xMax"]),
             float(element.attrib["yMax"]),
         )
-        for element in root.iter()
+        for page_index, page in enumerate(pages)
+        for element in page.iter()
         if element.tag.rsplit("}", 1)[-1] == "word"
     ]
 
-    def find_word(value: str) -> tuple[str, float, float, float, float]:
-        matches = [word for word in words if word[0] == value]
+    def find_word(value: str) -> tuple[int, str, float, float, float, float]:
+        matches = [word for word in words if word[1] == value]
         assert matches, f"rendered PDF is missing word {value!r}"
         return matches[0]
 
     function_header = find_word("Fonction")
     assert any(
-        word[0] == "Composant"
-        and abs(word[2] - function_header[2]) <= 1.5
-        and word[1] < function_header[1]
+        word[0] == function_header[0]
+        and word[1] == "Composant"
+        and abs(word[3] - function_header[3]) <= 1.5
+        and word[2] < function_header[2]
         for word in words
     ), "the first-column header should fit on one line after token wrapping"
     first_header_x = min(
-        word[1]
+        word[2]
         for word in words
-        if abs(word[2] - function_header[2]) <= 1.5 and word[1] < function_header[1]
+        if word[0] == function_header[0]
+        and abs(word[3] - function_header[3]) <= 1.5
+        and word[2] < function_header[2]
     )
     header_starts = [
         first_header_x,
-        function_header[1],
-        find_word("Mécanisme")[1],
-        find_word("Dépendance")[1],
+        function_header[2],
+        find_word("Mécanisme")[2],
+        find_word("Dépendance")[2],
     ]
     row_heads = (
         ("Moteur", "Utilisation", "Clé"),
@@ -563,11 +574,12 @@ async def test_real_typst_wraps_long_tokens_without_overlapping_narrow_table_cel
             left_words = [
                 word
                 for word in words
-                if abs(word[2] - neighbor[2]) <= 1.5
-                and header_starts[column_index] - 0.5 <= word[1] < neighbor[1]
+                if word[0] == neighbor[0]
+                and abs(word[3] - neighbor[3]) <= 1.5
+                and header_starts[column_index] - 0.5 <= word[2] < neighbor[2]
             ]
             assert left_words, f"could not inspect the preceding cell before {right_head!r}"
-            crossing = [word[0] for word in left_words if word[3] > neighbor[1] + 0.2]
+            crossing = [word[1] for word in left_words if word[4] > neighbor[2] + 0.2]
             assert not crossing, (
                 f"text in the cell before {right_head!r} crosses into its column: {crossing!r}"
             )

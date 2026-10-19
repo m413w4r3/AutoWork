@@ -11,6 +11,12 @@ from cti_app.application.analyst_handoff import (
     AnalystPostSynthesisService,
     loop_budget_from_settings,
 )
+from cti_app.application.analyst_opinion_service import (
+    AnalystOpinionService,
+    FindingServiceClaimKnowledgeProvider,
+    OperatorProtocolFigureAttachmentBuilder,
+    register_operator_opinion_tools,
+)
 from cti_app.application.article_novelty import ArticleNoveltyService
 from cti_app.application.behavior_report_import import BehaviorReportImporter
 from cti_app.application.bridge_investigator import (
@@ -33,11 +39,16 @@ from cti_app.application.investigation_acquisition_tools import (
     SampleAnalyzer,
     register_acquisition_tools,
 )
+from cti_app.application.investigation_advisor_tools import (
+    InvestigationAdvisorTool,
+    register_investigation_advisor_tool,
+)
 from cti_app.application.investigation_article_snapshot import ProductionArticleSnapshotAdapter
 from cti_app.application.investigation_extraction_tools import (
     extraction_tool_capabilities,
     register_extraction_tools,
 )
+from cti_app.application.investigation_findings import register_operator_finding_tools
 from cti_app.application.investigation_governance import SampleQualificationService
 from cti_app.application.investigation_local_tools import (
     SampleBytesReader,
@@ -60,7 +71,7 @@ from cti_app.application.investigation_persistence import (
 )
 from cti_app.application.investigation_protocol_tools import (
     ProductionProtocolModelStore,
-    protocol_tool_capabilities,
+    RepositoryProtocolDocumentEvidenceResolver,
     register_protocol_tools,
 )
 from cti_app.application.investigation_retrohunt_tools import (
@@ -96,7 +107,9 @@ from cti_app.application.investigation_tools import (
     RegistryToolDispatcher,
     ToolAdapter,
     ToolDefinition,
+    ToolExecutionContext,
     ToolRegistry,
+    project_tool_availability,
 )
 from cti_app.application.investigation_vt_tools import (
     register_virustotal_tools,
@@ -111,12 +124,14 @@ from cti_app.application.local_analysis import (
 )
 from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.native_analysis import NativeAnalysisService
+from cti_app.application.network_capture_import import capture_max_bytes
 from cti_app.application.network_protocol_model import NetworkProtocolWorkbench
 from cti_app.application.network_workbench import (
     NetworkWorkbench,
     ProductionNetworkCaptureBlobStore,
     QuarantinedCaptureSource,
 )
+from cti_app.application.operator_tool_invocation import OperatorToolInvocationService
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.research_context_builder import (
@@ -150,17 +165,34 @@ from cti_app.application.virustotal import (
     VirusTotalRoutingPolicy,
 )
 from cti_app.application.virustotal_persistence import VirusTotalObservationService
-from cti_app.config import Settings
+from cti_app.config import VIRUSTOTAL_DOWNLOAD_REQUIRED_CDN_HOST, Settings
 from cti_app.domain.goodware import NonDiscriminantPatternRegistry
-from cti_app.domain.investigation import SampleAssociation
+from cti_app.domain.investigation import (
+    InvestigationBudget,
+    SampleAssociation,
+)
 from cti_app.domain.network_protocol import NetworkExtractionLimitsV1
 from cti_app.domain.sample_similarity import CorpusMember, CorpusSnapshot
+from cti_app.domain.virustotal import (
+    VirusTotalCapability,
+    VirusTotalEndpointVariant,
+    VirusTotalTransportKind,
+)
 from cti_app.infrastructure.legitimate_services import load_legitimate_services
 from cti_app.infrastructure.rea_adapter import ReaReadOnlyRunner, build_native_analysis_port
 from cti_app.infrastructure.tshark_adapter import TsharkAdapter
 from cti_app.infrastructure.virustotal import VirusTotalRetrohuntProxyAdapter
 
 LOCAL_READ_CAPABILITY = "investigation.local_read"
+OPERATOR_WRITE_TOOL_NAMES = frozenset(
+    {
+        "finding.propose",
+        "finding.revise",
+        "opinion.compose",
+        "opinion.revise",
+        "opinion.note",
+    }
+)
 OPTIONAL_CAPABILITIES = {
     "virustotal": "investigation.virustotal",
     "shodan": "investigation.shodan",
@@ -170,10 +202,18 @@ OPTIONAL_CAPABILITIES = {
     "acquisition": "investigation.acquisition",
 }
 OPTIONAL_TOOL_NAMES = (
+    "finding.propose",
+    "finding.revise",
+    "opinion.compose",
+    "opinion.revise",
+    "opinion.note",
+    "advisor.consult",
     "vt.file_report",
+    "vt.object_report",
     "vt.relationships",
     "vt.intelligence_search",
     "vt.behaviour",
+    "vt.behaviour_pcap",
     "vt.download_sample",
     "shodan.host",
     "shodan.search",
@@ -204,12 +244,15 @@ OPTIONAL_TOOL_NAMES = (
     "vt.retrohunt.status",
     "vt.retrohunt.results",
     "network.capture.inspect",
+    "network.suricata_replay",
+    "network.suricata_validate_rules",
     "network.stream.reassemble",
     "network.messages.segment",
     "network.protocol.compare",
     "network.protocol.hypothesize",
     "network.protocol.verify",
     "network.protocol.render",
+    "network.protocol.document",
     NATIVE_TOOL_NAME,
 )
 FAMILY_CAPABILITY_KEYS = frozenset(
@@ -227,6 +270,7 @@ FAMILY_CAPABILITY_KEYS = frozenset(
         "network.protocol.hypothesize",
         "network.protocol.verify",
         "network.protocol.render",
+        "network.protocol.document",
         NATIVE_TOOL_NAME,
     }
 )
@@ -573,22 +617,35 @@ def _register_network_tool_family(
 def _register_protocol_tool_family(
     registry: ToolRegistry,
     *,
+    uow: UnitOfWork,
     workbench: NetworkWorkbench | None,
     dependencies: InvestigationToolDependencies,
     recorder: EvidenceRecorder,
     enabled: set[str],
 ) -> None:
-    if workbench is None:
-        return
-
-    protocol_workbench = NetworkProtocolWorkbench(workbench)
+    protocol_workbench = NetworkProtocolWorkbench(workbench) if workbench is not None else None
+    document_evidence = RepositoryProtocolDocumentEvidenceResolver(
+        investigations=uow.analyst_investigations,
+        observations=uow.evidence_observations,
+        findings=uow.investigation_findings,
+        article_snapshots=dependencies.article_snapshots,
+    )
     register_protocol_tools(
         registry,
         service=protocol_workbench,
         recorder=recorder,
         model_store=ProductionProtocolModelStore(dependencies.artifact_store),
+        document_evidence=document_evidence,
     )
-    enabled.update(protocol_tool_capabilities())
+    enabled.update({"network.protocol.render", "network.protocol.document"})
+    if protocol_workbench is not None:
+        enabled.update(
+            {
+                "network.protocol.compare",
+                "network.protocol.hypothesize",
+                "network.protocol.verify",
+            }
+        )
 
 
 def _register_native_tool_family(
@@ -721,11 +778,14 @@ class _PermissionAwareInvestigationTransport:
 @dataclass(frozen=True, slots=True)
 class InvestigationComposition:
     service: InvestigationService
+    operator_tool_invocations: OperatorToolInvocationService
     registry: ToolRegistry
     tool_dependencies: InvestigationToolDependencies
     available_capabilities: frozenset[str]
     available_tools: tuple[str, ...]
     unavailable_tools: tuple[str, ...]
+    unavailable_tool_reasons: Mapping[str, str]
+    advisor_tool: InvestigationAdvisorTool | None = None
 
 
 class _TrackingToolRegistry(InMemoryToolRegistry):
@@ -796,13 +856,74 @@ def investigation_tool_dependencies_from_settings(
 ) -> InvestigationToolDependencies:
     """Apply Settings opt-ins before making optional ports visible to registrars."""
 
+    vt_routing_policy = getattr(virustotal, "_routing_policy", None) or vt_routing_policy
+    vt_proxy_configured = bool(settings.virustotal_proxy_url and settings.virustotal_base_url)
+
+    def vt_route_configured(capability: VirusTotalCapability) -> bool:
+        if virustotal is None or not vt_proxy_configured:
+            return False
+        if vt_routing_policy is None:
+            return False
+        route = vt_routing_policy.route_for(capability)
+        return bool(
+            route is not None
+            and route.primary.transport is VirusTotalTransportKind.PROXY
+            and route.primary.variant is VirusTotalEndpointVariant.V3
+        )
+
+    configured_vt_capabilities = vt_capabilities or VirusTotalCapabilities()
+    download_hosts_configured = (
+        VIRUSTOTAL_DOWNLOAD_REQUIRED_CDN_HOST
+        in settings.virustotal_download_allowed_hosts.split(",")
+    )
+    download_ports_configured = any(
+        port.strip() for port in settings.virustotal_download_allowed_ports.split(",")
+    )
+    vt_capabilities = replace(
+        configured_vt_capabilities,
+        file_report=(
+            configured_vt_capabilities.file_report
+            and settings.virustotal_file_report_enabled
+            and vt_route_configured(VirusTotalCapability.FILE_REPORT)
+        ),
+        file_relationships=(
+            configured_vt_capabilities.file_relationships
+            and settings.virustotal_object_relationships_enabled
+            and vt_route_configured(VirusTotalCapability.FILE_RELATIONSHIPS)
+        ),
+        intelligence_search=(
+            configured_vt_capabilities.intelligence_search
+            and settings.virustotal_intelligence_search_enabled
+            and vt_route_configured(VirusTotalCapability.INTELLIGENCE_SEARCH)
+        ),
+        file_download=(
+            configured_vt_capabilities.file_download
+            and settings.virustotal_file_download_enabled
+            and download_hosts_configured
+            and download_ports_configured
+            and settings.investigation_max_hits_acquired > 0
+            and acquisition is not None
+            and vt_route_configured(VirusTotalCapability.FILE_DOWNLOAD)
+        ),
+        behaviour_reports=(
+            configured_vt_capabilities.behaviour_reports
+            and settings.virustotal_behaviour_reports_enabled
+            and vt_route_configured(VirusTotalCapability.BEHAVIOUR_REPORTS)
+        ),
+        behaviour_pcap=(
+            configured_vt_capabilities.behaviour_pcap
+            and settings.virustotal_behaviour_pcap_enabled
+            and vt_route_configured(VirusTotalCapability.BEHAVIOUR_PCAP)
+        ),
+    )
     vt_enabled = any(
         (
-            settings.virustotal_file_report_enabled,
-            settings.virustotal_object_relationships_enabled,
-            settings.virustotal_intelligence_search_enabled,
-            settings.virustotal_behaviour_reports_enabled,
-            settings.virustotal_file_download_enabled,
+            vt_capabilities.file_report,
+            vt_capabilities.file_relationships,
+            vt_capabilities.intelligence_search,
+            vt_capabilities.behaviour_reports,
+            vt_capabilities.file_download,
+            vt_capabilities.behaviour_pcap,
         )
     )
     shodan_enabled = settings.shodan_api_key is not None and any(
@@ -813,9 +934,7 @@ def investigation_tool_dependencies_from_settings(
             settings.shodan_count_enabled,
         )
     )
-    acquisition_enabled = (
-        settings.virustotal_file_download_enabled and settings.investigation_max_hits_acquired > 0
-    )
+    acquisition_enabled = vt_capabilities.file_download
     enabled_capabilities = set(available_capabilities)
     if not vt_enabled:
         virustotal = None
@@ -828,13 +947,6 @@ def investigation_tool_dependencies_from_settings(
     if not acquisition_enabled:
         acquisition = None
 
-    vt_capabilities = vt_capabilities or VirusTotalCapabilities(
-        file_report=settings.virustotal_file_report_enabled,
-        file_relationships=settings.virustotal_object_relationships_enabled,
-        intelligence_search=settings.virustotal_intelligence_search_enabled,
-        file_download=settings.virustotal_file_download_enabled,
-        behaviour_reports=settings.virustotal_behaviour_reports_enabled,
-    )
     shodan_capabilities = shodan_capabilities or ShodanCapabilities(
         host=settings.shodan_host_enabled,
         search=settings.shodan_search_enabled,
@@ -902,6 +1014,7 @@ def build_investigation_composition(
     optional_tool_ports: OptionalInvestigationToolPorts | None = None,
     tool_registrar: ToolRegistrar | None = None,
     turn_transport: InvestigationTurnTransport | None = None,
+    operator_mode: bool = False,
 ) -> InvestigationComposition:
     article_snapshots = ProductionArticleSnapshotAdapter(uow_factory, artifact_store)
     source_dependencies = tool_dependencies
@@ -1001,6 +1114,7 @@ def build_investigation_composition(
     )
     if base_dependencies.investigation_id != investigation_id:
         raise ValueError("Tool dependencies belong to another investigation")
+    operator_led = operator_mode
 
     if base_dependencies.sample_similarity is None and ports.similarity_artifacts is not None:
         base_dependencies = replace(
@@ -1044,12 +1158,13 @@ def build_investigation_composition(
         )
 
     registry = _TrackingToolRegistry()
+    evidence_summaries = CanonicalEvidenceSummaryPort(artifact_store)
     context_builder = ResearchContextBuilder(
         article_snapshots=base_dependencies.article_snapshots,
         observations=uow.evidence_observations,
         findings=uow.investigation_findings,
         registry=registry,
-        evidence_summaries=CanonicalEvidenceSummaryPort(artifact_store),
+        evidence_summaries=evidence_summaries,
         invocations=uow.tool_invocations,
         opinions=uow.analyst_opinions,
         rule_corpus_inventory=(
@@ -1071,6 +1186,7 @@ def build_investigation_composition(
         article=base_dependencies.article_snapshots,
         feature_packs=base_dependencies.feature_packs,
         graph=graph,
+        evidence_summary=evidence_summaries,
     )
     context_builder.register_local_tools(registry, read_port)
     dependencies = base_dependencies
@@ -1085,6 +1201,13 @@ def build_investigation_composition(
 
     if dependencies.virustotal is not None and dependencies.virustotal_observations is not None:
         vt_capabilities = dependencies.vt_capabilities or VirusTotalCapabilities()
+
+        async def resolve_vt_article(investigation_key: UUID) -> Any:
+            linked = await uow.analyst_investigations.get(investigation_key)
+            if linked is None:
+                raise ValueError("Investigation does not exist")
+            return await dependencies.article_snapshots.resolve(linked.synthesis_artifact_id)
+
         register_virustotal_tools(
             registry,
             virustotal=dependencies.virustotal,
@@ -1092,6 +1215,10 @@ def build_investigation_composition(
             recorder=recorder,
             evidence_observations=uow.evidence_observations,
             findings=uow.investigation_findings,
+            article_snapshot_resolver=resolve_vt_article,
+            capabilities=vt_capabilities,
+            evidence_payloads=artifact_store,
+            max_capture_bytes=capture_max_bytes(settings),
             max_pages=settings.virustotal_max_pages,
             page_size=settings.virustotal_default_page_size,
             max_results=min(settings.virustotal_max_results, 50),
@@ -1295,6 +1422,7 @@ def build_investigation_composition(
     )
     _register_protocol_tool_family(
         registry,
+        uow=uow,
         workbench=network_workbench,
         dependencies=dependencies,
         recorder=recorder,
@@ -1308,23 +1436,101 @@ def build_investigation_composition(
         enabled=enabled,
     )
 
+    advisor_tool: InvestigationAdvisorTool | None = None
+    if operator_led:
+        registry.unregister("sample.set_qualification")
+        register_operator_finding_tools(
+            registry,
+            findings=uow.investigation_findings,
+            observations=uow.evidence_observations,
+            investigations=uow.analyst_investigations,
+            article_snapshots=dependencies.article_snapshots,
+        )
+        opinion_service = AnalystOpinionService(
+            uow_factory=uow_factory,
+            artifact_store=artifact_store,
+            claim_knowledge_provider=FindingServiceClaimKnowledgeProvider(
+                uow_factory=uow_factory,
+                article_snapshots=dependencies.article_snapshots,
+            ),
+            author_id="operator:claude-client",
+        )
+        register_operator_opinion_tools(
+            registry,
+            service=opinion_service,
+            investigations=uow.analyst_investigations,
+            article_snapshots=dependencies.article_snapshots,
+            protocol_figure_builder=OperatorProtocolFigureAttachmentBuilder(
+                uow_factory=uow_factory,
+                artifact_store=artifact_store,
+            ),
+        )
+        # ModelConversationService always exposes conversation persistence
+        # methods, even when no Bridge transport is configured. Only an
+        # explicitly injected turn transport proves the advisor can execute.
+        if turn_transport is not None:
+            advisor_tool = InvestigationAdvisorTool(
+                transport=turn_transport,
+                settings=settings,
+                investigations=uow.analyst_investigations,
+                observations=uow.evidence_observations,
+                findings=uow.investigation_findings,
+                opinions=uow.analyst_opinions,
+                sample_associations=uow.sample_associations,
+                samples=getattr(uow, "samples", None),
+                blobs=getattr(uow, "blobs", None),
+                article_snapshots=dependencies.article_snapshots,
+                artifact_store=artifact_store,
+                registry=registry,
+            )
+            register_investigation_advisor_tool(registry, adapter=advisor_tool)
+
     if tool_registrar is not None:
         tool_registrar(registry, dependencies)
 
-    registered = registry.definitions
-    available_capabilities = frozenset(
+    registered_operator_capabilities = {
         definition.capability_key
-        for definition in registered
-        if definition.capability_key in enabled
-    )
-    available_tools = tuple(
-        sorted(
-            definition.name
-            for definition in registered
-            if definition.capability_key in available_capabilities
+        for definition in getattr(registry, "definitions", ())
+        if definition.name in OPERATOR_WRITE_TOOL_NAMES | {"advisor.consult"}
+    }
+    available_capabilities = frozenset(enabled | registered_operator_capabilities)
+    unavailable_tool_reasons = dict(
+        _unavailable_tool_reasons(
+            OPTIONAL_TOOL_NAMES,
+            dependencies=dependencies,
+            settings=settings,
         )
     )
-    unavailable_tools = tuple(name for name in OPTIONAL_TOOL_NAMES if name not in available_tools)
+    if not operator_led:
+        for name in (
+            "finding.propose",
+            "finding.revise",
+            "opinion.compose",
+            "opinion.revise",
+            "opinion.note",
+            "advisor.consult",
+        ):
+            unavailable_tool_reasons[name] = "operator_mode_required"
+    else:
+        unavailable_tool_reasons["sample.set_qualification"] = "human_qualification_required"
+        if advisor_tool is None:
+            unavailable_tool_reasons["advisor.consult"] = "bridge_transport_unavailable"
+    registry.set_availability_catalog(OPTIONAL_TOOL_NAMES, unavailable_tool_reasons)
+    availability_context = ToolExecutionContext(
+        investigation_id=investigation_id,
+        envelope=None,
+        budget=InvestigationBudget(limits={}),
+        idempotency_key="composition-tool-availability",
+        available_capabilities=available_capabilities,
+        unavailable_tool_reasons=unavailable_tool_reasons,
+    )
+    tool_availability = project_tool_availability(
+        registry,
+        availability_context,
+        known_tool_names=OPTIONAL_TOOL_NAMES,
+    )
+    available_tools = tool_availability.available_names
+    unavailable_tools = tuple(name for name, _reason in tool_availability.unavailable)
     bridge_transport = _PermissionAwareInvestigationTransport(
         turn_transport or ModelConversationTurnTransport(model_conversations)
     )
@@ -1356,12 +1562,113 @@ def build_investigation_composition(
     )
     return InvestigationComposition(
         service=service,
+        operator_tool_invocations=OperatorToolInvocationService(
+            investigation_id=investigation_id,
+            investigations=uow.analyst_investigations,
+            states=uow.investigation_states,
+            envelopes=uow.investigation_envelopes,
+            invocations=uow.tool_invocations,
+            context_builder=context_builder,
+            execution=service,
+            registry=registry,
+            available_capabilities=available_capabilities,
+            unavailable_tool_reasons=unavailable_tool_reasons,
+            observations=uow.evidence_observations,
+            evidence_summaries=evidence_summaries,
+        ),
         registry=registry,
         tool_dependencies=dependencies,
         available_capabilities=available_capabilities,
         available_tools=available_tools,
         unavailable_tools=unavailable_tools,
+        unavailable_tool_reasons=unavailable_tool_reasons,
+        advisor_tool=advisor_tool,
     )
+
+
+def _unavailable_tool_reasons(
+    names: tuple[str, ...],
+    *,
+    dependencies: InvestigationToolDependencies,
+    settings: Settings,
+) -> Mapping[str, str]:
+    """Provide bounded reason codes for optional tools absent from the registry."""
+    execution = dependencies.confined_analysis_execution
+    family_statuses = execution.family_statuses if execution is not None else {}
+
+    def reason_code(value: str | None, fallback: str) -> str:
+        if not isinstance(value, str):
+            return fallback
+        normalized = "_".join(value.strip().lower().split())
+        if (
+            len(normalized) <= 96
+            and normalized
+            and all(char in "abcdefghijklmnopqrstuvwxyz0123456789_.:-" for char in normalized)
+        ):
+            return normalized
+        return fallback
+
+    def worker_reason(family: str, fallback: str) -> str:
+        status = family_statuses.get(family)
+        if status is not None and not status.available and status.available_reason:
+            return reason_code(status.available_reason, fallback)
+        if execution is not None and not execution.available:
+            return reason_code(execution.available_reason, fallback)
+        return fallback
+
+    reasons: dict[str, str] = {}
+    for name in names:
+        if name == "sample.analyze":
+            reason = worker_reason("sample_analysis", "sample_analysis_unavailable")
+        elif name == "sample.extract_obfuscated_strings":
+            reason = worker_reason("floss", "floss_unavailable")
+        elif name == "sample.extract_configuration":
+            reason = worker_reason("mwcp", "configuration_extraction_unavailable")
+        elif name == "local.run_command":
+            reason = (
+                "local_analysis_disabled"
+                if not settings.local_analysis_enabled
+                else worker_reason("local_command", "local_command_unavailable")
+            )
+        elif name.startswith("rule."):
+            if not settings.rule_workbench_enabled:
+                reason = "rule_workbench_disabled"
+            elif dependencies.rule_corpus_bytes is None:
+                reason = "rule_corpus_unavailable"
+            else:
+                reason = worker_reason("yara", "rule_workbench_unavailable")
+        elif name == "network.capture.inspect":
+            reason = (
+                "network_capture_source_unavailable"
+                if dependencies.network_quarantine is None
+                else worker_reason("tshark", "tshark_unavailable")
+            )
+        elif name == "network.suricata_replay":
+            reason = worker_reason("suricata", "suricata_replay_unavailable")
+        elif name == "network.suricata_validate_rules":
+            reason = worker_reason("suricata", "suricata_validate_rules_unavailable")
+        elif name.startswith("network."):
+            reason = "tshark_unavailable" if dependencies.tshark is None else "network_unavailable"
+        elif name.startswith("ghidra."):
+            reason = "ghidra_disabled" if not settings.ghidra_enabled else "ghidra_unavailable"
+        elif name.startswith("vt.retrohunt."):
+            reason = "retrohunt_unavailable"
+        elif name.startswith("vt."):
+            reason = "virustotal_unavailable"
+        elif name.startswith("shodan."):
+            reason = "shodan_unavailable"
+        elif name == NATIVE_TOOL_NAME:
+            reason = "native_analysis_unavailable"
+        elif name == "sandbox.report.import":
+            reason = "behavior_report_import_unavailable"
+        elif name.startswith(("features.", "samples.")) or name == "signatures.candidates":
+            reason = "sample_similarity_unavailable"
+        elif name == "sample.set_qualification":
+            reason = "sample_association_unavailable"
+        else:
+            reason = "dependency_unavailable"
+        reasons[name] = reason_code(reason, "dependency_unavailable")
+    return reasons
 
 
 def build_investigation_service(
@@ -1382,12 +1689,19 @@ class InvestigationCompositionFactory:
     optional_tool_ports: OptionalInvestigationToolPorts | None = None
     tool_registrar: ToolRegistrar | None = None
     turn_transport: InvestigationTurnTransport | None = None
+    tool_dependencies: InvestigationToolDependencies | None = None
 
     @property
     def article_snapshots(self) -> ProductionArticleSnapshotAdapter:
         return ProductionArticleSnapshotAdapter(self.uow_factory, self.artifact_store)
 
-    def build(self, uow: UnitOfWork, investigation_id: UUID) -> InvestigationComposition:
+    def build(
+        self,
+        uow: UnitOfWork,
+        investigation_id: UUID,
+        *,
+        operator_mode: bool = False,
+    ) -> InvestigationComposition:
         return build_investigation_composition(
             uow,
             uow_factory=self.uow_factory,
@@ -1395,7 +1709,9 @@ class InvestigationCompositionFactory:
             model_conversations=self.model_conversations,
             settings=self.settings,
             investigation_id=investigation_id,
+            tool_dependencies=self.tool_dependencies,
             optional_tool_ports=self.optional_tool_ports,
             tool_registrar=self.tool_registrar,
             turn_transport=self.turn_transport,
+            operator_mode=operator_mode,
         )

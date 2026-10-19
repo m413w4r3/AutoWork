@@ -58,6 +58,36 @@ def run_real_headless_selftest() -> None:
         f"PASS real Ghidra {engine.ghidra_version} / Java {engine.java_version}: "
         f"list_imports on generated ELF ({len(imports_data['imports'])} imports)"
     )
+    decompile_result = service.analyze(
+        AnalysisRequest("decompile_function", digest, address="400078", limit=1), sample
+    )
+    decompile_data = decompile_result["data"]
+    if (
+        not isinstance(decompile_data, dict)
+        or decompile_data.get("status") != "succeeded"
+        or not isinstance(decompile_data.get("function"), dict)
+        or not isinstance(decompile_data["function"].get("decompilation"), str)
+        or not decompile_data["function"]["decompilation"].strip()
+    ):
+        raise RuntimeError("Ghidra did not decompile the generated ELF entry point")
+    print(
+        f"PASS real Ghidra {engine.ghidra_version} / Java {engine.java_version}: "
+        "decompile_function on generated ELF entry point"
+    )
+    unsupported_result = service.analyze(
+        AnalysisRequest("decompile_function", digest, address="1", limit=1), sample
+    )
+    unsupported_data = unsupported_result["data"]
+    if (
+        not isinstance(unsupported_data, dict)
+        or unsupported_data.get("status") != "unsupported_function"
+        or unsupported_data.get("reason") != "function_not_found_at_address"
+    ):
+        raise RuntimeError("Ghidra did not classify an absent ELF function precisely")
+    print(
+        f"PASS real Ghidra {engine.ghidra_version} / Java {engine.java_version}: "
+        "unsupported_function on absent ELF address"
+    )
 
 
 if __name__ == "__main__":

@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import copy
+from dataclasses import replace
 from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 
+from cti_app.api.investigation import _operator_status_tool_inventory
+from cti_app.application.confined_analysis import ConfinedAnalysisFamilyStatus
 from cti_app.application.investigation_composition import (
     InvestigationToolDependencies,
     build_investigation_composition,
 )
+from cti_app.application.investigation_contracts import ArticleContextV1
 from cti_app.application.investigation_persistence import (
     InMemoryAnalystOpinionRepository,
     InMemoryEvidenceObservationRepository,
@@ -17,7 +22,10 @@ from cti_app.application.investigation_persistence import (
     InMemorySampleAssociationRepository,
     InMemoryToolInvocationRepository,
 )
-from cti_app.application.investigation_state import InMemoryInvestigationStateRepository
+from cti_app.application.investigation_state import (
+    InMemoryInvestigationStateRepository,
+    InvestigationWorkingState,
+)
 from cti_app.application.investigation_tools import (
     InMemoryToolRegistry,
     RegistryToolDispatcher,
@@ -26,17 +34,38 @@ from cti_app.application.investigation_tools import (
     ToolEffect,
     ToolExecutionContext,
     ToolResult,
+    project_tool_availability,
+)
+from cti_app.application.local_analysis import LocalCommandCatalog, default_local_command_specs
+from cti_app.application.research_context_builder import ArticleSnapshot
+from cti_app.application.virustotal import (
+    VirusTotalCapabilities,
+    VirusTotalOperationRoute,
+    VirusTotalRouteStep,
+    VirusTotalRoutingPolicy,
 )
 from cti_app.config import Settings
 from cti_app.domain.investigation import (
+    AgendaItem,
     BudgetDimension,
+    InvestigationAgenda,
     InvestigationBudget,
     ToolInvocationStatus,
+)
+from cti_app.domain.virustotal import (
+    VirusTotalCapability,
+    VirusTotalEndpointVariant,
+    VirusTotalTransportKind,
 )
 
 
 class _ArticleSnapshots:
+    def __init__(self, snapshot=None) -> None:
+        self.snapshot = snapshot
+
     async def resolve(self, _synthesis_artifact_id):
+        if self.snapshot is not None:
+            return self.snapshot
         return SimpleNamespace(claims=())
 
     async def get_claims(self, _investigation_id, claim_ids=()):
@@ -56,6 +85,19 @@ class _Adapter:
     async def execute(self, _arguments, _context):
         self.calls += 1
         return ToolResult(ToolInvocationStatus.SUCCEEDED, output={"ok": True})
+
+
+class _VirusTotalPort:
+    async def object_report(self, *_args, **_kwargs):
+        raise AssertionError("The test only inspects registration and prompt context")
+
+    async def behaviour_pcap(self, *_args, **_kwargs):
+        raise AssertionError("The test only inspects registration and prompt context")
+
+
+class _VirusTotalObservations:
+    async def store_behaviour_pcap(self, *_args, **_kwargs):
+        raise AssertionError("The test only inspects registration and prompt context")
 
 
 def _uow():
@@ -96,14 +138,389 @@ def test_composition_keeps_built_in_local_capability_without_optional_ports() ->
         "article.get_claims",
         "evidence.get",
         "graph.neighbors",
+        "network.protocol.document",
+        "network.protocol.render",
         "sample.get_feature_pack",
         "sample.set_qualification",
     }
     assert "sample.analyze" in composition.unavailable_tools
-    assert composition.available_capabilities == frozenset({"investigation.local_read"})
+    assert composition.available_capabilities == frozenset(
+        {
+            "investigation.local_read",
+            "network.protocol.document",
+            "network.protocol.render",
+        }
+    )
     assert all(
         not name.startswith(("vt.", "shodan.", "rule.")) for name in composition.available_tools
     )
+
+
+@pytest.mark.asyncio
+async def test_vt_registry_operator_status_and_prompt_share_the_same_tool_names() -> None:
+    investigation_id = uuid4()
+    synthesis_id = uuid4()
+    snapshot = ArticleSnapshot(
+        subject_id=uuid4(),
+        production_run_id=uuid4(),
+        synthesis_artifact_id=synthesis_id,
+        synthesis_sha256="a" * 64,
+        article=ArticleContextV1(
+            short_summary="A bounded investigation context.",
+            claims=(),
+            documented_samples=(),
+            known_chain=(),
+            open_questions=(),
+        ),
+    )
+    artifact_store = SimpleNamespace(read_json=lambda _blob_id: {})
+    route = VirusTotalOperationRoute(
+        primary=VirusTotalRouteStep(
+            transport=VirusTotalTransportKind.PROXY,
+            variant=VirusTotalEndpointVariant.V3,
+        )
+    )
+    capabilities = VirusTotalCapabilities(file_report=True, behaviour_pcap=True)
+    worker_families = {
+        name: ConfinedAnalysisFamilyStatus(name, True, f"{name}-test")
+        for name in (
+            "sample_analysis",
+            "local_command",
+            "yara",
+            "floss",
+            "mwcp",
+            "suricata",
+        )
+    }
+    analysis_worker = SimpleNamespace(
+        available=True,
+        available_reason=None,
+        family_statuses=worker_families,
+    )
+    dependencies = InvestigationToolDependencies(
+        investigation_id=investigation_id,
+        article_snapshots=_ArticleSnapshots(snapshot),
+        observations=InMemoryEvidenceObservationRepository(),
+        findings=InMemoryFindingRepository(),
+        sample_associations=InMemorySampleAssociationRepository(),
+        feature_packs=_FeaturePacks(),
+        artifact_store=artifact_store,
+        virustotal=_VirusTotalPort(),
+        virustotal_observations=_VirusTotalObservations(),
+        vt_capabilities=capabilities,
+        vt_routing_policy=VirusTotalRoutingPolicy(
+            routes={
+                VirusTotalCapability.FILE_REPORT: route,
+                VirusTotalCapability.BEHAVIOUR_PCAP: route,
+            }
+        ),
+        confined_analysis_execution=analysis_worker,
+        local_commands=SimpleNamespace(
+            estimate_budget=lambda _command_id: SimpleNamespace(tool_seconds=1)
+        ),
+        local_command_catalog=LocalCommandCatalog(
+            specs=tuple(
+                replace(spec, requires_filesystem_confinement=True)
+                for spec in default_local_command_specs()
+            ),
+            which=lambda binary: f"/fake/{binary}",
+        ),
+        rule_workbench=SimpleNamespace(),
+        rule_corpus_bytes=SimpleNamespace(),
+        yara_engine=SimpleNamespace(available=True),
+        network_quarantine=SimpleNamespace(read_quarantined_capture=lambda *_args, **_kwargs: None),
+        tshark=SimpleNamespace(available=True, execution=analysis_worker),
+    )
+    settings = Settings.model_construct(
+        virustotal_proxy_url="http://127.0.0.1:9000",
+        virustotal_base_url="http://127.0.0.1:9000/api/v3",
+        virustotal_file_report_enabled=True,
+        virustotal_behaviour_pcap_enabled=True,
+        analysis_worker_enabled=True,
+        local_analysis_enabled=True,
+        rule_workbench_enabled=True,
+        ghidra_enabled=False,
+    )
+    uow = _uow()
+    uow.detection_candidates = SimpleNamespace()
+    composition = build_investigation_composition(
+        uow,
+        uow_factory=lambda: None,
+        artifact_store=artifact_store,
+        model_conversations=SimpleNamespace(),
+        settings=settings,
+        investigation_id=investigation_id,
+        tool_dependencies=dependencies,
+    )
+    budget = InvestigationBudget(limits={})
+    tool_context = ToolExecutionContext(
+        investigation_id=investigation_id,
+        envelope=None,
+        budget=budget,
+        idempotency_key="vt-capability-view-test",
+        available_capabilities=composition.available_capabilities,
+    )
+    state = InvestigationWorkingState(
+        investigation_id=investigation_id,
+        agenda=InvestigationAgenda(
+            items=(
+                AgendaItem(question="Inspect network indicators.", potential=1.0, rank=1),
+                AgendaItem(question="Review sandbox evidence.", potential=0.9, rank=2),
+            )
+        ),
+    )
+    prompt = await composition.service._context_builder.build(
+        investigation_id=investigation_id,
+        synthesis_artifact_id=synthesis_id,
+        state=state,
+        tool_context=tool_context,
+        budget_remaining={},
+        registry=composition.registry,
+    )
+
+    tool_availability = project_tool_availability(composition.registry, tool_context)
+    operator_inventory = await _operator_status_tool_inventory(
+        state=state,
+        composition=composition,
+        envelope=None,
+        invocations=(),
+        observations=(),
+    )
+    registry_names = {item.name for item in composition.registry.list_available(tool_context)}
+    operator_status_names = set(tool_availability.available_names)
+    prompt_names = {item.name for item in prompt.available_tools}
+    composition_names = set(composition.available_tools)
+    assert registry_names == operator_status_names == prompt_names == composition_names
+    assert operator_inventory == (
+        tuple(sorted(prompt_names)),
+        prompt.unavailable_tools,
+    )
+    assert {
+        "sample.analyze",
+        "local.run_command",
+        "rule.propose",
+        "rule.test",
+        "rule.revise",
+        "rule.compare",
+        "network.capture.inspect",
+        "network.suricata_replay",
+        "network.suricata_validate_rules",
+        "vt.file_report",
+        "vt.object_report",
+        "vt.behaviour_pcap",
+    } <= registry_names
+    assert "vt.behaviour" in composition.unavailable_tools
+    assert "vt.behaviour:virustotal_unavailable" in prompt.unavailable_tools
+    assert "sample.extract_obfuscated_strings:floss_unavailable" in prompt.unavailable_tools
+    assert "sample.extract_configuration:configuration_extraction_unavailable" in (
+        prompt.unavailable_tools
+    )
+
+    denied = await composition.service._dispatcher.dispatch(
+        tool_context,
+        tool_name="vt.behaviour",
+        schema_version="1",
+        arguments={},
+        purpose="Check an unavailable capability is rejected by the dispatcher.",
+        operation_key="unavailable-vt-behaviour",
+    )
+    assert denied.status is ToolInvocationStatus.UNAVAILABLE
+    assert "virustotal_unavailable" in denied.message
+
+
+@pytest.mark.asyncio
+async def test_attested_worker_controls_analysis_tool_prompt_registry_and_operator_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cti_app.infrastructure import investigation_runtime_ports as runtime_ports
+    from cti_app.infrastructure.investigation_runtime_ports import (
+        build_investigation_runtime_composition_factory,
+    )
+    from tests.confined_worker_harness import build_confined_worker_harness
+    from tests.test_investigation_runtime_ports import _runtime_inputs
+
+    investigation_id = uuid4()
+    synthesis_id = uuid4()
+    settings = Settings(
+        _env_file=None,
+        analysis_worker_enabled=True,
+        local_analysis_enabled=True,
+        rule_workbench_enabled=True,
+    )
+    runtime_inputs = _runtime_inputs(settings)
+    worker = build_confined_worker_harness(
+        settings=settings,
+        uow_factory=runtime_inputs["uow_factory"],  # type: ignore[arg-type]
+        artifact_store=runtime_inputs["artifact_store"],  # type: ignore[arg-type]
+    )
+    runtime_inputs["confined_analysis_execution"] = worker.port
+
+    async def read_capture(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    runtime_inputs["network_quarantine"] = SimpleNamespace(read_quarantined_capture=read_capture)
+
+    class _UnconfinedRunner:
+        filesystem_confined = False
+        namespace_reason = "bwrap_userns_refused_by_kernel"
+
+    monkeypatch.setattr(runtime_ports, "LocalCommandRunner", lambda **_kwargs: _UnconfinedRunner())
+    runtime = build_investigation_runtime_composition_factory(**runtime_inputs)
+    uow = _uow()
+    uow.detection_candidates = SimpleNamespace()
+    composition = runtime.composition_factory.build(uow, investigation_id)
+    assert runtime.ports.optional_tool_ports.confined_analysis_execution is worker.port
+    runtime_families = {item.family: item for item in runtime.ports.statuses}
+    assert runtime_families["local_filesystem_confinement"].state.value == "unavailable"
+    assert runtime_families["local_command_execution"].execution_mode == "analysis-worker"
+
+    snapshot = ArticleSnapshot(
+        subject_id=uuid4(),
+        production_run_id=uuid4(),
+        synthesis_artifact_id=synthesis_id,
+        synthesis_sha256="b" * 64,
+        article=ArticleContextV1(
+            short_summary="A bounded worker capability test.",
+            claims=(),
+            documented_samples=(),
+            known_chain=(),
+            open_questions=(),
+        ),
+    )
+    composition.service._context_builder.article_snapshots = _ArticleSnapshots(snapshot)
+    state = InvestigationWorkingState(
+        investigation_id=investigation_id,
+        agenda=InvestigationAgenda(
+            items=(
+                AgendaItem(question="Inspect sample features.", potential=1.0, rank=1),
+                AgendaItem(question="Compare related evidence.", potential=0.5, rank=2),
+            )
+        ),
+    )
+    tool_context = ToolExecutionContext(
+        investigation_id=investigation_id,
+        envelope=None,
+        budget=InvestigationBudget(limits={}),
+        idempotency_key="attested-worker-tool-parity",
+        available_capabilities=composition.available_capabilities,
+    )
+    prompt = await composition.service._context_builder.build(
+        investigation_id=investigation_id,
+        synthesis_artifact_id=synthesis_id,
+        state=state,
+        tool_context=tool_context,
+        budget_remaining={},
+        registry=composition.registry,
+    )
+    tool_availability = project_tool_availability(composition.registry, tool_context)
+    operator_inventory = await _operator_status_tool_inventory(
+        state=state,
+        composition=composition,
+        envelope=None,
+        invocations=(),
+        observations=(),
+    )
+    registry_names = {item.name for item in composition.registry.list_available(tool_context)}
+    prompt_names = {item.name for item in prompt.available_tools}
+    assert registry_names == set(tool_availability.available_names) == prompt_names
+    assert operator_inventory == (tuple(sorted(prompt_names)), prompt.unavailable_tools)
+
+    expected_families = {
+        "sample.analyze": "sample_analysis",
+        "sample.extract_obfuscated_strings": "floss",
+        "local.run_command": "local_command",
+        "rule.propose": "yara",
+        "rule.test": "yara",
+        "rule.revise": "yara",
+        "rule.compare": "yara",
+        "rule.propose_from_candidates": "yara",
+        "network.capture.inspect": "tshark",
+        "network.suricata_replay": "suricata",
+        "network.suricata_validate_rules": "suricata",
+    }
+    assert set(expected_families) <= set(composition.available_tools) | set(
+        composition.unavailable_tools
+    )
+    for name, family in expected_families.items():
+        worker_status = worker.attestation.families.get(family)
+        if worker_status is not None and worker_status.available:
+            assert name in composition.available_tools
+        else:
+            assert name in composition.unavailable_tools
+            assert composition.unavailable_tool_reasons[name] == (
+                worker_status.available_reason
+                if worker_status is not None and worker_status.available_reason
+                else worker.attestation.available_reason or f"{family}_unavailable"
+            )
+
+    unavailable_families = {
+        family: ConfinedAnalysisFamilyStatus(
+            family,
+            False,
+            status.version,
+            f"{family}_missing_from_worker_probe",
+        )
+        for family, status in worker.attestation.families.items()
+    }
+    unavailable_port = copy.copy(worker.port)
+    unavailable_port._attestation = replace(
+        worker.attestation,
+        families=unavailable_families,
+    )
+    unavailable_inputs = dict(runtime_inputs)
+    unavailable_inputs["confined_analysis_execution"] = unavailable_port
+    unavailable_runtime = build_investigation_runtime_composition_factory(**unavailable_inputs)
+    unavailable_uow = _uow()
+    unavailable_uow.detection_candidates = SimpleNamespace()
+    unavailable_composition = unavailable_runtime.composition_factory.build(
+        unavailable_uow, investigation_id
+    )
+    assert set(expected_families) <= set(unavailable_composition.unavailable_tools)
+    for name, family in expected_families.items():
+        assert unavailable_composition.unavailable_tool_reasons[name] == (
+            f"{family}_missing_from_worker_probe"
+        )
+
+    unavailable_composition.service._context_builder.article_snapshots = _ArticleSnapshots(snapshot)
+    unavailable_context = ToolExecutionContext(
+        investigation_id=investigation_id,
+        envelope=None,
+        budget=InvestigationBudget(limits={}),
+        idempotency_key="unattested-worker-tool-parity",
+        available_capabilities=unavailable_composition.available_capabilities,
+    )
+    unavailable_prompt = await unavailable_composition.service._context_builder.build(
+        investigation_id=investigation_id,
+        synthesis_artifact_id=synthesis_id,
+        state=state,
+        tool_context=unavailable_context,
+        budget_remaining={},
+        registry=unavailable_composition.registry,
+    )
+    unavailable_tool_availability = project_tool_availability(
+        unavailable_composition.registry, unavailable_context
+    )
+    unavailable_operator_inventory = await _operator_status_tool_inventory(
+        state=state,
+        composition=unavailable_composition,
+        envelope=None,
+        invocations=(),
+        observations=(),
+    )
+    unavailable_registry_names = {
+        item.name for item in unavailable_composition.registry.list_available(unavailable_context)
+    }
+    assert (
+        unavailable_registry_names
+        == set(unavailable_tool_availability.available_names)
+        == {item.name for item in unavailable_prompt.available_tools}
+    )
+    assert unavailable_operator_inventory == (
+        tuple(sorted(unavailable_registry_names)),
+        unavailable_prompt.unavailable_tools,
+    )
+    for name, family in expected_families.items():
+        assert f"{name}:{family}_missing_from_worker_probe" in unavailable_prompt.unavailable_tools
 
 
 @pytest.mark.asyncio

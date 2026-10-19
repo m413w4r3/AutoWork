@@ -20,6 +20,7 @@ from cti_app.application.local_analysis import (
 from cti_app.domain.local_analysis import (
     LocalAnalysisFileType,
     LocalCommandId,
+    LocalCommandResult,
     LocalCommandSpec,
     LocalCommandStatus,
 )
@@ -320,7 +321,8 @@ async def test_extraction_specs_require_filesystem_confinement_and_skip_version_
                 assert result.detail_code == "filesystem_confinement_required"
             assert not version_marker.exists()
             assert all(
-                not spec.requires_filesystem_confinement for spec in default_local_command_specs()
+                spec.requires_filesystem_confinement is (spec.id is LocalCommandId.MONODIS)
+                for spec in default_local_command_specs()
             )
     finally:
         detect_network_namespace.cache_clear()
@@ -541,6 +543,81 @@ async def test_output_limit_is_reported_as_truncated(tmp_path: Path) -> None:
     assert result.status is LocalCommandStatus.OUTPUT_TRUNCATED
     assert len(result.output.encode()) <= spec.max_output_bytes
     assert result.archive_record()["sample_sha256"] == _sha256(payload)
+
+
+def test_typed_catalog_includes_bounded_hex_and_hash_commands() -> None:
+    specs = {spec.id: spec for spec in default_local_command_specs()}
+
+    assert LocalCommandId.XXD in specs
+    assert LocalCommandId.SHA256SUM in specs
+    xxd_options = {option.name: option for option in specs[LocalCommandId.XXD].allowed_options}
+    sha256_options = {
+        option.name: option for option in specs[LocalCommandId.SHA256SUM].allowed_options
+    }
+    assert xxd_options["length"].maximum == 4096
+    assert xxd_options["offset"].minimum == 0
+    assert sha256_options["offset"].optional is True
+    assert sha256_options["length"].optional is True
+
+
+@pytest.mark.asyncio
+async def test_strings_accepts_a_bounded_byte_range_and_reads_only_that_range() -> None:
+    sample = b"prefix-MARKER-suffix"
+    samples = _Samples(sample)
+
+    class _RangeRunner:
+        def __init__(self) -> None:
+            self.sample_bytes: bytes | None = None
+
+        async def run(self, capability, *, sample_sha256, sample_bytes, options):
+            del options
+            self.sample_bytes = sample_bytes
+            return LocalCommandResult(
+                command_id=capability.spec.id,
+                status=LocalCommandStatus.SUCCEEDED,
+                sample_sha256=sample_sha256,
+                output=sample_bytes.decode(),
+                normalized_command=("strings",),
+            )
+
+    runner = _RangeRunner()
+    strings_spec = next(
+        spec for spec in default_local_command_specs() if spec.id is LocalCommandId.STRINGS
+    )
+    catalog = LocalCommandCatalog(
+        specs=(strings_spec,),
+        which=lambda _: "/usr/bin/strings",
+    )
+    service = LocalCommandService(samples, runner, catalog, enabled=True)
+
+    result = await service.run(
+        LocalCommandId.STRINGS,
+        _sha256(sample),
+        {"offset": 7, "length": 6},
+    )
+
+    assert result.status is LocalCommandStatus.SUCCEEDED
+    assert runner.sample_bytes == b"MARKER"
+    assert result.output == "MARKER"
+
+
+@pytest.mark.asyncio
+async def test_strings_rejects_unpaired_or_oversized_ranges_with_actionable_reasons() -> None:
+    sample = b"small harmless fixture"
+    samples = _Samples(sample)
+    spec = next(spec for spec in default_local_command_specs() if spec.id is LocalCommandId.STRINGS)
+    catalog = LocalCommandCatalog(specs=(spec,), which=lambda _: "/usr/bin/strings")
+    service = LocalCommandService(samples, LocalCommandRunner(), catalog, enabled=True)
+
+    unpaired = await service.run(LocalCommandId.STRINGS, _sha256(sample), {"offset": 0})
+    oversized = await service.run(
+        LocalCommandId.STRINGS,
+        _sha256(sample),
+        {"offset": 0, "length": 1_048_577},
+    )
+
+    assert unpaired.detail_code == "range_options_must_be_paired"
+    assert oversized.detail_code == "integer_option_above_maximum"
 
 
 @pytest.mark.asyncio

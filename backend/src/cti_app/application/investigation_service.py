@@ -105,6 +105,7 @@ from cti_app.domain.investigation import (
     InvestigationAgenda,
     InvestigationBudget,
     InvestigationEnvelope,
+    InvestigationExecutionMode,
     InvestigationFinding,
     NoveltyClass,
     ToolInvocation,
@@ -136,6 +137,7 @@ _OPINION_NAMESPACE = UUID("f141ae8e-999c-4a7f-b07d-5ffb0bd7b86d")
 _INVOCATION_RECONCILIATION_NAMESPACE = UUID("ac8d1f15-c6ca-4808-97db-d3b63d34f851")
 _INVALID_BRIDGE_ACTION_PREFIX = "bridge_invalid_output:"
 MAX_OPINION_DRAFT_CORRECTIONS = 2
+MAX_SAMPLE_ANALYSIS_FINISH_REFUSALS = 2
 MAX_IDENTICAL_DEFINITE_TOOL_FAILURES = 2
 MAX_STATE_VERSION_CONFLICT_RETRIES = 4
 _RECENT_ACTIONS_LIMIT = 32
@@ -186,7 +188,12 @@ class ProductionArtifactObservationWriter:
             result.status is ToolInvocationStatus.UNAVAILABLE
             and download_refusal_object_type is not None
         )
-        if result.observation_refs and not provider_auth_refusal and not provider_download_refusal:
+        if (
+            result.observation_refs
+            and invocation.tool_name not in {"vt.download_sample", "sample.analyze"}
+            and not provider_auth_refusal
+            and not provider_download_refusal
+        ):
             return ()
         safe_result = _sanitize_json(thaw_json(result.output))
         if not safe_result:
@@ -207,9 +214,18 @@ class ProductionArtifactObservationWriter:
             object_type=(
                 PROVIDER_AUTHORIZATION_REFUSAL_OBJECT_TYPE
                 if provider_auth_refusal
-                else download_refusal_object_type or "tool_call"
+                else download_refusal_object_type
+                or (
+                    "tool_result"
+                    if invocation.tool_name in {"vt.download_sample", "sample.analyze"}
+                    else "tool_call"
+                )
             ),
-            object_id=invocation.operation_key,
+            object_id=(
+                invocation.tool_name
+                if invocation.tool_name in {"vt.download_sample", "sample.analyze"}
+                else invocation.operation_key
+            ),
             limitations=("Tool output is untrusted provider or analysis data.",),
             invocation_ref=invocation.id,
             idempotency_key=f"tool_call:{invocation.operation_key}",
@@ -297,6 +313,23 @@ class InvestigationService:
         owner = getattr(commit_uow, "__self__", None)
         self._audit_decisions = audit_decisions or getattr(owner, "analyst_decisions", None)
 
+    @property
+    def available_capabilities(self) -> frozenset[str]:
+        return self._available_capabilities
+
+    @staticmethod
+    def external_llm_allowed(
+        snapshot: ArticleSnapshot, envelope: InvestigationEnvelope | None
+    ) -> bool:
+        return InvestigationService._external_allowed(snapshot, envelope)
+
+    @staticmethod
+    def unapproved_budget_for(investigation: AnalystInvestigation) -> InvestigationBudget:
+        return InvestigationService._unapproved_budget(investigation)
+
+    async def commit_current_uow(self) -> None:
+        await self._commit_current_uow()
+
     async def start(
         self,
         *,
@@ -308,6 +341,7 @@ class InvestigationService:
         envelope: InvestigationEnvelope | None,
         agenda: InvestigationAgenda | None = None,
         hypotheses: tuple[Hypothesis, ...] = (),
+        execution_mode: InvestigationExecutionMode | None = None,
         uow: Any | None = None,
     ) -> InvestigationWorkingState:
         """Create/reuse the post-synthesis investigation and its version-one state."""
@@ -326,6 +360,8 @@ class InvestigationService:
             raise ValueError("Post-synthesis handoff does not point to the requested synthesis")
         existing_state = await self._states.get(investigation.id)
         if existing_state is not None:
+            if execution_mode is not None and existing_state.execution_mode is not execution_mode:
+                raise ValueError("Investigation execution mode is immutable after state creation")
             return existing_state
         if envelope is not None and envelope.investigation_id != investigation.id:
             raise ValueError("Investigation envelope belongs to another investigation")
@@ -350,6 +386,7 @@ class InvestigationService:
             hypotheses=hypotheses,
             base_publication_artifact_id=snapshot.base_publication_artifact_id,
             base_publication_sha256=snapshot.base_publication_sha256,
+            execution_mode=execution_mode or InvestigationExecutionMode.BRIDGE_LED,
         )
         await self._states.save_if_version(state, expected_version=None)
         if investigation.status is AnalystInvestigationStatus.QUEUED:
@@ -368,7 +405,11 @@ class InvestigationService:
         if expected_version is not None and state.version != expected_version:
             raise InvestigationStateVersionConflict("Investigation state version changed")
         investigation = await self._require_investigation(investigation_id)
-        if owner_job_terminal and state.pending_context_sha256 is not None:
+        if (
+            state.execution_mode is InvestigationExecutionMode.BRIDGE_LED
+            and owner_job_terminal
+            and state.pending_context_sha256 is not None
+        ):
             attempt = investigation_bridge_attempt(state.recent_actions, state.turn_index)
             disposition = await self._bridge.reconcile_orphaned_turn(
                 investigation_id=investigation_id,
@@ -476,6 +517,8 @@ class InvestigationService:
     async def run(self, investigation_id: UUID) -> InvestigationWorkingState:
         state = await self._require_state(investigation_id)
         investigation = await self._require_investigation(investigation_id)
+        if state.execution_mode is InvestigationExecutionMode.OPERATOR_LED:
+            return state
         if state.stop_reason is not None:
             return state
         if investigation.status is AnalystInvestigationStatus.QUEUED:
@@ -543,9 +586,19 @@ class InvestigationService:
             stopped = await self._requested_stop(investigation_id)
             if stopped is not None:
                 return stopped
-            allowed = self._external_allowed(snapshot, envelope)
+            allowed = self.external_llm_allowed(snapshot, envelope)
             if not allowed:
                 # Context construction is the local read path; no model transport runs.
+                action = self._external_policy_block_action(snapshot, envelope, state.turn_index)
+                if action not in state.recent_actions:
+                    updated = replace(
+                        state,
+                        version=state.version + 1,
+                        recent_actions=(*state.recent_actions, action)[-_RECENT_ACTIONS_LIMIT:],
+                    )
+                    await self._save_state(state, updated)
+                    await self._commit_current_uow()
+                    state = updated
                 return await self.conclude(investigation_id, StopReason.MODEL_UNAVAILABLE)
 
             async def before_bridge_submission(
@@ -861,6 +914,83 @@ class InvestigationService:
                         )
                         await self._save_state(latest_state, recorded)
                         await self._commit_current_uow()
+                pending_samples = _pending_sample_analysis(
+                    context,
+                    await self._invocations.list_for_investigation(investigation_id),
+                )
+                analysis_tools = tuple(
+                    item.name
+                    for item in context.available_tools
+                    if item.name == "sample.analyze" or item.name.startswith("ghidra.")
+                )
+                if pending_samples and analysis_tools:
+                    current_envelope = await self._envelopes.get(investigation_id)
+                    remaining_turns = (
+                        current_envelope.budget.remaining.get(BudgetDimension.BRIDGE_TURNS)
+                        if current_envelope is not None
+                        else budget.remaining.get(BudgetDimension.BRIDGE_TURNS)
+                    )
+                    explicit_reason = _sample_blocked_reason(decision.reasoning_summary)
+                    sample_invocations = tuple(
+                        item
+                        for item in await self._invocations.list_for_investigation(investigation_id)
+                        if item.tool_name == "sample.analyze"
+                        or item.tool_name.startswith("ghidra.")
+                    )
+                    engine_unavailable = explicit_reason == "engine_unavailable" and all(
+                        all(
+                            (
+                                latest := _latest_applicable_analysis_invocation(
+                                    sample_invocations,
+                                    association_id=association_id,
+                                    sample_sha256=sample_sha256,
+                                    tool_name=tool_name,
+                                )
+                            )
+                            is not None
+                            and latest.status is ToolInvocationStatus.UNAVAILABLE
+                            for tool_name in analysis_tools
+                        )
+                        for association_id, sample_sha256 in pending_samples
+                    )
+                    if remaining_turns != 0 and not engine_unavailable:
+                        fingerprint = hashlib.sha256(
+                            "|".join(
+                                f"{association_id}:{sample_sha256}"
+                                for association_id, sample_sha256 in pending_samples
+                            ).encode("utf-8")
+                        ).hexdigest()[:16]
+                        refusal_count = _sample_finish_refusal_count(
+                            latest_state.recent_actions, fingerprint
+                        )
+                        if refusal_count < MAX_SAMPLE_ANALYSIS_FINISH_REFUSALS:
+                            association_ids = ", ".join(
+                                association_id for association_id, _sha256 in pending_samples
+                            )
+                            next_analysis_step = (
+                                "call sample.analyze with association_id and evidence_refs"
+                                if "sample.analyze" in analysis_tools
+                                else "call an available ghidra.* tool with the sample_sha256"
+                            )
+                            correction = (
+                                "finish_gate: acquired samples remain unanalyzed; "
+                                f"{next_analysis_step} for "
+                                f"{association_ids}. Refusal "
+                                f"{refusal_count + 1}/{MAX_SAMPLE_ANALYSIS_FINISH_REFUSALS}."
+                            )
+                            corrected = replace(
+                                latest_state,
+                                version=latest_state.version + 1,
+                                recent_actions=(
+                                    *latest_state.recent_actions,
+                                    f"finish_gate_refused:{fingerprint}:{refusal_count + 1}",
+                                    correction,
+                                )[-32:],
+                            )
+                            await self._save_state(latest_state, corrected)
+                            await self._commit_current_uow()
+                            state = corrected
+                            continue
                 return await self.conclude(investigation_id, StopReason.AGENT_FINISHED)
             if next_action is AgentNextAction.REQUEST_PERMISSION:
                 return await self.conclude(investigation_id, StopReason.PERMISSION_REQUIRED)
@@ -873,6 +1003,213 @@ class InvestigationService:
             state = latest_state
         # Bound one worker invocation; the investigation remains resumable and active.
         return state
+
+    async def execute_tool_call(
+        self,
+        *,
+        investigation: AnalystInvestigation,
+        envelope: InvestigationEnvelope | None,
+        budget: InvestigationBudget,
+        state: InvestigationWorkingState,
+        tool_name: str,
+        schema_version: str,
+        arguments: Mapping[str, Any],
+        purpose: str,
+        operation_key: str,
+        check_stop_before_dispatch: bool = True,
+    ) -> tuple[ToolInvocation, ToolResult, tuple[UUID, ...], bool]:
+        """Persist budget and RUNNING invocation before using the shared dispatcher."""
+        registered = self._registry.get(tool_name, schema_version)
+        definition = registered[0] if registered else None
+        cost = thaw_json(definition.cost_model) if definition is not None else {}
+        external_effect = definition is not None and definition.effect in {
+            ToolEffect.EXTERNAL_READ,
+            ToolEffect.ACQUIRE,
+            ToolEffect.EXTERNAL_ACTIVE,
+            ToolEffect.EXTERNAL_SUBMIT,
+        }
+        try:
+            budget.reserve(operation_key, cost)
+        except BudgetExceeded:
+            # The dispatcher repeats the budget preflight and returns a typed result.
+            pass
+        invocation = ToolInvocation(
+            investigation_id=investigation.id,
+            operation_key=operation_key,
+            tool_name=tool_name,
+            schema_version=schema_version,
+            normalized_parameters=arguments,
+            purpose=purpose,
+            reserved_budget=cost,
+        )
+        invocation = await self._invocations.add_if_absent(invocation)
+        if invocation.status is ToolInvocationStatus.PENDING:
+            running = invocation.transition(ToolInvocationStatus.RUNNING)
+            invocation = await self._invocations.update_if_version(
+                running, expected_version=invocation.version
+            )
+        else:
+            # A durable record wins over dispatcher memory. Never turn an existing
+            # invocation into a second external call.
+            if invocation.status is ToolInvocationStatus.RUNNING:
+                reviewed = invocation.transition(ToolInvocationStatus.NEEDS_REVIEW)
+                invocation = await self._invocations.update_if_version(
+                    reviewed, expected_version=invocation.version
+                )
+                await self._commit_current_uow()
+                return (
+                    invocation,
+                    ToolResult(
+                        status=ToolInvocationStatus.NEEDS_REVIEW,
+                        observation_refs=invocation.response_refs,
+                        message="Prior tool attempt needs reconciliation; it was not redispatched.",
+                        error_code="invocation_needs_review",
+                    ),
+                    invocation.response_refs,
+                    external_effect,
+                )
+            return (
+                invocation,
+                ToolResult(
+                    status=invocation.status,
+                    observation_refs=invocation.response_refs,
+                    message="Reused durable tool invocation; it was not redispatched.",
+                ),
+                invocation.response_refs,
+                False,
+            )
+
+        if envelope is not None:
+            envelope = await self._save_envelope_version(envelope)
+            budget = envelope.budget
+        # The RUNNING journal and its reservation are committed before the effect.
+        await self._commit_current_uow()
+
+        if check_stop_before_dispatch:
+            stopped = await self._requested_stop(investigation.id)
+            if stopped is not None:
+                budget.release(operation_key)
+                cancelled = invocation.transition(ToolInvocationStatus.FAILED)
+                invocation = await self._invocations.update_if_version(
+                    cancelled, expected_version=invocation.version
+                )
+                if envelope is not None:
+                    current_envelope = await self._envelopes.get(investigation.id)
+                    if current_envelope is not None:
+                        current_envelope.budget.release(operation_key)
+                        await self._save_envelope_version(current_envelope)
+                await self._commit_current_uow()
+                failure = ToolResult(
+                    status=ToolInvocationStatus.FAILED,
+                    exception_class="OperatorInterruption",
+                    error_code="operator_interrupted_before_tool_dispatch",
+                )
+                _log_terminal_tool_failure(invocation, failure)
+                return invocation, failure, (), external_effect
+
+        tool_budget = _copy_investigation_budget(budget)
+        tool_envelope = replace(envelope, budget=tool_budget) if envelope is not None else None
+        tool_context = ToolExecutionContext(
+            investigation_id=investigation.id,
+            envelope=tool_envelope,
+            budget=tool_budget,
+            idempotency_key=operation_key,
+            available_capabilities=self._available_capabilities,
+        )
+        result = await self._dispatcher.dispatch(
+            tool_context,
+            tool_name=tool_name,
+            schema_version=schema_version,
+            arguments=arguments,
+            purpose=purpose,
+            operation_key=operation_key,
+        )
+        uncertain_external = external_effect and (
+            (
+                result.status is ToolInvocationStatus.FAILED
+                and not _confirmed_external_non_execution(result)
+            )
+            or (
+                result.status is ToolInvocationStatus.NEEDS_REVIEW
+                and not result.output.get("request_permission", False)
+            )
+        )
+        if (
+            external_effect
+            and result.status is ToolInvocationStatus.FAILED
+            and not _confirmed_external_non_execution(result)
+        ):
+            result = replace(
+                result,
+                status=ToolInvocationStatus.NEEDS_REVIEW,
+                message=(
+                    "The external operation returned without a confirmed outcome; "
+                    "reconcile it before resuming. " + result.message
+                )[:2_000],
+            )
+        confirmed_partial_external_result = (
+            result.status is ToolInvocationStatus.UNAVAILABLE
+            and result.output.get("confirmed_non_execution") is True
+            and any(amount > 0 for amount in result.budget_consumed.values())
+        )
+        if (
+            result.status
+            in {
+                ToolInvocationStatus.UNAVAILABLE,
+                ToolInvocationStatus.POLICY_DENIED,
+            }
+            and not confirmed_partial_external_result
+        ):
+            budget.release(operation_key)
+        try:
+            persisted_observations = await self._persist_result_observations(invocation, result)
+        except Exception as exc:
+            valid_refs = await self._valid_observation_refs(
+                investigation.id, result.observation_refs
+            )
+            reviewed = invocation.transition(
+                ToolInvocationStatus.NEEDS_REVIEW,
+                response_refs=valid_refs,
+                consumed_budget={},
+            )
+            invocation = await self._invocations.update_if_version(
+                reviewed, expected_version=invocation.version
+            )
+            await self._commit_current_uow()
+            _log_terminal_tool_failure(
+                invocation,
+                result,
+                exception_class=type(exc).__name__,
+                error_code="tool_observation_persistence_failed",
+            )
+            return invocation, result, valid_refs, True
+        result_refs = list(result.observation_refs)
+        result_refs.extend(item.id for item in persisted_observations)
+        valid_refs = await self._valid_observation_refs(
+            investigation.id, tuple(dict.fromkeys(result_refs))
+        )
+        terminal = invocation.transition(
+            result.status,
+            response_refs=valid_refs,
+            consumed_budget=(
+                {}
+                if uncertain_external
+                else _actual_tool_consumption(tool_context.budget, operation_key, result)
+            ),
+        )
+        invocation = await self._invocations.update_if_version(
+            terminal, expected_version=invocation.version
+        )
+        await self._complete_tool_reservation(
+            investigation_id=investigation.id,
+            operation_key=operation_key,
+            result=result,
+            reserved_amounts=invocation.reserved_budget,
+            uncertain=uncertain_external,
+        )
+        await self._commit_current_uow()
+        _log_terminal_tool_failure(invocation, result)
+        return invocation, result, valid_refs, uncertain_external
 
     async def _process_turn(
         self,
@@ -1119,179 +1456,22 @@ class InvestigationService:
                     return state, stop
                 continue
 
-            cost = thaw_json(definition.cost_model) if definition else {}
-            try:
-                budget.reserve(operation_key, cost)
-            except BudgetExceeded:
-                # The dispatcher repeats the preflight and returns a typed result.
-                pass
-            invocation = ToolInvocation(
-                investigation_id=investigation.id,
-                operation_key=operation_key,
-                tool_name=proposed.tool_name,
-                schema_version=proposed.schema_version,
-                normalized_parameters=proposed.arguments,
-                purpose=proposed.purpose,
-                reserved_budget=cost,
-            )
-            invocation = await self._invocations.add_if_absent(invocation)
-            if invocation.status is ToolInvocationStatus.PENDING:
-                running = invocation.transition(ToolInvocationStatus.RUNNING)
-                invocation = await self._invocations.update_if_version(
-                    running, expected_version=invocation.version
-                )
-            elif invocation.status in {
-                ToolInvocationStatus.SUCCEEDED,
-                ToolInvocationStatus.EMPTY,
-            }:
-                observation_ids.extend(invocation.response_refs)
-                if set(invocation.response_refs).difference(state.last_seen_evidence_ids):
-                    progress = True
-                action_summaries.append(
-                    _action_summary(invocation.tool_name, invocation.status, "replayed")
-                )
-                continue
-            else:
-                return state, StopReason.SUBMISSION_NEEDS_REVIEW
-
-            if envelope is not None:
-                envelope = await self._save_envelope_version(envelope)
-                budget = envelope.budget
-            # The RUNNING row and its budget reservation must survive a worker
-            # crash after the remote side has accepted the operation.
-            await self._commit_current_uow()
-
-            stopped = await self._requested_stop(investigation.id)
-            if stopped is not None:
-                budget.release(operation_key)
-                cancelled = invocation.transition(ToolInvocationStatus.FAILED)
-                await self._invocations.update_if_version(
-                    cancelled, expected_version=invocation.version
-                )
-                if envelope is not None:
-                    current_envelope = await self._envelopes.get(investigation.id)
-                    if current_envelope is not None:
-                        current_envelope.budget.release(operation_key)
-                        await self._save_envelope_version(current_envelope)
-                await self._commit_current_uow()
-                _log_terminal_tool_failure(
-                    cancelled,
-                    ToolResult(
-                        status=ToolInvocationStatus.FAILED,
-                        exception_class="OperatorInterruption",
-                        error_code="operator_interrupted_before_tool_dispatch",
-                    ),
-                )
-                return stopped, stopped.stop_reason
-
-            tool_budget = _copy_investigation_budget(budget)
-            tool_envelope = replace(envelope, budget=tool_budget) if envelope is not None else None
-            tool_context = ToolExecutionContext(
-                investigation_id=investigation.id,
-                envelope=tool_envelope,
-                budget=tool_budget,
-                idempotency_key=operation_key,
-                available_capabilities=self._available_capabilities,
-            )
-            result = await self._dispatcher.dispatch(
-                tool_context,
+            invocation, result, valid_refs, uncertain_external = await self.execute_tool_call(
+                investigation=investigation,
+                envelope=envelope,
+                budget=budget,
+                state=state,
                 tool_name=proposed.tool_name,
                 schema_version=proposed.schema_version,
                 arguments=proposed.arguments,
                 purpose=proposed.purpose,
                 operation_key=operation_key,
             )
-            uncertain_external = external_effect and (
-                (
-                    result.status is ToolInvocationStatus.FAILED
-                    and not _confirmed_external_non_execution(result)
-                )
-                or (
-                    result.status is ToolInvocationStatus.NEEDS_REVIEW
-                    and not result.output.get("request_permission", False)
-                )
-            )
-            if (
-                external_effect
-                and result.status is ToolInvocationStatus.FAILED
-                and not _confirmed_external_non_execution(result)
-            ):
-                result = replace(
-                    result,
-                    status=ToolInvocationStatus.NEEDS_REVIEW,
-                    message=(
-                        "The external operation returned without a confirmed outcome; "
-                        "reconcile it before resuming. " + result.message
-                    )[:2_000],
-                )
-            confirmed_partial_external_result = (
-                result.status is ToolInvocationStatus.UNAVAILABLE
-                and result.output.get("confirmed_non_execution") is True
-                and any(amount > 0 for amount in result.budget_consumed.values())
-            )
-            if (
-                result.status
-                in {
-                    ToolInvocationStatus.UNAVAILABLE,
-                    ToolInvocationStatus.POLICY_DENIED,
-                }
-                and not confirmed_partial_external_result
-            ):
-                budget.release(operation_key)
-            try:
-                persisted_observations = await self._persist_result_observations(invocation, result)
-            except Exception as exc:
-                valid_refs = await self._valid_observation_refs(
-                    investigation.id, result.observation_refs
-                )
-                reviewed = invocation.transition(
-                    ToolInvocationStatus.NEEDS_REVIEW,
-                    response_refs=valid_refs,
-                    consumed_budget={},
-                )
-                await self._invocations.update_if_version(
-                    reviewed, expected_version=invocation.version
-                )
-                await self._commit_current_uow()
-                _log_terminal_tool_failure(
-                    reviewed,
-                    result,
-                    exception_class=type(exc).__name__,
-                    error_code="tool_observation_persistence_failed",
-                )
-                stopped = await self._requested_stop(investigation.id)
-                if stopped is not None:
-                    return stopped, stopped.stop_reason
-                return state, StopReason.SUBMISSION_NEEDS_REVIEW
-            result_refs = list(result.observation_refs)
-            result_refs.extend(item.id for item in persisted_observations)
-            valid_refs = await self._valid_observation_refs(
-                investigation.id, tuple(dict.fromkeys(result_refs))
-            )
             observation_ids.extend(valid_refs)
             if set(valid_refs).difference(state.last_seen_evidence_ids):
                 progress = True
-            terminal = invocation.transition(
-                result.status,
-                response_refs=valid_refs,
-                consumed_budget=(
-                    {}
-                    if uncertain_external
-                    else _actual_tool_consumption(tool_context.budget, operation_key, result)
-                ),
-            )
-            invocation = await self._invocations.update_if_version(
-                terminal, expected_version=invocation.version
-            )
-            await self._complete_tool_reservation(
-                investigation_id=investigation.id,
-                operation_key=operation_key,
-                result=result,
-                reserved_amounts=invocation.reserved_budget,
-                uncertain=uncertain_external,
-            )
-            await self._commit_current_uow()
-            _log_terminal_tool_failure(invocation, result)
+            if invocation.status is ToolInvocationStatus.NEEDS_REVIEW and uncertain_external:
+                return state, StopReason.SUBMISSION_NEEDS_REVIEW
             stopped = await self._requested_stop(investigation.id)
             if stopped is not None:
                 return stopped, stopped.stop_reason
@@ -1727,7 +1907,10 @@ class InvestigationService:
             }
         )
         if not result.output or (
-            result.observation_refs and not provider_auth_refusal and not provider_download_refusal
+            result.observation_refs
+            and invocation.tool_name not in {"vt.download_sample", "sample.analyze"}
+            and not provider_auth_refusal
+            and not provider_download_refusal
         ):
             return ()
         if self._observation_writer is None:
@@ -2235,6 +2418,34 @@ class InvestigationService:
             and tlp != "red"
             and (envelope.disclosure.tlp is None or envelope.disclosure.tlp.value != "red")
         )
+
+    @staticmethod
+    def _external_policy_block_action(
+        snapshot: ArticleSnapshot,
+        envelope: InvestigationEnvelope | None,
+        turn_index: int,
+    ) -> str:
+        tlp = (snapshot.tlp or "").strip().lower().replace("tlp:", "")
+        details = [
+            f"turn={turn_index}",
+            f"snapshot_external_allowed={int(snapshot.external_llm_allowed)}",
+            f"snapshot_do_not_submit={int(snapshot.do_not_submit)}",
+            f"snapshot_tlp_red={int(tlp == 'red')}",
+        ]
+        if envelope is None:
+            details.append("envelope=absent")
+        else:
+            envelope_tlp_red = (
+                envelope.disclosure.tlp is not None and envelope.disclosure.tlp.value == "red"
+            )
+            details.extend(
+                (
+                    f"envelope_external_allowed={int(envelope.disclosure.external_llm_allowed)}",
+                    f"envelope_do_not_submit={int(envelope.disclosure.do_not_submit)}",
+                    f"envelope_tlp_red={int(envelope_tlp_red)}",
+                )
+            )
+        return "bridge_submission_blocked:external_llm_policy:" + ":".join(details)
 
     @staticmethod
     def _unapproved_budget(investigation: AnalystInvestigation) -> InvestigationBudget:
@@ -2745,6 +2956,113 @@ def _normalize_subject_ref(subject_ref: str | None) -> str | None:
 
 def _normalize_opinion_note_text(text: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", text).casefold().split())
+
+
+def _pending_sample_analysis(
+    context: InvestigationContextV1,
+    invocations: Sequence[ToolInvocation],
+) -> tuple[tuple[str, str], ...]:
+    completed = {
+        ToolInvocationStatus.SUCCEEDED,
+        ToolInvocationStatus.PARTIAL,
+        ToolInvocationStatus.EMPTY,
+    }
+    pending: list[tuple[str, str]] = []
+    for sample in context.investigation.sample_deltas:
+        if not isinstance(sample, Mapping) or sample.get("analysis_status") == "analyzed":
+            continue
+        association_id = _safe_uuid_value(sample.get("association_id"))
+        sample_sha256 = sample.get("sha256")
+        if (
+            association_id is None
+            or not isinstance(sample_sha256, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", sample_sha256)
+        ):
+            continue
+        analyzed = any(
+            item.status in completed
+            and bool(item.response_refs)
+            and (
+                (
+                    item.tool_name == "sample.analyze"
+                    and _invocation_association_id(item) == association_id
+                )
+                or (
+                    item.tool_name.startswith("ghidra.")
+                    and _invocation_sample_sha256(item) == sample_sha256
+                )
+            )
+            for item in invocations
+        )
+        if not analyzed:
+            pending.append((association_id, sample_sha256))
+    return tuple(sorted(set(pending)))
+
+
+def _invocation_association_id(invocation: ToolInvocation) -> str | None:
+    parameters = invocation.normalized_parameters
+    if not isinstance(parameters, Mapping):
+        return None
+    return _safe_uuid_value(parameters.get("association_id"))
+
+
+def _invocation_sample_sha256(invocation: ToolInvocation) -> str | None:
+    parameters = invocation.normalized_parameters
+    if not isinstance(parameters, Mapping):
+        return None
+    value = parameters.get("sample_sha256") or parameters.get("sha256")
+    if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value):
+        return value
+    return None
+
+
+def _latest_applicable_analysis_invocation(
+    invocations: Sequence[ToolInvocation],
+    *,
+    association_id: str,
+    sample_sha256: str,
+    tool_name: str,
+) -> ToolInvocation | None:
+    matching = tuple(
+        item
+        for item in invocations
+        if item.tool_name == tool_name
+        and (
+            _invocation_association_id(item) == association_id
+            if tool_name == "sample.analyze"
+            else _invocation_sample_sha256(item) == sample_sha256
+        )
+    )
+    return max(matching, key=lambda item: (item.created_at, item.id.hex), default=None)
+
+
+def _safe_uuid_value(value: Any) -> str | None:
+    try:
+        return str(UUID(str(value)))
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _sample_blocked_reason(reasoning_summary: str) -> str | None:
+    match = re.search(
+        r"(?im)^\s*BLOCKED_REASON:\s*(engine_unavailable|budget_exhausted)\s*$",
+        reasoning_summary,
+    )
+    return match.group(1).casefold() if match else None
+
+
+def _sample_finish_refusal_count(actions: Sequence[str], fingerprint: str) -> int:
+    prefix = f"finish_gate_refused:{fingerprint}:"
+    for action in reversed(actions):
+        if not action.startswith("finish_gate_refused:"):
+            continue
+        if not action.startswith(prefix):
+            return 0
+        try:
+            return min(MAX_SAMPLE_ANALYSIS_FINISH_REFUSALS, max(0, int(action[len(prefix) :])))
+        except ValueError:
+            return 0
+    return 0
 
 
 def _rule_test_finish_status(

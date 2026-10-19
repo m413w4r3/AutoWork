@@ -119,6 +119,33 @@ def test_model_wait_budgets_are_configurable_and_bounded(monkeypatch: pytest.Mon
         Settings(_env_file=None)
 
 
+def test_bridge_submission_pacing_and_retry_backoff_are_configurable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    defaults = Settings(_env_file=None)
+    assert defaults.openai_bridge_min_submission_interval_seconds == 20
+    assert defaults.openai_bridge_submission_jitter_fraction == 0.3
+    assert defaults.openai_bridge_pre_submission_retry_base_seconds == 1
+    assert defaults.openai_bridge_pre_submission_retry_max_seconds == 8
+
+    monkeypatch.setenv("OPENAI_BRIDGE_MIN_SUBMISSION_INTERVAL_SECONDS", "0")
+    monkeypatch.setenv("OPENAI_BRIDGE_SUBMISSION_JITTER_FRACTION", "0.2")
+    monkeypatch.setenv("OPENAI_BRIDGE_PRE_SUBMISSION_RETRY_BASE_SECONDS", "2")
+    monkeypatch.setenv("OPENAI_BRIDGE_PRE_SUBMISSION_RETRY_MAX_SECONDS", "12")
+    configured = Settings(_env_file=None)
+    assert configured.openai_bridge_min_submission_interval_seconds == 0
+    assert configured.openai_bridge_submission_jitter_fraction == 0.2
+    assert configured.openai_bridge_pre_submission_retry_base_seconds == 2
+    assert configured.openai_bridge_pre_submission_retry_max_seconds == 12
+
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            openai_bridge_pre_submission_retry_base_seconds=4,
+            openai_bridge_pre_submission_retry_max_seconds=3,
+        )
+
+
 def test_job_actor_time_limit_outlives_the_dramatiq_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -140,6 +167,10 @@ def test_virustotal_settings_are_optional_and_bounded(monkeypatch: pytest.Monkey
     assert settings.virustotal_proxy_url is None
     assert settings.virustotal_retrohunt_enabled is False
     assert settings.virustotal_retrohunt_proxy_enabled is False
+    assert settings.virustotal_file_download_legacy_fallback_enabled is False
+    assert settings.virustotal_behaviour_pcap_enabled is False
+    assert settings.virustotal_download_max_redirects == 3
+    assert settings.virustotal_download_allowed_ports == "443"
     # Requests go through the VirusTotal proxy, which is reached over plain HTTP;
     # the https URL is only the real-API fallback route (VIRUSTOTAL_FALLBACK_BASE_URL).
     assert settings.virustotal_base_url == "http://www.virustotal.com/api/v3"
@@ -148,6 +179,15 @@ def test_virustotal_settings_are_optional_and_bounded(monkeypatch: pytest.Monkey
     monkeypatch.setenv("VIRUSTOTAL_RETROHUNT_ENABLED", "true")
     assert Settings(_env_file=None).virustotal_retrohunt_proxy_enabled is True
     monkeypatch.setenv("VIRUSTOTAL_MAX_PAGE_SIZE", "101")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+    monkeypatch.delenv("VIRUSTOTAL_MAX_PAGE_SIZE")
+    monkeypatch.setenv("VIRUSTOTAL_DOWNLOAD_MAX_REDIRECTS", "11")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+    monkeypatch.delenv("VIRUSTOTAL_DOWNLOAD_MAX_REDIRECTS")
+    monkeypatch.setenv("VIRUSTOTAL_DOWNLOAD_ALLOWED_PORTS", "443,70000")
     with pytest.raises(ValidationError):
         Settings(_env_file=None)
 
@@ -200,7 +240,10 @@ def test_compose_propagates_critical_settings_to_api_and_worker_from_a_fake_env(
     assert compose_keys == expected_keys
     assert all(key in worker_env for key in expected_keys)
     frontend_env = services["frontend"]["environment"]
-    assert not expected_keys.intersection(frontend_env)
+    # The Vite proxy injects the human operator token (required once a distinct
+    # operator-client token exists); no other critical setting may reach the UI.
+    assert not (expected_keys - {"OPERATOR_API_TOKEN"}).intersection(frontend_env)
+    assert "OPERATOR_CLIENT_API_TOKEN" not in frontend_env
 
     fake_dotenv = tmp_path / ".env"
     fake_dotenv.write_text(

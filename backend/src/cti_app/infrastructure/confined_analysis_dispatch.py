@@ -17,6 +17,7 @@ from cti_app.application.confined_analysis import (
     ConfinedAnalysisJobParameters,
     ConfinedAnalysisRequest,
     ConfinedAnalysisResult,
+    ConfinedAnalysisTool,
     ConfinedAnalysisWorkerAttestation,
     create_confined_analysis_job_registry,
     deterministic_confined_analysis_key,
@@ -91,7 +92,15 @@ class DramatiqConfinedAnalysisExecutionPort(ConfinedAnalysisExecutionPort):
         operation_key = deterministic_confined_analysis_key(
             request, worker_versions=self._attestation.versions
         )
-        family = request.tool.value
+        family = (
+            "suricata"
+            if request.tool
+            in {
+                ConfinedAnalysisTool.SURICATA_VALIDATE_RULES,
+                ConfinedAnalysisTool.SURICATA_REPLAY,
+            }
+            else request.tool.value
+        )
         if request.tool.value == "mwcp":
             parser_id = request.analysis_parameters.get("parser_id", "")
             family = f"mwcp_parser:{parser_id}"
@@ -370,9 +379,18 @@ def _attestation_from_response(raw: bytes, settings: Settings) -> ConfinedAnalys
                 "capa_ruleset_sha256",
                 "tshark",
                 "capinfos",
+                "suricata",
+                "suricata_ruleset_revision",
+                "suricata_ruleset_sha256",
                 "floss",
                 "mwcp",
                 "yara",
+                "local_file",
+                "local_strings",
+                "local_readelf",
+                "local_objdump",
+                "local_xxd",
+                "local_sha256sum",
             }
             or key.startswith("mwcp_parser:")
         },
@@ -403,6 +421,7 @@ def _family_statuses(
     smda_version = versions.get("smda")
     tshark_version = versions.get("tshark")
     capinfos_version = versions.get("capinfos")
+    suricata_version = versions.get("suricata")
     yara_version = versions.get("yara")
 
     def status(
@@ -449,6 +468,14 @@ def _family_statuses(
     smda = status("smda", smda_version, settings.analysis_smda_expected_version)
     tshark = status("tshark", tshark_version, settings.analysis_tshark_expected_version)
     capinfos = status("capinfos", capinfos_version, settings.analysis_capinfos_expected_version)
+    suricata = status("suricata", suricata_version, settings.analysis_suricata_expected_version)
+    if suricata.available and (
+        versions.get("suricata_ruleset_revision") != settings.analysis_suricata_ruleset_revision
+        or versions.get("suricata_ruleset_sha256") != settings.analysis_suricata_ruleset_sha256
+    ):
+        suricata = ConfinedAnalysisFamilyStatus(
+            "suricata", False, suricata.version, "analysis_suricata_ruleset_unattested"
+        )
     floss = status("floss", versions.get("floss"), "3.1.1")
     mwcp = status("mwcp", versions.get("mwcp"), "3.16.1")
     mwcp_parser_families: dict[str, ConfinedAnalysisFamilyStatus] = {}
@@ -477,6 +504,36 @@ def _family_statuses(
             "mwcp", True, mwcp.version, "allowlisted_parser_unavailable"
         )
     yara = status("yara", yara_version, "4.5.0")
+    local_command_versions = (
+        ("local_file", settings.analysis_local_file_expected_version),
+        ("local_strings", settings.analysis_local_binutils_expected_version),
+        ("local_readelf", settings.analysis_local_binutils_expected_version),
+        ("local_objdump", settings.analysis_local_binutils_expected_version),
+        ("local_xxd", settings.analysis_local_xxd_expected_version),
+        ("local_sha256sum", settings.analysis_local_coreutils_expected_version),
+    )
+    local_command_reason: str | None = None
+    if not worker_confined:
+        local_command_reason = "analysis_worker_isolation_unattested"
+    elif not dependencies_ready:
+        local_command_reason = "analysis_worker_dependencies_unavailable"
+    elif "local_command" not in supported_families:
+        local_command_reason = "analysis_family_not_supported_by_worker"
+    else:
+        for binary_family, expected_version in local_command_versions:
+            actual_version = _safe_version(versions.get(binary_family))
+            if actual_version is None:
+                local_command_reason = "analysis_tool_unavailable"
+                break
+            if actual_version != expected_version:
+                local_command_reason = "analysis_tool_version_unattested"
+                break
+    local_command = ConfinedAnalysisFamilyStatus(
+        "local_command",
+        local_command_reason is None,
+        "local-command-catalog-v1" if local_command_reason is None else None,
+        local_command_reason,
+    )
     sample = ConfinedAnalysisFamilyStatus(
         "sample_analysis",
         "sample_analysis" in supported_families
@@ -506,10 +563,12 @@ def _family_statuses(
             smda,
             tshark,
             capinfos,
+            suricata,
             floss,
             mwcp,
             *mwcp_parser_families.values(),
             yara,
+            local_command,
             sample,
         )
     }
@@ -522,9 +581,11 @@ def _unavailable_families(reason: str) -> dict[str, ConfinedAnalysisFamilyStatus
         "smda",
         "tshark",
         "capinfos",
+        "suricata",
         "floss",
         "mwcp",
         "yara",
+        "local_command",
         "sample_analysis",
     )
     return {

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
@@ -107,6 +108,8 @@ class _FakeRecorder:
         self.calls: list[dict[str, Any]] = []
         self.observation_id = uuid4()
         self.json_observations: dict[str, Any] = {}
+        self.payloads: dict[UUID, Mapping[str, Any]] = {}
+        self.observations: list[Any] = []
 
     async def record_existing_blob(self, **kwargs: Any) -> Any:
         self.calls.append(kwargs)
@@ -115,14 +118,28 @@ class _FakeRecorder:
     async def record_json(self, **kwargs: Any) -> Any:
         key = str(kwargs.get("idempotency_key") or uuid4())
         if key not in self.json_observations:
-            self.json_observations[key] = SimpleNamespace(
+            blob_id = uuid4()
+            observation = SimpleNamespace(
                 id=uuid4(),
+                investigation_id=kwargs["investigation_id"],
                 kind=kwargs["kind"],
                 object_type=kwargs["object_type"],
                 object_id=kwargs["object_id"],
-                blob_id=uuid4(),
+                blob_id=blob_id,
+                observed_at=datetime.now(UTC),
             )
+            self.json_observations[key] = observation
+            self.payloads[blob_id] = kwargs["payload"]
+            self.observations.append(observation)
         return self.json_observations[key]
+
+    async def list_for_investigation(self, investigation_id: UUID) -> tuple[Any, ...]:
+        return tuple(
+            item for item in self.observations if item.investigation_id == investigation_id
+        )
+
+    async def read_json(self, blob_id: UUID) -> Mapping[str, Any]:
+        return self.payloads[blob_id]
 
 
 class _FakeUow:
@@ -623,7 +640,7 @@ def _motif(value: str, *, sample_sha256: str, offset: int, provenance_id: str) -
 
 
 def _output_role(output: Mapping[str, Any], role: RuleTestCorpusRole) -> Mapping[str, Any]:
-    report = output["rule"]["report"]
+    report = output.get("report") or output["rule"]["report"]
     return next(item for item in report["roles"] if item["role"] == role.value)
 
 
@@ -704,6 +721,8 @@ async def test_real_bridge_uses_p09_and_rule_tools_and_replays_same_candidate() 
         associations=associations,  # type: ignore[arg-type]
         corpus_bytes=corpus_bytes,  # type: ignore[arg-type]
         recorder=recorder,  # type: ignore[arg-type]
+        evidence_observations=recorder,  # type: ignore[arg-type]
+        evidence_payloads=recorder,  # type: ignore[arg-type]
         corpus_inventory=inventory,
     )
     initial_comparison = _comparison(
@@ -734,17 +753,25 @@ async def test_real_bridge_uses_p09_and_rule_tools_and_replays_same_candidate() 
     v1_result = await adapter.execute(v1_arguments, _bridge_context())
     assert v1_result.status is ToolInvocationStatus.SUCCEEDED
     assert v1_result.output["rule"]["version"] == "v1"
-    assert v1_result.output["rule"]["candidate_status"] == DetectionCandidateStatus.TESTED.value
-    assert v1_result.output["rule"]["report"]["validation_status"] == "real_partial"
-    goodware_case = _output_role(v1_result.output, RuleTestCorpusRole.GOODWARE)["test_cases"][0]
+    assert v1_result.output["rule"]["candidate_status"] == DetectionCandidateStatus.CANDIDATE.value
+    assert v1_result.output["rule"]["validation_status"] == "untested"
+    assert "report" not in v1_result.output["rule"]
+    test_output, test_status, _test_refs = await rule_tools.execute(
+        "rule.test",
+        {
+            "candidate_id": v1_result.output["rule"]["candidate_id"],
+            "version": 1,
+        },
+        _bridge_context(),
+    )
+    assert test_status in {ToolInvocationStatus.SUCCEEDED, ToolInvocationStatus.PARTIAL}
+    assert test_output["report"]["validation_status"] == "real_partial"
+    assert test_output["report"]["revision_recommendation"] == "none_justified"
+    goodware_case = _output_role(test_output, RuleTestCorpusRole.GOODWARE)["test_cases"][0]
     assert goodware_case["provenance"] == RuleSampleProvenance.SYNTHETIC.value
-    assert _output_role(v1_result.output, RuleTestCorpusRole.HOLDOUT)["non_matches"] == (
-        holdout_hash,
-    )
-    assert _output_role(v1_result.output, RuleTestCorpusRole.HOLDOUT)["matches"] == ()
-    assert _output_role(v1_result.output, RuleTestCorpusRole.GOODWARE)["non_matches"] == (
-        goodware_hash,
-    )
+    assert _output_role(test_output, RuleTestCorpusRole.HOLDOUT)["non_matches"] == [holdout_hash]
+    assert _output_role(test_output, RuleTestCorpusRole.HOLDOUT)["matches"] == []
+    assert _output_role(test_output, RuleTestCorpusRole.GOODWARE)["non_matches"] == [goodware_hash]
     assert (
         len(
             await candidate_repository.list_for_candidate(
@@ -792,18 +819,17 @@ async def test_real_bridge_uses_p09_and_rule_tools_and_replays_same_candidate() 
         },
         _bridge_context(),
     )
-    assert v2_result.status is ToolInvocationStatus.SUCCEEDED
-    assert v2_result.output["rule"]["version"] == "v2"
-    assert v2_result.output["rule"]["candidate_status"] == DetectionCandidateStatus.REJECTED.value
-    assert _output_role(v2_result.output, RuleTestCorpusRole.HOLDOUT)["matches"] == (holdout_hash,)
-    assert _output_role(v2_result.output, RuleTestCorpusRole.HOLDOUT)["non_matches"] == ()
-    holdout_delta = next(
-        item
-        for item in v2_result.output["before_after"]["roles"]
-        if item["role"] == RuleTestCorpusRole.HOLDOUT.value
+    assert v2_result.status is ToolInvocationStatus.FAILED
+    assert v2_result.output["rule"]["error_code"] == "rule_revision_not_justified"
+    assert "Aucune révision justifiée" in v2_result.output["rule"]["message"]
+    assert (
+        len(
+            await candidate_repository.list_for_candidate(
+                UUID(v1_result.output["rule"]["candidate_id"])
+            )
+        )
+        == 1
     )
-    assert holdout_delta["matches_gained"] == (holdout_hash,)
-    assert v2_result.output["before_after"]["false_positives_added"] == (holdout_hash,)
     assert (
         next(
             item for item in associations.associations if item.sample_sha256 == hash_c

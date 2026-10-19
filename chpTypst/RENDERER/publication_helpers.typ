@@ -85,27 +85,49 @@
   if url in result { result } else { result + (url,) }
 })
 
-#let publication-timeline-events(events) = {
-  events.map(event => {
+#let render-publication-timeline(events, ordered: false) = {
+  let all-source-urls = events.fold((), (all, event) => {
+    event.source_urls.fold(all, (result, url) => {
+      if url in result { result } else { result + (url,) }
+    })
+  })
+  for event in events {
     let role-label = event.at("role_label", default: none)
+    let source-urls = unique-urls(event.source_urls)
+    let source-indices = source-urls.map(url => all-source-urls.position(candidate => candidate == url) + 1)
     let body = [
       #if has-text(role-label) [
         #text(size: 8pt, fill: grey)[#role-label]
         #linebreak()
       ]
+      #if has-text(event.display_date) [
+        #text(weight: "bold")[#event.display_date]
+        : #h(0.3em)
+      ]
       #semantic-or-plain(event.text, event.at("semantic_spans", default: none))
+      #if source-indices.len() > 0 [
+        #for (index, source-index) in source-indices.enumerate() [
+          #if index > 0 [, ]
+          #super[#link(source-urls.at(index))[#str(source-index)]]
+        ]
+      ]
     ]
-    (
-      event.display_date,
-      body,
-      unique-urls(event.source_urls),
-      none,
-    )
-  })
-}
-
-#let render-publication-timeline(events) = {
-  timeline(publication-timeline-events(events))
+    if ordered {
+      enum.item(body)
+    } else {
+      list.item(body)
+    }
+  }
+  if not ordered and all-source-urls.len() > 0 {
+    block(above: 2pt, below: 0pt)[
+      #for (index, url) in all-source-urls.enumerate() [
+        #if index > 0 [#linebreak()]
+        #text(size: 6pt, fill: grey)[#str(index + 1)]
+        #h(0.25em)
+        #link(url)[#text(size: 6pt, fill: grey)[#url]]
+      ]
+    ]
+  }
 }
 
 #let publication-styled-table(
@@ -203,60 +225,31 @@
   ]
 }
 
-#let render-ioc-table(rows) = {
+#let render-ioc-table(groups) = {
+  section-title[IOC — indicateurs, contexte et provenance]
   let header-cells = (
     [Type],
-    [Valeur exacte],
-    [Rôle et contexte],
-    [Première / dernière observation],
-    [Source et fiabilité],
-    [Statut et réserves],
+    [Valeur défanguée],
+    [Contexte et statut],
+    [Source [n]],
   )
-  let body-cells = rows.map(row => (
-    [#text(size: 7pt)[#row.type]],
-    [#text(font: code-font-families, size: 7pt)[#semantic-or-plain(row.value, row.value_spans)]],
-    [
-      #text(size: 7pt, weight: "bold")[Rôle : #row.source_role]
-      #parbreak()
-      #row.context
-      #if row.evidence_quote != row.context [
-        #parbreak()
-        #text(size: 6.5pt, fill: grey)[Preuve : #row.evidence_quote]
-      ]
-    ],
-    [
-      #text(size: 7pt)[Première : #if row.first_observed == none [Non renseignée] else [#row.first_observed]]
-      #parbreak()
-      #text(size: 7pt)[Dernière : #if row.last_observed == none [Non renseignée] else [#row.last_observed]]
-    ],
-    [
-      #for (index, source) in row.source_urls.enumerate() {
-        if index > 0 { parbreak() }
-        link(source.url)[#source.label]
-        parbreak()
-        text(size: 6pt, fill: grey)[#source.url]
-      }
-      #parbreak()
-      #text(size: 6.5pt)[Fiabilité : #row.reliability]
-    ],
-    [
-      #text(size: 7.5pt, weight: "bold")[#row.status_label]
-      #parbreak()
-      #text(size: 6.5pt)[#row.status_reason]
-      #if row.relevance_classification != none [
-        #parbreak()
-        #text(size: 6pt, fill: grey)[#row.relevance_classification · #row.relevance_reason_code]
-      ]
-    ],
-  )).flatten()
-  publication-styled-table(
-    (0.65, 1.8, 2.25, 1.3, 1.8, 1.55).map(weight => weight * 1fr),
-    cell-align: (left, left, left, left, left, left),
-    title: [*IOC — valeurs, provenance et décision de publication*],
-    ..(header-cells + body-cells),
-  )
-  v(3pt)
-  text(size: 7pt, fill: grey)[Les dates d'observation sont indiquées uniquement lorsqu'elles figurent dans l'extraction canonique.]
+  for group in groups {
+    block(above: 5pt, below: 2pt)[
+      #text(size: 9pt, weight: "bold")[#group.heading]
+      #let body-cells = group.rows.map(row => (
+        [#text(size: 7.5pt)[#row.type_label]],
+        [#text(font: code-font-families, size: 7pt)[#semantic-or-plain(row.value, row.value_spans)]],
+        [#text(size: 7pt)[#row.context_summary]],
+        [#text(size: 7pt, weight: "bold")[#row.source_numbers]],
+      )).flatten()
+      #publication-styled-table(
+        (0.8, 2.2, 2.5, 0.7).map(weight => weight * 1fr),
+        cell-align: (left, left, left, left),
+        inset: (x: 3pt, y: 2pt),
+        ..(header-cells + body-cells),
+      )
+    ]
+  }
 }
 
 #let render-figure-caption(
@@ -280,33 +273,30 @@
 )
 
 #let render-derived-timeline-figure(data) = {
-  let header-cells = ([Date], [Jours écoulés], [Repère], [Événement], [Source et preuve vérifiées])
-  let body-cells = data.events.map(event => (
-    [#text(size: 7pt, weight: "bold")[#event.date]],
-    [#text(size: 7pt)[Jour #event.offset_days]],
-    [#text(fill: accent)[●]],
-    [#text(hyphenate: false)[#event.text]],
-    [
-      #for (index, source) in event.sources.enumerate() {
-        if index > 0 { parbreak() }
-        link(source.url)[#publication-display-text(source.url_spans)]
-        parbreak()
-        text(size: 5pt, fill: grey)[Source SHA-256 : #publication-display-text(source.source_sha256_spans)]
-        parbreak()
-        text(size: 5pt, fill: grey)[Preuve SHA-256 : #publication-display-text(source.evidence_sha256_spans)]
-      }
-    ],
-  )).flatten()
-
   [
     #render-figure-caption(data.figure_number, data.title, none, top-space: 10pt)
     #text(size: 7pt, fill: grey)[Unité : #data.axis_unit. Dates sans heure ni fuseau.]
-    #publication-styled-table(
-      (0.8, 0.7, 0.5, 1.2, 1.8).map(weight => weight * 1fr),
-      cell-align: (left, center, center, left, left),
-      title: none,
-      ..(header-cells + body-cells),
-    )
+    #for (event-index, event) in data.events.enumerate() [
+      #enum.item[
+        #text(size: 9pt, weight: "bold")[#event.date]
+        #h(0.4em)
+        #text(size: 8pt, fill: grey)[Jour #event.offset_days]
+        #linebreak()
+        #text(hyphenate: false)[#event.text]
+        #if event.sources.len() > 0 [
+          #linebreak()
+          #text(size: 7.5pt, fill: grey)[Sources : ]
+          #for (source-index, source) in event.sources.enumerate() [
+            #if source-index > 0 [ · ]
+            #link(source.url)[Source #str(source-index + 1)]
+            #linebreak()
+            #text(size: 5.5pt, fill: grey)[Source SHA-256 : #publication-display-text(source.source_sha256_spans)]
+            #linebreak()
+            #text(size: 5.5pt, fill: grey)[Preuve SHA-256 : #publication-display-text(source.evidence_sha256_spans)]
+          ]
+        ]
+      ]
+    ]
     #text(size: 5.5pt, fill: grey)[Publication V5 SHA-256 : #publication-display-text(data.publication_sha256_spans)]
     #text(size: 5.5pt, fill: grey)[Identité de figure : #publication-display-text(data.figure_id_spans)]
   ]
@@ -481,11 +471,23 @@
   } else {
     item.at("semantic_title", default: none)
   }
-  let caption-content = if has-text(caption) {
-    render-figure-caption(item.figure_number, caption, semantic-caption)
-  } else {
-    none
-  }
+  let title = item.at("title", default: none)
+  let status-label = item.at("status_label", default: none)
+  let caption-content = [
+    #if has-text(status-label) and has-text(title) [
+      #block(above: 2pt, below: 2pt)[
+        #text(size: 9pt, weight: "bold")[#title]
+      ]
+    ]
+    #if has-text(status-label) [
+      #block(above: 2pt, below: 2pt)[
+        #text(size: 8pt, weight: "bold", fill: rgb("#315D7C"))[#status-label]
+      ]
+    ]
+    #if has-text(caption) [
+      #render-figure-caption(item.figure_number, caption, semantic-caption)
+    ]
+  ]
   render-publication-image(item.media_path, caption-content, max-height-fraction: 0.35)
 }
 
@@ -610,7 +612,7 @@
     ] else if content_section.type == "chronology" [
       #section-title[CHRONOLOGIE]
       #if content_section.at("derived_timeline_figure", default: none) == none [
-        #render-publication-timeline(content_section.timeline)
+        #render-publication-timeline(content_section.timeline, ordered: true)
       ]
       #if content_section.at("derived_timeline_figure", default: none) != none [
         #render-derived-timeline-figure(content_section.derived_timeline_figure)
@@ -631,6 +633,9 @@
       ]
     ] else if content_section.type == "analyst_opinion" [
       #section-title[AVIS DE L'ANALYSTE]
+      #if content_section.blocks.len() == 0 [
+        #text(size: 9pt, fill: grey, style: "italic")[#content_section.at("empty_message", default: "Aucun avis publié.")]
+      ]
       #for item in content_section.blocks [
         #heading(level: 3)[#item.number #item.heading]
         #text(size: 8pt, weight: "bold")[#item.qualification_label]
@@ -749,10 +754,16 @@
       ]
     ] else if content_section.type == "technical_annex" [
       #let ioc_rows = content_section.at("ioc_rows", default: ())
+      #let ioc_row_groups = content_section.at("ioc_row_groups", default: ())
       #let indicators = content_section.indicators
       #let originals = content_section.original_indicators
       #if ioc_rows.len() > 0 [
-        #render-ioc-table(ioc_rows)
+        #render-ioc-table(ioc_row_groups)
+        #if originals.ips.len() > 0 or originals.domains.len() > 0 or originals.urls.len() > 0 or originals.emails.len() > 0 or originals.hashes.len() > 0 [
+          #text(size: 9pt, weight: "bold")[IOC originaux à lien non démontré]
+          #text(size: 8pt, fill: grey)[#content_section.original_indicator_note]
+          #v(3pt)
+        ]
       ] else if indicators.ips.len() > 0 or indicators.domains.len() > 0 or indicators.urls.len() > 0 or indicators.emails.len() > 0 or indicators.hashes.len() > 0 [
         #ioc-list(
           title: [IOC],
@@ -763,7 +774,7 @@
           hashes: indicators.hashes,
         )
       ]
-      #if originals.ips.len() > 0 or originals.domains.len() > 0 or originals.urls.len() > 0 or originals.emails.len() > 0 or originals.hashes.len() > 0 [
+      #if ioc_rows.len() == 0 and (originals.ips.len() > 0 or originals.domains.len() > 0 or originals.urls.len() > 0 or originals.emails.len() > 0 or originals.hashes.len() > 0) [
         #v(8pt)
         #ioc-list(
           title: [IOC originaux à lien non démontré],

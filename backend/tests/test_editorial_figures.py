@@ -542,6 +542,12 @@ async def test_real_typst_renders_hash_pinned_timeline_and_anchored_chain(
         character for character in extracted.replace("\u00ad", "") if not character.isspace()
     )
     assert "Chronologiedesévénementsdatés" in normalized
+    timeline_start = extracted.index("Chronologie des événements datés")
+    timeline_end = extracted.index("Publication V5 SHA-256", timeline_start)
+    timeline_text = extracted[timeline_start:timeline_end]
+    assert "Jours écoulés" not in timeline_text
+    assert "1." in timeline_text
+    assert "Source 1" in timeline_text
     assert "Chaîned'ancragedesobservationsapprouvées" in normalized
     assert "jourcalendaire" in normalized
     assert "2025-01-12" in normalized and "2025-01-16" in normalized

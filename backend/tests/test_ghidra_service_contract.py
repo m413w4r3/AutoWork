@@ -9,7 +9,7 @@ from typing import Any
 import httpx
 import pytest
 
-from cti_app.ghidra_service.contract import CONTRACT_VERSION
+from cti_app.ghidra_service.contract import CONTRACT_VERSION, ContractError, parse_analysis_request
 from cti_app.ghidra_service.server import create_server
 from cti_app.ghidra_service.service import GhidraReadOnlyService
 
@@ -126,6 +126,20 @@ def test_contract_refuses_sample_over_limit_before_engine_invocation(running_ser
     assert response.status_code == 413
     assert response.json() == {"error": "sample_too_large"}
     assert engine.calls == []
+
+
+def test_decompile_contract_only_accepts_a_single_function_limit() -> None:
+    headers = _headers()
+
+    request = parse_analysis_request(
+        "/v1/analyze?operation=decompile_function&address=402068", headers
+    )
+
+    assert request.limit == 1
+    with pytest.raises(ContractError, match="limit_out_of_bounds"):
+        parse_analysis_request(
+            "/v1/analyze?operation=decompile_function&address=402068&limit=2", headers
+        )
 
 
 @pytest.mark.parametrize(
