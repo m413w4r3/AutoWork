@@ -12,6 +12,10 @@ from typing import Any, cast
 from urllib.parse import parse_qsl, urlsplit
 from uuid import UUID
 
+from cti_app.application.advisor_checkpoint import (
+    format_advisor_trace_purpose,
+    split_advisor_trace_purpose,
+)
 from cti_app.application.evidence_recorder import _sanitize_json, sanitize_evidence_text
 from cti_app.application.investigation_contracts import (
     MAX_CONTEXT_BYTES,
@@ -30,6 +34,11 @@ from cti_app.application.investigation_state import (
     InvestigationStateVersionConflict,
 )
 from cti_app.application.investigation_tools import ToolEffect, ToolExecutionContext, ToolRegistry
+from cti_app.application.operator_context_summary import (
+    InvestigationOperatorContextSummaryV1,
+    OperatorContextItemPageV1,
+    build_operator_context_summary,
+)
 from cti_app.application.persistence import AnalystInvestigationRepository
 from cti_app.application.research_context_builder import (
     CanonicalEvidenceSummaryPort,
@@ -79,6 +88,25 @@ _SIGNED_QUERY = frozenset(
     }
 )
 _ACTIVE_OPERATOR_INVOCATIONS: dict[str, asyncio.Lock] = {}
+_ADDITIONAL_CONTEXT_ITEM_SECTIONS = frozenset(
+    {
+        "finding_versions",
+        "available_tools",
+        "available_pivots",
+        "latest_tool_results",
+        "previous_actions",
+        "operator_requests",
+        "agenda",
+        "blocked_capabilities",
+        "budget_remaining",
+        "advisor_guidance",
+        "unavailable_tools",
+        "indicator_inventory",
+        "current_opinion",
+        "truncation",
+        "source",
+    }
+)
 
 
 class OperatorToolInvocationError(RuntimeError):
@@ -222,6 +250,39 @@ class OperatorToolInvocationService:
             context=context,
         )
 
+    async def get_context_summary(
+        self,
+        *,
+        expected_version: int | None = None,
+        expected_sha256: str | None = None,
+        since_version: int | None = None,
+    ) -> InvestigationOperatorContextSummaryV1:
+        state = await self._states.get(self._investigation_id)
+        if state is None:
+            raise OperatorToolInvocationError("investigation_not_started", 409)
+        self._require_operator_mode(state.execution_mode)
+        if expected_version is not None and state.version != expected_version:
+            raise OperatorToolInvocationError("stale_working_state", 409)
+        if expected_sha256 is not None and state.sha256 != expected_sha256:
+            raise OperatorToolInvocationError("stale_working_state", 409)
+        if since_version is not None and since_version > state.version:
+            raise OperatorToolInvocationError("operator_context_delta_base_invalid", 422)
+        operator_context = await self.get_context(
+            expected_version=state.version,
+            expected_sha256=state.sha256,
+        )
+        try:
+            return build_operator_context_summary(
+                operator_context.context,
+                investigation_id=self._investigation_id,
+                working_state_version=state.version,
+                working_state_sha256=state.sha256,
+                state=state,
+                since_version=since_version,
+            )
+        except ValueError as exc:
+            raise OperatorToolInvocationError("operator_context_summary_invalid", 503) from exc
+
     async def get_context_section(
         self,
         section: str,
@@ -230,7 +291,7 @@ class OperatorToolInvocationService:
         limit: int = 20,
         expected_version: int | None = None,
         expected_sha256: str | None = None,
-    ) -> OperatorContextSectionPageV1:
+    ) -> OperatorContextSectionPageV1 | OperatorContextItemPageV1:
         state = await self._states.get(self._investigation_id)
         if state is None:
             raise OperatorToolInvocationError("investigation_not_started", 409)
@@ -244,6 +305,40 @@ class OperatorToolInvocationService:
         investigation = await self._investigations.get(self._investigation_id)
         if investigation is None:
             raise OperatorToolInvocationError("investigation_not_found", 404)
+        if section in _ADDITIONAL_CONTEXT_ITEM_SECTIONS:
+            if offset < 0 or not 1 <= limit <= 20:
+                raise OperatorToolInvocationError("operator_context_page_invalid", 422)
+            operator_context = await self.get_context(
+                expected_version=state.version,
+                expected_sha256=state.sha256,
+            )
+            if section == "finding_versions":
+                total, page_items = await self._context_builder.read_context_section(
+                    section=section,
+                    investigation_id=self._investigation_id,
+                    state=state,
+                    offset=offset,
+                    limit=limit,
+                    synthesis_artifact_id=investigation.synthesis_artifact_id,
+                )
+            else:
+                all_items = _additional_context_items(operator_context, section)
+                total = len(all_items)
+                page_items = all_items[offset : offset + limit]
+            next_offset = offset + len(page_items) if offset + len(page_items) < total else None
+            return OperatorContextItemPageV1(
+                investigation_id=self._investigation_id,
+                working_state_version=operator_context.working_state_version,
+                working_state_sha256=operator_context.working_state_sha256,
+                context_sha256=operator_context.context_sha256,
+                section=section,
+                offset=offset,
+                limit=limit,
+                total=total,
+                next_offset=next_offset,
+                items=tuple(_context_item_json(item) for item in page_items),
+                section_truncated=_additional_context_section_truncated(operator_context, section),
+            )
         try:
             total, items = await self._context_builder.read_context_section(
                 section=section,
@@ -282,6 +377,9 @@ class OperatorToolInvocationService:
             raise OperatorToolInvocationError("idempotency_key_invalid", 422)
         schema_version = self._canonical_schema_version(tool_name, schema_version)
         try:
+            trace, _human_purpose = split_advisor_trace_purpose(
+                purpose, tool_name=tool_name, allow_server_denied=False
+            )
             _require_safe_operator_payload({"arguments": arguments, "purpose": purpose})
             payload = canonical_json_bytes(
                 {
@@ -296,6 +394,18 @@ class OperatorToolInvocationService:
             raise OperatorToolInvocationError(
                 "operator_payload_invalid_or_sensitive", 422
             ) from None
+
+        if trace is not None and "recommendation" in trace:
+            try:
+                await self._validate_recommendation_trace(
+                    trace["recommendation"], tool_name=tool_name, schema_version=schema_version
+                )
+            except ValueError as exc:
+                raise OperatorToolInvocationError(str(exc), 422) from None
+        if trace is not None and isinstance(trace.get("checkpoint"), Mapping):
+            checkpoint_id = str(trace["checkpoint"].get("id", ""))
+            if not checkpoint_id.endswith(f"@{expected_version}"):
+                raise OperatorToolInvocationError("advisor_checkpoint_stale", 409)
 
         key_digest = hashlib.sha256(
             f"{self._investigation_id}\0{idempotency_key}".encode()
@@ -313,6 +423,7 @@ class OperatorToolInvocationService:
                 expected_version=expected_version,
                 operation_prefix=operation_prefix,
                 operation_key=operation_key,
+                trace=trace,
             )
 
     def _canonical_schema_version(self, tool_name: str, schema_version: str) -> str:
@@ -340,6 +451,7 @@ class OperatorToolInvocationService:
         expected_version: int,
         operation_prefix: str,
         operation_key: str,
+        trace: Mapping[str, Any] | None,
     ) -> OperatorToolInvocationResult:
         state = await self._states.get(self._investigation_id)
         if state is None:
@@ -352,9 +464,8 @@ class OperatorToolInvocationService:
         snapshot = await self._context_builder.article_snapshots.resolve(
             investigation.synthesis_artifact_id
         )
-        advisor_disclosure_denied = tool_name == "advisor.consult" and not (
-            InvestigationService.external_llm_allowed(snapshot, envelope)
-        )
+        advisor_external_allowed = InvestigationService.external_llm_allowed(snapshot, envelope)
+        advisor_disclosure_denied = tool_name == "advisor.consult" and not advisor_external_allowed
         registered = self._registry.get(tool_name, schema_version)
         definition = registered[0] if registered is not None else None
         requires_external_disclosure = definition is not None and definition.effect in {
@@ -389,6 +500,105 @@ class OperatorToolInvocationService:
 
         if state.version != expected_version:
             raise OperatorToolInvocationError("stale_working_state", 409)
+
+        record_purpose = purpose
+        checkpoint = trace.get("checkpoint") if isinstance(trace, Mapping) else None
+        guidance = None
+        try:
+            operator_context = await self.get_context(expected_version=state.version)
+            guidance = operator_context.context.advisor_guidance
+        except OperatorToolInvocationError as exc:
+            if exc.code == "stale_working_state":
+                raise
+        except Exception:
+            # Checkpoint guidance is advisory and must not make a locally
+            # authorized operator action unavailable if the recap is unreadable.
+            guidance = None
+
+        advisor_denial_reason = None
+        if not advisor_external_allowed:
+            advisor_denial_reason = "external_disclosure_denied"
+        elif guidance is not None and guidance.advisor_turns_remaining <= 0:
+            advisor_denial_reason = "advisor_budget_exhausted"
+        elif "bridge.advisor" not in self._available_capabilities:
+            advisor_denial_reason = "advisor_capability_unavailable"
+
+        if guidance is not None:
+            due_reason = guidance.reason if guidance.checkpoint_due else None
+            expected_checkpoint_id = (
+                f"{due_reason}@{state.version}" if due_reason is not None else None
+            )
+            if isinstance(checkpoint, Mapping):
+                checkpoint_id = checkpoint.get("id")
+                if checkpoint_id != expected_checkpoint_id and not (
+                    tool_name == "advisor.consult"
+                    and not guidance.checkpoint_due
+                    and checkpoint_id == f"operator_requested@{state.version}"
+                ):
+                    raise OperatorToolInvocationError("advisor_checkpoint_stale", 409)
+            elif due_reason is not None:
+                if tool_name == "advisor.consult":
+                    status = "denied" if advisor_denial_reason else "consulted"
+                    checkpoint = {
+                        "id": expected_checkpoint_id,
+                        "status": status,
+                        **({"reason": advisor_denial_reason} if advisor_denial_reason else {}),
+                    }
+                else:
+                    checkpoint = {
+                        "id": expected_checkpoint_id,
+                        "status": "denied" if advisor_denial_reason else "skipped",
+                        "reason": advisor_denial_reason or "operator_proceeded_without_advisor",
+                    }
+                _trace = dict(trace or {})
+                _trace["checkpoint"] = checkpoint
+                record_purpose = format_advisor_trace_purpose(
+                    _human_purpose_from_purpose(purpose),
+                    checkpoint=checkpoint,
+                    recommendation=_trace.get("recommendation"),
+                )
+            elif tool_name == "advisor.consult" and checkpoint is None:
+                checkpoint = {
+                    "id": f"operator_requested@{state.version}",
+                    "status": "denied" if advisor_denial_reason else "consulted",
+                    **({"reason": advisor_denial_reason} if advisor_denial_reason else {}),
+                }
+                _trace = dict(trace or {})
+                _trace["checkpoint"] = checkpoint
+                record_purpose = format_advisor_trace_purpose(
+                    _human_purpose_from_purpose(purpose),
+                    checkpoint=checkpoint,
+                    recommendation=_trace.get("recommendation"),
+                )
+        elif tool_name == "advisor.consult" and checkpoint is None:
+            checkpoint = {
+                "id": f"operator_requested@{state.version}",
+                "status": "denied" if advisor_denial_reason else "consulted",
+                **({"reason": advisor_denial_reason} if advisor_denial_reason else {}),
+            }
+            _trace = dict(trace or {})
+            _trace["checkpoint"] = checkpoint
+            record_purpose = format_advisor_trace_purpose(
+                _human_purpose_from_purpose(purpose),
+                checkpoint=checkpoint,
+                recommendation=_trace.get("recommendation"),
+            )
+
+        if trace is not None and isinstance(trace.get("checkpoint"), Mapping):
+            if advisor_denial_reason and (
+                tool_name == "advisor.consult" or (guidance is not None and guidance.checkpoint_due)
+            ):
+                checkpoint = {
+                    "id": trace["checkpoint"]["id"],
+                    "status": "denied",
+                    "reason": advisor_denial_reason,
+                }
+                record_purpose = format_advisor_trace_purpose(
+                    _human_purpose_from_purpose(purpose),
+                    checkpoint=checkpoint,
+                    recommendation=trace.get("recommendation"),
+                )
+
         updated_state = state.with_operator_tool_action(
             f"operator_tool:{tool_name}:{operation_key[-16:]}"
         )
@@ -421,7 +631,7 @@ class OperatorToolInvocationService:
                 tool_name=tool_name,
                 schema_version=schema_version,
                 arguments=arguments,
-                purpose=purpose,
+                purpose=record_purpose,
                 operation_key=operation_key,
                 check_stop_before_dispatch=False,
             )
@@ -450,6 +660,100 @@ class OperatorToolInvocationService:
                 "external_llm_disclosure_denied" if advisor_disclosure_denied else None
             ),
         )
+
+    async def _validate_recommendation_trace(
+        self,
+        recommendation: Mapping[str, Any],
+        *,
+        tool_name: str,
+        schema_version: str,
+    ) -> None:
+        try:
+            advisor_invocation = await self._invocations.get(
+                UUID(str(recommendation["invocation_id"]))
+            )
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("advisor_recommendation_unavailable") from None
+        if (
+            advisor_invocation is None
+            or advisor_invocation.investigation_id != self._investigation_id
+            or advisor_invocation.tool_name != "advisor.consult"
+            or advisor_invocation.status is not ToolInvocationStatus.SUCCEEDED
+            or self._observations is None
+            or self._evidence_summaries is None
+        ):
+            raise ValueError("advisor_recommendation_unavailable")
+
+        recommendation_index = recommendation.get("index")
+        stored_output: Mapping[str, Any] | None = None
+        for observation_id in advisor_invocation.response_refs:
+            observation = await self._observations.get(observation_id)
+            if (
+                observation is None
+                or observation.investigation_id != self._investigation_id
+                or observation.source != "advisor.consult"
+            ):
+                continue
+            try:
+                payload = await self._evidence_summaries.summary(observation)
+            except Exception:
+                continue
+            if (
+                not isinstance(payload, Mapping)
+                or payload.get("schema") != "operator-advisor-call.v1"
+            ):
+                continue
+            if not isinstance(payload.get("output"), Mapping):
+                continue
+            stored_output = payload
+            break
+        if stored_output is None:
+            raise ValueError("advisor_recommendation_unavailable")
+
+        output = stored_output["output"]
+        recommendations = output.get("recommended_next_tools", ())
+        if (
+            not isinstance(recommendations, (list, tuple))
+            or not isinstance(recommendation_index, int)
+            or recommendation_index >= len(recommendations)
+        ):
+            raise ValueError("advisor_recommendation_unavailable")
+        proposed = recommendations[recommendation_index]
+        if not isinstance(proposed, Mapping):
+            raise ValueError("advisor_recommendation_unavailable")
+        proposed_tool = proposed.get("tool")
+        proposed_schema = proposed.get("schema_version")
+        basis_refs = proposed.get("basis_observation_refs", ())
+        input_refs = stored_output.get("input_observation_refs", ())
+        if (
+            not isinstance(proposed_tool, str)
+            or not isinstance(proposed_schema, str)
+            or not isinstance(basis_refs, (list, tuple))
+            or not basis_refs
+            or not isinstance(input_refs, (list, tuple))
+            or not set(basis_refs).issubset({str(item) for item in input_refs})
+            or output.get("untrusted") is not True
+            or self._registry.get(proposed_tool, proposed_schema) is None
+        ):
+            raise ValueError("advisor_recommendation_not_observation_validated")
+        for basis_ref in basis_refs:
+            try:
+                basis_observation = await self._observations.get(UUID(str(basis_ref)))
+            except (TypeError, ValueError):
+                basis_observation = None
+            if (
+                basis_observation is None
+                or basis_observation.investigation_id != self._investigation_id
+                or basis_observation.source == "advisor.consult"
+            ):
+                raise ValueError("advisor_recommendation_not_observation_validated")
+
+        decision = recommendation.get("decision")
+        if decision == "accepted":
+            if proposed_tool != tool_name or proposed_schema != schema_version:
+                raise ValueError("advisor_recommendation_action_mismatch")
+        elif decision == "refused" and proposed_tool == tool_name:
+            raise ValueError("advisor_recommendation_refusal_action_mismatch")
 
     @staticmethod
     def _require_operator_mode(mode: InvestigationExecutionMode) -> None:
@@ -554,6 +858,14 @@ def _operator_output_kind(tool_name: str) -> str:
     if tool_name == "sample.get_feature_pack":
         return "sample_feature_pack"
     return tool_name.replace(".", "_")[:96]
+
+
+def _human_purpose_from_purpose(purpose: str) -> str:
+    try:
+        _trace, human_purpose = split_advisor_trace_purpose(purpose, allow_server_denied=True)
+    except ValueError:
+        return purpose
+    return human_purpose
 
 
 def _bounded_json_value(value: Any, *, max_bytes: int = 32 * 1024) -> Any:
@@ -665,6 +977,71 @@ def _truncation_pointers(
         for flag, sections in section_by_flag.items()
         if flags.get(flag) is True
     }
+
+
+def _additional_context_items(
+    operator_context: InvestigationOperatorContextV1,
+    section: str,
+) -> tuple[Any, ...]:
+    context = operator_context.context
+    section_values: dict[str, Any] = {
+        "available_tools": context.available_tools,
+        "available_pivots": context.available_pivots,
+        "latest_tool_results": context.investigation.latest_tool_results,
+        "previous_actions": context.investigation.previous_actions,
+        "operator_requests": context.operator_requests,
+        "agenda": context.investigation.agenda,
+        "blocked_capabilities": context.investigation.blocked_capabilities,
+        "budget_remaining": tuple(
+            {"dimension": key, "remaining": value}
+            for key, value in sorted(context.investigation.budget_remaining.items())
+        ),
+        "advisor_guidance": (context.advisor_guidance,),
+        "unavailable_tools": context.unavailable_tools,
+        "indicator_inventory": context.indicator_inventory.items,
+        "current_opinion": (
+            (operator_context.current_opinion,)
+            if operator_context.current_opinion is not None
+            else ()
+        ),
+        "truncation": (
+            {
+                "flags": operator_context.truncation,
+                "counts": operator_context.truncation_counts,
+                "pointers": operator_context.truncation_pointers,
+            },
+        ),
+        "source": (context.source,),
+    }
+    value = section_values.get(section)
+    if value is None:
+        raise OperatorToolInvocationError("operator_context_section_unknown", 404)
+    if isinstance(value, Mapping):
+        return tuple({"key": key, "value": item} for key, item in sorted(value.items()))
+    if isinstance(value, tuple | list):
+        return tuple(value)
+    return (value,)
+
+
+def _additional_context_section_truncated(
+    operator_context: InvestigationOperatorContextV1,
+    section: str,
+) -> bool:
+    context = operator_context.context
+    if section == "available_pivots":
+        return context.available_pivots_truncated
+    if section == "unavailable_tools":
+        return context.unavailable_tools_truncated
+    if section == "indicator_inventory":
+        return context.indicator_inventory.truncated
+    return False
+
+
+def _context_item_json(value: Any) -> Any:
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        return model_dump(mode="json", by_alias=True)
+    return value
 
 
 __all__ = [

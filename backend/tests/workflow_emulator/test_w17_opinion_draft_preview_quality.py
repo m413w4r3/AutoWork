@@ -359,18 +359,21 @@ async def test_w17_real_typst_draft_preview_preserves_structure_and_limits(
         assert required.casefold() in normalized_text, f"W17 PDF text is missing {required!r}"
 
     reference_text = normalized_text.split("références", 1)[1].split("synthèse", 1)[0]
-    assert "•" in reference_text, "W17 references must render as a bulleted list"
+    # C8 renders navigable numbered references and a single ordered chronology.
+    assert "1." in reference_text and "https://example.com/report" in reference_text
     assert "https://example.com/report" in reference_text
     assert "1" in reference_text, "W17 source links must keep their numbered anchor"
     chronology_text = normalized_text.split("chronologie", 1)[1].split("limites des preuves", 1)[0]
     assert "1." in chronology_text, "W17 chronology must render as a numbered list"
     assert "rapport. 1" in chronology_text
+    annex_text = normalized_text.split("annexe technique", 1)[1]
     for table_heading in (
-        "type et valeur",
-        "contexte et observations",
-        "sources et décision de publication",
+        "type",
+        "valeur défanguée",
+        "contexte et statut",
+        "source [n]",
     ):
-        assert table_heading in normalized_text, f"W17 IOC table is missing {table_heading!r}"
+        assert table_heading in annex_text, f"W17 IOC annex table is missing {table_heading!r}"
 
     assert rendered_pages
     final_page_label = f"{len(rendered_pages)}/{len(rendered_pages)}"

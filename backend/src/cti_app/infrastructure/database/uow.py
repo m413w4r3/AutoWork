@@ -10,6 +10,7 @@ from cti_app.application.investigation_persistence import (
     FindingRepository,
     InvestigationBudgetRepository,
     InvestigationEnvelopeRepository,
+    InvestigationExperimentRepository,
     SampleAssociationRepository,
     ToolInvocationRepository,
 )
@@ -151,6 +152,7 @@ from cti_app.infrastructure.database.repositories.investigation import (
     SqlAlchemyFindingRepository,
     SqlAlchemyInvestigationBudgetRepository,
     SqlAlchemyInvestigationEnvelopeRepository,
+    SqlAlchemyInvestigationExperimentRepository,
     SqlAlchemyInvestigationStateRepository,
     SqlAlchemySampleAssociationRepository,
     SqlAlchemyToolInvocationRepository,
@@ -261,6 +263,7 @@ class SqlAlchemyUnitOfWork:
     tool_invocations: ToolInvocationRepository
     evidence_observations: EvidenceObservationRepository
     investigation_findings: FindingRepository
+    investigation_experiments: InvestigationExperimentRepository
     sample_associations: SampleAssociationRepository
     detection_candidates: InvestigationDetectionCandidateRepository
     analyst_opinions: AnalystOpinionRepository
@@ -356,6 +359,7 @@ class SqlAlchemyUnitOfWork:
         self.tool_invocations = SqlAlchemyToolInvocationRepository(self._session)
         self.evidence_observations = SqlAlchemyEvidenceObservationRepository(self._session)
         self.investigation_findings = SqlAlchemyFindingRepository(self._session)
+        self.investigation_experiments = SqlAlchemyInvestigationExperimentRepository(self._session)
         self.sample_associations = SqlAlchemySampleAssociationRepository(self._session)
         self.detection_candidates = SqlAlchemyDetectionCandidateRepository(self._session)
         self.analyst_opinions = SqlAlchemyAnalystOpinionRepository(self._session)

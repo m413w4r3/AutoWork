@@ -623,7 +623,8 @@ async def test_rule_cycle_requires_test_and_reports_only_explicit_test_results()
     second_test = await _call(harness, "rule.test", {"candidate_id": candidate_id, "version": 2})
     assert second_test.output["report"]["false_negative_count"] == 0
     assert second_test.output["report"]["false_positive_count"] == 0
-    assert second_test.output["validation_status"] == "real_validated"
+    assert second_test.output["validation_status"] == "real_partial"
+    assert second_test.output["validation_reason"] == "sample_bytes_missing_or_unverified"
     assert second_test.output["report"]["revision_recommendation"] == "none_justified"
     unjustified_revision = await _call(
         harness,
@@ -642,6 +643,148 @@ async def test_rule_cycle_requires_test_and_reports_only_explicit_test_results()
     assert unjustified_revision.status is ToolInvocationStatus.FAILED
     assert unjustified_revision.error_code == "rule_revision_not_justified"
     assert "Aucune révision justifiée" in unjustified_revision.message
+
+
+@pytest.mark.asyncio
+async def test_unconfirmed_seed_matches_remain_candidates_not_family_positives() -> None:
+    sample = b"unreviewed seed contains UnconfirmedMarker"
+    sample_sha256 = _sha256(sample)
+    holdout_sample = b"independent holdout contains UnconfirmedMarker"
+    holdout_sha256 = _sha256(holdout_sample)
+    harness = _harness(
+        samples={sample_sha256: sample, holdout_sha256: holdout_sample},
+        holdout=(holdout_sha256,),
+    )
+    await _associate(harness, sample_sha256, origin=SampleOrigin.SEED)
+    observation_ref = await _source_observation(harness, "UnconfirmedMarker")
+    proposed = await _call(
+        harness,
+        "rule.propose",
+        {"condition": "all", "motifs": [_motif("UnconfirmedMarker", observation_ref)]},
+    )
+
+    tested = await _call(
+        harness,
+        "rule.test",
+        {"candidate_id": proposed.output["candidate_id"], "version": 1},
+    )
+    report = tested.output["report"]
+    positive = next(item for item in report["roles"] if item["role"] == "confirmed_positive")
+    candidate = next(item for item in report["roles"] if item["role"] == "out_of_cluster_candidate")
+    holdout = next(item for item in report["roles"] if item["role"] == "holdout")
+    seed_result = candidate["test_cases"][0]
+
+    assert positive["test_cases"] == ()
+    assert candidate["matches"] == (sample_sha256,)
+    assert holdout["matches"] == (holdout_sha256,)
+    assert seed_result["expected_match"] is None
+    assert seed_result["family_confirmation"] == "not_assessed"
+    assert report["validation_status"] == "real_partial"
+    assert report["false_positive_count"] == 0
+    assert tested.output["candidate_status"] == DetectionCandidateStatus.CANDIDATE.value
+    assert report["evaluation_protocol"]["holdout_role"] == "holdout"
+    assert "does not confirm family" in report["evaluation_protocol"]["match_interpretation"]
+
+
+@pytest.mark.asyncio
+async def test_generic_dotnet_rule_requires_source_verified_all_of_motifs() -> None:
+    sample = b"System.Runtime.InteropServices private marker RareMarkerQz"
+    sample_sha256 = _sha256(sample)
+    harness = _harness(samples={sample_sha256: sample})
+    generic_ref = await _source_observation(harness, "System.Runtime.InteropServices")
+    specific_ref = await _source_observation(harness, "RareMarkerQz")
+    generic = _motif("System.Runtime.InteropServices", generic_ref)
+    generic["sample_sha256"] = sample_sha256
+    generic["offsets"] = [sample.index(b"System.Runtime.InteropServices")]
+    specific = _motif("RareMarkerQz", specific_ref, provenance_id="source-located-family-marker")
+    specific["sample_sha256"] = sample_sha256
+    specific["offsets"] = [sample.index(b"RareMarkerQz")]
+    meta = {
+        "hypothesis": "The family uses a private payload marker alongside CLR metadata.",
+        "dotnet_imports_discussion": (
+            "The CLR namespace is common in benign software and is not family evidence."
+        ),
+    }
+    rejected = await _call(
+        harness,
+        "rule.propose",
+        {"condition": "all", "motifs": [generic], "meta": meta},
+    )
+    assert rejected.status is ToolInvocationStatus.FAILED
+    assert rejected.error_code == "motif_validation_failed"
+
+    accepted = await _call(
+        harness,
+        "rule.propose",
+        {"condition": "all", "motifs": [generic, specific], "meta": meta},
+    )
+    assert accepted.status is ToolInvocationStatus.SUCCEEDED
+    signature = accepted.output["signature"]
+    assert signature["family"] is None
+    assert signature["hypothesis"] == meta["hypothesis"]
+    assert signature["source_provenance_complete"] is True
+    assert all(item["source_bytes_verified"] for item in signature["motifs"])
+
+
+@pytest.mark.asyncio
+async def test_existing_generic_dotnet_signature_is_reported_as_unqualified_candidate() -> None:
+    from cti_app.domain.investigation import DetectionCandidateVersion
+    from cti_app.infrastructure.yara_runner import IsolatedYaraRunner
+
+    sample = b"benign runtime references System.Runtime.InteropServices"
+    sample_sha256 = _sha256(sample)
+    harness = _harness(
+        samples={sample_sha256: sample},
+        goodware=(sample_sha256,),
+        engine=IsolatedYaraRunner(),
+    )
+    source = """rule ExistingGenericDotnet {
+    strings:
+        $namespace = "System.Runtime.InteropServices" ascii wide
+    condition:
+        $namespace
+}
+"""
+    version = DetectionCandidateVersion(
+        investigation_id=harness.investigation_id,
+        candidate_id=uuid4(),
+        source=source,
+        source_sha256=_sha256(source.encode()),
+        motif_provenance=(),
+    )
+    await harness.candidates.append_version(version, expected_previous_id=None)
+
+    tested = await _call(
+        harness,
+        "rule.test",
+        {"candidate_id": str(version.candidate_id), "version": 1},
+    )
+
+    report = tested.output["report"]
+    assert tested.output["candidate_status"] == DetectionCandidateStatus.REJECTED.value
+    assert tested.output["validation_status"] == "real_partial"
+    assert report["signature"]["generic_dotnet_import_count"] == 1
+    assert report["signature"]["generic_dotnet_guard"] == "incomplete"
+    assert report["metrics"]["real_goodware_false_positive_rate"]["numerator"] == 1
+    assert report["metrics"]["real_positive_sensitivity"]["status"] == "not_calculable"
+    assert any("source-byte-verified" in item for item in report["signature_limitations"])
+
+
+@pytest.mark.asyncio
+async def test_holdout_hash_overlapping_development_is_excluded() -> None:
+    sample = b"one benign sample cannot be both development and holdout"
+    sample_sha256 = _sha256(sample)
+    harness = _harness(
+        samples={sample_sha256: sample},
+        goodware=(sample_sha256,),
+        holdout=(sample_sha256,),
+    )
+
+    corpus = await harness.rule_tools._build_corpus(harness.investigation_id)
+
+    assert sum(case.sample_sha256 == sample_sha256 for case in corpus.cases) == 1
+    assert not any(case.role.value == "holdout" for case in corpus.cases)
+    assert any("exclu du holdout" in limitation for limitation in corpus.limitations)
 
 
 @pytest.mark.asyncio
@@ -782,7 +925,16 @@ async def test_missing_engine_and_unreadable_bytes_are_local_unavailable_results
     assert await unavailable_engine.candidates.list_for_candidate(unavailable_candidate_id) == ()
 
     missing_bytes = _harness(samples={})
-    await _associate(missing_bytes, sha256)
+    missing_seed = await _associate(missing_bytes, sha256)
+    confirmed_missing_seed = missing_seed.change_qualification(
+        SampleQualification.CONFIRMED,
+        actor_kind=QualificationActorKind.HUMAN,
+        actor_id="analyst-test",
+        reason="Fixture exercises missing-byte reporting for a qualified positive.",
+    )
+    await missing_bytes.associations.append_version(
+        confirmed_missing_seed, expected_version=missing_seed.version
+    )
     source_ref = await _source_observation(missing_bytes, "MarkerForTest")
     proposed = await _call(
         missing_bytes,
@@ -827,7 +979,16 @@ async def test_v1_v2_retest_and_comparison_record_exact_corpus_observations() ->
         goodware=(goodware_sha,),
         holdout=(holdout_sha,),
     )
-    await _associate(harness, first_sha, origin=SampleOrigin.SEED)
+    first_seed = await _associate(harness, first_sha, origin=SampleOrigin.SEED)
+    confirmed_first_seed = first_seed.change_qualification(
+        SampleQualification.CONFIRMED,
+        actor_kind=QualificationActorKind.HUMAN,
+        actor_id="analyst-test",
+        reason="Synthetic fixture is explicitly qualified for this test.",
+    )
+    await harness.associations.append_version(
+        confirmed_first_seed, expected_version=first_seed.version
+    )
     marker_one_ref = await _source_observation(harness, "AlphaFamilyMarker")
     marker_two_ref = await _source_observation(harness, "BetaVariantMarker")
     candidate_id = uuid4()

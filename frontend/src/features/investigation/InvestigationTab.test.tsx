@@ -318,6 +318,9 @@ describe("InvestigationTab", () => {
     expect(
       await screen.findByText(/Consultez et décidez l’enveloppe G2 ici/),
     ).toBeInTheDocument();
+    await userEvent.click(
+      screen.getByRole("button", { name: "Ouvrir l’onglet Journal & revue" }),
+    );
     expect(
       screen.getByText(/Décision requise : enveloppe G2 non approuvée/),
     ).toBeInTheDocument();
@@ -355,7 +358,16 @@ describe("InvestigationTab", () => {
       findings: [
         {
           id: "finding-new-sample",
+          logical_id: "finding-new-sample",
+          current_version_id: "finding-new-sample",
           version: 1,
+          revision_chain: [
+            {
+              id: "finding-new-sample",
+              version: 1,
+              created_at: "2026-10-13T08:00:00Z",
+            },
+          ],
           kind: "new_sample",
           assessment: "supported",
           novelty: "new_to_article",
@@ -369,7 +381,16 @@ describe("InvestigationTab", () => {
         },
         {
           id: "finding-claim",
+          logical_id: "finding-claim",
+          current_version_id: "finding-claim",
           version: 1,
+          revision_chain: [
+            {
+              id: "finding-claim",
+              version: 1,
+              created_at: "2026-10-13T08:05:00Z",
+            },
+          ],
           kind: "claim_verification",
           assessment: "refuted",
           novelty: "claim_correction",
@@ -421,9 +442,13 @@ describe("InvestigationTab", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("contredit", { exact: true })).toBeInTheDocument();
     expect(screen.getByText(/Éléments contradictoires/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Échantillons" }));
     expect(
       await screen.findByText(/Acquisition ≠ confirmation/),
     ).toBeInTheDocument();
+    await userEvent.click(
+      screen.getByRole("button", { name: "Journal & revue" }),
+    );
     expect(screen.getAllByText(/Tours Bridge/).length).toBeGreaterThan(1);
     expect(screen.getAllByText(/Unités VirusTotal/).length).toBeGreaterThan(1);
     expect(screen.getAllByText(/Crédits Shodan/).length).toBeGreaterThan(1);

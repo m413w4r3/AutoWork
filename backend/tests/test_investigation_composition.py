@@ -455,6 +455,8 @@ async def test_api_factory_operator_writes_execute_through_live_composition_serv
                     ),
                     claims=(),
                 ),
+                tlp=None,
+                do_not_submit=True,
                 external_llm_allowed=False,
             )
 

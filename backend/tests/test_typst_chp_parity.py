@@ -42,11 +42,30 @@ from cti_app.application.typst_compilation import (
 from cti_app.application.typst_render_execution import TypstRenderExecutor
 from cti_app.application.typst_rendering import (
     TemplateFile,
+    TypstDraftPreviewDocument,
     TypstMediaRef,
     TypstRenderer,
     TypstRenderSource,
     TypstTemplateBundle,
     load_template_bundle,
+)
+from cti_app.domain.analyst_opinion import (
+    AnalystObservationRelation,
+    AnalystObservationState,
+    AnalystObservationV1,
+    AnalystOpinionStatus,
+    opinion_blocks_with_observations,
+)
+from cti_app.domain.investigation_graph import (
+    InvestigationGraph,
+    InvestigationGraphConfidence,
+    InvestigationGraphDirection,
+    InvestigationGraphEdge,
+    InvestigationGraphEvidenceBasis,
+    InvestigationGraphEvidenceRef,
+    InvestigationGraphNode,
+    InvestigationGraphNodeKind,
+    InvestigationGraphSource,
 )
 from cti_app.domain.production_editorial_enrichment import (
     DiagramEdgeV1,
@@ -66,20 +85,28 @@ from cti_app.domain.publication import (
     ArtifactType,
     PublicationIndicatorGroupV1,
     PublicationIndicatorV1,
+    PublicationParagraphV1,
+    PublicationSectionKind,
+    PublicationSectionV1,
+    PublicationTimelineEntryV1,
 )
 from cti_app.domain.publication_document import (
     PublicationDocumentV4,
     PublicationDocumentV5,
+    PublicationIOCDisposition,
     PublicationTableColumnV1,
     PublicationTableRowV1,
     publication_document_text_anchors,
+    publication_document_v5_sha256,
     serialize_publication_document,
 )
 from cti_app.domain.semantic_annotation import (
     SEMANTIC_ANNOTATION_POLICY_VERSION,
     SEMANTIC_ANNOTATION_SCHEMA_VERSION,
     SemanticAnnotationProposalV1,
+    SemanticParagraphV1,
     SemanticRole,
+    SemanticTextSpanV1,
     SemanticTextV1,
 )
 from cti_app.infrastructure.d2_diagram_compiler import D2_COMPILER_VERSION, D2DiagramCompiler
@@ -318,9 +345,26 @@ def chp_parity_document() -> PublicationDocumentV4:
             ),
         ),
     )
+    indicators = tuple(
+        replace(
+            group,
+            indicators=tuple(
+                replace(
+                    indicator,
+                    value="https://display.example/path",
+                    normalized_value="https://display.example/path",
+                )
+                for indicator in group.indicators
+            ),
+        )
+        if group.artifact_type is ArtifactType.URL
+        else group
+        for group in document.indicators
+    )
     return replace(
         document,
         title="CHP visual parity fixture",
+        indicators=indicators,
         lead=(
             replace(document.lead[0], text="Synthesis lead paragraph for parity coverage."),
             replace(document.lead[1], text="A second lead paragraph."),
@@ -554,7 +598,7 @@ async def _assert_real_typst_keep_with_next_case(
             table = next(
                 block
                 for section in publication["content_sections"]
-                for block in section["blocks"]
+                for block in section.get("blocks", ())
                 if block["type"] == "table"
             )
         publication["content_sections"] = _keep_with_next_sections(target, filler_count, table)
@@ -599,7 +643,6 @@ async def _assert_real_typst_keep_with_next_case(
         assert completed.returncode == 0, completed.stderr.decode("utf-8", errors="replace")
         return PdfReader(BytesIO(await anyio.Path(output_path).read_bytes()), strict=True)
 
-    is_table = target in {"table", "long-table"}
     marker = (
         "Vulnérabilités cataloguées par système"
         if target == "table"
@@ -614,23 +657,33 @@ async def _assert_real_typst_keep_with_next_case(
         if target == "long-table"
         else ("Adresses IP :", "192.0.2.1")
     )
-    filler_count = (29 if edition else 30) if is_table else (30 if edition else 31)
+    filler_count = 30 if target == "long-table" else 60
     control_page_index: int | None = None
     selected_filler_count = filler_count
     if target == "long-table":
         control_workspace, control_data_path = await prepare_workspace(
             f"{target}-unsticky-control", control_files
         )
-        observed_endings: list[str] = []
-        for candidate_filler_count in range(filler_count, max(-1, filler_count - 9), -1):
+        observed_boundaries: list[str] = []
+        for candidate_filler_count in range(filler_count + 50, max(-1, filler_count - 20), -1):
             control_reader = await compile_at(
                 control_workspace, control_data_path, candidate_filler_count
             )
             for page_index, page in enumerate(control_reader.pages[:-1]):
                 page_text = page.extract_text() or ""
                 lines = _page_content_lines(page_text)
-                observed_endings.append(lines[-1] if lines else "<empty>")
                 next_page_text = control_reader.pages[page_index + 1].extract_text() or ""
+                if marker in page_text:
+                    header_is_present = all(
+                        heading in page_text
+                        for heading in ("Système", "Vulnérabilités recherchées")
+                    )
+                    observed_boundaries.append(
+                        f"fill={candidate_filler_count}, page={page_index}, "
+                        f"header={header_is_present}, first-row-here={following[-1] in page_text}, "
+                        f"first-row-next={following[-1] in next_page_text}, "
+                        f"tail={' '.join(lines[-5:])!r}"
+                    )
                 page_ending = " ".join(lines[-2:])
                 header_is_last = all(
                     heading in page_ending for heading in ("Système", "Vulnérabilités recherchées")
@@ -649,7 +702,7 @@ async def _assert_real_typst_keep_with_next_case(
                 break
         assert control_page_index is not None, (
             f"could not calibrate a split table {marker!r} at {filler_count} filler blocks; "
-            f"page endings: {observed_endings!r}"
+            f"title boundaries: {observed_boundaries!r}"
         )
 
     fixed_reader = await compile_at(fixed_workspace, fixed_data_path, selected_filler_count)
@@ -932,7 +985,7 @@ async def test_real_typst_pdf_preserves_chp_publication_structure(
         "Source : example.test — p. 1",
         "Display ip",
         "Display domain",
-        "Display url",
+        "hxxps://display[.]example/path",
         "Display email",
         "Display hash",
         "IOC",
@@ -1108,6 +1161,403 @@ async def test_real_typst_and_poppler_render_v6_opinion_without_changing_v5(
             check=True,
         )
     assert page_prefix.with_suffix(".png").is_file()
+
+
+@pytest.mark.asyncio
+async def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_navigable_refs(
+    tmp_path: Path,
+    typst_binary: str,
+    font_bundle_root: Path,
+) -> None:
+    publication, *_case = _frontmatter_v6_case()
+    main_indicator = next(
+        item
+        for group in publication.document.indicators
+        for item in group.indicators
+        if item.value == "core.example"
+    )
+    original_indicator = next(
+        item
+        for group in publication.original_indicators
+        for item in group.indicators
+        if item.value == "original.example"
+    )
+    main_detail = next(
+        item
+        for item in publication.ioc_details
+        if item.normalized_value == main_indicator.normalized_value
+    )
+    original_detail = next(
+        item
+        for item in publication.ioc_details
+        if item.normalized_value == original_indicator.normalized_value
+    )
+    candidate_detail = next(
+        item for item in publication.ioc_details if item.value == "contextual.example"
+    )
+    verified_original_detail = replace(
+        original_detail,
+        disposition=PublicationIOCDisposition.RETAINED,
+        disposition_reason="subject_relation_demonstrated",
+    )
+
+    original_group = PublicationIndicatorGroupV1(
+        original_indicator.artifact_type,
+        (original_indicator,),
+    )
+    kept_details = (main_detail, verified_original_detail, candidate_detail)
+    additional_source_ids = (
+        {item.source_document_id for item in publication.references}
+        | {
+            evidence.source_document_id
+            for item in publication.references
+            for evidence in item.evidence_refs
+        }
+        | {
+            source_id
+            for group in (original_group,)
+            for indicator in group.indicators
+            for source_id in indicator.source_document_ids
+        }
+        | {source_id for detail in kept_details for source_id in detail.source_document_ids}
+    )
+    body_section = PublicationSectionV1(
+        kind=PublicationSectionKind.TECHNICAL,
+        heading="Technique et portée",
+        paragraphs=(
+            PublicationParagraphV1(
+                text="La seconde source ne confirme pas l'attribution avancée.",
+                evidence_refs=publication.document.lead[0].evidence_refs,
+            ),
+        ),
+    )
+    chronology_event = PublicationTimelineEntryV1(
+        event_date=None,
+        date_text="12 juin 2026",
+        text="La source situe le premier jalon de l'activité au 12 juin 2026.",
+        evidence_refs=publication.document.lead[0].evidence_refs,
+    )
+    source = next(
+        item
+        for item in publication.document.sources
+        if item.source_document_id in {ref.source_document_id for ref in publication.references}
+    )
+    document_source_ids = set(additional_source_ids)
+    document_source_ids.update(
+        ref.source_document_id
+        for paragraph in publication.document.lead
+        for ref in paragraph.evidence_refs
+    )
+    document_source_ids.update(
+        ref.source_document_id
+        for section in (*publication.document.sections, body_section)
+        for paragraph in section.paragraphs
+        for ref in paragraph.evidence_refs
+    )
+    document_source_ids.update(
+        ref.source_document_id
+        for item in publication.document.timeline[:1]
+        for ref in item.evidence_refs
+    )
+    document_source_ids.update(
+        source_id
+        for group in publication.document.indicators
+        for indicator in group.indicators
+        for source_id in indicator.source_document_ids
+    )
+    document_source_ids.update(
+        source_id
+        for item in publication.document.uncertainties
+        for source_id in item.source_document_ids
+    )
+    documentary_figure = replace(
+        _figure_at(
+            "c8-documentary-figure",
+            "Diagramme documenté, non observé dans l'environnement analysé.",
+            EnrichmentPlacementKind.END,
+        ),
+        source_document_id=source.source_document_id,
+        source_url=source.canonical_url,
+    )
+    document = replace(
+        publication.document,
+        indicators=(PublicationIndicatorGroupV1(main_indicator.artifact_type, (main_indicator,)),),
+        timeline=(chronology_event,),
+        sections=(*publication.document.sections, body_section),
+        figures=(documentary_figure,),
+        sources=tuple(
+            item
+            for item in publication.document.sources
+            if item.source_document_id in document_source_ids
+        ),
+        additional_source_ids=frozenset(additional_source_ids),
+    )
+    publication = replace(
+        publication,
+        document=document,
+        semantic_text=SemanticTextV1(
+            schema_version=publication.semantic_text.schema_version,
+            policy_version=publication.semantic_text.policy_version,
+            paragraphs=tuple(
+                SemanticParagraphV1(
+                    anchor=anchor,
+                    spans=(SemanticTextSpanV1(SemanticRole.TEXT, text),),
+                )
+                for anchor, text in publication_document_text_anchors(
+                    document,
+                    references=publication.references,
+                ).items()
+            ),
+        ),
+        original_indicators=(original_group,),
+        ioc_details=kept_details,
+    )
+    assert len(publication.document.timeline) == 1
+    assert len(publication.timeline) == 1
+
+    opinion, citation_context = _approved_opinion(publication)
+    anchors = publication_document_text_anchors(
+        publication.document,
+        references=publication.references,
+    )
+    lead_anchor = next(anchor for anchor in anchors if anchor.startswith("lead:"))
+    section_anchor = next(
+        anchor
+        for anchor in anchors
+        if anchor.startswith(("lead:", "section:")) and anchor != lead_anchor
+    )
+    observations = (
+        AnalystObservationV1(
+            id=UUID(int=9301),
+            anchor=lead_anchor,
+            text="La référence consigne le premier jalon de l'activité.",
+            state=AnalystObservationState.INFERRED,
+            relation=AnalystObservationRelation.CONFIRMS,
+            finding_refs=(citation_context.findings[0].id,),
+            evidence_refs=(citation_context.observations[0].id,),
+        ),
+        AnalystObservationV1(
+            id=UUID(int=9302),
+            anchor=section_anchor,
+            text="La seconde source ne confirme pas l'attribution avancée.",
+            state=AnalystObservationState.OBSERVED,
+            relation=AnalystObservationRelation.REFUTES,
+            finding_refs=(citation_context.findings[0].id,),
+            evidence_refs=(citation_context.observations[0].id,),
+        ),
+    )
+    preview_opinion = replace(
+        opinion,
+        status=AnalystOpinionStatus.DRAFT,
+        reviewer_id=None,
+        blocks=opinion_blocks_with_observations(opinion.blocks, observations),
+        content_sha256="",
+    )
+    evidence_observation = citation_context.observations[0]
+    infrastructure_graph = InvestigationGraph(
+        investigation_id=preview_opinion.investigation_id,
+        publication_sha256=publication_document_v5_sha256(publication),
+        nodes=(
+            InvestigationGraphNode(
+                node_id="sample",
+                kind=InvestigationGraphNodeKind.FILE_SHA256,
+                value="d" * 64,
+                label="SHA-256 de l'échantillon",
+            ),
+            InvestigationGraphNode(
+                node_id="domain",
+                kind=InvestigationGraphNodeKind.DOMAIN,
+                value="observed.example",
+                label="observed.example",
+            ),
+        ),
+        edges=(
+            InvestigationGraphEdge(
+                source_node_id="sample",
+                target_node_id="domain",
+                relation="observed_contact",
+                direction=InvestigationGraphDirection.PIVOT_TO_TARGET,
+                source_kind=InvestigationGraphSource.PASSIVE_DNS,
+                evidence_basis=InvestigationGraphEvidenceBasis.OBSERVED,
+                confidence=InvestigationGraphConfidence.HIGH,
+                observed_at=evidence_observation.observed_at,
+                evidence_refs=(
+                    InvestigationGraphEvidenceRef(
+                        observation_id=evidence_observation.id,
+                        sha256=evidence_observation.sha256,
+                        source_name="Fixture observation",
+                        source_version=evidence_observation.source_version,
+                        observed_at=evidence_observation.observed_at,
+                    ),
+                ),
+            ),
+        ),
+    )
+    preview = TypstDraftPreviewDocument(
+        publication,
+        preview_opinion,
+        infrastructure_graph=infrastructure_graph,
+    )
+
+    template_bundle = load_template_bundle(_CHP_TYPST_ROOT)
+    render_source = TypstRenderer().render(preview, template_bundle)
+    render_data = json.loads(render_source.render_data_bytes)
+    sections = render_data["content_sections"]
+    section_by_type = {section["type"]: section for section in sections}
+    synthesis = section_by_type["synthesis"]
+    ioc_section = section_by_type["ioc"]
+    annex = section_by_type["technical_annex"]
+    notes = [block for block in synthesis["blocks"] if block["type"] == "analyst_observation"]
+    source_figures = [block for block in synthesis["blocks"] if block["type"] == "figure"]
+    graph_figure = section_by_type["analyst_opinion"]["infrastructure_graph_figure"]
+
+    def values(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [item for group in groups for item in group["items"]]
+
+    source_iocs = values(ioc_section["source_indicators"])
+    original_iocs = values(ioc_section["original_indicators"])
+    candidate_iocs = values(ioc_section["candidate_indicators"])
+    structural_snapshot = {
+        "schema_version": render_data["schema_version"],
+        "section_types": [section["type"] for section in sections],
+        "chronology_count": sum(section["type"] == "chronology" for section in sections),
+        "chronology_events": len(section_by_type.get("chronology", {}).get("timeline", ())),
+        "anchored_notes": [
+            (
+                item["anchor"],
+                item["relation_label"],
+                len(item["finding_refs"]),
+                len(item["evidence_refs"]),
+            )
+            for item in notes
+        ],
+        "ioc_values": {
+            "source": [item["value"]["text"] for item in source_iocs],
+            "original": [item["value"]["text"] for item in original_iocs],
+            "candidate": [item["value"]["text"] for item in candidate_iocs],
+        },
+        "provenance_counts": [
+            (len(item["source_refs"]), len(item["evidence"]))
+            for item in (*source_iocs, *original_iocs, *candidate_iocs)
+        ],
+        "documentary_figure": source_figures[0]["evidence_classification"],
+        "observed_figure_basis": graph_figure["edges"][0]["evidence_basis_label"],
+        "ioc_body_has_table": any(
+            block["type"] == "table" for block in ioc_section.get("blocks", ())
+        ),
+        "annex_has_exhaustive_table": bool(annex["ioc_row_groups"]),
+    }
+    assert structural_snapshot == {
+        "schema_version": "typst-publication-model-v26-anchored-editorial-spacing",
+        "section_types": [
+            "references",
+            "chronology",
+            "synthesis",
+            "analyst_opinion",
+            "ioc",
+            "technical_annex",
+        ],
+        "chronology_count": 1,
+        "chronology_events": 1,
+        "anchored_notes": [
+            (lead_anchor, "confirme", 1, 1),
+            (section_anchor, "contredit", 1, 1),
+        ],
+        "ioc_values": {
+            "source": ["core[.]example"],
+            "original": ["original[.]example"],
+            "candidate": ["contextual[.]example"],
+        },
+        "provenance_counts": [(1, 1), (1, 1), (1, 1)],
+        "documentary_figure": "documented_not_observed",
+        "observed_figure_basis": "fait observé",
+        "ioc_body_has_table": False,
+        "annex_has_exhaustive_table": True,
+    }
+    assert all(len(item["anchor_text_sha256"]["text"]) == 64 for item in notes)
+    body_anchor_targets = {
+        block.get("anchor_target") for block in synthesis["blocks"] if block["type"] == "paragraph"
+    }
+    assert {item["anchor_target"] for item in notes} <= body_anchor_targets
+    assert all("target_id" in entry for entry in section_by_type["references"]["entries"])
+
+    workspace = tmp_path / "c8-preview-workspace"
+    _build_workspace(
+        workspace,
+        bundle_files=template_bundle.files,
+        render_data_bytes=render_source.render_data_bytes,
+        media_refs=render_source.media_refs,
+    )
+    font_snapshot = load_font_bundle_snapshot(font_bundle_root, _FONT_BUNDLE_LOCK)
+    font_root = tmp_path / "c8-font-snapshot"
+    font_root.mkdir()
+    compiled = await TypstSubprocessCompiler(binary=str(typst_binary)).compile(
+        TypstCompileRequest(
+            workspace_root=workspace,
+            entrypoint_relative_path=render_source.entrypoint_relative_path,
+            font_paths=materialize_font_bundle(font_snapshot, font_root),
+        )
+    )
+
+    output_directory = await anyio.Path(
+        os.environ.get("C8_PREVIEW_OUTPUT_DIR", str(tmp_path))
+    ).expanduser()
+    await output_directory.mkdir(parents=True, exist_ok=True)
+    pdf_path = output_directory / "c8-preview-non-approuve.pdf"
+    await pdf_path.write_bytes(compiled.content)
+    reader = PdfReader(BytesIO(compiled.content), strict=True)
+    extracted = await anyio.run_process(
+        ("pdftotext", "-layout", str(pdf_path), "-"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+    pdf_text = extracted.stdout.decode("utf-8", errors="replace")
+    normalized_text = pdf_text.upper().replace("\u2019", "'")
+    assert "BROUILLON NON APPROUVÉ" in normalized_text
+    assert sum(line.strip() == "CHRONOLOGIE" for line in normalized_text.splitlines()) == 1
+    assert "IOC ORIGINAUX" in normalized_text
+    assert "PISTES / IOC CANDIDATS NON CONFIRMÉS" in normalized_text
+    assert "CORE[.]EXAMPLE" in normalized_text
+    assert "ORIGINAL[.]EXAMPLE" in normalized_text
+    assert "CONTEXTUAL[.]EXAMPLE" in normalized_text
+    assert "DOCUMENTÉ, NON OBSERVÉ" in normalized_text
+    assert "FAIT OBSERVÉ" in normalized_text
+    assert normalized_text.count("NOTE DE L'ANALYSTE") == 2
+    assert "SHA-256 DU PASSAGE" in normalized_text
+
+    internal_link_count = 0
+    internal_destination_pages: list[int] = []
+    external_uris: list[str] = []
+    for page in reader.pages:
+        for annotation_ref in page.get("/Annots", ()):
+            annotation = annotation_ref.get_object()
+            action = annotation.get("/A")
+            if action is not None and action.get("/S") == "/GoTo":
+                internal_link_count += 1
+                destination = action.get("/D")
+            else:
+                destination = annotation.get("/Dest")
+            if destination is not None:
+                internal_link_count += 1
+                resolved_destination = (
+                    destination.get_object() if hasattr(destination, "get_object") else destination
+                )
+                if isinstance(resolved_destination, list) and resolved_destination:
+                    page_reference = resolved_destination[0]
+                    target_page = (
+                        page_reference.get_object()
+                        if hasattr(page_reference, "get_object")
+                        else page_reference
+                    )
+                    internal_destination_pages.append(reader.get_page_number(target_page))
+            if action is not None and action.get("/URI") is not None:
+                external_uris.append(str(action["/URI"]))
+    assert internal_link_count > 0
+    assert internal_destination_pages
+    assert all(0 <= page_number < len(reader.pages) for page_number in internal_destination_pages)
+    assert any("https://" in uri for uri in external_uris)
+    assert any("autowork://investigations/" in uri for uri in external_uris)
 
 
 @pytest.mark.asyncio
@@ -1462,7 +1912,12 @@ async def test_real_typst_renders_annotated_literal_content_without_evaluating_i
     template_bundle = load_template_bundle(_CHP_TYPST_ROOT)
     render_source = TypstRenderer().render(document, template_bundle)
     render_data = json.loads(render_source.render_data_bytes)
-    first_paragraph = render_data["content_sections"][1]["blocks"][0]
+    synthesis_section = next(
+        section for section in render_data["content_sections"] if section["type"] == "synthesis"
+    )
+    first_paragraph = next(
+        block for block in synthesis_section["blocks"] if block["type"] == "paragraph"
+    )
     assert any(span["style"] == "semantic-actor" for span in first_paragraph["semantic_spans"])
     assert any(span["style"] == "semantic-command" for span in first_paragraph["semantic_spans"])
     assert b"render-publication" in render_source.source_bytes
@@ -1473,11 +1928,19 @@ async def test_real_typst_renders_annotated_literal_content_without_evaluating_i
     )
     assert "semantic-or-plain(item.text" in renderer_helpers
 
+    legacy_render_data = json.loads(render_source.render_data_bytes)
+    for section in legacy_render_data["content_sections"]:
+        if section["type"] in {"references", "chronology", "analyst_opinion"}:
+            section.pop("blocks", None)
+    legacy_render_data_bytes = json.dumps(
+        legacy_render_data, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
     workspace_root = tmp_path / "semantic-workspace"
     _build_workspace(
         workspace_root,
         bundle_files=template_bundle.files,
-        render_data_bytes=render_source.render_data_bytes,
+        render_data_bytes=legacy_render_data_bytes,
         media_refs=render_source.media_refs,
     )
     font_snapshot = load_font_bundle_snapshot(font_bundle_root, _FONT_BUNDLE_LOCK)
@@ -1552,22 +2015,21 @@ async def test_real_typst_frontmatter_and_120_original_iocs_flow_across_pages(
     assert len(reader.pages) >= 2
     assert "[Example actor] Décrit une activité documentée" in text
     assert "RÉFÉRENCES" in text
-    assert text.count("IOC") == 2
-    assert "Technical IOC feed" not in text
-    reserve_heading = "IOC originaux à lien non démontré"
-    assert reserve_heading in text
-    reserve_position = text.index(reserve_heading)
-    assert text.index("core[.]example") < reserve_position
-    assert "Le lien avec le sujet" in text and "pas démontré" in text
+    assert "Technical IOC feed" in text
+    assert "Contexte technique" in text
+    candidate_heading = "Pistes / IOC candidats non confirmés"
+    assert candidate_heading in text
+    candidate_position = text.index(candidate_heading)
+    assert text.index("core[.]example") < candidate_position
+    assert "Candidat non confirmé" in text
     assert "10 janvier 2026" in text
     assert "https://a.example/report" in text
     assert "Date de publication non précisée" in text
     assert all(f"original-{index:03d}[.]example" in compact_text for index in range(120))
-    main_list_text = text[:reserve_position]
-    reserve_list_text = text[reserve_position:]
-    assert all(f"original-{index:03d}.example" not in main_list_text for index in range(120))
-    assert all(f"original-{index:03d}[.]example" in main_list_text for index in range(120))
-    assert all(f"original-{index:03d}[.]example" not in reserve_list_text for index in range(120))
+    main_list_text = text[:candidate_position]
+    candidate_list_text = text[candidate_position:]
+    assert all(f"original-{index:03d}[.]example" not in main_list_text for index in range(120))
+    assert all(f"original-{index:03d}[.]example" in candidate_list_text for index in range(120))
 
     output_dir = anyio.Path(
         os.environ.get("AUTOWORK_REVIEW_ARTIFACT_DIR", str(tmp_path / "review"))

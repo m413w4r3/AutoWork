@@ -31,6 +31,7 @@ from tests.test_typst_chp_parity import (
 )
 from tests.test_typst_compiler_runtime import (
     _COPYABLE_VALUES,
+    _COPYABLE_WINDOWS_PATH,
     _assert_exact_copyable_pdf_text,
     _copyable_ioc_document,
     _install_narrow_technical_table,
@@ -354,6 +355,9 @@ async def test_real_typst_edition_preserves_copyable_technical_literals(
     )
     reader = PdfReader(BytesIO(compiled.content), strict=True)
     extracted = _assert_exact_copyable_pdf_text(reader, _COPYABLE_VALUES)
+    # The fixture classifies this Windows path as a URL; C8 omits invalid URLs
+    # instead of publishing them as network indicators.
+    assert _COPYABLE_WINDOWS_PATH not in extracted.replace("\n", "")
     assert extracted.count("IOC") >= len(edition_document.publications)
     assert "Registre Windows" in extracted
     assert len(reader.pages) >= 1

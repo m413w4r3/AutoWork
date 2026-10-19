@@ -7,6 +7,7 @@ import pytest
 
 from cti_app.application.protocol_diagram_projection import (
     project_protocol_diagram,
+    protocol_diagram_caption,
     protocol_diagram_pin_sha256,
 )
 from cti_app.domain.protocol_model import (
@@ -16,6 +17,7 @@ from cti_app.domain.protocol_model import (
     ProtocolDiagramNodeV1,
     ProtocolDiagramSpecV1,
     ProtocolDiagramStatus,
+    ProtocolEvidenceLevelV1,
     ProtocolEvidenceRefV1,
     ProtocolValidationStatus,
     StreamDirection,
@@ -67,6 +69,8 @@ def _field(
     encrypted_opaque: bool = False,
     endianness: str | None = None,
     evidence: tuple[ProtocolEvidenceRefV1, ...] = (),
+    evidence_level: ProtocolEvidenceLevelV1 | None = None,
+    justification: str | None = None,
 ) -> ProtocolDiagramFieldV1:
     return ProtocolDiagramFieldV1(
         field_id=field_id,
@@ -79,6 +83,8 @@ def _field(
         encrypted_opaque=encrypted_opaque,
         validation_status=status,
         evidence=evidence,
+        evidence_level=evidence_level,
+        justification=justification,
     )
 
 
@@ -252,6 +258,68 @@ def test_insufficient_evidence_renders_only_an_explicit_gap_card() -> None:
     assert "No protocol scenario established" in source
     assert "beacon" not in source.casefold()
     assert "generic sequence" in (diagram.caption or "")
+
+
+def test_figure_legend_separates_evidence_levels_and_marks_documentation_unobserved() -> None:
+    levels = tuple(ProtocolEvidenceLevelV1)
+    fields = tuple(
+        _field(
+            f"field-{index}",
+            level.value,
+            None if level is ProtocolEvidenceLevelV1.ARTICLE_DOCUMENTED else index - 1,
+            None if level is ProtocolEvidenceLevelV1.ARTICLE_DOCUMENTED else 1,
+            status=(
+                ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED
+                if level is ProtocolEvidenceLevelV1.ARTICLE_DOCUMENTED
+                else ProtocolValidationStatus.INFERRED
+            ),
+            evidence_level=level,
+            justification="Message-relative offset derived from the cited field evidence.",
+        )
+        for index, level in enumerate(levels, 1)
+    )
+    spec = _spec(ProtocolDiagramKind.MESSAGE_FORMAT, fields=fields)
+
+    diagram = project_protocol_diagram(spec)
+    source = encode_d2_source(diagram).decode("utf-8")
+    caption = protocol_diagram_caption(spec)
+
+    assert all(level.value.upper() in source for level in levels)
+    assert "DOCUMENTED, NOT OBSERVED" in source
+    assert any(
+        "offset justification Message-relative offset" in node.label for node in diagram.nodes
+    )
+    assert all(level.value.upper() in caption for level in levels)
+    assert "proof origin and are separate from validation status" in caption
+    assert "never means packet, frame, or byte observed" in caption
+
+
+def test_derived_field_order_is_not_labeled_observed_across_proof_levels() -> None:
+    spec = _spec(
+        ProtocolDiagramKind.MESSAGE_FORMAT,
+        fields=(
+            _field(
+                "captured",
+                "Captured field",
+                0,
+                1,
+                evidence=(_field_evidence(),),
+                evidence_level=ProtocolEvidenceLevelV1.SANDBOX_CAPTURE_OBSERVED,
+            ),
+            _field(
+                "inferred",
+                "Inferred field",
+                1,
+                1,
+                evidence_level=ProtocolEvidenceLevelV1.STATIC_INFERENCE,
+            ),
+        ),
+    )
+
+    diagram = project_protocol_diagram(spec)
+    order_edge = next(edge for edge in diagram.edges if edge.label.endswith("field order"))
+
+    assert order_edge.label.startswith("INFERRED · STATIC_INFERENCE")
 
 
 def test_protocol_pin_hash_covers_semantics_and_compiler_identity() -> None:

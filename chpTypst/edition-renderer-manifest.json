@@ -1,5 +1,5 @@
 {
-  "template_version": "chp-edition-v23-caption-spacing-graph-wrap",
+  "template_version": "chp-edition-v25-c8-spacing-compat",
   "files": [
     "RENDERER/edition.typ",
     "RENDERER/edition_helpers.typ",

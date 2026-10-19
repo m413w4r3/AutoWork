@@ -457,7 +457,7 @@ async def test_w14_a_similarity_rule_revision_and_new_article_sample(
             material=material,
             article_claim=f"The reference article documents seed SHA-256 {sha_a}.",
         )
-        await persist_sample_association_fixture(
+        association_a = await persist_sample_association_fixture(
             uow_factory,
             driver.artifact_store,
             investigation_id=seeded.investigation.id,
@@ -764,6 +764,28 @@ async def test_w14_a_similarity_rule_revision_and_new_article_sample(
                 downloads=1,
                 acquire=True,
             )
+            # Seed origin alone does not confirm family membership; A is an expected
+            # positive in this scenario, so qualify it with cited human-review evidence.
+            qualification_evidence_a = await _persist_observation(
+                uow_factory,
+                driver.artifact_store,
+                investigation_id=seeded.investigation.id,
+                kind=EvidenceKind.BINARY_ANALYSIS,
+                payload={"sample_sha256": sha_a, "retained_as": "article-seed-A"},
+                source="w14-human-qualification-fixture",
+                object_type="sample",
+                object_id=sha_a,
+            )
+            qualified_a = await qualify_sample_http(
+                client,
+                seeded.investigation.id,
+                association_a.id,
+                expected_version=association_a.version,
+                qualification=SampleQualification.CONFIRMED,
+                evidence_refs=(qualification_evidence_a.id,),
+            )
+            assert qualified_a.status_code == 200, qualified_a.text
+            assert qualified_a.json()["association"]["qualification"] == "confirmed"
             qualification_evidence = await _persist_observation(
                 uow_factory,
                 driver.artifact_store,
@@ -1585,8 +1607,9 @@ async def test_w14_e_retrohunt_subject_slots_replay_and_concurrent_investigation
             material=material_b,
             article_claim="A second independent workflow targets the same article subject.",
         )
+        seed_associations = {}
         for seeded, sample_bytes in ((first, bytes_a), (second, bytes_b)):
-            await persist_sample_association_fixture(
+            seed_associations[seeded.investigation.id] = await persist_sample_association_fixture(
                 uow_factory,
                 driver.artifact_store,
                 investigation_id=seeded.investigation.id,
@@ -1895,6 +1918,32 @@ async def test_w14_e_retrohunt_subject_slots_replay_and_concurrent_investigation
                     downloads=0,
                     acquire=False,
                 )
+                # These seeds are controlled positives for rule.test; their seed
+                # provenance does not replace explicit sample qualification.
+                association = seed_associations[seeded.investigation.id]
+                qualification_evidence = await _persist_observation(
+                    uow_factory,
+                    driver.artifact_store,
+                    investigation_id=seeded.investigation.id,
+                    kind=EvidenceKind.BINARY_ANALYSIS,
+                    payload={
+                        "sample_sha256": material.sample_hash,
+                        "retained_as": "w14-retrohunt-controlled-positive",
+                    },
+                    source="w14-human-qualification-fixture",
+                    object_type="sample",
+                    object_id=material.sample_hash,
+                )
+                qualified = await qualify_sample_http(
+                    client,
+                    seeded.investigation.id,
+                    association.id,
+                    expected_version=association.version,
+                    qualification=SampleQualification.CONFIRMED,
+                    evidence_refs=(qualification_evidence.id,),
+                )
+                assert qualified.status_code == 200, qualified.text
+                assert qualified.json()["association"]["qualification"] == "confirmed"
 
                 async def run_preparation_job(
                     app=app,

@@ -58,6 +58,7 @@ from cti_app.domain.rule_workbench import (
     RuleTestCorpusRole,
     RuleTestError,
     RuleTestErrorCode,
+    RuleTestMeasurementMethod,
     RuleTestReport,
     RuleValidationStatus,
     RuleVersionComparison,
@@ -209,6 +210,11 @@ _NOISE_CATEGORIES = frozenset(
         InvariantCategory.GENERIC_WINAPI,
         InvariantCategory.UNKNOWN,
     }
+)
+_GENERIC_DOTNET_IMPORT = re.compile(
+    r"^(?:mscoree\.dll|_?Cor(?:Exe|Dll)Main|mscorlib|netstandard|"
+    r"System(?:\.[A-Za-z_][A-Za-z0-9_]*)*|Microsoft(?:\.[A-Za-z_][A-Za-z0-9_]*)*)$",
+    re.IGNORECASE,
 )
 _PERSISTED_MOTIF_PREFIX = "rule-workbench-motif-v1:"
 
@@ -441,6 +447,7 @@ class RuleWorkbench:
         motifs: Sequence[RuleMotif],
         *,
         meta: Mapping[str, str | int | bool] | None = None,
+        condition: RuleConditionStrategy | str | None = None,
     ) -> RuleMotifValidationReport:
         issues: list[RuleMotifIssue] = []
         if not isinstance(motifs, Sequence):
@@ -554,6 +561,59 @@ class RuleWorkbench:
                         )
                     )
 
+        generic_dotnet_indices = tuple(
+            index
+            for index, motif in enumerate(motifs)
+            if isinstance(motif, RuleMotif) and _is_generic_dotnet_import(motif.value)
+        )
+        if generic_dotnet_indices:
+            try:
+                strategy = RuleConditionStrategy(condition) if condition is not None else None
+            except (TypeError, ValueError):
+                strategy = None
+            has_source_located_specific_motif = any(
+                isinstance(motif, RuleMotif)
+                and not _is_generic_dotnet_import(motif.value)
+                and motif.kind in {RuleMotifKind.STRING, RuleMotifKind.WIDE, RuleMotifKind.HEX}
+                and motif.sample_sha256 is not None
+                and motif.offsets is not None
+                for motif in motifs
+            )
+            all_motifs_source_located = all(
+                isinstance(motif, RuleMotif)
+                and motif.kind in {RuleMotifKind.STRING, RuleMotifKind.WIDE, RuleMotifKind.HEX}
+                and motif.sample_sha256 is not None
+                and motif.offsets is not None
+                for motif in motifs
+            )
+            hypothesis = meta.get("hypothesis") if isinstance(meta, Mapping) else None
+            import_discussion = (
+                meta.get("dotnet_imports_discussion") if isinstance(meta, Mapping) else None
+            )
+            has_documented_hypothesis = isinstance(hypothesis, str) and bool(hypothesis.strip())
+            has_import_discussion = isinstance(import_discussion, str) and bool(
+                import_discussion.strip()
+            )
+            if (
+                strategy is not RuleConditionStrategy.ALL
+                or not has_source_located_specific_motif
+                or not all_motifs_source_located
+                or not has_documented_hypothesis
+                or not has_import_discussion
+            ):
+                for index in generic_dotnet_indices:
+                    issues.append(
+                        RuleMotifIssue(
+                            code=RuleMotifIssueCode.GENERIC_DOTNET_IMPORT,
+                            motif_index=index,
+                            message=(
+                                "Common .NET imports and namespaces cannot identify a family "
+                                "alone; require ALL motifs and an independently source-located "
+                                "byte motif, then measure it on the development and holdout sets."
+                            ),
+                        )
+                    )
+
         if meta is not None and not isinstance(meta, Mapping):
             issues.append(
                 RuleMotifIssue(
@@ -597,11 +657,11 @@ class RuleWorkbench:
             return RuleBuildResult(source=None, rule_identifier=None, validation=report)
 
         if meta is not None and not isinstance(meta, Mapping):
-            report = self.validate_motifs(motifs, meta=meta)
+            report = self.validate_motifs(motifs, meta=meta, condition=strategy)
             return RuleBuildResult(source=None, rule_identifier=None, validation=report)
         supplied_meta = dict(meta or {})
         supplied_meta["workbench_condition"] = strategy.value
-        report = self.validate_motifs(motifs, meta=supplied_meta)
+        report = self.validate_motifs(motifs, meta=supplied_meta, condition=strategy)
         if not report.valid:
             return RuleBuildResult(source=None, rule_identifier=None, validation=report)
 
@@ -679,6 +739,72 @@ class RuleWorkbench:
             )
             return RuleBuildResult(source=None, rule_identifier=None, validation=report)
         return RuleBuildResult(source=source, rule_identifier=rule_identifier, validation=report)
+
+    async def verify_dotnet_source_motifs(
+        self, motifs: Sequence[RuleMotif]
+    ) -> RuleMotifValidationReport:
+        """Verify source bytes for rules that rely on common .NET imports."""
+        has_generic_dotnet = any(_is_generic_dotnet_import(motif.value) for motif in motifs)
+        if not has_generic_dotnet:
+            return RuleMotifValidationReport()
+        issues: list[RuleMotifIssue] = []
+        verified_indices: list[int] = []
+        verified_specific_source = False
+        for index, motif in enumerate(motifs):
+            if (
+                motif.sample_sha256 is None
+                or motif.offsets is None
+                or motif.kind not in {RuleMotifKind.STRING, RuleMotifKind.WIDE, RuleMotifKind.HEX}
+            ):
+                if has_generic_dotnet:
+                    issues.append(
+                        RuleMotifIssue(
+                            code=RuleMotifIssueCode.SOURCE_BYTES_UNVERIFIED,
+                            motif_index=index,
+                            message=(
+                                "Every generic .NET motif needs a source SHA and byte offset."
+                            ),
+                        )
+                    )
+                continue
+            try:
+                sample_bytes = await self._corpus_bytes.get_bytes_for_sample(motif.sample_sha256)
+            except Exception:
+                sample_bytes = b""
+            if (
+                not isinstance(sample_bytes, bytes)
+                or hashlib.sha256(sample_bytes).hexdigest() != motif.sample_sha256
+                or not any(
+                    _motif_matches_at(motif, sample_bytes, offset) for offset in motif.offsets
+                )
+            ):
+                issues.append(
+                    RuleMotifIssue(
+                        code=RuleMotifIssueCode.SOURCE_BYTES_UNVERIFIED,
+                        motif_index=index,
+                        message=(
+                            "The source SHA-256 or declared byte offset could not be verified "
+                            "against the quarantined sample bytes."
+                        ),
+                    )
+                )
+                continue
+            verified_indices.append(index)
+            if not _is_generic_dotnet_import(motif.value):
+                verified_specific_source = True
+        if has_generic_dotnet and not verified_specific_source and not issues:
+            issues.append(
+                RuleMotifIssue(
+                    code=RuleMotifIssueCode.SOURCE_BYTES_UNVERIFIED,
+                    message=(
+                        "A generic .NET motif needs a non-generic string/hex motif with a "
+                        "verified sample SHA-256 and byte offset."
+                    ),
+                )
+            )
+        return RuleMotifValidationReport(
+            issues=tuple(issues), verified_motif_indices=tuple(verified_indices)
+        )
 
     async def compile_and_test(
         self,
@@ -1106,9 +1232,15 @@ class RuleWorkbench:
             if new_motifs is None and new_condition is None:
                 raise RuleRevisionError("a revision must change motifs or condition")
 
-        validation = self.validate_motifs(current_motifs, meta=meta)
+        validation = self.validate_motifs(current_motifs, meta=meta, condition=strategy)
         if not validation.valid:
             raise RuleRevisionError("motifs or metadata failed validation", validation=validation)
+        source_validation = await self.verify_dotnet_source_motifs(current_motifs)
+        if not source_validation.valid:
+            raise RuleRevisionError(
+                "motif source bytes could not be verified",
+                validation=source_validation,
+            )
         if any(not motif.observation_refs for motif in current_motifs):
             issue = RuleMotifIssue(
                 code=RuleMotifIssueCode.MISSING_OBSERVATION,
@@ -1119,6 +1251,9 @@ class RuleWorkbench:
                 validation=RuleMotifValidationReport(issues=(issue,)),
             )
 
+        verified_source_motifs = {
+            current_motifs[index] for index in source_validation.verified_motif_indices
+        }
         build = self.build_rule(current_motifs, strategy, meta)
         if not build.valid or build.source is None:
             raise RuleRevisionError("rule could not be rendered", validation=build.validation)
@@ -1133,7 +1268,10 @@ class RuleWorkbench:
         motif_provenance = tuple(
             MotifProvenance(
                 motif=motif.value,
-                rationale=_serialize_motif(motif),
+                rationale=_serialize_motif(
+                    motif,
+                    source_bytes_verified=motif in verified_source_motifs,
+                ),
                 observation_refs=motif.observation_refs,
             )
             for motif in sorted(
@@ -1202,14 +1340,13 @@ class RuleWorkbench:
             )
         false_positives_a: set[str] = set()
         false_positives_b: set[str] = set()
-        for negative_role in (RuleTestCorpusRole.GOODWARE, RuleTestCorpusRole.HOLDOUT):
-            result_a = _role_report(report_a, negative_role)
-            result_b = _role_report(report_b, negative_role)
-            comparable = (set(result_a.matches) | set(result_a.non_matches)) & (
-                set(result_b.matches) | set(result_b.non_matches)
-            )
-            false_positives_a.update(set(result_a.matches) & comparable)
-            false_positives_b.update(set(result_b.matches) & comparable)
+        result_a = _role_report(report_a, RuleTestCorpusRole.GOODWARE)
+        result_b = _role_report(report_b, RuleTestCorpusRole.GOODWARE)
+        comparable = (set(result_a.matches) | set(result_a.non_matches)) & (
+            set(result_b.matches) | set(result_b.non_matches)
+        )
+        false_positives_a.update(set(result_a.matches) & comparable)
+        false_positives_b.update(set(result_b.matches) & comparable)
         return RuleVersionComparison(
             version_a_id=version_a.id,
             version_b_id=version_b.id,
@@ -1220,6 +1357,10 @@ class RuleWorkbench:
             false_positives_removed=tuple(sorted(false_positives_a - false_positives_b)),
             engine_version_a=report_a.engine_version,
             engine_version_b=report_b.engine_version,
+            metrics_a=report_a.metrics,
+            metrics_b=report_b.metrics,
+            measurement_method_a=report_a.measurement_method,
+            measurement_method_b=report_b.measurement_method,
         )
 
     async def _test_versions(
@@ -1281,6 +1422,11 @@ class RuleWorkbench:
             roles=tuple(role_reports),
             selection_bias=selection_bias,
             coverage_statement=coverage_statement,
+            measurement_method=(
+                RuleTestMeasurementMethod.CONFINED_ANALYSIS_WORKER
+                if self._confined_analysis is not None
+                else RuleTestMeasurementMethod.ISOLATED_YARA_WORKER
+            ),
         )
 
     def _limit_failure_report(
@@ -1411,6 +1557,40 @@ def _motif_identity(motif: RuleMotif) -> tuple[str, str]:
     return motif.kind.value, value
 
 
+def _is_generic_dotnet_import(value: str) -> bool:
+    return _GENERIC_DOTNET_IMPORT.fullmatch(value.strip()) is not None
+
+
+def is_generic_dotnet_import(value: str) -> bool:
+    """Shared detector used by rule admission and its persisted provenance."""
+    return _is_generic_dotnet_import(value)
+
+
+def _motif_matches_at(motif: RuleMotif, data: bytes, offset: int) -> bool:
+    if offset < 0 or offset >= len(data):
+        return False
+    if motif.kind is RuleMotifKind.STRING:
+        expected = motif.value.encode("utf-8")
+        return data[offset : offset + len(expected)] == expected
+    if motif.kind is RuleMotifKind.WIDE:
+        expected = motif.value.encode("utf-16le")
+        return data[offset : offset + len(expected)] == expected
+    if motif.kind is not RuleMotifKind.HEX:
+        return False
+    tokens = motif.value.split()
+    if not tokens or offset + len(tokens) > len(data):
+        return False
+    for token, actual in zip(tokens, data[offset : offset + len(tokens)], strict=True):
+        high_mask = 0 if token[0] == "?" else 0xF0
+        low_mask = 0 if token[1] == "?" else 0x0F
+        expected_byte = (0 if high_mask == 0 else int(token[0], 16) << 4) | (
+            0 if low_mask == 0 else int(token[1], 16)
+        )
+        if actual & (high_mask | low_mask) != expected_byte:
+            return False
+    return True
+
+
 def _render_motif(motif: RuleMotif) -> str:
     if motif.kind in {RuleMotifKind.HEX, RuleMotifKind.CODE_SEQUENCE}:
         return "{ " + " ".join(token.upper() for token in motif.value.split()) + " }"
@@ -1461,7 +1641,7 @@ def _address_value(value: int | str) -> int:
         return -1
 
 
-def _serialize_motif(motif: RuleMotif) -> str:
+def _serialize_motif(motif: RuleMotif, *, source_bytes_verified: bool = False) -> str:
     payload = {
         "kind": motif.kind.value,
         "provenance_kind": motif.provenance_kind.value,
@@ -1473,6 +1653,7 @@ def _serialize_motif(motif: RuleMotif) -> str:
         "positive_support": motif.positive_support,
         "benign_prevalence": motif.benign_prevalence,
         "goodware_occurrence_count": motif.goodware_occurrence_count,
+        "source_bytes_verified": source_bytes_verified,
     }
     return _PERSISTED_MOTIF_PREFIX + json.dumps(
         payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True

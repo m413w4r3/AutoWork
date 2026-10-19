@@ -60,11 +60,16 @@ from cti_app.domain.protocol_model import (
     HypothesisTransitionV1,
     ProtocolDiagramKind,
     ProtocolDiagramStatus,
+    ProtocolEvidenceLevelV1,
+    ProtocolEvidenceRefV1,
     ProtocolHypothesisProposalV1,
     ProtocolModelV1,
     ProtocolRenderResultV1,
     ProtocolTestKind,
     ProtocolTestPlanStepV1,
+    ProtocolValidationResultV1,
+    ProtocolValidationRunV1,
+    ProtocolValidationSplitV1,
     ProtocolValidationStatus,
 )
 from cti_app.infrastructure.pcap_reader import read_capture
@@ -413,6 +418,7 @@ def _proposal(*, first_expected: str = "01") -> ProtocolHypothesisProposalV1:
                 "hex",
                 None,
                 first_expected,
+                justification="Offset two is replayed against each complete training message.",
             ),
             HypothesisFieldV1(
                 second_field,
@@ -424,6 +430,7 @@ def _proposal(*, first_expected: str = "01") -> ProtocolHypothesisProposalV1:
                 "hex",
                 None,
                 "02",
+                justification="Offset two is replayed against each complete training message.",
             ),
         ),
         transitions=(
@@ -599,7 +606,14 @@ async def test_hypothesis_replays_then_holdout_contradiction_is_preserved() -> N
         traces=traces[:2],
     )
     assert all(field.evidence for field in model.fields)
+    assert all(field.justification for field in model.fields)
+    assert all(
+        field.evidence_level is ProtocolEvidenceLevelV1.HYPOTHETICAL for field in model.fields
+    )
     assert all(transition.evidence for transition in model.transitions)
+    assert model.validation_runs[0].split is ProtocolValidationSplitV1.TRAIN
+    assert model.validation_runs[0].result is ProtocolValidationResultV1.VERIFIED
+    assert model.validation_runs[0].evidence_level is ProtocolEvidenceLevelV1.HYPOTHETICAL
     assert model.test_plan == proposal.test_plan
     training_capture_hashes = {trace.capture.sha256 for trace in traces[:2]}
     for proof in (
@@ -616,9 +630,17 @@ async def test_hypothesis_replays_then_holdout_contradiction_is_preserved() -> N
     verified = await service.verify(model=model, traces=(traces[2],))
     opcode = next(field for field in verified.fields if field.field_id == "opcode_1")
     assert opcode.validation_status is ProtocolValidationStatus.CONTRADICTED
+    assert opcode.evidence_level is ProtocolEvidenceLevelV1.SANDBOX_CAPTURE_OBSERVED
+    assert verified.validation_runs[-1].split is ProtocolValidationSplitV1.HOLDOUT
+    assert verified.validation_runs[-1].result is ProtocolValidationResultV1.REJECTED
+    assert (
+        verified.validation_runs[-1].evidence_level
+        is ProtocolEvidenceLevelV1.SANDBOX_CAPTURE_OBSERVED
+    )
     assert any(
         item.item_id == "opcode_1"
         and item.validation_status is ProtocolValidationStatus.CONTRADICTED
+        and item.evidence_level is ProtocolEvidenceLevelV1.SANDBOX_CAPTURE_OBSERVED
         and item.evidence[0].frame_numbers
         for item in verified.verification_findings
     )
@@ -636,6 +658,48 @@ async def test_hypothesis_replays_then_holdout_contradiction_is_preserved() -> N
     assert next(
         field for field in later.fields if field.field_id == "opcode_1"
     ).validation_status is (ProtocolValidationStatus.CONTRADICTED)
+
+
+@pytest.mark.parametrize(
+    "split",
+    (ProtocolValidationSplitV1.TRAIN, ProtocolValidationSplitV1.HOLDOUT),
+)
+@pytest.mark.parametrize(
+    "result",
+    (
+        ProtocolValidationResultV1.VERIFIED,
+        ProtocolValidationResultV1.REJECTED,
+        ProtocolValidationResultV1.PARTIAL,
+    ),
+)
+def test_train_and_holdout_validation_results_require_capture_evidence(
+    result: ProtocolValidationResultV1,
+    split: ProtocolValidationSplitV1,
+) -> None:
+    documentary_evidence = ProtocolEvidenceRefV1(
+        documented_ref_kind="finding",
+        documented_ref_id=str(uuid4()),
+        documented_source_sha256="a" * 64,
+        source="static-analysis",
+    )
+
+    with pytest.raises(ValueError, match="capture evidence"):
+        ProtocolValidationRunV1(
+            split=split,
+            result=result,
+            tested_item_ids=("field-1",),
+            evidence=(documentary_evidence,),
+            detail="A documentary citation cannot prove a holdout outcome.",
+        )
+
+    not_testable = ProtocolValidationRunV1(
+        split=ProtocolValidationSplitV1.HOLDOUT,
+        result=ProtocolValidationResultV1.NOT_TESTABLE,
+        tested_item_ids=(),
+        evidence=(),
+        detail="No holdout capture is available.",
+    )
+    assert not_testable.evidence_level is ProtocolEvidenceLevelV1.STATIC_INFERENCE
 
 
 @pytest.mark.asyncio
@@ -952,6 +1016,27 @@ async def test_documented_protocol_tool_cites_and_renders_without_capture() -> N
                     "evidence_refs": [citation],
                 }
             ],
+            "characteristics": [
+                {
+                    "kind": "framing",
+                    "name": "length prefix",
+                    "statement": "A cited article describes a length-prefixed handshake.",
+                    "justification": (
+                        "The statement is directly cited and has not been observed in traffic."
+                    ),
+                    "evidence_refs": [citation],
+                }
+            ],
+            "static_function_provenance": [
+                {
+                    "sample_sha256": "a" * 64,
+                    "binary_sha256": "b" * 64,
+                    "provider": "ilspycmd",
+                    "provider_version": "9.1",
+                    "function_id": "ClientSession.Encode",
+                    "evidence_refs": [citation],
+                }
+            ],
             "transitions": [
                 {
                     "transition_id": "new-to-ready",
@@ -985,6 +1070,17 @@ async def test_documented_protocol_tool_cites_and_renders_without_capture() -> N
     assert store.model.fields[0].length is None
     assert store.model.fields[0].expected_hex is None
     assert store.model.fields[0].evidence[0].documented_source_sha256 == observation.sha256
+    assert (
+        store.model.characteristics[0].evidence_level is ProtocolEvidenceLevelV1.ARTICLE_DOCUMENTED
+    )
+    assert store.model.characteristics[0].validation_status is (
+        ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED
+    )
+    assert store.model.function_provenance[0].execution_mode == "static_non_executed"
+    assert (
+        store.model.function_provenance[0].evidence_level
+        is ProtocolEvidenceLevelV1.STATIC_INFERENCE
+    )
     duplicate = await dispatcher.dispatch(
         context,
         tool_name=NETWORK_PROTOCOL_DOCUMENT,
@@ -1013,6 +1109,11 @@ async def test_documented_protocol_tool_cites_and_renders_without_capture() -> N
         and "documenté, non observé" in " ".join(item["limitations"]).casefold()
         for item in views
     )
+    all_limitations = " ".join(value for item in views for value in item["limitations"])
+    assert "ARTICLE_DOCUMENTED" in all_limitations
+    assert "NOT OBSERVED" in all_limitations
+    assert "STATIC_INFERENCE" in all_limitations
+    assert "static, not executed" in all_limitations
 
     missing = {
         "model": {

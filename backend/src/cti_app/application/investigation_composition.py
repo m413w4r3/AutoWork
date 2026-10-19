@@ -44,6 +44,12 @@ from cti_app.application.investigation_advisor_tools import (
     register_investigation_advisor_tool,
 )
 from cti_app.application.investigation_article_snapshot import ProductionArticleSnapshotAdapter
+from cti_app.application.investigation_dotnet_tools import (
+    DOTNET_TOOL_NAMES,
+    dotnet_tool_capabilities,
+    register_dotnet_tools,
+)
+from cti_app.application.investigation_experiments import register_operator_experiment_tools
 from cti_app.application.investigation_extraction_tools import (
     extraction_tool_capabilities,
     register_extraction_tools,
@@ -191,6 +197,7 @@ OPERATOR_WRITE_TOOL_NAMES = frozenset(
         "opinion.compose",
         "opinion.revise",
         "opinion.note",
+        "experiment.record",
     }
 )
 OPTIONAL_CAPABILITIES = {
@@ -200,6 +207,7 @@ OPTIONAL_CAPABILITIES = {
     "local_commands": "investigation.local_commands",
     "ghidra": "investigation.ghidra",
     "acquisition": "investigation.acquisition",
+    "dotnet": "investigation.dotnet",
 }
 OPTIONAL_TOOL_NAMES = (
     "finding.propose",
@@ -207,6 +215,8 @@ OPTIONAL_TOOL_NAMES = (
     "opinion.compose",
     "opinion.revise",
     "opinion.note",
+    "experiment.record",
+    "experiment.list",
     "advisor.consult",
     "vt.file_report",
     "vt.object_report",
@@ -253,6 +263,7 @@ OPTIONAL_TOOL_NAMES = (
     "network.protocol.verify",
     "network.protocol.render",
     "network.protocol.document",
+    *DOTNET_TOOL_NAMES,
     NATIVE_TOOL_NAME,
 )
 FAMILY_CAPABILITY_KEYS = frozenset(
@@ -271,6 +282,8 @@ FAMILY_CAPABILITY_KEYS = frozenset(
         "network.protocol.verify",
         "network.protocol.render",
         "network.protocol.document",
+        "investigation.dotnet",
+        *DOTNET_TOOL_NAMES,
         NATIVE_TOOL_NAME,
     }
 )
@@ -654,6 +667,7 @@ def _register_native_tool_family(
     dependencies: InvestigationToolDependencies,
     recorder: EvidenceRecorder,
     settings: Settings,
+    uow_factory: UnitOfWorkFactory,
     enabled: set[str],
 ) -> None:
     port = build_native_analysis_port(settings, runner=dependencies.confined_rea_runner)
@@ -678,6 +692,21 @@ def _register_native_tool_family(
             port=port,
             recorder=recorder,
             sample_associations=dependencies.sample_associations,
+        )
+    )
+    register_dotnet_tools(
+        registry,
+        execution=dependencies.confined_analysis_execution,
+        sample_associations=dependencies.sample_associations,
+        recorder=recorder,
+        uow_factory=uow_factory,
+        settings=settings,
+    )
+    enabled.update(
+        dotnet_tool_capabilities(
+            execution=dependencies.confined_analysis_execution,
+            sample_associations=dependencies.sample_associations,
+            recorder=recorder,
         )
     )
 
@@ -1433,6 +1462,7 @@ def build_investigation_composition(
         dependencies=dependencies,
         recorder=recorder,
         settings=settings,
+        uow_factory=uow_factory,
         enabled=enabled,
     )
 
@@ -1446,6 +1476,17 @@ def build_investigation_composition(
             investigations=uow.analyst_investigations,
             article_snapshots=dependencies.article_snapshots,
         )
+        experiment_repository = getattr(uow, "investigation_experiments", None)
+        if experiment_repository is not None:
+            register_operator_experiment_tools(
+                registry,
+                experiments=experiment_repository,
+                observations=uow.evidence_observations,
+                invocations=uow.tool_invocations,
+                states=uow.investigation_states,
+                envelopes=uow.investigation_envelopes,
+                article_snapshots=dependencies.article_snapshots,
+            )
         opinion_service = AnalystOpinionService(
             uow_factory=uow_factory,
             artifact_store=artifact_store,
@@ -1659,6 +1700,8 @@ def _unavailable_tool_reasons(
             reason = "shodan_unavailable"
         elif name == NATIVE_TOOL_NAME:
             reason = "native_analysis_unavailable"
+        elif name in DOTNET_TOOL_NAMES:
+            reason = worker_reason("dotnet", "dotnet_ilspy_unavailable")
         elif name == "sandbox.report.import":
             reason = "behavior_report_import_unavailable"
         elif name.startswith(("features.", "samples.")) or name == "signatures.candidates":

@@ -28,6 +28,83 @@ class ProtocolValidationStatus(StrEnum):
     DOCUMENTED_NOT_OBSERVED = "documented_not_observed"
 
 
+class ProtocolEvidenceLevelV1(StrEnum):
+    """Origin of support for a protocol claim, separate from its validation status."""
+
+    ARTICLE_DOCUMENTED = "article_documented"
+    STATIC_INFERENCE = "static_inference"
+    SANDBOX_CAPTURE_OBSERVED = "sandbox_capture_observed"
+    HYPOTHETICAL = "hypothetical"
+    VERIFIED_ON_HOLDOUT = "verified_on_holdout"
+
+
+class ProtocolValidationSplitV1(StrEnum):
+    TRAIN = "train"
+    HOLDOUT = "holdout"
+
+
+class ProtocolValidationResultV1(StrEnum):
+    VERIFIED = "verified"
+    REJECTED = "rejected"
+    PARTIAL = "partial"
+    NOT_TESTABLE = "not_testable"
+
+
+class ProtocolCharacteristicKindV1(StrEnum):
+    FRAMING = "framing"
+    MESSAGE_LENGTH = "message_length"
+    ENCODING = "encoding"
+    NEGOTIATION = "negotiation"
+    CONFIGURATION = "configuration"
+    TRANSFORMATION = "transformation"
+    ENCRYPTION = "encryption"
+    UNCERTAINTY = "uncertainty"
+
+
+def _default_evidence_level(
+    status: ProtocolValidationStatus,
+    evidence: tuple[ProtocolEvidenceRefV1, ...] = (),
+) -> ProtocolEvidenceLevelV1:
+    if status is ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED:
+        return ProtocolEvidenceLevelV1.ARTICLE_DOCUMENTED
+    if any(item.capture_sha256 is not None for item in evidence):
+        return ProtocolEvidenceLevelV1.SANDBOX_CAPTURE_OBSERVED
+    return ProtocolEvidenceLevelV1.STATIC_INFERENCE
+
+
+def _validate_claim_evidence_level(
+    level: ProtocolEvidenceLevelV1,
+    status: ProtocolValidationStatus,
+    evidence: tuple[ProtocolEvidenceRefV1, ...],
+) -> None:
+    all_documented = bool(evidence) and all(_is_documented_evidence(item) for item in evidence)
+    all_captured = bool(evidence) and all(item.capture_sha256 is not None for item in evidence)
+    if level is ProtocolEvidenceLevelV1.ARTICLE_DOCUMENTED:
+        if status is not ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED or not all_documented:
+            raise ValueError(
+                "article-documented claims require documentary evidence and remain unobserved"
+            )
+    elif status is ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED:
+        raise ValueError("documented claims must use the article_documented evidence level")
+    elif level is ProtocolEvidenceLevelV1.STATIC_INFERENCE and not all_documented:
+        raise ValueError("static inferences require cited static-analysis evidence")
+    elif (
+        level
+        in {
+            ProtocolEvidenceLevelV1.SANDBOX_CAPTURE_OBSERVED,
+            ProtocolEvidenceLevelV1.HYPOTHETICAL,
+            ProtocolEvidenceLevelV1.VERIFIED_ON_HOLDOUT,
+        }
+        and not all_captured
+    ):
+        raise ValueError("capture-derived claims require capture evidence references")
+    if (
+        level is ProtocolEvidenceLevelV1.VERIFIED_ON_HOLDOUT
+        and status is not ProtocolValidationStatus.OBSERVED
+    ):
+        raise ValueError("verified-on-holdout claims must have a successful observed status")
+
+
 class AssuranceLevel(StrEnum):
     CONFIRMED = "confirmed"
     HIGH = "high"
@@ -203,8 +280,17 @@ class MessageDefinitionV1(_CanonicalContract):
     validation_status: ProtocolValidationStatus
     evidence: tuple[ProtocolEvidenceRefV1, ...]
     encrypted_opaque: bool = False
+    evidence_level: ProtocolEvidenceLevelV1 | None = None
 
     def __post_init__(self) -> None:
+        if self.evidence_level is None:
+            object.__setattr__(
+                self,
+                "evidence_level",
+                _default_evidence_level(self.validation_status, self.evidence),
+            )
+        assert self.evidence_level is not None
+        _validate_claim_evidence_level(self.evidence_level, self.validation_status, self.evidence)
         if not self.message_id or not self.name or self.ordinal < 1:
             raise ValueError("message identity and positive ordinal are required")
         if (self.min_length is None) != (self.max_length is None):
@@ -227,8 +313,17 @@ class ProtocolStateV1(_CanonicalContract):
     name: str
     validation_status: ProtocolValidationStatus
     evidence: tuple[ProtocolEvidenceRefV1, ...]
+    evidence_level: ProtocolEvidenceLevelV1 | None = None
 
     def __post_init__(self) -> None:
+        if self.evidence_level is None:
+            object.__setattr__(
+                self,
+                "evidence_level",
+                _default_evidence_level(self.validation_status, self.evidence),
+            )
+        assert self.evidence_level is not None
+        _validate_claim_evidence_level(self.evidence_level, self.validation_status, self.evidence)
         if not self.state_id or not self.name or not self.evidence:
             raise ValueError("protocol states require an identity, name, and cited evidence")
 
@@ -250,8 +345,18 @@ class FieldDefinitionV1(_CanonicalContract):
     value_sha256s: tuple[str, ...] = ()
     expected_hex: str | None = None
     encrypted_opaque: bool = False
+    justification: str | None = None
+    evidence_level: ProtocolEvidenceLevelV1 | None = None
 
     def __post_init__(self) -> None:
+        if self.evidence_level is None:
+            object.__setattr__(
+                self,
+                "evidence_level",
+                _default_evidence_level(self.validation_status, self.evidence),
+            )
+        assert self.evidence_level is not None
+        _validate_claim_evidence_level(self.evidence_level, self.validation_status, self.evidence)
         if not self.field_id or not self.message_id or not self.name or not self.source:
             raise ValueError("field identity and source are required")
         if self.offset is not None and self.offset < 0:
@@ -294,8 +399,17 @@ class ProtocolTransitionV1(_CanonicalContract):
     hypotheses: tuple[str, ...]
     validation_status: ProtocolValidationStatus
     evidence: tuple[ProtocolEvidenceRefV1, ...]
+    evidence_level: ProtocolEvidenceLevelV1 | None = None
 
     def __post_init__(self) -> None:
+        if self.evidence_level is None:
+            object.__setattr__(
+                self,
+                "evidence_level",
+                _default_evidence_level(self.validation_status, self.evidence),
+            )
+        assert self.evidence_level is not None
+        _validate_claim_evidence_level(self.evidence_level, self.validation_status, self.evidence)
         if not all(
             (self.transition_id, self.from_state, self.to_state, self.message_id, self.trigger)
         ):
@@ -312,12 +426,116 @@ class BinaryFunctionProvenanceV1(_CanonicalContract):
     provider_version: str
     function_id: str
     evidence: tuple[ProtocolEvidenceRefV1, ...]
+    execution_mode: str = "static_non_executed"
+    evidence_level: ProtocolEvidenceLevelV1 = ProtocolEvidenceLevelV1.STATIC_INFERENCE
 
     def __post_init__(self) -> None:
         if not _SHA256.fullmatch(self.sample_sha256) or not _SHA256.fullmatch(self.binary_sha256):
             raise ValueError("binary provenance digests must be lowercase sha256")
         if not all((self.provider, self.provider_version, self.function_id)) or not self.evidence:
             raise ValueError("function provenance requires provider, function, and evidence")
+        if self.execution_mode != "static_non_executed":
+            raise ValueError("protocol binary provenance must remain static and non-executed")
+        if self.evidence_level is not ProtocolEvidenceLevelV1.STATIC_INFERENCE:
+            raise ValueError("binary function provenance must remain a static inference")
+
+
+@dataclass(frozen=True, slots=True)
+class ProtocolCharacteristicV1(_CanonicalContract):
+    """Evidence-bound framing, negotiation, configuration, or transformation claim."""
+
+    kind: ProtocolCharacteristicKindV1
+    name: str
+    statement: str
+    evidence_level: ProtocolEvidenceLevelV1
+    validation_status: ProtocolValidationStatus
+    evidence: tuple[ProtocolEvidenceRefV1, ...]
+    justification: str
+
+    def __post_init__(self) -> None:
+        if not all(
+            isinstance(value, str) and value.strip()
+            for value in (self.name, self.statement, self.justification)
+        ):
+            raise ValueError("protocol characteristics require a claim and justification")
+        if len(self.name) > 128 or len(self.statement) > 1024 or len(self.justification) > 1024:
+            raise ValueError("protocol characteristic text exceeds its bound")
+        if not self.evidence:
+            raise ValueError("protocol characteristics require evidence references")
+        _validate_claim_evidence_level(self.evidence_level, self.validation_status, self.evidence)
+
+
+@dataclass(frozen=True, slots=True)
+class ProtocolValidationRunV1(_CanonicalContract):
+    """Result for one bounded training or holdout pass over cited traces."""
+
+    split: ProtocolValidationSplitV1
+    result: ProtocolValidationResultV1
+    tested_item_ids: tuple[str, ...]
+    evidence: tuple[ProtocolEvidenceRefV1, ...]
+    detail: str
+    evidence_level: ProtocolEvidenceLevelV1 | None = None
+
+    def __post_init__(self) -> None:
+        expected_level = _validation_run_evidence_level(self.split, self.result, self.evidence)
+        if self.evidence_level is None:
+            object.__setattr__(self, "evidence_level", expected_level)
+        elif self.evidence_level is not expected_level:
+            raise ValueError("validation evidence level must match its dataset split")
+        if len(set(self.tested_item_ids)) != len(self.tested_item_ids) or any(
+            not item for item in self.tested_item_ids
+        ):
+            raise ValueError("validation run item references must be unique and non-empty")
+        if len(self.detail) > 1024:
+            raise ValueError("validation run detail exceeds its bound")
+        if self.result is ProtocolValidationResultV1.NOT_TESTABLE and self.tested_item_ids:
+            raise ValueError("not-testable validation runs cannot claim tested items")
+        if self.result in {
+            ProtocolValidationResultV1.VERIFIED,
+            ProtocolValidationResultV1.REJECTED,
+            ProtocolValidationResultV1.PARTIAL,
+        } and (not self.tested_item_ids or not self.evidence):
+            raise ValueError("tested validation runs require tested items and evidence")
+
+
+def _validation_run_evidence_level(
+    split: ProtocolValidationSplitV1,
+    result: ProtocolValidationResultV1,
+    evidence: tuple[ProtocolEvidenceRefV1, ...],
+) -> ProtocolEvidenceLevelV1:
+    all_captured = bool(evidence) and all(item.capture_sha256 is not None for item in evidence)
+    if split is ProtocolValidationSplitV1.TRAIN:
+        if (
+            result
+            in {
+                ProtocolValidationResultV1.VERIFIED,
+                ProtocolValidationResultV1.REJECTED,
+                ProtocolValidationResultV1.PARTIAL,
+            }
+            and not all_captured
+        ):
+            raise ValueError("tested train results require capture evidence")
+        return (
+            ProtocolEvidenceLevelV1.HYPOTHETICAL
+            if all_captured
+            else ProtocolEvidenceLevelV1.STATIC_INFERENCE
+        )
+    if result is ProtocolValidationResultV1.VERIFIED:
+        if not all_captured:
+            raise ValueError("holdout verification requires capture evidence")
+        return ProtocolEvidenceLevelV1.VERIFIED_ON_HOLDOUT
+    if (
+        result
+        in {
+            ProtocolValidationResultV1.REJECTED,
+            ProtocolValidationResultV1.PARTIAL,
+        }
+        and not all_captured
+    ):
+        raise ValueError("tested holdout results require capture evidence")
+    if all_captured:
+        return ProtocolEvidenceLevelV1.SANDBOX_CAPTURE_OBSERVED
+    return ProtocolEvidenceLevelV1.STATIC_INFERENCE
 
 
 @dataclass(frozen=True, slots=True)
@@ -330,8 +548,17 @@ class ProtocolVerificationFindingV1(_CanonicalContract):
     observed: str | None
     detail: str
     evidence: tuple[ProtocolEvidenceRefV1, ...]
+    evidence_level: ProtocolEvidenceLevelV1 | None = None
 
     def __post_init__(self) -> None:
+        if self.evidence_level is None:
+            object.__setattr__(
+                self,
+                "evidence_level",
+                _default_evidence_level(self.validation_status, self.evidence),
+            )
+        assert self.evidence_level is not None
+        _validate_claim_evidence_level(self.evidence_level, self.validation_status, self.evidence)
         if self.validation_status not in {
             ProtocolValidationStatus.CONTRADICTED,
             ProtocolValidationStatus.UNRESOLVED,
@@ -387,6 +614,8 @@ class ProtocolModelV1(_CanonicalContract):
     extractor_versions: tuple[tuple[str, str], ...]
     states: tuple[ProtocolStateV1, ...] = ()
     documentary_evidence: tuple[ProtocolEvidenceRefV1, ...] = ()
+    characteristics: tuple[ProtocolCharacteristicV1, ...] = ()
+    validation_runs: tuple[ProtocolValidationRunV1, ...] = ()
 
     def __post_init__(self) -> None:
         if self.schema_version != "ProtocolModelV1":
@@ -430,8 +659,16 @@ class ProtocolModelV1(_CanonicalContract):
         ):
             raise ValueError("documented transitions must cite explicitly documented states")
         if self.validation_status is ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED:
-            if self.capture_sha256s or self.conversations or self.function_provenance:
-                raise ValueError("documentary models cannot contain capture or binary observations")
+            if self.capture_sha256s or self.conversations:
+                raise ValueError("documentary models cannot contain network captures")
+            if any(
+                item.execution_mode != "static_non_executed"
+                or item.evidence_level is not ProtocolEvidenceLevelV1.STATIC_INFERENCE
+                for item in self.function_provenance
+            ):
+                raise ValueError(
+                    "documentary function references must remain static and unexecuted"
+                )
             if not self.documentary_evidence or not all(
                 _is_documented_evidence(ref) for ref in self.documentary_evidence
             ):
@@ -457,6 +694,17 @@ class ProtocolModelV1(_CanonicalContract):
                 item.min_length is not None or item.max_length is not None for item in self.messages
             ):
                 raise ValueError("documentary models cannot contain observed message lengths")
+            if any(
+                getattr(item, "evidence_level", None)
+                is not ProtocolEvidenceLevelV1.ARTICLE_DOCUMENTED
+                for item in (*self.messages, *self.states, *self.fields, *self.transitions)
+            ):
+                raise ValueError("documentary elements must retain the article evidence level")
+            if any(
+                item.evidence_level is not ProtocolEvidenceLevelV1.ARTICLE_DOCUMENTED
+                for item in self.characteristics
+            ):
+                raise ValueError("documentary characteristics must remain explicitly unobserved")
 
     @classmethod
     def from_dict(cls, value: object) -> ProtocolModelV1:
@@ -491,8 +739,15 @@ class ProtocolModelV1(_CanonicalContract):
                 "extractor_versions",
                 "states",
                 "documentary_evidence",
+                "characteristics",
+                "validation_runs",
             },
-            optional_keys={"states", "documentary_evidence"},
+            optional_keys={
+                "states",
+                "documentary_evidence",
+                "characteristics",
+                "validation_runs",
+            },
         )
         return cls(
             schema_version=_str(data["schema_version"]),
@@ -529,6 +784,12 @@ class ProtocolModelV1(_CanonicalContract):
             extractor_versions=_versions_tuple(data["extractor_versions"]),
             states=tuple(_state_from_dict(item) for item in _list(data.get("states", []))),
             documentary_evidence=_evidence_tuple(data.get("documentary_evidence", [])),
+            characteristics=tuple(
+                _characteristic_from_dict(item) for item in _list(data.get("characteristics", []))
+            ),
+            validation_runs=tuple(
+                _validation_run_from_dict(item) for item in _list(data.get("validation_runs", []))
+            ),
         )
 
 
@@ -561,6 +822,7 @@ class HypothesisFieldV1(_CanonicalContract):
     condition: str | None
     expected_hex: str | None
     encrypted_opaque: bool = False
+    justification: str | None = None
 
     def __post_init__(self) -> None:
         if not self.field_id or not self.message_id or not self.name:
@@ -593,12 +855,30 @@ class HypothesisTransitionV1(_CanonicalContract):
 
 
 @dataclass(frozen=True, slots=True)
+class HypothesisCharacteristicV1(_CanonicalContract):
+    kind: ProtocolCharacteristicKindV1
+    name: str
+    statement: str
+    justification: str
+
+    def __post_init__(self) -> None:
+        if not all(
+            isinstance(value, str) and value.strip()
+            for value in (self.name, self.statement, self.justification)
+        ):
+            raise ValueError("hypothesis characteristics require a claim and rationale")
+        if any(len(value) > 1024 for value in (self.name, self.statement, self.justification)):
+            raise ValueError("hypothesis characteristic text exceeds its bound")
+
+
+@dataclass(frozen=True, slots=True)
 class ProtocolHypothesisProposalV1(_CanonicalContract):
     schema_version: str
     messages: tuple[HypothesisMessageV1, ...]
     fields: tuple[HypothesisFieldV1, ...]
     transitions: tuple[HypothesisTransitionV1, ...]
     test_plan: tuple[ProtocolTestPlanStepV1, ...]
+    characteristics: tuple[HypothesisCharacteristicV1, ...] = ()
 
     def __post_init__(self) -> None:
         if self.schema_version != "ProtocolHypothesisProposalV1":
@@ -627,7 +907,16 @@ class ProtocolHypothesisProposalV1(_CanonicalContract):
     @classmethod
     def from_dict(cls, value: object) -> ProtocolHypothesisProposalV1:
         data = _strict_object(
-            value, {"schema_version", "messages", "fields", "transitions", "test_plan"}
+            value,
+            {
+                "schema_version",
+                "messages",
+                "fields",
+                "transitions",
+                "test_plan",
+                "characteristics",
+            },
+            optional_keys={"characteristics"},
         )
         return cls(
             schema_version=_str(data["schema_version"]),
@@ -637,6 +926,10 @@ class ProtocolHypothesisProposalV1(_CanonicalContract):
                 _hypothesis_transition_from_dict(item) for item in _list(data["transitions"])
             ),
             test_plan=tuple(_test_step_from_dict(item) for item in _list(data["test_plan"])),
+            characteristics=tuple(
+                _hypothesis_characteristic_from_dict(item)
+                for item in _list(data.get("characteristics", []))
+            ),
         )
 
 
@@ -647,6 +940,7 @@ class ProtocolDiagramNodeV1(_CanonicalContract):
     role: str
     validation_status: ProtocolValidationStatus
     evidence: tuple[ProtocolEvidenceRefV1, ...] = ()
+    evidence_level: ProtocolEvidenceLevelV1 | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -659,6 +953,7 @@ class ProtocolDiagramEdgeV1(_CanonicalContract):
     timing_ms: int | None
     validation_status: ProtocolValidationStatus
     evidence: tuple[ProtocolEvidenceRefV1, ...]
+    evidence_level: ProtocolEvidenceLevelV1 | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -673,6 +968,8 @@ class ProtocolDiagramFieldV1(_CanonicalContract):
     encrypted_opaque: bool
     validation_status: ProtocolValidationStatus
     evidence: tuple[ProtocolEvidenceRefV1, ...]
+    evidence_level: ProtocolEvidenceLevelV1 | None = None
+    justification: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -926,8 +1223,11 @@ def _message_from_dict(value: object) -> MessageDefinitionV1:
             "validation_status",
             "evidence",
             "encrypted_opaque",
+            "evidence_level",
         },
+        optional_keys={"evidence_level"},
     )
+    status = ProtocolValidationStatus(_str(data["validation_status"]))
     return MessageDefinitionV1(
         message_id=_str(data["message_id"]),
         name=_str(data["name"]),
@@ -936,19 +1236,30 @@ def _message_from_dict(value: object) -> MessageDefinitionV1:
         min_length=None if data["min_length"] is None else _int(data["min_length"]),
         max_length=None if data["max_length"] is None else _int(data["max_length"]),
         field_ids=_str_tuple(data["field_ids"]),
-        validation_status=ProtocolValidationStatus(_str(data["validation_status"])),
+        validation_status=status,
         evidence=_evidence_tuple(data["evidence"]),
         encrypted_opaque=_bool(data["encrypted_opaque"]),
+        evidence_level=_evidence_level(
+            data.get("evidence_level"), status, _evidence_tuple(data["evidence"])
+        ),
     )
 
 
 def _state_from_dict(value: object) -> ProtocolStateV1:
-    data = _strict_object(value, {"state_id", "name", "validation_status", "evidence"})
+    data = _strict_object(
+        value,
+        {"state_id", "name", "validation_status", "evidence", "evidence_level"},
+        optional_keys={"evidence_level"},
+    )
+    status = ProtocolValidationStatus(_str(data["validation_status"]))
     return ProtocolStateV1(
         state_id=_str(data["state_id"]),
         name=_str(data["name"]),
-        validation_status=ProtocolValidationStatus(_str(data["validation_status"])),
+        validation_status=status,
         evidence=_evidence_tuple(data["evidence"]),
+        evidence_level=_evidence_level(
+            data.get("evidence_level"), status, _evidence_tuple(data["evidence"])
+        ),
     )
 
 
@@ -971,8 +1282,12 @@ def _field_from_dict(value: object) -> FieldDefinitionV1:
             "value_sha256s",
             "expected_hex",
             "encrypted_opaque",
+            "justification",
+            "evidence_level",
         },
+        optional_keys={"justification", "evidence_level"},
     )
+    status = ProtocolValidationStatus(_str(data["validation_status"]))
     return FieldDefinitionV1(
         field_id=_str(data["field_id"]),
         message_id=_str(data["message_id"]),
@@ -983,12 +1298,16 @@ def _field_from_dict(value: object) -> FieldDefinitionV1:
         encoding=_optional_str(data["encoding"]),
         condition=_optional_str(data["condition"]),
         source=_str(data["source"]),
-        validation_status=ProtocolValidationStatus(_str(data["validation_status"])),
+        validation_status=status,
         stability=FieldStability(_str(data["stability"])),
         evidence=_evidence_tuple(data["evidence"]),
         value_sha256s=_str_tuple(data["value_sha256s"]),
         expected_hex=_optional_str(data["expected_hex"]),
         encrypted_opaque=_bool(data["encrypted_opaque"]),
+        justification=_optional_str(data.get("justification")),
+        evidence_level=_evidence_level(
+            data.get("evidence_level"), status, _evidence_tuple(data["evidence"])
+        ),
     )
 
 
@@ -1004,8 +1323,11 @@ def _transition_from_dict(value: object) -> ProtocolTransitionV1:
             "hypotheses",
             "validation_status",
             "evidence",
+            "evidence_level",
         },
+        optional_keys={"evidence_level"},
     )
+    status = ProtocolValidationStatus(_str(data["validation_status"]))
     return ProtocolTransitionV1(
         transition_id=_str(data["transition_id"]),
         from_state=_str(data["from_state"]),
@@ -1013,8 +1335,11 @@ def _transition_from_dict(value: object) -> ProtocolTransitionV1:
         message_id=_str(data["message_id"]),
         trigger=_str(data["trigger"]),
         hypotheses=_str_tuple(data["hypotheses"]),
-        validation_status=ProtocolValidationStatus(_str(data["validation_status"])),
+        validation_status=status,
         evidence=_evidence_tuple(data["evidence"]),
+        evidence_level=_evidence_level(
+            data.get("evidence_level"), status, _evidence_tuple(data["evidence"])
+        ),
     )
 
 
@@ -1028,7 +1353,10 @@ def _function_from_dict(value: object) -> BinaryFunctionProvenanceV1:
             "provider_version",
             "function_id",
             "evidence",
+            "execution_mode",
+            "evidence_level",
         },
+        optional_keys={"execution_mode", "evidence_level"},
     )
     return BinaryFunctionProvenanceV1(
         sample_sha256=_str(data["sample_sha256"]),
@@ -1037,6 +1365,10 @@ def _function_from_dict(value: object) -> BinaryFunctionProvenanceV1:
         provider_version=_str(data["provider_version"]),
         function_id=_str(data["function_id"]),
         evidence=_evidence_tuple(data["evidence"]),
+        execution_mode=_str(data.get("execution_mode", "static_non_executed")),
+        evidence_level=ProtocolEvidenceLevelV1(
+            _str(data.get("evidence_level", ProtocolEvidenceLevelV1.STATIC_INFERENCE.value))
+        ),
     )
 
 
@@ -1052,17 +1384,22 @@ def _finding_from_dict(value: object) -> ProtocolVerificationFindingV1:
             "observed",
             "detail",
             "evidence",
+            "evidence_level",
         },
+        optional_keys={"evidence_level"},
     )
+    status = ProtocolValidationStatus(_str(data["validation_status"]))
+    evidence = _evidence_tuple(data["evidence"])
     return ProtocolVerificationFindingV1(
         finding_id=_str(data["finding_id"]),
         item_id=_str(data["item_id"]),
         kind=_str(data["kind"]),
-        validation_status=ProtocolValidationStatus(_str(data["validation_status"])),
+        validation_status=status,
         expected=_optional_str(data["expected"]),
         observed=_optional_str(data["observed"]),
         detail=_str(data["detail"]),
-        evidence=_evidence_tuple(data["evidence"]),
+        evidence=evidence,
+        evidence_level=_evidence_level(data.get("evidence_level"), status, evidence),
     )
 
 
@@ -1073,6 +1410,62 @@ def _test_step_from_dict(value: object) -> ProtocolTestPlanStepV1:
         message_id=_str(data["message_id"]),
         field_id=_optional_str(data["field_id"]),
         transition_id=_optional_str(data["transition_id"]),
+    )
+
+
+def _characteristic_from_dict(value: object) -> ProtocolCharacteristicV1:
+    data = _strict_object(
+        value,
+        {
+            "kind",
+            "name",
+            "statement",
+            "evidence_level",
+            "validation_status",
+            "evidence",
+            "justification",
+        },
+    )
+    return ProtocolCharacteristicV1(
+        kind=ProtocolCharacteristicKindV1(_str(data["kind"])),
+        name=_str(data["name"]),
+        statement=_str(data["statement"]),
+        evidence_level=ProtocolEvidenceLevelV1(_str(data["evidence_level"])),
+        validation_status=ProtocolValidationStatus(_str(data["validation_status"])),
+        evidence=_evidence_tuple(data["evidence"]),
+        justification=_str(data["justification"]),
+    )
+
+
+def _validation_run_from_dict(value: object) -> ProtocolValidationRunV1:
+    data = _strict_object(
+        value,
+        {"split", "result", "tested_item_ids", "evidence", "detail", "evidence_level"},
+        optional_keys={"evidence_level"},
+    )
+    return ProtocolValidationRunV1(
+        split=ProtocolValidationSplitV1(_str(data["split"])),
+        result=ProtocolValidationResultV1(_str(data["result"])),
+        tested_item_ids=_str_tuple(data["tested_item_ids"]),
+        evidence=_evidence_tuple(data["evidence"]),
+        detail=_str(data["detail"]),
+        evidence_level=(
+            None
+            if data.get("evidence_level") is None
+            else ProtocolEvidenceLevelV1(_str(data["evidence_level"]))
+        ),
+    )
+
+
+def _evidence_level(
+    value: object,
+    status: ProtocolValidationStatus,
+    evidence: tuple[ProtocolEvidenceRefV1, ...] = (),
+) -> ProtocolEvidenceLevelV1:
+    return (
+        _default_evidence_level(status, evidence)
+        if value is None
+        else ProtocolEvidenceLevelV1(_str(value))
     )
 
 
@@ -1114,7 +1507,9 @@ def _hypothesis_field_from_dict(value: object) -> HypothesisFieldV1:
             "condition",
             "expected_hex",
             "encrypted_opaque",
+            "justification",
         },
+        optional_keys={"justification"},
     )
     return HypothesisFieldV1(
         field_id=_str(data["field_id"]),
@@ -1127,6 +1522,17 @@ def _hypothesis_field_from_dict(value: object) -> HypothesisFieldV1:
         condition=_optional_str(data["condition"]),
         expected_hex=_optional_str(data["expected_hex"]),
         encrypted_opaque=_bool(data["encrypted_opaque"]),
+        justification=_optional_str(data.get("justification")),
+    )
+
+
+def _hypothesis_characteristic_from_dict(value: object) -> HypothesisCharacteristicV1:
+    data = _strict_object(value, {"kind", "name", "statement", "justification"})
+    return HypothesisCharacteristicV1(
+        kind=ProtocolCharacteristicKindV1(_str(data["kind"])),
+        name=_str(data["name"]),
+        statement=_str(data["statement"]),
+        justification=_str(data["justification"]),
     )
 
 

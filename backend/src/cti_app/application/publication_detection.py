@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from typing import Any, Protocol, cast
 from uuid import UUID
@@ -207,7 +208,65 @@ def _validation_fields(
         )
     except (TypeError, ValueError):
         reason = RuleValidationReason.EXECUTION_INCOMPLETE
+    if status is RuleValidationStatus.REAL_VALIDATED:
+        if payload.get("execution_status") != "ok":
+            return (
+                RuleValidationStatus.REAL_PARTIAL,
+                PublicationDetectionReason.EXECUTION_INCOMPLETE,
+            )
+        signature = payload.get("signature")
+        if payload.get("signature_limitations") or (
+            isinstance(signature, Mapping) and signature.get("generic_dotnet_guard") == "incomplete"
+        ):
+            return (
+                RuleValidationStatus.REAL_PARTIAL,
+                PublicationDetectionReason.SAMPLE_BYTES_MISSING,
+            )
+        metrics = payload.get("metrics")
+        positive = (
+            metrics.get("real_positive_sensitivity") if isinstance(metrics, Mapping) else None
+        )
+        goodware = (
+            metrics.get("real_goodware_false_positive_rate")
+            if isinstance(metrics, Mapping)
+            else None
+        )
+        if not _is_calculated_rate(positive) or not _is_calculated_rate(goodware):
+            return (
+                RuleValidationStatus.REAL_PARTIAL,
+                PublicationDetectionReason.SAMPLE_BYTES_MISSING,
+            )
+        assert isinstance(positive, Mapping) and isinstance(goodware, Mapping)
+        if positive.get("numerator") != positive.get("denominator"):
+            return RuleValidationStatus.REAL_PARTIAL, PublicationDetectionReason.FALSE_NEGATIVES
+        if goodware.get("numerator", 0) != 0:
+            return RuleValidationStatus.REAL_PARTIAL, PublicationDetectionReason.FALSE_POSITIVES
     return status, PublicationDetectionReason(reason.value)
+
+
+def _is_calculated_rate(value: Any) -> bool:
+    if not isinstance(value, Mapping) or value.get("status") != "calculated":
+        return False
+    numerator, denominator = value.get("numerator"), value.get("denominator")
+    interval = value.get("confidence_interval_95")
+    lower = interval.get("lower") if isinstance(interval, Mapping) else None
+    upper = interval.get("upper") if isinstance(interval, Mapping) else None
+    return (
+        isinstance(numerator, int)
+        and not isinstance(numerator, bool)
+        and isinstance(denominator, int)
+        and not isinstance(denominator, bool)
+        and 0 < denominator
+        and 0 <= numerator <= denominator
+        and value.get("method") == "wilson_score_two_sided_95"
+        and isinstance(lower, int | float)
+        and not isinstance(lower, bool)
+        and math.isfinite(lower)
+        and isinstance(upper, int | float)
+        and not isinstance(upper, bool)
+        and math.isfinite(upper)
+        and 0 <= lower <= upper <= 1
+    )
 
 
 def _publication_status(status: RuleValidationStatus) -> PublicationDetectionStatus:

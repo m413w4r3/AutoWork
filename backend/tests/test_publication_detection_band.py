@@ -21,7 +21,10 @@ from cti_app.application.publication_augmentation import (
     augment_publication_with_opinion,
 )
 from cti_app.application.publication_builder import build_publication_document_v5
-from cti_app.application.publication_detection import build_publication_detection
+from cti_app.application.publication_detection import (
+    _validation_fields,
+    build_publication_detection,
+)
 from cti_app.application.publication_qa import (
     PublicationQaErrorCode,
     qa_publication_v6,
@@ -53,6 +56,49 @@ from tests.test_publication_builder_v4 import _canonical_inputs, _enrichment_wit
 from tests.test_publication_document_v6 import _approved_opinion
 
 pytest_plugins = ("tests.test_typst_compiler_runtime",)
+
+
+def test_publication_detection_projects_only_calculable_yara_metrics() -> None:
+    claimed = {
+        "execution_status": "ok",
+        "validation_status": "real_validated",
+        "validation_reason": "real_positives_and_goodware_tested",
+    }
+    status, reason = _validation_fields(claimed)
+    assert status is RuleValidationStatus.REAL_PARTIAL
+    assert reason is PublicationDetectionReason.SAMPLE_BYTES_MISSING
+
+    measured = {
+        **claimed,
+        "metrics": {
+            "real_positive_sensitivity": {
+                "status": "calculated",
+                "numerator": 2,
+                "denominator": 2,
+                "confidence_interval_95": {"lower": 0.34, "upper": 1.0},
+                "method": "wilson_score_two_sided_95",
+            },
+            "real_goodware_false_positive_rate": {
+                "status": "calculated",
+                "numerator": 0,
+                "denominator": 12,
+                "confidence_interval_95": {"lower": 0.0, "upper": 0.24},
+                "method": "wilson_score_two_sided_95",
+            },
+        },
+    }
+    status, reason = _validation_fields(measured)
+    assert status is RuleValidationStatus.REAL_VALIDATED
+    assert reason is PublicationDetectionReason.VALIDATED
+
+    incomplete_signature = {
+        **measured,
+        "signature_limitations": ["source bytes are not verified"],
+    }
+    status, reason = _validation_fields(incomplete_signature)
+    assert status is RuleValidationStatus.REAL_PARTIAL
+    assert reason is PublicationDetectionReason.SAMPLE_BYTES_MISSING
+
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 _CHP_TYPST_ROOT = _REPOSITORY_ROOT / "chpTypst"

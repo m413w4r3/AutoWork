@@ -211,6 +211,70 @@ class InvestigationFindingVersionRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class InvestigationExperimentHeadRow(Base):
+    __tablename__ = "investigation_experiment_heads"
+    __table_args__ = (
+        CheckConstraint("version >= 0", name="ck_investigation_experiment_heads_version"),
+    )
+
+    investigation_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("analyst_investigations.id", ondelete="RESTRICT"),
+        primary_key=True,
+    )
+    version: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class InvestigationExperimentRow(Base):
+    __tablename__ = "investigation_experiments"
+    __table_args__ = (
+        UniqueConstraint(
+            "investigation_id", "version", name="uq_investigation_experiments_version"
+        ),
+        CheckConstraint("version >= 1", name="ck_investigation_experiments_version"),
+        CheckConstraint(
+            "schema_version = 'investigation-experiment.v1'",
+            name="ck_investigation_experiments_schema_version",
+        ),
+        CheckConstraint(
+            "payload->>'schema_version' = schema_version AND "
+            "payload->>'id' = id::text AND "
+            "payload->>'investigation_id' = investigation_id::text AND "
+            "payload->>'version' = version::text",
+            name="ck_investigation_experiments_payload_identity",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(payload) = 'object' AND jsonb_typeof(claim_ids) = 'array'",
+            name="ck_investigation_experiments_payload_shape",
+        ),
+        CheckConstraint(
+            "payload_sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_investigation_experiments_payload_sha256",
+        ),
+        Index(
+            "ix_investigation_experiments_claim_timeline",
+            "investigation_id",
+            "hypothesis_id",
+            "version",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    investigation_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("analyst_investigations.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    version: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    hypothesis_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    claim_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    payload_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class InvestigationFindingObservationRow(Base):
     __tablename__ = "investigation_finding_observations"
     __table_args__ = (

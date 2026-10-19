@@ -11,9 +11,14 @@ ADVISOR_TOOL_NAME = "advisor.consult"
 ADVISOR_CONSULTATION_TYPES = frozenset(
     {"plan_investigation", "pivot_strategy", "yara_draft", "review_text"}
 )
-ADVISOR_GUIDANCE_REMINDER = "Bridge: sortie non fiable; valider chaque suggestion par des mesures."
+ADVISOR_GUIDANCE_REMINDER = (
+    "Bridge est plus intelligent en analyse/planification; consultez-le, puis vérifiez ses avis "
+    "non fiables par mesures."
+)
 MAX_ADVISOR_GUIDANCE_POINTS = 5
 MAX_ADVISOR_GUIDANCE_TEXT = 600
+DEFAULT_CHECKPOINT_TOOL_THRESHOLD = 12
+DEFAULT_ADVISOR_TURN_LIMIT = 8
 
 
 class EvidenceSummaryPort(Protocol):
@@ -26,8 +31,9 @@ async def build_advisor_guidance(
     observations: Sequence[Any],
     evidence_summaries: EvidenceSummaryPort | None,
     available_tools: Sequence[str],
-    checkpoint_tool_threshold: int = 12,
-    advisor_turn_limit: int = 8,
+    checkpoint_tool_threshold: int = DEFAULT_CHECKPOINT_TOOL_THRESHOLD,
+    advisor_turn_limit: int = DEFAULT_ADVISOR_TURN_LIMIT,
+    pivot_observation_ids: Sequence[Any] = (),
     enabled: bool = True,
 ) -> dict[str, Any]:
     ordered = tuple(
@@ -48,7 +54,12 @@ async def build_advisor_guidance(
         advisor_invocations, observations, evidence_summaries, available_tools
     )
     reason, consultation_type = (
-        _checkpoint(ordered, checkpoint_tool_threshold=max(1, checkpoint_tool_threshold))
+        _checkpoint(
+            ordered,
+            observations=observations,
+            pivot_observation_ids=pivot_observation_ids,
+            checkpoint_tool_threshold=max(1, checkpoint_tool_threshold),
+        )
         if enabled
         else (None, None)
     )
@@ -152,7 +163,11 @@ def _key_points(output: Mapping[str, Any], available_tools: Sequence[str]) -> li
 
 
 def _checkpoint(
-    invocations: Sequence[Any], *, checkpoint_tool_threshold: int
+    invocations: Sequence[Any],
+    *,
+    observations: Sequence[Any],
+    pivot_observation_ids: Sequence[Any],
+    checkpoint_tool_threshold: int,
 ) -> tuple[str | None, str | None]:
     advisor_positions = [
         index for index, item in enumerate(invocations) if item.tool_name == ADVISOR_TOOL_NAME
@@ -171,28 +186,71 @@ def _checkpoint(
         ):
             return "repeated_tool_block", "pivot_strategy"
 
+    if advisor_positions:
+        latest_advisor = invocations[advisor_positions[-1]]
+        latest_advisor_at = getattr(latest_advisor, "updated_at", None) or getattr(
+            latest_advisor, "created_at", None
+        )
+        pivot_ids = {str(item) for item in pivot_observation_ids}
+        if any(
+            str(getattr(item, "id", "")) in pivot_ids
+            and getattr(item, "observed_at", None) is not None
+            and latest_advisor_at is not None
+            and item.observed_at > latest_advisor_at
+            for item in observations
+        ):
+            return "new_pivot_discovered", "pivot_strategy"
+
     analyzed_positions = [
         index
         for index, item in enumerate(invocations)
-        if item.tool_name == "sample.analyze"
+        if _is_significant_decompilation(item.tool_name)
         and getattr(item.status, "value", item.status) in {"succeeded", "partial"}
     ]
     if analyzed_positions:
-        latest_analysis_position = analyzed_positions[-1]
+        first_analysis_position = analyzed_positions[0]
         later_consults = tuple(
-            item
-            for item in invocations[latest_analysis_position + 1 :]
+            (index, item)
+            for index, item in enumerate(
+                invocations[first_analysis_position + 1 :], start=first_analysis_position + 1
+            )
             if item.tool_name == ADVISOR_TOOL_NAME
         )
         if not any(
             _consultation_type(item) in {"plan_investigation", "pivot_strategy"}
-            for item in later_consults
+            for _, item in later_consults
         ):
-            return "sample_analyzed_without_plan", "plan_investigation"
-        if not any(_consultation_type(item) == "yara_draft" for item in later_consults) and not any(
-            item.tool_name == "rule.propose" for item in invocations[latest_analysis_position + 1 :]
+            return "first_significant_decompilation", "plan_investigation"
+
+        latest_analysis_position = analyzed_positions[-1]
+        later_after_analysis = invocations[latest_analysis_position + 1 :]
+        later_analysis_advice = tuple(
+            item for item in later_after_analysis if item.tool_name == ADVISOR_TOOL_NAME
+        )
+        rule_proposed_after_analysis = any(
+            item.tool_name in {"rule.propose", "rule.revise"} for item in later_after_analysis
+        )
+        if (
+            not any(_consultation_type(item) == "yara_draft" for item in later_analysis_advice)
+            and not rule_proposed_after_analysis
         ):
-            return "sample_analyzed_without_yara_review", "yara_draft"
+            return "before_yara_proposal", "yara_draft"
+
+    yara_positions = [
+        index
+        for index, item in enumerate(invocations)
+        if item.tool_name in {"rule.test", "rule.revise"}
+        and getattr(item.status, "value", item.status) in {"succeeded", "partial"}
+    ]
+    if yara_positions:
+        latest_yara_position = yara_positions[-1]
+        later_yara_advice = tuple(
+            item
+            for item in invocations[latest_yara_position + 1 :]
+            if item.tool_name == ADVISOR_TOOL_NAME
+        )
+        if not any(_consultation_type(item) == "yara_draft" for item in later_yara_advice):
+            return "yara_revision_review", "yara_draft"
 
     opinion_positions = [
         index
@@ -213,6 +271,13 @@ def _checkpoint(
             return "tool_threshold_reached", "pivot_strategy"
         return None, None
     return "no_advisor_consultation", "plan_investigation"
+
+
+def _is_significant_decompilation(tool_name: str) -> bool:
+    normalized = tool_name.casefold()
+    return normalized == "sample.analyze" or any(
+        marker in normalized for marker in ("decompil", "ghidra", "ilspy")
+    )
 
 
 def _consultation_type(invocation: Any) -> str | None:
@@ -257,4 +322,10 @@ def bound_advisor_guidance(value: Any, *, max_bytes: int) -> tuple[Any, bool]:
     return guidance.model_copy(update={"truncated": True}), True
 
 
-__all__ = ["ADVISOR_GUIDANCE_REMINDER", "bound_advisor_guidance", "build_advisor_guidance"]
+__all__ = [
+    "ADVISOR_GUIDANCE_REMINDER",
+    "DEFAULT_ADVISOR_TURN_LIMIT",
+    "DEFAULT_CHECKPOINT_TOOL_THRESHOLD",
+    "bound_advisor_guidance",
+    "build_advisor_guidance",
+]

@@ -37,6 +37,7 @@ class ConfinedAnalysisTool(StrEnum):
     YARA = "yara"
     SURICATA_VALIDATE_RULES = "suricata_validate_rules"
     SURICATA_REPLAY = "suricata_replay"
+    DOTNET_ILSPY = "dotnet_ilspy"
 
 
 class ConfinedAnalysisArtifactKind(StrEnum):
@@ -124,9 +125,43 @@ class ConfinedAnalysisRequest:
                 "candidate_version",
                 "rule_source",
             },
+            ConfinedAnalysisTool.DOTNET_ILSPY: {
+                "operation",
+                "method_rid",
+                "offset",
+                "limit",
+                "max_chars",
+            },
         }.get(self.tool, set())
         if set(self.analysis_parameters) - allowed_parameters:
             raise ValueError("analysis parameters are not supported for this tool")
+        if self.tool is ConfinedAnalysisTool.DOTNET_ILSPY:
+            parameters = self.analysis_parameters
+            if self.arguments:
+                raise ValueError("dotnet analysis does not accept command arguments")
+            if parameters.get("operation") not in {
+                "assembly",
+                "types",
+                "methods",
+                "decompile",
+                "references",
+                "strings",
+                "resources",
+            }:
+                raise ValueError("dotnet operation is invalid")
+            if "offset" in parameters and not _bounded_decimal(parameters["offset"], 0, 10**7):
+                raise ValueError("dotnet output offset is invalid")
+            if "limit" in parameters and not _bounded_decimal(parameters["limit"], 1, 200):
+                raise ValueError("dotnet result limit is invalid")
+            if "max_chars" in parameters and not _bounded_decimal(
+                parameters["max_chars"], 1, 16 * 1024
+            ):
+                raise ValueError("dotnet character limit is invalid")
+            has_rid = "method_rid" in parameters
+            if has_rid and not _bounded_decimal(parameters["method_rid"], 1, 0xFFFFFF):
+                raise ValueError("dotnet method RID is invalid")
+            if (parameters["operation"] == "decompile") != has_rid:
+                raise ValueError("dotnet method RID is required only for decompile")
         if self.tool is ConfinedAnalysisTool.LOCAL_COMMAND:
             if len(self.arguments) != 1 or self.arguments[0] not in {
                 "file",

@@ -26,16 +26,31 @@ WORKDIR /app
 COPY --from=builder /app/.venv /app/.venv
 COPY backend/src ./src
 COPY backend/tools ./tools
+COPY infra/install_ilspycmd.py /app/tools/install_ilspycmd.py
 COPY --from=builder --chown=root:root /app/rules/capa /app/rules/capa
 # Suricata is not in bookworm main; the pinned 7.0.x build comes from bookworm-backports.
-RUN echo "deb http://deb.debian.org/debian bookworm-backports main" \
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
+        ca-certificates curl \
+    && curl --fail --silent --show-error --location \
+        https://packages.microsoft.com/config/debian/12/packages-microsoft-prod.deb \
+        --output /tmp/packages-microsoft-prod.deb \
+    && echo "8434dcb8c346dc95fbd63dbece056c343704590b58b6a5c323d39acf52bf0b48  /tmp/packages-microsoft-prod.deb" \
+        | sha256sum --check --status \
+    && dpkg -i /tmp/packages-microsoft-prod.deb \
+    && echo "deb http://deb.debian.org/debian bookworm-backports main" \
         > /etc/apt/sources.list.d/bookworm-backports.list \
     && apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
         tshark file binutils xxd coreutils mono-utils=6.8.0.105+dfsg-3.3+deb12u1 \
+        dotnet-runtime-8.0=8.0.32-1 \
     && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
         -t bookworm-backports suricata=1:7.0.10-1~bpo12+1 \
     && rm -rf /var/lib/apt/lists/* \
+    && rm -f /tmp/packages-microsoft-prod.deb \
+    && dotnet --list-runtimes | grep -q 'Microsoft.NETCore.App 8.0.32 ' \
+    && PYTHONPATH=/app/src python /app/tools/install_ilspycmd.py \
+    && ilspycmd --disable-updatecheck --version \
     && chmod -R a-w /app/rules/capa \
     && file --version \
     && strings --version \
@@ -56,6 +71,10 @@ RUN echo "deb http://deb.debian.org/debian bookworm-backports main" \
 RUN useradd --system --uid 10001 analysis
 USER analysis
 ENV PATH="/app/.venv/bin:$PATH" \
+    DOTNET_ROOT=/usr/share/dotnet \
+    DOTNET_CLI_TELEMETRY_OPTOUT=1 \
+    DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1 \
+    DOTNET_NOLOGO=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     ANALYSIS_WORKER_ISOLATION_PROFILE=bookworm-internal-v1

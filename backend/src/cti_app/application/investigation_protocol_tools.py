@@ -57,9 +57,13 @@ from cti_app.domain.network_protocol import (
 )
 from cti_app.domain.protocol_model import (
     AssuranceLevel,
+    BinaryFunctionProvenanceV1,
     FieldDefinitionV1,
     FieldStability,
     MessageDefinitionV1,
+    ProtocolCharacteristicKindV1,
+    ProtocolCharacteristicV1,
+    ProtocolEvidenceLevelV1,
     ProtocolEvidenceRefV1,
     ProtocolHypothesisProposalV1,
     ProtocolModelV1,
@@ -197,6 +201,7 @@ _PROPOSAL_SCHEMA: dict[str, Any] = {
                     },
                     "encoding": {"type": ["string", "null"], "maxLength": 64},
                     "condition": {"type": ["string", "null"], "maxLength": 256},
+                    "justification": {"type": ["string", "null"], "maxLength": 1024},
                     "expected_hex": {
                         "type": ["string", "null"],
                         "pattern": "^(?:[0-9a-f]{2}){1,16}$",
@@ -238,6 +243,24 @@ _PROPOSAL_SCHEMA: dict[str, Any] = {
             "type": "array",
             "maxItems": 256,
             "items": _TEST_STEP_SCHEMA,
+        },
+        "characteristics": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": [item.value for item in ProtocolCharacteristicKindV1],
+                    },
+                    "name": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "statement": {"type": "string", "minLength": 1, "maxLength": 1024},
+                    "justification": {"type": "string", "minLength": 1, "maxLength": 1024},
+                },
+                "required": ["kind", "name", "statement", "justification"],
+                "additionalProperties": False,
+            },
         },
     },
     "required": ["schema_version", "messages", "fields", "transitions", "test_plan"],
@@ -326,6 +349,49 @@ _DOCUMENTED_MODEL_SCHEMA: dict[str, Any] = {
                     "to_state",
                     "message_id",
                     "trigger",
+                    "evidence_refs",
+                ],
+                "additionalProperties": False,
+            },
+        },
+        "characteristics": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": [item.value for item in ProtocolCharacteristicKindV1],
+                    },
+                    "name": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "statement": {"type": "string", "minLength": 1, "maxLength": 1024},
+                    "justification": {"type": "string", "minLength": 1, "maxLength": 1024},
+                    "evidence_refs": _DOCUMENT_REF_LIST_SCHEMA,
+                },
+                "required": ["kind", "name", "statement", "justification", "evidence_refs"],
+                "additionalProperties": False,
+            },
+        },
+        "static_function_provenance": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "sample_sha256": {"type": "string", "pattern": _SHA_PATTERN},
+                    "binary_sha256": {"type": "string", "pattern": _SHA_PATTERN},
+                    "provider": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "provider_version": {"type": "string", "minLength": 1, "maxLength": 64},
+                    "function_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "evidence_refs": _DOCUMENT_REF_LIST_SCHEMA,
+                },
+                "required": [
+                    "sample_sha256",
+                    "binary_sha256",
+                    "provider",
+                    "provider_version",
+                    "function_id",
                     "evidence_refs",
                 ],
                 "additionalProperties": False,
@@ -633,16 +699,51 @@ async def _document_protocol_model(
             "fields",
             "transitions",
         },
+        optional={"characteristics", "static_function_provenance"},
     )
     messages_raw = _document_list(root["messages"], "messages", minimum=1, maximum=64)
     states_raw = _document_list(root["states"], "states", minimum=0, maximum=64)
     fields_raw = _document_list(root["fields"], "fields", minimum=0, maximum=128)
     transitions_raw = _document_list(root["transitions"], "transitions", minimum=0, maximum=128)
+    characteristics_raw = _document_list(
+        root.get("characteristics", []), "characteristics", minimum=0, maximum=64
+    )
+    static_function_rows = _document_list(
+        root.get("static_function_provenance", []),
+        "static_function_provenance",
+        minimum=0,
+        maximum=64,
+    )
 
     reference_lists: dict[str, tuple[tuple[str, str], ...]] = {}
     all_references: list[tuple[str, str]] = []
     reference_lists["root"] = _document_references(root["evidence_refs"])
     all_references.extend(reference_lists["root"])
+    characteristic_rows: list[dict[str, Any]] = []
+    for row_value in characteristics_raw:
+        row = _require_document_object(
+            row_value,
+            {"kind", "name", "statement", "justification", "evidence_refs"},
+        )
+        row_refs = _document_references(row["evidence_refs"])
+        all_references.extend(row_refs)
+        characteristic_rows.append({**row, "_references": row_refs})
+    static_function_provenance_rows: list[dict[str, Any]] = []
+    for row_value in static_function_rows:
+        row = _require_document_object(
+            row_value,
+            {
+                "sample_sha256",
+                "binary_sha256",
+                "provider",
+                "provider_version",
+                "function_id",
+                "evidence_refs",
+            },
+        )
+        row_refs = _document_references(row["evidence_refs"])
+        all_references.extend(row_refs)
+        static_function_provenance_rows.append({**row, "_references": row_refs})
     typed_rows: dict[str, list[dict[str, Any]]] = {
         "messages": [],
         "states": [],
@@ -761,6 +862,33 @@ async def _document_protocol_model(
         )
         for row in typed_rows["transitions"]
     )
+    model_characteristics = tuple(
+        ProtocolCharacteristicV1(
+            kind=ProtocolCharacteristicKindV1(
+                _document_enum(row["kind"], {item.value for item in ProtocolCharacteristicKindV1})
+            ),
+            name=_document_text(row["name"], "characteristic name", 128),
+            statement=_document_text(row["statement"], "characteristic statement", 1024),
+            evidence_level=ProtocolEvidenceLevelV1.ARTICLE_DOCUMENTED,
+            validation_status=ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED,
+            evidence=evidence(row["_references"]),
+            justification=_document_text(row["justification"], "characteristic rationale", 1024),
+        )
+        for row in characteristic_rows
+    )
+    static_function_provenance = tuple(
+        BinaryFunctionProvenanceV1(
+            sample_sha256=_document_text(row["sample_sha256"], "sample sha256", 64),
+            binary_sha256=_document_text(row["binary_sha256"], "binary sha256", 64),
+            provider=_document_text(row["provider"], "static provider", 128),
+            provider_version=_document_text(row["provider_version"], "provider version", 64),
+            function_id=_document_text(row["function_id"], "static function id", 128),
+            evidence=evidence(row["_references"]),
+            execution_mode="static_non_executed",
+            evidence_level=ProtocolEvidenceLevelV1.STATIC_INFERENCE,
+        )
+        for row in static_function_provenance_rows
+    )
     transport = _document_enum(root["transport"], {item.value for item in NetworkTransport})
     orientation = _document_enum(
         root["client_server_orientation"],
@@ -790,7 +918,7 @@ async def _document_protocol_model(
         messages=model_messages,
         fields=model_fields,
         transitions=model_transitions,
-        function_provenance=(),
+        function_provenance=static_function_provenance,
         validation_status=ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED,
         verification_findings=(),
         test_plan=(),
@@ -802,11 +930,15 @@ async def _document_protocol_model(
         extractor_versions=(("protocol-document", "1"),),
         states=model_states,
         documentary_evidence=evidence(reference_lists["root"]),
+        characteristics=model_characteristics,
     )
 
 
-def _require_document_object(value: object, required: set[str]) -> Mapping[str, Any]:
-    if not isinstance(value, Mapping) or set(value) != required:
+def _require_document_object(
+    value: object, required: set[str], *, optional: set[str] | None = None
+) -> Mapping[str, Any]:
+    allowed = required | (optional or set())
+    if not isinstance(value, Mapping) or not required.issubset(value) or set(value) - allowed:
         raise ValueError("documentary protocol input has missing or unknown fields")
     return value
 
@@ -907,6 +1039,8 @@ class _ProtocolToolAdapter:
                     "state_count": len(model.states),
                     "field_count": len(model.fields),
                     "transition_count": len(model.transitions),
+                    "characteristic_count": len(model.characteristics),
+                    "static_function_provenance_count": len(model.function_provenance),
                 }
                 observation_id = await self._record(context, model, blob_id, stored_sha, output)
                 output["observation_ref"] = str(observation_id)
@@ -962,6 +1096,8 @@ class _ProtocolToolAdapter:
                     "field_count": len(model.fields),
                     "transition_count": len(model.transitions),
                     "test_plan": [step.to_dict() for step in model.test_plan],
+                    "characteristic_count": len(model.characteristics),
+                    "validation_results": [run.to_dict() for run in model.validation_runs],
                 }
                 observation_id = await self._record(context, model, blob_id, stored_sha, output)
                 output["observation_ref"] = str(observation_id)
@@ -985,6 +1121,7 @@ class _ProtocolToolAdapter:
                     "model_blob_id": str(blob_id),
                     "model_sha256": stored_sha,
                     "validation_status": verified.validation_status.value,
+                    "validation_results": [run.to_dict() for run in verified.validation_runs],
                     "finding_count": len(verified.verification_findings),
                     "contradiction_count": sum(
                         item.validation_status.value == "contradicted"
@@ -999,7 +1136,9 @@ class _ProtocolToolAdapter:
                 output["observation_ref"] = str(observation_id)
                 status = (
                     ToolInvocationStatus.PARTIAL
-                    if verified.validation_status.value in {"contradicted", "unresolved"}
+                    if verified.validation_runs
+                    and verified.validation_runs[-1].result.value
+                    in {"rejected", "partial", "not_testable"}
                     else ToolInvocationStatus.SUCCEEDED
                 )
                 return self._result(context, started, status, output, (observation_id,))

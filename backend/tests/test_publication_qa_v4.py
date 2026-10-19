@@ -182,13 +182,15 @@ def test_publication_section_order_matrix(monkeypatch: pytest.MonkeyPatch) -> No
             v5_with_ioc_details,
             v5_detail_inputs,
             qa_publication_v5,
-            ("references", "synthesis", "technical_annex"),
+            # C8 adds body IOC lists before the exhaustive technical annex.
+            ("references", "synthesis", "ioc", "technical_annex"),
         ),
         (
             v5_with_chronology,
             timeline_inputs,
             qa_publication_v5,
-            ("references", "synthesis", "chronology"),
+            # C8 presents the sole sourced chronology before synthesis.
+            ("references", "chronology", "synthesis"),
         ),
         (
             v6_without_opinion,

@@ -288,6 +288,7 @@ async def test_verified_synthesis_http_job_finding_and_opinion_postgres(
             dispatcher.job_ids[0]
         )
         read = await client.get(f"/api/investigations/{investigation.id}")
+        pivots = await client.get(f"/api/investigations/{investigation.id}/pivots")
 
     assert read.status_code == 200, read.text
     result = read.json()
@@ -299,6 +300,10 @@ async def test_verified_synthesis_http_job_finding_and_opinion_postgres(
     assert result["opinion_draft"]["blocks"][0]["evidence_refs"] == [str(observation.id)]
     assert turn_transport.submission_count == 1
     assert str(observation_blob_id) not in read.text
+    assert pivots.status_code == 200, pivots.text
+    assert pivots.json()["schema_version"] == "investigation-pivot-frontier.v1"
+    assert pivots.json()["investigation_id"] == str(investigation.id)
+    assert pivots.json()["nodes"] == []
 
     async with uow_factory() as uow:
         persisted_publication = await uow.production_artifacts.get(publication.id)

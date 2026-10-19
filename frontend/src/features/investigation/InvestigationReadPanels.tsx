@@ -42,6 +42,22 @@ const VALIDATION_STATUS: Record<string, string> = {
   inferred: "Inféré",
   unresolved: "Non résolu",
   contradicted: "Contredit",
+  documented_not_observed: "Documenté, non observé",
+};
+
+const EVIDENCE_LEVEL: Record<string, string> = {
+  article_documented: "Documenté dans l’article · non observé",
+  static_inference: "Inférence statique · pas une observation d’exécution",
+  sandbox_capture_observed: "Observé dans une capture de sandbox",
+  hypothetical: "Hypothèse · non vérifiée",
+  verified_on_holdout: "Vérifié sur holdout",
+};
+
+const VALIDATION_RESULT: Record<string, string> = {
+  verified: "Vérifié",
+  rejected: "Rejeté",
+  partial: "Partiel",
+  not_testable: "Non testable",
 };
 
 const DIAGRAM_KIND: Record<ProtocolDiagramKind, string> = {
@@ -64,15 +80,25 @@ function StatusBadge({
 
 export function InvestigationReadPanels({
   investigationId,
+  view = "all",
 }: {
   investigationId: string;
+  view?: "all" | "claims" | "samples" | "network" | "journal";
 }) {
   return (
     <>
-      <SampleComparisonPanel investigationId={investigationId} />
-      <HypothesisEvidencePanel investigationId={investigationId} />
-      <ProtocolPanel investigationId={investigationId} />
-      <RetrohuntPanel investigationId={investigationId} />
+      {view === "all" || view === "samples" ? (
+        <SampleComparisonPanel investigationId={investigationId} />
+      ) : null}
+      {view === "all" || view === "claims" ? (
+        <HypothesisEvidencePanel investigationId={investigationId} />
+      ) : null}
+      {view === "all" || view === "network" ? (
+        <ProtocolPanel investigationId={investigationId} />
+      ) : null}
+      {view === "all" || view === "journal" ? (
+        <RetrohuntPanel investigationId={investigationId} />
+      ) : null}
     </>
   );
 }
@@ -422,6 +448,12 @@ function ProtocolPanel({ investigationId }: { investigationId: string }) {
                   labels={VALIDATION_STATUS}
                 />
               </p>
+              <p>
+                Niveau de preuve :{" "}
+                {EVIDENCE_LEVEL[
+                  stringField(modelQuery.data.model, "evidence_level") ?? ""
+                ] ?? "Non précisé pour le modèle"}
+              </p>
               <ProtocolDefinitions model={modelQuery.data.model} />
             </>
           )}
@@ -488,8 +520,31 @@ function ProtocolDefinitions({
 }: {
   model: ProtocolModelDetail["model"];
 }) {
+  const characteristics = recordArray(model.characteristics);
+  const validationRuns = recordArray(model.validation_runs);
   return (
     <div>
+      {characteristics.length > 0 ? (
+        <section aria-label="Caractéristiques du protocole et niveau de preuve">
+          <h3>Faits documentés, observés et hypothèses</h3>
+          <ul>
+            {characteristics.map((characteristic, index) => {
+              const id =
+                stringField(characteristic, "name") ??
+                `caractéristique-${index + 1}`;
+              const level = stringField(characteristic, "evidence_level") ?? "";
+              return (
+                <li key={`${id}-${index}`}>
+                  <strong>{id}</strong> ·{" "}
+                  {EVIDENCE_LEVEL[level] ?? "Niveau de preuve inconnu"} ·{" "}
+                  {stringField(characteristic, "statement") ??
+                    "Énoncé indisponible"}
+                </li>
+              );
+            })}
+          </ul>
+        </section>
+      ) : null}
       <h3>Messages et champs</h3>
       {model.messages.length === 0 ? (
         <p>Aucun message établi.</p>
@@ -506,6 +561,12 @@ function ProtocolDefinitions({
                 }
                 labels={VALIDATION_STATUS}
               />
+              <span>
+                {" "}
+                ·{" "}
+                {EVIDENCE_LEVEL[stringField(message, "evidence_level") ?? ""] ??
+                  "Niveau de preuve inconnu"}
+              </span>
               <span>
                 {" "}
                 · longueur {numberField(message, "min_length") ?? "?"}–
@@ -528,12 +589,86 @@ function ProtocolDefinitions({
               />
               <span>
                 {" "}
+                ·{" "}
+                {EVIDENCE_LEVEL[stringField(field, "evidence_level") ?? ""] ??
+                  "Niveau de preuve inconnu"}
+              </span>
+              <span>
+                {" "}
                 · offset {numberField(field, "offset") ?? "inconnu"} · longueur{" "}
                 {numberField(field, "length") ?? "inconnue"} ·{" "}
                 {stringField(field, "endianness") ?? "endianness inconnue"}
               </span>
+              {protocolEvidence(field).length > 0 ? (
+                <ul
+                  aria-label={`Preuves du champ ${stringField(field, "name") ?? index + 1}`}
+                >
+                  {protocolEvidence(field).map((item, evidenceIndex) => (
+                    <li
+                      key={`${stringField(item, "observation_id") ?? "evidence"}-${evidenceIndex}`}
+                    >
+                      {stringField(item, "capture_sha256") ? (
+                        <>
+                          Capture SHA-256{" "}
+                          <code>{stringField(item, "capture_sha256")}</code>
+                        </>
+                      ) : stringField(item, "documented_ref_kind") ? (
+                        <>
+                          Référence {stringField(item, "documented_ref_kind")}:{" "}
+                          {stringField(item, "documented_ref_id")}
+                        </>
+                      ) : (
+                        "Capture non identifiée"
+                      )}
+                      {stringField(item, "observation_id") ? (
+                        <>
+                          {" "}
+                          · observation {stringField(item, "observation_id")}
+                        </>
+                      ) : null}
+                      {Array.isArray(item.frame_numbers) &&
+                      item.frame_numbers.length > 0 ? (
+                        <> · trames {item.frame_numbers.join(", ")}</>
+                      ) : null}
+                      {typeof item.start_offset === "number" ? (
+                        <>
+                          {" "}
+                          · octets {item.start_offset}–
+                          {typeof item.end_offset === "number"
+                            ? item.end_offset
+                            : "?"}
+                        </>
+                      ) : null}
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
             </li>
           ))}
+        </ul>
+      )}
+      <h3>Validations du protocole</h3>
+      {validationRuns.length === 0 ? (
+        <p>Aucun essai train/holdout n’est consigné dans ce modèle.</p>
+      ) : (
+        <ul>
+          {validationRuns.map((run, index) => {
+            const split = stringField(run, "split") ?? "jeu inconnu";
+            const result = stringField(run, "result") ?? "résultat inconnu";
+            const level = stringField(run, "evidence_level") ?? "";
+            return (
+              <li key={`${split}-${index}`}>
+                {split === "train"
+                  ? "Développement"
+                  : split === "holdout"
+                    ? "Holdout"
+                    : split}{" "}
+                · {VALIDATION_RESULT[result] ?? result} ·{" "}
+                {EVIDENCE_LEVEL[level] ?? "Niveau de preuve non précisé"} ·{" "}
+                {stringField(run, "detail") ?? "Détail absent"}
+              </li>
+            );
+          })}
         </ul>
       )}
       {model.limitations.length > 0 ? (
@@ -541,6 +676,20 @@ function ProtocolDefinitions({
       ) : null}
     </div>
   );
+}
+
+function recordArray(value: unknown): Record<string, unknown>[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter(
+    (item): item is Record<string, unknown> =>
+      typeof item === "object" && item !== null && !Array.isArray(item),
+  );
+}
+
+function protocolEvidence(
+  item: Record<string, unknown>,
+): Record<string, unknown>[] {
+  return recordArray(item.evidence);
 }
 
 function stringField(

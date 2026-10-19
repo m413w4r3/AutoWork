@@ -904,10 +904,17 @@ class _RelationshipsAdapter(_VirusTotalAdapter):
                 )
                 descriptors = _descriptors(page.items, self.max_results)
                 page_summary = {
+                    "object_type": object_type.value,
+                    "object_id": object_anchor_id,
                     "relation": relation,
                     "observed_count": len(page.items),
                     "descriptors": descriptors,
                     "page": page_index + 1,
+                    "input_cursor": _safe_cursor(cursor) if cursor is not None else None,
+                    "next_cursor": _safe_cursor(page.next_cursor)
+                    if page.next_cursor is not None
+                    else None,
+                    "pagination_complete": page.exhaustive and page.next_cursor is None,
                 }
                 for raw_index, raw_observation in enumerate(raw_observations):
                     state.observation_refs.extend(
@@ -947,6 +954,7 @@ class _RelationshipsAdapter(_VirusTotalAdapter):
                     "pages": state.pages,
                     "observed_count": len(items),
                     "descriptors": output_descriptors,
+                    "pagination_complete": exhaustive,
                     "provider_routes": sorted(state.routes),
                     "limitations": list(limitations),
                 }
@@ -1047,6 +1055,11 @@ class _IntelligenceSearchAdapter(_VirusTotalAdapter):
                     "observed_count": len(result.items),
                     "descriptors": page_descriptors,
                     "page": page_index + 1,
+                    "input_cursor": _safe_cursor(cursor) if cursor is not None else None,
+                    "next_cursor": _safe_cursor(result.next_cursor)
+                    if result.next_cursor is not None
+                    else None,
+                    "pagination_complete": result.exhaustive and result.next_cursor is None,
                 }
                 for raw_index, raw_observation in enumerate(raw_observations):
                     state.observation_refs.extend(
@@ -1071,6 +1084,12 @@ class _IntelligenceSearchAdapter(_VirusTotalAdapter):
                             "effective_query": query,
                             "candidate": descriptor,
                             "page": page_index + 1,
+                            "evidence_refs": [str(item) for item in evidence_refs],
+                            "input_cursor": _safe_cursor(cursor) if cursor is not None else None,
+                            "next_cursor": _safe_cursor(result.next_cursor)
+                            if result.next_cursor is not None
+                            else None,
+                            "pagination_complete": result.exhaustive and result.next_cursor is None,
                         }
                         state.observation_refs.extend(
                             await self._record_raw_and_summary(
@@ -1111,6 +1130,7 @@ class _IntelligenceSearchAdapter(_VirusTotalAdapter):
                     "pages": state.pages,
                     "observed_count": len(items),
                     "descriptors": output_descriptors,
+                    "pagination_complete": exhaustive,
                     "provider_routes": sorted(state.routes),
                     "limitations": list(limitations),
                 }

@@ -36,6 +36,21 @@ export interface DetectionTestRoleReport {
   }>;
 }
 
+export interface DetectionRateMetric {
+  status: "calculated" | "not_calculable";
+  numerator: number;
+  denominator: number;
+  estimate: number | null;
+  confidence_interval_95: { lower: number; upper: number } | null;
+  method: string;
+}
+
+export type DetectionRateMetricName =
+  | "real_positive_sensitivity"
+  | "real_goodware_false_positive_rate"
+  | "real_holdout_sensitivity"
+  | "real_holdout_false_positive_rate";
+
 export interface DetectionTestReport {
   observation_id: string;
   sha256: string;
@@ -59,6 +74,9 @@ export interface DetectionTestReport {
   known_false_positives: string[];
   known_false_positive_status: "present" | "none_observed" | "not_tested";
   goodware_case_count: number;
+  metrics?: Partial<Record<DetectionRateMetricName, DetectionRateMetric>>;
+  match_interpretation?: string;
+  statistics_interpretation?: string;
 }
 
 export interface DetectionDecisionView {

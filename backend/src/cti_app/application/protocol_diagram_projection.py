@@ -40,6 +40,7 @@ from cti_app.domain.protocol_model import (
     ProtocolDiagramNodeV1,
     ProtocolDiagramSpecV1,
     ProtocolDiagramStatus,
+    ProtocolEvidenceLevelV1,
     ProtocolEvidenceRefV1,
     ProtocolRenderResultV1,
     ProtocolValidationStatus,
@@ -177,9 +178,11 @@ def project_protocol_diagram(spec: ProtocolDiagramSpecV1) -> DiagramSpecV1:
 def protocol_diagram_caption(spec: ProtocolDiagramSpecV1) -> str:
     """Return the human-readable status legend and bounded semantic limitations."""
     legend = (
-        "Legend: OBSERVED green; INFERRED orange and dashed; "
-        "UNRESOLVED gray; CONTRADICTED red; DOCUMENTED, NOT OBSERVED blue. "
-        "Status is stated on each element."
+        "Evidence-level legend: ARTICLE_DOCUMENTED (blue) means DOCUMENTED, NOT OBSERVED; "
+        "STATIC_INFERENCE; SANDBOX_CAPTURE_OBSERVED; HYPOTHETICAL; VERIFIED_ON_HOLDOUT. "
+        "These labels describe proof origin and are separate from validation status. "
+        "Validation status: OBSERVED green; INFERRED orange and dashed; UNRESOLVED gray; "
+        "CONTRADICTED red. An article diagram label never means packet, frame, or byte observed."
     )
     if _is_documented_view(spec):
         body = (
@@ -382,14 +385,43 @@ def _is_documented_view(spec: ProtocolDiagramSpecV1) -> bool:
     )
 
 
-def _status_label(status: ProtocolValidationStatus, text: str) -> str:
-    return f"{_status(status)} · {text.strip()}" if text.strip() else _status(status)
+def _status_label(
+    status: ProtocolValidationStatus,
+    text: str,
+    evidence_level: ProtocolEvidenceLevelV1 | None = None,
+    evidence: tuple[ProtocolEvidenceRefV1, ...] = (),
+) -> str:
+    pieces = [_status(status)]
+    pieces.append(_evidence_level_label(_resolved_evidence_level(evidence_level, status, evidence)))
+    if text.strip():
+        pieces.append(text.strip())
+    return " · ".join(pieces)
+
+
+def _resolved_evidence_level(
+    level: ProtocolEvidenceLevelV1 | None,
+    status: ProtocolValidationStatus,
+    evidence: tuple[ProtocolEvidenceRefV1, ...],
+) -> ProtocolEvidenceLevelV1:
+    if level is not None:
+        return level
+    if status is ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED:
+        return ProtocolEvidenceLevelV1.ARTICLE_DOCUMENTED
+    if any(item.capture_sha256 is not None for item in evidence):
+        return ProtocolEvidenceLevelV1.SANDBOX_CAPTURE_OBSERVED
+    return ProtocolEvidenceLevelV1.STATIC_INFERENCE
+
+
+def _evidence_level_label(level: ProtocolEvidenceLevelV1) -> str:
+    if level is ProtocolEvidenceLevelV1.ARTICLE_DOCUMENTED:
+        return "ARTICLE_DOCUMENTED · DOCUMENTED, NOT OBSERVED"
+    return level.value.upper()
 
 
 def _project_participant(node: ProtocolDiagramNodeV1) -> DiagramNodeV1:
     return DiagramNodeV1(
         node_id=node.node_id,
-        label=_status_label(node.validation_status, node.label),
+        label=_status_label(node.validation_status, node.label, node.evidence_level, node.evidence),
         evidence_refs=(),
         role=DiagramNodeRole.PROTOCOL_PARTICIPANT,
     )
@@ -398,7 +430,7 @@ def _project_participant(node: ProtocolDiagramNodeV1) -> DiagramNodeV1:
 def _project_state(node: ProtocolDiagramNodeV1) -> DiagramNodeV1:
     return DiagramNodeV1(
         node_id=node.node_id,
-        label=_status_label(node.validation_status, node.label),
+        label=_status_label(node.validation_status, node.label, node.evidence_level, node.evidence),
         evidence_refs=(),
         role=DiagramNodeRole.PROTOCOL_STATE,
     )
@@ -415,7 +447,12 @@ def _project_message(edge: ProtocolDiagramEdgeV1) -> DiagramEdgeV1:
     return DiagramEdgeV1(
         source_node_id=edge.source_id,
         target_node_id=edge.target_id,
-        label=_status_label(edge.validation_status, " · ".join(item for item in details if item)),
+        label=_status_label(
+            edge.validation_status,
+            " · ".join(item for item in details if item),
+            edge.evidence_level,
+            edge.evidence,
+        ),
         evidence_refs=(),
         relation_type=(
             DiagramRelationType.PROTOCOL_INFERENCE
@@ -453,7 +490,12 @@ def _project_transition(edge: ProtocolDiagramEdgeV1) -> DiagramEdgeV1:
     return DiagramEdgeV1(
         source_node_id=edge.source_id,
         target_node_id=edge.target_id,
-        label=_status_label(edge.validation_status, " · ".join(item for item in details if item)),
+        label=_status_label(
+            edge.validation_status,
+            " · ".join(item for item in details if item),
+            edge.evidence_level,
+            edge.evidence,
+        ),
         evidence_refs=(),
         relation_type=(
             DiagramRelationType.PROTOCOL_INFERENCE
@@ -476,10 +518,24 @@ def _project_field(field: ProtocolDiagramFieldV1, index: int) -> DiagramNodeV1:
     ]
     if field.condition:
         details.append(f"condition {field.condition.strip()}")
+    if field.offset is not None:
+        details.append(
+            "offset justification "
+            + (
+                field.justification.strip()
+                if field.justification and field.justification.strip()
+                else "not recorded"
+            )
+        )
     evidence_label = _field_evidence_label(field.evidence)
     if evidence_label:
         details.append(evidence_label)
-    label = _status_label(field.validation_status, field_name + " · " + " · ".join(details))
+    label = _status_label(
+        field.validation_status,
+        field_name + " · " + " · ".join(details),
+        field.evidence_level,
+        field.evidence,
+    )
     return DiagramNodeV1(
         node_id=f"protocol-field-{index:04d}",
         label=label,
@@ -559,11 +615,35 @@ def _field_order_edges(fields: tuple[ProtocolDiagramFieldV1, ...]) -> list[Diagr
             is ProtocolValidationStatus.OBSERVED
             else ProtocolValidationStatus.INFERRED
         )
+        left_level = _resolved_evidence_level(
+            left.evidence_level, left.validation_status, left.evidence
+        )
+        right_level = _resolved_evidence_level(
+            right.evidence_level, right.validation_status, right.evidence
+        )
+        edge_is_observed = (
+            left.validation_status is ProtocolValidationStatus.OBSERVED
+            and right.validation_status is ProtocolValidationStatus.OBSERVED
+            and left_level is right_level
+            and left_level
+            in {
+                ProtocolEvidenceLevelV1.SANDBOX_CAPTURE_OBSERVED,
+                ProtocolEvidenceLevelV1.VERIFIED_ON_HOLDOUT,
+            }
+        )
+        status = (
+            ProtocolValidationStatus.OBSERVED
+            if edge_is_observed
+            else ProtocolValidationStatus.INFERRED
+        )
+        edge_level = (
+            left_level if left_level is right_level else ProtocolEvidenceLevelV1.STATIC_INFERENCE
+        )
         edges.append(
             DiagramEdgeV1(
                 source_node_id=f"protocol-field-{left_index:04d}",
                 target_node_id=f"protocol-field-{right_index:04d}",
-                label=_status_label(status, "field order"),
+                label=_status_label(status, "field order", edge_level),
                 evidence_refs=(),
                 relation_type=(
                     DiagramRelationType.PROTOCOL_FACTUAL

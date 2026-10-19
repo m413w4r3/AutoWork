@@ -57,6 +57,7 @@ from cti_app.domain.rule_workbench import (
     RuleValidationStatus,
     YaraEngineResult,
     YaraExecutionStatus,
+    wilson_rate,
 )
 from cti_app.infrastructure.yara_runner import IsolatedYaraRunner
 
@@ -278,7 +279,7 @@ async def test_versions_retest_on_expanded_corpus_and_compare_matches() -> None:
         provenance_id=str(uuid4()),
         observation_refs=(uuid4(),),
         sample_sha256=_sha256(expanded_bytes),
-        offsets=(19,),
+        offsets=(expanded_bytes.index(b"Ty7Kp3Wq"),),
         positive_support=1,
     )
     expanded_corpus = (
@@ -571,6 +572,148 @@ async def test_validation_status_and_reason_are_stable_and_honest() -> None:
     )
     assert missing_bytes.validation_status is RuleValidationStatus.UNTESTED
     assert rule_validation_reason(missing_bytes) is RuleValidationReason.SAMPLE_BYTES_MISSING
+
+
+@pytest.mark.asyncio
+async def test_zero_observed_false_positives_keeps_wide_interval_and_unknown_sensitivity() -> None:
+    samples = {
+        _sha256(data): data
+        for data in (f"goodware fixture {index:02d}".encode() for index in range(12))
+    }
+    cases = tuple(
+        RuleTestCase(
+            sample_sha256=sample_sha256,
+            role=RuleTestCorpusRole.GOODWARE,
+            provenance=RuleSampleProvenance.SYNTHETIC,
+            expected_match=False,
+        )
+        for sample_sha256 in sorted(samples)
+    )
+    report = await _workbench(samples).compile_and_test(
+        "rule no_match { condition: false }",
+        cases,
+        selection_bias="Twelve generated unit-test examples, not real DLLs.",
+        coverage_statement="Only synthetic examples were measured.",
+    )
+
+    metrics = report.metrics
+    fpr = metrics["real_goodware_false_positive_rate"]
+    sensitivity = metrics["real_positive_sensitivity"]
+    assert fpr["status"] == "not_calculable"
+    assert sensitivity["status"] == "not_calculable"
+    assert report.validation_status is RuleValidationStatus.SYNTHETIC_ONLY
+
+    zero_of_twelve = wilson_rate(successes=0, trials=12)
+    interval = zero_of_twelve["confidence_interval_95"]
+    assert isinstance(interval, dict)
+    assert interval["lower"] == 0
+    assert interval["upper"] == pytest.approx(0.2425, abs=0.0001)
+
+
+def test_common_dotnet_import_needs_measured_conjunction() -> None:
+    workbench = _workbench({})
+    source = b"System.Runtime.InteropServices prefix:Qz9Vn5Hs:suffix"
+    source_hash = _sha256(source)
+    generic = RuleMotif(
+        kind=RuleMotifKind.STRING,
+        value="System.Runtime.InteropServices",
+        provenance_kind=RuleMotifProvenanceKind.P09_INVARIANT,
+        provenance_id="common-managed-import",
+        sample_sha256=source_hash,
+        offsets=(source.index(b"System.Runtime.InteropServices"),),
+        observation_refs=(uuid4(),),
+    )
+    specific = RuleMotif(
+        kind=RuleMotifKind.STRING,
+        value="Qz9Vn5Hs",
+        provenance_kind=RuleMotifProvenanceKind.P09_INVARIANT,
+        provenance_id="fixture-specific-byte-motif",
+        sample_sha256=source_hash,
+        offsets=(source.index(b"Qz9Vn5Hs"),),
+        observation_refs=(uuid4(),),
+    )
+    meta = {
+        "hypothesis": "A family-specific payload is identified by its private marker.",
+        "dotnet_imports_discussion": (
+            "The CLR namespace is common in benign .NET software and is context only."
+        ),
+    }
+
+    import_only = workbench.validate_motifs(
+        (generic,), meta=meta, condition=RuleConditionStrategy.ALL
+    )
+    broad_any = workbench.validate_motifs(
+        (generic, specific), meta=meta, condition=RuleConditionStrategy.ANY
+    )
+    narrowed_all = workbench.validate_motifs(
+        (generic, specific), meta=meta, condition=RuleConditionStrategy.ALL
+    )
+
+    assert any(
+        issue.code is RuleMotifIssueCode.GENERIC_DOTNET_IMPORT for issue in import_only.issues
+    )
+    assert any(issue.code is RuleMotifIssueCode.GENERIC_DOTNET_IMPORT for issue in broad_any.issues)
+    assert narrowed_all.valid
+
+
+@pytest.mark.asyncio
+async def test_common_dotnet_import_source_hash_and_offset_are_checked_on_bytes() -> None:
+    source = b"System.IO managed assembly marker Qz9Vn5Hs"
+    sample_sha256 = _sha256(source)
+    generic = RuleMotif(
+        kind=RuleMotifKind.STRING,
+        value="System.IO",
+        provenance_kind=RuleMotifProvenanceKind.P09_INVARIANT,
+        provenance_id="common-dotnet-import",
+        sample_sha256=sample_sha256,
+        offsets=(source.index(b"System.IO"),),
+        observation_refs=(uuid4(),),
+    )
+    specific = RuleMotif(
+        kind=RuleMotifKind.STRING,
+        value="Qz9Vn5Hs",
+        provenance_kind=RuleMotifProvenanceKind.P09_INVARIANT,
+        provenance_id="measured-marker",
+        sample_sha256=sample_sha256,
+        offsets=(source.index(b"Qz9Vn5Hs"),),
+        observation_refs=(uuid4(),),
+    )
+    workbench = _workbench({sample_sha256: source})
+
+    verified = await workbench.verify_dotnet_source_motifs((generic, specific))
+    invalid_offset = RuleMotif(
+        kind=RuleMotifKind.STRING,
+        value="Qz9Vn5Hs",
+        provenance_kind=RuleMotifProvenanceKind.P09_INVARIANT,
+        provenance_id="measured-marker",
+        sample_sha256=sample_sha256,
+        offsets=(0,),
+        observation_refs=(uuid4(),),
+    )
+    rejected = await workbench.verify_dotnet_source_motifs((generic, invalid_offset))
+
+    assert verified.valid
+    assert any(
+        issue.code is RuleMotifIssueCode.SOURCE_BYTES_UNVERIFIED for issue in rejected.issues
+    )
+
+
+@pytest.mark.asyncio
+async def test_non_dotnet_bridge_feature_is_outside_dotnet_source_guard() -> None:
+    motif = RuleMotif(
+        kind=RuleMotifKind.STRING,
+        value="Qz9Vn5Hs",
+        provenance_kind=RuleMotifProvenanceKind.P09_INVARIANT,
+        provenance_id="similarity-feature-p09-invariant",
+        sample_sha256="a" * 64,
+        offsets=(16,),
+        observation_refs=(uuid4(),),
+    )
+
+    report = await _workbench({}).verify_dotnet_source_motifs((motif,))
+
+    assert report.valid
+    assert report.verified_motif_indices == ()
 
 
 @pytest.mark.asyncio

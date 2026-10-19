@@ -13,8 +13,11 @@ from types import SimpleNamespace
 from typing import Any, cast
 from uuid import UUID, uuid4
 
+import httpx
 import pytest
+from fastapi import FastAPI
 
+from cti_app.api.investigation_captures import router as capture_router
 from cti_app.application.blob_storage import BlobReadLimitExceededError
 from cti_app.application.confined_analysis import (
     ConfinedAnalysisArtifactKind,
@@ -571,6 +574,102 @@ async def test_vt_sandbox_pcap_inspects_through_tool_and_confined_worker(
         assert any(item["value"] == "telemetry.example.test" for item in dns)
     else:
         assert dns == ()
+    assert worker_port.attestation.reachable
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(_missing_tools(), reason="real TShark and capinfos are required")
+async def test_capture_import_api_upload_reaches_the_confined_worker_tool() -> None:
+    database = _MemoryDatabase()
+    uow_factory = cast(UnitOfWorkFactory, database.uow)
+    settings = Settings(_env_file=None)
+    payload = _synthetic_pcap()
+    quarantine = _CaptureQuarantine(payload)
+    worker_port = _InProcessWorkerPort(
+        blobs=database.blobs,
+        uow_factory=uow_factory,
+        settings=settings,
+    )
+    limits = NetworkExtractionLimitsV1(max_packets=20, max_output_bytes=64 * 1024)
+    workbench = NetworkWorkbench(
+        quarantine=quarantine,
+        blobs=_CaptureBlobStore(database.blobs),
+        tshark=ConfinedTsharkAdapter(worker_port, limits=limits),
+        recorder=_EvidenceRecorder(database),
+        limits=limits,
+    )
+
+    class _ApiImportService:
+        max_upload_bytes = len(payload)
+
+        async def import_capture(
+            self,
+            *,
+            investigation_id: UUID,
+            content: bytes,
+            operator_id: str,
+            declared_sha256: str | None,
+        ) -> Any:
+            assert declared_sha256 == hashlib.sha256(content).hexdigest()
+            assert operator_id == "analyst:api-worker-test"
+            quarantine.content = content
+            reference = await workbench.accept_quarantined_capture(
+                "fixture:synthetic",
+                investigation_id=investigation_id,
+            )
+            return SimpleNamespace(
+                investigation_id=investigation_id,
+                source_reference=f"sha256:{reference.sha256}",
+                blob_id=reference.blob_id,
+                sha256=reference.sha256,
+                size_bytes=reference.size_bytes,
+                format=reference.format,
+                sample_id=uuid4(),
+                association_id=uuid4(),
+            )
+
+    app = FastAPI()
+    app.include_router(capture_router)
+    app.state.network_capture_import_service = _ApiImportService()
+
+    class _IdentityProvider:
+        async def current(self) -> Any:
+            return SimpleNamespace(actor_id="analyst:api-worker-test")
+
+    app.state.identity_provider = _IdentityProvider()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            f"/api/v1/investigations/{database.investigation_id}/network-captures",
+            content=payload,
+            headers={
+                "content-type": "application/octet-stream",
+                "x-content-sha256": hashlib.sha256(payload).hexdigest(),
+            },
+        )
+
+    assert response.status_code == 201, response.text
+    capture = response.json()
+    reference = NetworkCaptureRefV1(
+        blob_id=UUID(capture["blob_id"]),
+        sha256=capture["sha256"],
+        size_bytes=capture["size_bytes"],
+        format=NetworkCaptureFormat(capture["format"]),
+    )
+    tool = _CaptureInspectAdapter(workbench, _ToolEvidenceRecorder(), 60)
+    result = await tool.execute(
+        {"capture_ref": reference.to_dict()},
+        ToolExecutionContext(
+            investigation_id=database.investigation_id,
+            envelope=None,
+            budget=InvestigationBudget(limits={BudgetDimension.TOOL_SECONDS: 60}),
+            idempotency_key="api-import-confined-worker",
+        ),
+    )
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    assert result.output["report"]["packet_count"] == 4
     assert worker_port.attestation.reachable
 
 

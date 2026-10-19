@@ -554,6 +554,11 @@ class NetworkWorkbench:
             output_truncated = True
         truncated_packet_count = sum(packet.truncated for packet in parsed.packets)
         limitations = list(inspection.limitations)
+        if not parsed.packets:
+            limitations.append(
+                "Aucun paquet capturé; cela ne permet pas de conclure "
+                "à une absence de trafic réseau."
+            )
         if unparsed_frames:
             limitations.append(
                 "Certains frames ne fournissent pas de métadonnées TCP/UDP "

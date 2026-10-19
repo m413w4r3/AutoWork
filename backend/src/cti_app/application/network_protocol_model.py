@@ -33,6 +33,7 @@ from cti_app.domain.protocol_model import (
     FieldDefinitionV1,
     FieldStability,
     MessageDefinitionV1,
+    ProtocolCharacteristicV1,
     ProtocolConversationV1,
     ProtocolDiagramEdgeV1,
     ProtocolDiagramFieldV1,
@@ -41,11 +42,16 @@ from cti_app.domain.protocol_model import (
     ProtocolDiagramSpecV1,
     ProtocolDiagramStatus,
     ProtocolEndpointV1,
+    ProtocolEvidenceLevelV1,
     ProtocolEvidenceRefV1,
     ProtocolHypothesisProposalV1,
     ProtocolModelV1,
     ProtocolRenderResultV1,
+    ProtocolStateV1,
     ProtocolTransitionV1,
+    ProtocolValidationResultV1,
+    ProtocolValidationRunV1,
+    ProtocolValidationSplitV1,
     ProtocolValidationStatus,
     ProtocolVerificationFindingV1,
 )
@@ -184,6 +190,7 @@ class NetworkProtocolWorkbench:
                     ),
                     evidence=evidence,
                     encrypted_opaque=opaque,
+                    evidence_level=ProtocolEvidenceLevelV1.SANDBOX_CAPTURE_OBSERVED,
                 )
             )
             for trace in observed:
@@ -252,6 +259,12 @@ class NetworkProtocolWorkbench:
                     evidence=proof_items,
                     value_sha256s=digests,
                     encrypted_opaque=encrypted,
+                    justification=(
+                        "Offset measured from the message start and tied to the cited frames."
+                        if relative_offset is not None
+                        else None
+                    ),
+                    evidence_level=ProtocolEvidenceLevelV1.SANDBOX_CAPTURE_OBSERVED,
                 )
                 if field.field_id not in {existing.field_id for existing in fields}:
                     if len(fields) >= _MAX_MODEL_FIELDS:
@@ -307,6 +320,11 @@ class NetworkProtocolWorkbench:
                             stability=stability,
                             evidence=proof_items,
                             value_sha256s=value_hashes,
+                            justification=(
+                                "This byte range recurs at the same message-relative offset "
+                                "in independent captured messages."
+                            ),
+                            evidence_level=ProtocolEvidenceLevelV1.SANDBOX_CAPTURE_OBSERVED,
                         )
                     )
                     field_ids_by_message[message_id].append(field_id)
@@ -668,6 +686,7 @@ def _replay_hypothesis(
                 evidence=_unique_evidence(item.evidence for _, item in message_matches),
                 encrypted_opaque=hypothesis_message.encrypted_opaque
                 or any(item.stream.encrypted_opaque for _, item in message_matches),
+                evidence_level=ProtocolEvidenceLevelV1.HYPOTHETICAL,
             )
         )
 
@@ -737,6 +756,13 @@ def _replay_hypothesis(
                 value_sha256s=tuple(sorted(hashlib.sha256(value).hexdigest() for value in values)),
                 expected_hex=None if opaque else hypothesis_field.expected_hex,
                 encrypted_opaque=opaque,
+                justification=(
+                    None
+                    if opaque
+                    else hypothesis_field.justification
+                    or "The message-relative offset fits each cited training message."
+                ),
+                evidence_level=ProtocolEvidenceLevelV1.HYPOTHETICAL,
             )
         )
     for hypothesis_transition in proposal.transitions:
@@ -766,6 +792,7 @@ def _replay_hypothesis(
                 hypotheses=(f"hypothesis:{hypothesis_transition.transition_id}",),
                 validation_status=ProtocolValidationStatus.INFERRED,
                 evidence=_unique_evidence(item.evidence for _, item in transition_matches),
+                evidence_level=ProtocolEvidenceLevelV1.HYPOTHETICAL,
             )
         )
 
@@ -793,6 +820,33 @@ def _replay_hypothesis(
         endpoint for trace in traces for endpoint in (trace.source, trace.destination)
     )
     opaque_seen = any(message.encrypted_opaque for message in messages)
+    state_evidence: dict[str, list[ProtocolEvidenceRefV1]] = defaultdict(list)
+    for transition in transitions:
+        state_evidence[transition.from_state].extend(transition.evidence)
+        state_evidence[transition.to_state].extend(transition.evidence)
+    states = tuple(
+        ProtocolStateV1(
+            state_id=state_id,
+            name=state_id,
+            validation_status=ProtocolValidationStatus.INFERRED,
+            evidence=_unique_evidence(refs),
+            evidence_level=ProtocolEvidenceLevelV1.HYPOTHETICAL,
+        )
+        for state_id, refs in sorted(state_evidence.items())
+    )
+    training_evidence = _unique_evidence(trace.evidence for trace in traces)
+    characteristics = tuple(
+        ProtocolCharacteristicV1(
+            kind=item.kind,
+            name=item.name,
+            statement=item.statement,
+            evidence_level=ProtocolEvidenceLevelV1.HYPOTHETICAL,
+            validation_status=ProtocolValidationStatus.INFERRED,
+            evidence=training_evidence,
+            justification=item.justification,
+        )
+        for item in proposal.characteristics
+    )
     limitations = [
         "Famille et cluster non confirmés: aucun lien prouvé entre binaire et conversation."
     ]
@@ -843,12 +897,39 @@ def _replay_hypothesis(
         extractor_versions=_unique_versions(
             version for trace in traces for version in trace.extractor_versions
         ),
+        states=states,
+        characteristics=characteristics,
+        validation_runs=(
+            ProtocolValidationRunV1(
+                split=ProtocolValidationSplitV1.TRAIN,
+                result=ProtocolValidationResultV1.VERIFIED,
+                tested_item_ids=tuple(
+                    item_id
+                    for item_id in (
+                        *(item.message_id for item in messages),
+                        *(item.field_id for group in fields_by_message.values() for item in group),
+                        *(item.transition_id for item in transitions),
+                        *(item.name for item in characteristics),
+                    )
+                    if item_id
+                ),
+                evidence=training_evidence,
+                detail="Schema and state-machine hypotheses replayed on training traces only.",
+            ),
+        ),
     )
 
 
 def _verify_model(model: ProtocolModelV1, traces: Sequence[_ObservedTrace]) -> ProtocolModelV1:
     if not traces:
-        raise ProtocolTraceError("verification requires at least one holdout trace")
+        run = ProtocolValidationRunV1(
+            split=ProtocolValidationSplitV1.HOLDOUT,
+            result=ProtocolValidationResultV1.NOT_TESTABLE,
+            tested_item_ids=(),
+            evidence=(),
+            detail="No holdout trace contained testable stream material.",
+        )
+        return replace(model, validation_runs=(*model.validation_runs, run))
     message_by_key = {
         (direction, message.ordinal): message
         for message in model.messages
@@ -1072,6 +1153,9 @@ def _verify_model(model: ProtocolModelV1, traces: Sequence[_ObservedTrace]) -> P
                 item.validation_status,
                 message_status.get(item.message_id, item.validation_status),
             ),
+            evidence_level=_holdout_evidence_level(
+                message_status.get(item.message_id), item.evidence_level
+            ),
         )
         for item in model.messages
     )
@@ -1082,6 +1166,9 @@ def _verify_model(model: ProtocolModelV1, traces: Sequence[_ObservedTrace]) -> P
                 item.validation_status,
                 field_status.get(item.field_id, item.validation_status),
             ),
+            evidence_level=_holdout_evidence_level(
+                field_status.get(item.field_id), item.evidence_level
+            ),
         )
         for item in model.fields
     )
@@ -1091,6 +1178,9 @@ def _verify_model(model: ProtocolModelV1, traces: Sequence[_ObservedTrace]) -> P
             validation_status=_merge_status(
                 item.validation_status,
                 transition_status.get(item.transition_id, item.validation_status),
+            ),
+            evidence_level=_holdout_evidence_level(
+                transition_status.get(item.transition_id), item.evidence_level
             ),
         )
         for item in model.transitions
@@ -1109,6 +1199,38 @@ def _verify_model(model: ProtocolModelV1, traces: Sequence[_ObservedTrace]) -> P
     )
     if not new_findings and established_observations:
         status = _merge_status(status, ProtocolValidationStatus.OBSERVED)
+    tested_item_ids = tuple(
+        sorted(set(message_status) | set(field_status) | set(transition_status))
+    )
+    run_evidence = _unique_evidence(trace.evidence for trace in traces)
+    if not tested_item_ids:
+        validation_result = ProtocolValidationResultV1.NOT_TESTABLE
+        detail = "Holdout traces contained no model item that could be checked."
+    elif any(
+        item.validation_status is ProtocolValidationStatus.CONTRADICTED
+        for item in new_findings.values()
+    ):
+        validation_result = ProtocolValidationResultV1.REJECTED
+        detail = "Holdout evidence contradicts one or more proposed protocol items."
+    elif any(
+        item.validation_status is ProtocolValidationStatus.UNRESOLVED
+        for item in new_findings.values()
+    ) or any(
+        item is ProtocolValidationStatus.UNRESOLVED
+        for item in (*message_status.values(), *field_status.values(), *transition_status.values())
+    ):
+        validation_result = ProtocolValidationResultV1.PARTIAL
+        detail = "Holdout evidence checked only part of the proposed protocol model."
+    else:
+        validation_result = ProtocolValidationResultV1.VERIFIED
+        detail = "All tested protocol items matched the holdout evidence."
+    run = ProtocolValidationRunV1(
+        split=ProtocolValidationSplitV1.HOLDOUT,
+        result=validation_result,
+        tested_item_ids=tested_item_ids,
+        evidence=run_evidence,
+        detail=detail,
+    )
     return replace(
         model,
         messages=messages,
@@ -1116,12 +1238,53 @@ def _verify_model(model: ProtocolModelV1, traces: Sequence[_ObservedTrace]) -> P
         transitions=transitions,
         verification_findings=findings,
         validation_status=status,
+        validation_runs=(*model.validation_runs, run),
     )
+
+
+def _holdout_evidence_level(
+    status: ProtocolValidationStatus | None,
+    current: ProtocolEvidenceLevelV1 | None,
+) -> ProtocolEvidenceLevelV1 | None:
+    if status is ProtocolValidationStatus.OBSERVED:
+        return ProtocolEvidenceLevelV1.VERIFIED_ON_HOLDOUT
+    if status in {
+        ProtocolValidationStatus.CONTRADICTED,
+        ProtocolValidationStatus.UNRESOLVED,
+    }:
+        return ProtocolEvidenceLevelV1.SANDBOX_CAPTURE_OBSERVED
+    return current
 
 
 def _render_model(model: ProtocolModelV1) -> ProtocolRenderResultV1:
     if model.validation_status is ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED:
         return _render_documented_model(model)
+    validation_notes = tuple(
+        f"{run.split.value} validation: {run.result.value} "
+        f"({run.evidence_level.value if run.evidence_level else 'unresolved'}). {run.detail}"
+        for run in model.validation_runs
+    )
+    characteristic_notes = tuple(
+        f"{item.evidence_level.value} · {item.kind.value}/{item.name}: {item.statement} "
+        f"Justification: {item.justification}"
+        for item in model.characteristics
+    )
+    static_function_notes = tuple(
+        f"static_inference · {item.provider} {item.provider_version} function "
+        f"{item.function_id}, binary sha256 {item.binary_sha256}; static, not executed."
+        for item in model.function_provenance
+    )
+    model_context = (
+        f"Protocol: {model.protocol or 'unknown'}; transport: {model.transport.value}; "
+        f"client/server orientation: {model.client_server_orientation}."
+    )
+    render_notes = (
+        *model.limitations,
+        model_context,
+        *validation_notes,
+        *characteristic_notes,
+        *static_function_notes,
+    )
     sequence_nodes: dict[str, ProtocolDiagramNodeV1] = {}
     sequence_edges: list[ProtocolDiagramEdgeV1] = []
     message_by_id = {item.message_id: item for item in model.messages}
@@ -1136,6 +1299,7 @@ def _render_model(model: ProtocolModelV1) -> ProtocolRenderResultV1:
                 "observed_endpoint",
                 ProtocolValidationStatus.OBSERVED,
                 conversation.source.evidence,
+                ProtocolEvidenceLevelV1.SANDBOX_CAPTURE_OBSERVED,
             ),
         )
         sequence_nodes.setdefault(
@@ -1146,6 +1310,7 @@ def _render_model(model: ProtocolModelV1) -> ProtocolRenderResultV1:
                 "observed_endpoint",
                 ProtocolValidationStatus.OBSERVED,
                 conversation.destination.evidence,
+                ProtocolEvidenceLevelV1.SANDBOX_CAPTURE_OBSERVED,
             ),
         )
         previous_timestamp_ns: int | None = None
@@ -1194,6 +1359,7 @@ def _render_model(model: ProtocolModelV1) -> ProtocolRenderResultV1:
                     timing_ms=timing_ms,
                     validation_status=message.validation_status,
                     evidence=message_proofs or message.evidence,
+                    evidence_level=message.evidence_level,
                 )
             )
     sequence_ready = bool(sequence_edges) and all(edge.evidence for edge in sequence_edges)
@@ -1209,9 +1375,11 @@ def _render_model(model: ProtocolModelV1) -> ProtocolRenderResultV1:
         if sequence_ready
         else (),
         fields=(),
-        limitations=()
-        if sequence_ready
-        else ("No message sequence has sufficient trace evidence.",),
+        limitations=(
+            render_notes
+            if sequence_ready
+            else (*render_notes, "No message sequence has sufficient trace evidence.")
+        ),
     )
 
     state_nodes: dict[str, ProtocolDiagramNodeV1] = {}
@@ -1227,6 +1395,7 @@ def _render_model(model: ProtocolModelV1) -> ProtocolRenderResultV1:
                 "protocol_state",
                 transition.validation_status,
                 transition.evidence,
+                transition.evidence_level,
             ),
         )
         state_nodes.setdefault(
@@ -1237,6 +1406,7 @@ def _render_model(model: ProtocolModelV1) -> ProtocolRenderResultV1:
                 "protocol_state",
                 transition.validation_status,
                 transition.evidence,
+                transition.evidence_level,
             ),
         )
         state_edges.append(
@@ -1253,6 +1423,7 @@ def _render_model(model: ProtocolModelV1) -> ProtocolRenderResultV1:
                 timing_ms=None,
                 validation_status=transition.validation_status,
                 evidence=transition.evidence,
+                evidence_level=transition.evidence_level,
             )
         )
     state_ready = bool(state_edges)
@@ -1266,7 +1437,11 @@ def _render_model(model: ProtocolModelV1) -> ProtocolRenderResultV1:
         nodes=tuple(state_nodes.values()) if state_ready else (),
         edges=tuple(state_edges) if state_ready else (),
         fields=(),
-        limitations=() if state_ready else ("No state transition has sufficient trace evidence.",),
+        limitations=(
+            render_notes
+            if state_ready
+            else (*render_notes, "No state transition has sufficient trace evidence.")
+        ),
     )
 
     format_fields = tuple(
@@ -1281,6 +1456,8 @@ def _render_model(model: ProtocolModelV1) -> ProtocolRenderResultV1:
             encrypted_opaque=item.encrypted_opaque,
             validation_status=item.validation_status,
             evidence=item.evidence,
+            evidence_level=item.evidence_level,
+            justification=item.justification,
         )
         for item in model.fields
         if item.evidence
@@ -1296,7 +1473,11 @@ def _render_model(model: ProtocolModelV1) -> ProtocolRenderResultV1:
         nodes=(),
         edges=(),
         fields=format_fields if format_ready else (),
-        limitations=() if format_ready else ("No field layout has sufficient trace evidence.",),
+        limitations=(
+            render_notes
+            if format_ready
+            else (*render_notes, "No field layout has sufficient trace evidence.")
+        ),
     )
     statements: list[str] = []
     for message in model.messages:
@@ -1309,9 +1490,28 @@ def _render_model(model: ProtocolModelV1) -> ProtocolRenderResultV1:
     for finding in model.verification_findings:
         proof = finding.evidence[0]
         statements.append(
+            f"{finding.evidence_level.value if finding.evidence_level else 'unresolved'} "
             f"{finding.kind} for {finding.item_id} is {finding.validation_status.value} "
             f"in capture {proof.capture_sha256}, frames "
             f"{','.join(str(frame) for frame in proof.frame_numbers) or 'not listed'}."
+        )
+    for characteristic in model.characteristics:
+        statements.append(
+            f"{characteristic.kind.value} {characteristic.name} is "
+            f"{characteristic.evidence_level.value} and "
+            f"{characteristic.validation_status.value}: {characteristic.statement} "
+            f"Justification: {characteristic.justification}."
+        )
+    for run in model.validation_runs:
+        statements.append(
+            f"{run.split.value} validation result is {run.result.value} "
+            f"({run.evidence_level.value if run.evidence_level else 'unresolved'}): {run.detail}"
+        )
+    for function in model.function_provenance:
+        statements.append(
+            f"STATIC_INFERENCE: {function.provider} {function.provider_version} function "
+            f"{function.function_id} in binary sha256 {function.binary_sha256}; "
+            "static, not executed."
         )
     if any(item.encrypted_opaque for item in model.messages):
         statements.append("Encrypted opaque message content remains undecoded.")
@@ -1334,6 +1534,18 @@ def _render_documented_model(model: ProtocolModelV1) -> ProtocolRenderResultV1:
     """Render documented semantics without inventing capture coordinates."""
     label_status = ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED
     source_message = {item.message_id: item.name for item in model.messages}
+    characteristic_notes = tuple(
+        f"ARTICLE_DOCUMENTED · {item.kind.value}/{item.name}: {item.statement} "
+        f"Justification: {item.justification}; sources "
+        f"{_documentary_source_labels(item.evidence)}. NOT OBSERVED."
+        for item in model.characteristics
+    )
+    static_function_notes = tuple(
+        f"STATIC_INFERENCE · {item.provider} {item.provider_version} function "
+        f"{item.function_id}, binary sha256 {item.binary_sha256}; "
+        f"static, not executed; sources {_documentary_source_labels(item.evidence)}."
+        for item in model.function_provenance
+    )
     sequence_nodes = tuple(
         ProtocolDiagramNodeV1(
             node_id=f"documented-message-{item.message_id}",
@@ -1345,6 +1557,7 @@ def _render_documented_model(model: ProtocolModelV1) -> ProtocolRenderResultV1:
             role="documented_message",
             validation_status=label_status,
             evidence=item.evidence,
+            evidence_level=ProtocolEvidenceLevelV1.ARTICLE_DOCUMENTED,
         )
         for item in sorted(model.messages, key=lambda entry: (entry.ordinal, entry.message_id))
     )
@@ -1364,6 +1577,8 @@ def _render_documented_model(model: ProtocolModelV1) -> ProtocolRenderResultV1:
             "Documenté, non observé. L'ordre affiché vient des faits cités; "
             "aucune capture réseau n'a été consultée.",
             "Les rôles et directions inconnus restent inconnus.",
+            *characteristic_notes,
+            *static_function_notes,
         ),
     )
 
@@ -1375,6 +1590,7 @@ def _render_documented_model(model: ProtocolModelV1) -> ProtocolRenderResultV1:
             role="documented_state",
             validation_status=item.validation_status,
             evidence=item.evidence,
+            evidence_level=ProtocolEvidenceLevelV1.ARTICLE_DOCUMENTED,
         )
         for item in model.states
     }
@@ -1391,6 +1607,7 @@ def _render_documented_model(model: ProtocolModelV1) -> ProtocolRenderResultV1:
             timing_ms=None,
             validation_status=item.validation_status,
             evidence=item.evidence,
+            evidence_level=ProtocolEvidenceLevelV1.ARTICLE_DOCUMENTED,
         )
         for item in model.transitions
         if item.from_state in states_by_id and item.to_state in states_by_id
@@ -1411,6 +1628,8 @@ def _render_documented_model(model: ProtocolModelV1) -> ProtocolRenderResultV1:
             "Documenté, non observé. Les états et transitions proviennent "
             "uniquement des sources citées.",
             "Aucun échange réseau ni changement d'état n'a été observé dans une capture.",
+            *characteristic_notes,
+            *static_function_notes,
         ),
     )
 
@@ -1426,6 +1645,8 @@ def _render_documented_model(model: ProtocolModelV1) -> ProtocolRenderResultV1:
             encrypted_opaque=False,
             validation_status=item.validation_status,
             evidence=item.evidence,
+            evidence_level=ProtocolEvidenceLevelV1.ARTICLE_DOCUMENTED,
+            justification=item.justification,
         )
         for item in model.fields
     )
@@ -1445,16 +1666,33 @@ def _render_documented_model(model: ProtocolModelV1) -> ProtocolRenderResultV1:
             "Documenté, non observé. Les positions, tailles et valeurs d'octets "
             "non citées sont inconnues.",
             "Aucun offset, frame ou octet n'est fourni par ce modèle documentaire.",
+            *characteristic_notes,
+            *static_function_notes,
         ),
     )
-    statements = tuple(
-        f"{item.name} est documenté, non observé; sources "
-        f"{_documentary_source_labels(item.evidence)}."
-        for item in model.messages
-    ) + tuple(
-        f"Le champ {item.name} est documenté, non observé; offset et longueur inconnus; "
-        f"sources {_documentary_source_labels(item.evidence)}."
-        for item in model.fields
+    statements = (
+        tuple(
+            f"{item.name} est documenté, non observé; sources "
+            f"{_documentary_source_labels(item.evidence)}."
+            for item in model.messages
+        )
+        + tuple(
+            f"Le champ {item.name} est documenté, non observé; offset et longueur inconnus; "
+            f"sources {_documentary_source_labels(item.evidence)}."
+            for item in model.fields
+        )
+        + tuple(
+            f"La fonction {item.function_id} est référencée par {item.provider} "
+            f"{item.provider_version} comme preuve statique non exécutée; binaire "
+            f"sha256 {item.binary_sha256}; sources {_documentary_source_labels(item.evidence)}."
+            for item in model.function_provenance
+        )
+        + tuple(
+            f"{item.kind.value}/{item.name} est documenté, non observé: {item.statement} "
+            f"Justification: {item.justification}; sources "
+            f"{_documentary_source_labels(item.evidence)}."
+            for item in model.characteristics
+        )
     )
     return ProtocolRenderResultV1(
         schema_version="ProtocolRenderResultV1",

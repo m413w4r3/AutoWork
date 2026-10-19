@@ -3,7 +3,9 @@ import { useState, type FormEvent } from "react";
 import {
   useInvestigationDetections,
   useReviewDetection,
+  type DetectionRateMetric,
   type DetectionTestReport,
+  type DetectionTestRole,
   type DetectionVersionReview,
   type RuleValidationStatus,
 } from "../../api/detection";
@@ -64,6 +66,13 @@ const RULE_VALIDATION_STATUS_LABELS: Record<RuleValidationStatus, string> = {
   synthetic_only: "Testée uniquement sur fichiers synthétiques",
   real_partial: "Évaluation partielle sur fichiers réels",
   real_validated: "Évaluée sur échantillons réels",
+};
+
+const DETECTION_ROLE_LABELS: Record<DetectionTestRole, string> = {
+  confirmed_positive: "Positifs confirmés",
+  out_of_cluster_candidate: "Candidats hors groupe",
+  goodware: "Goodware",
+  holdout: "Holdout",
 };
 
 const SAMPLE_QUALIFICATION_LABELS: Record<
@@ -745,6 +754,12 @@ function DetectionVersionCard({
           <strong>Validation du corpus :</strong>{" "}
           {RULE_VALIDATION_STATUS_LABELS[version.validation_status]}
         </p>
+        {version.status === "candidate" || version.status === "experimental" ? (
+          <p className="verification-warning" role="note">
+            Cette règle reste une candidate. Un match est une correspondance
+            d’octets et ne confirme ni famille, ni intention, ni comportement.
+          </p>
+        ) : null}
         <p>
           Candidate {version.candidate_id} · version {version.version_id} ·
           SHA-256 <code>{version.source_sha256}</code>
@@ -865,9 +880,10 @@ function DetectionTestReportView({ report }: { report: DetectionTestReport }) {
       <ul>
         {report.roles.map((roleReport, index) => (
           <li key={`${roleReport.role}-${index}`}>
-            <strong>{roleReport.role}</strong> · {roleReport.matches.length}{" "}
-            correspondance(s) · {roleReport.non_matches.length} sans
-            correspondance · {roleReport.non_measurable.length} non mesurable(s)
+            <strong>{DETECTION_ROLE_LABELS[roleReport.role]}</strong> ·{" "}
+            {roleReport.matches.length} correspondance(s) ·{" "}
+            {roleReport.non_matches.length} sans correspondance ·{" "}
+            {roleReport.non_measurable.length} non mesurable(s)
             {roleReport.errors.length > 0
               ? ` · ${roleReport.errors.length} erreur(s)`
               : ""}
@@ -887,15 +903,46 @@ function DetectionTestReportView({ report }: { report: DetectionTestReport }) {
           </li>
         ))}
       </ul>
-      {report.known_false_positives.length > 0 ? (
+      {report.corpus_sha256 ? (
+        <p>
+          Corpus SHA-256 <code>{report.corpus_sha256}</code>
+        </p>
+      ) : null}
+      <dl aria-label="Taux de détection et intervalles de confiance">
+        <DetectionRate
+          label="Sensibilité sur positifs réels"
+          metric={report.metrics?.real_positive_sensitivity}
+        />
+        <DetectionRate
+          label="Faux positifs sur goodware réel"
+          metric={report.metrics?.real_goodware_false_positive_rate}
+        />
+        <DetectionRate
+          label="Sensibilité sur holdout réel"
+          metric={report.metrics?.real_holdout_sensitivity}
+        />
+        <DetectionRate
+          label="Faux positifs sur négatifs holdout réels"
+          metric={report.metrics?.real_holdout_false_positive_rate}
+        />
+      </dl>
+      {report.match_interpretation ? (
+        <p role="note">{report.match_interpretation}</p>
+      ) : null}
+      {report.statistics_interpretation ? (
+        <p role="note">{report.statistics_interpretation}</p>
+      ) : null}
+      {report.known_false_positive_status === "present" ? (
         <p>
           Faux positifs observés :{" "}
           {report.known_false_positives.map((item) => (
             <code key={item}>{item} </code>
           ))}
         </p>
-      ) : (
+      ) : report.known_false_positive_status === "none_observed" ? (
         <p>Aucun faux positif observé dans les cas goodware mesurés.</p>
+      ) : (
+        <p>Les faux positifs goodware ne sont pas évalués dans ce rapport.</p>
       )}
       {report.limitations.length > 0 ? (
         <ul>
@@ -907,5 +954,34 @@ function DetectionTestReportView({ report }: { report: DetectionTestReport }) {
         </ul>
       ) : null}
     </section>
+  );
+}
+
+function DetectionRate({
+  label,
+  metric,
+}: {
+  label: string;
+  metric: DetectionRateMetric | undefined;
+}) {
+  if (!metric) return null;
+  const {
+    numerator,
+    denominator,
+    estimate,
+    confidence_interval_95: interval,
+  } = metric;
+  const isCalculable =
+    metric.status === "calculated" && estimate !== null && interval !== null;
+  return (
+    <div>
+      <dt>{label}</dt>
+      <dd>
+        {isCalculable
+          ? `${(estimate * 100).toFixed(1)} % (95 % Wilson : ${(interval.lower * 100).toFixed(1)}–${(interval.upper * 100).toFixed(1)} %)`
+          : "Non calculable"}{" "}
+        · {numerator}/{denominator} mesuré(s)
+      </dd>
+    </div>
   );
 }

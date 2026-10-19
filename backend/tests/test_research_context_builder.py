@@ -53,6 +53,7 @@ from cti_app.application.investigation_tools import (
     ToolExecutionContext,
     validate_json_schema,
 )
+from cti_app.application.operator_context_summary import build_operator_context_summary
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.provider_probes import offline_preflight
 from cti_app.application.research_context_builder import (
@@ -292,6 +293,50 @@ async def test_canonical_evidence_summary_reads_only_sha_verified_bounded_facts(
     )
     yara_facts = await summaries.summary(yara_observation)
 
+    capture_payload = {
+        "schema": "NetworkCaptureReportV1",
+        "endpoints": [{"address": "203.0.113.8", "port": 443, "raw": "must-not-pass"}],
+        "dns_observations": [{"name": "dns.query", "value": "cdn.example.com", "frame_number": 2}],
+        "http_observations": [],
+        "tls_observations": [],
+        "capture_bytes": "must-not-reach-context",
+    }
+    capture_blob_id, capture_sha256 = await store.put_canonical_json(
+        capture_payload, bucket="investigation-evidence"
+    )
+    capture_observation = EvidenceObservation(
+        investigation_id=observation.investigation_id,
+        kind=EvidenceKind.OTHER,
+        blob_id=capture_blob_id,
+        sha256=capture_sha256,
+        source="network.capture.inspect",
+        source_version="1",
+        observed_at=datetime.now(UTC),
+        object_type="network_capture_report",
+        object_id="1" * 64,
+    )
+    capture_facts = await summaries.summary(capture_observation)
+    similarity_payload = {
+        "schema_version": "family-feature-comparison-v1",
+        "comparison_sample_sha256s": ["2" * 64],
+        "features": [{"value": "untrusted detail must not pass"}],
+    }
+    similarity_blob_id, similarity_sha256 = await store.put_canonical_json(
+        similarity_payload, bucket="investigation-evidence"
+    )
+    similarity_observation = EvidenceObservation(
+        investigation_id=observation.investigation_id,
+        kind=EvidenceKind.BINARY_ANALYSIS,
+        blob_id=similarity_blob_id,
+        sha256=similarity_sha256,
+        source="sample_similarity",
+        source_version="family-feature-comparison-v1",
+        observed_at=datetime.now(UTC),
+        object_type="family_feature_comparison",
+        object_id="3" * 64,
+    )
+    similarity_facts = await summaries.summary(similarity_observation)
+
     assert facts == payload
     assert mismatched is None
     assert download_facts == {
@@ -306,6 +351,17 @@ async def test_canonical_evidence_summary_reads_only_sha_verified_bounded_facts(
         "provenance_counts_by_role": {"confirmed_positive": {"real": 0, "synthetic": 1}},
         "false_positive_count": 0,
         "false_negative_count": 0,
+    }
+    assert capture_facts == {
+        "schema": "NetworkCaptureReportV1",
+        "endpoints": [{"address": "203.0.113.8"}],
+        "dns_observations": [{"name": "dns.query", "value": "cdn.example.com"}],
+        "http_observations": [],
+        "tls_observations": [],
+    }
+    assert similarity_facts == {
+        "schema_version": "family-feature-comparison-v1",
+        "comparison_sample_sha256s": ["2" * 64],
     }
 
 
@@ -2487,7 +2543,8 @@ async def test_large_operator_led_context_is_reduced_deterministically() -> None
             kind=FindingKind.CLAIM_VERIFICATION,
             assessment=FindingAssessment.INCONCLUSIVE,
             statement=f"Finding version {version}: " + "detail " * 50,
-            observation_refs=(),
+            observation_refs=(observation_ids[-1],),
+            claim_refs=("C0",),
             id=UUID(int=version),
             version=version,
             supersedes=previous_id,
@@ -2556,7 +2613,7 @@ async def test_large_operator_led_context_is_reduced_deterministically() -> None
             )
             for index in range(16)
         ),
-        documented_samples=(),
+        documented_samples=("c" * 64,),
         known_chain=tuple(
             {"summary": f"Known step {index}: " + "detail " * 45} for index in range(32)
         ),
@@ -2668,6 +2725,95 @@ async def test_large_operator_led_context_is_reduced_deterministically() -> None
         ),
         budget_remaining={},
     )
+    summary = build_operator_context_summary(
+        context,
+        investigation_id=investigation_id,
+        working_state_version=state.version,
+        working_state_sha256=state.sha256,
+        state=state,
+        since_version=state.version,
+    )
+    complete_evidence_ids = []
+    evidence_total, _ = await builder.read_context_section(
+        section="evidence_index",
+        investigation_id=investigation_id,
+        state=state,
+        offset=0,
+        limit=20,
+    )
+    for offset in range(0, evidence_total, 20):
+        _, evidence_page = await builder.read_context_section(
+            section="evidence_index",
+            investigation_id=investigation_id,
+            state=state,
+            offset=offset,
+            limit=20,
+        )
+        assert len(evidence_page) <= 20
+        complete_evidence_ids.extend(item["evidence_id"] for item in evidence_page)
+    complete_claim_ids = []
+    claims_total, _ = await builder.read_context_section(
+        section="article_claims",
+        investigation_id=investigation_id,
+        state=state,
+        offset=0,
+        limit=20,
+        synthesis_artifact_id=synthesis_artifact_id,
+    )
+    for offset in range(0, claims_total, 20):
+        _, claims_page = await builder.read_context_section(
+            section="article_claims",
+            investigation_id=investigation_id,
+            state=state,
+            offset=offset,
+            limit=20,
+            synthesis_artifact_id=synthesis_artifact_id,
+        )
+        assert len(claims_page) <= 20
+        complete_claim_ids.extend(item["id"] for item in claims_page)
+    complete_note_ids = []
+    notes_total, _ = await builder.read_context_section(
+        section="opinion_notes",
+        investigation_id=investigation_id,
+        state=state,
+        offset=0,
+        limit=20,
+    )
+    for offset in range(0, notes_total, 20):
+        _, notes_page = await builder.read_context_section(
+            section="opinion_notes",
+            investigation_id=investigation_id,
+            state=state,
+            offset=offset,
+            limit=20,
+        )
+        assert len(notes_page) <= 20
+        complete_note_ids.extend(item["note_id"] for item in notes_page)
+    findings_total, findings_page = await builder.read_context_section(
+        section="findings",
+        investigation_id=investigation_id,
+        state=state,
+        offset=0,
+        limit=20,
+    )
+    finding_version_ids = []
+    finding_versions_total, _ = await builder.read_context_section(
+        section="finding_versions",
+        investigation_id=investigation_id,
+        state=state,
+        offset=0,
+        limit=20,
+    )
+    for offset in range(0, finding_versions_total, 20):
+        _, finding_versions_page = await builder.read_context_section(
+            section="finding_versions",
+            investigation_id=investigation_id,
+            state=state,
+            offset=offset,
+            limit=20,
+        )
+        assert len(finding_versions_page) <= 20
+        finding_version_ids.extend(item["finding_id"] for item in finding_versions_page)
     old_evidence_page_total, old_evidence_page = await builder.read_context_section(
         section="evidence_index",
         investigation_id=investigation_id,
@@ -2683,6 +2829,135 @@ async def test_large_operator_led_context_is_reduced_deterministically() -> None
         limit=20,
     )
 
+    context_payload = json.loads(context.canonical_bytes())
+
+    def collect_evidence_refs(value):
+        if isinstance(value, dict):
+            refs = []
+            for key, item in value.items():
+                if key in {"evidence_id", "observation_id"} and isinstance(item, str):
+                    refs.append(item)
+                elif key in {"evidence_refs", "observation_refs"} and isinstance(item, list):
+                    refs.extend(ref for ref in item if isinstance(ref, str))
+                else:
+                    refs.extend(collect_evidence_refs(item))
+            return refs
+        if isinstance(value, list):
+            return [ref for item in value for ref in collect_evidence_refs(item)]
+        return []
+
+    def without_schema_descriptions(value):
+        if isinstance(value, dict):
+            return {
+                key: without_schema_descriptions(item)
+                for key, item in value.items()
+                if key != "description"
+            }
+        if isinstance(value, list):
+            return [without_schema_descriptions(item) for item in value]
+        return value
+
+    evidence_sections = {
+        key: context_payload["investigation"].get(key, [])
+        for key in (
+            "new_evidence",
+            "evidence_index",
+            "findings",
+            "tool_coverage",
+            "latest_tool_results",
+        )
+    }
+    evidence_ref_values = collect_evidence_refs(evidence_sections)
+    article_claim_ids = {item["id"] for item in context_payload["article"]["claims"]}
+    finding_claim_ids = {
+        claim_id
+        for finding in evidence_sections["findings"]
+        for claim_id in finding.get("claim_refs", [])
+    }
+    documented_sample_hashes = set(context_payload["article"]["documented_samples"])
+    sample_delta_hashes = {
+        item["sha256"]
+        for item in context_payload["investigation"]["sample_deltas"]
+        if isinstance(item.get("sha256"), str)
+    }
+    raw_schema_payloads = [
+        canonical_json_bytes(item.arguments_schema) for item in context.available_tools
+    ]
+    schema_payloads = [
+        canonical_json_bytes(without_schema_descriptions(item.arguments_schema))
+        for item in context.available_tools
+    ]
+    old_prompt = render_investigation_prompt(context)
+    old_prompt_chars = len(old_prompt)
+    old_context_chars = len(context.canonical_bytes().decode("utf-8"))
+    summary_bytes = summary.canonical_bytes()
+    summary_chars = len(summary_bytes.decode("utf-8"))
+    print(
+        "C9_BEFORE_AFTER "
+        + json.dumps(
+            {
+                "before_context_bytes": len(context.canonical_bytes()),
+                "before_context_chars_approx_tokens": round(old_context_chars / 4),
+                "before_prompt_bytes": len(old_prompt.encode("utf-8")),
+                "before_prompt_chars_approx_tokens": round(old_prompt_chars / 4),
+                "before_tokens_per_historical_action_approx": round(
+                    old_context_chars / 4 / len(observation_ids)
+                ),
+                "after_summary_bytes": len(summary_bytes),
+                "after_summary_chars_approx_tokens": round(summary_chars / 4),
+                "after_tokens_per_historical_action_approx": round(
+                    summary_chars / 4 / len(observation_ids)
+                ),
+                "context_payload_reduction_percent": round(
+                    (1 - len(summary_bytes) / len(context.canonical_bytes())) * 100, 2
+                ),
+                "raw_tool_schema_bytes": sum(map(len, raw_schema_payloads)),
+                "top_level_segment_bytes": {
+                    key: len(canonical_json_bytes({key: value}))
+                    for key, value in context_payload.items()
+                },
+                "operator_segment_bytes": {
+                    key: len(canonical_json_bytes({key: value}))
+                    for key, value in context_payload["investigation"].items()
+                },
+                "repeated_schema_skeleton_bytes": sum(map(len, schema_payloads))
+                - sum(map(len, set(schema_payloads))),
+                "evidence_id_occurrences": len(evidence_ref_values),
+                "unique_evidence_ids": len(set(evidence_ref_values)),
+                "repeated_evidence_id_occurrences": len(evidence_ref_values)
+                - len(set(evidence_ref_values)),
+                "article_finding_claim_id_overlap": len(article_claim_ids & finding_claim_ids),
+                "article_sample_delta_hash_overlap": len(
+                    documented_sample_hashes & sample_delta_hashes
+                ),
+                "truncation": {
+                    name: {
+                        "retained": retained,
+                        "omitted": context.investigation.truncation_counts.get(name, 0),
+                        "source_total": retained
+                        + context.investigation.truncation_counts.get(name, 0),
+                        "truncated_percent": round(
+                            context.investigation.truncation_counts.get(name, 0)
+                            / max(
+                                1,
+                                retained + context.investigation.truncation_counts.get(name, 0),
+                            )
+                            * 100,
+                            1,
+                        ),
+                    }
+                    for name, retained in (
+                        ("new_evidence", len(context.investigation.new_evidence)),
+                        ("evidence_index", len(context.investigation.evidence_index)),
+                        ("findings", len(context.investigation.findings)),
+                        ("opinion_notes", len(context.investigation.opinion_notes)),
+                        ("tool_coverage", len(context.investigation.tool_coverage)),
+                    )
+                },
+            },
+            sort_keys=True,
+        )
+    )
     assert len(context.canonical_bytes()) <= 262_144
     assert context.canonical_bytes() == repeated.canonical_bytes()
     assert context.source.synthesis_sha256 == "a" * 64
@@ -2706,6 +2981,47 @@ async def test_large_operator_led_context_is_reduced_deterministically() -> None
     assert context.investigation.evidence_index_truncated is True
     assert context.investigation.truncation_counts["evidence_index"] > 0
     assert context.investigation.truncation_counts["findings_superseded"] == 14
+    assert summary.context_sha256 == hashlib.sha256(context.canonical_bytes()).hexdigest()
+    assert summary.working_state_sha256 == state.sha256
+    assert summary.max_context_bytes == 262_144
+    assert (
+        summary.summary_sha256
+        == hashlib.sha256(summary.canonical_bytes(include_summary_hash=False)).hexdigest()
+    )
+    assert len(summary_bytes) * 20 < len(context.canonical_bytes())
+    assert summary.pointers.section_cursors["evidence_index"] == 0
+    assert summary.pointers.section_limit == 20
+    assert set(summary.pointers.endpoints) == {
+        "pivot_frontier",
+        "experiments",
+        "advisor_checkpoint",
+    }
+    assert summary.delta_since_version is not None
+    assert summary.delta_since_version.from_version == state.version
+    assert summary.delta_since_version.pointers_to_check == ()
+    known_pointers = set(summary.pointers.section_cursors) | set(summary.pointers.endpoints)
+    assert all(
+        set(sections).issubset(known_pointers) for sections in summary.truncation_pointers.values()
+    )
+    assert {flag for flag, truncated in summary.truncation.items() if truncated}.issubset(
+        summary.truncation_pointers
+    )
+    assert {
+        f"count.{name}" for name, count in summary.truncation_counts.items() if count > 0
+    }.issubset(summary.truncation_pointers)
+    assert summary.truncation_pointers["count.findings_superseded"] == ("finding_versions",)
+    summary_json = summary_bytes.decode("utf-8")
+    assert str(observation_ids[0]) not in summary_json
+    assert str(current_version_id) not in summary_json
+    assert str(notes[0].id) not in summary_json
+    assert set(complete_evidence_ids) == {str(item_id) for item_id in observation_ids}
+    assert set(evidence_ref_values).issubset(complete_evidence_ids)
+    assert set(complete_claim_ids) == {f"C{index}" for index in range(16)}
+    assert findings_total == 1
+    assert findings_page[0]["finding_id"] == str(current_version_id)
+    assert finding_versions_total == 15
+    assert set(finding_version_ids) == {str(UUID(int=version)) for version in range(1, 16)}
+    assert set(complete_note_ids) == {str(item.id) for item in notes}
     assert old_evidence_page_total == 220
     assert len(old_evidence_page) == 20
     assert old_evidence_page[0]["evidence_id"] == str(observation_ids[19])
@@ -2790,8 +3106,10 @@ async def test_small_context_hash_includes_bounded_advisor_guidance() -> None:
 
     assert context.advisor_guidance.checkpoint_due is False
     assert context.advisor_guidance.truncated is False
+    # The bounded reminder is part of canonical_bytes(); its intentional C5
+    # enrichment changes this deterministic fixture digest.
     assert hashlib.sha256(context.canonical_bytes()).hexdigest() == (
-        "3f4b51e915615eafe8da05d78ec6df43f4e92bedc858d94c3f025f1ec7b7d4d7"
+        "ed25f5728ac8fc51c5fb6168302d3b206ebf82e7cdd8c08df9d2ec353c00efba"
     )
 
 

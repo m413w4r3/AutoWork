@@ -77,7 +77,7 @@ from cti_app.domain.publication_render import (
 from cti_app.domain.typst_render import TypstRenderFormat, TypstRenderStatus
 
 PUBLICATION_RENDERER = "typst"
-PUBLICATION_RENDERER_VERSION = "publication-v10-typst-v6-canonical-investigation-figures"
+PUBLICATION_RENDERER_VERSION = "publication-v11-typst-v25-anchored-editorial-sections"
 
 
 class InfrastructureGraphDiagramCompiler(Protocol):

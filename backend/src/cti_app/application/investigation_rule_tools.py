@@ -42,6 +42,7 @@ from cti_app.application.rule_workbench import (
     RuleCorpusBytesUnavailable,
     RuleValidationReason,
     RuleWorkbench,
+    is_generic_dotnet_import,
     rule_validation_reason,
 )
 from cti_app.application.sample_acquisition import SAMPLES_QUARANTINE_BUCKET
@@ -57,7 +58,6 @@ from cti_app.domain.investigation import (
     EvidenceObservation,
     MotifProvenance,
     SampleAssociation,
-    SampleOrigin,
     SampleQualification,
     ToolInvocationStatus,
 )
@@ -75,6 +75,7 @@ from cti_app.domain.rule_workbench import (
     RuleVersionComparison,
     YaraEngineResult,
     YaraExecutionStatus,
+    rule_corpus_sha256,
 )
 
 JSON_SCHEMA_2020_12 = "https://json-schema.org/draft/2020-12/schema"
@@ -183,6 +184,12 @@ _META_OBJECT_SCHEMA: dict[str, Any] = {
         },
         "family": {"type": "string", "maxLength": 128, "pattern": _SAFE_TEXT_PATTERN},
         "description": {"type": "string", "maxLength": 512, "pattern": _SAFE_TEXT_PATTERN},
+        "hypothesis": {"type": "string", "maxLength": 512, "pattern": _SAFE_TEXT_PATTERN},
+        "dotnet_imports_discussion": {
+            "type": "string",
+            "maxLength": 512,
+            "pattern": _SAFE_TEXT_PATTERN,
+        },
         "source": {"type": "string", "maxLength": 128, "pattern": _SAFE_TEXT_PATTERN},
     },
 }
@@ -968,9 +975,15 @@ class _RuleTools:
             item for item in all_versions if item.investigation_id == context.investigation_id
         )
         if existing_versions:
-            validation = self.workbench.validate_motifs(generated, meta=meta)
+            validation = self.workbench.validate_motifs(generated, meta=meta, condition=condition)
             if not validation.valid:
                 raise _ToolFailed("motif_validation_failed")
+            source_validation = await self.workbench.verify_dotnet_source_motifs(generated)
+            if not source_validation.valid:
+                raise _ToolFailed("motif_source_unverified")
+            verified_source_motifs = {
+                generated[index] for index in source_validation.verified_motif_indices
+            }
             if any(not motif.observation_refs for motif in generated):
                 raise _ToolFailed("motifs_require_observation_refs")
             build = self.workbench.build_rule(generated, condition, meta)
@@ -981,7 +994,10 @@ class _RuleTools:
             expected_provenance = tuple(
                 MotifProvenance(
                     motif=motif.value,
-                    rationale=_serialize_motif(motif),
+                    rationale=_serialize_motif(
+                        motif,
+                        source_bytes_verified=motif in verified_source_motifs,
+                    ),
                     observation_refs=motif.observation_refs,
                 )
                 for motif in sorted(
@@ -1032,7 +1048,7 @@ class _RuleTools:
             condition=condition,
             meta=meta,
         )
-        output = self._version_output(result)
+        output = dict(self._version_output(result))
         status = (
             ToolInvocationStatus.SUCCEEDED
             if result.compile_check.status is YaraExecutionStatus.OK
@@ -1095,7 +1111,14 @@ class _RuleTools:
             condition=condition,
             meta=meta,
         )
-        output = self._version_output(result)
+        output = dict(self._version_output(result))
+        output["revision_basis"] = {
+            "measured_defect": "confirmed_positive_false_negative",
+            "parent_version": parent.version,
+            "parent_source_sha256": parent.source_sha256,
+            "test_corpus_sha256": previous_test.get("corpus_sha256"),
+            "false_negative_sha256s": previous_test.get("false_negative_sha256s", []),
+        }
         status = (
             ToolInvocationStatus.SUCCEEDED
             if result.compile_check.status is YaraExecutionStatus.OK
@@ -1166,7 +1189,11 @@ class _RuleTools:
             investigation_id=context.investigation_id,
         )
         evaluation = _status_for_report(report, corpus)
+        signature = _signature_manifest(selected)
+        # Candidate lifecycle records the measured outcome. Signature provenance and
+        # corpus limitations affect validation quality, not whether this test ran.
         candidate_status = _candidate_status(report, corpus)
+        validation_status, validation_reason = _effective_validation_quality(report, signature)
         observation = await self._record_report(
             context,
             report,
@@ -1183,9 +1210,11 @@ class _RuleTools:
                 "version": selected.version_label,
                 "source_sha256": selected.source_sha256,
                 "candidate_status": candidate_status.value,
-                "validation_status": report.validation_status.value,
-                "validation_reason": rule_validation_reason(report).value,
-                "report": _report_summary(report, observation.id, corpus),
+                "validation_status": validation_status.value,
+                "validation_reason": validation_reason.value,
+                "report": _report_summary(
+                    report, observation.id, corpus, selected, candidate_status
+                ),
             },
             evaluation,
             (observation.id,),
@@ -1212,13 +1241,13 @@ class _RuleTools:
         observation = await self._record_comparison(
             context, comparison, corpus, version_a, version_b
         )
-        output = _comparison_summary(comparison, observation.id, corpus)
+        output = _comparison_summary(comparison, observation.id, corpus, version_a, version_b)
         output["finding_candidate"] = {
             "kind": "detection",
-            "assessment": "qualified",
+            "assessment": "candidate",
             "summary": (
-                f"{version_b.version_label} changes matches relative to "
-                f"{version_a.version_label}; review corpus coverage before citing it."
+                f"{version_b.version_label} changes raw-byte matches relative to "
+                f"{version_a.version_label}; this does not confirm a family."
             ),
             "observation_refs": [str(observation.id)],
         }
@@ -1306,9 +1335,15 @@ class _RuleTools:
         meta: Mapping[str, str | int | bool] | None,
     ) -> _CreatedRuleCandidate:
         assert self.workbench is not None and self.candidates is not None
-        validation = self.workbench.validate_motifs(motifs, meta=meta)
+        validation = self.workbench.validate_motifs(motifs, meta=meta, condition=condition)
         if not validation.valid:
             raise _ToolFailed("motif_validation_failed")
+        source_validation = await self.workbench.verify_dotnet_source_motifs(motifs)
+        if not source_validation.valid:
+            raise _ToolFailed("motif_source_unverified")
+        verified_source_motifs = {
+            motifs[index] for index in source_validation.verified_motif_indices
+        }
         if any(not motif.observation_refs for motif in motifs):
             raise _ToolFailed("motifs_require_observation_refs")
         build = self.workbench.build_rule(motifs, condition, meta)
@@ -1346,7 +1381,10 @@ class _RuleTools:
             motif_provenance=tuple(
                 MotifProvenance(
                     motif=motif.value,
-                    rationale=_serialize_motif(motif),
+                    rationale=_serialize_motif(
+                        motif,
+                        source_bytes_verified=motif in verified_source_motifs,
+                    ),
                     observation_refs=motif.observation_refs,
                 )
                 for motif in sorted(
@@ -1389,6 +1427,7 @@ class _RuleTools:
                 "line": result.compile_check.line,
                 "purpose": "syntax_only; rule.test has not run",
             },
+            "signature": _signature_manifest(version),
             "observation_refs": [],
         }
 
@@ -1451,14 +1490,9 @@ class _RuleTools:
             if sample_sha256 in manual_import_hashes:
                 continue
             confirmed = any(item.qualification is SampleQualification.CONFIRMED for item in matches)
-            documented_seed = any(
-                item.origin is SampleOrigin.SEED
-                and item.qualification is not SampleQualification.REJECTED
-                for item in matches
-            )
             role = (
                 RuleTestCorpusRole.CONFIRMED_POSITIVE
-                if confirmed or documented_seed
+                if confirmed
                 else RuleTestCorpusRole.OUT_OF_CLUSTER_CANDIDATE
             )
             cases[(role, sample_sha256)] = _rule_case(investigation_id, role, sample_sha256)
@@ -1475,6 +1509,7 @@ class _RuleTools:
                 sample_sha256=item.sample_sha256,
                 role=item.role,
                 provenance=item.provenance,
+                expected_match=_expected_match(item.role),
             )
 
         try:
@@ -1482,16 +1517,39 @@ class _RuleTools:
         except Exception:
             holdout_hashes = ()
             limitations.append("Le holdout indépendant n'a pas pu être lu.")
+        development_hashes = set(by_hash)
+        development_hashes.update(
+            case.sample_sha256
+            for case in cases.values()
+            if case.role is not RuleTestCorpusRole.HOLDOUT
+        )
+        overlapping_holdout_hashes = {
+            sample_sha256
+            for role, sample_sha256 in cases
+            if role is RuleTestCorpusRole.HOLDOUT and sample_sha256 in development_hashes
+        }
+        for sample_sha256 in overlapping_holdout_hashes:
+            cases.pop((RuleTestCorpusRole.HOLDOUT, sample_sha256), None)
+        has_holdout_overlap = bool(overlapping_holdout_hashes)
         for sample_sha256 in _unique_valid_hashes(holdout_hashes):
+            if sample_sha256 in development_hashes:
+                has_holdout_overlap = True
+                continue
             cases[(RuleTestCorpusRole.HOLDOUT, sample_sha256)] = _rule_case(
                 investigation_id, RuleTestCorpusRole.HOLDOUT, sample_sha256
+            )
+        if has_holdout_overlap:
+            limitations.append(
+                "Un hash présent dans le développement a été exclu du holdout pour éviter "
+                "le chevauchement des corpus."
             )
         ordered_cases = tuple(
             cases[key] for key in sorted(cases, key=lambda item: (item[0].value, item[1]))
         )
         coverage = (
-            "Corpus exact par SHA-256; positifs confirmés et seeds documentés, candidats "
-            "hors-cluster, fichiers goodware importés par l'opérateur et holdout indépendant. "
+            "Corpus exact par SHA-256; positifs avec qualification confirmée, associations non "
+            "confirmées (dont seeds), candidats hors-cluster, fichiers goodware importés par "
+            "l'opérateur et holdout indépendant disjoint. "
             "Les hashes des baselines de caractéristiques sont exclus: aucun binaire goodware "
             "n'est testé sans import manuel. YARA examine directement les octets; l'extraction "
             "de caractéristiques réservées aux PE n'est pas appliquée. Les octets absents de la "
@@ -1551,6 +1609,32 @@ class _RuleTools:
             raise _ToolUnavailable("evidence_recorder_unavailable")
         version_ref = str(version.id) if version is not None else f"pending:{report.source_sha256}"
         payload = _report_payload(report, corpus, candidate_status)
+        signature = _signature_manifest(version)
+        signature_limitations = _signature_limitations(signature)
+        payload["signature"] = signature
+        payload["signature_limitations"] = signature_limitations
+        payload["limitations"] = list(
+            dict.fromkeys((*payload["limitations"], *signature_limitations))
+        )
+        effective_status, effective_reason = _effective_validation_quality(report, signature)
+        payload["validation_status"] = effective_status.value
+        payload["validation_reason"] = effective_reason.value
+        payload["candidate_status"] = candidate_status.value
+        payload["reproduction"] = {
+            "tool": "rule.test",
+            "command": (
+                f'rule.test(candidate_id="{candidate_id}", '
+                f"version={version.version if version is not None else 'latest'})"
+            ),
+            "arguments": {
+                "candidate_id": str(candidate_id),
+                "version": version.version if version is not None else None,
+            },
+            "measurement_method": report.measurement_method.value,
+            "engine_version": report.engine_version[:200],
+            "source_sha256": report.source_sha256,
+            "corpus_sha256": report.corpus_sha256,
+        }
         report_fingerprint = hashlib.sha256(
             json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
@@ -1569,7 +1653,7 @@ class _RuleTools:
             source_version="investigation-rule-tools.v1",
             object_type="detection_candidate_version",
             object_id=version_ref,
-            limitations=corpus.limitations,
+            limitations=tuple(payload["limitations"]),
             idempotency_key=(
                 f"{context.idempotency_key}:rule:{operation}:"
                 f"{candidate_id}:{version_ref}:{report_fingerprint}"
@@ -1589,6 +1673,17 @@ class _RuleTools:
             raise _ToolUnavailable("evidence_recorder_unavailable")
         object_id = f"{version_a.candidate_id}:{version_a.version}:{version_b.version}"
         roles = corpus.hashes_by_role()
+        signature_a = _signature_manifest(version_a)
+        signature_b = _signature_manifest(version_b)
+        limitations = tuple(
+            dict.fromkeys(
+                (
+                    *corpus.limitations,
+                    *_signature_limitations(signature_a),
+                    *_signature_limitations(signature_b),
+                )
+            )
+        )
         comparison_payload = {
             "schema": "investigation-yara-comparison.v1",
             "candidate_id": str(version_a.candidate_id),
@@ -1596,8 +1691,53 @@ class _RuleTools:
             "version_b_id": str(version_b.id),
             "source_sha256_a": version_a.source_sha256,
             "source_sha256_b": version_b.source_sha256,
+            "signature_a": signature_a,
+            "signature_b": signature_b,
+            "signature_limitations_a": _signature_limitations(signature_a),
+            "signature_limitations_b": _signature_limitations(signature_b),
             "engine_version_a": comparison.engine_version_a,
             "engine_version_b": comparison.engine_version_b,
+            "metrics_a": comparison.metrics_a,
+            "metrics_b": comparison.metrics_b,
+            "evaluation_protocol": {
+                "development_roles": [
+                    RuleTestCorpusRole.CONFIRMED_POSITIVE.value,
+                    RuleTestCorpusRole.OUT_OF_CLUSTER_CANDIDATE.value,
+                    RuleTestCorpusRole.GOODWARE.value,
+                ],
+                "holdout_role": RuleTestCorpusRole.HOLDOUT.value,
+                "holdout_policy": "Report separately; do not tune against holdout outcomes.",
+                "revision_gate": (
+                    "rule.revise requires a measured false negative on a confirmed positive; "
+                    "candidate and holdout matches do not justify revision."
+                ),
+                "match_interpretation": (
+                    "A YARA match is a byte-pattern hit only; it does not confirm family, "
+                    "intent, or behavior."
+                ),
+                "statistics_interpretation": (
+                    "Sensitivity and goodware false-positive rate use real, measured bytes; "
+                    "intervals are two-sided 95% Wilson score intervals. A 0/n observation "
+                    "does not establish a zero population rate."
+                ),
+            },
+            "reproduction": {
+                "tool": "rule.compare",
+                "command": (
+                    f'rule.compare(candidate_id="{version_a.candidate_id}", '
+                    f"version_a={version_a.version}, version_b={version_b.version})"
+                ),
+                "arguments": {
+                    "candidate_id": str(version_a.candidate_id),
+                    "version_a": version_a.version,
+                    "version_b": version_b.version,
+                },
+                "measurement_method_a": comparison.measurement_method_a.value,
+                "measurement_method_b": comparison.measurement_method_b.value,
+                "engine_version_a": comparison.engine_version_a,
+                "engine_version_b": comparison.engine_version_b,
+                "corpus_sha256": _corpus_manifest_sha256(corpus.cases),
+            },
             "corpus_sha256s_by_role": {role.value: list(hashes) for role, hashes in roles.items()},
             "roles": [
                 {
@@ -1610,7 +1750,7 @@ class _RuleTools:
             ],
             "false_positives_added": list(comparison.false_positives_added),
             "false_positives_removed": list(comparison.false_positives_removed),
-            "limitations": list(corpus.limitations),
+            "limitations": list(limitations),
         }
         comparison_fingerprint = hashlib.sha256(
             json.dumps(comparison_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -1623,7 +1763,7 @@ class _RuleTools:
             source_version="investigation-rule-tools.v1",
             object_type="detection_candidate_comparison",
             object_id=object_id,
-            limitations=corpus.limitations,
+            limitations=limitations,
             idempotency_key=(
                 f"{context.idempotency_key}:rule:compare:{object_id}:{comparison_fingerprint}"
             ),
@@ -1638,23 +1778,19 @@ def _candidate_status(
         return DetectionCandidateStatus.REJECTED
     positive = _role_for(report, RuleTestCorpusRole.CONFIRMED_POSITIVE)
     goodware = _role_for(report, RuleTestCorpusRole.GOODWARE)
-    holdout = _role_for(report, RuleTestCorpusRole.HOLDOUT)
-    if goodware.matches or holdout.matches:
+    if goodware.matches:
         return DetectionCandidateStatus.REJECTED
     if report.execution_status.value != "ok":
         return DetectionCandidateStatus.CANDIDATE
     if len(positive.matches) == 1 and not positive.non_matches and not positive.non_measurable:
         return DetectionCandidateStatus.EXPERIMENTAL
+    goodware_has_errors = bool(goodware.non_measurable or goodware.errors)
     if (
         len(positive.matches) > 1
         and not positive.non_matches
         and not positive.non_measurable
         and not positive.errors
-        and not any(
-            role.matches or role.non_measurable or role.errors
-            for role in report.roles
-            if role.role is not RuleTestCorpusRole.CONFIRMED_POSITIVE
-        )
+        and not goodware_has_errors
         and not corpus.limitations
     ):
         return DetectionCandidateStatus.TESTED
@@ -1697,20 +1833,56 @@ def _report_payload(
     candidate_status: DetectionCandidateStatus,
 ) -> dict[str, Any]:
     revision_recommendation, revision_guidance = _revision_guidance(report)
+    positive_role = _role_for(report, RuleTestCorpusRole.CONFIRMED_POSITIVE)
+    goodware_role = _role_for(report, RuleTestCorpusRole.GOODWARE)
+    false_positive_real_count = sum(
+        case.provenance.value == "real" and case.sample_sha256 in goodware_role.matches
+        for case in goodware_role.test_cases
+    )
+    false_negative_real_count = sum(
+        case.provenance.value == "real" and case.sample_sha256 in positive_role.non_matches
+        for case in positive_role.test_cases
+    )
     return {
         "source_sha256": report.source_sha256,
         "execution_status": report.execution_status.value,
         "validation_status": report.validation_status.value,
         "validation_reason": rule_validation_reason(report).value,
         "engine_version": report.engine_version[:200],
+        "measurement_method": report.measurement_method.value,
+        "evaluation_protocol": {
+            "development_roles": [
+                RuleTestCorpusRole.CONFIRMED_POSITIVE.value,
+                RuleTestCorpusRole.OUT_OF_CLUSTER_CANDIDATE.value,
+                RuleTestCorpusRole.GOODWARE.value,
+            ],
+            "holdout_role": RuleTestCorpusRole.HOLDOUT.value,
+            "holdout_policy": "Report separately; do not tune against holdout outcomes.",
+            "revision_gate": (
+                "rule.revise requires a measured false negative on a confirmed positive; "
+                "candidate and holdout matches do not justify revision."
+            ),
+            "match_interpretation": (
+                "A YARA match is a byte-pattern hit only; it does not confirm family, intent, "
+                "or behavior."
+            ),
+            "statistics_interpretation": (
+                "Sensitivity and goodware false-positive rate use real, measured bytes; "
+                "intervals are two-sided 95% Wilson score intervals. A 0/n observation "
+                "does not establish a zero population rate."
+            ),
+        },
+        "metrics": report.metrics,
         "candidate_status": candidate_status.value,
         "selection_bias": corpus.selection_bias,
         "coverage_statement": report.coverage_statement,
         "corpus_sha256": report.corpus_sha256,
         "provenance_counts_by_role": report.provenance_counts_by_role,
         "false_positive_count": len(report.false_positive_sha256s),
+        "false_positive_real_count": false_positive_real_count,
         "false_positive_sha256s": list(report.false_positive_sha256s),
         "false_negative_count": len(report.false_negative_sha256s),
+        "false_negative_real_count": false_negative_real_count,
         "false_negative_sha256s": list(report.false_negative_sha256s),
         "non_measurable_count": sum(len(role.non_measurable) for role in report.roles),
         "revision_recommendation": revision_recommendation,
@@ -1727,7 +1899,9 @@ def _report_payload(
                     {
                         "sha256": case.sample_sha256,
                         "provenance": case.provenance.value,
+                        "expected_match": _expected_match_for_case(case),
                         "outcome": _case_outcome(role, case.sample_sha256),
+                        "family_confirmation": "not_assessed",
                     }
                     for case in role.test_cases
                 ],
@@ -1753,20 +1927,74 @@ def _report_summary(
     report: RuleTestReport,
     observation_id: UUID | None,
     corpus: _RuleCorpusSnapshot | None,
+    version: DetectionCandidateVersion | None = None,
+    candidate_status: DetectionCandidateStatus | None = None,
 ) -> dict[str, Any]:
     revision_recommendation, revision_guidance = _revision_guidance(report)
+    positive_role = _role_for(report, RuleTestCorpusRole.CONFIRMED_POSITIVE)
+    goodware_role = _role_for(report, RuleTestCorpusRole.GOODWARE)
+    signature = _signature_manifest(version)
+    effective_status, effective_reason = _effective_validation_quality(report, signature)
+    candidate_id = str(version.candidate_id) if version is not None else "unknown"
+    version_number = version.version if version is not None else "latest"
     result: dict[str, Any] = {
         "source_sha256": report.source_sha256,
         "execution_status": report.execution_status.value,
-        "validation_status": report.validation_status.value,
-        "validation_reason": rule_validation_reason(report).value,
+        "validation_status": effective_status.value,
+        "validation_reason": effective_reason.value,
         "engine_version": report.engine_version[:200],
+        "measurement_method": report.measurement_method.value,
+        "evaluation_protocol": {
+            "development_roles": [
+                RuleTestCorpusRole.CONFIRMED_POSITIVE.value,
+                RuleTestCorpusRole.OUT_OF_CLUSTER_CANDIDATE.value,
+                RuleTestCorpusRole.GOODWARE.value,
+            ],
+            "holdout_role": RuleTestCorpusRole.HOLDOUT.value,
+            "holdout_policy": "Report separately; do not tune against holdout outcomes.",
+            "revision_gate": (
+                "rule.revise requires a measured false negative on a confirmed positive; "
+                "candidate and holdout matches do not justify revision."
+            ),
+            "match_interpretation": (
+                "A YARA match is a byte-pattern hit only; it does not confirm family, intent, "
+                "or behavior."
+            ),
+            "statistics_interpretation": (
+                "Sensitivity and goodware false-positive rate use real, measured bytes; "
+                "intervals are two-sided 95% Wilson score intervals. A 0/n observation "
+                "does not establish a zero population rate."
+            ),
+        },
+        "metrics": report.metrics,
+        "signature": signature,
+        "signature_limitations": _signature_limitations(signature),
+        "reproduction": {
+            "tool": "rule.test",
+            "command": (f'rule.test(candidate_id="{candidate_id}", version={version_number})'),
+            "arguments": {
+                "candidate_id": str(version.candidate_id) if version is not None else None,
+                "version": version.version if version is not None else None,
+            },
+            "measurement_method": report.measurement_method.value,
+            "engine_version": report.engine_version[:200],
+            "source_sha256": report.source_sha256,
+            "corpus_sha256": report.corpus_sha256,
+        },
         "corpus_sha256": report.corpus_sha256,
         "coverage_statement": report.coverage_statement,
         "provenance_counts_by_role": report.provenance_counts_by_role,
         "false_positive_count": len(report.false_positive_sha256s),
+        "false_positive_real_count": sum(
+            case.provenance.value == "real" and case.sample_sha256 in goodware_role.matches
+            for case in goodware_role.test_cases
+        ),
         "false_positive_sha256s": list(report.false_positive_sha256s),
         "false_negative_count": len(report.false_negative_sha256s),
+        "false_negative_real_count": sum(
+            case.provenance.value == "real" and case.sample_sha256 in positive_role.non_matches
+            for case in positive_role.test_cases
+        ),
         "false_negative_sha256s": list(report.false_negative_sha256s),
         "non_measurable_count": sum(len(role.non_measurable) for role in report.roles),
         "revision_recommendation": revision_recommendation,
@@ -1783,7 +2011,9 @@ def _report_summary(
                     {
                         "sha256": case.sample_sha256,
                         "provenance": case.provenance.value,
+                        "expected_match": _expected_match_for_case(case),
                         "outcome": _case_outcome(role, case.sample_sha256),
+                        "family_confirmation": "not_assessed",
                     }
                     for case in role.test_cases
                 ],
@@ -1795,11 +2025,179 @@ def _report_summary(
             for role in report.roles
         ],
     }
+    if candidate_status is not None:
+        result["candidate_status"] = candidate_status.value
     if observation_id is not None:
         result["observation_ref"] = str(observation_id)
     if corpus is not None:
-        result["limitations"] = list(corpus.limitations)
+        result["limitations"] = list(
+            dict.fromkeys(
+                (*corpus.limitations, *_signature_limitations(_signature_manifest(version)))
+            )
+        )
     return result
+
+
+def _signature_manifest(version: DetectionCandidateVersion | None) -> dict[str, Any]:
+    if version is None:
+        return {
+            "candidate_id": None,
+            "version": None,
+            "source_sha256": None,
+            "family": None,
+            "hypothesis": None,
+            "dotnet_imports_discussion": None,
+            "generic_dotnet_import_count": 0,
+            "condition": None,
+            "generic_dotnet_specific_motif_verified": False,
+            "generic_dotnet_guard": "not_applicable",
+            "source_provenance_complete": False,
+            "motifs": [],
+        }
+    meta = _meta_from_source(version.source)
+    motifs: list[dict[str, Any]] = []
+    for item in version.motif_provenance:
+        provenance: dict[str, Any] = {}
+        if item.rationale.startswith(_PERSISTED_MOTIF_PREFIX):
+            try:
+                parsed = json.loads(item.rationale[len(_PERSISTED_MOTIF_PREFIX) :])
+                if isinstance(parsed, Mapping):
+                    provenance = dict(parsed)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                provenance = {}
+        source_sha256 = provenance.get("sample_sha256")
+        offsets = provenance.get("offsets")
+        source_method = provenance.get("provenance_kind")
+        article_claim_refs = provenance.get("article_claim_refs")
+        exact_source = (
+            isinstance(source_sha256, str)
+            and re.fullmatch(_SHA256_PATTERN, source_sha256) is not None
+            and isinstance(offsets, list)
+            and bool(offsets)
+            and all(
+                isinstance(offset, int) and not isinstance(offset, bool) and offset >= 0
+                for offset in offsets
+            )
+            and isinstance(source_method, str)
+            and bool(source_method.strip())
+        )
+        motifs.append(
+            {
+                "motif_sha256": hashlib.sha256(item.motif.encode("utf-8")).hexdigest(),
+                "kind": provenance.get("kind", "unknown"),
+                "source_method": source_method if isinstance(source_method, str) else "unknown",
+                "source_sha256": source_sha256 if isinstance(source_sha256, str) else None,
+                "offsets": offsets if isinstance(offsets, list) else None,
+                "observation_refs": [str(reference) for reference in item.observation_refs],
+                "article_claim_refs": (
+                    article_claim_refs if isinstance(article_claim_refs, list) else []
+                ),
+                "rationale": provenance.get("rationale", ""),
+                "source_bytes_verified": provenance.get("source_bytes_verified") is True,
+                "generic_dotnet_import": is_generic_dotnet_import(item.motif),
+                "exact_source_available": exact_source,
+            }
+        )
+    source_generic_values = {
+        value for value in _yara_string_literals(version.source) if is_generic_dotnet_import(value)
+    }
+    provenance_generic_values = {
+        item.motif for item in version.motif_provenance if is_generic_dotnet_import(item.motif)
+    }
+    generic_values = source_generic_values | provenance_generic_values
+    generic_specific_verified = any(
+        not item["generic_dotnet_import"]
+        and item["source_bytes_verified"] is True
+        and item["kind"] in {"string", "wide", "hex"}
+        for item in motifs
+    )
+    condition = meta.get("workbench_condition")
+    generic_guard_passed = not generic_values or (
+        condition == RuleConditionStrategy.ALL.value
+        and generic_specific_verified
+        and bool(meta.get("hypothesis"))
+        and bool(meta.get("dotnet_imports_discussion"))
+    )
+    return {
+        "candidate_id": str(version.candidate_id),
+        "version_id": str(version.id),
+        "version": version.version,
+        "source_sha256": version.source_sha256,
+        "family": meta.get("family"),
+        "hypothesis": meta.get("hypothesis"),
+        "dotnet_imports_discussion": meta.get("dotnet_imports_discussion"),
+        "generic_dotnet_import_count": len(generic_values),
+        "condition": condition,
+        "generic_dotnet_specific_motif_verified": generic_specific_verified,
+        "generic_dotnet_guard": (
+            "not_applicable"
+            if not generic_values
+            else "pass"
+            if generic_guard_passed
+            else "incomplete"
+        ),
+        "source_provenance_complete": bool(motifs)
+        and all(
+            item["exact_source_available"] and item["source_method"] != "unknown" for item in motifs
+        ),
+        "source_bytes_verified": bool(motifs)
+        and all(item["source_bytes_verified"] for item in motifs),
+        "motifs": motifs,
+    }
+
+
+def _signature_limitations(signature: Mapping[str, Any]) -> tuple[str, ...]:
+    limitations: list[str] = []
+    if not signature.get("source_provenance_complete"):
+        limitations.append(
+            "Motif source SHA-256/method/offset provenance is incomplete; family causality "
+            "is not established."
+        )
+    if signature.get("source_provenance_complete") and not signature.get("source_bytes_verified"):
+        limitations.append(
+            "Motif byte offsets have source references but were not verified against the "
+            "quarantined source bytes."
+        )
+    if not signature.get("family") and not signature.get("hypothesis"):
+        limitations.append("No target family or signature hypothesis is recorded.")
+    if signature.get("generic_dotnet_import_count", 0) and not signature.get(
+        "dotnet_imports_discussion"
+    ):
+        limitations.append(
+            "Common .NET imports/namespaces lack an explicit discussion and remain generic hints."
+        )
+    if signature.get("generic_dotnet_guard") == "incomplete":
+        limitations.append(
+            "Common .NET motifs lack an ALL condition with a source-byte-verified specific motif, "
+            "hypothesis, and import discussion; this signature remains a candidate."
+        )
+    return tuple(limitations)
+
+
+def _effective_validation_quality(
+    report: RuleTestReport, signature: Mapping[str, Any]
+) -> tuple[RuleValidationStatus, RuleValidationReason]:
+    status = report.validation_status
+    reason = rule_validation_reason(report)
+    if status is RuleValidationStatus.REAL_VALIDATED and _signature_limitations(signature):
+        return RuleValidationStatus.REAL_PARTIAL, RuleValidationReason.SAMPLE_BYTES_MISSING
+    return status, reason
+
+
+def _yara_string_literals(source: str) -> tuple[str, ...]:
+    sections = re.search(r"(?ms)^\s*strings\s*:\s*(.*?)^\s*condition\s*:", source)
+    if sections is None:
+        return ()
+    values: list[str] = []
+    pattern = r'(?m)^\s*\$[A-Za-z0-9_]+\s*=\s*("(?:\\.|[^"\\])*")'
+    for match in re.finditer(pattern, sections[1]):
+        try:
+            value = ast.literal_eval(match.group(1))
+        except (SyntaxError, ValueError):
+            continue
+        if isinstance(value, str):
+            values.append(value)
+    return tuple(values)
 
 
 def _revision_guidance(report: RuleTestReport) -> tuple[str, str]:
@@ -1881,14 +2279,77 @@ def _comparison_summary(
     comparison: RuleVersionComparison,
     observation_id: UUID,
     corpus: _RuleCorpusSnapshot,
+    version_a: DetectionCandidateVersion,
+    version_b: DetectionCandidateVersion,
 ) -> dict[str, Any]:
+    signature_a = _signature_manifest(version_a)
+    signature_b = _signature_manifest(version_b)
+    limitations = tuple(
+        dict.fromkeys(
+            (
+                *corpus.limitations,
+                *_signature_limitations(signature_a),
+                *_signature_limitations(signature_b),
+            )
+        )
+    )
     return {
         "version_a_id": str(comparison.version_a_id),
         "version_b_id": str(comparison.version_b_id),
         "version_a": comparison.version_a,
         "version_b": comparison.version_b,
+        "source_sha256_a": version_a.source_sha256,
+        "source_sha256_b": version_b.source_sha256,
+        "signature_a": signature_a,
+        "signature_b": signature_b,
+        "signature_limitations_a": _signature_limitations(signature_a),
+        "signature_limitations_b": _signature_limitations(signature_b),
         "engine_version_a": comparison.engine_version_a,
         "engine_version_b": comparison.engine_version_b,
+        "measurement_method_a": comparison.measurement_method_a.value,
+        "measurement_method_b": comparison.measurement_method_b.value,
+        "corpus_sha256": _corpus_manifest_sha256(corpus.cases),
+        "metrics_a": comparison.metrics_a,
+        "metrics_b": comparison.metrics_b,
+        "evaluation_protocol": {
+            "development_roles": [
+                RuleTestCorpusRole.CONFIRMED_POSITIVE.value,
+                RuleTestCorpusRole.OUT_OF_CLUSTER_CANDIDATE.value,
+                RuleTestCorpusRole.GOODWARE.value,
+            ],
+            "holdout_role": RuleTestCorpusRole.HOLDOUT.value,
+            "holdout_policy": "Report separately; do not tune against holdout outcomes.",
+            "revision_gate": (
+                "rule.revise requires a measured false negative on a confirmed positive; "
+                "candidate and holdout matches do not justify revision."
+            ),
+            "match_interpretation": (
+                "A YARA match is a byte-pattern hit only; it does not confirm family, intent, "
+                "or behavior."
+            ),
+            "statistics_interpretation": (
+                "Sensitivity and goodware false-positive rate use real, measured bytes; "
+                "intervals are two-sided 95% Wilson score intervals. A 0/n observation "
+                "does not establish a zero population rate."
+            ),
+        },
+        "reproduction": {
+            "tool": "rule.compare",
+            "command": (
+                f'rule.compare(candidate_id="{version_a.candidate_id}", '
+                f"version_a={comparison.version_a[1:]}, version_b={comparison.version_b[1:]})"
+            ),
+            "arguments": {
+                "candidate_id": str(version_a.candidate_id),
+                "version_a": comparison.version_a,
+                "version_b": comparison.version_b,
+            },
+            "measurement_method_a": comparison.measurement_method_a.value,
+            "measurement_method_b": comparison.measurement_method_b.value,
+            "engine_version_a": comparison.engine_version_a,
+            "engine_version_b": comparison.engine_version_b,
+            "corpus_sha256": _corpus_manifest_sha256(corpus.cases),
+        },
         "corpus_sha256s_by_role": {
             role.value: list(hashes) for role, hashes in corpus.hashes_by_role().items()
         },
@@ -1903,7 +2364,7 @@ def _comparison_summary(
         ],
         "false_positives_added": list(comparison.false_positives_added),
         "false_positives_removed": list(comparison.false_positives_removed),
-        "limitations": list(corpus.limitations),
+        "limitations": list(limitations),
         "observation_ref": str(observation_id),
     }
 
@@ -2089,7 +2550,7 @@ def _condition_from_source(source: str) -> RuleConditionStrategy:
     return RuleConditionStrategy(match.group(1))
 
 
-def _serialize_motif(motif: RuleMotif) -> str:
+def _serialize_motif(motif: RuleMotif, *, source_bytes_verified: bool = False) -> str:
     payload = {
         "kind": motif.kind.value,
         "provenance_kind": motif.provenance_kind.value,
@@ -2101,6 +2562,7 @@ def _serialize_motif(motif: RuleMotif) -> str:
         "positive_support": motif.positive_support,
         "benign_prevalence": motif.benign_prevalence,
         "goodware_occurrence_count": motif.goodware_occurrence_count,
+        "source_bytes_verified": source_bytes_verified,
     }
     return _PERSISTED_MOTIF_PREFIX + json.dumps(
         payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
@@ -2149,7 +2611,24 @@ def _rule_case(
     investigation_id: UUID, role: RuleTestCorpusRole, sample_sha256: str
 ) -> RuleTestCase:
     case_id = uuid5(_UUID_NAMESPACE, f"{investigation_id}:{role.value}:{sample_sha256}")
-    return RuleTestCase(id=case_id, role=role, sample_sha256=sample_sha256)
+    return RuleTestCase(
+        id=case_id,
+        role=role,
+        sample_sha256=sample_sha256,
+        expected_match=_expected_match(role),
+    )
+
+
+def _expected_match(role: RuleTestCorpusRole) -> bool | None:
+    if role is RuleTestCorpusRole.CONFIRMED_POSITIVE:
+        return True
+    if role is RuleTestCorpusRole.GOODWARE:
+        return False
+    return None
+
+
+def _expected_match_for_case(case: RuleTestCase) -> bool | None:
+    return case.expected_result
 
 
 def _unique_valid_hashes(values: Sequence[str]) -> tuple[str, ...]:
@@ -2158,6 +2637,12 @@ def _unique_valid_hashes(values: Sequence[str]) -> tuple[str, ...]:
         if isinstance(value, str) and re.fullmatch(_SHA256_PATTERN, value):
             hashes.add(value)
     return tuple(sorted(hashes))
+
+
+def _corpus_manifest_sha256(
+    cases: Sequence[RuleTestCase],
+) -> str:
+    return rule_corpus_sha256(cases)
 
 
 def _safe_error_code(exc: Exception) -> str:

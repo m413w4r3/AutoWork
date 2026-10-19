@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
@@ -53,6 +54,7 @@ from cti_app.domain.investigation import (
     ToolInvocationStatus,
     thaw_json,
 )
+from cti_app.domain.investigation_experiment import InvestigationExperimentV1
 from cti_app.domain.investigation_state import (
     Hypothesis,
     HypothesisStatus,
@@ -497,6 +499,114 @@ class SqlAlchemyFindingRepository:
             supersedes=row.supersedes_id,
             created_at=row.created_at,
         )
+
+
+class SqlAlchemyInvestigationExperimentRepository:
+    """CAS append-only storage for a single investigation experiment stream."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def version(self, investigation_id: UUID) -> int:
+        from cti_app.infrastructure.database.models.investigation import (
+            InvestigationExperimentHeadRow,
+        )
+
+        version = await self._session.scalar(
+            select(InvestigationExperimentHeadRow.version).where(
+                InvestigationExperimentHeadRow.investigation_id == investigation_id
+            )
+        )
+        return int(version or 0)
+
+    async def list_for_investigation(
+        self, investigation_id: UUID
+    ) -> tuple[InvestigationExperimentV1, ...]:
+        from cti_app.infrastructure.database.models.investigation import (
+            InvestigationExperimentRow,
+        )
+
+        rows = await self._session.scalars(
+            select(InvestigationExperimentRow)
+            .where(InvestigationExperimentRow.investigation_id == investigation_id)
+            .order_by(InvestigationExperimentRow.version)
+        )
+        return tuple(self._experiment_from_row(row) for row in rows)
+
+    async def append_if_version(
+        self, experiment: InvestigationExperimentV1, *, expected_version: int
+    ) -> InvestigationExperimentV1:
+        from cti_app.infrastructure.database.models.investigation import (
+            InvestigationExperimentHeadRow,
+            InvestigationExperimentRow,
+        )
+
+        existing = await self._session.scalar(
+            select(InvestigationExperimentRow).where(InvestigationExperimentRow.id == experiment.id)
+        )
+        if existing is not None:
+            current = self._experiment_from_row(existing)
+            if current.identity_sha256 == experiment.identity_sha256:
+                return current
+            raise ValueError("Experiment identity is already used with different content")
+
+        await self._session.execute(
+            insert(InvestigationExperimentHeadRow)
+            .values(
+                investigation_id=experiment.investigation_id,
+                version=0,
+                updated_at=datetime.now(UTC),
+            )
+            .on_conflict_do_nothing(
+                index_elements=[InvestigationExperimentHeadRow.investigation_id]
+            )
+        )
+        head = await self._session.scalar(
+            select(InvestigationExperimentHeadRow)
+            .where(InvestigationExperimentHeadRow.investigation_id == experiment.investigation_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if head is None or head.version != expected_version:
+            raise VersionConflictError("Investigation experiment timeline version changed")
+        if experiment.version != expected_version + 1:
+            raise VersionConflictError("Experiment version must append to the expected timeline")
+
+        payload = experiment.to_payload()
+        self._session.add(
+            InvestigationExperimentRow(
+                id=experiment.id,
+                investigation_id=experiment.investigation_id,
+                version=experiment.version,
+                hypothesis_id=experiment.hypothesis_id,
+                claim_ids=list(experiment.claim_ids),
+                schema_version=experiment.schema_version,
+                payload=payload,
+                payload_sha256=experiment.canonical_sha256,
+                recorded_at=experiment.recorded_at,
+            )
+        )
+        head.version = experiment.version
+        head.updated_at = datetime.now(UTC)
+        await self._session.flush()
+        return experiment
+
+    @staticmethod
+    def _experiment_from_row(row: Any) -> InvestigationExperimentV1:
+        from cti_app.domain.investigation import canonical_json_bytes
+
+        if hashlib.sha256(canonical_json_bytes(row.payload)).hexdigest() != row.payload_sha256:
+            raise ValueError("Persisted experiment payload hash does not match")
+        experiment = InvestigationExperimentV1.from_payload(row.payload)
+        if (
+            experiment.id != row.id
+            or experiment.investigation_id != row.investigation_id
+            or experiment.version != row.version
+            or experiment.hypothesis_id != row.hypothesis_id
+            or list(experiment.claim_ids) != list(row.claim_ids)
+        ):
+            raise ValueError("Persisted experiment payload does not match its indexed columns")
+        return experiment
 
 
 def _finding_values(finding: InvestigationFinding) -> dict[str, Any]:

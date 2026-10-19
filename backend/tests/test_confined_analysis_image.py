@@ -24,9 +24,9 @@ import pytest
 )
 def test_built_analysis_worker_image_has_attested_analysis_binaries() -> None:
     root = Path(__file__).resolve().parents[2]
-    from tests.test_confined_local_commands import _MINIMAL_DOTNET_ASSEMBLY
+    from tests.dotnet_fixture import MINIMAL_DOTNET_ASSEMBLY
 
-    fixture_b64 = base64.b64encode(_MINIMAL_DOTNET_ASSEMBLY).decode("ascii")
+    fixture_b64 = base64.b64encode(MINIMAL_DOTNET_ASSEMBLY).decode("ascii")
     code = "\n".join(
         (
             "import asyncio, base64, hashlib, importlib.metadata, re, shutil, subprocess",
@@ -51,6 +51,15 @@ def test_built_analysis_worker_image_has_attested_analysis_binaries() -> None:
             "assert '2022-01-14' in xxd.stdout + xxd.stderr",
             "assert '9.1' in subprocess.check_output(['sha256sum', '--version'], text=True)",
             "assert shutil.which('monodis')",
+            "assert shutil.which('ilspycmd') and shutil.which('dotnet')",
+            "from cti_app.infrastructure.ilspycmd import (ILSPYCMD_VERSION, ",
+            "ILSPYCMD_PACKAGE_SHA512, ilspycmd_provenance)",
+            "provenance = ilspycmd_provenance()",
+            "assert provenance and provenance['version'] == ILSPYCMD_VERSION",
+            "assert provenance['package_sha512'] == ILSPYCMD_PACKAGE_SHA512",
+            "assert ILSPYCMD_VERSION == '9.1.0.7988'",
+            "assert 'Microsoft.NETCore.App 8.0.32 ' in subprocess.check_output(",
+            "['dotnet', '--list-runtimes'], text=True)",
             "assert subprocess.check_output(['dpkg-query', '-W', '-f=${Version}', 'mono-utils'], ",
             "text=True).strip() == '6.8.0.105+dfsg-3.3+deb12u1'",
             "monodis_help = subprocess.run(['monodis', '--help'], capture_output=True, ",
@@ -78,6 +87,8 @@ def test_built_analysis_worker_image_has_attested_analysis_binaries() -> None:
             "from cti_app.workers.confined_analysis import _validate_local_command_arguments",
             "from cti_app.workers.confined_analysis import build_analysis_worker_probe_payload",
             "from cti_app.workers.confined_analysis import _run_monodis",
+            "from cti_app.workers.confined_analysis import _extract_monodis_method_body",
+            "from cti_app.workers.dotnet_analysis import run_dotnet_analysis",
             "from cti_app.config import Settings",
             f"fixture = base64.b64decode({fixture_b64!r})",
             "from uuid import uuid4",
@@ -96,6 +107,39 @@ def test_built_analysis_worker_image_has_attested_analysis_binaries() -> None:
             "assert monodis_result['method'] == 'Fixture.Main'",
             "assert monodis_result['offset'] == 0 and monodis_result['length'] <= 8192",
             "assert 'IL_0001:  ret' in monodis_result['stdout']",
+            "dotnet_parameters = ConfinedAnalysisJobParameters(",
+            " investigation_id=uuid4(), artifact_id=uuid4(), artifact_sha256=fixture_sha256,",
+            " operation_key='confined-analysis:' + 'c' * 64,",
+            " tool=ConfinedAnalysisTool.DOTNET_ILSPY, timeout_seconds=30,",
+            " max_output_bytes=16384, analysis_parameters={'operation': 'decompile',",
+            "  'method_rid': '1', 'offset': '0', 'max_chars': '8192'})",
+            "dotnet_result = asyncio.run(run_dotnet_analysis(",
+            " dotnet_parameters, fixture, Settings(_env_file=None),",
+            " monodis_version=lambda: '6.8.0.105+dfsg-3.3+deb12u1',",
+            " extract_monodis_method_body=_extract_monodis_method_body))",
+            "assert dotnet_result['status'] == 'SUCCEEDED', dotnet_result",
+            "assert dotnet_result['engine'] == 'ilspycmd'",
+            "assert dotnet_result['schema_version'] == 'dotnet-analysis-result.v1'",
+            "assert dotnet_result['method_token'] == '0x06000001'",
+            "assert 'ldc.i4.7' in dotnet_result['stdout']",
+            "assert 'IL_0001: ret' in dotnet_result['stdout']",
+            "assert dotnet_result['source']['sha256'] == fixture_sha256",
+            "invalid_result = asyncio.run(run_dotnet_analysis(",
+            " dotnet_parameters, b'not a PE or CLI assembly', Settings(_env_file=None),",
+            " monodis_version=lambda: '6.8.0.105+dfsg-3.3+deb12u1',",
+            " extract_monodis_method_body=_extract_monodis_method_body))",
+            "assert invalid_result['status'] == 'FAILED', invalid_result",
+            "assert invalid_result['available_reason'] == 'dotnet_invalid_or_missing_cli_metadata'",
+            "assert invalid_result['schema_version'] == 'dotnet-analysis-result.v1'",
+            "inspect_parameters = dotnet_parameters.model_copy(update={",
+            " 'analysis_parameters': {'operation': 'assembly'}})",
+            "inspect_result = asyncio.run(run_dotnet_analysis(",
+            " inspect_parameters, fixture, Settings(_env_file=None),",
+            " monodis_version=lambda: '6.8.0.105+dfsg-3.3+deb12u1',",
+            " extract_monodis_method_body=_extract_monodis_method_body))",
+            "assert inspect_result['metadata']['metadata_signature'] == 'BSJB'",
+            "assert inspect_result['metadata']['architecture'] == 'x86'",
+            "assert inspect_result['metadata']['managed_analysis_path'].startswith('ilspycmd')",
             "try:",
             " _validate_local_command_arguments(('file', '/etc/passwd'), {'mime_type': 'false'}, "
             "max_range_bytes=1048576)",

@@ -10,6 +10,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Protocol, TypeGuard
 from uuid import UUID
 
+from cti_app.application.advisor_checkpoint import advisor_checkpoint_summary
 from cti_app.application.investigation_contracts import (
     MAX_CONTEXT_CONFIRMED_IOC_BYTES,
     MAX_CONTEXT_CONFIRMED_IOCS,
@@ -38,6 +39,7 @@ from cti_app.application.investigation_persistence import (
     SampleAssociationRepository,
     ToolInvocationRepository,
 )
+from cti_app.application.investigation_pivot_frontier import discovered_indicator_values
 from cti_app.application.investigation_pivots import available_investigation_pivots
 from cti_app.application.investigation_tools import (
     InMemoryToolRegistry,
@@ -96,6 +98,7 @@ MAX_CONTEXT_FINDING_STATEMENT_CHARS = 420
 MAX_CONTEXT_PUBLICATION_ANCHORS = 128
 MAX_CONTEXT_PUBLICATION_ANCHOR_BYTES = 20 * 1024
 MAX_CONTEXT_TOOLS = 64
+MAX_PIVOT_SOURCE_OBSERVATIONS = 512
 MAX_CONTEXT_RULE_CORPUS_IMPORTS = 64
 MAX_CONTEXT_RULE_CANDIDATES = 16
 INVESTIGATION_MAX_CONTEXT_BYTES = 256 * 1024
@@ -348,6 +351,40 @@ class CanonicalEvidenceSummaryPort:
             }
         if schema == "virustotal-investigation-summary.v1":
             return payload
+        if schema == "NetworkCaptureReportV1":
+            bounded: dict[str, Any] = {"schema": schema}
+            for field in (
+                "endpoints",
+                "dns_observations",
+                "http_observations",
+                "tls_observations",
+            ):
+                items = payload.get(field)
+                if not isinstance(items, Sequence) or isinstance(items, (str, bytes)):
+                    continue
+                selected: list[dict[str, str]] = []
+                for item in items[:64]:
+                    if not isinstance(item, Mapping):
+                        continue
+                    keys = ("address",) if field == "endpoints" else ("name", "value")
+                    selected.append(
+                        {
+                            key: value[:512]
+                            for key in keys
+                            if isinstance((value := item.get(key)), str)
+                        }
+                    )
+                bounded[field] = selected
+            return bounded
+        if payload.get("schema_version") == "family-feature-comparison-v1":
+            sample_hashes = payload.get("comparison_sample_sha256s")
+            if isinstance(sample_hashes, Sequence) and not isinstance(sample_hashes, (str, bytes)):
+                return {
+                    "schema_version": "family-feature-comparison-v1",
+                    "comparison_sample_sha256s": [
+                        value for value in sample_hashes[:64] if isinstance(value, str)
+                    ],
+                }
         if schema == "shodan-observation.v1":
             summary = payload.get("summary")
             return summary if isinstance(summary, Mapping) else None
@@ -707,13 +744,32 @@ class ResearchContextBuilder:
             for item in state.hypotheses[:MAX_CONTEXT_HYPOTHESES]
         )
         indicator_inventory = self._indicator_inventory(snapshot)
-        available_pivots, available_pivots_truncated = available_investigation_pivots(
+        pivot_observations = tuple(
+            item
+            for item in observations
+            if item.kind is EvidenceKind.VT_RELATIONSHIP
+            or item.source == "sample_similarity"
+            or item.source.startswith("network.capture.")
+        )
+        pivot_observations_truncated = len(pivot_observations) > MAX_PIVOT_SOURCE_OBSERVATIONS
+        pivot_observations = pivot_observations[-MAX_PIVOT_SOURCE_OBSERVATIONS:]
+        pivot_payloads: dict[str, Mapping[str, Any] | None] = {}
+        if self._evidence_summaries is not None:
+            for observation in pivot_observations:
+                summary = await self._evidence_summaries.summary(observation)
+                pivot_payloads[str(observation.id)] = (
+                    summary if isinstance(summary, Mapping) else None
+                )
+        discovered_inventory = discovered_indicator_values(pivot_observations, pivot_payloads)
+        available_pivots, pivots_truncated = available_investigation_pivots(
             inventory=indicator_inventory.items,
+            discovered_inventory=discovered_inventory,
             tools=tools,
             tool_coverage=tool_coverage,
             invocations=tool_invocations,
             observations=observations,
         )
+        available_pivots_truncated = pivots_truncated or pivot_observations_truncated
         user_requests = self._user_requests_from_actions(state.recent_actions)
         all_previous_actions = tuple(
             {"summary": _truncate(_safe_untrusted(action), 300)}
@@ -827,6 +883,7 @@ class ResearchContextBuilder:
                     available_tools=tuple(item.name for item in tools),
                     checkpoint_tool_threshold=get_settings().operator_advisor_checkpoint_tool_threshold,
                     advisor_turn_limit=get_settings().operator_advisor_max_turns_per_investigation,
+                    pivot_observation_ids=tuple(item.id for item in pivot_observations),
                     enabled=state.execution_mode is InvestigationExecutionMode.OPERATOR_LED,
                 )
             ),
@@ -996,6 +1053,21 @@ class ResearchContextBuilder:
             )
             return len(observations), tuple(
                 evidence_item.model_dump(mode="json") for evidence_item in evidence_index_items
+            )
+        if section == "finding_versions":
+            all_finding_values = tuple(
+                await self._findings.list_for_investigation(investigation_id)
+            )
+            ordered_findings = tuple(self._order_findings(all_finding_values))
+            selected_findings = ordered_findings[page]
+            finding_rows, _ = self._finding_context(
+                selected_findings,
+                observation_ids={observation.id for observation in observations},
+                max_items=limit,
+                max_bytes=INVESTIGATION_MAX_CONTEXT_BYTES,
+            )
+            return len(ordered_findings), tuple(
+                finding.model_dump(mode="json") for finding in finding_rows
             )
         if section == "findings":
             all_finding_values = tuple(
@@ -2206,6 +2278,9 @@ class ResearchContextBuilder:
                         facts = candidate_facts
                         break
             summary = _tool_coverage_summary(invocation, observation, facts)
+            checkpoint_summary = advisor_checkpoint_summary(invocation)
+            if checkpoint_summary:
+                summary = _truncate(f"{summary} {checkpoint_summary}", 512)
             entry = ToolCoverageEntryV1(
                 invocation_id=invocation.id,
                 tool_name=_truncate(_safe_untrusted(invocation.tool_name), 128),

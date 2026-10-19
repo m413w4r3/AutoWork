@@ -10,6 +10,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _HOST_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$", re.ASCII)
 VIRUSTOTAL_DOWNLOAD_REQUIRED_CDN_HOST = "vtsamples.commondatastorage.googleapis.com"
+DOTNET_ANALYSIS_DEFAULT_ADDRESS_SPACE_LIMIT_BYTES = 8 * 1024**3
+DOTNET_ANALYSIS_MIN_ADDRESS_SPACE_LIMIT_BYTES = 8 * 1024**3
+DOTNET_ANALYSIS_MAX_ADDRESS_SPACE_LIMIT_BYTES = 32 * 1024**3
+DOTNET_GC_HEAP_HARD_LIMIT = "0x10000000"
+DOTNET_GC_CONCURRENT = "0"
 
 
 def _normalize_download_host_list(value: str) -> frozenset[str]:
@@ -293,6 +298,13 @@ class Settings(BaseSettings):
     local_analysis_cpu_limit_seconds: int = Field(default=30, ge=1, le=600)
     local_analysis_memory_limit_bytes: int = Field(
         default=512 * 1024 * 1024, ge=64 * 1024 * 1024, le=4 * 1024 * 1024 * 1024
+    )
+    # CoreCLR reserves virtual address space; this RLIMIT_AS ceiling is not an RSS bound.
+    # The analysis-worker Compose cgroup remains the effective aggregate memory limit.
+    dotnet_analysis_address_space_limit_bytes: int = Field(
+        default=DOTNET_ANALYSIS_DEFAULT_ADDRESS_SPACE_LIMIT_BYTES,
+        ge=DOTNET_ANALYSIS_MIN_ADDRESS_SPACE_LIMIT_BYTES,
+        le=DOTNET_ANALYSIS_MAX_ADDRESS_SPACE_LIMIT_BYTES,
     )
     local_analysis_file_size_limit_bytes: int = Field(
         default=1 * 1024 * 1024, ge=4096, le=100 * 1024 * 1024

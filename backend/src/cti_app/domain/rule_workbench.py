@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from uuid import UUID, uuid4
@@ -40,6 +41,11 @@ class RuleValidationStatus(StrEnum):
     REAL_VALIDATED = "real_validated"
 
 
+class RuleTestMeasurementMethod(StrEnum):
+    ISOLATED_YARA_WORKER = "isolated_yara_worker"
+    CONFINED_ANALYSIS_WORKER = "confined_analysis_worker"
+
+
 class RuleConditionStrategy(StrEnum):
     ANY = "any"
     ALL = "all"
@@ -56,6 +62,8 @@ class RuleMotifIssueCode(StrEnum):
     TOO_MANY_MOTIFS = "too_many_motifs"
     INVALID_METADATA = "invalid_metadata"
     MISSING_OBSERVATION = "missing_observation"
+    GENERIC_DOTNET_IMPORT = "generic_dotnet_import"
+    SOURCE_BYTES_UNVERIFIED = "source_bytes_unverified"
 
 
 class YaraExecutionStatus(StrEnum):
@@ -158,6 +166,33 @@ class RuleTestCase:
         if self.expected_match is not None and not isinstance(self.expected_match, bool):
             raise TypeError("expected_match must be a boolean or None")
 
+    @property
+    def expected_result(self) -> bool | None:
+        if self.expected_match is not None:
+            return self.expected_match
+        if self.role is RuleTestCorpusRole.CONFIRMED_POSITIVE:
+            return True
+        if self.role is RuleTestCorpusRole.GOODWARE:
+            return False
+        return None
+
+
+def rule_corpus_sha256(cases: Sequence[RuleTestCase]) -> str:
+    """Hash sample identities together with role, provenance, and declared truth labels."""
+    normalized = sorted(cases, key=lambda case: (case.role.value, case.sample_sha256))
+    payload = "\n".join(
+        ":".join(
+            (
+                case.role.value,
+                case.sample_sha256,
+                case.provenance.value,
+                "unknown" if case.expected_result is None else str(case.expected_result).lower(),
+            )
+        )
+        for case in normalized
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class RuleMotifIssue:
@@ -169,6 +204,17 @@ class RuleMotifIssue:
 @dataclass(frozen=True, slots=True, kw_only=True)
 class RuleMotifValidationReport:
     issues: tuple[RuleMotifIssue, ...] = ()
+    verified_motif_indices: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        indices = tuple(self.verified_motif_indices)
+        if any(
+            not isinstance(index, int) or isinstance(index, bool) or index < 0 for index in indices
+        ):
+            raise ValueError("verified motif indices must be non-negative integers")
+        if len(indices) != len(set(indices)):
+            raise ValueError("verified motif indices must be unique")
+        object.__setattr__(self, "verified_motif_indices", tuple(sorted(indices)))
 
     @property
     def valid(self) -> bool:
@@ -228,6 +274,8 @@ class RuleRoleTestReport:
         test_cases = tuple(self.test_cases)
         if any(case.role is not self.role for case in test_cases):
             raise ValueError("test case role does not match its role report")
+        if len({case.sample_sha256 for case in test_cases}) != len(test_cases):
+            raise ValueError("role report test cases must be unique by SHA-256")
         if {case.sample_sha256 for case in test_cases} != set(self.corpus_sha256s):
             if self.corpus_sha256s:
                 raise ValueError("role report test cases must match its declared corpus")
@@ -264,11 +312,15 @@ class RuleTestReport:
     roles: tuple[RuleRoleTestReport, ...]
     selection_bias: str
     coverage_statement: str
+    measurement_method: RuleTestMeasurementMethod = RuleTestMeasurementMethod.ISOLATED_YARA_WORKER
     id: UUID = field(default_factory=uuid4)
 
     def __post_init__(self) -> None:
         _require_sha256(self.source_sha256, "source_sha256")
         object.__setattr__(self, "execution_status", YaraExecutionStatus(self.execution_status))
+        object.__setattr__(
+            self, "measurement_method", RuleTestMeasurementMethod(self.measurement_method)
+        )
         roles = tuple(self.roles)
         if {result.role for result in roles} != set(RuleTestCorpusRole) or len(roles) != len(
             RuleTestCorpusRole
@@ -284,10 +336,7 @@ class RuleTestReport:
 
     @property
     def corpus_sha256(self) -> str:
-        payload = "\n".join(
-            f"{role.role.value}:{','.join(role.corpus_sha256s)}" for role in self.roles
-        )
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        return rule_corpus_sha256(tuple(case for role in self.roles for case in role.test_cases))
 
     @property
     def provenance_counts_by_role(self) -> dict[str, dict[str, int]]:
@@ -304,6 +353,60 @@ class RuleTestReport:
             item for item in self.roles if item.role is RuleTestCorpusRole.CONFIRMED_POSITIVE
         )
         return tuple(sorted(positives.non_matches))
+
+    @property
+    def metrics(self) -> dict[str, dict[str, object]]:
+        """Rates on real, measured samples; unknown labels never enter denominators."""
+        positives = next(
+            item for item in self.roles if item.role is RuleTestCorpusRole.CONFIRMED_POSITIVE
+        )
+        goodware = next(item for item in self.roles if item.role is RuleTestCorpusRole.GOODWARE)
+        holdout = next(item for item in self.roles if item.role is RuleTestCorpusRole.HOLDOUT)
+        real_positive_hashes = {
+            case.sample_sha256
+            for case in positives.test_cases
+            if case.provenance is RuleSampleProvenance.REAL
+            and case.sample_sha256 in set(positives.matches) | set(positives.non_matches)
+        }
+        real_goodware_hashes = {
+            case.sample_sha256
+            for case in goodware.test_cases
+            if case.provenance is RuleSampleProvenance.REAL
+            and case.sample_sha256 in set(goodware.matches) | set(goodware.non_matches)
+        }
+        measured_holdout_hashes = set(holdout.matches) | set(holdout.non_matches)
+        real_holdout_positives = {
+            case.sample_sha256
+            for case in holdout.test_cases
+            if case.provenance is RuleSampleProvenance.REAL
+            and case.expected_result is True
+            and case.sample_sha256 in measured_holdout_hashes
+        }
+        real_holdout_negatives = {
+            case.sample_sha256
+            for case in holdout.test_cases
+            if case.provenance is RuleSampleProvenance.REAL
+            and case.expected_result is False
+            and case.sample_sha256 in measured_holdout_hashes
+        }
+        return {
+            "real_positive_sensitivity": wilson_rate(
+                successes=len(real_positive_hashes & set(positives.matches)),
+                trials=len(real_positive_hashes),
+            ),
+            "real_goodware_false_positive_rate": wilson_rate(
+                successes=len(real_goodware_hashes & set(goodware.matches)),
+                trials=len(real_goodware_hashes),
+            ),
+            "real_holdout_sensitivity": wilson_rate(
+                successes=len(real_holdout_positives & set(holdout.matches)),
+                trials=len(real_holdout_positives),
+            ),
+            "real_holdout_false_positive_rate": wilson_rate(
+                successes=len(real_holdout_negatives & set(holdout.matches)),
+                trials=len(real_holdout_negatives),
+            ),
+        }
 
     @property
     def validation_status(self) -> RuleValidationStatus:
@@ -364,6 +467,46 @@ class RuleTestReport:
         ):
             return RuleValidationStatus.REAL_VALIDATED
         return RuleValidationStatus.REAL_PARTIAL
+
+
+def wilson_rate(*, successes: int, trials: int) -> dict[str, object]:
+    if trials == 0:
+        return {
+            "status": "not_calculable",
+            "numerator": 0,
+            "denominator": 0,
+            "estimate": None,
+            "confidence_interval_95": None,
+            "method": "wilson_score_two_sided_95",
+        }
+    if not 0 <= successes <= trials:
+        raise ValueError("rate numerator must be between zero and the denominator")
+    z = 1.959963984540054
+    estimate = successes / trials
+    denominator = 1 + z * z / trials
+    center = (estimate + z * z / (2 * trials)) / denominator
+    half_width = (
+        z
+        * ((estimate * (1 - estimate) / trials + z * z / (4 * trials * trials)) ** 0.5)
+        / denominator
+    )
+    lower = max(0.0, center - half_width)
+    upper = min(1.0, center + half_width)
+    if successes == 0:
+        lower = 0.0
+    if successes == trials:
+        upper = 1.0
+    return {
+        "status": "calculated",
+        "numerator": successes,
+        "denominator": trials,
+        "estimate": estimate,
+        "confidence_interval_95": {
+            "lower": lower,
+            "upper": upper,
+        },
+        "method": "wilson_score_two_sided_95",
+    }
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -438,6 +581,10 @@ class RuleVersionComparison:
     false_positives_removed: tuple[str, ...] = ()
     engine_version_a: str = "unknown"
     engine_version_b: str = "unknown"
+    metrics_a: Mapping[str, Mapping[str, object]] = field(default_factory=dict)
+    metrics_b: Mapping[str, Mapping[str, object]] = field(default_factory=dict)
+    measurement_method_a: RuleTestMeasurementMethod = RuleTestMeasurementMethod.ISOLATED_YARA_WORKER
+    measurement_method_b: RuleTestMeasurementMethod = RuleTestMeasurementMethod.ISOLATED_YARA_WORKER
 
     def __post_init__(self) -> None:
         roles = tuple(self.roles)
@@ -447,6 +594,14 @@ class RuleVersionComparison:
             raise ValueError("a version comparison must include every corpus role")
         object.__setattr__(
             self, "roles", tuple(sorted(roles, key=lambda result: result.role.value))
+        )
+        object.__setattr__(self, "metrics_a", dict(self.metrics_a))
+        object.__setattr__(self, "metrics_b", dict(self.metrics_b))
+        object.__setattr__(
+            self, "measurement_method_a", RuleTestMeasurementMethod(self.measurement_method_a)
+        )
+        object.__setattr__(
+            self, "measurement_method_b", RuleTestMeasurementMethod(self.measurement_method_b)
         )
         for field_name in ("false_positives_added", "false_positives_removed"):
             values = tuple(getattr(self, field_name))

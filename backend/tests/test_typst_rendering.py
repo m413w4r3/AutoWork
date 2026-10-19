@@ -241,10 +241,11 @@ def test_minimal_document_has_complete_empty_sections_and_is_deterministic(tmp_p
     assert first.source_bytes == second.source_bytes
     assert first.render_data_sha256 == second.render_data_sha256
     assert first.media_refs == ()
-    assert data["schema_version"] == "typst-publication-model-v24-canonical-investigation-figures"
+    assert data["schema_version"] == "typst-publication-model-v26-anchored-editorial-spacing"
     references, synthesis = data["content_sections"]
     assert references["type"] == "references"
-    assert references["timeline"] == []
+    assert len(references["entries"]) == 1
+    assert references["entries"][0]["source_urls"] == ["https://example.test/1"]
     assert references["blocks"] == []
     assert references["sources"] == [
         {
@@ -256,7 +257,13 @@ def test_minimal_document_has_complete_empty_sections_and_is_deterministic(tmp_p
     ]
     assert synthesis == {
         "type": "synthesis",
-        "blocks": [{"type": "paragraph", "text": "Initial assessment"}],
+        "blocks": [
+            {
+                "type": "paragraph",
+                "text": "Initial assessment",
+                "anchor_target": "publication-paragraph-1c4decbc8d241b506463",
+            }
+        ],
     }
 
 
@@ -311,12 +318,19 @@ def test_v6_render_model_uses_dated_source_references_and_both_ioc_groups(
 
     assert model["title"] == "[Example actor] Décrit une activité documentée"
     assert "title_spans" not in model
-    references, synthesis, annex = model["content_sections"]
+    sections = {item["type"]: item for item in model["content_sections"]}
+    references = sections["references"]
+    synthesis = sections["synthesis"]
+    annex = sections["technical_annex"]
     assert references["type"] == "references"
-    assert references["timeline"][0]["display_date"] == "10 janvier 2026"
-    assert references["timeline"][0]["source_urls"] == ["https://a.example/report"]
-    assert references["timeline"][-1]["display_date"] == "Date de publication non précisée"
-    assert references["timeline"][-1]["source_urls"] == ["https://missing.example/article"]
+    assert references["entries"][0]["display_date"] == "10 janvier 2026"
+    assert references["entries"][0]["source_urls"] == ["https://a.example/report"]
+    undated_reference = next(
+        item
+        for item in references["entries"]
+        if item["source_urls"] == ["https://missing.example/article"]
+    )
+    assert undated_reference["display_date"] == "Date de publication non précisée"
     assert synthesis["type"] == "synthesis"
     assert annex["type"] == "technical_annex"
     assert annex["indicators"]["domains"]
@@ -366,6 +380,45 @@ def test_render_ioc_projection_deduplicates_normalized_values_across_groups() ->
     ]
 
 
+def test_ioc_projection_keeps_defanged_values_in_type_specific_lists() -> None:
+    values = (
+        (ArtifactType.IP, "198.51.100[.]10", "198.51.100.10"),
+        (ArtifactType.DOMAIN, "core[.]example", "core.example"),
+        (
+            ArtifactType.URL,
+            "hxxps://cdn[.]example[.]test/path",
+            "https://cdn.example.test/path",
+        ),
+        (ArtifactType.HASH, "a" * 64, "a" * 64),
+    )
+    document = replace(
+        _full_document(),
+        indicators=tuple(
+            PublicationIndicatorGroupV1(
+                artifact_type,
+                (
+                    PublicationIndicatorV1(
+                        value=value,
+                        normalized_value=normalized,
+                        artifact_type=artifact_type,
+                        source_document_ids=(_SOURCE_ID,),
+                    ),
+                ),
+            )
+            for artifact_type, value, normalized in values
+        ),
+    )
+
+    model = project_publication_to_typst_model(document)
+    annex = next(item for item in model.content_sections if item["type"] == "technical_annex")
+    indicators = annex["indicators"]
+
+    assert [item["text"] for item in indicators["ips"]] == ["198.51.100[.]10"]
+    assert [item["text"] for item in indicators["domains"]] == ["core[.]example"]
+    assert [item["text"] for item in indicators["urls"]] == ["hxxps://cdn[.]example[.]test/path"]
+    assert [item["text"] for item in indicators["hashes"]] == ["a" * 64]
+
+
 def test_full_mapping_preserves_text_timeline_indicators_and_optional_sources(
     tmp_path: Path,
 ) -> None:
@@ -380,25 +433,33 @@ def test_full_mapping_preserves_text_timeline_indicators_and_optional_sources(
 
     assert data["language"] == "fr"
     assert data["title"] == "Intrusion report"
-    references, synthesis, technical_annex = data["content_sections"]
+    sections = {item["type"]: item for item in data["content_sections"]}
+    references = sections["references"]
+    chronology = sections["chronology"]
+    synthesis = sections["synthesis"]
+    technical_annex = sections["technical_annex"]
     assert references["type"] == "references"
-    assert references["timeline"] == [
-        {
-            "display_date": "",
-            "text": "No display date",
-            "source_urls": ["https://example.test/one"],
-        },
-        {
-            "display_date": "3 février 2025",
-            "text": "One source event",
-            "source_urls": ["https://example.test/two"],
-        },
-        {
-            "display_date": "early 2025",
-            "text": "Several source event",
-            "source_urls": ["https://example.test/one", "https://example.test/two"],
-        },
+    assert {item["source_urls"][0] for item in references["entries"]} == {
+        "https://example.test/one",
+        "https://example.test/two",
+    }
+    assert [
+        (item["display_date"], item["text"], item["source_urls"]) for item in chronology["timeline"]
+    ] == [
+        ("", "No display date", ["https://example.test/one"]),
+        ("3 février 2025", "One source event", ["https://example.test/two"]),
+        (
+            "early 2025",
+            "Several source event",
+            ["https://example.test/one", "https://example.test/two"],
+        ),
     ]
+    reference_target_ids = {entry["target_id"] for entry in references["entries"]}
+    assert all(
+        reference["target_id"] in reference_target_ids
+        for item in chronology["timeline"]
+        for reference in item["source_refs"]
+    )
     assert technical_annex["type"] == "technical_annex"
     assert technical_annex["indicators"] == {
         key: [{"text": f"Display {label}", "break_chunks": []}]
@@ -431,12 +492,18 @@ def test_full_mapping_preserves_text_timeline_indicators_and_optional_sources(
             "url": "https://example.test/one",
         },
     ]
-    assert synthesis["blocks"][:2] == [
-        {"type": "paragraph", "text": _INJECTION_TEXT},
-        {"type": "paragraph", "text": "Second lead paragraph"},
+    assert [(item["type"], item["text"]) for item in synthesis["blocks"][:2]] == [
+        ("paragraph", _INJECTION_TEXT),
+        ("paragraph", "Second lead paragraph"),
     ]
+    assert all(
+        item["anchor_target"].startswith("publication-paragraph-")
+        for item in synthesis["blocks"][:2]
+    )
     assert synthesis["blocks"][2] == {"type": "section_heading", "text": _INJECTION_TEXT}
-    assert synthesis["blocks"][3] == {"type": "paragraph", "text": "Section body"}
+    assert synthesis["blocks"][3]["type"] == "paragraph"
+    assert synthesis["blocks"][3]["text"] == "Section body"
+    assert synthesis["blocks"][3]["anchor_target"].startswith("publication-paragraph-")
     assert "—été".encode() in renderer.render(document, bundle).render_data_bytes
 
 
@@ -459,13 +526,15 @@ def test_synthesis_section_heading_is_projected_before_its_paragraph(tmp_path: P
 
     data = json.loads(renderer.render(document, bundle).render_data_bytes)
 
-    synthesis = data["content_sections"][1]
-    assert synthesis["blocks"][2:] == [
-        {"type": "section_heading", "text": "Accès initial"},
-        {"type": "paragraph", "text": "Section body"},
-        {"type": "section_heading", "text": "Persistance"},
-        {"type": "paragraph", "text": "A task is created."},
+    synthesis = next(item for item in data["content_sections"] if item["type"] == "synthesis")
+    assert [(item["type"], item["text"]) for item in synthesis["blocks"][2:]] == [
+        ("section_heading", "Accès initial"),
+        ("paragraph", "Section body"),
+        ("section_heading", "Persistance"),
+        ("paragraph", "A task is created."),
     ]
+    assert synthesis["blocks"][3]["anchor_target"].startswith("publication-paragraph-")
+    assert synthesis["blocks"][5]["anchor_target"].startswith("publication-paragraph-")
 
 
 def test_brief_without_synthesis_sections_has_no_section_headings(tmp_path: Path) -> None:
@@ -473,7 +542,7 @@ def test_brief_without_synthesis_sections_has_no_section_headings(tmp_path: Path
     document = replace(_full_document(), sections=())
 
     data = json.loads(renderer.render(document, bundle).render_data_bytes)
-    synthesis = data["content_sections"][1]
+    synthesis = next(item for item in data["content_sections"] if item["type"] == "synthesis")
 
     assert synthesis["blocks"]
     assert all(block["type"] != "section_heading" for block in synthesis["blocks"])
@@ -520,13 +589,13 @@ def test_v5_projection_maps_semantic_spans_to_closed_typst_helpers(tmp_path: Pat
     document = PublicationDocumentV5(document=base, semantic_text=semantic_text)
 
     data = json.loads(renderer.render(document, bundle).render_data_bytes)
-    synthesis = data["content_sections"][1]
+    synthesis = next(item for item in data["content_sections"] if item["type"] == "synthesis")
     paragraph = synthesis["blocks"][0]
     table = next(block for block in synthesis["blocks"] if block["type"] == "table")
     styles = {span["style"] for span in paragraph["semantic_spans"]}
     semantic_cells = table["semantic_cells"]
 
-    assert data["schema_version"] == "typst-publication-model-v24-canonical-investigation-figures"
+    assert data["schema_version"] == "typst-publication-model-v26-anchored-editorial-spacing"
     assert table["column_weights"] == _table_column_weights(base.tables[0])
     assert all(0.8 <= weight <= 2.4 for weight in table["column_weights"])
     assert paragraph["text"] == lead_text
@@ -566,7 +635,10 @@ def test_v5_typst_projection_keeps_extracted_xml_parameter_as_literal_text(
 
     render_data_bytes = renderer.render(document, bundle).render_data_bytes
     render_data = json.loads(render_data_bytes)
-    paragraph = render_data["content_sections"][1]["blocks"][0]
+    synthesis = next(
+        item for item in render_data["content_sections"] if item["type"] == "synthesis"
+    )
+    paragraph = synthesis["blocks"][0]
 
     assert paragraph["text"] == paragraph_text
     assert "".join(span["text"] for span in paragraph["semantic_spans"]) == paragraph_text
@@ -657,7 +729,7 @@ def test_long_iocs_and_semantic_literals_get_render_only_break_opportunities(
     )
 
     data = json.loads(renderer.render(document, bundle).render_data_bytes)
-    synthesis = data["content_sections"][1]
+    synthesis = next(item for item in data["content_sections"] if item["type"] == "synthesis")
     lead = next(
         block
         for block in synthesis["blocks"]
@@ -717,7 +789,11 @@ def test_technical_table_cells_render_monospace_and_break_long_values(
     )
     data = json.loads(renderer.render(_full_document(tables=(table,)), bundle).render_data_bytes)
     rendered_table = next(
-        block for block in data["content_sections"][1]["blocks"] if block["type"] == "table"
+        block
+        for section in data["content_sections"]
+        if section["type"] == "synthesis"
+        for block in section["blocks"]
+        if block["type"] == "table"
     )
     styles = [
         {span["style"] for span in cell_spans} for cell_spans in rendered_table["semantic_cells"]
@@ -764,12 +840,16 @@ def test_lead_is_the_first_synthesis_paragraph_and_repeated_intro_is_suppressed(
     )
 
     data = json.loads(renderer.render(document, bundle).render_data_bytes)
-    references, synthesis, _annex = data["content_sections"]
+    sections = {item["type"]: item for item in data["content_sections"]}
+    references = sections["references"]
+    synthesis = sections["synthesis"]
     paragraphs = [block["text"] for block in synthesis["blocks"] if block["type"] == "paragraph"]
 
     assert [section["type"] for section in data["content_sections"]] == [
         "references",
+        "chronology",
         "synthesis",
+        "ioc",
         "technical_annex",
     ]
     assert paragraphs[0] == "Opening assessment."
@@ -816,8 +896,9 @@ def test_all_placements_preserve_collection_order_and_type_priority(tmp_path: Pa
     )
     document = _full_document(tables=tables, diagrams=diagrams, figures=figures)
     data = json.loads(renderer.render(document, bundle).render_data_bytes)
-    reference_blocks = data["content_sections"][0]["blocks"]
-    blocks = data["content_sections"][1]["blocks"]
+    sections = {item["type"]: item for item in data["content_sections"]}
+    reference_blocks = sections["references"]["blocks"]
+    blocks = sections["synthesis"]["blocks"]
 
     expected_by_placement = {
         name: [
@@ -920,7 +1001,11 @@ def test_figure_reader_source_hides_pipeline_locators_and_media_refs_deduplicate
     rendered = renderer.render(document, bundle)
     data = json.loads(rendered.render_data_bytes)
     figure_blocks = [
-        block for block in data["content_sections"][1]["blocks"] if block["type"] == "figure"
+        block
+        for section in data["content_sections"]
+        if section["type"] == "synthesis"
+        for block in section["blocks"]
+        if block["type"] == "figure"
     ]
 
     assert len(rendered.media_refs) == 1

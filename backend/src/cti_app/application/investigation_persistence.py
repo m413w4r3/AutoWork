@@ -22,6 +22,7 @@ from cti_app.domain.investigation import (
     SampleAssociation,
     ToolInvocation,
 )
+from cti_app.domain.investigation_experiment import InvestigationExperimentV1
 
 
 class VersionConflictError(RuntimeError):
@@ -64,6 +65,18 @@ class FindingRepository(Protocol):
     async def append_version(
         self, finding: InvestigationFinding, *, expected_previous_id: UUID | None
     ) -> InvestigationFinding: ...
+
+
+class InvestigationExperimentRepository(Protocol):
+    async def version(self, investigation_id: UUID) -> int: ...
+
+    async def list_for_investigation(
+        self, investigation_id: UUID
+    ) -> tuple[InvestigationExperimentV1, ...]: ...
+
+    async def append_if_version(
+        self, experiment: InvestigationExperimentV1, *, expected_version: int
+    ) -> InvestigationExperimentV1: ...
 
 
 class SampleAssociationRepository(Protocol):

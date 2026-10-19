@@ -365,6 +365,33 @@ def test_local_analysis_and_ghidra_are_disabled_with_bounded_settings(
         Settings(_env_file=None)
 
 
+def test_dotnet_address_space_limit_is_bounded_and_passed_to_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("DOTNET_ANALYSIS_ADDRESS_SPACE_LIMIT_BYTES", raising=False)
+    defaults = Settings(_env_file=None)
+    assert defaults.dotnet_analysis_address_space_limit_bytes == 8 * 1024**3
+
+    monkeypatch.setenv("DOTNET_ANALYSIS_ADDRESS_SPACE_LIMIT_BYTES", str(16 * 1024**3))
+    assert Settings(_env_file=None).dotnet_analysis_address_space_limit_bytes == 16 * 1024**3
+    for invalid in (4 * 1024**3, 64 * 1024**3):
+        monkeypatch.setenv("DOTNET_ANALYSIS_ADDRESS_SPACE_LIMIT_BYTES", str(invalid))
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None)
+
+    repo_root = Path(__file__).resolve().parents[2]
+    compose = yaml.safe_load((repo_root / "compose.yaml").read_text(encoding="utf-8"))
+    worker = compose["services"]["analysis-worker"]
+    assert worker["mem_limit"] == "2g"
+    assert worker["pids_limit"] == 128
+    assert worker["cpus"] == 2.0
+    assert worker["environment"]["DOTNET_ANALYSIS_ADDRESS_SPACE_LIMIT_BYTES"] == (
+        "${DOTNET_ANALYSIS_ADDRESS_SPACE_LIMIT_BYTES:-8589934592}"
+    )
+    example_names = set(_parse_fake_dotenv(repo_root / ".env.example"))
+    assert "DOTNET_ANALYSIS_ADDRESS_SPACE_LIMIT_BYTES" in example_names
+
+
 def test_investigation_runtime_settings_are_documented_with_safe_defaults() -> None:
     prefixes = (
         "local_analysis_",

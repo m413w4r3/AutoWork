@@ -201,6 +201,10 @@ EXPECTED_TRIGGERS: dict[tuple[str, str], str] = {
     ("edition_audit_events", "trg_edition_audit_events_append_only"): "reject_audit_mutation",
     ("job_events", "trg_job_events_append_only"): "reject_audit_mutation",
     ("human_decisions", "trg_human_decisions_append_only"): "reject_human_decision_mutation",
+    (
+        "investigation_experiments",
+        "trg_investigation_experiments_append_only",
+    ): "reject_investigation_experiment_mutation",
     ("analyst_decisions", "trg_analyst_decisions_append_only"): "reject_evidence_mutation",
     ("analyst_input_packs", "trg_analyst_input_packs_append_only"): "reject_evidence_mutation",
     ("collection_attempts", "trg_collection_attempts_append_only"): "reject_evidence_mutation",

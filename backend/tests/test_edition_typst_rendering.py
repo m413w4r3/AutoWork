@@ -159,7 +159,7 @@ def test_renders_one_article_with_edition_metadata_and_private_entrypoint(tmp_pa
 
     assert source.entrypoint_relative_path == "RENDERER/edition.typ"
     assert source.render_data_relative_path == "RENDERER/edition-render-data.json"
-    assert data["schema_version"] == "typst-edition-model-v21-protocol-figure-pins"
+    assert data["schema_version"] == "typst-edition-model-v23-publication-v26-editorial-spacing"
     assert data["edition"] == {
         "id": str(_EDITION_ID),
         "country": "Iran",
@@ -189,10 +189,13 @@ def test_edition_keeps_v6_title_dated_references_and_ioc_groups(tmp_path: Path) 
     _, data = _render_data(tmp_path, edition)
 
     embedded = data["publications"][0]
-    references, synthesis, annex = embedded["content_sections"]
+    sections = {item["type"]: item for item in embedded["content_sections"]}
+    references = sections["references"]
+    synthesis = sections["synthesis"]
+    annex = sections["technical_annex"]
     assert embedded["title"] == "[Example actor] Décrit une activité documentée"
-    assert references["timeline"][0]["display_date"] == "10 janvier 2026"
-    assert references["timeline"][0]["source_urls"] == ["https://a.example/report"]
+    assert references["entries"][0]["display_date"] == "10 janvier 2026"
+    assert references["entries"][0]["source_urls"] == ["https://a.example/report"]
     assert synthesis["type"] == "synthesis"
     assert [item["text"] for item in annex["original_indicators"]["domains"]] == [
         "context.example",
@@ -211,7 +214,8 @@ def test_edition_renders_v6_opinion_between_synthesis_and_annex(tmp_path: Path) 
 
     with_opinion = data["publications"][0]["content_sections"]
     section_types = [section["type"] for section in with_opinion]
-    assert section_types[:4] == ["references", "synthesis", "chronology", "analyst_opinion"]
+    assert section_types[:4] == ["references", "chronology", "synthesis", "analyst_opinion"]
+    assert "ioc" in section_types
     assert section_types.index("analyst_opinion") < section_types.index("technical_annex")
     opinion_section = next(item for item in with_opinion if item["type"] == "analyst_opinion")
     assert opinion_section["heading"] == "Avis de l'analyste"
@@ -300,11 +304,19 @@ def test_shared_projection_covers_publication_content_and_typst_syntax_as_data(
     source, data = _render_data(tmp_path, edition)
     publication = data["publications"][0]
     projected = project_publication_to_typst_model(document)
-    references, synthesis, technical_annex = publication["content_sections"]
+    sections = {item["type"]: item for item in publication["content_sections"]}
+    references = sections["references"]
+    chronology = sections["chronology"]
+    synthesis = sections["synthesis"]
+    technical_annex = sections["technical_annex"]
     body_types = [block["type"] for block in synthesis["blocks"]]
 
     assert publication["title"] == "Intrusion report"
-    assert references["timeline"][0]["text"] == "No display date"
+    assert {item["source_urls"][0] for item in references["entries"]} == {
+        "https://example.test/one",
+        "https://example.test/two",
+    }
+    assert chronology["timeline"][0]["text"] == "No display date"
     assert synthesis["blocks"][0]["text"] == _INJECTION_TEXT
     assert "section_heading" in body_types
     assert any(
@@ -318,12 +330,11 @@ def test_shared_projection_covers_publication_content_and_typst_syntax_as_data(
     assert "uncertainties" not in publication
     assert references["sources"][0]["url"] == "https://example.test/one"
     assert len(source.media_refs) == 2
-    assert (
-        json.loads(source.render_data_bytes)["publications"][0]["content_sections"][1]["blocks"][0][
-            "text"
-        ]
-        == _INJECTION_TEXT
+    rendered_sections = json.loads(source.render_data_bytes)["publications"][0]["content_sections"]
+    rendered_synthesis = next(
+        section for section in rendered_sections if section["type"] == "synthesis"
     )
+    assert rendered_synthesis["blocks"][0]["text"] == _INJECTION_TEXT
     assert source.source_bytes == b'#let edition = json("edition-render-data.json")\n'
     assert source.source_bytes != _INJECTION_TEXT.encode()
     assert publication["content_sections"] == projected.content_sections
@@ -591,7 +602,7 @@ def test_shared_publication_projection_is_pure_and_complete(tmp_path: Path) -> N
 def test_repository_edition_manifest_snapshots_expected_assets() -> None:
     bundle = load_template_bundle(_CHP_TYPST_ROOT, manifest_name=_EDITION_MANIFEST)
 
-    assert bundle.template_version == "chp-edition-v23-caption-spacing-graph-wrap"
+    assert bundle.template_version == "chp-edition-v25-c8-spacing-compat"
     assert {file.relative_path for file in bundle.files} == {
         "RENDERER/edition.typ",
         "RENDERER/edition_helpers.typ",

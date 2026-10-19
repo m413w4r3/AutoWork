@@ -8,6 +8,8 @@ import pytest
 
 from cti_app.application.investigation_contracts import AdvisorGuidanceV1, AdvisorLastAdviceV1
 from cti_app.application.operator_advisor_guidance import (
+    DEFAULT_ADVISOR_TURN_LIMIT,
+    DEFAULT_CHECKPOINT_TOOL_THRESHOLD,
     bound_advisor_guidance,
     build_advisor_guidance,
 )
@@ -60,6 +62,8 @@ async def test_guidance_requests_initial_plan_and_exposes_budget_and_safety_remi
     assert result["suggested_consultation_type"] == "plan_investigation"
     assert result["advisor_turns_remaining"] == 4
     assert "non fiable" in result["reminder"]
+    assert "analyse/planification" in result["reminder"]
+    assert len(result["reminder"]) <= 120
 
 
 @pytest.mark.asyncio
@@ -76,7 +80,7 @@ async def test_guidance_uses_deterministic_tool_threshold_and_sample_checkpoints
         available_tools=(),
         checkpoint_tool_threshold=2,
     )
-    assert threshold["reason"] == "sample_analyzed_without_plan"
+    assert threshold["reason"] == "first_significant_decompilation"
     assert threshold["suggested_consultation_type"] == "plan_investigation"
 
     after_plan = (
@@ -93,8 +97,110 @@ async def test_guidance_uses_deterministic_tool_threshold_and_sample_checkpoints
         evidence_summaries=None,
         available_tools=(),
     )
-    assert yara["reason"] == "sample_analyzed_without_yara_review"
+    assert yara["reason"] == "before_yara_proposal"
     assert yara["suggested_consultation_type"] == "yara_draft"
+
+
+@pytest.mark.asyncio
+async def test_event_checkpoint_fixture_fits_eight_consultations_and_keeps_twelve_tool_fallback():
+    base = datetime.now(UTC)
+    pivot_id = uuid4()
+    pivot_observation = SimpleNamespace(id=pivot_id, observed_at=base + timedelta(seconds=1))
+    advisor = invocation(
+        "advisor.consult",
+        created_at=base,
+        parameters={"consultation_type": "plan_investigation"},
+        consumed=1,
+    )
+    fixtures = (
+        ((), (), (), "no_advisor_consultation"),
+        (
+            (
+                advisor,
+                invocation("dotnet.decompile", created_at=base + timedelta(seconds=1)),
+            ),
+            (),
+            (),
+            "first_significant_decompilation",
+        ),
+        ((advisor,), (pivot_observation,), (pivot_id,), "new_pivot_discovered"),
+        (
+            (
+                advisor,
+                invocation("vt.file_report", status=ToolInvocationStatus.FAILED),
+                invocation("vt.file_report", status=ToolInvocationStatus.FAILED),
+            ),
+            (),
+            (),
+            "repeated_tool_block",
+        ),
+        (
+            (
+                invocation("sample.analyze", created_at=base),
+                invocation(
+                    "advisor.consult",
+                    created_at=base + timedelta(seconds=1),
+                    parameters={"consultation_type": "plan_investigation"},
+                ),
+            ),
+            (),
+            (),
+            "before_yara_proposal",
+        ),
+        (
+            (
+                invocation("sample.analyze", created_at=base),
+                invocation(
+                    "advisor.consult",
+                    created_at=base + timedelta(seconds=1),
+                    parameters={"consultation_type": "plan_investigation"},
+                ),
+                invocation("rule.propose"),
+                invocation("rule.test"),
+            ),
+            (),
+            (),
+            "yara_revision_review",
+        ),
+        (
+            (advisor, invocation("opinion.compose", created_at=base + timedelta(seconds=1))),
+            (),
+            (),
+            "opinion_review_due",
+        ),
+    )
+
+    measured = []
+    for calls, observations, pivot_ids, expected_reason in fixtures:
+        result = await build_advisor_guidance(
+            invocations=calls,
+            observations=observations,
+            evidence_summaries=None,
+            available_tools=(),
+            pivot_observation_ids=pivot_ids,
+        )
+        assert result["checkpoint_due"] is True
+        assert result["reason"] == expected_reason
+        measured.append(expected_reason)
+
+    assert len(measured) == 7
+    assert len(measured) <= DEFAULT_ADVISOR_TURN_LIMIT == 8
+    assert DEFAULT_CHECKPOINT_TOOL_THRESHOLD == 12
+
+    fallback_calls = (
+        advisor,
+        *(
+            invocation(f"local.read.{index}", created_at=base + timedelta(seconds=index + 1))
+            for index in range(12)
+        ),
+    )
+    fallback = await build_advisor_guidance(
+        invocations=fallback_calls,
+        observations=(),
+        evidence_summaries=None,
+        available_tools=(),
+    )
+    assert fallback["reason"] == "tool_threshold_reached"
 
 
 @pytest.mark.asyncio

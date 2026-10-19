@@ -3,6 +3,7 @@
 #import "publication_helpers.typ": render-publication-body, render-target
 
 #let has-text(value) = value != none and value != ""
+#let publication-reference-scope(publication) = "edition-article-" + str(publication.position) + "-"
 
 #let index-entries(publications) = publications.map(publication => (
   publication.number,
@@ -22,7 +23,10 @@
     [#text(weight: "bold", fill: purple)[#publication.number]],
   )
   #v(10pt)
-  #render-publication-body(publication)
+  #render-publication-body(
+    publication,
+    reference-scope: publication-reference-scope(publication),
+  )
 ]
 
 #let render-brief(publication) = [
@@ -39,7 +43,10 @@
   )
   #v(6pt)
   #set text(size: 10pt)
-  #render-publication-body(publication)
+  #render-publication-body(
+    publication,
+    reference-scope: publication-reference-scope(publication),
+  )
 ]
 
 #let render-edition(edition) = {

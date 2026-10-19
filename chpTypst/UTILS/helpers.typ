@@ -125,7 +125,7 @@
   #upper(content)
 ]
 
-#let section-title(content, is-sticky: true) = block(sticky: is-sticky)[
+#let section-title(content, is-sticky: true) = block(sticky: is-sticky, below: 6pt)[
   #v(4pt)
 
   #text(

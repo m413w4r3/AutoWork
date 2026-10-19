@@ -37,7 +37,20 @@ async def run_analysis_subprocess(
     env = {
         key: value
         for key, value in (environment or {}).items()
-        if key in {"PATH", "LANG", "LC_ALL", "PYTHONPATH"}
+        if key
+        in {
+            "PATH",
+            "LANG",
+            "LC_ALL",
+            "PYTHONPATH",
+            "DOTNET_ROOT",
+            "DOTNET_CLI_TELEMETRY_OPTOUT",
+            "DOTNET_NOLOGO",
+            "DOTNET_SKIP_FIRST_TIME_EXPERIENCE",
+            "DOTNET_GCHeapHardLimit",
+            "DOTNET_gcConcurrent",
+            "NUGET_PACKAGES",
+        }
     }
 
     def limit() -> None:

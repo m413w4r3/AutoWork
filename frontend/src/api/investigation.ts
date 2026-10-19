@@ -91,7 +91,14 @@ export interface InvestigationHypothesis {
 
 export interface InvestigationFinding {
   id: string;
+  logical_id: string;
+  current_version_id: string;
   version: number;
+  revision_chain: Array<{
+    id: string;
+    version: number;
+    created_at: string;
+  }>;
   kind: FindingKind;
   assessment: FindingAssessment;
   novelty: FindingNovelty | null;

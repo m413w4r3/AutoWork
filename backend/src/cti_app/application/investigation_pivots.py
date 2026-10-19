@@ -11,6 +11,7 @@ from cti_app.application.investigation_contracts import (
     ToolCoverageEntryV1,
     ToolSummaryV1,
 )
+from cti_app.application.investigation_pivot_frontier import PivotableIndicatorType
 from cti_app.application.investigation_tools import ToolEffect
 from cti_app.domain.investigation import (
     EvidenceObservation,
@@ -37,6 +38,7 @@ _COVERED_STATUSES = frozenset(
 def available_investigation_pivots(
     *,
     inventory: Sequence[ConfirmedIOCContextV1],
+    discovered_inventory: Sequence[tuple[PivotableIndicatorType, str]] = (),
     tools: Sequence[ToolSummaryV1],
     tool_coverage: Sequence[ToolCoverageEntryV1],
     invocations: Sequence[ToolInvocation],
@@ -67,7 +69,8 @@ def available_investigation_pivots(
     def add(
         *,
         tool_name: str,
-        indicator: ConfirmedIOCContextV1,
+        indicator_type: PivotableIndicatorType,
+        indicator_value: str,
         arguments: Mapping[str, Any],
     ) -> None:
         tool = read_tools.get(tool_name)
@@ -83,28 +86,32 @@ def available_investigation_pivots(
         pivot = AvailablePivotV1(
             tool_name=tool_name,
             schema_version=tool.schema_version,
-            indicator_type=indicator.indicator_type,
-            indicator_value=indicator.value,
+            indicator_type=indicator_type,
+            indicator_value=indicator_value,
             arguments=dict(arguments),
         )
         candidates[(tool_name, normalized.decode("utf-8"))] = pivot
 
-    for indicator in inventory:
-        kind = indicator.indicator_type
-        value = indicator.value
+    indicator_values = tuple((item.indicator_type, item.value) for item in inventory) + tuple(
+        discovered_inventory
+    )
+
+    for kind, value in indicator_values:
         linked_evidence = _linked_observations(
             kind, value, observations, observation_ids_by_indicator
         )
         if kind in {"md5", "sha1", "sha256"}:
             add(
                 tool_name="vt.file_report",
-                indicator=indicator,
+                indicator_type=kind,
+                indicator_value=value,
                 arguments={"file_hash": value},
             )
             for relation in ("contacted_ips", "contacted_domains"):
                 add(
                     tool_name="vt.relationships",
-                    indicator=indicator,
+                    indicator_type=kind,
+                    indicator_value=value,
                     arguments={
                         "object_type": "file",
                         "object_id": value,
@@ -114,18 +121,25 @@ def available_investigation_pivots(
         elif kind == "ipv4":
             add(
                 tool_name="vt.relationships",
-                indicator=indicator,
+                indicator_type=kind,
+                indicator_value=value,
                 arguments={
                     "object_type": "ip_address",
                     "object_id": value,
                     "relation": "resolutions",
                 },
             )
-            add(tool_name="shodan.host", indicator=indicator, arguments={"ip": value})
+            add(
+                tool_name="shodan.host",
+                indicator_type=kind,
+                indicator_value=value,
+                arguments={"ip": value},
+            )
         elif kind == "domain":
             add(
                 tool_name="vt.relationships",
-                indicator=indicator,
+                indicator_type=kind,
+                indicator_value=value,
                 arguments={
                     "object_type": "domain",
                     "object_id": value,
@@ -135,7 +149,8 @@ def available_investigation_pivots(
         elif kind == "url":
             add(
                 tool_name="vt.relationships",
-                indicator=indicator,
+                indicator_type=kind,
+                indicator_value=value,
                 arguments={
                     "object_type": "url",
                     "object_id": value,
@@ -151,13 +166,15 @@ def available_investigation_pivots(
             }
             add(
                 tool_name="vt.intelligence_search",
-                indicator=indicator,
+                indicator_type=kind,
+                indicator_value=value,
                 arguments=exact_search_arguments,
             )
             if kind in {"ipv4", "domain"}:
                 add(
                     tool_name="shodan.count",
-                    indicator=indicator,
+                    indicator_type=kind,
+                    indicator_value=value,
                     arguments=exact_search_arguments,
                 )
 
@@ -218,7 +235,17 @@ def _linked_observations(
         "url": "url",
     }
     object_type = object_types[indicator_type]
-    ids = set(observation_ids_by_indicator.get((object_type, value.casefold()), ()))
+    aliases = {
+        "file": ("file", "files"),
+        "ip": ("ip", "ip_address", "ip_addresses", "ipv4"),
+        "domain": ("domain", "domains"),
+        "url": ("url", "urls"),
+    }[object_type]
+    ids = {
+        observation_id
+        for alias in aliases
+        for observation_id in observation_ids_by_indicator.get((alias, value.casefold()), ())
+    }
     ordered = [
         str(item.id)
         for item in sorted(observations, key=lambda item: (item.observed_at, str(item.id)))

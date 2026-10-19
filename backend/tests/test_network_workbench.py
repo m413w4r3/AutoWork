@@ -341,6 +341,36 @@ def test_native_pcap_reader_reports_packet_metadata_and_pcapng() -> None:
     assert next_generation.packets[0].payload == b"abc"
 
 
+@pytest.mark.asyncio
+async def test_zero_packet_capture_is_success_without_claiming_no_network() -> None:
+    class _EmptyTshark:
+        async def inspect(self, *_args, **_kwargs) -> TsharkInspection:
+            return TsharkInspection(
+                status=LocalCommandStatus.EMPTY,
+                detail_code=None,
+                tshark_version="4.0.17",
+                capinfos_version="4.0.17",
+                packets=(),
+                capinfos_summary="0 packets",
+                output_truncated=False,
+                ja3_available=False,
+            )
+
+    workbench, _ = _workbench(_pcap(()), tshark=_EmptyTshark())  # type: ignore[arg-type]
+    reference = await _accepted_reference(workbench)
+
+    outcome = await workbench.inspect(reference, investigation_id=_NETWORK_INVESTIGATION_ID)
+
+    assert outcome.status is ToolInvocationStatus.SUCCEEDED
+    assert outcome.report is not None
+    assert outcome.report.packet_count == 0
+    assert outcome.report.conversations == ()
+    assert any(
+        "Aucun paquet capturé" in limitation and "absence de trafic réseau" in limitation
+        for limitation in outcome.report.limitations
+    )
+
+
 @pytest.mark.parametrize(
     ("link_type", "encapsulate", "expected_format"),
     (

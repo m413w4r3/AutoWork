@@ -8,10 +8,10 @@ import json
 import logging
 import math
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import datetime
-from typing import Annotated, Any, cast
+from typing import Annotated, Any, Literal, cast
 from uuid import UUID, uuid5
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request, status
@@ -40,6 +40,9 @@ from cti_app.application.investigation_contracts import (
     OperatorToolInvocationResponseV1,
     OperatorToolInvocationViewV1,
 )
+from cti_app.application.investigation_experiments import (
+    build_investigation_experiment_timeline,
+)
 from cti_app.application.investigation_governance import (
     EnvelopeDecisionConflictError,
     EnvelopeNotFoundError,
@@ -63,6 +66,10 @@ from cti_app.application.investigation_operator_view import (
     build_investigation_operator_view,
 )
 from cti_app.application.investigation_persistence import VersionConflictError
+from cti_app.application.investigation_pivot_frontier import (
+    build_pivot_frontier,
+    frontier_to_dict,
+)
 from cti_app.application.investigation_service import InvestigationService
 from cti_app.application.investigation_state import InvestigationStateVersionConflict
 from cti_app.application.investigation_tools import (
@@ -72,6 +79,10 @@ from cti_app.application.investigation_tools import (
 from cti_app.application.jobs import DuplicateJobError
 from cti_app.application.network_protocol_model import render_protocol_model
 from cti_app.application.operator_advisor_guidance import build_advisor_guidance
+from cti_app.application.operator_context_summary import (
+    InvestigationOperatorContextSummaryV1,
+    OperatorContextItemPageV1,
+)
 from cti_app.application.operator_tool_invocation import (
     OperatorToolInvocationError,
 )
@@ -99,6 +110,22 @@ from cti_app.domain.investigation import (
     SampleQualification,
     TLPLevel,
     ToolInvocationStatus,
+)
+from cti_app.domain.investigation_experiment import (
+    EXPERIMENT_TIMELINE_SCHEMA_VERSION,
+    ConsolidatedClaimStatus,
+    ExperimentAvailability,
+    ExperimentMethodMode,
+    ExperimentVerdict,
+    ObservationCoverage,
+    ObservationOutcome,
+)
+from cti_app.domain.investigation_pivot_frontier import (
+    PIVOT_FRONTIER_SCHEMA_VERSION,
+    PivotDisclosureState,
+    PivotExecutionState,
+    PivotG2State,
+    PivotQualificationLevel,
 )
 from cti_app.domain.investigation_state import (
     InvestigationWorkingState,
@@ -239,9 +266,18 @@ class HypothesisView(BaseModel):
     finding_refs: list[UUID]
 
 
-class FindingView(BaseModel):
+class FindingRevisionView(BaseModel):
     id: UUID
     version: int
+    created_at: datetime
+
+
+class FindingView(BaseModel):
+    id: UUID
+    logical_id: UUID
+    current_version_id: UUID
+    version: int
+    revision_chain: list[FindingRevisionView]
     kind: str
     assessment: FindingAssessment
     novelty: str | None
@@ -251,6 +287,97 @@ class FindingView(BaseModel):
     observation_refs: list[UUID]
     claim_refs: list[str]
     created_at: datetime
+
+
+class ExperimentInputRefView(BaseModel):
+    input_type: str
+    input_id: str
+    sha256: str | None
+
+
+class ExperimentInvocationRefView(BaseModel):
+    invocation_id: UUID
+    version: int
+
+
+class ExperimentObservationRefView(BaseModel):
+    observation_id: UUID
+    sha256: str
+
+
+class InvestigationExperimentViewV1(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    schema_version: str = Field(pattern=r"^investigation-experiment\.v1$")
+    id: UUID
+    investigation_id: UUID
+    version: int
+    hypothesis_id: str
+    claim_ids: list[str]
+    working_state_version: int
+    g2_envelope_version: int
+    prediction: str
+    falsification_criterion: str
+    method: str
+    method_mode: ExperimentMethodMode
+    input_type: str
+    input_refs: list[ExperimentInputRefView]
+    preconditions: list[str]
+    availability: ExperimentAvailability
+    tool_name: str
+    tool_version: str
+    tool_schema_version: str
+    tool_arguments: dict[str, Any]
+    step_ids: list[str]
+    tool_invocation_refs: list[ExperimentInvocationRefView]
+    observation_refs: list[ExperimentObservationRefView]
+    expected: str
+    actual: str
+    actual_outcome: ObservationOutcome
+    observation_coverage: ObservationCoverage
+    started_at: datetime
+    completed_at: datetime
+    recorded_at: datetime
+    scope: str
+    limitations: list[str]
+    verdict: ExperimentVerdict
+    implication: str
+    next_pivots: list[str]
+    author: str
+    origin: str
+
+
+class ClaimExperimentScopeViewV1(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    experiment_id: UUID
+    scope: str
+    verdict: ExperimentVerdict
+    observation_ids: list[UUID]
+
+
+class ConsolidatedClaimVerdictViewV1(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    claim_id: str
+    status: ConsolidatedClaimStatus
+    verdicts: list[ExperimentVerdict]
+    experiment_ids: list[UUID]
+    scopes: list[ClaimExperimentScopeViewV1]
+    contradictory: bool
+
+
+class InvestigationExperimentTimelineResponseV1(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    schema_version: str = Field(
+        default=EXPERIMENT_TIMELINE_SCHEMA_VERSION,
+        pattern=r"^investigation-experiment-timeline\.v1$",
+    )
+    investigation_id: UUID
+    stream_version: int
+    experiments: list[InvestigationExperimentViewV1]
+    claims: list[ConsolidatedClaimVerdictViewV1]
 
 
 class ObservationView(BaseModel):
@@ -264,6 +391,89 @@ class ObservationView(BaseModel):
     object_id: str
     limitations: list[str]
     invocation_ref: UUID | None
+
+
+class PivotPriorityFactorsView(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    novelty_vs_article: int
+    novelty_vs_verified: int
+    depth: int
+    cost: int
+    formula: str
+
+
+class PivotFrontierNodeView(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    canonical_id: str = Field(min_length=1, max_length=256)
+    indicator_type: str = Field(min_length=1, max_length=32)
+    value: str = Field(min_length=1, max_length=2_048)
+    parent_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    path: list[str]
+    source_observation_id: str | None
+    source: str = Field(min_length=1, max_length=256)
+    source_version: str = Field(min_length=1, max_length=128)
+    source_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    level: PivotQualificationLevel
+    reason: str = Field(min_length=1, max_length=512)
+    confidence: float = Field(ge=0, le=1)
+    limitations: list[str]
+    novelty_vs_article: bool
+    novelty_vs_verified: bool
+    estimated_cost: int = Field(ge=0)
+    g2_state: PivotG2State
+    disclosure_state: PivotDisclosureState
+    priority_score: int = Field(ge=0, le=100)
+    priority_factors: PivotPriorityFactorsView
+    state: PivotExecutionState
+    state_reason: str = Field(min_length=1, max_length=512)
+    cursor: str | None = Field(default=None, max_length=2_048)
+    pagination_complete: bool | None
+    children_observed: list[str]
+
+
+class PivotFrontierEdgeView(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    parent_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    child_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    relation: str = Field(min_length=1, max_length=128)
+    source_observation_id: str
+    source_version: str
+    source_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    reason: str = Field(min_length=1, max_length=512)
+    confidence: float = Field(ge=0, le=1)
+    limitations: list[str]
+
+
+class PivotFrontierPathView(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    root_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    target_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    node_ids: list[str]
+    edge_ids: list[str]
+
+
+class PivotFrontierResponseV1(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    schema_version: str = Field(
+        default=PIVOT_FRONTIER_SCHEMA_VERSION,
+        pattern=r"^investigation-pivot-frontier\.v1$",
+    )
+    investigation_id: UUID
+    source_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    frontier_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    nodes: list[PivotFrontierNodeView]
+    edges: list[PivotFrontierEdgeView]
+    paths: list[PivotFrontierPathView]
+    truncated: bool
+    next_cursor: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 class OperatorObservationPayloadResponse(BaseModel):
@@ -647,15 +857,83 @@ async def get_investigation(investigation_id: UUID, request: Request) -> Investi
 
 
 @router.get(
+    "/investigations/{investigation_id}/experiments",
+    response_model=InvestigationExperimentTimelineResponseV1,
+)
+async def get_investigation_experiments(
+    investigation_id: UUID, request: Request
+) -> InvestigationExperimentTimelineResponseV1:
+    async with _uow_factory(request)() as uow:
+        investigation = await uow.analyst_investigations.get(investigation_id)
+        if investigation is None:
+            raise _http_error(404, "investigation_not_found")
+        repository = getattr(uow, "investigation_experiments", None)
+        if repository is None:
+            raise _http_error(503, "investigation_experiments_unavailable")
+        timeline = await build_investigation_experiment_timeline(repository, investigation_id)
+    return InvestigationExperimentTimelineResponseV1.model_validate(
+        timeline.to_payload(), strict=False
+    )
+
+
+@router.get(
+    "/investigations/{investigation_id}/pivots",
+    response_model=PivotFrontierResponseV1,
+)
+async def get_investigation_pivot_frontier(
+    investigation_id: UUID,
+    request: Request,
+    limit: int = Query(default=200, ge=1, le=500),
+    cursor: str | None = Query(default=None, pattern=r"^[0-9a-f]{64}$"),
+) -> PivotFrontierResponseV1:
+    """Read the deterministic pivot graph derived from the article and stored evidence."""
+    async with _uow_factory(request)() as uow:
+        investigation = await uow.analyst_investigations.get(investigation_id)
+        if investigation is None:
+            raise _http_error(404, "investigation_not_found")
+        try:
+            snapshot = await _composition_factory(request).article_snapshots.resolve(
+                investigation.synthesis_artifact_id
+            )
+        except (KeyError, ValueError) as exc:
+            raise _http_error(409, "pivot_frontier_article_unavailable") from exc
+        observations = tuple(
+            await uow.evidence_observations.list_for_investigation(investigation_id)
+        )
+        invocations = tuple(await uow.tool_invocations.list_for_investigation(investigation_id))
+        envelope = await uow.investigation_envelopes.get(investigation_id)
+        payloads = await _pivot_observation_payloads(request, uow, observations)
+        try:
+            frontier = build_pivot_frontier(
+                investigation_id=str(investigation_id),
+                snapshot=snapshot,
+                observations=observations,
+                observation_payloads=payloads,
+                invocations=invocations,
+                envelope=envelope,
+                limit=limit,
+                cursor=cursor,
+            )
+        except ValueError as exc:
+            raise _http_error(422, "pivot_frontier_cursor_invalid") from exc
+    payload = frontier_to_dict(frontier)
+    payload["investigation_id"] = investigation_id
+    payload["nodes"] = payload.pop("records")
+    return PivotFrontierResponseV1.model_validate(payload)
+
+
+@router.get(
     "/investigations/{investigation_id}/operator/context",
-    response_model=InvestigationOperatorContextV1,
+    response_model=InvestigationOperatorContextV1 | InvestigationOperatorContextSummaryV1,
 )
 async def get_investigation_operator_context(
     investigation_id: UUID,
     request: Request,
+    view: Literal["full", "summary"] = Query(default="full"),
     expected_version: int | None = Query(default=None, ge=1),
     expected_sha256: str | None = Query(default=None, pattern=_SHA256),
-) -> InvestigationOperatorContextV1:
+    since_version: int | None = Query(default=None, ge=1),
+) -> InvestigationOperatorContextV1 | InvestigationOperatorContextSummaryV1:
     await _require_operator_client(request)
     async with _uow_factory(request)() as uow:
         investigation = await uow.analyst_investigations.get(investigation_id)
@@ -663,6 +941,12 @@ async def get_investigation_operator_context(
             raise _http_error(404, "investigation_not_found")
         composition = _composition_factory(request).build(uow, investigation_id, operator_mode=True)
         try:
+            if view == "summary":
+                return await composition.operator_tool_invocations.get_context_summary(
+                    expected_version=expected_version,
+                    expected_sha256=expected_sha256,
+                    since_version=since_version,
+                )
             return await composition.operator_tool_invocations.get_context(
                 expected_version=expected_version,
                 expected_sha256=expected_sha256,
@@ -706,7 +990,7 @@ async def get_investigation_operator_context(
 
 @router.get(
     "/investigations/{investigation_id}/operator/context/section/{section}",
-    response_model=OperatorContextSectionPageV1,
+    response_model=OperatorContextSectionPageV1 | OperatorContextItemPageV1,
 )
 async def get_investigation_operator_context_section(
     investigation_id: UUID,
@@ -716,7 +1000,7 @@ async def get_investigation_operator_context_section(
     limit: int = Query(default=20, ge=1, le=20),
     expected_version: int | None = Query(default=None, ge=1),
     expected_sha256: str | None = Query(default=None, pattern=_SHA256),
-) -> OperatorContextSectionPageV1:
+) -> OperatorContextSectionPageV1 | OperatorContextItemPageV1:
     await _require_operator_client(request)
     async with _uow_factory(request)() as uow:
         investigation = await uow.analyst_investigations.get(investigation_id)
@@ -2017,6 +2301,7 @@ async def _investigation_view(
     all_findings = await uow.investigation_findings.list_for_investigation(investigation_id)
     superseded_ids = {item.supersedes for item in all_findings if item.supersedes is not None}
     findings = tuple(item for item in all_findings if item.id not in superseded_ids)
+    findings_by_id = {item.id: item for item in all_findings}
     observations = await uow.evidence_observations.list_for_investigation(investigation_id)
     associations = await uow.sample_associations.list_for_investigation(investigation_id)
     opinion = await uow.analyst_opinions.get(uuid5(_OPINION_NAMESPACE, str(investigation_id)))
@@ -2068,7 +2353,10 @@ async def _investigation_view(
         findings=[
             FindingView(
                 id=item.id,
+                logical_id=_finding_logical_id(item, findings_by_id),
+                current_version_id=item.id,
                 version=item.version,
+                revision_chain=_finding_revision_chain(item, findings_by_id),
                 kind=item.kind.value,
                 assessment=item.assessment,
                 novelty=item.novelty.value if item.novelty else None,
@@ -2116,6 +2404,27 @@ async def _investigation_view(
         allowed_providers=list(envelope.allowed_providers) if envelope is not None else [],
         acquire_hits_allowed=envelope.acquire_hits_allowed if envelope is not None else False,
     )
+
+
+def _finding_revision_chain(
+    current: Any, findings_by_id: Mapping[UUID, Any]
+) -> list[FindingRevisionView]:
+    chain = []
+    seen: set[UUID] = set()
+    item = current
+    while item is not None and item.id not in seen:
+        seen.add(item.id)
+        chain.append(
+            FindingRevisionView(id=item.id, version=item.version, created_at=item.created_at)
+        )
+        item = findings_by_id.get(item.supersedes) if item.supersedes is not None else None
+    chain.reverse()
+    return chain
+
+
+def _finding_logical_id(current: Any, findings_by_id: Mapping[UUID, Any]) -> UUID:
+    chain = _finding_revision_chain(current, findings_by_id)
+    return chain[0].id if chain else current.id
 
 
 def _opinion_view(opinion: AnalystOpinionV1 | None) -> OpinionDraftView | None:
@@ -2452,6 +2761,43 @@ def _artifact_store(request: Request) -> ProductionArtifactStore:
             "investigation_artifacts_unavailable",
         )
     return cast(ProductionArtifactStore, configured)
+
+
+async def _pivot_observation_payloads(
+    request: Request, uow: Any, observations: Sequence[Any]
+) -> dict[str, Mapping[str, Any] | None]:
+    payloads: dict[str, Mapping[str, Any] | None] = {}
+    for observation in observations:
+        source = observation.source.casefold()
+        if (
+            observation.kind.value != "vt_relationship"
+            and observation.invocation_ref is None
+            and source != "sample_similarity"
+            and not source.startswith("network.capture.")
+        ):
+            continue
+        blob = await uow.blobs.get(observation.blob_id)
+        descriptor = getattr(blob, "descriptor", None)
+        if descriptor is None:
+            continue
+        mime_type = descriptor.mime_type.split(";", 1)[0].strip().casefold()
+        if mime_type != "application/json" or getattr(descriptor, "size", 0) > 128 * 1024:
+            continue
+        try:
+            raw = await _artifact_store(request).read_bytes(
+                observation.blob_id, max_bytes=128 * 1024
+            )
+        except (KeyError, ValueError):
+            continue
+        if hashlib.sha256(raw).hexdigest() != observation.sha256:
+            continue
+        try:
+            value = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if isinstance(value, Mapping):
+            payloads[str(observation.id)] = value
+    return payloads
 
 
 def _comparison_summary(raw: dict[str, Any], blob_id: UUID, sha256: str) -> dict[str, Any]:

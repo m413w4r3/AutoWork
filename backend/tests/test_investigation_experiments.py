@@ -1,0 +1,353 @@
+from __future__ import annotations
+
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from uuid import uuid4
+
+import pytest
+
+from cti_app.api.investigation import _finding_logical_id, _finding_revision_chain
+from cti_app.application.investigation_experiments import (
+    EXPERIMENT_RECORD_TOOL,
+    EXPERIMENT_TOOL_SCHEMA_VERSION,
+    InMemoryInvestigationExperimentRepository,
+    OperatorExperimentToolAdapter,
+    build_investigation_experiment_timeline,
+    register_operator_experiment_tools,
+)
+from cti_app.application.investigation_persistence import VersionConflictError
+from cti_app.application.investigation_tools import (
+    InMemoryToolRegistry,
+    RegistryToolDispatcher,
+    ToolExecutionContext,
+)
+from cti_app.domain.investigation import (
+    DisclosureBounds,
+    InvestigationBudget,
+    InvestigationEnvelope,
+    ToolInvocationStatus,
+)
+from cti_app.domain.investigation_experiment import (
+    ConsolidatedClaimStatus,
+    ExperimentAvailability,
+    ExperimentInputRefV1,
+    ExperimentObservationRefV1,
+    ExperimentVerdict,
+    InvestigationExperimentV1,
+    ObservationCoverage,
+    ObservationOutcome,
+)
+
+NOW = datetime(2026, 10, 19, 12, 0, tzinfo=UTC)
+CLAIM_ID = "claim:network-behaviour"
+
+
+def _experiment(
+    version: int,
+    verdict: ExperimentVerdict,
+    *,
+    investigation_id=None,
+    actual_outcome: ObservationOutcome = ObservationOutcome.OBSERVED,
+    coverage: ObservationCoverage = ObservationCoverage.COMPLETE,
+    limitations: tuple[str, ...] = (),
+) -> InvestigationExperimentV1:
+    return InvestigationExperimentV1(
+        id=uuid4(),
+        investigation_id=investigation_id or uuid4(),
+        version=version,
+        hypothesis_id="hypothesis-network",
+        claim_ids=(CLAIM_ID,),
+        working_state_version=2,
+        g2_envelope_version=1,
+        prediction="The sample emits the documented marker.",
+        falsification_criterion="A complete capture lacks the marker.",
+        method="Passively inspect the persisted capture with the pinned parser.",
+        input_type="sample_sha256",
+        input_refs=(ExperimentInputRefV1("sample_sha256", "a" * 64, "a" * 64),),
+        preconditions=("Capture is complete and bound to this investigation.",),
+        availability=ExperimentAvailability.AVAILABLE,
+        tool_name="network.capture.inspect",
+        tool_version="tshark-4.4.1",
+        tool_schema_version="network-capture-inspect.v1",
+        tool_arguments={"max_packets": 500},
+        step_ids=(f"step-{version}",),
+        tool_invocation_refs=(),
+        observation_refs=(ExperimentObservationRefV1(uuid4(), "b" * 64),),
+        expected="Marker should occur in the captured stream.",
+        actual="Marker observed."
+        if actual_outcome is ObservationOutcome.OBSERVED
+        else "No marker observed.",
+        actual_outcome=actual_outcome,
+        observation_coverage=coverage,
+        started_at=NOW + timedelta(minutes=version),
+        completed_at=NOW + timedelta(minutes=version, seconds=20),
+        recorded_at=NOW + timedelta(minutes=version, seconds=21),
+        scope="Static capture inspection; does not establish victim execution.",
+        limitations=limitations,
+        verdict=verdict,
+        implication="Retain this result as one evidence line.",
+        next_pivots=("c" * 64,),
+    )
+
+
+@pytest.mark.asyncio
+async def test_three_experiments_preserve_contradiction_and_scope() -> None:
+    investigation_id = uuid4()
+    positive = _experiment(1, ExperimentVerdict.SUPPORTS, investigation_id=investigation_id)
+    contradictory = _experiment(
+        2,
+        ExperimentVerdict.REFUTES,
+        investigation_id=investigation_id,
+        actual_outcome=ObservationOutcome.NOT_OBSERVED,
+    )
+    inconclusive = _experiment(
+        3,
+        ExperimentVerdict.INCONCLUSIVE,
+        investigation_id=investigation_id,
+        actual_outcome=ObservationOutcome.NOT_OBSERVED,
+        coverage=ObservationCoverage.LIMITED,
+        limitations=("Provider capture is partial; the relevant time window is absent.",),
+    )
+    experiments = (positive, contradictory, inconclusive)
+    repository = InMemoryInvestigationExperimentRepository()
+    for index, experiment in enumerate(experiments):
+        await repository.append_if_version(experiment, expected_version=index)
+
+    timeline = await build_investigation_experiment_timeline(repository, investigation_id)
+    (verdict,) = timeline.claims
+
+    assert timeline.stream_version == 3
+    assert timeline.experiments == experiments
+    assert verdict.claim_id == CLAIM_ID
+    assert verdict.status is ConsolidatedClaimStatus.QUALIFIED
+    assert verdict.contradictory is True
+    assert verdict.verdicts == (
+        ExperimentVerdict.SUPPORTS,
+        ExperimentVerdict.REFUTES,
+        ExperimentVerdict.INCONCLUSIVE,
+    )
+    assert len(verdict.experiment_ids) == len(verdict.scopes) == 3
+    assert verdict.scopes[-1].scope == inconclusive.scope
+
+
+def test_limited_not_observed_cannot_be_marked_refuted() -> None:
+    with pytest.raises(ValueError, match="cannot refute"):
+        _experiment(
+            1,
+            ExperimentVerdict.REFUTES,
+            actual_outcome=ObservationOutcome.NOT_OBSERVED,
+            coverage=ObservationCoverage.LIMITED,
+            limitations=("Only a partial capture was available.",),
+        )
+
+
+def test_tool_arguments_reject_secret_fields_and_round_trip_hashes() -> None:
+    experiment = _experiment(1, ExperimentVerdict.SUPPORTS)
+    assert InvestigationExperimentV1.from_payload(experiment.to_payload()) == experiment
+    assert len(experiment.canonical_sha256) == 64
+    assert experiment.to_payload()["method_mode"] == "passive"
+
+    with pytest.raises(ValueError, match="secret-bearing keys"):
+        replace(experiment, tool_arguments={"api_key": "never-store-this"})
+    with pytest.raises(TypeError, match="method_mode"):
+        replace(experiment, method_mode="active")
+
+
+@pytest.mark.asyncio
+async def test_experiment_repository_uses_append_only_cas_and_timeline_projection() -> None:
+    repository = InMemoryInvestigationExperimentRepository()
+    experiment = _experiment(1, ExperimentVerdict.SUPPORTS)
+
+    await repository.append_if_version(experiment, expected_version=0)
+    with pytest.raises(VersionConflictError):
+        await repository.append_if_version(
+            replace(
+                experiment,
+                id=uuid4(),
+                version=2,
+                verdict=ExperimentVerdict.REFUTES,
+                recorded_at=NOW + timedelta(minutes=5),
+            ),
+            expected_version=0,
+        )
+    timeline = await build_investigation_experiment_timeline(
+        repository, experiment.investigation_id
+    )
+
+    assert timeline.stream_version == 1
+    assert timeline.experiments == (experiment,)
+    assert timeline.claims[0].status is ConsolidatedClaimStatus.SUPPORTED
+
+
+def test_next_pivots_are_stable_c1_frontier_node_ids() -> None:
+    with pytest.raises(ValueError, match="stable C1 frontier node IDs"):
+        replace(_experiment(1, ExperimentVerdict.SUPPORTS), next_pivots=("not-a-pivot-id",))
+
+
+def test_finding_revisions_keep_logical_identity_and_frozen_revision_ids() -> None:
+    logical_id = uuid4()
+    current_id = uuid4()
+    first = SimpleNamespace(id=logical_id, version=1, created_at=NOW, supersedes=None)
+    current = SimpleNamespace(
+        id=current_id,
+        version=2,
+        created_at=NOW + timedelta(seconds=1),
+        supersedes=logical_id,
+    )
+    findings = {logical_id: first, current_id: current}
+
+    chain = _finding_revision_chain(current, findings)
+
+    assert _finding_logical_id(current, findings) == logical_id
+    assert [revision.id for revision in chain] == [logical_id, current_id]
+    assert [revision.version for revision in chain] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_record_tool_requires_g2_and_persisted_investigation_observations() -> None:
+    investigation_id = uuid4()
+    approval_id = uuid4()
+    budget = InvestigationBudget()
+    envelope = InvestigationEnvelope(
+        investigation_id=investigation_id,
+        allowed_providers=(),
+        budget=budget,
+        acquire_hits_allowed=False,
+        disclosure=DisclosureBounds(),
+        approval_decision_id=approval_id,
+        approval_actor_id="analyst:test",
+    )
+    observation_id = uuid4()
+    observation = SimpleNamespace(
+        id=observation_id,
+        investigation_id=investigation_id,
+        sha256="b" * 64,
+        invocation_ref=None,
+    )
+
+    class _Observations:
+        async def get(self, item_id):
+            return observation if item_id == observation_id else None
+
+    class _States:
+        async def get(self, item_id):
+            assert item_id == investigation_id
+            return SimpleNamespace(
+                version=2,
+                hypotheses=(SimpleNamespace(id="hypothesis-network"),),
+            )
+
+    class _Envelopes:
+        async def get(self, item_id):
+            assert item_id == investigation_id
+            return envelope
+
+    class _Claims:
+        async def get_claims(self, item_id, claim_ids):
+            assert item_id == investigation_id
+            return tuple(SimpleNamespace(id=claim_id) for claim_id in claim_ids)
+
+    class _Invocations:
+        async def get(self, _item_id):
+            return None
+
+    experiments = InMemoryInvestigationExperimentRepository()
+    adapter = OperatorExperimentToolAdapter(
+        experiments=experiments,
+        observations=_Observations(),
+        invocations=_Invocations(),
+        states=_States(),
+        envelopes=_Envelopes(),
+        article_snapshots=_Claims(),
+    )
+    context = ToolExecutionContext(
+        investigation_id=investigation_id,
+        envelope=envelope,
+        budget=budget,
+        idempotency_key="record-observation-1",
+    )
+    arguments = {
+        "expected_version": 0,
+        "hypothesis_id": "hypothesis-network",
+        "claim_ids": [CLAIM_ID],
+        "prediction": "The sample emits the marker.",
+        "falsification_criterion": "A complete capture contains no marker.",
+        "method": "Passively inspect the persisted capture with parser 4.4.1.",
+        "method_mode": "passive",
+        "input_type": "sample_sha256",
+        "input_refs": [{"input_type": "sample_sha256", "input_id": "a" * 64, "sha256": "a" * 64}],
+        "preconditions": ["The observation is bound to the current investigation."],
+        "availability": "available",
+        "tool_name": "network.capture.inspect",
+        "tool_version": "4.4.1",
+        "tool_schema_version": "network-capture-inspect.v1",
+        "tool_arguments": {"max_packets": 500},
+        "step_ids": ["step-1"],
+        "tool_invocation_refs": [],
+        "observation_refs": [{"observation_id": str(observation_id), "sha256": "b" * 64}],
+        "expected": "The marker is present.",
+        "actual": "The marker is present in the persisted observation.",
+        "actual_outcome": "observed",
+        "observation_coverage": "complete",
+        "started_at": NOW.isoformat(),
+        "completed_at": (NOW + timedelta(seconds=1)).isoformat(),
+        "scope": "Static capture inspection; execution remains unverified.",
+        "limitations": [],
+        "verdict": "supports",
+        "implication": "The cited capture supports this bounded claim.",
+        "next_pivots": ["c" * 64],
+    }
+
+    denied = await adapter.execute(arguments, replace(context, envelope=None))
+    assert denied.status is ToolInvocationStatus.POLICY_DENIED
+    assert denied.error_code == "g2_approval_required"
+
+    saved = await adapter.execute(arguments, context)
+    assert saved.status is ToolInvocationStatus.SUCCEEDED
+    assert (await experiments.list_for_investigation(investigation_id))[0].observation_refs[
+        0
+    ].sha256 == "b" * 64
+
+    invalid_reference = dict(arguments)
+    invalid_reference["expected_version"] = 1
+    invalid_reference["observation_refs"] = [
+        {"observation_id": str(observation_id), "sha256": "d" * 64}
+    ]
+    rejected = await adapter.execute(invalid_reference, replace(context, idempotency_key="bad-sha"))
+    assert rejected.status is ToolInvocationStatus.FAILED
+    assert rejected.error_code == "experiment_observation_invalid"
+
+
+@pytest.mark.asyncio
+async def test_record_tool_registry_requires_operator_write_capability() -> None:
+    investigation_id = uuid4()
+    registry = InMemoryToolRegistry()
+    register_operator_experiment_tools(
+        registry,
+        experiments=InMemoryInvestigationExperimentRepository(),
+        observations=SimpleNamespace(),
+        invocations=SimpleNamespace(),
+        states=SimpleNamespace(),
+        envelopes=SimpleNamespace(),
+        article_snapshots=SimpleNamespace(),
+    )
+    definition = registry.get(EXPERIMENT_RECORD_TOOL, EXPERIMENT_TOOL_SCHEMA_VERSION)
+    assert definition is not None
+    assert definition[0].capability_key == "operator.write"
+    dispatcher = RegistryToolDispatcher(registry)
+    result = await dispatcher.dispatch(
+        ToolExecutionContext(
+            investigation_id=investigation_id,
+            envelope=None,
+            budget=InvestigationBudget(),
+            idempotency_key="unauthorized-record",
+        ),
+        tool_name=EXPERIMENT_RECORD_TOOL,
+        schema_version=EXPERIMENT_TOOL_SCHEMA_VERSION,
+        arguments={},
+        purpose="Record a bounded experiment",
+        operation_key="unauthorized-record",
+    )
+    assert result.status is ToolInvocationStatus.UNAVAILABLE
+    assert "operator.write" in result.message

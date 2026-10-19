@@ -10,6 +10,7 @@ import pytest
 
 from cti_app.application.bridge_investigator import TurnSubmission, TurnSubmissionStatus
 from cti_app.application.investigation_advisor_tools import (
+    ADVISOR_RESPONSE_SCHEMA,
     MAX_ADVISOR_INPUT_BYTES,
     InvestigationAdvisorTool,
     _safe_text,
@@ -156,6 +157,35 @@ def make_context(investigation_id, key="operator:advisor:test", capabilities=())
     )
 
 
+def advisor_response(summary, basis_refs, *, recommendations=()):
+    return json.dumps(
+        {
+            "schema": ADVISOR_RESPONSE_SCHEMA,
+            "summary": summary,
+            "alternative_hypotheses": [
+                {"statement": "Une autre explication reste possible.", "basis_refs": basis_refs}
+            ],
+            "discriminating_experiment": {
+                "question": "Quel résultat distingue les hypothèses ?",
+                "tool": None,
+                "schema_version": None,
+                "expected_signal": "Un signal mesuré distinct.",
+                "basis_refs": basis_refs,
+            },
+            "discarded_lead": {
+                "lead": "La piste moins discriminante.",
+                "reason": "Elle ne sépare pas les hypothèses.",
+                "basis_refs": basis_refs,
+            },
+            "recommended_next_tools": list(recommendations),
+            "risks": [],
+            "questions": [],
+            "untrusted": True,
+        },
+        ensure_ascii=False,
+    )
+
+
 @pytest.mark.asyncio
 async def test_yara_draft_sends_only_verified_offsets_and_returns_untrusted_text() -> None:
     investigation_id = uuid4()
@@ -170,7 +200,10 @@ async def test_yara_draft_sends_only_verified_offsets_and_returns_untrusted_text
     }
     observation, raw = make_observation(investigation_id, measured)
     transport = Transport(
-        TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="rule candidate")
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=advisor_response("rule candidate", [str(observation.id)]),
+        )
     )
     tool, sample_blob_id = make_tool(
         investigation_id=investigation_id,
@@ -233,6 +266,23 @@ async def test_yara_draft_sends_only_verified_offsets_and_returns_untrusted_text
     assert "UNTRUSTED ADVISORY" in result.output["advisory_text"]
     assert result.output["untrusted"] is True
     assert result.budget_consumed[BudgetDimension.BRIDGE_TURNS] == 1
+    advisor_observation = next(
+        item
+        for item in tool._observations.observations.values()
+        if item.source == "advisor.consult"
+    )
+    persisted = json.loads(
+        await tool._artifact_store.read_bytes(advisor_observation.blob_id, max_bytes=16 * 1024)
+    )
+    assert persisted["schema"] == "operator-advisor-call.v1"
+    assert persisted["input_observation_refs"] == [str(observation.id)]
+    assert persisted["output"]["schema"] == ADVISOR_RESPONSE_SCHEMA
+    assert persisted["output"]["alternative_hypotheses"][0]["basis_refs"] == [str(observation.id)]
+    assert persisted["output"]["discriminating_experiment"]["basis_refs"] == [str(observation.id)]
+    assert persisted["output"]["discarded_lead"]["basis_refs"] == [str(observation.id)]
+    assert persisted["cost"]["bridge_turns"] == 1
+    assert persisted["cost"]["context_bytes"] > 0
+    assert persisted["cost"]["context_units"] > 0
 
 
 @pytest.mark.asyncio
@@ -254,7 +304,10 @@ async def test_plan_investigation_compacts_six_refs_to_actual_prompt_budget() ->
         observations.append(observation)
         raw_by_blob[observation.blob_id] = raw
     transport = Transport(
-        TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="Bounded next steps.")
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=advisor_response("Bounded next steps.", [str(observations[0].id)]),
+        )
     )
     tool, _sample_blob = make_tool(
         investigation_id=investigation_id,
@@ -346,21 +399,19 @@ async def test_minimal_plan_assembles_evidence_and_parses_structured_output() ->
     transport = Transport(
         TurnSubmission(
             TurnSubmissionStatus.SUCCEEDED,
-            output_text=json.dumps(
-                {
-                    "summary": "Comparer la constante mesurée au comportement observé.",
-                    "recommended_next_tools": [
-                        {
-                            "tool": "sample.analyze",
-                            "why": "Vérifier les moteurs statiques manquants.",
-                            "args_hint": {"sample_sha256": "c" * 64},
-                        }
-                    ],
-                    "risks": ["La chaîne seule ne prouve pas l'exécution."],
-                    "questions": ["Le même mutex apparaît-il dans un autre échantillon ?"],
-                    "untrusted": True,
-                },
-                ensure_ascii=False,
+            output_text=advisor_response(
+                "Comparer la constante mesurée au comportement observé.",
+                [str(observation.id)],
+                recommendations=(
+                    {
+                        "tool": "sample.analyze",
+                        "schema_version": "1",
+                        "why": "Vérifier les moteurs statiques manquants.",
+                        "args_hint": {"sample_sha256": "c" * 64},
+                        "expected_signal": "La même capacité apparaît dans une deuxième mesure.",
+                        "basis_refs": [str(observation.id)],
+                    },
+                ),
             ),
         )
     )
@@ -422,7 +473,122 @@ async def test_minimal_plan_assembles_evidence_and_parses_structured_output() ->
     assert "Quel pivot ensuite ?" in prompt
     assert result.output["summary"].startswith("Comparer")
     assert result.output["recommended_next_tools"][0]["tool"] == "sample.analyze"
+    assert result.output["recommended_next_tools"][0]["schema_version"] == "1"
+    assert result.output["recommended_next_tools"][0]["basis_observation_refs"] == (
+        str(observation.id),
+    )
     assert result.output["untrusted"] is True
+
+
+@pytest.mark.asyncio
+async def test_pivot_strategy_persists_only_observation_validated_recommendations() -> None:
+    investigation_id = uuid4()
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": "e" * 64,
+            "strings": [{"value": "BeaconPath", "offset": 256}],
+        },
+    )
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=advisor_response(
+                "La fonction mesurée fournit un pivot vérifiable.",
+                [str(observation.id)],
+                recommendations=(
+                    {
+                        "tool": "sample.analyze",
+                        "schema_version": "1",
+                        "why": "Comparer les fonctions à une autre mesure.",
+                        "args_hint": {"sample_sha256": "e" * 64},
+                        "expected_signal": (
+                            "La même fonction est mesurée dans le second échantillon."
+                        ),
+                        "basis_refs": [str(observation.id)],
+                    },
+                ),
+            ),
+        )
+    )
+    tool, _sample_blob = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+    tool._registry = Registry(
+        (
+            SimpleNamespace(
+                name="sample.analyze",
+                schema_version="1",
+                capability_key="local.sample_analysis",
+            ),
+        )
+    )
+
+    result = await tool.execute(
+        {
+            "consultation_type": "pivot_strategy",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, capabilities=("local.sample_analysis",)),
+    )
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    suggestion = result.output["recommended_next_tools"][0]
+    assert suggestion["tool"] == "sample.analyze"
+    assert suggestion["schema_version"] == "1"
+    assert suggestion["basis_observation_refs"] == (str(observation.id),)
+    advisor_observation = next(
+        item
+        for item in tool._observations.observations.values()
+        if item.source == "advisor.consult"
+    )
+    persisted = json.loads(
+        await tool._artifact_store.read_bytes(advisor_observation.blob_id, max_bytes=16 * 1024)
+    )
+    assert persisted["input_observation_refs"] == [str(observation.id)]
+    persisted_suggestion = persisted["output"]["recommended_next_tools"][0]
+    assert persisted_suggestion["tool"] == "sample.analyze"
+    assert persisted_suggestion["basis_observation_refs"] == [str(observation.id)]
+    assert persisted["output"]["alternative_hypotheses"][0]["basis_refs"] == [str(observation.id)]
+    assert persisted["output"]["discarded_lead"]["basis_refs"] == [str(observation.id)]
+
+
+@pytest.mark.asyncio
+async def test_pivot_strategy_rejects_a_basis_reference_absent_from_observations() -> None:
+    investigation_id = uuid4()
+    observation, raw = make_observation(
+        investigation_id,
+        {"schema": "sample-obfuscated-strings.v1", "sample_sha256": "f" * 64, "strings": []},
+    )
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=advisor_response("Unsupported pivot.", [str(uuid4())]),
+        )
+    )
+    tool, _sample_blob = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+
+    result = await tool.execute(
+        {
+            "consultation_type": "pivot_strategy",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id),
+    )
+
+    assert result.status is ToolInvocationStatus.FAILED
+    assert result.error_code == "advisor_output_invalid"
+    assert result.output["advisor_status"] == "output_invalid"
+    assert len(transport.calls) == 1
 
 
 @pytest.mark.asyncio
@@ -443,14 +609,9 @@ async def test_minimal_yara_draft_selects_measured_blob_offsets_server_side() ->
     transport = Transport(
         TurnSubmission(
             TurnSubmissionStatus.SUCCEEDED,
-            output_text=json.dumps(
-                {
-                    "summary": 'rule Sample { strings: $a = "CreateMutexW" condition: $a }',
-                    "recommended_next_tools": [],
-                    "risks": [],
-                    "questions": [],
-                    "untrusted": True,
-                }
+            output_text=advisor_response(
+                'rule Sample { strings: $a = "CreateMutexW" condition: $a }',
+                [str(observation.id)],
             ),
         )
     )
@@ -618,7 +779,7 @@ async def test_confirmed_rate_limit_does_not_consume_advisor_bridge_turn_budget(
     transport = Transport(
         TurnSubmission(
             TurnSubmissionStatus.SUCCEEDED,
-            output_text=json.dumps({"summary": "Continuer les mesures."}),
+            output_text=advisor_response("Continuer les mesures.", [f"article:{'a' * 64}"]),
         )
     )
     tool, _sample_blob_id = make_tool(

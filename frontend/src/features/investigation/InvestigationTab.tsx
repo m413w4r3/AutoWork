@@ -11,17 +11,7 @@ import {
   useSubjectInvestigations,
   type InvestigationView,
 } from "../../api/investigation";
-import { AnalystOpinionEditor } from "./AnalystOpinionEditor";
-import { InvestigationGovernancePanel } from "./InvestigationGovernancePanel";
-import { InvestigationReadPanels } from "./InvestigationReadPanels";
-import {
-  ClaimVerification,
-  DetectionReviewPanel,
-  InvestigationBudgetAndDecisions,
-  InvestigationFindings,
-  InvestigationObservations,
-  InvestigationSamples,
-} from "./InvestigationPanels";
+import { InvestigationLabViews } from "./InvestigationLabViews";
 
 const HASH_PATTERN = /^[0-9a-f]{64}$/;
 
@@ -274,16 +264,6 @@ function InvestigationDetail({
           pas déclarée en échec global.
         </p>
       ) : null}
-      {investigation.stop_reason === "permission_required" ? (
-        <p className="verification-warning" role="note">
-          Permission requise pour poursuivre. Consultez et décidez l’enveloppe
-          G2 ici :{" "}
-          <a href="#investigation-envelope-panel">
-            ouvrir les décisions d’enveloppe
-          </a>
-          .
-        </p>
-      ) : null}
       {actionError ? (
         <p className="error-message" role="alert">
           {actionError.message}
@@ -311,66 +291,11 @@ function InvestigationDetail({
           </button>
         ) : null}
       </div>
-      <InvestigationHypotheses investigation={investigation} />
-      <InvestigationFindings
-        findings={investigation.findings}
-        observations={investigation.observations}
+      <InvestigationLabViews
+        investigation={investigation}
+        editionId={editionId}
+        showG2Prompt={investigation.stop_reason === "permission_required"}
       />
-      <InvestigationGovernancePanel investigation={investigation} />
-      <InvestigationSamples
-        investigationId={investigation.id}
-        observations={investigation.observations}
-      />
-      <InvestigationReadPanels investigationId={investigation.id} />
-      <ClaimVerification
-        findings={investigation.findings}
-        observations={investigation.observations}
-      />
-      <InvestigationObservations observations={investigation.observations} />
-      <InvestigationBudgetAndDecisions investigation={investigation} />
-      <DetectionReviewPanel investigationId={investigation.id} />
-      <AnalystOpinionEditor
-        investigationId={investigation.id}
-        currentDraft={investigation.opinion_draft}
-        compositionHref={`/editions/${encodeURIComponent(editionId)}/composition`}
-      />
-    </section>
-  );
-}
-
-function InvestigationHypotheses({
-  investigation,
-}: {
-  investigation: InvestigationView;
-}) {
-  return (
-    <section
-      className="job-card"
-      aria-labelledby="investigation-hypotheses-heading"
-    >
-      <h2 id="investigation-hypotheses-heading">Analyses et pistes</h2>
-      {investigation.agenda.length === 0 &&
-      investigation.hypotheses.length === 0 ? (
-        <p>Aucune piste en attente.</p>
-      ) : null}
-      {investigation.agenda.length > 0 ? (
-        <ol>
-          {investigation.agenda.map((item) => (
-            <li key={`${item.rank}-${item.question}`}>
-              {item.question} · priorité {item.potential}
-            </li>
-          ))}
-        </ol>
-      ) : null}
-      {investigation.hypotheses.length > 0 ? (
-        <ul>
-          {investigation.hypotheses.map((hypothesis) => (
-            <li key={hypothesis.id}>
-              {hypothesis.statement} · {hypothesis.status}
-            </li>
-          ))}
-        </ul>
-      ) : null}
     </section>
   );
 }

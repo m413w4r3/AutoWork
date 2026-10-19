@@ -125,6 +125,17 @@ _GUARD_FUNCTIONS: tuple[tuple[str, str], ...] = (
         """,
     ),
     (
+        "reject_investigation_experiment_mutation",
+        """
+        CREATE FUNCTION reject_investigation_experiment_mutation() RETURNS trigger AS $$
+        BEGIN
+            RAISE EXCEPTION 'investigation_experiments is append-only'
+                USING ERRCODE = '55000';
+        END;
+        $$ LANGUAGE plpgsql
+        """,
+    ),
+    (
         "reject_discovery_intakes_mutation",
         """
         CREATE FUNCTION reject_discovery_intakes_mutation() RETURNS trigger AS $$
@@ -378,6 +389,12 @@ _TRIGGERS: tuple[tuple[str, str, str, str], ...] = (
         "selection_idempotency_records",
         "trg_selection_idempotency_records_append_only",
         "reject_selection_mutation",
+        "append_only",
+    ),
+    (
+        "investigation_experiments",
+        "trg_investigation_experiments_append_only",
+        "reject_investigation_experiment_mutation",
         "append_only",
     ),
     (

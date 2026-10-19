@@ -71,7 +71,6 @@ _COPYABLE_VALUES = (
     _COPYABLE_HASH,
     _COPYABLE_DEFANGED_LONG_URL,
     _COPYABLE_DEFANGED_EXACT_URL,
-    _COPYABLE_WINDOWS_PATH,
     _COPYABLE_REGISTRY_PATH,
     _COPYABLE_TABLE_URL,
     _COPYABLE_DEFANGED_URL,
@@ -370,6 +369,9 @@ async def test_real_typst_article_preserves_copyable_technical_literals(
     )
     reader = PdfReader(BytesIO(compiled.content), strict=True)
     extracted = _assert_exact_copyable_pdf_text(reader, _COPYABLE_VALUES)
+    # The fixture classifies this Windows path as a URL; C8 omits invalid URLs
+    # instead of publishing them as network indicators.
+    assert _COPYABLE_WINDOWS_PATH not in extracted.replace("\n", "")
     assert "IOC" in extracted
     assert "Narrow hash column" in extracted
     assert "Registre Windows" in extracted
@@ -951,6 +953,7 @@ async def test_real_typst_lot6_a4_composition_fixture(
     ):
         assert hidden_title not in text
     assert "Tableau des artefacts observés" in text
+    # V17 keeps the retained and unconfirmed original lists in its annex shape.
     assert text.count("IOC") == 2
     reserve_heading = "IOC originaux à lien non démontré"
     assert reserve_heading in text

@@ -22,6 +22,7 @@ from cti_app.application.confined_analysis import (
     create_confined_analysis_job_registry,
     deterministic_confined_analysis_key,
 )
+from cti_app.application.dotnet_analysis import ILSPYCMD_PACKAGE_SHA512, ILSPYCMD_VERSION
 from cti_app.application.jobs import DuplicateJobError, JobService
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.config import Settings
@@ -93,7 +94,9 @@ class DramatiqConfinedAnalysisExecutionPort(ConfinedAnalysisExecutionPort):
             request, worker_versions=self._attestation.versions
         )
         family = (
-            "suricata"
+            "dotnet"
+            if request.tool is ConfinedAnalysisTool.DOTNET_ILSPY
+            else "suricata"
             if request.tool
             in {
                 ConfinedAnalysisTool.SURICATA_VALIDATE_RULES,
@@ -391,6 +394,8 @@ def _attestation_from_response(raw: bytes, settings: Settings) -> ConfinedAnalys
                 "local_objdump",
                 "local_xxd",
                 "local_sha256sum",
+                "ilspycmd",
+                "ilspycmd_package_sha512",
             }
             or key.startswith("mwcp_parser:")
         },
@@ -478,6 +483,18 @@ def _family_statuses(
         )
     floss = status("floss", versions.get("floss"), "3.1.1")
     mwcp = status("mwcp", versions.get("mwcp"), "3.16.1")
+    dotnet = status("dotnet", versions.get("ilspycmd"), ILSPYCMD_VERSION)
+    if dotnet.available and versions.get("ilspycmd_package_sha512") != ILSPYCMD_PACKAGE_SHA512:
+        dotnet = ConfinedAnalysisFamilyStatus(
+            "dotnet", False, dotnet.version, "ilspycmd_package_hash_unattested"
+        )
+    if (
+        dotnet.available
+        and versions.get("local_monodis") != settings.analysis_local_monodis_expected_version
+    ):
+        dotnet = ConfinedAnalysisFamilyStatus(
+            "dotnet", False, dotnet.version, "monodis_package_version_unattested"
+        )
     mwcp_parser_families: dict[str, ConfinedAnalysisFamilyStatus] = {}
     for parser_id, configured_version in settings.mwcp_parser_versions.items():
         family_name = f"mwcp_parser:{parser_id}"
@@ -570,6 +587,7 @@ def _family_statuses(
             yara,
             local_command,
             sample,
+            dotnet,
         )
     }
 
@@ -587,6 +605,7 @@ def _unavailable_families(reason: str) -> dict[str, ConfinedAnalysisFamilyStatus
         "yara",
         "local_command",
         "sample_analysis",
+        "dotnet",
     )
     return {
         name: ConfinedAnalysisFamilyStatus(name, False, available_reason=reason) for name in names

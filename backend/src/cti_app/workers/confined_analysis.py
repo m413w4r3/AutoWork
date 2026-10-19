@@ -56,6 +56,7 @@ from cti_app.infrastructure.pcap_reader import PcapReaderError, read_capture
 from cti_app.infrastructure.smda import SmdaAdapter
 from cti_app.infrastructure.static_analysis import StaticFeatureExtractor, build_packing_signals
 from cti_app.infrastructure.yara_runner import IsolatedYaraRunner, YaraRunnerLimits
+from cti_app.workers.dotnet_analysis import probe_ilspycmd, run_dotnet_analysis
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _VERSION = re.compile(r"(?:TShark|Capinfos) \(Wireshark\) ([0-9]+\.[0-9]+\.[0-9]+)")
@@ -358,6 +359,16 @@ async def _execute_tool(
         )
     if tool is ConfinedAnalysisTool.LOCAL_COMMAND:
         return await _run_local_command(parameters, payload, settings)
+    if tool is ConfinedAnalysisTool.DOTNET_ILSPY:
+        if sample is None:
+            raise ConfinedAnalysisArtifactMismatch("analysis_tool_requires_sample_artifact")
+        return await run_dotnet_analysis(
+            parameters,
+            payload,
+            settings,
+            monodis_version=_monodis_package_version,
+            extract_monodis_method_body=_extract_monodis_method_body,
+        )
     if tool in {
         ConfinedAnalysisTool.SURICATA_VALIDATE_RULES,
         ConfinedAnalysisTool.SURICATA_REPLAY,
@@ -2083,6 +2094,7 @@ def _reduce_family_result(family: Mapping[str, Any]) -> dict[str, Any]:
 
 def build_analysis_worker_probe_payload(settings: Settings) -> dict[str, Any]:
     capa_rules = settings.analysis_capa_rules_path
+    ilspy_version, ilspy_package_sha512 = probe_ilspycmd(settings)
     versions = {
         "static": "autowork-static-v1"
         if _distribution_version("pefile") and _distribution_version("pyelftools")
@@ -2100,6 +2112,8 @@ def build_analysis_worker_probe_payload(settings: Settings) -> dict[str, Any]:
         "local_xxd": _local_binary_version("xxd", "-v"),
         "local_sha256sum": _local_binary_version("sha256sum", "--version"),
         "local_monodis": _monodis_package_version() if shutil.which("monodis") else None,
+        "ilspycmd": ilspy_version,
+        "ilspycmd_package_sha512": ilspy_package_sha512,
         "suricata": _probe_suricata_version(shutil.which("suricata") or "suricata"),
         "suricata_ruleset_revision": _read_marker(
             settings.analysis_suricata_rules_path / "AUTOWORK_RULESET_REVISION"
@@ -2139,6 +2153,7 @@ def build_analysis_worker_probe_payload(settings: Settings) -> dict[str, Any]:
             "floss",
             "mwcp",
             "yara",
+            "dotnet",
         ],
         "versions": versions,
     }

@@ -256,8 +256,17 @@ def test_typst_ioc_table_keeps_full_values_and_evidence_disposition() -> None:
         display_indicator_value(value, kind, defanged=True)
         for kind, value, _context, _status in values
     }
+    reference_target = model.content_sections[0]["entries"][0]["target_id"]
     assert all(
-        row["source_refs"] == [{"number": 1, "url": "https://example.com/report"}] for row in rows
+        row["source_refs"]
+        == [
+            {
+                "number": 1,
+                "url": "https://example.com/report",
+                "target_id": reference_target,
+            }
+        ]
+        for row in rows
     )
     assert all(row["roles"] for row in rows)
     references = "\n".join(item["text"] for item in model.content_sections[0]["timeline"])
@@ -406,7 +415,9 @@ async def test_real_typst_ioc_table_keeps_values_and_fits_a4_pages(tmp_path: Pat
         assert value in normalized_text
     assert "Thesourcerepeatsonelongcampaignevidencepassageforthesevalues." not in normalized_text
     assert normalized_text.count("Thesourcerepeatsone…") >= 58
-    assert "IOC—indicateurs,contexteetprovenance" in normalized_text
+    # C8 uses an IOC list in the body and labels the exhaustive table as an annex.
+    assert "IOC" in normalized_text
+    assert "ANNEXETECHNIQUE—inventaireexhaustifdesIOC" in normalized_text
     assert "Type" in extracted_text
     assert "Valeurdéfanguée" in normalized_text
     assert "Contexteetstatut" in normalized_text
