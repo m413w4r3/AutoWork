@@ -58,6 +58,9 @@ export interface InvestigationExperiment {
   scope: string;
   limitations: string[];
   verdict: ExperimentVerdict;
+  /** Additive fields; absent on legacy records and older timeline responses. */
+  supersedes_experiment_ids?: string[];
+  superseded_by?: string[];
   implication: string;
   next_pivots: string[];
   author: string;
@@ -69,6 +72,7 @@ export interface ClaimExperimentScope {
   scope: string;
   verdict: ExperimentVerdict;
   observation_ids: string[];
+  superseded_by?: string[];
 }
 
 export interface ConsolidatedClaimVerdict {
@@ -78,6 +82,7 @@ export interface ConsolidatedClaimVerdict {
   experiment_ids: string[];
   scopes: ClaimExperimentScope[];
   contradictory: boolean;
+  superseded_by?: string[];
 }
 
 export interface InvestigationExperimentTimeline {

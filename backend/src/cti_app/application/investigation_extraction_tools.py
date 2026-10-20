@@ -15,6 +15,7 @@ from cti_app.application.behavior_report_import import (
     BehaviorReportImporter,
     BehaviorReportImportError,
 )
+from cti_app.application.confined_analysis import confined_analysis_operation_cache_identity
 from cti_app.application.evidence_recorder import EvidenceRecorder, sanitize_evidence_text
 from cti_app.application.goodware import GoodwareMeasurementService
 from cti_app.application.investigation_persistence import SampleAssociationRepository
@@ -310,6 +311,12 @@ class _FlossToolAdapter(_ExtractionToolBase):
         self.goodware = goodware
         self.uow_factory = uow_factory
 
+    @property
+    def operation_cache_identity(self) -> Mapping[str, Any]:
+        return confined_analysis_operation_cache_identity(
+            getattr(self.port, "_confined_analysis", None)
+        )
+
     async def execute(
         self, arguments: Mapping[str, Any], context: ToolExecutionContext
     ) -> ToolResult:
@@ -528,6 +535,12 @@ class _ConfigurationToolAdapter(_ExtractionToolBase):
             reserved_seconds=reserved_seconds,
         )
         self.port = port
+
+    @property
+    def operation_cache_identity(self) -> Mapping[str, Any]:
+        return confined_analysis_operation_cache_identity(
+            getattr(self.port, "_confined_analysis", None)
+        )
 
     async def execute(
         self, arguments: Mapping[str, Any], context: ToolExecutionContext

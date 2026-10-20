@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -25,15 +26,18 @@ from cti_app.application.investigation_tools import (
     ToolResult,
 )
 from cti_app.application.research_context_builder import ArticleSnapshotPort
-from cti_app.domain.investigation import ToolInvocationStatus
+from cti_app.domain.investigation import InvestigationExecutionMode, ToolInvocationStatus
 from cti_app.domain.investigation_experiment import (
     EXPERIMENT_TIMELINE_SCHEMA_VERSION,
     EXPERIMENT_TOOL_SCHEMA_VERSION,
+    HYPOTHESIS_DECLARE_TOOL_SCHEMA_VERSION,
+    HYPOTHESIS_ID_PATTERN,
     ExperimentAvailability,
     ExperimentInputRefV1,
     ExperimentInvocationRefV1,
     ExperimentMethodMode,
     ExperimentObservationRefV1,
+    ExperimentReferenceErrorCode,
     ExperimentVerdict,
     InvestigationExperimentV1,
     ObservationCoverage,
@@ -49,6 +53,28 @@ _UUID_SCHEMA = {
 _SHA256_SCHEMA = {"type": "string", "pattern": r"^[0-9a-f]{64}$"}
 EXPERIMENT_RECORD_TOOL = "experiment.record"
 EXPERIMENT_LIST_TOOL = "experiment.list"
+HYPOTHESIS_DECLARE_TOOL = "hypothesis.declare"
+
+
+class _ExperimentReferenceError(ValueError):
+    def __init__(self, code: ExperimentReferenceErrorCode, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+async def _require_current_g2(envelopes: Any, context: ToolExecutionContext) -> Any:
+    envelope = context.envelope
+    if envelope is None:
+        raise PermissionError("g2_approval_required")
+    current_envelope = await envelopes.get(context.investigation_id)
+    if (
+        current_envelope is None
+        or current_envelope.version != envelope.version
+        or current_envelope.approval_decision_id != envelope.approval_decision_id
+    ):
+        raise PermissionError("g2_envelope_changed")
+    return envelope
 
 
 class InMemoryInvestigationExperimentRepository:
@@ -93,11 +119,30 @@ class InvestigationExperimentTimelineV1:
     claims: tuple[Any, ...]
 
     def to_payload(self) -> dict[str, Any]:
+        superseded_by: dict[UUID, list[UUID]] = {}
+        ordered_experiments = sorted(
+            self.experiments, key=lambda item: (item.version, str(item.id))
+        )
+        for experiment in ordered_experiments:
+            for superseded_id in experiment.supersedes_experiment_ids:
+                superseded_by.setdefault(superseded_id, []).append(experiment.id)
+
+        experiment_payloads = []
+        for item in self.experiments:
+            payload = item.to_payload()
+            payload.setdefault(
+                "supersedes_experiment_ids",
+                [str(experiment_id) for experiment_id in item.supersedes_experiment_ids],
+            )
+            payload["superseded_by"] = [
+                str(experiment_id) for experiment_id in superseded_by.get(item.id, ())
+            ]
+            experiment_payloads.append(payload)
         return {
             "schema_version": self.schema_version,
             "investigation_id": str(self.investigation_id),
             "stream_version": self.stream_version,
-            "experiments": [item.to_payload() for item in self.experiments],
+            "experiments": experiment_payloads,
             "claims": [item.to_payload() for item in self.claims],
         }
 
@@ -159,47 +204,46 @@ class OperatorExperimentToolAdapter:
                     "Experiment recording is not authorized for the current investigation state."
                 ),
             )
-        except (KeyError, TypeError, ValueError) as exc:
-            message = str(exc)
-            code = (
-                "experiment_observation_invalid"
-                if "observation" in message.casefold()
-                else "experiment_reference_invalid"
-                if "hypothesis" in message.casefold() or "claim" in message.casefold()
-                else "experiment_invalid"
-            )
+        except _ExperimentReferenceError as exc:
             return ToolResult(
                 ToolInvocationStatus.FAILED,
-                output={"error_code": code},
-                error_code=code,
-                message=code,
+                output={"error_code": exc.code.value},
+                error_code=exc.code.value,
+                message=exc.message,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            return ToolResult(
+                ToolInvocationStatus.FAILED,
+                output={"error_code": "experiment_invalid"},
+                error_code="experiment_invalid",
+                message=str(exc),
             )
 
     async def _execute(
         self, arguments: Mapping[str, Any], context: ToolExecutionContext
     ) -> ToolResult:
-        envelope = context.envelope
-        if envelope is None:
-            raise PermissionError("g2_approval_required")
-        current_envelope = await self._envelopes.get(context.investigation_id)
-        if (
-            current_envelope is None
-            or current_envelope.version != envelope.version
-            or current_envelope.approval_decision_id != envelope.approval_decision_id
-        ):
-            raise PermissionError("g2_envelope_changed")
+        envelope = await _require_current_g2(self._envelopes, context)
 
         state = await self._states.get(context.investigation_id)
         if state is None:
-            raise ValueError("hypothesis state is not persisted")
+            raise _ExperimentReferenceError(
+                ExperimentReferenceErrorCode.UNKNOWN_HYPOTHESIS,
+                "The hypothesis is not declared for this investigation.",
+            )
         hypothesis_id = str(arguments["hypothesis_id"])
         if all(item.id != hypothesis_id for item in state.hypotheses):
-            raise ValueError("hypothesis does not belong to this investigation")
+            raise _ExperimentReferenceError(
+                ExperimentReferenceErrorCode.UNKNOWN_HYPOTHESIS,
+                "The hypothesis is not declared for this investigation.",
+            )
         claim_ids = tuple(dict.fromkeys(str(item) for item in arguments["claim_ids"]))
         claims = await self._article_snapshots.get_claims(context.investigation_id, claim_ids)
         valid_claim_ids = {item.id for item in claims}
         if not claim_ids or any(item not in valid_claim_ids for item in claim_ids):
-            raise ValueError("claim references are not in this investigation article")
+            raise _ExperimentReferenceError(
+                ExperimentReferenceErrorCode.UNKNOWN_CLAIM,
+                "One or more claim IDs are not in this investigation article.",
+            )
 
         observations: dict[UUID, Any] = {}
         observation_refs = tuple(
@@ -211,9 +255,15 @@ class OperatorExperimentToolAdapter:
         for reference in observation_refs:
             observation = await self._observations.get(reference.observation_id)
             if observation is None or observation.investigation_id != context.investigation_id:
-                raise ValueError("observation does not belong to this investigation")
+                raise _ExperimentReferenceError(
+                    ExperimentReferenceErrorCode.OBSERVATION_MISMATCH,
+                    "The observation is missing or belongs to another investigation.",
+                )
             if observation.sha256 != reference.sha256:
-                raise ValueError("observation sha256 does not match persisted evidence")
+                raise _ExperimentReferenceError(
+                    ExperimentReferenceErrorCode.OBSERVATION_MISMATCH,
+                    "The observation SHA-256 does not match persisted evidence.",
+                )
             observations[reference.observation_id] = observation
 
         invocation_refs = tuple(
@@ -288,6 +338,19 @@ class OperatorExperimentToolAdapter:
             next_pivots=tuple(str(item) for item in arguments["next_pivots"]),
             author="operator-led",
             origin=EXPERIMENT_RECORD_TOOL,
+            supersedes_experiment_ids=tuple(
+                UUID(str(item)) for item in arguments.get("supersedes_experiment_ids", ())
+            ),
+        )
+        existing_experiments = await self._experiments.list_for_investigation(
+            context.investigation_id
+        )
+        _validate_supersedes_experiments(
+            existing_experiments,
+            experiment_id=experiment.id,
+            investigation_id=context.investigation_id,
+            version=experiment.version,
+            supersedes_experiment_ids=experiment.supersedes_experiment_ids,
         )
         saved = await self._experiments.append_if_version(
             experiment, expected_version=int(arguments["expected_version"])
@@ -328,6 +391,66 @@ class _ExperimentListToolAdapter:
         )
 
 
+class OperatorHypothesisDeclareToolAdapter:
+    """Confirm a hypothesis that the invocation service appended in its state CAS."""
+
+    def __init__(self, *, states: InvestigationStateRepository, envelopes: Any) -> None:
+        self._states = states
+        self._envelopes = envelopes
+
+    async def execute(
+        self, arguments: Mapping[str, Any], context: ToolExecutionContext
+    ) -> ToolResult:
+        try:
+            if "operator.write" not in context.available_capabilities:
+                return ToolResult(
+                    ToolInvocationStatus.POLICY_DENIED,
+                    error_code="operator_write_required",
+                    message="The operator.write capability is required to declare a hypothesis.",
+                )
+            await _require_current_g2(self._envelopes, context)
+            state = await self._states.get(context.investigation_id)
+            hypothesis_id = str(arguments["hypothesis_id"])
+            statement = str(arguments["statement"])
+            if re.fullmatch(HYPOTHESIS_ID_PATTERN, hypothesis_id) is None:
+                raise ValueError("The hypothesis ID format is invalid.")
+            if state is None or state.execution_mode is not InvestigationExecutionMode.OPERATOR_LED:
+                raise ValueError("An operator-led working state is required.")
+            hypothesis = next((item for item in state.hypotheses if item.id == hypothesis_id), None)
+            if hypothesis is None:
+                raise ValueError("The hypothesis declaration was not included in the state CAS.")
+            if hypothesis.statement != statement:
+                return ToolResult(
+                    ToolInvocationStatus.FAILED,
+                    output={"error_code": "hypothesis_identity_conflict"},
+                    error_code="hypothesis_identity_conflict",
+                    message="This hypothesis ID is already declared with different content.",
+                )
+            return ToolResult(
+                ToolInvocationStatus.SUCCEEDED,
+                output={"hypothesis_id": hypothesis.id, "statement": hypothesis.statement},
+            )
+        except PermissionError as exc:
+            code = (
+                str(exc)
+                if str(exc) in {"g2_approval_required", "g2_envelope_changed"}
+                else "hypothesis_declaration_forbidden"
+            )
+            return ToolResult(
+                ToolInvocationStatus.POLICY_DENIED,
+                output={"error_code": code},
+                error_code=code,
+                message="Hypothesis declaration requires the current approved G2 envelope.",
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            return ToolResult(
+                ToolInvocationStatus.FAILED,
+                output={"error_code": "hypothesis_declaration_invalid"},
+                error_code="hypothesis_declaration_invalid",
+                message=str(exc),
+            )
+
+
 def register_operator_experiment_tools(
     registry: ToolRegistry,
     *,
@@ -346,18 +469,56 @@ def register_operator_experiment_tools(
         envelopes=envelopes,
         article_snapshots=article_snapshots,
     )
+    registry.register(
+        ToolDefinition(
+            name=HYPOTHESIS_DECLARE_TOOL,
+            schema_version=HYPOTHESIS_DECLARE_TOOL_SCHEMA_VERSION,
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "hypothesis_id": {
+                        "type": "string",
+                        "pattern": HYPOTHESIS_ID_PATTERN,
+                        "minLength": 1,
+                        "maxLength": 128,
+                    },
+                    "statement": {"type": "string", "minLength": 1, "maxLength": 8_000},
+                },
+                "required": ["hypothesis_id", "statement"],
+                "additionalProperties": False,
+            },
+            effect=ToolEffect.LOCAL_COMPUTE,
+            cost_model={},
+            confidentiality=ToolConfidentiality.CONFIDENTIAL,
+            limitations=(
+                "Hypotheses are appended to the canonical working state by the operator CAS.",
+            ),
+            capability_key="operator.write",
+        ),
+        OperatorHypothesisDeclareToolAdapter(states=states, envelopes=envelopes),
+    )
     text = {"type": "string", "minLength": 1, "maxLength": 8_000}
     string_array = {"type": "array", "maxItems": 128, "items": text}
     register_schema = {
         "type": "object",
         "properties": {
             "expected_version": {"type": "integer", "minimum": 0},
-            "hypothesis_id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "hypothesis_id": {
+                "type": "string",
+                "pattern": HYPOTHESIS_ID_PATTERN,
+            },
             "claim_ids": {
                 "type": "array",
                 "minItems": 1,
                 "maxItems": 32,
                 "items": {"type": "string", "minLength": 1, "maxLength": 128},
+            },
+            "supersedes_experiment_ids": {
+                "type": "array",
+                "maxItems": 64,
+                "uniqueItems": True,
+                "items": _UUID_SCHEMA,
+                "description": "Earlier experiments in this investigation replaced by this record.",
             },
             "prediction": text,
             "falsification_criterion": text,
@@ -517,12 +678,64 @@ def _datetime(value: Any) -> datetime:
         raise ValueError("Experiment dates must use ISO 8601 strings") from exc
 
 
+def _validate_supersedes_experiments(
+    experiments: tuple[InvestigationExperimentV1, ...],
+    *,
+    experiment_id: UUID,
+    investigation_id: UUID,
+    version: int,
+    supersedes_experiment_ids: tuple[UUID, ...],
+) -> None:
+    if experiment_id in supersedes_experiment_ids:
+        raise _ExperimentReferenceError(
+            ExperimentReferenceErrorCode.SUPERSEDED_EXPERIMENT_MISMATCH,
+            "An experiment cannot supersede itself.",
+        )
+    by_id = {item.id: item for item in experiments}
+    for superseded_id in supersedes_experiment_ids:
+        superseded = by_id.get(superseded_id)
+        if (
+            superseded is None
+            or superseded.investigation_id != investigation_id
+            or superseded.version >= version
+        ):
+            raise _ExperimentReferenceError(
+                ExperimentReferenceErrorCode.SUPERSEDED_EXPERIMENT_MISMATCH,
+                "Superseded experiments must exist earlier in this investigation.",
+            )
+
+    supersedes_by_id = {item.id: item.supersedes_experiment_ids for item in experiments}
+    supersedes_by_id[experiment_id] = supersedes_experiment_ids
+
+    def reaches_experiment(current_id: UUID, target_id: UUID, visited: set[UUID]) -> bool:
+        if current_id == target_id:
+            return True
+        if current_id in visited:
+            return False
+        visited.add(current_id)
+        return any(
+            reaches_experiment(parent_id, target_id, visited)
+            for parent_id in supersedes_by_id.get(current_id, ())
+        )
+
+    if any(
+        reaches_experiment(superseded_id, experiment_id, set())
+        for superseded_id in supersedes_experiment_ids
+    ):
+        raise _ExperimentReferenceError(
+            ExperimentReferenceErrorCode.SUPERSEDED_EXPERIMENT_MISMATCH,
+            "Superseding experiment references cannot form a cycle.",
+        )
+
+
 __all__ = [
     "EXPERIMENT_LIST_TOOL",
     "EXPERIMENT_RECORD_TOOL",
+    "HYPOTHESIS_DECLARE_TOOL",
     "InMemoryInvestigationExperimentRepository",
     "InvestigationExperimentTimelineV1",
     "OperatorExperimentToolAdapter",
+    "OperatorHypothesisDeclareToolAdapter",
     "build_investigation_experiment_timeline",
     "register_operator_experiment_tools",
 ]

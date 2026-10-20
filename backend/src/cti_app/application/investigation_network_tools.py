@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from typing import Any
 from uuid import UUID
 
+from cti_app.application.confined_analysis import confined_analysis_operation_cache_identity
 from cti_app.application.evidence_recorder import EvidenceRecorder
 from cti_app.application.investigation_tools import (
     ToolAdapter,
@@ -257,6 +258,13 @@ class _NetworkToolAdapter:
 
 
 class _CaptureInspectAdapter(_NetworkToolAdapter):
+    @property
+    def operation_cache_identity(self) -> Mapping[str, Any] | None:
+        execution = getattr(self.workbench.tshark, "execution", None)
+        if execution is None:
+            return None
+        return confined_analysis_operation_cache_identity(execution)
+
     async def execute(
         self, arguments: Mapping[str, Any], context: ToolExecutionContext
     ) -> ToolResult:
@@ -460,6 +468,10 @@ class _SuricataToolAdapter(_NetworkToolAdapter):
         self.suricata = suricata
         self.replay = replay
         self.name = NETWORK_SURICATA_REPLAY if replay else NETWORK_SURICATA_VALIDATE_RULES
+
+    @property
+    def operation_cache_identity(self) -> Mapping[str, Any]:
+        return confined_analysis_operation_cache_identity(getattr(self.suricata, "execution", None))
 
     async def execute(
         self, arguments: Mapping[str, Any], context: ToolExecutionContext

@@ -198,6 +198,7 @@ OPERATOR_WRITE_TOOL_NAMES = frozenset(
         "opinion.revise",
         "opinion.note",
         "experiment.record",
+        "hypothesis.declare",
     }
 )
 OPTIONAL_CAPABILITIES = {
@@ -216,6 +217,7 @@ OPTIONAL_TOOL_NAMES = (
     "opinion.revise",
     "opinion.note",
     "experiment.record",
+    "hypothesis.declare",
     "experiment.list",
     "advisor.consult",
     "vt.file_report",

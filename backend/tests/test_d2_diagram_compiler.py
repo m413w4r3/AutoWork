@@ -320,6 +320,25 @@ def test_node_count_selects_vertical_layout_only_after_eight_nodes(
     assert source.startswith(f"direction: {expected_direction}\n")
 
 
+def test_stacks_documentary_protocol_sequence_without_inventing_edges() -> None:
+    source = encode_d2_source(
+        _diagram(
+            profile=DiagramProfile.PROTOCOL_SEQUENCE,
+            direction=EnrichmentDiagramDirection.TOP_TO_BOTTOM,
+            nodes=(
+                _node("first", "1. First documented event"),
+                _node("second", "2. Second documented event"),
+            ),
+            edges=(),
+        )
+    ).decode()
+
+    assert source.startswith("direction: down\nmessage_order: {\n  grid-rows: 2\n")
+    assert '  n001: "1. First documented event"' in source
+    assert '  n002: "2. Second documented event"' in source
+    assert " -> " not in source
+
+
 @pytest.mark.parametrize(
     ("label_length", "expected_direction"),
     ((44, "right"), (45, "down")),

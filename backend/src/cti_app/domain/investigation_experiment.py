@@ -16,6 +16,8 @@ from cti_app.domain.investigation import canonical_json_bytes, freeze_json, thaw
 EXPERIMENT_SCHEMA_VERSION = "investigation-experiment.v1"
 EXPERIMENT_TIMELINE_SCHEMA_VERSION = "investigation-experiment-timeline.v1"
 EXPERIMENT_TOOL_SCHEMA_VERSION = "operator-experiment.v1"
+HYPOTHESIS_DECLARE_TOOL_SCHEMA_VERSION = "operator-hypothesis-declare.v1"
+HYPOTHESIS_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SENSITIVE_ARGUMENT_KEY = re.compile(
     r"(?:secret|token|password|passwd|api[_-]?key|authorization|credential|cookie|private[_-]?key)",
@@ -58,6 +60,13 @@ class ConsolidatedClaimStatus(StrEnum):
     REFUTED = "refuted"
     QUALIFIED = "qualified"
     INCONCLUSIVE = "inconclusive"
+
+
+class ExperimentReferenceErrorCode(StrEnum):
+    UNKNOWN_HYPOTHESIS = "experiment_hypothesis_unknown"
+    UNKNOWN_CLAIM = "experiment_claim_unknown"
+    OBSERVATION_MISMATCH = "experiment_observation_ref_mismatch"
+    SUPERSEDED_EXPERIMENT_MISMATCH = "superseded_experiment_ref_mismatch"
 
 
 def _aware(value: datetime, name: str) -> None:
@@ -172,6 +181,7 @@ class InvestigationExperimentV1:
     origin: str = "operator_tool"
     schema_version: str = EXPERIMENT_SCHEMA_VERSION
     method_mode: ExperimentMethodMode = ExperimentMethodMode.PASSIVE
+    supersedes_experiment_ids: tuple[UUID, ...] = ()
 
     def __post_init__(self) -> None:
         if self.schema_version != EXPERIMENT_SCHEMA_VERSION:
@@ -216,6 +226,18 @@ class InvestigationExperimentV1:
         object.__setattr__(self, "author", _nonempty(self.author, "author", maximum=256))
         object.__setattr__(self, "origin", _nonempty(self.origin, "origin", maximum=256))
         object.__setattr__(self, "claim_ids", tuple(dict.fromkeys(self.claim_ids)))
+        supersedes_experiment_ids = tuple(self.supersedes_experiment_ids)
+        if len(supersedes_experiment_ids) > 64 or len(set(supersedes_experiment_ids)) != len(
+            supersedes_experiment_ids
+        ):
+            raise ValueError("Superseded experiment references exceed their limits")
+        if self.id in supersedes_experiment_ids:
+            raise ValueError("An experiment cannot supersede itself")
+        object.__setattr__(
+            self,
+            "supersedes_experiment_ids",
+            tuple(sorted(supersedes_experiment_ids, key=str)),
+        )
         object.__setattr__(self, "input_refs", tuple(self.input_refs))
         object.__setattr__(self, "preconditions", tuple(self.preconditions))
         object.__setattr__(self, "step_ids", tuple(dict.fromkeys(self.step_ids)))
@@ -273,7 +295,7 @@ class InvestigationExperimentV1:
             raise ValueError("Limited observation coverage must state its limitations")
 
     def to_payload(self) -> dict[str, Any]:
-        return {
+        payload = {
             "schema_version": self.schema_version,
             "id": str(self.id),
             "investigation_id": str(self.investigation_id),
@@ -312,6 +334,12 @@ class InvestigationExperimentV1:
             "author": self.author,
             "origin": self.origin,
         }
+        # Omit the additive field when empty so legacy payload identity hashes stay stable.
+        if self.supersedes_experiment_ids:
+            payload["supersedes_experiment_ids"] = [
+                str(item) for item in self.supersedes_experiment_ids
+            ]
+        return payload
 
     @property
     def canonical_sha256(self) -> str:
@@ -332,6 +360,9 @@ class InvestigationExperimentV1:
                 investigation_id=UUID(str(payload["investigation_id"])),
                 version=int(payload["version"]),
                 schema_version=str(payload["schema_version"]),
+                supersedes_experiment_ids=tuple(
+                    UUID(str(item)) for item in payload.get("supersedes_experiment_ids", ())
+                ),
                 hypothesis_id=str(payload["hypothesis_id"]),
                 claim_ids=tuple(str(item) for item in payload["claim_ids"]),
                 working_state_version=int(payload["working_state_version"]),
@@ -387,6 +418,7 @@ class ClaimExperimentScopeV1:
     scope: str
     verdict: ExperimentVerdict
     observation_ids: tuple[UUID, ...]
+    superseded_by: tuple[UUID, ...] = ()
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -394,6 +426,7 @@ class ClaimExperimentScopeV1:
             "scope": self.scope,
             "verdict": self.verdict.value,
             "observation_ids": [str(item) for item in self.observation_ids],
+            "superseded_by": [str(item) for item in self.superseded_by],
         }
 
 
@@ -405,6 +438,7 @@ class ConsolidatedClaimVerdictV1:
     experiment_ids: tuple[UUID, ...]
     scopes: tuple[ClaimExperimentScopeV1, ...]
     contradictory: bool
+    superseded_by: tuple[UUID, ...] = ()
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -414,6 +448,7 @@ class ConsolidatedClaimVerdictV1:
             "experiment_ids": [str(item) for item in self.experiment_ids],
             "scopes": [item.to_payload() for item in self.scopes],
             "contradictory": self.contradictory,
+            "superseded_by": [str(item) for item in self.superseded_by],
         }
 
 
@@ -421,24 +456,36 @@ def consolidate_claim_experiments(
     experiments: tuple[InvestigationExperimentV1, ...],
 ) -> tuple[ConsolidatedClaimVerdictV1, ...]:
     by_claim: dict[str, list[InvestigationExperimentV1]] = {}
-    for experiment in sorted(experiments, key=lambda item: (item.version, str(item.id))):
+    ordered_experiments = tuple(sorted(experiments, key=lambda item: (item.version, str(item.id))))
+    superseded_ids = {
+        superseded_id
+        for experiment in ordered_experiments
+        for superseded_id in experiment.supersedes_experiment_ids
+    }
+    superseded_by: dict[UUID, list[UUID]] = {}
+    for experiment in ordered_experiments:
+        for superseded_id in experiment.supersedes_experiment_ids:
+            superseded_by.setdefault(superseded_id, []).append(experiment.id)
+    for experiment in ordered_experiments:
         for claim_id in experiment.claim_ids:
             by_claim.setdefault(claim_id, []).append(experiment)
     result: list[ConsolidatedClaimVerdictV1] = []
     for claim_id, items in sorted(by_claim.items()):
-        verdicts = tuple(dict.fromkeys(item.verdict for item in items))
+        active_items = tuple(item for item in items if item.id not in superseded_ids)
+        verdicts = tuple(dict.fromkeys(item.verdict for item in active_items))
         decisive = set(verdicts) & {ExperimentVerdict.SUPPORTS, ExperimentVerdict.REFUTES}
         contradictory = len(decisive) == 2
-        if contradictory or ExperimentVerdict.QUALIFIES in verdicts:
+        latest_verdict = active_items[-1].verdict if active_items else None
+        if contradictory:
             status = ConsolidatedClaimStatus.QUALIFIED
-        elif verdicts == (ExperimentVerdict.SUPPORTS,):
+        elif latest_verdict is ExperimentVerdict.SUPPORTS:
             status = ConsolidatedClaimStatus.SUPPORTED
-        elif verdicts == (ExperimentVerdict.REFUTES,):
+        elif latest_verdict is ExperimentVerdict.REFUTES:
             status = ConsolidatedClaimStatus.REFUTED
-        elif set(verdicts) <= {ExperimentVerdict.INCONCLUSIVE, ExperimentVerdict.BLOCKED}:
-            status = ConsolidatedClaimStatus.INCONCLUSIVE
-        else:
+        elif latest_verdict is ExperimentVerdict.QUALIFIES:
             status = ConsolidatedClaimStatus.QUALIFIED
+        else:
+            status = ConsolidatedClaimStatus.INCONCLUSIVE
         result.append(
             ConsolidatedClaimVerdictV1(
                 claim_id=claim_id,
@@ -451,10 +498,18 @@ def consolidate_claim_experiments(
                         scope=item.scope,
                         verdict=item.verdict,
                         observation_ids=tuple(ref.observation_id for ref in item.observation_refs),
+                        superseded_by=tuple(superseded_by.get(item.id, ())),
                     )
                     for item in items
                 ),
                 contradictory=contradictory,
+                superseded_by=tuple(
+                    dict.fromkeys(
+                        superseding_id
+                        for item in items
+                        for superseding_id in superseded_by.get(item.id, ())
+                    )
+                ),
             )
         )
     return tuple(result)
@@ -464,6 +519,8 @@ __all__ = [
     "EXPERIMENT_SCHEMA_VERSION",
     "EXPERIMENT_TIMELINE_SCHEMA_VERSION",
     "EXPERIMENT_TOOL_SCHEMA_VERSION",
+    "HYPOTHESIS_DECLARE_TOOL_SCHEMA_VERSION",
+    "HYPOTHESIS_ID_PATTERN",
     "ClaimExperimentScopeV1",
     "ConsolidatedClaimStatus",
     "ConsolidatedClaimVerdictV1",

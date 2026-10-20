@@ -4,7 +4,7 @@ import base64
 import hashlib
 import json
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
@@ -998,6 +998,38 @@ async def test_page_ceiling_returns_partial_with_cursor_and_provider_route() -> 
     assert result.output["next_cursor"] == "cursor-2"
     assert result.output["provider_routes"] == ("proxy:v3",)
     assert result.budget_consumed[BudgetDimension.VT_UNITS] == 2
+
+
+@pytest.mark.asyncio
+async def test_relationship_page_archive_is_untyped_and_summary_remains_typed() -> None:
+    body = json.dumps(
+        {
+            "data": [{"id": _CANDIDATE_HASH, "type": "file"}],
+            "padding": "x" * (128 * 1024),
+        },
+        separators=(",", ":"),
+    ).encode()
+    page = replace(
+        _page(({"id": _CANDIDATE_HASH, "type": "file"},)),
+        raw_json_pages=(body,),
+    )
+    tools = _tool_set()
+    tools.vt.relationship_pages = [page]
+
+    result = await _dispatch(
+        tools,
+        "vt.relationships",
+        {"object_type": "file", "object_id": _SEED_HASH, "relation": "dropped_files"},
+    )
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    evidence = await tools.evidence.list_for_investigation(tools.context.investigation_id)
+    raw_evidence = [item for item in evidence if item.sha256 == hashlib.sha256(body).hexdigest()]
+    summaries = [item for item in evidence if item.kind is EvidenceKind.VT_RELATIONSHIP]
+    assert len(raw_evidence) == 1
+    assert raw_evidence[0].kind is EvidenceKind.OTHER
+    assert len(summaries) == 1
+    assert summaries[0].sha256 != raw_evidence[0].sha256
 
 
 @pytest.mark.asyncio

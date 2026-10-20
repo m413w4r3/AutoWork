@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -11,8 +11,10 @@ from cti_app.api.investigation import _finding_logical_id, _finding_revision_cha
 from cti_app.application.investigation_experiments import (
     EXPERIMENT_RECORD_TOOL,
     EXPERIMENT_TOOL_SCHEMA_VERSION,
+    HYPOTHESIS_DECLARE_TOOL,
     InMemoryInvestigationExperimentRepository,
     OperatorExperimentToolAdapter,
+    _validate_supersedes_experiments,
     build_investigation_experiment_timeline,
     register_operator_experiment_tools,
 )
@@ -29,6 +31,7 @@ from cti_app.domain.investigation import (
     ToolInvocationStatus,
 )
 from cti_app.domain.investigation_experiment import (
+    HYPOTHESIS_DECLARE_TOOL_SCHEMA_VERSION,
     ConsolidatedClaimStatus,
     ExperimentAvailability,
     ExperimentInputRefV1,
@@ -51,6 +54,7 @@ def _experiment(
     actual_outcome: ObservationOutcome = ObservationOutcome.OBSERVED,
     coverage: ObservationCoverage = ObservationCoverage.COMPLETE,
     limitations: tuple[str, ...] = (),
+    supersedes_experiment_ids: tuple[UUID, ...] = (),
 ) -> InvestigationExperimentV1:
     return InvestigationExperimentV1(
         id=uuid4(),
@@ -88,6 +92,7 @@ def _experiment(
         verdict=verdict,
         implication="Retain this result as one evidence line.",
         next_pivots=("c" * 64,),
+        supersedes_experiment_ids=supersedes_experiment_ids,
     )
 
 
@@ -144,14 +149,117 @@ def test_limited_not_observed_cannot_be_marked_refuted() -> None:
 
 def test_tool_arguments_reject_secret_fields_and_round_trip_hashes() -> None:
     experiment = _experiment(1, ExperimentVerdict.SUPPORTS)
+    legacy_payload = experiment.to_payload()
+    assert "supersedes_experiment_ids" not in legacy_payload
     assert InvestigationExperimentV1.from_payload(experiment.to_payload()) == experiment
     assert len(experiment.canonical_sha256) == 64
     assert experiment.to_payload()["method_mode"] == "passive"
+    assert (
+        InvestigationExperimentV1.from_payload(legacy_payload).identity_sha256
+        == experiment.identity_sha256
+    )
 
     with pytest.raises(ValueError, match="secret-bearing keys"):
         replace(experiment, tool_arguments={"api_key": "never-store-this"})
     with pytest.raises(TypeError, match="method_mode"):
         replace(experiment, method_mode="active")
+
+
+@pytest.mark.asyncio
+async def test_superseded_inconclusive_experiment_stays_in_history_but_not_verdict() -> None:
+    investigation_id = uuid4()
+    inconclusive = _experiment(
+        1,
+        ExperimentVerdict.INCONCLUSIVE,
+        investigation_id=investigation_id,
+        actual_outcome=ObservationOutcome.NOT_OBSERVED,
+        coverage=ObservationCoverage.LIMITED,
+        limitations=("The relevant time window was absent.",),
+    )
+    supports = _experiment(
+        2,
+        ExperimentVerdict.SUPPORTS,
+        investigation_id=investigation_id,
+        supersedes_experiment_ids=(inconclusive.id,),
+    )
+    repository = InMemoryInvestigationExperimentRepository()
+    await repository.append_if_version(inconclusive, expected_version=0)
+    await repository.append_if_version(supports, expected_version=1)
+
+    timeline = await build_investigation_experiment_timeline(repository, investigation_id)
+
+    (summary,) = timeline.claims
+    assert summary.status is ConsolidatedClaimStatus.SUPPORTED
+    assert summary.verdicts == (ExperimentVerdict.SUPPORTS,)
+    assert summary.experiment_ids == (inconclusive.id, supports.id)
+    assert tuple(scope.experiment_id for scope in summary.scopes) == (
+        inconclusive.id,
+        supports.id,
+    )
+    assert supports.to_payload()["supersedes_experiment_ids"] == [str(inconclusive.id)]
+    assert InvestigationExperimentV1.from_payload(supports.to_payload()) == supports
+
+
+@pytest.mark.asyncio
+async def test_active_support_and_refutation_remain_contradictory() -> None:
+    investigation_id = uuid4()
+    supports = _experiment(1, ExperimentVerdict.SUPPORTS, investigation_id=investigation_id)
+    refutes = _experiment(
+        2,
+        ExperimentVerdict.REFUTES,
+        investigation_id=investigation_id,
+        actual_outcome=ObservationOutcome.NOT_OBSERVED,
+    )
+    repository = InMemoryInvestigationExperimentRepository()
+    await repository.append_if_version(supports, expected_version=0)
+    await repository.append_if_version(refutes, expected_version=1)
+
+    timeline = await build_investigation_experiment_timeline(repository, investigation_id)
+    (summary,) = timeline.claims
+
+    assert summary.status is ConsolidatedClaimStatus.QUALIFIED
+    assert summary.contradictory is True
+    assert summary.verdicts == (ExperimentVerdict.SUPPORTS, ExperimentVerdict.REFUTES)
+
+
+def test_supersedes_references_must_be_prior_local_and_acyclic() -> None:
+    investigation_id = uuid4()
+    earlier = _experiment(1, ExperimentVerdict.SUPPORTS, investigation_id=investigation_id)
+    current_id = uuid4()
+    _validate_supersedes_experiments(
+        (earlier,),
+        experiment_id=current_id,
+        investigation_id=investigation_id,
+        version=2,
+        supersedes_experiment_ids=(earlier.id,),
+    )
+    foreign = _experiment(1, ExperimentVerdict.SUPPORTS)
+    future = _experiment(2, ExperimentVerdict.SUPPORTS, investigation_id=investigation_id)
+    for candidates, candidate_id in (
+        ((earlier,), uuid4()),
+        ((earlier, foreign), foreign.id),
+        ((earlier, future), future.id),
+    ):
+        with pytest.raises(ValueError, match="must exist earlier"):
+            _validate_supersedes_experiments(
+                candidates,
+                experiment_id=current_id,
+                investigation_id=investigation_id,
+                version=2,
+                supersedes_experiment_ids=(candidate_id,),
+            )
+
+    cyclic_earlier = replace(earlier, supersedes_experiment_ids=(current_id,))
+    with pytest.raises(ValueError, match="cannot form a cycle"):
+        _validate_supersedes_experiments(
+            (cyclic_earlier,),
+            experiment_id=current_id,
+            investigation_id=investigation_id,
+            version=2,
+            supersedes_experiment_ids=(earlier.id,),
+        )
+    with pytest.raises(ValueError, match="cannot supersede itself"):
+        replace(earlier, supersedes_experiment_ids=(earlier.id,))
 
 
 @pytest.mark.asyncio
@@ -227,8 +335,12 @@ async def test_record_tool_requires_g2_and_persisted_investigation_observations(
     )
 
     class _Observations:
+        item = observation
+
         async def get(self, item_id):
-            return observation if item_id == observation_id else None
+            return self.item if item_id == observation_id else None
+
+    observations = _Observations()
 
     class _States:
         async def get(self, item_id):
@@ -246,7 +358,9 @@ async def test_record_tool_requires_g2_and_persisted_investigation_observations(
     class _Claims:
         async def get_claims(self, item_id, claim_ids):
             assert item_id == investigation_id
-            return tuple(SimpleNamespace(id=claim_id) for claim_id in claim_ids)
+            return tuple(
+                SimpleNamespace(id=claim_id) for claim_id in claim_ids if claim_id == CLAIM_ID
+            )
 
     class _Invocations:
         async def get(self, _item_id):
@@ -255,7 +369,7 @@ async def test_record_tool_requires_g2_and_persisted_investigation_observations(
     experiments = InMemoryInvestigationExperimentRepository()
     adapter = OperatorExperimentToolAdapter(
         experiments=experiments,
-        observations=_Observations(),
+        observations=observations,
         invocations=_Invocations(),
         states=_States(),
         envelopes=_Envelopes(),
@@ -316,7 +430,31 @@ async def test_record_tool_requires_g2_and_persisted_investigation_observations(
     ]
     rejected = await adapter.execute(invalid_reference, replace(context, idempotency_key="bad-sha"))
     assert rejected.status is ToolInvocationStatus.FAILED
-    assert rejected.error_code == "experiment_observation_invalid"
+    assert rejected.error_code == "experiment_observation_ref_mismatch"
+    assert "SHA-256" in rejected.message
+
+    unknown_hypothesis = dict(arguments)
+    unknown_hypothesis["hypothesis_id"] = "hypothesis-missing"
+    rejected_hypothesis = await adapter.execute(
+        unknown_hypothesis, replace(context, idempotency_key="unknown-hypothesis")
+    )
+    assert rejected_hypothesis.error_code == "experiment_hypothesis_unknown"
+    assert "hypothesis" in rejected_hypothesis.message.casefold()
+
+    unknown_claim = dict(arguments)
+    unknown_claim["claim_ids"] = ["claim:not-in-article"]
+    rejected_claim = await adapter.execute(
+        unknown_claim, replace(context, idempotency_key="unknown-claim")
+    )
+    assert rejected_claim.error_code == "experiment_claim_unknown"
+    assert "claim" in rejected_claim.message.casefold()
+
+    observations.item = SimpleNamespace(**{**vars(observation), "investigation_id": uuid4()})
+    rejected_observation = await adapter.execute(
+        arguments, replace(context, idempotency_key="foreign-observation")
+    )
+    assert rejected_observation.error_code == "experiment_observation_ref_mismatch"
+    assert "another investigation" in rejected_observation.message
 
 
 @pytest.mark.asyncio
@@ -335,6 +473,13 @@ async def test_record_tool_registry_requires_operator_write_capability() -> None
     definition = registry.get(EXPERIMENT_RECORD_TOOL, EXPERIMENT_TOOL_SCHEMA_VERSION)
     assert definition is not None
     assert definition[0].capability_key == "operator.write"
+    assert "supersedes_experiment_ids" in definition[0].input_schema["properties"]
+    assert "supersedes_experiment_ids" not in definition[0].input_schema["required"]
+    hypothesis_definition = registry.get(
+        HYPOTHESIS_DECLARE_TOOL, HYPOTHESIS_DECLARE_TOOL_SCHEMA_VERSION
+    )
+    assert hypothesis_definition is not None
+    assert hypothesis_definition[0].capability_key == "operator.write"
     dispatcher = RegistryToolDispatcher(registry)
     result = await dispatcher.dispatch(
         ToolExecutionContext(
@@ -351,3 +496,19 @@ async def test_record_tool_registry_requires_operator_write_capability() -> None
     )
     assert result.status is ToolInvocationStatus.UNAVAILABLE
     assert "operator.write" in result.message
+
+    declaration = await dispatcher.dispatch(
+        ToolExecutionContext(
+            investigation_id=investigation_id,
+            envelope=None,
+            budget=InvestigationBudget(),
+            idempotency_key="unauthorized-declare",
+        ),
+        tool_name=HYPOTHESIS_DECLARE_TOOL,
+        schema_version=HYPOTHESIS_DECLARE_TOOL_SCHEMA_VERSION,
+        arguments={},
+        purpose="Declare a hypothesis without operator.write",
+        operation_key="unauthorized-declare",
+    )
+    assert declaration.status is ToolInvocationStatus.UNAVAILABLE
+    assert "operator.write" in declaration.message

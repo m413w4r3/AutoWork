@@ -389,19 +389,26 @@ def tool_operation_key(
     schema_version: str,
     normalized_parameters: Mapping[str, Any],
     purpose: str,
+    cache_identity: Mapping[str, Any] | None = None,
 ) -> str:
     """Build a stable operation identity from the operation and normalized input.
 
     ``purpose`` remains in the API for existing callers and invocation records,
     but explanatory model text must not split an otherwise identical operation.
+    Confined local analyses may provide a result/worker cache identity; callers
+    that omit it retain their historical key shape, including external tools.
     """
     _validate_safe_parameters(normalized_parameters)
+    if cache_identity is not None:
+        _validate_safe_parameters(cache_identity, "cache_identity")
     payload = {
         "investigation_id": str(investigation_id),
         "tool_name": tool_name,
         "schema_version": schema_version,
         "parameters": normalized_parameters,
     }
+    if cache_identity is not None:
+        payload["cache_identity"] = cache_identity
     return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
 
 

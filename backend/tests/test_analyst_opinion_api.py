@@ -27,7 +27,17 @@ class _PreviewRenderer:
     def __init__(self) -> None:
         self.rendered_synthesis: ProductionSynthesisV1 | None = None
 
-    async def render_draft_preview(self, document, opinion, synthesis) -> CompiledTypstDocument:
+    async def render_draft_preview(
+        self,
+        document,
+        opinion,
+        synthesis,
+        *,
+        infrastructure_graph=None,
+        findings=(),
+        evidence_observations=(),
+    ) -> CompiledTypstDocument:
+        del document, opinion, infrastructure_graph, findings, evidence_observations
         self.rendered_synthesis = synthesis
         content = b"%PDF-1.4\npreview fixture\n"
         return CompiledTypstDocument(

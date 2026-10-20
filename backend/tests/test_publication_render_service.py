@@ -798,7 +798,7 @@ async def test_render_uses_the_loaded_template_and_font_snapshots(
     # C8 intentionally stamps the anchored editorial section layout as v11/v25.
     assert (
         publication_rendering.PUBLICATION_RENDERER_VERSION
-        == "publication-v11-typst-v25-anchored-editorial-sections"
+        == "publication-v12-typst-v30-opinion-provenance"
     )
     expected_templates = {file.relative_path: file.content for file in template_bundle.files}
     observed_templates = {

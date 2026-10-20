@@ -59,6 +59,7 @@ from cti_app.application.investigation_tools import (
     ToolExecutionContext,
     ToolRegistry,
     ToolResult,
+    tool_operation_cache_identity,
 )
 from cti_app.application.persistence import (
     AnalystDecisionRepository,
@@ -752,13 +753,7 @@ class InvestigationService:
                 await self._commit_current_uow()
                 return concluded
             seen_operation_keys = {
-                tool_operation_key(
-                    investigation_id=item.investigation_id,
-                    tool_name=item.tool_name,
-                    schema_version=item.schema_version,
-                    normalized_parameters=item.normalized_parameters,
-                    purpose=item.purpose,
-                )
+                _operation_key_base(item.operation_key)
                 for item in await self._invocations.list_for_investigation(investigation_id)
             }
             outcome = await self._process_turn(
@@ -997,7 +992,7 @@ class InvestigationService:
             if (
                 latest_state.no_progress_streak >= self._no_progress_limit
                 and next_action is not AgentNextAction.SWITCH_HYPOTHESIS
-                and not _proposes_unseen_operation(investigation_id, decision, seen_operation_keys)
+                and not self._has_unseen_operation(investigation_id, decision, seen_operation_keys)
             ):
                 return await self.conclude(investigation_id, StopReason.NO_NEW_INFORMATION)
             state = latest_state
@@ -1211,6 +1206,51 @@ class InvestigationService:
         _log_terminal_tool_failure(invocation, result)
         return invocation, result, valid_refs, uncertain_external
 
+    def _tool_operation_key(
+        self,
+        *,
+        investigation_id: UUID,
+        tool_name: str,
+        schema_version: str,
+        normalized_parameters: Mapping[str, Any],
+        purpose: str,
+    ) -> str:
+        registered = self._registry.get(tool_name, schema_version)
+        cache_identity = None
+        if registered is not None and registered[0].effect in {
+            ToolEffect.LOCAL_READ,
+            ToolEffect.LOCAL_COMPUTE,
+        }:
+            # Version local deterministic results with their implementation proof.
+            # External provider identities stay stable so deployment cannot reissue them.
+            cache_identity = tool_operation_cache_identity(registered[1])
+        return tool_operation_key(
+            investigation_id=investigation_id,
+            tool_name=tool_name,
+            schema_version=schema_version,
+            normalized_parameters=normalized_parameters,
+            purpose=purpose,
+            cache_identity=cache_identity,
+        )
+
+    def _has_unseen_operation(
+        self,
+        investigation_id: UUID,
+        decision: AgentTurnDecisionV1,
+        seen_operation_keys: set[str],
+    ) -> bool:
+        return any(
+            self._tool_operation_key(
+                investigation_id=investigation_id,
+                tool_name=call.tool_name,
+                schema_version=call.schema_version,
+                normalized_parameters=call.arguments,
+                purpose=call.purpose,
+            )
+            not in seen_operation_keys
+            for call in decision.proposed_tool_calls
+        )
+
     async def _process_turn(
         self,
         *,
@@ -1277,7 +1317,7 @@ class InvestigationService:
                     )
                 )
                 continue
-            base_operation_key = tool_operation_key(
+            base_operation_key = self._tool_operation_key(
                 investigation_id=investigation.id,
                 tool_name=proposed.tool_name,
                 schema_version=proposed.schema_version,
@@ -1303,15 +1343,10 @@ class InvestigationService:
                 and item.schema_version == proposed.schema_version
                 and thaw_json(item.normalized_parameters) == thaw_json(proposed.arguments)
             )
-            matching_invocations = (
-                all_matching_invocations
-                if deduplicate_read
-                else tuple(
-                    item
-                    for item in all_matching_invocations
-                    if item.operation_key == operation_key
-                    or item.operation_key.startswith(f"{operation_key}:retry:")
-                )
+            matching_invocations = tuple(
+                item
+                for item in all_matching_invocations
+                if _operation_key_matches(item.operation_key, operation_key)
             )
             invocation = matching_invocations[-1] if matching_invocations else None
             external_effect = definition is not None and definition.effect in {
@@ -2811,22 +2846,14 @@ def _same_reconciliation_decision(actual: AnalystDecision, expected: AnalystDeci
     )
 
 
-def _proposes_unseen_operation(
-    investigation_id: UUID,
-    decision: AgentTurnDecisionV1,
-    seen_operation_keys: set[str],
-) -> bool:
-    return any(
-        tool_operation_key(
-            investigation_id=investigation_id,
-            tool_name=call.tool_name,
-            schema_version=call.schema_version,
-            normalized_parameters=call.arguments,
-            purpose=call.purpose,
-        )
-        not in seen_operation_keys
-        for call in decision.proposed_tool_calls
-    )
+def _operation_key_base(operation_key: str) -> str:
+    """Remove attempt/turn suffixes while preserving the hashed operation identity."""
+    return operation_key.partition(":")[0]
+
+
+def _operation_key_matches(existing_key: str, current_key: str) -> bool:
+    """Reuse only this exact operation version or one of its recorded retries."""
+    return existing_key == current_key or existing_key.startswith(f"{current_key}:retry:")
 
 
 def _envelope_reduced_since(

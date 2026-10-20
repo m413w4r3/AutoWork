@@ -177,13 +177,25 @@ class _TypstDraftPreviewRenderer:
         document,
         opinion,
         synthesis: ProductionSynthesisV1,
+        *,
+        infrastructure_graph=None,
+        findings=(),
+        evidence_observations=(),
     ) -> CompiledTypstDocument:
         from cti_app.application.typst_rendering import TypstDraftPreviewDocument
 
         self.rendered_opinion = opinion
         self.rendered_synthesis = synthesis
         source = self._renderer.render(
-            TypstDraftPreviewDocument(document, opinion, synthesis), self._templates
+            TypstDraftPreviewDocument(
+                document,
+                opinion,
+                synthesis,
+                infrastructure_graph,
+                findings,
+                evidence_observations,
+            ),
+            self._templates,
         )
         media_bytes = {
             reference.asset_id: await self._media_assets.read(reference.asset_id)

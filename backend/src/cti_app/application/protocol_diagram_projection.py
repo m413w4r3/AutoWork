@@ -46,7 +46,10 @@ from cti_app.domain.protocol_model import (
     ProtocolValidationStatus,
 )
 
-PROTOCOL_DIAGRAM_PROJECTION_VERSION = "protocol-diagram-projection-v1"
+PROTOCOL_DIAGRAM_PROJECTION_VERSION = "protocol-diagram-projection-v2"
+PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION = (
+    f"{DIAGRAM_COMPILATION_POLICY_VERSION}+{PROTOCOL_DIAGRAM_PROJECTION_VERSION}"
+)
 _MAX_FIELD_EVIDENCE_REFS = 8
 _MAX_FIELD_EVIDENCE_FRAMES = 12
 _STATUS_LABELS = {
@@ -184,25 +187,45 @@ def protocol_diagram_caption(spec: ProtocolDiagramSpecV1) -> str:
         "Validation status: OBSERVED green; INFERRED orange and dashed; UNRESOLVED gray; "
         "CONTRADICTED red. An article diagram label never means packet, frame, or byte observed."
     )
+    limitations = tuple(item.strip() for item in spec.limitations if item.strip())
     if _is_documented_view(spec):
-        body = (
-            "Modèle documenté, non observé. This view comes only from cited written facts. "
-            "No network traffic, frames, offsets, or byte values were observed."
+        limit_line = (
+            "Modèle documenté, non observé; aucun trafic réseau, trame, offset ou valeur "
+            "d'octet observés"
         )
     elif spec.status is ProtocolDiagramStatus.INSUFFICIENT_EVIDENCE:
-        body = "Insufficient evidence; no generic sequence or schema was inserted."
+        limit_line = "No protocol scenario established; no generic sequence or schema was inserted"
     else:
-        body = "Protocol view projected only from the supplied semantic evidence."
-    if (
-        spec.kind is ProtocolDiagramKind.MESSAGE_FORMAT
-        and _is_documented_view(spec)
-        and not spec.fields
-    ):
-        body += " Champs sans offset ni longueur documentés."
-    limitations = tuple(item.strip() for item in spec.limitations if item.strip())
+        limit_line = "vue limitée aux éléments sémantiques fournis"
     if limitations:
-        body = f"{body} Limits: {'; '.join(limitations)}"
-    return f"{spec.title}. {body} {legend}"
+        limit_line += "; " + "; ".join(limitations)
+    proof_levels = _protocol_spec_evidence_levels(spec)
+    if proof_levels == (ProtocolEvidenceLevelV1.ARTICLE_DOCUMENTED,):
+        proof_summary = "ARTICLE_DOCUMENTED — Modèle documenté, non observé"
+    elif proof_levels:
+        proof_summary = ", ".join(level.value.upper() for level in proof_levels)
+    else:
+        proof_summary = "INSUFFICIENT_EVIDENCE"
+    return f"{spec.title}\nLimits: {limit_line}\nProof levels: {proof_summary}\n{legend}"
+
+
+def _protocol_spec_evidence_levels(
+    spec: ProtocolDiagramSpecV1,
+) -> tuple[ProtocolEvidenceLevelV1, ...]:
+    """Return the distinct evidence origins actually present in a protocol view."""
+    evidence_levels = {
+        _resolved_evidence_level(item.evidence_level, item.validation_status, item.evidence)
+        for item in spec.nodes
+    }
+    evidence_levels.update(
+        _resolved_evidence_level(item.evidence_level, item.validation_status, item.evidence)
+        for item in spec.edges
+    )
+    evidence_levels.update(
+        _resolved_evidence_level(item.evidence_level, item.validation_status, item.evidence)
+        for item in spec.fields
+    )
+    return tuple(level for level in ProtocolEvidenceLevelV1 if level in evidence_levels)
 
 
 def protocol_diagram_pin_sha256(
@@ -242,7 +265,7 @@ def opinion_protocol_figures(
             pin_sha256=item.pin_sha256,
             compiler_name=item.compiled.compiler,
             compiler_version=item.compiled.compiler_version,
-            compiler_policy_version=item.compiled.compiler_policy_version,
+            compiler_policy_version=PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION,
             caption=item.diagram.caption or item.spec.title,
             field_evidence=(
                 tuple(
@@ -391,11 +414,27 @@ def _status_label(
     evidence_level: ProtocolEvidenceLevelV1 | None = None,
     evidence: tuple[ProtocolEvidenceRefV1, ...] = (),
 ) -> str:
-    pieces = [_status(status)]
-    pieces.append(_evidence_level_label(_resolved_evidence_level(evidence_level, status, evidence)))
-    if text.strip():
-        pieces.append(text.strip())
-    return " · ".join(pieces)
+    resolved_level = _resolved_evidence_level(evidence_level, status, evidence)
+    status_label = _status(status)
+    evidence_label = _evidence_level_label(resolved_level)
+    body = text.strip()
+    repeated_prefixes = (
+        status_label,
+        resolved_level.value.upper(),
+        evidence_label,
+    )
+    for prefix in repeated_prefixes:
+        while body.casefold().startswith(prefix.casefold()):
+            body = body[len(prefix) :].lstrip(" ·:—-")
+
+    # ARTICLE_DOCUMENTED and DOCUMENTED_NOT_OBSERVED describe the same proof
+    # class. Keep that phrase once; other validation/proof pairs remain distinct.
+    header = (
+        status_label
+        if status_label.casefold() == evidence_label.casefold()
+        else f"{status_label} · {evidence_label}"
+    )
+    return f"{header} · {body}" if body else header
 
 
 def _resolved_evidence_level(
@@ -414,7 +453,7 @@ def _resolved_evidence_level(
 
 def _evidence_level_label(level: ProtocolEvidenceLevelV1) -> str:
     if level is ProtocolEvidenceLevelV1.ARTICLE_DOCUMENTED:
-        return "ARTICLE_DOCUMENTED · DOCUMENTED, NOT OBSERVED"
+        return "ARTICLE_DOCUMENTED"
     return level.value.upper()
 
 
@@ -686,6 +725,7 @@ def _validate_projected_graph(
 
 
 __all__ = [
+    "PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION",
     "PROTOCOL_DIAGRAM_PROJECTION_VERSION",
     "ProtocolDiagramPreviewV1",
     "ProtocolDiagramProjectionError",

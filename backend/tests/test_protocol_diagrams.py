@@ -204,13 +204,28 @@ def test_protocol_projection_builds_three_distinct_views_and_keeps_statuses() ->
     sequence, states, message = (project_protocol_diagram(item) for item in _three_views())
 
     sequence_source = encode_d2_source(sequence).decode("utf-8")
+    sequence_text = sequence_source.replace("\\n", " ")
     state_source = encode_d2_source(states).decode("utf-8")
     message_source = encode_d2_source(message).decode("utf-8")
 
-    assert "shape: sequence_diagram" in sequence_source
-    assert sequence_source.index("order 1") < sequence_source.index("order 2")
-    assert "frames 9" in sequence_source
-    assert "timing 400 ms" in sequence_source
+    # The publication projection is a vertical D2 graph rather than D2's
+    # horizontal sequence shape, which shrinks long participant labels.
+    assert "direction: down" in sequence_source
+    assert all(
+        sequence_source.index(label) < sequence_source.index(next_label)
+        for label, next_label in zip(
+            ("Client", "DNS resolver", "Endpoint / C2"),
+            ("DNS resolver", "Endpoint / C2", "Payload endpoint"),
+            strict=True,
+        )
+    )
+    sequence_relations = [
+        line for line in sequence_source.splitlines() if " -> " in line.partition(":")[0]
+    ]
+    assert len(sequence_relations) == len(sequence.edges)
+    assert sequence_text.index("order 1") < sequence_text.index("order 2")
+    assert "frames 9" in sequence_text
+    assert "timing 400 ms" in sequence_text
     assert "INFERRED" in sequence_source
     assert 'stroke: "#B54708"' in sequence_source
     assert 'fill: "#FFF3E0"' in sequence_source
@@ -237,10 +252,16 @@ def test_protocol_projection_escapes_model_text_before_d2_encoding() -> None:
 
     source = encode_d2_source(project_protocol_diagram(spec)).decode("utf-8")
 
-    assert 'Client\\"\\nclient -> attacker: \\$' in source
-    assert 'query \\"\\n\\${inject}' in source
+    assert r"Client\" client -> attacker:" in source
+    assert r"query \"" in source
+    assert r"\${payload}" in source
+    assert r"\${inject}" in source
     assert "\nclient -> attacker:" not in source
     assert "\n${inject}" not in source
+    structural_relations = [
+        line for line in source.splitlines() if " -> " in line.partition(":")[0]
+    ]
+    assert len(structural_relations) == len(spec.edges)
 
 
 def test_insufficient_evidence_renders_only_an_explicit_gap_card() -> None:
@@ -255,7 +276,7 @@ def test_insufficient_evidence_renders_only_an_explicit_gap_card() -> None:
     assert len(diagram.nodes) == 1
     assert diagram.edges == ()
     assert "INSUFFICIENT EVIDENCE" in source
-    assert "No protocol scenario established" in source
+    assert "No protocol scenario established" in source.replace("\\n", " ")
     assert "beacon" not in source.casefold()
     assert "generic sequence" in (diagram.caption or "")
 

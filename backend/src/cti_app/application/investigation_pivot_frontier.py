@@ -42,6 +42,40 @@ _DEFANG_SCHEME = re.compile(r"^hxxps?://", re.I)
 _MAX_FRONTIER_RECORDS = 2_000
 PivotableIndicatorType = Literal["md5", "sha1", "sha256", "ipv4", "domain", "url"]
 _PIVOTABLE_INDICATOR_TYPES = frozenset({"md5", "sha1", "sha256", "ipv4", "domain", "url"})
+_BENIGN_BACKGROUND_INFRASTRUCTURE_LIST_VERSION = "2"
+# Exact Cloudflare/Google/Quad9 resolver addresses and selected Microsoft,
+# Windows Update, Skype, and Edge service suffixes. This context list is not an
+# IOC denylist; article-documented indicators retain their article qualification.
+_BENIGN_BACKGROUND_INFRASTRUCTURE_IPS = frozenset(
+    {
+        "1.0.0.1",
+        "1.1.1.1",
+        "8.8.4.4",
+        "8.8.8.8",
+        "9.9.9.9",
+        "142.251.184.94",
+    }
+)
+_BENIGN_BACKGROUND_INFRASTRUCTURE_DOMAINS = frozenset(
+    {
+        "c.pki.goog",
+        "dns.google",
+    }
+)
+_BENIGN_BACKGROUND_INFRASTRUCTURE_DOMAIN_SUFFIXES = frozenset(
+    {
+        "microsoft.com",
+        "windowsupdate.com",
+        "skype.com",
+        "skype.net",
+        "msedge.net",
+        "edge.microsoft.com",
+    }
+)
+# The observed Cloudflare address is not established as a public resolver. Keep
+# this exact host pivotable and surface its possible shared hosting/CDN role.
+_SHARED_HOSTING_CDN_POSSIBLE_IPS = frozenset({"162.159.36.2"})
+_NON_PIVOTABLE_PRIORITY_ADJUSTMENT = -100
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,7 +169,7 @@ def discovered_indicator_values(
     observations: Sequence[EvidenceObservation],
     payloads: Mapping[str, Mapping[str, Any] | None],
 ) -> tuple[tuple[PivotableIndicatorType, str], ...]:
-    """Return unique, pivotable children supported by persisted evidence summaries."""
+    """Return actionable children; full frontier records retain classified observations."""
     values: dict[str, tuple[PivotableIndicatorType, str]] = {}
     for observation in observations:
         payload = payloads.get(str(observation.id))
@@ -146,6 +180,8 @@ def discovered_indicator_values(
                 str(descriptor.get("type", "")), str(descriptor.get("identifier", ""))
             )
             if candidate is not None and candidate.indicator_type in _PIVOTABLE_INDICATOR_TYPES:
+                if _classification_for_indicator(candidate.indicator_type, candidate.value)[1]:
+                    continue
                 indicator_type = cast(PivotableIndicatorType, candidate.indicator_type)
                 values.setdefault(candidate.canonical_id, (indicator_type, candidate.value))
     return tuple(values[key] for key in sorted(values))
@@ -237,6 +273,22 @@ def build_pivot_frontier(
             if direct is not None:
                 verified.add(direct.canonical_id)
         if not isinstance(payload, Mapping):
+            if observation.kind.value == "vt_relationship":
+                parent = normalize_pivot_indicator(observation.object_type, observation.object_id)
+                if parent is not None:
+                    limitation = (
+                        f"Observation VT {observation.id} omise de la frontière: "
+                        "son résumé JSON borné est indisponible; elle n'est pas utilisée "
+                        "comme preuve ni comme pivot."
+                    )
+                    for root_id in record_by_canonical.get(parent.canonical_id, ()):
+                        if root_id not in roots:
+                            continue
+                        root = records[root_id]
+                        if limitation not in root.limitations:
+                            records[root_id] = replace(
+                                root, limitations=(*root.limitations, limitation)
+                            )
             continue
         source_digests.append(observation.sha256)
         relation = str(payload.get("relation", ""))
@@ -379,19 +431,37 @@ def build_pivot_frontier(
     for record_id, record in tuple(records.items()):
         novel = record.canonical_id not in article_by_canonical
         novelty_verified = record.canonical_id not in verified
+        (
+            classified_level,
+            classification_reason,
+            classification_limitation,
+            classification_adjustment,
+        ) = _classification_for_record(record, article_by_canonical)
+        reason = record.reason
+        limitations = record.limitations
+        if classification_reason is not None:
+            reason = f"{reason}; {classification_reason}"
+        if classification_limitation is not None:
+            limitations = tuple(dict.fromkeys((*limitations, classification_limitation)))
         factors = _priority_factors(
             novel=novel,
             verified=novelty_verified,
             depth=max(1, len(record.path) - 1),
             cost=record.estimated_cost,
+            classification_adjustment=classification_adjustment,
         )
         records[record_id] = replace(
             record,
+            level=classified_level or record.level,
+            reason=reason,
+            limitations=limitations,
             children_observed=tuple(sorted(children.get(record_id, ()))),
             novelty_vs_article=novel,
             novelty_vs_verified=novelty_verified,
             priority_factors=factors,
-            priority_score=_priority_score(factors),
+            priority_score=_priority_score(
+                factors, classification_adjustment=classification_adjustment
+            ),
         )
 
     roots.extend(
@@ -419,6 +489,7 @@ def build_pivot_frontier(
     page_paths = tuple(path for path in all_paths if path.target_id in included)
     frontier_identity = {
         "schema_version": PIVOT_FRONTIER_SCHEMA_VERSION,
+        "background_infrastructure_list_version": (_BENIGN_BACKGROUND_INFRASTRUCTURE_LIST_VERSION),
         "investigation_id": investigation_id,
         "source_sha256": source_sha256,
         "records": [item.id for item in all_records],
@@ -731,6 +802,8 @@ def _safe_cursor_value(value: Any) -> str | None:
 def _policy_states(
     snapshot: ArticleSnapshot, envelope: InvestigationEnvelope | None
 ) -> tuple[PivotG2State, PivotDisclosureState]:
+    # Derived records use the same envelope and snapshot bounds; these states
+    # do not depend on whether a derived indicator is documented or benign.
     g2 = PivotG2State.REQUIRED
     if envelope is not None:
         g2 = (
@@ -752,24 +825,111 @@ def _policy_states(
 
 
 def _priority_factors(
-    *, novel: bool, verified: bool, depth: int, cost: int
+    *, novel: bool, verified: bool, depth: int, cost: int, classification_adjustment: int = 0
 ) -> PivotPriorityFactors:
+    formula = "clamp(50*article_novelty + 30*verified_novelty + 5/depth - 5*cost, 0, 100)"
+    if classification_adjustment:
+        formula = (
+            "clamp(50*article_novelty + 30*verified_novelty + 5/depth - 5*cost "
+            f"+ classification_adjustment({classification_adjustment}), 0, 100)"
+        )
     return PivotPriorityFactors(
         novelty_vs_article=1 if novel else 0,
         novelty_vs_verified=1 if verified else 0,
         depth=max(1, depth),
         cost=max(0, cost),
+        formula=formula,
     )
 
 
-def _priority_score(factors: PivotPriorityFactors) -> int:
+def _priority_score(factors: PivotPriorityFactors, *, classification_adjustment: int = 0) -> int:
     score = (
         50 * factors.novelty_vs_article
         + 30 * factors.novelty_vs_verified
         + round(5 / factors.depth)
         - 5 * factors.cost
+        + classification_adjustment
     )
     return max(0, min(100, score))
+
+
+def _classification_for_record(
+    record: PivotFrontierRecord,
+    documented_indicators: Mapping[str, NormalizedPivotIndicator],
+) -> tuple[PivotQualificationLevel | None, str | None, str | None, int]:
+    """Classify non-global IPs and exact known background infrastructure.
+
+    Article-documented indicators retain their article qualification even when
+    the same canonical value also appears in a derived observation.
+    """
+    if record.source == "article" or record.canonical_id in documented_indicators:
+        return None, None, None, 0
+
+    return _classification_for_indicator(record.indicator_type, record.value)
+
+
+def _classification_for_indicator(
+    indicator_type: str, value: str
+) -> tuple[PivotQualificationLevel | None, str | None, str | None, int]:
+    """Return deterministic background classification and its score effect."""
+    host = _indicator_host(indicator_type, value)
+    if host is None:
+        return None, None, None, 0
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        if host not in _BENIGN_BACKGROUND_INFRASTRUCTURE_DOMAINS and not any(
+            host == suffix or host.endswith(f".{suffix}")
+            for suffix in _BENIGN_BACKGROUND_INFRASTRUCTURE_DOMAIN_SUFFIXES
+        ):
+            return None, None, None, 0
+    else:
+        if not address.is_global:
+            return (
+                PivotQualificationLevel.REJECTED,
+                "non_pivotable_non_global_ip_address",
+                "Adresse IP non globale (privée, locale, link-local, partagée, documentaire "
+                "ou réservée selon ipaddress); aucun pivot externe n'est proposé.",
+                _NON_PIVOTABLE_PRIORITY_ADJUSTMENT,
+            )
+        if address.compressed not in _BENIGN_BACKGROUND_INFRASTRUCTURE_IPS:
+            if address.compressed in _SHARED_HOSTING_CDN_POSSIBLE_IPS:
+                return (
+                    None,
+                    None,
+                    "Adresse d'hébergement mutualisé/CDN possible (plage Cloudflare); "
+                    "le rôle DNS de cette adresse n'est pas établi et elle reste pivotable.",
+                    0,
+                )
+            return None, None, None, 0
+
+    return (
+        PivotQualificationLevel.REJECTED,
+        "benign_background_infrastructure:"
+        f"list-v{_BENIGN_BACKGROUND_INFRASTRUCTURE_LIST_VERSION}:not_pivotable",
+        "Infrastructure publique de fond reconnue par la liste exacte et versionnée "
+        f"v{_BENIGN_BACKGROUND_INFRASTRUCTURE_LIST_VERSION}; conservée visible pour le contexte, "
+        "mais non pivotable. Ce classement ne signifie pas malveillance ni innocuité absolue.",
+        _NON_PIVOTABLE_PRIORITY_ADJUSTMENT,
+    )
+
+
+def _indicator_host(indicator_type: str, value: str) -> str | None:
+    if indicator_type in {"ipv4", "ipv6"}:
+        return value
+    if indicator_type == "domain":
+        return value.replace("[.]", ".").casefold()
+    if indicator_type != "url":
+        return None
+    value = _DEFANG_DOT.sub(".", value)
+    value = _DEFANG_SCHEME.sub(
+        lambda match: "https://" if match.group(0).casefold().startswith("hxxps") else "http://",
+        value,
+    )
+    try:
+        return (urlsplit(value).hostname or "").casefold() or None
+    except ValueError:
+        return None
 
 
 def _paths(

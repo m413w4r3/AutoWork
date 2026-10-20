@@ -10,6 +10,7 @@ from fastapi import FastAPI
 from httpx import ASGITransport
 
 from cti_app.api.investigation import router
+from cti_app.application.blob_storage import BlobReadLimitExceededError
 from cti_app.domain.investigation import EvidenceKind, FindingAssessment
 from cti_app.domain.investigation_state import Hypothesis, HypothesisStatus
 
@@ -256,6 +257,43 @@ async def test_sample_comparison_detail_is_bounded_and_owned_by_the_investigatio
     )
     assert foreign.status_code == 404
     assert len(store.artifact_reads) == reads_before
+
+
+@pytest.mark.asyncio
+async def test_oversized_sample_comparison_is_reported_as_an_omission_not_proof() -> None:
+    store = _Store()
+    _blob(
+        store,
+        investigation_id=INVESTIGATION_ID,
+        logical_bucket="investigation-sample-similarity",
+        sha256="9" * 64,
+        object_type="family_feature_comparison",
+        payload={"investigation_id": str(INVESTIGATION_ID)},
+    )
+    observation = store.observations.rows[-1]
+
+    class _OversizedArtifactStore:
+        async def read_json(self, _blob_id: UUID) -> dict[str, object]:
+            raise BlobReadLimitExceededError(
+                size_bytes=70_843_573,
+                max_bytes=10_000_000,
+            )
+
+    client = _client(store)
+    client.app.state.production_artifact_store = _OversizedArtifactStore()
+
+    response = await client.get(f"/api/investigations/{INVESTIGATION_ID}/sample-comparisons")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["comparisons"] == []
+    assert body["omitted_comparisons"] == [
+        {
+            "observation_id": str(observation.id),
+            "size_bytes": 70_843_573,
+            "reason": "exceeds_read_limit",
+        }
+    ]
 
 
 @pytest.mark.asyncio

@@ -19,6 +19,7 @@ from cti_app.application.blob_storage import (
     BlobStorageUnavailableError,
     BlobStore,
 )
+from cti_app.application.confined_analysis import confined_analysis_operation_cache_identity
 from cti_app.application.evidence_recorder import EvidenceRecorder
 from cti_app.application.investigation_persistence import (
     DetectionCandidateRepository,
@@ -643,6 +644,14 @@ class _RuleToolAdapter(ToolAdapter):
     def __init__(self, service: _RuleTools, tool_name: str) -> None:
         self._service = service
         self._tool_name = tool_name
+
+    @property
+    def operation_cache_identity(self) -> Mapping[str, Any] | None:
+        workbench = self._service.workbench
+        execution = getattr(workbench, "_confined_analysis", None)
+        if execution is None:
+            return None
+        return confined_analysis_operation_cache_identity(execution)
 
     async def execute(
         self, arguments: Mapping[str, Any], context: ToolExecutionContext

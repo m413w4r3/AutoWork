@@ -591,12 +591,17 @@ class _VirusTotalAdapter:
         summary: Mapping[str, Any],
         limitations: tuple[str, ...],
         page_index: int,
+        raw_kind: EvidenceKind | None = None,
         suffix: str = "page",
     ) -> tuple[UUID, UUID]:
         source_version = _route_label_from_observation(raw_observation)
+        selected_raw_kind = raw_kind or kind
+        raw_purpose = f"raw:{suffix}:{page_index}"
+        if selected_raw_kind is not kind:
+            raw_purpose = f"raw:{selected_raw_kind.value}:{suffix}:{page_index}"
         raw_evidence = await self.recorder.record_existing_blob(
             investigation_id=context.investigation_id,
-            kind=kind,
+            kind=selected_raw_kind,
             blob_id=raw_observation.blob_id,
             sha256=raw_observation.raw_sha256,
             source="VirusTotal",
@@ -604,7 +609,7 @@ class _VirusTotalAdapter:
             object_type=object_type,
             object_id=object_id,
             limitations=limitations,
-            idempotency_key=self._evidence_key(context, f"raw:{suffix}:{page_index}", object_id),
+            idempotency_key=self._evidence_key(context, raw_purpose, object_id),
         )
         summary_evidence = await self.recorder.record_json(
             investigation_id=context.investigation_id,
@@ -921,6 +926,7 @@ class _RelationshipsAdapter(_VirusTotalAdapter):
                         await self._record_raw_and_summary(
                             context,
                             kind=EvidenceKind.VT_RELATIONSHIP,
+                            raw_kind=EvidenceKind.OTHER,
                             raw_observation=raw_observation,
                             object_type=object_anchor_type,
                             object_id=object_anchor_id,

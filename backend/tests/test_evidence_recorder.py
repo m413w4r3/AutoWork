@@ -187,3 +187,56 @@ async def test_json_limit_and_typed_tool_result_do_not_create_duplicate_other_ev
 
     assert await writer.archive(invocation, result) == ()
     assert await repository.list_for_investigation(investigation_id) == (typed,)
+
+
+@pytest.mark.asyncio
+async def test_capture_association_accepts_only_quarantined_and_versioned_vt_sources() -> None:
+    store = _BlobStore()
+    repository = InMemoryEvidenceObservationRepository()
+    recorder = ProductionEvidenceRecorder(store, repository)  # type: ignore[arg-type]
+    investigation_id = uuid4()
+    sha256 = "e" * 64
+    vt_blob_id = uuid4()
+    quarantine_blob_id = uuid4()
+    unrelated_blob_id = uuid4()
+
+    await recorder.record_existing_blob(
+        investigation_id=investigation_id,
+        kind=EvidenceKind.OTHER,
+        blob_id=vt_blob_id,
+        sha256=sha256,
+        source="VirusTotal",
+        source_version="vt-sandbox-pcap.v1",
+        object_type="network_capture",
+        object_id=sha256,
+    )
+    await recorder.record_existing_blob(
+        investigation_id=investigation_id,
+        kind=EvidenceKind.OTHER,
+        blob_id=quarantine_blob_id,
+        sha256=sha256,
+        source="network.quarantine",
+        source_version="network-capture-acceptance.v1",
+        object_type="network_capture",
+        object_id=sha256,
+    )
+    await recorder.record_existing_blob(
+        investigation_id=investigation_id,
+        kind=EvidenceKind.OTHER,
+        blob_id=unrelated_blob_id,
+        sha256=sha256,
+        source="VirusTotal",
+        source_version="api-v3",
+        object_type="network_capture",
+        object_id=sha256,
+    )
+
+    assert await recorder.is_capture_associated(
+        investigation_id=investigation_id, blob_id=vt_blob_id, sha256=sha256
+    )
+    assert await recorder.is_capture_associated(
+        investigation_id=investigation_id, blob_id=quarantine_blob_id, sha256=sha256
+    )
+    assert not await recorder.is_capture_associated(
+        investigation_id=investigation_id, blob_id=unrelated_blob_id, sha256=sha256
+    )

@@ -15,6 +15,7 @@ from cti_app.application.confined_analysis import (
     ConfinedAnalysisExecutionPort,
     ConfinedAnalysisRequest,
     ConfinedAnalysisTool,
+    confined_analysis_operation_cache_identity,
 )
 from cti_app.application.dotnet_analysis import (
     ILSPYCMD_LICENSE,
@@ -52,12 +53,20 @@ DOTNET_TOOL_NAMES = (
     "resources.list",
 )
 _TOOL_OUTPUT_BYTES = 24 * 1024
+_PERSISTED_RESULT_BYTES = 48 * 1024
+_OPERATOR_RESULT_BYTES = 8 * 1024
+_RESULT_JSON_CHUNK_CHARS = 4_000
+_OBSERVATION_PAGE_LENGTH = 16 * 1024
+_NATIVE_STRING_LIMIT_CHARS = 16_384
 _TOOL_SECONDS = 60
 _MAX_SAMPLE_BYTES = 64 * 1024 * 1024
 _LIMITATIONS = (
     "Lecture statique uniquement : le code de l'assembly n'est ni chargé ni exécuté.",
     ("Le worker est confine, en lecture seule et sans reseau; aucun restore NuGet a l'execution."),
-    "Le CIL est décompilé par ILSpyCmd; monodis sert aux métadonnées et au repli de décompilation.",
+    (
+        "ILSpyCmd décompile le CIL lorsqu'il trouve le corps; monodis lit les métadonnées "
+        "et peut fournir un repli CIL."
+    ),
     (
         "Les references/imports seuls ne prouvent pas un C2; chaines obfusquees et blobs chiffres "
         "restent non resolus."
@@ -135,7 +144,16 @@ def _tool_schemas() -> dict[str, Mapping[str, Any]]:
     }
     offset = {"type": "integer", "minimum": 0, "maximum": 10000000}
     limit = {"type": "integer", "minimum": 1, "maximum": 200}
-    max_chars = {"type": "integer", "minimum": 1, "maximum": 16384}
+    max_chars = {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 16384,
+        "description": (
+            "Worker output cap in characters. The normalized observation is preserved in "
+            "verified 4,000-character chunks, up to 48 KiB; the direct response is a preview. "
+            "Read further through the returned observation URL using offset and length."
+        ),
+    }
     rid = {"type": "integer", "minimum": 1, "maximum": 16777215}
     specs: dict[str, tuple[dict[str, Any], tuple[str, ...], str]] = {
         "assembly.inspect": (
@@ -219,6 +237,13 @@ class _DotnetToolAdapter(ToolAdapter):
             "resources.list": "resources",
         }[name]
 
+    @property
+    def operation_cache_identity(self) -> Mapping[str, Any]:
+        return confined_analysis_operation_cache_identity(
+            self._execution,
+            result_schema_version="dotnet-analysis-result.v3",
+        )
+
     async def execute(
         self, arguments: Mapping[str, Any], context: ToolExecutionContext
     ) -> ToolResult:
@@ -296,10 +321,31 @@ class _DotnetToolAdapter(ToolAdapter):
                     "operation": self._operation,
                 }
             )
+        sanitizer_truncated = _result_exceeds_sanitizer_limits(raw_result)
         safe_result = _sanitize_json_value(dict(raw_result))
-        bounded_result, normalized_truncated = normalize_native_data(
-            safe_result,
-            max_output_bytes=_TOOL_OUTPUT_BYTES,
+        chunked_result, long_text_key = _preserve_long_text_fields(safe_result)
+        normalized_result, normalized_truncated = normalize_native_data(
+            chunked_result,
+            max_output_bytes=_PERSISTED_RESULT_BYTES,
+            max_items=MAX_NATIVE_RESULT_ITEMS,
+        )
+        persisted_result = _restore_long_text_fields(normalized_result, long_text_key)
+        result_truncated_by_tool = (
+            sanitizer_truncated or normalized_truncated or raw_result.get("truncated") is True
+        )
+        result_json = json.dumps(
+            persisted_result,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        result_json_bytes = result_json.encode("utf-8")
+        result_json_sha256 = hashlib.sha256(result_json_bytes).hexdigest()
+        result_json_chunks = _text_chunks(result_json, _RESULT_JSON_CHUNK_CHARS)
+        operator_result, response_truncated = normalize_native_data(
+            persisted_result,
+            max_output_bytes=_OPERATOR_RESULT_BYTES,
             max_items=MAX_NATIVE_RESULT_ITEMS,
         )
         worker_status = str(raw_result.get("status", "FAILED")).upper()
@@ -307,7 +353,7 @@ class _DotnetToolAdapter(ToolAdapter):
             "obfusqué"
             if worker_status == "OBFUSCATED"
             else "tronqué"
-            if normalized_truncated or raw_result.get("truncated") is True
+            if result_truncated_by_tool
             else "partiel"
             if worker_status in {"PARTIAL", "TIMEOUT"}
             else "complet"
@@ -315,6 +361,18 @@ class _DotnetToolAdapter(ToolAdapter):
             else "échec"
         )
         local_command_family = self._execution.family_statuses.get("local_command")
+        engine_value = raw_result.get("engine")
+        engine = (
+            engine_value
+            if isinstance(engine_value, str) and engine_value in {"ilspycmd", "monodis-fallback"}
+            else "monodis"
+        )
+        version_value = raw_result.get("version")
+        engine_version = version_value if isinstance(version_value, str) and version_value else None
+        if engine == "ilspycmd" and engine_version is None:
+            engine_version = ILSPYCMD_VERSION
+        if engine_version is None and local_command_family is not None:
+            engine_version = local_command_family.version
         observation: dict[str, Any] = {
             "schema_version": "dotnet-analysis-observation.v1",
             "tool": self._name,
@@ -323,18 +381,19 @@ class _DotnetToolAdapter(ToolAdapter):
             "sample_size_bytes": size_bytes,
             "status": analysis_status,
             "source": {
-                "engine": "ILSpyCmd",
-                "version": ILSPYCMD_VERSION,
-                "package_sha512": ILSPYCMD_PACKAGE_SHA512,
-                "source_commit": ILSPYCMD_SOURCE_COMMIT,
-                "project_url": ILSPYCMD_PROJECT_URL,
-                "license": ILSPYCMD_LICENSE,
+                "engine": engine,
+                "version": engine_version,
                 "monodis_version": local_command_family.version
                 if local_command_family is not None
                 else None,
             },
-            "result": bounded_result,
-            "result_truncated_by_tool_boundary": normalized_truncated,
+            "result": operator_result,
+            "result_json_encoding": "utf-8-json",
+            "result_json_byte_length": len(result_json_bytes),
+            "result_json_sha256": result_json_sha256,
+            "result_json_chunks": result_json_chunks,
+            "result_truncated_by_tool_boundary": result_truncated_by_tool,
+            "result_truncated_by_operator_response": response_truncated or result_truncated_by_tool,
             "limitations": list(_LIMITATIONS),
         }
         identity_payload = json.dumps(
@@ -343,16 +402,24 @@ class _DotnetToolAdapter(ToolAdapter):
             separators=(",", ":"),
         ).encode("utf-8")
         request_fingerprint = hashlib.sha256(identity_payload).hexdigest()
+        source_version = f"dotnet-analysis-observation.v1:{engine}:{engine_version or 'unknown'}"
+        if engine == "ilspycmd":
+            observation["source"].update(
+                {
+                    "package_sha512": ILSPYCMD_PACKAGE_SHA512,
+                    "source_commit": ILSPYCMD_SOURCE_COMMIT,
+                    "project_url": ILSPYCMD_PROJECT_URL,
+                    "license": ILSPYCMD_LICENSE,
+                }
+            )
+            source_version = f"{source_version}:{ILSPYCMD_PACKAGE_SHA512}"
         try:
             recorded = await self._recorder.record_json(
                 investigation_id=context.investigation_id,
                 kind=EvidenceKind.BINARY_ANALYSIS,
                 payload=observation,
-                source="dotnet.ilspycmd",
-                source_version=(
-                    f"dotnet-analysis-observation.v1:{ILSPYCMD_VERSION}:"
-                    f"{ILSPYCMD_PACKAGE_SHA512}:monodis"
-                ),
+                source=f"dotnet.{engine}",
+                source_version=source_version,
                 object_type="dotnet_analysis",
                 object_id=f"{sample_sha256}:{self._operation}:{request_fingerprint}",
                 limitations=_LIMITATIONS,
@@ -372,8 +439,16 @@ class _DotnetToolAdapter(ToolAdapter):
             "operation": self._operation,
             "status": analysis_status,
             "source": observation["source"],
-            "result": bounded_result,
+            "result": operator_result,
+            "result_byte_length": len(result_json_bytes),
+            "result_json_sha256": result_json_sha256,
+            "result_truncated_by_response": response_truncated or result_truncated_by_tool,
             "evidence_observation_id": str(recorded.id),
+            "evidence_observation_sha256": recorded.sha256,
+            "evidence_observation_url": (
+                f"/api/investigations/{context.investigation_id}/operator/observations/"
+                f"{recorded.id}?offset=0&length={_OBSERVATION_PAGE_LENGTH}"
+            ),
             "limitations": list(_LIMITATIONS),
         }
         invocation_status = (
@@ -428,9 +503,70 @@ class _DotnetToolAdapter(ToolAdapter):
 
 def _sanitize_json_value(value: Any) -> Any:
     if isinstance(value, str):
-        return sanitize_evidence_text(value, max_chars=16 * 1024)
+        return sanitize_evidence_text(value, max_chars=_PERSISTED_RESULT_BYTES)
     if isinstance(value, Mapping):
         return {str(key): _sanitize_json_value(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [_sanitize_json_value(item) for item in value[:MAX_NATIVE_RESULT_ITEMS]]
     return value
+
+
+def _result_exceeds_sanitizer_limits(value: Any) -> bool:
+    if isinstance(value, str):
+        return len(value) > _PERSISTED_RESULT_BYTES
+    if isinstance(value, Mapping):
+        return any(_result_exceeds_sanitizer_limits(item) for item in value.values())
+    if isinstance(value, list | tuple):
+        return len(value) > MAX_NATIVE_RESULT_ITEMS or any(
+            _result_exceeds_sanitizer_limits(item) for item in value[:MAX_NATIVE_RESULT_ITEMS]
+        )
+    return False
+
+
+def _preserve_long_text_fields(value: Any) -> tuple[Any, str]:
+    occupied_keys: set[str] = set()
+
+    def collect_keys(item: Any) -> None:
+        if isinstance(item, Mapping):
+            for key, child in item.items():
+                if isinstance(key, str):
+                    occupied_keys.add(key)
+                collect_keys(child)
+        elif isinstance(item, list | tuple):
+            for child in item:
+                collect_keys(child)
+
+    collect_keys(value)
+    marker = "__autowork_dotnet_full_text_chunks__"
+    while marker in occupied_keys:
+        marker += "_"
+
+    def chunk(item: Any) -> Any:
+        if isinstance(item, str) and len(item) > _NATIVE_STRING_LIMIT_CHARS:
+            parts = {
+                f"{index:08d}": item[start : start + _NATIVE_STRING_LIMIT_CHARS]
+                for index, start in enumerate(range(0, len(item), _NATIVE_STRING_LIMIT_CHARS))
+            }
+            return {marker: parts}
+        if isinstance(item, Mapping):
+            return {str(key): chunk(child) for key, child in item.items()}
+        if isinstance(item, list | tuple):
+            return [chunk(child) for child in item]
+        return item
+
+    return chunk(value), marker
+
+
+def _restore_long_text_fields(value: Any, marker: str) -> Any:
+    if isinstance(value, Mapping):
+        if set(value) == {marker} and isinstance(value[marker], Mapping):
+            parts = value[marker]
+            return "".join(str(parts[key]) for key in sorted(parts))
+        return {str(key): _restore_long_text_fields(child, marker) for key, child in value.items()}
+    if isinstance(value, list | tuple):
+        return [_restore_long_text_fields(child, marker) for child in value]
+    return value
+
+
+def _text_chunks(value: str, chunk_chars: int) -> list[str]:
+    return [value[index : index + chunk_chars] for index in range(0, len(value), chunk_chars)]

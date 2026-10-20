@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import logging
 import re
 from collections import defaultdict, deque
 from collections.abc import Mapping, Sequence
@@ -14,6 +15,7 @@ from typing import Any, Protocol
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import UUID
 
+from cti_app.application.blob_storage import BlobReadLimitExceededError
 from cti_app.application.investigation_persistence import (
     EvidenceObservationRepository,
     FindingRepository,
@@ -44,6 +46,7 @@ from cti_app.domain.publication_document import (
 )
 
 _MAX_EVIDENCE_BYTES = 128 * 1024
+_logger = logging.getLogger(__name__)
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SENSITIVE_QUERY_KEYS = frozenset(
     {
@@ -303,16 +306,36 @@ class InvestigationGraphSource:
     async def _read_canonical_payload(
         self, observation: EvidenceObservation
     ) -> Mapping[str, Any] | None:
-        raw = await self._artifact_reader.read_bytes(
-            observation.blob_id, max_bytes=_MAX_EVIDENCE_BYTES
-        )
+        try:
+            raw = await self._artifact_reader.read_bytes(
+                observation.blob_id, max_bytes=_MAX_EVIDENCE_BYTES
+            )
+        except BlobReadLimitExceededError:
+            _log_omitted_observation(observation, "blob_exceeds_read_limit")
+            return None
         if hashlib.sha256(raw).hexdigest() != observation.sha256:
+            _log_omitted_observation(observation, "sha256_mismatch")
             return None
         try:
             payload = json.loads(raw)
         except (UnicodeDecodeError, json.JSONDecodeError):
+            _log_omitted_observation(observation, "payload_not_json")
             return None
-        return payload if isinstance(payload, Mapping) else None
+        if not isinstance(payload, Mapping):
+            _log_omitted_observation(observation, "payload_not_mapping")
+            return None
+        return payload
+
+
+def _log_omitted_observation(observation: EvidenceObservation, reason: str) -> None:
+    _logger.warning(
+        "Evidence observation omitted from infrastructure graph projection",
+        extra={
+            "event": "investigation_graph_observation_omitted",
+            "observation_id": str(observation.id),
+            "reason": reason,
+        },
+    )
 
 
 def _article_seeds(

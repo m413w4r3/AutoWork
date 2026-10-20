@@ -334,6 +334,14 @@ class ToolAdapter(Protocol):
     ) -> ToolResult: ...
 
 
+def tool_operation_cache_identity(adapter: ToolAdapter) -> Mapping[str, Any] | None:
+    """Return optional result and implementation versions for idempotent local tools."""
+    identity = getattr(adapter, "operation_cache_identity", None)
+    if callable(identity):
+        identity = identity()
+    return identity if isinstance(identity, Mapping) else None
+
+
 class ToolRegistry(Protocol):
     def register(self, definition: ToolDefinition, adapter: ToolAdapter) -> None: ...
 

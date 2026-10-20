@@ -612,7 +612,7 @@ class _CompletingDispatcher:
         self.calls.append(job_id)
         job = self.jobs.jobs[job_id]
         payload = {
-            "schema": "confined-analysis-result.v1",
+            "schema": "confined-analysis-result.v2",
             "operation_key": job.parameters.operation_key,
             "artifact_id": str(job.parameters.artifact_id),
             "artifact_kind": job.parameters.artifact_kind.value,
@@ -1008,7 +1008,7 @@ async def test_tool_registry_dispatch_runs_capa_and_strings_through_worker(
     )
     proof_bytes = blobs.payloads[analysis.blob_id]
     proof = json.loads(proof_bytes)
-    assert proof["schema"] == "confined-analysis-result.v1"
+    assert proof["schema"] == "confined-analysis-result.v2"
     assert proof["artifact_sha256"] == sha256
     assert proof["result"]["families"]["static"]["strings"]
     assert _MARKER in {item["value"] for item in proof["result"]["families"]["static"]["strings"]}

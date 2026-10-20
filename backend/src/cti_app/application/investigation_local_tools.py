@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import math
@@ -12,6 +13,7 @@ from datetime import UTC, datetime
 from typing import Any, Protocol, cast
 
 from cti_app.application.blob_storage import BlobStorageUnavailableError
+from cti_app.application.confined_analysis import confined_analysis_operation_cache_identity
 from cti_app.application.evidence_recorder import EvidenceRecorder, sanitize_evidence_text
 from cti_app.application.investigation_persistence import SampleAssociationRepository
 from cti_app.application.investigation_tools import (
@@ -83,6 +85,9 @@ _BINARY_FIELD = re.compile(
 )
 _TRUNCATION_MARKER = "[TRUNCATED: bounded analysis output]"
 _MAX_LOCAL_OUTPUT_CHARS = 12_000
+_MAX_PERSISTED_LOCAL_OUTPUT_BYTES = 48 * 1024
+_LOCAL_OUTPUT_CHUNK_CHARS = 4_000
+_LOCAL_RESPONSE_PREVIEW_CHARS = 4_000
 _MAX_GHIDRA_DATA_BYTES = 48 * 1024
 _MAX_GHIDRA_TEXT_CHARS = 8_000
 
@@ -183,7 +188,10 @@ def _local_command_schema(catalog: LocalCommandCatalog) -> dict[str, Any]:
                     "method_name ou method_rid et une plage offset/length bornée en octets. "
                     "xxd lit au plus 4096 octets; sha256sum accepte une sous-plage bornée. "
                     "Aucun chemin n'est fourni par l'appelant: l'échantillon est adressé "
-                    "par sample_sha256."
+                    "par sample_sha256. La preuve conserve jusqu'à 48 KiB de sortie "
+                    "assainie dans output_chunks base64 UTF-8, avec output_byte_length et SHA-256; "
+                    "la réponse directe reste un aperçu. Lire le reste via observation_url "
+                    "avec offset et length (pages de 32 KiB maximum)."
                 ),
             },
             "sample_sha256": _sha256_schema(),
@@ -473,6 +481,13 @@ class _LocalRunCommandAdapter(_LocalAdapterBase):
         self.command_catalog = command_catalog
         self.max_local_output_chars = max_local_output_chars
 
+    @property
+    def operation_cache_identity(self) -> Mapping[str, Any] | None:
+        execution = getattr(self.command_service, "execution", None)
+        if execution is None:
+            return None
+        return confined_analysis_operation_cache_identity(execution)
+
     async def execute(
         self, arguments: Mapping[str, Any], context: ToolExecutionContext
     ) -> ToolResult:
@@ -562,22 +577,35 @@ class _LocalRunCommandAdapter(_LocalAdapterBase):
                 reason="sample_hash_missing",
                 message="The local command returned no sample hash.",
             )
-        output_text, text_truncated = _bounded_local_output(
-            result.output, self.max_local_output_chars
-        )
+        response_limit = min(self.max_local_output_chars, _LOCAL_RESPONSE_PREVIEW_CHARS)
+        output_text, response_truncated = _bounded_local_output(result.output, response_limit)
+        output_bytes, evidence_truncated = _bounded_persisted_local_output(result.output)
         status = _local_status(result.status)
-        truncated = text_truncated or result.status in {
+        tool_output_truncated = evidence_truncated or result.status in {
             LocalCommandStatus.TIMEOUT,
             LocalCommandStatus.OUTPUT_TRUNCATED,
         }
-        if truncated and _TRUNCATION_MARKER not in output_text:
-            output_text = _append_truncation_marker(output_text, self.max_local_output_chars)
-        if truncated and status is ToolInvocationStatus.SUCCEEDED:
+        if (response_truncated or tool_output_truncated) and _TRUNCATION_MARKER not in output_text:
+            output_text = _append_truncation_marker(output_text, response_limit)
+        if tool_output_truncated and status is ToolInvocationStatus.SUCCEEDED:
             status = ToolInvocationStatus.PARTIAL
 
         archive = result.archive_record()
-        archive["output"] = output_text
-        archive["output_truncated"] = truncated
+        archive_preview, _ = _bounded_local_output(result.output, _LOCAL_RESPONSE_PREVIEW_CHARS)
+        if tool_output_truncated and _TRUNCATION_MARKER not in archive_preview:
+            archive_preview = _append_truncation_marker(
+                archive_preview, _LOCAL_RESPONSE_PREVIEW_CHARS
+            )
+        archive["output"] = archive_preview
+        archive["output_truncated"] = tool_output_truncated
+        archive["output_truncated_by_response"] = response_truncated
+        archive["output_encoding"] = "base64-utf8"
+        archive["output_byte_length"] = len(output_bytes)
+        archive["output_sha256"] = hashlib.sha256(output_bytes).hexdigest()
+        archive["output_chunks"] = _text_chunks(
+            base64.b64encode(output_bytes).decode("ascii"), _LOCAL_OUTPUT_CHUNK_CHARS
+        )
+        archive["output_truncated_by_evidence_limit"] = evidence_truncated
         archive["untrusted_data"] = True
         if range_info is not None:
             archive["range"] = dict(range_info)
@@ -598,11 +626,11 @@ class _LocalRunCommandAdapter(_LocalAdapterBase):
                     "bytes_read": bytes_read,
                     "limit_seconds": capability.spec.timeout_seconds if capability else None,
                 }
-            elif text_truncated:
+            elif evidence_truncated:
                 partial_reason = {
-                    "code": "operator_output_character_limit_reached",
+                    "code": "evidence_output_byte_limit_reached",
                     "bytes_read": bytes_read,
-                    "limit_bytes": capability.spec.max_output_bytes if capability else None,
+                    "limit_bytes": _MAX_PERSISTED_LOCAL_OUTPUT_BYTES,
                 }
         if partial_reason is not None:
             archive["partial_reason"] = partial_reason
@@ -639,10 +667,16 @@ class _LocalRunCommandAdapter(_LocalAdapterBase):
             "exit_code": result.exit_code,
             "duration_seconds": result.duration_seconds,
             "output": output_text,
-            "output_truncated": truncated,
+            "output_truncated": tool_output_truncated,
+            "output_truncated_by_response": response_truncated,
             "reason": result.detail_code,
             "untrusted_data": True,
             "observation_ref": str(observation.id),
+            "observation_sha256": observation.sha256,
+            "observation_url": (
+                f"/api/investigations/{context.investigation_id}/operator/observations/"
+                f"{observation.id}?offset=0&length=16384"
+            ),
         }
         if range_info is not None:
             output["range"] = dict(range_info)
@@ -1112,6 +1146,19 @@ def _bounded_local_output(value: str, max_chars: int) -> tuple[str, bool]:
         return sanitized, False
     prefix_length = max(0, max_chars - len(_TRUNCATION_MARKER) - 1)
     return sanitized[:prefix_length] + "\n" + _TRUNCATION_MARKER, True
+
+
+def _bounded_persisted_local_output(value: str) -> tuple[bytes, bool]:
+    sanitized = sanitize_evidence_text(value, max_chars=len(value) + 1_024)
+    encoded = sanitized.encode("utf-8")
+    if len(encoded) <= _MAX_PERSISTED_LOCAL_OUTPUT_BYTES:
+        return encoded, False
+    bounded = encoded[:_MAX_PERSISTED_LOCAL_OUTPUT_BYTES].decode("utf-8", errors="ignore")
+    return bounded.encode("utf-8"), True
+
+
+def _text_chunks(value: str, chunk_chars: int) -> list[str]:
+    return [value[index : index + chunk_chars] for index in range(0, len(value), chunk_chars)]
 
 
 def _append_truncation_marker(value: str, max_chars: int) -> str:

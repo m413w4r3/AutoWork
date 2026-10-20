@@ -371,6 +371,54 @@ async def test_zero_packet_capture_is_success_without_claiming_no_network() -> N
     )
 
 
+@pytest.mark.asyncio
+async def test_capture_report_counts_protocols_once_per_packet_and_keeps_endpoint_ports() -> None:
+    capture = _pcap(
+        (
+            _udp_frame(source_port=53000, destination_port=53, payload=b"query"),
+            _udp_frame(source_port=53001, destination_port=53, payload=b"response"),
+        )
+    )
+    workbench, _ = _workbench(capture)
+    reference = await _accepted_reference(workbench)
+    _content, parsed = await workbench._load(reference, investigation_id=_NETWORK_INVESTIGATION_ID)
+    rows = tuple(
+        TsharkPacketFields(
+            frame_number=index,
+            timestamp=None,
+            frame_length=None,
+            protocol="DNS",
+            protocol_stack="frame:eth:ip:udp:dns",
+            values=("",) * (len(TSHARK_FIELDS) - 5),
+        )
+        for index in (1, 2)
+    )
+    inspection = TsharkInspection(
+        status=LocalCommandStatus.SUCCEEDED,
+        detail_code=None,
+        tshark_version="test-runner",
+        capinfos_version="test-runner",
+        packets=rows,
+        capinfos_summary="2 packets",
+        output_truncated=False,
+        ja3_available=False,
+    )
+
+    report, _truncated = workbench._capture_report(
+        reference,
+        parsed,
+        _flows(parsed.packets),
+        inspection,
+        (),
+    )
+
+    dns = next(item for item in report.protocols if item.protocol == "DNS")
+    endpoint_pairs = {(item.address, item.port) for item in report.endpoints}
+    assert report.packet_count == 2
+    assert dns.packet_count == 2
+    assert endpoint_pairs == {("10.0.0.2", 53000), ("10.0.0.2", 53001), ("8.8.8.8", 53)}
+
+
 @pytest.mark.parametrize(
     ("link_type", "encapsulate", "expected_format"),
     (

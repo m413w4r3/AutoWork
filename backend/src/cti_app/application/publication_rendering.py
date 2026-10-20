@@ -59,6 +59,7 @@ from cti_app.application.typst_rendering import (
     load_template_bundle,
 )
 from cti_app.domain.analyst_opinion import AnalystOpinionV1
+from cti_app.domain.investigation import EvidenceObservation, InvestigationFinding
 from cti_app.domain.investigation_graph import InvestigationGraph
 from cti_app.domain.media_assets import MediaAssetKind
 from cti_app.domain.production import ProductionArtifactStage, ProductionArtifactStatus
@@ -77,7 +78,7 @@ from cti_app.domain.publication_render import (
 from cti_app.domain.typst_render import TypstRenderFormat, TypstRenderStatus
 
 PUBLICATION_RENDERER = "typst"
-PUBLICATION_RENDERER_VERSION = "publication-v11-typst-v25-anchored-editorial-sections"
+PUBLICATION_RENDERER_VERSION = "publication-v12-typst-v30-opinion-provenance"
 
 
 class InfrastructureGraphDiagramCompiler(Protocol):
@@ -224,6 +225,8 @@ class PublicationRenderService:
         synthesis: ProductionSynthesisV1 | None = None,
         *,
         infrastructure_graph: InvestigationGraph | None = None,
+        findings: tuple[InvestigationFinding, ...] = (),
+        evidence_observations: tuple[EvidenceObservation, ...] = (),
     ) -> CompiledTypstDocument:
         """Compile an ephemeral, watermarked draft without creating render state."""
         try:
@@ -232,6 +235,8 @@ class PublicationRenderService:
                 opinion,
                 synthesis,
                 infrastructure_graph,
+                findings,
+                evidence_observations,
             )
         except ValueError as exc:
             raise PublicationRenderDocumentInvalidError(str(exc)) from exc

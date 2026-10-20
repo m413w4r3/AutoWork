@@ -20,7 +20,7 @@ from cti_app.domain.local_analysis import (
 )
 
 CONFINED_ANALYSIS_JOB_KIND = "sample.confined_analysis.v1"
-CONFINED_ANALYSIS_RESULT_SCHEMA = "confined-analysis-result.v1"
+CONFINED_ANALYSIS_RESULT_SCHEMA = "confined-analysis-result.v2"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -360,6 +360,35 @@ class ConfinedAnalysisExecutionPort(Protocol):
     async def execute(self, request: ConfinedAnalysisRequest) -> ConfinedAnalysisResult: ...
 
 
+def confined_analysis_operation_cache_identity(
+    execution: ConfinedAnalysisExecutionPort | None,
+    *,
+    result_schema_version: str = CONFINED_ANALYSIS_RESULT_SCHEMA,
+) -> Mapping[str, Any]:
+    """Version a tool-result reuse key with its result contract and worker proof."""
+    attestation = execution.attestation if execution is not None else None
+    worker_attestation = None
+    if attestation is not None:
+        worker_attestation = {
+            "reachable": attestation.reachable,
+            "confined": attestation.confined,
+            "dependencies_ready": attestation.dependencies_ready,
+            "isolation_profile": attestation.isolation_profile,
+            "versions": dict(sorted(attestation.versions.items())),
+            "families": {
+                name: {
+                    "available": status.available,
+                    "version": status.version,
+                }
+                for name, status in sorted(attestation.families.items())
+            },
+        }
+    return {
+        "result_schema_version": result_schema_version,
+        "worker_attestation": worker_attestation,
+    }
+
+
 class ConfinedAnalysisJobParameters(JobParameters):
     # Durable job rows are JSON. This contract deliberately accepts their JSON
     # UUID/enumeration forms when the worker validates the persisted payload.
@@ -397,7 +426,8 @@ def deterministic_confined_analysis_key(
     request: ConfinedAnalysisRequest, *, worker_versions: Mapping[str, str | None]
 ) -> str:
     payload = {
-        "schema": "confined-analysis-operation.v1",
+        "schema": "confined-analysis-operation.v2",
+        "result_schema_version": CONFINED_ANALYSIS_RESULT_SCHEMA,
         "investigation_id": str(request.investigation_id),
         "association_id": str(request.association_id),
         "sample_id": str(request.sample_id),

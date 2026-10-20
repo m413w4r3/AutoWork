@@ -7,7 +7,7 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, cast
 from urllib.parse import parse_qsl, urlsplit
 from uuid import UUID
@@ -23,6 +23,7 @@ from cti_app.application.investigation_contracts import (
     InvestigationOperatorContextV1,
     OperatorContextSectionPageV1,
 )
+from cti_app.application.investigation_experiments import HYPOTHESIS_DECLARE_TOOL
 from cti_app.application.investigation_persistence import (
     InvestigationEnvelopeRepository,
     ToolInvocationRepository,
@@ -51,6 +52,11 @@ from cti_app.domain.investigation import (
     ToolInvocationStatus,
     canonical_json_bytes,
 )
+from cti_app.domain.investigation_experiment import (
+    HYPOTHESIS_DECLARE_TOOL_SCHEMA_VERSION,
+    HYPOTHESIS_ID_PATTERN,
+)
+from cti_app.domain.investigation_state import Hypothesis
 
 _LEGACY_SCHEMA_V1_TOOLS = frozenset(
     {
@@ -60,6 +66,7 @@ _LEGACY_SCHEMA_V1_TOOLS = frozenset(
         "opinion.note",
         "opinion.revise",
         "advisor.consult",
+        HYPOTHESIS_DECLARE_TOOL,
     }
 )
 
@@ -602,6 +609,42 @@ class OperatorToolInvocationService:
         updated_state = state.with_operator_tool_action(
             f"operator_tool:{tool_name}:{operation_key[-16:]}"
         )
+        declaration_authorized = (
+            tool_name == HYPOTHESIS_DECLARE_TOOL
+            and schema_version == HYPOTHESIS_DECLARE_TOOL_SCHEMA_VERSION
+            and definition is not None
+            and definition.capability_key == "operator.write"
+            and "operator.write" in self._available_capabilities
+            and envelope is not None
+        )
+        if declaration_authorized and envelope is not None:
+            current_envelope = await self._envelopes.get(self._investigation_id)
+            declaration_authorized = (
+                current_envelope is not None
+                and current_envelope.version == envelope.version
+                and current_envelope.approval_decision_id == envelope.approval_decision_id
+            )
+        if declaration_authorized:
+            hypothesis_id = arguments.get("hypothesis_id")
+            statement = arguments.get("statement")
+            if (
+                isinstance(hypothesis_id, str)
+                and re.fullmatch(HYPOTHESIS_ID_PATTERN, hypothesis_id) is not None
+                and isinstance(statement, str)
+                and 1 <= len(statement) <= 8_000
+                and set(arguments) == {"hypothesis_id", "statement"}
+            ):
+                try:
+                    hypothesis = Hypothesis(id=hypothesis_id, statement=statement)
+                except (TypeError, ValueError):
+                    hypothesis = None
+                if hypothesis is not None and not any(
+                    item.id == hypothesis.id for item in state.hypotheses
+                ):
+                    updated_state = replace(
+                        updated_state,
+                        hypotheses=(*state.hypotheses, hypothesis),
+                    )
         try:
             updated_state = await self._states.save_if_version(
                 updated_state, expected_version=state.version
@@ -802,6 +845,10 @@ class OperatorToolInvocationService:
                     {
                         "observation_id": str(observation.id),
                         "sha256": observation.sha256,
+                        "url": (
+                            f"/api/investigations/{self._investigation_id}/operator/observations/"
+                            f"{observation.id}?offset=0&length=16384"
+                        ),
                         "summary": summary,
                     }
                 )

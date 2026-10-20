@@ -117,6 +117,23 @@ function SampleComparisonPanel({
   return (
     <section className="job-card" aria-labelledby="sample-comparison-heading">
       <h2 id="sample-comparison-heading">Comparaison d’échantillons</h2>
+      {comparisonsQuery.data?.omitted_comparisons?.map((omission) => (
+        <p
+          key={omission.observation_id}
+          className="warning-message"
+          role="note"
+        >
+          Comparaison trop volumineuse, omise — observation{" "}
+          <code>{omission.observation_id}</code> (
+          {omission.size_bytes.toLocaleString("fr-FR")} octets ;{" "}
+          {omission.reason}).
+        </p>
+      ))}
+      {comparisonsQuery.data?.omitted_comparisons_truncated ? (
+        <p role="note">
+          D’autres comparaisons trop volumineuses ont été omises de cette liste.
+        </p>
+      ) : null}
       {comparisonsQuery.isPending ? (
         <p role="status">Chargement des comparaisons…</p>
       ) : comparisonsQuery.isError ? (

@@ -206,6 +206,8 @@ def _node_references(diagram: DiagramSpecV1) -> dict[str, str]:
 
 def _layout_font_sizes(diagram: DiagramSpecV1, *, force_vertical: bool) -> tuple[int, int, int]:
     """Keep small graphs close to body size and scale denser horizontal graphs up."""
+    if diagram.profile is DiagramProfile.PROTOCOL_SEQUENCE:
+        return 18, 14, 32
     if force_vertical or len(diagram.nodes) <= 3:
         return _NODE_FONT_SIZE, _EDGE_FONT_SIZE, 24
     if len(diagram.nodes) == 4:
@@ -226,16 +228,22 @@ def _d2_requires_vertical_layout(node_count: int, labels: Sequence[str]) -> bool
 
 def encode_d2_source(diagram: DiagramSpecV1) -> bytes:
     """Encode the canonical graph using only synthetic D2 identifiers."""
-    if diagram.profile is DiagramProfile.PROTOCOL_SEQUENCE:
-        return _encode_protocol_sequence_source(diagram)
-
     node_references = _node_references(diagram)
+    stack_unconnected_sequence = (
+        diagram.profile is DiagramProfile.PROTOCOL_SEQUENCE
+        and len(diagram.nodes) > 1
+        and not diagram.edges
+    )
     # Treat stored vertical directions from older enrichment versions as derived
     # layout choices. Compact graphs now use the print-safe horizontal default.
     graph_labels = [node.label for node in diagram.nodes]
     graph_labels.extend(edge.label or "" for edge in diagram.edges)
     graph_labels.extend(group.label for group in diagram.groups)
-    force_vertical = _d2_requires_vertical_layout(len(diagram.nodes), graph_labels)
+    # Sequence views use a top-to-bottom graph for the print column. D2's native
+    # sequence shape lays participants across the page and shrinks long captions.
+    force_vertical = diagram.profile is DiagramProfile.PROTOCOL_SEQUENCE or (
+        _d2_requires_vertical_layout(len(diagram.nodes), graph_labels)
+    )
     node_font_size, edge_font_size, node_wrap_width = _layout_font_sizes(
         diagram, force_vertical=force_vertical
     )
@@ -323,6 +331,23 @@ def encode_d2_source(diagram: DiagramSpecV1) -> bytes:
         edge_lines.extend(("  }", "}"))
         lines.extend(edge_lines)
 
+    if stack_unconnected_sequence:
+        # An evidence-backed documentary sequence has ordered events but no
+        # observed endpoints or exchange edges. Use a D2 grid to stack those
+        # events without inventing a relation merely to force vertical layout.
+        lines = [
+            lines[0],
+            "message_order: {",
+            f"  grid-rows: {len(diagram.nodes)}",
+            "  style: {",
+            '    fill: "#FFFFFF"',
+            '    stroke: "#FFFFFF"',
+            '    font-color: "#FFFFFF"',
+            "    stroke-width: 0",
+            "  }",
+            *(f"  {line}" for line in lines[1:]),
+            "}",
+        ]
     return ("\n".join(lines) + "\n").encode(D2_SOURCE_ENCODING)
 
 
@@ -342,51 +367,6 @@ def _protocol_status(label: str) -> str | None:
 def _protocol_edge_color(label: str | None) -> str:
     status = _protocol_status(label or "")
     return _PROTOCOL_STATUS_COLORS[status][0] if status is not None else _EDGE_COLOR
-
-
-def _encode_protocol_sequence_source(diagram: DiagramSpecV1) -> bytes:
-    """Use D2's sequence diagram shape with synthetic identifiers and quoted labels."""
-    node_references = _node_references(diagram)
-    lines = ["shape: sequence_diagram"]
-    for node in diagram.nodes:
-        status = _protocol_status(node.label)
-        stroke, fill = (
-            _PROTOCOL_STATUS_COLORS[status]
-            if status is not None
-            else (_NODE_STROKE_BY_ROLE[node.role], _NODE_FILL)
-        )
-        lines.extend(
-            (
-                f"{node_references[node.node_id]}: {_escape_d2_label(node.label)} {{",
-                "  style: {",
-                f'    stroke: "{stroke}"',
-                f'    fill: "{fill}"',
-                "  }",
-                "}",
-            )
-        )
-    for edge in diagram.edges:
-        line = (
-            f"{node_references[edge.source_node_id]} -> "
-            f"{node_references[edge.target_node_id]}: "
-            f"{_escape_d2_label(edge.label or '')}"
-        )
-        status = _protocol_status(edge.label or "")
-        edge_color = _PROTOCOL_STATUS_COLORS[status][0] if status is not None else _EDGE_COLOR
-        lines.extend(
-            (
-                line + " {",
-                "  style: {",
-                f'    stroke: "{edge_color}"',
-                "    stroke-width: 1",
-                "    stroke-dash: 5"
-                if status in {"INFERRED", "UNRESOLVED", "CONTRADICTED"}
-                else "    stroke-dash: 0",
-                "  }",
-                "}",
-            )
-        )
-    return ("\n".join(lines) + "\n").encode(D2_SOURCE_ENCODING)
 
 
 def _wrap_d2_label(value: str, width: int = 24) -> str:

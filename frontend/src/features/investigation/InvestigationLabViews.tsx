@@ -440,6 +440,17 @@ function ExperimentDetail({
             {experiment.recorded_at}
           </time>
         </summary>
+        {experiment.superseded_by?.length ? (
+          <p className="verification-warning" role="note">
+            Remplacée par :{" "}
+            {experiment.superseded_by.map((experimentId, index) => (
+              <span key={experimentId}>
+                {index > 0 ? ", " : ""}
+                <code>{experimentId}</code>
+              </span>
+            ))}
+          </p>
+        ) : null}
         <dl>
           <dt>Protocole / méthode</dt>
           <dd>

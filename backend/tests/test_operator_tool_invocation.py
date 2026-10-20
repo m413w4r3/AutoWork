@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -13,6 +13,7 @@ from fastapi import FastAPI
 from httpx import ASGITransport
 from pydantic import ValidationError
 
+import cti_app.api.investigation as investigation_api
 from cti_app.api.investigation import router
 from cti_app.application.advisor_checkpoint import (
     advisor_checkpoint_summary,
@@ -26,12 +27,22 @@ from cti_app.application.investigation_advisor_tools import (
     InvestigationAdvisorTool,
     register_investigation_advisor_tool,
 )
+from cti_app.application.investigation_experiments import (
+    EXPERIMENT_RECORD_TOOL,
+    HYPOTHESIS_DECLARE_TOOL,
+    InMemoryInvestigationExperimentRepository,
+    register_operator_experiment_tools,
+)
 from cti_app.application.investigation_tools import ToolResult
+from cti_app.application.operator_advisor_guidance import build_advisor_guidance
 from cti_app.application.operator_tool_invocation import (
     OperatorToolInvocationError,
     OperatorToolInvocationService,
 )
-from cti_app.application.research_context_builder import InvestigationContextTooLarge
+from cti_app.application.research_context_builder import (
+    CanonicalEvidenceSummaryPort,
+    InvestigationContextTooLarge,
+)
 from cti_app.config import Settings
 from cti_app.domain.investigation import (
     BudgetDimension,
@@ -43,6 +54,11 @@ from cti_app.domain.investigation import (
     ToolInvocationStatus,
     canonical_json_bytes,
 )
+from cti_app.domain.investigation_experiment import (
+    EXPERIMENT_TOOL_SCHEMA_VERSION,
+    HYPOTHESIS_DECLARE_TOOL_SCHEMA_VERSION,
+)
+from cti_app.domain.investigation_state import Hypothesis
 from tests.test_investigation_service import _Fixture
 
 
@@ -87,6 +103,101 @@ async def _fixture(
 
 
 @pytest.mark.asyncio
+async def test_advisor_validation_rejection_is_json_serializable_in_api_response(monkeypatch):
+    investigation_id = uuid4()
+    invocation_id = uuid4()
+    captured = ToolResult(
+        ToolInvocationStatus.NEEDS_REVIEW,
+        error_code="advisor_output_invalid",
+        output={
+            "advisor_status": "output_invalid",
+            "validation_rejection": {
+                "code": "object_required",
+                "path": "$.recommended_next_tools[0].args_hint",
+            },
+            "response_excerpt": '{"args_hint":"--limit 3"}',
+            "response_sha256": "a" * 64,
+            "response_bytes": 24,
+        },
+    )
+    invocation = SimpleNamespace(
+        operation_key="advisor-api-serialization-test",
+        id=invocation_id,
+        tool_name="advisor.consult",
+        schema_version=ADVISOR_SCHEMA_VERSION,
+        status=ToolInvocationStatus.NEEDS_REVIEW,
+        version=1,
+        response_refs=(),
+    )
+    result = SimpleNamespace(
+        investigation_id=investigation_id,
+        working_state_version=2,
+        idempotent_replay=False,
+        invocation=invocation,
+        error_code="invocation_needs_review",
+        job_id=None,
+        output={"kind": "advisor_consult", "status": "needs_review", "data": {}},
+    )
+
+    class _Uow:
+        class _Investigations:
+            async def get(self, _investigation_id):
+                return object()
+
+        analyst_investigations = _Investigations()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc_info):
+            return None
+
+    class _OperatorInvocations:
+        async def invoke(self, **_kwargs):
+            return result
+
+    advisor = object.__new__(InvestigationAdvisorTool)
+    advisor._results = {invocation.operation_key: captured}
+
+    composition = SimpleNamespace(
+        operator_tool_invocations=_OperatorInvocations(),
+        advisor_tool=advisor,
+    )
+
+    monkeypatch.setattr(investigation_api, "_uow_factory", lambda _request: _Uow)
+    monkeypatch.setattr(
+        investigation_api,
+        "_composition_factory",
+        lambda _request: SimpleNamespace(build=lambda *_args, **_kwargs: composition),
+    )
+
+    async def allow_operator_client(_request):
+        return None
+
+    monkeypatch.setattr(investigation_api, "_require_operator_client", allow_operator_client)
+    app = FastAPI()
+    app.include_router(router)
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            f"/api/investigations/{investigation_id}/operator/tools/advisor.consult",
+            headers={"Idempotency-Key": "advisor-api-serialization-test"},
+            json={
+                "schema_version": ADVISOR_SCHEMA_VERSION,
+                "arguments": {"consultation_type": "plan_investigation"},
+                "purpose": "Check bounded advisor serialization.",
+                "expected_version": 1,
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["advisor_output"]["validation_rejection"] == {
+        "code": "object_required",
+        "path": "$.recommended_next_tools[0].args_hint",
+    }
+
+
+@pytest.mark.asyncio
 async def test_same_key_replays_durable_result_and_changed_payload_conflicts() -> None:
     fixture, state, service = await _fixture()
     request = {
@@ -99,6 +210,7 @@ async def test_same_key_replays_durable_result_and_changed_payload_conflicts() -
     }
 
     first = await service.invoke(**request)
+    after_first = await fixture.states.get(fixture.investigation_id)
     replay = await service.invoke(**request)
 
     assert first.invocation.status is ToolInvocationStatus.SUCCEEDED
@@ -109,11 +221,335 @@ async def test_same_key_replays_durable_result_and_changed_payload_conflicts() -
     )
     assert replay.idempotent_replay is True
     assert replay.invocation.id == first.invocation.id
+    assert first.working_state_version == state.version + 1
+    assert after_first is not None
+    assert after_first.version == state.version + 1
+    assert (await fixture.states.get(fixture.investigation_id)).version == after_first.version
     assert fixture.tools["vt.file_report"].calls == [{"query": "sample hash"}]
     assert first.invocation.operation_key in fixture.committed_running_keys
     with pytest.raises(OperatorToolInvocationError) as error:
         await service.invoke(**{**request, "purpose": "different payload"})
     assert error.value.code == "idempotency_conflict"
+
+
+@pytest.mark.asyncio
+async def test_hypothesis_declare_uses_one_cas_and_is_idempotent() -> None:
+    fixture, state, _ = await _fixture()
+    fixture.available_capabilities = frozenset((*fixture.available_capabilities, "operator.write"))
+    fixture.service._available_capabilities = fixture.available_capabilities
+    experiment_repository = InMemoryInvestigationExperimentRepository()
+    register_operator_experiment_tools(
+        fixture.registry,
+        experiments=experiment_repository,
+        observations=fixture.observations,
+        invocations=fixture.invocations,
+        states=fixture.states,
+        envelopes=fixture.envelopes,
+        article_snapshots=fixture.context_builder.article_snapshots,
+    )
+    service = _service(fixture)
+    request = {
+        "tool_name": HYPOTHESIS_DECLARE_TOOL,
+        "schema_version": "1",
+        "arguments": {
+            "hypothesis_id": "H-S3P2.1",
+            "statement": "PsProxy delegates retrieval through the observed proxy stage.",
+        },
+        "purpose": "Record the operator's falsifiable S3P2.1 hypothesis.",
+        "expected_version": state.version,
+        "idempotency_key": "hypothesis-s3p2-declare-1",
+    }
+
+    first = await service.invoke(**request)
+    after_first = await fixture.states.get(fixture.investigation_id)
+    replay = await service.invoke(**request)
+
+    assert first.invocation.status is ToolInvocationStatus.SUCCEEDED
+    assert first.working_state_version == state.version + 1
+    assert after_first is not None
+    assert after_first.version == state.version + 1
+    assert after_first.hypotheses == (
+        Hypothesis(
+            id="H-S3P2.1",
+            statement="PsProxy delegates retrieval through the observed proxy stage.",
+        ),
+    )
+    assert replay.idempotent_replay is True
+    assert replay.invocation.id == first.invocation.id
+    assert (await fixture.states.get(fixture.investigation_id)).version == after_first.version
+
+    same_content = await service.invoke(
+        tool_name=HYPOTHESIS_DECLARE_TOOL,
+        schema_version=HYPOTHESIS_DECLARE_TOOL_SCHEMA_VERSION,
+        arguments=request["arguments"],
+        purpose=request["purpose"],
+        expected_version=after_first.version,
+        idempotency_key="hypothesis-s3p2-declare-2",
+    )
+    after_same_content = await fixture.states.get(fixture.investigation_id)
+    assert same_content.invocation.status is ToolInvocationStatus.SUCCEEDED
+    assert after_same_content is not None
+    assert after_same_content.version == after_first.version + 1
+    assert after_same_content.hypotheses == after_first.hypotheses
+
+    conflicting_content = await service.invoke(
+        tool_name=HYPOTHESIS_DECLARE_TOOL,
+        schema_version=HYPOTHESIS_DECLARE_TOOL_SCHEMA_VERSION,
+        arguments={
+            **request["arguments"],
+            "statement": "A conflicting statement must not replace the declaration.",
+        },
+        purpose=request["purpose"],
+        expected_version=after_same_content.version,
+        idempotency_key="hypothesis-s3p2-conflicting-content",
+    )
+    after_conflict = await fixture.states.get(fixture.investigation_id)
+    assert conflicting_content.invocation.status is ToolInvocationStatus.FAILED
+    assert after_conflict is not None
+    assert after_conflict.hypotheses == after_same_content.hypotheses
+
+
+@pytest.mark.asyncio
+async def test_hypothesis_declare_without_current_g2_does_not_append_hypothesis() -> None:
+    fixture, state, _ = await _fixture()
+    fixture.available_capabilities = frozenset((*fixture.available_capabilities, "operator.write"))
+    fixture.service._available_capabilities = fixture.available_capabilities
+    register_operator_experiment_tools(
+        fixture.registry,
+        experiments=InMemoryInvestigationExperimentRepository(),
+        observations=fixture.observations,
+        invocations=fixture.invocations,
+        states=fixture.states,
+        envelopes=fixture.envelopes,
+        article_snapshots=fixture.context_builder.article_snapshots,
+    )
+    fixture.envelopes._items.pop(fixture.investigation_id)
+    service = _service(fixture)
+
+    result = await service.invoke(
+        tool_name=HYPOTHESIS_DECLARE_TOOL,
+        schema_version=HYPOTHESIS_DECLARE_TOOL_SCHEMA_VERSION,
+        arguments={"hypothesis_id": "H-no-g2", "statement": "A bounded hypothesis."},
+        purpose="Try a declaration without an approved G2 envelope.",
+        expected_version=state.version,
+        idempotency_key="hypothesis-no-g2",
+    )
+
+    saved_state = await fixture.states.get(fixture.investigation_id)
+    assert result.invocation.status is ToolInvocationStatus.POLICY_DENIED
+    assert result.output["data"]["result"]["error_code"] == "g2_approval_required"
+    assert saved_state is not None
+    assert saved_state.version == state.version + 1
+    assert saved_state.hypotheses == ()
+
+
+@pytest.mark.asyncio
+async def test_hypothesis_declare_does_not_append_after_g2_changes() -> None:
+    fixture, state, _ = await _fixture()
+    fixture.available_capabilities = frozenset((*fixture.available_capabilities, "operator.write"))
+    fixture.service._available_capabilities = fixture.available_capabilities
+    original_repository = fixture.envelopes
+    approved_envelope = await original_repository.get(fixture.investigation_id)
+    assert approved_envelope is not None
+
+    class _ChangingEnvelopeRepository:
+        def __init__(self) -> None:
+            self.reads = 0
+
+        async def get(self, investigation_id):
+            self.reads += 1
+            if self.reads >= 3:
+                return replace(approved_envelope, approval_decision_id=uuid4())
+            return await original_repository.get(investigation_id)
+
+        async def save_if_version(self, envelope, *, expected_version):
+            return await original_repository.save_if_version(
+                envelope, expected_version=expected_version
+            )
+
+    changing_repository = _ChangingEnvelopeRepository()
+    fixture.envelopes = changing_repository
+    fixture.service._envelopes = changing_repository
+    register_operator_experiment_tools(
+        fixture.registry,
+        experiments=InMemoryInvestigationExperimentRepository(),
+        observations=fixture.observations,
+        invocations=fixture.invocations,
+        states=fixture.states,
+        envelopes=changing_repository,
+        article_snapshots=fixture.context_builder.article_snapshots,
+    )
+
+    result = await _service(fixture).invoke(
+        tool_name=HYPOTHESIS_DECLARE_TOOL,
+        schema_version=HYPOTHESIS_DECLARE_TOOL_SCHEMA_VERSION,
+        arguments={"hypothesis_id": "H-S3P2.1", "statement": "A bounded hypothesis."},
+        purpose="Reject a declaration after its G2 envelope changes.",
+        expected_version=state.version,
+        idempotency_key="hypothesis-stale-g2",
+    )
+
+    saved_state = await fixture.states.get(fixture.investigation_id)
+    assert result.invocation.status is ToolInvocationStatus.POLICY_DENIED
+    assert result.output["data"]["result"]["error_code"] == "g2_envelope_changed"
+    assert saved_state is not None
+    assert saved_state.hypotheses == ()
+
+
+@pytest.mark.asyncio
+async def test_hypothesis_declare_rejects_uncontrolled_ids_without_state_append() -> None:
+    fixture, state, _ = await _fixture()
+    fixture.available_capabilities = frozenset((*fixture.available_capabilities, "operator.write"))
+    fixture.service._available_capabilities = fixture.available_capabilities
+    register_operator_experiment_tools(
+        fixture.registry,
+        experiments=InMemoryInvestigationExperimentRepository(),
+        observations=fixture.observations,
+        invocations=fixture.invocations,
+        states=fixture.states,
+        envelopes=fixture.envelopes,
+        article_snapshots=fixture.context_builder.article_snapshots,
+    )
+
+    result = await _service(fixture).invoke(
+        tool_name=HYPOTHESIS_DECLARE_TOOL,
+        schema_version=HYPOTHESIS_DECLARE_TOOL_SCHEMA_VERSION,
+        arguments={"hypothesis_id": "H invalid/id", "statement": "A bounded hypothesis."},
+        purpose="Reject an uncontrolled hypothesis identifier.",
+        expected_version=state.version,
+        idempotency_key="hypothesis-invalid-id",
+    )
+
+    saved_state = await fixture.states.get(fixture.investigation_id)
+    assert result.invocation.status is ToolInvocationStatus.FAILED
+    assert saved_state is not None
+    assert saved_state.version == state.version + 1
+    assert saved_state.hypotheses == ()
+
+
+@pytest.mark.asyncio
+async def test_hypothesis_declare_requires_operator_write_capability() -> None:
+    fixture, state, _ = await _fixture()
+    fixture.available_capabilities = frozenset(
+        item for item in fixture.available_capabilities if item != "operator.write"
+    )
+    fixture.service._available_capabilities = fixture.available_capabilities
+    register_operator_experiment_tools(
+        fixture.registry,
+        experiments=InMemoryInvestigationExperimentRepository(),
+        observations=fixture.observations,
+        invocations=fixture.invocations,
+        states=fixture.states,
+        envelopes=fixture.envelopes,
+        article_snapshots=fixture.context_builder.article_snapshots,
+    )
+
+    result = await _service(fixture).invoke(
+        tool_name=HYPOTHESIS_DECLARE_TOOL,
+        schema_version=HYPOTHESIS_DECLARE_TOOL_SCHEMA_VERSION,
+        arguments={"hypothesis_id": "H-S3P2.1", "statement": "A bounded hypothesis."},
+        purpose="Reject a declaration without operator.write.",
+        expected_version=state.version,
+        idempotency_key="hypothesis-without-operator-write",
+    )
+
+    saved_state = await fixture.states.get(fixture.investigation_id)
+    assert result.invocation.status is ToolInvocationStatus.UNAVAILABLE
+    assert "operator.write" in result.output["error"]["reason"]
+    assert saved_state is not None
+    assert saved_state.hypotheses == ()
+
+
+@pytest.mark.asyncio
+async def test_operator_led_experiment_record_uses_declared_hypothesis_and_stream_cas() -> None:
+    fixture, state, _ = await _fixture()
+    fixture.available_capabilities = frozenset((*fixture.available_capabilities, "operator.write"))
+    fixture.service._available_capabilities = fixture.available_capabilities
+    experiment_repository = InMemoryInvestigationExperimentRepository()
+    register_operator_experiment_tools(
+        fixture.registry,
+        experiments=experiment_repository,
+        observations=fixture.observations,
+        invocations=fixture.invocations,
+        states=fixture.states,
+        envelopes=fixture.envelopes,
+        article_snapshots=fixture.context_builder.article_snapshots,
+    )
+    service = _service(fixture)
+    declared = await service.invoke(
+        tool_name=HYPOTHESIS_DECLARE_TOOL,
+        schema_version=HYPOTHESIS_DECLARE_TOOL_SCHEMA_VERSION,
+        arguments={
+            "hypothesis_id": "H-S3P2.1",
+            "statement": "PsProxy uses the measured proxy stage.",
+        },
+        purpose="Declare a hypothesis before recording its test.",
+        expected_version=state.version,
+        idempotency_key="hypothesis-before-experiment",
+    )
+    assert declared.invocation.status is ToolInvocationStatus.SUCCEEDED
+
+    observation = EvidenceObservation(
+        investigation_id=fixture.investigation_id,
+        kind=EvidenceKind.OTHER,
+        blob_id=uuid4(),
+        sha256="b" * 64,
+        source="network.capture.inspect",
+        source_version="network-capture-inspect.v1",
+        observed_at=datetime.now(UTC),
+        object_type="capture",
+        object_id="capture-sha256",
+    )
+    await fixture.observations.append_if_absent(observation)
+    started_at = datetime.now(UTC) - timedelta(seconds=2)
+    arguments = {
+        "expected_version": 0,
+        "hypothesis_id": "H-S3P2.1",
+        "claim_ids": ["C1"],
+        "prediction": "The persisted capture contains the proxy marker.",
+        "falsification_criterion": "A complete relevant capture contains no proxy marker.",
+        "method": "Passively inspect the persisted capture with the pinned parser.",
+        "method_mode": "passive",
+        "input_type": "capture_sha256",
+        "input_refs": [{"input_type": "capture_sha256", "input_id": "a" * 64, "sha256": "a" * 64}],
+        "preconditions": ["The capture is persisted and bound to this investigation."],
+        "availability": "available",
+        "tool_name": "network.capture.inspect",
+        "tool_version": "4.4.1",
+        "tool_schema_version": "network-capture-inspect.v1",
+        "tool_arguments": {"max_packets": 500},
+        "step_ids": ["step-s3p2-1"],
+        "tool_invocation_refs": [],
+        "observation_refs": [{"observation_id": str(observation.id), "sha256": observation.sha256}],
+        "expected": "The proxy marker is present in the relevant capture window.",
+        "actual": "The proxy marker is present in the persisted capture.",
+        "actual_outcome": "observed",
+        "observation_coverage": "complete",
+        "started_at": started_at.isoformat(),
+        "completed_at": (started_at + timedelta(seconds=1)).isoformat(),
+        "scope": "Static capture inspection; no victim execution is established.",
+        "limitations": [],
+        "verdict": "supports",
+        "implication": "The capture supports the bounded proxy-stage claim.",
+        "next_pivots": ["c" * 64],
+    }
+
+    result = await service.invoke(
+        tool_name=EXPERIMENT_RECORD_TOOL,
+        schema_version=EXPERIMENT_TOOL_SCHEMA_VERSION,
+        arguments=arguments,
+        purpose="Record the experiment against persisted S3P2.1 evidence.",
+        expected_version=declared.working_state_version,
+        idempotency_key="experiment-s3p2-record-1",
+    )
+
+    saved = await experiment_repository.list_for_investigation(fixture.investigation_id)
+    assert result.invocation.status is ToolInvocationStatus.SUCCEEDED
+    assert len(saved) == 1
+    assert saved[0].version == 1
+    assert saved[0].hypothesis_id == "H-S3P2.1"
+    assert saved[0].observation_refs[0].observation_id == observation.id
+    assert saved[0].observation_refs[0].sha256 == observation.sha256
 
 
 @pytest.mark.asyncio
@@ -316,12 +752,7 @@ async def test_advisor_recommendations_record_acceptance_refusal_and_empirical_o
     for item in (initial_observation, accepted_observation, alternative_observation):
         await fixture.observations.append_if_absent(item)
 
-    class SummaryReader:
-        async def summary(self, observation):
-            raw = artifacts.values.get(observation.blob_id)
-            return json.loads(raw) if raw is not None else None
-
-    summaries = SummaryReader()
+    summaries = CanonicalEvidenceSummaryPort(artifacts)
 
     class StrictBridge:
         def __init__(self):
@@ -361,7 +792,6 @@ async def test_advisor_recommendations_record_acceptance_refusal_and_empirical_o
                                 "tool": "vt.file_report",
                                 "schema_version": "1",
                                 "why": "Vérifier la fiche du hash déjà mesuré.",
-                                "args_hint": {"query": "a" * 64},
                                 "expected_signal": "La fiche contient la même configuration.",
                                 "basis_refs": basis,
                             },
@@ -435,6 +865,35 @@ async def test_advisor_recommendations_record_acceptance_refusal_and_empirical_o
     assert advice.invocation.status is ToolInvocationStatus.SUCCEEDED
     assert persisted_advice
     assert advice.invocation.consumed_budget[BudgetDimension.BRIDGE_TURNS] == 1
+    advisor_observation = next(
+        item for item in persisted_advice if item.id in advice.invocation.response_refs
+    )
+    advisor_summary = await summaries.summary(advisor_observation)
+    assert advisor_summary is not None
+    assert advisor_summary["schema"] == "operator-advisor-call.v1"
+    assert advisor_summary["consultation_type"] == "pivot_strategy"
+    assert isinstance(advisor_summary["input_observation_refs"], list)
+    projected_output = advisor_summary["output"]
+    assert isinstance(projected_output["alternative_hypotheses"], list)
+    assert isinstance(projected_output["basis_observation_refs"], list)
+    assert isinstance(projected_output["recommended_next_tools"], list)
+    assert isinstance(projected_output["risks"], list)
+    assert isinstance(projected_output["questions"], list)
+    assert advisor_summary["output"]["normalizations"] == [
+        "$.recommended_next_tools[0].args_hint:absent_to_empty_object"
+    ]
+    assert len(canonical_json_bytes(advisor_summary)) <= 48 * 1024
+    guidance = await build_advisor_guidance(
+        invocations=(advice.invocation,),
+        observations=(advisor_observation,),
+        evidence_summaries=summaries,
+        available_tools=("vt.file_report", "vt.object_report", "sample.analyze"),
+    )
+    assert guidance["last_advice"] is not None
+    assert guidance["last_advice"]["invocation_id"] == advice.invocation.id
+    assert guidance["last_advice"]["consultation_type"] == "pivot_strategy"
+    assert isinstance(guidance["last_advice"]["date"], datetime)
+    assert isinstance(guidance["last_advice"]["key_points"], tuple)
     advice_trace = _trace(advice.invocation)
     assert "checkpoint " in advice_trace
     assert " consulted" in advice_trace
@@ -495,6 +954,41 @@ async def test_advisor_recommendations_record_acceptance_refusal_and_empirical_o
     assert alternative_observation.id in refused.invocation.response_refs
     assert "refused" in _trace(refused.invocation)
     assert "Le pivot VT ne discrimine pas assez" in _trace(refused.invocation)
+
+    current_state = await fixture.states.get(fixture.investigation_id)
+    app = FastAPI()
+    app.include_router(router)
+    app.state.identity_provider = _IdentityProvider()
+    app.state.uow_factory = lambda: _Uow(fixture)
+    app.state.investigation_composition_factory = _CompositionFactory(
+        service, fixture=fixture, artifact_store=artifacts
+    )
+
+    async with httpx.AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        operator_status = await client.get(
+            f"/api/investigations/{fixture.investigation_id}/operator-status"
+        )
+        operator_context = await client.get(
+            f"/api/investigations/{fixture.investigation_id}/operator/context",
+            params={
+                "view": "summary",
+                "expected_version": current_state.version,
+                "expected_sha256": current_state.sha256,
+            },
+        )
+
+    assert operator_status.status_code == 200, operator_status.text
+    last_advice = operator_status.json()["advisor_guidance"]["last_advice"]
+    assert last_advice is not None
+    assert last_advice["consultation_type"] == "pivot_strategy"
+    assert isinstance(datetime.fromisoformat(last_advice["date"]), datetime)
+    assert isinstance(last_advice["key_points"], list)
+    assert last_advice["key_points"]
+    assert last_advice["invocation_id"] == str(advice.invocation.id)
+    assert operator_context.status_code == 200, operator_context.text
+    assert operator_context.json()["schema"] == "investigation-operator-context-summary.v1"
 
     fixture.tools["sample.analyze"].result = ToolResult(
         status=ToolInvocationStatus.SUCCEEDED,
@@ -690,6 +1184,26 @@ class _IdentityProvider:
 class _Uow:
     def __init__(self, fixture: _Fixture) -> None:
         self.analyst_investigations = fixture.investigations
+        self.investigation_states = fixture.states
+        self.investigation_envelopes = fixture.envelopes
+        self.analyst_decisions = fixture.analyst_decisions
+        self.tool_invocations = fixture.invocations
+        self.evidence_observations = fixture.observations
+        self.analyst_opinions = fixture.opinions
+
+        class _Jobs:
+            async def list_for_aggregate(self, *_args, **_kwargs):
+                return ()
+
+        class _ModelConversationTurns:
+            async def get_by_idempotency_key(self, *_args, **_kwargs):
+                return None
+
+            async def get(self, *_args, **_kwargs):
+                return None
+
+        self.jobs = _Jobs()
+        self.model_conversation_turns = _ModelConversationTurns()
 
     async def __aenter__(self) -> _Uow:
         return self
@@ -699,8 +1213,20 @@ class _Uow:
 
 
 class _CompositionFactory:
-    def __init__(self, invocation_service: OperatorToolInvocationService) -> None:
+    def __init__(
+        self,
+        invocation_service: OperatorToolInvocationService,
+        *,
+        fixture: _Fixture | None = None,
+        artifact_store: object | None = None,
+    ) -> None:
         self.operator_tool_invocations = invocation_service
+        self.fixture = fixture
+        self.artifact_store = artifact_store
+        self.settings = SimpleNamespace(
+            operator_advisor_checkpoint_tool_threshold=12,
+            operator_advisor_max_turns_per_investigation=8,
+        )
 
     def build(
         self,
@@ -710,7 +1236,15 @@ class _CompositionFactory:
         operator_mode: bool = False,
     ) -> SimpleNamespace:
         assert operator_mode is True
-        return SimpleNamespace(operator_tool_invocations=self.operator_tool_invocations)
+        composition = SimpleNamespace(operator_tool_invocations=self.operator_tool_invocations)
+        if self.fixture is not None:
+            composition.tool_dependencies = SimpleNamespace(
+                article_snapshots=self.fixture.context_builder.article_snapshots,
+                artifact_store=self.artifact_store,
+            )
+            composition.registry = self.fixture.registry
+            composition.available_capabilities = self.fixture.available_capabilities
+        return composition
 
 
 @pytest.mark.asyncio
@@ -786,6 +1320,11 @@ async def test_operator_http_routes_expose_bounded_context_and_idempotent_invoca
             "purpose": "verify report",
             "expected_version": state.version,
         }
+        stale_tool = await client.post(
+            f"/api/investigations/{fixture.investigation_id}/operator/tools/vt.file_report",
+            json={**payload, "expected_version": state.version + 1},
+            headers={"Idempotency-Key": "stale-http-key"},
+        )
         first = await client.post(
             f"/api/investigations/{fixture.investigation_id}/operator/tools/vt.file_report",
             json=payload,
@@ -828,9 +1367,14 @@ async def test_operator_http_routes_expose_bounded_context_and_idempotent_invoca
     assert finding_versions_page.json()["untrusted_data"] is True
     assert stale_summary.status_code == 409
     assert stale_summary.json()["detail"]["code"] == "stale_working_state"
+    assert stale_tool.status_code == 409
+    assert stale_tool.json()["detail"]["code"] == "stale_working_state"
     assert first.status_code == replay.status_code == 200
     assert first.json()["invocation"]["status"] == "succeeded"
     assert replay.json()["idempotent_replay"] is True
+    saved_state = await fixture.states.get(fixture.investigation_id)
+    assert saved_state is not None
+    assert saved_state.version == state.version + 1
     assert "sample hash" not in first.text
     assert fixture.tools["vt.file_report"].calls == [{"query": "sample hash"}]
 

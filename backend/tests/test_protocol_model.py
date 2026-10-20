@@ -34,6 +34,7 @@ from cti_app.application.investigation_tools import (
 from cti_app.application.network_protocol_model import (
     HypothesisNotReplayableError,
     NetworkProtocolWorkbench,
+    ProtocolTraceError,
     ProtocolTraceRequestV1,
 )
 from cti_app.application.network_workbench import (
@@ -513,6 +514,33 @@ async def test_protocol_compare_is_deterministic_and_keeps_endianness_variants()
     proposal_dict["free_text"] = "unstructured model output is rejected"
     with pytest.raises(ValueError):
         ProtocolHypothesisProposalV1.from_dict(proposal_dict)
+
+
+@pytest.mark.asyncio
+async def test_protocol_compare_and_hypothesis_reject_holdout_traces() -> None:
+    service, traces = await _network_and_traces(
+        (
+            (
+                _messages_capture(endian="big"),
+                True,
+                hashlib.sha256(b"sample-holdout").hexdigest(),
+            ),
+        )
+    )
+
+    with pytest.raises(ProtocolTraceError, match="this operation does not accept holdout traces"):
+        await service.compare(
+            subject_id="holdout-not-training",
+            investigation_id=_INVESTIGATION_ID,
+            traces=traces,
+        )
+    with pytest.raises(ProtocolTraceError, match="this operation does not accept holdout traces"):
+        await service.hypothesize(
+            subject_id="holdout-not-training",
+            investigation_id=_INVESTIGATION_ID,
+            proposal=_proposal(),
+            traces=traces,
+        )
 
 
 @pytest.mark.asyncio

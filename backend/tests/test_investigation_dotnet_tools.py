@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from contextlib import AbstractAsyncContextManager
 from types import SimpleNamespace
 from uuid import uuid4
@@ -38,6 +40,25 @@ class _Execution:
 
     def __init__(self) -> None:
         self.requests = []
+        self.result = {
+            "status": "SUCCEEDED",
+            "operation": "methods",
+            "version": "6.8.0.105",
+            "source": {"sha256": SAMPLE_SHA256},
+            "records": [
+                {
+                    "rid": 1,
+                    "token": "0x06000001",
+                    "type_name": "Fixture",
+                    "method_name": "Main",
+                    "signature": "int32 Main()",
+                }
+            ],
+            "total_items": 1,
+            "offset": 0,
+            "next_offset": None,
+            "truncated": False,
+        }
         self.family_statuses = {
             "dotnet": ConfinedAnalysisFamilyStatus("dotnet", True, "9.1.0.7988"),
             "local_command": ConfinedAnalysisFamilyStatus(
@@ -50,26 +71,7 @@ class _Execution:
         return SimpleNamespace(
             status=ToolInvocationStatus.SUCCEEDED,
             available_reason=None,
-            payload={
-                "result": {
-                    "status": "SUCCEEDED",
-                    "operation": "methods",
-                    "source": {"sha256": SAMPLE_SHA256},
-                    "records": [
-                        {
-                            "rid": 1,
-                            "token": "0x06000001",
-                            "type_name": "Fixture",
-                            "method_name": "Main",
-                            "signature": "int32 Main()",
-                        }
-                    ],
-                    "total_items": 1,
-                    "offset": 0,
-                    "next_offset": None,
-                    "truncated": False,
-                }
-            },
+            payload={"result": self.result},
         )
 
 
@@ -80,11 +82,18 @@ class _Recorder:
 
     async def record_json(self, **kwargs):
         self.calls.append(kwargs)
-        return SimpleNamespace(id=self.record_id)
+        encoded = json.dumps(
+            kwargs["payload"],
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return SimpleNamespace(id=self.record_id, sha256=hashlib.sha256(encoded).hexdigest())
 
 
 @pytest.mark.asyncio
-async def test_methods_tool_uses_canonical_blob_and_persists_versioned_evidence() -> None:
+async def test_dotnet_tools_use_canonical_blob_and_report_the_actual_engine() -> None:
     investigation_id = uuid4()
     association_id = uuid4()
     sample_id = uuid4()
@@ -148,6 +157,9 @@ async def test_methods_tool_uses_canonical_blob_and_persists_versioned_evidence(
     assert result.status is ToolInvocationStatus.SUCCEEDED
     assert result.output["sample_sha256"] == SAMPLE_SHA256
     assert result.output["result"]["records"][0]["token"] == "0x06000001"
+    assert result.output["source"]["engine"] == "monodis"
+    assert result.output["source"]["version"] == "6.8.0.105"
+    assert "package_sha512" not in result.output["source"]
     assert result.observation_refs == (recorder.record_id,)
     assert execution.requests[0].artifact_id == blob_id
     assert execution.requests[0].association_id == association_id
@@ -159,12 +171,103 @@ async def test_methods_tool_uses_canonical_blob_and_persists_versioned_evidence(
     }
     evidence = recorder.calls[0]
     assert evidence["kind"] is EvidenceKind.BINARY_ANALYSIS
-    assert evidence["source"] == "dotnet.ilspycmd"
-    assert ILSPYCMD_VERSION in evidence["source_version"]
-    assert ILSPYCMD_PACKAGE_SHA512 in evidence["source_version"]
+    assert evidence["source"] == "dotnet.monodis"
+    assert evidence["source_version"] == "dotnet-analysis-observation.v1:monodis:6.8.0.105"
+    assert evidence["payload"]["source"]["engine"] == "monodis"
     assert evidence["payload"]["schema_version"] == "dotnet-analysis-observation.v1"
     assert evidence["payload"]["sample_sha256"] == SAMPLE_SHA256
     assert any("C2" in item for item in evidence["limitations"])
+
+    execution.result = {
+        "status": "PARTIAL",
+        "operation": "decompile",
+        "engine": "monodis-fallback",
+        "version": "6.8.0.105",
+        "method_rid": 1,
+        "method_token": "0x06000001",
+        "type_name": "Fixture",
+        "method_name": "Main",
+        "stdout": "IL_0000: ldc.i4.7\nIL_0001: ret",
+        "offset": 0,
+        "length_chars": 25,
+        "total_chars": 25,
+        "next_offset": None,
+        "truncated": False,
+        "interpretation": "Fallback CIL disassembly; decompilation was unavailable.",
+    }
+    decompile_found = registry.get("method.decompile", "1")
+    assert decompile_found is not None
+    _, decompile_adapter = decompile_found
+    decompile_result = await decompile_adapter.execute(
+        {"sample_sha256": SAMPLE_SHA256, "method_rid": 1}, context
+    )
+
+    assert decompile_result.status is ToolInvocationStatus.SUCCEEDED
+    assert decompile_result.output["source"]["engine"] == "monodis-fallback"
+    assert decompile_result.output["source"]["version"] == "6.8.0.105"
+    assert decompile_result.output["result"]["engine"] == "monodis-fallback"
+
+    full_cil = "".join(f"IL_{index:04x}: nop\n" for index in range(2_600))
+    execution.result = {
+        "status": "SUCCEEDED",
+        "operation": "decompile",
+        "engine": "monodis-fallback",
+        "version": "6.8.0.105",
+        "method_rid": 32,
+        "method_token": "0x06000020",
+        "type_name": "Blackwood",
+        "method_name": "FixtureMethod",
+        "stdout": full_cil,
+        "offset": 0,
+        "length_chars": len(full_cil),
+        "total_chars": len(full_cil),
+        "next_offset": None,
+        "truncated": False,
+    }
+    full_result = await decompile_adapter.execute(
+        {"sample_sha256": SAMPLE_SHA256, "method_rid": 32, "max_chars": 12_000}, context
+    )
+    full_evidence = recorder.calls[-1]["payload"]
+    full_json = "".join(full_evidence["result_json_chunks"])
+    full_json_bytes = full_json.encode("utf-8")
+    assert len(full_cil.encode("utf-8")) > 32_000
+    assert json.loads(full_json)["stdout"] == full_cil
+    assert full_evidence["result_json_sha256"] == hashlib.sha256(full_json_bytes).hexdigest()
+    assert max(map(len, full_evidence["result_json_chunks"])) <= 4_000
+    assert full_evidence["result_truncated_by_tool_boundary"] is False
+    assert full_result.output["result_truncated_by_response"] is True
+    assert full_result.output["evidence_observation_id"] == str(recorder.record_id)
+    assert full_result.output["evidence_observation_url"].endswith(
+        f"{recorder.record_id}?offset=0&length=16384"
+    )
+    assert execution.requests[-1].analysis_parameters["max_chars"] == "12000"
+
+    execution.result = {
+        "status": "SUCCEEDED",
+        "operation": "decompile",
+        "engine": "ilspycmd",
+        "version": ILSPYCMD_VERSION,
+        "package_sha512": ILSPYCMD_PACKAGE_SHA512,
+        "method_rid": 1,
+        "method_token": "0x06000001",
+        "type_name": "Fixture",
+        "method_name": "Main",
+        "stdout": "IL_0000: ldc.i4.7\nIL_0001: ret",
+        "offset": 0,
+        "length_chars": 25,
+        "total_chars": 25,
+        "next_offset": None,
+        "truncated": False,
+    }
+    ilspy_result = await decompile_adapter.execute(
+        {"sample_sha256": SAMPLE_SHA256, "method_rid": 1}, context
+    )
+
+    assert ilspy_result.status is ToolInvocationStatus.SUCCEEDED
+    assert ilspy_result.output["source"]["engine"] == "ilspycmd"
+    assert ilspy_result.output["source"]["version"] == ILSPYCMD_VERSION
+    assert ilspy_result.output["source"]["package_sha512"] == ILSPYCMD_PACKAGE_SHA512
+    assert recorder.calls[-1]["source"] == "dotnet.ilspycmd"
 
 
 async def _list_associations(requested_id, expected_id, association):

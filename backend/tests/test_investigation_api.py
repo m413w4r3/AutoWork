@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 from dataclasses import replace
@@ -606,6 +607,7 @@ def test_operator_observation_route_paginates_sanitized_canonical_json() -> None
             "text": "operator evidence " * 3_000,
             "signed": "https://evidence.example/report?X-Amz-Signature=private",
             "api_key": "private-token",
+            "arbitrary_blob": "A" * 300,
         },
         separators=(",", ":"),
     ).encode()
@@ -658,9 +660,138 @@ def test_operator_observation_route_paginates_sanitized_canonical_json() -> None
     assert first_page["next_offset"] == 32_000
     combined = first_page["payload"] + second.json()["payload"]
     assert "[URL omitted]" in combined
+    assert "[encoded binary content omitted]" in combined
     assert "private-token" not in combined
     assert "X-Amz-Signature" not in combined
     assert len(first_page["payload"]) <= 32_000
+
+
+def _read_operator_observation(payload: dict[str, Any]):
+    canonical = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    blob_id = uuid4()
+    observation_id = uuid4()
+    observation = SimpleNamespace(
+        id=observation_id,
+        investigation_id=INVESTIGATION_ID,
+        blob_id=blob_id,
+        sha256=hashlib.sha256(canonical).hexdigest(),
+        source="AutoWork local analysis",
+        object_type="file",
+        object_id=payload.get("sample_sha256"),
+    )
+    store = _Store()
+    store.observations.append(observation)
+
+    def uow_factory():
+        uow = _Uow(store)
+        uow.blobs = _Rows(
+            {
+                blob_id: SimpleNamespace(
+                    descriptor=SimpleNamespace(
+                        mime_type="application/json",
+                        logical_bucket="investigation-evidence",
+                    )
+                )
+            }
+        )
+        return uow
+
+    class ArtifactStore:
+        async def read_bytes(self, requested_blob_id, *, max_bytes):
+            assert requested_blob_id == blob_id
+            assert max_bytes == 8 * 1024 * 1024
+            return canonical
+
+    client, _store = _client(store=store)
+    client.app.state.uow_factory = uow_factory
+    client.app.state.production_artifact_store = ArtifactStore()
+
+    class OperatorIdentityProvider:
+        async def current(self):
+            return Identity(
+                actor_id="operator:claude-client",
+                scopes=frozenset({IdentityScope.OPERATOR_CLIENT}),
+            )
+
+    client.app.state.identity_provider = OperatorIdentityProvider()
+    response = client.get(
+        f"/api/investigations/{INVESTIGATION_ID}/operator/observations/{observation_id}",
+        params={"offset": 0, "length": 32_000},
+    )
+    return response
+
+
+def test_operator_observation_reads_verified_xxd_base64_utf8_chunks() -> None:
+    sample_sha256 = "b" * 64
+    hex_bytes = " ".join(f"{byte:02x}" for byte in range(16))
+    ascii_column = "." * 16
+    xxd_output = "".join(
+        f"{offset:08x}: {hex_bytes}  {ascii_column}\n" for offset in range(128)
+    ).encode("utf-8")
+    encoded_output = base64.b64encode(xxd_output).decode("ascii")
+    chunks = [
+        encoded_output[index : index + 4_000] for index in range(0, len(encoded_output), 4_000)
+    ]
+    payload = {
+        "schema": "local-command-execution.v1",
+        "command_id": "xxd",
+        "sample_sha256": sample_sha256,
+        "output_encoding": "base64-utf8",
+        "output_byte_length": len(xxd_output),
+        "output_sha256": hashlib.sha256(xxd_output).hexdigest(),
+        "output_chunks": chunks,
+    }
+
+    response = _read_operator_observation(payload)
+
+    assert response.status_code == 200, response.text
+    visible = json.loads(response.json()["payload"])
+    decoded = base64.b64decode("".join(visible["output_chunks"]), validate=True)
+    assert visible["output_chunks"] == chunks
+    assert len(chunks) == 4
+    assert decoded == xxd_output
+    assert len(decoded) == visible["output_byte_length"] == 9_728
+    assert hashlib.sha256(decoded).hexdigest() == visible["output_sha256"]
+
+
+def test_operator_observation_masks_non_utf8_declared_text_chunks() -> None:
+    output = b"\xff\xfe\x00"
+    payload = {
+        "schema": "local-command-execution.v1",
+        "command_id": "xxd",
+        "sample_sha256": "c" * 64,
+        "output_encoding": "base64-utf8",
+        "output_byte_length": len(output),
+        "output_sha256": hashlib.sha256(output).hexdigest(),
+        "output_chunks": [base64.b64encode(output).decode("ascii")],
+    }
+
+    response = _read_operator_observation(payload)
+
+    assert response.status_code == 200, response.text
+    visible = json.loads(response.json()["payload"])
+    assert visible["output_chunks"] == ["[encoded binary content omitted]"]
+    assert base64.b64encode(output).decode("ascii") not in response.text
+
+
+def test_operator_observation_refuses_sensitive_text_inside_encoded_chunks() -> None:
+    output = b"00000000: api_key=chunk-secret https://example.test/?X-Amz-Signature=signed-secret\n"
+    payload = {
+        "schema": "local-command-execution.v1",
+        "command_id": "xxd",
+        "sample_sha256": "d" * 64,
+        "output_encoding": "base64-utf8",
+        "output_byte_length": len(output),
+        "output_sha256": hashlib.sha256(output).hexdigest(),
+        "output_chunks": [base64.b64encode(output).decode("ascii")],
+    }
+
+    response = _read_operator_observation(payload)
+
+    assert response.status_code == 422
+    assert "operator_observation_sensitive_text" in response.text
+    assert "chunk-secret" not in response.text
+    assert "signed-secret" not in response.text
 
 
 def _start_body() -> dict[str, str]:

@@ -12,6 +12,7 @@ from uuid import UUID, uuid4
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.confined_analysis import (
     CONFINED_ANALYSIS_JOB_KIND,
+    CONFINED_ANALYSIS_RESULT_SCHEMA,
     ConfinedAnalysisExecutionPort,
     ConfinedAnalysisFamilyStatus,
     ConfinedAnalysisJobParameters,
@@ -234,7 +235,7 @@ class DramatiqConfinedAnalysisExecutionPort(ConfinedAnalysisExecutionPort):
             )
         if (
             not isinstance(result_payload, dict)
-            or result_payload.get("schema") != "confined-analysis-result.v1"
+            or result_payload.get("schema") != CONFINED_ANALYSIS_RESULT_SCHEMA
             or result_payload.get("operation_key") != operation_key
             or result_payload.get("artifact_id") != str(request.artifact_id)
             or result_payload.get("artifact_kind") != request.artifact_kind.value

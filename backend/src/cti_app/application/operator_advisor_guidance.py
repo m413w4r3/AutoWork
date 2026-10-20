@@ -129,7 +129,7 @@ async def _latest_advice(
     return None
 
 
-def _key_points(output: Mapping[str, Any], available_tools: Sequence[str]) -> list[str]:
+def _key_points(output: Mapping[str, Any], available_tools: Sequence[str]) -> tuple[str, ...]:
     candidates: list[str] = []
     summary = output.get("summary")
     if isinstance(summary, str) and summary.strip():
@@ -159,7 +159,7 @@ def _key_points(output: Mapping[str, Any], available_tools: Sequence[str]) -> li
         if text:
             points.append(text)
             remaining -= len(text)
-    return points
+    return tuple(points)
 
 
 def _checkpoint(

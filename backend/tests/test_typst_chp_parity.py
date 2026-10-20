@@ -1448,7 +1448,7 @@ async def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_na
         "annex_has_exhaustive_table": bool(annex["ioc_row_groups"]),
     }
     assert structural_snapshot == {
-        "schema_version": "typst-publication-model-v26-anchored-editorial-spacing",
+        "schema_version": "typst-publication-model-v27-opinion-citations",
         "section_types": [
             "references",
             "chronology",

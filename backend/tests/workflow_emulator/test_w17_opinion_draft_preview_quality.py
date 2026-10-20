@@ -43,6 +43,7 @@ from cti_app.domain.investigation import (
     FindingAssessment,
     FindingKind,
     InvestigationFinding,
+    NoveltyClass,
 )
 from cti_app.domain.production import ProductionEvidenceBasis
 from cti_app.domain.production_extraction import (
@@ -264,6 +265,109 @@ def _document_and_opinion() -> tuple[
         status=AnalystOpinionStatus.DRAFT,
     )
     return document, opinion, synthesis, (finding,), (observation,)
+
+
+def test_draft_new_sample_iocs_require_supported_finding_and_persisted_subject_refs() -> None:
+    document, opinion, synthesis, findings, observations = _document_and_opinion()
+    hashes = (
+        "77e8056d432b3aa2ac47cba783cc7912fe7dbfea12c62e654e84d11c80e5f3f8",
+        "0c75d6000177936adafef1e244dbab16e76362368b5ceb78caa50e0223184545",
+    )
+    candidate_hash = "f" * 64
+    unrelated_statement_hash = "e" * 64
+    sample_observations = tuple(
+        replace(
+            observations[0],
+            id=UUID(int=1800 + index),
+            object_type="file",
+            object_id=value,
+        )
+        for index, value in enumerate((*hashes, candidate_hash), start=1)
+    )
+    sample_findings = (
+        replace(
+            findings[0],
+            id=UUID(int=1901),
+            kind=FindingKind.NEW_SAMPLE,
+            assessment=FindingAssessment.SUPPORTED,
+            novelty=NoveltyClass.NEW_TO_ARTICLE,
+            statement=(
+                "[UNTRUSTED ARTICLE OR TOOL DATA] Blackwood.dll.conf "
+                f"{hashes[0]} and {hashes[1]} were decoded; {unrelated_statement_hash} "
+                "is not cited. [END UNTRUSTED DATA]"
+            ),
+            scope=f"Subject reference: {hashes[0]}",
+            observation_refs=(sample_observations[0].id, sample_observations[1].id),
+        ),
+        replace(
+            findings[0],
+            id=UUID(int=1902),
+            kind=FindingKind.NEW_SAMPLE,
+            assessment=FindingAssessment.QUALIFIED,
+            novelty=NoveltyClass.NEW_TO_ARTICLE,
+            statement=f"Blackwood.dll.conf {candidate_hash} is not confirmed.",
+            scope=f"Subject reference: {candidate_hash}",
+            observation_refs=(sample_observations[2].id,),
+        ),
+    )
+
+    model = project_publication_to_typst_model(
+        TypstDraftPreviewDocument(
+            document,
+            opinion,
+            synthesis,
+            findings=sample_findings,
+            evidence_observations=sample_observations,
+        )
+    )
+    ioc_section = next(item for item in model.content_sections if item["type"] == "ioc")
+    original_hashes = {
+        item["value"]["text"]
+        for group in ioc_section["original_indicators"]
+        for item in group["items"]
+    }
+    candidate_hashes = {
+        item["value"]["text"]
+        for group in ioc_section["candidate_indicators"]
+        for item in group["items"]
+    }
+    assert original_hashes == set(hashes)
+    assert candidate_hashes == {candidate_hash}
+    assert unrelated_statement_hash not in original_hashes | candidate_hashes
+    original_items = [
+        item for group in ioc_section["original_indicators"] for item in group["items"]
+    ]
+    assert all("Blackwood.dll.conf" in item["context"] for item in original_items)
+    assert all(len(item["draft_refs"]) == 3 for item in original_items)
+    annex = next(item for item in model.content_sections if item["type"] == "technical_annex")
+    provenance_ids = {item["reference_id"] for item in annex["opinion_refs"]}
+    assert {str(item.id) for item in sample_findings[:2]}.issubset(provenance_ids)
+    assert {str(item.id) for item in sample_observations[:2]}.issubset(provenance_ids)
+
+
+def test_preview_without_eligible_findings_has_no_empty_or_invented_ioc_section() -> None:
+    document, opinion, synthesis, _findings, _observations = _document_and_opinion()
+    empty_document = replace(
+        document,
+        document=replace(document.document, indicators=()),
+        original_indicators=(),
+        ioc_details=(),
+    )
+    empty_opinion = replace(
+        opinion,
+        blocks=(),
+        base_publication_sha256=publication_document_v5_sha256(empty_document),
+        content_sha256="",
+    )
+    model = project_publication_to_typst_model(
+        TypstDraftPreviewDocument(
+            empty_document,
+            empty_opinion,
+            synthesis,
+        )
+    )
+    assert all(item["type"] != "ioc" for item in model.content_sections)
+    assert "f" * 64 not in str(model.content_sections)
 
 
 @pytest.mark.asyncio

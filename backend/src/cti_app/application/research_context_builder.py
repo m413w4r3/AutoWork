@@ -52,6 +52,7 @@ from cti_app.application.investigation_tools import (
     project_tool_availability,
 )
 from cti_app.application.operator_advisor_guidance import (
+    ADVISOR_CONSULTATION_TYPES,
     bound_advisor_guidance,
     build_advisor_guidance,
 )
@@ -408,7 +409,227 @@ class CanonicalEvidenceSummaryPort:
                 )
                 if key in payload
             }
+        if (
+            schema == "operator-advisor-call.v1"
+            and observation.source == "advisor.consult"
+            and observation.object_type == "advisor_call"
+        ):
+            return _operator_advisor_call_summary(payload)
         return None
+
+
+def _operator_advisor_call_summary(payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """Expose only validated, normalized, size-bounded advisor facts."""
+    consultation_type = payload.get("consultation_type")
+    output = payload.get("output")
+    input_refs = _advisor_observation_refs(payload.get("input_observation_refs"))
+    if (
+        not isinstance(consultation_type, str)
+        or consultation_type not in ADVISOR_CONSULTATION_TYPES
+        or input_refs is None
+        or not isinstance(output, Mapping)
+        or output.get("schema") != "advisor-response.v2"
+        or output.get("consultation_type") != consultation_type
+        or output.get("untrusted") is not True
+    ):
+        return None
+
+    summary = _advisor_bounded_text(output.get("summary"), 1_800)
+    alternatives = output.get("alternative_hypotheses")
+    experiment = output.get("discriminating_experiment")
+    discarded = output.get("discarded_lead")
+    recommendations = output.get("recommended_next_tools")
+    if (
+        summary is None
+        or not isinstance(alternatives, (list, tuple))
+        or not 1 <= len(alternatives) <= 4
+        or not isinstance(experiment, Mapping)
+        or not isinstance(discarded, Mapping)
+        or not isinstance(recommendations, (list, tuple))
+        or len(recommendations) > 5
+    ):
+        return None
+
+    bounded_alternatives: list[dict[str, Any]] = []
+    for item in alternatives:
+        if not isinstance(item, Mapping):
+            return None
+        statement = _advisor_bounded_text(item.get("statement"), 240)
+        basis_refs = _advisor_bounded_text_refs(item.get("basis_refs"))
+        if statement is None or basis_refs is None or not basis_refs:
+            return None
+        bounded_alternatives.append({"statement": statement, "basis_refs": basis_refs})
+
+    experiment_question = _advisor_bounded_text(experiment.get("question"), 240)
+    experiment_signal = _advisor_bounded_text(experiment.get("expected_signal"), 240)
+    experiment_basis = _advisor_bounded_text_refs(experiment.get("basis_refs"))
+    experiment_tool = experiment.get("tool")
+    experiment_schema = experiment.get("schema_version")
+    bounded_experiment_tool = (
+        None if experiment_tool is None else _advisor_bounded_text(experiment_tool, 160)
+    )
+    bounded_experiment_schema = (
+        None if experiment_schema is None else _advisor_bounded_text(experiment_schema, 64)
+    )
+    if (
+        experiment_question is None
+        or experiment_signal is None
+        or experiment_basis is None
+        or not experiment_basis
+        or (experiment_tool is None) != (experiment_schema is None)
+        or (experiment_tool is not None and bounded_experiment_tool is None)
+        or (experiment_schema is not None and bounded_experiment_schema is None)
+    ):
+        return None
+    bounded_experiment = {
+        "question": experiment_question,
+        "tool": bounded_experiment_tool,
+        "schema_version": bounded_experiment_schema,
+        "expected_signal": experiment_signal,
+        "basis_refs": experiment_basis,
+    }
+
+    discarded_lead = _advisor_bounded_text(discarded.get("lead"), 240)
+    discarded_reason = _advisor_bounded_text(discarded.get("reason"), 240)
+    discarded_basis = _advisor_bounded_text_refs(discarded.get("basis_refs"))
+    if discarded_lead is None or discarded_reason is None or not discarded_basis:
+        return None
+    bounded_discarded = {
+        "lead": discarded_lead,
+        "reason": discarded_reason,
+        "basis_refs": discarded_basis,
+    }
+
+    input_ref_set = set(input_refs)
+    bounded_recommendations: list[dict[str, Any]] = []
+    for item in recommendations:
+        if not isinstance(item, Mapping):
+            return None
+        tool = _advisor_bounded_text(item.get("tool"), 160)
+        schema_version = _advisor_bounded_text(item.get("schema_version"), 64)
+        why = _advisor_bounded_text(item.get("why"), 200)
+        expected_signal = _advisor_bounded_text(item.get("expected_signal"), 220)
+        basis_refs = _advisor_observation_refs(item.get("basis_refs"))
+        basis_observation_refs = _advisor_observation_refs(item.get("basis_observation_refs"))
+        if (
+            tool is None
+            or schema_version is None
+            or why is None
+            or expected_signal is None
+            or basis_refs is None
+            or not basis_refs
+            or basis_observation_refs is None
+            or not basis_observation_refs
+            or not set(basis_refs).issubset(input_ref_set)
+            or not set(basis_observation_refs).issubset(input_ref_set)
+        ):
+            return None
+        bounded_recommendations.append(
+            {
+                "tool": tool,
+                "schema_version": schema_version,
+                "why": why,
+                "expected_signal": expected_signal,
+                "basis_refs": basis_refs,
+                "basis_observation_refs": basis_observation_refs,
+            }
+        )
+
+    risks = _advisor_bounded_text_list(output.get("risks", ()), max_items=5, max_chars=180)
+    questions = _advisor_bounded_text_list(output.get("questions", ()), max_items=5, max_chars=180)
+    normalizations = _advisor_bounded_text_list(
+        output.get("normalizations", ()), max_items=32, max_chars=180
+    )
+    basis_observation_refs = _advisor_observation_refs(output.get("basis_observation_refs", ()))
+    if (
+        risks is None
+        or questions is None
+        or normalizations is None
+        or basis_observation_refs is None
+    ):
+        return None
+
+    bounded_output: dict[str, Any] = {
+        "schema": "advisor-response.v2",
+        "consultation_type": consultation_type,
+        "summary": summary,
+        "alternative_hypotheses": bounded_alternatives,
+        "discriminating_experiment": bounded_experiment,
+        "discarded_lead": bounded_discarded,
+        "basis_observation_refs": basis_observation_refs,
+        "recommended_next_tools": bounded_recommendations,
+        "risks": risks,
+        "questions": questions,
+        "untrusted": True,
+    }
+    if normalizations:
+        bounded_output["normalizations"] = normalizations
+    normalization_status = output.get("normalization_status")
+    if normalization_status == "partially_normalized":
+        bounded_output["normalization_status"] = normalization_status
+
+    bounded = {
+        "schema": "operator-advisor-call.v1",
+        "consultation_type": consultation_type,
+        "input_observation_refs": input_refs,
+        "output": bounded_output,
+    }
+    encoded_size = len(
+        json.dumps(bounded, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    )
+    if encoded_size > 48 * 1024:
+        return None
+    return bounded
+
+
+def _advisor_bounded_text(value: Any, max_chars: int) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = " ".join(value.split())
+    return normalized[:max_chars] if normalized else None
+
+
+def _advisor_bounded_text_list(value: Any, *, max_items: int, max_chars: int) -> list[str] | None:
+    if not isinstance(value, (list, tuple)) or len(value) > max_items:
+        return None
+    selected: list[str] = []
+    for item in value:
+        bounded = _advisor_bounded_text(item, max_chars)
+        if bounded is None:
+            return None
+        selected.append(bounded)
+    return selected
+
+
+def _advisor_bounded_text_refs(value: Any, *, max_items: int = 64) -> list[str] | None:
+    if not isinstance(value, (list, tuple)) or len(value) > max_items:
+        return None
+    refs: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            return None
+        bounded = _advisor_bounded_text(item, 160)
+        if bounded is None:
+            return None
+        if bounded not in refs:
+            refs.append(bounded)
+    return refs
+
+
+def _advisor_observation_refs(value: Any, *, max_items: int = 128) -> list[str] | None:
+    if not isinstance(value, (list, tuple)) or len(value) > max_items:
+        return None
+    refs: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            return None
+        try:
+            ref = str(UUID(item))
+        except ValueError:
+            return None
+        if ref not in refs:
+            refs.append(ref)
+    return refs
 
 
 def _binary_evidence_summary(

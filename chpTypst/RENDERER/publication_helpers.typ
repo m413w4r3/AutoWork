@@ -27,6 +27,17 @@
   }
 }
 
+#let render-opinion-text(spans, fallback) = block(width: 100%)[
+  #set par(justify: false)
+  #if spans == none [#fallback] else [
+    #for span in spans [
+      #if span.at("technical", default: false) [
+        #text(font: code-font-families, size: 8pt, hyphenate: false)[#publication-display-text(span)]
+      ] else [#span.text]
+    ]
+  ]
+]
+
 #let publication-detection-code-line(item) = {
   let chunks = item.at("break_chunks", default: ())
   let break-after = item.at("break_after", default: ())
@@ -283,7 +294,7 @@
     [Type],
     [Valeur défanguée],
     [Contexte et statut],
-    [Source [n]],
+    [Source [n] / preuves],
   )
   for group in groups {
     let body-cells = group.rows.map(row => (
@@ -302,6 +313,12 @@
             #link(source-url)[#text(size: 7pt, weight: "bold")[#str(source-number)]]
           ] else [
             #text(size: 7pt, weight: "bold")[#str(source-number)]
+          ]
+        ]
+        #for reference in row.at("draft_refs", default: ()) [
+          #if reference.at("href", default: none) != none [
+            #if row.source_refs.len() > 0 [, ]
+            #link(reference.href)[#text(size: 6.5pt, fill: grey)[#reference.label]]
           ]
         ]
       ],
@@ -565,7 +582,11 @@
       ]
     ]
   ]
-  render-publication-image(item.media_path, caption-content, max-height-fraction: 0.35)
+  if has-text(item.at("status_legend", default: none)) {
+    render-publication-image(item.media_path, caption-content, max-height-fraction: 0.52)
+  } else {
+    render-publication-image(item.media_path, caption-content, max-height-fraction: 0.35)
+  }
 }
 
 #let render-figure(item) = {
@@ -637,7 +658,7 @@
     #if unanchored [Avis de l'analyste — passage non ancré] else [Note de l'analyste]
   ]
   #parbreak()
-  #text(item.text)
+  #render-opinion-text(item.at("text_spans", default: none), item.text)
   #parbreak()
   #text(size: 8pt, fill: grey)[État : #item.state_label · relation : #item.relation_label]
   #if not unanchored [
@@ -648,18 +669,18 @@
   ]
   #if item.finding_refs.len() > 0 [
     #parbreak()
-    #text(size: 8pt, fill: grey)[Constats : ]
+    #text(size: 6.5pt, fill: grey)[Constats : ]
     #for (index, reference) in item.finding_refs.enumerate() [
       #if index > 0 [ · ]
-      #link(reference.href)[#reference.label]
+      #link(reference.href)[#text(size: 6.5pt, fill: grey)[#reference.label]]
     ]
   ]
   #if item.evidence_refs.len() > 0 [
     #parbreak()
-    #text(size: 8pt, fill: grey)[Évidences : ]
+    #text(size: 6.5pt, fill: grey)[Évidences : ]
     #for (index, reference) in item.evidence_refs.enumerate() [
       #if index > 0 [ · ]
-      #link(reference.href)[#reference.label]
+      #link(reference.href)[#text(size: 6.5pt, fill: grey)[#reference.label]]
     ]
   ]
 ]
@@ -668,9 +689,11 @@
   list.item[
     #text(font: code-font-families, size: 8.5pt, hyphenate: false)[#publication-display-text(item.value)]
     #block(above: 1pt, below: 2pt)[
-      #text(size: 8pt, fill: grey)[Source : ]
-      #for (index, source-ref) in item.at("source_refs", default: ()).enumerate() [
-        #if index > 0 [, ]
+      #let source-refs = item.at("source_refs", default: ())
+      #if source-refs.len() > 0 [
+        #text(size: 7pt, fill: grey)[Source : ]
+        #for (index, source-ref) in source-refs.enumerate() [
+          #if index > 0 [, ]
         #let source-number = source-ref.at("number", default: index + 1)
         #let target-id = source-ref.at("target_id", default: none)
         #let source-url = source-ref.at("url", default: none)
@@ -681,8 +704,20 @@
         ] else [
           #text(size: 8pt, fill: grey)[#str(source-number)]
         ]
+        ]
       ]
-      #text(size: 8pt, fill: grey)[ · #item.qualification]
+      #if item.at("context", default: "") != "" [
+        #text(size: 7pt, fill: grey)[#item.context · ]
+      ]
+      #text(size: 7pt, fill: grey)[#item.qualification]
+      #if item.at("draft_refs", default: ()).len() > 0 [
+        #linebreak()
+        #text(size: 6pt, fill: grey)[Preuves : ]
+        #for (index, reference) in item.draft_refs.enumerate() [
+          #if index > 0 [ · ]
+          #link(reference.href)[#text(size: 6pt, fill: grey)[#reference.label]]
+        ]
+      ]
     ]
     #for evidence in item.evidence [
       #block(above: 0pt, below: 1pt)[
@@ -833,7 +868,7 @@
     ] else if content_section.type == "limitations" [
       #section-title[LIMITES DES PREUVES]
       #for item in content_section.items [
-        #item.text
+        #render-opinion-text(item.at("text_spans", default: none), item.text)
         #if item.source_urls.len() > 0 [
           #parbreak()
           #text(size: 8pt, fill: grey)[Sources : ]
@@ -863,18 +898,18 @@
         #item.text
         #parbreak()
         #if item.finding_refs.len() > 0 [
-          #text(size: 8pt, fill: grey)[Findings : ]
+          #text(size: 6.5pt, fill: grey)[Findings : ]
           #for (index, reference) in item.finding_refs.enumerate() [
             #if index > 0 [ · ]
-            #link(reference.href)[#reference.label]
+            #link(reference.href)[#text(size: 6.5pt, fill: grey)[#reference.label]]
           ]
           #parbreak()
         ]
         #if item.evidence_refs.len() > 0 [
-          #text(size: 8pt, fill: grey)[Évidences : ]
+          #text(size: 6.5pt, fill: grey)[Évidences : ]
           #for (index, reference) in item.evidence_refs.enumerate() [
             #if index > 0 [ · ]
-            #link(reference.href)[#reference.label]
+            #link(reference.href)[#text(size: 6.5pt, fill: grey)[#reference.label]]
           ]
           #parbreak()
         ]
@@ -882,6 +917,18 @@
       #for figure in content_section.at("protocol_figures", default: ()) [
         #v(8pt)
         #render-diagram(figure)
+        #if figure.at("renderer_warning", default: none) != none [
+          #block(
+            width: 100%,
+            fill: rgb("#fff8e8"),
+            stroke: 0.5pt + rgb("#d6a84f"),
+            inset: 5pt,
+            radius: 2pt,
+          )[
+            #set par(justify: false, leading: 1em, spacing: 0pt)
+            #text(size: 7.5pt)[#figure.renderer_warning]
+          ]
+        ]
       ]
       #if content_section.at("investigation_chain_figure", default: none) != none [
         #v(8pt)
@@ -1035,6 +1082,44 @@
           emails: legacy_original_indicators.at("emails", default: ()),
           hashes: legacy_original_indicators.at("hashes", default: ()),
         )
+      ]
+      #let opinion_refs = content_section.at("opinion_refs", default: ())
+      #let protocol_details = content_section.at("protocol_figure_details", default: ())
+      #if opinion_refs.len() > 0 or protocol_details.len() > 0 [
+        #v(10pt)
+        #section-title[ANNEXE — provenance de l'avis et des figures]
+        #for item in opinion_refs [
+          #block(above: 1pt, below: 1pt)[
+            #text(size: 6.5pt, fill: grey)[#item.context · #item.kind_label ]
+            #link(item.href)[
+              #text(font: code-font-families, size: 6.5pt, hyphenate: false)[
+                #publication-display-text(item.reference_id_spans)
+              ]
+            ]
+          ]
+        ]
+        #for figure in protocol_details [
+          #heading(level: 3)[#figure.title — détails de provenance]
+          #render-opinion-text(figure.caption_spans, figure.caption)
+          #for metadata-line in figure.metadata_lines [
+            #block(above: 1pt, below: 1pt)[
+              #text(font: code-font-families, size: 5.5pt, hyphenate: false)[
+                #publication-display-text(metadata-line)
+              ]
+            ]
+          ]
+          #block(
+            width: 100%,
+            fill: rgb("#f5f6f8"),
+            inset: 4pt,
+            radius: 2pt,
+          )[
+            #set par(justify: false, leading: 0.9em, spacing: 0pt)
+            #text(font: code-font-families, size: 5pt, hyphenate: false)[
+              #publication-display-text(figure.field_evidence_json)
+            ]
+          ]
+        ]
       ]
     ] else {
       panic("unsupported publication content section type: " + content_section.type)

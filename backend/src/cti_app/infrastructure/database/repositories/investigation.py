@@ -1123,6 +1123,9 @@ def _working_state_from_row(row: InvestigationWorkingStateRow) -> InvestigationW
     except (AttributeError, KeyError, TypeError, ValueError) as exc:
         raise ValueError("Persisted investigation state is invalid") from exc
     normalized_payload = dict(payload)
+    # Legacy v1 states may predate these additive fields. Their read defaults
+    # are zero deduplicated findings and bridge-led execution.
+    normalized_payload.setdefault("deduplicated_findings", 0)
     normalized_payload.setdefault("execution_mode", InvestigationExecutionMode.BRIDGE_LED.value)
     if (
         state.to_payload() != normalized_payload

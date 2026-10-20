@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import replace
 from datetime import UTC, datetime
 from uuid import UUID
 
 import pytest
 
+from cti_app.application.blob_storage import BlobReadLimitExceededError
 from cti_app.application.investigation_figures import build_investigation_graph_figure
 from cti_app.application.investigation_graph_source import InvestigationGraphSource
 from cti_app.application.publication_augmentation import augment_publication_with_opinion
@@ -33,6 +35,14 @@ class _BlobReader:
         payload = self.payloads[blob_id]
         if len(payload) > max_bytes:
             raise ValueError("oversized test blob")
+        return payload
+
+
+class _BoundedBlobReader(_BlobReader):
+    async def read_bytes(self, blob_id: UUID, *, max_bytes: int) -> bytes:
+        payload = self.payloads[blob_id]
+        if len(payload) > max_bytes:
+            raise BlobReadLimitExceededError(size_bytes=len(payload), max_bytes=max_bytes)
         return payload
 
 
@@ -318,6 +328,92 @@ async def test_projection_is_deterministic_and_reports_omitted_nodes() -> None:
     assert f"{first.omitted_count} autres omis" in figure["d2_source"]
     assert "domaines regroupés" in figure["d2_source"]
     assert first.omitted_edge_count > 0
+
+
+@pytest.mark.asyncio
+async def test_projection_omits_oversized_and_non_mapping_observations_explicitly(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    seed_hash = "d" * 64
+    publication = _publication_with_seed_hash(seed_hash)
+    valid, valid_blob = _observation(
+        observation_id=20,
+        kind=EvidenceKind.VT_RELATIONSHIP,
+        object_type="file",
+        object_id=seed_hash,
+        source="VirusTotal",
+        observed_at=datetime(2026, 10, 17, 12, 0, tzinfo=UTC),
+        payload={
+            "schema": "virustotal-investigation-summary.v1",
+            "relation": "contacted_domains",
+            "descriptors": [{"type": "domain", "identifier": "valid.example"}],
+        },
+    )
+    oversized_id = UUID(int=21)
+    oversized_blob_id = UUID(int=10_021)
+    oversized_bytes = b"\x00" + b"x" * (128 * 1024)
+    oversized = EvidenceObservation(
+        id=oversized_id,
+        investigation_id=UUID(int=900),
+        kind=EvidenceKind.VT_RELATIONSHIP,
+        blob_id=oversized_blob_id,
+        sha256=hashlib.sha256(oversized_bytes).hexdigest(),
+        source="VirusTotal",
+        source_version="fixture-v1",
+        observed_at=datetime(2026, 10, 17, 12, 1, tzinfo=UTC),
+        object_type="file",
+        object_id=seed_hash,
+    )
+    non_mapping_id = UUID(int=22)
+    non_mapping_blob_id = UUID(int=10_022)
+    non_mapping_bytes = b"[]"
+    non_mapping = EvidenceObservation(
+        id=non_mapping_id,
+        investigation_id=UUID(int=900),
+        kind=EvidenceKind.VT_RELATIONSHIP,
+        blob_id=non_mapping_blob_id,
+        sha256=hashlib.sha256(non_mapping_bytes).hexdigest(),
+        source="VirusTotal",
+        source_version="fixture-v1",
+        observed_at=datetime(2026, 10, 17, 12, 2, tzinfo=UTC),
+        object_type="file",
+        object_id=seed_hash,
+    )
+    source = InvestigationGraphSource(
+        artifact_reader=_BoundedBlobReader(
+            {
+                valid_blob[0]: valid_blob[1],
+                oversized_blob_id: oversized_bytes,
+                non_mapping_blob_id: non_mapping_bytes,
+            }
+        )
+    )
+
+    with caplog.at_level(logging.WARNING, logger="cti_app.application.investigation_graph_source"):
+        graph = await source.project(
+            investigation_id=UUID(int=900),
+            publication=publication,
+            observations=(valid, oversized, non_mapping),
+            findings=(),
+        )
+
+    assert graph is not None
+    observation_refs = {
+        reference.observation_id
+        for edge in graph.edges
+        for reference in edge.evidence_refs
+        if reference.observation_id is not None
+    }
+    assert observation_refs == {valid.id}
+    omissions = {
+        (record.observation_id, record.reason)
+        for record in caplog.records
+        if getattr(record, "event", None) == "investigation_graph_observation_omitted"
+    }
+    assert omissions == {
+        (str(oversized.id), "blob_exceeds_read_limit"),
+        (str(non_mapping.id), "payload_not_mapping"),
+    }
 
 
 @pytest.mark.asyncio

@@ -243,7 +243,13 @@ class ProductionEvidenceRecorder:
             observation.kind is EvidenceKind.OTHER
             and observation.blob_id == blob_id
             and observation.sha256 == sha256
-            and observation.source == "network.quarantine"
+            and (
+                observation.source == "network.quarantine"
+                or (
+                    observation.source == "VirusTotal"
+                    and observation.source_version == "vt-sandbox-pcap.v1"
+                )
+            )
             and observation.object_type == "network_capture"
             and observation.object_id == sha256
             for observation in observations

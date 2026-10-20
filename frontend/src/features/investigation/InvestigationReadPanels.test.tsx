@@ -27,6 +27,13 @@ function mockResponse(url: string): Response {
         },
       ],
       truncated: false,
+      omitted_comparisons: [
+        {
+          observation_id: "44444444-4444-4444-8444-444444444444",
+          size_bytes: 70_843_573,
+          reason: "exceeds_read_limit",
+        },
+      ],
     });
   }
   if (url.endsWith(`/sample-comparisons/${COMPARISON_ID}`)) {
@@ -249,6 +256,9 @@ describe("InvestigationReadPanels", () => {
     );
 
     expect(await screen.findByText("CreateFileW")).toBeInTheDocument();
+    expect(
+      await screen.findByText(/Comparaison trop volumineuse, omise/),
+    ).toBeInTheDocument();
     expect(screen.getByText("3 occurrence(s) mesurée(s)")).toBeInTheDocument();
     expect(
       await screen.findByText("Contradictions conservées"),

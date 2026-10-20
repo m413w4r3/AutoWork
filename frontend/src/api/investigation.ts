@@ -246,6 +246,12 @@ export interface SampleComparisonSummary {
   warnings: string[];
 }
 
+export interface OmittedSampleComparison {
+  observation_id: string;
+  size_bytes: number;
+  reason: "exceeds_read_limit";
+}
+
 export interface SampleComparisonFeature {
   feature_key: string;
   kind: string;
@@ -479,6 +485,8 @@ export function listSampleComparisons(investigationId: string): Promise<{
   investigation_id: string;
   comparisons: SampleComparisonSummary[];
   truncated: boolean;
+  omitted_comparisons?: OmittedSampleComparison[];
+  omitted_comparisons_truncated?: boolean;
 }> {
   return investigationRequest(
     `/api/investigations/${encodeURIComponent(investigationId)}/sample-comparisons`,

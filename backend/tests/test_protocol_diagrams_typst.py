@@ -16,6 +16,7 @@ from pypdf import PdfReader
 from cti_app.application.edition_typst_rendering import EditionTypstRenderer
 from cti_app.application.network_protocol_model import render_protocol_model
 from cti_app.application.protocol_diagram_projection import (
+    PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION,
     compile_protocol_render_result,
     opinion_protocol_figures,
 )
@@ -522,6 +523,18 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
     figures = opinion_protocol_figures(rendered)
     assert {item.kind for item in figures} == set(ProtocolDiagramKind)
     assert all("documenté, non observé" in item.caption.casefold() for item in figures)
+    assert all(
+        item.compiler_policy_version == PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION for item in figures
+    )
+    legacy_sequence = replace(
+        figures[0],
+        caption=(
+            "Séquence de négociation. "
+            "This view comes only from cited written facts. "
+            "No network traffic, frames, offsets, or byte values were observed."
+        ),
+        compiler_policy_version="diagram-d2-svg-v8-chapsvision",
+    )
     format_figure = next(
         item for item in figures if item.kind is ProtocolDiagramKind.MESSAGE_FORMAT
     )
@@ -540,6 +553,13 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
     publication = augment_publication_with_opinion(base, opinion_with_figures, citation_context)
     publication_bundle = load_template_bundle(_REPOSITORY_ROOT / "chpTypst")
     source = TypstRenderer().render(publication, publication_bundle)
+    stale_publication = augment_publication_with_opinion(
+        base,
+        replace(opinion, protocol_figures=(legacy_sequence, *figures[1:]), content_sha256=""),
+        citation_context,
+    )
+    stale_publication_source = TypstRenderer().render(stale_publication, publication_bundle)
+    assert "Rendu hérité".encode() not in stale_publication_source.render_data_bytes
     media_bytes: dict[UUID, bytes] = {}
     for reference in source.media_refs:
         try:
@@ -584,7 +604,7 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
         opinion,
         status=AnalystOpinionStatus.DRAFT,
         reviewer_id=None,
-        protocol_figures=figures,
+        protocol_figures=(legacy_sequence, *figures[1:]),
         content_sha256="",
     )
     preview_source = TypstRenderer().render(
@@ -608,6 +628,17 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
     )
     preview_pdf_path = audit_root / "preview.pdf"
     preview_pdf_path.write_bytes(preview_pdf.content)
+    preview_pages = [
+        " ".join((page.extract_text() or "").split())
+        for page in PdfReader(preview_pdf_path, strict=True).pages
+    ]
+    assert any("Rendu hérité" in page for page in preview_pages)
+    sequence_page = next(
+        page
+        for page in preview_pages
+        if "Séquence réseau du protocole" in page and "Séquence de négociation" in page
+    )
+    assert "This view comes only from cited written facts" not in sequence_page
 
     pdftotext = shutil.which("pdftotext")
     pdftoppm = shutil.which("pdftoppm")

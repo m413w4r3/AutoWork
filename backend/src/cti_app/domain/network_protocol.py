@@ -157,12 +157,16 @@ class NetworkCaptureRefV1:
 
 @dataclass(frozen=True, slots=True)
 class NetworkEndpointV1:
+    """A socket endpoint; the same address may occur with different ports."""
+
     address: str
     port: int | None
 
 
 @dataclass(frozen=True, slots=True)
 class ProtocolCountV1:
+    """Count packets containing this protocol, once per packet."""
+
     protocol: str
     packet_count: int
 

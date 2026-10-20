@@ -1,5 +1,5 @@
 {
-  "template_version": "chp-article-v29-c8-spacing-compat",
+  "template_version": "chp-article-v31-protocol-render-staleness-warning",
   "files": [
     "RENDERER/publication.typ",
     "RENDERER/publication_helpers.typ",

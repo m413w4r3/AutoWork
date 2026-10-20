@@ -24,6 +24,9 @@ from cti_app.application.production_normalization import (
     display_indicator_value,
     normalize_indicator_value,
 )
+from cti_app.application.protocol_diagram_projection import (
+    PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION,
+)
 from cti_app.application.typst_bundle import hash_bundle_contents, resolve_bundle_files
 from cti_app.domain.analyst_opinion import (
     AnalystObservationRelation,
@@ -33,6 +36,13 @@ from cti_app.domain.analyst_opinion import (
     OpinionBlockType,
     OpinionProtocolFigureV1,
     normalize_opinion_text,
+)
+from cti_app.domain.investigation import (
+    EvidenceObservation,
+    FindingAssessment,
+    FindingKind,
+    InvestigationFinding,
+    NoveltyClass,
 )
 from cti_app.domain.investigation_graph import InvestigationGraph
 from cti_app.domain.media_assets import MediaAssetKind
@@ -66,9 +76,9 @@ from cti_app.domain.semantic_annotation import (
     timeline_anchor,
 )
 
-# v26 adds compatibility aliases/empty block collections and the anchored
-# editorial spacing contract without changing canonical V5/V6 publication data.
-_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v26-anchored-editorial-spacing"
+# v27 adds compact opinion citations, technical text spans, and draft IOC provenance.
+# Canonical V5/V6 publication data remains unchanged.
+_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v27-opinion-citations"
 _PUBLICATION_RENDERER_MANIFEST = "renderer-manifest.json"
 _FRENCH_MONTH_NAMES = (
     "janvier",
@@ -375,6 +385,7 @@ def publication_content_section_types(
         if isinstance(publication_v5, PublicationDocumentV5)
         else ()
     )
+    draft_iocs = _draft_opinion_iocs(draft_preview) if draft_preview is not None else ()
     ioc_details = (
         publication_v5.ioc_details if isinstance(publication_v5, PublicationDocumentV5) else ()
     )
@@ -382,9 +393,20 @@ def publication_content_section_types(
         any(group.indicators for group in document.indicators)
         or any(group.indicators for group in original_indicator_groups)
         or ioc_details
+        or draft_iocs
     )
     if has_iocs:
         section_types.append("ioc")
+
+    has_opinion_provenance = bool(
+        opinion
+        and (
+            opinion.protocol_figures
+            or any(block.finding_refs or block.evidence_refs for block in opinion.blocks)
+            or any(note.finding_refs or note.evidence_refs for note in opinion.observations)
+        )
+    )
+    if has_iocs or (draft_preview is not None and has_opinion_provenance):
         section_types.append("technical_annex")
     return tuple(section_types)
 
@@ -481,13 +503,28 @@ class TypstDraftPreviewDocument:
     analyst_opinion: AnalystOpinionV1
     synthesis: ProductionSynthesisV1 | None = None
     infrastructure_graph: InvestigationGraph | None = None
+    findings: tuple[InvestigationFinding, ...] = ()
+    evidence_observations: tuple[EvidenceObservation, ...] = ()
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.base_publication, name)
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "findings", tuple(self.findings))
+        object.__setattr__(self, "evidence_observations", tuple(self.evidence_observations))
+        if any(not isinstance(item, InvestigationFinding) for item in self.findings):
+            raise ValueError("Draft preview findings have an invalid type")
+        if any(not isinstance(item, EvidenceObservation) for item in self.evidence_observations):
+            raise ValueError("Draft preview observations have an invalid type")
         if self.analyst_opinion.status is not AnalystOpinionStatus.DRAFT:
             raise ValueError("Only draft opinions can use the draft preview projection")
+        if any(
+            item.investigation_id != self.analyst_opinion.investigation_id for item in self.findings
+        ) or any(
+            item.investigation_id != self.analyst_opinion.investigation_id
+            for item in self.evidence_observations
+        ):
+            raise ValueError("Draft preview evidence belongs to another investigation")
         if self.synthesis is not None and (
             self.synthesis.subject_id != self.base_publication.subject_id
             or self.synthesis.title != self.base_publication.title
@@ -513,6 +550,236 @@ class TypstDraftPreviewDocument:
             for item in self.analyst_opinion.observations
         ):
             raise ValueError("Draft opinion observation anchor is stale or unsupported")
+
+
+@dataclass(frozen=True, slots=True)
+class _DraftIOC:
+    artifact_type: ArtifactType
+    value: str
+    normalized_value: str
+    status: str
+    context: str
+    finding_refs: tuple[UUID, ...]
+    observation_refs: tuple[UUID, ...]
+    qualification: str
+
+
+_SUBJECT_REF_SCOPE_PREFIX = "Subject reference: "
+_SAMPLE_HASH_PATTERN = re.compile(r"^(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})$", re.IGNORECASE)
+_DEFANGED_URL_PATTERN = re.compile(r"\bhxxps?://[^\s\"'<>]+", re.IGNORECASE)
+_DEFANGED_IP_PATTERN = re.compile(r"(?<!\d)(?:\d{1,3}\[\.\]){3}\d{1,3}(?!\d)")
+_DEFANGED_DOMAIN_PATTERN = re.compile(r"(?<![\w.-])(?:[A-Za-z0-9-]+\[\.\])+[A-Za-z0-9-]+(?![\w.-])")
+_OPINION_TECHNICAL_TOKEN = re.compile(
+    r"(?<![0-9a-f])(?:[0-9a-f]{64}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+    r"[0-9a-f]{4}-[0-9a-f]{12})(?![0-9a-f])",
+    re.IGNORECASE,
+)
+
+
+def _opinion_text_spans(value: str) -> list[dict[str, Any]]:
+    """Mark hashes and UUIDs for monospaced, non-justified Typst rendering."""
+    spans: list[dict[str, Any]] = []
+    cursor = 0
+    for match in _OPINION_TECHNICAL_TOKEN.finditer(value):
+        if match.start() > cursor:
+            spans.append({"text": value[cursor : match.start()], "technical": False})
+        spans.append(
+            {
+                **_breakable_typst_display_text(
+                    match.group(0), interval=8, break_at_technical_separators=True
+                ),
+                "technical": True,
+            }
+        )
+        cursor = match.end()
+    if cursor < len(value) or not spans:
+        spans.append({"text": value[cursor:], "technical": False})
+    return spans
+
+
+def _bounded_ioc_context(value: str, limit: int = 320) -> str:
+    cleaned = re.sub(r"^\[UNTRUSTED ARTICLE OR TOOL DATA\]\s*", "", value.strip())
+    cleaned = re.sub(r"\s*\[END UNTRUSTED DATA\]\s*$", "", cleaned)
+    cleaned = " ".join(cleaned.split())
+    if len(cleaned) <= limit:
+        return cleaned
+    prefix = cleaned[: limit - 1].rsplit(" ", 1)[0]
+    return (prefix or cleaned[: limit - 1]).rstrip(" ,;:") + "…"
+
+
+def _supported_subject_hashes(
+    finding: InvestigationFinding,
+    observations_by_id: Mapping[UUID, EvidenceObservation],
+) -> tuple[str, ...]:
+    first_line = finding.scope.partition("\n")[0]
+    subject_ref = (
+        first_line[len(_SUBJECT_REF_SCOPE_PREFIX) :].strip()
+        if first_line.startswith(_SUBJECT_REF_SCOPE_PREFIX)
+        else ""
+    )
+    cited = [observations_by_id.get(reference) for reference in finding.observation_refs]
+    if not cited or any(item is None for item in cited):
+        return ()
+    persisted = [item for item in cited if item is not None]
+    cited_file_hashes = {
+        item.object_id.casefold()
+        for item in persisted
+        if item.object_type in {"file", "sample_sha256"}
+        and _SAMPLE_HASH_PATTERN.fullmatch(item.object_id)
+    }
+    if subject_ref:
+        normalized_subject_ref = subject_ref.casefold()
+        if normalized_subject_ref not in cited_file_hashes:
+            return ()
+    else:
+        # Older findings may carry the subject only on one persisted file
+        # observation; refuse to choose when those observations disagree.
+        if len(cited_file_hashes) != 1:
+            return ()
+        normalized_subject_ref = next(iter(cited_file_hashes))
+
+    # A composite finding can cite multiple decoded files. Include another
+    # subject only when its hash is present in the statement AND matches a
+    # persisted file identity among the finding's observation refs. The prose
+    # can therefore select evidence-backed subjects but cannot create an IOC.
+    statement_hashes = {
+        match.group(0).casefold()
+        for match in re.finditer(
+            r"(?<![0-9a-f])(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})(?![0-9a-f])",
+            finding.statement,
+            re.IGNORECASE,
+        )
+    }
+    related_subjects = cited_file_hashes.intersection(statement_hashes)
+    return tuple(sorted({normalized_subject_ref, *related_subjects}))
+
+
+def _defanged_note_indicators(text: str) -> tuple[tuple[ArtifactType, str, str], ...]:
+    candidates: list[tuple[int, int, ArtifactType, str]] = []
+    occupied: list[tuple[int, int]] = []
+    for pattern, artifact_type in (
+        (_DEFANGED_URL_PATTERN, ArtifactType.URL),
+        (_DEFANGED_IP_PATTERN, ArtifactType.IP),
+        (_DEFANGED_DOMAIN_PATTERN, ArtifactType.DOMAIN),
+    ):
+        for match in pattern.finditer(text):
+            if any(match.start() < end and match.end() > start for start, end in occupied):
+                continue
+            raw = match.group(0).rstrip(".,;:)]}")
+            if "[.]" not in raw and "hxxp" not in raw.casefold():
+                continue
+            candidates.append((match.start(), match.end(), artifact_type, raw))
+            occupied.append((match.start(), match.end()))
+
+    projected: dict[tuple[ArtifactType, str], tuple[ArtifactType, str, str]] = {}
+    for _start, _end, artifact_type, raw in candidates:
+        refanged = raw.replace("hxxps://", "https://").replace("hxxp://", "http://")
+        refanged = refanged.replace("[.]", ".").replace("(.)", ".").replace("[:]", ":")
+        try:
+            normalized = normalize_indicator_value(refanged, artifact_type)
+            display = display_indicator_value(normalized, artifact_type, defanged=True)
+        except ValueError:
+            continue
+        projected[(artifact_type, normalized.casefold())] = (artifact_type, display, normalized)
+    return tuple(
+        projected[key] for key in sorted(projected, key=lambda item: (item[0].value, item[1]))
+    )
+
+
+def _draft_opinion_iocs(value: TypstDraftPreviewDocument) -> tuple[_DraftIOC, ...]:
+    opinion = value.analyst_opinion
+    observations_by_id = {
+        item.id: item
+        for item in value.evidence_observations
+        if item.investigation_id == opinion.investigation_id
+    }
+    projected: dict[tuple[ArtifactType, str, str], _DraftIOC] = {}
+
+    for finding in value.findings:
+        if (
+            finding.kind is not FindingKind.NEW_SAMPLE
+            or finding.novelty is not NoveltyClass.NEW_TO_ARTICLE
+            or not finding.observation_refs
+            or any(reference not in observations_by_id for reference in finding.observation_refs)
+        ):
+            continue
+        subject_hashes = _supported_subject_hashes(finding, observations_by_id)
+        if not subject_hashes:
+            continue
+        if finding.assessment is FindingAssessment.REFUTED:
+            continue
+        if finding.assessment is FindingAssessment.SUPPORTED:
+            status = "originals"
+            qualification = "Finding new_to_article étayé par les observations citées."
+        else:
+            status = "candidates"
+            qualification = "Candidat non confirmé : le finding n'est pas supported."
+        for subject_hash in subject_hashes:
+            item = _DraftIOC(
+                artifact_type=ArtifactType.HASH,
+                value=subject_hash,
+                normalized_value=subject_hash,
+                status=status,
+                context=_bounded_ioc_context(finding.statement),
+                finding_refs=(finding.id,),
+                observation_refs=finding.observation_refs,
+                qualification=qualification,
+            )
+            projected[(item.artifact_type, item.normalized_value.casefold(), status)] = item
+
+    valid_anchors = publication_document_text_anchors(
+        value.base_publication.document,
+        references=value.base_publication.references,
+    )
+    for note in opinion.observations:
+        if (
+            note.anchor not in valid_anchors
+            or not note.evidence_refs
+            or any(reference not in observations_by_id for reference in note.evidence_refs)
+            or note.relation is AnalystObservationRelation.REFUTES
+        ):
+            continue
+        status = (
+            "originals"
+            if note.state is AnalystObservationState.OBSERVED
+            and note.relation is AnalystObservationRelation.CONFIRMS
+            else "candidates"
+        )
+        for artifact_type, display_value, normalized_value in _defanged_note_indicators(note.text):
+            item = _DraftIOC(
+                artifact_type=artifact_type,
+                value=display_value,
+                normalized_value=normalized_value,
+                status=status,
+                context=_bounded_ioc_context(note.text),
+                finding_refs=note.finding_refs,
+                observation_refs=note.evidence_refs,
+                qualification=(
+                    "Indicateur observé dans une note ancrée et confirmée."
+                    if status == "originals"
+                    else "Candidat non confirmé extrait d'une note ancrée."
+                ),
+            )
+            key = (artifact_type, normalized_value.casefold(), status)
+            previous = projected.get(key)
+            if previous is not None:
+                item = _DraftIOC(
+                    artifact_type=item.artifact_type,
+                    value=item.value,
+                    normalized_value=item.normalized_value,
+                    status=item.status,
+                    context=" / ".join(dict.fromkeys((previous.context, item.context))),
+                    finding_refs=tuple(dict.fromkeys(previous.finding_refs + item.finding_refs)),
+                    observation_refs=tuple(
+                        dict.fromkeys(previous.observation_refs + item.observation_refs)
+                    ),
+                    qualification=previous.qualification,
+                )
+            projected[key] = item
+    return tuple(
+        projected[key]
+        for key in sorted(projected, key=lambda item: (item[0].value, item[1], item[2]))
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -715,6 +982,7 @@ def project_publication_to_typst_model(
         else None
     )
     detection = publication_v6.detection if publication_v6 is not None else None
+    draft_iocs = _draft_opinion_iocs(draft_preview) if draft_preview is not None else ()
     if isinstance(publication_v5, PublicationDocumentV5):
         document = publication_v5.document
         semantic_by_anchor = {item.anchor: item for item in publication_v5.semantic_text.paragraphs}
@@ -871,10 +1139,42 @@ def project_publication_to_typst_model(
     def opinion_citation(kind: str, reference_id: UUID) -> dict[str, str]:
         noun = "Finding" if kind == "finding" else "Évidence"
         uri_kind = "findings" if kind == "finding" else "evidence"
+        reference_text = str(reference_id)
         return {
-            "label": f"{noun} {reference_id}",
-            "href": (f"autowork://investigations/{investigation_id}/{uri_kind}/{reference_id}"),
+            "label": f"{noun} {reference_text[:8]}",
+            "full_label": f"{noun} {reference_text}",
+            "href": f"autowork://investigations/{investigation_id}/{uri_kind}/{reference_id}",
+            "reference_id": reference_text,
+            "kind": kind,
         }
+
+    opinion_provenance_entries: list[dict[str, Any]] = []
+    _opinion_provenance_keys: set[tuple[str, str, str]] = set()
+
+    def collect_opinion_references(
+        context_label: str,
+        kind: str,
+        reference_ids: tuple[UUID, ...],
+    ) -> list[dict[str, str]]:
+        projected = []
+        for reference_id in reference_ids:
+            reference = opinion_citation(kind, reference_id)
+            key = (context_label, kind, reference["reference_id"])
+            if key not in _opinion_provenance_keys:
+                _opinion_provenance_keys.add(key)
+                opinion_provenance_entries.append(
+                    {
+                        "context": context_label,
+                        "kind_label": "Finding" if kind == "finding" else "Évidence",
+                        "reference_id": reference["reference_id"],
+                        "reference_id_spans": _breakable_typst_display_text(
+                            reference["reference_id"], interval=8
+                        ),
+                        "href": reference["href"],
+                    }
+                )
+            projected.append(reference)
+        return projected
 
     lead_fingerprints = {
         " ".join(lead_paragraph.text.casefold().split()) for lead_paragraph in document.lead
@@ -899,15 +1199,14 @@ def project_publication_to_typst_model(
                 "state_label": _OBSERVATION_STATE_LABELS[observation.state],
                 "relation_label": _OBSERVATION_RELATION_LABELS[observation.relation],
                 "text": observation.text,
+                "text_spans": _opinion_text_spans(observation.text),
                 "anchor": observation.anchor,
-                "finding_refs": [
-                    opinion_citation("finding", reference_id)
-                    for reference_id in observation.finding_refs
-                ],
-                "evidence_refs": [
-                    opinion_citation("evidence", reference_id)
-                    for reference_id in observation.evidence_refs
-                ],
+                "finding_refs": collect_opinion_references(
+                    f"Note ancrée {observation.anchor}", "finding", observation.finding_refs
+                ),
+                "evidence_refs": collect_opinion_references(
+                    f"Note ancrée {observation.anchor}", "evidence", observation.evidence_refs
+                ),
             }
             anchor_text = body_anchor_texts.get(observation.anchor)
             if anchor_text is None:
@@ -1098,6 +1397,8 @@ def project_publication_to_typst_model(
                 "statuses": set(),
                 "provenance": [],
                 "_provenance_keys": set(),
+                "_draft_contexts": [],
+                "_draft_references": [],
             }
             ioc_by_key[key] = row
         return row
@@ -1388,6 +1689,8 @@ def project_publication_to_typst_model(
                 ),
                 "_source_ids": set(),
                 "_evidence": {},
+                "_draft_contexts": [],
+                "_draft_references": [],
                 "qualifications": set(),
             }
             grouped[key] = item
@@ -1457,6 +1760,62 @@ def project_publication_to_typst_model(
                 + ".",
             )
 
+    for draft_ioc in draft_iocs:
+        status = draft_ioc.status
+        canonical = canonical_ioc_key(draft_ioc.normalized_value, draft_ioc.artifact_type)
+        list_key = (draft_ioc.artifact_type, canonical.casefold())
+        display_value = defanged_ioc_value(
+            draft_ioc.value, draft_ioc.normalized_value, draft_ioc.artifact_type
+        )
+        if display_value is None:
+            continue
+        grouped = ioc_lists_by_status[status]
+        draft_ioc_item = grouped.get(list_key)
+        if draft_ioc_item is None:
+            draft_ioc_item = {
+                "artifact_type": draft_ioc.artifact_type.value,
+                "type_label": ioc_type_heading(draft_ioc.artifact_type, draft_ioc.normalized_value),
+                "value": _breakable_typst_display_text(
+                    display_value, interval=8, break_at_technical_separators=True
+                ),
+                "_source_ids": set(),
+                "_evidence": {},
+                "_draft_contexts": [],
+                "_draft_references": [],
+                "qualifications": set(),
+            }
+            grouped[list_key] = draft_ioc_item
+        draft_ioc_item["_draft_contexts"].append(draft_ioc.context)
+        provenance_context = (
+            f"IOC original {display_value}"
+            if draft_ioc.status == "originals"
+            else f"IOC candidat {display_value}"
+        )
+        draft_ioc_item["_draft_references"].extend(
+            collect_opinion_references(
+                provenance_context,
+                "finding",
+                draft_ioc.finding_refs,
+            )
+        )
+        draft_ioc_item["_draft_references"].extend(
+            collect_opinion_references(
+                provenance_context,
+                "evidence",
+                draft_ioc.observation_refs,
+            )
+        )
+        draft_ioc_item["qualifications"].add(draft_ioc.qualification)
+
+        row = ensure_ioc_row(draft_ioc.artifact_type, display_value, draft_ioc.normalized_value)
+        if row is not None:
+            row["statuses"].add(
+                "IOC original — finding étayé" if status == "originals" else "Candidat non confirmé"
+            )
+            row["_draft_contexts"].append(draft_ioc.context)
+            reference_count = len(draft_ioc.finding_refs) + len(draft_ioc.observation_refs)
+            row["_draft_references"].extend(draft_ioc_item["_draft_references"][-reference_count:])
+
     def project_ioc_list_groups(status: str) -> list[dict[str, Any]]:
         grouped: dict[str, list[dict[str, Any]]] = {}
         items = sorted(
@@ -1476,21 +1835,30 @@ def project_publication_to_typst_model(
             evidence_rows = []
             evidence_by_source = item.pop("_evidence")
             for source_id in source_ids:
-                for detail in evidence_by_source.get(source_id, {}).values():
+                for evidence_detail in evidence_by_source.get(source_id, {}).values():
                     evidence_rows.append(
                         {
                             "source_number": reference_number_by_source_id.get(source_id),
                             "source_target": reference_target_by_source_id.get(source_id),
-                            "context": abbreviated(detail.context, 180),
-                            "quote": abbreviated(detail.evidence_quote, 56),
+                            "context": abbreviated(evidence_detail.context, 180),
+                            "quote": abbreviated(evidence_detail.evidence_quote, 56),
                             "quote_sha256": _breakable_typst_display_text(
-                                hashlib.sha256(detail.evidence_quote.encode("utf-8")).hexdigest(),
+                                hashlib.sha256(
+                                    evidence_detail.evidence_quote.encode("utf-8")
+                                ).hexdigest(),
                                 interval=8,
                                 break_at_technical_separators=True,
                             ),
                         }
                     )
             item["evidence"] = evidence_rows
+            item["context"] = " / ".join(dict.fromkeys(item.pop("_draft_contexts")))
+            item["draft_refs"] = list(
+                {
+                    (reference["kind"], reference["reference_id"]): reference
+                    for reference in item.pop("_draft_references")
+                }.values()
+            )
             item["qualification"] = "; ".join(sorted(item.pop("qualifications"), key=str.casefold))
             grouped.setdefault(item["type_label"], []).append(item)
         return [{"heading": heading, "items": values} for heading, values in grouped.items()]
@@ -1508,6 +1876,10 @@ def project_publication_to_typst_model(
         key=lambda item: (item["type"], item["value"].casefold()),
     ):
         context_summary = compact_ioc_provenance(row)
+        draft_contexts = tuple(dict.fromkeys(row.pop("_draft_contexts")))
+        draft_references = row.pop("_draft_references")
+        if draft_contexts:
+            context_summary += " · Contexte du finding : " + " / ".join(draft_contexts)
         source_ids = sorted(row.pop("_source_ids"), key=str)
         row.pop("_provenance_keys")
         row.pop("provenance")
@@ -1541,6 +1913,12 @@ def project_publication_to_typst_model(
                 "source_urls": source_links,
                 "source_refs": source_refs,
                 "context_summary": context_summary,
+                "draft_refs": list(
+                    {
+                        (reference["kind"], reference["reference_id"]): reference
+                        for reference in draft_references
+                    }.values()
+                ),
             }
         )
         ioc_rows.append(row)
@@ -1765,6 +2143,7 @@ def project_publication_to_typst_model(
         content_sections.append(
             {"type": "limitations", "heading": "Limites des preuves", "items": limitations}
         )
+    protocol_figure_provenance: list[dict[str, Any]] = []
     if "analyst_opinion" in expected_section_types:
         qualification_labels = {
             "fact": "Fait étayé",
@@ -1816,33 +2195,72 @@ def project_publication_to_typst_model(
                 + (1 if investigation_chain_figure is not None else 0)
                 + 1
             )
-        opinion_section: dict[str, Any] = {
-            "type": "analyst_opinion",
-            "heading": "Avis de l'analyste",
-            "blocks": [
+        projected_opinion_blocks: list[dict[str, Any]] = []
+        for index, (
+            heading,
+            text,
+            qualification,
+            certainty,
+            finding_refs,
+            evidence_refs,
+        ) in enumerate(display_blocks):
+            context_label = f"Bloc 1.{index + 1} — {heading}"
+            projected_opinion_blocks.append(
                 {
                     "number": f"1.{index + 1}",
                     "heading": heading,
                     "text": text,
+                    "text_spans": _opinion_text_spans(text),
                     "qualification": qualification,
                     "qualification_label": qualification_labels[qualification],
                     "certainty_percent": round(certainty * 100),
-                    "finding_refs": [
-                        opinion_citation("finding", reference_id) for reference_id in finding_refs
-                    ],
-                    "evidence_refs": [
-                        opinion_citation("evidence", reference_id) for reference_id in evidence_refs
-                    ],
+                    "finding_refs": collect_opinion_references(
+                        context_label, "finding", finding_refs
+                    ),
+                    "evidence_refs": collect_opinion_references(
+                        context_label, "evidence", evidence_refs
+                    ),
                 }
-                for index, (
-                    heading,
-                    text,
-                    qualification,
-                    certainty,
-                    finding_refs,
-                    evidence_refs,
-                ) in enumerate(display_blocks)
-            ],
+            )
+
+        protocol_figure_provenance = []
+        for protocol_figure in opinion_figures:
+            field_evidence_json = json.dumps(
+                [item.to_payload() for item in protocol_figure.field_evidence],
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            protocol_figure_provenance.append(
+                {
+                    "title": _PROTOCOL_FIGURE_TITLES[protocol_figure.kind.value],
+                    "caption": protocol_figure.caption,
+                    "caption_spans": _opinion_text_spans(protocol_figure.caption),
+                    "metadata_lines": [
+                        _breakable_typst_display_text(
+                            f"{label} : {value}", interval=8, break_at_technical_separators=True
+                        )
+                        for label, value in (
+                            ("SHA-256 modèle", protocol_figure.model_sha256),
+                            ("SHA-256 spécification", protocol_figure.spec_sha256),
+                            ("SHA-256 figure", protocol_figure.asset_sha256),
+                            ("SHA-256 aperçu", protocol_figure.preview_sha256),
+                            ("SHA-256 épingle", protocol_figure.pin_sha256),
+                            ("Compilateur", protocol_figure.compiler_name),
+                            ("Version compilateur", protocol_figure.compiler_version),
+                            ("Politique compilateur", protocol_figure.compiler_policy_version),
+                        )
+                    ],
+                    "field_evidence_json": _breakable_typst_display_text(
+                        field_evidence_json,
+                        interval=12,
+                        break_at_technical_separators=True,
+                    ),
+                }
+            )
+        opinion_section: dict[str, Any] = {
+            "type": "analyst_opinion",
+            "heading": "Avis de l'analyste",
+            "blocks": projected_opinion_blocks,
             "unresolved_points": list(unresolved_points),
             "unanchored_observations": unanchored_observations,
             "has_anchored_observations": bool(
@@ -1860,41 +2278,117 @@ def project_publication_to_typst_model(
         if infrastructure_graph_figure is not None:
             opinion_section["infrastructure_graph_figure"] = infrastructure_graph_figure
         if opinion_figures:
-            opinion_section["protocol_figures"] = [
-                {
-                    "type": "diagram",
-                    "key": f"protocol-{figure.kind.value}",
-                    "title": _PROTOCOL_FIGURE_TITLES[figure.kind.value],
-                    "caption": figure.caption,
-                    "status_label": (
-                        "Modèle documenté, non observé"
-                        if "documented, not observed" in figure.caption.casefold()
-                        else "Modèle de protocole — statut indiqué dans les éléments cités"
+
+            def protocol_figure_brief(
+                protocol_figure: OpinionProtocolFigureV1,
+            ) -> tuple[str, str, str, str | None]:
+                caption_lines = protocol_figure.caption.splitlines()
+                source_title = caption_lines[0].rstrip(".")
+                has_structured_caption = any(
+                    line.startswith("Limits: ") for line in caption_lines
+                ) and any(line.startswith("Proof levels: ") for line in caption_lines)
+                if not has_structured_caption:
+                    source_title = source_title.partition(". ")[0].rstrip(".").strip()
+                    if len(source_title) > 120:
+                        source_title = source_title[:117].rstrip() + "…"
+                    if not source_title:
+                        source_title = "Vue de protocole persistée"
+                for suffix in (
+                    " · documenté, non observé",
+                    " · documented, not observed",
+                ):
+                    if source_title.casefold().endswith(suffix):
+                        source_title = source_title[: -len(suffix)]
+                        break
+                proof_line = next(
+                    (
+                        line.removeprefix("Proof levels: ")
+                        for line in caption_lines
+                        if line.startswith("Proof levels: ")
                     ),
+                    "voir les niveaux indiqués sur les nœuds et relations",
+                )
+                raw_limit_line = next(
+                    (
+                        line.removeprefix("Limits: ")
+                        for line in caption_lines
+                        if line.startswith("Limits: ")
+                    ),
+                    "aucun échange réseau non étayé n'est ajouté",
+                )
+                limit_parts = [part.strip() for part in raw_limit_line.split(";")]
+                limit_index = (
+                    1
+                    if len(limit_parts) > 1
+                    and (
+                        "ARTICLE_DOCUMENTED" in proof_line or proof_line == "INSUFFICIENT_EVIDENCE"
+                    )
+                    else 0
+                )
+                limit_line = limit_parts[min(limit_index, len(limit_parts) - 1)]
+                proof_levels = proof_line.partition(" — ")[0]
+                proof_label = (
+                    "Niveaux de preuve : " if "," in proof_levels else "Niveau de preuve : "
+                ) + proof_line
+                title = f"{_PROTOCOL_FIGURE_TITLES[protocol_figure.kind.value]} — {source_title}"
+                renderer_warning = None
+                if draft_preview is not None and (
+                    protocol_figure.compiler_policy_version
+                    != PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION
+                    or not has_structured_caption
+                ):
+                    renderer_warning = (
+                        "Rendu hérité — politique enregistrée : "
+                        f"{protocol_figure.compiler_policy_version}; attendue : "
+                        f"{PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION}. Refaire "
+                        "network.protocol.render puis rattacher les trois vues avec "
+                        "opinion.revise."
+                    )
+                return title, f"Limites : {limit_line}.", proof_label, renderer_warning
+
+            def project_protocol_figure(
+                index: int, protocol_figure: OpinionProtocolFigureV1
+            ) -> dict[str, Any]:
+                title, caption, status_label, renderer_warning = protocol_figure_brief(
+                    protocol_figure
+                )
+                return {
+                    "type": "diagram",
+                    "key": f"protocol-{protocol_figure.kind.value}",
+                    "title": title,
+                    "caption": caption,
+                    "status_label": status_label,
+                    "renderer_warning": renderer_warning,
                     "status_legend": (
-                        "Legend: OBSERVED green; INFERRED orange and dashed; "
-                        "UNRESOLVED gray; CONTRADICTED red. "
-                        "An article diagram label never means packet, frame, or byte observed."
+                        "Legend: OBSERVED green; INFERRED orange; "
+                        "UNRESOLVED gray; CONTRADICTED red."
                     ),
                     "media_path": media_ref(
-                        asset_id=figure.asset_id,
+                        asset_id=protocol_figure.asset_id,
                         expected_kind=MediaAssetKind.DIAGRAM_SVG,
                         expected_mime_type="image/svg+xml",
-                        expected_sha256=figure.asset_sha256,
+                        expected_sha256=protocol_figure.asset_sha256,
                         expected_byte_size=None,
                     ).media_path,
-                    "model_sha256": figure.model_sha256,
-                    "spec_sha256": figure.spec_sha256,
-                    "asset_sha256": figure.asset_sha256,
-                    "preview_sha256": figure.preview_sha256,
-                    "pin_sha256": figure.pin_sha256,
-                    "compiler_name": figure.compiler_name,
-                    "compiler_version": figure.compiler_version,
-                    "compiler_policy_version": figure.compiler_policy_version,
-                    "field_evidence": [item.to_payload() for item in figure.field_evidence],
+                    # Retain the existing V5/V6 render-data fields for consumers; their
+                    # full values are displayed only in the final technical annex.
+                    "model_sha256": protocol_figure.model_sha256,
+                    "spec_sha256": protocol_figure.spec_sha256,
+                    "asset_sha256": protocol_figure.asset_sha256,
+                    "preview_sha256": protocol_figure.preview_sha256,
+                    "pin_sha256": protocol_figure.pin_sha256,
+                    "compiler_name": protocol_figure.compiler_name,
+                    "compiler_version": protocol_figure.compiler_version,
+                    "compiler_policy_version": protocol_figure.compiler_policy_version,
+                    "field_evidence": [
+                        item.to_payload() for item in protocol_figure.field_evidence
+                    ],
                     "figure_number": next_figure_number + index,
                 }
-                for index, figure in enumerate(opinion_figures, start=1)
+
+            opinion_section["protocol_figures"] = [
+                project_protocol_figure(index, protocol_figure)
+                for index, protocol_figure in enumerate(opinion_figures, start=1)
             ]
         content_sections.append(opinion_section)
     if detection is not None and "detection" in expected_section_types:
@@ -1910,6 +2404,8 @@ def project_publication_to_typst_model(
                 "original_indicator_note": original_indicator_note,
                 "ioc_rows": ioc_rows,
                 "ioc_row_groups": ioc_row_groups,
+                "opinion_refs": opinion_provenance_entries,
+                "protocol_figure_details": protocol_figure_provenance,
             }
         )
 

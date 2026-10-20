@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import json
 import logging
@@ -24,6 +25,7 @@ from cti_app.application.analyst_handoff import (
     current_verified_extraction_inputs,
     loop_budget_from_settings,
 )
+from cti_app.application.blob_storage import BlobReadLimitExceededError
 from cti_app.application.bridge_investigator import make_investigation_turn_idempotency_key
 from cti_app.application.diagram_compilation import DiagramCompilationError
 from cti_app.application.evidence_recorder import sanitize_evidence_text
@@ -341,6 +343,8 @@ class InvestigationExperimentViewV1(BaseModel):
     scope: str
     limitations: list[str]
     verdict: ExperimentVerdict
+    supersedes_experiment_ids: list[UUID] = Field(default_factory=list)
+    superseded_by: list[UUID] = Field(default_factory=list)
     implication: str
     next_pivots: list[str]
     author: str
@@ -354,6 +358,7 @@ class ClaimExperimentScopeViewV1(BaseModel):
     scope: str
     verdict: ExperimentVerdict
     observation_ids: list[UUID]
+    superseded_by: list[UUID] = Field(default_factory=list)
 
 
 class ConsolidatedClaimVerdictViewV1(BaseModel):
@@ -365,6 +370,7 @@ class ConsolidatedClaimVerdictViewV1(BaseModel):
     experiment_ids: list[UUID]
     scopes: list[ClaimExperimentScopeViewV1]
     contradictory: bool
+    superseded_by: list[UUID] = Field(default_factory=list)
 
 
 class InvestigationExperimentTimelineResponseV1(BaseModel):
@@ -501,24 +507,125 @@ _OBSERVATION_BINARY_FIELD = re.compile(
     r"(?i)(?:raw[_-]?(?:bytes|binary|octets|file|sample|payload)|"
     r"bytes[_-]?(?:raw|file|sample|payload))"
 )
+_OBSERVATION_TEXT_CHUNK_OMITTED = "[encoded binary content omitted]"
+_LOCAL_TEXT_CHUNK_MAX_BYTES = 48 * 1024
+_DECOMPILE_TEXT_CHUNK_MAX_BYTES = 4 * 1024 * 1024
 
 
-def _sanitize_observation_payload(value: Any, *, depth: int = 0) -> Any:
+class _SensitiveObservationTextError(ValueError):
+    """Raised when an otherwise readable tool transcript contains redacted data."""
+
+
+def _observation_base64_text_chunk_spec(
+    value: Mapping[str, Any], *, allow_confined_text_chunks: bool
+) -> tuple[str, str, str, int] | None:
+    if not allow_confined_text_chunks:
+        return None
+    if (
+        value.get("schema") == "local-command-execution.v1"
+        and value.get("command_id") == "xxd"
+        and value.get("output_encoding") == "base64-utf8"
+    ):
+        return ("output_chunks", "output_byte_length", "output_sha256", _LOCAL_TEXT_CHUNK_MAX_BYTES)
+    if (
+        value.get("schema_version") == "dotnet-analysis-observation.v1"
+        and value.get("tool") == "method.decompile"
+        and value.get("result_json_encoding") == "base64-utf8"
+    ):
+        return (
+            "result_json_chunks",
+            "result_json_byte_length",
+            "result_json_sha256",
+            _DECOMPILE_TEXT_CHUNK_MAX_BYTES,
+        )
+    return None
+
+
+def _verified_base64_text_chunks(
+    chunks: Any,
+    *,
+    byte_length: Any,
+    sha256: Any,
+    max_bytes: int,
+) -> list[str]:
+    if (
+        not isinstance(chunks, list)
+        or len(chunks) > 512
+        or isinstance(byte_length, bool)
+        or not isinstance(byte_length, int)
+        or byte_length < 0
+        or byte_length > max_bytes
+        or not isinstance(sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", sha256) is None
+        or any(not isinstance(chunk, str) for chunk in chunks)
+    ):
+        return [_OBSERVATION_TEXT_CHUNK_OMITTED]
+
+    encoded_length = sum(len(chunk) for chunk in chunks)
+    if encoded_length > ((max_bytes + 2) // 3) * 4:
+        return [_OBSERVATION_TEXT_CHUNK_OMITTED]
+    try:
+        encoded = "".join(chunks).encode("ascii")
+        decoded = base64.b64decode(encoded, validate=True)
+        text = decoded.decode("utf-8", errors="strict")
+    except (binascii.Error, UnicodeError, ValueError):
+        return [_OBSERVATION_TEXT_CHUNK_OMITTED]
+    if (
+        len(decoded) != byte_length
+        or hashlib.sha256(decoded).hexdigest() != sha256
+        or len(decoded) > max_bytes
+        or any(ord(char) < 0x20 and char not in "\t\n\r" for char in text)
+        or "\x7f" in text
+    ):
+        return [_OBSERVATION_TEXT_CHUNK_OMITTED]
+
+    if sanitize_evidence_text(text, max_chars=max_bytes) != text:
+        raise _SensitiveObservationTextError("Decoded tool text contains redacted content")
+    return list(chunks)
+
+
+def _sanitize_observation_payload(
+    value: Any, *, depth: int = 0, allow_confined_text_chunks: bool = False
+) -> Any:
     """Mask long encoded blobs while retaining bounded, readable evidence facts."""
     if depth > 16:
         return "[maximum depth omitted]"
     if isinstance(value, dict):
         safe: dict[str, Any] = {}
+        chunk_spec = (
+            _observation_base64_text_chunk_spec(
+                value, allow_confined_text_chunks=allow_confined_text_chunks
+            )
+            if depth == 0
+            else None
+        )
         for key, item in list(value.items())[:128]:
             safe_key = str(key)[:256]
             if _OBSERVATION_SECRET_FIELD.search(safe_key) or _OBSERVATION_BINARY_FIELD.search(
                 safe_key
             ):
                 continue
-            safe[safe_key] = _sanitize_observation_payload(item, depth=depth + 1)
+            if chunk_spec is not None and safe_key == chunk_spec[0]:
+                safe[safe_key] = _verified_base64_text_chunks(
+                    item,
+                    byte_length=value.get(chunk_spec[1]),
+                    sha256=value.get(chunk_spec[2]),
+                    max_bytes=chunk_spec[3],
+                )
+            else:
+                safe[safe_key] = _sanitize_observation_payload(
+                    item,
+                    depth=depth + 1,
+                    allow_confined_text_chunks=allow_confined_text_chunks,
+                )
         return safe
     if isinstance(value, list):
-        return [_sanitize_observation_payload(item, depth=depth + 1) for item in value[:512]]
+        return [
+            _sanitize_observation_payload(
+                item, depth=depth + 1, allow_confined_text_chunks=allow_confined_text_chunks
+            )
+            for item in value[:512]
+        ]
     if isinstance(value, str):
         safe_text = sanitize_evidence_text(value, max_chars=8 * 1024 * 1024)
         if _BASE64_BLOB_TEXT.fullmatch(safe_text):
@@ -919,7 +1026,7 @@ async def get_investigation_pivot_frontier(
     payload = frontier_to_dict(frontier)
     payload["investigation_id"] = investigation_id
     payload["nodes"] = payload.pop("records")
-    return PivotFrontierResponseV1.model_validate(payload)
+    return PivotFrontierResponseV1.model_validate(payload, strict=False)
 
 
 @router.get(
@@ -1001,7 +1108,7 @@ async def get_investigation_operator_context_section(
     expected_version: int | None = Query(default=None, ge=1),
     expected_sha256: str | None = Query(default=None, pattern=_SHA256),
 ) -> OperatorContextSectionPageV1 | OperatorContextItemPageV1:
-    await _require_operator_client(request)
+    await _require_article_claim_reader(request, section)
     async with _uow_factory(request)() as uow:
         investigation = await uow.analyst_investigations.get(investigation_id)
         if investigation is None:
@@ -1140,7 +1247,17 @@ async def get_investigation_operator_observation(
             raise _http_error(422, "operator_observation_invalid_json") from exc
         if not isinstance(canonical, dict):
             raise _http_error(422, "operator_observation_invalid_payload")
-        sanitized = _sanitize_observation_payload(canonical)
+        allow_confined_text_chunks = (
+            getattr(observation, "source", None) == "AutoWork local analysis"
+            and getattr(observation, "object_type", None) == "file"
+            and canonical.get("sample_sha256") == getattr(observation, "object_id", None)
+        )
+        try:
+            sanitized = _sanitize_observation_payload(
+                canonical, allow_confined_text_chunks=allow_confined_text_chunks
+            )
+        except _SensitiveObservationTextError as exc:
+            raise _http_error(422, "operator_observation_sensitive_text") from exc
         payload_json = json.dumps(
             sanitized, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
@@ -1520,6 +1637,8 @@ async def list_investigation_sample_comparisons(
         await _require_investigation(uow, investigation_id)
         observations = await uow.evidence_observations.list_for_investigation(investigation_id)
         summaries: list[dict[str, Any]] = []
+        omitted_comparisons: list[dict[str, Any]] = []
+        omitted_comparisons_truncated = False
         seen: set[UUID] = set()
         for observation in observations:
             if observation.object_type != "family_feature_comparison":
@@ -1527,7 +1646,30 @@ async def list_investigation_sample_comparisons(
             blob = await uow.blobs.get_by_address(_SIMILARITY_BUCKET, observation.object_id)
             if blob is None or blob.id in seen or blob.descriptor.sha256 != observation.sha256:
                 continue
-            raw = await artifact_store.read_json(blob.id)
+            try:
+                raw = await artifact_store.read_json(blob.id)
+            except BlobReadLimitExceededError as exc:
+                seen.add(blob.id)
+                _logger.warning(
+                    "Sample comparison omitted because its canonical blob exceeds the read limit",
+                    extra={
+                        "event": "sample_comparison_omitted",
+                        "observation_id": str(observation.id),
+                        "size_bytes": exc.size_bytes,
+                        "reason": "exceeds_read_limit",
+                    },
+                )
+                if len(omitted_comparisons) < limit:
+                    omitted_comparisons.append(
+                        {
+                            "observation_id": str(observation.id),
+                            "size_bytes": exc.size_bytes,
+                            "reason": "exceeds_read_limit",
+                        }
+                    )
+                else:
+                    omitted_comparisons_truncated = True
+                continue
             if raw.get("investigation_id") != str(investigation_id):
                 continue
             seen.add(blob.id)
@@ -1538,6 +1680,8 @@ async def list_investigation_sample_comparisons(
         "investigation_id": investigation_id,
         "comparisons": summaries[:limit],
         "truncated": len(summaries) > limit,
+        "omitted_comparisons": omitted_comparisons,
+        "omitted_comparisons_truncated": omitted_comparisons_truncated,
     }
 
 
@@ -3152,6 +3296,20 @@ async def _require_operator_client(request: Request) -> None:
     identity = await _identity(request)
     if not identity.has_scope(IdentityScope.OPERATOR_CLIENT):
         raise _http_error(403, "operator_client_scope_required")
+
+
+async def _require_article_claim_reader(request: Request, section: str) -> None:
+    identity = await _identity(request)
+    if identity.has_scope(IdentityScope.OPERATOR_CLIENT):
+        return
+    if section == "article_claims" and identity.has_scope(IdentityScope.HUMAN_OPERATOR):
+        provider = getattr(request.app.state, "identity_provider", None)
+        provider_mode = getattr(provider, "mode", None)
+        if provider_mode == "local" or (
+            provider_mode == "authenticated" and getattr(provider, "verified", False) is True
+        ):
+            return
+    raise _http_error(403, "operator_client_scope_required")
 
 
 async def _dispatch(request: Request, job: Job) -> None:

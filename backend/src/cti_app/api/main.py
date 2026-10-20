@@ -1,7 +1,7 @@
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from uuid import NAMESPACE_URL, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 import httpx
 from fastapi import FastAPI, Request
@@ -778,11 +778,24 @@ def _operator_client_route_allowed(method: str, path: str) -> bool:
     parts = path.strip("/").split("/")
     if len(parts) < 3 or parts[:2] != ["api", "investigations"]:
         return False
+    try:
+        UUID(parts[2])
+    except ValueError:
+        return False
     if method == "GET" and len(parts) == 4 and parts[3] == "operator-status":
         return True
     if method == "GET" and len(parts) == 3:
         return True
     if method == "GET" and len(parts) == 5 and parts[3:] == ["operator", "context"]:
+        return True
+    if method == "GET" and len(parts) == 4 and parts[3] in {"pivots", "experiments"}:
+        return True
+    if (
+        method == "GET"
+        and len(parts) == 7
+        and parts[3:6] == ["operator", "context", "section"]
+        and parts[6]
+    ):
         return True
     if (
         method == "GET"

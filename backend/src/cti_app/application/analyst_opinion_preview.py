@@ -19,6 +19,7 @@ from cti_app.domain.analyst_opinion import (
     OpinionProtocolFigureV1,
     verify_opinion_citations,
 )
+from cti_app.domain.investigation import EvidenceObservation, InvestigationFinding
 from cti_app.domain.investigation_graph import InvestigationGraph
 from cti_app.domain.production import ProductionArtifactStage, ProductionArtifactStatus
 from cti_app.domain.production_synthesis import (
@@ -40,6 +41,8 @@ class DraftOpinionPdfRenderer(Protocol):
         synthesis: ProductionSynthesisV1,
         *,
         infrastructure_graph: InvestigationGraph | None = None,
+        findings: tuple[InvestigationFinding, ...] = (),
+        evidence_observations: tuple[EvidenceObservation, ...] = (),
     ) -> CompiledTypstDocument: ...
 
 
@@ -178,7 +181,11 @@ class AnalystOpinionPreviewService:
         )
         if infrastructure_graph is None:
             compiled = await self._renderer.render_draft_preview(
-                document, render_opinion, parsed_synthesis
+                document,
+                render_opinion,
+                parsed_synthesis,
+                findings=findings,
+                evidence_observations=observations,
             )
         else:
             compiled = await self._renderer.render_draft_preview(
@@ -186,6 +193,8 @@ class AnalystOpinionPreviewService:
                 render_opinion,
                 parsed_synthesis,
                 infrastructure_graph=infrastructure_graph,
+                findings=findings,
+                evidence_observations=observations,
             )
         content = compiled.content
         renderer_sha256 = compiled.sha256

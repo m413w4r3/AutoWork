@@ -472,13 +472,14 @@ class NetworkWorkbench:
         protocol_counts: Counter[str] = Counter()
         ignored_protocol_layers = {"FRAME", "ETH", "ETHERTYPE", "DATA"}
         for row in packet_rows:
-            if row.protocol.strip():
-                protocol_counts[row.protocol.strip().upper()] += 1
-            protocol_counts.update(
+            packet_protocols = {
                 layer.upper()
                 for layer in row.protocol_stack.split(":")
                 if layer and layer.upper() not in ignored_protocol_layers
-            )
+            }
+            if row.protocol.strip():
+                packet_protocols.add(row.protocol.strip().upper())
+            protocol_counts.update(packet_protocols)
         protocols = tuple(
             ProtocolCountV1(protocol, count)
             for protocol, count in sorted(protocol_counts.items())[: self.limits.max_protocols]

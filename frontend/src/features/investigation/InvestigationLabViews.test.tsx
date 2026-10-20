@@ -446,6 +446,61 @@ describe("InvestigationLabViews", () => {
     expect(screen.getByText(/coût estimé 2/)).toBeInTheDocument();
   });
 
+  it("marque une expérience conservée dans l’historique comme remplacée", async () => {
+    const client = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false, refetchInterval: false, staleTime: Infinity },
+      },
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url =
+          typeof input === "string"
+            ? input
+            : input instanceof URL
+              ? input.href
+              : input.url;
+        const response = mockResponse(url);
+        if (!url.endsWith("/experiments")) return response;
+        const timeline = (await response.json()) as {
+          experiments: Array<{ id: string; superseded_by?: string[] }>;
+          claims: Array<Record<string, unknown>>;
+        };
+        const previous = timeline.experiments[0];
+        const replacement = timeline.experiments[1];
+        const claim = timeline.claims[0];
+        if (!previous || !replacement || !claim) {
+          throw new Error("The experiment fixture is incomplete");
+        }
+        previous.superseded_by = [replacement.id];
+        timeline.claims[0] = {
+          ...claim,
+          status: "supported",
+          verdicts: ["supports"],
+          experiment_ids: [replacement.id],
+          contradictory: false,
+        };
+        return Response.json(timeline);
+      }),
+    );
+    render(
+      <QueryClientProvider client={client}>
+        <InvestigationLabViews
+          investigation={investigation}
+          editionId="edition-1"
+        />
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByText(/Remplacée par/)).toBeInTheDocument();
+    expect(
+      screen.getByText("99999999-9999-4999-8999-999999999999"),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Expérience v1 · Réfute/)).toBeInTheDocument();
+    expect(screen.getByText(/Expérience v2 · Soutient/)).toBeInTheDocument();
+  });
+
   it("affiche explicitement une sensibilité non calculable et les limites YARA", async () => {
     const client = new QueryClient({
       defaultOptions: {

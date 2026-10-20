@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import sys
 from collections.abc import Mapping, Sequence
@@ -541,6 +542,41 @@ async def test_timeout_and_truncation_are_partial_with_an_explicit_marker(status
     assert payload["output_truncated"] is True
     assert "[TRUNCATED:" in payload["output"]
     assert observation.kind is EvidenceKind.BINARY_ANALYSIS
+    assert (
+        observation.sha256
+        == hashlib.sha256(ProductionArtifactStore.canonical_json_bytes(payload)).hexdigest()
+    )
+
+
+@pytest.mark.asyncio
+async def test_long_local_output_is_persisted_in_hashed_byte_bounded_chunks() -> None:
+    full_cil = "".join(f"IL_{index:04x}: nop\n" for index in range(2_600))
+    harness = _Harness(command_output=full_cil, max_local_output_chars=128)
+
+    result = await _dispatch(
+        harness.registry,
+        harness.context(key="long-local-output"),
+        LOCAL_RUN_COMMAND,
+        _local_arguments(),
+    )
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    assert result.output["output_truncated_by_response"] is True
+    assert result.output["observation_ref"] == str(result.observation_refs[0])
+    assert result.output["observation_url"].endswith(
+        f"{result.observation_refs[0]}?offset=0&length=16384"
+    )
+    observation = await harness.observations.get(result.observation_refs[0])
+    assert observation is not None
+    payload = harness.artifact_store.payloads[observation.blob_id]
+    assert payload["output_encoding"] == "base64-utf8"
+    assert payload["output_truncated"] is False
+    assert payload["output_truncated_by_evidence_limit"] is False
+    assert max(map(len, payload["output_chunks"])) <= 4_000
+    output_bytes = base64.b64decode("".join(payload["output_chunks"]))
+    assert output_bytes == full_cil.encode("utf-8")
+    assert payload["output_byte_length"] == len(output_bytes)
+    assert payload["output_sha256"] == hashlib.sha256(output_bytes).hexdigest()
     assert (
         observation.sha256
         == hashlib.sha256(ProductionArtifactStore.canonical_json_bytes(payload)).hexdigest()

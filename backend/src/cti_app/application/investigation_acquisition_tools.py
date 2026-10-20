@@ -12,9 +12,11 @@ from uuid import UUID
 from cti_app.application.capabilities import CapabilitiesService
 from cti_app.application.code_features import CodeFeatureService
 from cti_app.application.confined_analysis import (
+    CONFINED_ANALYSIS_RESULT_SCHEMA,
     ConfinedAnalysisExecutionPort,
     ConfinedAnalysisRequest,
     ConfinedAnalysisTool,
+    confined_analysis_operation_cache_identity,
 )
 from cti_app.application.evidence_recorder import EvidenceRecorder, sanitize_evidence_text
 from cti_app.application.goodware import GoodwareMeasurementService
@@ -160,6 +162,10 @@ class LocalSampleAnalysisService:
         self._analysis_timeout_seconds = analysis_timeout_seconds
         self._max_output_bytes = max_output_bytes
 
+    @property
+    def operation_cache_identity(self) -> Mapping[str, Any]:
+        return confined_analysis_operation_cache_identity(self._confined_analysis)
+
     async def describe(self, association_id: UUID) -> Mapping[str, Any]:
         """Return quarantine metadata without reading the sample bytes."""
         sample = await self._hits.resolve_quarantined_sample(association_id)
@@ -240,7 +246,7 @@ class LocalSampleAnalysisService:
                     blob_id=result.result_blob_id,
                     sha256=result.result_sha256,
                     source="autowork.analysis_worker",
-                    source_version="confined-analysis-result.v1",
+                    source_version=CONFINED_ANALYSIS_RESULT_SCHEMA,
                     object_type="sample",
                     object_id=sample.sha256,
                     limitations=(
@@ -538,6 +544,13 @@ class _SampleAnalyzeAdapter:
     def __init__(self, hits: HitAcquisitionService, analyzer: SampleAnalyzer | None) -> None:
         self._hits = hits
         self._analyzer = analyzer
+
+    @property
+    def operation_cache_identity(self) -> Mapping[str, Any]:
+        identity = getattr(self._analyzer, "operation_cache_identity", None)
+        if isinstance(identity, Mapping):
+            return identity
+        return confined_analysis_operation_cache_identity(None)
 
     async def execute(
         self, arguments: Mapping[str, Any], context: ToolExecutionContext
