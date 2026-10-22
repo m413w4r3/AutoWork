@@ -53,6 +53,18 @@ class ImportedNetworkCapture:
     association_id: UUID
 
 
+@dataclass(frozen=True, slots=True)
+class NetworkCaptureInventoryItem:
+    observation_id: UUID
+    source_reference: str
+    blob_id: UUID
+    sha256: str
+    size_bytes: int
+    format: NetworkCaptureFormat
+    mime_type: str
+    observed_at: datetime
+
+
 class NetworkCaptureImportService:
     """Store capture bytes in the quarantine bucket and bind them to an investigation."""
 
@@ -70,6 +82,57 @@ class NetworkCaptureImportService:
     @property
     def max_upload_bytes(self) -> int:
         return capture_max_bytes(self._settings)
+
+    async def list_captures(
+        self, *, investigation_id: UUID, limit: int = 50, offset: int = 0
+    ) -> tuple[NetworkCaptureInventoryItem, ...]:
+        if not 1 <= limit <= 100 or offset < 0:
+            raise ValueError("network capture page is outside its supported bounds")
+        async with self._uow_factory() as uow:
+            if await uow.analyst_investigations.get(investigation_id) is None:
+                raise CaptureInvestigationNotFoundError(str(investigation_id))
+            observations = await uow.evidence_observations.list_for_investigation(investigation_id)
+            candidates = sorted(
+                (
+                    item
+                    for item in observations
+                    if item.source == "network.quarantine"
+                    and item.source_version == _IMPORT_SOURCE_VERSION
+                    and item.object_type == "network_capture"
+                    and item.object_id == item.sha256
+                    and _SHA256.fullmatch(item.sha256) is not None
+                ),
+                key=lambda item: (item.observed_at, str(item.id)),
+                reverse=True,
+            )
+            page = candidates[offset : offset + limit]
+            result: list[NetworkCaptureInventoryItem] = []
+            formats_by_mime = {mime: capture_format for capture_format, mime in _PCAP_MIME.items()}
+            for observation in page:
+                blob = await uow.blobs.get(observation.blob_id)
+                if (
+                    blob is None
+                    or blob.descriptor.sha256 != observation.sha256
+                    or blob.descriptor.logical_bucket != _NETWORK_CAPTURE_QUARANTINE_BUCKET
+                ):
+                    continue
+                mime_type = blob.descriptor.mime_type.split(";", 1)[0].strip().lower()
+                capture_format = formats_by_mime.get(mime_type)
+                if capture_format is None:
+                    continue
+                result.append(
+                    NetworkCaptureInventoryItem(
+                        observation_id=observation.id,
+                        source_reference=f"sha256:{observation.sha256}",
+                        blob_id=observation.blob_id,
+                        sha256=observation.sha256,
+                        size_bytes=blob.descriptor.size,
+                        format=capture_format,
+                        mime_type=mime_type,
+                        observed_at=observation.observed_at,
+                    )
+                )
+        return tuple(result)
 
     async def import_capture(
         self,

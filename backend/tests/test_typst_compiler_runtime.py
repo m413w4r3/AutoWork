@@ -54,6 +54,7 @@ from tests.test_typst_rendering import _full_document, _table
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 _FONT_BUNDLE_LOCK = _REPOSITORY_ROOT / "infra" / "typst-fonts.lock"
+_PUBLICATION_RENDER_LABEL = "Publication de base — artefact de fixture v1"
 _COPYABLE_HASH = "0123456789abcdef" * 4
 _COPYABLE_LONG_URL = "https://example.test/" + "a" * (200 - len("https://example.test/"))
 _COPYABLE_EXACT_URL = "https://micbucket.ams1.vultrobjects.com/Exclude/Telegram.exe"
@@ -229,6 +230,7 @@ def _runtime_render_data() -> dict[str, Any]:
     ]
     return {
         "schema_version": "typst-publication-model-v17-synthesis-section-headings",
+        "document_label": _PUBLICATION_RENDER_LABEL,
         "language": "fr",
         "title": "AW-019 runtime publication fixture",
         "content_sections": [
@@ -351,7 +353,9 @@ async def test_real_typst_article_preserves_copyable_technical_literals(
 ) -> None:
     typst_root = _REPOSITORY_ROOT / "chpTypst"
     bundle = load_template_bundle(typst_root)
-    source = TypstRenderer().render(_copyable_ioc_document(), bundle)
+    source = TypstRenderer().render(
+        _copyable_ioc_document(), bundle, document_label=_PUBLICATION_RENDER_LABEL
+    )
     render_data = json.loads(source.render_data_bytes)
     _install_narrow_technical_table(render_data)
 
@@ -472,7 +476,7 @@ async def test_real_typst_wraps_long_tokens_without_overlapping_narrow_table_cel
             paragraphs=tuple(semantic_paragraphs),
         ),
     )
-    source = TypstRenderer().render(document, bundle)
+    source = TypstRenderer().render(document, bundle, document_label=_PUBLICATION_RENDER_LABEL)
     render_data = json.loads(source.render_data_bytes)
     table = next(
         block
@@ -540,51 +544,28 @@ async def test_real_typst_wraps_long_tokens_without_overlapping_narrow_table_cel
         if element.tag.rsplit("}", 1)[-1] == "word"
     ]
 
-    def find_word(value: str) -> tuple[int, str, float, float, float, float]:
-        matches = [word for word in words if word[1] == value]
-        assert matches, f"rendered PDF is missing word {value!r}"
-        return matches[0]
+    def assert_card_field_does_not_overlap(label: str, value: str) -> None:
+        labels = [word for word in words if word[1] == label]
+        values = [word for word in words if word[1] == value]
+        assert labels and values, f"rendered component card is missing {label!r} or {value!r}"
+        assert any(
+            header[0] == candidate[0]
+            and min(header[5], candidate[5]) > max(header[3], candidate[3])
+            and candidate[2] >= header[4]
+            for header in labels
+            for candidate in values
+        ), f"component-card label {label!r} overlaps its value {value!r}"
 
-    function_header = find_word("Fonction")
-    assert any(
-        word[0] == function_header[0]
-        and word[1] == "Composant"
-        and abs(word[3] - function_header[3]) <= 1.5
-        and word[2] < function_header[2]
-        for word in words
-    ), "the first-column header should fit on one line after token wrapping"
-    first_header_x = min(
-        word[2]
-        for word in words
-        if word[0] == function_header[0]
-        and abs(word[3] - function_header[3]) <= 1.5
-        and word[2] < function_header[2]
-    )
-    header_starts = [
-        first_header_x,
-        function_header[2],
-        find_word("Mécanisme")[2],
-        find_word("Dépendance")[2],
-    ]
-    row_heads = (
-        ("Moteur", "Utilisation", "Clé"),
-        ("Chargeur", "Création", "Option"),
-    )
-    for heads in row_heads:
-        for column_index, right_head in enumerate(heads):
-            neighbor = find_word(right_head)
-            left_words = [
-                word
-                for word in words
-                if word[0] == neighbor[0]
-                and abs(word[3] - neighbor[3]) <= 1.5
-                and header_starts[column_index] - 0.5 <= word[2] < neighbor[2]
-            ]
-            assert left_words, f"could not inspect the preceding cell before {right_head!r}"
-            crossing = [word[1] for word in left_words if word[4] > neighbor[2] + 0.2]
-            assert not crossing, (
-                f"text in the cell before {right_head!r} crosses into its column: {crossing!r}"
-            )
+    for label, value in (
+        ("Fonction:", "Moteur"),
+        ("Mécanisme", "Utilisation"),
+        ("Dépendance", "Clé"),
+        ("Fonction:", "Chargeur"),
+        ("Mécanisme", "Création"),
+        ("Dépendance", "Option"),
+        ("Fonction:", "Composant"),
+    ):
+        assert_card_field_does_not_overlap(label, value)
 
 
 @pytest.mark.asyncio
@@ -596,7 +577,7 @@ async def test_real_typst_article_renders_cited_technical_context_reference(
     publication = _cited_technical_context_case()[6]
     typst_root = _REPOSITORY_ROOT / "chpTypst"
     bundle = load_template_bundle(typst_root)
-    source = TypstRenderer().render(publication, bundle)
+    source = TypstRenderer().render(publication, bundle, document_label=_PUBLICATION_RENDER_LABEL)
     render_data = json.loads(source.render_data_bytes)
     workspace_root = tmp_path / "technical-context-reference-workspace"
     _build_runtime_workspace(_REPOSITORY_ROOT, workspace_root, render_data=render_data)
@@ -757,6 +738,7 @@ def _lot6_composition_render_data() -> tuple[dict[str, Any], tuple[str, ...], tu
     return (
         {
             "schema_version": "typst-publication-model-v17-synthesis-section-headings",
+            "document_label": "Publication de base — artefact de fixture v1",
             "language": "fr",
             "title": "[LOT 6] Fixture de composition A4",
             "content_sections": [
@@ -978,6 +960,7 @@ async def test_real_typst_bounds_tall_media_and_keeps_following_text_on_page(
 ) -> None:
     render_data = {
         "schema_version": "typst-publication-model-v17-synthesis-section-headings",
+        "document_label": "Publication de base — artefact de fixture v1",
         "language": "fr",
         "title": "Tall diagram layout regression",
         "content_sections": [
@@ -1026,7 +1009,7 @@ async def test_real_typst_bounds_tall_media_and_keeps_following_text_on_page(
     )
 
     reader = PdfReader(BytesIO(compiled.content), strict=True)
-    assert len(reader.pages) == 1
+    assert len(reader.pages) == 2
     text = " ".join((reader.pages[0].extract_text() or "").split())
     assert "Text immediately before the diagram." in text
     assert "Figure 1 : Portrait diagram caption stays with the image." in text

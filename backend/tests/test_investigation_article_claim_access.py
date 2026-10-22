@@ -41,9 +41,11 @@ async def test_authenticated_human_can_read_only_article_claims(
             limit: int,
             expected_version: int | None,
             expected_sha256: str | None,
+            cursor: str | None = None,
         ) -> object:
             assert section in {"article_claims", "budget_remaining"}
             assert (offset, limit, expected_version, expected_sha256) == (0, 20, None, None)
+            assert cursor is None
             return page
 
     operator_context = _OperatorContext()
@@ -80,6 +82,7 @@ async def test_authenticated_human_can_read_only_article_claims(
         limit=20,
         expected_version=None,
         expected_sha256=None,
+        cursor=None,
     )
     assert result is page
 
@@ -96,6 +99,7 @@ async def test_authenticated_human_can_read_only_article_claims(
         limit=20,
         expected_version=None,
         expected_sha256=None,
+        cursor=None,
     )
     assert local_result is page
 
@@ -108,6 +112,7 @@ async def test_authenticated_human_can_read_only_article_claims(
             limit=20,
             expected_version=None,
             expected_sha256=None,
+            cursor=None,
         )
     assert error.value.status_code == 403
     assert error.value.detail["code"] == "operator_client_scope_required"
@@ -127,6 +132,7 @@ async def test_authenticated_human_can_read_only_article_claims(
             limit=20,
             expected_version=None,
             expected_sha256=None,
+            cursor=None,
         )
     assert unverified_error.value.status_code == 403
     assert unverified_error.value.detail["code"] == "operator_client_scope_required"
@@ -146,5 +152,6 @@ async def test_authenticated_human_can_read_only_article_claims(
         limit=20,
         expected_version=None,
         expected_sha256=None,
+        cursor=None,
     )
     assert client_result is page

@@ -1,0 +1,42 @@
+advisor-wire.v1
+
+TYPE: yara_draft
+
+STATUS: partial
+
+yara
+
+`import "pe"
+import "dotnet"
+
+rule Managed_PE_Candidate
+{
+    meta:
+        description = "Experimental managed PE detection"
+        confidence = "low"
+        validation = "pending"
+
+    strings:
+        $marker = "1F4F22C4-CF61-4049-A21F-3B07CD631961" ascii
+
+    condition:
+        pe.is_pe and
+        dotnet.is_dotnet and
+        $marker
+}`
+
+MOTIF: $marker | measurements=M1
+
+INVARIANT: Une seule règle conjonctive. Le fichier doit être un PE/CLI géré brut contenant M1. Aucun hash de fichier, nom d'assemblage, import .NET ordinaire ou marqueur DOS générique utilisé.
+
+INVARIANT: Les fichiers .conf, XML, ZIP et RuntimeBrokerApi non-PE sont exclus par les contraintes structurelles.
+
+LIMITATION: M1 constitue le seul motif distinctif mesuré. Son appartenance commune à PsProxy, RuntimeBroker, Blackwood et VS_SDKs n'est pas établie.
+
+LIMITATION: L'exclusion de DubaiAirport n'est pas démontrée. Un PE/CLI leurre contenant M1 pourrait correspondre.
+
+LIMITATION: Aucun lien statique commun aux quatre cibles n'est confirmé par les observations disponibles.
+
+LIMITATION: Compilation, faux positifs et couverture non testés. Candidats non G3-confirmés.
+
+LIMITATION: Aucune signature unique, suffisamment discriminante pour les quatre familles sans bruit significatif, n'est actuellement étayée. La règle constitue uniquement un filtre expérimental, non une détection familiale validée.

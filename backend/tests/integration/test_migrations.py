@@ -1,4 +1,4 @@
-"""Exhaustive coverage of the mutable fresh-database migration baseline.
+"""Exhaustive coverage of the frozen baseline and additive C2 migration.
 
 This module validates, against a real (temporary) PostgreSQL database:
 
@@ -21,15 +21,17 @@ This module validates, against a real (temporary) PostgreSQL database:
    asserting tables/functions/triggers are completely gone after the full
    downgrade and fully restored after re-upgrading.
 
-Structural comparisons are generic (driven by ``Base.metadata``) rather than
-transcribed by hand, so the exhaustive checks stay correct as the mutable
-baseline and its models evolve instead of silently drifting out of date.
+The ORM schema is compared structurally against ``Base.metadata``. The C2
+bridge additionally exercises empty, previously stamped, manually installed,
+and malformed PostgreSQL schemas using disposable databases.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
+from uuid import uuid4
 
 import pytest
 from alembic import command
@@ -79,9 +81,8 @@ from tests.integration.conftest import _alembic_config
 def _head_revision() -> str:
     """Read the chain head instead of pinning one migration by name.
 
-    The rest of this module compares the live schema against ``Base.metadata``
-    precisely so it stays correct as the mutable baseline and its models evolve;
-    hardcoding the head revision was the one place that silently drifted.
+    The rest of this module compares the full migrated schema against
+    ``Base.metadata``. The current head includes additive C2 migration 0002.
     """
     from alembic.script import ScriptDirectory
 
@@ -123,13 +124,15 @@ INVESTIGATION_TABLES = frozenset(
         "investigation_budget_reservations",
         "investigation_budget_reservation_amounts",
         "investigation_working_states",
+        "investigation_experiment_heads",
+        "investigation_experiments",
     }
 )
 
 EXPECTED_TABLES = frozenset(Base.metadata.tables) | {ALEMBIC_TABLE, "discovery_candidates"}
 
 
-def test_investigation_tables_are_registered_in_the_baseline_inventory() -> None:
+def test_investigation_tables_are_registered_in_orm_metadata() -> None:
     assert INVESTIGATION_TABLES <= set(Base.metadata.tables)
 
 
@@ -144,9 +147,7 @@ ColumnShape = tuple[str, bool, int | None]
 # ORM-derived and the reflected-from-database index shapes.
 IndexShape = tuple[str, tuple[str, ...], bool, bool]
 
-# (table, trigger_name) -> function_name, for every trigger installed by the
-# mutable baseline at HEAD. This is the complete, canonical schema installed
-# by the current baseline.
+# (table, trigger_name) -> function_name, for every trigger installed at HEAD.
 EXPECTED_TRIGGERS: dict[tuple[str, str], str] = {
     (
         "edition_composition_events",
@@ -448,6 +449,22 @@ async def _function_names(database_url: str) -> set[str]:
         await engine.dispose()
 
 
+async def _function_definitions(database_url: str) -> dict[str, str]:
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.connect() as connection:
+            rows = await connection.execute(
+                text(
+                    "SELECT p.proname, pg_get_functiondef(p.oid) "
+                    "FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+                    "WHERE n.nspname = 'public'"
+                )
+            )
+            return {name: definition for name, definition in rows}
+    finally:
+        await engine.dispose()
+
+
 async def _trigger_function_pairs(database_url: str) -> dict[tuple[str, str], str]:
     engine = create_async_engine(database_url)
     try:
@@ -505,6 +522,152 @@ async def _database_snapshot(database_url: str) -> dict[str, dict[str, Any]]:
     try:
         async with engine.connect() as connection:
             return await connection.run_sync(_snapshot_database)
+    finally:
+        await engine.dispose()
+
+
+async def _c2_catalog_snapshot(database_url: str) -> dict[str, Any]:
+    schema = await _database_snapshot(database_url)
+    functions = await _function_definitions(database_url)
+    triggers = await _trigger_definitions(database_url)
+    c2_table_names = {"investigation_experiment_heads", "investigation_experiments"}
+    return {
+        "tables": {name: schema[name] for name in sorted(c2_table_names) if name in schema},
+        "function": functions.get("reject_investigation_experiment_mutation"),
+        "triggers": {key: value for key, value in triggers.items() if key[0] in c2_table_names},
+    }
+
+
+async def _insert_edition_marker(database_url: str, edition_id: Any) -> str:
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO editions "
+                    "(id, country, country_code, period_start, period_end, tlp, languages, "
+                    "state, version, created_at, updated_at) "
+                    "VALUES (:id, 'Migration fixture', 'FR', DATE '2026-10-01', "
+                    "DATE '2026-10-31', 'CLEAR', CAST(:languages AS jsonb), 'open', 1, "
+                    "now(), now())"
+                ),
+                {"id": edition_id, "languages": json.dumps(["fr"])},
+            )
+            result = await connection.execute(
+                text("SELECT country FROM editions WHERE id = :id"), {"id": edition_id}
+            )
+            return str(result.scalar_one())
+    finally:
+        await engine.dispose()
+
+
+async def _install_manual_c2_ddl(database_url: str) -> None:
+    # Exact copy of the documented 2026-10-19 DDL, executed on a disposable DB.
+    statements = (
+        """
+        CREATE TABLE investigation_experiment_heads (
+            investigation_id uuid PRIMARY KEY
+                REFERENCES analyst_investigations(id) ON DELETE RESTRICT,
+            version bigint NOT NULL
+                CONSTRAINT ck_investigation_experiment_heads_version CHECK (version >= 0),
+            updated_at timestamptz NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE investigation_experiments (
+            id uuid PRIMARY KEY,
+            investigation_id uuid NOT NULL
+                REFERENCES analyst_investigations(id) ON DELETE RESTRICT,
+            version bigint NOT NULL
+                CONSTRAINT ck_investigation_experiments_version CHECK (version >= 1),
+            hypothesis_id varchar(128) NOT NULL,
+            claim_ids jsonb NOT NULL,
+            schema_version varchar(64) NOT NULL
+                CONSTRAINT ck_investigation_experiments_schema_version
+                    CHECK (schema_version = 'investigation-experiment.v1'),
+            payload jsonb NOT NULL,
+            payload_sha256 varchar(64) NOT NULL
+                CONSTRAINT ck_investigation_experiments_payload_sha256
+                    CHECK (payload_sha256 ~ '^[0-9a-f]{64}$'),
+            recorded_at timestamptz NOT NULL,
+            CONSTRAINT uq_investigation_experiments_version
+                UNIQUE (investigation_id, version),
+            CONSTRAINT ck_investigation_experiments_payload_identity CHECK (
+                payload->>'schema_version' = schema_version
+                AND payload->>'id' = id::text
+                AND payload->>'investigation_id' = investigation_id::text
+                AND payload->>'version' = version::text
+            ),
+            CONSTRAINT ck_investigation_experiments_payload_shape CHECK (
+                jsonb_typeof(payload) = 'object'
+                AND jsonb_typeof(claim_ids) = 'array'
+            )
+        )
+        """,
+        """
+        CREATE INDEX ix_investigation_experiments_claim_timeline
+            ON investigation_experiments (investigation_id, hypothesis_id, version)
+        """,
+        """
+        CREATE FUNCTION reject_investigation_experiment_mutation() RETURNS trigger AS $$
+        BEGIN
+            RAISE EXCEPTION 'investigation_experiments is append-only'
+                USING ERRCODE = '55000';
+        END;
+        $$ LANGUAGE plpgsql
+        """,
+        """
+        CREATE TRIGGER trg_investigation_experiments_append_only
+            BEFORE UPDATE OR DELETE ON investigation_experiments
+            FOR EACH ROW EXECUTE FUNCTION reject_investigation_experiment_mutation()
+        """,
+    )
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.begin() as connection:
+            for statement in statements:
+                await connection.execute(text(statement))
+    finally:
+        await engine.dispose()
+
+
+async def _insert_experiment_without_parent(database_url: str) -> None:
+    experiment_id = uuid4()
+    investigation_id = uuid4()
+    payload = json.dumps(
+        {
+            "schema_version": "investigation-experiment.v1",
+            "id": str(experiment_id),
+            "investigation_id": str(investigation_id),
+            "version": 1,
+        }
+    )
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.begin() as connection:
+            # This disposable fixture has no investigation parent. Remove the
+            # FK to exercise the downgrade data guard with one persisted row.
+            await connection.execute(
+                text(
+                    "ALTER TABLE investigation_experiments "
+                    "DROP CONSTRAINT investigation_experiments_investigation_id_fkey"
+                )
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO investigation_experiments "
+                    "(id, investigation_id, version, hypothesis_id, claim_ids, schema_version, "
+                    "payload, payload_sha256, recorded_at) "
+                    "VALUES (:id, :investigation_id, 1, 'migration-guard', CAST('[]' AS jsonb), "
+                    "'investigation-experiment.v1', CAST(:payload AS jsonb), :sha256, now())"
+                ),
+                {
+                    "id": experiment_id,
+                    "investigation_id": investigation_id,
+                    "payload": payload,
+                    "sha256": "a" * 64,
+                },
+            )
     finally:
         await engine.dispose()
 
@@ -866,7 +1029,7 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
     command.upgrade(config, "head")
     command.current(config)
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
-    assert _head_revision() == "0001_baseline"
+    assert _head_revision() == "0002_c2_experiments"
 
     tables = asyncio.run(_table_names(temporary_postgres_url))
     assert _REPAIR_TABLE in tables
@@ -927,6 +1090,113 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
     assert asyncio.run(_trigger_definitions(temporary_postgres_url)) == trigger_definitions
 
 
+def _assert_c2_absent(database_url: str) -> None:
+    tables = asyncio.run(_table_names(database_url))
+    assert not {"investigation_experiment_heads", "investigation_experiments"} & tables
+    assert "reject_investigation_experiment_mutation" not in asyncio.run(
+        _function_names(database_url)
+    )
+    triggers = asyncio.run(_trigger_function_pairs(database_url))
+    assert not any(
+        table in {"investigation_experiment_heads", "investigation_experiments"}
+        for table, _name in triggers
+    )
+
+
+def test_stamped_0001_without_c2_upgrades_additively_and_preserves_data(
+    temporary_postgres_url: str,
+) -> None:
+    config = _alembic_config(temporary_postgres_url)
+    command.upgrade(config, "0001_baseline")
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0001_baseline"
+    _assert_c2_absent(temporary_postgres_url)
+
+    edition_id = uuid4()
+    marker = asyncio.run(_insert_edition_marker(temporary_postgres_url, edition_id))
+    assert marker == "Migration fixture"
+    before = asyncio.run(_database_snapshot(temporary_postgres_url))
+
+    command.upgrade(config, "head")
+
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0002_c2_experiments"
+    after = asyncio.run(_database_snapshot(temporary_postgres_url))
+    for table_name, table_schema in before.items():
+        assert after[table_name] == table_schema
+    assert {"investigation_experiment_heads", "investigation_experiments"} <= set(after)
+    assert asyncio.run(_insert_edition_marker_read(temporary_postgres_url, edition_id)) == (
+        "Migration fixture"
+    )
+
+
+def test_stamped_0001_with_exact_manual_c2_schema_advances_without_ddl(
+    temporary_postgres_url: str,
+) -> None:
+    config = _alembic_config(temporary_postgres_url)
+    command.upgrade(config, "0001_baseline")
+    _assert_c2_absent(temporary_postgres_url)
+    edition_id = uuid4()
+    asyncio.run(_insert_edition_marker(temporary_postgres_url, edition_id))
+    asyncio.run(_install_manual_c2_ddl(temporary_postgres_url))
+    before_c2 = asyncio.run(_c2_catalog_snapshot(temporary_postgres_url))
+    before_tables = asyncio.run(_database_snapshot(temporary_postgres_url))
+
+    command.upgrade(config, "head")
+
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0002_c2_experiments"
+    assert asyncio.run(_c2_catalog_snapshot(temporary_postgres_url)) == before_c2
+    after_tables = asyncio.run(_database_snapshot(temporary_postgres_url))
+    for table_name, table_schema in before_tables.items():
+        assert after_tables[table_name] == table_schema
+    assert asyncio.run(_insert_edition_marker_read(temporary_postgres_url, edition_id)) == (
+        "Migration fixture"
+    )
+
+
+def test_stamped_0001_with_malformed_manual_c2_is_rejected_without_changes(
+    temporary_postgres_url: str,
+) -> None:
+    config = _alembic_config(temporary_postgres_url)
+    command.upgrade(config, "0001_baseline")
+    asyncio.run(_install_manual_c2_ddl(temporary_postgres_url))
+
+    async def _alter_manual_schema() -> None:
+        engine = create_async_engine(temporary_postgres_url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "ALTER TABLE investigation_experiment_heads "
+                        "ALTER COLUMN version TYPE integer"
+                    )
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_alter_manual_schema())
+    before_c2 = asyncio.run(_c2_catalog_snapshot(temporary_postgres_url))
+    before_tables = asyncio.run(_database_snapshot(temporary_postgres_url))
+
+    with pytest.raises(RuntimeError, match="C2 migration preflight rejected") as exc_info:
+        command.upgrade(config, "head")
+
+    assert "investigation_experiment_heads.version" in str(exc_info.value)
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0001_baseline"
+    assert asyncio.run(_c2_catalog_snapshot(temporary_postgres_url)) == before_c2
+    assert asyncio.run(_database_snapshot(temporary_postgres_url)) == before_tables
+
+
+async def _insert_edition_marker_read(database_url: str, edition_id: Any) -> str:
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.connect() as connection:
+            result = await connection.execute(
+                text("SELECT country FROM editions WHERE id = :id"), {"id": edition_id}
+            )
+            return str(result.scalar_one())
+    finally:
+        await engine.dispose()
+
+
 # ---------------------------------------------------------------------------
 # 7: upgrade head -> downgrade base -> upgrade head
 # ---------------------------------------------------------------------------
@@ -951,3 +1221,29 @@ def test_migration_up_and_down_on_temporary_postgres(temporary_postgres_url: str
     assert asyncio.run(_table_names(temporary_postgres_url)) == EXPECTED_TABLES
     assert asyncio.run(_function_names(temporary_postgres_url)) == EXPECTED_FUNCTIONS
     assert asyncio.run(_trigger_function_pairs(temporary_postgres_url)) == EXPECTED_TRIGGERS
+
+
+def test_c2_downgrade_refuses_to_discard_experiment_rows(
+    temporary_postgres_url: str,
+) -> None:
+    config = _alembic_config(temporary_postgres_url)
+    command.upgrade(config, "head")
+    asyncio.run(_insert_experiment_without_parent(temporary_postgres_url))
+
+    with pytest.raises(RuntimeError, match="refusing to downgrade C2 experiment storage"):
+        command.downgrade(config, "0001_baseline")
+
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0002_c2_experiments"
+
+    async def _experiment_count() -> int:
+        engine = create_async_engine(temporary_postgres_url)
+        try:
+            async with engine.connect() as connection:
+                result = await connection.execute(
+                    text("SELECT count(*) FROM investigation_experiments")
+                )
+                return int(result.scalar_one())
+        finally:
+            await engine.dispose()
+
+    assert asyncio.run(_experiment_count()) == 1

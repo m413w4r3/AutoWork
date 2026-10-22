@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -11,6 +12,7 @@ import pytest
 
 from cti_app.application.analyst_opinion_service import (
     AnalystOpinionService,
+    OperatorOpinionToolAdapter,
     OpinionCompositionSelection,
     OpinionError,
     OpinionErrorCode,
@@ -19,11 +21,19 @@ from cti_app.application.analyst_opinion_service import (
 from cti_app.application.investigation_persistence import VersionConflictError
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.domain.analyst_opinion import (
+    AnalystObservationRelation,
+    AnalystObservationState,
+    AnalystObservationV1,
     AnalystOpinionStatus,
     AnalystOpinionV1,
+    BridgeDraftReferenceV1,
+    BridgeReviewReferenceV1,
+    ImplantMaterialEditorialV1,
+    ImplantMaterialType,
     OpinionBlock,
     OpinionBlockType,
     OpinionClaimQualification,
+    OpinionProtocolFigureV1,
 )
 from cti_app.domain.editorial import AnalystDecision
 from cti_app.domain.investigation import (
@@ -46,6 +56,7 @@ from cti_app.domain.production import (
     ProductionArtifactStatus,
 )
 from cti_app.domain.production_synthesis import production_synthesis_to_json
+from cti_app.domain.protocol_model import ProtocolDiagramKind
 from cti_app.domain.publication_document import (
     serialize_publication_document,
 )
@@ -150,8 +161,11 @@ class _MemoryStore:
     def __init__(self, blobs: dict[UUID, bytes]) -> None:
         self.blobs = blobs
 
-    async def read_bytes(self, blob_id: UUID) -> bytes:
-        return self.blobs[blob_id]
+    async def read_bytes(self, blob_id: UUID, *, max_bytes: int | None = None) -> bytes:
+        value = self.blobs[blob_id]
+        if max_bytes is not None and len(value) > max_bytes:
+            raise ValueError("blob exceeds requested read bound")
+        return value
 
     async def store_stage_payloads(self, *, canonical: dict[str, object]):
         blob_id = uuid4()
@@ -524,3 +538,545 @@ async def test_claim_verification_uses_the_local_knowledge_provider_protocol() -
     assert len(opinion.blocks) == 1
     assert opinion.blocks[0].qualification is OpinionClaimQualification.FACT
     assert opinion.blocks[0].finding_refs == (claim_finding.id,)
+
+
+@pytest.mark.asyncio
+async def test_opinion_revision_accepts_only_persisted_bridge_draft_and_review_refs() -> None:
+    harness = make_opinion_harness()
+    text = "Le comportement mesuré correspond au finding cité."
+    text_sha256 = hashlib.sha256(text.encode()).hexdigest()
+    attacker_token = "ghp_" + "a" * 36
+    material_text = (
+        f"Configuration implant : RC4 00112233445566778899aabbccddeeff; C2 {attacker_token}."
+    )
+    material_text_sha256 = hashlib.sha256(material_text.encode()).hexdigest()
+    draft_invocation_id = str(uuid4())
+    review_invocation_id = str(uuid4())
+    review_output_sha256 = "d" * 64
+
+    def persist_call(payload: dict[str, object]) -> None:
+        input_refs = payload.setdefault("input_refs", [])
+        raw_output = payload["output"]
+        assert isinstance(raw_output, dict)
+        output = dict(raw_output)
+        output.setdefault("schema", "advisor-response.v3")
+        output["output_sha256"] = payload["output_sha256"]
+        output["bridge_provenance"] = {
+            "bridge_invocation_id": payload["bridge_invocation_id"],
+            "bridge_invocation_id_kind": payload["bridge_invocation_id_kind"],
+            "output_sha256": payload["output_sha256"],
+            "input_refs": input_refs,
+        }
+        payload["output"] = output
+        raw = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode()
+        blob_id = uuid4()
+        harness.store.blobs[blob_id] = raw
+        call = EvidenceObservation(
+            investigation_id=harness.investigation.id,
+            kind=EvidenceKind.OTHER,
+            blob_id=blob_id,
+            sha256=hashlib.sha256(raw).hexdigest(),
+            source="advisor.consult",
+            source_version="advisor-consult.v1",
+            observed_at=datetime.now(UTC),
+            object_type="advisor_call",
+            object_id=str(payload["consultation_type"]),
+        )
+        harness.observations.items = (*harness.observations.items, call)
+
+    draft_output_sha = "c" * 64
+    persist_call(
+        {
+            "schema": "operator-advisor-call.v1",
+            "consultation_type": "draft_text",
+            "advisor_status": "partial",
+            "bridge_invocation_id": draft_invocation_id,
+            "bridge_invocation_id_kind": "conversation_turn",
+            "output_sha256": draft_output_sha,
+            "output": {
+                "schema": "advisor-response.v3",
+                "usable": False,
+                "output_sha256": draft_output_sha,
+                "blocks": [
+                    {
+                        "block_type": "key_findings",
+                        "form": "body",
+                        "anchor": None,
+                        "usable": True,
+                        "sentences": [{"text": text, "assertion_ids": ["a1"]}],
+                    },
+                    {
+                        "block_type": "implant_materials",
+                        "form": "body",
+                        "anchor": None,
+                        "usable": True,
+                        "sentences": [{"text": material_text, "assertion_ids": ["a2"]}],
+                    },
+                ],
+            },
+        }
+    )
+    persist_call(
+        {
+            "schema": "operator-advisor-call.v1",
+            "consultation_type": "review_text",
+            "advisor_status": "partial",
+            "bridge_invocation_id": review_invocation_id,
+            "bridge_invocation_id_kind": "conversation_turn",
+            "output_sha256": review_output_sha256,
+            "reviewed_text_sha256": text_sha256,
+            "review_target": {
+                "form": "body",
+                "block_type": "key_findings",
+                "anchor": None,
+            },
+            "review_units": [
+                {
+                    "unit_id": "U1",
+                    "form": "body",
+                    "block_type": "key_findings",
+                    "anchor": None,
+                    "reviewed_text_sha256": text_sha256,
+                },
+                {
+                    "unit_id": "U2",
+                    "form": "body",
+                    "block_type": "implant_materials",
+                    "anchor": None,
+                    "reviewed_text_sha256": material_text_sha256,
+                },
+            ],
+            "output": {
+                "schema": "advisor-response.v3",
+                "usable": False,
+                "reviews": [
+                    {
+                        "unit_id": "U1",
+                        "remarks": ["Conserver la distinction entre fait et interprétation."],
+                        "usable": True,
+                    },
+                    {
+                        "unit_id": "U2",
+                        "remarks": ["Conserver les observables C2 tels qu'observés."],
+                        "usable": True,
+                    },
+                ],
+            },
+        }
+    )
+    block = OpinionBlock(
+        block_type=OpinionBlockType.KEY_FINDINGS,
+        text=text,
+        finding_refs=(harness.finding.id,),
+        evidence_refs=(harness.observation.id,),
+        qualification=OpinionClaimQualification.FACT,
+        certainty=0.8,
+        bridge_authored=True,
+        bridge_draft_ref=BridgeDraftReferenceV1(draft_invocation_id, text_sha256),
+        bridge_review_ref=BridgeReviewReferenceV1(
+            review_invocation_id, review_output_sha256, text_sha256
+        ),
+    )
+
+    composed_with_bridge = await harness.service.compose_from_findings(
+        harness.investigation.id,
+        OpinionCompositionSelection(),
+        draft_blocks=(block,),
+    )
+    assert composed_with_bridge.blocks[0].bridge_draft_ref == block.bridge_draft_ref
+    assert composed_with_bridge.blocks[0].bridge_review_ref == block.bridge_review_ref
+
+    material_section = OpinionBlock(
+        block_type=OpinionBlockType.IMPLANT_MATERIALS,
+        text=material_text,
+        bridge_authored=True,
+        bridge_draft_ref=BridgeDraftReferenceV1(draft_invocation_id, material_text_sha256),
+        bridge_review_ref=BridgeReviewReferenceV1(
+            review_invocation_id, review_output_sha256, material_text_sha256
+        ),
+    )
+    material = ImplantMaterialEditorialV1(
+        type=ImplantMaterialType.ATTACKER_GITHUB_C2_TOKEN,
+        value=attacker_token,
+        role="Canal C2 de l'implant",
+        sample_location="offset 0x120",
+        sample_sha256="a" * 64,
+        evidence_observation_id=harness.observation.id,
+    )
+    revised = await harness.service.revise(
+        composed_with_bridge.id,
+        composed_with_bridge.version,
+        OpinionRevisionEdits(
+            (block, material_section),
+            implant_materials=(material,),
+        ),
+        "editor:one",
+        expected_sha256=composed_with_bridge.content_sha256,
+    )
+    assert revised.blocks[0].bridge_authored is True
+    assert revised.blocks[0].bridge_draft_ref == block.bridge_draft_ref
+    assert revised.blocks[0].bridge_review_ref == block.bridge_review_ref
+    assert revised.implant_materials == (material,)
+    assert revised.implant_materials[0].value == attacker_token
+    assert revised.implant_materials_section is not None
+    assert revised.implant_materials_section.text == material_text
+    assert revised.implant_materials_section.bridge_draft_ref == material_section.bridge_draft_ref
+    assert revised.implant_materials_section.bridge_review_ref == material_section.bridge_review_ref
+
+
+@pytest.mark.asyncio
+async def test_protocol_figures_empty_list_detaches_but_none_preserves() -> None:
+    harness = make_opinion_harness()
+    adapter = OperatorOpinionToolAdapter(
+        service=harness.service,
+        investigations=SimpleNamespace(),
+        article_snapshots=SimpleNamespace(),
+    )
+    figures = tuple(
+        OpinionProtocolFigureV1(
+            kind=kind,
+            model_sha256="a" * 64,
+            spec_sha256="b" * 64,
+            asset_id=uuid4(),
+            asset_sha256="c" * 64,
+            preview_sha256="d" * 64,
+            pin_sha256="e" * 64,
+            compiler_name="d2",
+            compiler_version="0.6.9",
+            compiler_policy_version="protocol-diagram.v1",
+            caption=f"Diagramme synthétique {kind.value}.",
+        )
+        for kind in ProtocolDiagramKind
+    )
+    opinion = await harness.service.compose_from_findings(
+        harness.investigation.id,
+        OpinionCompositionSelection(),
+        protocol_figures=figures,
+        draft_blocks=(),
+    )
+
+    unchanged, unchanged_observations = await adapter._protocol_figures(
+        harness.investigation.id, None
+    )
+    unchanged_opinion = await harness.service.revise(
+        opinion.id,
+        opinion.version,
+        OpinionRevisionEdits(blocks=opinion.blocks, protocol_figures=unchanged),
+        "editor:test",
+        expected_sha256=opinion.content_sha256,
+    )
+    detached, detached_observations = await adapter._protocol_figures(harness.investigation.id, [])
+    detached_opinion = await harness.service.revise(
+        unchanged_opinion.id,
+        unchanged_opinion.version,
+        OpinionRevisionEdits(
+            blocks=unchanged_opinion.blocks,
+            protocol_figures=detached,
+        ),
+        "editor:test",
+        expected_sha256=unchanged_opinion.content_sha256,
+    )
+
+    assert unchanged is None
+    assert unchanged_observations == ()
+    assert detached == ()
+    assert detached_observations == ()
+    assert unchanged_opinion.protocol_figures == figures
+    assert detached_opinion.protocol_figures == ()
+
+
+@pytest.mark.asyncio
+async def test_compose_and_revise_accept_per_unit_refs_from_batched_advisor_calls() -> None:
+    harness = make_opinion_harness()
+    draft_invocation_id = str(uuid4())
+    review_invocation_id = str(uuid4())
+    draft_output_sha = "c" * 64
+    review_output_sha = "d" * 64
+    body_text = "Le comportement mesuré apparaît dans le premier bloc."
+    note_text = "La réserve de portée accompagne le paragraphe cité."
+    anchor = "lead:0001"
+    body_sha = hashlib.sha256(body_text.encode()).hexdigest()
+    note_sha = hashlib.sha256(note_text.encode()).hexdigest()
+
+    def persist_call(payload: dict[str, object]) -> None:
+        input_refs = payload.setdefault("input_refs", [])
+        raw_output = payload["output"]
+        assert isinstance(raw_output, dict)
+        output = dict(raw_output)
+        output.setdefault("schema", "advisor-response.v3")
+        output["output_sha256"] = payload["output_sha256"]
+        output["bridge_provenance"] = {
+            "bridge_invocation_id": payload["bridge_invocation_id"],
+            "bridge_invocation_id_kind": payload["bridge_invocation_id_kind"],
+            "output_sha256": payload["output_sha256"],
+            "input_refs": input_refs,
+        }
+        payload["output"] = output
+        raw = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode()
+        blob_id = uuid4()
+        harness.store.blobs[blob_id] = raw
+        call = EvidenceObservation(
+            investigation_id=harness.investigation.id,
+            kind=EvidenceKind.OTHER,
+            blob_id=blob_id,
+            sha256=hashlib.sha256(raw).hexdigest(),
+            source="advisor.consult",
+            source_version="advisor-consult.v1",
+            observed_at=datetime.now(UTC),
+            object_type="advisor_call",
+            object_id=str(payload["consultation_type"]),
+        )
+        harness.observations.items = (*harness.observations.items, call)
+
+    persist_call(
+        {
+            "schema": "operator-advisor-call.v1",
+            "consultation_type": "draft_text",
+            "advisor_status": "partial",
+            "bridge_invocation_id": draft_invocation_id,
+            "bridge_invocation_id_kind": "conversation_turn",
+            "output_sha256": draft_output_sha,
+            "output": {
+                "schema": "advisor-response.v3",
+                "usable": False,
+                "output_sha256": draft_output_sha,
+                "blocks": [
+                    {
+                        "unit_id": "U1",
+                        "block_type": "key_findings",
+                        "form": "body",
+                        "anchor": None,
+                        "usable": True,
+                        "sentences": [{"text": body_text, "assertion_ids": ["a1"]}],
+                    },
+                    {
+                        "unit_id": "U2",
+                        "block_type": "claim_verification",
+                        "form": "analyst_note",
+                        "anchor": anchor,
+                        "usable": True,
+                        "sentences": [{"text": note_text, "assertion_ids": ["a2"]}],
+                    },
+                ],
+            },
+        }
+    )
+    persist_call(
+        {
+            "schema": "operator-advisor-call.v1",
+            "consultation_type": "review_text",
+            "advisor_status": "partial",
+            "bridge_invocation_id": review_invocation_id,
+            "bridge_invocation_id_kind": "conversation_turn",
+            "output_sha256": review_output_sha,
+            "review_units": [
+                {
+                    "unit_id": "U1",
+                    "form": "body",
+                    "block_type": "key_findings",
+                    "anchor": None,
+                    "reviewed_text_sha256": body_sha,
+                },
+                {
+                    "unit_id": "U2",
+                    "form": "analyst_note",
+                    "block_type": "claim_verification",
+                    "anchor": anchor,
+                    "reviewed_text_sha256": note_sha,
+                },
+            ],
+            "output": {
+                "schema": "advisor-response.v3",
+                "usable": False,
+                "reviews": [
+                    {
+                        "unit_id": "U1",
+                        "remarks": ["Conserver la distinction fait/interprétation."],
+                        "usable": True,
+                    },
+                    {
+                        "unit_id": "U2",
+                        "remarks": ["Préciser la limite de portée."],
+                        "usable": True,
+                    },
+                ],
+            },
+        }
+    )
+    body = OpinionBlock(
+        block_type=OpinionBlockType.KEY_FINDINGS,
+        text=body_text,
+        finding_refs=(harness.finding.id,),
+        evidence_refs=(harness.observation.id,),
+        qualification=OpinionClaimQualification.FACT,
+        certainty=0.8,
+        bridge_authored=True,
+        bridge_draft_ref=BridgeDraftReferenceV1(draft_invocation_id, body_sha),
+        bridge_review_ref=BridgeReviewReferenceV1(
+            review_invocation_id, review_output_sha, body_sha
+        ),
+    )
+    note = AnalystObservationV1(
+        id=uuid4(),
+        anchor=anchor,
+        text=note_text,
+        state=AnalystObservationState.OBSERVED,
+        relation=AnalystObservationRelation.QUALIFIES,
+        finding_refs=(harness.finding.id,),
+        evidence_refs=(harness.observation.id,),
+        bridge_authored=True,
+        bridge_block_type=OpinionBlockType.CLAIM_VERIFICATION,
+        bridge_draft_ref=BridgeDraftReferenceV1(draft_invocation_id, note_sha),
+        bridge_review_ref=BridgeReviewReferenceV1(
+            review_invocation_id, review_output_sha, note_sha
+        ),
+    )
+
+    composed = await harness.service.compose_from_findings(
+        harness.investigation.id,
+        OpinionCompositionSelection(),
+        draft_blocks=(body,),
+    )
+    revised = await harness.service.revise(
+        composed.id,
+        composed.version,
+        OpinionRevisionEdits(composed.blocks, observations=(note,)),
+        "editor:one",
+        expected_sha256=composed.content_sha256,
+    )
+
+    assert revised.blocks[0].bridge_draft_ref == body.bridge_draft_ref
+    assert revised.blocks[0].bridge_review_ref == body.bridge_review_ref
+    assert revised.observations[0].bridge_draft_ref == note.bridge_draft_ref
+    assert revised.observations[0].bridge_review_ref == note.bridge_review_ref
+
+
+@pytest.mark.asyncio
+async def test_opinion_revision_rejects_unpersisted_bridge_invocation() -> None:
+    harness = make_opinion_harness()
+    current = await harness.service.compose_from_findings(harness.investigation.id)
+    text = "Le finding mesuré est repris dans ce brouillon."
+    block = OpinionBlock(
+        block_type=OpinionBlockType.KEY_FINDINGS,
+        text=text,
+        finding_refs=(harness.finding.id,),
+        evidence_refs=(harness.observation.id,),
+        qualification=OpinionClaimQualification.FACT,
+        bridge_authored=True,
+        bridge_draft_ref=BridgeDraftReferenceV1(
+            str(uuid4()), hashlib.sha256(text.encode()).hexdigest()
+        ),
+    )
+
+    with pytest.raises(OpinionError) as error:
+        await harness.service.revise(
+            current.id,
+            current.version,
+            OpinionRevisionEdits((block,)),
+            "editor:one",
+            expected_sha256=current.content_sha256,
+        )
+
+    assert error.value.code is OpinionErrorCode.INVALID_SELECTION
+
+
+@pytest.mark.asyncio
+async def test_service_rejects_review_sha_from_an_older_target_as_review_text_stale() -> None:
+    harness = make_opinion_harness()
+    text = "Texte de la version courante."
+    text_sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    block = SimpleNamespace(
+        block_type=OpinionBlockType.CLAIM_VERIFICATION,
+        text=text,
+        bridge_authored=True,
+        bridge_draft_ref=SimpleNamespace(text_sha256=text_sha256),
+        bridge_review_ref=SimpleNamespace(reviewed_text_sha256="b" * 64),
+    )
+    opinion = SimpleNamespace(
+        investigation_id=harness.investigation.id,
+        blocks=(block,),
+        observations=(),
+        implant_materials_section=None,
+    )
+
+    class EmptyObservationRepository:
+        async def list_for_investigation(self, _investigation_id):
+            return ()
+
+    uow = SimpleNamespace(evidence_observations=EmptyObservationRepository())
+    with pytest.raises(OpinionError) as error:
+        await harness.service._validate_bridge_provenance(uow, opinion)
+
+    assert error.value.code is OpinionErrorCode.REVIEW_TEXT_STALE
+
+
+@pytest.mark.asyncio
+async def test_opinion_revision_rejects_call_without_nested_bridge_provenance() -> None:
+    harness = make_opinion_harness()
+    current = await harness.service.compose_from_findings(harness.investigation.id)
+    text = "Le constat conserve son lien avec la mesure observée."
+    invocation_id = str(uuid4())
+    text_sha256 = hashlib.sha256(text.encode()).hexdigest()
+    output_sha256 = "f" * 64
+    payload = {
+        "schema": "operator-advisor-call.v1",
+        "consultation_type": "draft_text",
+        "advisor_status": "partial",
+        "bridge_invocation_id": invocation_id,
+        "bridge_invocation_id_kind": "conversation_turn",
+        "input_refs": [],
+        "output_sha256": output_sha256,
+        "output": {
+            "schema": "advisor-response.v3",
+            "usable": False,
+            "output_sha256": output_sha256,
+            "blocks": [
+                {
+                    "block_type": "key_findings",
+                    "form": "body",
+                    "anchor": None,
+                    "usable": True,
+                    "sentences": [{"text": text, "assertion_ids": ["a1"]}],
+                }
+            ],
+        },
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    blob_id = uuid4()
+    harness.store.blobs[blob_id] = raw
+    call = EvidenceObservation(
+        investigation_id=harness.investigation.id,
+        kind=EvidenceKind.OTHER,
+        blob_id=blob_id,
+        sha256=hashlib.sha256(raw).hexdigest(),
+        source="advisor.consult",
+        source_version="advisor-consult.v1",
+        observed_at=datetime.now(UTC),
+        object_type="advisor_call",
+        object_id="draft_text",
+    )
+    harness.observations.items = (*harness.observations.items, call)
+    block = OpinionBlock(
+        block_type=OpinionBlockType.KEY_FINDINGS,
+        text=text,
+        finding_refs=(harness.finding.id,),
+        evidence_refs=(harness.observation.id,),
+        qualification=OpinionClaimQualification.FACT,
+        bridge_authored=True,
+        bridge_draft_ref=BridgeDraftReferenceV1(invocation_id, text_sha256),
+    )
+
+    with pytest.raises(OpinionError) as error:
+        await harness.service.revise(
+            current.id,
+            current.version,
+            OpinionRevisionEdits((block,)),
+            "editor:one",
+            expected_sha256=current.content_sha256,
+        )
+
+    assert error.value.code is OpinionErrorCode.INVALID_SELECTION

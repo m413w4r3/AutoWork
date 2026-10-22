@@ -50,6 +50,10 @@
 ]
 
 #let render-edition(edition) = {
+  let document-label = edition.at("document_label", default: none)
+  if not has-text(document-label) {
+    panic("edition render-data requires document_label")
+  }
   align(center)[
     #image("../UTILS/chap.png", width: 18%)
     #v(14pt)
@@ -64,6 +68,8 @@
       #v(8pt)
       #text(size: 12pt)[#edition.edition.bulletin_period]
     ]
+    #v(5pt)
+    #text(size: 9pt, weight: "bold", fill: purple)[#edition.at("document_header", default: "Bulletin de veille CTI")]
     #v(6pt)
     #text(size: 11pt)[Bulletin n° #edition.edition.bulletin_number]
     #linebreak()
@@ -114,4 +120,9 @@
   for publication in briefs {
     render-brief(publication)
   }
+
+  pagebreak()
+  heading(level: 1)[Provenance de l'édition]
+  text(size: 8pt, fill: purple)[Identité complète : ]
+  text(size: 8pt)[#document-label]
 }

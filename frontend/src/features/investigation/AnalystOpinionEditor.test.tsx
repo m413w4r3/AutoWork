@@ -61,6 +61,8 @@ function makeOpinion(
         certainty: 0.9,
       },
     ],
+    implant_materials: [],
+    implant_materials_section: null,
     provenance: {
       investigation_id: INVESTIGATION_ID,
       synthesis_artifact_id: "55555555-5555-4555-8555-555555555555",

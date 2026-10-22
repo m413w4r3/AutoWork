@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any, cast
 from uuid import UUID
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request, Response, status
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic_core import PydanticCustomError
 
 from cti_app.application.analyst_opinion_preview import AnalystOpinionPreviewService
 from cti_app.application.analyst_opinion_service import (
@@ -38,6 +41,10 @@ from cti_app.domain.analyst_opinion import (
     AnalystObservationState,
     AnalystObservationV1,
     AnalystOpinionV1,
+    BridgeDraftReferenceV1,
+    BridgeReviewReferenceV1,
+    ImplantMaterialEditorialV1,
+    ImplantMaterialType,
     OpinionBlock,
     OpinionBlockType,
     OpinionClaimQualification,
@@ -56,7 +63,9 @@ class OpinionSelectionPayload(BaseModel):
     finding_ids: tuple[UUID, ...] = ()
     claim_ids: tuple[str, ...] = ()
     block_types: tuple[OpinionBlockType, ...] = tuple(
-        item for item in OpinionBlockType if item is not OpinionBlockType.ANALYST_OBSERVATIONS
+        item
+        for item in OpinionBlockType
+        if item not in {OpinionBlockType.ANALYST_OBSERVATIONS, OpinionBlockType.IMPLANT_MATERIALS}
     )
 
 
@@ -64,6 +73,21 @@ class ComposeOpinionPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     selection: OpinionSelectionPayload = Field(default_factory=OpinionSelectionPayload)
+
+
+class BridgeDraftReferencePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    invocation_id: str = Field(min_length=1, max_length=128)
+    text_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class BridgeReviewReferencePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    invocation_id: str = Field(min_length=1, max_length=128)
+    output_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    reviewed_text_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class OpinionBlockEdit(BaseModel):
@@ -75,6 +99,30 @@ class OpinionBlockEdit(BaseModel):
     evidence_refs: tuple[UUID, ...] = ()
     qualification: OpinionClaimQualification = OpinionClaimQualification.FACT
     certainty: float = Field(default=0.5, ge=0, le=1)
+    bridge_authored: bool = False
+    bridge_draft_ref: BridgeDraftReferencePayload | None = None
+    bridge_review_ref: BridgeReviewReferencePayload | None = None
+
+    @field_validator("block_type")
+    @classmethod
+    def reject_editorial_projection_types(cls, value: OpinionBlockType) -> OpinionBlockType:
+        if value is OpinionBlockType.ANALYST_OBSERVATIONS:
+            raise ValueError("Editorial projection blocks are not direct operator edits")
+        return value
+
+    @model_validator(mode="after")
+    def validate_bridge_refs(self) -> OpinionBlockEdit:
+        text_sha256 = hashlib.sha256(self.text.encode("utf-8")).hexdigest()
+        if self.bridge_draft_ref is not None and self.bridge_draft_ref.text_sha256 != text_sha256:
+            raise ValueError("Bridge draft reference does not match opinion text")
+        if self.bridge_authored and self.bridge_draft_ref is None:
+            raise ValueError("Bridge-authored opinion blocks require a draft reference")
+        if self.bridge_review_ref is not None:
+            if self.bridge_draft_ref is None:
+                raise ValueError("Bridge review reference requires a Bridge draft reference")
+            if self.bridge_review_ref.reviewed_text_sha256 != text_sha256:
+                raise PydanticCustomError("review_text_stale", "review_text_stale")
+        return self
 
     def to_domain(self) -> OpinionBlock:
         return OpinionBlock(
@@ -84,6 +132,38 @@ class OpinionBlockEdit(BaseModel):
             evidence_refs=self.evidence_refs,
             qualification=self.qualification,
             certainty=self.certainty,
+            bridge_authored=self.bridge_authored,
+            bridge_draft_ref=(
+                BridgeDraftReferenceV1(**self.bridge_draft_ref.model_dump())
+                if self.bridge_draft_ref is not None
+                else None
+            ),
+            bridge_review_ref=(
+                BridgeReviewReferenceV1(**self.bridge_review_ref.model_dump())
+                if self.bridge_review_ref is not None
+                else None
+            ),
+        )
+
+
+class ImplantMaterialEdit(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: ImplantMaterialType
+    value: str = Field(min_length=1, max_length=4096)
+    role: str = Field(min_length=1, max_length=300)
+    sample_location: str = Field(min_length=1, max_length=500)
+    sample_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    evidence_observation_id: UUID
+
+    def to_domain(self) -> ImplantMaterialEditorialV1:
+        return ImplantMaterialEditorialV1(
+            type=self.type,
+            value=self.value,
+            role=self.role,
+            sample_location=self.sample_location,
+            sample_sha256=self.sample_sha256,
+            evidence_observation_id=self.evidence_observation_id,
         )
 
 
@@ -118,6 +198,7 @@ class ReviseOpinionPayload(BaseModel):
     blocks: tuple[OpinionBlockEdit, ...]
     unresolved_points: tuple[str, ...] = ()
     observations: tuple[OpinionObservationEdit, ...] | None = None
+    implant_materials: tuple[ImplantMaterialEdit, ...] | None = None
     protocol_model_blob_id: UUID | None = None
     protocol_views: tuple[ProtocolDiagramKind, ...] | None = Field(default=None, max_length=3)
 
@@ -216,6 +297,7 @@ def _raise_opinion_error(exc: OpinionError) -> None:
         OpinionErrorCode.TLP_FORBIDDEN: status.HTTP_403_FORBIDDEN,
         OpinionErrorCode.DO_NOT_SUBMIT: status.HTTP_403_FORBIDDEN,
         OpinionErrorCode.INVALID_SELECTION: status.HTTP_422_UNPROCESSABLE_CONTENT,
+        OpinionErrorCode.REVIEW_TEXT_STALE: status.HTTP_422_UNPROCESSABLE_CONTENT,
         OpinionErrorCode.INVALID_OBSERVATION_ANCHOR: status.HTTP_422_UNPROCESSABLE_CONTENT,
         OpinionErrorCode.CITATIONS_INVALID: status.HTTP_422_UNPROCESSABLE_CONTENT,
         OpinionErrorCode.OPINION_NOT_DRAFT: status.HTTP_409_CONFLICT,
@@ -247,6 +329,7 @@ def _opinion_payload(opinion: AnalystOpinionV1 | None) -> dict[str, Any] | None:
     if opinion is None:
         return None
     item = opinion
+    implant_materials_section = item.implant_materials_section
     item_payload = item.to_payload()
     item_payload["blocks"] = [
         {
@@ -258,7 +341,8 @@ def _opinion_payload(opinion: AnalystOpinionV1 | None) -> dict[str, Any] | None:
             "certainty": block.certainty,
         }
         for block in item.blocks
-        if block.block_type is not OpinionBlockType.ANALYST_OBSERVATIONS
+        if block.block_type
+        not in {OpinionBlockType.ANALYST_OBSERVATIONS, OpinionBlockType.IMPLANT_MATERIALS}
     ]
     return {
         **item_payload,
@@ -285,6 +369,26 @@ def _opinion_payload(opinion: AnalystOpinionV1 | None) -> dict[str, Any] | None:
             }
             for observation in item.observations
         ],
+        "implant_materials": [material.to_payload() for material in item.implant_materials],
+        "implant_materials_section": (
+            {
+                "type": OpinionBlockType.IMPLANT_MATERIALS.value,
+                "text": implant_materials_section.text,
+                "bridge_authored": implant_materials_section.bridge_authored,
+                "bridge_draft_ref": (
+                    implant_materials_section.bridge_draft_ref.to_payload()
+                    if implant_materials_section.bridge_draft_ref is not None
+                    else None
+                ),
+                "bridge_review_ref": (
+                    implant_materials_section.bridge_review_ref.to_payload()
+                    if implant_materials_section.bridge_review_ref is not None
+                    else None
+                ),
+            }
+            if implant_materials_section is not None
+            else None
+        ),
         "provenance": {
             "investigation_id": str(item.investigation_id),
             "synthesis_artifact_id": str(item.synthesis_artifact_id),
@@ -384,6 +488,11 @@ async def revise_opinion(
             if payload.observations is not None
             else None
         ),
+        implant_materials=(
+            tuple(item.to_domain() for item in payload.implant_materials)
+            if payload.implant_materials is not None
+            else None
+        ),
         protocol_figures=protocol_figures,
     )
     try:
@@ -446,6 +555,9 @@ async def preview_opinion_pdf(
             "X-Opinion-Content-SHA256": preview.opinion_sha256,
             "X-Base-Publication-SHA256": preview.base_publication_sha256,
             "X-Opinion-Status": "draft-unapproved",
+            "X-PDF-Lineage": json.dumps(
+                preview.lineage_manifest, ensure_ascii=True, separators=(",", ":")
+            ),
         },
     )
 

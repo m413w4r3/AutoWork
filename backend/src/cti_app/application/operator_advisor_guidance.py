@@ -1,4 +1,4 @@
-"""Deterministic, bounded checkpoints for operator use of the Bridge advisor."""
+"""Non-blocking suggestions for operator use of the Bridge advisor."""
 
 from __future__ import annotations
 
@@ -9,16 +9,23 @@ from cti_app.domain.investigation import BudgetDimension
 
 ADVISOR_TOOL_NAME = "advisor.consult"
 ADVISOR_CONSULTATION_TYPES = frozenset(
-    {"plan_investigation", "pivot_strategy", "yara_draft", "review_text"}
+    {
+        "plan_investigation",
+        "pivot_strategy",
+        "yara_draft",
+        "review_text",
+        "draft_text",
+        "suricata_draft",
+        "figure_plan",
+    }
 )
 ADVISOR_GUIDANCE_REMINDER = (
-    "Bridge est plus intelligent en analyse/planification; consultez-le, puis vérifiez ses avis "
-    "non fiables par mesures."
+    "Suggestion facultative; Bridge non fiable. Hypothèse → pivot → succès/échec → coût; "
+    "absence ≠ négatif; pas d'historique."
 )
 MAX_ADVISOR_GUIDANCE_POINTS = 5
 MAX_ADVISOR_GUIDANCE_TEXT = 600
 DEFAULT_CHECKPOINT_TOOL_THRESHOLD = 12
-DEFAULT_ADVISOR_TURN_LIMIT = 8
 
 
 class EvidenceSummaryPort(Protocol):
@@ -32,7 +39,7 @@ async def build_advisor_guidance(
     evidence_summaries: EvidenceSummaryPort | None,
     available_tools: Sequence[str],
     checkpoint_tool_threshold: int = DEFAULT_CHECKPOINT_TOOL_THRESHOLD,
-    advisor_turn_limit: int = DEFAULT_ADVISOR_TURN_LIMIT,
+    g2_bridge_turns_remaining: int | None = None,
     pivot_observation_ids: Sequence[Any] = (),
     enabled: bool = True,
 ) -> dict[str, Any]:
@@ -50,6 +57,9 @@ async def build_advisor_guidance(
         int(item.consumed_budget.get(BudgetDimension.BRIDGE_TURNS, 0))
         for item in advisor_invocations
     )
+    g2_turns_remaining = (
+        max(0, g2_bridge_turns_remaining) if g2_bridge_turns_remaining is not None else None
+    )
     latest_advice = await _latest_advice(
         advisor_invocations, observations, evidence_summaries, available_tools
     )
@@ -63,25 +73,65 @@ async def build_advisor_guidance(
         if enabled
         else (None, None)
     )
-    if used >= advisor_turn_limit:
-        if reason is None:
-            reason, consultation_type = "advisor_budget_exhausted", None
-        elif consultation_type is not None:
-            reason = "advisor_budget_exhausted"
-            consultation_type = None
+    exhausted_reason = (
+        "g2_bridge_budget_exhausted"
+        if g2_turns_remaining is not None and g2_turns_remaining < 1
+        else None
+    )
+    if exhausted_reason is not None:
+        reason, consultation_type = exhausted_reason, None
 
     guidance: dict[str, Any] = {
         "checkpoint_due": reason is not None,
         "reason": reason,
-        "suggested_consultation_type": consultation_type,
+        # The strict context DTO currently accepts only the legacy four-value enum.
+        # Keep the checkpoint reason visible without making context construction fail
+        # until the DTO is extended in its separately scoped module.
+        "suggested_consultation_type": consultation_type
+        if consultation_type
+        in {"plan_investigation", "pivot_strategy", "yara_draft", "review_text"}
+        else None,
         "last_advice": latest_advice,
-        "reminder": ADVISOR_GUIDANCE_REMINDER,
+        "reminder": _checkpoint_reminder(reason, consultation_type),
         "advisor_turns_used": used,
-        "advisor_turn_limit": max(0, advisor_turn_limit),
-        "advisor_turns_remaining": max(0, advisor_turn_limit - used),
+        "advisor_turn_limit": None,
+        "advisor_turns_remaining": None,
+        "g2_bridge_turns_remaining": g2_turns_remaining,
         "truncated": False,
     }
     return guidance
+
+
+def _checkpoint_reminder(reason: str | None, consultation_type: str | None) -> str:
+    if reason is None:
+        return ADVISOR_GUIDANCE_REMINDER
+    if consultation_type is None:
+        return "Suggestion Bridge indisponible: budget G2 épuisé; aucun appel requis."
+    targeted = {
+        "new_pivot_discovered": (
+            "Hypothèse changée: hypothèse → pivot → succès/échec → coût; mesurer avant de "
+            "conclure; absence ≠ négatif."
+        ),
+        "pivot_without_measurement": (
+            "Pivot sans mesure: pas de conclusion; hypothèse → pivot → succès/échec → coût; "
+            "absence ≠ négatif."
+        ),
+        "repeated_tool_block": (
+            "Blocage répété: hypothèse → pivot → succès/échec → coût; autre mesure; "
+            "absence ≠ négatif."
+        ),
+        "editorial_draft_due": (
+            "Brouillon modifié: texte courant seul; avis obsolète. Hypothèse → pivot → "
+            "succès/échec → coût; pas d'historique."
+        ),
+        "opinion_review_due": (
+            "Revue obsolète: texte/version courants; hypothèse → pivot → succès/échec → coût; "
+            "absence ≠ négatif."
+        ),
+    }
+    if reason in targeted:
+        return targeted[reason]
+    return ADVISOR_GUIDANCE_REMINDER
 
 
 async def _latest_advice(
@@ -94,7 +144,7 @@ async def _latest_advice(
         return None
     observations_by_id = {getattr(item, "id", None): item for item in observations}
     for invocation in reversed(advisor_invocations):
-        if getattr(invocation.status, "value", invocation.status) != "succeeded":
+        if getattr(invocation.status, "value", invocation.status) not in {"succeeded", "partial"}:
             continue
         normalized = getattr(invocation, "normalized_parameters", {})
         consultation_type = (
@@ -115,13 +165,22 @@ async def _latest_advice(
             output = payload.get("output")
             if not isinstance(output, Mapping) or output.get("untrusted") is not True:
                 continue
+            if output.get("usable", True) is False or output.get("advisor_status") == "refused":
+                continue
+            persisted_type = payload.get("consultation_type", consultation_type)
+            if persisted_type not in {
+                "plan_investigation",
+                "pivot_strategy",
+                "yara_draft",
+                "review_text",
+            }:
+                continue
             points = _key_points(output, available_tools)
             return {
-                "consultation_type": (
-                    consultation_type
-                    if consultation_type in ADVISOR_CONSULTATION_TYPES
-                    else str(payload.get("consultation_type", "plan_investigation"))
-                ),
+                "consultation_type": consultation_type
+                if consultation_type
+                in {"plan_investigation", "pivot_strategy", "yara_draft", "review_text"}
+                else persisted_type,
                 "date": invocation.updated_at,
                 "key_points": points,
                 "invocation_id": invocation.id,
@@ -134,6 +193,28 @@ def _key_points(output: Mapping[str, Any], available_tools: Sequence[str]) -> tu
     summary = output.get("summary")
     if isinstance(summary, str) and summary.strip():
         candidates.append(summary.strip())
+    for block in output.get("blocks", ()):
+        if not isinstance(block, Mapping):
+            continue
+        block_type = block.get("block_type")
+        sentences = block.get("sentences", ())
+        if isinstance(sentences, (list, tuple)):
+            first = next(
+                (
+                    item.get("text")
+                    for item in sentences
+                    if isinstance(item, Mapping) and isinstance(item.get("text"), str)
+                ),
+                None,
+            )
+            if isinstance(first, str) and first.strip():
+                candidates.append(f"{block_type}: {first.strip()}")
+    figure = output.get("figure_plan")
+    if isinstance(figure, Mapping) and isinstance(figure.get("title"), str):
+        candidates.append(f"figure_plan: {figure['title']}")
+    refusal = output.get("refusal_reason")
+    if isinstance(refusal, str) and refusal.strip():
+        candidates.append(f"Refus: {refusal.strip()}")
     for recommendation in output.get("recommended_next_tools", ()):
         if not isinstance(recommendation, Mapping):
             continue
@@ -151,8 +232,15 @@ def _key_points(output: Mapping[str, Any], available_tools: Sequence[str]) -> tu
             )
     points: list[str] = []
     remaining = MAX_ADVISOR_GUIDANCE_TEXT
-    for candidate in candidates[:MAX_ADVISOR_GUIDANCE_POINTS]:
+    seen: set[str] = set()
+    for candidate in candidates:
+        if len(points) >= MAX_ADVISOR_GUIDANCE_POINTS:
+            break
         text = " ".join(candidate.split())
+        normalized = text.casefold()
+        if not text or normalized in seen:
+            continue
+        seen.add(normalized)
         if not remaining:
             break
         text = text[:remaining]
@@ -191,6 +279,27 @@ def _checkpoint(
         latest_advisor_at = getattr(latest_advisor, "updated_at", None) or getattr(
             latest_advisor, "created_at", None
         )
+        if _consultation_type(latest_advisor) == "pivot_strategy" and post_consult:
+            response_statuses: dict[str, set[str]] = {}
+            for invocation in post_consult:
+                status = getattr(invocation.status, "value", invocation.status)
+                for reference in getattr(invocation, "response_refs", ()):
+                    response_statuses.setdefault(str(reference), set()).add(str(status))
+            measured_after_pivot = any(
+                str(getattr(observation, "id", "")) in response_statuses
+                and getattr(observation, "observed_at", None) is not None
+                and latest_advisor_at is not None
+                and observation.observed_at > latest_advisor_at
+                and (
+                    "succeeded" in response_statuses[str(getattr(observation, "id", ""))]
+                    or "partial" in response_statuses[str(getattr(observation, "id", ""))]
+                    or getattr(getattr(observation, "kind", None), "value", None)
+                    == "negative_result"
+                )
+                for observation in observations
+            )
+            if not measured_after_pivot:
+                return "pivot_without_measurement", "pivot_strategy"
         pivot_ids = {str(item) for item in pivot_observation_ids}
         if any(
             str(getattr(item, "id", "")) in pivot_ids
@@ -251,6 +360,16 @@ def _checkpoint(
         )
         if not any(_consultation_type(item) == "yara_draft" for item in later_yara_advice):
             return "yara_revision_review", "yara_draft"
+
+    if analyzed_positions:
+        latest_analysis_position = analyzed_positions[-1]
+        later_analysis_advice = tuple(
+            item
+            for item in invocations[latest_analysis_position + 1 :]
+            if item.tool_name == ADVISOR_TOOL_NAME
+        )
+        if not any(_consultation_type(item) == "draft_text" for item in later_analysis_advice):
+            return "editorial_draft_due", "draft_text"
 
     opinion_positions = [
         index
@@ -324,7 +443,6 @@ def bound_advisor_guidance(value: Any, *, max_bytes: int) -> tuple[Any, bool]:
 
 __all__ = [
     "ADVISOR_GUIDANCE_REMINDER",
-    "DEFAULT_ADVISOR_TURN_LIMIT",
     "DEFAULT_CHECKPOINT_TOOL_THRESHOLD",
     "bound_advisor_guidance",
     "build_advisor_guidance",

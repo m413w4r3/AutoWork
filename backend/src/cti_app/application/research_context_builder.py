@@ -59,6 +59,7 @@ from cti_app.application.operator_advisor_guidance import (
 from cti_app.config import get_settings
 from cti_app.domain.analyst_opinion import AnalystOpinionV1, investigation_opinion_id
 from cti_app.domain.investigation import (
+    BudgetDimension,
     DetectionCandidateVersion,
     EvidenceKind,
     EvidenceObservation,
@@ -121,6 +122,16 @@ _SIGNED_QUERY = re.compile(r"[?&](?:x-amz-[^=]+|x-goog-[^=]+|signature|sig|acces
 
 
 @dataclass(frozen=True, slots=True)
+class ArticlePassageSnapshot:
+    """Exact paragraph text retained from the verified canonical synthesis."""
+
+    claim_id: str
+    section_index: int | None
+    heading: str
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
 class ArticleSnapshot:
     subject_id: UUID
     production_run_id: UUID
@@ -135,6 +146,7 @@ class ArticleSnapshot:
     narrative_hashes: tuple[str, ...] = ()
     confirmed_iocs: tuple[ConfirmedIOCContextV1, ...] = ()
     confirmed_iocs_truncated: bool = False
+    article_passages: tuple[ArticlePassageSnapshot, ...] = ()
 
     def __post_init__(self) -> None:
         if (self.base_publication_artifact_id is None) != (self.base_publication_sha256 is None):
@@ -178,8 +190,9 @@ class RuleCorpusContextInventoryPort(Protocol):
 class CanonicalEvidenceSummaryPort:
     """Read bounded, structured facts from canonical evidence blobs."""
 
-    def __init__(self, artifact_store: Any) -> None:
+    def __init__(self, artifact_store: Any, *, max_payload_bytes: int = 512 * 1024 * 1024) -> None:
         self._artifact_store = artifact_store
+        self._max_payload_bytes = max_payload_bytes
 
     async def blob_metadata(self, blob_id: UUID) -> Mapping[str, Any] | None:
         """Read canonical blob descriptors only; this never fetches blob content."""
@@ -291,7 +304,7 @@ class CanonicalEvidenceSummaryPort:
             return _binary_evidence_summary(observation, metadata) if metadata else None
         raw: bytes | None = None
         try:
-            raw = await reader(observation.blob_id, max_bytes=128 * 1024)
+            raw = await reader(observation.blob_id, max_bytes=self._max_payload_bytes)
             if hashlib.sha256(raw).hexdigest() != observation.sha256:
                 return None
             payload = json.loads(raw)
@@ -312,6 +325,18 @@ class CanonicalEvidenceSummaryPort:
             ):
                 return _download_sample_result_facts(result)
             return result
+        if (
+            schema == "operator-advisor-call.v1"
+            and observation.source == "advisor.consult"
+            and observation.object_type == "advisor_call"
+        ):
+            summary = _operator_advisor_call_summary(payload)
+            usage = _advisor_usage_facts(payload)
+            if summary is None:
+                # Some advisor response versions intentionally have no normalized prose
+                # projection. Keep their verified accounting visible without exposing output.
+                return {"schema": schema, **usage}
+            return {**summary, **usage}
         if schema == "local-command-execution.v1":
             return {
                 key: payload[key]
@@ -409,13 +434,182 @@ class CanonicalEvidenceSummaryPort:
                 )
                 if key in payload
             }
-        if (
-            schema == "operator-advisor-call.v1"
-            and observation.source == "advisor.consult"
-            and observation.object_type == "advisor_call"
-        ):
-            return _operator_advisor_call_summary(payload)
         return None
+
+    async def advisor_usage(self, observation: EvidenceObservation) -> Mapping[str, Any]:
+        """Read reported usage and a clearly labelled context-size estimate."""
+        unavailable = {"status": "usage_unavailable"}
+        if observation.source != "advisor.consult" or observation.object_type not in {
+            "advisor_call",
+            "tool_call",
+        }:
+            return {
+                "provider_usage": unavailable,
+                "bridge_invocation_id": None,
+                "estimated_context_tokens": {
+                    "status": "not_available",
+                    "reason": "advisor_observation_unavailable",
+                },
+            }
+        metadata = await self.blob_metadata(observation.blob_id)
+        if metadata is not None:
+            if metadata.get("sha256") != observation.sha256:
+                return {
+                    "provider_usage": unavailable,
+                    "bridge_invocation_id": None,
+                    "estimated_context_tokens": {
+                        "status": "not_available",
+                        "reason": "evidence_hash_mismatch",
+                    },
+                }
+            mime_type = metadata.get("mime_type")
+            normalized_mime = (
+                mime_type.split(";", 1)[0].strip().casefold() if isinstance(mime_type, str) else ""
+            )
+            if normalized_mime != "application/json":
+                return {
+                    "provider_usage": unavailable,
+                    "bridge_invocation_id": None,
+                    "estimated_context_tokens": {
+                        "status": "not_available",
+                        "reason": "evidence_not_json",
+                    },
+                }
+        reader = getattr(self._artifact_store, "read_bytes", None)
+        if not callable(reader):
+            return {
+                "provider_usage": unavailable,
+                "bridge_invocation_id": None,
+                "estimated_context_tokens": {
+                    "status": "not_available",
+                    "reason": "evidence_reader_unavailable",
+                },
+            }
+        try:
+            raw = await reader(observation.blob_id, max_bytes=self._max_payload_bytes)
+            if hashlib.sha256(raw).hexdigest() != observation.sha256:
+                return {
+                    "provider_usage": unavailable,
+                    "bridge_invocation_id": None,
+                    "estimated_context_tokens": {
+                        "status": "not_available",
+                        "reason": "evidence_hash_mismatch",
+                    },
+                }
+            payload = json.loads(raw)
+        except Exception:
+            return {
+                "provider_usage": unavailable,
+                "bridge_invocation_id": None,
+                "estimated_context_tokens": {
+                    "status": "not_available",
+                    "reason": "evidence_unreadable",
+                },
+            }
+        if not isinstance(payload, Mapping):
+            return {
+                "provider_usage": unavailable,
+                "bridge_invocation_id": None,
+                "estimated_context_tokens": {
+                    "status": "not_available",
+                    "reason": "evidence_payload_invalid",
+                },
+            }
+        if payload.get("schema") == "investigation-tool-observation.v1":
+            result = payload.get("result")
+            payload = result if isinstance(result, Mapping) else {}
+        elif payload.get("schema") != "operator-advisor-call.v1":
+            payload = {}
+        return _advisor_usage_facts(payload)
+
+
+def _advisor_usage_facts(payload: Mapping[str, Any]) -> dict[str, Any]:
+    unavailable = {"status": "usage_unavailable"}
+    raw_usage = payload.get("provider_usage")
+    provider_usage: dict[str, Any] = unavailable
+    if isinstance(raw_usage, Mapping) and raw_usage.get("status") == "available":
+        allowed_counts = (
+            "input_tokens",
+            "output_tokens",
+            "total_tokens",
+            "cached_input_tokens",
+            "reasoning_tokens",
+        )
+        counts = {
+            key: value
+            for key in allowed_counts
+            if isinstance((value := raw_usage.get(key)), int)
+            and not isinstance(value, bool)
+            and value >= 0
+        }
+        if counts:
+            provider_usage = {"status": "available", **counts}
+    elif isinstance(raw_usage, Mapping) and raw_usage.get("status") == "not_submitted":
+        provider_usage = {"status": "not_submitted"}
+
+    raw_invocation_id = payload.get("bridge_invocation_id")
+    try:
+        bridge_invocation_id = str(UUID(str(raw_invocation_id))) if raw_invocation_id else None
+    except (TypeError, ValueError):
+        bridge_invocation_id = None
+
+    context_bytes = payload.get("context_bytes")
+    cost = payload.get("cost")
+    if not isinstance(context_bytes, int) or isinstance(context_bytes, bool) or context_bytes < 0:
+        context_bytes = cost.get("context_bytes") if isinstance(cost, Mapping) else None
+    positive_context_bytes = (
+        context_bytes
+        if isinstance(context_bytes, int)
+        and not isinstance(context_bytes, bool)
+        and context_bytes > 0
+        else None
+    )
+    estimate = payload.get("context_estimate", payload.get("estimated_context_tokens"))
+    if isinstance(estimate, Mapping) and estimate.get("status") == "estimated":
+        value = estimate.get("value")
+        estimated_bytes = estimate.get("context_bytes", context_bytes)
+        if (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and value >= 0
+            and isinstance(estimated_bytes, int)
+            and not isinstance(estimated_bytes, bool)
+            and estimated_bytes >= 0
+        ):
+            estimated_context_tokens: dict[str, Any] = {
+                "status": "estimated",
+                "value": value,
+                "context_bytes": estimated_bytes,
+                "basis": "context_bytes/4",
+            }
+        else:
+            estimated_context_tokens = {
+                "status": "not_available",
+                "reason": "stored_estimate_invalid",
+            }
+    elif isinstance(estimate, Mapping) and estimate.get("status") == "not_available":
+        reason = estimate.get("reason")
+        estimated_context_tokens = {
+            "status": "not_available",
+            "reason": reason if isinstance(reason, str) and len(reason) <= 80 else "unavailable",
+        }
+    elif positive_context_bytes is not None:
+        estimated_context_tokens = {
+            "status": "estimated",
+            "value": (positive_context_bytes + 3) // 4,
+            "context_bytes": positive_context_bytes,
+            "basis": "context_bytes/4",
+        }
+    else:
+        estimated_context_tokens = {
+            "status": "not_available",
+            "reason": "no_verified_context_bytes",
+        }
+    return {
+        "provider_usage": provider_usage,
+        "bridge_invocation_id": bridge_invocation_id,
+        "estimated_context_tokens": estimated_context_tokens,
+    }
 
 
 def _operator_advisor_call_summary(payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
@@ -442,11 +636,10 @@ def _operator_advisor_call_summary(payload: Mapping[str, Any]) -> Mapping[str, A
     if (
         summary is None
         or not isinstance(alternatives, (list, tuple))
-        or not 1 <= len(alternatives) <= 4
+        or not alternatives
         or not isinstance(experiment, Mapping)
         or not isinstance(discarded, Mapping)
         or not isinstance(recommendations, (list, tuple))
-        or len(recommendations) > 5
     ):
         return None
 
@@ -574,23 +767,20 @@ def _operator_advisor_call_summary(payload: Mapping[str, Any]) -> Mapping[str, A
         "input_observation_refs": input_refs,
         "output": bounded_output,
     }
-    encoded_size = len(
-        json.dumps(bounded, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    )
-    if encoded_size > 48 * 1024:
-        return None
     return bounded
 
 
 def _advisor_bounded_text(value: Any, max_chars: int) -> str | None:
+    del max_chars
     if not isinstance(value, str):
         return None
-    normalized = " ".join(value.split())
-    return normalized[:max_chars] if normalized else None
+    normalized = value.strip()
+    return normalized or None
 
 
 def _advisor_bounded_text_list(value: Any, *, max_items: int, max_chars: int) -> list[str] | None:
-    if not isinstance(value, (list, tuple)) or len(value) > max_items:
+    del max_items
+    if not isinstance(value, (list, tuple)):
         return None
     selected: list[str] = []
     for item in value:
@@ -602,7 +792,8 @@ def _advisor_bounded_text_list(value: Any, *, max_items: int, max_chars: int) ->
 
 
 def _advisor_bounded_text_refs(value: Any, *, max_items: int = 64) -> list[str] | None:
-    if not isinstance(value, (list, tuple)) or len(value) > max_items:
+    del max_items
+    if not isinstance(value, (list, tuple)):
         return None
     refs: list[str] = []
     for item in value:
@@ -617,7 +808,8 @@ def _advisor_bounded_text_refs(value: Any, *, max_items: int = 64) -> list[str] 
 
 
 def _advisor_observation_refs(value: Any, *, max_items: int = 128) -> list[str] | None:
-    if not isinstance(value, (list, tuple)) or len(value) > max_items:
+    del max_items
+    if not isinstance(value, (list, tuple)):
         return None
     refs: list[str] = []
     for item in value:
@@ -1103,7 +1295,11 @@ class ResearchContextBuilder:
                     evidence_summaries=self._evidence_summaries,
                     available_tools=tuple(item.name for item in tools),
                     checkpoint_tool_threshold=get_settings().operator_advisor_checkpoint_tool_threshold,
-                    advisor_turn_limit=get_settings().operator_advisor_max_turns_per_investigation,
+                    g2_bridge_turns_remaining=(
+                        tool_context.budget.remaining.get(BudgetDimension.BRIDGE_TURNS)
+                        if tool_context.envelope is not None
+                        else None
+                    ),
                     pivot_observation_ids=tuple(item.id for item in pivot_observations),
                     enabled=state.execution_mode is InvestigationExecutionMode.OPERATOR_LED,
                 )

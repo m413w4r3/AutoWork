@@ -25,11 +25,12 @@ from cti_app.domain.classification import TLP
 from cti_app.domain.editions import Edition
 from cti_app.domain.entities import SampleOrigin, SampleState, Subject
 from cti_app.domain.investigation import (
-    SampleOrigin as AssociationSampleOrigin,
-)
-from cti_app.domain.investigation import (
+    QualificationActorKind,
     SampleQualification,
     ToolInvocationStatus,
+)
+from cti_app.domain.investigation import (
+    SampleOrigin as AssociationSampleOrigin,
 )
 from cti_app.domain.production import (
     AnalystInputPack,
@@ -189,7 +190,7 @@ async def test_operator_import_is_persisted_once_in_quarantine_and_read_back_ver
     imported = await service.import_bytes(
         investigation_id=investigation.id,
         content=content,
-        intended_role=RuleTestCorpusRole.CONFIRMED_POSITIVE,
+        intended_role=RuleTestCorpusRole.NEW_CANDIDATE_UNCONFIRMED,
         provenance=RuleSampleProvenance.SYNTHETIC,
         operator_id="operator:postgres-integration",
         reason="Reproduce one quoted configuration fragment.",
@@ -199,7 +200,7 @@ async def test_operator_import_is_persisted_once_in_quarantine_and_read_back_ver
     replay = await service.import_bytes(
         investigation_id=investigation.id,
         content=content,
-        intended_role=RuleTestCorpusRole.CONFIRMED_POSITIVE,
+        intended_role=RuleTestCorpusRole.NEW_CANDIDATE_UNCONFIRMED,
         provenance=RuleSampleProvenance.SYNTHETIC,
         operator_id="operator:postgres-integration",
         reason="Reproduce one quoted configuration fragment.",
@@ -221,7 +222,7 @@ async def test_operator_import_is_persisted_once_in_quarantine_and_read_back_ver
     inventory = await list_manual_rule_corpus_imports(uow_factory, investigation.id)
     assert len(inventory) == 1
     assert inventory[0].sample_sha256 == sha256
-    assert inventory[0].role is RuleTestCorpusRole.CONFIRMED_POSITIVE
+    assert inventory[0].role is RuleTestCorpusRole.NEW_CANDIDATE_UNCONFIRMED
     assert inventory[0].provenance is RuleSampleProvenance.SYNTHETIC
     assert inventory[0].size_bytes == len(content)
 
@@ -455,13 +456,13 @@ async def test_postgres_rule_propose_test_and_revise_use_imported_non_pe_corpus(
     imports = [
         (
             exact_positive,
-            RuleTestCorpusRole.CONFIRMED_POSITIVE,
+            RuleTestCorpusRole.NEW_CANDIDATE_UNCONFIRMED,
             RuleSampleProvenance.SYNTHETIC,
             "Synthetic .NET config reproducing the cited fragment.",
         ),
         (
             spaced_positive,
-            RuleTestCorpusRole.CONFIRMED_POSITIVE,
+            RuleTestCorpusRole.NEW_CANDIDATE_UNCONFIRMED,
             RuleSampleProvenance.SYNTHETIC,
             "Synthetic whitespace variant of the cited .NET config fragment.",
         ),
@@ -528,8 +529,40 @@ async def test_postgres_rule_propose_test_and_revise_use_imported_non_pe_corpus(
                 assert response.json()["sha256"] == hashlib.sha256(content).hexdigest()
                 assert response.json()["local_only"] is True
                 assert response.json()["executed"] is False
+            listing = await client.get(
+                f"/api/investigations/{target_investigation.id}/rule-corpus/imports",
+                params={"limit": 5, "offset": 0},
+            )
+            assert listing.status_code == 200, listing.text
+            assert listing.json()["schema_version"] == "manual-rule-corpus-import-inventory.v1"
+            assert len(listing.json()["imports"]) == 5
+            assert all("bytes" not in item for item in listing.json()["imports"])
+            assert all(
+                item["operator_id"] == "operator:rule-workbench-integration"
+                for item in listing.json()["imports"]
+            )
     assert len(await list_manual_rule_corpus_imports(uow_factory, investigation.id)) == 11
     assert len(await list_manual_rule_corpus_imports(uow_factory, second_investigation.id)) == 11
+    async with uow_factory() as uow:
+        for target_investigation in (investigation, second_investigation):
+            associations = await uow.sample_associations.list_for_investigation(
+                target_investigation.id
+            )
+            for content in (exact_positive, spaced_positive):
+                sample_sha256 = hashlib.sha256(content).hexdigest()
+                association = next(
+                    item for item in associations if item.sample_sha256 == sample_sha256
+                )
+                confirmed = association.change_qualification(
+                    SampleQualification.CONFIRMED,
+                    actor_kind=QualificationActorKind.HUMAN,
+                    actor_id="operator:postgres-integration",
+                    reason="The integration fixture explicitly qualifies this synthetic positive.",
+                )
+                await uow.sample_associations.append_version(
+                    confirmed, expected_version=association.version
+                )
+        await uow.commit()
 
     engine = IsolatedYaraRunner()
     if not engine.available:
@@ -685,26 +718,34 @@ async def test_postgres_rule_propose_test_and_revise_use_imported_non_pe_corpus(
             "rule-test",
         )
         report = tested.output["report"]
-        assert tested.status is ToolInvocationStatus.SUCCEEDED
+        assert tested.status is ToolInvocationStatus.PARTIAL
         assert tested.output["validation_status"] == "real_partial"
         assert report["execution_status"] == "ok"
         assert report["validation_status"] == "real_partial"
+        assert report["final_status"] == "ONE_RULE_NOT_VALIDATED"
+        assert "investigation_goodware_baseline_unbound" in report["validation_reasons"]
+        assert (
+            "in_scope_positive_not_matched:new_candidate_unconfirmed"
+            not in report["validation_reasons"]
+        )
         assert report["false_positive_count"] == 0
         assert report["false_negative_count"] == 1
         by_role = {item["role"]: item for item in report["roles"]}
-        assert len(by_role["confirmed_positive"]["non_matches"]) == 1
-        assert len(by_role["confirmed_positive"]["matches"]) == 1
-        assert (
-            hashlib.sha256(spaced_positive).hexdigest()
-            in by_role["confirmed_positive"]["non_matches"]
+        assert len(by_role["human_confirmed"]["non_matches"]) == 1
+        assert len(by_role["human_confirmed"]["matches"]) == 1
+        assert len(by_role["human_confirmed"]["coverage_matrix"]) == 2
+        assert all(
+            "strings" in row and "format_magic" in row
+            for row in by_role["human_confirmed"]["coverage_matrix"]
         )
         assert (
-            hashlib.sha256(exact_positive).hexdigest() in by_role["confirmed_positive"]["matches"]
+            hashlib.sha256(spaced_positive).hexdigest() in by_role["human_confirmed"]["non_matches"]
         )
-        assert len(by_role["out_of_cluster_candidate"]["non_matches"]) == 1
+        assert hashlib.sha256(exact_positive).hexdigest() in by_role["human_confirmed"]["matches"]
+        assert len(by_role["new_candidate_unconfirmed"]["non_matches"]) == 1
         assert by_role["goodware"]["provenance_counts"] == {"real": 8, "synthetic": 0}
         assert len(by_role["goodware"]["non_matches"]) == 8
-        assert report["provenance_counts_by_role"]["confirmed_positive"] == {
+        assert report["provenance_counts_by_role"]["human_confirmed"] == {
             "real": 0,
             "synthetic": 2,
         }
@@ -735,15 +776,56 @@ async def test_postgres_rule_propose_test_and_revise_use_imported_non_pe_corpus(
             "rule-test-v2",
         )
         revised_report = revised_test.output["report"]
-        assert revised_test.status is ToolInvocationStatus.SUCCEEDED
+        assert revised_test.status is ToolInvocationStatus.PARTIAL
         assert revised_test.output["validation_status"] == "real_partial"
+        assert revised_report["final_status"] == "ONE_RULE_NOT_VALIDATED"
         assert revised_report["false_negative_count"] == 0
         assert revised_report["false_positive_count"] == 0
         revised_positive = next(
-            item for item in revised_report["roles"] if item["role"] == "confirmed_positive"
+            item for item in revised_report["roles"] if item["role"] == "human_confirmed"
         )
         assert len(revised_positive["matches"]) == 2
         assert hashlib.sha256(spaced_positive).hexdigest() in revised_positive["matches"]
+
+        late_holdout_bytes = b"a newly designated holdout created after rule v2"
+        late_holdout_sha256 = hashlib.sha256(late_holdout_bytes).hexdigest()
+        designation = await importer.designate_holdout(
+            investigation_id=investigation.id,
+            sample_sha256=late_holdout_sha256,
+            intended_role=RuleTestCorpusRole.HOLDOUT_NEGATIVE,
+            operator_id="operator:postgres-integration",
+            reason="The operator designates this hash after historical rule versions exist.",
+        )
+        late_holdout = await importer.import_bytes(
+            investigation_id=investigation.id,
+            content=late_holdout_bytes,
+            intended_role=RuleTestCorpusRole.HOLDOUT_NEGATIVE,
+            provenance=RuleSampleProvenance.REAL,
+            operator_id="operator:postgres-integration",
+            reason="The holdout was explicitly designated before upload.",
+        )
+        assert late_holdout.sha256 == late_holdout_sha256
+        assert late_holdout.designated_at == designation.designated_at
+
+        retest_after_late_designation = await call(
+            "rule.test",
+            {"candidate_id": candidate_id, "version": 2},
+            "rule-test-v2-late-designation",
+        )
+        late_report = retest_after_late_designation.output["report"]
+        assert retest_after_late_designation.status is ToolInvocationStatus.PARTIAL
+        late_holdout_role = next(
+            item
+            for item in late_report["roles"]
+            if item["role"] == RuleTestCorpusRole.HOLDOUT_NEGATIVE.value
+        )
+        assert not late_holdout_role["test_cases"]
+        assert late_holdout_sha256 not in {
+            sha256
+            for role in late_report["roles"]
+            for sha256 in (*role["matches"], *role["non_matches"], *role["non_measurable"])
+        }
+        assert any("holdouts" in limitation for limitation in late_report["limitations"])
 
         versions = await uow.detection_candidates.list_for_candidate(UUID(candidate_id))
         assert [item.version for item in versions] == [1, 2]

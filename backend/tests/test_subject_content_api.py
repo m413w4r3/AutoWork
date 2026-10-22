@@ -231,6 +231,12 @@ class _PublicationRenderService:
             self._cached_preview_attempt = self.preview_attempt
         return self.preview_attempt
 
+    async def lineage_manifest_for_render(self, render: object) -> dict[str, object]:
+        return {
+            "schema_version": "pdf-lineage.v1",
+            "render_identity": getattr(render, "input_hash", None),
+        }
+
 
 def _app(
     uow: _Uow,

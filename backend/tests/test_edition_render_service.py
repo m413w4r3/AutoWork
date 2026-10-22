@@ -434,23 +434,27 @@ class _CapturingEditionTypstRenderer:
     def __init__(self) -> None:
         self.documents: list[EditionDocumentV2] = []
         self.templates: list[TypstTemplateBundle] = []
+        self.document_labels: list[str] = []
 
     def render(
         self,
         document: EditionDocumentV2,
         template_bundle: TypstTemplateBundle,
         *,
+        document_label: str,
         artifact_identities: dict[str, dict[str, Any]] | None = None,
     ) -> TypstRenderSource:
         del artifact_identities
         self.documents.append(document)
         self.templates.append(template_bundle)
+        self.document_labels.append(document_label)
         source = next(
             file.content
             for file in template_bundle.files
             if file.relative_path == "RENDERER/edition.typ"
         )
-        data = ProductionArtifactStore.canonical_json_bytes(document.to_json())
+        payload = {**document.to_json(), "document_label": document_label}
+        data = ProductionArtifactStore.canonical_json_bytes(payload)
         return TypstRenderSource(
             source_bytes=source,
             source_sha256=hashlib.sha256(source).hexdigest(),
@@ -458,7 +462,7 @@ class _CapturingEditionTypstRenderer:
             render_data_sha256=hashlib.sha256(data).hexdigest(),
             media_refs=(),
             entrypoint_relative_path="RENDERER/edition.typ",
-            render_data_relative_path="RENDERER/render-data.json",
+            render_data_relative_path="RENDERER/edition-render-data.json",
         )
 
 
@@ -570,6 +574,11 @@ async def test_edition_render_service_reuses_same_inputs_and_only_compiles_once(
     assert first.status is TypstRenderStatus.SUCCEEDED
     assert compiler.call_count == 1
     assert renderer.documents == [document]
+    assert len(renderer.document_labels) == 1
+    assert str(release.edition_id) in renderer.document_labels[0]
+    assert str(release.id) in renderer.document_labels[0]
+    render_data = json.loads(compiler.workspace_snapshots[0]["RENDERER/edition-render-data.json"])
+    assert render_data["document_label"] == renderer.document_labels[0]
     assert len(renders.renders) == 1
     assert first.source_blob_id is not None
     assert first.render_data_blob_id is not None

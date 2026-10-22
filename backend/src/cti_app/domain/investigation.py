@@ -493,6 +493,22 @@ class ToolInvocation:
             version=self.version + 1,
         )
 
+    def resolve_pre_submission_failure(
+        self,
+        *,
+        now: datetime | None = None,
+    ) -> ToolInvocation:
+        """Resolve a reviewed invocation only after its caller proves no submit occurred."""
+        if self.status is not ToolInvocationStatus.NEEDS_REVIEW:
+            raise ValueError("Only a needs-review invocation can be resolved as unsubmitted")
+        return replace(
+            self,
+            status=ToolInvocationStatus.FAILED,
+            consumed_budget={},
+            updated_at=now or datetime.now(UTC),
+            version=self.version + 1,
+        )
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class EvidenceObservation:

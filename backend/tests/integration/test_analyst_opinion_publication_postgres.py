@@ -181,9 +181,11 @@ class _TypstDraftPreviewRenderer:
         infrastructure_graph=None,
         findings=(),
         evidence_observations=(),
+        base_publication_identity=None,
     ) -> CompiledTypstDocument:
         from cti_app.application.typst_rendering import TypstDraftPreviewDocument
 
+        del base_publication_identity
         self.rendered_opinion = opinion
         self.rendered_synthesis = synthesis
         source = self._renderer.render(
@@ -196,6 +198,7 @@ class _TypstDraftPreviewRenderer:
                 evidence_observations,
             ),
             self._templates,
+            document_label="Aperçu d'avis PostgreSQL — test",
         )
         media_bytes = {
             reference.asset_id: await self._media_assets.read(reference.asset_id)
@@ -740,7 +743,9 @@ async def test_postgres_opinion_approval_publishes_new_v6_and_preserves_v5(
             timeout=30,
         )
         preview_text = " ".join(extracted.stdout.decode("utf-8", errors="replace").split())
-        assert preview_text.count("Modèle documenté, non observé") >= 3
+        assert preview_text.count("Niveau de preuve") >= 3
+        assert preview_text.count("ARTICLE_DOCUMENTED") >= 3
+        assert preview_text.count("documenté, non observé") >= 3
         assert all(
             title in preview_text.casefold()
             for title in ("séquence réseau", "machine à états", "format de message")

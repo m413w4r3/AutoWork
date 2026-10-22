@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, Literal, cast
 from uuid import UUID
 
@@ -227,6 +228,7 @@ async def download_subject_publication_pdf(subject_id: UUID, request: Request) -
             detail={"code": "publication_pdf_integrity_mismatch"},
         ) from exc
 
+    lineage = await _publication_render_service(request).lineage_manifest_for_render(render)
     return Response(
         content=content,
         media_type="application/pdf",
@@ -235,6 +237,7 @@ async def download_subject_publication_pdf(subject_id: UUID, request: Request) -
             "X-Publication-Artifact-Id": str(publication.artifact.id),
             "X-Publication-Artifact-Version": str(publication.artifact.version),
             "X-Publication-Render-Identity": render.input_hash,
+            "X-PDF-Lineage": json.dumps(lineage, ensure_ascii=True, separators=(",", ":")),
         },
     )
 
@@ -459,6 +462,7 @@ async def get_subject_publication_preview_pdf(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={"code": "publication_pdf_integrity_mismatch"},
         ) from exc
+    lineage = await _publication_render_service(request).lineage_manifest_for_render(render)
     return Response(
         content=content,
         media_type="application/pdf",
@@ -469,6 +473,7 @@ async def get_subject_publication_preview_pdf(
             "X-Publication-Artifact-Id": str(artifact_id),
             "X-Publication-Artifact-Version": str(preview.artifact_version),
             "X-Publication-Render-Identity": render.input_hash,
+            "X-PDF-Lineage": json.dumps(lineage, ensure_ascii=True, separators=(",", ":")),
             "X-Content-Type-Options": "nosniff",
         },
     )

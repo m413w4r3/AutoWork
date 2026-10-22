@@ -30,7 +30,7 @@ const BLOCK_ORDER: OpinionBlockType[] = [
   "uncertainties_and_next_leads",
 ];
 
-const BLOCK_LABELS: Record<OpinionBlockType, string> = {
+const BLOCK_LABELS: Record<OpinionBlockType | "implant_materials", string> = {
   key_findings: "Apports de l’enquête",
   additional_samples: "Échantillons complémentaires",
   infection_chain_and_capabilities: "Chaîne d’infection et capacités",
@@ -38,6 +38,7 @@ const BLOCK_LABELS: Record<OpinionBlockType, string> = {
   claim_verification: "Vérification des affirmations",
   proposed_detections: "Détections proposées",
   uncertainties_and_next_leads: "Incertitudes et prochaines pistes",
+  implant_materials: "Matériel relatif à l’implant",
 };
 
 const QUALIFICATION_LABELS: Record<OpinionQualification, string> = {

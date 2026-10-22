@@ -70,6 +70,23 @@ function renderConsole(
         }),
       );
     }
+    if (url.endsWith("/releases/release-1/lineage")) {
+      return Promise.resolve(
+        Response.json({
+          nature: "edition_release",
+          edition_id: EDITION_ID,
+          edition_release_id: "release-1",
+          manifest_id: "manifest-1",
+          render_id: "render-1",
+          render_data_sha256: "c".repeat(64),
+          pdf_sha256: "b".repeat(64),
+          is_current: true,
+          historical: false,
+          history_reasons: [],
+          publications: [],
+        }),
+      );
+    }
     if (release === null) {
       return Promise.resolve(
         Response.json(
@@ -306,8 +323,13 @@ describe("PublicationConsole", () => {
       screen.getByRole("heading", { name: "Rendu PDF" }),
     ).toBeInTheDocument();
     expect(screen.getByText("Bulletin publié")).toBeInTheDocument();
+    expect(await screen.findByText("edition_release")).toBeInTheDocument();
+    expect(screen.getByText("actuel")).toBeInTheDocument();
     const link = screen.getByRole("link", { name: "Télécharger le PDF" });
-    expect(link).toHaveAttribute("href", "/api/editions/edition-1/release/pdf");
+    expect(link).toHaveAttribute(
+      "href",
+      "/api/editions/edition-1/releases/release-1/pdf",
+    );
     expect(link).toHaveAttribute("download");
     expect(
       fetchMock.mock.calls.every(([input]) => !urlOf(input).endsWith("/pdf")),

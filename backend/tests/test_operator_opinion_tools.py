@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from types import SimpleNamespace
 from typing import Any, cast
 from uuid import uuid4
@@ -147,6 +148,65 @@ async def test_note_rejects_unlisted_anchor_and_synthetic_observed_note() -> Non
     assert service.revision is None
 
 
+@pytest.mark.asyncio
+async def test_opinion_revise_attaches_clear_implant_text_with_bridge_refs() -> None:
+    investigation_id = uuid4()
+    opinion = current_opinion(investigation_id)
+    service = OpinionService(opinion)
+    adapter = OperatorOpinionToolAdapter(
+        service=service,
+        investigations=SimpleNamespace(),
+        article_snapshots=ArticleSnapshots(()),
+    )
+    text = "RC4 key 00112233445566778899aabbccddeeff; C2 ghp_" + "f" * 36
+    text_sha256 = hashlib.sha256(text.encode()).hexdigest()
+    draft_invocation_id = str(uuid4())
+    review_invocation_id = str(uuid4())
+    review_output_sha256 = "d" * 64
+
+    result = await adapter.execute(
+        {
+            "action": "revise",
+            "opinion_id": str(opinion.id),
+            "expected_opinion_version": opinion.version,
+            "expected_opinion_sha256": opinion.content_sha256,
+            "blocks": [
+                {
+                    "block_type": "implant_materials",
+                    "text": text,
+                    "finding_refs": [],
+                    "evidence_refs": [],
+                    "qualification": "fact",
+                    "certainty": 1.0,
+                    "bridge_authored": True,
+                    "bridge_draft_ref": {
+                        "invocation_id": draft_invocation_id,
+                        "text_sha256": text_sha256,
+                    },
+                    "bridge_review_ref": {
+                        "invocation_id": review_invocation_id,
+                        "output_sha256": review_output_sha256,
+                        "reviewed_text_sha256": text_sha256,
+                    },
+                }
+            ],
+            "unresolved_points": [],
+        },
+        context(investigation_id),
+    )
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    assert service.revision is not None
+    block = service.revision[2].blocks[0]
+    assert block.block_type.value == "implant_materials"
+    assert block.text == text
+    assert block.bridge_authored is True
+    assert block.bridge_draft_ref.invocation_id == draft_invocation_id
+    assert block.bridge_draft_ref.text_sha256 == text_sha256
+    assert block.bridge_review_ref.invocation_id == review_invocation_id
+    assert block.bridge_review_ref.output_sha256 == review_output_sha256
+
+
 def async_get(value):
     async def get(_key):
         return value
@@ -202,3 +262,38 @@ def test_compose_and_revise_schemas_describe_bounded_protocol_figure_selection()
                 },
                 schema,
             )
+
+    implant_text = "Material CTI en clair ghp_" + "e" * 36
+    text_sha256 = hashlib.sha256(implant_text.encode()).hexdigest()
+    implant_block = {
+        "block_type": "implant_materials",
+        "text": implant_text,
+        "finding_refs": [],
+        "evidence_refs": [],
+        "qualification": "fact",
+        "certainty": 1,
+        "bridge_authored": True,
+        "bridge_draft_ref": {"invocation_id": "draft-1", "text_sha256": text_sha256},
+        "bridge_review_ref": {
+            "invocation_id": "review-1",
+            "output_sha256": "d" * 64,
+            "reviewed_text_sha256": text_sha256,
+        },
+    }
+    revise_schema = definitions["opinion.revise"].input_schema
+    revise_payload = {
+        "action": "revise",
+        "opinion_id": str(uuid4()),
+        "expected_opinion_version": 1,
+        "expected_opinion_sha256": "a" * 64,
+        "blocks": [implant_block],
+        "unresolved_points": [],
+    }
+    validate_json_schema(revise_payload, revise_schema)
+    compose_payload = {
+        "action": "compose",
+        "selection": {"finding_ids": [], "claim_ids": [], "block_types": []},
+        "blocks": [implant_block],
+    }
+    with pytest.raises(ValueError):
+        validate_json_schema(compose_payload, definitions["opinion.compose"].input_schema)

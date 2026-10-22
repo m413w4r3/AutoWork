@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 import time
@@ -43,6 +44,7 @@ NETWORK_TOOL_NAMES = frozenset(
 )
 NETWORK_SURICATA_TOOL_NAMES = frozenset({NETWORK_SURICATA_VALIDATE_RULES, NETWORK_SURICATA_REPLAY})
 _FLOW_ID = re.compile(r"^[0-9a-f]{24}$")
+_CANDIDATE_SOURCE_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$")
 _MAX_TOOL_SECONDS = 120
 
 _CAPTURE_REF_SCHEMA: dict[str, Any] = {
@@ -209,6 +211,7 @@ class _NetworkToolAdapter:
         object_type: str,
         object_id: str,
         payload: Mapping[str, Any],
+        idempotency_key: str | None = None,
     ) -> UUID:
         observation = await self.recorder.record_json(
             investigation_id=context.investigation_id,
@@ -222,7 +225,9 @@ class _NetworkToolAdapter:
                 "Les sorties sont des observations bornées, pas un décodage affirmé.",
                 "Les octets complets restent référencés par le blob de capture immuable.",
             ),
-            idempotency_key=context.idempotency_key,
+            idempotency_key=(
+                context.idempotency_key if idempotency_key is None else idempotency_key
+            ),
         )
         return observation.id
 
@@ -309,6 +314,14 @@ class _CaptureInspectAdapter(_NetworkToolAdapter):
                 "report": report.to_dict(),
                 "report_sha256": report.canonical_sha256,
                 "observation_ref": str(observation_id),
+                "truncation": {
+                    "tshark_output_truncated": report.output_truncated,
+                    "detail": (
+                        "TShark fields or summary were truncated; consult the full capture blob."
+                        if report.output_truncated
+                        else None
+                    ),
+                },
             },
         )
 
@@ -481,7 +494,9 @@ class _SuricataToolAdapter(_NetworkToolAdapter):
             reference = await self._accept_capture(
                 self._capture_ref(arguments.get("capture_ref")), context
             )
-            parameters = self._candidate_parameters(arguments.get("candidate"))
+            parameters, candidate_provenance = self._candidate_parameters(
+                arguments.get("candidate")
+            )
             outcome = (
                 await self.workbench.replay_suricata(
                     reference,
@@ -561,23 +576,80 @@ class _SuricataToolAdapter(_NetworkToolAdapter):
             "capture_sha256": reference.sha256,
             "operation_key": outcome.operation_key,
             "tool": self.name,
+            "candidate_provenance": candidate_provenance,
             "engine": dict(engine),
         }
-        object_id = ":".join(
-            str(value)
-            for value in (
-                reference.sha256,
-                engine.get("ruleset_revision", "fixed"),
-                engine.get("rule_sha256", "unknown"),
-            )
-        )
+        object_id = hashlib.sha256(
+            "\0".join(
+                str(value)
+                for value in (
+                    reference.sha256,
+                    engine.get("ruleset_revision", "fixed"),
+                    engine.get("rule_sha256", "unknown"),
+                    candidate_provenance,
+                    parameters.get("candidate_id", ""),
+                    parameters.get("candidate_version", ""),
+                )
+            ).encode("utf-8")
+        ).hexdigest()
         observation_id = await self._record(
             context,
             source=self.name,
             object_type="suricata_observation",
             object_id=object_id,
             payload=payload,
+            idempotency_key=hashlib.sha256(
+                f"{context.idempotency_key or ''}\0{object_id}".encode()
+            ).hexdigest(),
         )
+        truncation_value = engine.get("truncated")
+        eve_truncated = (
+            truncation_value if self.replay and isinstance(truncation_value, bool) else None
+        )
+        syntax_validation = (
+            "valid"
+            if not self.replay and status is ToolInvocationStatus.SUCCEEDED
+            else "partial"
+            if not self.replay and status is ToolInvocationStatus.PARTIAL
+            else "failed"
+            if not self.replay
+            else "loaded_during_replay"
+            if status in {ToolInvocationStatus.SUCCEEDED, ToolInvocationStatus.PARTIAL}
+            else "not_established"
+        )
+        replay_completed = status in {
+            ToolInvocationStatus.SUCCEEDED,
+            ToolInvocationStatus.PARTIAL,
+        }
+        detection_result = (
+            "single_capture_replay_only" if self.replay and replay_completed else "not_assessed"
+        )
+        detection_detail = (
+            "One capture replay is an observation only; it does not empirically validate detection."
+            if self.replay
+            else "Rule syntax/configuration validation does not establish detection efficacy."
+        )
+        if eve_truncated is True:
+            eve_detail = (
+                "EVE bytes or retained event summary are truncated; "
+                "replay conclusions are incomplete."
+            )
+        elif self.replay and eve_truncated is None:
+            eve_detail = (
+                "The worker did not return an EVE/event-summary truncation flag; "
+                "completeness is unknown."
+            )
+        else:
+            eve_detail = None
+        truncation = {
+            "eve_or_event_summary_truncated": eve_truncated,
+            "eve_detail": eve_detail,
+            "tshark_output_truncated": None,
+            "tshark_detail": (
+                "Not measured by this Suricata operation; check "
+                "network.capture.inspect.report.output_truncated."
+            ),
+        }
         return self._tool_result(
             context,
             status=status,
@@ -586,40 +658,81 @@ class _SuricataToolAdapter(_NetworkToolAdapter):
             output={
                 "engine_status": engine_status.lower(),
                 "engine": dict(engine),
+                "candidate_provenance": candidate_provenance,
+                "rule_syntax_validation": syntax_validation,
+                "detection_result": detection_result,
+                "detection_detail": detection_detail,
+                "detection_empirically_validated": False,
+                "truncation": truncation,
                 "observation_ref": str(observation_id),
             },
         )
 
     @staticmethod
-    def _candidate_parameters(value: object) -> dict[str, str]:
+    def _candidate_parameters(
+        value: object,
+    ) -> tuple[dict[str, str], dict[str, Any] | None]:
         if value is None:
-            return {}
-        if not isinstance(value, Mapping) or set(value) != {
+            return {}, None
+        required = {
             "candidate_id",
             "candidate_version",
             "rule_source",
-        }:
+            "source",
+            "source_ref",
+        }
+        allowed = required | {"evidence_refs"}
+        if (
+            not isinstance(value, Mapping)
+            or not required.issubset(value)
+            or not set(value).issubset(allowed)
+        ):
             raise ValueError("suricata_candidate_invalid")
         candidate_id = value["candidate_id"]
         candidate_version = value["candidate_version"]
         rule_source = value["rule_source"]
+        source = value["source"]
+        source_ref = value["source_ref"]
+        evidence_refs = value.get("evidence_refs", ())
         if (
             not isinstance(candidate_id, str)
             or isinstance(candidate_version, bool)
             or not isinstance(candidate_version, int)
             or not isinstance(rule_source, str)
+            or not isinstance(source, str)
+            or source not in {"bridge", "operator"}
+            or not isinstance(source_ref, str)
+            or _CANDIDATE_SOURCE_REF.fullmatch(source_ref) is None
+            or not isinstance(evidence_refs, (list, tuple))
+            or len(evidence_refs) > 16
+            or any(not isinstance(item, str) for item in evidence_refs)
         ):
             raise ValueError("suricata_candidate_invalid")
+        try:
+            normalized_refs = tuple(str(UUID(item)) for item in evidence_refs)
+        except ValueError as exc:
+            raise ValueError("suricata_candidate_evidence_ref_invalid") from exc
+        if len(normalized_refs) != len(set(normalized_refs)):
+            raise ValueError("suricata_candidate_evidence_ref_invalid")
+        if source == "bridge" and not normalized_refs:
+            raise ValueError("suricata_candidate_bridge_refs_required")
         rule_source = validate_suricata_rule_source(
             rule_source,
             candidate_id=candidate_id,
             candidate_version=str(candidate_version),
         )
-        return {
-            "candidate_id": candidate_id,
-            "candidate_version": str(candidate_version),
-            "rule_source": rule_source,
-        }
+        return (
+            {
+                "candidate_id": candidate_id,
+                "candidate_version": str(candidate_version),
+                "rule_source": rule_source,
+            },
+            {
+                "source": source,
+                "source_ref": source_ref.strip(),
+                "evidence_refs": list(normalized_refs),
+            },
+        )
 
 
 def _capture_schema(description: str) -> dict[str, Any]:
@@ -649,8 +762,26 @@ def _suricata_schema(description: str) -> dict[str, Any]:
                     },
                     "candidate_version": {"type": "integer", "minimum": 1, "maximum": 100_000},
                     "rule_source": {"type": "string", "minLength": 1, "maxLength": 65_536},
+                    "source": {"type": "string", "enum": ["bridge", "operator"]},
+                    "source_ref": {
+                        "type": "string",
+                        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$",
+                    },
+                    "evidence_refs": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 16,
+                        "uniqueItems": True,
+                        "items": {"type": "string", "format": "uuid"},
+                    },
                 },
-                "required": ["candidate_id", "candidate_version", "rule_source"],
+                "required": [
+                    "candidate_id",
+                    "candidate_version",
+                    "rule_source",
+                    "source",
+                    "source_ref",
+                ],
                 "additionalProperties": False,
             },
         },

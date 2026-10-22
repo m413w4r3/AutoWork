@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import math
@@ -46,6 +47,7 @@ from cti_app.domain.reference_corpus import ReferenceCorpusVerdict
 from cti_app.domain.rule_workbench import (
     RuleBuildResult,
     RuleConditionStrategy,
+    RuleFileCoverage,
     RuleMotif,
     RuleMotifIssue,
     RuleMotifIssueCode,
@@ -54,6 +56,7 @@ from cti_app.domain.rule_workbench import (
     RuleMotifValidationReport,
     RuleRoleTestReport,
     RuleRoleVersionComparison,
+    RuleStringHit,
     RuleTestCase,
     RuleTestCorpusRole,
     RuleTestError,
@@ -64,6 +67,7 @@ from cti_app.domain.rule_workbench import (
     RuleVersionComparison,
     YaraEngineResult,
     YaraExecutionStatus,
+    detect_file_format_magic,
 )
 
 
@@ -118,6 +122,53 @@ def rule_validation_reason(report: RuleTestReport) -> RuleValidationReason:
     return RuleValidationReason.SAMPLE_BYTES_MISSING
 
 
+def validate_single_rule_candidate(rule_source: str) -> tuple[str, ...]:
+    """Reject source shapes that cannot represent one evidence-led YARA candidate."""
+    if not isinstance(rule_source, str) or not rule_source.strip():
+        return ("rule_source_empty",)
+    source = re.sub(r"(?s)/\*.*?\*/", "", rule_source)
+    source = re.sub(r"(?m)//[^\n]*$", "", source)
+    declarations = re.findall(
+        r"(?i)\b(?:(?:private|global)\s+)*rule\s+[A-Za-z_][A-Za-z0-9_]*\b",
+        source,
+    )
+    reasons: list[str] = []
+    if len(declarations) != 1:
+        reasons.append("exactly_one_rule_required")
+    condition_match = re.search(r"(?is)\bcondition\s*:\s*(.*?)(?:\}\s*)?$", source)
+    condition = condition_match.group(1).strip() if condition_match else ""
+    if not condition:
+        reasons.append("condition_required")
+    strings_match = re.search(r"(?is)\bstrings\s*:\s*(.*?)\bcondition\s*:", source)
+    strings_section = strings_match.group(1) if strings_match else ""
+    string_defs = tuple(
+        re.finditer(
+            r'\$[A-Za-z_][A-Za-z0-9_]*\s*=\s*(?:"(?:\\.|[^"\\])*"|\{[^}]*\}|/(?:\\.|[^/\\])+/)',
+            strings_section,
+        )
+    )
+    if not string_defs:
+        reasons.append("measured_string_or_byte_pattern_required")
+    condition_identifiers = re.findall(r"\$[A-Za-z_][A-Za-z0-9_]*", condition)
+    refers_to_all_defined_patterns = (
+        re.search(r"(?i)\b(?:any|all|\d+)\s+of\s+them\b", condition) is not None
+    )
+    if not condition_identifiers and not refers_to_all_defined_patterns:
+        reasons.append("condition_must_reference_measured_patterns")
+    if re.search(r"(?i)\bor\b", condition):
+        reasons.append("or_branches_disguised_as_multiple_rules_forbidden")
+    compact_condition = re.sub(r"\s+", "", condition).strip("()")
+    if re.search(r"(?i)\bhash\.sha256\s*\(", condition):
+        reasons.append("hash_equality_condition_forbidden")
+    if re.fullmatch(r"(?i)filesize==\d+(?:kb|mb|gb)?", compact_condition):
+        reasons.append("filesize_only_condition_forbidden")
+    if re.search(r'(?i)\bimport\s+["\']dotnet["\']', source) and not (
+        string_defs and (condition_identifiers or refers_to_all_defined_patterns)
+    ):
+        reasons.append("generic_dotnet_import_only_forbidden")
+    return tuple(dict.fromkeys(reasons))
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class YaraSampleInput:
     sample_sha256: str
@@ -135,6 +186,7 @@ class _MutableRoleResult(TypedDict):
     non_matches: set[str]
     non_measurable: set[str]
     errors: list[RuleTestError]
+    file_results: dict[str, RuleFileCoverage]
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -144,7 +196,7 @@ class RuleWorkbenchPolicy:
     minimum_string_entropy_bits: float = 2.2
     minimum_hex_entropy_bits: float = 1.2
     maximum_motifs: int = 128
-    maximum_source_bytes: int = 1_000_000
+    maximum_source_bytes: int = 512 * 1024 * 1024
     maximum_metadata_value_chars: int = 2048
     maximum_corpus_cases: int = 256
     maximum_sample_bytes: int = 64 * 1024 * 1024
@@ -263,6 +315,13 @@ class RuleWorkbench:
 
     def compile_check(self, rule_source: str) -> YaraEngineResult:
         """Compile generated rule source without evaluating it against a corpus."""
+        source_issues = validate_single_rule_candidate(rule_source)
+        if source_issues:
+            return YaraEngineResult(
+                status=YaraExecutionStatus.INVALID_INPUT,
+                engine_version="unavailable",
+                message="single-rule source guard: " + ",".join(source_issues),
+            )
         if len(rule_source.encode("utf-8")) > self._policy.maximum_source_bytes:
             return YaraEngineResult(
                 status=YaraExecutionStatus.RESOURCE_EXCEEDED,
@@ -815,25 +874,59 @@ class RuleWorkbench:
         coverage_statement: str,
         investigation_id: UUID | None = None,
     ) -> RuleTestReport:
-        if self._confined_analysis is not None:
-            return await self._compile_and_test_confined(
-                rule_source,
-                corpus,
-                selection_bias=selection_bias,
-                coverage_statement=coverage_statement,
-                investigation_id=investigation_id,
-            )
-        if self._yara_engine is None:
-            raise RuntimeError("no YARA execution port is configured")
         source_sha256 = hashlib.sha256(rule_source.encode("utf-8")).hexdigest()
         cases = _canonical_corpus(corpus)
         by_role: dict[RuleTestCorpusRole, list[RuleTestCase]] = {
             role: [case for case in cases if case.role is role] for role in RuleTestCorpusRole
         }
         results: dict[RuleTestCorpusRole, _MutableRoleResult] = {
-            role: {"matches": set(), "non_matches": set(), "non_measurable": set(), "errors": []}
+            role: {
+                "matches": set(),
+                "non_matches": set(),
+                "non_measurable": set(),
+                "errors": [],
+                "file_results": {},
+            }
             for role in RuleTestCorpusRole
         }
+        source_issues = validate_single_rule_candidate(rule_source)
+        if source_issues:
+            for role, role_cases in by_role.items():
+                for case in role_cases:
+                    results[role]["errors"].append(
+                        RuleTestError(
+                            code=RuleTestErrorCode.INVALID_SAMPLE,
+                            message="single-rule source guard: " + ",".join(source_issues),
+                            sample_sha256=case.sample_sha256,
+                        )
+                    )
+                    results[role]["file_results"][case.sample_sha256] = RuleFileCoverage(
+                        sample_sha256=case.sample_sha256,
+                        role=role,
+                        matched=None,
+                        format_magic=case.format_magic,
+                        details_complete=False,
+                        unavailable_strings=source_issues,
+                    )
+            return self._report(
+                source_sha256,
+                YaraExecutionStatus.INVALID_INPUT,
+                "unavailable",
+                by_role,
+                results,
+                selection_bias,
+                coverage_statement,
+            )
+        if self._confined_analysis is not None:
+            return await self._compile_and_test_confined(
+                rule_source,
+                cases,
+                selection_bias=selection_bias,
+                coverage_statement=coverage_statement,
+                investigation_id=investigation_id,
+            )
+        if self._yara_engine is None:
+            raise RuntimeError("no YARA execution port is configured")
         try:
             compilation = self._yara_engine.compile(rule_source)
         except Exception:
@@ -853,7 +946,16 @@ class RuleWorkbench:
                             message=compilation.message or status.value,
                             sample_sha256=case.sample_sha256,
                             line=compilation.line,
+                            column=compilation.column,
                         )
+                    )
+                    results[role]["file_results"][case.sample_sha256] = RuleFileCoverage(
+                        sample_sha256=case.sample_sha256,
+                        role=role,
+                        matched=None,
+                        format_magic=case.format_magic,
+                        details_complete=False,
+                        unavailable_strings=(status.value,),
                     )
             return self._report(
                 source_sha256,
@@ -930,9 +1032,25 @@ class RuleWorkbench:
             if case.sample_sha256 in unavailable:
                 non_measurable = role_result["non_measurable"]
                 non_measurable.add(case.sample_sha256)
+                role_result["file_results"][case.sample_sha256] = RuleFileCoverage(
+                    sample_sha256=case.sample_sha256,
+                    role=case.role,
+                    matched=None,
+                    format_magic=case.format_magic,
+                    details_complete=False,
+                    unavailable_strings=("sample_bytes_missing",),
+                )
             elif case.sample_sha256 in corpus_errors:
                 errors = role_result["errors"]
                 errors.append(corpus_errors[case.sample_sha256])
+                role_result["file_results"][case.sample_sha256] = RuleFileCoverage(
+                    sample_sha256=case.sample_sha256,
+                    role=case.role,
+                    matched=None,
+                    format_magic=case.format_magic,
+                    details_complete=False,
+                    unavailable_strings=("sample_bytes_unverified",),
+                )
 
         if sample_bytes:
             samples = tuple(
@@ -954,12 +1072,26 @@ class RuleWorkbench:
                     continue
                 role_result = results[case.role]
                 if matching.status is YaraExecutionStatus.OK:
+                    payload = sample_bytes[case.sample_sha256]
                     target = (
                         role_result["matches"]
                         if case.sample_sha256 in matched
                         else role_result["non_matches"]
                     )
                     target.add(case.sample_sha256)
+                    hits, unavailable_patterns = _extract_yara_string_hits(rule_source, payload)
+                    details_complete = not unavailable_patterns and (
+                        case.sample_sha256 not in matched or bool(hits)
+                    )
+                    role_result["file_results"][case.sample_sha256] = RuleFileCoverage(
+                        sample_sha256=case.sample_sha256,
+                        role=case.role,
+                        matched=case.sample_sha256 in matched,
+                        format_magic=detect_file_format_magic(payload),
+                        strings=hits,
+                        details_complete=details_complete,
+                        unavailable_strings=unavailable_patterns,
+                    )
                 else:
                     errors = role_result["errors"]
                     errors.append(
@@ -968,7 +1100,16 @@ class RuleWorkbench:
                             message=matching.message or matching.status.value,
                             sample_sha256=case.sample_sha256,
                             line=matching.line,
+                            column=matching.column,
                         )
+                    )
+                    role_result["file_results"][case.sample_sha256] = RuleFileCoverage(
+                        sample_sha256=case.sample_sha256,
+                        role=case.role,
+                        matched=None,
+                        format_magic=detect_file_format_magic(sample_bytes[case.sample_sha256]),
+                        details_complete=False,
+                        unavailable_strings=(matching.status.value,),
                     )
         return self._report(
             source_sha256,
@@ -996,7 +1137,13 @@ class RuleWorkbench:
             role: [case for case in cases if case.role is role] for role in RuleTestCorpusRole
         }
         results: dict[RuleTestCorpusRole, _MutableRoleResult] = {
-            role: {"matches": set(), "non_matches": set(), "non_measurable": set(), "errors": []}
+            role: {
+                "matches": set(),
+                "non_matches": set(),
+                "non_measurable": set(),
+                "errors": [],
+                "file_results": {},
+            }
             for role in RuleTestCorpusRole
         }
         family = self._confined_analysis.family_statuses.get("yara")
@@ -1022,7 +1169,7 @@ class RuleWorkbench:
                 coverage_statement,
                 "corpus exceeds the configured case count",
             )
-        if len(rule_source.encode("utf-8")) > min(self._policy.maximum_source_bytes, 256_000):
+        if len(rule_source.encode("utf-8")) > self._policy.maximum_source_bytes:
             return self._limit_failure_report(
                 source_sha256,
                 engine_version,
@@ -1036,6 +1183,14 @@ class RuleWorkbench:
         if not callable(resolver):
             for case in cases:
                 results[case.role]["non_measurable"].add(case.sample_sha256)
+                results[case.role]["file_results"][case.sample_sha256] = RuleFileCoverage(
+                    sample_sha256=case.sample_sha256,
+                    role=case.role,
+                    matched=None,
+                    format_magic=case.format_magic,
+                    details_complete=False,
+                    unavailable_strings=("sample_bytes_missing",),
+                )
             return self._report(
                 source_sha256,
                 status,
@@ -1058,6 +1213,16 @@ class RuleWorkbench:
                 for same_sample in cases:
                     if same_sample.sample_sha256 == case.sample_sha256:
                         results[same_sample.role]["non_measurable"].add(case.sample_sha256)
+                        results[same_sample.role]["file_results"][case.sample_sha256] = (
+                            RuleFileCoverage(
+                                sample_sha256=case.sample_sha256,
+                                role=same_sample.role,
+                                matched=None,
+                                format_magic=same_sample.format_magic,
+                                details_complete=False,
+                                unavailable_strings=("sample_bytes_missing",),
+                            )
+                        )
                 continue
             response = await self._confined_analysis.execute(
                 ConfinedAnalysisRequest(
@@ -1089,6 +1254,16 @@ class RuleWorkbench:
                                 code=RuleTestErrorCode.INVALID_SAMPLE,
                                 message=message[:1000],
                                 sample_sha256=case.sample_sha256,
+                            )
+                        )
+                        results[same_sample.role]["file_results"][case.sample_sha256] = (
+                            RuleFileCoverage(
+                                sample_sha256=case.sample_sha256,
+                                role=same_sample.role,
+                                matched=None,
+                                format_magic=same_sample.format_magic,
+                                details_complete=False,
+                                unavailable_strings=("sample_not_measurable",),
                             )
                         )
                 continue
@@ -1128,6 +1303,19 @@ class RuleWorkbench:
                                 line=worker_result.get("line")
                                 if isinstance(worker_result.get("line"), int)
                                 else None,
+                                column=worker_result.get("column")
+                                if isinstance(worker_result.get("column"), int)
+                                else None,
+                            )
+                        )
+                        results[same_sample.role]["file_results"][case.sample_sha256] = (
+                            RuleFileCoverage(
+                                sample_sha256=case.sample_sha256,
+                                role=same_sample.role,
+                                matched=None,
+                                format_magic=same_sample.format_magic,
+                                details_complete=False,
+                                unavailable_strings=(worker_status.value,),
                             )
                         )
                 if worker_status in {
@@ -1139,10 +1327,63 @@ class RuleWorkbench:
                     break
                 continue
             matched = worker_result.get("matches") is True
+            raw_hits = worker_result.get("string_hits")
+            raw_unavailable = worker_result.get("unavailable_strings")
+            hits: list[RuleStringHit] = []
+            coverage_unavailable: list[str] = []
+            if isinstance(raw_hits, Sequence) and not isinstance(raw_hits, str | bytes):
+                for item in raw_hits[:256]:
+                    if not isinstance(item, Mapping):
+                        continue
+                    identifier = item.get("identifier")
+                    offsets = item.get("offsets")
+                    if (
+                        not isinstance(identifier, str)
+                        or not identifier
+                        or not isinstance(offsets, Sequence)
+                        or isinstance(offsets, str | bytes)
+                        or len(offsets) > 256
+                        or any(type(offset) is not int or offset < 0 for offset in offsets)
+                    ):
+                        continue
+                    hits.append(RuleStringHit(identifier=identifier, offsets=tuple(offsets)))
+            else:
+                coverage_unavailable.append("worker_coverage_metadata_missing")
+            if isinstance(raw_unavailable, Sequence) and not isinstance(
+                raw_unavailable, str | bytes
+            ):
+                coverage_unavailable.extend(
+                    item[:160] for item in raw_unavailable[:256] if isinstance(item, str) and item
+                )
+            else:
+                coverage_unavailable.append("worker_coverage_metadata_missing")
+            unavailable_patterns = tuple(sorted(set(coverage_unavailable)))
+            format_magic_value = worker_result.get("format_magic")
+            format_magic = (
+                format_magic_value
+                if isinstance(format_magic_value, str) and format_magic_value.strip()
+                else case.format_magic
+            )
+            details_complete = (
+                worker_result.get("coverage_details_complete") is True
+                and not unavailable_patterns
+                and (not matched or bool(hits))
+            )
             for same_sample in cases:
                 if same_sample.sample_sha256 == case.sample_sha256:
                     results[same_sample.role]["matches" if matched else "non_matches"].add(
                         case.sample_sha256
+                    )
+                    results[same_sample.role]["file_results"][case.sample_sha256] = (
+                        RuleFileCoverage(
+                            sample_sha256=case.sample_sha256,
+                            role=same_sample.role,
+                            matched=matched,
+                            format_magic=format_magic,
+                            strings=tuple(hits),
+                            details_complete=details_complete,
+                            unavailable_strings=unavailable_patterns,
+                        )
                     )
         if (
             status is YaraExecutionStatus.OK
@@ -1403,6 +1644,25 @@ class RuleWorkbench:
         for role in RuleTestCorpusRole:
             result = results[role]
             errors = result["errors"]
+            file_results = dict(result["file_results"])
+            for case in by_role[role]:
+                file_results.setdefault(
+                    case.sample_sha256,
+                    RuleFileCoverage(
+                        sample_sha256=case.sample_sha256,
+                        role=role,
+                        matched=(
+                            True
+                            if case.sample_sha256 in result["matches"]
+                            else False
+                            if case.sample_sha256 in result["non_matches"]
+                            else None
+                        ),
+                        format_magic=case.format_magic,
+                        details_complete=False,
+                        unavailable_strings=("coverage_details_unavailable",),
+                    ),
+                )
             role_reports.append(
                 RuleRoleTestReport(
                     role=role,
@@ -1412,6 +1672,10 @@ class RuleWorkbench:
                     non_matches=tuple(sorted(result["non_matches"])),
                     non_measurable=tuple(sorted(result["non_measurable"])),
                     errors=tuple(errors),
+                    file_results=tuple(
+                        file_results[case.sample_sha256]
+                        for case in sorted(by_role[role], key=lambda item: item.sample_sha256)
+                    ),
                 )
             )
         coverage_statement = _coverage_with_provenance(coverage_statement, role_reports)
@@ -1445,6 +1709,7 @@ class RuleWorkbench:
             result["non_matches"].clear()
             result["non_measurable"].clear()
             result["errors"].clear()
+            result["file_results"].clear()
             result["errors"].extend(
                 RuleTestError(
                     code=RuleTestErrorCode.RESOURCE_EXCEEDED,
@@ -1564,6 +1829,86 @@ def _is_generic_dotnet_import(value: str) -> bool:
 def is_generic_dotnet_import(value: str) -> bool:
     """Shared detector used by rule admission and its persisted provenance."""
     return _is_generic_dotnet_import(value)
+
+
+def _extract_yara_string_hits(
+    source: str, data: bytes
+) -> tuple[tuple[RuleStringHit, ...], tuple[str, ...]]:
+    """Report literal/hex/regex YARA string offsets without executing sample bytes."""
+    strings_match = re.search(r"(?is)\bstrings\s*:\s*(.*?)\bcondition\s*:", source)
+    if strings_match is None:
+        return (), ("strings_section",)
+    definition = re.compile(
+        r"(\$[A-Za-z_][A-Za-z0-9_]*)\s*=\s*"
+        r'("(?:\\.|[^"\\])*"|\{[^}]*\}|/(?:\\.|[^/\\])+/)\s*([^\n]*)'
+    )
+    hits: list[RuleStringHit] = []
+    unavailable: list[str] = []
+    for match in definition.finditer(strings_match.group(1)):
+        identifier, raw_pattern, raw_modifiers = match.groups()
+        modifiers = set(raw_modifiers.casefold().split())
+        unsupported_modifiers = modifiers - {"ascii", "wide", "nocase", "fullword"}
+        if unsupported_modifiers or ("wide" in modifiers and raw_pattern.startswith("/")):
+            unavailable.append(identifier)
+            continue
+        flags = re.IGNORECASE if "nocase" in modifiers else 0
+        try:
+            if raw_pattern.startswith('"'):
+                value = ast.literal_eval(raw_pattern)
+                if not isinstance(value, str) or not value:
+                    unavailable.append(identifier)
+                    continue
+                encodings: list[bytes] = []
+                if "ascii" in modifiers or "wide" not in modifiers:
+                    encodings.append(value.encode("utf-8"))
+                if "wide" in modifiers:
+                    encodings.append(value.encode("utf-16le"))
+                patterns = [
+                    re.compile(b"(?=(" + re.escape(item) + b"))", flags) for item in encodings
+                ]
+            elif raw_pattern.startswith("{"):
+                tokens = raw_pattern[1:-1].split()
+                if not tokens or any(
+                    re.fullmatch(r"[0-9a-fA-F]{2}|\?\?", item) is None for item in tokens
+                ):
+                    unavailable.append(identifier)
+                    continue
+                expression = b"".join(
+                    b"[\\s\\S]" if token == "??" else re.escape(bytes.fromhex(token))
+                    for token in tokens
+                )
+                patterns = [re.compile(b"(?=(" + expression + b"))")]
+            else:
+                regex_text = raw_pattern[1:-1]
+                patterns = [re.compile(b"(?=(" + regex_text.encode("utf-8") + b"))", flags)]
+        except (SyntaxError, ValueError, UnicodeEncodeError, re.error):
+            unavailable.append(identifier)
+            continue
+
+        offsets: set[int] = set()
+        for pattern in patterns:
+            for found in pattern.finditer(data):
+                offset = found.start(1)
+                if "fullword" in modifiers:
+                    before = data[offset - 1] if offset else None
+                    end = found.end(1)
+                    after = data[end] if end < len(data) else None
+
+                    def word(item: int | None) -> bool:
+                        return item is not None and (
+                            48 <= item <= 57 or 65 <= item <= 90 or 97 <= item <= 122 or item == 95
+                        )
+
+                    if word(before) or word(after):
+                        continue
+                offsets.add(offset)
+                if len(offsets) > 256:
+                    unavailable.append(identifier)
+                    offsets = set(sorted(offsets)[:256])
+                    break
+        if offsets:
+            hits.append(RuleStringHit(identifier=identifier, offsets=tuple(sorted(offsets))))
+    return tuple(sorted(hits, key=lambda item: item.identifier)), tuple(sorted(set(unavailable)))
 
 
 def _motif_matches_at(motif: RuleMotif, data: bytes, offset: int) -> bool:

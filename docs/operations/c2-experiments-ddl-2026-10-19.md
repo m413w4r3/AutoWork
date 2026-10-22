@@ -1,10 +1,12 @@
 # C2 experiment storage DDL (2026-10-19)
 
 The additive DDL below was applied to the live PostgreSQL database on
-2026-10-19 under the already-recorded authorization. The repository target
-schema is represented by the mutable `0001_baseline` (repository policy forbids
-additional revisions; a `0002` bridge revision was prototyped and removed). The
-live database already holds the objects and stays stamped `0001_baseline`.
+2026-10-19 under the already-recorded authorization. At that time, the
+repository still used a mutable `0001_baseline` and had no `0002` revision.
+The decision recorded in ADR-0007 freezes `0001_baseline` at the pre-C2 shape
+and restores an additive `0002_c2_experiments` revision. The live database
+still holds these objects and remains stamped `0001_baseline` until an
+operator runs the documented backup, preflight and upgrade procedure.
 
 ```sql
 CREATE TABLE investigation_experiment_heads (
@@ -148,9 +150,10 @@ all experiments; any `supports` plus `refutes` pair produces `qualified` with
 ## Destructive rollback SQL (not executed)
 
 This SQL discards the complete C2 experiment history. It was not run and is
-not part of the authorized additive change. Do not run it against live without
-a separate approved database change plan and preservation of any required
-records.
+not part of the additive migration. The `0002` downgrade refuses to proceed
+when experiment or head rows exist. Downgrade is for disposable fixtures only;
+never run it against the live database, even when the current row counts are
+zero.
 
 ```sql
 DROP TRIGGER IF EXISTS trg_investigation_experiments_append_only

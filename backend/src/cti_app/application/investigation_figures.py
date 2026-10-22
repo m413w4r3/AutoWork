@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import date
 from typing import Any
 from urllib.parse import urlsplit
@@ -29,6 +30,11 @@ _INFRASTRUCTURE_GRAPH_FIGURE_POLICY_VERSION = (
     "investigation-infrastructure-figure-v1-canonical-edges"
 )
 _SHA256 = frozenset("0123456789abcdef")
+_DISPLAY_UUID = re.compile(
+    r"(?<![0-9a-f])[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![0-9a-f])",
+    re.IGNORECASE,
+)
+_DISPLAY_HASH = re.compile(r"(?<![0-9a-f])[0-9a-f]{32,64}(?![0-9a-f])", re.IGNORECASE)
 
 
 def _is_sha256(value: str | None) -> bool:
@@ -246,7 +252,7 @@ def build_investigation_graph_figure(
         basis_label = _GRAPH_BASIS_LABELS[edge.evidence_basis]
         confidence_label = _GRAPH_CONFIDENCE_LABELS[edge.confidence]
         timestamp = edge.observed_at.isoformat() if edge.observed_at else "date non fournie"
-        edge_label = edge.relation
+        edge_label = _GRAPH_RELATION_LABELS.get(edge.relation, edge.relation.replace("_", " "))
         connector = "--" if edge.direction is InvestigationGraphDirection.UNDIRECTED else "->"
         d2_lines.extend(
             (
@@ -267,6 +273,9 @@ def build_investigation_graph_figure(
                 "source_value": from_node.value,
                 "target_value": to_node.value,
                 "relation": edge.relation,
+                "relation_label": _GRAPH_RELATION_LABELS.get(
+                    edge.relation, edge.relation.replace("_", " ")
+                ),
                 "direction": edge.direction.value,
                 "direction_label": _GRAPH_DIRECTION_LABELS[edge.direction],
                 "direction_symbol": _GRAPH_DIRECTION_SYMBOLS[edge.direction],
@@ -360,6 +369,15 @@ _GRAPH_DIRECTION_SYMBOLS = {
     InvestigationGraphDirection.ARTICLE_TO_IOC: "→",
     InvestigationGraphDirection.UNDIRECTED: "↔",
 }
+_GRAPH_RELATION_LABELS = {
+    "observed_contact": "contact observé",
+    "contacted_domains": "domaines contactés",
+    "resolves_to": "résout vers",
+    "resolved_to": "résout vers",
+    "downloads": "télécharge",
+    "hosts": "héberge",
+    "communicates_with": "communique avec",
+}
 _GRAPH_BASIS_LABELS = {
     InvestigationGraphEvidenceBasis.OBSERVED: "fait observé",
     InvestigationGraphEvidenceBasis.PROVIDER_ASSERTION: "affirmation fournisseur",
@@ -375,12 +393,15 @@ _GRAPH_CONFIDENCE_LABELS = {
 
 
 def _graph_node_display_label(kind: InvestigationGraphNodeKind, value: str, label: str) -> str:
-    if kind is InvestigationGraphNodeKind.FILE_SHA256 and _is_sha256(value):
-        return f"SHA-256 · {value[:12]}…{value[-8:]}"
+    if kind is InvestigationGraphNodeKind.FILE_SHA256:
+        return "Empreinte de fichier"
     if kind is InvestigationGraphNodeKind.URL:
         parsed = urlsplit(value)
-        return f"URL · {parsed.hostname or 'URL'}{parsed.path[:44]}"
-    return label
+        label = f"URL · {parsed.hostname or 'URL'}{parsed.path[:44]}"
+    label = _DISPLAY_UUID.sub("", label)
+    label = _DISPLAY_HASH.sub("", label)
+    label = re.sub(r"[_\s]+", " ", label).strip(" ·|,:;-—")
+    return label or "Indicateur réseau"
 
 
 def _escape_d2_literal(value: str) -> str:

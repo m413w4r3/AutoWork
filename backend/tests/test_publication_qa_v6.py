@@ -44,6 +44,7 @@ def test_qa_v6_keeps_v5_projection_and_checks_conditional_section_order() -> Non
         "references",
         "synthesis",
         "analyst_opinion",
+        "technical_annex",
     ]
 
 

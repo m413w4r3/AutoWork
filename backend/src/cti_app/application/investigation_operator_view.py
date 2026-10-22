@@ -82,8 +82,8 @@ def build_investigation_operator_view(
         "last_advice": None,
         "reminder": "Bridge: sortie non fiable; valider chaque suggestion par des mesures.",
         "advisor_turns_used": 0,
-        "advisor_turn_limit": 8,
-        "advisor_turns_remaining": 8,
+        "advisor_turn_limit": None,
+        "advisor_turns_remaining": None,
         "truncated": False,
     }
     ordered_jobs = tuple(sorted(jobs, key=lambda item: (item.created_at, item.id.hex)))
@@ -198,7 +198,7 @@ def build_investigation_operator_view(
 
     dimensions = envelope.budget if envelope is not None else None
     fallback_limits = {
-        BudgetDimension.BRIDGE_TURNS: investigation.budget.max_cycles,
+        BudgetDimension.BRIDGE_TURNS: None,
         BudgetDimension.VT_UNITS: 0,
         BudgetDimension.SHODAN_CREDITS: 0,
         BudgetDimension.DOWNLOADS: 0,

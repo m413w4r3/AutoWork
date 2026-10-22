@@ -1088,6 +1088,7 @@ class _IntelligenceSearchAdapter(_VirusTotalAdapter):
                             break
                         candidate_summary = {
                             "effective_query": query,
+                            "justification": justification,
                             "candidate": descriptor,
                             "page": page_index + 1,
                             "evidence_refs": [str(item) for item in evidence_refs],

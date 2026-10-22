@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
@@ -34,6 +34,77 @@ class OpinionBlockType(StrEnum):
     PROPOSED_DETECTIONS = "proposed_detections"
     UNCERTAINTIES_AND_NEXT_LEADS = "uncertainties_and_next_leads"
     ANALYST_OBSERVATIONS = "analyst_observations"
+    IMPLANT_MATERIALS = "implant_materials"
+
+
+class ImplantMaterialType(StrEnum):
+    RC4_KEY = "rc4_key"
+    AES_KEY = "aes_key"
+    PASSPHRASE = "passphrase"
+    XOR_SCHEME = "xor_scheme"
+    ATTACKER_GITHUB_C2_TOKEN = "attacker_github_c2_token"
+    OTHER = "other"
+
+
+@dataclass(frozen=True, slots=True)
+class ImplantMaterialEditorialV1:
+    """A sourced sample value approved for clear-text CTI publication."""
+
+    type: ImplantMaterialType
+    value: str
+    role: str
+    sample_location: str
+    sample_sha256: str
+    evidence_observation_id: UUID
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.type, ImplantMaterialType):
+            raise TypeError("Implant material type must use ImplantMaterialType")
+        for name, value, maximum in (
+            ("value", self.value, 4096),
+            ("role", self.role, 300),
+            ("sample_location", self.sample_location, 500),
+        ):
+            if not isinstance(value, str) or not value.strip() or len(value) > maximum:
+                raise ValueError(f"Implant material {name} is invalid")
+            if any(ord(character) < 32 for character in value):
+                raise ValueError(f"Implant material {name} must fit on one line")
+        _validate_sha256(self.sample_sha256, "implant material sample_sha256")
+        if not isinstance(self.evidence_observation_id, UUID):
+            raise TypeError("Implant material evidence reference must be a UUID")
+
+    def to_payload(self) -> dict[str, str]:
+        return {
+            "type": self.type.value,
+            "value": self.value,
+            "role": self.role,
+            "sample_location": self.sample_location,
+            "sample_sha256": self.sample_sha256,
+            "evidence_observation_id": str(self.evidence_observation_id),
+        }
+
+    @classmethod
+    def from_payload(cls, value: object) -> ImplantMaterialEditorialV1:
+        expected = {
+            "type",
+            "value",
+            "role",
+            "sample_location",
+            "sample_sha256",
+            "evidence_observation_id",
+        }
+        if not isinstance(value, Mapping) or set(value) != expected:
+            raise ValueError("Implant material editorial payload has missing or unknown fields")
+        if any(not isinstance(value[key], str) for key in expected):
+            raise ValueError("Implant material editorial values must be text")
+        return cls(
+            type=ImplantMaterialType(value["type"]),
+            value=value["value"],
+            role=value["role"],
+            sample_location=value["sample_location"],
+            sample_sha256=value["sample_sha256"],
+            evidence_observation_id=UUID(value["evidence_observation_id"]),
+        )
 
 
 class OpinionClaimQualification(StrEnum):
@@ -123,6 +194,48 @@ def normalize_opinion_text(block_type: OpinionBlockType, text: str) -> str:
 
 
 @dataclass(frozen=True, slots=True)
+class BridgeDraftReferenceV1:
+    invocation_id: str
+    text_sha256: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.invocation_id, str)
+            or not self.invocation_id.strip()
+            or len(self.invocation_id) > 128
+        ):
+            raise ValueError("Bridge draft invocation identity is invalid")
+        _validate_sha256(self.text_sha256, "Bridge draft text hash")
+
+    def to_payload(self) -> dict[str, str]:
+        return {"invocation_id": self.invocation_id, "text_sha256": self.text_sha256}
+
+
+@dataclass(frozen=True, slots=True)
+class BridgeReviewReferenceV1:
+    invocation_id: str
+    output_sha256: str
+    reviewed_text_sha256: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.invocation_id, str)
+            or not self.invocation_id.strip()
+            or len(self.invocation_id) > 128
+        ):
+            raise ValueError("Bridge review invocation identity is invalid")
+        _validate_sha256(self.output_sha256, "Bridge review output hash")
+        _validate_sha256(self.reviewed_text_sha256, "Bridge reviewed text hash")
+
+    def to_payload(self) -> dict[str, str]:
+        return {
+            "invocation_id": self.invocation_id,
+            "output_sha256": self.output_sha256,
+            "reviewed_text_sha256": self.reviewed_text_sha256,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class OpinionBlock:
     block_type: OpinionBlockType
     text: str
@@ -130,6 +243,9 @@ class OpinionBlock:
     evidence_refs: tuple[UUID, ...] = ()
     qualification: OpinionClaimQualification = OpinionClaimQualification.FACT
     certainty: float = 0.5
+    bridge_authored: bool = False
+    bridge_draft_ref: BridgeDraftReferenceV1 | None = None
+    bridge_review_ref: BridgeReviewReferenceV1 | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.block_type, OpinionBlockType):
@@ -138,6 +254,29 @@ class OpinionBlock:
             raise TypeError("qualification must use OpinionClaimQualification")
         if isinstance(self.certainty, bool) or not 0.0 <= self.certainty <= 1.0:
             raise ValueError("Opinion certainty must be between 0 and 1")
+        if not isinstance(self.bridge_authored, bool):
+            raise TypeError("Bridge authorship marker must be boolean")
+        if self.bridge_draft_ref is not None and not isinstance(
+            self.bridge_draft_ref, BridgeDraftReferenceV1
+        ):
+            raise TypeError("Bridge draft reference is invalid")
+        if self.bridge_review_ref is not None and not isinstance(
+            self.bridge_review_ref, BridgeReviewReferenceV1
+        ):
+            raise TypeError("Bridge review reference is invalid")
+        if self.bridge_draft_ref is not None:
+            expected_text_sha = hashlib.sha256(self.text.encode("utf-8")).hexdigest()
+            if self.bridge_draft_ref.text_sha256 != expected_text_sha:
+                raise ValueError("Bridge draft reference does not match opinion text")
+            object.__setattr__(self, "bridge_authored", True)
+        if self.bridge_authored and self.bridge_draft_ref is None:
+            raise ValueError("Bridge-authored opinion blocks require a draft reference")
+        if self.bridge_review_ref is not None:
+            if self.bridge_draft_ref is None:
+                raise ValueError("Bridge review reference requires a Bridge draft reference")
+            expected_text_sha = hashlib.sha256(self.text.encode("utf-8")).hexdigest()
+            if self.bridge_review_ref.reviewed_text_sha256 != expected_text_sha:
+                raise ValueError("Bridge review reference does not match reviewed opinion text")
         object.__setattr__(self, "finding_refs", tuple(self.finding_refs))
         object.__setattr__(self, "evidence_refs", tuple(self.evidence_refs))
 
@@ -166,6 +305,10 @@ class AnalystObservationV1:
     relation: AnalystObservationRelation
     finding_refs: tuple[UUID, ...] = ()
     evidence_refs: tuple[UUID, ...] = ()
+    bridge_authored: bool = False
+    bridge_block_type: OpinionBlockType | None = None
+    bridge_draft_ref: BridgeDraftReferenceV1 | None = None
+    bridge_review_ref: BridgeReviewReferenceV1 | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.id, UUID):
@@ -178,6 +321,37 @@ class AnalystObservationV1:
             raise TypeError("Analyst observation state must use AnalystObservationState")
         if not isinstance(self.relation, AnalystObservationRelation):
             raise TypeError("Analyst observation relation must use AnalystObservationRelation")
+        if not isinstance(self.bridge_authored, bool):
+            raise TypeError("Bridge authorship marker must be boolean")
+        if self.bridge_block_type is not None and (
+            not isinstance(self.bridge_block_type, OpinionBlockType)
+            or self.bridge_block_type
+            in {OpinionBlockType.ANALYST_OBSERVATIONS, OpinionBlockType.IMPLANT_MATERIALS}
+        ):
+            raise ValueError("Bridge analyst-note target block type is invalid")
+        if self.bridge_draft_ref is not None and not isinstance(
+            self.bridge_draft_ref, BridgeDraftReferenceV1
+        ):
+            raise TypeError("Bridge draft reference is invalid")
+        if self.bridge_review_ref is not None and not isinstance(
+            self.bridge_review_ref, BridgeReviewReferenceV1
+        ):
+            raise TypeError("Bridge review reference is invalid")
+        if self.bridge_draft_ref is not None:
+            expected_text_sha = hashlib.sha256(self.text.encode("utf-8")).hexdigest()
+            if self.bridge_draft_ref.text_sha256 != expected_text_sha:
+                raise ValueError("Bridge draft reference does not match analyst note")
+            object.__setattr__(self, "bridge_authored", True)
+        if self.bridge_authored and self.bridge_draft_ref is None:
+            raise ValueError("Bridge-authored analyst notes require a draft reference")
+        if self.bridge_draft_ref is not None and self.bridge_block_type is None:
+            raise ValueError("Bridge-authored analyst notes require a target block type")
+        if self.bridge_review_ref is not None:
+            if self.bridge_draft_ref is None:
+                raise ValueError("Bridge review reference requires a Bridge draft reference")
+            expected_text_sha = hashlib.sha256(self.text.encode("utf-8")).hexdigest()
+            if self.bridge_review_ref.reviewed_text_sha256 != expected_text_sha:
+                raise ValueError("Bridge review reference does not match reviewed analyst note")
         object.__setattr__(self, "finding_refs", tuple(self.finding_refs))
         object.__setattr__(self, "evidence_refs", tuple(self.evidence_refs))
         if any(not isinstance(item, UUID) for item in self.finding_refs + self.evidence_refs):
@@ -195,7 +369,7 @@ class AnalystObservationV1:
             raise ValueError("Observed analyst notes require explicit evidence references")
 
     def to_payload(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "id": str(self.id),
             "anchor": self.anchor,
             "text": self.text,
@@ -204,10 +378,22 @@ class AnalystObservationV1:
             "finding_refs": [str(ref) for ref in self.finding_refs],
             "evidence_refs": [str(ref) for ref in self.evidence_refs],
         }
+        if self.bridge_authored or self.bridge_review_ref is not None:
+            payload["bridge_authored"] = self.bridge_authored
+            payload["bridge_block_type"] = (
+                self.bridge_block_type.value if self.bridge_block_type is not None else None
+            )
+            payload["bridge_draft_ref"] = (
+                self.bridge_draft_ref.to_payload() if self.bridge_draft_ref is not None else None
+            )
+            payload["bridge_review_ref"] = (
+                self.bridge_review_ref.to_payload() if self.bridge_review_ref is not None else None
+            )
+        return payload
 
     @classmethod
     def from_payload(cls, value: object) -> AnalystObservationV1:
-        expected = {
+        legacy_expected = {
             "id",
             "anchor",
             "text",
@@ -216,7 +402,16 @@ class AnalystObservationV1:
             "finding_refs",
             "evidence_refs",
         }
-        if not isinstance(value, Mapping) or set(value) != expected:
+        expected = legacy_expected | {
+            "bridge_authored",
+            "bridge_block_type",
+            "bridge_draft_ref",
+            "bridge_review_ref",
+        }
+        if not isinstance(value, Mapping) or frozenset(value) not in {
+            frozenset(legacy_expected),
+            frozenset(expected),
+        }:
             raise ValueError("Analyst observation payload has missing or unknown fields")
         if any(
             not isinstance(value[key], str) for key in ("id", "anchor", "text", "state", "relation")
@@ -230,6 +425,9 @@ class AnalystObservationV1:
             raise ValueError("Analyst observation references must be lists")
         if any(not isinstance(item, str) for item in (*finding_refs, *evidence_refs)):
             raise ValueError("Analyst observation reference IDs must be strings")
+        bridge_authored = value.get("bridge_authored", False)
+        raw_draft_ref = value.get("bridge_draft_ref")
+        raw_review_ref = value.get("bridge_review_ref")
         return cls(
             id=UUID(value["id"]),
             anchor=value["anchor"],
@@ -238,6 +436,14 @@ class AnalystObservationV1:
             relation=AnalystObservationRelation(value["relation"]),
             finding_refs=tuple(UUID(item) for item in finding_refs),
             evidence_refs=tuple(UUID(item) for item in evidence_refs),
+            bridge_authored=bridge_authored,
+            bridge_block_type=(
+                OpinionBlockType(value["bridge_block_type"])
+                if value.get("bridge_block_type") is not None
+                else None
+            ),
+            bridge_draft_ref=_draft_ref_from_payload(raw_draft_ref),
+            bridge_review_ref=_review_ref_from_payload(raw_review_ref),
         )
 
 
@@ -387,7 +593,30 @@ class AnalystOpinionV1:
             raise ValueError("An opinion must attach all three protocol views together")
         if len(figure_kinds) != len(set(figure_kinds)):
             raise ValueError("An opinion must not repeat a protocol figure kind")
-        _ = self.observations
+        notes = self.observations
+        materials = self.implant_materials
+        _ = self.implant_materials_section
+        if len(
+            {
+                (item.type, item.value, item.sample_sha256, item.sample_location)
+                for item in materials
+            }
+        ) != len(materials):
+            raise ValueError("Implant material editorial items must be unique")
+        hydrated_blocks = _hydrate_bridge_block_refs(self.blocks)
+        if hydrated_blocks != self.blocks:
+            object.__setattr__(self, "blocks", hydrated_blocks)
+        if any(
+            block.bridge_draft_ref is not None or block.bridge_review_ref is not None
+            for block in self.blocks
+            if block.block_type
+            not in {OpinionBlockType.ANALYST_OBSERVATIONS, OpinionBlockType.IMPLANT_MATERIALS}
+        ):
+            object.__setattr__(
+                self,
+                "blocks",
+                opinion_blocks_with_observations(self.blocks, notes),
+            )
         block_types = tuple(block.block_type for block in self.blocks)
         if len(block_types) != len(set(block_types)):
             raise ValueError("An opinion may contain each block type only once")
@@ -401,8 +630,76 @@ class AnalystOpinionV1:
         return tuple(
             block
             for block in self.blocks
-            if block.is_renderable and block.block_type is not OpinionBlockType.ANALYST_OBSERVATIONS
+            if block.is_renderable
+            and block.block_type
+            not in {OpinionBlockType.ANALYST_OBSERVATIONS, OpinionBlockType.IMPLANT_MATERIALS}
         )
+
+    @property
+    def implant_materials(self) -> tuple[ImplantMaterialEditorialV1, ...]:
+        payload = self._implant_material_payload()
+        if payload is None:
+            return ()
+        result = tuple(ImplantMaterialEditorialV1.from_payload(item) for item in payload["items"])
+        if not result or len(result) > 100:
+            raise ValueError("An opinion must contain between 1 and 100 implant-material items")
+        return result
+
+    @property
+    def implant_materials_section(self) -> OpinionBlock | None:
+        """Return the editorial text and its Bridge refs beside typed material values."""
+        payload = self._implant_material_payload()
+        if payload is None:
+            return None
+        text = payload.get("editorial_text")
+        draft_payload = payload.get("bridge_draft_ref")
+        review_payload = payload.get("bridge_review_ref")
+        bridge_authored = payload.get("bridge_authored", False)
+        if not isinstance(bridge_authored, bool):
+            raise ValueError("Opinion implant-material authorship marker is invalid")
+        if text is None:
+            if bridge_authored or draft_payload is not None or review_payload is not None:
+                raise ValueError("Implant-material Bridge references require editorial text")
+            return None
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("Opinion implant-material editorial text is invalid")
+        draft_ref = _draft_ref_from_payload(draft_payload)
+        review_ref = _review_ref_from_payload(review_payload)
+        return OpinionBlock(
+            block_type=OpinionBlockType.IMPLANT_MATERIALS,
+            text=text,
+            bridge_authored=bridge_authored,
+            bridge_draft_ref=draft_ref,
+            bridge_review_ref=review_ref,
+        )
+
+    def _implant_material_payload(self) -> dict[str, Any] | None:
+        payload_blocks = [
+            block for block in self.blocks if block.block_type is OpinionBlockType.IMPLANT_MATERIALS
+        ]
+        if not payload_blocks:
+            return None
+        if len(payload_blocks) != 1:
+            raise ValueError("Opinion must contain one implant-material projection block")
+        try:
+            payload = json.loads(payload_blocks[0].text)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Opinion implant-material projection is invalid JSON") from exc
+        optional = {
+            "editorial_text",
+            "bridge_authored",
+            "bridge_draft_ref",
+            "bridge_review_ref",
+        }
+        if (
+            not isinstance(payload, dict)
+            or not {"schema", "items"}.issubset(payload)
+            or set(payload) - ({"schema", "items"} | optional)
+            or payload["schema"] != "implant-materials.v1"
+            or not isinstance(payload["items"], list)
+        ):
+            raise ValueError("Opinion implant-material projection is unsupported")
+        return payload
 
     @property
     def observations(self) -> tuple[AnalystObservationV1, ...]:
@@ -421,20 +718,37 @@ class AnalystOpinionV1:
             raise ValueError("Opinion analyst-observation projection is invalid JSON") from exc
         if (
             not isinstance(payload, dict)
-            or set(payload) != {"schema", "items"}
+            or set(payload)
+            not in (
+                {"schema", "items"},
+                {"schema", "items", "bridge_block_refs"},
+            )
             or payload["schema"] != "analyst-observations.v1"
             or not isinstance(payload["items"], list)
         ):
             raise ValueError("Opinion analyst-observation projection is unsupported")
         result = tuple(AnalystObservationV1.from_payload(item) for item in payload["items"])
-        if not result or len({item.id for item in result}) != len(result):
-            raise ValueError("Opinion analyst-observation identities must be unique and non-empty")
+        if len({item.id for item in result}) != len(result):
+            raise ValueError("Opinion analyst-observation identities must be unique")
+        if not result and not payload.get("bridge_block_refs"):
+            raise ValueError("Opinion analyst-observation projection must contain data")
         if len(result) > 100:
             raise ValueError("An opinion is limited to 100 analyst observations")
         return result
 
     def content_payload(self) -> dict[str, object]:
         """Return the stable JSON projection whose bytes are covered by content_sha256."""
+        block_payloads: list[dict[str, object]] = []
+        for block in self.blocks:
+            block_payload: dict[str, object] = {
+                "type": block.block_type.value,
+                "text": block.text,
+                "finding_refs": [str(ref) for ref in block.finding_refs],
+                "evidence_refs": [str(ref) for ref in block.evidence_refs],
+                "qualification": block.qualification.value,
+                "certainty": block.certainty,
+            }
+            block_payloads.append(block_payload)
         payload: dict[str, object] = {
             "schema": "analyst-opinion.v1",
             "id": str(self.id),
@@ -444,17 +758,7 @@ class AnalystOpinionV1:
             "synthesis_sha256": self.synthesis_sha256,
             "base_publication_artifact_id": str(self.base_publication_artifact_id),
             "base_publication_sha256": self.base_publication_sha256,
-            "blocks": [
-                {
-                    "type": block.block_type.value,
-                    "text": block.text,
-                    "finding_refs": [str(ref) for ref in block.finding_refs],
-                    "evidence_refs": [str(ref) for ref in block.evidence_refs],
-                    "qualification": block.qualification.value,
-                    "certainty": block.certainty,
-                }
-                for block in self.blocks
-            ],
+            "blocks": block_payloads,
             "unresolved_points": list(self.unresolved_points),
             "author_id": self.author_id,
             "reviewer_id": self.reviewer_id,
@@ -477,20 +781,55 @@ def _validate_sha256(value: str, name: str) -> None:
         raise ValueError(f"{name} must be lowercase SHA-256")
 
 
+def _draft_ref_from_payload(value: object) -> BridgeDraftReferenceV1 | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or set(value) != {"invocation_id", "text_sha256"}:
+        raise ValueError("Bridge draft reference has missing or unknown fields")
+    if not isinstance(value["invocation_id"], str) or not isinstance(value["text_sha256"], str):
+        raise ValueError("Bridge draft reference values are invalid")
+    return BridgeDraftReferenceV1(value["invocation_id"], value["text_sha256"])
+
+
+def _review_ref_from_payload(value: object) -> BridgeReviewReferenceV1 | None:
+    if value is None:
+        return None
+    expected = {"invocation_id", "output_sha256", "reviewed_text_sha256"}
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise ValueError("Bridge review reference has missing or unknown fields")
+    if any(not isinstance(value[key], str) for key in expected):
+        raise ValueError("Bridge review reference values are invalid")
+    return BridgeReviewReferenceV1(
+        invocation_id=value["invocation_id"],
+        output_sha256=value["output_sha256"],
+        reviewed_text_sha256=value["reviewed_text_sha256"],
+    )
+
+
 def opinion_blocks_with_observations(
     blocks: Iterable[OpinionBlock], observations: Iterable[AnalystObservationV1]
 ) -> tuple[OpinionBlock, ...]:
     """Persist the versioned note projection inside the existing immutable opinion payload."""
+    block_items = tuple(blocks)
     ordinary_blocks = tuple(
-        block for block in blocks if block.block_type is not OpinionBlockType.ANALYST_OBSERVATIONS
+        block
+        for block in block_items
+        if block.block_type
+        not in {OpinionBlockType.ANALYST_OBSERVATIONS, OpinionBlockType.IMPLANT_MATERIALS}
+    )
+    material_blocks = tuple(
+        block for block in block_items if block.block_type is OpinionBlockType.IMPLANT_MATERIALS
     )
     notes = tuple(observations)
-    if not notes:
-        return ordinary_blocks
+    bridge_refs = _bridge_block_refs(ordinary_blocks)
+    if not notes and not bridge_refs:
+        return (*ordinary_blocks, *material_blocks)
     payload = {
         "schema": "analyst-observations.v1",
         "items": [item.to_payload() for item in notes],
     }
+    if bridge_refs:
+        payload["bridge_block_refs"] = bridge_refs
     projection = OpinionBlock(
         block_type=OpinionBlockType.ANALYST_OBSERVATIONS,
         text=canonical_json_bytes(payload).decode("utf-8"),
@@ -499,7 +838,160 @@ def opinion_blocks_with_observations(
         qualification=OpinionClaimQualification.HYPOTHESIS,
         certainty=0.0,
     )
-    return (*ordinary_blocks, projection)
+    return (*ordinary_blocks, *material_blocks, projection)
+
+
+def opinion_blocks_with_implant_materials(
+    blocks: Iterable[OpinionBlock],
+    materials: Iterable[ImplantMaterialEditorialV1],
+    *,
+    section: OpinionBlock | None = None,
+) -> tuple[OpinionBlock, ...]:
+    """Persist typed sample material as a distinct, hash-covered opinion element."""
+    block_items = tuple(blocks)
+    ordinary_blocks = tuple(
+        block
+        for block in block_items
+        if block.block_type
+        not in {OpinionBlockType.ANALYST_OBSERVATIONS, OpinionBlockType.IMPLANT_MATERIALS}
+    )
+    observation_blocks = tuple(
+        block for block in block_items if block.block_type is OpinionBlockType.ANALYST_OBSERVATIONS
+    )
+    if section is None:
+        section = next(
+            (
+                block
+                for block in block_items
+                if block.block_type is OpinionBlockType.IMPLANT_MATERIALS
+            ),
+            None,
+        )
+    if section is not None and section.block_type is not OpinionBlockType.IMPLANT_MATERIALS:
+        raise TypeError("Implant material editorial section must target implant_materials")
+    material_items = tuple(materials)
+    if not material_items:
+        return (*ordinary_blocks, *observation_blocks)
+    if any(not isinstance(item, ImplantMaterialEditorialV1) for item in material_items):
+        raise TypeError("Implant material edits must contain ImplantMaterialEditorialV1 values")
+    payload: dict[str, object] = {
+        "schema": "implant-materials.v1",
+        "items": [item.to_payload() for item in material_items],
+    }
+    if section is not None:
+        payload.update(
+            {
+                "editorial_text": section.text,
+                "bridge_authored": section.bridge_authored,
+                "bridge_draft_ref": (
+                    section.bridge_draft_ref.to_payload()
+                    if section.bridge_draft_ref is not None
+                    else None
+                ),
+                "bridge_review_ref": (
+                    section.bridge_review_ref.to_payload()
+                    if section.bridge_review_ref is not None
+                    else None
+                ),
+            }
+        )
+    projection = OpinionBlock(
+        block_type=OpinionBlockType.IMPLANT_MATERIALS,
+        text=canonical_json_bytes(payload).decode("utf-8"),
+        finding_refs=(),
+        evidence_refs=(),
+        qualification=OpinionClaimQualification.FACT,
+        certainty=1.0,
+    )
+    return (*ordinary_blocks, projection, *observation_blocks)
+
+
+def _bridge_block_refs(blocks: tuple[OpinionBlock, ...]) -> list[dict[str, object]]:
+    refs: list[dict[str, object]] = []
+    for index, block in enumerate(blocks):
+        if block.bridge_draft_ref is None and block.bridge_review_ref is None:
+            continue
+        refs.append(
+            {
+                "block_index": index,
+                "block_type": block.block_type.value,
+                "text_sha256": hashlib.sha256(block.text.encode("utf-8")).hexdigest(),
+                "bridge_authored": block.bridge_authored,
+                "bridge_draft_ref": (
+                    block.bridge_draft_ref.to_payload()
+                    if block.bridge_draft_ref is not None
+                    else None
+                ),
+                "bridge_review_ref": (
+                    block.bridge_review_ref.to_payload()
+                    if block.bridge_review_ref is not None
+                    else None
+                ),
+            }
+        )
+    return refs
+
+
+def _hydrate_bridge_block_refs(blocks: tuple[OpinionBlock, ...]) -> tuple[OpinionBlock, ...]:
+    projections = [
+        block for block in blocks if block.block_type is OpinionBlockType.ANALYST_OBSERVATIONS
+    ]
+    if not projections:
+        return blocks
+    if len(projections) != 1:
+        raise ValueError("Opinion must contain one analyst-observation projection block")
+    try:
+        payload = json.loads(projections[0].text)
+    except json.JSONDecodeError as exc:
+        raise ValueError("Opinion analyst-observation projection is invalid JSON") from exc
+    if not isinstance(payload, Mapping):
+        raise ValueError("Opinion analyst-observation projection is invalid")
+    raw_refs = payload.get("bridge_block_refs", [])
+    if not isinstance(raw_refs, list) or len(raw_refs) > 32:
+        raise ValueError("Opinion Bridge block references are invalid")
+    ordinary = [
+        block for block in blocks if block.block_type is not OpinionBlockType.ANALYST_OBSERVATIONS
+    ]
+    hydrated = list(ordinary)
+    seen_indices: set[int] = set()
+    expected = {
+        "block_index",
+        "block_type",
+        "text_sha256",
+        "bridge_authored",
+        "bridge_draft_ref",
+        "bridge_review_ref",
+    }
+    for raw in raw_refs:
+        if not isinstance(raw, Mapping) or set(raw) != expected:
+            raise ValueError("Opinion Bridge block reference has invalid fields")
+        index = raw["block_index"]
+        if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < len(ordinary):
+            raise ValueError("Opinion Bridge block reference index is invalid")
+        if index in seen_indices:
+            raise ValueError("Opinion Bridge block reference index is duplicated")
+        seen_indices.add(index)
+        block = ordinary[index]
+        if (
+            raw["block_type"] != block.block_type.value
+            or raw["text_sha256"] != hashlib.sha256(block.text.encode("utf-8")).hexdigest()
+        ):
+            raise ValueError("Opinion Bridge block reference does not match its block")
+        if not isinstance(raw["bridge_authored"], bool):
+            raise ValueError("Opinion Bridge authorship marker is invalid")
+        hydrated[index] = replace(
+            block,
+            bridge_authored=raw["bridge_authored"],
+            bridge_draft_ref=_draft_ref_from_payload(raw["bridge_draft_ref"]),
+            bridge_review_ref=_review_ref_from_payload(raw["bridge_review_ref"]),
+        )
+    projection = projections[0]
+    original_projection_index = blocks.index(projection)
+    if original_projection_index != len(ordinary):
+        # The opinion repository keeps block order. Requiring the ledger last makes
+        # its stable indices independent from an in-place projection insertion.
+        raise ValueError("Opinion analyst-observation projection must follow body blocks")
+    return (*hydrated, projection)
 
 
 def _payload_text(payload: Mapping[str, Any], key: str) -> str:
@@ -617,6 +1109,11 @@ def verify_opinion_citations(
     observation_ids = {observation.id for observation in observations}
     violations: list[CitationViolation] = []
     for block in opinion.blocks:
+        if block.block_type in {
+            OpinionBlockType.ANALYST_OBSERVATIONS,
+            OpinionBlockType.IMPLANT_MATERIALS,
+        }:
+            continue
         referenced_findings: list[InvestigationFinding] = []
         for finding_ref in block.finding_refs:
             finding = finding_by_id.get(finding_ref)
@@ -719,6 +1216,8 @@ __all__ = [
     "AnalystObservationV1",
     "AnalystOpinionStatus",
     "AnalystOpinionV1",
+    "BridgeDraftReferenceV1",
+    "BridgeReviewReferenceV1",
     "CitationViolation",
     "CitationViolationCode",
     "OpinionBlock",

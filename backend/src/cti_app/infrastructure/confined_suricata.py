@@ -23,7 +23,7 @@ _RULE_HEADER = re.compile(
 _FORBIDDEN_RULE_DIRECTIVE = re.compile(r"\b(?:include|lua|filestore)\b", re.IGNORECASE)
 _RESERVED_SID_MIN = 9_900_000
 _RESERVED_SID_MAX = 9_999_999
-_MAX_RULE_BYTES = 65_536
+_DEFAULT_MAX_RULE_BYTES = 512 * 1024 * 1024
 
 
 def validate_suricata_rule_source(
@@ -31,16 +31,16 @@ def validate_suricata_rule_source(
     *,
     candidate_id: str | None = None,
     candidate_version: str | None = None,
-    max_bytes: int = _MAX_RULE_BYTES,
+    max_bytes: int = _DEFAULT_MAX_RULE_BYTES,
 ) -> str:
-    """Validate bounded alert-only rules and their reserved, versioned SIDs."""
+    """Validate alert-only rules and their reserved, versioned SIDs."""
     if not isinstance(source, str) or not source.strip():
         raise ValueError("suricata_rule_source_empty")
     try:
         encoded = source.encode("utf-8", "strict")
     except UnicodeEncodeError as exc:
         raise ValueError("suricata_rule_source_invalid_encoding") from exc
-    if len(encoded) > min(max_bytes, _MAX_RULE_BYTES):
+    if len(encoded) > max_bytes:
         raise ValueError("suricata_rule_source_too_large")
     if any(ord(character) < 32 and character not in "\r\n\t" for character in source):
         raise ValueError("suricata_rule_source_control_character")

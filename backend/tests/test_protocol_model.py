@@ -13,6 +13,7 @@ from uuid import UUID, uuid4, uuid5
 
 import pytest
 
+import cti_app.application.investigation_protocol_tools as protocol_tools_module
 from cti_app.application.investigation_protocol_tools import (
     NETWORK_PROTOCOL_COMPARE,
     NETWORK_PROTOCOL_DOCUMENT,
@@ -205,6 +206,26 @@ class _EvidenceRecorder:
             observed_at=observed_at,
             idempotency_key=idempotency_key,
         )
+
+
+class _IdempotentEvidenceRecorder(_EvidenceRecorder):
+    def __init__(self) -> None:
+        super().__init__()
+        self.observations_by_key: dict[str, EvidenceObservation] = {}
+        self.record_arguments: list[dict[str, Any]] = []
+
+    async def record_json(self, **kwargs: Any) -> EvidenceObservation:
+        idempotency_key = kwargs.get("idempotency_key")
+        if isinstance(idempotency_key, str) and idempotency_key in self.observations_by_key:
+            existing = self.observations_by_key[idempotency_key]
+            if existing.object_id != kwargs["object_id"]:
+                raise AssertionError("one idempotency key was reused for a different render")
+            return existing
+        self.record_arguments.append(dict(kwargs))
+        observation = await super().record_json(**kwargs)
+        if isinstance(idempotency_key, str):
+            self.observations_by_key[idempotency_key] = observation
+        return observation
 
 
 class _ProtocolModelStore:
@@ -1132,16 +1153,20 @@ async def test_documented_protocol_tool_cites_and_renders_without_capture() -> N
     assert rendered.output["protocol_model_blob_id"] == str(blob_id)
     views = rendered.output["diagrams"]
     assert {item["kind"] for item in views} == {item.value for item in ProtocolDiagramKind}
-    assert all(
-        "documenté, non observé" in item["title"].casefold()
-        and "documenté, non observé" in " ".join(item["limitations"]).casefold()
-        for item in views
+    assert all("documenté, non observé" not in item["title"].casefold() for item in views)
+    assert all(len(item["title"]) <= 72 for item in views)
+    diagram_labels = [node["label"] for item in views for node in item["nodes"]]
+    assert all("ARTICLE_DOCUMENTED" not in label for label in diagram_labels)
+    assert all("STATIC_INFERENCE" not in label for label in diagram_labels)
+    assert all("sources" not in label.casefold() for label in diagram_labels)
+    assert all(len(label) <= 72 for label in diagram_labels)
+    limitations = " ".join(value for item in views for value in item["limitations"])
+    assert "offset" in limitations.casefold()
+    assert "trame" in limitations.casefold()
+    assert "static, not executed" not in limitations
+    assert any(
+        node["evidence_level"] == "article_documented" for item in views for node in item["nodes"]
     )
-    all_limitations = " ".join(value for item in views for value in item["limitations"])
-    assert "ARTICLE_DOCUMENTED" in all_limitations
-    assert "NOT OBSERVED" in all_limitations
-    assert "STATIC_INFERENCE" in all_limitations
-    assert "static, not executed" in all_limitations
 
     missing = {
         "model": {
@@ -1199,6 +1224,105 @@ async def test_protocol_render_tool_returns_existing_observation_uuid() -> None:
     observation_ref = result.observation_refs[0]
     assert isinstance(observation_ref, UUID)
     assert result.output["observation_ref"] == str(observation_ref)
+
+
+@pytest.mark.asyncio
+async def test_protocol_render_registry_contract_and_versioned_observation_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_service, traces = await _network_and_traces(
+        ((_messages_capture(endian="big"), False, None),)
+    )
+    model = (
+        await model_service.compare(
+            subject_id="render-contract",
+            investigation_id=_INVESTIGATION_ID,
+            traces=traces,
+        )
+    ).model
+    recorder = _IdempotentEvidenceRecorder()
+    model_store = _ProtocolModelStore(model)
+    registry = InMemoryToolRegistry()
+    register_protocol_tools(
+        registry,
+        service=None,
+        recorder=recorder,
+        model_store=model_store,
+        tool_seconds=5,
+    )
+    registration = registry.get(NETWORK_PROTOCOL_RENDER, "1")
+    assert registration is not None
+    definition, adapter = registration
+    assert definition.schema_version == "1"
+    assert registry.get(NETWORK_PROTOCOL_RENDER, "network-protocol-render.v1") is None
+    assert tuple(definition.input_schema["required"]) == ("model_blob_id",)
+    assert "protocol_model_blob_id" not in definition.input_schema["properties"]
+
+    context = ToolExecutionContext(
+        investigation_id=_INVESTIGATION_ID,
+        envelope=None,
+        budget=InvestigationBudget({BudgetDimension.TOOL_SECONDS: 30}),
+        idempotency_key="same-protocol-render-call",
+        available_capabilities=frozenset({NETWORK_PROTOCOL_RENDER}),
+    )
+    dispatcher = RegistryToolDispatcher(registry)
+    old_contract = await dispatcher.dispatch(
+        context,
+        tool_name=NETWORK_PROTOCOL_RENDER,
+        schema_version="1",
+        arguments={"protocol_model_blob_id": str(model_store.blob_id)},
+        purpose="reject the obsolete protocol render input",
+        operation_key="old-protocol-render-contract",
+    )
+    assert old_contract.status is ToolInvocationStatus.FAILED
+    assert old_contract.error_code == "invalid_tool_arguments"
+
+    arguments = {"model_blob_id": str(model_store.blob_id)}
+    first = await dispatcher.dispatch(
+        context,
+        tool_name=NETWORK_PROTOCOL_RENDER,
+        schema_version="1",
+        arguments=arguments,
+        purpose="render the model using the current protocol",
+        operation_key="same-protocol-render-call",
+    )
+    repeated_dispatch = await dispatcher.dispatch(
+        context,
+        tool_name=NETWORK_PROTOCOL_RENDER,
+        schema_version="1",
+        arguments=arguments,
+        purpose="render the model using the current protocol",
+        operation_key="same-protocol-render-call",
+    )
+    repeated = await adapter.execute(arguments, context)
+    assert first.status is ToolInvocationStatus.SUCCEEDED
+    assert repeated_dispatch.observation_refs == first.observation_refs
+    assert repeated.observation_refs == first.observation_refs
+    assert first.output["protocol_model_blob_id"] == str(model_store.blob_id)
+
+    original_render = protocol_tools_module.render_protocol_model
+
+    def changed_content(candidate: ProtocolModelV1) -> ProtocolRenderResultV1:
+        rendered = original_render(candidate)
+        return replace(
+            rendered,
+            factual_statements=(*rendered.factual_statements, "Changed semantic render fixture."),
+        )
+
+    monkeypatch.setattr(protocol_tools_module, "render_protocol_model", changed_content)
+    changed = await adapter.execute(arguments, context)
+    assert changed.observation_refs != first.observation_refs
+
+    monkeypatch.setattr(
+        protocol_tools_module,
+        "NETWORK_PROTOCOL_RENDERER_VERSION",
+        "network-protocol-renderer-test-vnext",
+    )
+    changed_renderer = await adapter.execute(arguments, context)
+    assert changed_renderer.observation_refs != changed.observation_refs
+    assert len(recorder.record_arguments) == 3
+    assert len({item["object_id"] for item in recorder.record_arguments}) == 3
+    assert len({item["idempotency_key"] for item in recorder.record_arguments}) == 3
 
 
 @pytest.mark.parametrize(

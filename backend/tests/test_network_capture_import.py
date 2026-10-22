@@ -10,7 +10,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from cti_app.api.investigation_captures import router
+from cti_app.api.investigation_captures import legacy_router, router
 from cti_app.application.blob_storage import BlobReadLimitExceededError
 from cti_app.application.investigation_acquisition import HitAcquisitionService
 from cti_app.application.network_capture_import import (
@@ -49,10 +49,13 @@ _PCAPNG_HEADER = (
 def test_api_root_mounts_capture_import_routes() -> None:
     from cti_app.api.main import create_app
 
-    paths = set(create_app().openapi()["paths"])
+    spec = create_app().openapi()
+    paths = set(spec["paths"])
 
     assert "/api/v1/network-captures/capabilities" in paths
     assert "/api/v1/investigations/{investigation_id}/network-captures" in paths
+    assert "/api/investigations/{investigation_id}/network-captures" in paths
+    assert "get" in spec["paths"]["/api/v1/investigations/{investigation_id}/network-captures"]
 
 
 class _EvidenceRepository:
@@ -455,6 +458,7 @@ async def test_import_route_requires_operator_identity() -> None:
     harness = _Harness()
     app = FastAPI()
     app.include_router(router)
+    app.include_router(legacy_router)
     app.state.network_capture_import_service = harness.service
 
     async with httpx.AsyncClient(
@@ -519,6 +523,7 @@ async def test_import_route_exposes_capabilities_and_imports_uploaded_content() 
     harness = _Harness()
     app = FastAPI()
     app.include_router(router)
+    app.include_router(legacy_router)
     app.state.network_capture_import_service = harness.service
     app.state.identity_provider = SimpleNamespace(current=lambda: _identity("analyst:api-test"))
 
@@ -534,6 +539,10 @@ async def test_import_route_exposes_capabilities_and_imports_uploaded_content() 
                 "x-content-sha256": hashlib.sha256(_PCAP_HEADER).hexdigest(),
             },
         )
+        listing = await client.get(
+            f"/api/investigations/{_INVESTIGATION_ID}/network-captures",
+            params={"limit": 10, "offset": 0},
+        )
 
     assert capabilities.status_code == 200
     assert capabilities.json()["schema_version"] == "network-capture-import-capabilities.v1"
@@ -545,6 +554,15 @@ async def test_import_route_exposes_capabilities_and_imports_uploaded_content() 
     assert response.json()["association_id"]
     expected_reference = f"sha256:{hashlib.sha256(_PCAP_HEADER).hexdigest()}"
     assert response.json()["source_reference"] == expected_reference
+    assert listing.status_code == 200, listing.text
+    listed = listing.json()
+    assert listed["schema_version"] == "network-capture-inventory.v1"
+    assert len(listed["captures"]) == 1
+    assert listed["captures"][0]["source_reference"] == expected_reference
+    assert listed["captures"][0]["size_bytes"] == len(_PCAP_HEADER)
+    assert listed["captures"][0]["format"] == "pcap"
+    assert "bytes" not in listed["captures"][0]
+    assert _PCAP_HEADER.hex() not in listing.text
 
 
 async def _identity(actor_id: str):

@@ -13,6 +13,7 @@ from uuid import UUID, uuid4, uuid5
 
 import pytest
 
+from cti_app.application.advisor_contracts import ADVISOR_SOURCE_PARSER_VERSION
 from cti_app.application.bridge_investigator import BridgeInvestigator, ScriptedTurnTransport
 from cti_app.application.investigation_persistence import (
     InMemoryDetectionCandidateRepository,
@@ -28,6 +29,8 @@ from cti_app.application.investigation_rule_tools import (
     RULE_TEST_SCHEMA,
     RULE_WORKBENCH_CAPABILITY,
     QuarantineRuleCorpusBytes,
+    _report_summary,
+    _RuleCorpusSnapshot,
     _version_summary,
     register_rule_tools,
     rule_tool_capabilities,
@@ -64,6 +67,12 @@ from cti_app.domain.legitimate_services import LegitimateServiceRegistry
 from cti_app.domain.rule_workbench import (
     RuleMotifKind,
     RuleMotifProvenanceKind,
+    RuleRoleTestReport,
+    RuleTestCase,
+    RuleTestCorpusRole,
+    RuleTestError,
+    RuleTestErrorCode,
+    RuleTestReport,
     YaraEngineResult,
     YaraExecutionStatus,
 )
@@ -75,6 +84,128 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def test_report_summary_without_corpus_uses_empty_corpus_fallback() -> None:
+    report = RuleTestReport(
+        source_sha256="a" * 64,
+        execution_status=YaraExecutionStatus.OK,
+        engine_version="fixture-yara",
+        roles=tuple(
+            RuleRoleTestReport(role=role, corpus_sha256s=()) for role in RuleTestCorpusRole
+        ),
+        selection_bias="No samples were available.",
+        coverage_statement="No corpus coverage.",
+    )
+
+    summary = _report_summary(report, observation_id=None, corpus=None)
+
+    assert summary["final_status"] == "ONE_RULE_NOT_VALIDATED"
+    assert "qualified_positive_corpus_missing" in summary["validation_reasons"]
+
+
+def test_report_summary_preserves_yara_reason_location_and_failing_role() -> None:
+    role = RuleTestCorpusRole.HOLDOUT_NEGATIVE
+    diagnostic = RuleTestError(
+        code=RuleTestErrorCode.COMPILE_ERROR,
+        message="syntax error, unexpected '}'",
+        sample_sha256="b" * 64,
+        line=4,
+        column=1,
+    )
+    report = RuleTestReport(
+        source_sha256="a" * 64,
+        execution_status=YaraExecutionStatus.COMPILE_ERROR,
+        engine_version="fixture-yara",
+        roles=tuple(
+            RuleRoleTestReport(
+                role=current_role,
+                corpus_sha256s=("b" * 64,) if current_role is role else (),
+                test_cases=(
+                    RuleTestCase(
+                        sample_sha256="b" * 64,
+                        role=role,
+                        holdout_designated_at=datetime(2026, 10, 20, tzinfo=UTC),
+                    ),
+                )
+                if current_role is role
+                else (),
+                errors=(diagnostic,) if current_role is role else (),
+            )
+            for current_role in RuleTestCorpusRole
+        ),
+        selection_bias="Fixture corpus.",
+        coverage_statement="Fixture coverage.",
+    )
+
+    summary = _report_summary(report, observation_id=None, corpus=None)
+    role_summary = next(item for item in summary["roles"] if item["role"] == role.value)
+    diagnostic = role_summary["errors"][0]
+
+    assert diagnostic == {
+        "code": "compile_error",
+        "message": "syntax error, unexpected '}'",
+        "sample_sha256": "b" * 64,
+        "line": 4,
+        "column": 1,
+        "role": "holdout_negative",
+    }
+
+
+@pytest.mark.asyncio
+async def test_large_rule_report_is_persisted_as_a_complete_blob() -> None:
+    artifact_store = _MemoryArtifactStore()
+    harness = _harness(samples={}, artifact_store=artifact_store)
+    role = RuleTestCorpusRole.DOCUMENTED_SEED_UNCONFIRMED
+    cases = tuple(
+        RuleTestCase(
+            sample_sha256=hashlib.sha256(f"synthetic-report-case-{index}".encode()).hexdigest(),
+            role=role,
+        )
+        for index in range(900)
+    )
+    hashes = tuple(case.sample_sha256 for case in cases)
+    report = RuleTestReport(
+        source_sha256="a" * 64,
+        execution_status=YaraExecutionStatus.OK,
+        engine_version="fixture-yara",
+        roles=tuple(
+            RuleRoleTestReport(
+                role=current_role,
+                corpus_sha256s=hashes if current_role is role else (),
+                test_cases=cases if current_role is role else (),
+                non_measurable=hashes if current_role is role else (),
+            )
+            for current_role in RuleTestCorpusRole
+        ),
+        selection_bias="Synthetic persistence fixture.",
+        coverage_statement="All generated report rows are retained.",
+    )
+    corpus = _RuleCorpusSnapshot(
+        cases=cases,
+        selection_bias="Synthetic persistence fixture.",
+        coverage_statement="All generated report rows are retained.",
+        limitations=(),
+    )
+
+    observation = await harness.rule_tools._record_report(
+        harness.context,
+        report,
+        corpus,
+        candidate_id=uuid4(),
+        version=None,
+        candidate_status=DetectionCandidateStatus.CANDIDATE,
+        operation="test",
+    )
+
+    encoded = artifact_store.values[observation.blob_id]
+    persisted = json.loads(encoded)
+    persisted_role = next(item for item in persisted["roles"] if item["role"] == role.value)
+    assert len(encoded) > 131_072
+    assert hashlib.sha256(encoded).hexdigest() == observation.sha256
+    assert len(persisted_role["test_cases"]) == len(cases)
+    assert len(persisted_role["non_measurable"]) == len(cases)
+    assert persisted["summary"]["test_case_count"] == len(cases)
+
+
 class _MemoryCorpusBytes:
     def __init__(self, samples: Mapping[str, bytes]) -> None:
         self.samples = dict(samples)
@@ -84,6 +215,11 @@ class _MemoryCorpusBytes:
             return self.samples[sample_sha256]
         except KeyError as exc:
             raise RuleCorpusBytesUnavailable("fixture bytes unavailable") from exc
+
+    async def get_artifact_id_for_sample(self, sample_sha256: str) -> UUID:
+        if sample_sha256 not in self.samples:
+            raise RuleCorpusBytesUnavailable("fixture bytes unavailable")
+        return uuid5(_EVIDENCE_NAMESPACE, f"corpus-artifact:{sample_sha256}")
 
     async def goodware_sample_sha256s(self, investigation_id: UUID) -> Sequence[str]:
         del investigation_id
@@ -189,8 +325,31 @@ class _MemoryEvidence:
         self.payloads[blob_id] = json.loads(serialized)
         return observation
 
-    async def record_existing_blob(self, **_kwargs: Any) -> EvidenceObservation:
-        raise AssertionError("rule tools only record bounded JSON reports")
+    async def record_existing_blob(self, **kwargs: Any) -> EvidenceObservation:
+        observation_id = (
+            uuid5(_EVIDENCE_NAMESPACE, kwargs["idempotency_key"])
+            if kwargs.get("idempotency_key")
+            else uuid4()
+        )
+        observation = EvidenceObservation(
+            id=observation_id,
+            investigation_id=kwargs["investigation_id"],
+            kind=kwargs["kind"],
+            blob_id=kwargs["blob_id"],
+            sha256=kwargs["sha256"],
+            source=kwargs["source"],
+            source_version=kwargs["source_version"],
+            observed_at=kwargs.get("observed_at") or datetime.now(UTC),
+            object_type=kwargs["object_type"],
+            object_id=kwargs["object_id"],
+            limitations=kwargs.get("limitations", ()),
+            invocation_ref=kwargs.get("invocation_ref"),
+        )
+        existing = await self.repository.get(observation.id)
+        if existing is not None:
+            assert existing == observation
+            return existing
+        return await self.repository.append_if_absent(observation)
 
     async def record_negative(self, **_kwargs: Any) -> EvidenceObservation:
         raise AssertionError("rule tools do not record negative observations")
@@ -226,7 +385,35 @@ class _MemoryInventory(_MemoryCorpusBytes):
             )
             for sample_sha256 in self.goodware
         )
-        return (*goodware, *self._manual_imports)
+        holdout = tuple(
+            RuleCorpusInventoryItem(
+                sample_sha256=sample_sha256,
+                role=RuleTestCorpusRole.HOLDOUT_POSITIVE,
+                provenance=RuleSampleProvenance.REAL,
+                size_bytes=len(self.samples.get(sample_sha256, b"")),
+                source_description="Explicitly designated positive holdout fixture.",
+                format_magic="legacy_untyped",
+                designated_at=datetime(2026, 1, 1, tzinfo=UTC),
+                observation_id=uuid5(_EVIDENCE_NAMESPACE, f"holdout:{sample_sha256}"),
+                operator_id="analyst-test",
+            )
+            for sample_sha256 in self.holdout
+        )
+        return (*goodware, *holdout, *self._manual_imports)
+
+
+class _MemoryArtifactStore:
+    def __init__(self) -> None:
+        self.values: dict[UUID, bytes] = {}
+
+    async def put_canonical_json(self, payload: Mapping[str, Any], *, bucket: str):
+        assert bucket == "investigation-evidence"
+        encoded = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        blob_id = uuid4()
+        self.values[blob_id] = encoded
+        return blob_id, hashlib.sha256(encoded).hexdigest()
 
 
 @dataclass
@@ -251,6 +438,7 @@ def _harness(
     manual_imports: Sequence[Any] = (),
     article_claims: Any | None = None,
     engine: Any | None = None,
+    artifact_store: Any | None = None,
     evidence_repository: InMemoryEvidenceObservationRepository | None = None,
 ) -> _ToolHarness:
     investigation_id = uuid4()
@@ -288,6 +476,7 @@ def _harness(
         evidence_observations=evidence.repository,
         evidence_payloads=evidence,
         article_claims=article_claims,
+        artifact_store=artifact_store,
     )
     budget = InvestigationBudget(
         limits={BudgetDimension.TOOL_SECONDS: 600},
@@ -395,13 +584,23 @@ async def test_tool_schemas_capabilities_and_approval_are_closed() -> None:
         {
             RULE_WORKBENCH_CAPABILITY,
             "rule.propose",
+            "rule.propose_bridge",
+            "rule.operator_syntax_fix",
             "rule.test",
             "rule.revise",
             "rule.compare",
             "rule.get",
         }
     )
-    for name in ("rule.propose", "rule.test", "rule.revise", "rule.compare", "rule.get"):
+    for name in (
+        "rule.propose",
+        "rule.propose_bridge",
+        "rule.operator_syntax_fix",
+        "rule.test",
+        "rule.revise",
+        "rule.compare",
+        "rule.get",
+    ):
         registered = harness.registry.get(name, "1")
         assert registered is not None
         definition, _adapter = registered
@@ -461,6 +660,416 @@ def test_optional_rule_tool_arguments_accept_empty_wire_values() -> None:
         {"candidate_id": candidate_id, "version_a": 1, "version_b": 2},
         RULE_COMPARE_SCHEMA,
     )
+
+
+async def _bridge_yara_observation(
+    harness: _ToolHarness,
+    *,
+    source: str,
+    measurement_catalog: Sequence[Mapping[str, Any]] | None = None,
+    motifs: Sequence[Mapping[str, Any]] | None = None,
+) -> tuple[UUID, UUID, str]:
+    motif_observation_id = await _source_observation(harness, "BridgeMeasuredMarker")
+    motif_observation = await harness.evidence.repository.get(motif_observation_id)
+    assert motif_observation is not None
+    invocation_id = uuid4()
+    source_sha256 = hashlib.sha256(source.encode("utf-8")).hexdigest()
+    selected_catalog = list(
+        measurement_catalog
+        or (
+            {
+                "alias": "M1",
+                "measurement_id": str(motif_observation.id),
+                "sha256": "a" * 64,
+                "sample_sha256": "1" * 64,
+                "offset": 0,
+                "length": len(b"BridgeMeasuredMarker"),
+                "kind": "string",
+                "encoding": "ascii",
+                "value": "BridgeMeasuredMarker",
+            },
+        )
+    )
+    measurement_input_refs = [
+        {"kind": "measurement", "id": row["measurement_id"], "sha256": row["sha256"]}
+        for row in selected_catalog
+    ]
+    selected_motifs = list(
+        motifs
+        or (
+            {
+                "name": "$marker",
+                "measurement_refs": [
+                    {
+                        "measurement_id": str(motif_observation.id),
+                        "sha256": "a" * 64,
+                    }
+                ],
+            },
+        )
+    )
+    observation = await harness.evidence.record_json(
+        investigation_id=harness.investigation_id,
+        kind=EvidenceKind.OTHER,
+        payload={
+            "schema": "operator-advisor-call.v1",
+            "consultation_type": "yara_draft",
+            "advisor_response_schema": "advisor-response.v3",
+            "advisor_status": "succeeded",
+            "bridge_invocation_id": str(invocation_id),
+            "input_refs": [
+                {
+                    "kind": "observation",
+                    "id": str(motif_observation.id),
+                    "sha256": motif_observation.sha256,
+                },
+                *measurement_input_refs,
+            ],
+            "measurement_catalog": selected_catalog,
+            "output": {
+                "schema": "advisor-response.v3",
+                "consultation_type": "yara_draft",
+                "status": "succeeded",
+                "advisor_status": "succeeded",
+                "usable": True,
+                "bridge_provenance": {
+                    "bridge_invocation_id": str(invocation_id),
+                    "measurement_catalog": selected_catalog,
+                },
+                "rule_source": source,
+                "rule_source_sha256": source_sha256,
+                "motifs": selected_motifs,
+            },
+        },
+        source="advisor.consult",
+        source_version="advisor-response.v3",
+        object_type="advisor_call",
+        object_id="yara_draft",
+        idempotency_key=f"bridge-yara:{invocation_id}",
+    )
+    return observation.id, invocation_id, source_sha256
+
+
+@pytest.mark.asyncio
+async def test_bridge_yara_proposal_rejects_motif_bytes_that_differ_from_measurement() -> None:
+    harness = _harness(samples={})
+    source = 'rule bridge_candidate { strings: $marker = "BridgeWrongMarker" condition: $marker }'
+    observation_id, invocation_id, source_sha256 = await _bridge_yara_observation(
+        harness, source=source
+    )
+
+    rejected = await _call(
+        harness,
+        "rule.propose_bridge",
+        {
+            "bridge_observation_id": str(observation_id),
+            "bridge_invocation_id": str(invocation_id),
+            "rule_source_sha256": source_sha256,
+        },
+    )
+
+    assert rejected.status is ToolInvocationStatus.FAILED
+    assert rejected.error_code == "motif_bytes_mismatch"
+    assert rejected.output["diagnostic"]["motif"] == "$marker"
+    assert rejected.output["diagnostic"]["measurement_alias"] == "M1"
+    assert rejected.output["diagnostic"]["reason"] == "pattern_bytes_differ"
+
+
+@pytest.mark.asyncio
+async def test_bridge_yara_proposal_accepts_each_exact_hex_measurement() -> None:
+    harness = _harness(samples={})
+    source = """import "pe"
+import "dotnet"
+rule bridge_candidate {
+    strings:
+        $m2 = { EC CA DC C8 C2 8F C9 D5 }
+        $m5 = { 19 44 4A 0A 01 01 18 08 }
+    condition:
+        pe.is_pe and dotnet.is_dotnet and $m2 and $m5
+}
+"""
+    catalog = [
+        {
+            "alias": "M2",
+            "measurement_id": "m002",
+            "sha256": "d" * 64,
+            "sample_sha256": "53f35e49eb9b271fd8cbcd3daacb525328dbf159a03dbd1c7adebe0363daa402",
+            "offset": 14784,
+            "length": 8,
+            "kind": "hex",
+            "encoding": "raw",
+            "value": "eccadcc8c28fc9d5",
+        },
+        {
+            "alias": "M5",
+            "measurement_id": "m005",
+            "sha256": "e" * 64,
+            "sample_sha256": "53f35e49eb9b271fd8cbcd3daacb525328dbf159a03dbd1c7adebe0363daa402",
+            "offset": 15232,
+            "length": 8,
+            "kind": "hex",
+            "encoding": "raw",
+            "value": "19444a0a01011808",
+        },
+    ]
+    motifs = [
+        {"name": "$m2", "measurement_refs": [{"measurement_id": "m002", "sha256": "d" * 64}]},
+        {"name": "$m5", "measurement_refs": [{"measurement_id": "m005", "sha256": "e" * 64}]},
+    ]
+    observation_id, invocation_id, source_sha256 = await _bridge_yara_observation(
+        harness, source=source, measurement_catalog=catalog, motifs=motifs
+    )
+
+    proposed = await _call(
+        harness,
+        "rule.propose_bridge",
+        {
+            "bridge_observation_id": str(observation_id),
+            "bridge_invocation_id": str(invocation_id),
+            "rule_source_sha256": source_sha256,
+        },
+    )
+
+    assert proposed.status is ToolInvocationStatus.SUCCEEDED
+    assert proposed.output["source_sha256"] == source_sha256
+
+
+@pytest.mark.asyncio
+async def test_rule_test_failure_persists_stage_reason_and_holdout_role() -> None:
+    harness = _harness(samples={})
+    source_ref = await _source_observation(harness, "RuleTestDiagnosticMarker")
+    proposed = await _call(
+        harness,
+        "rule.propose",
+        {
+            "condition": "all",
+            "motifs": [_motif("RuleTestDiagnosticMarker", source_ref)],
+        },
+    )
+
+    async def fail_corpus(_investigation_id, *, tested_version):
+        del tested_version
+        raise ValueError("holdout cases require a persisted designation time")
+
+    harness.rule_tools._build_corpus = fail_corpus
+    failed = await _call(
+        harness,
+        "rule.test",
+        {"candidate_id": proposed.output["candidate_id"]},
+    )
+
+    assert failed.status is ToolInvocationStatus.FAILED
+    assert failed.error_code == "invalid_rule_input"
+    assert failed.output["diagnostic"] == {
+        "stage": "corpus_validation",
+        "exception_class": "ValueError",
+        "reason": "holdout cases require a persisted designation time",
+        "role": "holdout",
+    }
+
+
+@pytest.mark.asyncio
+async def test_bridge_yara_proposal_verifies_observation_source_and_operator_fix_is_versioned() -> (
+    None
+):
+    harness = _harness(samples={})
+    source = (
+        'rule bridge_candidate { strings: $marker = "BridgeMeasuredMarker" condition: $marker }'
+    )
+    observation_id, invocation_id, source_sha256 = await _bridge_yara_observation(
+        harness, source=source
+    )
+
+    rejected = await _call(
+        harness,
+        "rule.propose_bridge",
+        {
+            "bridge_observation_id": str(observation_id),
+            "bridge_invocation_id": str(invocation_id),
+            "rule_source_sha256": "b" * 64,
+        },
+    )
+    assert rejected.status is ToolInvocationStatus.FAILED
+    assert rejected.error_code == "bridge_yara_source_sha256_mismatch"
+
+    proposed = await _call(
+        harness,
+        "rule.propose_bridge",
+        {
+            "bridge_observation_id": str(observation_id),
+            "bridge_invocation_id": str(invocation_id),
+            "rule_source_sha256": source_sha256,
+        },
+    )
+    assert proposed.status is ToolInvocationStatus.SUCCEEDED
+    assert proposed.output["source_author"] == "bridge"
+    assert proposed.output["source_sha256"] == source_sha256
+    candidate_id = proposed.output["candidate_id"]
+
+    fixed_source = (
+        'rule bridge_candidate {\n    strings:\n        $marker = "BridgeMeasuredMarker"\n'
+        "    condition:\n        $marker\n}\n"
+    )
+    fixed = await _call(
+        harness,
+        "rule.operator_syntax_fix",
+        {
+            "candidate_id": candidate_id,
+            "parent_version": 1,
+            "source": fixed_source,
+            "author": "operator:analyst-42",
+        },
+    )
+    assert fixed.status is ToolInvocationStatus.SUCCEEDED
+    assert fixed.output["version"] == "v2"
+    assert fixed.output["source_author"] == "operator:analyst-42"
+    assert fixed.output["source_change_kind"] == "operator_syntax_fix"
+    assert fixed.output["source_diff"]
+
+    history = await _call(
+        harness, "rule.get", {"candidate_id": candidate_id, "include_history": True}
+    )
+    assert history.status is ToolInvocationStatus.SUCCEEDED
+    assert history.output["versions"][0]["signature"]["source_attribution"]["author"] == "bridge"
+    attribution = history.output["versions"][1]["signature"]["source_attribution"]
+    assert attribution["author"] == "operator:analyst-42"
+    assert attribution["change_kind"] == "operator_syntax_fix"
+    assert "operator_diff" in attribution
+
+
+@pytest.mark.asyncio
+async def test_bridge_yara_proposal_accepts_only_linked_current_parser_reparse() -> None:
+    harness = _harness(samples={})
+    source = (
+        'rule bridge_candidate { strings: $marker = "BridgeMeasuredMarker" condition: $marker }'
+    )
+    original_id, invocation_id, source_sha256 = await _bridge_yara_observation(
+        harness, source=source
+    )
+    original = await harness.evidence.repository.get(original_id)
+    assert original is not None
+    original_payload = harness.evidence.payloads[original.blob_id]
+    output_sha256 = "d" * 64
+    original_payload["output_sha256"] = output_sha256
+    original_output = original_payload["output"]
+    original_output["output_sha256"] = output_sha256
+    original_output["bridge_provenance"].update(
+        output_sha256=output_sha256,
+        input_refs=original_payload["input_refs"],
+    )
+    reparsed_payload = {
+        **original_payload,
+        "advisor_status": "succeeded",
+        "output_sha256": output_sha256,
+        "reparsed_from_observation_id": str(original.id),
+        "parser_version": ADVISOR_SOURCE_PARSER_VERSION,
+        "output": {
+            **original_output,
+            "status": "partial",
+            "advisor_status": "succeeded",
+            "output_sha256": output_sha256,
+            "parser_version": ADVISOR_SOURCE_PARSER_VERSION,
+            "bridge_provenance": {
+                **original_output["bridge_provenance"],
+                "bridge_invocation_id": str(invocation_id),
+                "output_sha256": output_sha256,
+                "input_refs": original_payload["input_refs"],
+            },
+        },
+    }
+    reparsed = await harness.evidence.record_json(
+        investigation_id=harness.investigation_id,
+        kind=EvidenceKind.OTHER,
+        payload=reparsed_payload,
+        source="advisor.consult",
+        source_version=ADVISOR_SOURCE_PARSER_VERSION,
+        object_type="advisor_call",
+        object_id="yara_draft",
+        idempotency_key="advisor-reparse-test",
+    )
+
+    proposed = await _call(
+        harness,
+        "rule.propose_bridge",
+        {
+            "bridge_observation_id": str(reparsed.id),
+            "bridge_invocation_id": str(invocation_id),
+            "rule_source_sha256": source_sha256,
+        },
+    )
+
+    assert proposed.status is ToolInvocationStatus.SUCCEEDED
+    assert proposed.output["bridge_observation_id"] == str(reparsed.id)
+    assert proposed.output["bridge_invocation_id"] == str(invocation_id)
+    assert proposed.output["source_author"] == "bridge"
+
+
+@pytest.mark.asyncio
+async def test_bridge_yara_proposal_rejects_truncated_source_and_two_rule_source() -> None:
+    harness = _harness(samples={})
+    source = (
+        'rule first { strings: $marker = "BridgeMeasuredMarker" condition: $marker } '
+        'rule second { strings: $other = "also-marker" condition: $other }'
+    )
+    observation_id, invocation_id, source_sha256 = await _bridge_yara_observation(
+        harness, source=source
+    )
+    observation = await harness.evidence.repository.get(observation_id)
+    assert observation is not None
+    payload = harness.evidence.payloads[observation.blob_id]
+    payload["output"]["truncation_status"] = "normalized_output_oversized"
+
+    rejected = await _call(
+        harness,
+        "rule.propose_bridge",
+        {
+            "bridge_observation_id": str(observation_id),
+            "bridge_invocation_id": str(invocation_id),
+            "rule_source_sha256": source_sha256,
+        },
+    )
+    assert rejected.status is ToolInvocationStatus.FAILED
+    assert rejected.error_code == "bridge_yara_source_truncated"
+
+    payload["output"].pop("truncation_status")
+    two_rules = await _call(
+        harness,
+        "rule.propose_bridge",
+        {
+            "bridge_observation_id": str(observation_id),
+            "bridge_invocation_id": str(invocation_id),
+            "rule_source_sha256": source_sha256,
+        },
+    )
+    assert two_rules.status is ToolInvocationStatus.FAILED
+    assert "exactly_one_rule_required" in two_rules.error_code
+
+
+@pytest.mark.asyncio
+async def test_bridge_yara_proposal_requires_motif_measurement_ref_in_transmitted_inputs() -> None:
+    harness = _harness(samples={})
+    source = (
+        'rule bridge_candidate { strings: $marker = "BridgeMeasuredMarker" condition: $marker }'
+    )
+    observation_id, invocation_id, source_sha256 = await _bridge_yara_observation(
+        harness, source=source
+    )
+    observation = await harness.evidence.repository.get(observation_id)
+    assert observation is not None
+    payload = harness.evidence.payloads[observation.blob_id]
+    payload["output"]["motifs"][0]["measurement_refs"][0]["sha256"] = "c" * 64
+
+    rejected = await _call(
+        harness,
+        "rule.propose_bridge",
+        {
+            "bridge_observation_id": str(observation_id),
+            "bridge_invocation_id": str(invocation_id),
+            "rule_source_sha256": source_sha256,
+        },
+    )
+    assert rejected.status is ToolInvocationStatus.FAILED
+    assert rejected.error_code == "bridge_yara_measurement_ref_not_transmitted"
 
 
 @pytest.mark.asyncio
@@ -570,6 +1179,16 @@ async def test_rule_cycle_requires_test_and_reports_only_explicit_test_results()
             ),
         ),
     )
+    positive_association = await _associate(harness, positive_sha256, origin=SampleOrigin.MANUAL)
+    await harness.associations.append_version(
+        positive_association.change_qualification(
+            SampleQualification.CONFIRMED,
+            actor_kind=QualificationActorKind.HUMAN,
+            actor_id="analyst-test",
+            reason="This fixture verifies the qualified-positive revision gate.",
+        ),
+        expected_version=positive_association.version,
+    )
     original_ref = await _source_observation(harness, "OriginalMarker")
     additional_ref = await _source_observation(harness, "NewMarker")
     proposed = await _call(
@@ -621,8 +1240,20 @@ async def test_rule_cycle_requires_test_and_reports_only_explicit_test_results()
     assert "report" not in revised.output
 
     second_test = await _call(harness, "rule.test", {"candidate_id": candidate_id, "version": 2})
-    assert second_test.output["report"]["false_negative_count"] == 0
-    assert second_test.output["report"]["false_positive_count"] == 0
+    test_report = second_test.output["report"]
+    assert test_report["false_negative_count"] == 0
+    assert test_report["false_positive_count"] == 0
+    assert test_report["rule_version_id"] == revised.output["version_id"]
+    assert test_report["rule_source_sha256"] == revised.output["source_sha256"]
+    assert test_report["final_status"] == "ONE_RULE_NOT_VALIDATED"
+    assert test_report["corpus_sha256"]
+    assert test_report["test_refs"]
+    assert any(
+        row["sha256"] == hashlib.sha256(positive).hexdigest()
+        for role in test_report["roles"]
+        for row in role["coverage_matrix"]
+    )
+    assert "confidence_interval_95" in test_report["metrics"]["real_positive_sensitivity"]
     assert second_test.output["validation_status"] == "real_partial"
     assert second_test.output["validation_reason"] == "sample_bytes_missing_or_unverified"
     assert second_test.output["report"]["revision_recommendation"] == "none_justified"
@@ -669,12 +1300,14 @@ async def test_unconfirmed_seed_matches_remain_candidates_not_family_positives()
         {"candidate_id": proposed.output["candidate_id"], "version": 1},
     )
     report = tested.output["report"]
-    positive = next(item for item in report["roles"] if item["role"] == "confirmed_positive")
-    candidate = next(item for item in report["roles"] if item["role"] == "out_of_cluster_candidate")
-    holdout = next(item for item in report["roles"] if item["role"] == "holdout")
+    positive = next(item for item in report["roles"] if item["role"] == "human_confirmed")
+    candidate = next(
+        item for item in report["roles"] if item["role"] == "documented_seed_unconfirmed"
+    )
+    holdout = next(item for item in report["roles"] if item["role"] == "holdout_positive")
     seed_result = candidate["test_cases"][0]
 
-    assert positive["test_cases"] == ()
+    assert not positive["test_cases"]
     assert candidate["matches"] == (sample_sha256,)
     assert holdout["matches"] == (holdout_sha256,)
     assert seed_result["expected_match"] is None
@@ -682,7 +1315,10 @@ async def test_unconfirmed_seed_matches_remain_candidates_not_family_positives()
     assert report["validation_status"] == "real_partial"
     assert report["false_positive_count"] == 0
     assert tested.output["candidate_status"] == DetectionCandidateStatus.CANDIDATE.value
-    assert report["evaluation_protocol"]["holdout_role"] == "holdout"
+    assert report["evaluation_protocol"]["holdout_roles"] == (
+        "holdout_positive",
+        "holdout_negative",
+    )
     assert "does not confirm family" in report["evaluation_protocol"]["match_interpretation"]
 
 
@@ -782,9 +1418,12 @@ async def test_holdout_hash_overlapping_development_is_excluded() -> None:
 
     corpus = await harness.rule_tools._build_corpus(harness.investigation_id)
 
-    assert sum(case.sample_sha256 == sample_sha256 for case in corpus.cases) == 1
-    assert not any(case.role.value == "holdout" for case in corpus.cases)
-    assert any("exclu du holdout" in limitation for limitation in corpus.limitations)
+    assert sum(case.sample_sha256 == sample_sha256 for case in corpus.cases) == 2
+    assert {case.role for case in corpus.cases} == {
+        RuleTestCorpusRole.GOODWARE,
+        RuleTestCorpusRole.HOLDOUT_POSITIVE,
+    }
+    assert corpus.holdout_overlap_sha256s == (sample_sha256,)
 
 
 @pytest.mark.asyncio
@@ -851,6 +1490,50 @@ def test_rule_version_summary_without_report_is_explicitly_untested() -> None:
     assert summary["validation_status"] == "untested"
     assert summary["validation_reason"] == "explicit_rule_test_required"
     assert summary["latest_test_report"] is None
+    assert summary["final_status"] == "ONE_RULE_NOT_VALIDATED"
+    assert summary["validation_reasons"] == ["explicit_rule_test_required"]
+
+
+def test_rule_version_summary_separates_latest_result_from_historical_crash() -> None:
+    version = SimpleNamespace(
+        id=uuid4(),
+        candidate_id=uuid4(),
+        investigation_id=uuid4(),
+        version=1,
+        version_label="v1",
+        parent_version_id=None,
+        source='rule candidate { strings: $marker = "marker" condition: $marker }',
+        source_sha256="a" * 64,
+        status=DetectionCandidateStatus.CANDIDATE,
+        test_refs=(),
+        motif_provenance=(),
+    )
+    reports = [
+        {
+            "operation": "test",
+            "version_id": str(version.id),
+            "rule_version_id": str(version.id),
+            "source_sha256": version.source_sha256,
+            "execution_status": "engine_crashed",
+            "final_status": "ONE_RULE_NOT_VALIDATED",
+            "validation_reasons": ["engine_not_ok"],
+        },
+        {
+            "operation": "test",
+            "version_id": str(version.id),
+            "rule_version_id": str(version.id),
+            "source_sha256": version.source_sha256,
+            "execution_status": "ok",
+            "final_status": "ONE_RULE_NOT_VALIDATED",
+            "validation_reasons": ["qualified_positive_corpus_missing"],
+        },
+    ]
+
+    summary = _version_summary(version, reports)
+
+    assert summary["latest_test_report"]["execution_status"] == "ok"
+    assert summary["final_status"] == "ONE_RULE_NOT_VALIDATED"
+    assert summary["reports"] == reports
 
 
 @pytest.mark.asyncio
@@ -954,7 +1637,7 @@ async def test_missing_engine_and_unreadable_bytes_are_local_unavailable_results
     assert observation is not None
     assert observation.kind is EvidenceKind.YARA_MATCH
     report = missing_bytes.evidence.payloads[observation.blob_id]
-    positive = next(role for role in report["roles"] if role["role"] == "confirmed_positive")
+    positive = next(role for role in report["roles"] if role["role"] == "bytes_missing")
     assert positive["non_measurable"] == [sha256]
     assert positive["non_matches"] == []
     assert "data" not in json.dumps(report).lower()
@@ -1028,7 +1711,7 @@ async def test_v1_v2_retest_and_comparison_record_exact_corpus_observations() ->
         "rule.test",
         {"candidate_id": str(candidate_id), "version": 1},
     )
-    assert v1_test.output["report"]["false_negative_count"] == 1
+    assert v1_test.output["report"]["false_negative_count"] == 2
     assert v1_test.output["report"]["revision_recommendation"] == "revise_false_negative"
 
     v2_result = await _call(
@@ -1057,7 +1740,7 @@ async def test_v1_v2_retest_and_comparison_record_exact_corpus_observations() ->
         "rule.test",
         {"candidate_id": str(candidate_id), "version": 2},
     )
-    assert v2_test.output["report"]["false_negative_count"] == 0
+    assert v2_test.output["report"]["false_negative_count"] == 1
     assert v2_test.output["report"]["revision_recommendation"] == "none_justified"
 
     compared = await _call(
@@ -1065,9 +1748,9 @@ async def test_v1_v2_retest_and_comparison_record_exact_corpus_observations() ->
         "rule.compare",
         {"candidate_id": str(candidate_id), "version_a": 1, "version_b": 2},
     )
-    assert compared.status is ToolInvocationStatus.SUCCEEDED
+    assert compared.status is ToolInvocationStatus.PARTIAL
     positive_delta = next(
-        role for role in compared.output["roles"] if role["role"] == "confirmed_positive"
+        role for role in compared.output["roles"] if role["role"] == "human_confirmed"
     )
     assert positive_delta["matches_gained"] == (second_sha,)
     assert compared.output["finding_candidate"]["kind"] == "detection"
@@ -1079,9 +1762,9 @@ async def test_v1_v2_retest_and_comparison_record_exact_corpus_observations() ->
     assert v1_observation is not None and v1_observation.kind is EvidenceKind.YARA_MATCH
     v1_payload = harness.evidence.payloads[v1_observation.blob_id]
     role_hashes = v1_payload["corpus_sha256s_by_role"]
-    assert role_hashes["confirmed_positive"] == sorted([first_sha, second_sha])
+    assert role_hashes["human_confirmed"] == sorted([first_sha, second_sha])
     assert role_hashes["goodware"] == [goodware_sha]
-    assert role_hashes["holdout"] == [holdout_sha]
+    assert role_hashes["holdout_positive"] == [holdout_sha]
     for payload in harness.evidence.payloads.values():
         serialized = json.dumps(payload, sort_keys=True)
         assert first_bytes.decode() not in serialized
@@ -1498,7 +2181,7 @@ async def test_goodware_feature_baseline_is_not_reported_as_tested_goodware_byte
     corpus = await tools._build_corpus(investigation_id)
 
     assert not any(case.role is RuleTestCorpusRole.GOODWARE for case in corpus.cases)
-    assert "no goodware binaries" in corpus.coverage_statement.casefold()
+    assert "aucun fichier binaire goodware" in " ".join(corpus.limitations).casefold()
 
 
 @pytest.mark.asyncio
@@ -1583,12 +2266,12 @@ async def test_synthetic_positive_and_real_goodware_report_provenance() -> None:
     assert payload["validation_status"] == "real_partial"
     assert payload["false_positive_count"] == 0
     assert payload["false_negative_count"] == 0
-    assert payload["provenance_counts_by_role"]["confirmed_positive"] == {
+    assert payload["provenance_counts_by_role"]["new_candidate_unconfirmed"] == {
         "real": 0,
         "synthetic": 1,
     }
     assert payload["provenance_counts_by_role"]["goodware"] == {"real": 1, "synthetic": 0}
-    assert "positives: 1 synthetic" in payload["coverage_statement"].casefold()
+    assert "seeds/candidats non confirmés" in payload["coverage_statement"].casefold()
 
 
 @pytest.mark.asyncio
@@ -1690,7 +2373,7 @@ async def test_article_claim_rule_test_and_revise_supports_non_pe_files() -> Non
     assert tested.output["report"]["false_negative_count"] == 0
     assert tested.output["report"]["validation_status"] == "real_partial"
     assert tested.output["report"]["revision_recommendation"] == "none_justified"
-    assert "positives: 1 synthetic" in tested.output["report"]["coverage_statement"]
+    assert "positives: none" in tested.output["report"]["coverage_statement"]
 
     revised = await _call(
         harness,
@@ -1821,7 +2504,7 @@ async def test_rule_with_only_synthetic_positive_cases_is_synthetic_only() -> No
         {"candidate_id": proposed.output["candidate_id"]},
     )
     assert tested.output["report"]["validation_status"] == "synthetic_only"
-    assert tested.output["report"]["provenance_counts_by_role"]["confirmed_positive"] == {
+    assert tested.output["report"]["provenance_counts_by_role"]["new_candidate_unconfirmed"] == {
         "real": 0,
         "synthetic": 1,
     }

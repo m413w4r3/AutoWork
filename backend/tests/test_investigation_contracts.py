@@ -95,6 +95,18 @@ def test_compact_tool_arguments_follow_registered_json_schema_types() -> None:
         },
         ("vt.download_sample", "1"): VT_DOWNLOAD_SAMPLE_SCHEMA,
         ("rule.propose", "1"): RULE_PROPOSE_SCHEMA,
+        ("sample.search", "1"): {
+            "type": "object",
+            "properties": {
+                "filters": {
+                    "type": "object",
+                    "properties": {
+                        "since": {"type": "string"},
+                        "enabled": {"type": "boolean"},
+                    },
+                }
+            },
+        },
     }
     wire = """@@DECISION@@
 GOAL: Preserve typed arguments.
@@ -121,6 +133,13 @@ NAME: rule.propose
 VERSION: 1
 PURPOSE: Propose a bounded rule.
 ARG meta: {"classification":"trojan","description":"synthetic metadata"}
+@@END@@
+@@TOOL@@
+NAME: sample.search
+VERSION: 1
+PURPOSE: Search a bounded sample set.
+ARG filters.since: 2025-01-01
+ARG filters.enabled: true
 @@END@@"""
 
     decision = parse_agent_turn_decision(wire, tool_schemas=schemas)
@@ -138,6 +157,7 @@ ARG meta: {"classification":"trojan","description":"synthetic metadata"}
         "classification": "trojan",
         "description": "synthetic metadata",
     }
+    assert calls["sample.search"]["filters"] == {"since": "2025-01-01", "enabled": True}
 
 
 def test_compact_rule_motifs_accept_multiline_json_for_real_rule_schemas() -> None:
@@ -362,6 +382,29 @@ def test_full_context_has_versioned_schema_and_canonical_serialization() -> None
     assert payload["view"] == "full"
     assert InvestigationContextV1.json_schema()["properties"]["schema"]
     assert parse_investigation_context(serialized).canonical_bytes() == serialized
+
+
+def test_historical_full_context_defaults_missing_sample_deltas() -> None:
+    context = InvestigationContextV1(
+        view="full",
+        investigation_id=uuid4(),
+        source=_source(),
+        article=ArticleContextV1(
+            short_summary="Historical article summary.",
+            claims=(),
+            documented_samples=(),
+            known_chain=(),
+            open_questions=(),
+        ),
+        investigation=_investigation(),
+        available_tools=(),
+    )
+    payload = json.loads(context.canonical_bytes())
+    payload["investigation"].pop("sample_deltas")
+
+    parsed = parse_investigation_context(payload)
+
+    assert parsed.investigation.sample_deltas == ()
 
 
 def test_delta_context_cannot_reembed_article_content() -> None:

@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 from pydantic import ConfigDict
@@ -74,6 +75,10 @@ EDITION_RENDER_BUCKETS = TypstRenderBuckets(
     render_data="edition-renders-render-data",
     output="edition-renders-output",
 )
+
+
+def _version_identity_sha256(name: str, version: str) -> str:
+    return hashlib.sha256(f"{name}\0{version}".encode()).hexdigest()
 
 
 class EditionRenderParameters(JobParameters):
@@ -209,6 +214,7 @@ class EditionRenderService:
 
         document = await self._read_edition_document(release)
         artifact_identities = await self._read_manifest_artifact_identities(release)
+        publication_lineage = await self._read_pinned_publication_lineage(release, document)
         try:
             template_bundle, font_bundle = load_typst_render_bundle_snapshots(
                 chp_typst_root=self._chp_typst_root,
@@ -267,10 +273,69 @@ class EditionRenderService:
 
         def build_source() -> TypstRenderSource:
             try:
-                return self._renderer.render(
+                artifact_labels = [
+                    f"artefact {item['artifact']['id']} v{item['artifact']['version']} "
+                    f"SHA-256 {item['artifact']['sha256']}"
+                    for item in publication_lineage
+                    if isinstance(item.get("artifact"), dict) and item["artifact"].get("id")
+                ]
+                label = f"Édition publiée {release.edition_id} — release {release.id}"
+                if artifact_labels:
+                    label += "; " + "; ".join(artifact_labels)
+                elif publication_lineage:
+                    label += "; artefact non identifiable"
+                lineage = {
+                    "schema_version": "pdf-lineage.v1",
+                    "nature": "edition_release",
+                    "edition_id": str(release.edition_id),
+                    "edition_release_id": str(release.id),
+                    "manifest_id": str(release.manifest_id),
+                    "edition_document_sha256": release.edition_document_sha256,
+                    "publications": publication_lineage,
+                    "renderer": {
+                        "name": EDITION_RENDERER,
+                        "version": EDITION_RENDERER_VERSION,
+                        "identity_sha256": _version_identity_sha256(
+                            EDITION_RENDERER, EDITION_RENDERER_VERSION
+                        ),
+                    },
+                    "template": {
+                        "version": template_bundle.template_version,
+                        "sha256": template_bundle.sha256,
+                    },
+                    "compiler": {
+                        "name": TYPST_COMPILER,
+                        "version": TYPST_COMPILER_VERSION,
+                        "identity_sha256": _version_identity_sha256(
+                            TYPST_COMPILER, TYPST_COMPILER_VERSION
+                        ),
+                        "binary_sha256": None,
+                    },
+                    "rendered_at": now.isoformat(),
+                }
+                source = self._renderer.render(
                     document,
                     template_bundle,
+                    document_label=label,
                     artifact_identities=artifact_identities,
+                )
+                payload = json.loads(source.render_data_bytes)
+                if not isinstance(payload, dict):
+                    raise ValueError("Edition render-data must be a JSON object")
+                if payload.get("document_label") != label:
+                    raise ValueError("Edition renderer omitted document_label")
+                payload["pdf_lineage"] = lineage
+                render_data_bytes = json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                return replace(
+                    source,
+                    render_data_bytes=render_data_bytes,
+                    render_data_sha256=hashlib.sha256(render_data_bytes).hexdigest(),
                 )
             except RendererSchemaUnsupportedError as exc:
                 raise EditionRenderPublicationSchemaUnsupportedError(str(exc)) from exc
@@ -349,6 +414,128 @@ class EditionRenderService:
         except Exception:
             # Missing optional location provenance cannot block an immutable PDF render.
             return {}
+
+    async def _read_pinned_publication_lineage(
+        self, release: EditionRelease, document: EditionDocumentV2
+    ) -> list[dict[str, Any]]:
+        """Capture each frozen publication and opinion identity in the durable render-data."""
+        try:
+            async with self._uow_factory() as uow:
+                manifest_blob_id = await uow.publication_manifests.get_blob_id(release.manifest_id)
+                if manifest_blob_id is None:
+                    return [
+                        {
+                            "artifact": None,
+                            "opinion": None,
+                            "lineage_warning": "pinned_manifest_unavailable",
+                        }
+                    ]
+                manifest_payload = await self._artifact_store.read_json(manifest_blob_id)
+                if not isinstance(manifest_payload, dict):
+                    return [
+                        {
+                            "artifact": None,
+                            "opinion": None,
+                            "lineage_warning": "pinned_manifest_unavailable",
+                        }
+                    ]
+                manifest = PublicationManifestV1.from_json(manifest_payload)
+                publication_by_subject = {
+                    str(item.subject_id): item.document for item in document.publications
+                }
+                result: list[dict[str, Any]] = []
+                runtime_uow = cast(Any, uow)
+                for entry in manifest.entries:
+                    artifact = await uow.production_artifacts.get(entry.document_artifact_id)
+                    review_decision_id = getattr(entry, "review_decision_id", None)
+                    document_sha256 = getattr(entry, "document_sha256", None)
+                    if artifact is None:
+                        result.append(
+                            {
+                                "subject_id": str(entry.subject_id),
+                                "production_run_id": str(entry.production_run_id),
+                                "artifact": {
+                                    "id": str(entry.document_artifact_id),
+                                    "version": entry.document_artifact_version,
+                                    "sha256": document_sha256,
+                                    "document_schema": None,
+                                },
+                                "opinion": None,
+                                "review_decision_id": (
+                                    str(review_decision_id)
+                                    if review_decision_id is not None
+                                    else None
+                                ),
+                                "lineage_warning": "pinned_artifact_unavailable",
+                            }
+                        )
+                        continue
+                    augmentation = artifact.metadata.get("publication_augmentation")
+                    publication = publication_by_subject.get(str(entry.subject_id))
+                    canonical_sha256 = None
+                    if artifact.canonical_blob_id is not None:
+                        canonical_bytes = await self._artifact_store.read_bytes(
+                            artifact.canonical_blob_id
+                        )
+                        canonical_sha256 = hashlib.sha256(canonical_bytes).hexdigest()
+                    opinion_identity = None
+                    if isinstance(augmentation, dict):
+                        opinion_id = UUID(str(augmentation["opinion_id"]))
+                        opinion_version = int(augmentation["opinion_version"])
+                        opinion = await runtime_uow.analyst_opinions.get(
+                            opinion_id, version=opinion_version
+                        )
+                        opinion_identity = {
+                            "id": str(opinion_id),
+                            "version": opinion_version,
+                            "status": opinion.status.value if opinion is not None else "unknown",
+                            "sha256": str(
+                                augmentation.get("opinion_content_sha256")
+                                or (opinion.content_sha256 if opinion is not None else "")
+                            ),
+                            "investigation_id": str(augmentation.get("investigation_id")),
+                        }
+                    result.append(
+                        {
+                            "subject_id": str(entry.subject_id),
+                            "production_run_id": str(entry.production_run_id),
+                            "artifact": {
+                                "id": str(artifact.id),
+                                "version": artifact.version,
+                                "sha256": canonical_sha256,
+                                "document_schema": (
+                                    getattr(publication, "schema_version", None)
+                                    if publication is not None
+                                    else None
+                                ),
+                            },
+                            "opinion": opinion_identity,
+                            "review_decision_id": (
+                                str(review_decision_id) if review_decision_id is not None else None
+                            ),
+                            "lineage_warning": (
+                                "publication_schema_and_metadata_disagree"
+                                if (publication is not None) != isinstance(augmentation, dict)
+                                or artifact.version != entry.document_artifact_version
+                                or artifact.production_run_id != entry.production_run_id
+                                or (
+                                    document_sha256 is not None
+                                    and canonical_sha256 != document_sha256
+                                )
+                                else None
+                            ),
+                        }
+                    )
+                await uow.commit()
+            return result
+        except Exception:
+            return [
+                {
+                    "artifact": None,
+                    "opinion": None,
+                    "lineage_warning": "pinned_source_chain_unavailable",
+                }
+            ]
 
 
 def _ensure_edition_publications_are_supported(payload: dict[str, Any]) -> None:

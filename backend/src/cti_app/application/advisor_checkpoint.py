@@ -157,7 +157,7 @@ def advisor_checkpoint_summary(invocation: Any) -> str | None:
         costs = (
             (BudgetDimension.BRIDGE_TURNS, "turns"),
             (BudgetDimension.CONTEXT_BYTES, "bytes"),
-            (BudgetDimension.CONTEXT_TOKENS, "tokens"),
+            (BudgetDimension.CONTEXT_TOKENS, "context_units_estimated"),
             (BudgetDimension.TOOL_SECONDS, "seconds"),
         )
         cost_text = ",".join(f"{label}:{budget.get(dimension, 0)}" for dimension, label in costs)

@@ -196,25 +196,25 @@ def test_publication_section_order_matrix(monkeypatch: pytest.MonkeyPatch) -> No
             v6_without_opinion,
             inputs,
             qa_publication_v6,
-            ("references", "synthesis", "analyst_opinion"),
+            ("references", "synthesis"),
         ),
         (
             v6_with_opinion,
             inputs,
             qa_publication_v6,
-            ("references", "synthesis", "analyst_opinion"),
+            (
+                "references",
+                "synthesis",
+                "analyst_opinion",
+                "technical_annex",
+            ),
         ),
     )
     for publication, case_inputs, qa, expected_types in cases:
         model = project_publication_to_typst_model(publication)
         assert tuple(section["type"] for section in model.content_sections) == expected_types
         if publication is v6_without_opinion:
-            opinion_section = next(
-                section
-                for section in model.content_sections
-                if section["type"] == "analyst_opinion"
-            )
-            assert opinion_section["empty_message"] == "Aucun avis publié."
+            assert all(section["type"] != "analyst_opinion" for section in model.content_sections)
         assert qa(publication=publication, **case_inputs)["passed"] is True
 
     timeline_model = project_publication_to_typst_model(v5_with_chronology)

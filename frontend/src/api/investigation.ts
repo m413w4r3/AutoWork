@@ -165,6 +165,7 @@ export interface InvestigationOpinionDraft {
 export interface BudgetDimensionView {
   limit: number | null;
   consumed: number;
+  reserved: number;
   remaining: number | null;
 }
 
@@ -192,6 +193,7 @@ export interface InvestigationView {
   blocked_decisions: BlockedInvestigationDecision[];
   available_tools: string[];
   unavailable_tools: string[];
+  unavailable_tool_reasons: Record<string, string>;
   envelope_approved: boolean;
   allowed_providers: string[];
   acquire_hits_allowed: boolean;

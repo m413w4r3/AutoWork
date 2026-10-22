@@ -358,8 +358,16 @@ def test_v5_publication_projects_indicators_and_original_indicators() -> None:
         Path(__file__).resolve().parents[2] / "chpTypst",
         manifest_name="edition-renderer-manifest.json",
     )
-    render_source = EditionTypstRenderer().render(edition, bundle)
+    render_source = EditionTypstRenderer().render(
+        edition,
+        bundle,
+        document_label=(
+            "Édition publiée 00000000-0000-4000-8000-000000000201 "
+            "— release 00000000-0000-4000-8000-000000000202"
+        ),
+    )
     render_data = json.loads(render_source.render_data_bytes)
+    assert render_data["document_label"].startswith("Édition publiée ")
     assert render_data["publications"][0]["file_ioc_count"] == 1
     assert render_data["file_ioc_count"] == 1
 

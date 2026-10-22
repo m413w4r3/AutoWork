@@ -1,118 +1,110 @@
-# Boucle opérateur Sonnet medium
+# Playbook opérateur CTI
 
-Pour chaque investigation `operator_led`, l’opérateur choisit et lance toutes les actions. Bridge est plus intelligent pour les questions d’analyse et de planification: demandez son avis quand un choix exige ce raisonnement. La consultation reste facultative à chaque étape; aucune réponse Bridge n’est exécutée automatiquement.
+L’opérateur pilote l’investigation `operator_led` depuis l’état canonique AutoWork. Les outils mesurent et enregistrent; Bridge conseille; aucune sortie de modèle ne constitue une preuve ou ne déclenche une action automatiquement.
 
-## Lire l’état et les checkpoints
+## Boucle de décision
 
-```sh
-ID='<investigation-uuid>'
-~/.cache/audit/opapi.sh GET "/api/investigations/${ID}/operator-status"
-~/.cache/audit/opapi.sh GET "/api/investigations/${ID}/operator/context?view=summary"
-```
+Avant chaque prochaine action analytique, noter brièvement :
 
-Vérifier `execution_mode=operator_led`, `working_state_version`, l’enveloppe G2, le budget restant, la capacité `bridge.advisor` et `advisor_guidance`. Les raisons de checkpoint principales sont `no_advisor_consultation` (plan initial), `first_significant_decompilation`, `new_pivot_discovered`, `repeated_tool_block`, `before_yara_proposal`, `yara_revision_review` et `opinion_review_due`. Un seuil de 12 actions reste un rappel de secours, pas un appel obligatoire après chaque outil. Le plafond est de 8 consultations par investigation.
+1. **Hypothèse** — quel fait ou quelle explication départager ?
+2. **Pivot** — quelle valeur, observation ou source exacte examiner ?
+3. **Critère** — quel résultat mesurable confirme ou écarte l’hypothèse ?
+4. **Coût** — lectures, outils externes, tours Bridge attendus, délai et budget G2 restant. Distinguer les consommations confirmées, réservées, estimées et inconnues.
+5. **Décision suivante** — poursuivre, pivoter, arrêter, demander une analyse Bridge ou conserver explicitement l’inconnu.
 
-Les checkpoints couvrent les décisions analytiques utiles: après l’article/plan, après la première analyse ou décompilation significative, après un nouvel élément de la frontière de pivots, après des blocages répétés, avant un brouillon YARA, après son test avant révision, et sur le brouillon d’avis contradictoire avant G3. L’opérateur peut continuer localement et consigner le motif du report.
+Après l’action, inscrire le résultat observé, sa référence/version, l’écart au critère, la limite restante et la décision suivante. Une valeur absente, un artefact non acquis, une réponse `partial` ou un outil indisponible ne constitue pas un résultat négatif.
 
-## Contexte allégé et preuves à la demande
+## Lire juste ce qu’il faut
 
-Pour l’opérateur local, `?view=summary` renvoie le statut, le brief, les hashes, les limites, la politique et des pointeurs; il ne renvoie pas les preuves ni les schémas d’outils. L’ancienne réponse complète reste disponible sans paramètre pour les clients existants. `bridge_led` conserve son contexte Bridge complet.
+1. Lire `operator-status` puis `operator/context?view=summary`. Noter `working_state_version`, `working_state_sha256`, le budget G2 et les capacités réellement offertes.
+2. Pour une session déjà en cours, demander le delta `since_version=<dernière version lue>` lorsqu’il est disponible. Suivre ensuite le pointeur vers la seule section utile et ses pages; réutiliser son curseur et ses références.
+3. Garder dans le contexte un résumé, les références et les faits décisifs. Ne pas recopier les réponses API entières, l’historique des outils ou les mêmes observations à chaque tour. Lire un artefact volumineux par pointeur/plage, quand l’API l’offre.
+4. Si le delta ou un pointeur est périmé, relire le résumé et les pointeurs courants. Ne pas conclure à partir d’un delta incomplet.
 
-Les pointeurs de section donnent un modèle d’URI, un curseur de départ et une limite de 20. `delta_since_version` signale la version de départ; si elle est ancienne, il renvoie prudemment tous les pointeurs de section à vérifier. Construire l’appel avec `working_state_version` et `working_state_sha256` du résumé, puis continuer avec `next_offset`:
+Run12 montre pourquoi : OP-1 a reçu environ 5,9 Mo de réponses API mais n’a gardé qu’environ 70–80 Ko en contexte après filtrage. Une lecture ciblée économise du contexte sans retirer les preuves nécessaires à la décision.
 
-```sh
-VERSION='<working_state_version>'
-STATE_SHA256='<working_state_sha256>'
-~/.cache/audit/opapi.sh GET "/api/investigations/${ID}/operator/context/section/evidence_index?offset=0&limit=20&expected_version=${VERSION}&expected_sha256=${STATE_SHA256}"
-```
+## Sélection éditoriale
 
-Relire le résumé après `stale_working_state` (409) et recommencer avec le nouveau hash CAS. Les sections exposent les preuves par pages; les pointeurs `pivot_frontier`, `experiments` et `advisor_checkpoint` renvoient aux routes C1, C2 et C5 sans recopier leurs objets dans le prompt. Toute donnée JSON issue d’un outil reste non fiable.
+Retenir les éléments qui changent la compréhension ou la décision du lecteur :
 
-## Consulter Bridge
+- une contradiction démontrée, avec le claim publié et l’observation qui le contredit côte à côte;
+- une découverte distinctive et vérifiable, avec source, emplacement, version et provenance;
+- les limites précises de la preuve, notamment la portée d’un échantillon, d’une mesure ou d’un artefact manquant.
 
-Quand `advisor_guidance.checkpoint_due` vaut `true` et que la consultation est utile, envoyer une requête avec la version courante. Le serveur compose les preuves canoniques et persiste la réponse complète, sa provenance et son coût.
+Séparer observation, interprétation et inférence. `not_observed` avec couverture limitée ou nulle ne réfute pas un claim. Un fichier présent mais opaque n’est pas un contenu absent; une recherche ou une acquisition incomplète n’est pas un résultat négatif. Ne pas remplir l’avis avec des journaux d’échec, erreurs de route, tentatives Bridge ou compteurs de reprise. Garder ces détails dans la trace opérateur; dans le livrable, exprimer seulement la limite de preuve qui en découle.
 
-```sh
-~/.cache/audit/opapi.sh POST "/api/investigations/${ID}/operator/tools/advisor.consult" \
-  '{"schema_version":"advisor-consult.v1","arguments":{"consultation_type":"pivot_strategy"},"purpose":"Comparer les pivots à partir des mesures disponibles.","expected_version":7}' \
-  "advisor-${ID}-pivot-01"
-```
+OP-2B a estimé au moins 37 appels pour rédiger et revoir 18 unités alors que 18 tours restaient. Cette expérience impose de choisir les unités éditoriales utiles et de définir leur critère d’acceptation; elle ne justifie pas d’ajouter des quotas locaux.
 
-Remplacer `7` par `working_state_version`. Les types acceptés sont `plan_investigation`, `pivot_strategy`, `yara_draft` et `review_text`. `review_text` reçoit un seul bloc d’avis versionné. `yara_draft` ne reçoit que des mesures vérifiées avec leurs offsets, blobs, hashes et versions d’extracteur; son texte reste un candidat.
+## Consulter Bridge souvent et utilement
 
-La réponse `advisor-response.v2` contient des hypothèses alternatives, une expérience discriminante, une piste écartée et des références de base. Chaque recommandation de pivot nomme un outil et sa version exacte, explique le signal attendu et cite au moins une observation réelle. Le serveur refuse la réponse si ses références ne figurent pas parmi les observations/sources transmises ou si l’outil/la version n’est pas disponible. Les données et la réponse restent marquées non fiables.
+Consulter Bridge lorsqu’un jugement peut changer la branche d’analyse, après une observation discriminante, pour comparer des pivots, pour rédiger une unité ou pour revoir le texte courant. Ne pas attendre un compteur arbitraire d’outils; consulter après chaque jalon éditorial qui le justifie, sans répéter mécaniquement un appel identique.
 
-Les champs envoyés sont limités à l’article synthétisé, aux observations/résumés sélectionnés, aux mesures vérifiées, à l’avis cité, aux outils disponibles et au budget. Aucun octet brut, secret, chemin hôte ou URL signée n’est transmis. Le résultat complet est conservé dans l’observation `advisor.consult`; `context_units` donne l’estimation de tokens dérivée des octets de contexte, et `tool_coverage` reprend le checkpoint, les références, les dimensions de coût, la décision et le résultat observé.
+Fournir un dossier de faits réels et limité à la question : claim ou section pertinente, passages sources verbatim, observations et mesures utiles, contre-exemples, emplacement et limites. Pour une revue, inclure le texte exact courant. Indiquer le critère de réponse utile et le coût/décision que la réponse peut changer. Ne demander jamais du JSON : utiliser le format texte `advisor-wire.v1` prévu pour le type de tâche.
 
-## Déclarer une hypothèse et consigner une expérience
+Traiter chaque unité séparément, ou envoyer un lot seulement si le chemin Bridge courant le prend explicitement en charge et rend le statut, le texte et les références de chaque unité. Si une réponse est partielle, conserver les unités complètes et marquer les autres comme non traitées; ne pas les déclarer négatives ni les remplacer par du texte opérateur sans le signaler.
 
-En `operator_led`, déclarer d’abord l’hypothèse choisie avec `hypothesis.declare` (`operator-hypothesis-declare.v1`, capacité `operator.write`, G2 courant). Fournir `hypothesis_id` et `statement`; le rejeu avec la même clé d’idempotence restitue l’invocation, et le même contenu sous une autre clé ne crée pas de doublon. Ensuite, `experiment.record` (`operator-experiment.v1`) n’accepte que cette hypothèse, les claims de l’article et des observations persistées de l’investigation avec leur SHA-256 exact.
+Vérifier chaque assertion contre les références transmises. Une réponse `succeeded`, `partial` ou un tour confirmé ne garantit pas que le texte est exact, complet ou attachable. Vérifier que les références existent et soutiennent la phrase, que les affirmations distinguent faits et inférences et que la revue concerne exactement le texte courant.
 
-Pour `experiment.record`, `expected_version` désigne le `stream_version` du flux d’expériences, pas `working_state_version`. En cas de refus, `experiment_hypothesis_unknown` indique une hypothèse non déclarée, `experiment_claim_unknown` un claim absent de l’article, et `experiment_observation_ref_mismatch` une observation absente/d’une autre investigation ou un SHA-256 discordant. Une observation `not_observed` à couverture `limited` ou `none` ne peut pas réfuter un claim.
+### Coût et reprise
 
-Une nouvelle expérience peut fournir `supersedes_experiment_ids` pour remplacer des expériences antérieures du même flux. La consolidation écarte leurs verdicts, conserve l’historique append-only et ne garde que le dernier verdict non remplacé; les contradictions entre verdicts actifs restent « nuancées ». Les anciens enregistrements sans ce champ restent valides.
+Consigner par invocation le statut, l’identifiant d’invocation opérateur, l’identifiant Bridge quand il existe, les octets d’entrée/sortie, le délai, les tours confirmés, les réservations G2 et l’usage fournisseur réel. Si l’usage fournisseur est `unavailable`, le garder inconnu; `octets/4` est une estimation de contexte, pas une facturation.
 
-Les sorties `method.decompile` et `local.run_command` conservent jusqu’à 48 KiB de résultat assaini dans l’observation, en fragments de 4 000 caractères au plus, avec SHA-256. Le JSON CIL .NET est découpé directement; la sortie locale est encodée en `base64-utf8` (`output_encoding`, `output_chunks`, `output_byte_length`, `output_sha256`). La réponse opérateur reste un aperçu. Lire le reste via `observation_url` et ses paramètres `offset`/`length` (pages de 32 KiB maximum); les limites de sortie confinée de chaque outil restent applicables.
+Les traces OP-3bis comptent 22 consultations Bridge confirmées, mais seulement 12 avec une estimation de contexte et sans usage fournisseur disponible. Des invocations `unavailable` ont aussi coexisté avec des exécutions Bridge terminées. Les compteurs d’outil, soumissions, tours confirmés et usage fournisseur ne sont donc pas interchangeables.
 
-## Décider, tracer et vérifier
+Après timeout, pacing ou réponse ambiguë, réconcilier d’abord l’invocation exacte et sa sortie persistée. Ne pas refaire un POST à l’aveugle et ne pas supposer qu’un état `unavailable` signifie qu’aucun travail fournisseur n’a eu lieu.
 
-Bridge propose; l’opérateur vérifie le schéma et les effets, puis choisit séparément l’outil à invoquer. Chaque appel opérateur conserve le coût (`bridge_turns`, octets/tokens de contexte, secondes), les observations sources et les refs de sortie. Le journal affiche `consulted`, `skipped(reason)` ou `denied(reason)`. Une action après un checkpoint non consulté est enregistrée comme saut; un refus TLP/divulgation ou budget est enregistré comme refus.
+## Procédures courantes
 
-Pour donner un motif explicite de report, préfixer `purpose` avec le marqueur ci-dessous. `checkpoint_id` est la raison de `advisor_guidance` suivie de `@working_state_version`:
+### Reparser une réponse existante
+
+Avant une nouvelle consultation, retrouver l’observation de sortie et l’invocation Bridge exacte. Vérifier que la réponse brute complète est persistée, puis utiliser `advisor.reparse` sur cette sortie avec le parseur courant. Reparse ne lance pas une nouvelle consultation Bridge. Vérifier les unités et références extraites; si la sortie brute est absente ou vide, laisser l’unité non résolue et réconcilier l’invocation, sans inventer de texte.
+
+Cette précaution répond à OP-3 : un travail Bridge apparaissait terminé dans les journaux alors qu’AutoWork n’avait pas de réponse liée; OP-3bis a aussi montré qu’un reparse ne peut pas retrouver les phrases absentes de la sortie brute.
+
+### Revoir l’avis courant
+
+Relire l’avis juste avant une revue ou une révision; noter son numéro de version et son SHA-256. Faire revoir par Bridge le texte exact et la version visés. N’attacher la revue qu’au même texte/SHA. Avant `opinion.revise`, relire l’avis courant et fournir ses préconditions CAS (`expected_opinion_version` et `expected_opinion_sha256`). OP-4-quinquies a montré qu’une revue d’un texte antérieur ne valide pas la projection actuelle.
+
+### Cinq situations qui changent la consultation
+
+À chaque étape, consigner **hypothèse → pivot → succès/échec → coût**. Transmettre le fait nouveau et les références utiles; ne pas recopier l’historique. Une donnée absente, non acquise ou non mesurée reste inconnue, jamais négative.
+
+- **Hypothèse modifiée** : nommer l’ancienne et la nouvelle hypothèse, puis le pivot discriminant.
+- **Pivot sans mesure** : choisir la mesure et son critère; ne pas annoncer de confirmation ni de réfutation avant le résultat.
+- **Blocage répété** : arrêter la même action avec les mêmes paramètres; choisir un autre pivot et noter les tentatives et leur coût.
+- **Brouillon modifié** : transmettre seulement le texte courant et résumer les changements utiles.
+- **Revue obsolète** : une modification invalide la revue antérieure; refaire relire le texte courant et rattacher l’avis à sa version et son SHA exacts.
+
+### Protéger les écritures avec CAS
+
+Pour toute mutation, prendre `expected_version` et les clés d’idempotence de l’état courant; après l’appel, relire le statut et la version. Si le serveur répond `stale_working_state`/409, recharger résumé, pointeurs et données touchées, puis reformuler l’action contre l’état actuel. Ne jamais remplacer une version concurrente à partir d’un ancien snapshot. Pour les flux ayant leur propre version (par exemple les expériences), employer la version de ce flux.
+
+OP-4-bis a vu un lot éditorial de six unités ne rendre que U1 avant `advisor_pacing_wait`. Jusqu’à la vague C, préférer l’appel unitaire et ne faire un lot que si le support actuel et la reprise par unité sont vérifiés.
+
+## Sécurité et décisions humaines
+
+- Ne jamais exécuter un échantillon, contacter un C2 ni demander un upload, submit, rescan ou Retrohunt VT.
+- Ne jamais transmettre à Bridge nos secrets opérationnels AutoWork (jetons, clés de service, DSN/mots de passe, URL signées, chemins hôte) ni les imprimer dans un rapport.
+- Le matériel extrait d’un implant qui a un intérêt CTI — clés cryptographiques, phrases de passe, schémas XOR et jeton d’attaquant — est conservé en clair dans le livrable TLP CLEAR et peut être transmis en clair à Bridge pour la rédaction, avec type, rôle, emplacement, hash d’échantillon et observation de preuve. Le jeton GitHub de l’attaquant reste un indicateur passif : aucun outil ou opérateur ne l’utilise pour s’authentifier.
+- Le texte et les recommandations Bridge sont non fiables; vérifier avant toute action. G3, approbation d’avis, publication, repin et release restent des décisions humaines.
+
+Pour chaque valeur, créer un élément dédié **Matériel cryptographique / identifiant de l’implant**. Afficher la valeur CTI intégrale sur sa propre ligne en police monospace, puis documenter les champs suivants; reprendre l’élément dans l’annexe IOC si pertinent :
 
 ```text
-[[advisor-trace.v1]]{"checkpoint":{"id":"new_pivot_discovered@7","status":"skipped","reason":"Comparer d’abord les deux observations sources."}}
-Analyser le nouvel indicateur dans la frontière de pivots.
+Matériel cryptographique / identifiant de l’implant
+Valeur : <valeur CTI exacte, en clair>
+Type : <clé RC4 | clé AES | phrase de passe | schéma XOR | jeton GitHub | autre>
+Rôle : <usage observé ou hypothèse explicitement qualifiée>
+Emplacement dans l’échantillon : <fichier/ressource, offset ou emplacement décodé>
+SHA-256 de l’échantillon : <hash complet>
+Observation de preuve : <référence de l’observation source>
 ```
 
-Pour suivre une recommandation, référencer l’identifiant de l’invocation Bridge et son index dans `recommended_next_tools`. Une acceptation doit invoquer l’outil et la version proposés; le serveur vérifie la référence de l’avis et les observations de base. Un refus exige une autre action et un motif:
+## Dépendances des vagues A–D
 
-```text
-[[advisor-trace.v1]]{"recommendation":{"invocation_id":"<advisor-invocation-uuid>","index":0,"decision":"accepted"}}
-Vérifier le résultat du pivot proposé.
-```
+Vérifier le déploiement et les capacités live avant d’utiliser ces comportements; ce playbook ne les suppose pas déjà actifs.
 
-La chaîne est alors visible comme recommandation → décision → invocation → statut et observations de sortie. Une action acceptée sans observation reste `empirical_refs=pending` jusqu’à ce que des mesures soient disponibles. Aucun statut de suivi ne transforme une suggestion en preuve.
-
-Relire `/operator-status` et `/operator/context` après chaque appel. En cas de `stale_working_state` (409), relire la version avant de reformuler. Après `advisor_rate_limited`, `advisor_pacing_wait` ou timeout ambigu, ne pas retenter à l’aveugle; conserver l’état incertain et réconcilier les invocations.
-
-Pour `advisor.consult`, régler le timeout du client appelant à au moins 200 s. Une réponse Bridge a déjà pris 163 s; un client limité à 120 s peut abandonner alors que l’invocation reste `running`. Ce délai concerne le client opérateur, pas le transport serveur.
-
-## Mesure des seuils
-
-Les fixtures C5 identifient sept causes de checkpoint distinctes, donc au plus sept consultations si chacune est choisie une fois, sous le plafond existant de huit. Le rappel de 12 outils ne sert qu’aux longues séquences sans événement; la fixture le déclenche après exactement 12 outils depuis le dernier avis. Ces mesures synthétiques justifient de garder les valeurs par défaut 12/8; elles ne prétendent pas mesurer une investigation réelle.
-
-## Consultation réelle sur la stack
-
-L’orchestrateur rejoue au minimum `pivot_strategy` et `yara_draft` par l’API réelle sur une investigation `operator_led`. Prérequis: G2 active et non révoquée, fournisseur Bridge autorisé dans l’enveloppe, `external_llm_allowed=true`, `do_not_submit=false`, TLP compatible, capacité `bridge.advisor` disponible, budget `bridge_turns` et budget de contexte non épuisés, délai de pacing respecté, observations de référence appartenant à l’investigation. Utiliser la version CAS courante.
-
-Pour chaque appel, vérifier l’invocation API, son statut, l’observation MinIO `advisor.consult`, son SHA-256, le `consultation_type`, les refs d’entrée/sortie, la réponse structurée et toutes les dimensions de coût. Puis invoquer explicitement une suggestion `pivot_strategy`, relire l’observation produite et consigner `accepted` seulement si l’outil/version correspondent. Sur un second scénario, consigner un refus motivé et vérifier l’action alternative et ses résultats. Ne pas appeler Bridge si TLP/divulgation, G2, capacité ou budget refusent la consultation; vérifier que le refus est persisté sans effet externe.
-
-Les suggestions ne donnent aucune autorisation G2/G3, d’upload, de rescan, d’exécution de binaire, de publication ou de qualification d’échantillon. Une règle YARA reste un brouillon qui doit être testée sur des mesures réelles.
-
-## Actualiser les figures de protocole d’un avis
-
-Les figures D2 sont des pièces jointes immuables du brouillon qui les a sélectionnées. `network.protocol.render` enregistre une observation des spécifications sémantiques; la compilation D2 actuelle et l’attachement des trois SVG ont lieu lors de `opinion.revise`. Un aperçu d’une ancienne version continue d’utiliser ses SVG persistés et affiche un avertissement « Rendu hérité » lorsque leur politique de projection ou leur légende est ancienne.
-
-Pour Run12, l’investigation est `5f66ebfb-1653-45e6-83cd-a29af6f87868`, le modèle documenté est le blob `e535d7e4-7a4d-470d-818f-2c3a9ea9ae7a`, et l’observation de rendu sémantique actuellement attachée est `070bdb45-c9fa-525d-b6ab-66d89310e763`. L’avis brouillon `d9935324-2ccc-5067-9dc9-17efc0637823` est en v26 (`4f9157804db0349215f65e6220b503fe6a8a1ba6be7c38e0494c734fd9ed8a8c`); la publication de base a le SHA-256 `3a436eada0d8162aef1d730b60b3f739e6f7c056b80593dbf9d97510133b96ba`.
-
-1. Relire `GET /api/investigations/5f66ebfb-1653-45e6-83cd-a29af6f87868/opinion`. Vérifier que le brouillon courant est toujours v26, récupérer ses `blocks` et `unresolved_points`, et noter son SHA-256. Si la version a changé, utiliser ses valeurs actuelles; ne pas écraser une révision concurrente.
-2. Invoquer `network.protocol.render` avec `arguments: {"protocol_model_blob_id":"e535d7e4-7a4d-470d-818f-2c3a9ea9ae7a"}`. Conserver le nouvel `observation_ref` renvoyé. L’observation `070bdb45-c9fa-525d-b6ab-66d89310e763` est l’ancienne référence et ne doit pas être réutilisée pour cette sélection.
-3. Invoquer `opinion.revise` sur l’avis `d9935324-2ccc-5067-9dc9-17efc0637823` avec `action: "revise"`, `expected_opinion_version: 26`, `expected_opinion_sha256: "4f9157804db0349215f65e6220b503fe6a8a1ba6be7c38e0494c734fd9ed8a8c"`, les `blocks` et `unresolved_points` relus à l’étape précédente, et cette sélection:
-
-   ```json
-   {
-     "protocol_figures": [
-       {
-         "protocol_model_blob_id": "e535d7e4-7a4d-470d-818f-2c3a9ea9ae7a",
-         "render_observation_id": "<nouvel observation_ref de network.protocol.render>",
-         "views": ["sequence", "state_machine", "message_format"]
-       }
-     ]
-   }
-   ```
-
-   Les trois vues sont sélectionnées ensemble. Vérifier que le résultat est un brouillon v27 et relever le nouveau `content_sha256`; cette révision ne valide ni ne publie l’avis.
-4. Refaire l’aperçu sans demander de recompilation implicite: `GET /api/opinions/d9935324-2ccc-5067-9dc9-17efc0637823/preview.pdf?version=27&opinion_sha256=<content_sha256_v27>&base_publication_sha256=3a436eada0d8162aef1d730b60b3f739e6f7c056b80593dbf9d97510133b96ba`. Vérifier les figures de protocole autour des pages 16–17 (et leur nouvelle pagination), les légendes courtes, les libellés de preuve non répétés et l’absence de l’avertissement « Rendu hérité » pour les trois pièces jointes v27.
-
-Ne pas utiliser l’option `protocol_model_blob_id` de la route d’aperçu pour un contrôle en lecture seule: elle compile et persiste des SVG. L’aperçu sans cette option reste strictement lié aux figures déjà persistées dans la version demandée; un avertissement visible identifie les pièces jointes anciennes jusqu’à leur réattachement dans une nouvelle version du brouillon.
+- **Après vague A** : comptabilité par invocation, stockage intégral avant parsing/reparse et retrait des quotas advisor locaux. Avant cela, réconcilier toute réponse ambiguë et ne pas compter sur une sortie longue complète.
+- **Après vague B** : constitution automatique de dossiers de faits typés pour Bridge, avec provenance et sélection d’extraits. Avant cela, assembler manuellement le texte factuel indispensable, sans dump JSON ni secret opérationnel.
+- **Après vague C** : pacing, attente et reprise de lots multi-unités, plus contexte/pagination ciblés. Avant cela, faire une unité par appel, ou seulement un lot dont le support et le curseur de reprise sont confirmés; ne pas laisser tomber les unités non rendues.
+- **Après vague D** : guidance Investigator/P10 simplifiée. Jusque-là, la session opérateur décide à partir du résumé, des pointeurs et des faits vérifiés; elle ne suppose pas que l’agent Investigator pilote la session `operator_led`.

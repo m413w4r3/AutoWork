@@ -4,6 +4,7 @@ import hashlib
 import socket
 from collections.abc import Sequence
 from dataclasses import FrozenInstanceError
+from datetime import UTC, datetime
 from typing import Any, ClassVar
 from uuid import UUID, uuid4
 
@@ -20,6 +21,7 @@ from cti_app.application.rule_workbench import (
     RuleWorkbench,
     YaraSampleInput,
     rule_validation_reason,
+    validate_single_rule_candidate,
 )
 from cti_app.domain.goodware import (
     Banality,
@@ -57,6 +59,7 @@ from cti_app.domain.rule_workbench import (
     RuleValidationStatus,
     YaraEngineResult,
     YaraExecutionStatus,
+    detect_file_format_magic,
     wilson_rate,
 )
 from cti_app.infrastructure.yara_runner import IsolatedYaraRunner
@@ -145,7 +148,15 @@ def _motif(value: str, *, observation_ref: UUID | None = None) -> RuleMotif:
 
 
 def _case(data: bytes, role: RuleTestCorpusRole) -> RuleTestCase:
-    return RuleTestCase(sample_sha256=_sha256(data), role=role)
+    return RuleTestCase(
+        sample_sha256=_sha256(data),
+        role=role,
+        holdout_designated_at=(
+            datetime(2026, 1, 1, tzinfo=UTC)
+            if role in {RuleTestCorpusRole.HOLDOUT_POSITIVE, RuleTestCorpusRole.HOLDOUT_NEGATIVE}
+            else None
+        ),
+    )
 
 
 def _workbench(
@@ -163,6 +174,65 @@ def _workbench(
         non_discriminant_patterns=non_discriminant or NonDiscriminantPatternRegistry(()),
         legitimate_services=legitimate or LegitimateServiceRegistry(()),
     )
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_reason"),
+    (
+        (
+            'rule first { strings: $a = "marker" condition: $a } '
+            'rule second { strings: $b = "marker" condition: $b }',
+            "exactly_one_rule_required",
+        ),
+        (
+            'rule hash_gate { strings: $a = "marker" '
+            'condition: hash.sha256(0, filesize) == "' + ("a" * 64) + '" }',
+            "hash_equality_condition_forbidden",
+        ),
+        (
+            'rule size_gate { strings: $a = "marker" condition: filesize == 1234 }',
+            "filesize_only_condition_forbidden",
+        ),
+        (
+            'rule branch_gate { strings: $a = "marker" $b = "other" condition: $a or $b }',
+            "or_branches_disguised_as_multiple_rules_forbidden",
+        ),
+        (
+            'import "dotnet" rule clr_only { condition: dotnet.is_assembly }',
+            "generic_dotnet_import_only_forbidden",
+        ),
+    ),
+)
+def test_single_rule_source_guard_rejects_cheating_shapes(
+    source: str, expected_reason: str
+) -> None:
+    assert expected_reason in validate_single_rule_candidate(source)
+
+
+def test_single_rule_source_guard_accepts_one_measured_rule_using_all_of_them() -> None:
+    source = 'rule measured { strings: $a = "marker" condition: 1 of them }'
+    assert validate_single_rule_candidate(source) == ()
+
+
+@pytest.mark.asyncio
+async def test_rule_coverage_matrix_includes_actual_format_and_literal_offsets() -> None:
+    data = b"prefix:RareMarkerQz:suffix"
+    source = 'rule measured { strings: $marker = "RareMarkerQz" condition: $marker }'
+    report = await _workbench({_sha256(data): data}).compile_and_test(
+        source,
+        (_case(data, RuleTestCorpusRole.NEW_CANDIDATE_UNCONFIRMED),),
+        selection_bias="One selected candidate sample.",
+        coverage_statement="One candidate's bytes were measured.",
+    )
+    role = next(
+        item for item in report.roles if item.role is RuleTestCorpusRole.NEW_CANDIDATE_UNCONFIRMED
+    )
+    assert role.test_cases[0].expected_result is None
+    assert role.file_results[0].matched is True
+    assert role.file_results[0].format_magic == "text"
+    assert role.file_results[0].strings[0].identifier == "$marker"
+    assert role.file_results[0].strings[0].offsets == (7,)
+    assert detect_file_format_magic(b"MZ" + b"\\x00" * 64) == "dos_mz"
 
 
 @pytest.mark.asyncio
@@ -221,7 +291,7 @@ async def test_confined_rule_test_marks_one_failed_file_non_measurable(
     )
 
     report = await workbench.compile_and_test(
-        "rule harmless { condition: true }",
+        'rule harmless { strings: $marker = "marker" condition: $marker }',
         (
             RuleTestCase(
                 sample_sha256=problematic_sha256,
@@ -241,6 +311,101 @@ async def test_confined_rule_test_marks_one_failed_file_non_measurable(
     assert positive.non_measurable == (problematic_sha256,)
     assert positive.errors[0].code.value == file_status.value
     assert positive.errors[0].message == "per-file YARA limit reached"
+
+
+@pytest.mark.asyncio
+async def test_confined_rule_test_resolves_worker_bytes_for_every_operator_corpus_role() -> None:
+    roles = (
+        RuleTestCorpusRole.DOCUMENTED_SEED_UNCONFIRMED,
+        RuleTestCorpusRole.NEW_CANDIDATE_UNCONFIRMED,
+        RuleTestCorpusRole.HUMAN_CONFIRMED,
+        RuleTestCorpusRole.GOODWARE,
+        RuleTestCorpusRole.HARD_NEGATIVE,
+        RuleTestCorpusRole.HOLDOUT_POSITIVE,
+        RuleTestCorpusRole.HOLDOUT_NEGATIVE,
+        RuleTestCorpusRole.OUT_OF_SCOPE,
+    )
+    hashes = tuple(f"{index + 1:064x}" for index in range(len(roles)))
+    artifacts = {sample_sha256: uuid4() for sample_sha256 in hashes}
+    investigation_id = uuid4()
+
+    class CorpusArtifactIds:
+        byte_reads = 0
+
+        async def get_artifact_id_for_sample(self, sample_sha256: str) -> UUID:
+            return artifacts[sample_sha256]
+
+        async def get_bytes_for_sample(self, sample_sha256: str) -> bytes:
+            self.byte_reads += 1
+            raise AssertionError(f"application process read corpus bytes for {sample_sha256}")
+
+    class ConfinedYara:
+        family_statuses: ClassVar[dict[str, ConfinedAnalysisFamilyStatus]] = {
+            "yara": ConfinedAnalysisFamilyStatus("yara", True, "4.5.0")
+        }
+
+        def __init__(self) -> None:
+            self.requests = []
+
+        async def execute(self, request: Any) -> ConfinedAnalysisResult:
+            self.requests.append(request)
+            return ConfinedAnalysisResult(
+                status=ToolInvocationStatus.SUCCEEDED,
+                operation_key="confined-analysis:all-corpus-roles",
+                artifact_id=request.artifact_id,
+                input_sha256=request.sha256,
+                payload={
+                    "result": {
+                        "status": "ok",
+                        "version": "4.5.0",
+                        "matches": False,
+                        "format_magic": "text",
+                        "string_hits": [{"identifier": "$marker", "offsets": [0]}],
+                        "unavailable_strings": [],
+                        "coverage_details_complete": True,
+                    }
+                },
+            )
+
+    corpus_bytes = CorpusArtifactIds()
+    confined = ConfinedYara()
+    workbench = RuleWorkbench(
+        corpus_bytes=corpus_bytes,  # type: ignore[arg-type]
+        yara_engine=None,
+        confined_analysis=confined,  # type: ignore[arg-type]
+        detection_candidates=MemoryDetectionCandidates(),
+        non_discriminant_patterns=NonDiscriminantPatternRegistry(()),
+        legitimate_services=LegitimateServiceRegistry(()),
+    )
+    designation = datetime(2026, 1, 1, tzinfo=UTC)
+    cases = tuple(
+        RuleTestCase(
+            sample_sha256=sample_sha256,
+            role=role,
+            holdout_designated_at=(designation if role.value.startswith("holdout_") else None),
+        )
+        for role, sample_sha256 in zip(roles, hashes, strict=True)
+    )
+
+    rule_source = " " * 300_000 + 'rule harmless { strings: $marker = "marker" condition: $marker }'
+    report = await workbench.compile_and_test(
+        rule_source,
+        cases,
+        investigation_id=investigation_id,
+        selection_bias="Operator roles use canonical quarantine artifact identities.",
+        coverage_statement="The confined worker measures bytes for each corpus role.",
+    )
+
+    assert report.execution_status is YaraExecutionStatus.OK
+    assert corpus_bytes.byte_reads == 0
+    assert {request.sha256 for request in confined.requests} == set(hashes)
+    assert all(request.artifact_id == artifacts[request.sha256] for request in confined.requests)
+    assert all(request.artifact_kind.value == "corpus_sample" for request in confined.requests)
+    assert all(request.tool.value == "yara" for request in confined.requests)
+    assert all(
+        request.analysis_parameters["rule_source"] == rule_source for request in confined.requests
+    )
+    assert {role.role for role in report.roles if role.test_cases} == set(roles)
 
 
 @pytest.mark.asyncio
@@ -477,7 +642,7 @@ async def test_compile_errors_are_typed_and_engine_unavailable_is_local() -> Non
     case = _case(data, RuleTestCorpusRole.CONFIRMED_POSITIVE)
     workbench = _workbench({_sha256(data): data})
     compile_report = await workbench.compile_and_test(
-        "rule broken {",
+        'rule broken { strings: $marker = "marker" condition: $marker',
         (case,),
         selection_bias="One synthetic selected sample.",
         coverage_statement="One corpus member was declared.",
@@ -590,7 +755,7 @@ async def test_zero_observed_false_positives_keeps_wide_interval_and_unknown_sen
         for sample_sha256 in sorted(samples)
     )
     report = await _workbench(samples).compile_and_test(
-        "rule no_match { condition: false }",
+        'rule no_match { strings: $never = "never-match-this-corpus" condition: $never }',
         cases,
         selection_bias="Twelve generated unit-test examples, not real DLLs.",
         coverage_statement="Only synthetic examples were measured.",

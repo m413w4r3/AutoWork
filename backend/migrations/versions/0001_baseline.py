@@ -1,9 +1,7 @@
-"""Current PostgreSQL schema baseline and sole mutable revision.
+"""Frozen pre-C2 PostgreSQL baseline for databases stamped 0001_baseline.
 
-The database is reset before this fresh-database revision is applied. The
-current ORM metadata is therefore the complete target schema: it creates
-every table, column, constraint and index in one operation, with no
-historical revisions or data conversions involved.
+This revision is intentionally kept at the shape already represented by
+existing 0001 installations. C2 experiment storage is added by 0002.
 """
 
 from collections.abc import Sequence
@@ -17,7 +15,7 @@ from cti_app.infrastructure.database.models import (  # noqa: F401
     discovery,
     edition_composition,
     # The publication manifest tables include schema-versioned V1 (batch)
-    # and V2 (composition) snapshots in this mutable baseline.
+    # and V2 (composition) snapshots in this frozen baseline.
     edition_publication,
     edition_render,
     editions,
@@ -41,6 +39,11 @@ revision: str = "0001_baseline"
 down_revision: str | None = None
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
+
+_C2_TABLES = frozenset({"investigation_experiment_heads", "investigation_experiments"})
+_BASELINE_TABLES = tuple(
+    table for table in Base.metadata.tables.values() if table.name not in _C2_TABLES
+)
 
 
 _GUARD_FUNCTIONS: tuple[tuple[str, str], ...] = (
@@ -120,17 +123,6 @@ _GUARD_FUNCTIONS: tuple[tuple[str, str], ...] = (
                 RETURN OLD;
             END IF;
             RAISE EXCEPTION '% is append-only', TG_TABLE_NAME USING ERRCODE = '55000';
-        END;
-        $$ LANGUAGE plpgsql
-        """,
-    ),
-    (
-        "reject_investigation_experiment_mutation",
-        """
-        CREATE FUNCTION reject_investigation_experiment_mutation() RETURNS trigger AS $$
-        BEGIN
-            RAISE EXCEPTION 'investigation_experiments is append-only'
-                USING ERRCODE = '55000';
         END;
         $$ LANGUAGE plpgsql
         """,
@@ -392,12 +384,6 @@ _TRIGGERS: tuple[tuple[str, str, str, str], ...] = (
         "append_only",
     ),
     (
-        "investigation_experiments",
-        "trg_investigation_experiments_append_only",
-        "reject_investigation_experiment_mutation",
-        "append_only",
-    ),
-    (
         "reference_members",
         "reference_members_immutable",
         "forbid_reference_mutation",
@@ -413,20 +399,20 @@ _TRIGGERS: tuple[tuple[str, str, str, str], ...] = (
 
 
 def upgrade() -> None:
-    # This is intentionally a fresh-schema operation. No revision checks,
-    # ALTER/backfill path, or old-state inspection belongs in the reset.
+    # This frozen revision creates the pre-C2 shape represented by databases
+    # already stamped 0001. Later schema changes belong in additive revisions.
     # Collection and evidence provenance is subject/discovery-lineage based.
     # The target production_input_snapshots schema includes its captured,
     # non-null publication_language column in the ORM metadata below.
     # The target production_runs schema keeps no synthesis conversation
     # identity: the durable ModelRun owns provider recovery.
     # AnalystDecisionRow's CHECK values and structured details column are
-    # created from the production model metadata in this mutable baseline.
+    # created from the production model metadata in this frozen baseline.
     # The VirusTotal observation capability CHECK is generated from the
     # VirusTotalCapability enum in the ORM model metadata below.
     # The investigation_run job's aggregate CHECK (ck_jobs_investigation_run_aggregate)
     # is declared by the jobs ORM model and therefore created here.
-    Base.metadata.create_all(bind=op.get_bind(), checkfirst=False)
+    Base.metadata.create_all(bind=op.get_bind(), tables=_BASELINE_TABLES, checkfirst=False)
     for _function_name, definition in _GUARD_FUNCTIONS:
         op.execute(definition)
     for table, trigger_name, function_name, kind in _TRIGGERS:
@@ -452,7 +438,7 @@ def downgrade() -> None:
     # between source_collections and collection_attempts. PostgreSQL can drop
     # the fresh schema deterministically when the tables are removed with
     # CASCADE; this is only the inverse of the empty-database baseline.
-    for metadata_table in reversed(tuple(Base.metadata.tables.values())):
+    for metadata_table in reversed(_BASELINE_TABLES):
         op.execute(f'DROP TABLE IF EXISTS "{metadata_table.name}" CASCADE')
     for function_name, _definition in reversed(_GUARD_FUNCTIONS):
         op.execute(f"DROP FUNCTION IF EXISTS {function_name}()")

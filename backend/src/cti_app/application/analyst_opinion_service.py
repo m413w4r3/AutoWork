@@ -31,11 +31,15 @@ from cti_app.domain.analyst_opinion import (
     AnalystObservationV1,
     AnalystOpinionStatus,
     AnalystOpinionV1,
+    BridgeDraftReferenceV1,
+    BridgeReviewReferenceV1,
     CitationViolation,
+    ImplantMaterialEditorialV1,
     OpinionBlock,
     OpinionBlockType,
     OpinionClaimQualification,
     OpinionProtocolFigureV1,
+    opinion_blocks_with_implant_materials,
     opinion_blocks_with_observations,
     verify_opinion_citations,
 )
@@ -72,7 +76,9 @@ _DECISION_NAMESPACE = UUID("6fd4bf30-7369-4c64-9bf4-d5bd17c67ce2")
 _OPERATOR_NOTE_NAMESPACE = UUID("a6088d45-c437-4d6c-9d7b-0cc75a789410")
 OPERATOR_OPINION_SCHEMA_VERSION = "operator-opinion.v1"
 _OPERATOR_BLOCK_TYPES = tuple(
-    item for item in OpinionBlockType if item is not OpinionBlockType.ANALYST_OBSERVATIONS
+    item
+    for item in OpinionBlockType
+    if item not in {OpinionBlockType.ANALYST_OBSERVATIONS, OpinionBlockType.IMPLANT_MATERIALS}
 )
 
 
@@ -94,6 +100,7 @@ class OpinionErrorCode(StrEnum):
     OPINION_NOT_APPROVED = "opinion_not_approved"
     OPINION_NOT_DRAFT = "opinion_not_draft"
     INVALID_SELECTION = "invalid_selection"
+    REVIEW_TEXT_STALE = "review_text_stale"
     INVALID_OBSERVATION_ANCHOR = "invalid_observation_anchor"
     INVALID_STATE = "invalid_opinion_state"
     IDEMPOTENCY_CONFLICT = "idempotency_conflict"
@@ -181,7 +188,9 @@ class OpinionCompositionSelection:
     finding_ids: tuple[UUID, ...] = ()
     claim_ids: tuple[str, ...] = ()
     block_types: tuple[OpinionBlockType, ...] = tuple(
-        item for item in OpinionBlockType if item is not OpinionBlockType.ANALYST_OBSERVATIONS
+        item
+        for item in OpinionBlockType
+        if item not in {OpinionBlockType.ANALYST_OBSERVATIONS, OpinionBlockType.IMPLANT_MATERIALS}
     )
 
     def __post_init__(self) -> None:
@@ -202,6 +211,7 @@ class OpinionRevisionEdits:
     unresolved_points: tuple[str, ...] = ()
     protocol_figures: tuple[OpinionProtocolFigureV1, ...] | None = None
     observations: tuple[AnalystObservationV1, ...] | None = None
+    implant_materials: tuple[ImplantMaterialEditorialV1, ...] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "blocks", tuple(self.blocks))
@@ -216,6 +226,12 @@ class OpinionRevisionEdits:
             object.__setattr__(self, "observations", tuple(self.observations))
             if any(not isinstance(item, AnalystObservationV1) for item in self.observations):
                 raise TypeError("Opinion edits must contain AnalystObservationV1 values")
+        if self.implant_materials is not None:
+            object.__setattr__(self, "implant_materials", tuple(self.implant_materials))
+            if any(
+                not isinstance(item, ImplantMaterialEditorialV1) for item in self.implant_materials
+            ):
+                raise TypeError("Opinion edits must contain ImplantMaterialEditorialV1 values")
 
 
 @dataclass(frozen=True, slots=True)
@@ -272,6 +288,7 @@ class AnalystOpinionService:
         selection: OpinionCompositionSelection | Mapping[str, object] | None = None,
         *,
         protocol_figures: tuple[OpinionProtocolFigureV1, ...] | None = None,
+        draft_blocks: tuple[OpinionBlock, ...] | None = None,
     ) -> AnalystOpinionV1:
         normalized = self._normalize_selection(selection)
         opinion_id = uuid5(_OPINION_NAMESPACE, str(investigation_id))
@@ -305,12 +322,18 @@ class AnalystOpinionService:
             ):
                 raise OpinionError(OpinionErrorCode.STALE_BASE)
 
-            blocks, unresolved = await self._compose_blocks(
-                investigation_id=investigation_id,
-                findings=selected,
-                observations=observations,
-                selection=normalized,
-            )
+            if draft_blocks is None:
+                blocks, unresolved = await self._compose_blocks(
+                    investigation_id=investigation_id,
+                    findings=selected,
+                    observations=observations,
+                    selection=normalized,
+                )
+            else:
+                blocks = tuple(draft_blocks)
+                if any(not isinstance(item, OpinionBlock) for item in blocks):
+                    raise OpinionError(OpinionErrorCode.INVALID_SELECTION)
+                unresolved = ()
             next_version = (current.version if current else 0) + 1
             opinion = AnalystOpinionV1(
                 id=opinion_id,
@@ -339,6 +362,7 @@ class AnalystOpinionService:
                 and current.protocol_figures == opinion.protocol_figures
             ):
                 return current
+            await self._validate_bridge_provenance(uow, opinion)
             violations = verify_opinion_citations(opinion, findings, observations)
             if violations:
                 raise OpinionError(
@@ -371,7 +395,28 @@ class AnalystOpinionService:
             edited_observations = (
                 revision.observations if revision.observations is not None else current.observations
             )
-            edited_blocks = opinion_blocks_with_observations(revision.blocks, edited_observations)
+            edited_materials = (
+                revision.implant_materials
+                if revision.implant_materials is not None
+                else current.implant_materials
+            )
+            revised_material_section = next(
+                (
+                    block
+                    for block in revision.blocks
+                    if block.block_type is OpinionBlockType.IMPLANT_MATERIALS
+                ),
+                None,
+            )
+            if revised_material_section is None and (
+                revision.implant_materials is None or edited_materials == current.implant_materials
+            ):
+                revised_material_section = current.implant_materials_section
+            edited_blocks = opinion_blocks_with_implant_materials(
+                opinion_blocks_with_observations(revision.blocks, edited_observations),
+                edited_materials,
+                section=revised_material_section,
+            )
             if current.version != expected_version:
                 replay = await uow.analyst_opinions.get(opinion_id, version=expected_version + 1)
                 if (
@@ -409,6 +454,7 @@ class AnalystOpinionService:
                 author_id=actor_id,
                 status=AnalystOpinionStatus.DRAFT,
             )
+            await self._validate_bridge_provenance(uow, candidate)
             await self._validate_citations(uow, candidate)
             try:
                 result = await uow.analyst_opinions.append_version(
@@ -819,18 +865,30 @@ class AnalystOpinionService:
         violations = verify_opinion_citations(opinion, findings, observations)
         finding_by_id = {item.id: item for item in findings}
         observation_by_id = {item.id: item for item in observations}
-        foreign = any(
-            (finding := finding_by_id.get(ref)) is not None
-            and finding.investigation_id != opinion.investigation_id
-            for block in opinion.blocks
-            for ref in block.finding_refs
-        ) or any(
-            (observation := observation_by_id.get(ref)) is not None
-            and observation.investigation_id != opinion.investigation_id
-            for block in opinion.blocks
-            for ref in block.evidence_refs
+        material_observation_refs = {
+            item.evidence_observation_id for item in opinion.implant_materials
+        }
+        missing_material_evidence = material_observation_refs - observation_by_id.keys()
+        foreign = (
+            any(
+                (finding := finding_by_id.get(ref)) is not None
+                and finding.investigation_id != opinion.investigation_id
+                for block in opinion.blocks
+                for ref in block.finding_refs
+            )
+            or any(
+                (observation := observation_by_id.get(ref)) is not None
+                and observation.investigation_id != opinion.investigation_id
+                for block in opinion.blocks
+                for ref in block.evidence_refs
+            )
+            or any(
+                (observation := observation_by_id.get(ref)) is not None
+                and observation.investigation_id != opinion.investigation_id
+                for ref in material_observation_refs
+            )
         )
-        if violations or foreign:
+        if violations or foreign or missing_material_evidence:
             raise OpinionError(
                 OpinionErrorCode.CITATIONS_INVALID,
                 citation_violations=violations,
@@ -855,6 +913,275 @@ class AnalystOpinionService:
                 for note in opinion.observations
             ):
                 raise OpinionError(OpinionErrorCode.INVALID_OBSERVATION_ANCHOR)
+
+    async def _validate_bridge_provenance(self, uow: UnitOfWork, opinion: AnalystOpinionV1) -> None:
+        requested: list[
+            tuple[
+                str,
+                str,
+                str | None,
+                BridgeDraftReferenceV1 | None,
+                BridgeReviewReferenceV1 | None,
+            ]
+        ] = []
+        for block in opinion.blocks:
+            if block.block_type in {
+                OpinionBlockType.ANALYST_OBSERVATIONS,
+                OpinionBlockType.IMPLANT_MATERIALS,
+            }:
+                continue
+            if block.bridge_authored or block.bridge_draft_ref or block.bridge_review_ref:
+                requested.append(
+                    (
+                        block.text,
+                        block.block_type.value,
+                        None,
+                        block.bridge_draft_ref,
+                        block.bridge_review_ref,
+                    )
+                )
+        for note in opinion.observations:
+            if note.bridge_authored or note.bridge_draft_ref or note.bridge_review_ref:
+                requested.append(
+                    (
+                        note.text,
+                        (
+                            note.bridge_block_type.value
+                            if note.bridge_block_type is not None
+                            else OpinionBlockType.ANALYST_OBSERVATIONS.value
+                        ),
+                        note.anchor,
+                        note.bridge_draft_ref,
+                        note.bridge_review_ref,
+                    )
+                )
+        material_section = opinion.implant_materials_section
+        if material_section is not None and (
+            material_section.bridge_authored
+            or material_section.bridge_draft_ref
+            or material_section.bridge_review_ref
+        ):
+            requested.append(
+                (
+                    material_section.text,
+                    OpinionBlockType.IMPLANT_MATERIALS.value,
+                    None,
+                    material_section.bridge_draft_ref,
+                    material_section.bridge_review_ref,
+                )
+            )
+        if not requested:
+            return
+
+        persisted = await uow.evidence_observations.list_for_investigation(opinion.investigation_id)
+        advisor_calls: dict[str, Mapping[str, Any]] = {}
+        for observation in persisted:
+            if observation.investigation_id != opinion.investigation_id:
+                continue
+            if observation.source != "advisor.consult" or observation.object_type != "advisor_call":
+                continue
+            try:
+                raw = await self._artifact_store.read_bytes(
+                    observation.blob_id, max_bytes=160 * 1024
+                )
+                if hashlib.sha256(raw).hexdigest() != observation.sha256:
+                    continue
+                payload = json.loads(raw)
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                continue
+            if (
+                not isinstance(payload, Mapping)
+                or payload.get("schema") != "operator-advisor-call.v1"
+                or payload.get("consultation_type") != observation.object_id
+            ):
+                continue
+            invocation_id = payload.get("bridge_invocation_id")
+            if isinstance(invocation_id, str):
+                advisor_calls[invocation_id] = payload
+
+        for text_value, block_type, anchor, draft_ref, review_ref in requested:
+            text_sha256 = hashlib.sha256(text_value.encode("utf-8")).hexdigest()
+            if review_ref is not None and review_ref.reviewed_text_sha256 != text_sha256:
+                raise OpinionError(OpinionErrorCode.REVIEW_TEXT_STALE)
+            if draft_ref is None or draft_ref.text_sha256 != text_sha256:
+                raise OpinionError(OpinionErrorCode.INVALID_SELECTION)
+            draft_call = advisor_calls.get(draft_ref.invocation_id)
+            if not self._bridge_call_contains_draft(
+                draft_call,
+                text_value=text_value,
+                text_sha256=text_sha256,
+                block_type=block_type,
+                anchor=anchor,
+            ):
+                raise OpinionError(OpinionErrorCode.INVALID_SELECTION)
+            if review_ref is not None:
+                review_call = advisor_calls.get(review_ref.invocation_id)
+                if not self._bridge_call_reviews_text(
+                    review_call,
+                    review_ref=review_ref,
+                    text_sha256=text_sha256,
+                    block_type=block_type,
+                    anchor=anchor,
+                ):
+                    raise OpinionError(OpinionErrorCode.INVALID_SELECTION)
+
+    @staticmethod
+    def _bridge_call_contains_draft(
+        call: Mapping[str, Any] | None,
+        *,
+        text_value: str,
+        text_sha256: str,
+        block_type: str,
+        anchor: str | None,
+    ) -> bool:
+        if call is None or call.get("consultation_type") != "draft_text":
+            return False
+        if not AnalystOpinionService._bridge_call_has_real_provenance(call):
+            return False
+        output = call.get("output")
+        if not isinstance(output, Mapping):
+            return False
+        if output.get("schema") != "advisor-response.v3":
+            return False
+        for block in output.get("blocks", ()):
+            if not isinstance(block, Mapping):
+                continue
+            if (
+                block.get("block_type") != block_type
+                or block.get("form") != ("analyst_note" if anchor is not None else "body")
+                or block.get("anchor") != anchor
+            ):
+                continue
+            sentences = block.get("sentences")
+            if not isinstance(sentences, list) or not sentences:
+                continue
+            sentence_texts: list[str] = []
+            for item in sentences:
+                if not isinstance(item, Mapping):
+                    continue
+                sentence_text = item.get("text")
+                if isinstance(sentence_text, str):
+                    sentence_texts.append(sentence_text)
+            if (
+                len(sentence_texts) == len(sentences)
+                and (
+                    block.get("usable") is True
+                    or (
+                        "usable" not in block
+                        and output.get("usable") is True
+                        and call.get("advisor_status") == "succeeded"
+                    )
+                )
+                and " ".join(sentence_texts) == text_value
+                and hashlib.sha256(" ".join(sentence_texts).encode("utf-8")).hexdigest()
+                == text_sha256
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _bridge_call_reviews_text(
+        call: Mapping[str, Any] | None,
+        *,
+        review_ref: BridgeReviewReferenceV1,
+        text_sha256: str,
+        block_type: str,
+        anchor: str | None,
+    ) -> bool:
+        if call is None or call.get("consultation_type") != "review_text":
+            return False
+        if not AnalystOpinionService._bridge_call_has_real_provenance(call):
+            return False
+        if call.get("output_sha256") != review_ref.output_sha256:
+            return False
+        output = call.get("output")
+        if not isinstance(output, Mapping) or output.get("schema") != "advisor-response.v3":
+            return False
+        expected_form = "analyst_note" if anchor is not None else "body"
+        review_units = call.get("review_units")
+        if isinstance(review_units, list):
+            reviews = output.get("reviews", ())
+            if not isinstance(reviews, (list, tuple)):
+                return False
+            for unit in review_units:
+                if not (
+                    isinstance(unit, Mapping)
+                    and unit.get("reviewed_text_sha256") == text_sha256
+                    and unit.get("form") == expected_form
+                    and unit.get("block_type") == block_type
+                    and unit.get("anchor") == anchor
+                ):
+                    continue
+                for review in reviews:
+                    if not (
+                        isinstance(review, Mapping)
+                        and review.get("unit_id") == unit.get("unit_id")
+                        and isinstance(review.get("remarks"), list)
+                        and review.get("remarks")
+                    ):
+                        continue
+                    if review.get("usable") is True or (
+                        "usable" not in review
+                        and output.get("usable") is True
+                        and call.get("advisor_status") == "succeeded"
+                    ):
+                        return True
+            return False
+        if call.get("reviewed_text_sha256") != text_sha256:
+            return False
+        reviews = output.get("reviews", ())
+        if not isinstance(reviews, (list, tuple)):
+            return False
+        if not any(
+            isinstance(review, Mapping)
+            and isinstance(review.get("remarks"), list)
+            and review.get("remarks")
+            and (
+                review.get("usable") is True
+                or (
+                    "usable" not in review
+                    and output.get("usable") is True
+                    and call.get("advisor_status") == "succeeded"
+                )
+            )
+            for review in reviews
+        ):
+            return False
+        review_target = call.get("review_target")
+        return bool(
+            isinstance(review_target, Mapping)
+            and review_target.get("form") == expected_form
+            and review_target.get("block_type") == block_type
+            and review_target.get("anchor") == anchor
+        )
+
+    @staticmethod
+    def _bridge_call_has_real_provenance(call: Mapping[str, Any]) -> bool:
+        invocation_id = call.get("bridge_invocation_id")
+        output_sha256 = call.get("output_sha256")
+        output = call.get("output")
+        provenance = output.get("bridge_provenance") if isinstance(output, Mapping) else None
+        if (
+            call.get("advisor_status") not in {"succeeded", "partial"}
+            or call.get("bridge_invocation_id_kind") != "conversation_turn"
+            or not isinstance(invocation_id, str)
+            or not isinstance(output_sha256, str)
+            or len(output_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in output_sha256)
+            or not isinstance(output, Mapping)
+            or not isinstance(provenance, Mapping)
+            or provenance.get("bridge_invocation_id") != invocation_id
+            or provenance.get("bridge_invocation_id_kind") != "conversation_turn"
+            or provenance.get("output_sha256") != output_sha256
+            or output.get("output_sha256") != output_sha256
+            or not isinstance(call.get("input_refs"), list)
+            or provenance.get("input_refs") != call.get("input_refs")
+        ):
+            return False
+        try:
+            return str(UUID(invocation_id)) == invocation_id
+        except (TypeError, ValueError):
+            return False
 
     async def _resolve_base(
         self, uow: UnitOfWork, investigation: AnalystInvestigation
@@ -1011,7 +1338,11 @@ class AnalystOpinionService:
                     tuple(
                         item
                         for item in OpinionBlockType
-                        if item is not OpinionBlockType.ANALYST_OBSERVATIONS
+                        if item
+                        not in {
+                            OpinionBlockType.ANALYST_OBSERVATIONS,
+                            OpinionBlockType.IMPLANT_MATERIALS,
+                        }
                     ),
                 ),
             )
@@ -1180,10 +1511,16 @@ class OperatorOpinionToolAdapter:
         protocol_figures, figure_observation_refs = await self._protocol_figures(
             context.investigation_id, arguments.get("protocol_figures")
         )
+        draft_blocks = (
+            tuple(_operator_opinion_block(item) for item in arguments["blocks"])
+            if "blocks" in arguments
+            else None
+        )
         opinion = await self._service.compose_from_findings(
             context.investigation_id,
             selection,
             protocol_figures=protocol_figures,
+            draft_blocks=draft_blocks,
         )
         return _operator_opinion_result(
             opinion,
@@ -1205,7 +1542,10 @@ class OperatorOpinionToolAdapter:
         protocol_figures, figure_observation_refs = await self._protocol_figures(
             context.investigation_id, arguments.get("protocol_figures")
         )
-        blocks = tuple(_operator_opinion_block(item) for item in arguments["blocks"])
+        blocks = tuple(
+            _operator_opinion_block(item, allow_implant_materials=True)
+            for item in arguments["blocks"]
+        )
         edits = OpinionRevisionEdits(
             blocks=blocks,
             unresolved_points=tuple(str(item) for item in arguments["unresolved_points"]),
@@ -1254,7 +1594,7 @@ class OperatorOpinionToolAdapter:
         except (TypeError, ValueError) as exc:
             raise OpinionError(OpinionErrorCode.PROTOCOL_FIGURES_INVALID) from exc
         if not request.protocol_figures:
-            return None, ()
+            return (), ()
         if self._protocol_figure_builder is None:
             raise OpinionError(OpinionErrorCode.PROTOCOL_FIGURES_UNAVAILABLE)
         return await self._protocol_figure_builder.build(
@@ -1289,6 +1629,14 @@ class OperatorOpinionToolAdapter:
             relation=AnalystObservationRelation(str(arguments["relation"])),
             finding_refs=tuple(UUID(str(item)) for item in arguments["finding_refs"]),
             evidence_refs=tuple(UUID(str(item)) for item in arguments["evidence_refs"]),
+            bridge_authored=arguments.get("bridge_authored", False),
+            bridge_block_type=(
+                OpinionBlockType(str(arguments["bridge_block_type"]))
+                if arguments.get("bridge_block_type") is not None
+                else None
+            ),
+            bridge_draft_ref=_operator_bridge_draft_ref(arguments.get("bridge_draft_ref")),
+            bridge_review_ref=_operator_bridge_review_ref(arguments.get("bridge_review_ref")),
         )
         notes = (*[item for item in current.observations if item.anchor != anchor], note)
         opinion = await self._service.revise(
@@ -1330,6 +1678,25 @@ def register_operator_opinion_tools(
         "items": {"type": "string", "minLength": 1, "maxLength": 128},
     }
     uuid_list = {"type": "array", "maxItems": 128, "items": uuid_schema}
+    bridge_draft_ref_schema = {
+        "type": "object",
+        "properties": {
+            "invocation_id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "text_sha256": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
+        },
+        "required": ["invocation_id", "text_sha256"],
+        "additionalProperties": False,
+    }
+    bridge_review_ref_schema = {
+        "type": "object",
+        "properties": {
+            "invocation_id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "output_sha256": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
+            "reviewed_text_sha256": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
+        },
+        "required": ["invocation_id", "output_sha256", "reviewed_text_sha256"],
+        "additionalProperties": False,
+    }
     blocks_schema = {
         "type": "array",
         "maxItems": 32,
@@ -1348,6 +1715,9 @@ def register_operator_opinion_tools(
                     "enum": [item.value for item in OpinionClaimQualification],
                 },
                 "certainty": {"type": "number", "minimum": 0, "maximum": 1},
+                "bridge_authored": {"type": "boolean"},
+                "bridge_draft_ref": bridge_draft_ref_schema,
+                "bridge_review_ref": bridge_review_ref_schema,
             },
             "required": [
                 "block_type",
@@ -1359,6 +1729,16 @@ def register_operator_opinion_tools(
             ],
             "additionalProperties": False,
         },
+    }
+    revision_blocks_schema = cast(dict[str, Any], json.loads(json.dumps(blocks_schema)))
+    revision_items = cast(dict[str, Any], revision_blocks_schema["items"])
+    revision_properties = cast(dict[str, Any], revision_items["properties"])
+    revision_properties["block_type"] = {
+        "type": "string",
+        "enum": [
+            *(item.value for item in _OPERATOR_BLOCK_TYPES),
+            OpinionBlockType.IMPLANT_MATERIALS.value,
+        ],
     }
     protocol_figures_schema = {
         "type": "array",
@@ -1402,6 +1782,7 @@ def register_operator_opinion_tools(
                 "properties": {
                     "action": {"const": "compose"},
                     "protocol_figures": protocol_figures_schema,
+                    "blocks": blocks_schema,
                     "selection": {
                         "type": "object",
                         "properties": {
@@ -1442,7 +1823,7 @@ def register_operator_opinion_tools(
                     "opinion_id": uuid_schema,
                     "expected_opinion_version": {"type": "integer", "minimum": 1},
                     "expected_opinion_sha256": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
-                    "blocks": blocks_schema,
+                    "blocks": revision_blocks_schema,
                     "unresolved_points": {
                         "type": "array",
                         "maxItems": 128,
@@ -1490,6 +1871,13 @@ def register_operator_opinion_tools(
                     "expected_opinion_sha256": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
                     "finding_refs": {"type": "array", "maxItems": 16, "items": uuid_schema},
                     "evidence_refs": {"type": "array", "maxItems": 16, "items": uuid_schema},
+                    "bridge_authored": {"type": "boolean"},
+                    "bridge_block_type": {
+                        "type": "string",
+                        "enum": [item.value for item in _OPERATOR_BLOCK_TYPES],
+                    },
+                    "bridge_draft_ref": bridge_draft_ref_schema,
+                    "bridge_review_ref": bridge_review_ref_schema,
                 },
                 "required": [
                     "action",
@@ -1514,12 +1902,16 @@ def register_operator_opinion_tools(
     )
 
 
-def _operator_opinion_block(value: object) -> OpinionBlock:
+def _operator_opinion_block(
+    value: object, *, allow_implant_materials: bool = False
+) -> OpinionBlock:
     if not isinstance(value, Mapping):
         raise ValueError("Opinion block is invalid")
     block_type = OpinionBlockType(str(value["block_type"]))
-    if block_type is OpinionBlockType.ANALYST_OBSERVATIONS:
-        raise ValueError("Analyst observation blocks are written through the note tool")
+    if block_type is OpinionBlockType.ANALYST_OBSERVATIONS or (
+        block_type is OpinionBlockType.IMPLANT_MATERIALS and not allow_implant_materials
+    ):
+        raise ValueError("Editorial projection blocks are not direct operator edits")
     return OpinionBlock(
         block_type=block_type,
         text=str(value["text"]),
@@ -1527,6 +1919,32 @@ def _operator_opinion_block(value: object) -> OpinionBlock:
         evidence_refs=tuple(UUID(str(item)) for item in value["evidence_refs"]),
         qualification=OpinionClaimQualification(str(value["qualification"])),
         certainty=float(value["certainty"]),
+        bridge_authored=value.get("bridge_authored", False),
+        bridge_draft_ref=_operator_bridge_draft_ref(value.get("bridge_draft_ref")),
+        bridge_review_ref=_operator_bridge_review_ref(value.get("bridge_review_ref")),
+    )
+
+
+def _operator_bridge_draft_ref(value: object) -> BridgeDraftReferenceV1 | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or set(value) != {"invocation_id", "text_sha256"}:
+        raise ValueError("Bridge draft reference is invalid")
+    if not isinstance(value["invocation_id"], str) or not isinstance(value["text_sha256"], str):
+        raise ValueError("Bridge draft reference is invalid")
+    return BridgeDraftReferenceV1(value["invocation_id"], value["text_sha256"])
+
+
+def _operator_bridge_review_ref(value: object) -> BridgeReviewReferenceV1 | None:
+    if value is None:
+        return None
+    expected = {"invocation_id", "output_sha256", "reviewed_text_sha256"}
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise ValueError("Bridge review reference is invalid")
+    if any(not isinstance(value[key], str) for key in expected):
+        raise ValueError("Bridge review reference is invalid")
+    return BridgeReviewReferenceV1(
+        value["invocation_id"], value["output_sha256"], value["reviewed_text_sha256"]
     )
 
 

@@ -506,6 +506,8 @@ async def test_preview_pdf_uses_edition_typst_template_and_creates_no_rows(
     assert len(compiler.requests) == 1
     assert compiler.requests[0].entrypoint_relative_path == "RENDERER/edition.typ"
     assert compiler.workspace_files[0]["RENDERER/edition.typ"] == b"// edition template entrypoint"
+    render_data = json.loads(compiler.workspace_files[0]["RENDERER/edition-render-data.json"])
+    assert render_data["document_label"] == f"Aperçu d'édition — édition {EDITION_ID} v1"
     assert uow.publication_manifests == []
     assert uow.edition_releases == []
     assert uow.edition_renders == []

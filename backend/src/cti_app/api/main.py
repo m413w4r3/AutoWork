@@ -21,7 +21,12 @@ from cti_app.api.editions import router as editions_router
 from cti_app.api.fusion import fusion_router
 from cti_app.api.health import router as health_router
 from cti_app.api.investigation import router as investigation_router
-from cti_app.api.investigation_captures import router as investigation_captures_router
+from cti_app.api.investigation_captures import (
+    legacy_router as investigation_captures_legacy_router,
+)
+from cti_app.api.investigation_captures import (
+    router as investigation_captures_router,
+)
 from cti_app.api.investigation_rule_corpus import router as investigation_rule_corpus_router
 from cti_app.api.jobs import router as jobs_router
 from cti_app.api.model_conversations import router as model_conversations_router
@@ -760,6 +765,7 @@ def create_app() -> FastAPI:
     application.include_router(model_conversations_router)
     application.include_router(investigation_router)
     application.include_router(investigation_captures_router)
+    application.include_router(investigation_captures_legacy_router)
     application.include_router(investigation_rule_corpus_router)
     application.include_router(production_router)
     application.include_router(production_control_router)
@@ -776,6 +782,19 @@ def create_app() -> FastAPI:
 
 def _operator_client_route_allowed(method: str, path: str) -> bool:
     parts = path.strip("/").split("/")
+    if method == "GET" and parts == ["api", "v1", "network-captures", "capabilities"]:
+        return True
+    if (
+        method == "GET"
+        and len(parts) == 5
+        and parts[:3] == ["api", "v1", "investigations"]
+        and parts[4] == "network-captures"
+    ):
+        try:
+            UUID(parts[3])
+        except ValueError:
+            return False
+        return True
     if len(parts) < 3 or parts[:2] != ["api", "investigations"]:
         return False
     try:
@@ -788,7 +807,33 @@ def _operator_client_route_allowed(method: str, path: str) -> bool:
         return True
     if method == "GET" and len(parts) == 5 and parts[3:] == ["operator", "context"]:
         return True
-    if method == "GET" and len(parts) == 4 and parts[3] in {"pivots", "experiments"}:
+    if (
+        method == "GET"
+        and len(parts) == 4
+        and parts[3]
+        in {
+            "pivots",
+            "experiments",
+            "envelope",
+            "samples",
+            "opinion",
+            "detections",
+            "network-captures",
+        }
+    ):
+        return True
+    if method == "GET" and len(parts) == 5 and parts[3:] == ["rule-corpus", "imports"]:
+        return True
+    if (
+        method == "POST"
+        and len(parts) == 5
+        and tuple(parts[3:])
+        in {
+            ("rule-corpus", "imports"),
+            ("rule-corpus", "roles"),
+            ("rule-corpus", "holdout-designations"),
+        }
+    ):
         return True
     if (
         method == "GET"

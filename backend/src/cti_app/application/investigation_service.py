@@ -125,7 +125,6 @@ from cti_app.domain.investigation_state import (
 from cti_app.domain.production import (
     AnalystInvestigation,
     AnalystInvestigationStatus,
-    LoopBudget,
     ProductionArtifact,
     ProductionRun,
 )
@@ -368,7 +367,6 @@ class InvestigationService:
             raise ValueError("Investigation envelope belongs to another investigation")
         existing_envelope = await self._envelopes.get(investigation.id)
         if existing_envelope is None and envelope is not None:
-            envelope = self._with_turn_budget(envelope, investigation.budget)
             await self._envelopes.save_if_version(envelope, expected_version=None)
         elif (
             existing_envelope is not None
@@ -1144,7 +1142,6 @@ class InvestigationService:
             )
         confirmed_partial_external_result = (
             result.status is ToolInvocationStatus.UNAVAILABLE
-            and result.output.get("confirmed_non_execution") is True
             and any(amount > 0 for amount in result.budget_consumed.values())
         )
         if (
@@ -2486,7 +2483,6 @@ class InvestigationService:
     def _unapproved_budget(investigation: AnalystInvestigation) -> InvestigationBudget:
         return InvestigationBudget(
             limits={
-                BudgetDimension.BRIDGE_TURNS: investigation.budget.max_cycles,
                 BudgetDimension.VT_UNITS: 0,
                 BudgetDimension.SHODAN_CREDITS: 0,
                 BudgetDimension.DOWNLOADS: 0,
@@ -2681,6 +2677,13 @@ class InvestigationService:
                 reservation = expected_reservation
             if reservation.status is not BudgetReservationStatus.RESERVED or uncertain:
                 return
+            if _confirmed_external_non_execution(result):
+                envelope.budget.release_confirmed_non_submission(operation_key)
+                try:
+                    await self._save_envelope_version(envelope)
+                    return
+                except VersionConflictError:
+                    continue
             if result.status in {
                 ToolInvocationStatus.SUCCEEDED,
                 ToolInvocationStatus.EMPTY,
@@ -2700,18 +2703,6 @@ class InvestigationService:
             except VersionConflictError:
                 continue
         raise VersionConflictError("Tool budget reservation changed repeatedly")
-
-    @staticmethod
-    def _with_turn_budget(
-        envelope: InvestigationEnvelope, legacy_budget: LoopBudget
-    ) -> InvestigationEnvelope:
-        limits = dict(envelope.budget.limits)
-        limits.setdefault(BudgetDimension.BRIDGE_TURNS, legacy_budget.max_cycles)
-        if limits == dict(envelope.budget.limits):
-            return envelope
-        return replace(
-            envelope, budget=InvestigationBudget(limits=limits), version=envelope.version
-        )
 
     async def _require_state(self, investigation_id: UUID) -> InvestigationWorkingState:
         state = await self._states.get(investigation_id)
@@ -3208,6 +3199,15 @@ def _confirmed_external_non_execution(result: ToolResult) -> bool:
         result.error_code == "invalid_tool_arguments"
         or result.output.get("error_code") == "invalid_tool_arguments"
         or result.output.get("reason") == "subject_slot_limit"
+        or (
+            result.error_code == "advisor_input_invalid"
+            and result.output.get("failure_stage") == "pre_transport_validation"
+            and result.output.get("confirmed_non_execution") is True
+        )
+        or (
+            result.error_code in {"advisor_rate_limited", "advisor_unavailable"}
+            and result.output.get("confirmed_non_execution") is True
+        )
     )
 
 

@@ -31,6 +31,7 @@ from cti_app.application.investigation_tools import (
     ToolResult,
 )
 from cti_app.application.network_protocol_model import (
+    NETWORK_PROTOCOL_RENDERER_VERSION,
     HypothesisNotReplayableError,
     NetworkProtocolWorkbench,
     ProtocolTraceError,
@@ -41,6 +42,10 @@ from cti_app.application.network_workbench import NetworkCaptureRejected
 from cti_app.application.production_artifact_store import (
     MAX_ARTIFACT_BYTES,
     ProductionArtifactStore,
+)
+from cti_app.application.protocol_diagram_projection import (
+    PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION,
+    PROTOCOL_DIAGRAM_PROJECTION_VERSION,
 )
 from cti_app.domain.investigation import (
     BudgetDimension,
@@ -87,6 +92,7 @@ PROTOCOL_TOOL_NAMES = frozenset(
     }
 )
 _MAX_TOOL_SECONDS = 120
+PROTOCOL_RENDER_OBSERVATION_SCHEMA_VERSION = "protocol-render-observation.v2"
 _MODEL_BUCKET = "network-protocol-models"
 _FLOW_PATTERN = "^[0-9a-f]{24}$"
 _SHA_PATTERN = "^[0-9a-f]{64}$"
@@ -1143,7 +1149,7 @@ class _ProtocolToolAdapter:
                 )
                 return self._result(context, started, status, output, (observation_id,))
 
-            blob_value = arguments.get("protocol_model_blob_id") or arguments.get("model_blob_id")
+            blob_value = arguments.get("model_blob_id")
             model = await self._load_model_for_investigation(
                 _uuid(blob_value), context.investigation_id
             )
@@ -1152,22 +1158,32 @@ class _ProtocolToolAdapter:
                 if self.service is not None
                 else render_protocol_model(model)
             )
+            render_identity = _protocol_render_observation_identity(model, rendered)
+            render_payload = {
+                **rendered.to_dict(),
+                "render_identity": render_identity,
+                "renderer_version": NETWORK_PROTOCOL_RENDERER_VERSION,
+                "projection_version": PROTOCOL_DIAGRAM_PROJECTION_VERSION,
+                "figure_policy_version": PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION,
+            }
             render_observation = await self.recorder.record_json(
                 investigation_id=context.investigation_id,
                 kind=EvidenceKind.OTHER,
-                payload=rendered.to_dict(),
+                payload=render_payload,
                 source=NETWORK_PROTOCOL_RENDER,
-                source_version="1",
+                source_version=PROTOCOL_RENDER_OBSERVATION_SCHEMA_VERSION,
                 object_type="protocol_diagram_specs",
-                object_id=rendered.canonical_sha256,
+                object_id=render_identity,
                 limitations=(
                     "Specs sémantiques; le lot L7 projette ces données vers DiagramSpecV1/D2.",
                     "Aucun D2 libre fourni par le modèle n'est compilé.",
                 ),
-                idempotency_key=context.idempotency_key,
+                idempotency_key=_protocol_render_idempotency_key(
+                    context.idempotency_key, render_identity
+                ),
             )
             output = {
-                **rendered.to_dict(),
+                **render_payload,
                 "protocol_model_blob_id": str(blob_value),
                 "observation_ref": str(render_observation.id),
             }
@@ -1279,6 +1295,29 @@ class _ProtocolToolAdapter:
             budget_consumed={BudgetDimension.TOOL_SECONDS: consumed},
             output={**output, "status": status.value},
         )
+
+
+def _protocol_render_observation_identity(
+    model: ProtocolModelV1,
+    rendered: Any,
+) -> str:
+    """Content address protocol specs together with their renderer/schema policy."""
+    identity = "\0".join(
+        (
+            PROTOCOL_RENDER_OBSERVATION_SCHEMA_VERSION,
+            NETWORK_PROTOCOL_RENDERER_VERSION,
+            PROTOCOL_DIAGRAM_PROJECTION_VERSION,
+            PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION,
+            model.canonical_sha256,
+            rendered.canonical_sha256,
+        )
+    )
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _protocol_render_idempotency_key(idempotency_key: str | None, render_identity: str) -> str:
+    """Make retries idempotent only for the same model and renderer contract."""
+    return hashlib.sha256(f"{idempotency_key or ''}\0{render_identity}".encode()).hexdigest()
 
 
 def _operation_schema(

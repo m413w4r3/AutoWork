@@ -177,6 +177,9 @@ def _install_workspace(
         render_data=render_data,
         media_files=media_files,
     )
+    entrypoint_path = workspace_root / entrypoint
+    entrypoint_path.parent.mkdir(parents=True, exist_ok=True)
+    entrypoint_path.write_bytes(source.source_bytes)
     media_root = workspace_root / "RENDERER" / "media"
     for name, content in media_content.items():
         (media_root / name).write_bytes(content)
@@ -233,10 +236,10 @@ def _persist_and_verify_pdf_outputs(
         for spec in _three_views():
             assert spec.title in pdf_text
             assert spec.kind.value in pdf_text
-        assert "Legend: OBSERVED green" in pdf_text
-        assert "INFERRED orange" in pdf_text
-        assert "UNRESOLVED gray" in pdf_text
-        assert "CONTRADICTED red" in pdf_text
+        assert "Observation étayée : vert" in pdf_text
+        assert "inférence : orange" in pdf_text
+        assert "non résolu : gris" in pdf_text
+        assert "contredit : rouge" in pdf_text
         raster_prefix = output_root / f"synthetic-{name}-page"
         subprocess.run(
             (
@@ -293,7 +296,11 @@ async def test_real_article_and_edition_render_all_protocol_figures(
     assert v6.rendered_opinion.protocol_figures == figures
 
     publication_bundle = load_template_bundle(_REPOSITORY_ROOT / "chpTypst")
-    article_source = TypstRenderer().render(v6, publication_bundle)
+    article_source = TypstRenderer().render(
+        v6,
+        publication_bundle,
+        document_label="Protocol figure test",
+    )
     media_bytes: dict[UUID, bytes] = {}
     for reference in article_source.media_refs:
         try:
@@ -320,6 +327,10 @@ async def test_real_article_and_edition_render_all_protocol_figures(
     edition_source = EditionTypstRenderer().render(
         _edition_document(((1, v6), (2, v6))),
         edition_bundle,
+        document_label=(
+            "Édition publiée 00000000-0000-4000-8000-000000000030 — release "
+            "00000000-0000-4000-8000-000000000099"
+        ),
     )
     for source in (article_source, edition_source):
         data = json.loads(source.render_data_bytes)
@@ -368,7 +379,11 @@ async def test_real_article_and_edition_render_all_protocol_figures(
     )
 
     _persist_and_verify_pdf_outputs(
-        Path("/tmp/autowork-protocol-l7"),
+        _REPOSITORY_ROOT
+        / ".autowork-runs"
+        / "run12-editorial-2026-10-20"
+        / "lots"
+        / "protocol-typst-test",
         rendered,
         article_pdf.content,
         edition_pdf.content,
@@ -507,7 +522,7 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
     assert len(result.diagrams) == 3
     assert len(result.diagrams[0].nodes) == 4
     assert len(result.diagrams[1].nodes) == 3
-    assert all("documenté, non observé" in item.title.casefold() for item in result.diagrams)
+    assert all("documenté, non observé" not in item.title.casefold() for item in result.diagrams)
     assert all(
         not item.edges or all(not edge.frame_numbers for edge in item.edges)
         for item in result.diagrams
@@ -522,7 +537,11 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
     )
     figures = opinion_protocol_figures(rendered)
     assert {item.kind for item in figures} == set(ProtocolDiagramKind)
-    assert all("documenté, non observé" in item.caption.casefold() for item in figures)
+    assert all("ARTICLE_DOCUMENTED" in item.caption for item in figures)
+    assert all(
+        "offsets" in item.caption.casefold() or "valeurs" in item.caption.casefold()
+        for item in figures
+    )
     assert all(
         item.compiler_policy_version == PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION for item in figures
     )
@@ -542,24 +561,48 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
     format_view = next(
         item for item in rendered if item.spec.kind is ProtocolDiagramKind.MESSAGE_FORMAT
     )
-    assert any(
-        "champs sans offset ni longueur documentés" in item.label.casefold()
-        for item in format_view.diagram.nodes
-    )
+    assert len(format_view.diagram.nodes) == 1
+    assert format_view.diagram.nodes[0].label == "Aucun élément établi"
+    assert "offsets" in (format_view.diagram.caption or "").casefold()
 
     base = _base_v5()
     opinion, citation_context = _approved_opinion(base)
     opinion_with_figures = replace(opinion, protocol_figures=figures, content_sha256="")
     publication = augment_publication_with_opinion(base, opinion_with_figures, citation_context)
     publication_bundle = load_template_bundle(_REPOSITORY_ROOT / "chpTypst")
-    source = TypstRenderer().render(publication, publication_bundle)
+    source = TypstRenderer().render(
+        publication,
+        publication_bundle,
+        document_label="Documented protocol test",
+    )
     stale_publication = augment_publication_with_opinion(
         base,
         replace(opinion, protocol_figures=(legacy_sequence, *figures[1:]), content_sha256=""),
         citation_context,
     )
-    stale_publication_source = TypstRenderer().render(stale_publication, publication_bundle)
+    stale_publication_source = TypstRenderer().render(
+        stale_publication,
+        publication_bundle,
+        document_label="Documented protocol stale test",
+    )
     assert "Rendu hérité".encode() not in stale_publication_source.render_data_bytes
+    detached_publication = augment_publication_with_opinion(
+        base,
+        replace(opinion, protocol_figures=(), content_sha256=""),
+        citation_context,
+    )
+    detached_source = TypstRenderer().render(
+        detached_publication,
+        publication_bundle,
+        document_label="Documented protocol detached test",
+    )
+    detached_model = json.loads(detached_source.render_data_bytes)
+    assert all(
+        not section.get("protocol_figures") for section in detached_model["content_sections"]
+    )
+    assert {figure.asset_id for figure in figures}.isdisjoint(
+        {reference.asset_id for reference in detached_source.media_refs}
+    )
     media_bytes: dict[UUID, bytes] = {}
     for reference in source.media_refs:
         try:
@@ -590,12 +633,21 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
         )
     ).stdout.decode("utf-8", errors="replace")
     extracted = " ".join(extracted.split()).casefold()
-    assert extracted.count("documenté, non observé") >= 3
+    assert extracted.count("article_documented") == 3
+    assert extracted.count("niveau de preuve") == 3
+    assert "voir les niveaux indiqués sur les nœuds et relations" not in extracted
     assert all(
         title in extracted for title in ("séquence réseau", "machine à états", "format de message")
     )
 
-    audit_root = Path(os.environ.get("TMPDIR", "/tmp")) / "lotL2" / "protocol"
+    audit_root = (
+        _REPOSITORY_ROOT
+        / ".autowork-runs"
+        / "run12-editorial-2026-10-20"
+        / "lots"
+        / "protocol-typst-test"
+        / "audit"
+    )
     audit_root.mkdir(parents=True, exist_ok=True)
     publication_pdf_path = audit_root / "publication.pdf"
     publication_pdf_path.write_bytes(pdf.content)
@@ -608,7 +660,9 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
         content_sha256="",
     )
     preview_source = TypstRenderer().render(
-        TypstDraftPreviewDocument(base, preview_opinion), publication_bundle
+        TypstDraftPreviewDocument(base, preview_opinion),
+        publication_bundle,
+        document_label="Documented protocol preview test",
     )
     preview_media: dict[UUID, bytes] = {}
     for reference in preview_source.media_refs:
@@ -632,13 +686,11 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
         " ".join((page.extract_text() or "").split())
         for page in PdfReader(preview_pdf_path, strict=True).pages
     ]
-    assert any("Rendu hérité" in page for page in preview_pages)
-    sequence_page = next(
-        page
-        for page in preview_pages
-        if "Séquence réseau du protocole" in page and "Séquence de négociation" in page
+    assert all("Rendu hérité" not in page for page in preview_pages)
+    assert all("Séquence de négociation" not in page for page in preview_pages)
+    assert all(
+        "This view comes only from cited written facts" not in page for page in preview_pages
     )
-    assert "This view comes only from cited written facts" not in sequence_page
 
     pdftotext = shutil.which("pdftotext")
     pdftoppm = shutil.which("pdftoppm")
@@ -653,8 +705,11 @@ async def test_documented_protocol_model_renders_all_three_views_in_opinion_pdf(
         )
         pdf_text = " ".join(extracted.stdout.decode("utf-8", errors="replace").split())
         lowered = pdf_text.casefold()
-        assert pdf_text.count("Modèle documenté, non observé") >= 3
-        assert "champs sans offset ni longueur documentés" in lowered
+        expected_proof_levels = 3 if label == "publication" else 2
+        assert pdf_text.count("Niveau de preuve") == expected_proof_levels
+        assert pdf_text.count("ARTICLE_DOCUMENTED") == expected_proof_levels
+        assert "offsets et valeurs d'octets inconnus" in lowered
+        assert "modèle documenté, non observé" not in lowered
         assert all(
             title in lowered
             for title in ("séquence réseau", "machine à états", "format de message")

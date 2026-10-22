@@ -1,0 +1,33 @@
+{
+  "cd3ae038-77b6-4e2d-aab8-83b291bc2e23": {
+    "raw_text": "JSON"
+  },
+  "ca78b757-988d-4bb4-a622-ed5a2cb6deaf": {
+    "alternative_refs": [["@o1", "@o2"], ["@o3", "@o4"], ["@u1"]],
+    "experiment_refs": ["@o1", "@o2"],
+    "discarded_refs": ["@u2"],
+    "recommendation_refs": [["@o1", "@o5"], ["@o6", "@o7"]],
+    "recommendation_args_hint": ["string", "string"]
+  },
+  "d595141f-a80b-44e0-b265-53b90f97eebc": {
+    "alternative_refs": [["@o1", "@u1", "@u2"], ["@u3", "@u4"], ["@u5"], ["@o2", "@u6"]],
+    "experiment_refs": ["@o1", "@o2", "@o3", "@u7"],
+    "discarded_refs": ["@u8"],
+    "recommendation_refs": [["@o1", "@o2", "@o3", "@o4"], ["@o1", "@u9"], ["@o2", "@u10"], ["@o1", "@o2", "@u11"], ["@o1", "@o2", "@o3"]],
+    "recommendation_args_hint": ["string", "string", "string", "string", "string"]
+  },
+  "f125ff59-bff6-4ec4-8879-43aad4a2a83a": {
+    "alternative_refs": [["@u1"], ["@u2"], ["@u3"]],
+    "experiment_refs": ["@o1", "@u4"],
+    "discarded_refs": ["@u5"],
+    "recommendation_refs": [["@o1", "@o2"], ["@o3"], ["@o4"], ["@o5"]],
+    "recommendation_args_hint": ["string", "string", "string", "string"]
+  },
+  "ab1851f2-15fd-4e11-a474-8721bf001aa6": {
+    "alternative_refs": [["@u1", "@u2"], ["@o1", "@o2", "@o3", "@u3"], ["@u4", "@u5"]],
+    "experiment_refs": ["@o1", "@o2", "@o3", "@u6"],
+    "discarded_refs": ["@u7", "@u8"],
+    "recommendation_refs": [["@o1", "@o2", "@o3"], ["@o1", "@u9"], ["@u10"], ["@o1", "@o2"]],
+    "recommendation_args_hint": ["object", "object", "object", "object"]
+  }
+}

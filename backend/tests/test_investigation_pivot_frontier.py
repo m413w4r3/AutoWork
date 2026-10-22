@@ -27,11 +27,13 @@ from cti_app.application.investigation_pivot_frontier import (
 from cti_app.application.investigation_pivots import available_investigation_pivots
 from cti_app.application.research_context_builder import ArticleSnapshot
 from cti_app.domain.investigation import (
+    BudgetDimension,
     DisclosureBounds,
     EvidenceKind,
     EvidenceObservation,
     InvestigationBudget,
     InvestigationEnvelope,
+    TLPLevel,
     ToolInvocation,
     ToolInvocationStatus,
 )
@@ -209,6 +211,15 @@ async def test_pivot_frontier_api_accepts_c1_strings_and_keeps_contract_validati
     observation = _relation_observation(article_hash, "2" * 64)
     snapshot = _snapshot(article_hash)
     investigation = SimpleNamespace(synthesis_artifact_id=snapshot.synthesis_artifact_id)
+    envelope = InvestigationEnvelope(
+        investigation_id=investigation_id,
+        allowed_providers=("vt",),
+        budget=InvestigationBudget(),
+        acquire_hits_allowed=True,
+        disclosure=DisclosureBounds(tlp=TLPLevel.CLEAR),
+        approval_decision_id=uuid4(),
+        approval_actor_id="analyst-test",
+    )
 
     class _Rows:
         async def get(self, _identifier: object) -> SimpleNamespace:
@@ -223,7 +234,8 @@ async def test_pivot_frontier_api_accepts_c1_strings_and_keeps_contract_validati
             list_for_investigation=lambda _identifier: _observations()
         ),
         tool_invocations=SimpleNamespace(list_for_investigation=lambda _identifier: _empty_rows()),
-        investigation_envelopes=SimpleNamespace(get=lambda _identifier: _no_envelope()),
+        analyst_decisions=SimpleNamespace(list_for_investigation=lambda _identifier: _empty_rows()),
+        investigation_envelopes=SimpleNamespace(get=lambda _identifier: _approved_envelope()),
     )
 
     @asynccontextmanager
@@ -236,8 +248,8 @@ async def test_pivot_frontier_api_accepts_c1_strings_and_keeps_contract_validati
     async def _empty_rows() -> tuple[object, ...]:
         return ()
 
-    async def _no_envelope() -> None:
-        return None
+    async def _approved_envelope() -> InvestigationEnvelope:
+        return envelope
 
     async def _resolve_snapshot(_artifact_id: object) -> ArticleSnapshot:
         return snapshot
@@ -259,6 +271,14 @@ async def test_pivot_frontier_api_accepts_c1_strings_and_keeps_contract_validati
         ),
     )
     monkeypatch.setattr(investigation_api, "_pivot_observation_payloads", _observation_payloads)
+    original_build = investigation_api.build_pivot_frontier
+    forwarded_policy: dict[str, object] = {}
+
+    def _record_build(**kwargs):
+        forwarded_policy["g2_vt_authorized"] = kwargs.get("g2_vt_authorized")
+        return original_build(**kwargs)
+
+    monkeypatch.setattr(investigation_api, "build_pivot_frontier", _record_build)
 
     response = await get_investigation_pivot_frontier(
         investigation_id, SimpleNamespace(), limit=50, cursor=None
@@ -266,6 +286,7 @@ async def test_pivot_frontier_api_accepts_c1_strings_and_keeps_contract_validati
 
     root = next(node for node in response.nodes if node.source == "article")
     assert response.investigation_id == investigation_id
+    assert forwarded_policy["g2_vt_authorized"] is True
     assert root.level is PivotQualificationLevel.DOCUMENTED
     assert str(observation.id) in " ".join(root.limitations)
     assert "preuve ni comme pivot" in " ".join(root.limitations)
@@ -284,6 +305,122 @@ async def test_pivot_frontier_api_accepts_c1_strings_and_keeps_contract_validati
     raw_payload["nodes"][0]["confidence"] = 1.1
     with pytest.raises(ValidationError):
         PivotFrontierResponseV1.model_validate(raw_payload, strict=False)
+
+
+@pytest.mark.asyncio
+async def test_pivots_route_builds_content_pattern_from_unlinked_typed_xxd() -> None:
+    import base64
+    import hashlib
+    import json
+    from collections.abc import AsyncIterator
+    from contextlib import asynccontextmanager
+
+    from fastapi import FastAPI
+    from httpx import ASGITransport, AsyncClient
+
+    from cti_app.api import investigation as investigation_api
+
+    investigation_id = uuid4()
+    sample_sha256 = "b" * 64
+    offset = 8_472_852
+    measured_bytes = bytes.fromhex("ed c7 c7 cb cf c3 f0 cc 94 96 c2 93 91 92 c1 88")
+    hex_column = " ".join(f"{byte:02x}" for byte in measured_bytes)
+    ascii_column = "".join(chr(byte) if 32 <= byte < 127 else "." for byte in measured_bytes)
+    output_bytes = f"{offset:08x}: {hex_column:<47}  {ascii_column}".encode()
+    payload = {
+        "schema": "local-command-execution.v1",
+        "command_id": "xxd",
+        "command": ["xxd", "-g", "1", "-s", str(offset), "-l", str(len(measured_bytes))],
+        "sample_sha256": sample_sha256,
+        "output_encoding": "base64-utf8",
+        "output_byte_length": len(output_bytes),
+        "output_sha256": hashlib.sha256(output_bytes).hexdigest(),
+        "output_chunks": [base64.b64encode(output_bytes).decode("ascii")],
+        "output_truncated": False,
+        "untrusted_data": True,
+    }
+    raw_payload = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    blob_id = uuid4()
+    observation = EvidenceObservation(
+        investigation_id=investigation_id,
+        kind=EvidenceKind.BINARY_ANALYSIS,
+        blob_id=blob_id,
+        sha256=hashlib.sha256(raw_payload).hexdigest(),
+        source="AutoWork local analysis",
+        source_version="xxd-test-v1",
+        observed_at=datetime(2026, 10, 20, tzinfo=UTC),
+        object_type="file",
+        object_id=sample_sha256,
+    )
+    snapshot = _snapshot("a" * 64)
+    investigation = SimpleNamespace(synthesis_artifact_id=snapshot.synthesis_artifact_id)
+    blob = SimpleNamespace(
+        descriptor=SimpleNamespace(
+            mime_type="application/json",
+            size=len(raw_payload),
+            sha256=observation.sha256,
+        )
+    )
+
+    class _Rows:
+        async def get(self, _identifier: object) -> SimpleNamespace:
+            return investigation
+
+        async def list_for_investigation(
+            self, _identifier: object
+        ) -> tuple[EvidenceObservation, ...]:
+            return (observation,)
+
+    class _Blobs:
+        async def get(self, requested_blob_id: object) -> SimpleNamespace:
+            assert requested_blob_id == blob_id
+            return blob
+
+    class _ArtifactStore:
+        async def read_bytes(self, requested_blob_id: object, *, max_bytes: int) -> bytes:
+            assert requested_blob_id == blob_id
+            assert max_bytes > 128 * 1024
+            return raw_payload
+
+    uow = SimpleNamespace(
+        analyst_investigations=_Rows(),
+        evidence_observations=_Rows(),
+        blobs=_Blobs(),
+        tool_invocations=SimpleNamespace(list_for_investigation=lambda _id: _empty_rows()),
+        analyst_decisions=SimpleNamespace(list_for_investigation=lambda _id: _empty_rows()),
+        investigation_envelopes=SimpleNamespace(get=lambda _id: _no_envelope()),
+    )
+
+    @asynccontextmanager
+    async def _unit_of_work() -> AsyncIterator[SimpleNamespace]:
+        yield uow
+
+    async def _empty_rows() -> tuple[object, ...]:
+        return ()
+
+    async def _no_envelope() -> None:
+        return None
+
+    async def _resolve_snapshot(_artifact_id: object) -> ArticleSnapshot:
+        return snapshot
+
+    app = FastAPI()
+    app.include_router(investigation_api.router)
+    app.state.uow_factory = lambda: _unit_of_work()
+    app.state.investigation_composition_factory = SimpleNamespace(
+        article_snapshots=SimpleNamespace(resolve=_resolve_snapshot)
+    )
+    app.state.production_artifact_store = _ArtifactStore()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(f"/api/investigations/{investigation_id}/pivots")
+
+    assert response.status_code == 200, response.text
+    content_candidate = next(
+        node for node in response.json()["nodes"] if node["indicator_type"] == "content_pattern"
+    )
+    assert content_candidate["source_observation_id"] == str(observation.id)
+    assert content_candidate["value"] == f"content:{{{measured_bytes.hex()}}}"
 
 
 def test_frontier_preserves_distinct_relations_but_deduplicates_candidate_values() -> None:
@@ -788,3 +925,96 @@ def test_approved_envelope_states_apply_to_derived_nodes() -> None:
     assert candidate.level is PivotQualificationLevel.DISCOVERED
     assert candidate.g2_state is PivotG2State.APPROVED
     assert candidate.disclosure_state.value == "allowed"
+
+
+def test_content_pattern_frontier_is_bounded_and_remaining_candidates_page_on_demand() -> None:
+    observations: list[EvidenceObservation] = []
+    payloads: dict[str, dict[str, object]] = {}
+    investigation_id = uuid4()
+    for index in range(140):
+        sample_sha256 = f"{index + 1:064x}"
+        observation = EvidenceObservation(
+            investigation_id=investigation_id,
+            kind=EvidenceKind.BINARY_STRING,
+            blob_id=uuid4(),
+            sha256=f"{index + 2:064x}",
+            source="autowork.floss",
+            source_version="floss-test-v1",
+            observed_at=datetime(2026, 10, 20, tzinfo=UTC),
+            object_type="sample",
+            object_id=sample_sha256,
+        )
+        observations.append(observation)
+        payloads[str(observation.id)] = {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": sample_sha256,
+            "strings": [
+                {
+                    "value": f"BlackwoodMarker{index:03d}Distinctive",
+                    "kind": "static",
+                    "encoding": "ascii",
+                    "offset": index * 100,
+                    "goodware_occurrences": 0,
+                    "truncated_fields": [],
+                }
+            ],
+        }
+
+    snapshot = _snapshot("a" * 64)
+    first_page = build_pivot_frontier(
+        investigation_id=str(investigation_id),
+        snapshot=snapshot,
+        observations=tuple(observations),
+        observation_payloads=payloads,
+        limit=500,
+    )
+
+    assert first_page.truncated is True
+    assert first_page.next_cursor is not None
+    assert len(first_page.records) == 128
+    assert all(item.indicator_type == "content_pattern" for item in first_page.records)
+    first_candidate = first_page.records[0]
+    assert first_candidate.value.startswith("content:{")
+    assert first_candidate.source_sha256 in {item.object_id for item in observations}
+    assert first_candidate.source_observation_id in {str(item.id) for item in observations}
+    assert any(item.startswith("mesure_bridge=") for item in first_candidate.limitations)
+    assert any(item.startswith("evidence_refs=") for item in first_candidate.limitations)
+    assert first_candidate.state is PivotExecutionState.BLOCKED
+
+    second_page = build_pivot_frontier(
+        investigation_id=str(investigation_id),
+        snapshot=snapshot,
+        observations=tuple(observations),
+        observation_payloads=payloads,
+        limit=500,
+        cursor=first_page.next_cursor,
+    )
+
+    candidates = [
+        item
+        for item in (*first_page.records, *second_page.records)
+        if item.indicator_type == "content_pattern"
+    ]
+    assert len(candidates) == 140
+
+    exhausted_envelope = InvestigationEnvelope(
+        investigation_id=investigation_id,
+        allowed_providers=("virustotal",),
+        budget=InvestigationBudget(limits={BudgetDimension.VT_UNITS: 0}),
+        acquire_hits_allowed=True,
+        disclosure=DisclosureBounds(),
+        approval_decision_id=uuid4(),
+        approval_actor_id="analyst-test",
+    )
+    budget_limited = build_pivot_frontier(
+        investigation_id=str(investigation_id),
+        snapshot=replace(snapshot, do_not_submit=False),
+        observations=tuple(observations),
+        observation_payloads=payloads,
+        envelope=exhausted_envelope,
+        limit=8,
+    )
+    assert all(item.g2_state is PivotG2State.APPROVED for item in budget_limited.records)
+    assert all(item.state_reason == "vt_budget_exhausted" for item in budget_limited.records), [
+        item.state_reason for item in budget_limited.records
+    ]

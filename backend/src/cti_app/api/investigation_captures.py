@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Literal, cast
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, HTTPException, Query, Request, status
 from pydantic import BaseModel
 
 from cti_app.application.network_capture_import import (
@@ -16,6 +16,7 @@ from cti_app.application.network_workbench import NetworkCaptureRejected
 from cti_app.domain.network_protocol import NetworkCaptureRejection
 
 router = APIRouter(prefix="/api/v1", tags=["investigation-captures"])
+legacy_router = APIRouter(prefix="/api", tags=["investigation-captures"])
 _CAPTURE_CONTENT_TYPES = frozenset(
     {
         "application/octet-stream",
@@ -35,6 +36,25 @@ class CaptureImportResponse(BaseModel):
     format: str
     sample_id: UUID
     association_id: UUID
+
+
+class CaptureMetadataView(BaseModel):
+    observation_id: UUID
+    source_reference: str
+    blob_id: UUID
+    sha256: str
+    size_bytes: int
+    format: str
+    mime_type: str
+    observed_at: str
+
+
+class CaptureListResponse(BaseModel):
+    schema_version: Literal["network-capture-inventory.v1"] = "network-capture-inventory.v1"
+    investigation_id: UUID
+    limit: int
+    offset: int
+    captures: list[CaptureMetadataView]
 
 
 def _import_service(request: Request) -> NetworkCaptureImportService:
@@ -62,6 +82,53 @@ async def _operator_id(request: Request) -> str:
             detail={"code": "operator_identity_required"},
         )
     return actor_id.strip()
+
+
+@legacy_router.get(
+    "/investigations/{investigation_id}/network-captures",
+    response_model=CaptureListResponse,
+)
+@router.get(
+    "/investigations/{investigation_id}/network-captures",
+    response_model=CaptureListResponse,
+)
+async def list_investigation_captures(
+    investigation_id: UUID,
+    request: Request,
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0, le=10_000),
+) -> CaptureListResponse:
+    await _operator_id(request)
+    service = _import_service(request)
+    try:
+        captures = await service.list_captures(
+            investigation_id=investigation_id,
+            limit=limit,
+            offset=offset,
+        )
+    except CaptureInvestigationNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "investigation_not_found"},
+        ) from exc
+    return CaptureListResponse(
+        investigation_id=investigation_id,
+        limit=limit,
+        offset=offset,
+        captures=[
+            CaptureMetadataView(
+                observation_id=item.observation_id,
+                source_reference=item.source_reference,
+                blob_id=item.blob_id,
+                sha256=item.sha256,
+                size_bytes=item.size_bytes,
+                format=item.format.value,
+                mime_type=item.mime_type,
+                observed_at=item.observed_at.isoformat(),
+            )
+            for item in captures
+        ],
+    )
 
 
 @router.get("/network-captures/capabilities")

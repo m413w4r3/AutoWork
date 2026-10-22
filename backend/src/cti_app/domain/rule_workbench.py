@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from enum import StrEnum
 from uuid import UUID, uuid4
 
@@ -23,10 +24,78 @@ class RuleMotifProvenanceKind(StrEnum):
 
 
 class RuleTestCorpusRole(StrEnum):
-    CONFIRMED_POSITIVE = "confirmed_positive"
-    OUT_OF_CLUSTER_CANDIDATE = "out_of_cluster_candidate"
+    DOCUMENTED_SEED_UNCONFIRMED = "documented_seed_unconfirmed"
+    NEW_CANDIDATE_UNCONFIRMED = "new_candidate_unconfirmed"
+    HUMAN_CONFIRMED = "human_confirmed"
     GOODWARE = "goodware"
-    HOLDOUT = "holdout"
+    HARD_NEGATIVE = "hard_negative"
+    HOLDOUT_POSITIVE = "holdout_positive"
+    HOLDOUT_NEGATIVE = "holdout_negative"
+    OUT_OF_SCOPE = "out_of_scope"
+    BYTES_MISSING = "bytes_missing"
+
+    # Compatibility aliases; the explicit values above are persisted.
+    CONFIRMED_POSITIVE = "human_confirmed"
+    OUT_OF_CLUSTER_CANDIDATE = "new_candidate_unconfirmed"
+    HOLDOUT = "holdout_positive"
+
+
+class OneRuleTestStatus(StrEnum):
+    CANDIDATE_MEASURED = "ONE_RULE_CANDIDATE_MEASURED"
+    NOT_VALIDATED = "ONE_RULE_NOT_VALIDATED"
+
+
+def detect_file_format_magic(content: bytes) -> str:
+    """Classify a file from a bounded prefix using its on-disk magic bytes."""
+    if content.startswith(b"MZ") and len(content) >= 0x40:
+        pe_offset = int.from_bytes(content[0x3C:0x40], "little")
+        if pe_offset + 24 <= len(content) and content[pe_offset : pe_offset + 4] == b"PE\0\0":
+            optional_header = pe_offset + 24
+            magic = int.from_bytes(content[optional_header : optional_header + 2], "little")
+            directory_offset = optional_header + (112 if magic == 0x20B else 96)
+            clr_entry = directory_offset + 14 * 8
+            if len(content) >= clr_entry + 4 and int.from_bytes(
+                content[clr_entry : clr_entry + 4], "little"
+            ):
+                return "pe_cli"
+            return "pe"
+        return "dos_mz"
+    if content.startswith((b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")):
+        return "zip"
+    if content.startswith(b"\x7fELF"):
+        return "elf"
+    if content.startswith(b"\xca\xfe\xba\xbe"):
+        return "mach_o_fat"
+    if content.startswith((b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe")):
+        return "mach_o_32"
+    if content.startswith((b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe")):
+        return "mach_o_64"
+    if content.startswith(b"%PDF-"):
+        return "pdf"
+    if content.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if content.startswith(b"\xff\xd8\xff"):
+        return "jpeg"
+    if content.startswith(b"SQLite format 3\0"):
+        return "sqlite"
+    if content.startswith(b"\x1f\x8b"):
+        return "gzip"
+    if content.startswith(b"\0asm"):
+        return "wasm"
+    prefix = content[:256].lstrip()
+    if prefix.startswith(b"<?xml") or prefix.startswith(b"<"):
+        try:
+            prefix.decode("utf-8")
+        except UnicodeDecodeError:
+            return "unknown"
+        return "xml_or_text"
+    if prefix and b"\0" not in prefix:
+        try:
+            prefix.decode("utf-8")
+        except UnicodeDecodeError:
+            return "unknown"
+        return "text"
+    return "unknown"
 
 
 class RuleSampleProvenance(StrEnum):
@@ -157,22 +226,54 @@ class RuleTestCase:
     provenance: RuleSampleProvenance = RuleSampleProvenance.REAL
     sample_id: UUID | None = None
     expected_match: bool | None = None
+    format_magic: str = "unknown"
+    holdout_designated_at: datetime | None = None
+    declared_role: RuleTestCorpusRole | None = None
     id: UUID = field(default_factory=uuid4)
 
     def __post_init__(self) -> None:
         _require_sha256(self.sample_sha256, "sample_sha256")
         object.__setattr__(self, "role", RuleTestCorpusRole(self.role))
+        if self.declared_role is not None:
+            object.__setattr__(self, "declared_role", RuleTestCorpusRole(self.declared_role))
         object.__setattr__(self, "provenance", RuleSampleProvenance(self.provenance))
         if self.expected_match is not None and not isinstance(self.expected_match, bool):
             raise TypeError("expected_match must be a boolean or None")
+        if not isinstance(self.format_magic, str) or not self.format_magic.strip():
+            raise ValueError("format_magic must describe the detected file format")
+        if self.holdout_designated_at is not None:
+            if (
+                self.holdout_designated_at.tzinfo is None
+                or self.holdout_designated_at.utcoffset() is None
+            ):
+                raise ValueError("holdout designation time must be timezone-aware")
+            object.__setattr__(
+                self, "holdout_designated_at", self.holdout_designated_at.astimezone(UTC)
+            )
+        if (
+            self.role
+            in {
+                RuleTestCorpusRole.HOLDOUT_POSITIVE,
+                RuleTestCorpusRole.HOLDOUT_NEGATIVE,
+            }
+            and self.holdout_designated_at is None
+        ):
+            raise ValueError("holdout cases require a persisted designation time")
 
     @property
     def expected_result(self) -> bool | None:
         if self.expected_match is not None:
             return self.expected_match
-        if self.role is RuleTestCorpusRole.CONFIRMED_POSITIVE:
+        if self.role in {
+            RuleTestCorpusRole.HUMAN_CONFIRMED,
+            RuleTestCorpusRole.HOLDOUT_POSITIVE,
+        }:
             return True
-        if self.role is RuleTestCorpusRole.GOODWARE:
+        if self.role in {
+            RuleTestCorpusRole.GOODWARE,
+            RuleTestCorpusRole.HARD_NEGATIVE,
+            RuleTestCorpusRole.HOLDOUT_NEGATIVE,
+        }:
             return False
         return None
 
@@ -187,6 +288,11 @@ def rule_corpus_sha256(cases: Sequence[RuleTestCase]) -> str:
                 case.sample_sha256,
                 case.provenance.value,
                 "unknown" if case.expected_result is None else str(case.expected_result).lower(),
+                case.format_magic,
+                case.holdout_designated_at.isoformat()
+                if case.holdout_designated_at is not None
+                else "not_holdout",
+                case.declared_role.value if case.declared_role is not None else "direct_role",
             )
         )
         for case in normalized
@@ -242,14 +348,56 @@ class RuleTestError:
     message: str
     sample_sha256: str | None = None
     line: int | None = None
+    column: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "code", RuleTestErrorCode(self.code))
         object.__setattr__(self, "message", self.message[:1000])
         if self.sample_sha256 is not None:
             _require_sha256(self.sample_sha256, "sample_sha256")
-        if self.line is not None and self.line < 1:
+        if self.line is not None and (
+            isinstance(self.line, bool) or not isinstance(self.line, int) or self.line < 1
+        ):
             raise ValueError("line must be positive")
+        if self.column is not None and (
+            isinstance(self.column, bool) or not isinstance(self.column, int) or self.column < 1
+        ):
+            raise ValueError("column must be positive")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class RuleStringHit:
+    identifier: str
+    offsets: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if not self.identifier.startswith("$"):
+            raise ValueError("YARA string identifiers must begin with '$'")
+        offsets = tuple(self.offsets)
+        if not offsets or any(isinstance(item, bool) or item < 0 for item in offsets):
+            raise ValueError("YARA string hits require non-negative offsets")
+        object.__setattr__(self, "offsets", offsets)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class RuleFileCoverage:
+    sample_sha256: str
+    role: RuleTestCorpusRole
+    matched: bool | None
+    format_magic: str
+    strings: tuple[RuleStringHit, ...] = ()
+    details_complete: bool = True
+    unavailable_strings: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        _require_sha256(self.sample_sha256, "sample_sha256")
+        object.__setattr__(self, "role", RuleTestCorpusRole(self.role))
+        if self.matched is not None and not isinstance(self.matched, bool):
+            raise TypeError("matched must be boolean or None")
+        if not self.format_magic:
+            raise ValueError("file format magic is required")
+        object.__setattr__(self, "strings", tuple(self.strings))
+        object.__setattr__(self, "unavailable_strings", tuple(self.unavailable_strings))
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -261,6 +409,7 @@ class RuleRoleTestReport:
     non_matches: tuple[str, ...] = ()
     non_measurable: tuple[str, ...] = ()
     errors: tuple[RuleTestError, ...] = ()
+    file_results: tuple[RuleFileCoverage, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "role", RuleTestCorpusRole(self.role))
@@ -280,6 +429,12 @@ class RuleRoleTestReport:
             if self.corpus_sha256s:
                 raise ValueError("role report test cases must match its declared corpus")
         object.__setattr__(self, "test_cases", test_cases)
+        file_results = tuple(self.file_results)
+        if any(item.role is not self.role for item in file_results):
+            raise ValueError("file coverage role does not match its role report")
+        if {item.sample_sha256 for item in file_results} - set(self.corpus_sha256s):
+            raise ValueError("file coverage must belong to the declared corpus")
+        object.__setattr__(self, "file_results", file_results)
         measured = set(self.matches) | set(self.non_matches)
         if set(self.matches) & set(self.non_matches):
             raise ValueError("a corpus member cannot both match and not match")
@@ -344,68 +499,62 @@ class RuleTestReport:
 
     @property
     def false_positive_sha256s(self) -> tuple[str, ...]:
-        goodware = next(item for item in self.roles if item.role is RuleTestCorpusRole.GOODWARE)
-        return tuple(sorted(goodware.matches))
+        negative_roles = {
+            RuleTestCorpusRole.GOODWARE,
+            RuleTestCorpusRole.HARD_NEGATIVE,
+            RuleTestCorpusRole.HOLDOUT_NEGATIVE,
+        }
+        return tuple(
+            sorted(
+                {
+                    sample_sha256
+                    for item in self.roles
+                    if item.role in negative_roles
+                    for sample_sha256 in item.matches
+                }
+            )
+        )
 
     @property
     def false_negative_sha256s(self) -> tuple[str, ...]:
-        positives = next(
-            item for item in self.roles if item.role is RuleTestCorpusRole.CONFIRMED_POSITIVE
+        positive_roles = {
+            RuleTestCorpusRole.HUMAN_CONFIRMED,
+            RuleTestCorpusRole.HOLDOUT_POSITIVE,
+        }
+        return tuple(
+            sorted(
+                {
+                    sample_sha256
+                    for item in self.roles
+                    if item.role in positive_roles
+                    for sample_sha256 in item.non_matches
+                }
+            )
         )
-        return tuple(sorted(positives.non_matches))
 
     @property
     def metrics(self) -> dict[str, dict[str, object]]:
         """Rates on real, measured samples; unknown labels never enter denominators."""
-        positives = next(
-            item for item in self.roles if item.role is RuleTestCorpusRole.CONFIRMED_POSITIVE
-        )
-        goodware = next(item for item in self.roles if item.role is RuleTestCorpusRole.GOODWARE)
-        holdout = next(item for item in self.roles if item.role is RuleTestCorpusRole.HOLDOUT)
-        real_positive_hashes = {
-            case.sample_sha256
-            for case in positives.test_cases
-            if case.provenance is RuleSampleProvenance.REAL
-            and case.sample_sha256 in set(positives.matches) | set(positives.non_matches)
-        }
-        real_goodware_hashes = {
-            case.sample_sha256
-            for case in goodware.test_cases
-            if case.provenance is RuleSampleProvenance.REAL
-            and case.sample_sha256 in set(goodware.matches) | set(goodware.non_matches)
-        }
-        measured_holdout_hashes = set(holdout.matches) | set(holdout.non_matches)
-        real_holdout_positives = {
-            case.sample_sha256
-            for case in holdout.test_cases
-            if case.provenance is RuleSampleProvenance.REAL
-            and case.expected_result is True
-            and case.sample_sha256 in measured_holdout_hashes
-        }
-        real_holdout_negatives = {
-            case.sample_sha256
-            for case in holdout.test_cases
-            if case.provenance is RuleSampleProvenance.REAL
-            and case.expected_result is False
-            and case.sample_sha256 in measured_holdout_hashes
-        }
+        by_role = {item.role: item for item in self.roles}
+
+        def rate(role: RuleTestCorpusRole) -> dict[str, object]:
+            result = by_role[role]
+            measured_real = {
+                case.sample_sha256
+                for case in result.test_cases
+                if case.provenance is RuleSampleProvenance.REAL
+                and case.sample_sha256 in set(result.matches) | set(result.non_matches)
+            }
+            return wilson_rate(
+                successes=len(measured_real & set(result.matches)), trials=len(measured_real)
+            )
+
         return {
-            "real_positive_sensitivity": wilson_rate(
-                successes=len(real_positive_hashes & set(positives.matches)),
-                trials=len(real_positive_hashes),
-            ),
-            "real_goodware_false_positive_rate": wilson_rate(
-                successes=len(real_goodware_hashes & set(goodware.matches)),
-                trials=len(real_goodware_hashes),
-            ),
-            "real_holdout_sensitivity": wilson_rate(
-                successes=len(real_holdout_positives & set(holdout.matches)),
-                trials=len(real_holdout_positives),
-            ),
-            "real_holdout_false_positive_rate": wilson_rate(
-                successes=len(real_holdout_negatives & set(holdout.matches)),
-                trials=len(real_holdout_negatives),
-            ),
+            "real_positive_sensitivity": rate(RuleTestCorpusRole.HUMAN_CONFIRMED),
+            "real_goodware_false_positive_rate": rate(RuleTestCorpusRole.GOODWARE),
+            "real_hard_negative_false_positive_rate": rate(RuleTestCorpusRole.HARD_NEGATIVE),
+            "real_holdout_sensitivity": rate(RuleTestCorpusRole.HOLDOUT_POSITIVE),
+            "real_holdout_false_positive_rate": rate(RuleTestCorpusRole.HOLDOUT_NEGATIVE),
         }
 
     @property
@@ -423,14 +572,14 @@ class RuleTestReport:
             return RuleValidationStatus.UNTESTED
 
         positives = next(
-            item for item in self.roles if item.role is RuleTestCorpusRole.CONFIRMED_POSITIVE
+            item for item in self.roles if item.role is RuleTestCorpusRole.HUMAN_CONFIRMED
         )
         goodware = next(item for item in self.roles if item.role is RuleTestCorpusRole.GOODWARE)
         measured_real_positives = [
             case
             for case in positives.test_cases
             if case.provenance is RuleSampleProvenance.REAL
-            and case.sample_sha256 in measured_roles[RuleTestCorpusRole.CONFIRMED_POSITIVE]
+            and case.sample_sha256 in measured_roles[RuleTestCorpusRole.HUMAN_CONFIRMED]
         ]
         measured_real_goodware = [
             case
@@ -516,13 +665,26 @@ class RuleCorpusInventoryItem:
     provenance: RuleSampleProvenance
     size_bytes: int
     source_description: str = ""
+    format_magic: str = "unknown"
+    designated_at: datetime | None = None
+    observation_id: UUID | None = None
+    operator_id: str | None = None
 
     def __post_init__(self) -> None:
         _require_sha256(self.sample_sha256, "sample_sha256")
         object.__setattr__(self, "role", RuleTestCorpusRole(self.role))
         object.__setattr__(self, "provenance", RuleSampleProvenance(self.provenance))
-        if self.role is RuleTestCorpusRole.HOLDOUT:
-            raise ValueError("operator imports cannot declare the holdout role")
+        if not self.format_magic.strip():
+            raise ValueError("format_magic must describe the detected file format")
+        if self.designated_at is not None:
+            if self.designated_at.tzinfo is None or self.designated_at.utcoffset() is None:
+                raise ValueError("designation time must be timezone-aware")
+            object.__setattr__(self, "designated_at", self.designated_at.astimezone(UTC))
+        if self.role in {
+            RuleTestCorpusRole.HOLDOUT_POSITIVE,
+            RuleTestCorpusRole.HOLDOUT_NEGATIVE,
+        } and (self.designated_at is None or self.observation_id is None):
+            raise ValueError("holdout imports require a persisted role and designation time")
         if (
             isinstance(self.size_bytes, bool)
             or not isinstance(self.size_bytes, int)
@@ -542,6 +704,7 @@ class YaraEngineResult:
     matches_sha256: tuple[str, ...] = ()
     message: str = ""
     line: int | None = None
+    column: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "status", YaraExecutionStatus(self.status))
@@ -552,6 +715,8 @@ class YaraEngineResult:
         object.__setattr__(self, "matches_sha256", matches)
         if self.line is not None and self.line < 1:
             raise ValueError("line must be positive")
+        if self.column is not None and self.column < 1:
+            raise ValueError("column must be positive")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

@@ -6,11 +6,12 @@ import hashlib
 import json
 import logging
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from io import BytesIO
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid5
 
 from cti_app.application.blobs import BlobCatalogService
@@ -21,19 +22,30 @@ from cti_app.application.production_artifact_store import ProductionArtifactStor
 from cti_app.application.sample_acquisition import SAMPLES_QUARANTINE_BUCKET
 from cti_app.config import Settings
 from cti_app.domain.entities import ProvenanceEvent, Sample, SampleOrigin, SampleState
-from cti_app.domain.investigation import EvidenceKind, EvidenceObservation, SampleAssociation
+from cti_app.domain.investigation import (
+    EvidenceKind,
+    EvidenceObservation,
+    QualificationActorKind,
+    SampleAssociation,
+    SampleQualification,
+)
 from cti_app.domain.investigation import SampleOrigin as AssociationSampleOrigin
 from cti_app.domain.production import AnalystInvestigation, AnalystInvestigationStatus
 from cti_app.domain.rule_workbench import (
     RuleCorpusInventoryItem,
     RuleSampleProvenance,
     RuleTestCorpusRole,
+    detect_file_format_magic,
 )
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _IMPORT_SOURCE = "operator.rule-corpus"
 _IMPORT_VERSION = "manual-rule-corpus-import.v1"
 _IMPORT_OBJECT_TYPE = "manual_rule_corpus_import"
+_HOLDOUT_DESIGNATION_EVENT = "rule_corpus_holdout_designated"
+_HOLDOUT_ROLES = frozenset(
+    {RuleTestCorpusRole.HOLDOUT_POSITIVE, RuleTestCorpusRole.HOLDOUT_NEGATIVE}
+)
 _OPERATOR_IMPORT_ASSOCIATION_NAMESPACE = UUID("b7bcc71a-5fb4-4e18-93d6-a82b8aa813dc")
 _METADATA_PREFIX = "manual_rule_corpus_metadata:"
 _HARD_MAX_UPLOAD_BYTES = 64 * 1024 * 1024
@@ -57,12 +69,25 @@ class RuleCorpusImportRejection(StrEnum):
     INVALID_METADATA = "invalid_metadata"
     INVESTIGATION_NOT_FOUND = "investigation_not_found"
     INVESTIGATION_TERMINAL = "investigation_terminal"
+    HUMAN_CONFIRMATION_REQUIRED = "human_confirmation_required"
+    ROLE_CONFLICT = "sample_sha256_role_conflict"
+    HOLDOUT_AFTER_RULE = "holdout_must_be_designated_before_rule"
+    HOLDOUT_OVERLAP = "holdout_sha256_overlaps_development"
+    HOLDOUT_NOT_DESIGNATED = "holdout_designation_required"
+    SAMPLE_LOOKUP_INVALID = "sample_lookup_requires_exactly_one_identity"
+    SAMPLE_NOT_FOUND = "quarantined_sample_not_found"
+    SAMPLE_AMBIGUOUS = "quarantined_sample_identity_ambiguous"
+    SAMPLE_NOT_QUARANTINED = "sample_not_in_quarantine"
 
 
 class ManualRuleCorpusImportRejected(ValueError):
     def __init__(self, reason: RuleCorpusImportRejection) -> None:
         self.reason = reason
         super().__init__(reason.value)
+
+
+class RuleCorpusImportInvestigationNotFound(LookupError):
+    """The requested investigation does not exist."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,11 +104,24 @@ class ImportedRuleCorpusFile:
     operator_id: str
     sample_id: UUID
     association_id: UUID
+    format_magic: str = "unknown"
+    designated_at: datetime | None = None
     idempotent_replay: bool = False
 
     @property
     def logical_bucket(self) -> str:
         return SAMPLES_QUARANTINE_BUCKET
+
+
+@dataclass(frozen=True, slots=True)
+class HoldoutDesignation:
+    investigation_id: UUID
+    sample_sha256: str
+    intended_role: RuleTestCorpusRole
+    designated_at: datetime
+    operator_id: str
+    reason: str
+    idempotent_replay: bool = False
 
 
 class ManualRuleCorpusImportService:
@@ -109,6 +147,172 @@ class ManualRuleCorpusImportService:
             raise ValueError("rule_corpus_import_max_bytes must be a positive integer")
         return min(configured, _HARD_MAX_UPLOAD_BYTES)
 
+    async def list_imports(self, investigation_id: UUID) -> tuple[RuleCorpusInventoryItem, ...]:
+        async with self._uow_factory() as uow:
+            if await uow.analyst_investigations.get(investigation_id) is None:
+                raise RuleCorpusImportInvestigationNotFound(str(investigation_id))
+        return await list_manual_rule_corpus_imports(self._uow_factory, investigation_id)
+
+    async def designate_holdout(
+        self,
+        *,
+        investigation_id: UUID,
+        sample_sha256: str,
+        intended_role: RuleTestCorpusRole | str,
+        operator_id: str,
+        reason: str,
+    ) -> HoldoutDesignation:
+        if not isinstance(sample_sha256, str) or _SHA256.fullmatch(sample_sha256) is None:
+            raise ManualRuleCorpusImportRejected(RuleCorpusImportRejection.SHA256_MISMATCH)
+        sample_sha256 = sample_sha256.casefold()
+        try:
+            role = RuleTestCorpusRole(intended_role)
+        except (TypeError, ValueError) as exc:
+            raise ManualRuleCorpusImportRejected(RuleCorpusImportRejection.INVALID_ROLE) from exc
+        if role not in _HOLDOUT_ROLES:
+            raise ManualRuleCorpusImportRejected(RuleCorpusImportRejection.INVALID_ROLE)
+        clean_operator_id = sanitize_evidence_text(operator_id, max_chars=256).strip()
+        clean_reason = sanitize_evidence_text(reason, max_chars=1_500).strip()
+        if not clean_operator_id or not clean_reason:
+            raise ManualRuleCorpusImportRejected(RuleCorpusImportRejection.INVALID_METADATA)
+
+        async with self._uow_factory() as uow:
+            investigation = await uow.analyst_investigations.get(investigation_id)
+            if investigation is None:
+                raise ManualRuleCorpusImportRejected(
+                    RuleCorpusImportRejection.INVESTIGATION_NOT_FOUND
+                )
+            if investigation.status in _TERMINAL_STATUSES:
+                raise ManualRuleCorpusImportRejected(
+                    RuleCorpusImportRejection.INVESTIGATION_TERMINAL
+                )
+            observations = await uow.evidence_observations.list_for_investigation(investigation_id)
+            prior_roles = _corpus_roles_for_sha(observations, sample_sha256)
+            if prior_roles and prior_roles != {role}:
+                raise ManualRuleCorpusImportRejected(RuleCorpusImportRejection.HOLDOUT_OVERLAP)
+            prior = await self._holdout_designation_for_sha(
+                uow, investigation_id, sample_sha256, observations=observations
+            )
+            if prior is not None:
+                if prior.intended_role is not role:
+                    raise ManualRuleCorpusImportRejected(RuleCorpusImportRejection.HOLDOUT_OVERLAP)
+                return HoldoutDesignation(
+                    investigation_id=prior.investigation_id,
+                    sample_sha256=prior.sample_sha256,
+                    intended_role=prior.intended_role,
+                    designated_at=prior.designated_at,
+                    operator_id=prior.operator_id,
+                    reason=prior.reason,
+                    idempotent_replay=True,
+                )
+
+            designated_at = datetime.now(UTC)
+            subject = await uow.subjects.get(investigation.subject_id)
+            if subject is None:
+                raise ManualRuleCorpusImportRejected(
+                    RuleCorpusImportRejection.INVESTIGATION_NOT_FOUND
+                )
+            event = ProvenanceEvent(
+                aggregate_type="investigation",
+                aggregate_id=investigation_id,
+                subject_id=investigation.subject_id,
+                event_type=_HOLDOUT_DESIGNATION_EVENT,
+                payload={
+                    "sample_sha256": sample_sha256,
+                    "intended_role": role.value,
+                    "designated_at": designated_at.isoformat(),
+                    "operator_id": clean_operator_id,
+                    "reason": clean_reason,
+                },
+                tlp=subject.tlp,
+                actor_id=clean_operator_id,
+                occurred_at=designated_at,
+            )
+            await uow.provenance.append(event)
+            await uow.commit()
+        _logger.info(
+            "operator_rule_corpus_holdout_designated",
+            extra={
+                "event": "operator.rule_corpus_holdout_designated",
+                "investigation_id": str(investigation_id),
+                "operator_id": clean_operator_id,
+                "sample_sha256": sample_sha256,
+                "intended_role": role.value,
+                "designated_at": designated_at.isoformat(),
+            },
+        )
+        return HoldoutDesignation(
+            investigation_id=investigation_id,
+            sample_sha256=sample_sha256,
+            intended_role=role,
+            designated_at=designated_at,
+            operator_id=clean_operator_id,
+            reason=clean_reason,
+        )
+
+    @staticmethod
+    async def _holdout_designation_for_sha(
+        uow: Any,
+        investigation_id: UUID,
+        sample_sha256: str,
+        *,
+        observations: Sequence[EvidenceObservation] | None = None,
+    ) -> HoldoutDesignation | None:
+        found: list[HoldoutDesignation] = []
+        for event in await uow.provenance.list_for_aggregate("investigation", investigation_id):
+            payload = event.payload
+            if (
+                event.event_type != _HOLDOUT_DESIGNATION_EVENT
+                or payload.get("sample_sha256") != sample_sha256
+            ):
+                continue
+            try:
+                role = RuleTestCorpusRole(payload["intended_role"])
+                designated_at = event.occurred_at
+                operator_id = event.actor_id or payload["operator_id"]
+                reason = payload["reason"]
+            except (KeyError, TypeError, ValueError):
+                continue
+            if (
+                role not in _HOLDOUT_ROLES
+                or not isinstance(operator_id, str)
+                or not operator_id.strip()
+                or not isinstance(reason, str)
+                or not reason.strip()
+                or designated_at.tzinfo is None
+                or designated_at.utcoffset() is None
+            ):
+                continue
+            found.append(
+                HoldoutDesignation(
+                    investigation_id=investigation_id,
+                    sample_sha256=sample_sha256,
+                    intended_role=role,
+                    designated_at=designated_at.astimezone(UTC),
+                    operator_id=operator_id,
+                    reason=reason,
+                )
+            )
+
+        for observation in observations or ():
+            if observation.sha256 != sample_sha256:
+                continue
+            metadata = parse_manual_rule_corpus_metadata(observation)
+            if metadata is None or metadata["intended_role"] not in _HOLDOUT_ROLES:
+                continue
+            designated_at = metadata["designated_at"]
+            found.append(
+                HoldoutDesignation(
+                    investigation_id=investigation_id,
+                    sample_sha256=sample_sha256,
+                    intended_role=metadata["intended_role"],
+                    designated_at=designated_at,
+                    operator_id=metadata["operator_id"],
+                    reason=metadata["reason"],
+                )
+            )
+        return min(found, key=lambda item: item.designated_at) if found else None
+
     async def import_bytes(
         self,
         *,
@@ -128,10 +332,15 @@ class ManualRuleCorpusImportService:
         if len(content) > self.max_upload_bytes:
             raise ManualRuleCorpusImportRejected(RuleCorpusImportRejection.SIZE_LIMIT)
         try:
-            role = RuleTestCorpusRole(intended_role)
+            raw_role = str(intended_role)
+            legacy_roles = {
+                "confirmed_positive": RuleTestCorpusRole.HUMAN_CONFIRMED,
+                "out_of_cluster_candidate": RuleTestCorpusRole.NEW_CANDIDATE_UNCONFIRMED,
+            }
+            role = legacy_roles.get(raw_role) or RuleTestCorpusRole(raw_role)
         except (TypeError, ValueError) as exc:
             raise ManualRuleCorpusImportRejected(RuleCorpusImportRejection.INVALID_ROLE) from exc
-        if role is RuleTestCorpusRole.HOLDOUT:
+        if role is RuleTestCorpusRole.BYTES_MISSING:
             raise ManualRuleCorpusImportRejected(RuleCorpusImportRejection.INVALID_ROLE)
         try:
             source_provenance = RuleSampleProvenance(provenance)
@@ -149,6 +358,8 @@ class ManualRuleCorpusImportService:
             raise ManualRuleCorpusImportRejected(RuleCorpusImportRejection.INVALID_METADATA)
 
         actual_sha256 = hashlib.sha256(content).hexdigest()
+        format_magic = detect_file_format_magic(content)
+        designated_at: datetime | None = None
         if declared_sha256 is not None and (
             not isinstance(declared_sha256, str)
             or not _SHA256.fullmatch(declared_sha256)
@@ -167,9 +378,40 @@ class ManualRuleCorpusImportService:
                 raise ManualRuleCorpusImportRejected(
                     RuleCorpusImportRejection.INVESTIGATION_TERMINAL
                 )
+            associations = await uow.sample_associations.list_for_investigation(investigation_id)
+            existing_association = next(
+                (item for item in associations if item.sample_sha256 == actual_sha256), None
+            )
+            if role is RuleTestCorpusRole.HUMAN_CONFIRMED and not _human_confirmed(
+                existing_association
+            ):
+                raise ManualRuleCorpusImportRejected(
+                    RuleCorpusImportRejection.HUMAN_CONFIRMATION_REQUIRED
+                )
             prior_observation = await self._find_existing_import(
                 uow.evidence_observations, investigation_id, object_id
             )
+            all_import_observations = await uow.evidence_observations.list_for_investigation(
+                investigation_id
+            )
+            prior_roles = _corpus_roles_for_sha(all_import_observations, actual_sha256)
+            designation = await self._holdout_designation_for_sha(
+                uow, investigation_id, actual_sha256, observations=all_import_observations
+            )
+            if role in _HOLDOUT_ROLES:
+                if designation is None:
+                    raise ManualRuleCorpusImportRejected(
+                        RuleCorpusImportRejection.HOLDOUT_NOT_DESIGNATED
+                    )
+                if designation.intended_role is not role:
+                    raise ManualRuleCorpusImportRejected(RuleCorpusImportRejection.HOLDOUT_OVERLAP)
+                designated_at = designation.designated_at
+            elif designation is not None:
+                raise ManualRuleCorpusImportRejected(RuleCorpusImportRejection.HOLDOUT_OVERLAP)
+            if prior_observation is None and prior_roles and prior_roles != {role}:
+                if role in _HOLDOUT_ROLES or prior_roles & _HOLDOUT_ROLES:
+                    raise ManualRuleCorpusImportRejected(RuleCorpusImportRejection.HOLDOUT_OVERLAP)
+                raise ManualRuleCorpusImportRejected(RuleCorpusImportRejection.ROLE_CONFLICT)
             if prior_observation is not None:
                 record = await uow.blobs.get(prior_observation.blob_id)
                 if record is None or record.descriptor.logical_bucket != SAMPLES_QUARANTINE_BUCKET:
@@ -216,6 +458,8 @@ class ManualRuleCorpusImportService:
             "source_description": clean_source_description,
             "operator_id": clean_operator_id,
             "size_bytes": len(content),
+            "format_magic": format_magic,
+            "designated_at": designated_at.isoformat() if designated_at else None,
         }
         limitations = (
             "Fichier non fiable conservé uniquement en quarantaine; jamais exécuté.",
@@ -269,9 +513,297 @@ class ManualRuleCorpusImportService:
             operator_id=clean_operator_id,
             sample_id=sample.id,
             association_id=association.id,
+            format_magic=format_magic,
+            designated_at=designated_at,
         )
         _audit_import(imported)
         return imported
+
+    async def assign_existing_sample(
+        self,
+        *,
+        investigation_id: UUID,
+        intended_role: RuleTestCorpusRole | str,
+        provenance: RuleSampleProvenance | str,
+        operator_id: str,
+        reason: str,
+        sample_id: UUID | None = None,
+        sample_sha256: str | None = None,
+        source_description: str = "",
+    ) -> ImportedRuleCorpusFile:
+        if (sample_id is None) == (sample_sha256 is None):
+            raise ManualRuleCorpusImportRejected(RuleCorpusImportRejection.SAMPLE_LOOKUP_INVALID)
+        if sample_sha256 is not None and (
+            not isinstance(sample_sha256, str) or _SHA256.fullmatch(sample_sha256) is None
+        ):
+            raise ManualRuleCorpusImportRejected(RuleCorpusImportRejection.SHA256_MISMATCH)
+        try:
+            raw_role = str(intended_role)
+            role = {
+                "confirmed_positive": RuleTestCorpusRole.HUMAN_CONFIRMED,
+                "out_of_cluster_candidate": RuleTestCorpusRole.NEW_CANDIDATE_UNCONFIRMED,
+            }.get(raw_role) or RuleTestCorpusRole(raw_role)
+            source_provenance = RuleSampleProvenance(provenance)
+        except (TypeError, ValueError) as exc:
+            raise ManualRuleCorpusImportRejected(RuleCorpusImportRejection.INVALID_ROLE) from exc
+        if role is RuleTestCorpusRole.BYTES_MISSING:
+            raise ManualRuleCorpusImportRejected(RuleCorpusImportRejection.INVALID_ROLE)
+
+        clean_operator_id = sanitize_evidence_text(operator_id, max_chars=256).strip()
+        clean_reason = sanitize_evidence_text(reason, max_chars=1_500).strip()
+        clean_source_description = sanitize_evidence_text(
+            source_description, max_chars=1_000
+        ).strip()
+        if not clean_operator_id or not clean_reason:
+            raise ManualRuleCorpusImportRejected(RuleCorpusImportRejection.INVALID_METADATA)
+
+        async with self._uow_factory() as uow:
+            investigation = await uow.analyst_investigations.get(investigation_id)
+            if investigation is None:
+                raise ManualRuleCorpusImportRejected(
+                    RuleCorpusImportRejection.INVESTIGATION_NOT_FOUND
+                )
+            if investigation.status in _TERMINAL_STATUSES:
+                raise ManualRuleCorpusImportRejected(
+                    RuleCorpusImportRejection.INVESTIGATION_TERMINAL
+                )
+            sample = await self._existing_quarantined_sample(
+                uow,
+                investigation,
+                sample_id=sample_id,
+                sample_sha256=sample_sha256,
+            )
+            blob = await uow.blobs.get(sample.blob_id)
+            if (
+                blob is None
+                or blob.descriptor.logical_bucket != SAMPLES_QUARANTINE_BUCKET
+                or blob.descriptor.sha256 is None
+                or (
+                    sample_sha256 is not None and blob.descriptor.sha256 != sample_sha256.casefold()
+                )
+                or (
+                    sample.expected_hash is not None
+                    and _SHA256.fullmatch(sample.expected_hash.casefold()) is not None
+                    and sample.expected_hash.casefold() != blob.descriptor.sha256
+                )
+            ):
+                raise ManualRuleCorpusImportRejected(
+                    RuleCorpusImportRejection.SAMPLE_NOT_QUARANTINED
+                )
+            actual_sha256 = blob.descriptor.sha256
+            observations = await uow.evidence_observations.list_for_investigation(investigation_id)
+            prior_roles = _corpus_roles_for_sha(observations, actual_sha256)
+            designation = await self._holdout_designation_for_sha(
+                uow, investigation_id, actual_sha256, observations=observations
+            )
+            if role in _HOLDOUT_ROLES:
+                if designation is None:
+                    raise ManualRuleCorpusImportRejected(
+                        RuleCorpusImportRejection.HOLDOUT_NOT_DESIGNATED
+                    )
+                if designation.intended_role is not role:
+                    raise ManualRuleCorpusImportRejected(RuleCorpusImportRejection.HOLDOUT_OVERLAP)
+            elif designation is not None:
+                raise ManualRuleCorpusImportRejected(RuleCorpusImportRejection.HOLDOUT_OVERLAP)
+            if prior_roles and prior_roles != {role}:
+                if role in _HOLDOUT_ROLES or prior_roles & _HOLDOUT_ROLES:
+                    raise ManualRuleCorpusImportRejected(RuleCorpusImportRejection.HOLDOUT_OVERLAP)
+                raise ManualRuleCorpusImportRejected(RuleCorpusImportRejection.ROLE_CONFLICT)
+
+            associations = await uow.sample_associations.list_for_investigation(investigation_id)
+            existing_association = next(
+                (item for item in associations if item.sample_sha256 == actual_sha256), None
+            )
+            if role is RuleTestCorpusRole.HUMAN_CONFIRMED and not _human_confirmed(
+                existing_association
+            ):
+                raise ManualRuleCorpusImportRejected(
+                    RuleCorpusImportRejection.HUMAN_CONFIRMATION_REQUIRED
+                )
+            object_id = f"{actual_sha256}:{role.value}"
+            prior_observation = await self._find_existing_import(
+                uow.evidence_observations, investigation_id, object_id
+            )
+            if prior_observation is not None:
+                prior = parse_manual_rule_corpus_metadata(prior_observation)
+                if prior is None or prior["intended_role"] is not role:
+                    raise ValueError("Existing rule-corpus role metadata is unreadable")
+                association = await self._ensure_existing_sample_association(
+                    uow, investigation=investigation, sample=sample, sha256=actual_sha256
+                )
+                await uow.commit()
+                return _import_from_observation(
+                    prior_observation,
+                    size_bytes=blob.descriptor.size,
+                    metadata=prior,
+                    sample_id=sample.id,
+                    association_id=association.id,
+                    idempotent_replay=True,
+                )
+
+            designated_at = (
+                designation.designated_at
+                if role in _HOLDOUT_ROLES and designation is not None
+                else None
+            )
+            metadata: dict[str, Any] = {
+                "intended_role": role.value,
+                "provenance": source_provenance.value,
+                "reason": clean_reason,
+                "source_description": clean_source_description,
+                "operator_id": clean_operator_id,
+                "size_bytes": blob.descriptor.size,
+                "format_magic": "quarantined_uninspected",
+                "designated_at": designated_at.isoformat() if designated_at else None,
+                "classification_method": "existing_quarantined_sample",
+            }
+            limitations = (
+                "Rôle opérateur appliqué à un blob déjà en quarantaine; octets non exposés.",
+                "Échantillon non fiable; jamais exécuté par cette opération.",
+                _METADATA_PREFIX + json.dumps(metadata, ensure_ascii=False, separators=(",", ":")),
+            )
+            recorder = ProductionEvidenceRecorder(self._artifact_store, uow.evidence_observations)
+            observation = await recorder.record_existing_blob(
+                investigation_id=investigation_id,
+                kind=EvidenceKind.OTHER,
+                blob_id=blob.id,
+                sha256=actual_sha256,
+                source=_IMPORT_SOURCE,
+                source_version=_IMPORT_VERSION,
+                object_type=_IMPORT_OBJECT_TYPE,
+                object_id=object_id,
+                limitations=limitations,
+                idempotency_key=f"rule-corpus-role:{investigation_id}:{actual_sha256}:{role.value}",
+            )
+            association = await self._ensure_existing_sample_association(
+                uow, investigation=investigation, sample=sample, sha256=actual_sha256
+            )
+            await uow.provenance.append(
+                ProvenanceEvent(
+                    aggregate_type="sample",
+                    aggregate_id=sample.id,
+                    subject_id=sample.subject_id,
+                    event_type="sample_corpus_role_assigned_by_operator",
+                    payload={
+                        "investigation_id": str(investigation_id),
+                        "sample_sha256": actual_sha256,
+                        "intended_role": role.value,
+                        "provenance": source_provenance.value,
+                        "operator_id": clean_operator_id,
+                        "reason": clean_reason,
+                    },
+                    tlp=sample.tlp,
+                    actor_id=clean_operator_id,
+                )
+            )
+            await uow.commit()
+
+        assigned = ImportedRuleCorpusFile(
+            investigation_id=investigation_id,
+            observation_id=observation.id,
+            blob_id=blob.id,
+            sha256=actual_sha256,
+            size_bytes=blob.descriptor.size,
+            intended_role=role,
+            provenance=source_provenance,
+            reason=clean_reason,
+            source_description=clean_source_description,
+            operator_id=clean_operator_id,
+            sample_id=sample.id,
+            association_id=association.id,
+            format_magic="quarantined_uninspected",
+            designated_at=designated_at,
+        )
+        _logger.info(
+            "operator_rule_corpus_role_assigned",
+            extra={
+                "event": "operator.rule_corpus_role_assigned",
+                "investigation_id": str(investigation_id),
+                "operator_id": clean_operator_id,
+                "sha256": actual_sha256,
+                "intended_role": role.value,
+                "sample_id": str(sample.id),
+            },
+        )
+        return assigned
+
+    @staticmethod
+    async def _existing_quarantined_sample(
+        uow: Any,
+        investigation: AnalystInvestigation,
+        *,
+        sample_id: UUID | None,
+        sample_sha256: str | None,
+    ) -> Sample:
+        if sample_id is not None:
+            sample = await uow.samples.get(sample_id)
+            candidates = (sample,) if sample is not None else ()
+        else:
+            candidates = await uow.samples.list_for_subject(investigation.subject_id)
+        matches: list[Sample] = []
+        non_quarantined_match = False
+        for sample in candidates:
+            if sample is None or sample.subject_id != investigation.subject_id:
+                continue
+            blob = await uow.blobs.get(sample.blob_id)
+            if (
+                blob is None
+                or blob.descriptor.logical_bucket != SAMPLES_QUARANTINE_BUCKET
+                or (
+                    sample_sha256 is not None and blob.descriptor.sha256 != sample_sha256.casefold()
+                )
+            ):
+                continue
+            if getattr(sample.state, "value", sample.state) not in {
+                SampleState.QUARANTINED.value,
+                SampleState.REVIEW_CANDIDATE.value,
+            }:
+                non_quarantined_match = True
+                continue
+            matches.append(sample)
+        if not matches:
+            if non_quarantined_match:
+                raise ManualRuleCorpusImportRejected(
+                    RuleCorpusImportRejection.SAMPLE_NOT_QUARANTINED
+                )
+            raise ManualRuleCorpusImportRejected(RuleCorpusImportRejection.SAMPLE_NOT_FOUND)
+        if len(matches) != 1:
+            raise ManualRuleCorpusImportRejected(RuleCorpusImportRejection.SAMPLE_AMBIGUOUS)
+        return matches[0]
+
+    @staticmethod
+    async def _ensure_existing_sample_association(
+        uow: Any,
+        *,
+        investigation: AnalystInvestigation,
+        sample: Sample,
+        sha256: str,
+    ) -> SampleAssociation:
+        association = cast(
+            SampleAssociation | None,
+            next(
+                (
+                    item
+                    for item in await uow.sample_associations.list_for_investigation(
+                        investigation.id
+                    )
+                    if item.sample_sha256 == sha256
+                ),
+                None,
+            ),
+        )
+        if association is not None:
+            return association
+        association = SampleAssociation(
+            id=uuid5(_OPERATOR_IMPORT_ASSOCIATION_NAMESPACE, f"{investigation.id}:{sha256}"),
+            investigation_id=investigation.id,
+            sample_sha256=sha256,
+            origin=AssociationSampleOrigin.MANUAL,
+        )
+        return cast(
+            SampleAssociation,
+            await uow.sample_associations.append_version(association, expected_version=0),
+        )
 
     @staticmethod
     async def _ensure_imported_sample(
@@ -386,6 +918,17 @@ class ManualRuleCorpusImportService:
         )
 
 
+def _corpus_roles_for_sha(
+    observations: Sequence[EvidenceObservation], sample_sha256: str
+) -> set[RuleTestCorpusRole]:
+    return {
+        metadata["intended_role"]
+        for observation in observations
+        if observation.sha256 == sample_sha256
+        and (metadata := parse_manual_rule_corpus_metadata(observation)) is not None
+    }
+
+
 def parse_manual_rule_corpus_metadata(
     observation: EvidenceObservation,
 ) -> dict[str, Any] | None:
@@ -401,9 +944,15 @@ def parse_manual_rule_corpus_metadata(
             continue
         try:
             metadata = json.loads(limitation[len(_METADATA_PREFIX) :])
-            role = RuleTestCorpusRole(metadata["intended_role"])
+            raw_role = metadata["intended_role"]
+            if raw_role == "confirmed_positive":
+                role = RuleTestCorpusRole.HUMAN_CONFIRMED
+            elif raw_role == "out_of_cluster_candidate":
+                role = RuleTestCorpusRole.NEW_CANDIDATE_UNCONFIRMED
+            else:
+                role = RuleTestCorpusRole(raw_role)
             provenance = RuleSampleProvenance(metadata["provenance"])
-            if role is RuleTestCorpusRole.HOLDOUT:
+            if role is RuleTestCorpusRole.BYTES_MISSING:
                 return None
             if not isinstance(metadata.get("size_bytes"), int):
                 return None
@@ -412,7 +961,28 @@ def parse_manual_rule_corpus_metadata(
                 for key in ("reason", "source_description", "operator_id")
             ):
                 return None
-            return {**metadata, "intended_role": role, "provenance": provenance}
+            format_magic = metadata.get("format_magic", "legacy_untyped")
+            if not isinstance(format_magic, str) or not format_magic.strip():
+                return None
+            designated_at = metadata.get("designated_at")
+            if role in {
+                RuleTestCorpusRole.HOLDOUT_POSITIVE,
+                RuleTestCorpusRole.HOLDOUT_NEGATIVE,
+            }:
+                if not isinstance(designated_at, str):
+                    return None
+                designated_at = datetime.fromisoformat(designated_at)
+                if designated_at.tzinfo is None or designated_at.utcoffset() is None:
+                    return None
+            elif designated_at is not None:
+                return None
+            return {
+                **metadata,
+                "format_magic": format_magic,
+                "intended_role": role,
+                "provenance": provenance,
+                "designated_at": designated_at,
+            }
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             return None
     return None
@@ -432,6 +1002,10 @@ def manual_rule_corpus_inventory_item(
         provenance=metadata["provenance"],
         size_bytes=size_bytes,
         source_description=metadata["source_description"],
+        format_magic=metadata["format_magic"],
+        designated_at=metadata["designated_at"],
+        observation_id=observation.id,
+        operator_id=metadata["operator_id"],
     )
 
 
@@ -480,7 +1054,21 @@ def _import_from_observation(
         operator_id=metadata["operator_id"],
         sample_id=sample_id,
         association_id=association_id,
+        format_magic=metadata.get("format_magic", "legacy_untyped"),
+        designated_at=metadata.get("designated_at"),
         idempotent_replay=idempotent_replay,
+    )
+
+
+def _human_confirmed(association: SampleAssociation | None) -> bool:
+    return bool(
+        association is not None
+        and association.qualification is SampleQualification.CONFIRMED
+        and any(
+            change.to_qualification is SampleQualification.CONFIRMED
+            and change.actor_kind is QualificationActorKind.HUMAN
+            for change in association.changes
+        )
     )
 
 

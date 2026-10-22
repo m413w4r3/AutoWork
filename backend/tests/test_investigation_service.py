@@ -42,6 +42,7 @@ from cti_app.application.investigation_service import (
     InvocationReconciliationOutcome,
     ProductionArtifactContextSnapshotRepository,
     ProductionArtifactObservationWriter,
+    _confirmed_external_non_execution,
     _envelope_reduced_since,
     bridge_budget_operation_key,
 )
@@ -3085,6 +3086,56 @@ async def test_confirmed_nonexecution_without_provider_call_releases_reservation
     assert reservation.status is BudgetReservationStatus.RELEASED
     assert latest_envelope.budget.consumed[BudgetDimension.VT_UNITS] == 0
     assert latest_envelope.budget.consumed[BudgetDimension.DOWNLOADS] == 0
+
+
+@pytest.mark.asyncio
+async def test_pre_transport_advisor_input_failure_releases_every_reserved_unit() -> None:
+    fixture = _Fixture(responses=[], tools=())
+    state = await fixture.start()
+    operation_key = "synthetic-advisor-pre-transport-rejection"
+    reserved = {
+        BudgetDimension.BRIDGE_TURNS: 1,
+        BudgetDimension.TOOL_SECONDS: 240,
+        BudgetDimension.CONTEXT_BYTES: 110_592,
+    }
+    envelope = await fixture.envelopes.get(state.investigation_id)
+    envelope.budget.reserve(operation_key, reserved)
+    await fixture.envelopes.save_if_version(
+        replace(envelope, version=envelope.version + 1), expected_version=envelope.version
+    )
+    result = ToolResult(
+        ToolInvocationStatus.UNAVAILABLE,
+        error_code="advisor_unavailable",
+        budget_consumed={
+            BudgetDimension.BRIDGE_TURNS: 0,
+            BudgetDimension.CONTEXT_BYTES: 4_096,
+        },
+        output={
+            "advisor_status": "unavailable",
+            "failure_stage": "pre_submission",
+            "confirmed_non_execution": True,
+            "bridge_invocation_id": None,
+            "provider_usage": {"status": "not_submitted"},
+        },
+    )
+
+    assert _confirmed_external_non_execution(result) is True
+    await fixture.service._complete_tool_reservation(
+        investigation_id=state.investigation_id,
+        operation_key=operation_key,
+        result=result,
+        reserved_amounts=reserved,
+        uncertain=False,
+    )
+
+    latest_envelope = await fixture.envelopes.get(state.investigation_id)
+    reservation = next(
+        item for item in latest_envelope.budget.reservations if item.operation_key == operation_key
+    )
+    assert reservation.status is BudgetReservationStatus.RELEASED
+    assert latest_envelope.budget.reserved[BudgetDimension.BRIDGE_TURNS] == 0
+    assert latest_envelope.budget.reserved[BudgetDimension.TOOL_SECONDS] == 0
+    assert latest_envelope.budget.reserved[BudgetDimension.CONTEXT_BYTES] == 0
 
 
 @pytest.mark.asyncio

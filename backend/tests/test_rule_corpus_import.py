@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+from datetime import UTC, datetime
+from io import BytesIO
 from types import SimpleNamespace
 from uuid import UUID
 
@@ -8,6 +10,10 @@ import pytest
 
 from cti_app.application.investigation_acquisition import HitAcquisitionService
 from cti_app.application.investigation_persistence import InMemoryEvidenceObservationRepository
+from cti_app.application.rule_corpus_import import (
+    ManualRuleCorpusImportRejected,
+    RuleCorpusImportRejection,
+)
 from cti_app.application.sample_acquisition import SAMPLES_QUARANTINE_BUCKET
 from cti_app.domain.classification import TLP
 from cti_app.domain.entities import ProvenanceEvent, Sample, SampleOrigin, SampleState
@@ -207,7 +213,7 @@ async def test_import_accepts_non_pe_xml_and_is_idempotent_by_role_and_content()
     payload = {
         "investigation_id": _INVESTIGATION_ID,
         "content": content,
-        "intended_role": RuleTestCorpusRole.CONFIRMED_POSITIVE,
+        "intended_role": RuleTestCorpusRole.NEW_CANDIDATE_UNCONFIRMED,
         "provenance": "synthetic",
         "operator_id": "analyst:offline-operator",
         "reason": "Generated from a quoted configuration fragment.",
@@ -219,7 +225,8 @@ async def test_import_accepts_non_pe_xml_and_is_idempotent_by_role_and_content()
 
     assert imported.sha256 == hashlib.sha256(content).hexdigest()
     assert imported.size_bytes == len(content)
-    assert imported.intended_role is RuleTestCorpusRole.CONFIRMED_POSITIVE
+    assert imported.intended_role is RuleTestCorpusRole.NEW_CANDIDATE_UNCONFIRMED
+    assert imported.format_magic == "xml_or_text"
     assert imported.provenance.value == "synthetic"
     assert replay.observation_id == imported.observation_id
     assert replay.blob_id == imported.blob_id
@@ -292,6 +299,280 @@ async def test_import_rejects_hash_mismatch_size_overrun_and_terminal_investigat
     assert harness.blobs.ingest_count == 0
 
 
+@pytest.mark.asyncio
+async def test_import_persists_one_explicit_role_and_rejects_role_relabeling() -> None:
+    harness = _Harness()
+    content = b"ordinary benign fixture with a documented role"
+    first = await harness.service.import_bytes(
+        investigation_id=_INVESTIGATION_ID,
+        content=content,
+        intended_role=RuleTestCorpusRole.GOODWARE,
+        provenance="real",
+        operator_id="analyst:offline-operator",
+        reason="Documented local benign baseline member.",
+    )
+    assert first.format_magic == "text"
+    assert first.designated_at is None
+
+    with pytest.raises(ManualRuleCorpusImportRejected) as conflict:
+        await harness.service.import_bytes(
+            investigation_id=_INVESTIGATION_ID,
+            content=content,
+            intended_role=RuleTestCorpusRole.HARD_NEGATIVE,
+            provenance="real",
+            operator_id="analyst:offline-operator",
+            reason="Attempted conflicting label for the same bytes.",
+        )
+    assert conflict.value.reason is RuleCorpusImportRejection.ROLE_CONFLICT
+
+
+@pytest.mark.asyncio
+async def test_import_accepts_legacy_candidate_form_value_and_persists_explicit_role() -> None:
+    harness = _Harness()
+    imported = await harness.service.import_bytes(
+        investigation_id=_INVESTIGATION_ID,
+        content=b"candidate supplied through the legacy multipart form value",
+        intended_role="out_of_cluster_candidate",
+        provenance="synthetic",
+        operator_id="analyst:offline-operator",
+        reason="Compatibility with the current multipart schema.",
+    )
+    assert imported.intended_role is RuleTestCorpusRole.NEW_CANDIDATE_UNCONFIRMED
+
+
+@pytest.mark.asyncio
+async def test_holdout_role_is_timestamped_and_disjoint_by_sha() -> None:
+    harness = _Harness()
+    content = b"independent holdout bytes with a measured marker"
+    sha256 = hashlib.sha256(content).hexdigest()
+    designation = await harness.service.designate_holdout(
+        investigation_id=_INVESTIGATION_ID,
+        sample_sha256=sha256,
+        intended_role=RuleTestCorpusRole.HOLDOUT_NEGATIVE,
+        operator_id="analyst:offline-operator",
+        reason="Reserved before drafting the candidate rule.",
+    )
+    holdout = await harness.service.import_bytes(
+        investigation_id=_INVESTIGATION_ID,
+        content=content,
+        intended_role=RuleTestCorpusRole.HOLDOUT_NEGATIVE,
+        provenance="real",
+        operator_id="analyst:offline-operator",
+        reason="Reserved before drafting the candidate rule.",
+    )
+    assert holdout.designated_at is not None
+    assert holdout.format_magic == "text"
+    assert holdout.designated_at == designation.designated_at
+    event = next(
+        event
+        for event in harness.provenance.items
+        if event.event_type == "rule_corpus_holdout_designated"
+    )
+    assert event.actor_id == "analyst:offline-operator"
+    assert event.payload["reason"] == "Reserved before drafting the candidate rule."
+    assert event.occurred_at == designation.designated_at
+
+    with pytest.raises(ManualRuleCorpusImportRejected) as overlap:
+        await harness.service.import_bytes(
+            investigation_id=_INVESTIGATION_ID,
+            content=content,
+            intended_role=RuleTestCorpusRole.GOODWARE,
+            provenance="real",
+            operator_id="analyst:offline-operator",
+            reason="The same bytes cannot also be development goodware.",
+        )
+    assert overlap.value.reason is RuleCorpusImportRejection.HOLDOUT_OVERLAP
+
+
+@pytest.mark.asyncio
+async def test_holdout_upload_requires_prior_append_only_designation() -> None:
+    harness = _Harness()
+    content = b"holdout cannot self-designate while being imported"
+
+    with pytest.raises(ManualRuleCorpusImportRejected) as rejected:
+        await harness.service.import_bytes(
+            investigation_id=_INVESTIGATION_ID,
+            content=content,
+            intended_role=RuleTestCorpusRole.HOLDOUT_NEGATIVE,
+            provenance="real",
+            operator_id="analyst:offline-operator",
+            reason="A reason on upload does not replace designation.",
+        )
+    assert rejected.value.reason is RuleCorpusImportRejection.HOLDOUT_NOT_DESIGNATED
+    assert harness.blobs.ingest_count == 0
+
+
+@pytest.mark.parametrize("identity_field", ["sample_id", "sample_sha256"])
+@pytest.mark.parametrize("expected_hash_kind", ["sha256", "sha1"])
+@pytest.mark.asyncio
+async def test_existing_quarantine_sample_gets_audited_role_without_upload_or_qualification(
+    identity_field,
+    expected_hash_kind,
+) -> None:
+    harness = _Harness()
+    sample_bytes = b"already quarantined seed bytes"
+    blob = await harness.blobs.ingest(
+        BytesIO(sample_bytes),
+        logical_bucket=SAMPLES_QUARANTINE_BUCKET,
+        mime_type="application/octet-stream",
+    )
+    sha256 = hashlib.sha256(sample_bytes).hexdigest()
+    sample = Sample(
+        subject_id=_SUBJECT_ID,
+        blob_id=blob.id,
+        original_name="seed.bin",
+        origin="source_seed",
+        acquired_at=datetime.now(UTC),
+        license_restriction=None,
+        tlp=TLP.AMBER,
+        do_not_submit=True,
+        external_llm_allowed=False,
+        origin_kind=SampleOrigin.SOURCE_SEED,
+        state=SampleState.QUARANTINED,
+        source_service="seed",
+        source_object_id=sha256,
+        expected_hash=(
+            sha256 if expected_hash_kind == "sha256" else hashlib.sha1(sample_bytes).hexdigest()
+        ),
+    )
+    harness.samples.items[sample.id] = sample
+    ingests_before_assignment = harness.blobs.ingest_count
+    identity = {identity_field: sample.id if identity_field == "sample_id" else sha256}
+
+    assigned = await harness.service.assign_existing_sample(
+        investigation_id=_INVESTIGATION_ID,
+        **identity,
+        intended_role=RuleTestCorpusRole.DOCUMENTED_SEED_UNCONFIRMED,
+        provenance="real",
+        operator_id="analyst:offline-operator",
+        reason="This existing seed belongs to the documented training corpus.",
+        source_description="Seed already present in quarantine.",
+    )
+
+    assert assigned.sample_id == sample.id
+    assert assigned.sha256 == sha256
+    assert assigned.intended_role is RuleTestCorpusRole.DOCUMENTED_SEED_UNCONFIRMED
+    assert assigned.format_magic == "quarantined_uninspected"
+    assert harness.blobs.ingest_count == ingests_before_assignment
+    association = harness.sample_associations.items[assigned.association_id]
+    assert association.qualification is SampleQualification.CANDIDATE
+    assert not association.changes
+    event = next(
+        event
+        for event in harness.provenance.items
+        if event.event_type == "sample_corpus_role_assigned_by_operator"
+    )
+    assert event.actor_id == "analyst:offline-operator"
+    assert event.payload["sample_sha256"] == sha256
+    assert event.payload["reason"] == (
+        "This existing seed belongs to the documented training corpus."
+    )
+
+
+@pytest.mark.asyncio
+async def test_existing_sample_role_cannot_create_human_confirmation() -> None:
+    harness = _Harness()
+    blob = await harness.blobs.ingest(
+        BytesIO(b"unconfirmed quarantined bytes"),
+        logical_bucket=SAMPLES_QUARANTINE_BUCKET,
+        mime_type="application/octet-stream",
+    )
+    sha256 = blob.descriptor.sha256
+    sample = Sample(
+        subject_id=_SUBJECT_ID,
+        blob_id=blob.id,
+        original_name="unconfirmed.bin",
+        origin="source_seed",
+        acquired_at=datetime.now(UTC),
+        license_restriction=None,
+        tlp=TLP.AMBER,
+        do_not_submit=True,
+        external_llm_allowed=False,
+        state=SampleState.QUARANTINED,
+        expected_hash=sha256,
+    )
+    harness.samples.items[sample.id] = sample
+
+    with pytest.raises(ManualRuleCorpusImportRejected) as rejected:
+        await harness.service.assign_existing_sample(
+            investigation_id=_INVESTIGATION_ID,
+            sample_id=sample.id,
+            intended_role=RuleTestCorpusRole.HUMAN_CONFIRMED,
+            provenance="real",
+            operator_id="analyst:offline-operator",
+            reason="An operator corpus label cannot qualify the sample.",
+        )
+    assert rejected.value.reason is RuleCorpusImportRejection.HUMAN_CONFIRMATION_REQUIRED
+    assert harness.sample_associations.items == {}
+
+
+@pytest.mark.asyncio
+async def test_existing_sample_holdout_role_requires_and_uses_prior_designation() -> None:
+    harness = _Harness()
+    sample_bytes = b"existing quarantine holdout bytes"
+    blob = await harness.blobs.ingest(
+        BytesIO(sample_bytes),
+        logical_bucket=SAMPLES_QUARANTINE_BUCKET,
+        mime_type="application/octet-stream",
+    )
+    sample = Sample(
+        subject_id=_SUBJECT_ID,
+        blob_id=blob.id,
+        original_name="holdout.bin",
+        origin="source_seed",
+        acquired_at=datetime.now(UTC),
+        license_restriction=None,
+        tlp=TLP.AMBER,
+        do_not_submit=True,
+        external_llm_allowed=False,
+        state=SampleState.QUARANTINED,
+        expected_hash=blob.descriptor.sha256,
+    )
+    harness.samples.items[sample.id] = sample
+
+    async def assign_existing_holdout():
+        return await harness.service.assign_existing_sample(
+            investigation_id=_INVESTIGATION_ID,
+            sample_id=sample.id,
+            intended_role=RuleTestCorpusRole.HOLDOUT_NEGATIVE,
+            provenance="real",
+            operator_id="analyst:offline-operator",
+            reason="Reserve this existing sample as an independent holdout.",
+        )
+
+    with pytest.raises(ManualRuleCorpusImportRejected) as rejected:
+        await assign_existing_holdout()
+    assert rejected.value.reason is RuleCorpusImportRejection.HOLDOUT_NOT_DESIGNATED
+    assert harness.sample_associations.items == {}
+
+    designation = await harness.service.designate_holdout(
+        investigation_id=_INVESTIGATION_ID,
+        sample_sha256=blob.descriptor.sha256,
+        intended_role=RuleTestCorpusRole.HOLDOUT_NEGATIVE,
+        operator_id="analyst:offline-operator",
+        reason="Reserve this existing sample as an independent holdout.",
+    )
+    assigned = await assign_existing_holdout()
+
+    assert assigned.intended_role is RuleTestCorpusRole.HOLDOUT_NEGATIVE
+    assert assigned.designated_at == designation.designated_at
+
+
+@pytest.mark.asyncio
+async def test_human_confirmed_import_requires_existing_human_qualification() -> None:
+    harness = _Harness()
+    with pytest.raises(ManualRuleCorpusImportRejected) as rejected:
+        await harness.service.import_bytes(
+            investigation_id=_INVESTIGATION_ID,
+            content=b"bytes without a human membership decision",
+            intended_role=RuleTestCorpusRole.HUMAN_CONFIRMED,
+            provenance="real",
+            operator_id="analyst:offline-operator",
+            reason="The import itself cannot create a truth label.",
+        )
+    assert rejected.value.reason is RuleCorpusImportRejection.HUMAN_CONFIRMATION_REQUIRED
+
+
 def test_rule_corpus_import_route_is_mounted_and_uses_multipart() -> None:
     from cti_app.api.main import create_app
 
@@ -299,8 +580,17 @@ def test_rule_corpus_import_route_is_mounted_and_uses_multipart() -> None:
     path = "/api/investigations/{investigation_id}/rule-corpus/imports"
 
     assert path in spec["paths"]
+    assert "get" in spec["paths"][path]
     request_body = spec["paths"][path]["post"]["requestBody"]["content"]
     assert "multipart/form-data" in request_body
+    role_enum = request_body["multipart/form-data"]["schema"]["properties"]["intended_role"]["enum"]
+    assert role_enum == [
+        role.value for role in RuleTestCorpusRole if role is not RuleTestCorpusRole.BYTES_MISSING
+    ]
+    assert (
+        "/api/investigations/{investigation_id}/rule-corpus/holdout-designations" in spec["paths"]
+    )
+    assert "/api/investigations/{investigation_id}/rule-corpus/roles" in spec["paths"]
 
 
 def test_authenticated_multipart_route_imports_xml_and_replays_the_same_record() -> None:
@@ -337,6 +627,7 @@ def test_authenticated_multipart_route_imports_xml_and_replays_the_same_record()
             data=form,
             files={"file": ("RuntimeBroker.exe.config", content, "application/xml")},
         )
+        listing = client.get(f"/api/investigations/{_INVESTIGATION_ID}/rule-corpus/imports")
 
     assert first.status_code == 200, first.text
     assert replay.status_code == 200, replay.text
@@ -352,6 +643,55 @@ def test_authenticated_multipart_route_imports_xml_and_replays_the_same_record()
     assert replay.json()["sample_id"] == first_body["sample_id"]
     assert replay.json()["association_id"] == first_body["association_id"]
     assert replay.json()["idempotent_replay"] is True
+    assert listing.status_code == 200, listing.text
+    listed = listing.json()
+    assert listed["schema_version"] == "manual-rule-corpus-import-inventory.v1"
+    assert len(listed["imports"]) == 1
+    assert listed["imports"][0]["source_reference"] == f"sha256:{first_body['sha256']}"
+    assert listed["imports"][0]["operator_id"] == "analyst:manual-import-test"
+    assert "bytes" not in listed["imports"][0]
+
+    with TestClient(app) as client:
+        assigned = client.post(
+            f"/api/investigations/{_INVESTIGATION_ID}/rule-corpus/roles",
+            json={
+                "sha256": first_body["sha256"],
+                "intended_role": "goodware",
+                "provenance": "real",
+                "reason": "Confirm the existing quarantine sample's corpus role.",
+                "source_description": "Existing operator import.",
+            },
+        )
+        holdout_content = b"holdout designated before its upload"
+        holdout_sha256 = hashlib.sha256(holdout_content).hexdigest()
+        designation = client.post(
+            f"/api/investigations/{_INVESTIGATION_ID}/rule-corpus/holdout-designations",
+            json={
+                "sha256": holdout_sha256,
+                "intended_role": "holdout_negative",
+                "reason": "Reserve this independent sample before rule creation.",
+            },
+        )
+        imported_holdout = client.post(
+            f"/api/investigations/{_INVESTIGATION_ID}/rule-corpus/imports",
+            data={
+                "intended_role": "holdout_negative",
+                "provenance": "real",
+                "reason": "Import the previously designated holdout.",
+                "sha256": holdout_sha256,
+            },
+            files={"file": ("holdout.bin", holdout_content, "application/octet-stream")},
+        )
+
+    assert assigned.status_code == 200, assigned.text
+    assert assigned.json()["bytes_exposed"] is False
+    assert assigned.json()["executed"] is False
+    assert assigned.json()["idempotent_replay"] is True
+    assert designation.status_code == 200, designation.text
+    assert designation.json()["append_only"] is True
+    assert designation.json()["operator_id"] == "analyst:manual-import-test"
+    assert imported_holdout.status_code == 200, imported_holdout.text
+    assert imported_holdout.json()["sha256"] == holdout_sha256
 
 
 def test_manual_rule_corpus_route_requires_operator_identity() -> None:

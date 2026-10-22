@@ -774,6 +774,22 @@ def test_bridge_detail_submission_state_accepts_only_known_values() -> None:
     assert parsed("probably_not_sent") is None
 
 
+def test_http_429_honors_retry_after_and_is_a_confirmed_rejection() -> None:
+    response = httpx.Response(
+        429,
+        request=httpx.Request("POST", "https://bridge.test/v1/responses"),
+        headers={"Retry-After": "17"},
+        json={"detail": {"code": "bridge_rate_limited", "retryable": True}},
+    )
+
+    error = _bridge_http_error(response, attempts=1)
+
+    assert error.code == "bridge_rate_limited"
+    assert error.submission_state == "pre_submission"
+    assert error.retryable is True
+    assert error.retry_after == 17
+
+
 @pytest.mark.parametrize(
     ("bridge_code", "diagnostic_code"),
     [

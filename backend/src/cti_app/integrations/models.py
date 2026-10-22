@@ -338,6 +338,10 @@ def _bridge_http_error(
         pass
     if default_phase == "preflight":
         submission_state = "pre_submission"
+    elif status == 429 and submission_state is None:
+        # An HTTP 429 is a completed provider rejection. The request did not
+        # start a generation, so retrying after Retry-After is safe.
+        submission_state = "pre_submission"
     elif (
         submission_state is None
         and server_code == "bridge_server_error"

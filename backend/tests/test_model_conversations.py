@@ -68,7 +68,10 @@ from cti_app.domain.model_runs import (
 )
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 from cti_app.integrations.models import BlobModelOutputStore, BridgeTransportError, FakeModelAdapter
-from tests.conversation_support import InMemoryConversationUnitOfWorkFactory
+from tests.conversation_support import (
+    InMemoryConversationUnitOfWorkFactory,
+    InMemoryModelConversationTurnRepository,
+)
 
 
 def _request(context: ConversationContext) -> ModelRequest:
@@ -295,6 +298,7 @@ class _FailOnceBeforeSubmissionAdapter(_ScriptedBridgeAdapter):
                 "bridge_server_error",
                 "Composer payload was not ready before submission.",
                 retryable=True,
+                retry_after=23,
                 submission_state="pre_submission",
             )
         del role, output_schema
@@ -368,9 +372,11 @@ async def test_model_transport_recovers_persisted_confirmed_pre_submission_failu
     assert first.status is TurnSubmissionStatus.UNAVAILABLE
     assert first.submission_state == "pre_submission"
     assert first.retryable is True
+    assert first.retry_after_seconds == 23
     assert replay.status is TurnSubmissionStatus.UNAVAILABLE
     assert replay.submission_state == "pre_submission"
     assert replay.retryable is True
+    assert replay.retry_after_seconds == 23
     assert len(adapter.calls) == 1
 
     resumed = await transport.submit_with_attempt(**args, attempt=1)
@@ -1563,6 +1569,40 @@ async def test_native_needs_review_is_not_collapsed_into_a_generic_error(
     assert model_run.response_id == "resp_65a707c50a5549a582b2fc3f"
     assert turn.status is ConversationTurnStatus.NEEDS_REVIEW
     assert len(adapter.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_targeted_turn_content_lookup_does_not_load_conversation_history(
+    tmp_path: Path, monkeypatch
+) -> None:
+    adapter = _ScriptedBridgeAdapter("Persisted answer")
+    service, _state = _build_service(adapter, tmp_path)
+    conversation = await _fresh_conversation(service)
+    target_turn = None
+    for index in range(4):
+        target_turn = await service.add_turn(
+            conversation.id,
+            message=f"Historical consultation {index}",
+            mode=ConversationMode.FRESH,
+            external_llm_allowed=True,
+            idempotency_key=f"history-turn-{index}",
+            correlation_id=f"history-correlation-{index}",
+        )
+    assert target_turn is not None
+
+    async def reject_full_history(_self, _conversation_id):
+        raise AssertionError("Targeted lookup must not enumerate historical turns")
+
+    monkeypatch.setattr(
+        InMemoryModelConversationTurnRepository,
+        "list_for_conversation",
+        reject_full_history,
+    )
+    content = await service.turn_content_by_idempotency_key(conversation.id, "history-turn-3")
+
+    assert content is not None
+    assert content.turn.id == target_turn.id
+    assert content.output_text == "Persisted answer"
 
 
 class _UnpersistedCandidateAdapter(_StalledVisibleAnswerAdapter):

@@ -59,6 +59,7 @@ from cti_app.infrastructure.pcap_reader import CapturedPacket
 
 _SOURCE = "network.messages.segment"
 _MAX_TRACE_COUNT = 32
+NETWORK_PROTOCOL_RENDERER_VERSION = "network-protocol-renderer-v2"
 _MAX_OBSERVED_MESSAGES = 512
 _MAX_MODEL_FIELDS = 256
 _MAX_BYTE_RUNS_PER_MESSAGE = 64
@@ -1534,26 +1535,10 @@ def _render_documented_model(model: ProtocolModelV1) -> ProtocolRenderResultV1:
     """Render documented semantics without inventing capture coordinates."""
     label_status = ProtocolValidationStatus.DOCUMENTED_NOT_OBSERVED
     source_message = {item.message_id: item.name for item in model.messages}
-    characteristic_notes = tuple(
-        f"ARTICLE_DOCUMENTED · {item.kind.value}/{item.name}: {item.statement} "
-        f"Justification: {item.justification}; sources "
-        f"{_documentary_source_labels(item.evidence)}. NOT OBSERVED."
-        for item in model.characteristics
-    )
-    static_function_notes = tuple(
-        f"STATIC_INFERENCE · {item.provider} {item.provider_version} function "
-        f"{item.function_id}, binary sha256 {item.binary_sha256}; "
-        f"static, not executed; sources {_documentary_source_labels(item.evidence)}."
-        for item in model.function_provenance
-    )
     sequence_nodes = tuple(
         ProtocolDiagramNodeV1(
             node_id=f"documented-message-{item.message_id}",
-            label=(
-                f"{item.ordinal}. {item.name} · direction "
-                f"{', '.join(direction.value for direction in item.directions) or 'unknown'} · "
-                f"sources {_documentary_source_labels(item.evidence)}"
-            ),
+            label=f"{item.ordinal}. {item.name}",
             role="documented_message",
             validation_status=label_status,
             evidence=item.evidence,
@@ -1569,16 +1554,12 @@ def _render_documented_model(model: ProtocolModelV1) -> ProtocolRenderResultV1:
             if sequence_nodes
             else ProtocolDiagramStatus.INSUFFICIENT_EVIDENCE
         ),
-        title="Message sequence · documenté, non observé",
+        title="Séquence du protocole",
         nodes=sequence_nodes,
         edges=(),
         fields=(),
         limitations=(
-            "Documenté, non observé. L'ordre affiché vient des faits cités; "
-            "aucune capture réseau n'a été consultée.",
-            "Les rôles et directions inconnus restent inconnus.",
-            *characteristic_notes,
-            *static_function_notes,
+            "Modèle documentaire; aucune capture réseau ni direction de flux n'est observée.",
         ),
     )
 
@@ -1586,7 +1567,7 @@ def _render_documented_model(model: ProtocolModelV1) -> ProtocolRenderResultV1:
     state_nodes = {
         item.state_id: ProtocolDiagramNodeV1(
             node_id=item.state_id,
-            label=f"{item.name} · sources {_documentary_source_labels(item.evidence)}",
+            label=item.name,
             role="documented_state",
             validation_status=item.validation_status,
             evidence=item.evidence,
@@ -1598,10 +1579,7 @@ def _render_documented_model(model: ProtocolModelV1) -> ProtocolRenderResultV1:
         ProtocolDiagramEdgeV1(
             source_id=item.from_state,
             target_id=item.to_state,
-            label=(
-                f"{item.trigger}: {source_message[item.message_id]} · "
-                f"sources {_documentary_source_labels(item.evidence)}"
-            ),
+            label=f"{item.trigger}: {source_message[item.message_id]}",
             order=None,
             frame_numbers=(),
             timing_ms=None,
@@ -1620,16 +1598,13 @@ def _render_documented_model(model: ProtocolModelV1) -> ProtocolRenderResultV1:
             if state_nodes
             else ProtocolDiagramStatus.INSUFFICIENT_EVIDENCE
         ),
-        title="State machine · documenté, non observé",
+        title="États du protocole",
         nodes=tuple(state_nodes.values()),
         edges=state_edges,
         fields=(),
         limitations=(
-            "Documenté, non observé. Les états et transitions proviennent "
-            "uniquement des sources citées.",
-            "Aucun échange réseau ni changement d'état n'a été observé dans une capture.",
-            *characteristic_notes,
-            *static_function_notes,
+            "États et transitions tirés des sources; aucun changement n'est observé "
+            "dans une capture.",
         ),
     )
 
@@ -1658,16 +1633,12 @@ def _render_documented_model(model: ProtocolModelV1) -> ProtocolRenderResultV1:
             if format_fields
             else ProtocolDiagramStatus.INSUFFICIENT_EVIDENCE
         ),
-        title="Message format · documenté, non observé",
+        title="Champs du message",
         nodes=(),
         edges=(),
         fields=format_fields,
         limitations=(
-            "Documenté, non observé. Les positions, tailles et valeurs d'octets "
-            "non citées sont inconnues.",
-            "Aucun offset, frame ou octet n'est fourni par ce modèle documentaire.",
-            *characteristic_notes,
-            *static_function_notes,
+            "ARTICLE_DOCUMENTED: aucun offset, longueur, trame ni valeur d'octet n'est fourni.",
         ),
     )
     statements = (

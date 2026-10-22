@@ -21,7 +21,7 @@ class YaraRunnerLimits:
     cpu_seconds: int = 8
     memory_bytes: int = 512 * 1024 * 1024
     maximum_output_bytes: int = 64 * 1024
-    maximum_source_bytes: int = 1_000_000
+    maximum_source_bytes: int = 512 * 1024 * 1024
     maximum_samples: int = 256
     maximum_sample_bytes: int = 64 * 1024 * 1024
     maximum_total_sample_bytes: int = 256 * 1024 * 1024
@@ -238,6 +238,7 @@ class IsolatedYaraRunner(YaraEnginePort):
                         matches_sha256=tuple(response.get("matches_sha256", ())),
                         message=str(response.get("message", ""))[:1000],
                         line=response.get("line"),
+                        column=response.get("column"),
                     )
                 except (KeyError, TypeError, ValueError) as exc:
                     return _failure(

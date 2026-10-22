@@ -401,10 +401,7 @@ async def test_w17_real_typst_draft_preview_preserves_structure_and_limits(
     empty_model = project_publication_to_typst_model(
         TypstDraftPreviewDocument(document, empty_opinion, synthesis)
     )
-    empty_opinion_section = next(
-        item for item in empty_model.content_sections if item["type"] == "analyst_opinion"
-    )
-    assert empty_opinion_section["empty_message"] == "Aucun avis publié."
+    assert all(item["type"] != "analyst_opinion" for item in empty_model.content_sections)
     assert any(group.artifact_type is ArtifactType.DOMAIN for group in document.indicators)
     assert synthesis.uncertainties
     assert any(item["type"] == "limitations" for item in model.content_sections)
@@ -426,10 +423,11 @@ async def test_w17_real_typst_draft_preview_preserves_structure_and_limits(
         typst_fonts_lock_path=fonts_lock,
     )
     try:
-        compiled = await service.render_draft_preview(document, opinion, synthesis)
+        draft_render = await service.render_draft_preview(document, opinion, synthesis)
     finally:
         tempfile.tempdir = None
 
+    compiled = draft_render.compiled_document
     expected_sha256 = hashlib.sha256(compiled.content).hexdigest()
     assert compiled.sha256 == expected_sha256
     capture_path = Path(
@@ -474,7 +472,7 @@ async def test_w17_real_typst_draft_preview_preserves_structure_and_limits(
     for table_heading in (
         "type",
         "valeur défanguée",
-        "contexte et statut",
+        "statut, relation et contexte",
         "source [n]",
     ):
         assert table_heading in annex_text, f"W17 IOC annex table is missing {table_heading!r}"
@@ -490,7 +488,8 @@ async def test_w17_real_typst_draft_preview_preserves_structure_and_limits(
     assert source_paragraph < anchored_note, "W17 analyst note must follow its anchored paragraph"
     assert len(compiled.content) > 2_000
 
-    empty_compiled = await service.render_draft_preview(document, empty_opinion, synthesis)
+    empty_draft_render = await service.render_draft_preview(document, empty_opinion, synthesis)
+    empty_compiled = empty_draft_render.compiled_document
     empty_pdf_path = tmp_path / "w17-empty-opinion-preview.pdf"
     empty_text, _ = await asyncio.to_thread(
         _inspect_rendered_pdf,
@@ -500,5 +499,5 @@ async def test_w17_real_typst_draft_preview_preserves_structure_and_limits(
         pdftoppm,
     )
     normalized_empty_text = " ".join(empty_text.split()).casefold().replace("\u2019", "'")
-    assert "avis de l'analyste" in normalized_empty_text
-    assert "aucun avis publié" in normalized_empty_text
+    assert "avis de l'analyste" not in normalized_empty_text
+    assert "aucun avis publié" not in normalized_empty_text

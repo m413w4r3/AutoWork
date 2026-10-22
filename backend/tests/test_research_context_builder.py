@@ -27,8 +27,11 @@ from cti_app.application.investigation_acquisition_tools import (
 from cti_app.application.investigation_article_snapshot import (
     ProductionArticleSnapshotAdapter,
     _extract_narrative_hashes,
+    _synthesis_passages,
 )
 from cti_app.application.investigation_contracts import (
+    AdvisorGuidanceV1,
+    AdvisorLastAdviceV1,
     ArticleClaimV1,
     ArticleContextV1,
     ConfirmedIOCContextV1,
@@ -123,6 +126,39 @@ from cti_app.domain.publication import ArtifactType
 from cti_app.domain.publication_document import serialize_publication_document
 
 
+@pytest.mark.parametrize(
+    "consultation_type",
+    (
+        "plan_investigation",
+        "pivot_strategy",
+        "yara_draft",
+        "review_text",
+        "draft_text",
+        "suricata_draft",
+        "figure_plan",
+    ),
+)
+def test_advisor_guidance_contract_accepts_all_consultation_types(consultation_type) -> None:
+    guidance = AdvisorGuidanceV1(
+        checkpoint_due=False,
+        suggested_consultation_type=consultation_type,
+        last_advice=AdvisorLastAdviceV1(
+            consultation_type=consultation_type,
+            date=datetime.now(UTC),
+            key_points=("Point vérifié.",),
+            invocation_id=UUID("00000000-0000-4000-8000-000000000001"),
+        ),
+        reminder="Valider chaque suggestion par une preuve.",
+        advisor_turns_used=0,
+        advisor_turn_limit=None,
+        advisor_turns_remaining=None,
+    )
+
+    assert guidance.suggested_consultation_type == consultation_type
+    assert guidance.last_advice is not None
+    assert guidance.last_advice.consultation_type == consultation_type
+
+
 class _SnapshotPort:
     def __init__(self, snapshot):
         self.snapshot = snapshot
@@ -161,6 +197,22 @@ def test_article_snapshot_extracts_bounded_hash_families_from_claims_and_sources
 
     assert extracted == {md5.lower(), sha1.lower(), sha256.lower()}
     assert len(_extract_narrative_hashes({"value": md5 + " " + sha1}, limit=1)) == 1
+
+
+def test_article_passages_keep_claim_ids_headings_and_verbatim_paragraphs() -> None:
+    paragraph = "S3P3.1 exact canonical passage. " + ("Loader detail. " * 600)
+    passages = _synthesis_passages(
+        {
+            "lead": [{"text": "Lead paragraph."}],
+            "sections": [{"heading": "Loading", "paragraphs": [{"text": paragraph}]}],
+            "timeline": [{"text": "A timeline event."}],
+        }
+    )
+
+    assert [item.claim_id for item in passages] == ["L1.1", "S1P1.1", "T1"]
+    assert passages[1].heading == "Loading"
+    assert passages[1].section_index == 1
+    assert passages[1].text == paragraph
 
 
 class _ReadPort:
@@ -362,6 +414,110 @@ async def test_canonical_evidence_summary_reads_only_sha_verified_bounded_facts(
     assert similarity_facts == {
         "schema_version": "family-feature-comparison-v1",
         "comparison_sample_sha256s": ["2" * 64],
+    }
+
+
+@pytest.mark.asyncio
+async def test_canonical_evidence_summary_reads_bridge_reported_usage() -> None:
+    store = _MemoryCanonicalArtifactStore()
+    bridge_invocation_id = uuid4()
+    payload = {
+        "schema": "operator-advisor-call.v1",
+        "bridge_invocation_id": str(bridge_invocation_id),
+        "provider_usage": {
+            "status": "available",
+            "input_tokens": 321,
+            "output_tokens": 54,
+            "total_tokens": 375,
+            "provider_private_field": "must-not-leak",
+        },
+        "context_bytes": 1_024,
+        "context_estimate": {
+            "status": "estimated",
+            "value": 256,
+            "context_bytes": 1_024,
+            "basis": "context_bytes/4",
+        },
+    }
+    blob_id, sha256 = await store.put_canonical_json(payload, bucket="investigation-evidence")
+    observation = EvidenceObservation(
+        investigation_id=uuid4(),
+        kind=EvidenceKind.OTHER,
+        blob_id=blob_id,
+        sha256=sha256,
+        source="advisor.consult",
+        source_version="1",
+        observed_at=datetime.now(UTC),
+        object_type="advisor_call",
+        object_id="call-1",
+    )
+
+    usage = await CanonicalEvidenceSummaryPort(store).advisor_usage(observation)
+
+    assert usage == {
+        "provider_usage": {
+            "status": "available",
+            "input_tokens": 321,
+            "output_tokens": 54,
+            "total_tokens": 375,
+        },
+        "bridge_invocation_id": str(bridge_invocation_id),
+        "estimated_context_tokens": {
+            "status": "estimated",
+            "value": 256,
+            "context_bytes": 1_024,
+            "basis": "context_bytes/4",
+        },
+    }
+    summary = await CanonicalEvidenceSummaryPort(store).summary(observation)
+    assert summary is not None
+    assert summary["estimated_context_tokens"] == usage["estimated_context_tokens"]
+    assert "provider_private_field" not in str(summary)
+
+
+@pytest.mark.asyncio
+async def test_canonical_evidence_summary_exposes_local_advisor_failure_telemetry() -> None:
+    store = _MemoryCanonicalArtifactStore()
+    result = {
+        "advisor_status": "invalid_input",
+        "input_error_code": "measurement_candidate_not_verified",
+        "failure_stage": "pre_transport_validation",
+        "confirmed_non_execution": True,
+        "bridge_invocation_id": None,
+        "provider_usage": {"status": "not_submitted"},
+        "context_estimate": {
+            "status": "not_available",
+            "reason": "pre_transport_validation",
+        },
+    }
+    blob_id, sha256 = await store.put_canonical_json(
+        {"schema": "investigation-tool-observation.v1", "result": result},
+        bucket="investigation-evidence",
+    )
+    observation = EvidenceObservation(
+        investigation_id=uuid4(),
+        kind=EvidenceKind.OTHER,
+        blob_id=blob_id,
+        sha256=sha256,
+        source="advisor.consult",
+        source_version="1",
+        observed_at=datetime.now(UTC),
+        object_type="tool_call",
+        object_id="advisor.consult",
+    )
+
+    port = CanonicalEvidenceSummaryPort(store)
+    summary = await port.summary(observation)
+    usage = await port.advisor_usage(observation)
+
+    assert summary == result
+    assert usage == {
+        "provider_usage": {"status": "not_submitted"},
+        "bridge_invocation_id": None,
+        "estimated_context_tokens": {
+            "status": "not_available",
+            "reason": "pre_transport_validation",
+        },
     }
 
 
@@ -1448,7 +1604,7 @@ async def test_context_indexes_canonical_operator_imports_before_analysis() -> N
 
 
 @pytest.mark.asyncio
-async def test_prompt_lists_schema_derived_required_arguments_and_examples() -> None:
+async def test_prompt_lists_schema_derived_required_arguments_as_plain_text() -> None:
     investigation_id = uuid4()
     synthesis_artifact_id = uuid4()
     snapshot = ArticleSnapshot(
@@ -1518,16 +1674,15 @@ async def test_prompt_lists_schema_derived_required_arguments_and_examples() -> 
     for name, schema in schemas.items():
         required = schema.get("required", [])
         required_line = f"{name} required ARG keys: {', '.join(required)}"
-        example_prefix = f"{name} minimal ARG JSON: "
         assert required_line in prompt
-        example_line = next(line for line in prompt.splitlines() if line.startswith(example_prefix))
-        example = json.loads(example_line.removeprefix(example_prefix))
-        assert set(example) == set(required)
-        validate_json_schema(example, schema)
+        assert f"{name} minimal ARG JSON" not in prompt
         if name == "vt.download_sample":
             assert schema == VT_DOWNLOAD_SAMPLE_SCHEMA
         if name == "sample.analyze":
             assert schema == SAMPLE_ANALYZE_SCHEMA
+    assert "ARG values are plain scalars" in prompt
+    assert "dotted field names" in prompt
+    assert "application/json" not in prompt
 
 
 def test_schema_example_uses_distinct_values_for_unique_hash_arrays() -> None:
@@ -1936,7 +2091,7 @@ async def test_context_includes_bounded_operator_rule_corpus_inventory() -> None
         {
             "kind": "operator_rule_corpus_sample",
             "sha256": "a" * 64,
-            "role": "confirmed_positive",
+            "role": "human_confirmed",
             "provenance": "synthetic",
             "size_bytes": 73,
             "source_description": (
@@ -2725,6 +2880,53 @@ async def test_large_operator_led_context_is_reduced_deterministically() -> None
         ),
         budget_remaining={},
     )
+    baseline_summary = build_operator_context_summary(
+        context,
+        investigation_id=investigation_id,
+        working_state_version=state.version,
+        working_state_sha256=state.sha256,
+        state=state,
+    )
+    changed_agenda = (*context.investigation.agenda[:-1], "Vérifier la nouvelle preuve ajoutée.")
+    changed_context = context.model_copy(
+        update={
+            "investigation": context.investigation.model_copy(update={"agenda": changed_agenda})
+        }
+    )
+    changed_summary = build_operator_context_summary(
+        changed_context,
+        investigation_id=investigation_id,
+        working_state_version=state.version,
+        working_state_sha256=state.sha256,
+        state=state,
+        since_version=state.version,
+        since_fingerprint=baseline_summary.fingerprint,
+    )
+    assert changed_summary.delta_since_version is not None
+    assert changed_summary.delta_since_version.strategy == "section_hashes"
+    assert changed_summary.delta_since_version.pointers_to_check == ("agenda",)
+    for invalidation_name in ("observations", "publication", "schema", "worker", "g2"):
+        base = build_operator_context_summary(
+            context,
+            investigation_id=investigation_id,
+            working_state_version=state.version,
+            working_state_sha256=state.sha256,
+            state=state,
+            invalidation_facts={invalidation_name: "before"},
+        )
+        invalidated = build_operator_context_summary(
+            context,
+            investigation_id=investigation_id,
+            working_state_version=state.version,
+            working_state_sha256=state.sha256,
+            state=state,
+            since_version=state.version,
+            since_fingerprint=base.fingerprint,
+            invalidation_facts={invalidation_name: "after"},
+        )
+        assert invalidated.delta_since_version is not None
+        assert invalidated.delta_since_version.strategy == "all_sections_conservative"
+        assert len(invalidated.delta_since_version.pointers_to_check) == 32
     summary = build_operator_context_summary(
         context,
         investigation_id=investigation_id,
@@ -2732,6 +2934,7 @@ async def test_large_operator_led_context_is_reduced_deterministically() -> None
         working_state_sha256=state.sha256,
         state=state,
         since_version=state.version,
+        since_fingerprint=baseline_summary.fingerprint,
     )
     complete_evidence_ids = []
     evidence_total, _ = await builder.read_context_section(
@@ -2887,8 +3090,8 @@ async def test_large_operator_led_context_is_reduced_deterministically() -> None
         canonical_json_bytes(without_schema_descriptions(item.arguments_schema))
         for item in context.available_tools
     ]
-    old_prompt = render_investigation_prompt(context)
-    old_prompt_chars = len(old_prompt)
+    compact_prompt = render_investigation_prompt(context)
+    compact_prompt_chars = len(compact_prompt)
     old_context_chars = len(context.canonical_bytes().decode("utf-8"))
     summary_bytes = summary.canonical_bytes()
     summary_chars = len(summary_bytes.decode("utf-8"))
@@ -2898,8 +3101,8 @@ async def test_large_operator_led_context_is_reduced_deterministically() -> None
             {
                 "before_context_bytes": len(context.canonical_bytes()),
                 "before_context_chars_approx_tokens": round(old_context_chars / 4),
-                "before_prompt_bytes": len(old_prompt.encode("utf-8")),
-                "before_prompt_chars_approx_tokens": round(old_prompt_chars / 4),
+                "after_prompt_bytes": len(compact_prompt.encode("utf-8")),
+                "after_prompt_chars_approx_tokens": round(compact_prompt_chars / 4),
                 "before_tokens_per_historical_action_approx": round(
                     old_context_chars / 4 / len(observation_ids)
                 ),
@@ -2960,6 +3163,12 @@ async def test_large_operator_led_context_is_reduced_deterministically() -> None
     )
     assert len(context.canonical_bytes()) <= 262_144
     assert context.canonical_bytes() == repeated.canonical_bytes()
+    assert len(compact_prompt.encode("utf-8")) <= 96_000
+    assert "BEGIN_CANONICAL_INVESTIGATION_CONTEXT" not in compact_prompt
+    assert "arguments_schema" not in compact_prompt
+    assert all(reference in compact_prompt for reference in set(evidence_ref_values))
+    assert all(claim_id in compact_prompt for claim_id in complete_claim_ids)
+    assert "DERNIERS RÉSULTATS D'OUTILS" in compact_prompt
     assert context.source.synthesis_sha256 == "a" * 64
     assert context.operator_requests[0].request_id == request_id
     assert context.indicator_inventory.items == ()
@@ -3106,10 +3315,10 @@ async def test_small_context_hash_includes_bounded_advisor_guidance() -> None:
 
     assert context.advisor_guidance.checkpoint_due is False
     assert context.advisor_guidance.truncated is False
-    # The bounded reminder is part of canonical_bytes(); its intentional C5
-    # enrichment changes this deterministic fixture digest.
+    # The bounded reminder is part of canonical_bytes(); the D guidance update
+    # changes this deterministic fixture digest.
     assert hashlib.sha256(context.canonical_bytes()).hexdigest() == (
-        "ed25f5728ac8fc51c5fb6168302d3b206ebf82e7cdd8c08df9d2ec353c00efba"
+        "82e5197e230bf882fe076f6851b96afbc50c713d1731978c686ca8d90aa84338"
     )
 
 

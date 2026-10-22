@@ -479,6 +479,7 @@ async def test_real_typst_renders_hash_pinned_timeline_and_anchored_chain(
         render_source = TypstRenderer().render(
             render_document,
             template_bundle,
+            document_label="Publication de test — figures éditoriales",
             infrastructure_graph_media_ref=graph_media_ref,
         )
         workspace_root = tmp_path / f"{label}-workspace"
@@ -528,11 +529,13 @@ async def test_real_typst_renders_hash_pinned_timeline_and_anchored_chain(
     repeated_source = TypstRenderer().render(
         publication_v6,
         template_bundle,
+        document_label="Publication de test — figures éditoriales",
         infrastructure_graph_media_ref=graph_media_ref,
     )
     repeated_render = TypstRenderer().render(
         publication_v6,
         template_bundle,
+        document_label="Publication de test — figures éditoriales",
         infrastructure_graph_media_ref=graph_media_ref,
     )
     assert repeated_source.render_data_bytes == repeated_render.render_data_bytes
@@ -541,21 +544,23 @@ async def test_real_typst_renders_hash_pinned_timeline_and_anchored_chain(
     normalized = "".join(
         character for character in extracted.replace("\u00ad", "") if not character.isspace()
     )
-    assert "Chronologiedesévénementsdatés" in normalized
-    timeline_start = extracted.index("Chronologie des événements datés")
-    timeline_end = extracted.index("Publication V5 SHA-256", timeline_start)
+    assert "Événementsdatés" in normalized
+    timeline_start = extracted.index("Événements datés")
+    timeline_end = extracted.index("SYNTHÈSE", timeline_start)
     timeline_text = extracted[timeline_start:timeline_end]
     assert "Jours écoulés" not in timeline_text
-    assert "1." in timeline_text
-    assert "Source 1" in timeline_text
-    assert "Chaîned'ancragedesobservationsapprouvées" in normalized
-    assert "jourcalendaire" in normalized
+    assert timeline_text.count("2025-01-12") == 1
+    assert timeline_text.count("2025-01-16") == 1
+    assert "Sources" in timeline_text and "1" in timeline_text
+    assert "Référencesdel'avis" in normalized
+    assert "jourcalendaire" not in normalized
     assert "2025-01-12" in normalized and "2025-01-16" in normalized
-    assert str(observation.id) in extracted
-    assert "lead:0001" in extracted
-    assert "SourceSHA-256" in normalized
+    assert observation.text in extracted
+    assert str(observation.id) not in extracted
+    assert "lead:0001" not in extracted
+    assert "SourceSHA-256" not in normalized
     assert "Graphed'infrastructureetdepivots" in normalized
-    assert "contacted_domains" in normalized
+    assert "domainescontactés" in normalized
     assert "VirusTotal" in normalized
     assert "Shodan" in normalized
     assert "Article" in normalized
@@ -566,23 +571,23 @@ async def test_real_typst_renders_hash_pinned_timeline_and_anchored_chain(
     assert "dns:A" in extracted
     assert "mentions IOC" in extracted
     assert "pivot.example" in normalized
-    assert infrastructure_graph.sha256 in normalized
-    assert "PreuveSHA-256" in normalized
-    assert "c" * 64 in normalized
-    assert "d" * 64 in normalized
-    assert "a" * 64 in normalized
+    assert infrastructure_graph.sha256 not in normalized
+    assert "PreuveSHA-256" not in normalized
+    assert "c" * 64 not in normalized
+    assert "d" * 64 not in normalized
+    assert "a" * 64 not in normalized
     source_figure = publication.document.figures[0]
     for text in (preview_text, extracted):
         normalized_figure_text = "".join(character for character in text if not character.isspace())
         assert "".join(source_figure.caption.split()) in normalized_figure_text
         assert "".join(source_figure.provenance.split()) in normalized_figure_text
-        assert source_figure.sha256 in normalized_figure_text
+        assert source_figure.sha256 not in normalized_figure_text
         assert "Sourcearchivée" not in normalized_figure_text
         assert "Attribution:" in normalized_figure_text
-        assert "SHA-256archivé:" in normalized_figure_text
-        assert "Taille:" in normalized_figure_text
-    assert publication_v6.analyst_opinion.content_sha256 in normalized
-    assert publication_document_v5_sha256(publication) in normalized
+        assert "SHA-256archivé:" not in normalized_figure_text
+        assert "Taille:" not in normalized_figure_text
+    assert publication_v6.analyst_opinion.content_sha256 not in normalized
+    assert publication_document_v5_sha256(publication) not in normalized
 
     async def read_bbox_pages(pdf_path: Path) -> list[list[tuple[float, float, str]]]:
         result = await asyncio.to_thread(
@@ -625,15 +630,8 @@ async def test_real_typst_renders_hash_pinned_timeline_and_anchored_chain(
         attribution_index = next(
             i for i, (_, _, text) in enumerate(figure_page) if text.startswith("Attribution :")
         )
-        archive_index = next(
-            i for i, (_, _, text) in enumerate(figure_page) if text.startswith("SHA-256 archivé :")
-        )
-        size_index = next(
-            i for i, (_, _, text) in enumerate(figure_page) if text.startswith("Taille :")
-        )
-        metadata_lines = figure_page[source_index : size_index + 1]
+        metadata_lines = figure_page[source_index : attribution_index + 1]
         assert "Attribution :" in figure_page[attribution_index][2]
-        assert "SHA-256 archivé :" in figure_page[archive_index][2]
         for previous, current in pairwise(metadata_lines):
             assert previous[1] <= current[0], (
                 f"figure metadata lines overlap: {previous} / {current}"
@@ -641,9 +639,7 @@ async def test_real_typst_renders_hash_pinned_timeline_and_anchored_chain(
 
         chronology_heading = next(line for line in all_lines if line[2].strip() == "CHRONOLOGIE")
         chronology_caption = next(
-            line
-            for line in all_lines
-            if line[2].startswith("Figure 2 : Chronologie des événements datés")
+            line for line in all_lines if line[2].startswith("Figure 2 : Événements datés")
         )
         assert chronology_heading[1] <= chronology_caption[0], (
             "chronology title overlaps its figure caption: "
@@ -667,11 +663,13 @@ async def test_real_typst_renders_hash_pinned_timeline_and_anchored_chain(
         legend_start = next(
             i for i, (_, _, text) in enumerate(legend_page) if text.startswith("Légende :")
         )
-        legend_end = max(
-            i
-            for i, (_, _, text) in enumerate(legend_page)
-            if i >= legend_start
-            and ("Identité de figure" in text or text.startswith("de figure :"))
+        legend_end = (
+            next(
+                i
+                for i, (_, _, text) in enumerate(legend_page)
+                if i > legend_start and text.strip() == "IOC"
+            )
+            - 1
         )
         legend_lines = legend_page[legend_start : legend_end + 1]
         for previous, current in pairwise(legend_lines):
@@ -682,7 +680,7 @@ async def test_real_typst_renders_hash_pinned_timeline_and_anchored_chain(
         bbox_pages = await read_bbox_pages(pdf_path)
         graph_page_index = assert_figure_caption_spacing(bbox_pages)
         page_count = len(PdfReader(pdf_path, strict=True).pages)
-        assert page_count == 2
+        assert page_count == 3
         raster_prefix = tmp_path / f"{label}-page"
         await asyncio.to_thread(
             subprocess.run,

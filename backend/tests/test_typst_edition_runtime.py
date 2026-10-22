@@ -42,6 +42,10 @@ pytest_plugins = ("tests.test_typst_compiler_runtime",)
 
 _CHP_TYPST_ROOT = Path(__file__).resolve().parents[2] / "chpTypst"
 _EDITION_MANIFEST = "edition-renderer-manifest.json"
+_EDITION_RENDER_LABEL = (
+    "Édition publiée 00000000-0000-4000-8000-000000000020 "
+    "— release 00000000-0000-4000-8000-000000000099"
+)
 
 
 def _edition_document() -> EditionDocumentV2:
@@ -85,7 +89,9 @@ async def test_real_typst_compiles_multi_article_edition_in_one_pass(
     font_bundle_root: Path,
 ) -> None:
     bundle = load_template_bundle(_CHP_TYPST_ROOT, manifest_name=_EDITION_MANIFEST)
-    source = EditionTypstRenderer().render(_edition_document(), bundle)
+    source = EditionTypstRenderer().render(
+        _edition_document(), bundle, document_label=_EDITION_RENDER_LABEL
+    )
     workspace_root = tmp_path / "workspace"
     _build_workspace(
         workspace_root,
@@ -175,7 +181,7 @@ async def test_real_typst_cover_has_internal_links_briefs_and_release_annexes(
         ),
     )
     bundle = load_template_bundle(_CHP_TYPST_ROOT, manifest_name=_EDITION_MANIFEST)
-    source = EditionTypstRenderer().render(document, bundle)
+    source = EditionTypstRenderer().render(document, bundle, document_label=_EDITION_RENDER_LABEL)
     render_data = json.loads(source.render_data_bytes)
     workspace_root = tmp_path / "workspace"
     _build_workspace(
@@ -284,7 +290,9 @@ async def test_real_typst_compiles_legacy_and_current_semantic_policies_together
         ),
     )
     bundle = load_template_bundle(_CHP_TYPST_ROOT, manifest_name=_EDITION_MANIFEST)
-    source = EditionTypstRenderer().render(edition_document, bundle)
+    source = EditionTypstRenderer().render(
+        edition_document, bundle, document_label=_EDITION_RENDER_LABEL
+    )
     workspace_root = tmp_path / "mixed-policy-edition-workspace"
     _build_workspace(
         workspace_root,
@@ -327,7 +335,9 @@ async def test_real_typst_edition_preserves_copyable_technical_literals(
         ),
     )
     bundle = load_template_bundle(_CHP_TYPST_ROOT, manifest_name=_EDITION_MANIFEST)
-    source = EditionTypstRenderer().render(edition_document, bundle)
+    source = EditionTypstRenderer().render(
+        edition_document, bundle, document_label=_EDITION_RENDER_LABEL
+    )
     render_data = json.loads(source.render_data_bytes)
     _install_narrow_technical_table(render_data)
     render_data_bytes = json.dumps(
@@ -388,7 +398,9 @@ async def test_real_typst_edition_keeps_titles_with_following_content(
     publication = replace(edition_document.publications[0], document=_full_document(tables=tables))
     edition_document = replace(edition_document, publications=(publication,))
     template_bundle = load_template_bundle(_CHP_TYPST_ROOT, manifest_name=_EDITION_MANIFEST)
-    render_source = EditionTypstRenderer().render(edition_document, template_bundle)
+    render_source = EditionTypstRenderer().render(
+        edition_document, template_bundle, document_label=_EDITION_RENDER_LABEL
+    )
     await _assert_real_typst_keep_with_next_case(
         tmp_path=tmp_path,
         typst_binary=typst_binary,

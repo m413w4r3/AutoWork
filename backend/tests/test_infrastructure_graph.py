@@ -10,11 +10,15 @@ from uuid import UUID
 import pytest
 
 from cti_app.application.blob_storage import BlobReadLimitExceededError
-from cti_app.application.investigation_figures import build_investigation_graph_figure
+from cti_app.application.investigation_figures import (
+    _graph_node_display_label,
+    build_investigation_graph_figure,
+)
 from cti_app.application.investigation_graph_source import InvestigationGraphSource
 from cti_app.application.publication_augmentation import augment_publication_with_opinion
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.investigation import EvidenceKind, EvidenceObservation
+from cti_app.domain.investigation_graph import InvestigationGraphNodeKind
 from cti_app.domain.production import ProductionEvidenceBasis
 from cti_app.domain.publication import ArtifactType
 from cti_app.domain.publication_document import (
@@ -106,6 +110,21 @@ def _observation(
         object_id=object_id,
     )
     return observation, (blob_id, raw)
+
+
+def test_graph_node_display_labels_remove_uuid_and_hash_material() -> None:
+    identity = str(UUID(int=87_001))
+    digest = hashlib.sha256(b"synthetic graph label fixture").hexdigest()
+
+    label = _graph_node_display_label(
+        InvestigationGraphNodeKind.DOMAIN,
+        "fixture.example",
+        f"Campaign_node_{identity}_{digest}",
+    )
+
+    assert label == "Campaign node"
+    assert identity not in label
+    assert digest not in label
 
 
 @pytest.mark.asyncio
@@ -234,7 +253,7 @@ async def test_projects_hash_to_vt_domain_to_shodan_ip_with_canonical_provenance
     figure = build_investigation_graph_figure(publication, graph)
     assert figure is not None
     assert figure["graph_sha256"] == graph.sha256
-    assert "contacted_domains" in figure["d2_source"]
+    assert "domaines contactés" in figure["d2_source"]
     assert " -- " in figure["d2_source"]
     assert "confiance" in figure["caption"].lower()
 

@@ -12,7 +12,12 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal, cast
 from urllib.parse import urlsplit, urlunsplit
 
+from cti_app.application.content_pivot_candidates import (
+    candidate_frontier_limit,
+    verify_content_pattern_candidates,
+)
 from cti_app.domain.investigation import (
+    BudgetDimension,
     EvidenceObservation,
     InvestigationEnvelope,
     ToolInvocation,
@@ -195,6 +200,7 @@ def build_pivot_frontier(
     observation_payloads: Mapping[str, Mapping[str, Any] | None],
     invocations: Sequence[ToolInvocation] = (),
     envelope: InvestigationEnvelope | None = None,
+    g2_vt_authorized: bool | None = None,
     limit: int = _MAX_FRONTIER_RECORDS,
     cursor: str | None = None,
 ) -> PivotFrontierV1:
@@ -212,6 +218,7 @@ def build_pivot_frontier(
     edges: dict[str, PivotFrontierEdge] = {}
     children: dict[str, set[str]] = {}
     roots: list[str] = []
+    content_candidate_order: dict[str, tuple[int, int, int, int, str]] = {}
     verified: set[str] = set()
     source_digests = [snapshot.synthesis_sha256]
 
@@ -338,7 +345,7 @@ def build_pivot_frontier(
                     novel=novelty, verified=not is_verified, depth=depth, cost=cost
                 )
                 state, state_reason, state_cursor, complete = _source_state(payload)
-                g2, disclosure = _policy_states(snapshot, envelope)
+                g2, disclosure = _policy_states(snapshot, envelope, g2_vt_authorized)
                 limitations = tuple(
                     dict.fromkeys(
                         (
@@ -405,6 +412,84 @@ def build_pivot_frontier(
                         ),
                     )
 
+    content_candidates = verify_content_pattern_candidates(
+        ordered_observations,
+        observation_payloads,
+    )
+    if content_candidates:
+        g2_state, disclosure_state = _policy_states(snapshot, envelope, g2_vt_authorized)
+        for candidate in content_candidates:
+            primary = candidate.measurements[0]
+            record_id = _stable_id("content_pattern", candidate.id)
+            if g2_state is not PivotG2State.APPROVED:
+                state = PivotExecutionState.BLOCKED
+                state_reason = "g2_approval_required"
+            elif disclosure_state is not PivotDisclosureState.ALLOWED:
+                state = PivotExecutionState.BLOCKED
+                state_reason = "external_disclosure_blocked"
+            elif envelope is not None and envelope.budget.remaining[BudgetDimension.VT_UNITS] == 0:
+                state = PivotExecutionState.BLOCKED
+                state_reason = "vt_budget_exhausted"
+            else:
+                state = PivotExecutionState.QUEUED
+                state_reason = "operator_selection_required; generation_does_not_execute"
+            bridge_measurements = tuple(
+                "mesure_bridge="
+                + json.dumps(
+                    {
+                        "kind": item.bridge_kind,
+                        "value": item.bridge_value,
+                        "offset": item.offset,
+                        "length": item.length,
+                        "sample_sha256": item.sample_sha256,
+                        "observation_id": item.observation_id,
+                        "source_file": item.source_file,
+                    },
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                for item in candidate.measurements[:8]
+            )
+            limitations = (
+                *bridge_measurements,
+                "evidence_refs=" + json.dumps(candidate.evidence_refs, separators=(",", ":")),
+                "Exécution VT passive: l'opérateur choisit le pivot; query, G2, TLP et budget "
+                "sont revérifiés à l'exécution.",
+            )
+            factors = _priority_factors(novel=True, verified=True, depth=1, cost=1)
+            record = PivotFrontierRecord(
+                id=record_id,
+                canonical_id=f"content_pattern:{candidate.id}",
+                indicator_type="content_pattern",
+                value=candidate.query,
+                parent_id=None,
+                path=(record_id,),
+                source_observation_id=primary.observation_id,
+                source=primary.source,
+                source_version=primary.source_version,
+                source_sha256=primary.sample_sha256,
+                level=PivotQualificationLevel.CANDIDATE,
+                reason=candidate.justification,
+                confidence=0.4,
+                limitations=limitations,
+                novelty_vs_article=True,
+                novelty_vs_verified=True,
+                estimated_cost=1,
+                g2_state=g2_state,
+                disclosure_state=disclosure_state,
+                priority_score=_priority_score(factors),
+                priority_factors=factors,
+                state=state,
+                state_reason=state_reason,
+                cursor=None,
+                pagination_complete=None,
+                children_observed=(),
+            )
+            records[record_id] = record
+            content_candidate_order[record_id] = candidate.rank_key
+            roots.append(record_id)
+
     for invocation in sorted(invocations, key=lambda item: (item.updated_at, item.id.hex)):
         source_digests.append(
             hashlib.sha256(
@@ -469,7 +554,16 @@ def build_pivot_frontier(
         for record in records.values()
         if record.parent_id is None and record.id not in roots
     )
-    all_records = tuple(records[key] for key in sorted(records))
+    all_records = tuple(
+        sorted(
+            records.values(),
+            key=lambda item: (
+                (0, *content_candidate_order[item.id])
+                if item.id in content_candidate_order
+                else (1, item.id)
+            ),
+        )
+    )
     all_edges = tuple(edges[key] for key in sorted(edges))
     all_paths = _paths(roots, records, all_edges)
     source_sha256 = hashlib.sha256("\n".join(sorted(source_digests)).encode()).hexdigest()
@@ -479,8 +573,12 @@ def build_pivot_frontier(
         if not matches:
             raise ValueError("pivot frontier cursor is not present in this projection")
         start = matches[0] + 1
-    page = all_records[start : start + limit]
-    has_more = start + limit < len(all_records)
+    page_limit = candidate_frontier_limit(
+        limit,
+        has_content_candidates=bool(content_candidate_order),
+    )
+    page = all_records[start : start + page_limit]
+    has_more = start + page_limit < len(all_records)
     next_cursor = page[-1].id if has_more and page else None
     included = {item.id for item in page}
     page_edges = tuple(
@@ -800,22 +898,32 @@ def _safe_cursor_value(value: Any) -> str | None:
 
 
 def _policy_states(
-    snapshot: ArticleSnapshot, envelope: InvestigationEnvelope | None
+    snapshot: ArticleSnapshot,
+    envelope: InvestigationEnvelope | None,
+    g2_vt_authorized: bool | None = None,
 ) -> tuple[PivotG2State, PivotDisclosureState]:
     # Derived records use the same envelope and snapshot bounds; these states
     # do not depend on whether a derived indicator is documented or benign.
-    g2 = PivotG2State.REQUIRED
-    if envelope is not None:
-        g2 = (
-            PivotG2State.APPROVED
-            if envelope.acquire_hits_allowed and "virustotal" in envelope.allowed_providers
-            else PivotG2State.BLOCKED
-        )
+    has_vt_provider = envelope is not None and any(
+        provider.casefold() in {"vt", "virustotal"} for provider in envelope.allowed_providers
+    )
+    allows_vt = (
+        g2_vt_authorized
+        if g2_vt_authorized is not None
+        else envelope is not None and envelope.acquire_hits_allowed and has_vt_provider
+    )
+    g2 = (
+        PivotG2State.REQUIRED
+        if envelope is None
+        else PivotG2State.APPROVED
+        if allows_vt
+        else PivotG2State.BLOCKED
+    )
     if envelope is None:
         return g2, PivotDisclosureState.UNKNOWN
     tlp = envelope.disclosure.tlp.value if envelope.disclosure.tlp is not None else ""
     allowed = (
-        "virustotal" in envelope.allowed_providers
+        allows_vt
         and not envelope.disclosure.do_not_submit
         and not snapshot.do_not_submit
         and tlp not in {"amber", "red"}

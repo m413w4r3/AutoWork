@@ -555,6 +555,17 @@ async def test_operator_led_experiment_record_uses_declared_hypothesis_and_strea
 @pytest.mark.asyncio
 async def test_operator_dispatcher_wires_minimal_advisor_request_to_strict_bridge_transport():
     fixture, state, _ = await _fixture()
+    article_port = fixture.context_builder.article_snapshots
+    article_port.snapshot = replace(
+        article_port.snapshot,
+        article_passages=(
+            SimpleNamespace(
+                claim_id="S1P1",
+                heading="Loader chain",
+                text="S1P1. The article describes a loader chain.",
+            ),
+        ),
+    )
     fixture.envelope = replace(fixture.envelope, allowed_providers=("bridge",))
     fixture.envelopes._items[fixture.investigation_id] = fixture.envelope
     fixture.available_capabilities = frozenset({"bridge.advisor"})
@@ -577,6 +588,16 @@ async def test_operator_dispatcher_wires_minimal_advisor_request_to_strict_bridg
             assert len(raw) <= max_bytes
             return raw
 
+        async def put_text(self, value, *, bucket):
+            return await self.put_bytes(
+                value.encode("utf-8"), bucket=bucket, mime_type="text/plain"
+            )
+
+        async def put_bytes(self, value, *, bucket, mime_type):
+            blob_id = uuid4()
+            self.values[blob_id] = bytes(value)
+            return blob_id
+
     class StrictBridge:
         def __init__(self):
             self.calls = []
@@ -591,14 +612,13 @@ async def test_operator_dispatcher_wires_minimal_advisor_request_to_strict_bridg
                 "external_llm_allowed",
             }
             assert kwargs["external_llm_allowed"] is True
-            assert len(kwargs["prompt"].encode()) <= 12 * 1024
+            assert len(kwargs["prompt"].encode()) <= 32 * 1024 * 1024
             self.calls.append(kwargs)
-            input_json = (
-                kwargs["prompt"]
-                .split("<UNTRUSTED_ADVISORY_INPUT>\n", 1)[1]
-                .split("\n</UNTRUSTED_ADVISORY_INPUT>", 1)[0]
+            article_ref = next(
+                line[1:].split("]", 1)[0]
+                for line in kwargs["prompt"].splitlines()
+                if line.startswith("[E")
             )
-            article_ref = json.loads(input_json)["article_source_ref"]
             return TurnSubmission(
                 TurnSubmissionStatus.SUCCEEDED,
                 output_text=json.dumps(
@@ -645,7 +665,6 @@ async def test_operator_dispatcher_wires_minimal_advisor_request_to_strict_bridg
         settings=Settings(
             openai_bridge_min_submission_interval_seconds=0,
             openai_bridge_submission_jitter_fraction=0,
-            operator_advisor_min_consultation_interval_seconds=0,
         ),
         investigations=fixture.investigations,
         observations=fixture.observations,
@@ -665,15 +684,29 @@ async def test_operator_dispatcher_wires_minimal_advisor_request_to_strict_bridg
     result = await service.invoke(
         tool_name="advisor.consult",
         schema_version=ADVISOR_SCHEMA_VERSION,
-        arguments={"consultation_type": "plan_investigation"},
+        arguments={"consultation_type": "plan_investigation", "question": "S1P1"},
         purpose="Orienter le prochain pivot a partir de l'etat mesure.",
         expected_version=state.version,
         idempotency_key="operator-advisor-minimal-e2e",
     )
 
-    assert result.invocation.status is ToolInvocationStatus.SUCCEEDED
+    advisor_result = result.output["data"]["result"]
+    assert result.invocation.status is ToolInvocationStatus.SUCCEEDED, {
+        key: advisor_result.get(key)
+        for key in (
+            "advisor_status",
+            "failure_stage",
+            "failure_reason",
+            "bridge_turns_consumed",
+            "error_code",
+        )
+    }
     assert len(transport.calls) == 1
-    assert "UNTRUSTED_ADVISORY_INPUT" in transport.calls[0]["prompt"]
+    prompt = transport.calls[0]["prompt"]
+    assert "DOSSIER DE FAITS" in prompt
+    assert "Article S1P1" in prompt
+    assert "UNTRUSTED_ADVISORY_INPUT" not in prompt
+    assert "article:" not in prompt
     refs = [await fixture.observations.get(ref) for ref in result.invocation.response_refs]
     advisor_records = [
         item for item in refs if item is not None and item.source == "advisor.consult"
@@ -719,6 +752,16 @@ async def test_advisor_recommendations_record_acceptance_refusal_and_empirical_o
             assert len(raw) <= max_bytes
             return raw
 
+        async def put_text(self, value, *, bucket):
+            return await self.put_bytes(
+                value.encode("utf-8"), bucket=bucket, mime_type="text/plain"
+            )
+
+        async def put_bytes(self, value, *, bucket, mime_type):
+            blob_id = uuid4()
+            self.values[blob_id] = bytes(value)
+            return blob_id
+
     artifacts = ArtifactStore()
 
     def add_measurement(source: str, sample_hash: str, value: str) -> EvidenceObservation:
@@ -751,6 +794,20 @@ async def test_advisor_recommendations_record_acceptance_refusal_and_empirical_o
     alternative_observation = add_measurement("sample.analyze", "a" * 64, "LoaderFunction")
     for item in (initial_observation, accepted_observation, alternative_observation):
         await fixture.observations.append_if_absent(item)
+
+    async def get_verified_blob(blob_id):
+        observation = next(
+            (
+                item
+                for item in (initial_observation, accepted_observation, alternative_observation)
+                if item.blob_id == blob_id
+            ),
+            None,
+        )
+        raw = artifacts.values.get(blob_id)
+        if observation is None or raw is None:
+            return None
+        return SimpleNamespace(descriptor=SimpleNamespace(sha256=observation.sha256, size=len(raw)))
 
     summaries = CanonicalEvidenceSummaryPort(artifacts)
 
@@ -826,7 +883,6 @@ async def test_advisor_recommendations_record_acceptance_refusal_and_empirical_o
         settings=Settings(
             openai_bridge_min_submission_interval_seconds=0,
             openai_bridge_submission_jitter_fraction=0,
-            operator_advisor_min_consultation_interval_seconds=0,
         ),
         investigations=fixture.investigations,
         observations=fixture.observations,
@@ -834,7 +890,7 @@ async def test_advisor_recommendations_record_acceptance_refusal_and_empirical_o
         opinions=fixture.opinions,
         sample_associations=SimpleNamespace(list_for_investigation=empty_associations),
         samples=SimpleNamespace(list_for_subject=empty_samples),
-        blobs=SimpleNamespace(),
+        blobs=SimpleNamespace(get=get_verified_blob),
         article_snapshots=fixture.context_builder.article_snapshots,
         artifact_store=artifacts,
         registry=fixture.registry,
@@ -862,7 +918,7 @@ async def test_advisor_recommendations_record_acceptance_refusal_and_empirical_o
         for item in await fixture.observations.list_for_investigation(fixture.investigation_id)
         if item.source == "advisor.consult"
     ]
-    assert advice.invocation.status is ToolInvocationStatus.SUCCEEDED
+    assert advice.invocation.status is ToolInvocationStatus.PARTIAL, advice.output
     assert persisted_advice
     assert advice.invocation.consumed_budget[BudgetDimension.BRIDGE_TURNS] == 1
     advisor_observation = next(
@@ -1173,6 +1229,89 @@ async def test_replay_after_persisted_running_marks_review_without_redispatch() 
     assert fixture.tools["vt.file_report"].calls == []
 
 
+@pytest.mark.asyncio
+async def test_replay_releases_legacy_advisor_reservation_with_proven_pre_submit_failure() -> None:
+    fixture, state, _ = await _fixture()
+    idempotency_key = "legacy-invalid-advisor-input"
+    schema_version = ADVISOR_SCHEMA_VERSION
+    arguments = {"consultation_type": "pivot_strategy"}
+    purpose = "Recover a locally rejected advisor consultation."
+    payload = canonical_json_bytes(
+        {
+            "tool_name": "advisor.consult",
+            "schema_version": schema_version,
+            "arguments": arguments,
+            "purpose": purpose,
+            "expected_version": state.version,
+        }
+    )
+    key_digest = hashlib.sha256(
+        f"{fixture.investigation_id}\0{idempotency_key}".encode()
+    ).hexdigest()
+    operation_key = f"operator:{key_digest}:{hashlib.sha256(payload).hexdigest()}"
+    reserved = {BudgetDimension.BRIDGE_TURNS: 1}
+    envelope = await fixture.envelopes.get(fixture.investigation_id)
+    envelope.budget.reserve(operation_key, reserved)
+    await fixture.envelopes.save_if_version(
+        replace(envelope, version=envelope.version + 1), expected_version=envelope.version
+    )
+
+    observation = EvidenceObservation(
+        investigation_id=fixture.investigation_id,
+        kind=EvidenceKind.OTHER,
+        blob_id=uuid4(),
+        sha256="e" * 64,
+        source="advisor.consult",
+        source_version="advisor-consult-v1",
+        observed_at=datetime.now(UTC),
+        object_type="tool_call",
+        object_id="advisor.consult",
+    )
+    await fixture.observations.append_if_absent(observation)
+    invocation = ToolInvocation(
+        investigation_id=fixture.investigation_id,
+        operation_key=operation_key,
+        tool_name="advisor.consult",
+        schema_version=schema_version,
+        normalized_parameters=arguments,
+        purpose=purpose,
+        reserved_budget=reserved,
+        response_refs=(observation.id,),
+    )
+    invocation = invocation.transition(ToolInvocationStatus.RUNNING).transition(
+        ToolInvocationStatus.NEEDS_REVIEW
+    )
+    await fixture.invocations.add_if_absent(invocation)
+
+    class _LegacyEvidenceSummary:
+        async def summary(self, _observation):
+            return {"advisor_status": "invalid_input"}
+
+    service = _service(
+        fixture,
+        observations=fixture.observations,
+        evidence_summaries=_LegacyEvidenceSummary(),
+    )
+    replay = await service.invoke(
+        tool_name="advisor.consult",
+        schema_version=schema_version,
+        arguments=arguments,
+        purpose=purpose,
+        expected_version=state.version,
+        idempotency_key=idempotency_key,
+    )
+
+    latest_envelope = await fixture.envelopes.get(fixture.investigation_id)
+    reservation = next(
+        item for item in latest_envelope.budget.reservations if item.operation_key == operation_key
+    )
+    assert replay.idempotent_replay is True
+    assert replay.invocation.status is ToolInvocationStatus.FAILED
+    assert reservation.status.value == "released"
+    assert latest_envelope.budget.reserved[BudgetDimension.BRIDGE_TURNS] == 0
+    assert fixture.bridge_transport.submission_count == 0
+
+
 class _IdentityProvider:
     async def current(self) -> Identity:
         return Identity(
@@ -1225,7 +1364,6 @@ class _CompositionFactory:
         self.artifact_store = artifact_store
         self.settings = SimpleNamespace(
             operator_advisor_checkpoint_tool_threshold=12,
-            operator_advisor_max_turns_per_investigation=8,
         )
 
     def build(
@@ -1254,7 +1392,7 @@ async def test_operator_http_routes_expose_bounded_context_and_idempotent_invoca
     app.include_router(router)
     app.state.identity_provider = _IdentityProvider()
     app.state.uow_factory = lambda: _Uow(fixture)
-    app.state.investigation_composition_factory = _CompositionFactory(service)
+    app.state.investigation_composition_factory = _CompositionFactory(service, fixture=fixture)
 
     async with httpx.AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"
@@ -1280,6 +1418,8 @@ async def test_operator_http_routes_expose_bounded_context_and_idempotent_invoca
             section="evidence_index",
             cursor=summary_payload["pointers"]["section_cursors"]["evidence_index"],
             limit=summary_payload["pointers"]["section_limit"],
+            version=state.version,
+            sha256=state.sha256,
         )
         section = await client.get(
             evidence_pointer,
@@ -1335,6 +1475,7 @@ async def test_operator_http_routes_expose_bounded_context_and_idempotent_invoca
             json=payload,
             headers={"Idempotency-Key": "http-key"},
         )
+        stale_page = await client.get(evidence_pointer)
 
     assert context.status_code == 200, context.text
     assert context.json()["working_state_version"] == state.version
@@ -1348,7 +1489,8 @@ async def test_operator_http_routes_expose_bounded_context_and_idempotent_invoca
     assert summary_payload["context_sha256"] == context.json()["context_sha256"]
     assert summary_payload["working_state_sha256"] == state.sha256
     assert summary_payload["delta_since_version"]["from_version"] == state.version
-    assert summary_payload["pointers"]["section_cursors"]["evidence_index"] == 0
+    evidence_cursor = summary_payload["pointers"]["section_cursors"]["evidence_index"]
+    assert evidence_cursor == 0
     assert (
         "/operator/context/section/{section}" in summary_payload["pointers"]["section_uri_template"]
     )
@@ -1357,6 +1499,8 @@ async def test_operator_http_routes_expose_bounded_context_and_idempotent_invoca
     assert section.status_code == 200, section.text
     assert section.json()["section"] == "evidence_index"
     assert section.json()["offset"] == 0
+    assert section.json()["working_state_version"] == state.version
+    assert section.json()["working_state_sha256"] == state.sha256
     assert tool_section.status_code == 200, tool_section.text
     assert tool_section.json()["schema"] == "investigation-operator-context-item-page.v1"
     assert tool_section.json()["section"] == "available_tools"
@@ -1369,6 +1513,8 @@ async def test_operator_http_routes_expose_bounded_context_and_idempotent_invoca
     assert stale_summary.json()["detail"]["code"] == "stale_working_state"
     assert stale_tool.status_code == 409
     assert stale_tool.json()["detail"]["code"] == "stale_working_state"
+    assert stale_page.status_code == 409
+    assert stale_page.json()["detail"]["code"] == "stale_working_state"
     assert first.status_code == replay.status_code == 200
     assert first.json()["invocation"]["status"] == "succeeded"
     assert replay.json()["idempotent_replay"] is True

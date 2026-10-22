@@ -27,6 +27,9 @@ from cti_app.application.analyst_handoff import (
 )
 from cti_app.application.blob_storage import BlobReadLimitExceededError
 from cti_app.application.bridge_investigator import make_investigation_turn_idempotency_key
+from cti_app.application.content_pivot_candidates import (
+    validated_unlinked_content_pivot_payload,
+)
 from cti_app.application.diagram_compilation import DiagramCompilationError
 from cti_app.application.evidence_recorder import sanitize_evidence_text
 from cti_app.application.identity import IdentityProvider, IdentityScope
@@ -36,6 +39,7 @@ from cti_app.application.investigation_composition import (
 )
 from cti_app.application.investigation_contracts import (
     AdvisorGuidanceV1,
+    InvestigationContextV1,
     InvestigationOperatorContextV1,
     OperatorContextSectionPageV1,
     OperatorToolInvocationRequestV1,
@@ -84,6 +88,7 @@ from cti_app.application.operator_advisor_guidance import build_advisor_guidance
 from cti_app.application.operator_context_summary import (
     InvestigationOperatorContextSummaryV1,
     OperatorContextItemPageV1,
+    build_operator_context_summary,
 )
 from cti_app.application.operator_tool_invocation import (
     OperatorToolInvocationError,
@@ -585,10 +590,16 @@ def _verified_base64_text_chunks(
 
 
 def _sanitize_observation_payload(
-    value: Any, *, depth: int = 0, allow_confined_text_chunks: bool = False
+    value: Any,
+    *,
+    depth: int = 0,
+    allow_confined_text_chunks: bool = False,
+    preserve_complete_content: bool = False,
 ) -> Any:
     """Mask long encoded blobs while retaining bounded, readable evidence facts."""
-    if depth > 16:
+    if depth > (64 if preserve_complete_content else 16):
+        if preserve_complete_content:
+            raise ValueError("Complete observation exceeds the nesting guard")
         return "[maximum depth omitted]"
     if isinstance(value, dict):
         safe: dict[str, Any] = {}
@@ -599,10 +610,12 @@ def _sanitize_observation_payload(
             if depth == 0
             else None
         )
-        for key, item in list(value.items())[:128]:
-            safe_key = str(key)[:256]
-            if _OBSERVATION_SECRET_FIELD.search(safe_key) or _OBSERVATION_BINARY_FIELD.search(
-                safe_key
+        entries = value.items() if preserve_complete_content else list(value.items())[:128]
+        for key, item in entries:
+            safe_key = str(key) if preserve_complete_content else str(key)[:256]
+            if not preserve_complete_content and (
+                _OBSERVATION_SECRET_FIELD.search(safe_key)
+                or _OBSERVATION_BINARY_FIELD.search(safe_key)
             ):
                 continue
             if chunk_spec is not None and safe_key == chunk_spec[0]:
@@ -617,18 +630,26 @@ def _sanitize_observation_payload(
                     item,
                     depth=depth + 1,
                     allow_confined_text_chunks=allow_confined_text_chunks,
+                    preserve_complete_content=preserve_complete_content,
                 )
         return safe
     if isinstance(value, list):
         return [
             _sanitize_observation_payload(
-                item, depth=depth + 1, allow_confined_text_chunks=allow_confined_text_chunks
+                item,
+                depth=depth + 1,
+                allow_confined_text_chunks=allow_confined_text_chunks,
+                preserve_complete_content=preserve_complete_content,
             )
-            for item in value[:512]
+            for item in (value if preserve_complete_content else value[:512])
         ]
     if isinstance(value, str):
-        safe_text = sanitize_evidence_text(value, max_chars=8 * 1024 * 1024)
-        if _BASE64_BLOB_TEXT.fullmatch(safe_text):
+        safe_text = (
+            value
+            if preserve_complete_content
+            else sanitize_evidence_text(value, max_chars=8 * 1024 * 1024)
+        )
+        if not preserve_complete_content and _BASE64_BLOB_TEXT.fullmatch(safe_text):
             return "[encoded binary content omitted]"
         return safe_text
     if isinstance(value, bytes | bytearray | memoryview):
@@ -673,6 +694,7 @@ class OpinionDraftView(BaseModel):
 class BudgetDimensionView(BaseModel):
     limit: int | None
     consumed: int
+    reserved: int
     remaining: int | None
 
 
@@ -701,6 +723,7 @@ class InvestigationView(BaseModel):
     blocked_decisions: list[BlockedDecisionView]
     available_tools: list[str]
     unavailable_tools: list[str]
+    unavailable_tool_reasons: dict[str, str]
     envelope_approved: bool
     allowed_providers: list[str]
     acquire_hits_allowed: bool
@@ -955,11 +978,20 @@ async def get_investigation(investigation_id: UUID, request: Request) -> Investi
         investigation = await uow.analyst_investigations.get(investigation_id)
         if investigation is None:
             raise _http_error(404, "investigation_not_found")
-        composition = _composition_factory(request).build(uow, investigation_id)
+        state = await uow.investigation_states.get(investigation_id)
+        composition = _composition_factory(request).build(
+            uow,
+            investigation_id,
+            operator_mode=(
+                state is not None
+                and state.execution_mode is InvestigationExecutionMode.OPERATOR_LED
+            ),
+        )
         return await _investigation_view(
             uow,
             investigation_id,
             composition=composition,
+            state=state,
         )
 
 
@@ -1009,6 +1041,18 @@ async def get_investigation_pivot_frontier(
         )
         invocations = tuple(await uow.tool_invocations.list_for_investigation(investigation_id))
         envelope = await uow.investigation_envelopes.get(investigation_id)
+        decisions = tuple(await uow.analyst_decisions.list_for_investigation(investigation_id))
+        authorization = g2_envelope_authorization_state(envelope, decisions)
+        ceiling = authorization.authorization_ceiling
+        g2_vt_authorized = bool(
+            not authorization.revoked
+            and ceiling is not None
+            and ceiling.acquire_hits_allowed
+            and any(
+                provider.casefold() in {"vt", "virustotal"}
+                for provider in ceiling.allowed_providers
+            )
+        )
         payloads = await _pivot_observation_payloads(request, uow, observations)
         try:
             frontier = build_pivot_frontier(
@@ -1018,6 +1062,7 @@ async def get_investigation_pivot_frontier(
                 observation_payloads=payloads,
                 invocations=invocations,
                 envelope=envelope,
+                g2_vt_authorized=g2_vt_authorized,
                 limit=limit,
                 cursor=cursor,
             )
@@ -1040,6 +1085,7 @@ async def get_investigation_operator_context(
     expected_version: int | None = Query(default=None, ge=1),
     expected_sha256: str | None = Query(default=None, pattern=_SHA256),
     since_version: int | None = Query(default=None, ge=1),
+    since_fingerprint: str | None = Query(default=None, max_length=8_192),
 ) -> InvestigationOperatorContextV1 | InvestigationOperatorContextSummaryV1:
     await _require_operator_client(request)
     async with _uow_factory(request)() as uow:
@@ -1049,10 +1095,29 @@ async def get_investigation_operator_context(
         composition = _composition_factory(request).build(uow, investigation_id, operator_mode=True)
         try:
             if view == "summary":
-                return await composition.operator_tool_invocations.get_context_summary(
+                operator_context = await composition.operator_tool_invocations.get_context(
                     expected_version=expected_version,
                     expected_sha256=expected_sha256,
+                )
+                state = await uow.investigation_states.get(investigation_id)
+                if state is None:
+                    raise OperatorToolInvocationError("investigation_not_started", 409)
+                invalidation_facts = await _operator_context_invalidation_facts(
+                    uow=uow,
+                    investigation=investigation,
+                    composition=composition,
+                    context=operator_context.context,
+                    investigation_id=investigation_id,
+                )
+                return build_operator_context_summary(
+                    operator_context.context,
+                    investigation_id=investigation_id,
+                    working_state_version=operator_context.working_state_version,
+                    working_state_sha256=operator_context.working_state_sha256,
+                    state=state,
                     since_version=since_version,
+                    since_fingerprint=since_fingerprint,
+                    invalidation_facts=invalidation_facts,
                 )
             return await composition.operator_tool_invocations.get_context(
                 expected_version=expected_version,
@@ -1095,6 +1160,168 @@ async def get_investigation_operator_context(
             raise _http_error(503, "operator_context_unavailable") from exc
 
 
+async def _operator_context_invalidation_facts(
+    *,
+    uow: Any,
+    investigation: Any,
+    composition: InvestigationComposition,
+    context: InvestigationContextV1,
+    investigation_id: UUID,
+) -> dict[str, Any]:
+    observations = tuple(await uow.evidence_observations.list_for_investigation(investigation_id))
+    observation_facts = [
+        {
+            "id": str(item.id),
+            "sha256": item.sha256,
+            "source": item.source,
+            "source_version": item.source_version,
+            "kind": getattr(item.kind, "value", item.kind),
+            "observed_at": item.observed_at.isoformat(),
+            "object_type": item.object_type,
+            "object_id": item.object_id,
+            "limitations": list(item.limitations),
+            "invocation_ref": str(item.invocation_ref) if item.invocation_ref else None,
+        }
+        for item in sorted(observations, key=lambda item: (str(item.id), item.sha256))
+    ]
+
+    publication_facts: dict[str, Any] = {
+        "base_publication_artifact_id": (
+            str(base_publication_id)
+            if (
+                base_publication_id := getattr(
+                    context.investigation, "base_publication_artifact_id", None
+                )
+            )
+            is not None
+            else None
+        ),
+        "base_publication_sha256": getattr(context.investigation, "base_publication_sha256", None),
+    }
+    publication_repository = getattr(uow, "production_artifacts", None)
+    get_current_publication = getattr(publication_repository, "get_current", None)
+    if callable(get_current_publication):
+        try:
+            publication = await get_current_publication(
+                investigation.production_run_id, "publication"
+            )
+        except Exception:
+            publication = None
+            publication_facts["lookup_unavailable"] = True
+        if publication is not None:
+            publication_facts["current"] = {
+                name: (str(value) if isinstance(value, UUID) else getattr(value, "value", value))
+                for name in (
+                    "id",
+                    "version",
+                    "status",
+                    "canonical_blob_id",
+                    "input_hash",
+                    "output_sha256",
+                )
+                if (value := getattr(publication, name, None)) is not None
+            }
+
+    schema_facts = [
+        {
+            "name": item.name,
+            "schema_version": item.schema_version,
+            "input_schema": item.input_schema,
+        }
+        for item in getattr(composition.registry, "definitions", ())
+    ]
+    dependencies = getattr(composition, "tool_dependencies", None)
+    execution = getattr(dependencies, "confined_analysis_execution", None)
+    family_statuses = getattr(execution, "family_statuses", {})
+    worker_facts: dict[str, Any] = {}
+    if isinstance(family_statuses, Mapping):
+        worker_facts = {
+            str(family): {
+                name: getattr(item, name, None) for name in ("available", "version", "reason")
+            }
+            for family, item in sorted(family_statuses.items(), key=lambda pair: str(pair[0]))
+        }
+
+    envelope = await uow.investigation_envelopes.get(investigation_id)
+    decisions = tuple(await uow.analyst_decisions.list_for_investigation(investigation_id))
+    authorization = g2_envelope_authorization_state(envelope, decisions)
+    budget = getattr(envelope, "budget", None)
+    g2_facts: dict[str, Any] = {
+        "envelope_version": getattr(envelope, "version", None),
+        "approved_at": (
+            approved_at.isoformat()
+            if isinstance((approved_at := getattr(envelope, "approved_at", None)), datetime)
+            else None
+        ),
+        "revoked": authorization.revoked,
+        "allowed_providers": list(getattr(envelope, "allowed_providers", ())),
+        "acquire_hits_allowed": getattr(envelope, "acquire_hits_allowed", False),
+        "approval_decision_id": str(getattr(envelope, "approval_decision_id", "")) or None,
+        "approval_actor_id": getattr(envelope, "approval_actor_id", None),
+        "authorization_ceiling": (
+            {
+                "allowed_providers": list(authorization.authorization_ceiling.allowed_providers),
+                "budget_limits": {
+                    dimension.value: value
+                    for dimension, value in (
+                        authorization.authorization_ceiling.budget_limits.items()
+                    )
+                },
+                "acquire_hits_allowed": authorization.authorization_ceiling.acquire_hits_allowed,
+                "disclosure": {
+                    "tlp": getattr(
+                        authorization.authorization_ceiling.disclosure.tlp,
+                        "value",
+                        authorization.authorization_ceiling.disclosure.tlp,
+                    ),
+                    "do_not_submit": authorization.authorization_ceiling.disclosure.do_not_submit,
+                    "external_llm_allowed": (
+                        authorization.authorization_ceiling.disclosure.external_llm_allowed
+                    ),
+                },
+            }
+            if authorization.authorization_ceiling is not None
+            else None
+        ),
+        "disclosure": {
+            name: getattr(
+                getattr(getattr(envelope, "disclosure", None), name, None),
+                "value",
+                getattr(getattr(envelope, "disclosure", None), name, None),
+            )
+            for name in ("tlp", "do_not_submit", "external_llm_allowed")
+        },
+        "budget": {},
+    }
+    if budget is not None:
+        g2_facts["budget"] = {
+            dimension.value: {
+                "limit": budget.limits.get(dimension),
+                "consumed": budget.consumed[dimension],
+                "reserved": budget.reserved[dimension],
+                "remaining": budget.remaining[dimension],
+            }
+            for dimension in BudgetDimension
+        }
+    experiment_repository = getattr(uow, "investigation_experiments", None)
+    experiment_version = None
+    version_reader = getattr(experiment_repository, "version", None)
+    if callable(version_reader):
+        try:
+            experiment_version = await version_reader(investigation_id)
+        except Exception:
+            experiment_version = None
+
+    return {
+        "observations": observation_facts,
+        "publication": publication_facts,
+        "schema": schema_facts,
+        "worker": worker_facts,
+        "g2": g2_facts,
+        "experiments": experiment_version,
+    }
+
+
 @router.get(
     "/investigations/{investigation_id}/operator/context/section/{section}",
     response_model=OperatorContextSectionPageV1 | OperatorContextItemPageV1,
@@ -1105,6 +1332,7 @@ async def get_investigation_operator_context_section(
     request: Request,
     offset: int = Query(default=0, ge=0),
     limit: int = Query(default=20, ge=1, le=20),
+    cursor: str | None = Query(default=None, max_length=1_024),
     expected_version: int | None = Query(default=None, ge=1),
     expected_sha256: str | None = Query(default=None, pattern=_SHA256),
 ) -> OperatorContextSectionPageV1 | OperatorContextItemPageV1:
@@ -1121,6 +1349,7 @@ async def get_investigation_operator_context_section(
                 limit=limit,
                 expected_version=expected_version,
                 expected_sha256=expected_sha256,
+                cursor=cursor,
             )
         except OperatorToolInvocationError as exc:
             raise _http_error(exc.status_code, exc.code, details=exc.details) from exc
@@ -1233,9 +1462,25 @@ async def get_investigation_operator_observation(
             raise _http_error(415, "operator_observation_not_json")
         if descriptor.logical_bucket in {"samples-quarantine", "network-quarantine"}:
             raise _http_error(415, "operator_observation_binary_forbidden")
+        max_object_bytes = int(
+            getattr(
+                getattr(_composition_factory(request), "settings", None),
+                "model_output_max_bytes",
+                512 * 1024 * 1024,
+            )
+        )
+        observation_source = getattr(observation, "source", "")
+        observation_object_type = getattr(observation, "object_type", "")
+        preserve_complete_content = (
+            observation_source == "advisor.consult" and observation_object_type == "advisor_call"
+        ) or (
+            str(observation_source).casefold() == "autowork ruleworkbench"
+            and observation_object_type == "detection_candidate_version"
+        )
         try:
             raw = await _artifact_store(request).read_bytes(
-                observation.blob_id, max_bytes=8 * 1024 * 1024
+                observation.blob_id,
+                max_bytes=max_object_bytes if preserve_complete_content else 8 * 1024 * 1024,
             )
         except (ValueError, KeyError) as exc:
             raise _http_error(413, "operator_observation_too_large") from exc
@@ -1254,14 +1499,17 @@ async def get_investigation_operator_observation(
         )
         try:
             sanitized = _sanitize_observation_payload(
-                canonical, allow_confined_text_chunks=allow_confined_text_chunks
+                canonical,
+                allow_confined_text_chunks=allow_confined_text_chunks,
+                preserve_complete_content=preserve_complete_content,
             )
         except _SensitiveObservationTextError as exc:
             raise _http_error(422, "operator_observation_sensitive_text") from exc
         payload_json = json.dumps(
             sanitized, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
-        if len(payload_json.encode("utf-8")) > 8 * 1024 * 1024:
+        payload_maximum = max_object_bytes if preserve_complete_content else 8 * 1024 * 1024
+        if len(payload_json.encode("utf-8")) > payload_maximum:
             raise _http_error(413, "operator_observation_too_large")
         page = payload_json[offset : offset + length]
         next_offset = offset + len(page) if offset + len(page) < len(payload_json) else None
@@ -1338,18 +1586,21 @@ async def get_investigation_operator_status(
         artifact_store = getattr(
             getattr(composition, "tool_dependencies", None), "artifact_store", None
         )
+        evidence_summaries = (
+            CanonicalEvidenceSummaryPort(artifact_store) if artifact_store is not None else None
+        )
         advisor_guidance = await build_advisor_guidance(
             invocations=invocations,
             observations=observations,
-            evidence_summaries=(
-                CanonicalEvidenceSummaryPort(artifact_store) if artifact_store is not None else None
-            ),
+            evidence_summaries=evidence_summaries,
             available_tools=available_tool_names,
             checkpoint_tool_threshold=getattr(
                 advisor_settings, "operator_advisor_checkpoint_tool_threshold", 12
             ),
-            advisor_turn_limit=getattr(
-                advisor_settings, "operator_advisor_max_turns_per_investigation", 8
+            g2_bridge_turns_remaining=(
+                envelope.budget.remaining.get(BudgetDimension.BRIDGE_TURNS)
+                if envelope is not None
+                else None
             ),
             enabled=state.execution_mode is InvestigationExecutionMode.OPERATOR_LED,
         )
@@ -1408,6 +1659,12 @@ async def get_investigation_operator_status(
                 pending_bridge_turn.idempotency_key if pending_bridge_turn else None
             ),
         )
+        invocation_costs = await _operator_bridge_invocation_costs(
+            invocations=invocations,
+            observations=observations,
+            evidence_summaries=evidence_summaries,
+        )
+        _attach_operator_invocation_costs(view.payload, invocation_costs)
         return InvestigationOperatorStatusResponse.model_validate(view.payload)
 
 
@@ -2446,15 +2703,17 @@ async def _investigation_view(
     superseded_ids = {item.supersedes for item in all_findings if item.supersedes is not None}
     findings = tuple(item for item in all_findings if item.id not in superseded_ids)
     findings_by_id = {item.id: item for item in all_findings}
-    observations = await uow.evidence_observations.list_for_investigation(investigation_id)
+    observations = tuple(await uow.evidence_observations.list_for_investigation(investigation_id))
     associations = await uow.sample_associations.list_for_investigation(investigation_id)
+    invocations = tuple(await uow.tool_invocations.list_for_investigation(investigation_id))
+    decisions = tuple(await uow.analyst_decisions.list_for_investigation(investigation_id))
+    authorization = g2_envelope_authorization_state(envelope, decisions)
     opinion = await uow.analyst_opinions.get(uuid5(_OPINION_NAMESPACE, str(investigation_id)))
     effective_budget = (
         envelope.budget
         if envelope is not None
         else InvestigationBudget(
             limits={
-                BudgetDimension.BRIDGE_TURNS: investigation.budget.max_cycles,
                 BudgetDimension.VT_UNITS: 0,
                 BudgetDimension.SHODAN_CREDITS: 0,
                 BudgetDimension.DOWNLOADS: 0,
@@ -2465,10 +2724,39 @@ async def _investigation_view(
         dimension.value: BudgetDimensionView(
             limit=effective_budget.limits.get(dimension),
             consumed=effective_budget.consumed[dimension],
+            reserved=effective_budget.reserved[dimension],
             remaining=effective_budget.remaining[dimension],
         )
         for dimension in BudgetDimension
     }
+    tool_inventory = await _operator_status_tool_inventory(
+        state=state,
+        composition=composition,
+        envelope=envelope,
+        invocations=invocations,
+        observations=observations,
+        external_llm_allowed=(
+            not authorization.revoked
+            and InvestigationService.external_llm_allowed(snapshot, envelope)
+        ),
+    )
+    if tool_inventory is None:
+        available_tools = tuple(composition.available_tools)
+        unavailable_tools = tuple(composition.unavailable_tools)
+        unavailable_tool_reasons = {
+            name: reason
+            for name, reason in getattr(composition, "unavailable_tool_reasons", {}).items()
+            if name in unavailable_tools
+        }
+    else:
+        available_tools, diagnostics = tool_inventory
+        parsed_diagnostics = tuple(
+            item.partition(":") for item in diagnostics if isinstance(item, str)
+        )
+        unavailable_tool_reasons = {
+            name: reason for name, separator, reason in parsed_diagnostics if separator
+        }
+        unavailable_tools = tuple(sorted(unavailable_tool_reasons))
     blocked = _blocked_decisions(state)
     return InvestigationView(
         id=investigation.id,
@@ -2542,9 +2830,10 @@ async def _investigation_view(
         opinion_draft=_opinion_view(opinion),
         budget=budget,
         blocked_decisions=blocked,
-        available_tools=list(composition.available_tools),
-        unavailable_tools=list(composition.unavailable_tools),
-        envelope_approved=envelope is not None,
+        available_tools=list(available_tools),
+        unavailable_tools=list(unavailable_tools),
+        unavailable_tool_reasons=unavailable_tool_reasons,
+        envelope_approved=envelope is not None and not authorization.revoked,
         allowed_providers=list(envelope.allowed_providers) if envelope is not None else [],
         acquire_hits_allowed=envelope.acquire_hits_allowed if envelope is not None else False,
     )
@@ -2654,7 +2943,6 @@ async def _current_envelope_view(request: Request, investigation_id: UUID) -> En
 def _configured_budget(settings: Any) -> InvestigationBudget:
     return InvestigationBudget(
         limits={
-            BudgetDimension.BRIDGE_TURNS: int(getattr(settings, "investigation_max_cycles", 12)),
             BudgetDimension.VT_UNITS: int(getattr(settings, "investigation_max_vt_read_units", 0)),
             BudgetDimension.SHODAN_CREDITS: int(
                 getattr(settings, "investigation_max_shodan_credits", 0)
@@ -2809,6 +3097,7 @@ def _envelope_view(
             dimension.value: BudgetDimensionView(
                 limit=budget.limits.get(dimension),
                 consumed=budget.consumed[dimension],
+                reserved=budget.reserved[dimension],
                 remaining=budget.remaining[dimension],
             )
             for dimension in BudgetDimension
@@ -2907,40 +3196,76 @@ def _artifact_store(request: Request) -> ProductionArtifactStore:
     return cast(ProductionArtifactStore, configured)
 
 
+def _validated_unlinked_pivot_payload(
+    observation: Any, value: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    """Admit only the known typed local-analysis payloads without invocation refs."""
+    return validated_unlinked_content_pivot_payload(observation, value)
+
+
+def _reject_non_json_constant(value: str) -> Any:
+    raise ValueError(f"Invalid JSON constant: {value}")
+
+
 async def _pivot_observation_payloads(
     request: Request, uow: Any, observations: Sequence[Any]
 ) -> dict[str, Mapping[str, Any] | None]:
     payloads: dict[str, Mapping[str, Any] | None] = {}
+    max_object_bytes = int(
+        getattr(
+            getattr(_composition_factory(request), "settings", None),
+            "model_output_max_bytes",
+            512 * 1024 * 1024,
+        )
+    )
     for observation in observations:
-        source = observation.source.casefold()
-        if (
-            observation.kind.value != "vt_relationship"
-            and observation.invocation_ref is None
-            and source != "sample_similarity"
-            and not source.startswith("network.capture.")
-        ):
+        source = observation.source.strip().casefold()
+        kind = getattr(observation.kind, "value", observation.kind)
+        is_legacy_source = (
+            kind == "vt_relationship"
+            or source == "sample_similarity"
+            or source.startswith("network.capture.")
+        )
+        is_typed_source = (
+            source == "autowork.floss"
+            or source == "autowork local analysis"
+            or source.startswith("local.")
+            or source.startswith("dotnet.")
+        )
+        if observation.invocation_ref is None and not is_legacy_source and not is_typed_source:
             continue
         blob = await uow.blobs.get(observation.blob_id)
         descriptor = getattr(blob, "descriptor", None)
         if descriptor is None:
             continue
         mime_type = descriptor.mime_type.split(";", 1)[0].strip().casefold()
-        if mime_type != "application/json" or getattr(descriptor, "size", 0) > 128 * 1024:
+        descriptor_size = getattr(descriptor, "size", None)
+        if (
+            mime_type != "application/json"
+            or type(descriptor_size) is not int
+            or not 0 <= descriptor_size <= max_object_bytes
+            or getattr(descriptor, "sha256", None) != observation.sha256
+        ):
             continue
         try:
             raw = await _artifact_store(request).read_bytes(
-                observation.blob_id, max_bytes=128 * 1024
+                observation.blob_id, max_bytes=max_object_bytes
             )
-        except (KeyError, ValueError):
+        except (BlobReadLimitExceededError, KeyError, ValueError):
             continue
-        if hashlib.sha256(raw).hexdigest() != observation.sha256:
+        if len(raw) != descriptor_size or hashlib.sha256(raw).hexdigest() != observation.sha256:
             continue
         try:
-            value = json.loads(raw)
-        except (UnicodeDecodeError, json.JSONDecodeError):
+            value = json.loads(raw, parse_constant=_reject_non_json_constant)
+        except (UnicodeDecodeError, ValueError):
             continue
-        if isinstance(value, Mapping):
-            payloads[str(observation.id)] = value
+        if not isinstance(value, Mapping):
+            continue
+        if observation.invocation_ref is None and not is_legacy_source:
+            value = _validated_unlinked_pivot_payload(observation, value)
+            if value is None:
+                continue
+        payloads[str(observation.id)] = value
     return payloads
 
 
@@ -3207,6 +3532,94 @@ async def _operator_status_tool_inventory(
     if pending is not None:
         return pending
     return availability.available_names, availability.unavailable_diagnostics[:64]
+
+
+async def _operator_bridge_invocation_costs(
+    *,
+    invocations: Sequence[Any],
+    observations: Sequence[Any],
+    evidence_summaries: CanonicalEvidenceSummaryPort | None,
+) -> dict[str, dict[str, Any]]:
+    observations_by_id = {getattr(item, "id", None): item for item in observations}
+    costs: dict[str, dict[str, Any]] = {}
+    unavailable_usage = {"status": "usage_unavailable"}
+    for invocation in invocations:
+        if getattr(invocation, "tool_name", None) != "advisor.consult":
+            continue
+        invocation_id = str(getattr(invocation, "id", ""))
+        usage_observation = None
+        usage_summary: Mapping[str, Any] = {}
+        if evidence_summaries is not None:
+            for observation_id in reversed(tuple(getattr(invocation, "response_refs", ()))):
+                observation = observations_by_id.get(observation_id)
+                if (
+                    observation is None
+                    or getattr(observation, "source", None) != "advisor.consult"
+                    or getattr(observation, "object_type", None)
+                    not in {"advisor_call", "tool_call"}
+                ):
+                    continue
+                usage_observation = observation
+                try:
+                    usage_summary = await evidence_summaries.advisor_usage(observation)
+                except Exception:
+                    usage_summary = {}
+                break
+
+        consumed_budget = getattr(invocation, "consumed_budget", {})
+        raw_context_bytes = (
+            consumed_budget.get(BudgetDimension.CONTEXT_BYTES, 0)
+            if isinstance(consumed_budget, Mapping)
+            else 0
+        )
+        context_bytes = (
+            raw_context_bytes
+            if isinstance(raw_context_bytes, int)
+            and not isinstance(raw_context_bytes, bool)
+            and raw_context_bytes >= 0
+            else 0
+        )
+        provider_usage = usage_summary.get("provider_usage", unavailable_usage)
+        if not isinstance(provider_usage, Mapping):
+            provider_usage = unavailable_usage
+        estimated_context_tokens = usage_summary.get("estimated_context_tokens")
+        if isinstance(estimated_context_tokens, Mapping) and estimated_context_tokens.get(
+            "status"
+        ) in {"estimated", "not_available"}:
+            estimate = dict(estimated_context_tokens)
+        elif context_bytes > 0:
+            estimate = {
+                "status": "estimated",
+                "value": (context_bytes + 3) // 4,
+                "context_bytes": context_bytes,
+                "basis": "context_bytes/4",
+            }
+        else:
+            estimate = {
+                "status": "not_available",
+                "reason": "no_verified_context_bytes",
+            }
+        costs[invocation_id] = {
+            "invocation_id": invocation_id,
+            "bridge_invocation_id": usage_summary.get("bridge_invocation_id"),
+            "provider_usage_observation_id": (
+                str(usage_observation.id) if usage_observation is not None else None
+            ),
+            "provider_usage": dict(provider_usage),
+            "estimated_context_tokens": estimate,
+        }
+    return costs
+
+
+def _attach_operator_invocation_costs(
+    payload: dict[str, Any], costs: Mapping[str, dict[str, Any]]
+) -> None:
+    for item in payload.get("invocations", ()):
+        if not isinstance(item, dict):
+            continue
+        invocation_id = str(item.get("id", ""))
+        if invocation_id in costs:
+            item["cost"] = costs[invocation_id]
 
 
 def _unavailable_tool_diagnostics(

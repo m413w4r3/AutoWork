@@ -1,4 +1,4 @@
-#import "../UTILS/helpers.typ": section-title, timeline, ioc-list, semantic-text, semantic-or-plain, code-font-families
+#import "../UTILS/helpers.typ": section-title, timeline, ioc-list, semantic-text, semantic-or-plain, code-font-families, noteAnalyste
 #import "../UTILS/colors.typ": accent, grey
 
 #let has-text(value) = value != none and value != ""
@@ -29,11 +29,11 @@
 
 #let render-opinion-text(spans, fallback) = block(width: 100%)[
   #set par(justify: false)
-  #if spans == none [#fallback] else [
+  #if spans == none [#text(fallback)] else [
     #for span in spans [
       #if span.at("technical", default: false) [
         #text(font: code-font-families, size: 8pt, hyphenate: false)[#publication-display-text(span)]
-      ] else [#span.text]
+      ] else [#text(span.text)]
     ]
   ]
 ]
@@ -260,11 +260,53 @@
     none
   }
 
-  let weights = item.at("column_weights", default: item.columns.map(column => 1.0))
-  let widths = weights.map(weight => weight * 1fr)
-  let cell-alignments = item.columns.map(column => left)
   let semantic-columns = item.at("semantic_columns", default: none)
   let semantic-cells = item.at("semantic_cells", default: none)
+  let card-display-cells = item.at("card_display_cells", default: ())
+  if item.columns.len() > 2 {
+    block(above: 6pt)[
+      #if title != none [#title]
+      #for (row-index, row) in item.rows.enumerate() [
+        #block(
+          width: 100%,
+          above: 3pt,
+          below: 4pt,
+          fill: rgb("#F8FAFC"),
+          stroke: 0.4pt + rgb("#D0D5DD"),
+          inset: 6pt,
+          radius: 3pt,
+          breakable: true,
+        )[
+          #set text(hyphenate: false)
+          #set par(justify: false, leading: 1.05em, spacing: 1pt)
+          #box[#text(font: code-font-families, size: 9pt, weight: "bold", hyphenate: false)[
+            #semantic-or-plain(
+              row.first(),
+              if semantic-cells == none { none } else { semantic-cells.at(row-index * item.columns.len()) },
+            )
+          ]]
+          #for (column-index, column) in item.columns.slice(1).enumerate() [
+            #linebreak()
+            #text(size: 8pt, weight: "bold")[#column: ]
+            #let cell-index = row-index * item.columns.len() + column-index + 1
+            #let display-row = if card-display-cells.len() > row-index { card-display-cells.at(row-index) } else { () }
+            #let display-cell = if display-row.len() > column-index + 1 { display-row.at(column-index + 1) } else { none }
+            #if display-cell != none [
+              #text(font: code-font-families, size: 8pt, hyphenate: false)[#publication-display-text(display-cell)]
+            ] else [
+              #semantic-or-plain(
+                row.at(column-index + 1),
+                if semantic-cells == none { none } else { semantic-cells.at(cell-index) },
+              )
+            ]
+          ]
+        ]
+      ]
+    ]
+  } else {
+    let weights = item.at("column_weights", default: item.columns.map(column => 1.0))
+    let widths = weights.map(weight => weight * 1fr)
+    let cell-alignments = item.columns.map(column => left)
   let header-cells = item.columns.enumerate().map(((index, cell)) => [
     #semantic-or-plain(cell, if semantic-columns == none { none } else { semantic-columns.at(index) })
   ])
@@ -280,6 +322,7 @@
     title: title,
     ..(header-cells + body-cells),
   )
+  }
 
   v(4pt)
   if has-text(item.caption) [
@@ -289,47 +332,96 @@
   ]
 }
 
+#let render-opinion-references(references, reference-scope: "") = {
+  for (index, reference) in references.enumerate() [
+    #if index > 0 [ · ]
+    #link(label(reference-scope + reference.target_id))[#reference.label]
+  ]
+}
+
+#let render-source-references(references, reference-scope: "") = {
+  for (index, source-ref) in references.enumerate() [
+    #if index > 0 [, ]
+    #let source-number = source-ref.at("number", default: index + 1)
+    #let target-id = source-ref.at("target_id", default: none)
+    #let source-url = source-ref.at("url", default: none)
+    #if target-id != none [
+      #link(label(reference-scope + target-id))[#str(source-number)]
+    ] else if source-url != none [
+      #link(source-url)[#str(source-number)]
+    ] else [#str(source-number)]
+  ]
+}
+
 #let render-ioc-table(groups, reference-scope: "") = {
-  let header-cells = (
-    [Type],
-    [Valeur défanguée],
-    [Contexte et statut],
-    [Source [n] / preuves],
-  )
   for group in groups {
-    let body-cells = group.rows.map(row => (
-      [#text(size: 7.5pt)[#row.type_label]],
-      [#text(font: code-font-families, size: 7pt)[#semantic-or-plain(row.value, row.value_spans)]],
-      [#text(size: 7pt)[#row.context_summary]],
-      [
-        #for (index, source-ref) in row.at("source_refs", default: ()).enumerate() [
-          #if index > 0 [, ]
-          #let source-number = source-ref.at("number", default: index + 1)
-          #let target-id = source-ref.at("target_id", default: none)
-          #let source-url = source-ref.at("url", default: none)
-          #if target-id != none [
-            #link(label(reference-scope + target-id))[#text(size: 7pt, weight: "bold")[#str(source-number)]]
-          ] else if source-url != none [
-            #link(source-url)[#text(size: 7pt, weight: "bold")[#str(source-number)]]
-          ] else [
-            #text(size: 7pt, weight: "bold")[#str(source-number)]
+    let hash-only = group.rows.len() > 0 and group.rows.all(row => row.type == "hash")
+    let header-cells = if hash-only {
+      ([Empreinte de fichier — une valeur par ligne], [Statut, relation et provenance])
+    } else {
+      ([Type], [Valeur défanguée], [Statut, relation et contexte], [Source [#text[n]]])
+    }
+    let body-cells = if hash-only {
+      group.rows.map(row => (
+        [
+          #box[#text(font: code-font-families, size: 8pt, hyphenate: false)[#row.value]]
+        ],
+        [
+          #text(size: 7.5pt, weight: "bold")[Ind. #row.at("indicator_status_short_label", default: row.at("indicator_status_label", default: "")) · Rel. #row.at("relationship_status_short_label", default: row.at("relationship_status_label", default: row.status_label))]
+          #let context-summary = row.at("hash_context_summary", default: row.at("context_summary", default: ""))
+          #let source-refs = row.at("source_refs", default: ())
+          #if context-summary != "" [
+            #linebreak()
+            #text(size: 6.5pt, fill: grey)[#context-summary]
           ]
-        ]
-        #for reference in row.at("draft_refs", default: ()) [
-          #if reference.at("href", default: none) != none [
-            #if row.source_refs.len() > 0 [, ]
-            #link(reference.href)[#text(size: 6.5pt, fill: grey)[#reference.label]]
+          #if source-refs.len() > 0 [
+            #if context-summary != "" [#text(size: 6.5pt, fill: grey)[ · ]]
+            #text(size: 6.5pt, fill: grey)[src ]
+            #text(size: 6.5pt, fill: grey)[#render-source-references(source-refs, reference-scope: reference-scope)]
           ]
-        ]
-      ],
-    )).flatten()
-    block(sticky: true, above: 5pt, below: 2pt)[
+          #let draft-refs = row.at("draft_refs", default: ())
+          #if draft-refs.len() > 0 [
+            #if context-summary != "" or source-refs.len() > 0 [#text(size: 6.5pt, fill: grey)[ · ]]
+            #render-opinion-references(draft-refs, reference-scope: reference-scope)
+          ]
+        ],
+      )).flatten()
+    } else {
+      group.rows.map(row => (
+        [#text(size: 7pt, weight: "bold")[#row.type_label]],
+        [#text(font: code-font-families, size: 7.5pt, hyphenate: false)[#semantic-or-plain(row.value, row.value_spans)]],
+        [
+          #text(size: 7pt, weight: "bold")[Indicateur : #row.at("indicator_status_label", default: "")]
+          #linebreak()
+          #text(size: 7pt, weight: "bold")[Relation : #row.at("relationship_status_label", default: row.status_label)]
+          #let context-summary = row.at("context_summary", default: "")
+          #if context-summary != "" [
+            #linebreak()
+            #text(size: 6.5pt, fill: grey)[#context-summary]
+          ]
+        ],
+        [
+          #let source-refs = row.at("source_refs", default: ())
+          #if source-refs.len() > 0 [#render-source-references(source-refs, reference-scope: reference-scope)]
+          #let draft-refs = row.at("draft_refs", default: ())
+          #if draft-refs.len() > 0 [
+            #linebreak()
+            #render-opinion-references(draft-refs, reference-scope: reference-scope)
+          ]
+        ],
+      )).flatten()
+    }
+    block(sticky: true, above: 3pt, below: 1pt)[
       #text(size: 9pt, weight: "bold")[#group.heading]
     ]
     publication-styled-table(
-      (0.8, 2.2, 2.5, 0.7).map(weight => weight * 1fr),
-      cell-align: (left, left, left, left),
-      inset: (x: 3pt, y: 2pt),
+      if hash-only {
+        (0.72, 0.28).map(weight => weight * 1fr)
+      } else {
+        (0.7, 1.4, 3.0, 0.9).map(weight => weight * 1fr)
+      },
+      cell-align: if hash-only { (left, left) } else { (left, left, left, left) },
+      inset: (x: 3pt, y: 1pt),
       ..(header-cells + body-cells),
     )
   }
@@ -355,78 +447,57 @@
   ],
 )
 
-#let render-derived-timeline-figure(data) = {
-  [
-    #render-figure-caption(data.figure_number, data.title, none, top-space: 10pt)
-    #text(size: 7pt, fill: grey)[Unité : #data.axis_unit. Dates sans heure ni fuseau.]
-    #for (event-index, event) in data.events.enumerate() [
-      #enum.item[
-        #text(size: 9pt, weight: "bold")[#(event.date + " : ")]
-        #text(hyphenate: false)[#event.text]
+#let render-derived-timeline-figure(data, reference-scope: "") = {
+  let header-cells = ([Date], [Événement et source])
+  let body-cells = data.events.map(event => (
+    [#text(size: 9pt, weight: "bold")[#event.date]],
+    [
+      #text(size: 9pt, hyphenate: false)[#event.text]
+      #let source-refs = event.at("source_refs", default: ())
+      #if source-refs.len() > 0 [
         #linebreak()
-        #text(size: 8pt, fill: grey)[Jour #event.offset_days]
-        #if event.sources.len() > 0 [
-          #linebreak()
-          #text(size: 7.5pt, fill: grey)[Sources : ]
-          #for (source-index, source) in event.sources.enumerate() [
-            #if source-index > 0 [ · ]
-            #link(source.url)[Source #str(source-index + 1)]
-            #linebreak()
-            #text(size: 5.5pt, fill: grey)[Source SHA-256 : #publication-display-text(source.source_sha256_spans)]
-            #linebreak()
-            #text(size: 5.5pt, fill: grey)[Preuve SHA-256 : #publication-display-text(source.evidence_sha256_spans)]
-          ]
-        ]
-      ]
-    ]
-    #text(size: 5.5pt, fill: grey)[Publication V5 SHA-256 : #publication-display-text(data.publication_sha256_spans)]
-    #text(size: 5.5pt, fill: grey)[Identité de figure : #publication-display-text(data.figure_id_spans)]
-  ]
-}
-
-#let render-investigation-chain-figure(data) = {
-  let header-cells = ([Paragraphe cible], [Relation], [Observation et citations])
-  let body-cells = data.rows.map(row => (
-    [
-      #text(size: 6.5pt, weight: "bold")[#row.anchor]
-      #parbreak()
-      #text(size: 6pt, fill: grey)[#row.anchor_text]
-    ],
-    [#text(size: 8pt, fill: accent)[→ #row.relation]],
-    [
-      #text(size: 6pt, fill: grey)[Observation #row.state · #row.observation_id]
-      #parbreak()
-      #row.text
-      #if row.finding_refs.len() > 0 [
-        #parbreak()
-        #text(size: 6pt, fill: grey)[Findings : ]
-        #for (index, reference) in row.finding_refs.enumerate() [
-          #if index > 0 [ · ]
-          #link(reference.href)[#reference.id]
-        ]
-      ]
-      #if row.evidence_refs.len() > 0 [
-        #parbreak()
-        #text(size: 6pt, fill: grey)[Évidences : ]
-        #for (index, reference) in row.evidence_refs.enumerate() [
-          #if index > 0 [ · ]
-          #link(reference.href)[#reference.id]
-        ]
+        #text(size: 7.5pt, fill: grey)[Sources : #render-source-references(source-refs, reference-scope: reference-scope)]
       ]
     ],
   )).flatten()
-
-  [
-    #render-figure-caption(data.figure_number, data.title, none, bottom-space: 6pt)
+  block(breakable: true, above: 2pt)[
+    #render-figure-caption(data.figure_number, data.title, none, top-space: 5pt)
+    #if has-text(data.at("caption", default: none)) [
+      #text(size: 8pt, fill: grey, style: "italic")[#data.caption]
+      #v(4pt)
+    ]
     #publication-styled-table(
-      (1.35, 0.75, 3.4).map(weight => weight * 1fr),
-      cell-align: (left, center, left),
-      title: none,
+      (1.15, 4.85).map(weight => weight * 1fr),
+      cell-align: (left, left),
+      breakable: true,
       ..(header-cells + body-cells),
     )
-    #text(size: 5.5pt, fill: grey)[SHA-256 de l'avis #data.opinion_id, version #data.opinion_version : #publication-display-text(data.opinion_sha256_spans)]
-    #text(size: 5.5pt, fill: grey)[Publication V5 SHA-256 : #publication-display-text(data.base_publication_sha256_spans)]
-    #text(size: 5.5pt, fill: grey)[Identité de figure : #publication-display-text(data.figure_id_spans)]
+  ]
+}
+
+#let render-investigation-chain-figure(data, reference-scope: "") = {
+  block(breakable: true)[
+    #render-figure-caption(data.figure_number, data.title, none, bottom-space: 3pt)
+    #for row in data.rows [
+      #block(
+        width: 100%,
+        above: 3pt,
+        below: 3pt,
+        fill: rgb("#F8FAFC"),
+        stroke: 0.4pt + rgb("#D0D5DD"),
+        inset: 5pt,
+        radius: 3pt,
+        breakable: true,
+      )[
+        #let finding-refs = row.at("finding_refs", default: ())
+        #let evidence-refs = row.at("evidence_refs", default: ())
+        #if finding-refs.len() > 0 or evidence-refs.len() > 0 [
+          #render-opinion-references(finding-refs, reference-scope: reference-scope)
+          #if finding-refs.len() > 0 and evidence-refs.len() > 0 [ · ]
+          #render-opinion-references(evidence-refs, reference-scope: reference-scope)
+        ]
+      ]
+    ]
   ]
 }
 
@@ -446,30 +517,27 @@
   align(center)[#rendered-image]
 })
 
-#let render-infrastructure-graph-figure(data) = {
+#let render-infrastructure-graph-figure(data, reference-scope: "") = {
   let header-cells = ([Relation canonique, sources et preuves],)
   let body-cells = data.edges.map(edge => [
-    #text(size: 5pt, weight: "bold")[#publication-display-text(edge.at("source_value_spans", default: edge.source_value))]
+    #text(size: 8pt, weight: "bold", font: code-font-families, hyphenate: false)[#publication-display-text(edge.at("source_value_spans", default: edge.source_value))]
     #h(0.35em)
-    #text(size: 6pt, fill: accent)[#edge.direction_symbol]
+    #text(size: 8pt, fill: accent)[#edge.direction_symbol]
     #h(0.35em)
-    #text(size: 5pt, weight: "bold")[#publication-display-text(edge.at("target_value_spans", default: edge.target_value))]
+    #text(size: 8pt, weight: "bold", font: code-font-families, hyphenate: false)[#publication-display-text(edge.at("target_value_spans", default: edge.target_value))]
     #linebreak()
-    #text(size: 4.8pt, fill: grey)[#edge.direction_label · #edge.relation · #edge.source_label · #edge.evidence_basis_label · confiance #edge.confidence_label]
+    #text(size: 7pt, fill: grey)[#edge.direction_label · #edge.at("relation_label", default: edge.relation) · #edge.source_label · #edge.evidence_basis_label · confiance #edge.confidence_label]
     #if edge.at("observed_at", default: none) != none [
       #linebreak()
-      #text(size: 4.5pt, fill: grey)[Collecte ou résolution : #edge.observed_at]
+      #text(size: 7pt, fill: grey)[Observé le #edge.observed_at]
     ]
-    #for reference in edge.at("evidence_refs", default: ()) [
+    #let finding-refs = edge.at("finding_refs", default: ())
+    #let evidence-refs = edge.at("evidence_refs", default: ())
+    #if finding-refs.len() > 0 or evidence-refs.len() > 0 [
       #linebreak()
-      #if reference.at("observation_id", default: none) != none [
-        #text(size: 4.5pt, fill: grey)[#reference.source_name · observation #reference.observation_id · SHA-256 #publication-display-text(reference.at("sha256_spans", default: reference.sha256))]
-      ] else [
-        #text(size: 4.5pt, fill: grey)[#reference.source_name · source #reference.source_document_id · SHA-256 #publication-display-text(reference.at("sha256_spans", default: reference.sha256))]
-      ]
-      #if reference.at("source_version", default: none) != none [
-        #text(size: 4.5pt, fill: grey)[ · version #reference.source_version]
-      ]
+      #render-opinion-references(finding-refs, reference-scope: reference-scope)
+      #if finding-refs.len() > 0 and evidence-refs.len() > 0 [ · ]
+      #render-opinion-references(evidence-refs, reference-scope: reference-scope)
     ]
   ])
 
@@ -480,7 +548,7 @@
       #text(size: 7pt, fill: grey)[#data.caption]
       #parbreak()
       #if data.at("media_path", default: none) != none [
-        #render-bounded-svg-image(data.media_path, max-height-fraction: 0.08)
+        #render-bounded-svg-image(data.media_path, max-height-fraction: 0.12)
       ] else [
         #text(size: 6pt, fill: grey)[Aperçu du graphe indisponible ; relations canoniques :]
       ]
@@ -496,15 +564,15 @@
     )
     #v(3pt)
     #block(breakable: false, above: 2pt, below: 3pt)[
-      #text(size: 5.5pt, fill: grey)[Légende : ]
-      #text(size: 5.5pt, fill: rgb("#15803D"))[fait observé · trait plein]
-      #text(size: 5.5pt, fill: grey)[ · ]
-      #text(size: 5.5pt, fill: rgb("#B45309"))[affirmation fournisseur · trait discontinu]
-      #text(size: 5.5pt, fill: grey)[ · ]
-      #text(size: 5.5pt, fill: rgb("#2563EB"))[affirmation article · trait discontinu]
-      #text(size: 5.5pt, fill: grey)[ · ]
-      #text(size: 5.5pt, fill: rgb("#7C3AED"))[inférence · pointillé]
-      #text(size: 5.5pt, fill: grey)[ · les résultats vides et 404 ne forment pas d'arête.]
+      #text(size: 6.5pt, fill: grey)[Légende : ]
+      #text(size: 6.5pt, fill: rgb("#15803D"))[fait observé · trait plein]
+      #text(size: 6.5pt, fill: grey)[ · ]
+      #text(size: 6.5pt, fill: rgb("#B45309"))[affirmation fournisseur · trait discontinu]
+      #text(size: 6.5pt, fill: grey)[ · ]
+      #text(size: 6.5pt, fill: rgb("#2563EB"))[affirmation article · trait discontinu]
+      #text(size: 6.5pt, fill: grey)[ · ]
+      #text(size: 6.5pt, fill: rgb("#7C3AED"))[inférence · pointillé]
+      #text(size: 6.5pt, fill: grey)[ · les résultats vides et 404 ne forment pas d'arête.]
       #if data.omitted_count > 0 [
         #linebreak()
         #text(size: 6pt, weight: "bold")[#data.omitted_count autres omis selon le plafond déterministe.]
@@ -512,13 +580,6 @@
       #if data.omitted_edge_count > 0 [
         #linebreak()
         #text(size: 6pt, weight: "bold")[#data.omitted_edge_count relations supplémentaires omises.]
-      ]
-    ]
-    #block(above: 2pt)[
-      #text(size: 3.5pt, fill: grey)[
-        Graphe SHA-256 : #publication-display-text(data.graph_sha256_spans) ·
-        Pub V5 : #publication-display-text(data.publication_sha256_spans) ·
-        Identité de figure : #publication-display-text(data.figure_id_spans)
       ]
     ]
   ]
@@ -554,8 +615,18 @@
 })
 
 #let render-diagram(item) = {
-  let caption = if has-text(item.caption) { item.caption } else { item.title }
-  let semantic-caption = if has-text(item.caption) {
+  let legacy-renderer = item.at("legacy_renderer", default: false)
+  if not legacy-renderer {
+  let caption = if legacy-renderer {
+    "Rendu hérité"
+  } else if has-text(item.caption) {
+    item.caption
+  } else {
+    item.title
+  }
+  let semantic-caption = if legacy-renderer {
+    none
+  } else if has-text(item.caption) {
     item.at("semantic_caption", default: none)
   } else {
     item.at("semantic_title", default: none)
@@ -563,7 +634,7 @@
   let title = item.at("title", default: none)
   let status-label = item.at("status_label", default: none)
   let caption-content = [
-    #if has-text(status-label) and has-text(title) [
+    #if has-text(title) and (has-text(status-label) or item.at("show_title", default: false)) [
       #block(above: 2pt, below: 2pt)[
         #text(size: 9pt, weight: "bold")[#title]
       ]
@@ -586,6 +657,7 @@
     render-publication-image(item.media_path, caption-content, max-height-fraction: 0.52)
   } else {
     render-publication-image(item.media_path, caption-content, max-height-fraction: 0.35)
+  }
   }
 }
 
@@ -612,17 +684,6 @@
     #if has-text(attribution) [
       #render-figure-annotation[Attribution : #attribution]
     ]
-    #let sha256 = item.at("sha256", default: none)
-    #let sha256-spans = item.at("sha256_spans", default: none)
-    #if sha256 != none and has-text(sha256) [
-      #render-figure-annotation[
-        SHA-256 archivé : #if sha256-spans == none [#sha256] else [#publication-display-text(sha256-spans)]
-      ]
-    ]
-    #let byte-size = item.at("byte_size", default: none)
-    #if byte-size != none [
-      #render-figure-annotation[Taille : #byte-size octets]
-    ]
   ]
   render-publication-image(
     item.media_path,
@@ -647,86 +708,39 @@
   render-publication-image(item.media_path, caption-content, max-height-fraction: 0.55)
 }
 
-#let render-analyst-observation(item, unanchored: false) = block(
-  width: 100%,
-  fill: rgb("#eeeeee"),
-  inset: 8pt,
-  radius: 4pt,
-  breakable: true,
-)[
-  #text(size: 11pt, weight: "extrabold", fill: rgb("#394b4b"))[
-    #if unanchored [Avis de l'analyste — passage non ancré] else [Note de l'analyste]
-  ]
-  #parbreak()
+#let render-analyst-observation(item, reference-scope: "") = noteAnalyste[
   #render-opinion-text(item.at("text_spans", default: none), item.text)
-  #parbreak()
-  #text(size: 8pt, fill: grey)[État : #item.state_label · relation : #item.relation_label]
-  #if not unanchored [
-    #parbreak()
-    #text(size: 8pt, fill: grey)[Passage annoté : #item.anchor]
-    #parbreak()
-    #text(size: 7pt, fill: grey)[SHA-256 du passage : #publication-display-text(item.anchor_text_sha256)]
-  ]
-  #if item.finding_refs.len() > 0 [
-    #parbreak()
-    #text(size: 6.5pt, fill: grey)[Constats : ]
-    #for (index, reference) in item.finding_refs.enumerate() [
-      #if index > 0 [ · ]
-      #link(reference.href)[#text(size: 6.5pt, fill: grey)[#reference.label]]
-    ]
-  ]
-  #if item.evidence_refs.len() > 0 [
-    #parbreak()
-    #text(size: 6.5pt, fill: grey)[Évidences : ]
-    #for (index, reference) in item.evidence_refs.enumerate() [
-      #if index > 0 [ · ]
-      #link(reference.href)[#text(size: 6.5pt, fill: grey)[#reference.label]]
-    ]
+  #let finding-refs = item.at("finding_refs", default: ())
+  #let evidence-refs = item.at("evidence_refs", default: ())
+  #if finding-refs.len() > 0 or evidence-refs.len() > 0 [
+    #v(3pt)
+    #text(size: 7pt, fill: grey)[Références : ]
+    #render-opinion-references(finding-refs, reference-scope: reference-scope)
+    #if finding-refs.len() > 0 and evidence-refs.len() > 0 [ · ]
+    #render-opinion-references(evidence-refs, reference-scope: reference-scope)
   ]
 ]
 
 #let render-ioc-item(item, reference-scope: "") = {
   list.item[
     #text(font: code-font-families, size: 8.5pt, hyphenate: false)[#publication-display-text(item.value)]
-    #block(above: 1pt, below: 2pt)[
-      #let source-refs = item.at("source_refs", default: ())
-      #if source-refs.len() > 0 [
-        #text(size: 7pt, fill: grey)[Source : ]
-        #for (index, source-ref) in source-refs.enumerate() [
-          #if index > 0 [, ]
-        #let source-number = source-ref.at("number", default: index + 1)
-        #let target-id = source-ref.at("target_id", default: none)
-        #let source-url = source-ref.at("url", default: none)
-        #if target-id != none [
-          #link(label(reference-scope + target-id))[#text(size: 8pt, fill: grey)[#str(source-number)]]
-        ] else if source-url != none [
-          #link(source-url)[#text(size: 8pt, fill: grey)[#str(source-number)]]
-        ] else [
-          #text(size: 8pt, fill: grey)[#str(source-number)]
-        ]
-        ]
-      ]
-      #if item.at("context", default: "") != "" [
-        #text(size: 7pt, fill: grey)[#item.context · ]
-      ]
-      #text(size: 7pt, fill: grey)[#item.qualification]
-      #if item.at("draft_refs", default: ()).len() > 0 [
-        #linebreak()
-        #text(size: 6pt, fill: grey)[Preuves : ]
-        #for (index, reference) in item.draft_refs.enumerate() [
-          #if index > 0 [ · ]
-          #link(reference.href)[#text(size: 6pt, fill: grey)[#reference.label]]
-        ]
+    #let indicator-status = item.at("indicator_status_label", default: none)
+    #let relationship-status = item.at("relationship_status_label", default: none)
+    #if has-text(indicator-status) or has-text(relationship-status) [
+      #linebreak()
+      #text(size: 7pt, fill: grey)[
+        #if has-text(indicator-status) [Indicateur : #text(indicator-status)]
+        #if has-text(indicator-status) and has-text(relationship-status) [ · ]
+        #if has-text(relationship-status) [Relation : #text(relationship-status)]
       ]
     ]
-    #for evidence in item.evidence [
-      #block(above: 0pt, below: 1pt)[
-        #text(size: 7pt, fill: grey)[
-          #if evidence.at("source_number", default: none) != none [Source #evidence.source_number · ]
-          #if evidence.at("context", default: "") != "" [#evidence.context · ]
-          « #evidence.quote »
-        ]
-      ]
+    #let source-refs = item.at("source_refs", default: ())
+    #let opinion-refs = item.at("draft_refs", default: ())
+    #if source-refs.len() > 0 or opinion-refs.len() > 0 [
+      #text(size: 7pt, fill: grey)[ · ]
+      #render-source-references(source-refs, reference-scope: reference-scope)
+      #if source-refs.len() > 0 and opinion-refs.len() > 0 [ · ]
+      #render-opinion-references(opinion-refs, reference-scope: reference-scope)
     ]
   ]
 }
@@ -785,7 +799,7 @@
   }
 }
 
-#let render-body-block(item) = {
+#let render-body-block(item, reference-scope: "") = {
   let body = if item.type == "section_heading" {
     block(sticky: true, above: 7pt, below: 5pt)[
       #heading(level: 3)[#item.text]
@@ -799,7 +813,7 @@
       #parbreak()
     ]
   } else if item.type == "analyst_observation" {
-    render-analyst-observation(item)
+    render-analyst-observation(item, reference-scope: reference-scope)
   } else if item.type == "table" {
     render-table(item)
   } else if item.type == "diagram" {
@@ -845,13 +859,13 @@
           #for (index, entry) in entries.enumerate() [#render-publication-reference(entry, index + 1, reference-scope: reference-scope)]
         ]
         #for item in blocks {
-          render-body-block(item)
+          render-body-block(item, reference-scope: reference-scope)
         }
       ]
     } else if content_section.type == "synthesis" [
       #section-title[SYNTHÈSE]
       #for item in content_section.at("blocks", default: ()) {
-        render-body-block(item)
+        render-body-block(item, reference-scope: reference-scope)
       }
     ] else if content_section.type == "chronology" [
       #section-title[CHRONOLOGIE]
@@ -863,7 +877,7 @@
         )
       ]
       #if content_section.at("derived_timeline_figure", default: none) != none [
-        #render-derived-timeline-figure(content_section.derived_timeline_figure)
+        #render-derived-timeline-figure(content_section.derived_timeline_figure, reference-scope: reference-scope)
       ]
     ] else if content_section.type == "limitations" [
       #section-title[LIMITES DES PREUVES]
@@ -880,75 +894,89 @@
         #parbreak()
       ]
     ] else if content_section.type == "analyst_opinion" [
-      #section-title[AVIS DE L'ANALYSTE]
       #let opinion-blocks = content_section.at("blocks", default: ())
-      #if (
-        opinion-blocks.len() == 0
-        and not content_section.at("has_anchored_observations", default: false)
-        and content_section.at("unanchored_observations", default: ()).len() == 0
-      ) [
-        #text(size: 9pt, fill: grey, style: "italic")[#content_section.at("empty_message", default: "Aucun avis publié.")]
-      ]
+      #let unanchored-observations = content_section.at("unanchored_observations", default: ())
+      #let unresolved-points = content_section.at("unresolved_points", default: ())
+      #let protocol-figures = content_section.at("protocol_figures", default: ())
+      #let has-opinion-content = (
+        opinion-blocks.len() > 0
+        or content_section.at("has_anchored_observations", default: false)
+        or unanchored-observations.len() > 0
+        or unresolved-points.len() > 0
+        or protocol-figures.len() > 0
+        or content_section.at("investigation_chain_figure", default: none) != none
+        or content_section.at("infrastructure_graph_figure", default: none) != none
+      )
+      #if has-opinion-content [
+      #section-title[AVIS DE L'ANALYSTE]
       #for item in opinion-blocks [
-        #heading(level: 3)[#item.number #item.heading]
-        #text(size: 8pt, weight: "bold")[#item.qualification_label]
+        #heading(level: 3)[#item.number #text(item.heading)]
+        #text(size: 8pt, weight: "bold")[#text(item.qualification_label)]
         #h(1em)
         #text(size: 8pt)[Confiance : #item.certainty_percent%]
         #parbreak()
-        #item.text
+        #text(item.text)
         #parbreak()
-        #if item.finding_refs.len() > 0 [
-          #text(size: 6.5pt, fill: grey)[Findings : ]
-          #for (index, reference) in item.finding_refs.enumerate() [
-            #if index > 0 [ · ]
-            #link(reference.href)[#text(size: 6.5pt, fill: grey)[#reference.label]]
-          ]
-          #parbreak()
-        ]
-        #if item.evidence_refs.len() > 0 [
-          #text(size: 6.5pt, fill: grey)[Évidences : ]
-          #for (index, reference) in item.evidence_refs.enumerate() [
-            #if index > 0 [ · ]
-            #link(reference.href)[#text(size: 6.5pt, fill: grey)[#reference.label]]
-          ]
+        #if item.finding_refs.len() > 0 or item.evidence_refs.len() > 0 [
+          #text(size: 7pt, fill: grey)[Références : ]
+          #render-opinion-references(item.finding_refs, reference-scope: reference-scope)
+          #if item.finding_refs.len() > 0 and item.evidence_refs.len() > 0 [ · ]
+          #render-opinion-references(item.evidence_refs, reference-scope: reference-scope)
           #parbreak()
         ]
       ]
-      #for figure in content_section.at("protocol_figures", default: ()) [
+      #for figure in protocol-figures [
         #v(8pt)
         #render-diagram(figure)
-        #if figure.at("renderer_warning", default: none) != none [
-          #block(
-            width: 100%,
-            fill: rgb("#fff8e8"),
-            stroke: 0.5pt + rgb("#d6a84f"),
-            inset: 5pt,
-            radius: 2pt,
-          )[
-            #set par(justify: false, leading: 1em, spacing: 0pt)
-            #text(size: 7.5pt)[#figure.renderer_warning]
-          ]
-        ]
       ]
       #if content_section.at("investigation_chain_figure", default: none) != none [
         #v(8pt)
-        #render-investigation-chain-figure(content_section.investigation_chain_figure)
+        #render-investigation-chain-figure(content_section.investigation_chain_figure, reference-scope: reference-scope)
       ]
       #if content_section.at("infrastructure_graph_figure", default: none) != none [
         #v(8pt)
-        #render-infrastructure-graph-figure(content_section.infrastructure_graph_figure)
+        #render-infrastructure-graph-figure(content_section.infrastructure_graph_figure, reference-scope: reference-scope)
       ]
-      #let unresolved-points = content_section.at("unresolved_points", default: ())
       #if unresolved-points.len() > 0 [
         #heading(level: 3)[Points non résolus]
         #for point in unresolved-points [
           #list.item[#point]
         ]
       ]
-      #for item in content_section.at("unanchored_observations", default: ()) [
+      #for item in unanchored-observations [
         #v(6pt)
-        #render-analyst-observation(item, unanchored: true)
+        #render-analyst-observation(item, reference-scope: reference-scope)
       ]
+      ]
+    ] else if content_section.type == "technical_materials" [
+      #v(12pt)
+      #section-title[#text(content_section.heading)]
+      #text(size: 8pt, weight: "bold")[#text(content_section.tlp_label)]
+      #text(size: 8pt)[ · Valeurs reproduites en clair telles qu’observées dans l’échantillon.]
+      #if content_section.editorial_text != none [
+        #v(5pt)
+        #text(size: 8pt)[#text(content_section.editorial_text)]
+      ]
+      #v(5pt)
+      #for item in content_section.items [
+        #block(breakable: false, width: 100%, above: 3pt, below: 6pt)[
+          #text(size: 8pt, weight: "bold")[#text(item.type_label)]
+          #text(size: 8pt)[ · Rôle : #text(item.role)]
+          #linebreak()
+          #text(size: 7pt)[Valeur : ]
+          #box[#text(font: code-font-families, size: 7pt, hyphenate: false)[#text(item.value)]]
+          #linebreak()
+          #text(size: 7pt)[Emplacement dans l’échantillon : ]
+          #text(font: code-font-families, size: 7pt, hyphenate: false)[#text(item.sample_location)]
+          #linebreak()
+          #text(size: 7pt)[SHA-256 de l’échantillon : ]
+          #text(font: code-font-families, size: 7pt, hyphenate: false)[#text(item.sample_sha256)]
+          #linebreak()
+          #text(size: 7pt)[Observation de preuve : ]
+          #link(label(reference-scope + item.evidence_ref.target_id))[#text(item.evidence_ref.label)]
+        ]
+      ]
+      #text(size: 7pt, fill: grey)[#text(content_section.attacker_identifier_note)]
     ] else if content_section.type == "detection" [
       #section-title[DÉTECTION]
       #block(
@@ -966,10 +994,6 @@
       ]
       #parbreak()
       #text(size: 8pt, weight: "bold")[Règle YARA candidate · #content_section.version]
-      #parbreak()
-      #text(size: 6.5pt, fill: grey)[ID candidat : #content_section.candidate_id · version : #content_section.version_id]
-      #parbreak()
-      #text(size: 6.5pt, fill: grey)[SHA-256 source : #publication-display-text(content_section.source_sha256)]
       #parbreak()
       #text(size: 7pt)[Tests : #content_section.positive_real_count positifs réels · #content_section.positive_synthetic_count positifs synthétiques · #content_section.goodware_tested_count fichiers bénins testés · #content_section.false_positive_count faux positifs]
       #parbreak()
@@ -992,19 +1016,11 @@
         #text(size: 7pt, fill: grey)[Limite : #limitation]
         #parbreak()
       ]
-      #let test_report_observation_id = content_section.at(
-        "test_report_observation_id",
-        default: none,
-      )
       #if content_section.retrohunt_submitted == false [
         #text(size: 7pt)[Aucun Retrohunt soumis.]
         #parbreak()
       ] else if content_section.retrohunt_submitted == true [
         #text(size: 7pt)[Retrohunt soumis.]
-        #parbreak()
-      ]
-      #if test_report_observation_id != none [
-        #text(size: 5.5pt, fill: grey)[Rapport canonique #test_report_observation_id · SHA-256 #publication-display-text(content_section.at("test_report_sha256", default: ""))]
         #parbreak()
       ]
       #heading(level: 3)[Code source]
@@ -1025,7 +1041,7 @@
     ] else if content_section.type == "ioc" [
       #v(16pt)
       #render-ioc-section(
-        "IOC",
+        "IOC de l'article",
         none,
         content_section.source_indicators,
         reference-scope: reference-scope,
@@ -1042,8 +1058,8 @@
       #if content_section.candidate_indicators.len() > 0 [
         #v(8pt)
         #render-ioc-section(
-          "Pistes / IOC candidats non confirmés",
-          "Ces éléments restent séparés des IOC retenus et des originaux dont l'association est étayée.",
+          "Pistes non confirmées",
+          "Éléments à examiner, sans promotion au statut d'IOC confirmé.",
           content_section.candidate_indicators,
           reference-scope: reference-scope,
         )
@@ -1056,6 +1072,12 @@
       #let ioc_row_groups = content_section.at("ioc_row_groups", default: ())
       #let legacy_indicators = content_section.at("indicators", default: none)
       #let legacy_original_indicators = content_section.at("original_indicators", default: none)
+      #let identity-provenance = content_section.at("publication_identity_provenance", default: none)
+      #if has-text(identity-provenance) [
+        #section-title[PROVENANCE DE PUBLICATION]
+        #text(size: 7.5pt, fill: grey)[Identité de base : #identity-provenance]
+        #v(5pt)
+      ]
       #if ioc_rows.len() > 0 [
         #v(16pt)
         #section-title[ANNEXE TECHNIQUE — inventaire exhaustif des IOC]
@@ -1071,6 +1093,29 @@
           hashes: legacy_indicators.at("hashes", default: ()),
         )
       ]
+      #let implant_identifier_rows = content_section.at("implant_identifier_rows", default: ())
+      #if implant_identifier_rows.len() > 0 [
+        #v(10pt)
+        #section-title[IDENTIFIANT C2 DE L’IMPLANT — IOC]
+        #text(size: 7pt, fill: grey)[Valeur observée dans l’échantillon; identifiant passif, sans authentification.]
+        #for item in implant_identifier_rows [
+          #block(breakable: false, width: 100%, above: 3pt, below: 5pt)[
+            #text(size: 8pt, weight: "bold")[#text(item.type_label)]
+            #text(size: 8pt)[ · Rôle : #text(item.role)]
+            #linebreak()
+            #text(size: 7pt)[Valeur : ]
+            #box[#text(font: code-font-families, size: 7pt, hyphenate: false)[#text(item.value)]]
+            #linebreak()
+            #text(size: 7pt)[Échantillon : ]
+            #text(font: code-font-families, size: 7pt, hyphenate: false)[#text(item.sample_sha256)]
+            #text(size: 7pt)[ · Emplacement : ]
+            #text(font: code-font-families, size: 7pt, hyphenate: false)[#text(item.sample_location)]
+            #linebreak()
+            #text(size: 7pt)[Preuve : ]
+            #link(label(reference-scope + item.evidence_ref.target_id))[#text(item.evidence_ref.label)]
+          ]
+        ]
+      ]
       #if ioc_rows.len() == 0 and legacy_indicators != none and legacy_original_indicators != none [
         #v(8pt)
         #ioc-list(
@@ -1084,39 +1129,51 @@
         )
       ]
       #let opinion_refs = content_section.at("opinion_refs", default: ())
-      #let protocol_details = content_section.at("protocol_figure_details", default: ())
-      #if opinion_refs.len() > 0 or protocol_details.len() > 0 [
+      #if opinion_refs.len() > 0 [
         #v(10pt)
-        #section-title[ANNEXE — provenance de l'avis et des figures]
-        #for item in opinion_refs [
-          #block(above: 1pt, below: 1pt)[
-            #text(size: 6.5pt, fill: grey)[#item.context · #item.kind_label ]
-            #link(item.href)[
-              #text(font: code-font-families, size: 6.5pt, hyphenate: false)[
-                #publication-display-text(item.reference_id_spans)
-              ]
-            ]
+        #section-title[ANNEXE DE TRAÇABILITÉ]
+        #text(size: 8pt, fill: grey)[Les renvois courts du corps désignent les identifiants canoniques suivants.]
+        #let finding-refs = opinion_refs.filter(item => item.kind_label == "Finding")
+        #let evidence-refs = opinion_refs.filter(item => item.kind_label == "Évidence")
+        #for (group-title, refs) in (("Findings", finding-refs), ("Évidences", evidence-refs)) [
+          #if refs.len() > 0 [
+            #v(4pt)
+            #text(size: 8pt, weight: "bold")[#group-title]
+            #grid(
+              columns: (1fr, 1fr),
+              column-gutter: 8pt,
+              row-gutter: 2pt,
+              ..refs.map(item => [
+                #block(breakable: false)[
+                  #text(size: 7.5pt, weight: "bold")[#item.label #label(reference-scope + item.target_id)]
+                  #h(0.35em)
+                  #link(item.href)[
+                    #text(font: code-font-families, size: 7.5pt, hyphenate: false)[
+                      #publication-display-text(item.reference_id_spans)
+                    ]
+                  ]
+                ]
+              ]),
+            )
           ]
         ]
-        #for figure in protocol_details [
-          #heading(level: 3)[#figure.title — détails de provenance]
-          #render-opinion-text(figure.caption_spans, figure.caption)
-          #for metadata-line in figure.metadata_lines [
-            #block(above: 1pt, below: 1pt)[
-              #text(font: code-font-families, size: 5.5pt, hyphenate: false)[
-                #publication-display-text(metadata-line)
+      ]
+      #let figure-provenance = content_section.at("protocol_figure_provenance", default: ())
+      #if figure-provenance.len() > 0 [
+        #v(10pt)
+        #section-title[PROVENANCE DES FIGURES D'AVIS]
+        #for figure in figure-provenance [
+          #block(above: 3pt, below: 5pt, breakable: true)[
+            #text(size: 8pt, weight: "bold")[#figure.kind_label]
+            #linebreak()
+            #text(size: 7pt)[Identifiant d'actif : ]
+            #text(font: code-font-families, size: 7pt, hyphenate: false)[#figure.asset_id]
+            #for field in ("model_sha256", "spec_sha256", "asset_sha256", "preview_sha256", "pin_sha256") [
+              #if figure.at(field, default: none) != none [
+                #linebreak()
+                #text(size: 7pt)[#field : ]
+                #text(font: code-font-families, size: 6.5pt, hyphenate: false)[#figure.at(field)]
               ]
-            ]
-          ]
-          #block(
-            width: 100%,
-            fill: rgb("#f5f6f8"),
-            inset: 4pt,
-            radius: 2pt,
-          )[
-            #set par(justify: false, leading: 0.9em, spacing: 0pt)
-            #text(font: code-font-families, size: 5pt, hyphenate: false)[
-              #publication-display-text(figure.field_evidence_json)
             ]
           ]
         ]
@@ -1128,9 +1185,22 @@
 }
 
 #let render-publication(publication) = {
-  render-target(
-    publication.at("article_title_target_id", default: none),
-    heading(level: 1)[#publication.title],
-  )
-  render-publication-body(publication)
+  let document-label = publication.at("document_label", default: none)
+  if not has-text(document-label) {
+    panic("publication render-data requires document_label")
+  }
+  [
+    #render-target(
+      publication.at("article_title_target_id", default: none),
+      heading(level: 1)[#publication.title],
+    )
+    #block(above: 2pt, below: 8pt)[
+      #text(size: 8pt, weight: "bold", fill: grey)[#publication.at("document_header", default: "Publication")]
+    ]
+    #render-publication-body(publication)
+    #pagebreak()
+    #section-title[PROVENANCE DE PUBLICATION]
+    #v(5pt)
+    #text(size: 7.5pt, fill: grey)[Identité complète : #document-label]
+  ]
 }

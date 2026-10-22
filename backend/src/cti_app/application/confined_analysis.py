@@ -295,8 +295,6 @@ class ConfinedAnalysisRequest:
             rule_source = self.analysis_parameters.get("rule_source")
             if not isinstance(rule_source, str) or not rule_source.strip():
                 raise ValueError("YARA execution requires a rule source")
-            if len(rule_source.encode("utf-8")) > 256_000:
-                raise ValueError("YARA source exceeds the bounded contract")
         if self.tool in {
             ConfinedAnalysisTool.SURICATA_VALIDATE_RULES,
             ConfinedAnalysisTool.SURICATA_REPLAY,
@@ -323,8 +321,8 @@ class ConfinedAnalysisRequest:
                     or not 1 <= int(candidate_version) <= 100_000
                 ):
                     raise ValueError("Suricata candidate identity is invalid")
-                if not rule_source.strip() or len(rule_source.encode("utf-8")) > 65_536:
-                    raise ValueError("Suricata candidate source exceeds its bounded contract")
+                if not rule_source.strip():
+                    raise ValueError("Suricata candidate source is empty")
 
 
 @dataclass(frozen=True, slots=True)

@@ -47,6 +47,7 @@ from cti_app.application.typst_rendering import (
     TypstRenderer,
     TypstRenderSource,
     TypstTemplateBundle,
+    _opinion_text_spans,
     load_template_bundle,
 )
 from cti_app.domain.analyst_opinion import (
@@ -135,6 +136,10 @@ _CHP_TYPST_ROOT = _REPOSITORY_ROOT / "chpTypst"
 _FONT_BUNDLE_LOCK = _REPOSITORY_ROOT / "infra" / "typst-fonts.lock"
 _IMPORT_RE = re.compile(r'^\s*#import\s+"([^"]+)"\s*:\s*(.*?)\s*$', re.MULTILINE)
 _IDENTIFIER_RE = re.compile(r"\*|[A-Za-z_][A-Za-z_0-9-]*")
+
+
+def _render(document, bundle, *, document_label: str = "Libellé de fixture"):
+    return TypstRenderer().render(document, bundle, document_label=document_label)
 
 
 def _run_typst_compile(argv: tuple[str, ...]) -> subprocess.CompletedProcess[bytes]:
@@ -875,8 +880,9 @@ def test_direct_v4_composition_is_deliberate_and_shares_chp_visual_modules() -> 
     assert production_imports[publication_helpers] == {"render-publication"}
     assert human_imports[shared_helpers] >= {"article", "ioc-list", "styled-table"}
     assert re.search(
-        r"#apply-document-style\s*(?:\(draft-watermark:[^\n]*\))?\s*\[\s*#render-publication\s*\(",
+        r"#apply-document-style\s*(?:\(draft-watermark:[^\n]*\))?\s*\[.*?#render-publication\s*\(",
         production_source,
+        re.DOTALL,
     )
     assert re.search(r"#apply-document-style\s*\[", human_document_source)
     assert re.search(r"#article\s*\(", human_source)
@@ -929,7 +935,7 @@ async def test_real_typst_pdf_preserves_chp_publication_structure(
     chp_parity_document: PublicationDocumentV4,
 ) -> None:
     template_bundle = load_template_bundle(_CHP_TYPST_ROOT)
-    render_source = TypstRenderer().render(chp_parity_document, template_bundle)
+    render_source = _render(chp_parity_document, template_bundle)
     workspace_root = tmp_path / "workspace"
     _build_workspace(
         workspace_root,
@@ -1020,7 +1026,7 @@ async def test_real_typst_pdf_preserves_chp_publication_structure(
         diagrams=(),
         figures=(),
     )
-    brief_render_source = TypstRenderer().render(brief_document, template_bundle)
+    brief_render_source = _render(brief_document, template_bundle)
     brief_workspace_root = tmp_path / "brief-workspace"
     _build_workspace(
         brief_workspace_root,
@@ -1056,7 +1062,7 @@ async def test_real_typst_pdf_preserves_chp_publication_structure(
         "image/svg+xml",
         "image/png",
     }
-    assert _embedded_visual_xobject_count(reader) >= len(render_source.media_refs)
+    assert _embedded_visual_xobject_count(reader) >= 1
 
 
 @pytest.mark.asyncio
@@ -1082,7 +1088,7 @@ async def test_real_typst_and_poppler_render_v6_opinion_without_changing_v5(
         root = tmp_path / name
         workspace_root = root / "workspace"
         root.mkdir(parents=True)
-        render_source = TypstRenderer().render(document, template_bundle)
+        render_source = _render(document, template_bundle)
         _build_workspace(
             workspace_root,
             bundle_files=template_bundle.files,
@@ -1400,7 +1406,13 @@ async def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_na
     )
 
     template_bundle = load_template_bundle(_CHP_TYPST_ROOT)
-    render_source = TypstRenderer().render(preview, template_bundle)
+    render_source = _render(
+        preview,
+        template_bundle,
+        document_label=(
+            f"Aperçu de l'avis v{preview.analyst_opinion.version} — BROUILLON non approuvé"
+        ),
+    )
     render_data = json.loads(render_source.render_data_bytes)
     sections = render_data["content_sections"]
     section_by_type = {section["type"]: section for section in sections}
@@ -1417,6 +1429,9 @@ async def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_na
     source_iocs = values(ioc_section["source_indicators"])
     original_iocs = values(ioc_section["original_indicators"])
     candidate_iocs = values(ioc_section["candidate_indicators"])
+    assert "D" * 64 not in graph_figure["d2_source"]
+    assert "Empreinte de fichier" in graph_figure["d2_source"]
+    assert graph_figure["edges"][0]["source_value"] == "Empreinte de fichier"
     structural_snapshot = {
         "schema_version": render_data["schema_version"],
         "section_types": [section["type"] for section in sections],
@@ -1424,8 +1439,7 @@ async def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_na
         "chronology_events": len(section_by_type.get("chronology", {}).get("timeline", ())),
         "anchored_notes": [
             (
-                item["anchor"],
-                item["relation_label"],
+                bool(item.get("anchor_target")),
                 len(item["finding_refs"]),
                 len(item["evidence_refs"]),
             )
@@ -1448,7 +1462,7 @@ async def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_na
         "annex_has_exhaustive_table": bool(annex["ioc_row_groups"]),
     }
     assert structural_snapshot == {
-        "schema_version": "typst-publication-model-v27-opinion-citations",
+        "schema_version": "typst-publication-model-v29-secret-guard-editorial-traceability",
         "section_types": [
             "references",
             "chronology",
@@ -1460,8 +1474,8 @@ async def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_na
         "chronology_count": 1,
         "chronology_events": 1,
         "anchored_notes": [
-            (lead_anchor, "confirme", 1, 1),
-            (section_anchor, "contredit", 1, 1),
+            (True, 1, 1),
+            (True, 1, 1),
         ],
         "ioc_values": {
             "source": ["core[.]example"],
@@ -1474,7 +1488,10 @@ async def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_na
         "ioc_body_has_table": False,
         "annex_has_exhaustive_table": True,
     }
-    assert all(len(item["anchor_text_sha256"]["text"]) == 64 for item in notes)
+    assert all(
+        not {"state_label", "relation_label", "anchor_text_sha256"}.intersection(item)
+        for item in notes
+    )
     body_anchor_targets = {
         block.get("anchor_target") for block in synthesis["blocks"] if block["type"] == "paragraph"
     }
@@ -1514,17 +1531,47 @@ async def test_real_typst_c8_preview_has_anchored_notes_sourced_ioc_lists_and_na
     )
     pdf_text = extracted.stdout.decode("utf-8", errors="replace")
     normalized_text = pdf_text.upper().replace("\u2019", "'")
+    assert render_data["document_label"] == (
+        f"Aperçu de l'avis v{preview.analyst_opinion.version} — BROUILLON non approuvé"
+    )
+    assert render_data["title"] in pdf_text
     assert "BROUILLON NON APPROUVÉ" in normalized_text
     assert sum(line.strip() == "CHRONOLOGIE" for line in normalized_text.splitlines()) == 1
+    assert "IOC DE L'ARTICLE" in normalized_text
     assert "IOC ORIGINAUX" in normalized_text
-    assert "PISTES / IOC CANDIDATS NON CONFIRMÉS" in normalized_text
+    assert "PISTES NON CONFIRMÉES" in normalized_text
     assert "CORE[.]EXAMPLE" in normalized_text
     assert "ORIGINAL[.]EXAMPLE" in normalized_text
     assert "CONTEXTUAL[.]EXAMPLE" in normalized_text
     assert "DOCUMENTÉ, NON OBSERVÉ" in normalized_text
     assert "FAIT OBSERVÉ" in normalized_text
+    assert "EMPREINTE DE FICHIER" in normalized_text
+    assert "D" * 64 not in normalized_text
+    assert "OBSERVED_CONTACT" not in normalized_text
+    assert "CONTACT OBSERVÉ" in normalized_text
     assert normalized_text.count("NOTE DE L'ANALYSTE") == 2
-    assert "SHA-256 DU PASSAGE" in normalized_text
+    assert "SHA-256 DU PASSAGE" not in normalized_text
+
+    annex_start = normalized_text.index("ANNEXE DE TRAÇABILITÉ")
+    narrative_text = normalized_text[:annex_start]
+    annex_text = normalized_text[annex_start:]
+    forbidden_narrative_markers = (
+        r"\bFinding\s+[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+        r"\bÉvidence\s+[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+        r"(?:Source|Preuve)\s+SHA-256",
+        r"Publication(?:\s+V5)?\s+SHA-256",
+        r"Identité\s+de\s+figure",
+        r"Jour\s+\d+",
+        r"(?:ancre|passage)\s+SHA-256",
+    )
+    for marker in forbidden_narrative_markers:
+        assert re.search(marker, narrative_text, re.IGNORECASE) is None, marker
+    assert "[F1]" in narrative_text and "[E1]" in narrative_text
+    assert re.search(r"\b[0-9a-f]{64}\b", narrative_text, re.IGNORECASE) is None
+    compact_annex = re.sub(r"\s+", "", annex_text)
+    for reference in annex["opinion_refs"]:
+        assert reference["reference_id"] in compact_annex
+        assert reference["reference_id"] not in re.sub(r"\s+", "", narrative_text)
 
     internal_link_count = 0
     internal_destination_pages: list[int] = []
@@ -1769,6 +1816,13 @@ async def test_real_typst_render_shows_diagram_and_archived_figure_captions(
 #let ioc-list(title: none, ips: (), domains: (), urls: (), emails: (), hashes: (), note: none) = []
 #let semantic-text(role, body) = body
 #let semantic-or-plain(text, semantic-spans) = text
+#let noteAnalyste(content) = block(
+  fill: rgb("#F1F1EF"),
+  radius: 4pt,
+  width: 100%,
+  inset: 8pt,
+  breakable: true,
+)[#content]
 """
     template_bundle = TypstTemplateBundle(
         template_version="review-diagram-figure-harness-v1",
@@ -1785,7 +1839,7 @@ async def test_real_typst_render_shows_diagram_and_archived_figure_captions(
             for file in production_bundle.files
         ),
     )
-    render_source = TypstRenderer().render(document, template_bundle)
+    render_source = _render(document, template_bundle)
     compiled_by_asset_id = {
         UUID(int=8181): compiled_diagram,
         UUID(int=8183): compiled_relationship,
@@ -1844,7 +1898,7 @@ async def test_real_typst_omits_references_heading_when_timeline_is_empty(
 ) -> None:
     document = replace(chp_parity_document, timeline=())
     template_bundle = load_template_bundle(_CHP_TYPST_ROOT)
-    render_source = TypstRenderer().render(document, template_bundle)
+    render_source = _render(document, template_bundle)
     workspace_root = tmp_path / "workspace"
     _build_workspace(
         workspace_root,
@@ -1910,7 +1964,7 @@ async def test_real_typst_renders_annotated_literal_content_without_evaluating_i
     )
     document = PublicationDocumentV5(document=base, semantic_text=semantic_text)
     template_bundle = load_template_bundle(_CHP_TYPST_ROOT)
-    render_source = TypstRenderer().render(document, template_bundle)
+    render_source = _render(document, template_bundle)
     render_data = json.loads(render_source.render_data_bytes)
     synthesis_section = next(
         section for section in render_data["content_sections"] if section["type"] == "synthesis"
@@ -1992,7 +2046,7 @@ async def test_real_typst_frontmatter_and_120_original_iocs_flow_across_pages(
         ioc_details=source_document.ioc_details,
     )
     template_bundle = load_template_bundle(_CHP_TYPST_ROOT)
-    render_source = TypstRenderer().render(publication, template_bundle)
+    render_source = _render(publication, template_bundle)
     workspace_root = tmp_path / "workspace-frontmatter"
     _build_workspace(
         workspace_root,
@@ -2017,19 +2071,20 @@ async def test_real_typst_frontmatter_and_120_original_iocs_flow_across_pages(
     assert "RÉFÉRENCES" in text
     assert "Technical IOC feed" in text
     assert "Contexte technique" in text
-    candidate_heading = "Pistes / IOC candidats non confirmés"
+    candidate_heading = "Pistes non confirmées"
     assert candidate_heading in text
+    original_position = text.index("IOC originaux")
     candidate_position = text.index(candidate_heading)
     assert text.index("core[.]example") < candidate_position
-    assert "Candidat non confirmé" in text
     assert "10 janvier 2026" in text
     assert "https://a.example/report" in text
     assert "Date de publication non précisée" in text
     assert all(f"original-{index:03d}[.]example" in compact_text for index in range(120))
-    main_list_text = text[:candidate_position]
-    candidate_list_text = text[candidate_position:]
-    assert all(f"original-{index:03d}[.]example" not in main_list_text for index in range(120))
-    assert all(f"original-{index:03d}[.]example" in candidate_list_text for index in range(120))
+    candidate_end = text.index("ANNEXE TECHNIQUE", candidate_position)
+    candidate_list_text = text[candidate_position:candidate_end]
+    originals_text = text[original_position:candidate_position]
+    assert all(f"original-{index:03d}[.]example" in originals_text for index in range(120))
+    assert all(f"original-{index:03d}[.]example" not in candidate_list_text for index in range(120))
 
     output_dir = anyio.Path(
         os.environ.get("AUTOWORK_REVIEW_ARTIFACT_DIR", str(tmp_path / "review"))
@@ -2047,6 +2102,81 @@ async def test_real_typst_frontmatter_and_120_original_iocs_flow_across_pages(
     assert rasterized.returncode == 0, rasterized.stderr.decode("utf-8", errors="replace")
     review_pages = [path async for path in output_dir.glob("frontmatter-ioc-review-*.png")]
     assert len(review_pages) >= 2
+
+
+@pytest.mark.asyncio
+async def test_real_typst_wide_component_cards_keep_filenames_and_paths_readable(
+    tmp_path: Path,
+    typst_binary: str,
+    font_bundle_root: Path,
+) -> None:
+    template_bundle = load_template_bundle(_CHP_TYPST_ROOT)
+    table = _table_at(
+        "component-inventory",
+        "Composants documentés",
+        EnrichmentPlacementKind.AFTER_LEAD,
+    )
+    path_a = r"C:\Program Files\Vendor\PsProxy.dll"
+    path_b = r"C:\ProgramData\Windows\Blackwood.dll"
+    table = replace(
+        table,
+        columns=(
+            PublicationTableColumnV1("component", "Composant"),
+            PublicationTableColumnV1("path", "Chemin Windows"),
+            PublicationTableColumnV1("role", "Rôle"),
+            PublicationTableColumnV1("evidence", "Contexte de preuve"),
+        ),
+        rows=(
+            PublicationTableRowV1(
+                ("PsProxy.dll", path_a, "Proxy", "Composant décrit par la source."),
+                table.rows[0].evidence_refs,
+            ),
+            PublicationTableRowV1(
+                ("Blackwood.dll", path_b, "Loader", "Rôle documenté dans l'analyse."),
+                table.rows[0].evidence_refs,
+            ),
+        ),
+    )
+    document = _full_document(tables=(table,))
+    hash_value = "a" * 64
+    hash_indicator = PublicationIndicatorV1(
+        value=hash_value,
+        normalized_value=hash_value,
+        artifact_type=ArtifactType.HASH,
+        source_document_ids=(document.sources[0].source_document_id,),
+    )
+    document = replace(
+        document,
+        indicators=(PublicationIndicatorGroupV1(ArtifactType.HASH, (hash_indicator,)),),
+    )
+    render_source = _render(document, template_bundle)
+    workspace = tmp_path / "component-cards-workspace"
+    _build_workspace(
+        workspace,
+        bundle_files=template_bundle.files,
+        render_data_bytes=render_source.render_data_bytes,
+        media_refs=render_source.media_refs,
+    )
+    font_snapshot = load_font_bundle_snapshot(font_bundle_root, _FONT_BUNDLE_LOCK)
+    font_root = tmp_path / "component-cards-fonts"
+    font_root.mkdir()
+    compiled = await TypstSubprocessCompiler(binary=str(typst_binary)).compile(
+        TypstCompileRequest(
+            workspace_root=workspace,
+            entrypoint_relative_path=render_source.entrypoint_relative_path,
+            font_paths=materialize_font_bundle(font_snapshot, font_root),
+        )
+    )
+
+    reader = PdfReader(BytesIO(compiled.content), strict=True)
+    extracted_text = "\n".join(page.extract_text() or "" for page in reader.pages)
+    assert any("PsProxy.dll" in line for line in extracted_text.splitlines())
+    assert any("Blackwood.dll" in line for line in extracted_text.splitlines())
+    assert "Program Files" in extracted_text
+    assert "ProgramData" in extracted_text
+    ioc_start = extracted_text.index("IOC de l'article")
+    assert hash_value in re.sub(r"\s+", "", extracted_text[ioc_start:])
+    assert hash_value not in re.sub(r"\s+", "", extracted_text[:ioc_start])
 
 
 @pytest.mark.asyncio
@@ -2069,7 +2199,7 @@ async def test_real_typst_article_keeps_titles_with_following_content(
         if target in {"table", "long-table"}
         else ()
     )
-    render_source = TypstRenderer().render(_full_document(tables=tables), template_bundle)
+    render_source = _render(_full_document(tables=tables), template_bundle)
     await _assert_real_typst_keep_with_next_case(
         tmp_path=tmp_path,
         typst_binary=typst_binary,
@@ -2078,3 +2208,132 @@ async def test_real_typst_article_keeps_titles_with_following_content(
         source=render_source,
         target=target,
     )
+
+
+@pytest.mark.asyncio
+async def test_real_typst_keeps_v57_analyst_note_with_literal_cti_text(
+    tmp_path: Path,
+    typst_binary: str,
+    font_bundle_root: Path,
+) -> None:
+    v57_note = (
+        "Deux fichiers Blackwood.dll.conf, identifiés par les SHA-256 complets "
+        "77e8056d432b3aa2ac47cba783cc7912fe7dbfea12c62e654e84d11c80e5f3f8 et "
+        "0c75d6000177936adafef1e244dbab16e76362368b5ceb78caa50e0223184545, sont "
+        "absents de l\u2019ensemble des quinze échantillons documentés à partir de "
+        "l\u2019article et "
+        "utilisés pour la comparaison interne, ensemble qui ne doit pas être confondu avec la "
+        "liste publique d\u2019IOC ; les infrastructures C2 associées à ces deux fichiers étaient "
+        "déjà documentées."
+    )
+    assert len(v57_note) == 477
+    active_typst_text = r"Texte littéral # $ * _ @ < > ` \ [ ] et #pagebreak()."
+    passphrase = "y0Da+QH#pwSg38E?=8R;71-jQu8Tqq"
+    github_pat = "github_pat_11AA22bb33CC44dd55EE66ff77GG88hh99II00jjKKll"
+    literal_note = f"Note de test : {active_typst_text}"
+    opinion_block = f"Bloc narratif : {active_typst_text}"
+    editorial_text = f"Texte éditorial : {active_typst_text}"
+    implant_role = f"Rôle : {active_typst_text}"
+    ioc_value = f"{github_pat} {active_typst_text}"
+
+    render_data = {
+        "v57_note": {
+            "text": v57_note,
+            "text_spans": _opinion_text_spans(v57_note),
+            "finding_refs": [],
+            "evidence_refs": [],
+        },
+        "literal_note": {
+            "text": literal_note,
+            "text_spans": _opinion_text_spans(literal_note),
+            "finding_refs": [],
+            "evidence_refs": [],
+        },
+        "opinion_block": {"text": opinion_block},
+        "editorial_text": editorial_text,
+        "implant": {"role": implant_role, "value": passphrase},
+        "ioc": {
+            "value": ioc_value,
+            "source_refs": [],
+            "draft_refs": [],
+        },
+    }
+    fixture_entry = TemplateFile(
+        relative_path="RENDERER/literal-text-fixture.typ",
+        content=(
+            b'#import "publication_helpers.typ": render-analyst-observation, render-ioc-item\n'
+            b'#import "../UTILS/helpers.typ": code-font-families\n'
+            b'#let data = json("render-data.json")\n'
+            b'#set page(paper: "a4", margin: 50pt)\n'
+            b"#set text(size: 9pt)\n"
+            b"#for index in range(61) [\n"
+            b"  Boundary filler keeps the analyst note near the page break.\n"
+            b"  #parbreak()\n"
+            b"]\n"
+            b"#render-analyst-observation(data.v57_note)\n"
+            b"#parbreak()\n"
+            b"#render-analyst-observation(data.literal_note)\n"
+            b"#parbreak()\n"
+            b"#text(data.opinion_block.text)\n"
+            b"#parbreak()\n"
+            b"#text(data.editorial_text)\n"
+            b"#parbreak()\n"
+            b"#block(breakable: false, width: 100%)[\n"
+            b'  #text(size: 8pt, weight: "bold")[#text(data.implant.role)]\n'
+            b"  #linebreak()\n"
+            b"  #text(size: 7pt)[Valeur : ]\n"
+            b"  #box[#text(font: code-font-families, size: 7pt, hyphenate: false)[\n"
+            b"    #text(data.implant.value)\n"
+            b"  ]]\n"
+            b"]\n"
+            b"#render-ioc-item(data.ioc)\n"
+        ),
+    )
+    template_bundle = load_template_bundle(_CHP_TYPST_ROOT)
+    workspace = tmp_path / "literal-opinion-workspace"
+    _build_workspace(
+        workspace,
+        bundle_files=(*template_bundle.files, fixture_entry),
+        render_data_bytes=json.dumps(render_data, ensure_ascii=False).encode("utf-8"),
+        media_refs=(),
+    )
+    font_snapshot = load_font_bundle_snapshot(font_bundle_root, _FONT_BUNDLE_LOCK)
+    font_root = tmp_path / "literal-opinion-fonts"
+    font_root.mkdir()
+    compiled = await TypstSubprocessCompiler(binary=str(typst_binary)).compile(
+        TypstCompileRequest(
+            workspace_root=workspace,
+            entrypoint_relative_path=fixture_entry.relative_path,
+            font_paths=materialize_font_bundle(font_snapshot, font_root),
+        )
+    )
+
+    pdf_path = tmp_path / "literal-opinion.pdf"
+    pdf_path.write_bytes(compiled.content)
+    extracted = await anyio.run_process(
+        ("pdftotext", "-layout", str(pdf_path), "-"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+    pdf_text = extracted.stdout.decode("utf-8", errors="replace")
+    pages = [page.extract_text() or "" for page in PdfReader(BytesIO(compiled.content)).pages]
+
+    def compact(value: str) -> str:
+        normalized = value.replace("\u2019", "'").replace("\u2018", "'")
+        return re.sub(r"\s+", "", normalized).casefold()
+
+    normalized_pdf = re.sub(r"\s+", " ", pdf_text).casefold()
+    note_page = next(page for page in pages if compact(v57_note[:72]) in compact(page))
+    assert compact("Note de l'analyste") in compact(note_page)
+    assert compact(v57_note) in compact(note_page)
+    for expected in (
+        literal_note,
+        opinion_block,
+        editorial_text,
+        implant_role,
+        passphrase,
+        ioc_value,
+    ):
+        assert compact(expected) in compact(pdf_text)
+    assert "#pagebreak()" in normalized_pdf

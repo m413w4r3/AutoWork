@@ -16,6 +16,7 @@ export type GovernanceTlpInput = GovernanceTlpBound | "amber+strict";
 export interface InvestigationEnvelopeDimensionView {
   limit: number | null;
   consumed: number;
+  reserved: number;
   remaining: number | null;
 }
 

@@ -34,7 +34,12 @@ from cti_app.application.investigation_state import (
     InvestigationStateRepository,
     InvestigationStateVersionConflict,
 )
-from cti_app.application.investigation_tools import ToolEffect, ToolExecutionContext, ToolRegistry
+from cti_app.application.investigation_tools import (
+    ToolEffect,
+    ToolExecutionContext,
+    ToolRegistry,
+    ToolResult,
+)
 from cti_app.application.operator_context_summary import (
     InvestigationOperatorContextSummaryV1,
     OperatorContextItemPageV1,
@@ -298,6 +303,7 @@ class OperatorToolInvocationService:
         limit: int = 20,
         expected_version: int | None = None,
         expected_sha256: str | None = None,
+        cursor: str | None = None,
     ) -> OperatorContextSectionPageV1 | OperatorContextItemPageV1:
         state = await self._states.get(self._investigation_id)
         if state is None:
@@ -307,6 +313,18 @@ class OperatorToolInvocationService:
             raise OperatorToolInvocationError("stale_working_state", 409)
         if expected_sha256 is not None and state.sha256 != expected_sha256:
             raise OperatorToolInvocationError("stale_working_state", 409)
+        if cursor is not None:
+            if expected_version is None or expected_sha256 is None:
+                raise OperatorToolInvocationError("operator_context_cursor_requires_cas", 422)
+            try:
+                cursor_offset = int(cursor)
+            except ValueError:
+                raise OperatorToolInvocationError("operator_context_cursor_invalid", 422) from None
+            if cursor_offset < 0:
+                raise OperatorToolInvocationError("operator_context_cursor_invalid", 422)
+            if offset not in {0, cursor_offset}:
+                raise OperatorToolInvocationError("operator_context_cursor_invalid", 422)
+            offset = cursor_offset
         if state.pending_context_sha256 is not None:
             raise OperatorToolInvocationError("bridge_checkpoint_pending", 409)
         investigation = await self._investigations.get(self._investigation_id)
@@ -333,6 +351,7 @@ class OperatorToolInvocationService:
                 total = len(all_items)
                 page_items = all_items[offset : offset + limit]
             next_offset = offset + len(page_items) if offset + len(page_items) < total else None
+            next_cursor = str(next_offset) if next_offset is not None else None
             return OperatorContextItemPageV1(
                 investigation_id=self._investigation_id,
                 working_state_version=operator_context.working_state_version,
@@ -343,6 +362,7 @@ class OperatorToolInvocationService:
                 limit=limit,
                 total=total,
                 next_offset=next_offset,
+                next_cursor=next_cursor,
                 items=tuple(_context_item_json(item) for item in page_items),
                 section_truncated=_additional_context_section_truncated(operator_context, section),
             )
@@ -360,13 +380,17 @@ class OperatorToolInvocationService:
                 raise OperatorToolInvocationError("operator_context_section_unknown", 404) from None
             raise
         next_offset = offset + len(items) if offset + len(items) < total else None
+        next_cursor = str(next_offset) if next_offset is not None else None
         return OperatorContextSectionPageV1(
             investigation_id=self._investigation_id,
+            working_state_version=state.version,
+            working_state_sha256=state.sha256,
             section=cast(Any, section),
             offset=offset,
             limit=limit,
             total=total,
             next_offset=next_offset,
+            next_cursor=next_cursor,
             items=items,
         )
 
@@ -448,6 +472,35 @@ class OperatorToolInvocationService:
         )
         return definitions[0].schema_version if len(definitions) == 1 else schema_version
 
+    async def _is_proven_pre_submit_advisor_failure(self, invocation: ToolInvocation) -> bool:
+        if (
+            invocation.tool_name != "advisor.consult"
+            or self._observations is None
+            or self._evidence_summaries is None
+        ):
+            return False
+        for observation_id in invocation.response_refs:
+            observation = await self._observations.get(observation_id)
+            if (
+                observation is None
+                or observation.investigation_id != self._investigation_id
+                or observation.source != "advisor.consult"
+                or observation.object_type != "tool_call"
+            ):
+                continue
+            try:
+                summary = await self._evidence_summaries.summary(observation)
+            except Exception:
+                continue
+            if (
+                isinstance(summary, Mapping)
+                and summary.get("advisor_status") == "invalid_input"
+                and summary.get("bridge_invocation_id") is None
+                and summary.get("failure_stage") in {None, "pre_transport_validation"}
+            ):
+                return True
+        return False
+
     async def _invoke_locked(
         self,
         *,
@@ -503,6 +556,47 @@ class OperatorToolInvocationService:
                     reviewed, expected_version=existing.version
                 )
                 await self._execution.commit_current_uow()
+            if (
+                existing.status is ToolInvocationStatus.NEEDS_REVIEW
+                and await self._is_proven_pre_submit_advisor_failure(existing)
+            ):
+                resolved = existing.resolve_pre_submission_failure()
+                existing = await self._invocations.update_if_version(
+                    resolved, expected_version=existing.version
+                )
+                failure = ToolResult(
+                    ToolInvocationStatus.FAILED,
+                    error_code="advisor_input_invalid",
+                    message=(
+                        "Persisted advisor invalid_input proves the invocation failed "
+                        "before Bridge submission; its legacy reason detail is unavailable."
+                    ),
+                    output={
+                        "advisor_status": "invalid_input",
+                        "failure_stage": "pre_transport_validation",
+                        "confirmed_non_execution": True,
+                        "bridge_invocation_id": None,
+                        "provider_usage": {"status": "not_submitted"},
+                        "context_estimate": {
+                            "status": "not_available",
+                            "reason": "pre_transport_validation",
+                        },
+                    },
+                )
+                await self._execution._complete_tool_reservation(
+                    investigation_id=self._investigation_id,
+                    operation_key=existing.operation_key,
+                    result=failure,
+                    reserved_amounts=existing.reserved_budget,
+                    uncertain=False,
+                )
+                await self._execution.commit_current_uow()
+                return await self._result(
+                    existing,
+                    state.version,
+                    replay=True,
+                    tool_result=failure,
+                )
             return await self._result(existing, state.version, replay=True)
 
         if state.version != expected_version:
@@ -525,8 +619,12 @@ class OperatorToolInvocationService:
         advisor_denial_reason = None
         if not advisor_external_allowed:
             advisor_denial_reason = "external_disclosure_denied"
-        elif guidance is not None and guidance.advisor_turns_remaining <= 0:
-            advisor_denial_reason = "advisor_budget_exhausted"
+        elif (
+            guidance is not None
+            and guidance.g2_bridge_turns_remaining is not None
+            and guidance.g2_bridge_turns_remaining < 1
+        ):
+            advisor_denial_reason = "g2_bridge_budget_exhausted"
         elif "bridge.advisor" not in self._available_capabilities:
             advisor_denial_reason = "advisor_capability_unavailable"
 
@@ -535,7 +633,7 @@ class OperatorToolInvocationService:
             expected_checkpoint_id = (
                 f"{due_reason}@{state.version}" if due_reason is not None else None
             )
-            if isinstance(checkpoint, Mapping):
+            if isinstance(checkpoint, Mapping) and tool_name != "advisor.consult":
                 checkpoint_id = checkpoint.get("id")
                 if checkpoint_id != expected_checkpoint_id and not (
                     tool_name == "advisor.consult"
@@ -721,7 +819,8 @@ class OperatorToolInvocationService:
             advisor_invocation is None
             or advisor_invocation.investigation_id != self._investigation_id
             or advisor_invocation.tool_name != "advisor.consult"
-            or advisor_invocation.status is not ToolInvocationStatus.SUCCEEDED
+            or advisor_invocation.status
+            not in {ToolInvocationStatus.SUCCEEDED, ToolInvocationStatus.PARTIAL}
             or self._observations is None
             or self._evidence_summaries is None
         ):
@@ -754,6 +853,12 @@ class OperatorToolInvocationService:
             raise ValueError("advisor_recommendation_unavailable")
 
         output = stored_output["output"]
+        if (
+            output.get("untrusted") is not True
+            or output.get("usable", True) is False
+            or output.get("advisor_status") == "refused"
+        ):
+            raise ValueError("advisor_recommendation_unavailable")
         recommendations = output.get("recommended_next_tools", ())
         if (
             not isinstance(recommendations, (list, tuple))

@@ -1,0 +1,42 @@
+advisor-wire.v1
+
+TYPE: yara_draft
+
+STATUS: partial
+
+yara
+
+`import "pe"
+import "dotnet"
+
+rule Observed_CLI_Marker_M1
+{
+    meta:
+        description = "Detection exploratoire PE/CLI"
+        category = "candidate"
+        confidence = "low"
+
+    strings:
+        $marker = "1F4F22C4-CF61-4049-A21F-3B07CD631961" ascii
+
+    condition:
+        pe.is_pe and
+        dotnet.is_dotnet and
+        $marker
+}`
+
+MOTIF: $marker | measurements=M1
+
+INVARIANT: Détection conditionnée à la présence exacte du marqueur ASCII M1 dans un fichier PE/CLI brut. Toutes les conditions sont conjointes. Aucun hash de fichier, import .NET générique, critère DOS isolé ou branche OR.
+
+INVARIANT: Les fichiers non-PE, notamment les configurations, XML, ZIP et captures réseau, sont exclus par les conditions de format.
+
+LIMITATION: M1 constitue l'unique mesure exploitable. Son attribution à PsProxy n'est pas vérifiée indépendamment.
+
+LIMITATION: Aucune couverture commune entre échantillons n'est démontrée.
+
+LIMITATION: La spécificité du marqueur n'est pas établie. Des faux positifs restent possibles.
+
+LIMITATION: Aucun test de compilation, de détection ou de non-régression n'a été exécuté.
+
+LIMITATION: Les observations transmises sont non fiables et potentiellement incomplètes. Les dépendances d'investigation et certains services de validation sont indisponibles.

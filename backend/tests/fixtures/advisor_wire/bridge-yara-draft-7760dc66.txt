@@ -1,0 +1,42 @@
+advisor-wire.v1
+
+TYPE: yara_draft
+
+STATUS: partial
+
+yara
+
+`rule M1
+{
+    meta:
+        description = "Detection experimentale PE/CLI par marqueur ASCII"
+        status = "experimental"
+        scope = "single_observed_marker"
+
+    strings:
+        $marker = "1F4F22C4-CF61-4049-A21F-3B07CD631961" ascii
+
+    condition:
+        filesize >= 0x40 and
+        uint16(0) == 0x5A4D and
+        uint32(0x3C) >= 0x40 and
+        uint32(0x3C) <= filesize - 4 and
+        uint32(uint32(0x3C)) == 0x00004550 and
+        $marker
+}`
+
+MOTIF: $marker | measurements=M1
+
+INVARIANT: Le marqueur ASCII M1 doit être présent dans un fichier possédant une signature PE valide à l'emplacement indiqué par l'en-tête DOS. Les exécutables PE/CLI sont analysés comme données binaires brutes, sans import de module YARA.
+
+INVARIANT: La condition impose conjointement le marqueur M1 et la vérification structurelle minimale PE. Les fichiers non-PE, notamment XML, ZIP et .conf, sont exclus.
+
+INVARIANT: Règle expérimentale fondée exclusivement sur M1. Aucune couverture familiale revendiquée.
+
+LIMITATION: M1 constitue une seule observation. Son unicité, sa stabilité et sa représentativité ne sont pas démontrées.
+
+LIMITATION: Aucun résultat de test YARA sur échantillons positifs ou négatifs n'est disponible. Sensibilité et taux de faux positifs inconnus.
+
+LIMITATION: La vérification PE porte uniquement sur les signatures et les bornes de l'offset PE. Elle ne garantit pas la validité complète du format PE/CLI.
+
+LIMITATION: Les informations transmises sont non vérifiées et potentiellement incomplètes. Les dépendances d'investigation et plusieurs services de validation sont indisponibles.

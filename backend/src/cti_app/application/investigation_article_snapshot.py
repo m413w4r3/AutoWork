@@ -25,7 +25,7 @@ from cti_app.application.investigation_contracts import (
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_normalization import normalize_indicator_value
-from cti_app.application.research_context_builder import ArticleSnapshot
+from cti_app.application.research_context_builder import ArticlePassageSnapshot, ArticleSnapshot
 from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
@@ -250,6 +250,7 @@ class ProductionArticleSnapshotAdapter:
             narrative_hashes=tuple(sorted(narrative_hashes)),
             confirmed_iocs=tuple(confirmed_iocs),
             confirmed_iocs_truncated=confirmed_iocs_truncated,
+            article_passages=_synthesis_passages(synthesis_payload),
         )
 
     async def get_claims(
@@ -388,6 +389,47 @@ def _synthesis_content(
             uncertainties.append(item["text"])
             narrative.append(f"Incertitude: {item['text']}")
     return claims[:128], narrative, chain[:256], uncertainties[:128]
+
+
+def _synthesis_passages(payload: dict[str, Any]) -> tuple[ArticlePassageSnapshot, ...]:
+    """Retain verbatim lead, section paragraphs, and timeline claims for task selection."""
+    result: list[ArticlePassageSnapshot] = []
+
+    def add(text: object, claim_id: str, *, section_index: int | None, heading: str) -> None:
+        if isinstance(text, str) and text.strip():
+            result.append(
+                ArticlePassageSnapshot(
+                    claim_id=claim_id,
+                    section_index=section_index,
+                    heading=heading.strip(),
+                    text=text,
+                )
+            )
+
+    for index, paragraph in enumerate(payload.get("lead", []), 1):
+        if isinstance(paragraph, dict):
+            add(paragraph.get("text"), f"L{index}.1", section_index=None, heading="Introduction")
+    for section_index, section in enumerate(payload.get("sections", []), 1):
+        if not isinstance(section, dict):
+            continue
+        heading = str(section.get("heading", ""))
+        for paragraph_index, paragraph in enumerate(section.get("paragraphs", []), 1):
+            if isinstance(paragraph, dict):
+                add(
+                    paragraph.get("text"),
+                    f"S{section_index}P{paragraph_index}.1",
+                    section_index=section_index,
+                    heading=heading,
+                )
+    for index, item in enumerate(payload.get("timeline", []), 1):
+        if isinstance(item, dict):
+            add(
+                item.get("text"),
+                f"T{index}",
+                section_index=None,
+                heading="Chronologie",
+            )
+    return tuple(result)
 
 
 def _citation_ref(value: dict[str, Any]) -> str:

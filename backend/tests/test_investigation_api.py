@@ -15,7 +15,11 @@ import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport
 
-from cti_app.api.investigation import router
+from cti_app.api.investigation import (
+    _attach_operator_invocation_costs,
+    _operator_bridge_invocation_costs,
+    router,
+)
 from cti_app.application.identity import Identity, IdentityScope, LocalIdentityProvider
 from cti_app.application.investigation_persistence import VersionConflictError
 from cti_app.application.investigation_state import InvestigationStateVersionConflict
@@ -23,6 +27,7 @@ from cti_app.application.jobs import DuplicateJobError
 from cti_app.domain.classification import TLP
 from cti_app.domain.investigation import (
     AgendaItem,
+    BudgetDimension,
     EvidenceKind,
     EvidenceObservation,
     InvestigationAgenda,
@@ -44,6 +49,74 @@ SUBJECT_ID = UUID("00000000-0000-0000-0000-000000000101")
 RUN_ID = UUID("00000000-0000-0000-0000-000000000102")
 SYNTHESIS_ID = UUID("00000000-0000-0000-0000-000000000103")
 INVESTIGATION_ID = UUID("00000000-0000-0000-0000-000000000104")
+
+
+@pytest.mark.asyncio
+async def test_operator_bridge_cost_projection_separates_reported_usage_and_estimate() -> None:
+    observation_id = uuid4()
+    bridge_invocation_id = uuid4()
+
+    class _UsagePort:
+        async def advisor_usage(self, observation):
+            return {
+                "provider_usage": {"status": "available", "total_tokens": 375},
+                "bridge_invocation_id": str(bridge_invocation_id),
+            }
+
+    costs = await _operator_bridge_invocation_costs(
+        invocations=(
+            SimpleNamespace(
+                id=uuid4(),
+                tool_name="advisor.consult",
+                response_refs=(observation_id,),
+                consumed_budget={BudgetDimension.CONTEXT_BYTES: 101},
+            ),
+        ),
+        observations=(
+            SimpleNamespace(
+                id=observation_id,
+                source="advisor.consult",
+                object_type="advisor_call",
+            ),
+        ),
+        evidence_summaries=_UsagePort(),
+    )
+
+    cost = next(iter(costs.values()))
+    assert cost["provider_usage"] == {"status": "available", "total_tokens": 375}
+    assert cost["bridge_invocation_id"] == str(bridge_invocation_id)
+    assert cost["estimated_context_tokens"] == {
+        "status": "estimated",
+        "value": 26,
+        "context_bytes": 101,
+        "basis": "context_bytes/4",
+    }
+    unavailable = await _operator_bridge_invocation_costs(
+        invocations=(
+            SimpleNamespace(
+                id=uuid4(),
+                tool_name="advisor.consult",
+                response_refs=(),
+                consumed_budget={},
+            ),
+        ),
+        observations=(),
+        evidence_summaries=None,
+    )
+    assert next(iter(unavailable.values()))["estimated_context_tokens"] == {
+        "status": "not_available",
+        "reason": "no_verified_context_bytes",
+    }
+
+
+def test_operator_status_cost_projection_matches_uuid_invocation_ids() -> None:
+    invocation_id = uuid4()
+    payload = {"invocations": [{"id": invocation_id, "status": "succeeded"}]}
+    costs = {str(invocation_id): {"provider_usage": {"status": "available"}}}
+
+    _attach_operator_invocation_costs(payload, costs)
+
+    assert payload["invocations"][0]["cost"] == costs[str(invocation_id)]
 
 
 class _Rows:

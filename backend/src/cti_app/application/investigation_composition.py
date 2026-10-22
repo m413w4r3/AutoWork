@@ -41,6 +41,8 @@ from cti_app.application.investigation_acquisition_tools import (
 )
 from cti_app.application.investigation_advisor_tools import (
     InvestigationAdvisorTool,
+    ReparsePersistedAdvisorOutputTool,
+    register_advisor_reparse_tool,
     register_investigation_advisor_tool,
 )
 from cti_app.application.investigation_article_snapshot import ProductionArticleSnapshotAdapter
@@ -151,7 +153,12 @@ from cti_app.application.research_context_builder import (
     SampleFeaturePackPort,
 )
 from cti_app.application.retrohunt import RETROHUNT_CAPABILITY, RetrohuntService
-from cti_app.application.rule_workbench import RuleCorpusBytesPort, RuleWorkbench, YaraEnginePort
+from cti_app.application.rule_workbench import (
+    RuleCorpusBytesPort,
+    RuleWorkbench,
+    RuleWorkbenchPolicy,
+    YaraEnginePort,
+)
 from cti_app.application.sample_acquisition import VirusTotalSampleAcquisitionService
 from cti_app.application.sample_extraction_ports import (
     ConfigurationExtractionPort,
@@ -199,6 +206,7 @@ OPERATOR_WRITE_TOOL_NAMES = frozenset(
         "opinion.note",
         "experiment.record",
         "hypothesis.declare",
+        "advisor.reparse",
     }
 )
 OPTIONAL_CAPABILITIES = {
@@ -1185,11 +1193,14 @@ def build_investigation_composition(
                 detection_candidates=uow.detection_candidates,
                 non_discriminant_patterns=NonDiscriminantPatternRegistry(()),
                 legitimate_services=load_legitimate_services(),
+                policy=RuleWorkbenchPolicy(maximum_source_bytes=settings.model_output_max_bytes),
             ),
         )
 
     registry = _TrackingToolRegistry()
-    evidence_summaries = CanonicalEvidenceSummaryPort(artifact_store)
+    evidence_summaries = CanonicalEvidenceSummaryPort(
+        artifact_store, max_payload_bytes=settings.model_output_max_bytes
+    )
     context_builder = ResearchContextBuilder(
         article_snapshots=base_dependencies.article_snapshots,
         observations=uow.evidence_observations,
@@ -1223,7 +1234,9 @@ def build_investigation_composition(
     dependencies = base_dependencies
 
     recorder: EvidenceRecorder = ProductionEvidenceRecorder(
-        artifact_store, uow.evidence_observations
+        artifact_store,
+        uow.evidence_observations,
+        max_payload_bytes=settings.model_output_max_bytes,
     )
     enabled = set(dependencies.available_capabilities)
     enabled.difference_update(FAMILY_CAPABILITY_KEYS)
@@ -1351,6 +1364,7 @@ def build_investigation_composition(
             associations=uow.sample_associations if rule_workbench_available else None,
             corpus_bytes=dependencies.rule_corpus_bytes if rule_workbench_available else None,
             recorder=recorder if rule_workbench_available else None,
+            artifact_store=artifact_store if rule_workbench_available else None,
             evidence_observations=(uow.evidence_observations if rule_get_ports_available else None),
             evidence_payloads=(
                 cast(EvidencePayloadReader, artifact_store) if rule_get_ports_available else None
@@ -1508,6 +1522,16 @@ def build_investigation_composition(
                 artifact_store=artifact_store,
             ),
         )
+        register_advisor_reparse_tool(
+            registry,
+            adapter=ReparsePersistedAdvisorOutputTool(
+                observations=uow.evidence_observations,
+                blobs=getattr(uow, "blobs", None),
+                artifact_store=artifact_store,
+                recorder=recorder,
+                settings=settings,
+            ),
+        )
         # ModelConversationService always exposes conversation persistence
         # methods, even when no Bridge transport is configured. Only an
         # explicitly injected turn transport proves the advisor can execute.
@@ -1518,6 +1542,7 @@ def build_investigation_composition(
                 investigations=uow.analyst_investigations,
                 observations=uow.evidence_observations,
                 findings=uow.investigation_findings,
+                experiments=getattr(uow, "investigation_experiments", None),
                 opinions=uow.analyst_opinions,
                 sample_associations=uow.sample_associations,
                 samples=getattr(uow, "samples", None),

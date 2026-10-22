@@ -1,5 +1,5 @@
 {
-  "template_version": "chp-article-v31-protocol-render-staleness-warning",
+  "template_version": "chp-article-v33-literal-analyst-notes",
   "files": [
     "RENDERER/publication.typ",
     "RENDERER/publication_helpers.typ",

@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, replace
-from typing import Protocol
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
+from typing import Any, Protocol
 from uuid import UUID
 
 from cti_app.application.analyst_opinion_service import OpinionError, OpinionErrorCode
 from cti_app.application.investigation_graph_source import InvestigationGraphSource
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.publication_rendering import DraftPublicationRender
 from cti_app.application.typst_compilation import CompiledTypstDocument
 from cti_app.domain.analyst_opinion import (
     AnalystOpinionStatus,
@@ -43,7 +45,8 @@ class DraftOpinionPdfRenderer(Protocol):
         infrastructure_graph: InvestigationGraph | None = None,
         findings: tuple[InvestigationFinding, ...] = (),
         evidence_observations: tuple[EvidenceObservation, ...] = (),
-    ) -> CompiledTypstDocument: ...
+        base_publication_identity: dict[str, Any],
+    ) -> DraftPublicationRender | CompiledTypstDocument: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +57,7 @@ class AnalystOpinionDraftPdf:
     opinion_version: int
     opinion_sha256: str
     base_publication_sha256: str
+    lineage_manifest: dict[str, Any] = field(default_factory=dict)
 
 
 class AnalystOpinionPreviewService:
@@ -100,6 +104,15 @@ class AnalystOpinionPreviewService:
             investigation = await uow.analyst_investigations.get(opinion.investigation_id)
             if investigation is None:
                 raise OpinionError(OpinionErrorCode.INVESTIGATION_NOT_FOUND)
+            current_run = None
+            latest_investigation = None
+            run_repository = getattr(uow, "production_runs", None)
+            current_run_getter = getattr(run_repository, "get_current_for_subject", None)
+            if callable(current_run_getter):
+                current_run = await current_run_getter(investigation.subject_id)
+            investigation_getter = getattr(uow.analyst_investigations, "get_for_run", None)
+            if callable(investigation_getter):
+                latest_investigation = await investigation_getter(investigation.production_run_id)
             current_publication = await uow.production_artifacts.get_current_for_revision(
                 investigation.production_run_id,
                 ProductionArtifactStage.PUBLICATION.value,
@@ -186,6 +199,16 @@ class AnalystOpinionPreviewService:
                 parsed_synthesis,
                 findings=findings,
                 evidence_observations=observations,
+                base_publication_identity={
+                    "artifact": {
+                        "id": str(base.id),
+                        "version": base.version,
+                        "sha256": base_sha256,
+                        "document_schema": "PublicationDocumentV5",
+                    },
+                    "investigation_id": str(investigation.id),
+                    "production_run_id": str(investigation.production_run_id),
+                },
             )
         else:
             compiled = await self._renderer.render_draft_preview(
@@ -195,12 +218,79 @@ class AnalystOpinionPreviewService:
                 infrastructure_graph=infrastructure_graph,
                 findings=findings,
                 evidence_observations=observations,
+                base_publication_identity={
+                    "artifact": {
+                        "id": str(base.id),
+                        "version": base.version,
+                        "sha256": base_sha256,
+                        "document_schema": "PublicationDocumentV5",
+                    },
+                    "investigation_id": str(investigation.id),
+                    "production_run_id": str(investigation.production_run_id),
+                },
             )
-        content = compiled.content
-        renderer_sha256 = compiled.sha256
+        rendered = (
+            compiled.compiled_document if isinstance(compiled, DraftPublicationRender) else compiled
+        )
+        content = rendered.content
+        renderer_sha256 = rendered.sha256
         pdf_sha256 = hashlib.sha256(content).hexdigest()
         if pdf_sha256 != renderer_sha256:
             raise ValueError("Draft preview PDF SHA-256 does not match its output")
+        history_reasons: list[str] = []
+        if current_run is not None and current_run.id != investigation.production_run_id:
+            history_reasons.append("investigation_run_is_not_current")
+        if latest_investigation is not None and latest_investigation.id != investigation.id:
+            history_reasons.append("investigation_is_not_current_for_run")
+        lineage: dict[str, Any] = (
+            dict(compiled.lineage)
+            if isinstance(compiled, DraftPublicationRender)
+            else {
+                "schema_version": "pdf-lineage.v1",
+                "nature": "opinion_draft_preview",
+                "artifact": {
+                    "id": str(base.id),
+                    "version": base.version,
+                    "sha256": base_sha256,
+                    "document_schema": "PublicationDocumentV5",
+                },
+                "investigation_id": str(investigation.id),
+                "production_run_id": str(investigation.production_run_id),
+                "renderer": {
+                    "name": rendered.compiler,
+                    "version": rendered.compiler_version,
+                    "identity_sha256": None,
+                },
+                "template": None,
+                "compiler": {
+                    "name": rendered.compiler,
+                    "version": rendered.compiler_version,
+                    "identity_sha256": None,
+                    "binary_sha256": None,
+                },
+                "rendered_at": datetime.now(UTC).isoformat(),
+            }
+        )
+        lineage.update(
+            {
+                "render_id": None,
+                "opinion": {
+                    "id": str(opinion.id),
+                    "version": opinion.version,
+                    "status": opinion.status.value,
+                    "sha256": opinion.content_sha256,
+                },
+                "render_data_sha256": (
+                    compiled.render_data_sha256
+                    if isinstance(compiled, DraftPublicationRender)
+                    else None
+                ),
+                "pdf_sha256": pdf_sha256,
+                "is_current": not history_reasons,
+                "historical": bool(history_reasons),
+                "history_reasons": history_reasons,
+            }
+        )
         return AnalystOpinionDraftPdf(
             content=content,
             sha256=pdf_sha256,
@@ -208,6 +298,7 @@ class AnalystOpinionPreviewService:
             opinion_version=opinion.version,
             opinion_sha256=opinion.content_sha256,
             base_publication_sha256=base_sha256,
+            lineage_manifest=lineage,
         )
 
 

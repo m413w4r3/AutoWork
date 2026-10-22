@@ -230,7 +230,7 @@ class ContextInvestigationV1(_StrictContract):
         default=None, exclude_if=lambda value: value is None
     )
     long_texts_truncated: bool | None = Field(default=None, exclude_if=lambda value: value is None)
-    sample_deltas: tuple[dict[str, Any], ...] = Field(max_length=512)
+    sample_deltas: tuple[dict[str, Any], ...] = Field(default=(), max_length=512)
     rule_deltas: tuple[dict[str, Any], ...] = Field(max_length=128)
     previous_actions: tuple[dict[str, Any], ...] = Field(max_length=256)
     user_requests: tuple[InvestigationUserRequestV1, ...] = Field(default=(), max_length=32)
@@ -254,8 +254,19 @@ class InvestigationDeltaV1(_StrictContract):
     user_requests: tuple[InvestigationUserRequestV1, ...] = Field(default=(), max_length=32)
 
 
+AdvisorConsultationType = Literal[
+    "plan_investigation",
+    "pivot_strategy",
+    "yara_draft",
+    "review_text",
+    "draft_text",
+    "suricata_draft",
+    "figure_plan",
+]
+
+
 class AdvisorLastAdviceV1(_StrictContract):
-    consultation_type: Literal["plan_investigation", "pivot_strategy", "yara_draft", "review_text"]
+    consultation_type: AdvisorConsultationType
     date: datetime
     key_points: tuple[str, ...] = Field(max_length=5)
     invocation_id: UUID
@@ -264,14 +275,15 @@ class AdvisorLastAdviceV1(_StrictContract):
 class AdvisorGuidanceV1(_StrictContract):
     checkpoint_due: bool
     reason: str | None = Field(default=None, max_length=96)
-    suggested_consultation_type: (
-        Literal["plan_investigation", "pivot_strategy", "yara_draft", "review_text"] | None
-    ) = None
+    suggested_consultation_type: AdvisorConsultationType | None = None
     last_advice: AdvisorLastAdviceV1 | None = None
     reminder: str = Field(max_length=120)
     advisor_turns_used: int = Field(ge=0)
-    advisor_turn_limit: int = Field(ge=0)
-    advisor_turns_remaining: int = Field(ge=0)
+    advisor_turn_limit: int | None = Field(default=None, ge=0)
+    advisor_turns_remaining: int | None = Field(default=None, ge=0)
+    g2_bridge_turns_remaining: int | None = Field(
+        default=None, ge=0, exclude_if=lambda value: value is None
+    )
     truncated: bool = False
 
 
@@ -297,8 +309,6 @@ class InvestigationContextV1(_StrictContract):
             checkpoint_due=False,
             reminder="Bridge: sortie non fiable; valider chaque suggestion par des mesures.",
             advisor_turns_used=0,
-            advisor_turn_limit=8,
-            advisor_turns_remaining=8,
         )
     )
     current_opinion: CurrentOpinionContextV1 | None = Field(default=None, exclude=True)
@@ -348,6 +358,8 @@ class OperatorContextSectionPageV1(_StrictContract):
         default="investigation-operator-context-section.v1", alias="schema"
     )
     investigation_id: UUID
+    working_state_version: int = Field(ge=1)
+    working_state_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     section: Literal[
         "new_evidence",
         "evidence_index",
@@ -368,6 +380,7 @@ class OperatorContextSectionPageV1(_StrictContract):
     limit: int = Field(ge=1, le=20)
     total: int = Field(ge=0)
     next_offset: int | None = Field(default=None, ge=0)
+    next_cursor: str | None = Field(default=None, max_length=1_024)
     items: tuple[dict[str, Any], ...] = Field(max_length=20)
 
 
@@ -1205,13 +1218,9 @@ def _tool_call_from_wire(
         if not key.startswith("arg:"):
             continue
         argument_name = key[4:].strip()
-        if not argument_name or len(values) != 1 or argument_name in arguments:
+        if not argument_name or len(values) != 1:
             raise ValueError("tool argument is missing or duplicated")
-        property_schema = properties.get(argument_name)
-        if isinstance(property_schema, Mapping) and property_schema.get("type") == "string":
-            arguments[argument_name] = _wire_string_argument(values[0][1])
-        else:
-            arguments[argument_name] = _wire_argument(values[0][1])
+        _set_dotted_wire_argument(arguments, argument_name, values[0][1], properties)
     # The tool block already carries a PURPOSE line; tools whose argument schema
     # also requires a ``purpose`` argument inherit it instead of failing validation.
     purpose_schema = properties.get("purpose")
@@ -1268,6 +1277,43 @@ def _wire_argument(value: str) -> Any:
     if len(values) > 1:
         return values
     return raw
+
+
+def _set_dotted_wire_argument(
+    arguments: dict[str, Any],
+    name: str,
+    value: str,
+    properties: Mapping[str, Any],
+) -> None:
+    """Build nested object arguments from dotted ARG names and plain scalar leaves."""
+    parts = [item.strip() for item in name.split(".")]
+    if not parts or any(not item for item in parts):
+        raise ValueError("tool argument path is invalid")
+    target = arguments
+    schema_properties: Mapping[str, Any] = properties
+    for part in parts[:-1]:
+        schema = schema_properties.get(part)
+        if not isinstance(schema, Mapping) or schema.get("type") != "object":
+            raise ValueError("nested tool argument path is not an object field")
+        nested_properties = schema.get("properties", {})
+        if not isinstance(nested_properties, Mapping):
+            raise ValueError("nested tool argument schema is invalid")
+        current = target.get(part)
+        if current is None:
+            current = {}
+            target[part] = current
+        if not isinstance(current, dict):
+            raise ValueError("nested tool argument path conflicts with a scalar")
+        target = current
+        schema_properties = nested_properties
+    leaf = parts[-1]
+    if leaf in target:
+        raise ValueError("tool argument is duplicated")
+    leaf_schema = schema_properties.get(leaf)
+    if isinstance(leaf_schema, Mapping) and leaf_schema.get("type") == "string":
+        target[leaf] = _wire_string_argument(value)
+    else:
+        target[leaf] = _wire_argument(value)
 
 
 def _finding_from_wire(
@@ -1361,7 +1407,10 @@ def _opinion_from_wire(
     if len(type_values) != 1:
         raise ValueError("OPINION.TYPE requires exactly one known block type")
     block_type = _wire_enum(type_values[0][1], OpinionBlockType)
-    if block_type is None or block_type is OpinionBlockType.ANALYST_OBSERVATIONS:
+    if block_type is None or block_type in {
+        OpinionBlockType.ANALYST_OBSERVATIONS,
+        OpinionBlockType.IMPLANT_MATERIALS,
+    }:
         raise ValueError("OPINION.TYPE must name a supported opinion block type")
     qualification_values = block.fields.get("qualification", [])
     qualification = (

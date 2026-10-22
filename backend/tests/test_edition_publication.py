@@ -502,6 +502,12 @@ class _Runs:
     async def get(self, run_id: UUID) -> ProductionRun | None:
         return self.runs.get(run_id)
 
+    async def get_current_for_subject(self, subject_id: UUID) -> ProductionRun | None:
+        return next(
+            (run for run in self.runs.values() if run.subject_id == subject_id),
+            None,
+        )
+
     async def get_for_update(self, run_id: UUID) -> ProductionRun | None:
         return await self.get(run_id)
 
@@ -2177,6 +2183,7 @@ async def test_release_pdf_route_returns_404_409_and_verified_pdf() -> None:
         render = _successful_edition_render(release.id, blobs, pdf_bytes=pdf)
         uow.edition_renders.add(render)
         downloaded = await client.get(url)
+        versioned = await client.get(f"/api/editions/{EDITION_ID}/releases/{release.id}/pdf")
 
         assert render.output_blob_id is not None
         blobs.blobs[render.output_blob_id] = b"%PDF-tampered!!!!"
@@ -2185,8 +2192,16 @@ async def test_release_pdf_route_returns_404_409_and_verified_pdf() -> None:
     assert downloaded.status_code == 200
     assert downloaded.headers["content-type"] == "application/pdf"
     assert downloaded.content == pdf
+    assert downloaded.headers["x-pdf-lineage-url"] == (
+        f"/api/editions/{EDITION_ID}/release/lineage"
+    )
     assert downloaded.headers["content-disposition"] == (
         'attachment; filename="bulletin-2026-08-FR.pdf"'
+    )
+    assert versioned.status_code == 200
+    assert versioned.content == pdf
+    assert versioned.headers["x-pdf-lineage-url"] == (
+        f"/api/editions/{EDITION_ID}/releases/{release.id}/lineage"
     )
     assert tampered.status_code == 500
     assert tampered.json()["detail"]["code"] == "release_pdf_integrity_mismatch"
@@ -2356,3 +2371,131 @@ async def test_retry_render_returns_404_when_edition_has_no_release() -> None:
         response = await client.post(f"/api/editions/{EDITION_ID}/release/render")
 
     assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_release_lineage_keeps_its_pinned_opinion_and_marks_newer_draft_historical() -> None:
+    edition_id = uuid4()
+    release_id = uuid4()
+    manifest_id = uuid4()
+    render_id = uuid4()
+    subject_id = uuid4()
+    run_id = uuid4()
+    artifact_id = uuid4()
+    investigation_id = uuid4()
+    opinion_id = uuid4()
+    render_data_blob_id = uuid4()
+    pinned_opinion = SimpleNamespace(
+        id=opinion_id,
+        version=16,
+        content_sha256="a" * 64,
+        status=SimpleNamespace(value="approved"),
+        investigation_id=investigation_id,
+    )
+    latest_opinion = SimpleNamespace(
+        id=opinion_id,
+        version=17,
+        content_sha256="b" * 64,
+        status=SimpleNamespace(value="draft"),
+        investigation_id=investigation_id,
+    )
+    persisted = {
+        "pdf_lineage": {
+            "schema_version": "pdf-lineage.v1",
+            "nature": "edition_release",
+            "edition_id": str(edition_id),
+            "edition_release_id": str(release_id),
+            "manifest_id": str(manifest_id),
+            "publications": [
+                {
+                    "subject_id": str(subject_id),
+                    "production_run_id": str(run_id),
+                    "artifact": {
+                        "id": str(artifact_id),
+                        "version": 2,
+                        "sha256": "c" * 64,
+                        "document_schema": "6",
+                    },
+                    "opinion": {
+                        "id": str(opinion_id),
+                        "version": 16,
+                        "status": "approved",
+                        "sha256": "a" * 64,
+                        "investigation_id": str(investigation_id),
+                    },
+                    "review_decision_id": None,
+                }
+            ],
+        }
+    }
+    render_data = json.dumps(persisted, separators=(",", ":")).encode()
+
+    class _UnitOfWork:
+        publication_manifests = SimpleNamespace(
+            get_latest_manifest_for_edition=lambda _edition_id: _async_return(
+                SimpleNamespace(id=manifest_id)
+            )
+        )
+        production_runs = SimpleNamespace(
+            get_current_for_subject=lambda _subject_id: _async_return(SimpleNamespace(id=run_id))
+        )
+        production_artifacts = SimpleNamespace(
+            get_current=lambda _run_id, _stage: _async_return(SimpleNamespace(id=artifact_id))
+        )
+        analyst_opinions = SimpleNamespace(
+            get=lambda _opinion_id, *, version=None: _async_return(
+                pinned_opinion if version == 16 else latest_opinion
+            )
+        )
+        analyst_investigations = SimpleNamespace(
+            get_for_run=lambda _run_id: _async_return(SimpleNamespace(id=investigation_id))
+        )
+
+        async def commit(self) -> None:
+            return None
+
+    class _Context:
+        async def __aenter__(self) -> _UnitOfWork:
+            return _UnitOfWork()
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    class _Store:
+        async def read_bytes(self, blob_id: UUID, *, max_bytes: int | None = None) -> bytes:
+            del max_bytes
+            assert blob_id == render_data_blob_id
+            return render_data
+
+    service = object.__new__(EditionPublicationService)
+    service._artifact_store = _Store()
+    service._uow_factory = lambda: _Context()
+
+    lineage = await service._release_pdf_lineage(
+        SimpleNamespace(id=edition_id),
+        SimpleNamespace(id=release_id, edition_id=edition_id, manifest_id=manifest_id),
+        SimpleNamespace(id=manifest_id),
+        SimpleNamespace(
+            id=render_id,
+            render_data_blob_id=render_data_blob_id,
+            renderer="typst",
+            renderer_version="edition-v1",
+            template_version="template-v1",
+            template_sha256="d" * 64,
+            compiler="typst",
+            compiler_version="0.15.1",
+            created_at=datetime.now(UTC),
+            output_sha256="e" * 64,
+        ),
+    )
+
+    pinned = lineage["publications"][0]["opinion"]
+    assert pinned["version"] == 16
+    assert pinned["sha256"] == "a" * 64
+    assert pinned["status"] == "approved"
+    assert lineage["historical"] is True
+    assert "pinned_opinion_is_older_than_current" in lineage["history_reasons"]
+
+
+async def _async_return(value: Any) -> Any:
+    return value

@@ -10,6 +10,7 @@ from cti_app.application.protocol_diagram_projection import (
     protocol_diagram_caption,
     protocol_diagram_pin_sha256,
 )
+from cti_app.domain.production_editorial_enrichment import DiagramRelationType
 from cti_app.domain.protocol_model import (
     ProtocolDiagramEdgeV1,
     ProtocolDiagramFieldV1,
@@ -223,23 +224,20 @@ def test_protocol_projection_builds_three_distinct_views_and_keeps_statuses() ->
         line for line in sequence_source.splitlines() if " -> " in line.partition(":")[0]
     ]
     assert len(sequence_relations) == len(sequence.edges)
-    assert sequence_text.index("order 1") < sequence_text.index("order 2")
-    assert "frames 9" in sequence_text
-    assert "timing 400 ms" in sequence_text
-    assert "INFERRED" in sequence_source
+    assert sequence_text.index("#1") < sequence_text.index("#2")
+    assert "frames 9" not in sequence_text
+    assert "timing 400 ms" not in sequence_text
+    assert "INFERRED" not in sequence_source
     assert 'stroke: "#B54708"' in sequence_source
-    assert 'fill: "#FFF3E0"' in sequence_source
-    assert all(
-        status in state_source for status in ("OBSERVED", "INFERRED", "UNRESOLVED", "CONTRADICTED")
-    )
-    assert "little" in message_source
+    assert "OBSERVED" not in state_source
+    assert "UNRESOLVED" not in state_source
     assert "Opaque" in message_source
     assert "encrypted" in message_source
     assert "payload" in message_source
     assert "sensitive plaintext must not appear" not in message_source
     assert "bytes omitted" in message_source
-    assert "capture eeeeeeeeeeee frames 31, 32" in message.nodes[0].label
-    assert "eeeeeeeeeeee" in message_source
+    assert "capture eeeeeeeeeeee frames 31, 32" not in message.nodes[0].label
+    assert "eeeeeeeeeeee" not in message_source
 
 
 def test_protocol_projection_escapes_model_text_before_d2_encoding() -> None:
@@ -252,7 +250,7 @@ def test_protocol_projection_escapes_model_text_before_d2_encoding() -> None:
 
     source = encode_d2_source(project_protocol_diagram(spec)).decode("utf-8")
 
-    assert r"Client\" client -> attacker:" in source
+    assert r"Client\" client > attacker\n\${payload}" in source
     assert r"query \"" in source
     assert r"\${payload}" in source
     assert r"\${inject}" in source
@@ -275,10 +273,11 @@ def test_insufficient_evidence_renders_only_an_explicit_gap_card() -> None:
 
     assert len(diagram.nodes) == 1
     assert diagram.edges == ()
-    assert "INSUFFICIENT EVIDENCE" in source
-    assert "No protocol scenario established" in source.replace("\\n", " ")
+    assert "INSUFFICIENT EVIDENCE" not in source
+    assert "Aucun élément établi" in source
     assert "beacon" not in source.casefold()
-    assert "generic sequence" in (diagram.caption or "")
+    assert "Niveau de preuve : INSUFFICIENT_EVIDENCE" in (diagram.caption or "")
+    assert "aucune séquence" in (diagram.caption or "")
 
 
 def test_figure_legend_separates_evidence_levels_and_marks_documentation_unobserved() -> None:
@@ -305,14 +304,13 @@ def test_figure_legend_separates_evidence_levels_and_marks_documentation_unobser
     source = encode_d2_source(diagram).decode("utf-8")
     caption = protocol_diagram_caption(spec)
 
-    assert all(level.value.upper() in source for level in levels)
-    assert "DOCUMENTED, NOT OBSERVED" in source
-    assert any(
-        "offset justification Message-relative offset" in node.label for node in diagram.nodes
-    )
+    assert all(level.value.upper() not in source for level in levels)
     assert all(level.value.upper() in caption for level in levels)
-    assert "proof origin and are separate from validation status" in caption
-    assert "never means packet, frame, or byte observed" in caption
+    assert caption.count("ARTICLE_DOCUMENTED") == 1
+    assert "documenté, non observé" in caption
+    assert all(len(node.label) <= 72 for node in diagram.nodes)
+    assert all("offset justification" not in node.label for node in diagram.nodes)
+    assert all("e" * 64 not in node.label for node in diagram.nodes)
 
 
 def test_derived_field_order_is_not_labeled_observed_across_proof_levels() -> None:
@@ -340,7 +338,8 @@ def test_derived_field_order_is_not_labeled_observed_across_proof_levels() -> No
     diagram = project_protocol_diagram(spec)
     order_edge = next(edge for edge in diagram.edges if edge.label.endswith("field order"))
 
-    assert order_edge.label.startswith("INFERRED · STATIC_INFERENCE")
+    assert order_edge.label == "field order"
+    assert order_edge.relation_type is DiagramRelationType.PROTOCOL_INFERENCE
 
 
 def test_protocol_pin_hash_covers_semantics_and_compiler_identity() -> None:
@@ -388,6 +387,5 @@ async def test_real_d2_renders_insufficient_evidence_without_a_scenario() -> Non
 
     result = await compiler.compile(diagram)
 
-    assert b"INSUFFICIENT EVIDENCE" in result.source_bytes
-    assert b"No protocol scenario" in result.source_bytes
-    assert b"established" in result.source_bytes
+    assert "Aucun élément établi".encode() in result.source_bytes
+    assert b"No protocol scenario" not in result.source_bytes

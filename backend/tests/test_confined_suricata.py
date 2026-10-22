@@ -228,13 +228,15 @@ async def _make_worker_port(
     return port, blobs, database, recorder, commands, capture, investigation.id
 
 
-def test_suricata_candidate_rules_are_versioned_bounded_and_confined() -> None:
+def test_suricata_candidate_rules_are_versioned_and_confined() -> None:
+    large_rule_source = "#" + "x" * 90_000 + "\n" + VERSIONED_RULE
     assert (
         validate_suricata_rule_source(
             VERSIONED_RULE, candidate_id="candidate-a", candidate_version="3"
         )
         == VERSIONED_RULE
     )
+    assert validate_suricata_rule_source(large_rule_source) == large_rule_source
     for source, expected in (
         (VERSIONED_RULE.replace("sid:9900042", "sid:1"), "reserved_range"),
         (VERSIONED_RULE.replace("rev:3", "rev:2"), "revision_mismatch"),

@@ -446,7 +446,6 @@ class VirusTotalRetrohuntPort(Protocol):
 
 _HASH_RE = re.compile(r"^(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})$", re.IGNORECASE)
 _CONTENT_DORK_RE = re.compile(r'(?i)(?<![\w])content\s*:\s*("(?:\\.|[^"\\])*"|\{[^}]*\}|[^\s()]+)?')
-_HEX_BYTE_RE = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{2}(?![0-9a-fA-F])")
 
 
 def normalize_file_hash(value: str) -> str:
@@ -490,16 +489,25 @@ def validate_search_query(value: str) -> str:
             byte_count = len(content.encode("utf-8"))
         elif term.startswith("{") and term.endswith("}"):
             content = term[1:-1]
-            compact_hex = re.sub(r"\s+", "", content)
-            if (
-                compact_hex
-                and len(compact_hex) % 2 == 0
-                and re.fullmatch(r"[0-9a-fA-F]+", compact_hex)
-            ):
-                byte_count = len(compact_hex) // 2
+            if re.search(r"\s", content):
+                byte_tokens = content.split()
+                if not byte_tokens or any(
+                    re.fullmatch(r"[0-9a-fA-F]{2}", token) is None for token in byte_tokens
+                ):
+                    raise VirusTotalInvalidInputError(
+                        "Le motif content:{...} doit contenir des octets hexadécimaux valides."
+                    )
+                byte_count = len(byte_tokens)
             else:
-                hex_bytes = _HEX_BYTE_RE.findall(content)
-                byte_count = len(hex_bytes) if hex_bytes else len(content.encode("utf-8"))
+                if (
+                    not content
+                    or len(content) % 2
+                    or re.fullmatch(r"[0-9a-fA-F]+", content) is None
+                ):
+                    raise VirusTotalInvalidInputError(
+                        "Le motif content:{...} doit contenir des octets hexadécimaux valides."
+                    )
+                byte_count = len(content) // 2
         else:
             byte_count = len(term.encode("utf-8"))
         if byte_count < 4:

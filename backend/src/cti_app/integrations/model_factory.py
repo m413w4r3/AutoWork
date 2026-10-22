@@ -153,6 +153,7 @@ def create_model_gateway(settings: Settings, uow_factory: UnitOfWorkFactory) -> 
             ModelRole.STRUCTURED_EXTRACTION: settings.openai_bridge_wait_timeout_seconds,
             ModelRole.CRITIC: settings.openai_bridge_wait_timeout_seconds,
         },
+        model_output_max_bytes=settings.model_output_max_bytes,
     )
 
 

@@ -25,6 +25,20 @@ OBSERVATION_ID = "56a906d5-943b-4dae-a3c8-867d730e2229"
         ),
         ("GET", f"/api/investigations/{INVESTIGATION_ID}/pivots"),
         ("GET", f"/api/investigations/{INVESTIGATION_ID}/experiments"),
+        ("GET", f"/api/investigations/{INVESTIGATION_ID}/envelope"),
+        ("GET", f"/api/investigations/{INVESTIGATION_ID}/samples"),
+        ("GET", f"/api/investigations/{INVESTIGATION_ID}/opinion"),
+        ("GET", f"/api/investigations/{INVESTIGATION_ID}/detections"),
+        ("GET", f"/api/investigations/{INVESTIGATION_ID}/network-captures"),
+        ("GET", f"/api/investigations/{INVESTIGATION_ID}/rule-corpus/imports"),
+        ("POST", f"/api/investigations/{INVESTIGATION_ID}/rule-corpus/imports"),
+        ("POST", f"/api/investigations/{INVESTIGATION_ID}/rule-corpus/roles"),
+        (
+            "POST",
+            f"/api/investigations/{INVESTIGATION_ID}/rule-corpus/holdout-designations",
+        ),
+        ("GET", "/api/v1/network-captures/capabilities"),
+        ("GET", f"/api/v1/investigations/{INVESTIGATION_ID}/network-captures"),
     ),
 )
 def test_operator_client_route_allowlist_includes_read_and_tool_routes(method, path) -> None:
@@ -43,7 +57,6 @@ def test_operator_client_route_allowlist_normalizes_outer_slashes_only() -> None
 @pytest.mark.parametrize(
     ("method", "path"),
     (
-        ("GET", f"/api/investigations/{INVESTIGATION_ID}/envelope"),
         ("POST", f"/api/investigations/{INVESTIGATION_ID}/envelope/approve"),
         ("POST", f"/api/investigations/{INVESTIGATION_ID}/envelope/revoke"),
         (
@@ -52,6 +65,11 @@ def test_operator_client_route_allowlist_normalizes_outer_slashes_only() -> None
         ),
         ("POST", f"/api/investigations/{INVESTIGATION_ID}/findings"),
         ("POST", f"/api/investigations/{INVESTIGATION_ID}/opinions/approve"),
+        ("POST", f"/api/investigations/{INVESTIGATION_ID}/opinion/compose"),
+        ("POST", f"/api/investigations/{INVESTIGATION_ID}/rule-corpus/roles/extra"),
+        ("PUT", f"/api/investigations/{INVESTIGATION_ID}/rule-corpus/roles"),
+        ("POST", f"/api/v1/investigations/{INVESTIGATION_ID}/network-captures"),
+        ("POST", "/api/detections/56a906d5-943b-4dae-a3c8-867d730e2229/approve"),
         ("POST", f"/api/investigations/{INVESTIGATION_ID}/pivots"),
         ("PUT", f"/api/investigations/{INVESTIGATION_ID}/experiments"),
         (
@@ -72,6 +90,7 @@ def test_operator_client_route_allowlist_normalizes_outer_slashes_only() -> None
             "/api/investigations/not-a-uuid/operator/context/section/budget_remaining",
         ),
         ("GET", "/api/investigations/not-a-uuid"),
+        ("GET", "/api/v1/investigations/not-a-uuid/network-captures"),
     ),
 )
 def test_operator_client_route_allowlist_excludes_governance_and_review_routes(

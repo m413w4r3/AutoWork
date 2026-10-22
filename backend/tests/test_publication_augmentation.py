@@ -55,9 +55,12 @@ def test_augmentation_projects_ordered_blocks_and_keeps_v5_bytes_unchanged() -> 
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
-    assert model.content_sections[-1]["type"] == "analyst_opinion"
-    assert model.content_sections[-1]["blocks"][0]["number"] == "1.1"
-    assert model.content_sections[-1]["blocks"][0]["qualification_label"] == "Fait étayé"
+    opinion_section = next(
+        section for section in model.content_sections if section["type"] == "analyst_opinion"
+    )
+    assert opinion_section["blocks"][0]["number"] == "1.1"
+    assert opinion_section["blocks"][0]["qualification_label"] == "Fait étayé"
+    assert model.content_sections[-1]["type"] == "technical_annex"
     assert serialize_publication_document(augmented)["base_publication"] == base_payload
     assert base_bytes_after == base_bytes
 

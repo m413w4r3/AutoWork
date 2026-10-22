@@ -15,7 +15,7 @@ from cti_app.application.investigation_persistence import EvidenceObservationRep
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.domain.investigation import EvidenceKind, EvidenceObservation
 
-MAX_EVIDENCE_JSON_BYTES = 128 * 1024
+MAX_EVIDENCE_JSON_BYTES = 512 * 1024 * 1024
 MAX_EVIDENCE_OBJECT_ITEMS = 256
 MAX_EVIDENCE_ARRAY_ITEMS = 128
 MAX_EVIDENCE_TEXT_CHARS = 4_000
@@ -25,6 +25,9 @@ _SECRET_FIELD = re.compile(
     r"(?:api[_-]?key|private[_-]?key|client[_-]?secret|access[_-]?token|"
     r"bearer|token|secret|password|authorization|credential|cookie|signature)",
     re.I,
+)
+_SAFE_USAGE_COUNT_FIELDS = frozenset(
+    {"input_tokens", "output_tokens", "total_tokens", "cached_input_tokens", "reasoning_tokens"}
 )
 _BINARY_FIELD = re.compile(
     r"(?:raw[_-]?bytes|(?:file|sample|payload|content|binary)[_-]?bytes|"
@@ -99,9 +102,12 @@ class ProductionEvidenceRecorder:
         self,
         artifact_store: ProductionArtifactStore,
         observations: EvidenceObservationRepository,
+        *,
+        max_payload_bytes: int = MAX_EVIDENCE_JSON_BYTES,
     ) -> None:
         self._artifact_store = artifact_store
         self._observations = observations
+        self._max_payload_bytes = max_payload_bytes
 
     async def record_json(
         self,
@@ -118,12 +124,19 @@ class ProductionEvidenceRecorder:
         observed_at: datetime | None = None,
         idempotency_key: str | None = None,
     ) -> EvidenceObservation:
-        safe_payload = _sanitize_json(payload)
+        safe_payload = (
+            _preserve_advisor_json(payload)
+            if source == "advisor.consult"
+            else _sanitize_json(payload)
+        )
         if not isinstance(safe_payload, dict):
             raise ValueError("Evidence JSON payload must be an object")
         encoded = ProductionArtifactStore.canonical_json_bytes(safe_payload)
-        if len(encoded) > MAX_EVIDENCE_JSON_BYTES:
-            raise ValueError(f"Evidence JSON payload exceeds {MAX_EVIDENCE_JSON_BYTES} bytes")
+        maximum = self._max_payload_bytes
+        if len(encoded) > maximum:
+            raise ValueError(
+                f"Evidence JSON payload exceeds configured {maximum} byte object guard"
+            )
         sha256 = hashlib.sha256(encoded).hexdigest()
         metadata = _safe_metadata(
             source=source,
@@ -337,7 +350,15 @@ def _sanitize_json(value: Any, *, depth: int = 0) -> Any:
             if index >= MAX_EVIDENCE_OBJECT_ITEMS:
                 break
             safe_key = str(key)[:256]
-            if _SECRET_FIELD.search(safe_key) or _BINARY_FIELD.search(safe_key):
+            safe_usage_count = (
+                safe_key in _SAFE_USAGE_COUNT_FIELDS
+                and isinstance(item, int)
+                and not isinstance(item, bool)
+                and item >= 0
+            )
+            if (_SECRET_FIELD.search(safe_key) and not safe_usage_count) or _BINARY_FIELD.search(
+                safe_key
+            ):
                 continue
             if safe_key.lower() in {"raw_bytes", "bytes", "octets"}:
                 continue
@@ -354,6 +375,25 @@ def _sanitize_json(value: Any, *, depth: int = 0) -> Any:
     if isinstance(value, float):
         return value if math.isfinite(value) else None
     return sanitize_evidence_text(value, max_chars=1_000)
+
+
+def _preserve_advisor_json(value: Any, *, depth: int = 0) -> Any:
+    """Keep complete, untrusted CTI advisor content intact in its MinIO artifact."""
+    if depth > 64:
+        raise ValueError("Advisor evidence JSON exceeds the configured nesting guard")
+    if isinstance(value, Mapping):
+        return {
+            str(key): _preserve_advisor_json(item, depth=depth + 1) for key, item in value.items()
+        }
+    if isinstance(value, list | tuple):
+        return [_preserve_advisor_json(item, depth=depth + 1) for item in value]
+    if isinstance(value, str | bool | int) or value is None:
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, bytes | bytearray | memoryview):
+        raise ValueError("Binary data must be archived in a dedicated blob")
+    return str(value)
 
 
 def _safe_metadata(

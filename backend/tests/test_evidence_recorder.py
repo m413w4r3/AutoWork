@@ -44,6 +44,13 @@ async def test_record_json_is_bounded_sanitized_and_idempotent() -> None:
         "api_key": "must-not-persist",
         "raw_bytes": b"harmless-binary-fixture",
         "nested": {"authorization": "Bearer top-secret", "count": 2},
+        "provider_usage": {
+            "status": "available",
+            "input_tokens": 321,
+            "output_tokens": 54,
+            "total_tokens": 375,
+            "provider_private_token": "must-not-persist",
+        },
     }
 
     first = await recorder.record_json(
@@ -88,6 +95,9 @@ async def test_record_json_is_bounded_sanitized_and_idempotent() -> None:
         assert forbidden not in stored
     assert b"[URL omitted]" in stored
     assert b"[redacted]" in stored
+    assert b'"input_tokens":321' in stored
+    assert b'"total_tokens":375' in stored
+    assert b"provider_private_token" not in stored
 
     with pytest.raises(ValueError, match="different content"):
         await recorder.record_json(
@@ -145,21 +155,26 @@ async def test_existing_blob_and_negative_result_keep_typed_provenance() -> None
 
 
 @pytest.mark.asyncio
-async def test_json_limit_and_typed_tool_result_do_not_create_duplicate_other_evidence() -> None:
+async def test_large_advisor_observation_preserves_complete_implant_material() -> None:
     store = _BlobStore()
     repository = InMemoryEvidenceObservationRepository()
+    recorder = ProductionEvidenceRecorder(store, repository, max_payload_bytes=2 * 1024 * 1024)  # type: ignore[arg-type]
+    implant_material = "implant_auth_token=" + "malware-config-" * 30_000
+    advisor = await recorder.record_json(
+        investigation_id=uuid4(),
+        kind=EvidenceKind.OTHER,
+        payload={"schema": "operator-advisor-call.v1", "output": {"text": implant_material}},
+        source="advisor.consult",
+        source_version="advisor-consult.v1",
+        object_type="advisor_call",
+        object_id="draft_text",
+    )
+    stored_advisor = store.blobs[advisor.blob_id]
+    assert MAX_EVIDENCE_JSON_BYTES > 128 * 1024
+    assert len(stored_advisor) > 128 * 1024
+    assert implant_material.encode() in stored_advisor
+
     recorder = ProductionEvidenceRecorder(store, repository)  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="exceeds"):
-        await recorder.record_json(
-            investigation_id=uuid4(),
-            kind=EvidenceKind.BINARY_ANALYSIS,
-            payload={f"field-{index}": "x" * 4_000 for index in range(256)},
-            source="local.analysis",
-            source_version="1",
-            object_type="file",
-            object_id="c" * 64,
-        )
-    assert MAX_EVIDENCE_JSON_BYTES == 128 * 1024
 
     investigation_id = uuid4()
     typed = await recorder.record_json(

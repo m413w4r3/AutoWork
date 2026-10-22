@@ -31,7 +31,7 @@ from cti_app.application.confined_analysis import (
 from cti_app.application.evidence_recorder import sanitize_evidence_text
 from cti_app.application.local_analysis import detect_file_type
 from cti_app.application.persistence import UnitOfWorkFactory
-from cti_app.application.rule_workbench import YaraSampleInput
+from cti_app.application.rule_workbench import YaraSampleInput, _extract_yara_string_hits
 from cti_app.application.sample_acquisition import SAMPLES_QUARANTINE_BUCKET
 from cti_app.application.static_analysis import StaticAnalysisService
 from cti_app.config import Settings
@@ -44,7 +44,7 @@ from cti_app.domain.local_analysis import (
     LOCAL_COMMAND_MAX_XXD_RANGE_BYTES,
     LocalAnalysisFileType,
 )
-from cti_app.domain.rule_workbench import YaraExecutionStatus
+from cti_app.domain.rule_workbench import YaraExecutionStatus, detect_file_format_magic
 from cti_app.infrastructure.analysis_subprocess import (
     AnalysisSubprocessStatus,
     run_analysis_subprocess,
@@ -59,6 +59,8 @@ from cti_app.infrastructure.yara_runner import IsolatedYaraRunner, YaraRunnerLim
 from cti_app.workers.dotnet_analysis import probe_ilspycmd, run_dotnet_analysis
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_MAX_YARA_COVERAGE_HITS = 256
+_MAX_YARA_COVERAGE_OFFSETS = 4_096
 _VERSION = re.compile(r"(?:TShark|Capinfos) \(Wireshark\) ([0-9]+\.[0-9]+\.[0-9]+)")
 _LOCAL_VERSION = re.compile(r"\b([0-9]{4}-[0-9]{2}-[0-9]{2}|[0-9]+(?:\.[0-9]+)+)\b")
 _SURICATA_VERSION = re.compile(r"\bSuricata(?:\s+version)?\s+([0-9]+\.[0-9]+\.[0-9]+)", re.I)
@@ -880,7 +882,7 @@ async def _run_yara(
         cpu_seconds=max(1, math.ceil(timeout)),
         memory_bytes=settings.analysis_capa_max_memory_bytes,
         maximum_output_bytes=min(parameters.max_output_bytes, 64 * 1024),
-        maximum_source_bytes=256_000,
+        maximum_source_bytes=settings.model_output_max_bytes,
         maximum_samples=1,
         maximum_sample_bytes=settings.analysis_max_sample_bytes,
         maximum_total_sample_bytes=settings.analysis_max_sample_bytes,
@@ -889,10 +891,32 @@ async def _run_yara(
     try:
         sample = YaraSampleInput(sample_sha256=parameters.artifact_sha256, data=payload)
         result = IsolatedYaraRunner(limits).match(source, (sample,))
+        matched = parameters.artifact_sha256 in result.matches_sha256
+        string_hits, unavailable_strings = _extract_yara_string_hits(source, payload)
+        bounded_hits: list[dict[str, Any]] = []
+        unavailable = set(unavailable_strings)
+        total_offsets = 0
+        truncated = False
+        for hit in string_hits:
+            remaining = _MAX_YARA_COVERAGE_OFFSETS - total_offsets
+            if len(bounded_hits) >= _MAX_YARA_COVERAGE_HITS or remaining <= 0:
+                unavailable.add(hit.identifier)
+                truncated = True
+                continue
+            offsets = hit.offsets[:remaining]
+            bounded_hits.append({"identifier": hit.identifier, "offsets": list(offsets)})
+            total_offsets += len(offsets)
+            if len(offsets) != len(hit.offsets):
+                unavailable.add(hit.identifier)
+                truncated = True
         return {
             "status": result.status.value,
             "version": result.engine_version,
-            "matches": parameters.artifact_sha256 in result.matches_sha256,
+            "matches": matched,
+            "format_magic": detect_file_format_magic(payload),
+            "string_hits": bounded_hits,
+            "unavailable_strings": sorted(unavailable),
+            "coverage_details_complete": not unavailable and not truncated,
             "output_sha256": hashlib.sha256(
                 json.dumps(
                     {"status": result.status.value, "matches": result.matches_sha256},
@@ -1578,7 +1602,7 @@ async def _run_suricata(
                 candidate["rule_source"],
                 candidate_id=candidate["candidate_id"],
                 candidate_version=candidate["candidate_version"],
-                max_bytes=settings.analysis_suricata_max_rule_bytes,
+                max_bytes=settings.model_output_max_bytes,
             )
         except ValueError as exc:
             return {"status": "POLICY_DENIED", "available_reason": str(exc)}
@@ -1595,7 +1619,7 @@ async def _run_suricata(
             rules_source = rules_path.read_text(encoding="utf-8")
             validate_suricata_rule_source(
                 rules_source,
-                max_bytes=settings.analysis_suricata_max_rule_bytes,
+                max_bytes=settings.model_output_max_bytes,
             )
             rule_sha256 = hashlib.sha256(rules_source.encode("utf-8")).hexdigest()
         except (OSError, UnicodeError, ValueError):
@@ -2120,7 +2144,7 @@ def build_analysis_worker_probe_payload(settings: Settings) -> dict[str, Any]:
         ),
         "suricata_ruleset_sha256": _file_sha256(
             settings.analysis_suricata_rules_path / "autowork.rules",
-            max_bytes=settings.analysis_suricata_max_rule_bytes,
+            max_bytes=settings.model_output_max_bytes,
         ),
         "floss": _distribution_version("flare-floss"),
         "mwcp": _distribution_version("mwcp"),

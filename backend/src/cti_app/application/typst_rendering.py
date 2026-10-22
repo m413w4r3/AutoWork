@@ -27,6 +27,7 @@ from cti_app.application.production_normalization import (
 from cti_app.application.protocol_diagram_projection import (
     PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION,
 )
+from cti_app.application.publication_secret_guard import guard_publication_render_data
 from cti_app.application.typst_bundle import hash_bundle_contents, resolve_bundle_files
 from cti_app.domain.analyst_opinion import (
     AnalystObservationRelation,
@@ -44,7 +45,7 @@ from cti_app.domain.investigation import (
     InvestigationFinding,
     NoveltyClass,
 )
-from cti_app.domain.investigation_graph import InvestigationGraph
+from cti_app.domain.investigation_graph import InvestigationGraph, InvestigationGraphNodeKind
 from cti_app.domain.media_assets import MediaAssetKind
 from cti_app.domain.production_editorial_enrichment import EnrichmentPlacementKind
 from cti_app.domain.production_synthesis import ProductionSynthesisV1
@@ -76,9 +77,9 @@ from cti_app.domain.semantic_annotation import (
     timeline_anchor,
 )
 
-# v27 adds compact opinion citations, technical text spans, and draft IOC provenance.
+# v28 adds compact editorial traceability and an explicit document label.
 # Canonical V5/V6 publication data remains unchanged.
-_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v27-opinion-citations"
+_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v29-secret-guard-editorial-traceability"
 _PUBLICATION_RENDERER_MANIFEST = "renderer-manifest.json"
 _FRENCH_MONTH_NAMES = (
     "janvier",
@@ -150,17 +151,6 @@ _OPINION_BLOCK_HEADINGS = {
     OpinionBlockType.CLAIM_VERIFICATION: "Vérification des affirmations",
     OpinionBlockType.PROPOSED_DETECTIONS: "Détections proposées",
     OpinionBlockType.UNCERTAINTIES_AND_NEXT_LEADS: "Incertitudes et prochaines pistes",
-}
-_OBSERVATION_STATE_LABELS = {
-    AnalystObservationState.OBSERVED: "Observation étayée",
-    AnalystObservationState.INFERRED: "Inférence de l'analyste",
-    AnalystObservationState.UNRESOLVED: "Point non résolu",
-}
-_OBSERVATION_RELATION_LABELS = {
-    AnalystObservationRelation.CONFIRMS: "confirme",
-    AnalystObservationRelation.REFUTES: "contredit",
-    AnalystObservationRelation.QUALIFIES: "nuance",
-    AnalystObservationRelation.UNRESOLVED: "ne permet pas de trancher",
 }
 
 
@@ -337,6 +327,7 @@ def publication_content_section_types(
         else None
     )
     rendered_opinion = publication_v6.rendered_opinion if publication_v6 is not None else None
+    attached_figure_ids = {item.asset_id for item in opinion.protocol_figures} if opinion else set()
     body_anchor_names = {
         *(lead_paragraph_anchor(index) for index, _ in enumerate(document.lead, start=1))
     }
@@ -355,10 +346,22 @@ def publication_content_section_types(
         and (
             rendered_opinion.blocks
             or rendered_opinion.unresolved_points
-            or rendered_opinion.protocol_figures
+            or any(
+                item.asset_id in attached_figure_ids for item in rendered_opinion.protocol_figures
+            )
         )
     )
-    has_opinion_figures = bool(opinion and (opinion.protocol_figures or opinion.unresolved_points))
+    has_opinion_figures = bool(
+        opinion
+        and (
+            any(
+                item.asset_id in attached_figure_ids
+                and item.compiler_policy_version == PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION
+                for item in opinion.protocol_figures
+            )
+            or opinion.unresolved_points
+        )
+    )
     has_approved_observation_chain = bool(
         publication_v6
         and opinion
@@ -373,13 +376,9 @@ def publication_content_section_types(
         or has_rendered_opinion_content
         or has_opinion_figures
         or has_approved_observation_chain
-        or (publication_v6 is not None and opinion is None)
         or (draft_preview is not None and opinion is not None)
     ):
         section_types.append("analyst_opinion")
-    if publication_v6 is not None and publication_v6.detection is not None:
-        section_types.append("detection")
-
     original_indicator_groups = (
         publication_v5.original_indicators
         if isinstance(publication_v5, PublicationDocumentV5)
@@ -395,9 +394,6 @@ def publication_content_section_types(
         or ioc_details
         or draft_iocs
     )
-    if has_iocs:
-        section_types.append("ioc")
-
     has_opinion_provenance = bool(
         opinion
         and (
@@ -406,7 +402,11 @@ def publication_content_section_types(
             or any(note.finding_refs or note.evidence_refs for note in opinion.observations)
         )
     )
-    if has_iocs or (draft_preview is not None and has_opinion_provenance):
+    if publication_v6 is not None and publication_v6.detection is not None:
+        section_types.append("detection")
+    if has_iocs:
+        section_types.append("ioc")
+    if has_iocs or has_opinion_provenance:
         section_types.append("technical_annex")
     return tuple(section_types)
 
@@ -803,9 +803,13 @@ class TypstRenderer:
         document: CanonicalPublicationDocument | TypstDraftPreviewDocument,
         template_bundle: TypstTemplateBundle,
         *,
+        document_label: str | None = None,
         target_artifact_identities: Mapping[str, Mapping[str, Any]] | None = None,
         infrastructure_graph_media_ref: TypstMediaRef | None = None,
     ) -> TypstRenderSource:
+        """Project a publication using its exact service-supplied nature and identity label."""
+        if not isinstance(document_label, str) or not document_label.strip():
+            raise TemplateBundleInvalidError("Publication render requires document_label")
         entrypoint = next(
             (
                 file
@@ -834,6 +838,8 @@ class TypstRenderer:
 
         render_data: dict[str, Any] = {
             "schema_version": _RENDER_DATA_SCHEMA_VERSION,
+            "document_label": document_label.strip(),
+            "document_header": _publication_document_header(document),
             "language": document.publication_language,
             "title": model.title,
             "content_sections": model.content_sections,
@@ -844,6 +850,7 @@ class TypstRenderer:
             render_data["mapping_instrumentation_version"] = MAPPING_RENDERER_VERSION
         if model.draft_watermark is not None:
             render_data["draft_watermark"] = model.draft_watermark
+        guard_publication_render_data(render_data)
         render_data_bytes = json.dumps(
             render_data,
             ensure_ascii=False,
@@ -859,6 +866,16 @@ class TypstRenderer:
             mapping_targets=target_descriptors,
             mapping_unmapped=unmapped,
         )
+
+
+def _publication_document_header(
+    document: CanonicalPublicationDocument | TypstDraftPreviewDocument,
+) -> str:
+    if isinstance(document, TypstDraftPreviewDocument):
+        return f"Avis — aperçu non approuvé v{document.analyst_opinion.version}"
+    if isinstance(document, PublicationDocumentV6) and document.analyst_opinion is not None:
+        return f"Avis — publication approuvée v{document.analyst_opinion.version}"
+    return "Publication"
 
 
 def instrument_publication_targets(
@@ -1140,41 +1157,43 @@ def project_publication_to_typst_model(
         noun = "Finding" if kind == "finding" else "Évidence"
         uri_kind = "findings" if kind == "finding" else "evidence"
         reference_text = str(reference_id)
-        return {
-            "label": f"{noun} {reference_text[:8]}",
-            "full_label": f"{noun} {reference_text}",
+        key = (kind, reference_id)
+        reference = opinion_reference_by_id.get(key)
+        if reference is not None:
+            return reference
+        opinion_reference_numbers[kind] += 1
+        short_label = f"[{kind[0].upper()}{opinion_reference_numbers[kind]}]"
+        target_id = f"trace-{kind[0]}-{opinion_reference_numbers[kind]:03d}"
+        reference = {
+            "label": short_label,
+            "target_id": target_id,
             "href": f"autowork://investigations/{investigation_id}/{uri_kind}/{reference_id}",
             "reference_id": reference_text,
             "kind": kind,
         }
+        opinion_reference_by_id[key] = reference
+        opinion_provenance_entries.append(
+            {
+                "label": short_label,
+                "target_id": target_id,
+                "kind_label": noun,
+                "reference_id": reference_text,
+                "reference_id_spans": _breakable_typst_display_text(reference_text, interval=8),
+                "href": reference["href"],
+            }
+        )
+        return reference
 
     opinion_provenance_entries: list[dict[str, Any]] = []
-    _opinion_provenance_keys: set[tuple[str, str, str]] = set()
+    opinion_reference_by_id: dict[tuple[str, UUID], dict[str, str]] = {}
+    opinion_reference_numbers = {"finding": 0, "evidence": 0}
 
     def collect_opinion_references(
-        context_label: str,
+        _context_label: str,
         kind: str,
         reference_ids: tuple[UUID, ...],
     ) -> list[dict[str, str]]:
-        projected = []
-        for reference_id in reference_ids:
-            reference = opinion_citation(kind, reference_id)
-            key = (context_label, kind, reference["reference_id"])
-            if key not in _opinion_provenance_keys:
-                _opinion_provenance_keys.add(key)
-                opinion_provenance_entries.append(
-                    {
-                        "context": context_label,
-                        "kind_label": "Finding" if kind == "finding" else "Évidence",
-                        "reference_id": reference["reference_id"],
-                        "reference_id_spans": _breakable_typst_display_text(
-                            reference["reference_id"], interval=8
-                        ),
-                        "href": reference["href"],
-                    }
-                )
-            projected.append(reference)
-        return projected
+        return [opinion_citation(kind, reference_id) for reference_id in reference_ids]
 
     lead_fingerprints = {
         " ".join(lead_paragraph.text.casefold().split()) for lead_paragraph in document.lead
@@ -1194,13 +1213,12 @@ def project_publication_to_typst_model(
     unanchored_observations: list[dict[str, Any]] = []
     if opinion is not None:
         for observation in opinion.observations:
+            if not observation.text.strip():
+                continue
             note: dict[str, Any] = {
                 "type": "analyst_observation",
-                "state_label": _OBSERVATION_STATE_LABELS[observation.state],
-                "relation_label": _OBSERVATION_RELATION_LABELS[observation.relation],
                 "text": observation.text,
                 "text_spans": _opinion_text_spans(observation.text),
-                "anchor": observation.anchor,
                 "finding_refs": collect_opinion_references(
                     f"Note ancrée {observation.anchor}", "finding", observation.finding_refs
                 ),
@@ -1216,11 +1234,6 @@ def project_publication_to_typst_model(
             note["anchor_target"] = (
                 "publication-paragraph-"
                 + hashlib.sha256(observation.anchor.encode("utf-8")).hexdigest()[:20]
-            )
-            note["anchor_text_sha256"] = _breakable_typst_display_text(
-                hashlib.sha256(anchor_text.encode("utf-8")).hexdigest(),
-                interval=8,
-                break_at_technical_separators=True,
             )
             notes_by_anchor.setdefault(observation.anchor, []).append(note)
 
@@ -1559,16 +1572,18 @@ def project_publication_to_typst_model(
                     reference_target_by_source_id.setdefault(source_id, target_id)
                     reference_number_by_source_id.setdefault(source_id, index)
 
-    def add_source_links(event: dict[str, Any]) -> None:
-        source_ids = event.pop("source_document_ids", ())
-        event["source_refs"] = [
+    def source_links_for_ids(source_ids: Any) -> list[dict[str, Any]]:
+        return [
             {
                 "number": reference_number_by_source_id[source_id],
                 "target_id": reference_target_by_source_id[source_id],
             }
-            for source_id in dict.fromkeys(UUID(item) for item in source_ids)
+            for source_id in dict.fromkeys(UUID(str(item)) for item in source_ids)
             if source_id in reference_number_by_source_id
         ]
+
+    def add_source_links(event: dict[str, Any]) -> None:
+        event["source_refs"] = source_links_for_ids(event.pop("source_document_ids", ()))
 
     for event in timeline:
         add_source_links(event)
@@ -1635,6 +1650,16 @@ def project_publication_to_typst_model(
         "originals": {},
         "candidates": {},
     }
+    ioc_group_priority = {"retained": 0, "originals": 1, "candidates": 2}
+    ioc_group_owner: dict[tuple[ArtifactType, str], str] = {}
+    ioc_origins: dict[tuple[ArtifactType, str], set[str]] = {}
+
+    def record_ioc_origin(artifact_type: ArtifactType, normalized_value: str, origin: str) -> None:
+        key = (
+            artifact_type,
+            canonical_ioc_key(normalized_value, artifact_type).casefold(),
+        )
+        ioc_origins.setdefault(key, set()).add(origin)
 
     def ioc_type_heading(artifact_type: ArtifactType, value: str) -> str:
         if artifact_type is ArtifactType.IP:
@@ -1678,7 +1703,15 @@ def project_publication_to_typst_model(
             return
         canonical = canonical_ioc_key(normalized_value, artifact_type).casefold()
         key = (artifact_type, canonical)
-        grouped = ioc_lists_by_status[status]
+        owner = ioc_group_owner.get(key)
+        if owner is None or ioc_group_priority[status] < ioc_group_priority[owner]:
+            if owner is not None:
+                existing = ioc_lists_by_status[owner].pop(key, None)
+                if existing is not None:
+                    ioc_lists_by_status[status][key] = existing
+            owner = status
+            ioc_group_owner[key] = owner
+        grouped = ioc_lists_by_status[owner]
         item = grouped.get(key)
         if item is None:
             item = {
@@ -1692,8 +1725,19 @@ def project_publication_to_typst_model(
                 "_draft_contexts": [],
                 "_draft_references": [],
                 "qualifications": set(),
+                "indicator_status_label": {
+                    "retained": "Documenté dans l'article",
+                    "originals": "IOC original du run",
+                    "candidates": "Piste non confirmée",
+                }[owner],
             }
             grouped[key] = item
+        else:
+            item["indicator_status_label"] = {
+                "retained": "Documenté dans l'article",
+                "originals": "IOC original du run",
+                "candidates": "Piste non confirmée",
+            }[owner]
         item["_source_ids"].add(source_id)
         item["qualifications"].add(qualification)
         for detail in details:
@@ -1704,6 +1748,7 @@ def project_publication_to_typst_model(
 
     for group in document.indicators:
         for indicator in group.indicators:
+            record_ioc_origin(indicator.artifact_type, indicator.normalized_value, "article")
             for source_id in indicator.source_document_ids:
                 add_ioc_list_item(
                     "retained",
@@ -1719,6 +1764,7 @@ def project_publication_to_typst_model(
 
     for group in original_indicator_groups:
         for indicator in group.indicators:
+            record_ioc_origin(indicator.artifact_type, indicator.normalized_value, "original")
             for source_id in indicator.source_document_ids:
                 details = matching_ioc_details(
                     indicator.artifact_type, indicator.normalized_value, source_id
@@ -1731,7 +1777,7 @@ def project_publication_to_typst_model(
                     and detail.evidence_quote.strip()
                 ]
                 add_ioc_list_item(
-                    "originals" if verified else "candidates",
+                    "originals",
                     artifact_type=indicator.artifact_type,
                     value=indicator.value,
                     normalized_value=indicator.normalized_value,
@@ -1747,6 +1793,7 @@ def project_publication_to_typst_model(
     for detail in ioc_details:
         if detail.disposition is not PublicationIOCDisposition.UNCERTAIN:
             continue
+        record_ioc_origin(detail.artifact_type, detail.normalized_value, "candidate")
         for source_id in detail.source_document_ids:
             add_ioc_list_item(
                 "candidates",
@@ -1764,12 +1811,25 @@ def project_publication_to_typst_model(
         status = draft_ioc.status
         canonical = canonical_ioc_key(draft_ioc.normalized_value, draft_ioc.artifact_type)
         list_key = (draft_ioc.artifact_type, canonical.casefold())
+        record_ioc_origin(
+            draft_ioc.artifact_type,
+            draft_ioc.normalized_value,
+            "original" if status == "originals" else "candidate",
+        )
         display_value = defanged_ioc_value(
             draft_ioc.value, draft_ioc.normalized_value, draft_ioc.artifact_type
         )
         if display_value is None:
             continue
-        grouped = ioc_lists_by_status[status]
+        owner = ioc_group_owner.get(list_key)
+        if owner is None or ioc_group_priority[status] < ioc_group_priority[owner]:
+            if owner is not None:
+                existing = ioc_lists_by_status[owner].pop(list_key, None)
+                if existing is not None:
+                    ioc_lists_by_status[status][list_key] = existing
+            owner = status
+            ioc_group_owner[list_key] = owner
+        grouped = ioc_lists_by_status[owner]
         draft_ioc_item = grouped.get(list_key)
         if draft_ioc_item is None:
             draft_ioc_item = {
@@ -1783,8 +1843,19 @@ def project_publication_to_typst_model(
                 "_draft_contexts": [],
                 "_draft_references": [],
                 "qualifications": set(),
+                "indicator_status_label": {
+                    "retained": "Documenté dans l'article",
+                    "originals": "IOC original du run",
+                    "candidates": "Piste non confirmée",
+                }[owner],
             }
             grouped[list_key] = draft_ioc_item
+        else:
+            draft_ioc_item["indicator_status_label"] = {
+                "retained": "Documenté dans l'article",
+                "originals": "IOC original du run",
+                "candidates": "Piste non confirmée",
+            }[owner]
         draft_ioc_item["_draft_contexts"].append(draft_ioc.context)
         provenance_context = (
             f"IOC original {display_value}"
@@ -1860,6 +1931,7 @@ def project_publication_to_typst_model(
                 }.values()
             )
             item["qualification"] = "; ".join(sorted(item.pop("qualifications"), key=str.casefold))
+            item["relationship_status_label"] = item["qualification"]
             grouped.setdefault(item["type_label"], []).append(item)
         return [{"heading": heading, "items": values} for heading, values in grouped.items()]
 
@@ -1871,11 +1943,26 @@ def project_publication_to_typst_model(
     }
 
     ioc_rows = []
-    for row in sorted(
-        ioc_by_key.values(),
-        key=lambda item: (item["type"], item["value"].casefold()),
+    for ioc_key, row in sorted(
+        ioc_by_key.items(),
+        key=lambda item: (item[1]["type"], item[1]["value"].casefold()),
     ):
         context_summary = compact_ioc_provenance(row)
+        hash_context_summary = None
+        if row["type"] == ArtifactType.HASH.value:
+            context_summary = abbreviated(context_summary, 120)
+            contexts = tuple(
+                dict.fromkeys(item["context"] for item in row["provenance"] if item.get("context"))
+            )
+            hash_context_summary = abbreviated(" / ".join(contexts), 36)
+        origins = ioc_origins.get(ioc_key, set())
+        indicator_status_label = (
+            "Documenté par l'article"
+            if "article" in origins
+            else "IOC original du run"
+            if "original" in origins
+            else "Piste non confirmée"
+        )
         draft_contexts = tuple(dict.fromkeys(row.pop("_draft_contexts")))
         draft_references = row.pop("_draft_references")
         if draft_contexts:
@@ -1905,14 +1992,29 @@ def project_publication_to_typst_model(
                 )
         row.update(
             {
-                "source_role": ", ".join(sorted(row["roles"], key=str.casefold)),
-                "roles": sorted(row["roles"], key=str.casefold),
+                "source_role": ", ".join(
+                    sorted(row["roles"], key=lambda role: str(role).casefold())
+                ),
+                "roles": sorted(row["roles"], key=lambda role: str(role).casefold()),
                 "status": ", ".join(statuses),
                 "status_label": ", ".join(statuses),
+                "indicator_status_label": indicator_status_label,
+                "indicator_status_short_label": (
+                    "Article"
+                    if "article" in origins
+                    else "Original"
+                    if "original" in origins
+                    else "Piste"
+                ),
+                "relationship_status_label": ", ".join(statuses),
+                "relationship_status_short_label": (
+                    statuses[0] if len(statuses) == 1 else "Plusieurs statuts"
+                ),
                 "status_reason": "",
                 "source_urls": source_links,
                 "source_refs": source_refs,
                 "context_summary": context_summary,
+                "hash_context_summary": hash_context_summary,
                 "draft_refs": list(
                     {
                         (reference["kind"], reference["reference_id"]): reference
@@ -1996,24 +2098,23 @@ def project_publication_to_typst_model(
         reference_entries or "chronology" in expected_section_types
     )
     if timeline_figure is not None:
-        timeline_figure["figure_number"] = figure_number + 1
-        timeline_figure["figure_id_spans"] = _breakable_typst_display_text(
-            timeline_figure["figure_id"], interval=8
-        )
-        timeline_figure["publication_sha256_spans"] = _breakable_typst_display_text(
-            timeline_figure["publication_sha256"], interval=8
-        )
-        for event in timeline_figure["events"]:
-            for source in event["sources"]:
-                source["url_spans"] = _breakable_typst_display_text(
-                    source["url"], interval=12, break_at_technical_separators=True
-                )
-                source["source_sha256_spans"] = _breakable_typst_display_text(
-                    source["source_sha256"], interval=8
-                )
-                source["evidence_sha256_spans"] = _breakable_typst_display_text(
-                    source["evidence_sha256"], interval=8
-                )
+        timeline_figure = {
+            "figure_id": timeline_figure["figure_id"],
+            "figure_number": figure_number + 1,
+            "title": "Événements datés",
+            "caption": "Dates reprises des événements cités dans les sources.",
+            "publication_sha256": timeline_figure["publication_sha256"],
+            "events": [
+                {
+                    "date": event["date"],
+                    "text": event["text"],
+                    "source_refs": source_links_for_ids(
+                        source["source_document_id"] for source in event["sources"]
+                    ),
+                }
+                for event in timeline_figure["events"]
+            ],
+        }
 
     if draft_preview is not None and draft_preview.synthesis is not None:
         chronology: list[dict[str, Any]] = []
@@ -2068,41 +2169,60 @@ def project_publication_to_typst_model(
         build_investigation_chain_figure(publication_v6) if publication_v6 is not None else None
     )
     if investigation_chain_figure is not None:
-        investigation_chain_figure["figure_id_spans"] = _breakable_typst_display_text(
-            investigation_chain_figure["figure_id"], interval=8
-        )
-        investigation_chain_figure["opinion_sha256_spans"] = _breakable_typst_display_text(
-            investigation_chain_figure["opinion_sha256"], interval=8
-        )
-        investigation_chain_figure["base_publication_sha256_spans"] = _breakable_typst_display_text(
-            investigation_chain_figure["base_publication_sha256"], interval=8
-        )
+        investigation_chain_figure = {
+            "figure_id": investigation_chain_figure["figure_id"],
+            "title": "Références de l'avis",
+            "caption": "Les appels du texte renvoient aux identifiants canoniques de l'annexe.",
+            "opinion_id": investigation_chain_figure["opinion_id"],
+            "opinion_version": investigation_chain_figure["opinion_version"],
+            "opinion_sha256": investigation_chain_figure["opinion_sha256"],
+            "base_publication_sha256": investigation_chain_figure["base_publication_sha256"],
+            "rows": [
+                {
+                    "finding_refs": [
+                        opinion_citation("finding", UUID(reference["id"]))
+                        for reference in row["finding_refs"]
+                    ],
+                    "evidence_refs": [
+                        opinion_citation("evidence", UUID(reference["id"]))
+                        for reference in row["evidence_refs"]
+                    ],
+                }
+                for row in investigation_chain_figure["rows"]
+            ],
+        }
     infrastructure_graph_figure = (
         build_investigation_graph_figure(publication_v5, infrastructure_graph)
         if isinstance(publication_v5, PublicationDocumentV5)
         else None
     )
     if infrastructure_graph_figure is not None:
+        graph_nodes_by_id = {
+            node["node_id"]: node for node in infrastructure_graph_figure.get("nodes", ())
+        }
         for edge in infrastructure_graph_figure["edges"]:
+            for side in ("source", "target"):
+                node = graph_nodes_by_id.get(edge[f"{side}_node_id"])
+                if (
+                    node is not None
+                    and node.get("kind") == InvestigationGraphNodeKind.FILE_SHA256.value
+                ):
+                    edge[f"{side}_value"] = "Empreinte de fichier"
             edge["source_value_spans"] = _breakable_typst_display_text(
                 edge["source_value"], interval=32, break_at_technical_separators=True
             )
             edge["target_value_spans"] = _breakable_typst_display_text(
                 edge["target_value"], interval=32, break_at_technical_separators=True
             )
-            for reference in edge["evidence_refs"]:
-                reference["sha256_spans"] = _breakable_typst_display_text(
-                    reference["sha256"], interval=32, break_at_technical_separators=True
-                )
-        infrastructure_graph_figure["figure_id_spans"] = _breakable_typst_display_text(
-            infrastructure_graph_figure["figure_id"], interval=8
-        )
-        infrastructure_graph_figure["graph_sha256_spans"] = _breakable_typst_display_text(
-            infrastructure_graph_figure["graph_sha256"], interval=8
-        )
-        infrastructure_graph_figure["publication_sha256_spans"] = _breakable_typst_display_text(
-            infrastructure_graph_figure["publication_sha256"], interval=8
-        )
+            edge["finding_refs"] = [
+                opinion_citation("finding", UUID(reference_id))
+                for reference_id in edge["finding_refs"]
+            ]
+            edge["evidence_refs"] = [
+                opinion_citation("evidence", UUID(reference["observation_id"]))
+                for reference in edge["evidence_refs"]
+                if reference.get("observation_id") is not None
+            ]
         if infrastructure_graph_media_ref is not None:
             if (
                 infrastructure_graph_media_ref.expected_kind is not MediaAssetKind.DIAGRAM_SVG
@@ -2143,11 +2263,13 @@ def project_publication_to_typst_model(
         content_sections.append(
             {"type": "limitations", "heading": "Limites des preuves", "items": limitations}
         )
-    protocol_figure_provenance: list[dict[str, Any]] = []
+    projected_opinion_section: dict[str, Any] | None = None
+    opinion_figure_provenance: list[dict[str, Any]] = []
+    attached_figure_ids = {item.asset_id for item in opinion.protocol_figures} if opinion else set()
     if "analyst_opinion" in expected_section_types:
         qualification_labels = {
             "fact": "Fait étayé",
-            "inference": "Inférence",
+            "inference": "Inférence de l'analyste",
             "hypothesis": "Hypothèse",
         }
         display_blocks: list[tuple[str, str, str, float, tuple[UUID, ...], tuple[UUID, ...]]] = []
@@ -2167,7 +2289,11 @@ def project_publication_to_typst_model(
                         rendered_block.evidence_refs,
                     )
                 )
-            opinion_figures = rendered_opinion.protocol_figures
+            opinion_figures = tuple(
+                item
+                for item in rendered_opinion.protocol_figures
+                if item.asset_id in attached_figure_ids
+            )
             unresolved_points = rendered_opinion.unresolved_points
         else:
             for opinion_block in opinion.renderable_blocks:
@@ -2183,15 +2309,36 @@ def project_publication_to_typst_model(
                 )
             opinion_figures = opinion.protocol_figures
             unresolved_points = opinion.unresolved_points
+        visible_opinion_figures = tuple(
+            item
+            for item in opinion_figures
+            if item.compiler_policy_version == PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION
+        )
+        opinion_figure_provenance.extend(
+            {
+                "kind_label": _PROTOCOL_FIGURE_TITLES[item.kind.value],
+                "asset_id": str(item.asset_id),
+                "model_sha256": item.model_sha256,
+                "spec_sha256": item.spec_sha256,
+                "asset_sha256": item.asset_sha256,
+                "preview_sha256": item.preview_sha256,
+                "pin_sha256": item.pin_sha256,
+                "compiler_name": item.compiler_name,
+                "compiler_version": item.compiler_version,
+                "compiler_policy_version": item.compiler_policy_version,
+                "field_evidence": [evidence.to_payload() for evidence in item.field_evidence],
+            }
+            for item in opinion_figures
+        )
         next_figure_number = figure_number + (1 if timeline_figure is not None else 0)
         if investigation_chain_figure is not None:
             investigation_chain_figure["figure_number"] = (
-                next_figure_number + len(opinion_figures) + 1
+                next_figure_number + len(visible_opinion_figures) + 1
             )
         if infrastructure_graph_figure is not None:
             infrastructure_graph_figure["figure_number"] = (
                 next_figure_number
-                + len(opinion_figures)
+                + len(visible_opinion_figures)
                 + (1 if investigation_chain_figure is not None else 0)
                 + 1
             )
@@ -2223,98 +2370,53 @@ def project_publication_to_typst_model(
                 }
             )
 
-        protocol_figure_provenance = []
-        for protocol_figure in opinion_figures:
-            field_evidence_json = json.dumps(
-                [item.to_payload() for item in protocol_figure.field_evidence],
-                ensure_ascii=False,
-                sort_keys=True,
-            )
-            protocol_figure_provenance.append(
-                {
-                    "title": _PROTOCOL_FIGURE_TITLES[protocol_figure.kind.value],
-                    "caption": protocol_figure.caption,
-                    "caption_spans": _opinion_text_spans(protocol_figure.caption),
-                    "metadata_lines": [
-                        _breakable_typst_display_text(
-                            f"{label} : {value}", interval=8, break_at_technical_separators=True
-                        )
-                        for label, value in (
-                            ("SHA-256 modèle", protocol_figure.model_sha256),
-                            ("SHA-256 spécification", protocol_figure.spec_sha256),
-                            ("SHA-256 figure", protocol_figure.asset_sha256),
-                            ("SHA-256 aperçu", protocol_figure.preview_sha256),
-                            ("SHA-256 épingle", protocol_figure.pin_sha256),
-                            ("Compilateur", protocol_figure.compiler_name),
-                            ("Version compilateur", protocol_figure.compiler_version),
-                            ("Politique compilateur", protocol_figure.compiler_policy_version),
-                        )
-                    ],
-                    "field_evidence_json": _breakable_typst_display_text(
-                        field_evidence_json,
-                        interval=12,
-                        break_at_technical_separators=True,
-                    ),
-                }
-            )
-        opinion_section: dict[str, Any] = {
+        projected_opinion_section = {
             "type": "analyst_opinion",
             "heading": "Avis de l'analyste",
             "blocks": projected_opinion_blocks,
             "unresolved_points": list(unresolved_points),
             "unanchored_observations": unanchored_observations,
-            "has_anchored_observations": bool(
-                opinion is not None and len(opinion.observations) > len(unanchored_observations)
-            ),
+            "has_anchored_observations": any(notes_by_anchor.values()),
         }
-        if (
-            not display_blocks
-            and not unanchored_observations
-            and not opinion_section["has_anchored_observations"]
-        ):
-            opinion_section["empty_message"] = "Aucun avis publié."
         if investigation_chain_figure is not None:
-            opinion_section["investigation_chain_figure"] = investigation_chain_figure
+            projected_opinion_section["investigation_chain_figure"] = investigation_chain_figure
         if infrastructure_graph_figure is not None:
-            opinion_section["infrastructure_graph_figure"] = infrastructure_graph_figure
-        if opinion_figures:
+            projected_opinion_section["infrastructure_graph_figure"] = infrastructure_graph_figure
+        if visible_opinion_figures:
 
             def protocol_figure_brief(
                 protocol_figure: OpinionProtocolFigureV1,
-            ) -> tuple[str, str, str, str | None]:
-                caption_lines = protocol_figure.caption.splitlines()
-                source_title = caption_lines[0].rstrip(".")
-                has_structured_caption = any(
+            ) -> tuple[str, str, str | None]:
+                caption_lines = [
+                    line.strip() for line in protocol_figure.caption.splitlines() if line.strip()
+                ]
+                source_title = caption_lines[0].rstrip(".") if caption_lines else ""
+                has_legacy_proof_metadata = any(
                     line.startswith("Limits: ") for line in caption_lines
                 ) and any(line.startswith("Proof levels: ") for line in caption_lines)
-                if not has_structured_caption:
-                    source_title = source_title.partition(". ")[0].rstrip(".").strip()
-                    if len(source_title) > 120:
-                        source_title = source_title[:117].rstrip() + "…"
-                    if not source_title:
-                        source_title = "Vue de protocole persistée"
-                for suffix in (
-                    " · documenté, non observé",
-                    " · documented, not observed",
+                title_prefix = _PROTOCOL_FIGURE_TITLES[protocol_figure.kind.value]
+
+                if (
+                    protocol_figure.compiler_policy_version
+                    != PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION
                 ):
-                    if source_title.casefold().endswith(suffix):
-                        source_title = source_title[: -len(suffix)]
-                        break
+                    source_title = source_title.partition(". ")[0].rstrip(".").strip()
+                    title = f"{title_prefix} — {source_title}" if source_title else title_prefix
+                    return title, "", None
+
+                if not has_legacy_proof_metadata:
+                    title = f"{title_prefix} — {source_title}" if source_title else title_prefix
+                    return title, "\n".join(caption_lines[1:]), None
+
                 proof_line = next(
-                    (
-                        line.removeprefix("Proof levels: ")
-                        for line in caption_lines
-                        if line.startswith("Proof levels: ")
-                    ),
-                    "voir les niveaux indiqués sur les nœuds et relations",
+                    line.removeprefix("Proof levels: ")
+                    for line in caption_lines
+                    if line.startswith("Proof levels: ")
                 )
                 raw_limit_line = next(
-                    (
-                        line.removeprefix("Limits: ")
-                        for line in caption_lines
-                        if line.startswith("Limits: ")
-                    ),
-                    "aucun échange réseau non étayé n'est ajouté",
+                    line.removeprefix("Limits: ")
+                    for line in caption_lines
+                    if line.startswith("Limits: ")
                 )
                 limit_parts = [part.strip() for part in raw_limit_line.split(";")]
                 limit_index = (
@@ -2330,38 +2432,27 @@ def project_publication_to_typst_model(
                 proof_label = (
                     "Niveaux de preuve : " if "," in proof_levels else "Niveau de preuve : "
                 ) + proof_line
-                title = f"{_PROTOCOL_FIGURE_TITLES[protocol_figure.kind.value]} — {source_title}"
-                renderer_warning = None
-                if draft_preview is not None and (
-                    protocol_figure.compiler_policy_version
-                    != PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION
-                    or not has_structured_caption
-                ):
-                    renderer_warning = (
-                        "Rendu hérité — politique enregistrée : "
-                        f"{protocol_figure.compiler_policy_version}; attendue : "
-                        f"{PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION}. Refaire "
-                        "network.protocol.render puis rattacher les trois vues avec "
-                        "opinion.revise."
-                    )
-                return title, f"Limites : {limit_line}.", proof_label, renderer_warning
+                title = f"{title_prefix} — {source_title}"
+                return title, f"Limites : {limit_line}.", proof_label
 
             def project_protocol_figure(
                 index: int, protocol_figure: OpinionProtocolFigureV1
             ) -> dict[str, Any]:
-                title, caption, status_label, renderer_warning = protocol_figure_brief(
-                    protocol_figure
-                )
+                title, caption, status_label = protocol_figure_brief(protocol_figure)
                 return {
                     "type": "diagram",
                     "key": f"protocol-{protocol_figure.kind.value}",
                     "title": title,
                     "caption": caption,
                     "status_label": status_label,
-                    "renderer_warning": renderer_warning,
+                    "show_title": True,
+                    "legacy_renderer": (
+                        protocol_figure.compiler_policy_version
+                        != PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION
+                    ),
                     "status_legend": (
-                        "Legend: OBSERVED green; INFERRED orange; "
-                        "UNRESOLVED gray; CONTRADICTED red."
+                        "Observation étayée : vert · inférence : orange · "
+                        "non résolu : gris · contredit : rouge."
                     ),
                     "media_path": media_ref(
                         asset_id=protocol_figure.asset_id,
@@ -2370,8 +2461,8 @@ def project_publication_to_typst_model(
                         expected_sha256=protocol_figure.asset_sha256,
                         expected_byte_size=None,
                     ).media_path,
-                    # Retain the existing V5/V6 render-data fields for consumers; their
-                    # full values are displayed only in the final technical annex.
+                    # Keep canonical provenance fields in render-data; the template
+                    # does not print them in the reader-facing figure.
                     "model_sha256": protocol_figure.model_sha256,
                     "spec_sha256": protocol_figure.spec_sha256,
                     "asset_sha256": protocol_figure.asset_sha256,
@@ -2386,29 +2477,85 @@ def project_publication_to_typst_model(
                     "figure_number": next_figure_number + index,
                 }
 
-            opinion_section["protocol_figures"] = [
+            projected_opinion_section["protocol_figures"] = [
                 project_protocol_figure(index, protocol_figure)
-                for index, protocol_figure in enumerate(opinion_figures, start=1)
+                for index, protocol_figure in enumerate(visible_opinion_figures, start=1)
             ]
-        content_sections.append(opinion_section)
+        if not (
+            projected_opinion_blocks
+            or unresolved_points
+            or unanchored_observations
+            or investigation_chain_figure is not None
+            or infrastructure_graph_figure is not None
+            or visible_opinion_figures
+        ):
+            projected_opinion_section = None
+    if projected_opinion_section is not None:
+        content_sections.append(projected_opinion_section)
+    implant_material_rows: list[dict[str, Any]] = []
+    implant_materials_section = opinion.implant_materials_section if opinion is not None else None
+    if opinion is not None and opinion.implant_materials:
+        material_labels = {
+            "rc4_key": "Clé RC4",
+            "aes_key": "Clé AES",
+            "passphrase": "Phrase de passe",
+            "xor_scheme": "Schéma XOR",
+            "attacker_github_c2_token": "Jeton GitHub de l'attaquant (C2)",
+            "other": "Autre matériel d'implant",
+        }
+        for material in opinion.implant_materials:
+            implant_material_rows.append(
+                {
+                    "type": material.type.value,
+                    "type_label": material_labels[material.type.value],
+                    "value": material.value,
+                    "role": material.role,
+                    "sample_location": material.sample_location,
+                    "sample_sha256": material.sample_sha256,
+                    "evidence_ref": opinion_citation("evidence", material.evidence_observation_id),
+                }
+            )
+        content_sections.append(
+            {
+                "type": "technical_materials",
+                "heading": "Matériel cryptographique et identifiants de l'implant",
+                "tlp_label": "TLP:CLEAR",
+                "attacker_identifier_note": (
+                    "Les identifiants C2 de l'attaquant sont des observables passifs; "
+                    "ils ne servent jamais à l'authentification."
+                ),
+                "editorial_text": (
+                    implant_materials_section.text
+                    if implant_materials_section is not None
+                    else None
+                ),
+                "items": implant_material_rows,
+            }
+        )
     if detection is not None and "detection" in expected_section_types:
         content_sections.append(_publication_detection_section(detection))
     if "ioc" in expected_section_types:
         content_sections.append({"type": "ioc", **ioc_body})
-    if "technical_annex" in expected_section_types:
-        content_sections.append(
-            {
-                "type": "technical_annex",
-                "indicators": indicators,
-                "original_indicators": original_indicators,
-                "original_indicator_note": original_indicator_note,
-                "ioc_rows": ioc_rows,
-                "ioc_row_groups": ioc_row_groups,
-                "opinion_refs": opinion_provenance_entries,
-                "protocol_figure_details": protocol_figure_provenance,
-            }
-        )
-
+    if (
+        "technical_annex" in expected_section_types
+        or opinion_provenance_entries
+        or opinion_figure_provenance
+    ):
+        technical_annex = {
+            "type": "technical_annex",
+            "indicators": indicators,
+            "original_indicators": original_indicators,
+            "original_indicator_note": original_indicator_note,
+            "ioc_rows": ioc_rows,
+            "ioc_row_groups": ioc_row_groups,
+            "opinion_refs": opinion_provenance_entries,
+            "implant_identifier_rows": [
+                item for item in implant_material_rows if item["type"] == "attacker_github_c2_token"
+            ],
+        }
+        if opinion_figure_provenance:
+            technical_annex["protocol_figure_provenance"] = opinion_figure_provenance
+        content_sections.append(technical_annex)
     # Legacy projection consumers index every section's block list directly.
     # Empty defaults are additive; renderers still decide visibility by type.
     for projected_section in content_sections:
@@ -2538,7 +2685,7 @@ def _timeline_source_urls(
 
 
 def _table_block(table: PublicationTableV1) -> dict[str, Any]:
-    return {
+    block: dict[str, Any] = {
         "type": "table",
         "key": table.key,
         "title": table.title,
@@ -2546,6 +2693,27 @@ def _table_block(table: PublicationTableV1) -> dict[str, Any]:
         "columns": [column.label for column in table.columns],
         "column_weights": _table_column_weights(table),
         "rows": [list(row.cells) for row in table.rows],
+    }
+    if len(table.columns) > 2:
+        block["card_display_cells"] = [
+            [
+                _component_path_display_text(cell) if "/" in cell or "\\" in cell else None
+                for cell in row.cells
+            ]
+            for row in table.rows
+        ]
+    return block
+
+
+def _component_path_display_text(value: str) -> dict[str, Any]:
+    """Allow wrapping between path components while keeping each name intact."""
+    chunks = re.split(r"(?<=[/\\])", value)
+    if len(chunks) < 2:
+        return {"text": value, "break_chunks": []}
+    return {
+        "text": value,
+        "break_chunks": chunks,
+        "break_after": [True] * (len(chunks) - 1),
     }
 
 

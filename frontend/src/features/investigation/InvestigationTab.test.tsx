@@ -18,13 +18,23 @@ function makeInvestigation(
   overrides: Partial<InvestigationView> = {},
 ): InvestigationView {
   const budget: InvestigationView["budget"] = {
-    bridge_turns: { limit: 8, consumed: 2, remaining: 6 },
-    vt_units: { limit: 10, consumed: 1, remaining: 9 },
-    shodan_credits: { limit: 5, consumed: 0, remaining: 5 },
-    downloads: { limit: 2, consumed: 0, remaining: 2 },
-    tool_seconds: { limit: 120, consumed: 12, remaining: 108 },
-    context_tokens: { limit: 20_000, consumed: 1_000, remaining: 19_000 },
-    context_bytes: { limit: 100_000, consumed: 5_000, remaining: 95_000 },
+    bridge_turns: { limit: 8, consumed: 2, reserved: 1, remaining: 5 },
+    vt_units: { limit: 10, consumed: 1, reserved: 0, remaining: 9 },
+    shodan_credits: { limit: 5, consumed: 0, reserved: 0, remaining: 5 },
+    downloads: { limit: 2, consumed: 0, reserved: 0, remaining: 2 },
+    tool_seconds: { limit: 120, consumed: 12, reserved: 0, remaining: 108 },
+    context_tokens: {
+      limit: 20_000,
+      consumed: 1_000,
+      reserved: 0,
+      remaining: 19_000,
+    },
+    context_bytes: {
+      limit: 100_000,
+      consumed: 5_000,
+      reserved: 0,
+      remaining: 95_000,
+    },
   };
   return {
     id: INVESTIGATION_ID,
@@ -45,6 +55,7 @@ function makeInvestigation(
     blocked_decisions: [],
     available_tools: ["article.get_claims"],
     unavailable_tools: [],
+    unavailable_tool_reasons: {},
     envelope_approved: false,
     allowed_providers: [],
     acquire_hits_allowed: false,
@@ -128,19 +139,31 @@ function createFetch(view: InvestigationView | null) {
           acquire_hits_allowed: false,
           max_acquire_volume: 0,
           budget: {
-            bridge_turns: { limit: 8, consumed: 2, remaining: 6 },
-            vt_units: { limit: 10, consumed: 1, remaining: 9 },
-            shodan_credits: { limit: 5, consumed: 0, remaining: 5 },
-            downloads: { limit: 0, consumed: 0, remaining: 0 },
-            tool_seconds: { limit: 120, consumed: 12, remaining: 108 },
+            bridge_turns: { limit: 8, consumed: 2, reserved: 1, remaining: 5 },
+            vt_units: { limit: 10, consumed: 1, reserved: 0, remaining: 9 },
+            shodan_credits: {
+              limit: 5,
+              consumed: 0,
+              reserved: 0,
+              remaining: 5,
+            },
+            downloads: { limit: 0, consumed: 0, reserved: 0, remaining: 0 },
+            tool_seconds: {
+              limit: 120,
+              consumed: 12,
+              reserved: 0,
+              remaining: 108,
+            },
             context_tokens: {
               limit: 20_000,
               consumed: 1_000,
+              reserved: 0,
               remaining: 19_000,
             },
             context_bytes: {
               limit: 100_000,
               consumed: 5_000,
+              reserved: 0,
               remaining: 95_000,
             },
           },
@@ -430,6 +453,7 @@ describe("InvestigationTab", () => {
         },
       ],
       unavailable_tools: ["virustotal.search"],
+      unavailable_tool_reasons: { "virustotal.search": "g2_disclosure_denied" },
       blocked_decisions: [{ code: "policy_denied", tool_name: "vt.download" }],
     });
     const { container } = renderInvestigation(view);
@@ -453,9 +477,14 @@ describe("InvestigationTab", () => {
     expect(screen.getAllByText(/Unités VirusTotal/).length).toBeGreaterThan(1);
     expect(screen.getAllByText(/Crédits Shodan/).length).toBeGreaterThan(1);
     expect(screen.getByText("Limites")).toBeInTheDocument();
+    expect(screen.getByText(/Capacités indisponibles/)).toBeInTheDocument();
     expect(
-      screen.getByText(/Capacités indisponibles, limites locales/),
+      screen.getByText(/Approbation de l’enveloppe G2 requise/),
     ).toBeInTheDocument();
+    expect(
+      screen.getAllByText(/2 consommé · 1 réservé · 5 restant · plafond 8/)
+        .length,
+    ).toBeGreaterThan(0);
     expect(container.textContent).not.toContain(
       "private-object-id-must-not-render",
     );

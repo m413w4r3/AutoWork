@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, cast
 from uuid import UUID
@@ -139,6 +139,7 @@ class ReleaseIOCArchiveUnreadableError(PublicationError):
 class EditionReleasePdf:
     content: bytes
     filename: str
+    lineage_manifest: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -441,16 +442,28 @@ class EditionPublicationService:
                 ),
             )
 
-    async def read_release_pdf(self, edition_id: UUID) -> EditionReleasePdf:
-        """Return the PDF pinned by the latest immutable release."""
+    async def read_release_pdf(
+        self, edition_id: UUID, release_id: UUID | None = None
+    ) -> EditionReleasePdf:
+        """Return the PDF pinned by the latest or explicitly versioned release."""
         async with self._uow_factory() as uow:
             edition = await uow.editions.get(edition_id)
-            manifest = await uow.publication_manifests.get_latest_manifest_for_edition(edition_id)
-            release = (
-                await uow.edition_releases.get_by_manifest(manifest.id)
-                if manifest is not None
-                else None
-            )
+            if release_id is not None:
+                release = await uow.edition_releases.get(release_id)
+                manifest = (
+                    await uow.publication_manifests.get(release.manifest_id)
+                    if release is not None and release.edition_id == edition_id
+                    else None
+                )
+            else:
+                manifest = await uow.publication_manifests.get_latest_manifest_for_edition(
+                    edition_id
+                )
+                release = (
+                    await uow.edition_releases.get_by_manifest(manifest.id)
+                    if manifest is not None
+                    else None
+                )
             render = (
                 await uow.edition_renders.get_pinned_succeeded_for_release(release.id)
                 if release is not None
@@ -467,7 +480,343 @@ class EditionPublicationService:
             raise ReleasePdfUnreadableError("release_pdf_storage_error") from exc
         except TypstRenderOutputIntegrityError as exc:
             raise ReleasePdfUnreadableError("release_pdf_integrity_mismatch") from exc
-        return EditionReleasePdf(content=content, filename=edition.bulletin_pdf_filename())
+        lineage = await self._release_pdf_lineage(edition, release, manifest, render)
+        return EditionReleasePdf(
+            content=content,
+            filename=edition.bulletin_pdf_filename(),
+            lineage_manifest=lineage,
+        )
+
+    async def read_release_lineage(
+        self, edition_id: UUID, release_id: UUID | None = None
+    ) -> dict[str, Any]:
+        """Return provenance without reading PDF bytes, optionally for an exact release."""
+        async with self._uow_factory() as uow:
+            edition = await uow.editions.get(edition_id)
+            if release_id is not None:
+                release = await uow.edition_releases.get(release_id)
+                manifest = (
+                    await uow.publication_manifests.get(release.manifest_id)
+                    if release is not None and release.edition_id == edition_id
+                    else None
+                )
+            else:
+                manifest = await uow.publication_manifests.get_latest_manifest_for_edition(
+                    edition_id
+                )
+                release = (
+                    await uow.edition_releases.get_by_manifest(manifest.id)
+                    if manifest is not None
+                    else None
+                )
+            render = (
+                await uow.edition_renders.get_pinned_succeeded_for_release(release.id)
+                if release is not None
+                else None
+            )
+            await uow.commit()
+        if edition is None or release is None:
+            raise PublicationManifestNotFoundError("edition_release_not_found")
+        if render is None or render.status is not TypstRenderStatus.SUCCEEDED:
+            raise ReleasePdfNotAvailableError("release_pdf_not_available")
+        return await self._release_pdf_lineage(edition, release, manifest, render)
+
+    async def _reconstruct_release_publications(
+        self, release: EditionRelease, manifest: PublicationManifest
+    ) -> list[dict[str, Any]]:
+        """Rebuild a legacy release's source identities from its immutable pins."""
+        document_bytes = await self._artifact_store.read_bytes(
+            release.edition_document_blob_id, max_bytes=MAX_ARTIFACT_BYTES
+        )
+        if hashlib.sha256(document_bytes).hexdigest() != release.edition_document_sha256:
+            raise ValueError("edition document hash does not match the release pin")
+        payload = json.loads(document_bytes)
+        if not isinstance(payload, dict):
+            raise ValueError("edition document is not a JSON object")
+        document = EditionDocumentV2.from_json(payload)
+        publication_by_subject = {
+            str(item.subject_id): item.document for item in document.publications
+        }
+        result: list[dict[str, Any]] = []
+        async with self._uow_factory() as uow:
+            runtime_uow = cast(Any, uow)
+            for entry in manifest.entries:
+                artifact = await uow.production_artifacts.get(entry.document_artifact_id)
+                publication = publication_by_subject.get(str(entry.subject_id))
+                review_decision_id = getattr(entry, "review_decision_id", None)
+                expected_sha256 = getattr(entry, "document_sha256", None)
+                warnings: list[str] = []
+                if artifact is None:
+                    result.append(
+                        {
+                            "subject_id": str(entry.subject_id),
+                            "production_run_id": str(entry.production_run_id),
+                            "artifact": {
+                                "id": str(entry.document_artifact_id),
+                                "version": entry.document_artifact_version,
+                                "sha256": expected_sha256,
+                                "document_schema": getattr(publication, "schema_version", None),
+                            },
+                            "opinion": None,
+                            "review_decision_id": (
+                                str(review_decision_id) if review_decision_id is not None else None
+                            ),
+                            "lineage_warning": "pinned_artifact_unavailable",
+                        }
+                    )
+                    continue
+                canonical_sha256 = None
+                if artifact.canonical_blob_id is not None:
+                    canonical_bytes = await self._artifact_store.read_bytes(
+                        artifact.canonical_blob_id, max_bytes=MAX_ARTIFACT_BYTES
+                    )
+                    canonical_sha256 = hashlib.sha256(canonical_bytes).hexdigest()
+                else:
+                    warnings.append("pinned_artifact_canonical_blob_unavailable")
+                if (
+                    artifact.version != entry.document_artifact_version
+                    or artifact.production_run_id != entry.production_run_id
+                    or artifact.subject_id != entry.subject_id
+                    or (expected_sha256 is not None and canonical_sha256 != expected_sha256)
+                ):
+                    warnings.append("manifest_and_artifact_identity_disagree")
+
+                artifact_metadata = artifact.metadata if isinstance(artifact.metadata, dict) else {}
+                augmentation = artifact_metadata.get("publication_augmentation")
+                opinion_identity = None
+                schema_version = getattr(publication, "schema_version", None)
+                if (
+                    schema_version == "6"
+                    and isinstance(augmentation, dict)
+                    and augmentation.get("opinion_id") is not None
+                    and augmentation.get("opinion_version") is not None
+                ):
+                    opinion_id = UUID(str(augmentation["opinion_id"]))
+                    opinion_version = int(augmentation["opinion_version"])
+                    opinion = await runtime_uow.analyst_opinions.get(
+                        opinion_id, version=opinion_version
+                    )
+                    opinion_sha256 = str(
+                        augmentation.get("opinion_content_sha256")
+                        or (opinion.content_sha256 if opinion is not None else "")
+                    )
+                    if opinion is None:
+                        warnings.append("pinned_opinion_identity_unavailable")
+                    elif opinion.content_sha256 != opinion_sha256:
+                        warnings.append("pinned_opinion_sha256_mismatch")
+                    opinion_identity = {
+                        "id": str(opinion_id),
+                        "version": opinion_version,
+                        "status": opinion.status.value if opinion is not None else "unknown",
+                        "sha256": opinion_sha256,
+                        "investigation_id": str(augmentation.get("investigation_id")),
+                    }
+                    provenance = getattr(publication, "provenance", None)
+                    if provenance is None or any(
+                        (
+                            str(getattr(provenance, "opinion_id", "")) != str(opinion_id),
+                            getattr(provenance, "opinion_version", None) != opinion_version,
+                            str(getattr(provenance, "opinion_content_sha256", ""))
+                            != opinion_sha256,
+                            str(getattr(provenance, "investigation_id", ""))
+                            != str(augmentation.get("investigation_id")),
+                        )
+                    ):
+                        warnings.append("publication_and_augmentation_provenance_disagree")
+                elif schema_version == "6" or isinstance(augmentation, dict):
+                    warnings.append("publication_schema_and_augmentation_metadata_disagree")
+
+                result.append(
+                    {
+                        "subject_id": str(entry.subject_id),
+                        "production_run_id": str(entry.production_run_id),
+                        "artifact": {
+                            "id": str(artifact.id),
+                            "version": artifact.version,
+                            "sha256": canonical_sha256,
+                            "document_schema": schema_version,
+                        },
+                        "opinion": opinion_identity,
+                        "review_decision_id": (
+                            str(review_decision_id) if review_decision_id is not None else None
+                        ),
+                        "lineage_warning": ";".join(warnings) if warnings else None,
+                    }
+                )
+            await uow.commit()
+        return result
+
+    async def _release_pdf_lineage(
+        self,
+        edition: Edition,
+        release: EditionRelease,
+        manifest: PublicationManifest | None,
+        render: EditionRender,
+    ) -> dict[str, Any]:
+        render_data = b""
+        if render.render_data_blob_id is not None:
+            try:
+                render_data = await self._artifact_store.read_bytes(
+                    render.render_data_blob_id, max_bytes=MAX_ARTIFACT_BYTES
+                )
+            except Exception:
+                # A legacy/missing render-data blob must not block delivery of a
+                # verified pinned PDF; the JSON sidecar marks the identity gap.
+                render_data = b""
+        try:
+            render_data_payload = json.loads(render_data) if render_data else {}
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            render_data_payload = {}
+        stored = (
+            render_data_payload.get("pdf_lineage")
+            if isinstance(render_data_payload, dict)
+            else None
+        )
+        lineage = (
+            dict(stored)
+            if isinstance(stored, dict)
+            else {
+                "schema_version": "pdf-lineage.v1",
+                "nature": "edition_release",
+                "edition_id": str(edition.id),
+                "edition_release_id": str(release.id),
+                "manifest_id": str(release.manifest_id),
+                "publications": [],
+                "lineage_warning": "persisted_render_lineage_unavailable",
+            }
+        )
+        reasons: list[str] = []
+        publications = lineage.get("publications")
+        publications = publications if isinstance(publications, list) else []
+        reconstructed = False
+        if not publications and manifest is not None:
+            try:
+                publications = await self._reconstruct_release_publications(release, manifest)
+                lineage["publications"] = publications
+                reconstructed = bool(publications)
+                if reconstructed:
+                    lineage["lineage_warning"] = "reconstructed_from_immutable_release_pins"
+            except Exception:
+                lineage["lineage_warning"] = "pinned_release_source_chain_unavailable"
+        if reconstructed:
+            lineage["lineage_source"] = "immutable_release_pins"
+        elif isinstance(stored, dict):
+            lineage["lineage_source"] = "persisted_render_data"
+        else:
+            lineage["lineage_source"] = "unavailable"
+            reasons.append("persisted_render_lineage_unavailable")
+        if not publications:
+            reasons.append("pinned_publication_identities_unavailable")
+        async with self._uow_factory() as uow:
+            runtime_uow = cast(Any, uow)
+            latest_manifest = await uow.publication_manifests.get_latest_manifest_for_edition(
+                edition.id
+            )
+            if latest_manifest is None or latest_manifest.id != release.manifest_id:
+                reasons.append("edition_release_is_not_latest")
+            for publication in publications:
+                if not isinstance(publication, dict):
+                    reasons.append("malformed_pinned_publication_lineage")
+                    continue
+                publication_reasons: list[str] = []
+                try:
+                    subject_id = UUID(str(publication["subject_id"]))
+                    run_id = UUID(str(publication["production_run_id"]))
+                    artifact_data = publication.get("artifact")
+                    if not isinstance(artifact_data, dict) or not artifact_data.get("id"):
+                        raise ValueError("pinned artifact identity unavailable")
+                    artifact_id = UUID(str(artifact_data["id"]))
+                    current_run = await uow.production_runs.get_current_for_subject(subject_id)
+                    current_artifact = await uow.production_artifacts.get_current(
+                        run_id, ProductionArtifactStage.PUBLICATION.value
+                    )
+                    if current_run is None or current_run.id != run_id:
+                        publication_reasons.append("production_run_is_not_current")
+                    if current_artifact is None or current_artifact.id != artifact_id:
+                        publication_reasons.append("publication_artifact_is_not_current")
+                    opinion_data = publication.get("opinion")
+                    if isinstance(opinion_data, dict):
+                        opinion_id = UUID(str(opinion_data["id"]))
+                        pinned_version = int(opinion_data["version"])
+                        pinned_opinion = await runtime_uow.analyst_opinions.get(
+                            opinion_id, version=pinned_version
+                        )
+                        current_opinion = await runtime_uow.analyst_opinions.get(opinion_id)
+                        if pinned_opinion is None or current_opinion is None:
+                            publication_reasons.append("pinned_opinion_identity_unavailable")
+                        else:
+                            opinion_data.update(
+                                {
+                                    "status": pinned_opinion.status.value,
+                                    "sha256": pinned_opinion.content_sha256,
+                                    "investigation_id": str(pinned_opinion.investigation_id),
+                                }
+                            )
+                            if (
+                                current_opinion.version != pinned_opinion.version
+                                or current_opinion.content_sha256 != pinned_opinion.content_sha256
+                            ):
+                                publication_reasons.append("pinned_opinion_is_older_than_current")
+                            current_investigation = (
+                                await runtime_uow.analyst_investigations.get_for_run(current_run.id)
+                                if current_run is not None
+                                else None
+                            )
+                            if (
+                                current_investigation is not None
+                                and current_investigation.id != pinned_opinion.investigation_id
+                            ):
+                                publication_reasons.append("pinned_opinion_investigation_mismatch")
+                    elif publication.get("lineage_warning"):
+                        publication_reasons.append(str(publication["lineage_warning"]))
+                except (KeyError, TypeError, ValueError):
+                    publication_reasons.append("pinned_publication_identity_unavailable")
+                publication["history_reasons"] = list(dict.fromkeys(publication_reasons))
+                publication["is_current"] = not publication_reasons
+                publication["historical"] = bool(publication_reasons)
+                reasons.extend(publication_reasons)
+            await uow.commit()
+
+        render_data_sha256 = hashlib.sha256(render_data).hexdigest() if render_data else None
+        lineage.update(
+            {
+                "render_id": str(render.id),
+                "render_data_sha256": render_data_sha256,
+                "renderer": {
+                    "name": render.renderer,
+                    "version": render.renderer_version,
+                    "identity_sha256": hashlib.sha256(
+                        f"{render.renderer}\0{render.renderer_version}".encode()
+                    ).hexdigest(),
+                },
+                "template": {
+                    "version": render.template_version,
+                    "sha256": render.template_sha256,
+                },
+                "compiler": {
+                    "name": render.compiler,
+                    "version": render.compiler_version,
+                    "identity_sha256": hashlib.sha256(
+                        f"{render.compiler}\0{render.compiler_version}".encode()
+                    ).hexdigest(),
+                    "binary_sha256": None,
+                },
+                "rendered_at": render.created_at.isoformat(),
+                "pdf_sha256": render.output_sha256,
+                "is_current": not reasons,
+                "historical": bool(reasons),
+                "history_reasons": list(dict.fromkeys(reasons)),
+            }
+        )
+        if manifest is None:
+            lineage["lineage_warning"] = "publication_manifest_unavailable"
+            lineage["is_current"] = False
+            lineage["historical"] = True
+            lineage["history_reasons"] = [
+                *lineage["history_reasons"],
+                "publication_manifest_unavailable",
+            ]
+        return lineage
 
     async def read_release_ioc_archive(self, edition_id: UUID) -> EditionIOCArchive:
         """Export IOC values only from the document pinned by the latest release."""

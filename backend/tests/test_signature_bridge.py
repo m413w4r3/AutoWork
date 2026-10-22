@@ -20,6 +20,7 @@ from cti_app.application.investigation_tools import (
     InMemoryToolRegistry,
     ToolExecutionContext,
 )
+from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.rule_workbench import (
     RuleCorpusBytesUnavailable,
     RuleWorkbench,
@@ -119,6 +120,9 @@ class _FakeRecorder:
         key = str(kwargs.get("idempotency_key") or uuid4())
         if key not in self.json_observations:
             blob_id = uuid4()
+            digest = hashlib.sha256(
+                ProductionArtifactStore.canonical_json_bytes(kwargs["payload"])
+            ).hexdigest()
             observation = SimpleNamespace(
                 id=uuid4(),
                 investigation_id=kwargs["investigation_id"],
@@ -126,6 +130,7 @@ class _FakeRecorder:
                 object_type=kwargs["object_type"],
                 object_id=kwargs["object_id"],
                 blob_id=blob_id,
+                sha256=digest,
                 observed_at=datetime.now(UTC),
             )
             self.json_observations[key] = observation
@@ -498,6 +503,11 @@ class _MemoryCorpus:
         except KeyError as exc:
             raise RuleCorpusBytesUnavailable(sample_sha256) from exc
 
+    async def get_artifact_id_for_sample(self, sample_sha256: str) -> UUID:
+        if sample_sha256 not in self.samples:
+            raise RuleCorpusBytesUnavailable(sample_sha256)
+        return uuid4()
+
 
 class _MemoryCandidateRepository:
     def __init__(self) -> None:
@@ -600,21 +610,18 @@ class _MemoryRuleAssociations:
 
 
 class _MemoryRuleCorpusInventory:
-    def __init__(
-        self, *, goodware: Sequence[RuleCorpusInventoryItem], holdout: Sequence[str]
-    ) -> None:
-        self.goodware = tuple(goodware)
-        self.holdout = tuple(holdout)
+    def __init__(self, *, imports: Sequence[RuleCorpusInventoryItem]) -> None:
+        self.imports = tuple(imports)
 
     async def manual_rule_corpus_imports(
         self, investigation_id: UUID
     ) -> Sequence[RuleCorpusInventoryItem]:
         assert investigation_id == _INVESTIGATION_ID
-        return self.goodware
+        return self.imports
 
     async def holdout_sample_sha256s(self, investigation_id: UUID) -> Sequence[str]:
         assert investigation_id == _INVESTIGATION_ID
-        return self.holdout
+        return ()
 
 
 def _digest(payload: bytes) -> str:
@@ -622,7 +629,15 @@ def _digest(payload: bytes) -> str:
 
 
 def _case(payload: bytes, role: RuleTestCorpusRole) -> RuleTestCase:
-    return RuleTestCase(sample_sha256=_digest(payload), role=role)
+    holdout_roles = {
+        RuleTestCorpusRole.HOLDOUT_POSITIVE,
+        RuleTestCorpusRole.HOLDOUT_NEGATIVE,
+    }
+    return RuleTestCase(
+        sample_sha256=_digest(payload),
+        role=role,
+        holdout_designated_at=(datetime(2026, 1, 1, tzinfo=UTC) if role in holdout_roles else None),
+    )
 
 
 def _motif(value: str, *, sample_sha256: str, offset: int, provenance_id: str) -> RuleMotif:
@@ -702,7 +717,7 @@ async def test_real_bridge_uses_p09_and_rule_tools_and_replays_same_candidate() 
         legitimate_services=LegitimateServiceRegistry(()),
     )
     inventory = _MemoryRuleCorpusInventory(
-        goodware=(
+        imports=(
             RuleCorpusInventoryItem(
                 sample_sha256=goodware_hash,
                 role=RuleTestCorpusRole.GOODWARE,
@@ -710,8 +725,16 @@ async def test_real_bridge_uses_p09_and_rule_tools_and_replays_same_candidate() 
                 size_bytes=len(goodware),
                 source_description="Synthetic benign-like bytes for the local YARA test.",
             ),
+            RuleCorpusInventoryItem(
+                sample_sha256=holdout_hash,
+                role=RuleTestCorpusRole.HOLDOUT_POSITIVE,
+                provenance=RuleSampleProvenance.SYNTHETIC,
+                size_bytes=len(holdout),
+                source_description="Synthetic holdout designated before rule development.",
+                designated_at=datetime(2026, 1, 1, tzinfo=UTC),
+                observation_id=UUID(int=9901),
+            ),
         ),
-        holdout=(holdout_hash,),
     )
     rule_registry = InMemoryToolRegistry()
     rule_tools = register_rule_tools(

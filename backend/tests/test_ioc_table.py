@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 import shutil
@@ -6,8 +7,9 @@ import subprocess
 import unicodedata
 import xml.etree.ElementTree as ET
 from dataclasses import replace
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 import pytest
@@ -24,22 +26,38 @@ from cti_app.application.typst_compilation import (
 )
 from cti_app.application.typst_paths import typst_bundle_paths
 from cti_app.application.typst_rendering import (
+    TypstDraftPreviewDocument,
     TypstRenderer,
     load_template_bundle,
     project_publication_to_typst_model,
 )
+from cti_app.domain.analyst_opinion import (
+    AnalystObservationRelation,
+    AnalystObservationState,
+    AnalystObservationV1,
+    AnalystOpinionStatus,
+    AnalystOpinionV1,
+    opinion_blocks_with_observations,
+)
 from cti_app.domain.discovery import SourceRole
+from cti_app.domain.investigation import EvidenceKind, EvidenceObservation
 from cti_app.domain.production_extraction import (
     ExtractionIndicatorStatus,
     ExtractionIndicatorV1,
     ProductionEvidenceBasis,
 )
-from cti_app.domain.publication import ArtifactType, PublicationReferenceEntryV1
+from cti_app.domain.publication import (
+    ArtifactType,
+    PublicationIndicatorGroupV1,
+    PublicationIndicatorV1,
+    PublicationReferenceEntryV1,
+)
 from cti_app.domain.publication_document import (
     PublicationDocumentV5,
     order_publication_references,
     publication_document_from_json,
     publication_document_text_anchors,
+    publication_document_v5_sha256,
     serialize_publication_document,
 )
 from cti_app.domain.semantic_annotation import (
@@ -313,11 +331,119 @@ def test_ioc_table_merges_roles_for_one_canonical_value_without_dropping_provena
     summary = row["context_summary"]
     assert "primary/independent" in summary
     assert "Hash SHA-256 n° 1 relevé" in summary
-    assert "Same hash independently" in summary
+    assert "Same hash…" in summary
     assert "lien établi" in summary
-    assert "preuve:" in summary
-    assert "fiab: source_verified" in summary
     assert "Preuve, contexte et décision" not in str(model.content_sections[0])
+
+
+def test_ioc_groups_deduplicate_candidate_against_article_and_original_statuses() -> None:
+    base, _values = _ioc_document()
+    source_id = base.document.sources[0].source_document_id
+    article_domain = "dedup.example.invalid"
+    original_ip = "198.51.100.42"
+    indicator_groups = (
+        *(
+            group
+            for group in base.document.indicators
+            if group.artifact_type is not ArtifactType.DOMAIN
+        ),
+        PublicationIndicatorGroupV1(
+            ArtifactType.DOMAIN,
+            (
+                PublicationIndicatorV1(
+                    value=article_domain,
+                    normalized_value=article_domain,
+                    artifact_type=ArtifactType.DOMAIN,
+                    source_document_ids=(source_id,),
+                ),
+            ),
+        ),
+    )
+    original_group = PublicationIndicatorGroupV1(
+        ArtifactType.IP,
+        (
+            PublicationIndicatorV1(
+                value=original_ip,
+                normalized_value=original_ip,
+                artifact_type=ArtifactType.IP,
+                source_document_ids=(source_id,),
+            ),
+        ),
+    )
+    base = replace(
+        base,
+        document=replace(base.document, indicators=indicator_groups),
+        original_indicators=(original_group,),
+    )
+    investigation_id = UUID(int=71_001)
+    evidence_id = UUID(int=71_002)
+    observation = EvidenceObservation(
+        id=evidence_id,
+        investigation_id=investigation_id,
+        kind=EvidenceKind.CLAIM_SOURCE,
+        blob_id=UUID(int=71_003),
+        sha256=hashlib.sha256(b"synthetic IOC dedupe evidence").hexdigest(),
+        source="synthetic fixture",
+        source_version="v1",
+        observed_at=datetime(2026, 10, 20, tzinfo=UTC),
+        object_type="domain",
+        object_id=article_domain,
+    )
+    note = AnalystObservationV1(
+        id=UUID(int=71_004),
+        anchor="lead:0001",
+        text="Candidate links dedup[.]example[.]invalid and 198[.]51[.]100[.]42.",
+        state=AnalystObservationState.INFERRED,
+        relation=AnalystObservationRelation.QUALIFIES,
+        evidence_refs=(evidence_id,),
+    )
+    opinion = AnalystOpinionV1(
+        id=UUID(int=71_005),
+        version=1,
+        investigation_id=investigation_id,
+        synthesis_artifact_id=UUID(int=71_006),
+        synthesis_sha256=hashlib.sha256(b"synthetic synthesis").hexdigest(),
+        base_publication_artifact_id=UUID(int=71_007),
+        base_publication_sha256=publication_document_v5_sha256(base),
+        blocks=opinion_blocks_with_observations((), (note,)),
+        author_id="synthetic-fixture",
+        status=AnalystOpinionStatus.DRAFT,
+    )
+
+    model = project_publication_to_typst_model(
+        TypstDraftPreviewDocument(
+            base_publication=base,
+            analyst_opinion=opinion,
+            evidence_observations=(observation,),
+        )
+    )
+    ioc_section = next(section for section in model.content_sections if section["type"] == "ioc")
+    article_items = [item for group in ioc_section["source_indicators"] for item in group["items"]]
+    original_items = [
+        item for group in ioc_section["original_indicators"] for item in group["items"]
+    ]
+    candidate_items = [
+        item for group in ioc_section["candidate_indicators"] for item in group["items"]
+    ]
+
+    def display_value(item: dict[str, object]) -> str:
+        value = item["value"]
+        return value["text"] if isinstance(value, dict) else str(value)
+
+    article_item = next(
+        item for item in article_items if display_value(item) == "dedup[.]example[.]invalid"
+    )
+    original_item = next(
+        item for item in original_items if display_value(item) == "198[.]51[.]100[.]42"
+    )
+    assert not any(
+        display_value(item) in {"dedup[.]example[.]invalid", "198[.]51[.]100[.]42"}
+        for item in candidate_items
+    )
+    assert article_item["indicator_status_label"] == "Documenté dans l'article"
+    assert "Candidat non confirmé" in article_item["relationship_status_label"]
+    assert original_item["indicator_status_label"] == "IOC original du run"
+    assert "Candidat non confirmé" in original_item["relationship_status_label"]
 
 
 @pytest.mark.asyncio
@@ -326,7 +452,11 @@ async def test_real_typst_ioc_table_keeps_values_and_fits_a4_pages(tmp_path: Pat
     document = _ioc_document_with_four_published_references(document)
     chp_typst_root, font_bundle_root, font_lock_path = typst_bundle_paths()
     template_bundle = load_template_bundle(chp_typst_root)
-    render_source = TypstRenderer().render(document, template_bundle)
+    render_source = TypstRenderer().render(
+        document,
+        template_bundle,
+        document_label="Publication de base — artefact fixture v1",
+    )
     render_data = json.loads(render_source.render_data_bytes)
     technical_annex = next(
         section
@@ -346,6 +476,24 @@ async def test_real_typst_ioc_table_keeps_values_and_fits_a4_pages(tmp_path: Pat
     assert all(
         "Preuve, contexte et décision" not in item["text"] for item in references["timeline"]
     )
+    traceability_refs: list[dict[str, Any]] = []
+    for index in range(1, 68):
+        kind = "finding" if index <= 15 else "evidence"
+        reference_id = str(UUID(int=90_000 + index))
+        traceability_refs.append(
+            {
+                "label": f"[{kind[0].upper()}{index:03d}]",
+                "target_id": f"trace-{kind[0]}-{index:03d}",
+                "kind_label": "Finding" if kind == "finding" else "Évidence",
+                "reference_id": reference_id,
+                "reference_id_spans": {"text": reference_id},
+                "href": f"autowork://fixture/{kind}/{reference_id}",
+            }
+        )
+    technical_annex["opinion_refs"] = traceability_refs
+    render_data_bytes = json.dumps(
+        render_data, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
 
     workspace_root = tmp_path / "ioc-table-workspace"
     shutil.copytree(chp_typst_root / "RENDERER", workspace_root / "RENDERER")
@@ -353,7 +501,7 @@ async def test_real_typst_ioc_table_keeps_values_and_fits_a4_pages(tmp_path: Pat
     media_root = workspace_root / "RENDERER" / "media"
     media_root.mkdir()
     shutil.copy2(chp_typst_root / "UTILS" / "chap.png", media_root / "figure.png")
-    (workspace_root / "RENDERER" / "render-data.json").write_bytes(render_source.render_data_bytes)
+    (workspace_root / "RENDERER" / "render-data.json").write_bytes(render_data_bytes)
 
     binary = os.environ.get("TYPST_BINARY") or shutil.which("typst")
     assert binary is not None, "Typst 0.15.1 must be installed for this rendering test"
@@ -373,7 +521,7 @@ async def test_real_typst_ioc_table_keeps_values_and_fits_a4_pages(tmp_path: Pat
         )
     )
 
-    audit_root = Path(os.environ.get("TMPDIR", "/tmp")) / "lotL2" / "regression-after" / "ioc"
+    audit_root = Path(os.environ.get("TMPDIR", "/tmp")) / "lotR" / "fixture-after"
     audit_root.mkdir(parents=True, exist_ok=True)
     pdf_path = audit_root / "ioc-table.pdf"
     pdf_path.write_bytes(compiled.content)
@@ -414,23 +562,72 @@ async def test_real_typst_ioc_table_keeps_values_and_fits_a4_pages(tmp_path: Pat
     for value in expected_values:
         assert value in normalized_text
     assert "Thesourcerepeatsonelongcampaignevidencepassageforthesevalues." not in normalized_text
-    assert normalized_text.count("Thesourcerepeatsone…") >= 58
+    assert normalized_text.count("Onesharedlongsourcecontext") >= 40
     # C8 uses an IOC list in the body and labels the exhaustive table as an annex.
     assert "IOC" in normalized_text
     assert "ANNEXETECHNIQUE—inventaireexhaustifdesIOC" in normalized_text
-    assert "Type" in extracted_text
-    assert "Valeurdéfanguée" in normalized_text
-    assert "Contexteetstatut" in normalized_text
-    assert "Source[n]" in normalized_text
-    assert "fiab:source_verified" in normalized_text
+    assert "Empreintedefichier—unevaleurparligne" in normalized_text
+    assert "Statut,relationetprovenance" in normalized_text
+    assert "Indicateur:" in normalized_text
+    assert "Relation:" in normalized_text
+    assert "src" in normalized_text
     assert "TLPnonprécisé" in normalized_text
     assert "Retenu" in extracted_text
     assert "Écarté" in extracted_text
     assert "Incertain" in extracted_text
     assert "Retenu" in extracted_text
-    page_count = len(PdfReader(pdf_path, strict=True).pages)
-    assert 3 <= page_count <= 5
-    assert extracted_text.count("Type") >= page_count
+    reader = PdfReader(pdf_path, strict=True)
+    page_count = len(reader.pages)
+    assert 4 <= page_count <= 7
+    page_texts = [page.extract_text() or "" for page in reader.pages]
+    hash_pages = [
+        page_number
+        for page_number, page_text in enumerate(page_texts, start=1)
+        if "Empreinte de fichier" in page_text
+    ]
+    hash_row_page_counts = {
+        page_number: sum(row["value"] in page_text for row in technical_annex["ioc_rows"])
+        for page_number, page_text in enumerate(page_texts, start=1)
+    }
+    hash_table_page = max(hash_row_page_counts, key=hash_row_page_counts.get)
+    trace_pages = [
+        page_number
+        for page_number, page_text in enumerate(page_texts, start=1)
+        if "[F001]" in page_text or "[E016]" in page_text
+    ]
+    matching_trace_refs = sum(
+        reference["reference_id"] in page_text
+        for page_text in page_texts
+        for reference in traceability_refs
+    )
+    assert 1 <= len(hash_pages) <= 4
+    assert hash_row_page_counts[hash_table_page] >= 15
+    assert len(trace_pages) == 1
+    assert matching_trace_refs == 67
+
+    for image_name, page_number in (
+        ("hash-table-70dpi", hash_table_page),
+        ("traceability-70dpi", trace_pages[0]),
+    ):
+        await asyncio.to_thread(
+            subprocess.run,
+            (
+                pdftoppm,
+                "-png",
+                "-r",
+                "70",
+                "-f",
+                str(page_number),
+                "-l",
+                str(page_number),
+                "-singlefile",
+                str(pdf_path),
+                str(audit_root / image_name),
+            ),
+            capture_output=True,
+            check=True,
+            timeout=20,
+        )
 
     bbox = await asyncio.to_thread(
         subprocess.run,

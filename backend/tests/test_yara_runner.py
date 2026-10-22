@@ -80,6 +80,7 @@ def test_compile_error_is_typed_with_source_line() -> None:
 
     assert result.status is YaraExecutionStatus.COMPILE_ERROR
     assert result.line is not None
+    assert result.column == 2
     assert len(result.message) <= 1000
 
 

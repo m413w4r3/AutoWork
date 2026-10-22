@@ -478,6 +478,7 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
         background_idle_timeout_seconds_by_role: Mapping[ModelRole, float] | None = None,
         request_timeout_seconds_by_role: Mapping[ModelRole, float] | None = None,
         bridge_wait_timeout_seconds_by_role: Mapping[ModelRole, float] | None = None,
+        model_output_max_bytes: int = 512 * 1024 * 1024,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._router = router
@@ -493,6 +494,7 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
         )
         self._request_timeout_seconds_by_role = dict(request_timeout_seconds_by_role or {})
         self._bridge_wait_timeout_seconds_by_role = dict(bridge_wait_timeout_seconds_by_role or {})
+        self._model_output_max_bytes = model_output_max_bytes
         self._clock = clock or (lambda: datetime.now(UTC))
         # Research, merge, extraction and drafting all funnel through _execute,
         # so a bridge or Qwen failure is recorded once here for every caller.
@@ -549,8 +551,10 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
         async with self._uow_factory() as uow:
             return await uow.model_runs.get(run_id)
 
-    async def read_output(self, reference: str, *, max_bytes: int = 10_000_000) -> bytes:
-        return await self._output_store.read(reference, max_bytes=max_bytes)
+    async def read_output(self, reference: str, *, max_bytes: int | None = None) -> bytes:
+        return await self._output_store.read(
+            reference, max_bytes=max_bytes or self._model_output_max_bytes
+        )
 
     async def archive_output(self, content: bytes, *, mime_type: str) -> str:
         return await self._output_store.store(content, mime_type=mime_type)
@@ -1299,7 +1303,7 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
         )
         if reference is None:
             raise ModelGatewayError("Succeeded ModelRun has no persisted output")
-        content = await self._output_store.read(reference, max_bytes=10_000_000)
+        content = await self._output_store.read(reference, max_bytes=self._model_output_max_bytes)
         text = content.decode("utf-8")
         structured = validate_structured_output(text, output_schema) if output_schema else None
         return ModelExecution(
@@ -1646,6 +1650,9 @@ def _error_details(
         "retryable": bool(getattr(exc, "retryable", False)),
         "attempts": max(1, int(getattr(exc, "attempts", 1))),
     }
+    retry_after = getattr(exc, "retry_after", None)
+    if isinstance(retry_after, int | float) and not isinstance(retry_after, bool):
+        details["retry_after"] = max(0.0, float(retry_after))
     for key in ("bridge_run_id", "bridge_status"):
         value = getattr(exc, key, None)
         if isinstance(value, str) and value:

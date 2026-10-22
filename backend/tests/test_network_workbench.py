@@ -6,7 +6,8 @@ import ipaddress
 import shutil
 import struct
 from collections.abc import Callable
-from uuid import UUID, uuid5
+from types import SimpleNamespace
+from uuid import UUID, uuid4, uuid5
 
 import pytest
 
@@ -14,6 +15,8 @@ from cti_app.application.investigation_network_tools import (
     NETWORK_CAPTURE_INSPECT,
     NETWORK_MESSAGES_SEGMENT,
     NETWORK_STREAM_REASSEMBLE,
+    NETWORK_SURICATA_REPLAY,
+    NETWORK_SURICATA_VALIDATE_RULES,
     network_tool_capabilities,
     register_network_tools,
 )
@@ -780,6 +783,141 @@ async def test_tools_register_with_versioned_bounded_schemas() -> None:
     assert definition.capability_key == NETWORK_CAPTURE_INSPECT
     assert definition.cost_model
     assert result.status is ToolInvocationStatus.UNAVAILABLE
+
+
+@pytest.mark.asyncio
+async def test_suricata_registry_accepts_bridge_provenance_and_reports_truncation() -> None:
+    capture = _mixed_capture()
+    workbench, _ = _workbench(capture)
+    reference = await _accepted_reference(workbench)
+
+    class _Execution:
+        available = True
+        available_reason = None
+
+        def __init__(self) -> None:
+            self.requests = []
+            self.family_statuses = {
+                "suricata": SimpleNamespace(available=True, available_reason=None)
+            }
+
+        async def execute(self, request):
+            self.requests.append(request)
+            rule_source = request.analysis_parameters.get("rule_source", "")
+            return SimpleNamespace(
+                status=ToolInvocationStatus.SUCCEEDED,
+                operation_key=f"offline-{request.tool.value}",
+                available_reason=None,
+                payload={
+                    "result": {
+                        "status": "SUCCEEDED",
+                        "ruleset_revision": "offline-fixture-v1",
+                        "rule_sha256": hashlib.sha256(rule_source.encode()).hexdigest(),
+                        "alert_count": 0,
+                        "event_counts": {"alert": 0},
+                        "truncated": request.tool.value == "suricata_replay",
+                    }
+                },
+            )
+
+    class _Recorder:
+        def __init__(self) -> None:
+            self.records = []
+
+        async def record_json(self, **kwargs):
+            self.records.append(kwargs)
+            return SimpleNamespace(id=uuid4())
+
+    execution = _Execution()
+    workbench.tshark = SimpleNamespace(available=True, execution=execution)  # type: ignore[assignment]
+    recorder = _Recorder()
+    registry = InMemoryToolRegistry()
+    register_network_tools(registry, workbench=workbench, recorder=recorder)  # type: ignore[arg-type]
+    context = ToolExecutionContext(
+        investigation_id=_NETWORK_INVESTIGATION_ID,
+        envelope=None,
+        budget=InvestigationBudget(),
+        idempotency_key="bridge-suricata-fixture",
+        available_capabilities=frozenset(
+            {NETWORK_SURICATA_VALIDATE_RULES, NETWORK_SURICATA_REPLAY, NETWORK_CAPTURE_INSPECT}
+        ),
+    )
+    candidate = {
+        "candidate_id": "bridge-fixture",
+        "candidate_version": 1,
+        "rule_source": 'alert tcp any any -> any any (msg:"offline fixture"; sid:9900001; rev:1;)',
+        "source": "bridge",
+        "source_ref": "bridge-consult-2026-10-20-1",
+        "evidence_refs": ["d54851ac-9efe-45ce-85c4-5ee2ca87bd16"],
+    }
+    arguments = {"capture_ref": reference.to_dict(), "candidate": candidate}
+
+    validate_registration = registry.get(NETWORK_SURICATA_VALIDATE_RULES, "1")
+    replay_registration = registry.get(NETWORK_SURICATA_REPLAY, "1")
+    assert validate_registration is not None and replay_registration is not None
+    validate_definition, validate_adapter = validate_registration
+    replay_definition, replay_adapter = replay_registration
+    required = validate_definition.input_schema["properties"]["candidate"]["required"]
+    assert {"source", "source_ref"}.issubset(required)
+    assert replay_definition.schema_version == "1"
+
+    candidate_without_source_ref = {
+        key: value for key, value in candidate.items() if key != "source_ref"
+    }
+    rejected = await validate_adapter.execute(
+        {
+            "capture_ref": reference.to_dict(),
+            "candidate": candidate_without_source_ref,
+        },
+        context,
+    )
+    assert rejected.status is ToolInvocationStatus.POLICY_DENIED
+    assert execution.requests == []
+
+    validated = await validate_adapter.execute(arguments, context)
+    replayed = await replay_adapter.execute(arguments, context)
+    assert validated.status is ToolInvocationStatus.SUCCEEDED
+    assert validated.output["rule_syntax_validation"] == "valid"
+    assert validated.output["detection_result"] == "not_assessed"
+    assert validated.output["detection_empirically_validated"] is False
+    assert replayed.status is ToolInvocationStatus.SUCCEEDED
+    assert replayed.output["rule_syntax_validation"] == "loaded_during_replay"
+    assert replayed.output["detection_result"] == "single_capture_replay_only"
+    assert "does not empirically validate detection" in replayed.output["detection_detail"]
+    assert replayed.output["detection_empirically_validated"] is False
+    assert replayed.output["truncation"]["eve_or_event_summary_truncated"] is True
+    assert replayed.output["truncation"]["tshark_output_truncated"] is None
+    assert "network.capture.inspect" in replayed.output["truncation"]["tshark_detail"]
+    assert all(
+        set(request.analysis_parameters) == {"candidate_id", "candidate_version", "rule_source"}
+        for request in execution.requests
+    )
+    assert recorder.records[-1]["payload"]["candidate_provenance"] == {
+        "source": "bridge",
+        "source_ref": "bridge-consult-2026-10-20-1",
+        "evidence_refs": candidate["evidence_refs"],
+    }
+
+    async def inspect_truncated(_reference, *, investigation_id):
+        assert investigation_id == _NETWORK_INVESTIGATION_ID
+        report = SimpleNamespace(
+            capture=reference,
+            output_truncated=True,
+            canonical_sha256="c" * 64,
+            to_dict=lambda: {"output_truncated": True},
+        )
+        return SimpleNamespace(
+            report=report,
+            status=ToolInvocationStatus.PARTIAL,
+            detail_code=None,
+        )
+
+    workbench.inspect = inspect_truncated  # type: ignore[method-assign]
+    capture_registration = registry.get(NETWORK_CAPTURE_INSPECT, "1")
+    assert capture_registration is not None
+    _capture_definition, capture_adapter = capture_registration
+    inspected = await capture_adapter.execute({"capture_ref": reference.to_dict()}, context)
+    assert inspected.output["truncation"]["tshark_output_truncated"] is True
 
 
 @pytest.mark.asyncio

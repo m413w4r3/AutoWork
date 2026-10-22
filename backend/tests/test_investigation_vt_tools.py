@@ -56,12 +56,14 @@ from cti_app.application.virustotal import (
     VirusTotalFile,
     VirusTotalFileReport,
     VirusTotalHttpError,
+    VirusTotalInvalidInputError,
     VirusTotalNotAuthorizedError,
     VirusTotalObjectReport,
     VirusTotalPage,
     VirusTotalQuotaExceededError,
     VirusTotalSearchResult,
     VirusTotalTransportError,
+    validate_search_query,
 )
 from cti_app.domain.analyst_opinion import (
     OpinionBlockType,
@@ -696,6 +698,77 @@ async def test_intelligence_search_rejects_long_control_short_content_and_unknow
     assert unknown.status is ToolInvocationStatus.POLICY_DENIED
     assert unknown.output["reason"] == "evidence_refs_unverified"
     assert tools.vt.calls["intelligence_search"] == 0
+
+
+@pytest.mark.asyncio
+async def test_content_query_justification_and_evidence_refs_persist_on_candidates() -> None:
+    tools = _tool_set()
+    seed = await ProductionEvidenceRecorder(tools.blob_store, tools.evidence).record_json(
+        investigation_id=tools.context.investigation_id,
+        kind=EvidenceKind.BINARY_STRING,
+        payload={"schema": "sample-obfuscated-strings.v1", "strings": []},
+        source="autowork.floss",
+        source_version="floss-test-v1",
+        object_type="sample",
+        object_id=_SEED_HASH,
+    )
+    tools.vt.search_pages = [_search_result(({"id": _CANDIDATE_HASH, "type": "file"},))]
+    query = "content:{0102030405060708090a0b0c}"
+
+    result = await _dispatch(
+        tools,
+        "vt.intelligence_search",
+        _search_arguments(seed.id, query),
+    )
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    persisted = await tools.evidence.list_for_investigation(tools.context.investigation_id)
+    summaries = []
+    for observation in persisted:
+        if (
+            observation.source != "VirusTotal"
+            or observation.kind is not EvidenceKind.VT_RELATIONSHIP
+        ):
+            continue
+        if observation.blob_id not in tools.blob_store.payloads:
+            continue
+        payload = await tools.blob_store.read_json(observation.blob_id)
+        if isinstance(payload.get("candidate"), dict):
+            summaries.append(payload)
+    assert len(summaries) == 1
+    assert summaries[0]["effective_query"] == query
+    assert summaries[0]["justification"] == _search_arguments(seed.id, query)["justification"]
+    assert summaries[0]["evidence_refs"] == [str(seed.id)]
+
+
+def test_content_search_validation_accepts_measured_hex_and_spaces() -> None:
+    assert validate_search_query("content:{01020304}") == "content:{01020304}"
+    assert validate_search_query("content:{01 02 03 04}") == "content:{01 02 03 04}"
+    assert validate_search_query('content:"ABCD"') == 'content:"ABCD"'
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "content:{01 02 03}",
+        "content:{010203}",
+        "content:{01 02 0g 04}",
+        "content:{0102030}",
+        "content:{01 0203 04}",
+    ),
+)
+def test_content_search_validation_rejects_short_or_invalid_hex(query: str) -> None:
+    with pytest.raises(VirusTotalInvalidInputError):
+        validate_search_query(query)
+
+
+def test_content_search_validation_enforces_the_2000_character_limit() -> None:
+    inner = "00 " * 662 + "00  "
+    query = f"content:{{{inner}}}"
+    assert len(query) == 2_000
+    assert validate_search_query(query) == query
+    with pytest.raises(VirusTotalInvalidInputError):
+        validate_search_query(query + " ")
 
 
 @pytest.mark.asyncio

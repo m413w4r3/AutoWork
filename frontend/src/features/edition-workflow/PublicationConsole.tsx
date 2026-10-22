@@ -4,14 +4,17 @@ import { getEditionComposition } from "../../api/editions";
 import {
   acceptEditionComposition,
   editionRulesUrl,
+  getEditionReleaseLineage,
   getRenderInputInspection,
   getEditionRelease,
   pdfInspectionUrl,
   releasePdfUrl,
   renderInputInspectionUrl,
   retryEditionRender,
+  versionedReleasePdfUrl,
   type EditionReleaseResponse,
 } from "../../api/publication";
+import type { EditionReleaseLineage } from "../../api/publication";
 import { ApiError } from "../../api/editions";
 import { publicationPollingInterval } from "./publicationPolling";
 
@@ -65,17 +68,22 @@ function RenderInspectionLinks({ renderId }: { renderId: string }) {
 
 function DownloadActions({
   editionId,
+  releaseId,
   pdfAvailable,
 }: {
   editionId: string;
+  releaseId: string | null;
   pdfAvailable: boolean;
 }) {
+  const pdfHref = releaseId
+    ? versionedReleasePdfUrl(editionId, releaseId)
+    : releasePdfUrl(editionId);
   return (
     <div className="publication-console__downloads">
       {pdfAvailable ? (
         <a
           className="button publication-console__download"
-          href={releasePdfUrl(editionId)}
+          href={pdfHref}
           download
         >
           Télécharger le PDF
@@ -89,6 +97,65 @@ function DownloadActions({
         Télécharger les règles (ZIP)
       </a>
     </div>
+  );
+}
+
+function ReleaseLineageStatus({
+  editionId,
+  releaseId,
+}: {
+  editionId: string;
+  releaseId: string | null;
+}) {
+  const lineage = useQuery({
+    queryKey: ["edition-release-lineage", editionId, releaseId ?? "none"],
+    queryFn: () => getEditionReleaseLineage(editionId, releaseId ?? ""),
+    enabled: Boolean(releaseId),
+    retry: false,
+  });
+  if (!releaseId) return null;
+  if (lineage.isPending) return <p role="status">Lecture du lignage PDF…</p>;
+  if (lineage.isError) {
+    return <p>Le manifeste de lignage du release est indisponible.</p>;
+  }
+  const value: EditionReleaseLineage = lineage.data;
+  return (
+    <section aria-label="Lignage du PDF publié">
+      <p>
+        Nature <strong>{value.nature}</strong> ·{" "}
+        <strong>{value.is_current ? "actuel" : "historique"}</strong> · release{" "}
+        <code>{value.edition_release_id}</code>
+      </p>
+      <p>
+        PDF SHA-256 · <code>{value.pdf_sha256 ?? "inconnu"}</code> · render-data{" "}
+        SHA-256 · <code>{value.render_data_sha256 ?? "inconnu"}</code>
+      </p>
+      {value.history_reasons.length > 0 ? (
+        <p>Historique : {value.history_reasons.join(", ")}</p>
+      ) : null}
+      <ul>
+        {value.publications.map((publication) => (
+          <li
+            key={`${publication.subject_id}-${publication.artifact?.id ?? "unknown"}`}
+          >
+            Artefact {publication.artifact?.id ?? "non identifiable"} v
+            {publication.artifact?.version ?? "?"} · SHA-256{" "}
+            {publication.artifact?.sha256 ?? "inconnu"}
+            {publication.opinion ? (
+              <>
+                {" "}
+                · avis {publication.opinion.id} v{publication.opinion.version} (
+                {publication.opinion.status})
+              </>
+            ) : null}
+            {publication.review_decision_id === null
+              ? " · décision de revue non épinglée"
+              : null}
+            {publication.historical ? " · historique" : " · actuel"}
+          </li>
+        ))}
+      </ul>
+    </section>
   );
 }
 
@@ -150,8 +217,15 @@ function ArchivedPublication({
           <RenderStatus release={release} />
           <DownloadActions
             editionId={editionId}
+            releaseId={release.release_id}
             pdfAvailable={release.pdf_available}
           />
+          {release.pdf_available ? (
+            <ReleaseLineageStatus
+              editionId={editionId}
+              releaseId={release.release_id}
+            />
+          ) : null}
           {release.render_id ? (
             <RenderInspectionLinks renderId={release.render_id} />
           ) : null}
@@ -254,8 +328,15 @@ export function PublicationConsole({
         ) : null}
         <DownloadActions
           editionId={editionId}
+          releaseId={current.release_id}
           pdfAvailable={current.pdf_available}
         />
+        {current.pdf_available ? (
+          <ReleaseLineageStatus
+            editionId={editionId}
+            releaseId={current.release_id}
+          />
+        ) : null}
         {current.render_id ? (
           <RenderInspectionLinks renderId={current.render_id} />
         ) : null}

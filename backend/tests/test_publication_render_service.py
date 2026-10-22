@@ -85,6 +85,162 @@ def _document() -> PublicationDocumentV4:
     )
 
 
+def test_pdf_identity_label_uses_artifact_version_and_hash_for_each_preview() -> None:
+    artifact_id = uuid4()
+    opinion_id = uuid4()
+    common = {
+        "nature": "opinion_draft_preview",
+        "artifact_id": artifact_id,
+        "artifact_version": 1,
+        "opinion_id": opinion_id,
+        "opinion_version": 27,
+        "opinion_status": "draft",
+    }
+    first = publication_rendering.publication_identity_label(
+        **common,
+        artifact_sha256="a" * 64,
+    )
+    second = publication_rendering.publication_identity_label(
+        **common,
+        artifact_sha256="b" * 64,
+    )
+
+    assert first != second
+    assert str(artifact_id) in first
+    assert "v1" in first
+    assert "a" * 64 in first
+    assert "Publication V5" not in first
+
+
+def test_publication_without_opinion_is_labeled_as_base_publication() -> None:
+    label = publication_rendering.publication_identity_label(
+        nature="base_publication",
+        artifact_id=uuid4(),
+        artifact_version=1,
+        artifact_sha256="c" * 64,
+    )
+
+    assert label.startswith("Publication de base")
+    assert "avis" not in label
+
+
+def test_lineage_render_data_carries_document_label_and_exact_render_hash() -> None:
+    label = "Aperçu d'avis opinion-1 v27 — draft; artefact artifact-1 v1"
+    source_bytes = b"typst source"
+    render_data_bytes = b"{}"
+    source = TypstRenderSource(
+        source_bytes=source_bytes,
+        source_sha256=hashlib.sha256(source_bytes).hexdigest(),
+        render_data_bytes=render_data_bytes,
+        render_data_sha256=hashlib.sha256(render_data_bytes).hexdigest(),
+        media_refs=(),
+    )
+
+    enriched = publication_rendering.with_publication_lineage(
+        source,
+        identity_label=label,
+        lineage={"nature": "opinion_draft_preview"},
+    )
+    payload = json.loads(enriched.render_data_bytes)
+
+    assert payload["document_label"] == label
+    assert payload["pdf_lineage"]["nature"] == "opinion_draft_preview"
+    assert enriched.render_data_sha256 == hashlib.sha256(enriched.render_data_bytes).hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_lineage_marks_a_pinned_opinion_from_another_investigation_historical() -> None:
+    run_id = uuid4()
+    subject_id = uuid4()
+    artifact_id = uuid4()
+    canonical_blob_id = uuid4()
+    render_data_blob_id = uuid4()
+    opinion_id = uuid4()
+    pinned_investigation_id = uuid4()
+    current_investigation_id = uuid4()
+    artifact = ProductionArtifact(
+        id=artifact_id,
+        production_run_id=run_id,
+        subject_id=subject_id,
+        stage=ProductionArtifactStage.PUBLICATION,
+        version=2,
+        input_hash="d" * 64,
+        canonical_blob_id=canonical_blob_id,
+        metadata={
+            "publication_augmentation": {
+                "opinion_id": str(opinion_id),
+                "opinion_version": 16,
+                "opinion_content_sha256": "a" * 64,
+                "investigation_id": str(pinned_investigation_id),
+            }
+        },
+    )
+    opinion = SimpleNamespace(
+        id=opinion_id,
+        version=16,
+        content_sha256="a" * 64,
+        status=SimpleNamespace(value="approved"),
+        investigation_id=pinned_investigation_id,
+    )
+
+    class _UnitOfWork:
+        production_artifacts = SimpleNamespace(
+            get=lambda requested_id: _async_value(
+                artifact if requested_id == artifact_id else None
+            ),
+            get_current=lambda requested_run_id, _stage: _async_value(
+                artifact if requested_run_id == run_id else None
+            ),
+        )
+        production_runs = SimpleNamespace(
+            get_current_for_subject=lambda requested_subject_id: _async_value(
+                SimpleNamespace(id=run_id) if requested_subject_id == subject_id else None
+            )
+        )
+        analyst_investigations = SimpleNamespace(
+            get_for_run=lambda requested_run_id: _async_value(
+                SimpleNamespace(id=current_investigation_id) if requested_run_id == run_id else None
+            )
+        )
+        analyst_opinions = SimpleNamespace(get=lambda _opinion_id, **_kwargs: _async_value(opinion))
+
+        async def commit(self) -> None:
+            return None
+
+    class _Context:
+        async def __aenter__(self) -> _UnitOfWork:
+            return _UnitOfWork()
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    class _Store:
+        async def read_bytes(self, blob_id: UUID) -> bytes:
+            return b"{}" if blob_id == render_data_blob_id else b"canonical publication"
+
+    service = object.__new__(publication_rendering.PublicationRenderService)
+    service._uow_factory = lambda: _Context()
+    service._artifact_store = _Store()
+    render = replace(
+        _proposed_render(artifact_id),
+        render_data_blob_id=render_data_blob_id,
+        output_blob_id=uuid4(),
+        output_sha256="b" * 64,
+        output_byte_size=10,
+        status=TypstRenderStatus.SUCCEEDED,
+    )
+
+    lineage = await service.lineage_manifest_for_render(render)
+
+    assert lineage["historical"] is True
+    assert lineage["is_current"] is False
+    assert "pinned_opinion_investigation_mismatch" in lineage["history_reasons"]
+
+
+async def _async_value(value: Any) -> Any:
+    return value
+
+
 def _proposed_render(artifact_id: UUID, *, input_hash: str | None = None) -> PublicationRender:
     now = datetime.now(UTC)
     return PublicationRender(
@@ -335,9 +491,10 @@ class FakeRenderer:
         document: PublicationDocumentV4,
         template_bundle: TypstTemplateBundle,
         *,
+        document_label: str,
         target_artifact_identities: dict[str, dict[str, Any]] | None = None,
     ) -> TypstRenderSource:
-        del document, target_artifact_identities
+        del document, document_label, target_artifact_identities
         self.call_count += 1
         source_bytes = next(
             file.content
@@ -798,7 +955,7 @@ async def test_render_uses_the_loaded_template_and_font_snapshots(
     # C8 intentionally stamps the anchored editorial section layout as v11/v25.
     assert (
         publication_rendering.PUBLICATION_RENDERER_VERSION
-        == "publication-v12-typst-v30-opinion-provenance"
+        == "publication-v14-typst-v32-literal-notes"
     )
     expected_templates = {file.relative_path: file.content for file in template_bundle.files}
     observed_templates = {

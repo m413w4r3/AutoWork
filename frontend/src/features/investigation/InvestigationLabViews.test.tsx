@@ -57,17 +57,28 @@ const investigation: InvestigationView = {
   ],
   opinion_draft: null,
   budget: {
-    bridge_turns: { limit: 10, consumed: 4, remaining: 6 },
-    vt_units: { limit: 0, consumed: 0, remaining: 0 },
-    shodan_credits: { limit: 0, consumed: 0, remaining: 0 },
-    downloads: { limit: 0, consumed: 0, remaining: 0 },
-    tool_seconds: { limit: 120, consumed: 15, remaining: 105 },
-    context_tokens: { limit: 20_000, consumed: 5_000, remaining: 15_000 },
-    context_bytes: { limit: 262_144, consumed: 80_000, remaining: 182_144 },
+    bridge_turns: { limit: 10, consumed: 4, reserved: 0, remaining: 6 },
+    vt_units: { limit: 0, consumed: 0, reserved: 0, remaining: 0 },
+    shodan_credits: { limit: 0, consumed: 0, reserved: 0, remaining: 0 },
+    downloads: { limit: 0, consumed: 0, reserved: 0, remaining: 0 },
+    tool_seconds: { limit: 120, consumed: 15, reserved: 0, remaining: 105 },
+    context_tokens: {
+      limit: 20_000,
+      consumed: 5_000,
+      reserved: 0,
+      remaining: 15_000,
+    },
+    context_bytes: {
+      limit: 262_144,
+      consumed: 80_000,
+      reserved: 0,
+      remaining: 182_144,
+    },
   },
   blocked_decisions: [],
   available_tools: [],
   unavailable_tools: [],
+  unavailable_tool_reasons: {},
   envelope_approved: true,
   allowed_providers: [],
   acquire_hits_allowed: false,
@@ -297,8 +308,8 @@ function mockResponse(url: string): Response {
           status: "candidate",
           validation_status: "real_partial",
           created_at: "2026-10-18T12:00:00Z",
-          test_reports: [
-            {
+          test_reports: (() => {
+            const latestReport = {
               observation_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
               sha256: "2".repeat(64),
               source_sha256: "1".repeat(64),
@@ -370,8 +381,16 @@ function mockResponse(url: string): Response {
                 "Un match est une correspondance d’octets, pas une confirmation de famille.",
               statistics_interpretation:
                 "L’intervalle est un score de Wilson à 95 %.",
-            },
-          ],
+            };
+            return [
+              {
+                ...latestReport,
+                observation_id: "99999999-9999-4999-8999-999999999999",
+                execution_status: "engine_crashed",
+              },
+              latestReport,
+            ];
+          })(),
           latest_decision: null,
           comparisons: [],
         },
@@ -533,16 +552,26 @@ describe("InvestigationLabViews", () => {
     );
 
     expect(
-      await screen.findByText(/Sensibilité sur positifs réels/),
+      (await screen.findAllByText(/Sensibilité sur positifs réels/)).length,
+    ).toBeGreaterThan(0);
+    expect(
+      screen.getAllByText(/Non calculable · 0\/0 mesuré/).length,
+    ).toBeGreaterThan(0);
+    expect(
+      screen.getAllByText(/Les faux positifs goodware ne sont pas évalués/)
+        .length,
+    ).toBeGreaterThan(0);
+    expect(
+      screen.getAllByText(/pas une confirmation de famille/).length,
+    ).toBeGreaterThan(0);
+    expect(
+      screen.getByText(/Dernier résultat pertinent · ok/),
     ).toBeInTheDocument();
     expect(
-      screen.getByText(/Non calculable · 0\/0 mesuré/),
+      screen.getByText(/Essai historique · engine_crashed/),
     ).toBeInTheDocument();
     expect(
-      screen.getByText(/Les faux positifs goodware ne sont pas évalués/),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText(/pas une confirmation de famille/),
+      screen.getByRole("heading", { name: /Candidate · version 1/ }),
     ).toBeInTheDocument();
   });
 });

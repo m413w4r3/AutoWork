@@ -183,6 +183,10 @@ class EditionPreviewPdfRenderer:
             render_source = self._renderer.render(
                 document,
                 template_bundle,
+                document_label=(
+                    f"Aperçu d'édition — édition {document.edition['id']} "
+                    f"v{document.edition['version']}"
+                ),
                 artifact_identities=artifact_identities,
             )
         except TemplateBundleInvalidError as exc:

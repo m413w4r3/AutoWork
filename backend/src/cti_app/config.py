@@ -107,8 +107,8 @@ class Settings(BaseSettings):
     openai_bridge_min_submission_interval_seconds: float = Field(default=20.0, ge=0, le=3600)
     openai_bridge_submission_jitter_fraction: float = Field(default=0.3, ge=0, le=0.3)
     operator_advisor_checkpoint_tool_threshold: int = Field(default=12, ge=1, le=1000)
-    operator_advisor_min_consultation_interval_seconds: float = Field(default=20.0, ge=0, le=3600)
-    operator_advisor_max_turns_per_investigation: int = Field(default=8, ge=1, le=100)
+    operator_advisor_max_input_bytes: int = Field(default=4_000_000, gt=0, le=1024 * 1024 * 1024)
+    model_output_max_bytes: int = Field(default=512 * 1024 * 1024, gt=0, le=5 * 1024 * 1024 * 1024)
     openai_bridge_pre_submission_retry_base_seconds: float = Field(default=1.0, ge=0, le=300)
     openai_bridge_pre_submission_retry_max_seconds: float = Field(default=8.0, ge=0, le=3600)
     openai_bridge_connect_timeout_seconds: float = Field(default=3.0, gt=0, le=30)
@@ -344,7 +344,6 @@ class Settings(BaseSettings):
         pattern=r"^[0-9a-f]{64}$",
     )
     analysis_suricata_timeout_seconds: float = Field(default=60.0, gt=0, le=120)
-    analysis_suricata_max_rule_bytes: int = Field(default=65_536, gt=0, le=65_536)
     analysis_suricata_max_eve_bytes: int = Field(
         default=16 * 1024 * 1024, gt=0, le=16 * 1024 * 1024
     )
@@ -380,9 +379,8 @@ class Settings(BaseSettings):
     native_analysis_max_response_bytes: int = Field(default=64 * 1024, ge=256, le=2 * 1024 * 1024)
     native_analysis_max_output_bytes: int = Field(default=32 * 1024, ge=256, le=64 * 1024)
 
-    # An investigation's loop budget is read exclusively from here — never
-    # from a domain default. Twelve Bridge turns is the product default: three
-    # turns is too short for an investigation that may use independent tools.
+    # Internal autonomous investigation cycles only. This does not cap
+    # operator-led Bridge consultations or the human-approved G2 bridge_turns.
     investigation_max_cycles: int = Field(default=12, ge=1, le=100)
     investigation_max_pivot_runs: int = Field(default=0, ge=0)
     investigation_max_hits_acquired: int = Field(default=0, ge=0)

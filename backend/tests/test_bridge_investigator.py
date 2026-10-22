@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 from types import SimpleNamespace
@@ -5,6 +6,7 @@ from uuid import uuid4
 
 import pytest
 
+from cti_app.application import bridge_investigator as bridge_module
 from cti_app.application.bridge_investigator import (
     BridgeInvestigator,
     BridgeSubmissionPacer,
@@ -13,6 +15,7 @@ from cti_app.application.bridge_investigator import (
     TurnSubmission,
     TurnSubmissionStatus,
     make_investigation_turn_idempotency_key,
+    submit_bridge_consultation_once,
 )
 from cti_app.application.investigation_contracts import (
     ArticleContextV1,
@@ -35,6 +38,45 @@ class _ManualClock:
     async def sleep(self, seconds: float) -> None:
         self.delays.append(seconds)
         self.now += seconds
+
+
+@pytest.mark.asyncio
+async def test_advisor_waits_for_provider_pacing_slot_without_timing_out(monkeypatch) -> None:
+    class _StuckPacer:
+        def __init__(self) -> None:
+            self.ready = asyncio.Event()
+
+        async def wait_for_next_submission(self) -> None:
+            await self.ready.wait()
+
+    pacer = _StuckPacer()
+    monkeypatch.setattr(bridge_module, "_shared_bridge_pacer", lambda **_kwargs: pacer)
+    transport = ScriptedTurnTransport(["unused"])
+    investigation_id = uuid4()
+
+    task = asyncio.create_task(
+        submit_bridge_consultation_once(
+            transport,
+            investigation_id=investigation_id,
+            subject_id=uuid4(),
+            turn_index=0,
+            context_sha256="a" * 64,
+            prompt="Synthetic pacing wait test.",
+            external_llm_allowed=True,
+            settings=SimpleNamespace(
+                openai_bridge_min_submission_interval_seconds=0.05,
+                openai_bridge_submission_jitter_fraction=0,
+            ),
+        )
+    )
+    await asyncio.sleep(0)
+    assert not task.done()
+    assert transport.submission_count == 0
+    pacer.ready.set()
+    result = await task
+
+    assert result.status is TurnSubmissionStatus.SUCCEEDED
+    assert transport.submission_count == 1
 
 
 def _context(investigation_id):
@@ -107,9 +149,11 @@ async def test_turn_is_structured_and_replayed_by_deterministic_identity() -> No
     assert "@@DECISION@@" in transport.prompts[0]
     assert "AGENT_TURN_DECISION_SCHEMA" not in transport.prompts[0]
     assert "no Markdown, backticks" in transport.prompts[0]
-    assert "JSON objects and arrays may span multiple lines" in transport.prompts[0]
-    assert "close before the next ARG or @@ marker" in transport.prompts[0]
-    assert "BEGIN_CANONICAL_INVESTIGATION_CONTEXT" in transport.prompts[0]
+    assert "ARG values are plain scalars" in transport.prompts[0]
+    assert "dotted field names" in transport.prompts[0]
+    assert "CONTEXTE FACTUEL CANONIQUE — TEXTE" in transport.prompts[0]
+    assert "BEGIN_CANONICAL_INVESTIGATION_CONTEXT" not in transport.prompts[0]
+    assert len(transport.prompts[0].encode("utf-8")) <= 96_000
     assert "only existing hypothesis IDs listed in the context" in transport.prompts[0]
     assert "do not create hypothesis labels" in transport.prompts[0].lower()
 
@@ -131,6 +175,23 @@ async def test_bridge_pacer_applies_minimum_interval_and_bounded_jitter() -> Non
     await pacer.wait_for_next_submission()
 
     assert clock.delays == [26, 20]
+
+
+@pytest.mark.asyncio
+async def test_bridge_pacer_shares_provider_retry_after_with_later_calls() -> None:
+    clock = _ManualClock()
+    pacer = BridgeSubmissionPacer(
+        minimum_interval_seconds=0,
+        jitter_fraction=0,
+        clock=clock,
+        sleeper=clock.sleep,
+    )
+
+    await pacer.wait_for_next_submission()
+    await pacer.defer_submissions(19)
+    await pacer.wait_for_next_submission()
+
+    assert clock.delays == [19]
 
 
 @pytest.mark.asyncio
@@ -187,6 +248,52 @@ async def test_pre_submission_retries_use_bounded_exponential_backoff() -> None:
     assert transport.submission_count == 4
     assert clock.delays == [2, 3]
     assert any(key.endswith(":attempt=3") for key in transport._by_key)
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_retries_honor_retry_after_without_abandoning_turn() -> None:
+    investigation_id = uuid4()
+    context = _context(investigation_id)
+    rejected = TurnSubmission(
+        TurnSubmissionStatus.UNAVAILABLE,
+        error_code="bridge_rate_limited",
+        submission_state="pre_submission",
+        retryable=True,
+        retry_after_seconds=7,
+    )
+    success = {
+        "reasoning_summary": "The synthetic request was accepted after backoff.",
+        "goal": "Finish the synthetic investigation.",
+        "hypothesis_refs": [],
+        "proposed_tool_calls": [],
+        "finding_proposals": [],
+        "opinion_delta": None,
+        "next_action": AgentNextAction.FINISH.value,
+    }
+    transport = ScriptedTurnTransport([rejected] * 5 + [success])
+    clock = _ManualClock()
+    bridge = BridgeInvestigator(
+        transport,
+        minimum_submission_interval_seconds=0,
+        submission_jitter_fraction=0,
+        pre_submission_retry_base_seconds=1,
+        pre_submission_retry_max_seconds=2,
+        clock=clock,
+        sleeper=clock.sleep,
+        rng=lambda: 0.5,
+    )
+
+    result = await bridge.turn(
+        investigation_id=investigation_id,
+        subject_id=context.source.subject_id,
+        turn_index=1,
+        context=context,
+        external_llm_allowed=True,
+    )
+
+    assert result.status is TurnSubmissionStatus.SUCCEEDED
+    assert transport.submission_count == 6
+    assert clock.delays == [7] * 5
 
 
 @pytest.mark.asyncio
@@ -639,6 +746,7 @@ class _PersistedConversationService:
         self.status = status
         self.output_text = output_text
         self.add_turn_count = 0
+        self.targeted_lookup_count = 0
         self.prompts = []
 
     async def get_or_create(self, conversation_id, **kwargs):
@@ -649,7 +757,20 @@ class _PersistedConversationService:
         )
 
     async def turns(self, conversation_id, *, context_subject_id):
-        return tuple(self.contents)
+        raise AssertionError("Bridge consultation must not load the full conversation history")
+
+    async def turn_content_by_idempotency_key(
+        self, conversation_id, idempotency_key, *, context_subject_id
+    ):
+        self.targeted_lookup_count += 1
+        return next(
+            (
+                content
+                for content in self.contents
+                if content.turn.idempotency_key == idempotency_key
+            ),
+            None,
+        )
 
     async def add_turn(self, conversation_id, *, idempotency_key, **kwargs):
         self.add_turn_count += 1
@@ -659,6 +780,7 @@ class _PersistedConversationService:
             idempotency_key=idempotency_key,
             status=self.status,
             error_message="uncertain submission" if self.output_text is None else None,
+            error_code=None,
         )
         self.contents.append(SimpleNamespace(turn=turn, output_text=self.output_text))
         return turn
@@ -685,6 +807,7 @@ async def test_model_transport_does_not_call_add_turn_for_ambiguous_persisted_re
     assert first.status is TurnSubmissionStatus.NEEDS_REVIEW
     assert second.status is TurnSubmissionStatus.NEEDS_REVIEW
     assert conversations.add_turn_count == 1
+    assert conversations.targeted_lookup_count >= 3
 
 
 @pytest.mark.asyncio
@@ -713,6 +836,75 @@ async def test_model_transport_reuses_successful_persisted_turn_without_add_turn
     assert second.status is TurnSubmissionStatus.SUCCEEDED
     assert second.output_text == output
     assert conversations.add_turn_count == 1
+    assert conversations.targeted_lookup_count >= 3
+
+
+@pytest.mark.asyncio
+async def test_model_transport_preserves_output_when_turn_needs_review() -> None:
+    investigation_id = uuid4()
+    context = _context(investigation_id)
+    output = "raw persisted advisor response"
+    conversations = _PersistedConversationService(
+        status=ConversationTurnStatus.NEEDS_REVIEW,
+        output_text=output,
+    )
+    transport = ModelConversationTurnTransport(conversations)
+    args = {
+        "investigation_id": investigation_id,
+        "subject_id": context.source.subject_id,
+        "turn_index": 0,
+        "context_sha256": hashlib.sha256(context.canonical_bytes()).hexdigest(),
+        "prompt": "canonical prompt",
+        "external_llm_allowed": True,
+    }
+
+    result = await transport.submit(**args)
+
+    assert result.status is TurnSubmissionStatus.NEEDS_REVIEW
+    assert result.output_text == output
+    assert result.bridge_invocation_id is not None
+    assert result.submission_state == "post_submission"
+
+
+@pytest.mark.asyncio
+async def test_consultation_has_no_short_application_timeout(monkeypatch) -> None:
+    class NoWaitPacer:
+        async def wait_for_next_submission(self):
+            return None
+
+    class RecoveringTransport:
+        async def submit(self, **_kwargs):
+            await asyncio.sleep(0.02)
+            return TurnSubmission(
+                TurnSubmissionStatus.SUCCEEDED,
+                output_text="response arrived after the former 240 second cutoff",
+            )
+
+        async def recover_persisted_submission(self, **kwargs):
+            self.recovery_args = kwargs
+            raise AssertionError("a completed transport must not be reconciled as a timeout")
+
+    monkeypatch.setattr(bridge_module, "_shared_bridge_pacer", lambda **_kwargs: NoWaitPacer())
+    transport = RecoveringTransport()
+    investigation_id = uuid4()
+    subject_id = uuid4()
+
+    result = await bridge_module.submit_bridge_consultation_once(
+        transport,
+        investigation_id=investigation_id,
+        subject_id=subject_id,
+        turn_index=3,
+        context_sha256="a" * 64,
+        prompt="slow synthetic prompt",
+        external_llm_allowed=True,
+        settings=SimpleNamespace(
+            openai_bridge_min_submission_interval_seconds=0,
+            openai_bridge_submission_jitter_fraction=0,
+        ),
+    )
+
+    assert result.status is TurnSubmissionStatus.SUCCEEDED
+    assert result.output_text == "response arrived after the former 240 second cutoff"
 
 
 @pytest.mark.asyncio

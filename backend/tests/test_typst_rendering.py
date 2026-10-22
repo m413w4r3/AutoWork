@@ -5,12 +5,14 @@ import json
 from dataclasses import replace
 from datetime import date
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
 from cti_app.application.semantic_annotation import EnglishTermDetector, SemanticAnnotator
 from cti_app.application.typst_rendering import (
+    TemplateBundleInvalidError,
+    TypstDraftPreviewDocument,
     TypstRenderer,
     TypstTemplateBundle,
     _display_date,
@@ -19,6 +21,14 @@ from cti_app.application.typst_rendering import (
     _timeline_source_urls,
     load_template_bundle,
     project_publication_to_typst_model,
+)
+from cti_app.domain.analyst_opinion import (
+    AnalystOpinionV1,
+    ImplantMaterialEditorialV1,
+    ImplantMaterialType,
+    OpinionBlock,
+    OpinionBlockType,
+    opinion_blocks_with_implant_materials,
 )
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.media_assets import MediaAssetKind
@@ -48,7 +58,10 @@ from cti_app.domain.publication_document import (
     PublicationDocumentV5,
     PublicationIOCDetailV1,
     PublicationIOCDisposition,
+    PublicationTableColumnV1,
+    PublicationTableRowV1,
     publication_document_text_anchors,
+    publication_document_v5_sha256,
 )
 from cti_app.domain.semantic_annotation import (
     SEMANTIC_ANNOTATION_POLICY_VERSION,
@@ -75,6 +88,10 @@ def _renderer(tmp_path: Path) -> tuple[TypstRenderer, TypstTemplateBundle]:
         encoding="utf-8",
     )
     return TypstRenderer(), load_template_bundle(tmp_path)
+
+
+def _render(renderer: TypstRenderer, document, bundle: TypstTemplateBundle):
+    return renderer.render(document, bundle, document_label="Libellé de fixture")
 
 
 def _ref(source_document_id: UUID, token: str) -> PublicationEvidenceRefV1:
@@ -231,8 +248,8 @@ def test_minimal_document_has_complete_empty_sections_and_is_deterministic(tmp_p
     (tmp_path / "RENDERER" / "publication.typ").write_bytes(b"changed after bundle load")
     document = _document()
 
-    first = renderer.render(document, bundle)
-    second = renderer.render(document, bundle)
+    first = _render(renderer, document, bundle)
+    second = _render(renderer, document, bundle)
     data = json.loads(first.render_data_bytes)
 
     assert first.source_bytes == b'#let publication = json("render-data.json")\n'
@@ -241,7 +258,11 @@ def test_minimal_document_has_complete_empty_sections_and_is_deterministic(tmp_p
     assert first.source_bytes == second.source_bytes
     assert first.render_data_sha256 == second.render_data_sha256
     assert first.media_refs == ()
-    assert data["schema_version"] == "typst-publication-model-v27-opinion-citations"
+    assert (
+        data["schema_version"] == "typst-publication-model-v29-secret-guard-editorial-traceability"
+    )
+    assert data["document_label"] == "Libellé de fixture"
+    assert data["document_header"] == "Publication"
     references, synthesis = data["content_sections"]
     assert references["type"] == "references"
     assert len(references["entries"]) == 1
@@ -265,6 +286,146 @@ def test_minimal_document_has_complete_empty_sections_and_is_deterministic(tmp_p
             }
         ],
     }
+
+
+def test_renderer_preserves_sample_cryptographic_material_in_clear(tmp_path: Path) -> None:
+    renderer, bundle = _renderer(tmp_path)
+    document = _document()
+    sample_value = "RC4 passphrase = synthetic-render-passphrase-021"
+    document = replace(
+        document,
+        lead=(replace(document.lead[0], text=sample_value), *document.lead[1:]),
+    )
+
+    rendered = _render(renderer, document, bundle)
+    assert sample_value in rendered.render_data_bytes.decode("utf-8")
+
+
+def test_opinion_github_tokens_and_typed_rc4_material_reach_publication_render_data(
+    tmp_path: Path,
+) -> None:
+    renderer, bundle = _renderer(tmp_path)
+    publication, *_ = _frontmatter_v6_case()
+    rc4_key = bytes(range(16)).hex()
+    ghp_token = "ghp_" + "a" * 36
+    fine_grained_token = "github_pat_" + "b" * 82
+    sample_sha256 = "c" * 64
+    observation_id = uuid4()
+    materials = (
+        ImplantMaterialEditorialV1(
+            type=ImplantMaterialType.RC4_KEY,
+            value=rc4_key,
+            role="Déchiffrement des données de configuration",
+            sample_location="0x120-0x12f",
+            sample_sha256=sample_sha256,
+            evidence_observation_id=observation_id,
+        ),
+        ImplantMaterialEditorialV1(
+            type=ImplantMaterialType.ATTACKER_GITHUB_C2_TOKEN,
+            value=fine_grained_token,
+            role="Canal C2 via l'API GitHub",
+            sample_location="0x500-0x55f",
+            sample_sha256=sample_sha256,
+            evidence_observation_id=observation_id,
+        ),
+    )
+    opinion = AnalystOpinionV1(
+        investigation_id=uuid4(),
+        synthesis_artifact_id=uuid4(),
+        synthesis_sha256="a" * 64,
+        base_publication_artifact_id=uuid4(),
+        base_publication_sha256=publication_document_v5_sha256(publication),
+        blocks=opinion_blocks_with_implant_materials(
+            (
+                OpinionBlock(
+                    OpinionBlockType.KEY_FINDINGS,
+                    f"L'implant contient les jetons {ghp_token} et {fine_grained_token} "
+                    "pour son canal C2.",
+                ),
+            ),
+            materials,
+        ),
+        author_id="fixture-analyst",
+    )
+    preview = TypstDraftPreviewDocument(base_publication=publication, analyst_opinion=opinion)
+
+    rendered = _render(renderer, preview, bundle)
+    data = json.loads(rendered.render_data_bytes)
+    sections = {item["type"]: item for item in data["content_sections"]}
+    opinion_text = sections["analyst_opinion"]["blocks"][0]["text"]
+    material_items = sections["technical_materials"]["items"]
+
+    assert ghp_token in opinion_text
+    assert fine_grained_token in opinion_text
+    assert material_items[0]["value"] == rc4_key
+    assert material_items[0]["type_label"] == "Clé RC4"
+    assert material_items[0]["role"] == "Déchiffrement des données de configuration"
+    assert material_items[0]["sample_location"] == "0x120-0x12f"
+    assert material_items[0]["sample_sha256"] == sample_sha256
+    assert material_items[0]["evidence_ref"]["label"] == "[E1]"
+    assert sections["technical_annex"]["implant_identifier_rows"][0]["value"] == fine_grained_token
+
+
+def test_publication_document_label_is_required_and_kept_verbatim(tmp_path: Path) -> None:
+    renderer, bundle = _renderer(tmp_path)
+    document = _document()
+
+    with pytest.raises(TemplateBundleInvalidError, match="document_label"):
+        renderer.render(document, bundle)
+    with pytest.raises(TemplateBundleInvalidError, match="document_label"):
+        renderer.render(document, bundle, document_label="  ")
+
+    label = "Publication enrichie — avis approuvé v17"
+    data = json.loads(
+        renderer.render(document, bundle, document_label=f"  {label}  ").render_data_bytes
+    )
+    assert data["document_label"] == label
+
+
+def test_wide_component_table_paths_wrap_between_components_only(tmp_path: Path) -> None:
+    renderer, bundle = _renderer(tmp_path)
+    table = _table_at("component-inventory", "Composants", EnrichmentPlacementKind.AFTER_LEAD)
+    path_a = r"C:\Program Files\Vendor\PsProxy.dll"
+    path_b = r"C:\ProgramData\Windows\Blackwood.dll"
+    table = replace(
+        table,
+        columns=(
+            PublicationTableColumnV1("component", "Composant"),
+            PublicationTableColumnV1("path", "Chemin Windows"),
+            PublicationTableColumnV1("role", "Rôle"),
+            PublicationTableColumnV1("evidence", "Contexte de preuve"),
+        ),
+        rows=(
+            PublicationTableRowV1(
+                ("PsProxy.dll", path_a, "Proxy", "Composant décrit."),
+                table.rows[0].evidence_refs,
+            ),
+            PublicationTableRowV1(
+                ("Blackwood.dll", path_b, "Loader", "Rôle documenté."),
+                table.rows[0].evidence_refs,
+            ),
+        ),
+    )
+
+    data = json.loads(_render(renderer, _full_document(tables=(table,)), bundle).render_data_bytes)
+    rendered_table = next(
+        block
+        for section in data["content_sections"]
+        for block in section["blocks"]
+        if block["type"] == "table"
+    )
+
+    assert rendered_table["rows"][0][0] == "PsProxy.dll"
+    assert rendered_table["rows"][1][0] == "Blackwood.dll"
+    assert rendered_table["card_display_cells"][0][1]["break_chunks"][-1] == "PsProxy.dll"
+    assert rendered_table["card_display_cells"][1][1]["break_chunks"][-1] == "Blackwood.dll"
+    assert all(
+        "PsProxy.dll" not in chunk and "Blackwood.dll" not in chunk
+        for row in rendered_table["card_display_cells"]
+        for cell in row
+        if cell is not None
+        for chunk in cell["break_chunks"][:-1]
+    )
 
 
 def test_chart_projection_uses_svg_media_and_shared_figure_numbering() -> None:
@@ -314,7 +475,7 @@ def test_v6_render_model_uses_dated_source_references_and_both_ioc_groups(
     publication, *_ = _frontmatter_v6_case()
     renderer, bundle = _renderer(tmp_path)
 
-    model = json.loads(renderer.render(publication, bundle).render_data_bytes)
+    model = json.loads(_render(renderer, publication, bundle).render_data_bytes)
 
     assert model["title"] == "[Example actor] Décrit une activité documentée"
     assert "title_spans" not in model
@@ -352,7 +513,7 @@ def test_v6_render_model_keeps_original_ioc_values_separate_from_subject_values(
     original = publication.original_indicators[0].indicators[0]
     renderer, bundle = _renderer(tmp_path)
 
-    model = json.loads(renderer.render(publication, bundle).render_data_bytes)
+    model = json.loads(_render(renderer, publication, bundle).render_data_bytes)
     annex = model["content_sections"][-1]
 
     displayed_domains = annex["indicators"]["domains"]
@@ -429,7 +590,7 @@ def test_full_mapping_preserves_text_timeline_indicators_and_optional_sources(
         document,
         sources=(document.sources[0], contextual_source, document.sources[2]),
     )
-    data = json.loads(renderer.render(document, bundle).render_data_bytes)
+    data = json.loads(_render(renderer, document, bundle).render_data_bytes)
 
     assert data["language"] == "fr"
     assert data["title"] == "Intrusion report"
@@ -504,7 +665,7 @@ def test_full_mapping_preserves_text_timeline_indicators_and_optional_sources(
     assert synthesis["blocks"][3]["type"] == "paragraph"
     assert synthesis["blocks"][3]["text"] == "Section body"
     assert synthesis["blocks"][3]["anchor_target"].startswith("publication-paragraph-")
-    assert "—été".encode() in renderer.render(document, bundle).render_data_bytes
+    assert "—été".encode() in _render(renderer, document, bundle).render_data_bytes
 
 
 def test_synthesis_section_heading_is_projected_before_its_paragraph(tmp_path: Path) -> None:
@@ -524,7 +685,7 @@ def test_synthesis_section_heading_is_projected_before_its_paragraph(tmp_path: P
         ),
     )
 
-    data = json.loads(renderer.render(document, bundle).render_data_bytes)
+    data = json.loads(_render(renderer, document, bundle).render_data_bytes)
 
     synthesis = next(item for item in data["content_sections"] if item["type"] == "synthesis")
     assert [(item["type"], item["text"]) for item in synthesis["blocks"][2:]] == [
@@ -541,7 +702,7 @@ def test_brief_without_synthesis_sections_has_no_section_headings(tmp_path: Path
     renderer, bundle = _renderer(tmp_path)
     document = replace(_full_document(), sections=())
 
-    data = json.loads(renderer.render(document, bundle).render_data_bytes)
+    data = json.loads(_render(renderer, document, bundle).render_data_bytes)
     synthesis = next(item for item in data["content_sections"] if item["type"] == "synthesis")
 
     assert synthesis["blocks"]
@@ -588,14 +749,16 @@ def test_v5_projection_maps_semantic_spans_to_closed_typst_helpers(tmp_path: Pat
     )
     document = PublicationDocumentV5(document=base, semantic_text=semantic_text)
 
-    data = json.loads(renderer.render(document, bundle).render_data_bytes)
+    data = json.loads(_render(renderer, document, bundle).render_data_bytes)
     synthesis = next(item for item in data["content_sections"] if item["type"] == "synthesis")
     paragraph = synthesis["blocks"][0]
     table = next(block for block in synthesis["blocks"] if block["type"] == "table")
     styles = {span["style"] for span in paragraph["semantic_spans"]}
     semantic_cells = table["semantic_cells"]
 
-    assert data["schema_version"] == "typst-publication-model-v27-opinion-citations"
+    assert (
+        data["schema_version"] == "typst-publication-model-v29-secret-guard-editorial-traceability"
+    )
     assert table["column_weights"] == _table_column_weights(base.tables[0])
     assert all(0.8 <= weight <= 2.4 for weight in table["column_weights"])
     assert paragraph["text"] == lead_text
@@ -633,7 +796,7 @@ def test_v5_typst_projection_keeps_extracted_xml_parameter_as_literal_text(
     )
     document = PublicationDocumentV5(document=base, semantic_text=semantic_text)
 
-    render_data_bytes = renderer.render(document, bundle).render_data_bytes
+    render_data_bytes = _render(renderer, document, bundle).render_data_bytes
     render_data = json.loads(render_data_bytes)
     synthesis = next(
         item for item in render_data["content_sections"] if item["type"] == "synthesis"
@@ -728,7 +891,7 @@ def test_long_iocs_and_semantic_literals_get_render_only_break_opportunities(
         ioc_details=(ioc_detail,),
     )
 
-    data = json.loads(renderer.render(document, bundle).render_data_bytes)
+    data = json.loads(_render(renderer, document, bundle).render_data_bytes)
     synthesis = next(item for item in data["content_sections"] if item["type"] == "synthesis")
     lead = next(
         block
@@ -787,7 +950,7 @@ def test_technical_table_cells_render_monospace_and_break_long_values(
         caption="Les valeurs exactes documentées par la source.",
         rows=tuple(replace(base_table.rows[0], cells=row) for row in cells),
     )
-    data = json.loads(renderer.render(_full_document(tables=(table,)), bundle).render_data_bytes)
+    data = json.loads(_render(renderer, _full_document(tables=(table,)), bundle).render_data_bytes)
     rendered_table = next(
         block
         for section in data["content_sections"]
@@ -839,7 +1002,7 @@ def test_lead_is_the_first_synthesis_paragraph_and_repeated_intro_is_suppressed(
         ),
     )
 
-    data = json.loads(renderer.render(document, bundle).render_data_bytes)
+    data = json.loads(_render(renderer, document, bundle).render_data_bytes)
     sections = {item["type"]: item for item in data["content_sections"]}
     references = sections["references"]
     synthesis = sections["synthesis"]
@@ -895,7 +1058,7 @@ def test_all_placements_preserve_collection_order_and_type_priority(tmp_path: Pa
         for position, suffix in enumerate(("z_first", "a_second"))
     )
     document = _full_document(tables=tables, diagrams=diagrams, figures=figures)
-    data = json.loads(renderer.render(document, bundle).render_data_bytes)
+    data = json.loads(_render(renderer, document, bundle).render_data_bytes)
     sections = {item["type"]: item for item in data["content_sections"]}
     reference_blocks = sections["references"]["blocks"]
     blocks = sections["synthesis"]["blocks"]
@@ -937,7 +1100,7 @@ def test_all_placements_preserve_collection_order_and_type_priority(tmp_path: Pa
 
     diagram_ref = next(
         ref
-        for ref in renderer.render(document, bundle).media_refs
+        for ref in _render(renderer, document, bundle).media_refs
         if ref.asset_id == diagrams[0].asset_id
     )
     assert diagram_ref.expected_kind is MediaAssetKind.DIAGRAM_SVG
@@ -998,7 +1161,7 @@ def test_figure_reader_source_hides_pipeline_locators_and_media_refs_deduplicate
         locator=replace(second.locator, section=None, figure_label="HTML image 7"),
     )
     document = _full_document(figures=(first, second, third))
-    rendered = renderer.render(document, bundle)
+    rendered = _render(renderer, document, bundle)
     data = json.loads(rendered.render_data_bytes)
     figure_blocks = [
         block
@@ -1064,7 +1227,7 @@ def test_figure_media_extension_matches_mime_type(
         asset_id=UUID(int=500 + len(extension)),
         mime_type=mime_type,
     )
-    rendered = renderer.render(_document(figures=(figure,)), bundle)
+    rendered = _render(renderer, _document(figures=(figure,)), bundle)
 
     assert rendered.media_refs[0].media_path.endswith(extension)
 

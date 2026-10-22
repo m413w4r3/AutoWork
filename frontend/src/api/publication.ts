@@ -669,6 +669,57 @@ export function releasePdfUrl(editionId: string): string {
   return `/api/editions/${encodeURIComponent(editionId)}/release/pdf`;
 }
 
+export function versionedReleasePdfUrl(
+  editionId: string,
+  releaseId: string,
+): string {
+  return `/api/editions/${encodeURIComponent(editionId)}/releases/${encodeURIComponent(releaseId)}/pdf`;
+}
+
+export interface EditionReleaseLineage {
+  nature: "edition_release";
+  edition_id: string;
+  edition_release_id: string;
+  manifest_id: string;
+  render_id: string;
+  render_data_sha256: string | null;
+  pdf_sha256: string | null;
+  is_current: boolean;
+  historical: boolean;
+  history_reasons: string[];
+  publications: Array<{
+    subject_id?: string;
+    production_run_id?: string;
+    artifact: {
+      id: string;
+      version: number;
+      sha256: string | null;
+      document_schema: string | null;
+    } | null;
+    opinion: {
+      id: string;
+      version: number;
+      status: string;
+      sha256: string;
+      investigation_id: string;
+    } | null;
+    is_current?: boolean;
+    historical?: boolean;
+    history_reasons?: string[];
+    review_decision_id?: string | null;
+    lineage_warning?: string | null;
+  }>;
+}
+
+export function getEditionReleaseLineage(
+  editionId: string,
+  releaseId: string,
+): Promise<EditionReleaseLineage> {
+  return request(
+    `/api/editions/${encodeURIComponent(editionId)}/releases/${encodeURIComponent(releaseId)}/lineage`,
+  );
+}
+
 export function retryEditionRender(
   editionId: string,
 ): Promise<EditionReleaseResponse> {

@@ -309,7 +309,13 @@ def encode_d2_source(diagram: DiagramSpecV1) -> bytes:
         if label:
             line += f": {_escape_d2_label(label)}"
         edge_color = (
-            _protocol_edge_color(edge.label) if _is_protocol_profile(diagram) else _EDGE_COLOR
+            _PROTOCOL_STATUS_COLORS["INFERRED"][0]
+            if _is_protocol_profile(diagram)
+            and edge.relation_type
+            in {DiagramRelationType.INFERENCE, DiagramRelationType.PROTOCOL_INFERENCE}
+            else _protocol_edge_color(edge.label)
+            if _is_protocol_profile(diagram)
+            else _EDGE_COLOR
         )
         edge_lines = [
             line + " {",
@@ -320,7 +326,10 @@ def encode_d2_source(diagram: DiagramSpecV1) -> bytes:
             f'    font-color: "{_EDGE_COLOR}"',
             "    italic: false",
         ]
-        if edge.relation_type is DiagramRelationType.INFERENCE:
+        if edge.relation_type in {
+            DiagramRelationType.INFERENCE,
+            DiagramRelationType.PROTOCOL_INFERENCE,
+        }:
             edge_lines.append("    stroke-dash: 5")
         elif _is_protocol_profile(diagram) and _protocol_status(edge.label or "") in {
             "INFERRED",

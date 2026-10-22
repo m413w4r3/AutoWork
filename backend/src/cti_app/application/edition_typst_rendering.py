@@ -14,6 +14,7 @@ from cti_app.application.edition_ioc_export import (
     project_publication_iocs,
 )
 from cti_app.application.pdf_mapping import MAPPING_RENDERER_VERSION
+from cti_app.application.publication_secret_guard import guard_publication_render_data
 from cti_app.application.typst_rendering import (
     TemplateBundleInvalidError,
     TypstMediaRef,
@@ -29,7 +30,9 @@ from cti_app.domain.publication_document import (
     PublicationDocumentV6,
 )
 
-_EDITION_RENDER_DATA_SCHEMA_VERSION = "typst-edition-model-v23-publication-v26-editorial-spacing"
+_EDITION_RENDER_DATA_SCHEMA_VERSION = (
+    "typst-edition-model-v24-secret-guard-short-continuation-header"
+)
 _FRENCH_MONTH_NAMES = (
     "janvier",
     "février",
@@ -78,8 +81,11 @@ class EditionTypstRenderer:
         document: EditionDocumentV2,
         template_bundle: TypstTemplateBundle,
         *,
+        document_label: str,
         artifact_identities: dict[str, dict[str, Any]] | None = None,
     ) -> TypstRenderSource:
+        if not isinstance(document_label, str) or not document_label.strip():
+            raise TemplateBundleInvalidError("Edition render requires document_label")
         entrypoint = next(
             (
                 file
@@ -162,12 +168,15 @@ class EditionTypstRenderer:
 
         render_data = {
             "schema_version": _EDITION_RENDER_DATA_SCHEMA_VERSION,
+            "document_label": document_label.strip(),
+            "document_header": f"Bulletin de veille CTI — édition v{edition['bulletin_number']}",
             "edition": edition,
             "publications": publications,
             "file_ioc_count": sum(item["file_ioc_count"] for item in publications),
         }
         if mapping_targets or mapping_unmapped:
             render_data["mapping_instrumentation_version"] = MAPPING_RENDERER_VERSION
+        guard_publication_render_data(render_data)
         render_data_bytes = json.dumps(
             render_data,
             ensure_ascii=False,

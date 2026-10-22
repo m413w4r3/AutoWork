@@ -306,7 +306,7 @@ def test_runtime_allows_local_yara_only_with_measured_confinement(
         "LocalCommandRunner",
         lambda **_kwargs: SimpleNamespace(filesystem_confined=True),
     )
-    monkeypatch.setattr(runtime_ports, "IsolatedYaraRunner", lambda: engine)
+    monkeypatch.setattr(runtime_ports, "IsolatedYaraRunner", lambda *_args, **_kwargs: engine)
     settings = Settings.model_construct(rule_workbench_enabled=True, analysis_worker_enabled=False)
 
     runtime = build_investigation_runtime_composition_factory(**_runtime_inputs(settings))

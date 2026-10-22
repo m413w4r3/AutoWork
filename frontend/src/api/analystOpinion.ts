@@ -37,7 +37,43 @@ export interface AnalystOpinionVersion {
   created_at: string;
   content_sha256: string;
   renderable_blocks: InvestigationOpinionBlock[];
+  implant_materials: ImplantMaterialEdit[];
+  implant_materials_section: ImplantMaterialsSection | null;
   provenance: OpinionProvenance;
+}
+
+export interface BridgeDraftReference {
+  invocation_id: string;
+  text_sha256: string;
+}
+
+export interface BridgeReviewReference {
+  invocation_id: string;
+  output_sha256: string;
+  reviewed_text_sha256: string;
+}
+
+export interface ImplantMaterialsSection {
+  type: "implant_materials";
+  text: string;
+  bridge_authored: boolean;
+  bridge_draft_ref: BridgeDraftReference | null;
+  bridge_review_ref: BridgeReviewReference | null;
+}
+
+export interface ImplantMaterialEdit {
+  type:
+    | "rc4_key"
+    | "aes_key"
+    | "passphrase"
+    | "xor_scheme"
+    | "attacker_github_c2_token"
+    | "other";
+  value: string;
+  role: string;
+  sample_location: string;
+  sample_sha256: string;
+  evidence_observation_id: string;
 }
 
 export interface OpinionProtocolFigure {
@@ -73,18 +109,22 @@ export interface OpinionCompositionInput {
 }
 
 export interface OpinionBlockEdit {
-  block_type: OpinionBlockType;
+  block_type: OpinionBlockType | "implant_materials";
   text: string;
   finding_refs: string[];
   evidence_refs: string[];
   qualification: OpinionQualification;
   certainty: number;
+  bridge_authored?: boolean;
+  bridge_draft_ref?: BridgeDraftReference | null;
+  bridge_review_ref?: BridgeReviewReference | null;
 }
 
 export interface ReviseOpinionInput {
   expected_version: number;
   blocks: OpinionBlockEdit[];
   unresolved_points: string[];
+  implant_materials?: ImplantMaterialEdit[];
   protocol_model_blob_id?: string;
   protocol_views?: ProtocolDiagramKind[];
 }
@@ -150,6 +190,18 @@ export function getAnalystOpinion(
   return investigationRequest(
     `/api/investigations/${encodeURIComponent(investigationId)}/opinion`,
   );
+}
+
+export function analystOpinionPreviewPdfUrl(
+  opinion: Pick<AnalystOpinionVersion, "id" | "version" | "content_sha256">,
+  basePublicationSha256: string,
+): string {
+  const query = new URLSearchParams({
+    version: String(opinion.version),
+    opinion_sha256: opinion.content_sha256,
+    base_publication_sha256: basePublicationSha256,
+  });
+  return `/api/opinions/${encodeURIComponent(opinion.id)}/preview.pdf?${query.toString()}`;
 }
 
 export function composeAnalystOpinion(

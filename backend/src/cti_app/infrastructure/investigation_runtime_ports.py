@@ -82,7 +82,7 @@ from cti_app.infrastructure.smda import SmdaAdapter
 from cti_app.infrastructure.tshark_adapter import TsharkAdapter
 from cti_app.infrastructure.virustotal import configure_virustotal_proxy_http_client
 from cti_app.infrastructure.virustotal_retrohunt_client import VirusTotalRetrohuntHttpClient
-from cti_app.infrastructure.yara_runner import IsolatedYaraRunner
+from cti_app.infrastructure.yara_runner import IsolatedYaraRunner, YaraRunnerLimits
 
 
 class RuntimePortState(StrEnum):
@@ -419,7 +419,9 @@ def build_investigation_runtime_ports(
             max_sample_bytes=settings.analysis_max_sample_bytes,
         )
     if settings.rule_workbench_enabled and _allow_unconfined_analysis_processes(settings):
-        candidate_yara_engine = IsolatedYaraRunner()
+        candidate_yara_engine = IsolatedYaraRunner(
+            YaraRunnerLimits(maximum_source_bytes=settings.model_output_max_bytes)
+        )
         if candidate_yara_engine.available:
             yara_engine = candidate_yara_engine
         else:

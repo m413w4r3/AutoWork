@@ -556,9 +556,9 @@ export function InvestigationBudgetAndDecisions({
             <div key={dimension}>
               <dt>{BUDGET_LABELS[dimension]}</dt>
               <dd>
-                {budget.consumed} consommé ·{" "}
-                {budget.remaining ?? "sans plafond"} restant · plafond{" "}
-                {budget.limit ?? "non défini"}
+                {budget.consumed} consommé · {budget.reserved} réservé ·{" "}
+                {budget.remaining ?? "illimité"} restant · plafond{" "}
+                {budget.limit ?? "illimité"}
               </dd>
             </div>
           );
@@ -620,9 +620,16 @@ export function InvestigationBudgetAndDecisions({
       )}
       {investigation.unavailable_tools.length > 0 ? (
         <div role="note">
-          <strong>Capacités indisponibles, limites locales :</strong>{" "}
-          {investigation.unavailable_tools.join(", ")}. Les autres pistes
-          restent consultables.
+          <strong>Capacités indisponibles :</strong>
+          <ul>
+            {investigation.unavailable_tools.map((tool) => (
+              <li key={tool}>
+                <code>{tool}</code> ·{" "}
+                {unavailableToolReason(tool, investigation)}
+              </li>
+            ))}
+          </ul>
+          Les autres pistes restent consultables.
         </div>
       ) : null}
       {investigation.available_tools.length > 0 ? (
@@ -638,6 +645,60 @@ function decisionLabel(code: string): string {
   if (code === "policy_denied") return "Opération refusée par la politique";
   if (code === "needs_review") return "Opération en attente d’une revue";
   return `Décision bloquée : ${code}`;
+}
+
+function unavailableToolReason(
+  tool: string,
+  investigation: InvestigationView,
+): string {
+  const reason = investigation.unavailable_tool_reasons[tool];
+  const normalized = reason?.toLowerCase() ?? "";
+  if (
+    normalized.includes("g2") ||
+    normalized.includes("disclosure") ||
+    normalized.includes("permission_required")
+  ) {
+    return investigation.envelope_approved
+      ? "Divulgation ou autorisation G2 à vérifier."
+      : "Approbation de l’enveloppe G2 requise.";
+  }
+  if (normalized.includes("budget") || normalized.includes("limit")) {
+    return "Plafond de budget atteint pour cette capacité.";
+  }
+  if (
+    normalized.includes("operator_mode") ||
+    normalized.includes("qualification") ||
+    normalized.includes("stage")
+  ) {
+    return "Étape opérateur ou qualification humaine requise.";
+  }
+  if (reason)
+    return `Dépendance ou worker indisponible : ${reason.replaceAll("_", " ")}.`;
+
+  const dimension = capabilityBudgetDimension(tool);
+  if (dimension !== null) {
+    const budget = investigation.budget[dimension];
+    if (budget.limit !== null && budget.remaining === 0) {
+      return `${BUDGET_LABELS[dimension]} : plafond atteint.`;
+    }
+  }
+  if (
+    !investigation.envelope_approved &&
+    (tool === "advisor.consult" ||
+      tool.startsWith("vt.") ||
+      tool.startsWith("shodan."))
+  ) {
+    return "Approbation de l’enveloppe G2 requise.";
+  }
+  return "Non disponible à cette étape de l’enquête.";
+}
+
+function capabilityBudgetDimension(tool: string): BudgetDimension | null {
+  if (tool === "advisor.consult") return "bridge_turns";
+  if (tool === "vt.download_sample") return "downloads";
+  if (tool.startsWith("vt.")) return "vt_units";
+  if (tool.startsWith("shodan.")) return "shodan_credits";
+  return null;
 }
 
 function EvidenceReferences({
@@ -744,11 +805,16 @@ function DetectionVersionCard({
   const [reason, setReason] = useState("");
   const [limitations, setLimitations] = useState("");
   const reports = version.test_reports;
+  const latestReport = reports[reports.length - 1];
+  const historicalReports = reports.slice(0, -1);
   return (
     <li>
       <article>
         <h3>
-          Version {version.version} · {version.status}
+          {version.status === "candidate" || version.status === "experimental"
+            ? "Candidate"
+            : version.status}{" "}
+          · version {version.version}
         </h3>
         <p>
           <strong>Validation du corpus :</strong>{" "}
@@ -781,19 +847,29 @@ function DetectionVersionCard({
             ))}
           </details>
         ) : null}
-        {reports.length === 0 ? (
+        {latestReport === undefined ? (
           <p>
             Aucun rapport de test valide : la revue de cette règle est
             indisponible.
           </p>
         ) : (
-          reports.map((report) => (
-            <DetectionTestReportView
-              key={report.observation_id}
-              report={report}
-            />
-          ))
+          <DetectionTestReportView
+            report={latestReport}
+            label="Dernier résultat pertinent"
+          />
         )}
+        {historicalReports.length > 0 ? (
+          <details>
+            <summary>Historique des essais ({reports.length})</summary>
+            {historicalReports.map((report) => (
+              <DetectionTestReportView
+                key={report.observation_id}
+                report={report}
+                label="Essai historique"
+              />
+            ))}
+          </details>
+        ) : null}
         {version.latest_decision ? (
           <p>
             Dernière décision : {version.latest_decision.type} par{" "}
@@ -865,11 +941,17 @@ function DetectionVersionCard({
   );
 }
 
-function DetectionTestReportView({ report }: { report: DetectionTestReport }) {
+function DetectionTestReportView({
+  report,
+  label,
+}: {
+  report: DetectionTestReport;
+  label: string;
+}) {
   return (
-    <section aria-label={`Rapport de test ${report.observation_id}`}>
+    <section aria-label={`${label} ${report.observation_id}`}>
       <h4>
-        Essais · {report.execution_status ?? "état inconnu"} · validation :{" "}
+        {label} · {report.execution_status ?? "état inconnu"} · validation :{" "}
         {report.validation_status}
       </h4>
       {report.engine_version ? <p>Moteur : {report.engine_version}</p> : null}

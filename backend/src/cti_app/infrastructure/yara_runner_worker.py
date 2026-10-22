@@ -29,6 +29,7 @@ def _emit(
     matches: tuple[str, ...] = (),
     message: str = "",
     line: int | None = None,
+    column: int | None = None,
 ) -> None:
     payload = {
         "status": status,
@@ -36,8 +37,33 @@ def _emit(
         "matches_sha256": matches,
         "message": message[:1000],
         "line": line,
+        "column": column,
     }
     sys.stdout.write(json.dumps(payload, separators=(",", ":")))
+
+
+def _syntax_error_column(source: str, line: int | None, message: str) -> int | None:
+    explicit = re.search(r"(?i)\bcolumn\s*[:=]?\s*(\d+)\b", message)
+    if explicit is not None:
+        return max(1, int(explicit.group(1)))
+    lines = source.splitlines()
+    if line is None or line < 1 or line > len(lines):
+        return None
+    source_line = lines[line - 1]
+    unexpected = re.search(r"(?i)unexpected\s+(.+?)(?:,|$)", message)
+    if unexpected is None:
+        return None
+    token = unexpected.group(1).strip()
+    if token.casefold() in {"$end", "<eof>", "end of file"}:
+        return len(source_line) + 1
+    if len(token) >= 2 and token[0] in "'\"" and token[-1] == token[0]:
+        token = token[1:-1]
+    elif len(token) >= 2 and token[0] == "<" and token[-1] == ">":
+        token = token[1:-1]
+    if not token:
+        return None
+    position = source_line.rfind(token)
+    return position + 1 if position >= 0 else None
 
 
 def _set_limits(memory_bytes: int, cpu_seconds: int, output_bytes: int) -> None:
@@ -126,11 +152,17 @@ def main(arguments: list[str]) -> int:
                 normalized_line = max(1, int(match.group(1)))
         elif normalized_line < 1:
             normalized_line = 1
+        try:
+            source_text = source_path.read_text(encoding="utf-8", errors="strict")
+        except (OSError, UnicodeDecodeError):
+            source_text = ""
+        normalized_column = _syntax_error_column(source_text, normalized_line, message)
         _emit(
             "compile_error",
             engine_version=engine_version,
             message=message,
             line=normalized_line,
+            column=normalized_column,
         )
         return 0
     except MemoryError:

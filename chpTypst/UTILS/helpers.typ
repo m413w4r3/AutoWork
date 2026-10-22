@@ -229,7 +229,7 @@
     radius: 4pt,
     width: 100%,
     inset: 8pt,
-    breakable: true,
+    breakable: false,
   )[
     #pad(
       top: 6pt,

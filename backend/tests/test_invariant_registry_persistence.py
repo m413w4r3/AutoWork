@@ -36,7 +36,7 @@ def test_registry_tables_are_queryable_and_do_not_own_blobs() -> None:
     }
 
 
-def test_current_schema_is_created_by_the_single_baseline() -> None:
+def test_invariant_registry_tables_remain_in_the_frozen_baseline() -> None:
     migration = Path(__file__).parents[1] / "migrations" / "versions" / "0001_baseline.py"
     source = migration.read_text()
     assert 'revision: str = "0001_baseline"' in source

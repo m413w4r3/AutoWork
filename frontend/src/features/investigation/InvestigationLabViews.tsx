@@ -31,8 +31,10 @@ import {
   InvestigationSamples,
 } from "./InvestigationPanels";
 import { InvestigationReadPanels } from "./InvestigationReadPanels";
+import { PublicationLineagePanel } from "./PublicationLineagePanel";
 
-type LabView = "claims" | "pivots" | "samples" | "network" | "journal";
+type LabView =
+  "claims" | "pivots" | "samples" | "network" | "journal" | "publication";
 
 const VIEWS: Array<{ id: LabView; label: string }> = [
   { id: "claims", label: "Claims / Hypothèses" },
@@ -40,6 +42,7 @@ const VIEWS: Array<{ id: LabView; label: string }> = [
   { id: "samples", label: "Échantillons" },
   { id: "network", label: "Réseau & détections" },
   { id: "journal", label: "Journal & revue" },
+  { id: "publication", label: "PDF & lignage" },
 ];
 
 const VERDICT_LABELS: Record<string, string> = {
@@ -177,6 +180,12 @@ export function InvestigationLabViews({
             editionId={editionId}
             selectedClaimId={selectedClaimId}
             onSelectClaim={setSelectedClaimId}
+          />
+        ) : null}
+        {activeView === "publication" ? (
+          <PublicationLineagePanel
+            investigationId={investigation.id}
+            subjectId={investigation.subject_id}
           />
         ) : null}
       </section>

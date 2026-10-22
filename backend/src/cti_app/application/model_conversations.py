@@ -213,12 +213,14 @@ class ConversationTurnFailedError(ModelConversationError):
         status: ConversationTurnStatus,
         submission_state: str | None = None,
         retryable: bool = False,
+        retry_after_seconds: float | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.status = status
         self.submission_state = submission_state
         self.retryable = retryable
+        self.retry_after_seconds = retry_after_seconds
 
 
 class ConversationPolicyError(ModelConversationError):
@@ -428,6 +430,34 @@ class ModelConversationService:
             )
             result.append(ConversationTurnContent(turn, input_text, output_text))
         return result
+
+    async def turn_content_by_idempotency_key(
+        self,
+        conversation_id: UUID,
+        idempotency_key: str,
+        *,
+        context_subject_id: UUID | None = None,
+    ) -> ConversationTurnContent | None:
+        """Load one persisted turn without replaying a conversation's full history."""
+        await self.get(conversation_id, context_subject_id=context_subject_id)
+        async with self._uow_factory() as uow:
+            turn = await uow.model_conversation_turns.get_by_idempotency_key(idempotency_key)
+            if turn is None:
+                return None
+            if turn.conversation_id != conversation_id:
+                raise ConversationPolicyError(
+                    "La clé d'idempotence appartient à une autre conversation"
+                )
+            blobs = {}
+            blob_id = _blob_id(turn.output_blob_reference)
+            if blob_id is not None:
+                blobs[blob_id] = await uow.blobs.get(blob_id)
+        output_text = (
+            await self._read_reference(turn.output_blob_reference, blobs)
+            if turn.output_blob_reference
+            else None
+        )
+        return ConversationTurnContent(turn, "", output_text)
 
     async def _recovery_target(
         self,
@@ -1115,6 +1145,13 @@ class ModelConversationService:
                         retryable=(
                             isinstance(failed_details, dict)
                             and failed_details.get("retryable") is True
+                        ),
+                        retry_after_seconds=(
+                            float(failed_details["retry_after"])
+                            if isinstance(failed_details, dict)
+                            and isinstance(failed_details.get("retry_after"), int | float)
+                            and not isinstance(failed_details.get("retry_after"), bool)
+                            else None
                         ),
                     )
 

@@ -153,9 +153,15 @@ async def test_two_agent_strategies_choose_distinct_tool_orders_and_draft_findin
     assert all(
         "current_stage" not in prompt for prompt in (*a_transport.prompts, *b_transport.prompts)
     )
-    # Each Bridge turn now runs in an independent Temporary Chat and therefore
-    # carries a bounded full context, including the article and current state.
-    assert all('"view":"full"' in prompt for prompt in (*a_transport.prompts, *b_transport.prompts))
+    # Each Bridge turn carries the bounded canonical context as readable text,
+    # including the article and current state, without a second JSON snapshot.
+    assert all(
+        "CONTEXTE FACTUEL CANONIQUE — TEXTE" in prompt
+        and "A verified campaign narrative." in prompt
+        and "The article describes a loader chain." in prompt
+        and '"view":"full"' not in prompt
+        for prompt in (*a_transport.prompts, *b_transport.prompts)
+    )
     assert fixture_a.handoff.modified_artifacts == []
     assert fixture_b.handoff.modified_artifacts == []
     assert all("yara" not in name.lower() for name in (*a_order, *b_order))

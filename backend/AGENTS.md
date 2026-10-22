@@ -14,20 +14,19 @@ Code lives under `src/cti_app/`.
 - Business decisions never belong in `infrastructure/`.
 - Tests never contact external APIs.
 - Integration tests use `make test-integration`.
-- `0001_baseline` is the complete schema intended for an empty database.
-- `alembic upgrade head` on an empty database must always create the target
-  schema.
-- `0001_baseline` remains intentionally mutable until the pre-first-edition
-  stabilization gate after AW-024. Until that gate is explicitly declared,
-  target schema changes update `0001_baseline`; no compatibility migration for
-  an older AutoWork database or deferred migration for a baseline change is
-  required.
-- The mutable baseline must describe the target schema directly. Do not add
-  legacy database detection, compatibility backfills, repair branches, or
-  old-database upgrade support.
-- Preserve downgrade and guard protections that belong to the current
-  single-baseline schema, not tests whose sole purpose is compatibility with
-  deleted revisions.
+- `0001_baseline` is frozen at the pre-C2 schema already represented by
+  installations stamped `0001_baseline`. Do not edit it to add later schema.
+- `0002_c2_experiments` adds C2 experiment storage. Fresh installs must run
+  `alembic upgrade head` and receive the exact ORM schema plus C2 objects.
+- Schema changes from `0002` onward are additive Alembic revisions. Preserve
+  historical revision behavior and add explicit preflight/compatibility logic
+  when an already-stamped installation may have received a manual change.
+- The C2 revision accepts a prior manual installation only after exhaustive
+  validation of its columns, constraints, indexes, foreign keys, function and
+  trigger. Partial or non-conforming objects must fail before schema changes.
+- Keep the `0002` downgrade guard: it must refuse to remove C2 storage while
+  experiment or head rows exist. Never downgrade C2 on the live database.
+- Preserve downgrade and guard protections for every versioned schema.
 
 ## Validation
 

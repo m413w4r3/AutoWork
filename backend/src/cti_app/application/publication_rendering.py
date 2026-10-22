@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol, cast
 from uuid import UUID, uuid4
 
 from cti_app.application.diagram_compilation import CompiledDiagram
@@ -78,7 +79,78 @@ from cti_app.domain.publication_render import (
 from cti_app.domain.typst_render import TypstRenderFormat, TypstRenderStatus
 
 PUBLICATION_RENDERER = "typst"
-PUBLICATION_RENDERER_VERSION = "publication-v12-typst-v30-opinion-provenance"
+PUBLICATION_RENDERER_VERSION = "publication-v14-typst-v32-literal-notes"
+PUBLICATION_IDENTITY_LABEL_FIELD = "document_label"
+PDF_LINEAGE_RENDER_DATA_FIELD = "pdf_lineage"
+
+
+@dataclass(frozen=True, slots=True)
+class DraftPublicationRender:
+    compiled_document: CompiledTypstDocument
+    render_data_sha256: str
+    lineage: dict[str, Any]
+
+
+def publication_identity_label(
+    *,
+    nature: str,
+    artifact_id: UUID,
+    artifact_version: int | None,
+    artifact_sha256: str,
+    opinion_id: UUID | None = None,
+    opinion_version: int | None = None,
+    opinion_status: str | None = None,
+) -> str:
+    """Return a display label based on persisted identities, never schema version."""
+    artifact_version_label = (
+        f"v{artifact_version}" if artifact_version is not None else "version inconnue"
+    )
+    if nature == "opinion_draft_preview":
+        return (
+            f"Aperçu d'avis {opinion_id} v{opinion_version} — {opinion_status}; "
+            f"publication de base {artifact_id} {artifact_version_label} — "
+            f"SHA-256 {artifact_sha256}"
+        )
+    if nature == "augmented_publication":
+        return (
+            f"Publication enrichie — avis {opinion_id} v{opinion_version} "
+            f"({opinion_status}); artefact {artifact_id} {artifact_version_label} — "
+            f"SHA-256 {artifact_sha256}"
+        )
+    return (
+        f"Publication de base — artefact {artifact_id} {artifact_version_label} — "
+        f"SHA-256 {artifact_sha256}"
+    )
+
+
+def with_publication_lineage(
+    render_source: TypstRenderSource,
+    *,
+    identity_label: str,
+    lineage: dict[str, Any],
+) -> TypstRenderSource:
+    """Add documented lineage to the canonical render-data bytes and their hash."""
+    payload = json.loads(render_source.render_data_bytes)
+    if not isinstance(payload, dict):
+        raise ValueError("Publication render-data must be a JSON object")
+    payload[PUBLICATION_IDENTITY_LABEL_FIELD] = identity_label
+    payload[PDF_LINEAGE_RENDER_DATA_FIELD] = lineage
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return replace(
+        render_source,
+        render_data_bytes=encoded,
+        render_data_sha256=hashlib.sha256(encoded).hexdigest(),
+    )
+
+
+def _version_identity_sha256(name: str, version: str) -> str:
+    return hashlib.sha256(f"{name}\0{version}".encode()).hexdigest()
 
 
 class InfrastructureGraphDiagramCompiler(Protocol):
@@ -224,17 +296,19 @@ class PublicationRenderService:
         opinion: AnalystOpinionV1,
         synthesis: ProductionSynthesisV1 | None = None,
         *,
+        base_publication_identity: dict[str, Any] | None = None,
         infrastructure_graph: InvestigationGraph | None = None,
         findings: tuple[InvestigationFinding, ...] = (),
         evidence_observations: tuple[EvidenceObservation, ...] = (),
-    ) -> CompiledTypstDocument:
+    ) -> DraftPublicationRender:
         """Compile an ephemeral, watermarked draft without creating render state."""
         try:
             projection = TypstDraftPreviewDocument(
                 document,
                 opinion,
                 synthesis,
-                infrastructure_graph,
+                # Opinion previews must not materialize a new diagram SVG.
+                None,
                 findings,
                 evidence_observations,
             )
@@ -250,17 +324,72 @@ class PublicationRenderService:
         except (TemplateBundleInvalidError, FontBundleInvalidError) as exc:
             raise PublicationRenderTemplateInvalidError(str(exc)) from exc
         try:
-            graph_media_ref = await self._compile_infrastructure_graph(
-                document, infrastructure_graph
+            del infrastructure_graph
+            base_publication_identity = base_publication_identity or {
+                "artifact": {
+                    "id": str(opinion.base_publication_artifact_id),
+                    "version": None,
+                    "sha256": opinion.base_publication_sha256,
+                    "document_schema": "PublicationDocumentV5",
+                },
+                "investigation_id": str(opinion.investigation_id),
+                "production_run_id": None,
+            }
+            artifact_identity = base_publication_identity.get("artifact", {})
+            lineage = {
+                **base_publication_identity,
+                "schema_version": "pdf-lineage.v1",
+                "nature": "opinion_draft_preview",
+                "opinion": {
+                    "id": str(opinion.id),
+                    "version": opinion.version,
+                    "status": opinion.status.value,
+                    "sha256": opinion.content_sha256,
+                },
+                "renderer": {
+                    "name": PUBLICATION_RENDERER,
+                    "version": PUBLICATION_RENDERER_VERSION,
+                    "identity_sha256": _version_identity_sha256(
+                        PUBLICATION_RENDERER, PUBLICATION_RENDERER_VERSION
+                    ),
+                },
+                "template": {
+                    "version": template_bundle.template_version,
+                    "sha256": template_bundle.sha256,
+                },
+                "compiler": {
+                    "name": TYPST_COMPILER,
+                    "version": TYPST_COMPILER_VERSION,
+                    "identity_sha256": _version_identity_sha256(
+                        TYPST_COMPILER, TYPST_COMPILER_VERSION
+                    ),
+                    "binary_sha256": None,
+                },
+                "rendered_at": datetime.now(UTC).isoformat(),
+            }
+            label = publication_identity_label(
+                nature="opinion_draft_preview",
+                artifact_id=UUID(str(artifact_identity["id"])),
+                artifact_version=(
+                    int(artifact_identity["version"])
+                    if artifact_identity.get("version") is not None
+                    else None
+                ),
+                artifact_sha256=str(artifact_identity["sha256"]),
+                opinion_id=opinion.id,
+                opinion_version=opinion.version,
+                opinion_status=opinion.status.value,
             )
-            if graph_media_ref is None:
-                render_source = self._renderer.render(projection, template_bundle)
-            else:
-                render_source = self._renderer.render(
-                    projection,
-                    template_bundle,
-                    infrastructure_graph_media_ref=graph_media_ref,
-                )
+            render_source = self._renderer.render(
+                projection,
+                template_bundle,
+                document_label=label,
+            )
+            render_source = with_publication_lineage(
+                render_source,
+                identity_label=label,
+                lineage=lineage,
+            )
             executed = await self._preview_executor.execute(
                 render_source=render_source,
                 template_bundle=template_bundle,
@@ -276,7 +405,11 @@ class PublicationRenderService:
             raise
         except Exception as exc:
             raise PublicationRenderFailedError("Unable to compile the draft preview") from exc
-        return executed.compiled_document
+        return DraftPublicationRender(
+            compiled_document=executed.compiled_document,
+            render_data_sha256=render_source.render_data_sha256,
+            lineage=lineage,
+        )
 
     async def render_pdf(self, publication_artifact_id: UUID) -> PublicationRender:
         async with self._uow_factory() as uow:
@@ -305,6 +438,199 @@ class PublicationRenderService:
             font_bundle=prepared.font_bundle,
             build_source=prepared.build_source,
         )
+
+    async def lineage_manifest_for_render(
+        self,
+        render: PublicationRender,
+        *,
+        is_current: bool | None = None,
+        history_reasons: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        """Reconstruct the durable manifest from the immutable render row and data blob."""
+        async with self._uow_factory() as uow:
+            runtime_uow = cast(Any, uow)
+            artifact = await uow.production_artifacts.get(render.publication_artifact_id)
+            current_run = (
+                await runtime_uow.production_runs.get_current_for_subject(artifact.subject_id)
+                if artifact is not None
+                else None
+            )
+            current_artifact = (
+                await uow.production_artifacts.get_current(
+                    artifact.production_run_id, ProductionArtifactStage.PUBLICATION.value
+                )
+                if artifact is not None
+                else None
+            )
+            source_investigation = (
+                await runtime_uow.analyst_investigations.get_for_run(artifact.production_run_id)
+                if artifact is not None
+                else None
+            )
+            current_investigation = (
+                await runtime_uow.analyst_investigations.get_for_run(current_run.id)
+                if current_run is not None
+                else None
+            )
+            augmentation = (
+                artifact.metadata.get("publication_augmentation")
+                if artifact is not None and isinstance(artifact.metadata, dict)
+                else None
+            )
+            opinion = None
+            if isinstance(augmentation, dict):
+                try:
+                    opinion_version = augmentation.get("opinion_version")
+                    opinion_id = augmentation.get("opinion_id")
+                    if isinstance(opinion_version, int) and isinstance(opinion_id, str):
+                        opinion = await runtime_uow.analyst_opinions.get(
+                            UUID(opinion_id), version=opinion_version
+                        )
+                except (TypeError, ValueError):
+                    opinion = None
+            current_opinion = (
+                await runtime_uow.analyst_opinions.get(opinion.id) if opinion is not None else None
+            )
+            await uow.commit()
+
+        if artifact is None:
+            raise PublicationRenderArtifactMissingError(
+                f"Publication artifact {render.publication_artifact_id} does not exist"
+            )
+        if render.render_data_blob_id is None:
+            render_data = b""
+            render_data_payload: dict[str, Any] = {}
+        else:
+            render_data = await self._artifact_store.read_bytes(render.render_data_blob_id)
+            try:
+                parsed = json.loads(render_data)
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                raise PublicationRenderDocumentInvalidError(
+                    "Persisted render-data is not valid JSON"
+                ) from exc
+            render_data_payload = parsed if isinstance(parsed, dict) else {}
+
+        stored_lineage = render_data_payload.get(PDF_LINEAGE_RENDER_DATA_FIELD)
+        if artifact.canonical_blob_id is None:
+            raise PublicationRenderArtifactInvalidError(
+                "Publication artifact has no canonical blob for lineage"
+            )
+        canonical_bytes = await self._artifact_store.read_bytes(artifact.canonical_blob_id)
+        canonical_sha256 = hashlib.sha256(canonical_bytes).hexdigest()
+        if isinstance(stored_lineage, dict):
+            lineage = dict(stored_lineage)
+        else:
+            augmentation_dict = augmentation if isinstance(augmentation, dict) else None
+            lineage = {
+                "schema_version": "pdf-lineage.v1",
+                "nature": (
+                    "augmented_publication" if augmentation_dict is not None else "base_publication"
+                ),
+                "artifact": {
+                    "id": str(artifact.id),
+                    "version": artifact.version,
+                    "sha256": canonical_sha256,
+                    "document_schema": None,
+                },
+                "opinion": (
+                    {
+                        "id": str(augmentation_dict.get("opinion_id")),
+                        "version": augmentation_dict.get("opinion_version"),
+                        "status": opinion.status.value if opinion is not None else "unknown",
+                        "sha256": str(augmentation_dict.get("opinion_content_sha256", "")),
+                    }
+                    if augmentation_dict is not None
+                    else None
+                ),
+                "investigation_id": (
+                    str(augmentation_dict.get("investigation_id"))
+                    if augmentation_dict is not None
+                    else str(current_investigation.id)
+                    if current_investigation is not None
+                    else None
+                ),
+                "production_run_id": str(artifact.production_run_id),
+            }
+
+        reasons = list(history_reasons)
+        if current_run is None:
+            reasons.append("current_production_run_unavailable")
+        elif current_run.id != artifact.production_run_id:
+            reasons.append("production_run_is_not_current")
+        if current_artifact is None:
+            reasons.append("current_publication_artifact_unavailable")
+        elif current_artifact.id != artifact.id:
+            reasons.append("publication_artifact_is_not_current")
+        opinion_lineage = lineage.get("opinion")
+        if isinstance(opinion_lineage, dict):
+            pinned_investigation_id = opinion_lineage.get("investigation_id") or lineage.get(
+                "investigation_id"
+            )
+            if current_investigation is None:
+                reasons.append("current_investigation_unavailable")
+            elif str(current_investigation.id) != str(pinned_investigation_id):
+                reasons.append("pinned_opinion_investigation_mismatch")
+            if opinion is None or current_opinion is None:
+                reasons.append("pinned_opinion_identity_unavailable")
+            elif (
+                current_opinion.version != opinion.version
+                or current_opinion.content_sha256 != opinion.content_sha256
+            ):
+                reasons.append("pinned_opinion_is_older_than_current")
+            elif opinion_lineage.get("status") not in {None, opinion.status.value}:
+                reasons.append("pinned_opinion_status_mismatch")
+            opinion_lineage.update(
+                {
+                    "status": opinion.status.value if opinion is not None else "unknown",
+                    "sha256": opinion.content_sha256
+                    if opinion is not None
+                    else opinion_lineage.get("sha256"),
+                    "investigation_id": (
+                        str(opinion.investigation_id)
+                        if opinion is not None
+                        else opinion_lineage.get("investigation_id")
+                    ),
+                }
+            )
+        if lineage.get("investigation_id") is None and source_investigation is not None:
+            lineage["investigation_id"] = str(source_investigation.id)
+
+        renderer_hash = _version_identity_sha256(render.renderer, render.renderer_version)
+        compiler_hash = _version_identity_sha256(render.compiler, render.compiler_version)
+        lineage["render_id"] = str(render.id)
+        lineage["render_data_sha256"] = (
+            hashlib.sha256(render_data).hexdigest() if render_data else None
+        )
+        lineage["renderer"] = {
+            "name": render.renderer,
+            "version": render.renderer_version,
+            "identity_sha256": renderer_hash,
+        }
+        lineage["template"] = {
+            "version": render.template_version,
+            "sha256": render.template_sha256,
+        }
+        lineage["compiler"] = {
+            "name": render.compiler,
+            "version": render.compiler_version,
+            "identity_sha256": compiler_hash,
+            "binary_sha256": None,
+        }
+        lineage["rendered_at"] = render.created_at.isoformat()
+        lineage["pdf_sha256"] = render.output_sha256
+        lineage["is_current"] = not reasons and is_current is not False
+        lineage["historical"] = not lineage["is_current"]
+        lineage["history_reasons"] = list(dict.fromkeys(reasons))
+        if render_data_payload.get(PUBLICATION_IDENTITY_LABEL_FIELD):
+            lineage["document_label"] = render_data_payload[PUBLICATION_IDENTITY_LABEL_FIELD]
+        artifact_lineage = lineage.get("artifact")
+        if (
+            lineage.get("nature") == "base_publication"
+            and isinstance(artifact_lineage, dict)
+            and artifact_lineage.get("document_schema") in {"6", "PublicationDocumentV6"}
+        ):
+            lineage["lineage_warning"] = "augmentation_metadata_absent_not_presented_as_enriched"
+        return lineage
 
     async def render_preview(self, publication_artifact_id: UUID) -> PublicationRenderAttempt:
         """Run or inspect the shared render lifecycle without hiding its state."""
@@ -439,17 +765,102 @@ class PublicationRenderService:
             updated_at=now,
         )
 
+        augmentation = artifact.metadata.get("publication_augmentation")
+        if isinstance(document, PublicationDocumentV6):
+            if not isinstance(augmentation, dict):
+                raise PublicationRenderArtifactInvalidError(
+                    "A V6 publication requires its pinned augmentation metadata"
+                )
+            provenance = document.provenance
+            if (
+                str(provenance.base_publication_artifact_id)
+                != str(
+                    augmentation.get(
+                        "base_publication_artifact_id",
+                        artifact.metadata.get("previous_publication_artifact_id"),
+                    )
+                )
+                or str(provenance.investigation_id) != str(augmentation.get("investigation_id"))
+                or str(provenance.opinion_id) != str(augmentation.get("opinion_id"))
+                or provenance.opinion_version != augmentation.get("opinion_version")
+                or provenance.opinion_content_sha256 != augmentation.get("opinion_content_sha256")
+            ):
+                raise PublicationRenderArtifactInvalidError(
+                    "V6 publication metadata does not match its document provenance"
+                )
+            nature = "augmented_publication"
+            opinion_identity: dict[str, Any] | None = {
+                "id": str(provenance.opinion_id),
+                "version": provenance.opinion_version,
+                "status": "approved",
+                "sha256": provenance.opinion_content_sha256,
+                "investigation_id": str(provenance.investigation_id),
+            }
+            investigation_id: str | None = str(provenance.investigation_id)
+        else:
+            if augmentation is not None:
+                raise PublicationRenderArtifactInvalidError(
+                    "A base publication cannot carry augmentation metadata"
+                )
+            nature = "base_publication"
+            opinion_identity = None
+            investigation_id = None
+
+        lineage = {
+            "schema_version": "pdf-lineage.v1",
+            "nature": nature,
+            "artifact": {
+                "id": str(artifact.id),
+                "version": artifact.version,
+                "sha256": publication_content_sha256,
+                "document_schema": document.schema_version,
+            },
+            "opinion": opinion_identity,
+            "investigation_id": investigation_id,
+            "production_run_id": str(artifact.production_run_id),
+            "renderer": {
+                "name": PUBLICATION_RENDERER,
+                "version": PUBLICATION_RENDERER_VERSION,
+                "identity_sha256": _version_identity_sha256(
+                    PUBLICATION_RENDERER, PUBLICATION_RENDERER_VERSION
+                ),
+            },
+            "template": {"version": template_version, "sha256": template_sha256},
+            "compiler": {
+                "name": TYPST_COMPILER,
+                "version": TYPST_COMPILER_VERSION,
+                "identity_sha256": _version_identity_sha256(TYPST_COMPILER, TYPST_COMPILER_VERSION),
+                "binary_sha256": None,
+            },
+            "rendered_at": now.isoformat(),
+        }
+        label = publication_identity_label(
+            nature=nature,
+            artifact_id=artifact.id,
+            artifact_version=artifact.version,
+            artifact_sha256=publication_content_sha256,
+            opinion_id=UUID(opinion_identity["id"]) if opinion_identity else None,
+            opinion_version=opinion_identity["version"] if opinion_identity else None,
+            opinion_status=opinion_identity["status"] if opinion_identity else None,
+        )
+
         def build_source() -> TypstRenderSource:
             try:
-                return self._renderer.render(
+                source = self._renderer.render(
                     document,
                     template_bundle,
+                    document_label=label,
                     target_artifact_identities=target_artifact_identities,
                     **(
                         {"infrastructure_graph_media_ref": graph_media_ref}
                         if graph_media_ref is not None
                         else {}
                     ),
+                )
+                return with_publication_lineage(
+                    source,
+                    identity_label=label,
+                    lineage=lineage,
                 )
             except TemplateBundleInvalidError as exc:
                 raise PublicationRenderTemplateInvalidError(str(exc)) from exc

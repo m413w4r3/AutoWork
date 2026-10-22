@@ -1620,8 +1620,47 @@ async def download_edition_pdf(edition_id: UUID, request: Request) -> Response:
     return Response(
         content=pdf.content,
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{pdf.filename}"'},
+        headers={
+            "Content-Disposition": f'attachment; filename="{pdf.filename}"',
+            "X-PDF-Lineage-URL": f"/api/editions/{edition_id}/release/lineage",
+        },
     )
+
+
+@router.get("/editions/{edition_id}/releases/{release_id}/pdf")
+async def download_versioned_edition_pdf(
+    edition_id: UUID, release_id: UUID, request: Request
+) -> Response:
+    try:
+        pdf = await _publication_service(request).read_release_pdf(edition_id, release_id)
+    except Exception as exc:
+        _raise_publication_error(exc)
+    return Response(
+        content=pdf.content,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{pdf.filename}"',
+            "X-PDF-Lineage-URL": (f"/api/editions/{edition_id}/releases/{release_id}/lineage"),
+        },
+    )
+
+
+@router.get("/editions/{edition_id}/release/lineage")
+async def get_edition_release_lineage(edition_id: UUID, request: Request) -> dict[str, Any]:
+    try:
+        return await _publication_service(request).read_release_lineage(edition_id)
+    except Exception as exc:
+        _raise_publication_error(exc)
+
+
+@router.get("/editions/{edition_id}/releases/{release_id}/lineage")
+async def get_versioned_edition_release_lineage(
+    edition_id: UUID, release_id: UUID, request: Request
+) -> dict[str, Any]:
+    try:
+        return await _publication_service(request).read_release_lineage(edition_id, release_id)
+    except Exception as exc:
+        _raise_publication_error(exc)
 
 
 @router.get("/editions/{edition_id}/release/iocs.zip")

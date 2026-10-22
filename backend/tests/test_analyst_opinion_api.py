@@ -6,8 +6,9 @@ from uuid import UUID
 import httpx
 import pytest
 from fastapi import FastAPI
+from pydantic import ValidationError
 
-from cti_app.api.analyst_opinion import router
+from cti_app.api.analyst_opinion import OpinionBlockEdit, router
 from cti_app.application.analyst_opinion_preview import AnalystOpinionPreviewService
 from cti_app.application.analyst_opinion_service import AnalystOpinionService
 from cti_app.application.analyst_publication_service import AnalystPublicationService
@@ -16,6 +17,30 @@ from cti_app.application.publication_augmentation import PublicationAugmentation
 from cti_app.application.typst_compilation import CompiledTypstDocument
 from cti_app.domain.production_synthesis import ProductionSynthesisV1
 from tests.test_analyst_opinion_service import make_opinion_harness
+
+
+def test_opinion_api_reports_review_text_stale_when_sha_differs_from_target_text() -> None:
+    text = "Texte de la version courante."
+    current_sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    with pytest.raises(ValidationError) as raised:
+        OpinionBlockEdit.model_validate(
+            {
+                "block_type": "claim_verification",
+                "text": text,
+                "bridge_draft_ref": {
+                    "invocation_id": "draft-call",
+                    "text_sha256": current_sha256,
+                },
+                "bridge_review_ref": {
+                    "invocation_id": "review-call",
+                    "output_sha256": "a" * 64,
+                    "reviewed_text_sha256": "b" * 64,
+                },
+            }
+        )
+
+    assert raised.value.errors()[0]["type"] == "review_text_stale"
 
 
 class _IdentityProvider:
@@ -36,8 +61,16 @@ class _PreviewRenderer:
         infrastructure_graph=None,
         findings=(),
         evidence_observations=(),
+        base_publication_identity=None,
     ) -> CompiledTypstDocument:
-        del document, opinion, infrastructure_graph, findings, evidence_observations
+        del (
+            document,
+            opinion,
+            infrastructure_graph,
+            findings,
+            evidence_observations,
+            base_publication_identity,
+        )
         self.rendered_synthesis = synthesis
         content = b"%PDF-1.4\npreview fixture\n"
         return CompiledTypstDocument(
@@ -53,6 +86,7 @@ class _PreviewRenderer:
 @pytest.mark.asyncio
 async def test_opinion_api_composes_revises_approves_and_publishes_without_repin() -> None:
     harness = make_opinion_harness()
+    attacker_token = "ghp_" + "a" * 36
     augmentation = PublicationAugmentationArtifactService(
         uow_factory=harness.uow_factory,  # type: ignore[arg-type]
         artifact_store=harness.store,  # type: ignore[arg-type]
@@ -118,13 +152,33 @@ async def test_opinion_api_composes_revises_approves_and_publishes_without_repin
                         "evidence_refs": [str(harness.observation.id)],
                     }
                 ],
+                "implant_materials": [
+                    {
+                        "type": "attacker_github_c2_token",
+                        "value": attacker_token,
+                        "role": "Canal C2 via l'API GitHub",
+                        "sample_location": "offset 0x120, longueur 40 octets",
+                        "sample_sha256": "a" * 64,
+                        "evidence_observation_id": str(harness.observation.id),
+                    }
+                ],
             },
             headers={"Idempotency-Key": "revise-1"},
         )
-        assert revise.status_code == 200
+        assert revise.status_code == 200, revise.text
         revised = revise.json()["draft"]
         assert revised["version"] == draft["version"] + 1
         assert revised["observations"][0]["anchor"] == "lead:0001"
+        assert revised["implant_materials"] == [
+            {
+                "type": "attacker_github_c2_token",
+                "value": attacker_token,
+                "role": "Canal C2 via l'API GitHub",
+                "sample_location": "offset 0x120, longueur 40 octets",
+                "sample_sha256": "a" * 64,
+                "evidence_observation_id": str(harness.observation.id),
+            }
+        ]
 
         revise_again = await client.post(
             f"/api/opinions/{draft['id']}/revise",
@@ -155,6 +209,7 @@ async def test_opinion_api_composes_revises_approves_and_publishes_without_repin
         assert revise_again.status_code == 200
         revised = revise_again.json()["draft"]
         assert revised["version"] == draft["version"] + 2
+        assert revised["implant_materials"][0]["value"] == attacker_token
 
         stale_revise = await client.post(
             f"/api/opinions/{draft['id']}/revise",
@@ -305,3 +360,94 @@ async def test_opinion_mutation_routes_require_idempotency_key() -> None:
 
     assert response.status_code == 422
     assert response.json()["detail"]["code"] == "idempotency_key_required"
+
+
+@pytest.mark.asyncio
+async def test_opinion_api_revise_accepts_implant_material_bridge_references(monkeypatch) -> None:
+    harness = make_opinion_harness()
+
+    async def skip_bridge_lookup(_uow, _opinion) -> None:
+        return None
+
+    monkeypatch.setattr(harness.service, "_validate_bridge_provenance", skip_bridge_lookup)
+    app = FastAPI()
+    app.include_router(router)
+    app.state.analyst_opinion_service = harness.service
+    app.state.identity_provider = _IdentityProvider()
+    implant_text = "RC4 00112233445566778899aabbccddeeff; C2 ghp_" + "b" * 36
+    text_sha256 = hashlib.sha256(implant_text.encode()).hexdigest()
+    draft_invocation_id = str(UUID(int=701))
+    review_invocation_id = str(UUID(int=702))
+    review_output_sha256 = "d" * 64
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        compose = await client.post(
+            f"/api/investigations/{harness.investigation.id}/opinion/compose",
+            json={"selection": {}},
+            headers={"Idempotency-Key": "implant-compose"},
+        )
+        assert compose.status_code == 200, compose.text
+        draft = compose.json()["draft"]
+        revise = await client.post(
+            f"/api/opinions/{draft['id']}/revise",
+            json={
+                "expected_version": draft["version"],
+                "expected_sha256": draft["content_sha256"],
+                "blocks": [
+                    *[
+                        {
+                            "block_type": block["type"],
+                            "text": block["text"],
+                            "finding_refs": block["finding_refs"],
+                            "evidence_refs": block["evidence_refs"],
+                            "qualification": block["qualification"],
+                            "certainty": block["certainty"],
+                        }
+                        for block in draft["blocks"]
+                    ],
+                    {
+                        "block_type": "implant_materials",
+                        "text": implant_text,
+                        "bridge_authored": True,
+                        "bridge_draft_ref": {
+                            "invocation_id": draft_invocation_id,
+                            "text_sha256": text_sha256,
+                        },
+                        "bridge_review_ref": {
+                            "invocation_id": review_invocation_id,
+                            "output_sha256": review_output_sha256,
+                            "reviewed_text_sha256": text_sha256,
+                        },
+                    },
+                ],
+                "implant_materials": [
+                    {
+                        "type": "attacker_github_c2_token",
+                        "value": "ghp_" + "b" * 36,
+                        "role": "Canal C2 observé",
+                        "sample_location": "offset 0x120",
+                        "sample_sha256": "a" * 64,
+                        "evidence_observation_id": str(harness.observation.id),
+                    }
+                ],
+            },
+            headers={"Idempotency-Key": "implant-revise"},
+        )
+
+    assert revise.status_code == 200, revise.text
+    revised = revise.json()["draft"]
+    section = revised["implant_materials_section"]
+    assert section["text"] == implant_text
+    assert section["bridge_authored"] is True
+    assert section["bridge_draft_ref"] == {
+        "invocation_id": draft_invocation_id,
+        "text_sha256": text_sha256,
+    }
+    assert section["bridge_review_ref"] == {
+        "invocation_id": review_invocation_id,
+        "output_sha256": review_output_sha256,
+        "reviewed_text_sha256": text_sha256,
+    }
+    assert revised["implant_materials"][0]["value"] == "ghp_" + "b" * 36

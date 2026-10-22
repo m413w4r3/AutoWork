@@ -496,7 +496,11 @@ async def test_real_typst_detection_band_reasons_and_rule_source_are_not_truncat
             citation_context,
             detection=rule,
         )
-        render_source = TypstRenderer().render(publication, template_bundle)
+        render_source = TypstRenderer().render(
+            publication,
+            template_bundle,
+            document_label=f"Publication enrichie — avis approuvé v1; fixture {name}",
+        )
         case_root = tmp_path / name
         workspace = case_root / "workspace"
         workspace.mkdir(parents=True)
@@ -569,6 +573,7 @@ async def test_real_typst_detection_band_reasons_and_rule_source_are_not_truncat
                 line
                 for line in page.splitlines()
                 if re.fullmatch(r"\s*\d+\s*/\s*\d+\s*", line) is None
+                and line.strip() != "Avis — publication approuvée v2"
             )
             for page in extracted.split("\f")
         )

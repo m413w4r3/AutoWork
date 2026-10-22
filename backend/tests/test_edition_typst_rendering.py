@@ -63,6 +63,9 @@ from tests.test_typst_rendering import (
 _CHP_TYPST_ROOT = Path(__file__).resolve().parents[2] / "chpTypst"
 _EDITION_MANIFEST = "edition-renderer-manifest.json"
 _EDITION_ID = UUID("11111111-1111-4111-8111-111111111111")
+_EDITION_RENDER_LABEL = (
+    f"Édition publiée {_EDITION_ID} — release 22222222-2222-4222-8222-222222222222"
+)
 
 
 def _edition_metadata() -> dict[str, object]:
@@ -148,8 +151,10 @@ def _render_data(
     tmp_path: Path, document: EditionDocumentV2
 ) -> tuple[TypstRenderSource, dict[str, Any]]:
     bundle = _edition_bundle(tmp_path)
-    source = EditionTypstRenderer().render(document, bundle)
-    return source, json.loads(source.render_data_bytes)
+    source = EditionTypstRenderer().render(document, bundle, document_label=_EDITION_RENDER_LABEL)
+    data = json.loads(source.render_data_bytes)
+    assert data["document_label"] == _EDITION_RENDER_LABEL
+    return source, data
 
 
 def test_renders_one_article_with_edition_metadata_and_private_entrypoint(tmp_path: Path) -> None:
@@ -159,7 +164,11 @@ def test_renders_one_article_with_edition_metadata_and_private_entrypoint(tmp_pa
 
     assert source.entrypoint_relative_path == "RENDERER/edition.typ"
     assert source.render_data_relative_path == "RENDERER/edition-render-data.json"
-    assert data["schema_version"] == "typst-edition-model-v23-publication-v26-editorial-spacing"
+    assert (
+        data["schema_version"] == "typst-edition-model-v24-secret-guard-short-continuation-header"
+    )
+    assert data["document_label"] == _EDITION_RENDER_LABEL
+    assert data["document_header"] == "Bulletin de veille CTI — édition v4"
     assert data["edition"] == {
         "id": str(_EDITION_ID),
         "country": "Iran",
@@ -398,11 +407,39 @@ def test_render_data_bytes_are_deterministic_across_runs(tmp_path: Path) -> None
     renderer = EditionTypstRenderer()
     bundle = _edition_bundle(tmp_path)
 
-    first = renderer.render(document, bundle)
-    second = renderer.render(document, bundle)
+    first = renderer.render(document, bundle, document_label=_EDITION_RENDER_LABEL)
+    second = renderer.render(document, bundle, document_label=_EDITION_RENDER_LABEL)
 
     assert first.render_data_bytes == second.render_data_bytes
     assert first.render_data_sha256 == second.render_data_sha256
+
+
+def test_edition_renderer_requires_document_label(tmp_path: Path) -> None:
+    document = _edition_document(((1, _publication("Single article", 1)),))
+    bundle = _edition_bundle(tmp_path)
+
+    with pytest.raises(TypeError, match="document_label"):
+        EditionTypstRenderer().render(document, bundle)  # type: ignore[call-arg]
+
+    with pytest.raises(TemplateBundleInvalidError, match="document_label"):
+        EditionTypstRenderer().render(document, bundle, document_label="  ")
+
+
+def test_edition_renderer_preserves_sample_secret_material_in_clear(tmp_path: Path) -> None:
+    publication = _publication("Single article", 1)
+    secret_text = "AES passphrase = synthetic-edition-passphrase-024"
+    publication = replace(
+        publication,
+        lead=(replace(publication.lead[0], text=secret_text), *publication.lead[1:]),
+    )
+    document = _edition_document(((1, publication),))
+
+    rendered = EditionTypstRenderer().render(
+        document,
+        _edition_bundle(tmp_path),
+        document_label=_EDITION_RENDER_LABEL,
+    )
+    assert secret_text in rendered.render_data_bytes.decode("utf-8")
 
 
 def test_v3_publication_is_rejected_with_stable_code(tmp_path: Path) -> None:
@@ -413,7 +450,11 @@ def test_v3_publication_is_rejected_with_stable_code(tmp_path: Path) -> None:
     edition = _edition_document(((1, legacy_document),))
 
     with pytest.raises(EditionRenderPublicationSchemaUnsupportedError) as raised:
-        EditionTypstRenderer().render(edition, _edition_bundle(tmp_path))
+        EditionTypstRenderer().render(
+            edition,
+            _edition_bundle(tmp_path),
+            document_label=_EDITION_RENDER_LABEL,
+        )
 
     assert raised.value.code == "edition_render_publication_schema_unsupported"
 
@@ -591,7 +632,11 @@ def test_shared_publication_projection_is_pure_and_complete(tmp_path: Path) -> N
     )
 
     model = project_publication_to_typst_model(document)
-    rendered = TypstRenderer().render(document, publication_bundle)
+    rendered = TypstRenderer().render(
+        document,
+        publication_bundle,
+        document_label="Libellé de fixture",
+    )
     render_data = json.loads(rendered.render_data_bytes)
 
     assert model.title == render_data["title"]

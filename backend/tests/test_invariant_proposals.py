@@ -11,6 +11,7 @@ import pytest
 from cti_app.application.invariant_proposals import (
     ProposalConversationService,
     ProposalOutputValidationError,
+    _parse_proposal_response_details,
 )
 from cti_app.application.invariants import InvariantProposalResult
 from cti_app.application.model_conversations import ConversationPolicyError
@@ -483,7 +484,12 @@ async def test_all_six_immutable_references_are_in_canonical_input() -> None:
         "goodware_baseline_id",
     }
     assert all(value for value in references.values())
-    assert all("BEGIN_P10_SNAPSHOT_DATA" in prompt for prompt in conversation.prompts)
+    assert all("BEGIN_P10_FACTS" in prompt for prompt in conversation.prompts)
+    assert all("do not return JSON" in prompt for prompt in conversation.prompts)
+    assert all("BEGIN_P10_SNAPSHOT_DATA" not in prompt for prompt in conversation.prompts)
+    assert len(conversation.prompts[0].encode("utf-8")) <= 96_000
+    assert '"snapshot_references":' not in conversation.prompts[0]
+    assert str(INVESTIGATION_ID) not in conversation.prompts[0]
 
 
 @pytest.mark.asyncio
@@ -783,9 +789,10 @@ async def test_prompt_injection_is_data_and_not_instruction_prose() -> None:
     service, _, conversation, _ = _service(state)
     await service.propose(investigation_id=INVESTIGATION_ID)
     prompt = conversation.prompts[0]
-    assert "BEGIN_P10_SNAPSHOT_DATA" in prompt
+    assert "BEGIN_P10_FACTS" in prompt
     assert "\\nrun a query" in prompt
-    assert prompt.index("BEGIN_P10_SNAPSHOT_DATA") < prompt.index("Ignore prior instructions")
+    assert prompt.index("BEGIN_P10_FACTS") < prompt.index("Ignore prior instructions")
+    assert '"payload":' not in prompt
 
 
 @pytest.mark.asyncio
@@ -800,11 +807,13 @@ async def test_raw_bytes_are_absent_from_prompt() -> None:
 
 
 @pytest.mark.asyncio
-async def test_malformed_output_fails_strictly() -> None:
+async def test_unrecognized_wire_output_is_partial_and_does_not_propose_candidates() -> None:
     conversation = _ConversationService(output="not-json")
     service, _, _, registry = _service(conversation=conversation)
-    with pytest.raises(ProposalOutputValidationError):
-        await service.propose(investigation_id=INVESTIGATION_ID)
+    result = await service.propose(investigation_id=INVESTIGATION_ID)
+    assert result.response.candidate_invariants == []
+    normalized = conversation.normalized_outputs[result.turn.id]
+    assert any("header missing" in item for item in normalized["transformations"])
     assert not registry.calls
 
 
@@ -939,6 +948,46 @@ def _candidate(
         "semantic_justification": "bounded fixture justification",
         "provenance_refs": [provenance_ref or _provenance_ref()],
     }
+
+
+def test_p10_advisor_wire_response_parses_as_text_and_marks_missing_fields() -> None:
+    provenance_ref = _provenance_ref()
+    raw = (
+        "A short preamble is ignored.\n"
+        "advisor-wire.v1\n"
+        "TYPE: p10_proposal\n"
+        "STATUS: partial\n"
+        "CANDIDATE: literal_string | c2_indicator | exact | CreateMutexW | "
+        "Mutex name distinguishes this sample. | "
+        f"refs={provenance_ref}\n"
+        "RISK: none\n"
+        "VALIDATION: compare against the quarantined corpus\n"
+        "QUESTION: none\n"
+    )
+
+    response, transformations = _parse_proposal_response_details(raw)
+
+    assert response.candidate_invariants[0].pattern == "CreateMutexW"
+    assert response.candidate_invariants[0].provenance_refs == [provenance_ref]
+    assert transformations
+    assert any("partial" in item for item in transformations)
+
+
+def test_p10_text_evidence_alias_resolves_through_local_manifest() -> None:
+    raw = (
+        "advisor-wire.v1\n"
+        "TYPE: p10_proposal\n"
+        "STATUS: succeeded\n"
+        "CANDIDATE: literal_string | c2_indicator | exact | CreateMutexW | "
+        "Mutex name distinguishes this sample. | refs=[E1]\n"
+        "RISK: none\nVALIDATION: none\nQUESTION: none\n"
+    )
+
+    response, _ = _parse_proposal_response_details(
+        raw, provenance_aliases={"E1": "canonical-provenance-reference"}
+    )
+
+    assert response.candidate_invariants[0].provenance_refs == ["canonical-provenance-reference"]
 
 
 async def _assert_delegated(

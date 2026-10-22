@@ -12,6 +12,8 @@ from cti_app.domain.analyst_opinion import (
     AnalystObservationV1,
     AnalystOpinionStatus,
     AnalystOpinionV1,
+    BridgeDraftReferenceV1,
+    BridgeReviewReferenceV1,
     CitationViolationCode,
     OpinionBlock,
     OpinionBlockType,
@@ -279,3 +281,96 @@ def test_analyst_observation_projection_is_versioned_and_requires_citations() ->
             state=AnalystObservationState.OBSERVED,
             relation=AnalystObservationRelation.CONFIRMS,
         )
+
+
+def test_bridge_block_provenance_roundtrips_through_existing_projection_payload() -> None:
+    text = "Le comportement est confirmé par la mesure citée."
+    draft_ref = BridgeDraftReferenceV1(
+        invocation_id=str(uuid4()),
+        text_sha256=hashlib.sha256(text.encode()).hexdigest(),
+    )
+    review_ref = BridgeReviewReferenceV1(
+        invocation_id=str(uuid4()),
+        output_sha256="a" * 64,
+        reviewed_text_sha256=draft_ref.text_sha256,
+    )
+    body = OpinionBlock(
+        block_type=OpinionBlockType.KEY_FINDINGS,
+        text=text,
+        qualification=OpinionClaimQualification.HYPOTHESIS,
+        bridge_authored=True,
+        bridge_draft_ref=draft_ref,
+        bridge_review_ref=review_ref,
+    )
+    opinion = _opinion(opinion_blocks_with_observations((body,), ()))
+
+    payload = opinion.content_payload()
+    serialized_blocks = payload["blocks"]
+    reconstructed_blocks = tuple(
+        OpinionBlock(
+            block_type=OpinionBlockType(item["type"]),
+            text=item["text"],
+            finding_refs=tuple(UUID(ref) for ref in item["finding_refs"]),
+            evidence_refs=tuple(UUID(ref) for ref in item["evidence_refs"]),
+            qualification=OpinionClaimQualification(item["qualification"]),
+            certainty=item["certainty"],
+        )
+        for item in serialized_blocks
+    )
+    reconstructed = AnalystOpinionV1(
+        id=opinion.id,
+        version=opinion.version,
+        investigation_id=opinion.investigation_id,
+        synthesis_artifact_id=opinion.synthesis_artifact_id,
+        synthesis_sha256=opinion.synthesis_sha256,
+        base_publication_artifact_id=opinion.base_publication_artifact_id,
+        base_publication_sha256=opinion.base_publication_sha256,
+        blocks=reconstructed_blocks,
+        author_id=opinion.author_id,
+        created_at=opinion.created_at,
+        content_sha256=opinion.content_sha256,
+    )
+
+    assert reconstructed.blocks[0].bridge_authored is True
+    assert reconstructed.blocks[0].bridge_draft_ref == draft_ref
+    assert reconstructed.blocks[0].bridge_review_ref == review_ref
+    assert reconstructed.content_sha256 == opinion.content_sha256
+
+
+def test_bridge_authorship_marker_requires_reference_and_note_target_type() -> None:
+    with pytest.raises(ValueError, match="require a draft reference"):
+        OpinionBlock(
+            block_type=OpinionBlockType.KEY_FINDINGS,
+            text="Texte marqué comme rédigé avec Bridge.",
+            bridge_authored=True,
+        )
+
+    note_text = "Une réserve reste à établir."
+    note_ref = BridgeDraftReferenceV1(
+        invocation_id=str(uuid4()),
+        text_sha256=hashlib.sha256(note_text.encode()).hexdigest(),
+    )
+    with pytest.raises(ValueError, match="target block type"):
+        AnalystObservationV1(
+            id=uuid4(),
+            anchor="section:1:paragraph:0001",
+            text=note_text,
+            state=AnalystObservationState.UNRESOLVED,
+            relation=AnalystObservationRelation.UNRESOLVED,
+            bridge_authored=True,
+            bridge_draft_ref=note_ref,
+        )
+
+    note = AnalystObservationV1(
+        id=uuid4(),
+        anchor="section:1:paragraph:0001",
+        text=note_text,
+        state=AnalystObservationState.UNRESOLVED,
+        relation=AnalystObservationRelation.UNRESOLVED,
+        bridge_authored=True,
+        bridge_block_type=OpinionBlockType.UNCERTAINTIES_AND_NEXT_LEADS,
+        bridge_draft_ref=note_ref,
+    )
+    assert AnalystObservationV1.from_payload(note.to_payload()) == note
+    opinion = _opinion(opinion_blocks_with_observations((), (note,)))
+    assert opinion.observations == (note,)

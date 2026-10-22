@@ -284,9 +284,9 @@ export function InvestigationGovernancePanel({
                   <div key={dimension}>
                     <dt>{BUDGET_LABELS[dimension]}</dt>
                     <dd>
-                      {value.consumed} consommé · plafond{" "}
-                      {value.limit ?? "sans plafond"} · restant{" "}
-                      {value.remaining ?? "sans plafond"}
+                      {value.consumed} consommé · {value.reserved} réservé ·
+                      plafond {value.limit ?? "illimité"} · restant{" "}
+                      {value.remaining ?? "illimité"}
                     </dd>
                   </div>
                 );
