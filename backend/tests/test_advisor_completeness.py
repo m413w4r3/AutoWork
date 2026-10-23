@@ -415,13 +415,31 @@ def test_generic_content_projection_omits_full_hexdumps_and_raw_bytes() -> None:
             "hex_bytes": "41" * 16_384,
             "bytes_hex": "41" * 16_384,
             "hexdump": full_dump,
-            "content": full_dump,
             "nested": {"hexdump": {"content": full_dump}},
             "raw_bytes": b"A" * 16_384,
         }
     )
 
     assert projected == []
+
+
+def test_generic_content_hexdump_is_rejected_with_a_reason() -> None:
+    from cti_app.application.advisor_dossier import extract_content_excerpts
+
+    dump = "00000000: " + "41 " * 16
+
+    with pytest.raises(ValueError, match="raw_hexdump_content_rejected"):
+        extract_content_excerpts({"content": dump})
+
+
+def test_short_generic_content_excerpt_is_preserved() -> None:
+    from cti_app.application.advisor_dossier import extract_content_excerpts
+
+    short_content = "A short synthetic observation excerpt."
+
+    projected = extract_content_excerpts({"content": short_content})
+
+    assert any(row["kind"] == "text" and row["text"] == short_content for row in projected)
 
 
 def test_decoded_hex_ioc_is_not_mistaken_for_raw_bytes() -> None:

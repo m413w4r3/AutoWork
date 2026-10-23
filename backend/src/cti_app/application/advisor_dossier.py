@@ -25,11 +25,23 @@ _CLAIM_ID = re.compile(r"\b(?:S\d+P\d+(?:\.\d+)?|L\d+(?:\.\d+)?|T\d+)\b", re.I)
 _UUID = re.compile(r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")
 _INTERNAL_SHA = re.compile(r"(?i)\b(?:sha(?:-?256)?\s*[:=]\s*)?[0-9a-f]{64}\b")
 _HEXDUMP_LINE = re.compile(r"(?im)^\s*(?:0x)?[0-9a-f]{4,16}:\s+(?:[0-9a-f]{2,8}\s+){4,}")
+# Per-field aggregate cap for generic content excerpts; not a dossier-size limit.
+MAX_GENERIC_CONTENT_EXCERPT_BYTES = 16_384
 _STOP = frozenset(
     "avec dans pour sans cette celui celle sont être avoir mais comme dans sur sous une des les "
     "aux par que qui quoi dont alors leur leurs elles ils cela ceci nous vous elle lui son sa "
     "ses from that this those have with which what where when then than into over under".split()
 )
+
+
+class ContentExcerptLimitExceeded(ValueError):
+    """Reject oversized generic content before it can enter a dossier or prompt."""
+
+    def __init__(self, reason_code: str) -> None:
+        self.reason_code = reason_code
+        super().__init__(reason_code)
+
+
 _DEFAULT_TASKS = {
     "plan_investigation": "Choisir la prochaine étape utile à partir des faits vérifiés.",
     "pivot_strategy": (
@@ -107,6 +119,7 @@ def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]
     """Extract complete methods, decoded values, and sentence-bounded text."""
     excerpts: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
+    content_field_bytes: dict[tuple[str, ...], int] = {}
     assembly_name = next(
         (
             value.strip()
@@ -123,7 +136,9 @@ def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]
             return
         text = value.replace("\r\n", "\n").replace("\r", "\n").strip()
         if _HEXDUMP_LINE.search(text):
-            return
+            raise ContentExcerptLimitExceeded("raw_hexdump_content_rejected")
+        if len(text.encode("utf-8")) > MAX_GENERIC_CONTENT_EXCERPT_BYTES:
+            raise ContentExcerptLimitExceeded("generic_content_excerpt_exceeds_16384_byte_limit")
         prefix = (
             f"{assembly_name} — "
             if assembly_name and assembly_name.casefold() not in title.casefold()
@@ -157,7 +172,19 @@ def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]
                 return value.strip()
         return fallback
 
-    def walk(value: Any, path: tuple[str, ...] = ()) -> None:
+    def add_content(field_path: tuple[str, ...], kind: str, title: str, value: str) -> None:
+        normalized = value.replace("\r\n", "\n").replace("\r", "\n").strip()
+        total_bytes = content_field_bytes.get(field_path, 0) + len(normalized.encode("utf-8"))
+        if total_bytes > MAX_GENERIC_CONTENT_EXCERPT_BYTES:
+            raise ContentExcerptLimitExceeded("generic_content_excerpt_exceeds_16384_byte_limit")
+        content_field_bytes[field_path] = total_bytes
+        add(kind, title, value)
+
+    def walk(
+        value: Any,
+        path: tuple[str, ...] = (),
+        content_field: tuple[str, ...] | None = None,
+    ) -> None:
         if any(
             token in part.casefold().replace("_", " ")
             for part in path
@@ -208,12 +235,25 @@ def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]
                         # A nested textual rendering of bytes is raw material too.
                         continue
                     elif any(token in content_path for token in ("string", "decoded", "config")):
-                        add("decoded", f"Valeur décodée — {name}", child)
+                        add_content(
+                            content_field or (*path, key),
+                            "decoded",
+                            f"Valeur décodée — {name}",
+                            child,
+                        )
                     else:
-                        add("text", f"Texte observé — {name}", child)
+                        add_content(
+                            content_field or (*path, key),
+                            "text",
+                            f"Texte observé — {name}",
+                            child,
+                        )
                     continue
                 if isinstance(child, (Mapping, list, tuple)):
-                    walk(child, (*path, key))
+                    nested_content_field = content_field
+                    if key in _CONTENT_KEYS and nested_content_field is None:
+                        nested_content_field = (*path, key)
+                    walk(child, (*path, key), nested_content_field)
             return
         if isinstance(value, (list, tuple)):
             for index, child in enumerate(value, start=1):
@@ -223,15 +263,25 @@ def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]
                         if path and any("string" in item or "decoded" in item for item in path)
                         else "text"
                     )
-                    add(
-                        kind,
-                        f"Valeur décodée {index}"
-                        if kind == "decoded"
-                        else f"Texte observé {index}",
-                        child,
-                    )
+                    if content_field is not None:
+                        add_content(
+                            content_field,
+                            kind,
+                            f"Valeur décodée {index}"
+                            if kind == "decoded"
+                            else f"Texte observé {index}",
+                            child,
+                        )
+                    else:
+                        add(
+                            kind,
+                            f"Valeur décodée {index}"
+                            if kind == "decoded"
+                            else f"Texte observé {index}",
+                            child,
+                        )
                 else:
-                    walk(child, (*path, str(index)))
+                    walk(child, (*path, str(index)), content_field)
             return
         if isinstance(value, str) and path:
             key = path[-1].casefold()

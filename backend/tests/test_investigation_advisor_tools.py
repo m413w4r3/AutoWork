@@ -1783,6 +1783,168 @@ async def test_short_verified_xxd_signature_remains_a_selectable_measurement() -
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("consultation_type", ["plan_investigation", "draft_text", "yara_draft"])
+@pytest.mark.parametrize("measurement_key", ["hex", "hex_bytes", "base64"])
+async def test_oversized_legacy_hex_measurement_is_rejected_before_prompt(
+    consultation_type: str, measurement_key: str
+) -> None:
+    investigation_id = uuid4()
+    sample_sha256 = "a" * 64
+    oversized_hex = "41" * 262_144
+    measurement_value = (
+        base64.b64encode(b"A" * 513).decode() if measurement_key == "base64" else oversized_hex
+    )
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": sample_sha256,
+            measurement_key: [{"value": measurement_value, "offset": 128}],
+        },
+    )
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    tool, sample_blob = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+
+    tool._sample_associations.list_for_investigation = async_get(
+        (SimpleNamespace(sample_sha256=sample_sha256),)
+    )
+    tool._samples.list_for_subject = async_get(
+        (
+            SimpleNamespace(
+                expected_hash=sample_sha256,
+                source_object_id=None,
+                state="quarantined",
+                do_not_submit=True,
+                external_llm_allowed=False,
+                blob_id=sample_blob,
+            ),
+        )
+    )
+    tool._blobs.add(sample_blob, sha256=sample_sha256, size=4096)
+
+    arguments: dict[str, Any] = {
+        "consultation_type": consultation_type,
+        "question": "Use the oversized raw hex marker from this observation.",
+        "evidence_refs": [str(observation.id)],
+    }
+    if consultation_type == "draft_text":
+        arguments["units"] = [
+            {
+                "id": "U1",
+                "block_type": "key_findings",
+                "form": "body",
+                "anchor": None,
+                "assertions": [
+                    {
+                        "id": "a1",
+                        "text": "The oversized marker is relevant.",
+                        "nature": "analyse",
+                        "refs": [{"kind": "observation", "id": str(observation.id)}],
+                        "block_type": "key_findings",
+                        "form": "body",
+                        "anchor": None,
+                    }
+                ],
+            }
+        ]
+    result = await tool.execute(
+        arguments,
+        make_context(
+            investigation_id,
+            key=f"operator:advisor:oversized-legacy-hex:{consultation_type}",
+        ),
+    )
+
+    assert result.status is ToolInvocationStatus.FAILED
+    assert result.error_code == "advisor_input_invalid"
+    assert result.output["input_error_code"] == "binary_measurement_exceeds_limit", repr(
+        result.output
+    )
+    assert [dict(item) for item in result.output["measurement_errors"]] == [
+        {"index": 0, "reason": "binary_measurement_exceeds_512_byte_limit"}
+    ]
+    assert measurement_value not in repr(result.output)
+    assert "dossier_text" not in result.output
+    assert transport.calls == []
+
+
+@pytest.mark.asyncio
+async def test_oversized_generic_content_is_rejected_before_prompt() -> None:
+    investigation_id = uuid4()
+    oversized_content = "41" * 16_384
+    observation, raw = make_observation(
+        investigation_id,
+        {"schema": "generic-observation.v1", "content": oversized_content},
+    )
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    tool, _sample_blob = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Review the content in this observation.",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, key="operator:advisor:oversized-generic-content"),
+    )
+
+    assert result.status is ToolInvocationStatus.FAILED
+    assert result.error_code == "advisor_input_invalid"
+    assert result.output["input_error_code"] == ("generic_content_excerpt_exceeds_16384_byte_limit")
+    assert oversized_content not in repr(result.output)
+    assert "dossier_text" not in result.output
+    assert transport.calls == []
+
+
+@pytest.mark.asyncio
+async def test_aggregate_generic_content_list_is_rejected_before_prompt() -> None:
+    investigation_id = uuid4()
+    first_content = "A" * 16_000
+    second_content = "B" * 16_000
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "generic-observation.v1",
+            "content": [first_content, second_content],
+        },
+    )
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    tool, _sample_blob = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Review the listed content in this observation.",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, key="operator:advisor:oversized-content-list"),
+    )
+
+    assert result.status is ToolInvocationStatus.FAILED
+    assert result.error_code == "advisor_input_invalid"
+    assert result.output["input_error_code"] == ("generic_content_excerpt_exceeds_16384_byte_limit")
+    assert first_content not in repr(result.output)
+    assert second_content not in repr(result.output)
+    assert "dossier_text" not in result.output
+    assert transport.calls == []
+
+
+@pytest.mark.asyncio
 async def test_unavailable_observation_blob_is_not_marked_retrievable() -> None:
     investigation_id = uuid4()
     observation, raw = make_observation(
