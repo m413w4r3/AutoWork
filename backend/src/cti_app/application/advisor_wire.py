@@ -111,16 +111,12 @@ def advisor_wire_aliases(prompt_data: Mapping[str, Any]) -> dict[str, dict[str, 
     for unit in prompt_data.get("units", ()):
         if not isinstance(unit, Mapping):
             continue
-        if isinstance(unit.get("opinion_id"), str):
-            add("opinion", unit.get("opinion_id"))
         for key, kind in (("evidence_refs", "observation"), ("finding_refs", "finding")):
             for item in unit.get(key, ()):
                 if isinstance(item, str):
                     add(kind, item)
     review_text = prompt_data.get("review_text")
     if isinstance(review_text, Mapping):
-        if isinstance(review_text.get("opinion_id"), str):
-            add("opinion", review_text.get("opinion_id"))
         for key, kind in (("evidence_refs", "observation"), ("finding_refs", "finding")):
             for item in review_text.get(key, ()):
                 if isinstance(item, str):
@@ -167,6 +163,8 @@ def advisor_wire_aliases(prompt_data: Mapping[str, Any]) -> dict[str, dict[str, 
             manifest_kind = item.get("kind")
             identifier = item.get("id")
             digest = item.get("sha256")
+            if item.get("origin") == "versioned_review_target":
+                continue
             if manifest_kind in {"article", "observation", "finding", "opinion"}:
                 if (
                     manifest_kind == "article"
@@ -233,6 +231,8 @@ def advisor_wire_aliases(prompt_data: Mapping[str, Any]) -> dict[str, dict[str, 
         alias = item.get("alias")
         if not isinstance(alias, str):
             continue
+        if item.get("origin") == "versioned_review_target":
+            continue
         evidence = dict(item)
         if evidence.get("kind") == "article" and isinstance(evidence.get("id"), str):
             identifier = evidence["id"]
@@ -250,8 +250,12 @@ def advisor_wire_aliases(prompt_data: Mapping[str, Any]) -> dict[str, dict[str, 
     }
 
 
-def render_advisor_wire_input(prompt_data: Mapping[str, Any]) -> str:
+def render_advisor_wire_input(
+    prompt_data: Mapping[str, Any], *, dossier_text: str | None = None
+) -> str:
     """Render only selected, human-readable task facts; never serialize internal data."""
+    if dossier_text is not None:
+        return dossier_text
     return build_advisor_dossier(prompt_data).text
 
 

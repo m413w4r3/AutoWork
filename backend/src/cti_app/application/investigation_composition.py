@@ -1542,6 +1542,7 @@ def build_investigation_composition(
                 investigations=uow.analyst_investigations,
                 observations=uow.evidence_observations,
                 findings=uow.investigation_findings,
+                investigation_states=uow.investigation_states,
                 experiments=getattr(uow, "investigation_experiments", None),
                 opinions=uow.analyst_opinions,
                 sample_associations=uow.sample_associations,

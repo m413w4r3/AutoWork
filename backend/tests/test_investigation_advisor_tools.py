@@ -174,6 +174,22 @@ def make_observation(investigation_id, payload):
 
 
 def make_tool(*, investigation_id, transport, observation=None, raw=None, allowed=True):
+    class _Hypothesis:
+        def to_payload(self):
+            return {
+                "id": "H_SYNTHETIC",
+                "statement": "Synthetic hypothesis for offline adviser tests.",
+                "status": "open",
+                "evidence_refs": [],
+                "finding_refs": [],
+            }
+
+    working_state = SimpleNamespace(
+        investigation_id=investigation_id,
+        version=1,
+        sha256="f" * 64,
+        hypotheses=(_Hypothesis(),),
+    )
     subject_id = uuid4()
     sample_blob_id = uuid4()
     snapshot = SimpleNamespace(
@@ -208,6 +224,7 @@ def make_tool(*, investigation_id, transport, observation=None, raw=None, allowe
         investigations=SimpleNamespace(get=lambda _id: None),
         observations=ObservationRepository((observation,) if observation else ()),
         findings=FindingRepository(),
+        investigation_states=SimpleNamespace(get=async_get(working_state)),
         opinions=SimpleNamespace(),
         sample_associations=SimpleNamespace(),
         samples=SimpleNamespace(),
@@ -845,6 +862,22 @@ async def test_yara_draft_sends_only_verified_offsets_and_returns_untrusted_text
         observation=observation,
         raw=raw,
     )
+    unrelated, unrelated_raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": "9" * 64,
+            "strings": [{"value": "UnrelatedTelemetryMarker", "offset": 512}],
+        },
+    )
+    tool._observations.observations[unrelated.id] = unrelated
+    tool._artifact_store.values[unrelated.blob_id] = unrelated_raw
+    tool._blobs.add(
+        unrelated.blob_id,
+        sha256=unrelated.sha256,
+        size=len(unrelated_raw),
+        logical_bucket="evidence",
+    )
     tool._registry = Registry(
         (
             SimpleNamespace(
@@ -1049,10 +1082,12 @@ async def test_plan_investigation_selects_relevant_content_from_six_refs() -> No
             tuple(
                 SimpleNamespace(
                     id=uuid4(),
+                    version=1,
                     kind=SimpleNamespace(value="network_behaviour"),
                     assessment=SimpleNamespace(value="inconclusive"),
                     statement=(f"Measured finding {index}: " + "x" * 900),
                     observation_refs=(observations[index].id,),
+                    claim_refs=(),
                     limitations=("bounded",) * 8,
                 )
                 for index in range(6)
@@ -1117,6 +1152,30 @@ async def test_minimal_plan_assembles_evidence_and_parses_structured_output() ->
         observation=observation,
         raw=raw,
     )
+    unrelated, unrelated_raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": "9" * 64,
+            "strings": [{"value": "UnrelatedFindingObservationMarker", "offset": 512}],
+        },
+    )
+    tool._observations.observations[unrelated.id] = unrelated
+    tool._artifact_store.values[unrelated.blob_id] = unrelated_raw
+    tool._blobs.add(
+        unrelated.blob_id,
+        sha256=unrelated.sha256,
+        size=len(unrelated_raw),
+        logical_bucket="evidence",
+    )
+    unrelated_finding = InvestigationFinding(
+        investigation_id=investigation_id,
+        kind=FindingKind.CAPABILITY,
+        assessment=FindingAssessment.INCONCLUSIVE,
+        statement="Une activité sans rapport reste à qualifier.",
+        observation_refs=(unrelated.id,),
+    )
+    tool._findings = FindingRepository((unrelated_finding,))
     tool._registry = Registry(
         (
             SimpleNamespace(
@@ -1144,7 +1203,10 @@ async def test_minimal_plan_assembles_evidence_and_parses_structured_output() ->
     tool._blobs.add(sample_blob_id, sha256="c" * 64, size=4096)
 
     result = await tool.execute(
-        {"consultation_type": "plan_investigation", "question": "Quel pivot ensuite ?"},
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Plan autour de CreateMutexW.",
+        },
         make_context(
             investigation_id,
             key="operator:advisor:minimal-plan",
@@ -1157,8 +1219,10 @@ async def test_minimal_plan_assembles_evidence_and_parses_structured_output() ->
     assert str(observation.id) not in prompt
     assert str(sample_blob_id) not in prompt
     assert {"ref": "E1", "kind": "observation"} in typed_prompt_payload(prompt)["wire_ref_catalog"]
+    assert "UnrelatedTelemetryMarker" not in prompt
     assert "evidence_recorded" not in prompt
-    assert "Quel pivot ensuite ?" in prompt
+    assert "Plan autour de CreateMutexW." in prompt
+    assert str(unrelated.id) not in prompt
     assert result.output["summary"].startswith("Comparer")
     assert result.output["recommended_next_tools"][0]["tool"] == "sample.analyze"
     assert result.output["recommended_next_tools"][0]["schema_version"] == "1"
@@ -1166,6 +1230,21 @@ async def test_minimal_plan_assembles_evidence_and_parses_structured_output() ->
         str(observation.id),
     )
     assert result.output["untrusted"] is True
+    advisor_observation = [
+        item
+        for item in tool._observations.observations.values()
+        if item.source == "advisor.consult"
+    ][-1]
+    persisted = json.loads(
+        await tool._artifact_store.read_bytes(advisor_observation.blob_id, max_bytes=64 * 1024)
+    )
+    unrelated_status = next(
+        item
+        for item in persisted["completeness_manifest"]
+        if item["kind"] == "observation" and item["id"] == str(unrelated.id)
+    )
+    assert "REQUIRED" not in {row["status"] for row in unrelated_status["statuses"]}
+    assert "INTENTIONALLY_OMITTED" in {row["status"] for row in unrelated_status["statuses"]}
 
 
 @pytest.mark.asyncio
@@ -1670,6 +1749,22 @@ async def test_minimal_yara_draft_selects_measured_blob_offsets_server_side() ->
         observation=observation,
         raw=raw,
     )
+    unmeasured, unmeasured_raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": "8" * 64,
+            "strings": [],
+        },
+    )
+    tool._observations.observations[unmeasured.id] = unmeasured
+    tool._artifact_store.values[unmeasured.blob_id] = unmeasured_raw
+    tool._blobs.add(
+        unmeasured.blob_id,
+        sha256=unmeasured.sha256,
+        size=len(unmeasured_raw),
+        logical_bucket="evidence",
+    )
     tool._sample_associations.list_for_investigation = async_get(
         (SimpleNamespace(sample_sha256=sample_sha256, id=uuid4()),)
     )
@@ -1697,6 +1792,21 @@ async def test_minimal_yara_draft_selects_measured_blob_offsets_server_side() ->
     assert "offset 128:" in prompt
     assert "offset 384:" in prompt
     assert result.output["rule_source"].rstrip("\n") == rule_source
+    advisor_observation = next(
+        item
+        for item in tool._observations.observations.values()
+        if item.source == "advisor.consult" and item.object_id == "yara_draft"
+    )
+    persisted = json.loads(
+        await tool._artifact_store.read_bytes(advisor_observation.blob_id, max_bytes=64 * 1024)
+    )
+    omitted = next(
+        item
+        for item in persisted["completeness_manifest"]
+        if item["kind"] == "observation" and item["id"] == str(unmeasured.id)
+    )
+    assert "REQUIRED" not in {row["status"] for row in omitted["statuses"]}
+    assert "INTENTIONALLY_OMITTED" in {row["status"] for row in omitted["statuses"]}
 
 
 @pytest.mark.parametrize(
@@ -2381,7 +2491,7 @@ async def test_review_text_passes_cited_refs_without_internal_provenance() -> No
         if item.source == "advisor.consult"
     )
     persisted = json.loads(
-        await tool._artifact_store.read_bytes(advisor_observation.blob_id, max_bytes=16 * 1024)
+        await tool._artifact_store.read_bytes(advisor_observation.blob_id, max_bytes=64 * 1024)
     )
     assert persisted["input_observation_refs"] == [str(observation.id)]
     assert persisted["input_source_refs"] == [source_ref]
