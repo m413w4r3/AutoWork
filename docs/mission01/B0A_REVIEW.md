@@ -93,3 +93,45 @@ Le registre indique 17 tests dans `docs/mission01/TASKS.md:38`; le run demandé 
 ## Coût
 
 **UNKNOWN** — aucun coût de tokens/fournisseur disponible.
+
+## Re-revue après fbc0f24
+
+- **Cible** : `fbc0f241408a649f0024464a07d2ee4b6a528fe1`; delta examiné `977468078379cdc90ab7897d80bf0e739968e8f8..fbc0f241408a649f0024464a07d2ee4b6a528fe1`.
+- **Verdict final** : **FAIL**. Les corrections F1–F4 sont confirmées et les drapeaux de troncature F5 sont rendus. F6 reste un défaut HIGH : un canal séparé de mesures hex legacy laisse passer des valeurs sans borne.
+
+| Constat | Reclassification R2 | Preuve et résultat |
+|---|---|---|
+| F1 — suite rouge | **CONFIRMED, corrigé / HIGH** | Le run demandé donne **116 passed**. La table `BRIDGE_CHAIN_EVAL.md:87-100` couvre exactement les 24 échecs initiaux, avec causes et actions cohérentes. Le diff ne supprime pas simplement des assertions : le compte `present` monte de 1 à 2 après ajout d’un passage requis; le motif lexical est corrigé; le test Suricata remplace l’ancien résultat `FAILED/SURICATA_NOT_JUSTIFIED` par le contrat désormais exigé : blocage `INSUFFICIENT_EVIDENCE` au préflight, référence exacte, zéro tour et zéro transport (`BRIDGE_CHAIN_EVAL.md:36,58,99`; `tests/test_advisor_completeness.py:48-76,366-405`; `tests/test_investigation_advisor_tools.py:4199-4218`). Ce test ne couvre donc plus le chemin de refus Suricata en aval, mais la condition absente est maintenant arrêtée plus tôt, comme le demande le contrat. Les autres assertions de rejet, normalisation, hash, parsing et absence de retry restent actives. Aucun test n’est désactivé ou marqué skip. |
+| F2 — contradiction multi-claim | **CONFIRMED, corrigé / MEDIUM** | Le préflight produit une référence distincte par claim non couvert (`advisor_dossier.py:1341-1387`). Avec `S1P3.1` et `S1P3.2`, une seule constatation liée à `S1P3.1` bloque sur `S1P3.2`; l’ajout de la seconde constatation donne `READY`. Test `test_multi_claim_contradiction_requires_each_named_claim` (`tests/test_advisor_completeness.py:194-243`), inclus dans les 116 succès. |
+| F3 — états MISSING/RETRIEVABLE | **CONFIRMED, corrigé / MEDIUM** | `MISSING` n’est ajouté que si l’élément est requis et sans corps (`advisor_dossier.py:1430-1450`). Une observation facultative sans corps est seulement `INTENTIONALLY_OMITTED` (`:1558-1575`). `RETRIEVABLE` exige maintenant `blob_read_verified is True` (`:1069-1076`); un échec de lecture devient `NOT_VERIFIED`, `TECHNICAL_BLOCKED` et aucun transport n’est appelé (`:1507-1548`, `:1583-1594`). Tests d’absence facultative et d’échec de lecture (`tests/test_advisor_completeness.py:246-318`) ainsi que le test d’échec simulé du lecteur canonique (`tests/test_investigation_advisor_tools.py:1786-1832`) passent. |
+| F4 — pertinence lexicale | **CONFIRMED, corrigé / MEDIUM** | Une preuve présente mais écartée par la sélection bornée reçoit `NOT_VERIFIED` et `INTENTIONALLY_OMITTED`; le motif indique expressément que la pertinence sémantique n’a pas été vérifiée (`advisor_dossier.py:1492-1506`). Le cas `CreateMutexW`/alias non lexical le teste et vérifie que le motif ne déclare pas la preuve sans pertinence (`tests/test_advisor_completeness.py:320-365`). |
+| F5 — troncature IOC | **CONFIRMED pour les drapeaux; UNKNOWN pour un compte IOC / LOW** | Le renderer ne supprime plus `truncated`, `truncation_counts` ni les clés `*_truncated` (`bridge_investigator.py:1512-1578`). Le test voit l’état tronqué de l’inventaire, l’index tronqué et le compte d’éléments d’index omis (`tests/test_bridge_investigator.py:213-234`). Mais `IndicatorInventoryV1` expose seulement `items` et `truncated` (`investigation_contracts.py:193-198`); `_indicator_inventory` retourne un booléen sans nombre d’IOC supprimés (`research_context_builder.py:2219-2235`). Le test ne prouve donc pas l’envoi d’un compte numérique d’IOC omis; le contrat ne le fournit actuellement pas. |
+| F6 — bytes/hexdump | **CONFIRMED, non corrigé / HIGH** | Le filtre générique bloque les champs nommés `hex`/`hexdump`, bytes et lignes hexdump avec offsets (`advisor_dossier.py:120-128,156-213`); le MD5 décodé et le xxd vérifié court sont préservés (`tests/test_advisor_completeness.py:408-433`, `tests/test_investigation_advisor_tools.py:1740-1782`). Cependant, le chemin legacy `_legacy_measurement_rows` accepte toute valeur hex syntaxiquement valide sans longueur maximale (`investigation_advisor_tools.py:2482-2536,5492-5498`); `verified_measurements` peut l’ajouter après association SHA (`investigation_advisor_tools.py:1637-1685`), puis le dossier place sa valeur entière dans le corps de la mesure (`advisor_dossier.py:545-601,847-868`). Oracle synthétique hors ligne : une valeur `41` répétée 262 144 fois produit une mesure de **524 288 caractères** et un prompt de **525 455 octets** contenant la valeur complète; cette taille reste sous la limite générale par défaut de 4 000 000 octets (`investigation_advisor_tools.py:85`, `config.py:110`). Un autre oracle avec `{"content": "41" * 16384}` produit un extrait de 32 768 caractères : la détection générique des seuls hexdumps avec offsets ne couvre pas non plus ce cas. Ces données sont synthétiques; aucun échantillon réel n’a été lu. La correction F6 ne ferme donc pas l’interdiction de transmettre des bytes bruts. |
+| F7/F8 — Bridge et wrappers | **CONFIRMED / LOW** | La documentation dit explicitement que `text_file` reste une simulation et qu’aucun reçu Bridge réel n’est prouvé (`BRIDGE_CHAIN_EVAL.md:67,81-83`). Le delta ajoute seulement des ajustements application/tests/docs; aucun dépôt Bridge, migration, pagination, chunking, API de récupération, accusé de lecture ou reçu fournisseur. Les wrappers `_compact_advisor_data` et `_fit_advisor_prompt` sont toujours des no-op, mais sont maintenant documentés comme compatibilité sans fonction de transport/compactage (`BRIDGE_CHAIN_EVAL.md:101`; source `investigation_advisor_tools.py:3512-3530`). |
+
+### Vérifications R2
+
+Le commit a été archivé dans `/tmp`, avec les liens `.venv` et `.autowork-runs` demandés. Les commandes ont utilisé exclusivement le Python du venv, avec les variables Conda retirées.
+
+```text
+PYTHONPATH=$PWD/src .venv/bin/python -m pytest tests/test_advisor_completeness.py tests/test_bridge_investigator.py tests/test_investigation_advisor_tools.py -q --tb=short
+116 passed in 1.90s
+
+PYTHONPATH=$PWD/src .venv/bin/python -m pytest tests/test_advisor_output_reparse.py -q --tb=short
+4 passed in 0.50s
+
+PYTHONPATH=$PWD/src .venv/bin/python -m ruff check <six fichiers Python modifiés>
+All checks passed!
+```
+
+Les tests ciblés de F2–F6 sont inclus dans les 116; l’oracle F6 de 524 288 caractères a été exécuté séparément, sans transport. Le test F5 couvre les drapeaux et le nombre tronqué d’éléments de l’index, pas le nombre d’IOC. Le reparse reste sans nouvel appel, selon le test dédié et `bridge_turns_consumed == 0`.
+
+### Portée, sécurité et inconnues R2
+
+Le delta contient seulement les trois modules applicatifs B0A, trois fichiers de tests et `BRIDGE_CHAIN_EVAL.md`; aucun fichier runtime/secret, migration ou changement hors périmètre ne figure dans `git diff --name-status`. Les gates `external_llm_allowed`, `do_not_submit` et TLP rouge précèdent toujours la construction/soumission (`investigation_advisor_tools.py:274-289`; `investigation_service.py:2437-2452`); la frontière provider de l’enveloppe est inchangée (`investigation_service.py:2884-2901`). Le masque des secrets précède le transport (`investigation_advisor_tools.py:310-320,630-639`). Aucun transport réel n’a été appelé.
+
+- **UNKNOWN** : présence effective de bytes/hexdumps complets dans des observations canoniques runtime; aucune donnée runtime n’a été lue. Le code permet néanmoins de les faire passer via les mesures hex legacy.
+- **UNKNOWN** : comportement réel de Bridge pour un dossier >200 000 octets, et existence d’un compteur IOC omis exigé en aval.
+- **UNKNOWN** : coût de tokens/fournisseur.
+
+**Action requise avant PASS** : borner ou refuser les valeurs hex dans `_legacy_measurement_rows`, avec un test qui suit cette mesure jusqu’au dossier/prompt; préciser si un compte numérique d’IOC omis est exigé et l’ajouter au contrat/test si oui.
