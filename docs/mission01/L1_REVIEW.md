@@ -6,9 +6,11 @@
 
 **Verdict initial (R1):** `FAIL` — remplacé par la re-revue R2 ci-dessous.
 
-**Verdict R2:** `FAIL` — remplacé par la re-revue finale R3 ci-dessous.
+**Verdict R2:** `FAIL` — remplacé par les re-revues R3 et R4 ci-dessous.
 
-**Verdict final (R3):** `FAIL`
+**Verdict R3:** `FAIL` — remplacé par le verdict final R4 ci-dessous.
+
+**Verdict final (R4):** `FAIL` — 2 `HIGH`, 0 `MEDIUM`.
 
 **Constats R1:** 0 `BLOCKER`, 1 `HIGH`, 1 `MEDIUM` (6 `LOW`; dont 1 `REJECTED`).
 
@@ -377,3 +379,120 @@ réseau n’a été contacté.
 déploiements, présence de tours historiques au format snapshot complet, et
 provider runtime. Aucun état runtime ou secret n’a été inspecté.
 **Coût R3:** UNKNOWN.
+
+## Re-revue finale après 8d7c969
+
+**Delta examiné:** `a3d17f81bdd26bbc8f50e16668762cc47c1ec1c4..8d7c96994a0e634f01c4dbff8e14968b757bd85f`.
+La réparation ferme le cas direct d’un invariant hors de `report_claims` et
+revalide les sources des snapshots historiques marquées. Deux chemins restent
+sans barrière démontrée; verdict final R4 : **`FAIL` — 2 HIGH, 0 MEDIUM**.
+
+### Constats reclassés
+
+1. **[CONFIRMED] [HIGH] Le rejeu des tours markerless ne réévalue pas les sources du contexte historique.**
+
+   Les prompts courants n’embarquent pas de snapshot canonique; le test confirme
+   l’absence du marqueur `BEGIN_P10_SNAPSHOT_DATA`
+   (`backend/tests/test_invariant_proposals.py:552-571`), et le rendu n’écrit
+   que les faits (`backend/src/cti_app/application/invariant_proposals.py:1045-1066`).
+   Au rejeu, le code traite le snapshot courant comme s’il était celui du tour
+   persisté et régénère ses alias depuis le contexte courant
+   (`invariant_proposals.py:202-210`). La clé d’idempotence exclut explicitement
+   `context` (`backend/src/cti_app/domain/invariant_proposals.py:287-289`), donc
+   une claim ou une provenance source peut disparaître du contexte sans changer
+   la clé qui retrouve le tour précédent. Dans ce cas, `_historical_claim_sources`
+   n’est appelé que pour les entrées portant l’ancien marqueur
+   (`invariant_proposals.py:223-228`); le chemin markerless passe au parsing,
+   à l’archivage et à P09 avec le snapshot courant (`:238-258`). Le contrôle
+   courant protège les références qui subsistent, mais ne peut prouver la
+   politique des sources présentes seulement dans le prompt historique.
+
+   Le test de rejeu courant rend une source RED tout en la laissant présente
+   dans le contexte actuel (`backend/tests/test_limits_mission01.py:563-583`);
+   il ne teste pas une source retirée/absente du contexte avant le rejeu. Le
+   test de snapshot historique absente force lui-même le format ancien marqué
+   (`:388-425`). Je n’affirme pas qu’un transport externe est réémis au rejeu;
+   le défaut est que le contrôle de politique historique demandé n’est pas
+   appliqué avant la réutilisation et le passage possible à P09. La sortie
+   persistée est parsée avec les alias recalculés du contexte courant
+   (`invariant_proposals.py:241-243`), pas avec une table d’alias conservée
+   avec le tour.
+
+   **Action requise:** lier le tour idempotent à un instantané conservé des
+   références de contexte, puis recharger leur politique courante avant tout
+   parsing/réutilisation/P09; ajouter un test markerless où une source de
+   l’ancien tour devient absente ou non résoluble et vérifier zéro appel P09.
+
+2. **[CONFIRMED] [HIGH] La borne de 256 provenances peut laisser passer un pattern dont une source restrictive a été tronquée.**
+
+   `_invariant_context` conserve les provenances canoniques de chaque invariant
+   et échoue si l’une est invalide (`invariant_proposals.py:2279-2294`). Mais
+   `_bound_context` passe récursivement les listes à `_bounded_json`, qui ne
+   garde que les 256 premiers éléments (`:2454-2471,2511-2518`). L’extraction de
+   politique parcourt ensuite seulement ce contexte borné
+   (`:2396-2440`), tandis que le rendu conserve le `pattern` de l’invariant et
+   affiche les invariants existants (`:1111-1125`; le format de ligne omet
+   seulement le champ `provenances`, `:1205-1230`). Le catalogue de provenance
+   est lui aussi une liste bornée à 256 après création (`:591-597`).
+
+   Le modèle `CandidateInvariant` n’impose pas de cardinalité maximale aux
+   provenances (`backend/src/cti_app/domain/invariants.py:395-467`), le service
+   P09 accepte une séquence sans limite correspondante
+   (`backend/src/cti_app/application/invariants.py:92-107`), et le dépôt stocke
+   une ligne pour chaque provenance (`backend/src/cti_app/infrastructure/database/repositories/invariants.py:197-220`).
+   Un invariant à plus de 256 références valides peut donc avoir une
+   `ReportClaimProvenance` restrictive après la borne: sa source ne participe
+   pas à la garde alors que son pattern reste dans le texte P10. Aucun test R4
+   ne couvre cette cardinalité.
+
+   **Action requise:** ne jamais tronquer une liste de provenances de contenu
+   sans refuser le contexte ou résoudre toutes ses références avant bornage;
+   tester une provenance restrictive après le 256e élément et vérifier refus
+   avant conversation/routage/transport.
+
+3. **[CONFIRMED] [LOW] Les cas R3 visibles dans le contexte borné sont maintenant fail-closed et testés.**
+
+   La résolution descend les `report_claims` et tous les mappings/listes du
+   contexte final; elle vérifie claim, sujet, lien vers la source, identité,
+   sujet de la SourceDocument et types/politique TLP
+   (`invariant_proposals.py:2323-2440`). `_invariant_context` refuse les
+   provenances non canoniques (`:2279-2287`). Le test avec une provenance
+   d’invariant hors `report_claims`, au plafond de développement maximal et
+   source RED, affirme zéro conversation, prompt, transport et pointeur de
+   conversation (`backend/tests/test_limits_mission01.py:333-384`). Les tests
+   couvrent aussi claim absente, `source_document_id` absent, sujet de source
+   différent et erreur de dépôt avec zéro transport (`:487-560`). Le rejeu
+   portant explicitement un snapshot marqué recharge la politique et refuse
+   une source devenue RED avant un second P09/transport (`:429-483`). Ces
+   résultats ferment les scénarios représentés, pas les deux contournements
+   décrits ci-dessus. Le rejeu historique testé couvre la transition vers RED;
+   DnS, externe interdit et erreurs de résolution ne sont pas chacun exercés
+   sur ce chemin historique.
+
+4. **[REJECTED] [LOW] Aucun retour du défaut P10, de l’override hors développement, de L06 ou d’un changement B0A dans le delta.**
+
+   Le delta ne touche que `backend/src/cti_app/application/invariant_proposals.py`
+   et les deux fichiers de tests (`git diff --name-only
+   a3d17f8..8d7c969`). Le défaut 96 000 octets, le parseur décimal strict et
+   les deux conditions de confinement du plafond de développement ne sont pas
+   modifiés; les tests G2/L06 et les contrôles de politique existants restent
+   dans le lot ciblé. Compose, `.env.example`, documentation active, frontend,
+   scripts et fichiers B0A ne sont pas dans le delta. Aucune régression de
+   routage ou élargissement additionnel n’a été trouvée.
+
+### Exécution R4
+
+Tests exécutés dans le worktree de l’implémenteur au SHA exact
+`8d7c96994a0e634f01c4dbff8e14968b757bd85f`, avec son `.venv`. Ils utilisent
+les fakes en mémoire; aucun fournisseur, PostgreSQL, Docker ou réseau n’a été
+contacté.
+
+- `PYTHONPATH=$PWD/src .venv/bin/python -m pytest tests/test_limits_mission01.py tests/test_invariant_proposals.py -q --tb=short` — **76 passed** en 0,78 s, code retour 0. Un `PytestCacheWarning` indique que le worktree cible en lecture seule ne peut écrire `.pytest_cache`.
+- `.venv/bin/ruff check --no-cache src/cti_app/application/invariant_proposals.py tests/test_limits_mission01.py tests/test_invariant_proposals.py` — **All checks passed**.
+- `git diff --check a3d17f8..8d7c969` — aucune erreur.
+
+**UNKNOWN:** fréquence de rejouabilité des tours markerless, cardinalité réelle
+des provenances dans les déploiements, et configuration/provider runtime. Ces
+informations opérationnelles ne sont pas nécessaires pour établir les deux
+chemins de code manquants; aucun runtime/secret n’a été inspecté.
+**Coût R4:** UNKNOWN.
