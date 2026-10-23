@@ -513,6 +513,8 @@ async def test_bridge_capabilities_and_archive_use_separate_timeouts() -> None:
     client = _TimeoutClient()
     transport = ChatGPTBridgeClient(
         "http://bridge.test/v1",
+        timeout_seconds=900,
+        connect_timeout_seconds=3,
         capabilities_timeout_seconds=2,
         archive_timeout_seconds=60,
         client=client,  # type: ignore[arg-type]
@@ -520,10 +522,13 @@ async def test_bridge_capabilities_and_archive_use_separate_timeouts() -> None:
 
     await transport.capabilities()
     await transport.archive_conversation(UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"))
+    await transport.create({"prompt": "offline timeout contract"}, timeout_seconds=123)
 
-    assert len(client.timeouts) == 2
+    assert len(client.timeouts) == 3
     assert client.timeouts[0].read == 2
     assert client.timeouts[1].read == 60
+    assert client.timeouts[2].read == 123
+    assert all(item.connect == 3 for item in client.timeouts)
 
 
 @pytest.mark.parametrize(

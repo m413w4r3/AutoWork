@@ -1092,6 +1092,7 @@ class ModelConversationService:
         external_llm_allowed: bool,
         web_search: bool = False,
         stateless_external: bool = False,
+        timeout_seconds: float | None = None,
         idempotency_key: str,
         correlation_id: str,
         context_subject_id: UUID | None = None,
@@ -1276,6 +1277,7 @@ class ModelConversationService:
                 provider=conversation.provider,
                 conversation=context,
                 run_id=run_id,
+                timeout_seconds=timeout_seconds,
             )
             run = self._gateway.build_run(request, _role(conversation.purpose))
             turn = ModelConversationTurn(

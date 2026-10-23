@@ -160,6 +160,7 @@ class InvestigationTurnTransport(Protocol):
         context_sha256: str,
         prompt: str,
         external_llm_allowed: bool,
+        timeout_seconds: float | None = None,
     ) -> TurnSubmission: ...
 
 
@@ -190,6 +191,8 @@ async def submit_bridge_consultation_once(
     prompt: str,
     external_llm_allowed: bool,
     settings: Settings | None = None,
+    timeout_seconds: float | None = None,
+    clock: Callable[[], float] | None = None,
 ) -> TurnSubmission:
     """Submit one non-decision consultation using Bridge's shared pacing and transport."""
     key = make_investigation_turn_idempotency_key(
@@ -216,6 +219,7 @@ async def submit_bridge_consultation_once(
         rng=None,
     )
     await pacer.wait_for_next_submission()
+    execution_started_at = (clock or time.monotonic)()
     try:
         submission = await transport.submit(
             investigation_id=investigation_id,
@@ -224,7 +228,24 @@ async def submit_bridge_consultation_once(
             context_sha256=context_sha256,
             prompt=prompt,
             external_llm_allowed=True,
+            timeout_seconds=timeout_seconds,
         )
+        if (
+            timeout_seconds is not None
+            and (clock or time.monotonic)() - execution_started_at > timeout_seconds
+        ):
+            # A transport that returns after its advertised deadline is still
+            # ambiguous. Never let its late text reach advisor parsing.
+            return TurnSubmission(
+                TurnSubmissionStatus.NEEDS_REVIEW,
+                idempotency_key=submission.idempotency_key or key,
+                conversation_id=submission.conversation_id or conversation_id,
+                detail="Bridge returned after the bounded execution deadline.",
+                error_code="bridge_execution_timeout",
+                submission_state="external_state_unknown",
+                failure_stage="bridge_execution",
+                failure_reason="execution_deadline_exceeded",
+            )
         if (
             submission.error_code == "bridge_rate_limited"
             and submission.submission_state == "pre_submission"
@@ -235,6 +256,20 @@ async def submit_bridge_consultation_once(
                 else configured.openai_bridge_pre_submission_retry_base_seconds
             )
         return submission
+    except TimeoutError:
+        # The per-call deadline can expire after transport entry. Keep this
+        # terminal and ambiguous; callers must not automatically submit again.
+        return TurnSubmission(
+            TurnSubmissionStatus.NEEDS_REVIEW,
+            idempotency_key=key,
+            conversation_id=conversation_id,
+            detail="Bridge consultation exceeded its bounded execution deadline.",
+            error_code="bridge_execution_timeout",
+            retryable=False,
+            submission_state="external_state_unknown",
+            failure_stage="bridge_execution",
+            failure_reason="execution_deadline_exceeded",
+        )
     except Exception as exc:
         code = str(getattr(exc, "code", ""))[:64] or "bridge_unavailable"
         submission_state = getattr(exc, "submission_state", None)
@@ -373,6 +408,7 @@ class ModelConversationTurnTransport:
         context_sha256: str,
         prompt: str,
         external_llm_allowed: bool,
+        timeout_seconds: float | None = None,
         attempt: int = 0,
     ) -> TurnSubmission:
         key = make_investigation_turn_idempotency_key(
@@ -500,6 +536,7 @@ class ModelConversationTurnTransport:
                 correlation_id=f"investigation:{investigation_id}:turn:{turn_index}:{key[:16]}",
                 context_subject_id=subject_id,
                 lifecycle_policy=ConversationPolicy.KEEP,
+                timeout_seconds=timeout_seconds,
             )
             if turn.status is ConversationTurnStatus.NEEDS_REVIEW:
                 captured = await self._recover_persisted_output(
@@ -672,6 +709,7 @@ class ModelConversationTurnTransport:
         prompt: str,
         external_llm_allowed: bool,
         attempt: int,
+        timeout_seconds: float | None = None,
     ) -> TurnSubmission:
         return await self.submit(
             investigation_id=investigation_id,
@@ -680,6 +718,7 @@ class ModelConversationTurnTransport:
             context_sha256=context_sha256,
             prompt=prompt,
             external_llm_allowed=external_llm_allowed,
+            timeout_seconds=timeout_seconds,
             attempt=attempt,
         )
 
@@ -703,7 +742,9 @@ class ScriptedTurnTransport:
         context_sha256: str,
         prompt: str,
         external_llm_allowed: bool,
+        timeout_seconds: float | None = None,
     ) -> TurnSubmission:
+        del timeout_seconds
         return await self._submit(
             investigation_id=investigation_id,
             subject_id=subject_id,
@@ -724,7 +765,9 @@ class ScriptedTurnTransport:
         prompt: str,
         external_llm_allowed: bool,
         attempt: int,
+        timeout_seconds: float | None = None,
     ) -> TurnSubmission:
+        del timeout_seconds
         return await self._submit(
             investigation_id=investigation_id,
             subject_id=subject_id,
