@@ -1519,8 +1519,6 @@ _OMITTED_TEXT_KEYS = frozenset(
         "synthesis_sha256",
         "advisor_turn_limit",
         "advisor_turns_remaining",
-        "truncated",
-        "truncation_counts",
     }
 )
 
@@ -1537,7 +1535,6 @@ def _text_value(value: Any, *, depth: int = 0) -> str:
             f"{str(key).replace('_', ' ')}={_text_value(item, depth=depth + 1)}"
             for key, item in value.items()
             if str(key) not in _OMITTED_TEXT_KEYS
-            and not str(key).endswith("_truncated")
             and not (str(key).endswith("_sha256") and str(key) != "sample_sha256")
             and item not in (None, "", [], {})
         ]
@@ -1561,7 +1558,7 @@ def _text_records(records: Sequence[Any], *, record_label: str) -> str:
 def _text_sections(payload: Mapping[str, Any]) -> str:
     lines: list[str] = []
     for key, value in payload.items():
-        if key in _OMITTED_TEXT_KEYS or key.endswith("_truncated"):
+        if key in _OMITTED_TEXT_KEYS:
             continue
         if value in (None, "", [], {}):
             continue
@@ -1572,7 +1569,6 @@ def _text_sections(payload: Mapping[str, Any]) -> str:
                 f"- {str(child_key).replace('_', ' ')}: {_text_value(child_value)}"
                 for child_key, child_value in value.items()
                 if str(child_key) not in _OMITTED_TEXT_KEYS
-                and not str(child_key).endswith("_truncated")
                 and child_value not in (None, "", [], {})
             ]
             lines.extend(rows or ["- (vide)"])
