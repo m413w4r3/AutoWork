@@ -1,10 +1,11 @@
 # Mission 01 B1A1 — revue adversariale indépendante
 
-- **TASK_ID :** M01-B1A1-REVIEW-R2
+- **TASK_ID courant :** M01-B1A1-REVIEW-R3 (les sections R1/R2 ci-dessous sont l’historique)
 - **Base :** `main@058bb4af2278e3941956e523c5a1d560208de228`
 - **Commit initial :** `3a745de788f2af286274d024a404e6ae7f6728fd` (`fix(investigation): harden admission durability`)
-- **Réparation réexaminée :** `d1580a93c8c9a15ba1584b2974c74dd16adb1de0` (`fix(investigation): attest pre-submission failures`), delta `3a745de..d1580a9`
-- **Intégration indiquée :** `fe68c85`
+- **Réparation R2 réexaminée :** `d1580a93c8c9a15ba1584b2974c74dd16adb1de0` (`fix(investigation): attest pre-submission failures`), delta `3a745de..d1580a9`
+- **Cible R3 :** `2f88a42352575fb486a84b581644706e6be52576`, intégrée par `2cafb379372b603d9d873a1070f1470364aec7e0`
+- **Intégration initiale :** `fe68c85`
 
 **Périmètre :** relecture adversariale du delta et des sources réelles, suites offline demandées, Ruff ciblé. Aucune migration, aucun accès live ou fournisseur.
 
@@ -128,3 +129,50 @@ All checks passed!
 ```
 
 **Verdict final : FAIL**, malgré les 124 tests verts : la nouvelle clé peut encore contourner la revue d’une invocation ambiguë avec des paramètres canoniquement équivalents. L’atomicité révocation/dispatch demeure correctement `BLOCKED`. **UNKNOWN :** coût/tokens d’exécution; borne runtime 3 600/7 200 s; tests négatifs dédiés pour observation croisée, montants partiels et SHA corrompu; concurrence multi-processus/production. Aucun fournisseur live n’a été contacté.
+
+## Re-revue finale après 2f88a42
+
+**TASK_ID :** `M01-B1A1-REVIEW-R3`
+
+**Cible :** `2f88a42352575fb486a84b581644706e6be52576`, intégré par `2cafb379372b603d9d873a1070f1470364aec7e0`. Cette correction a été implémentée par le parent et a fait l’objet d’une relecture adversariale indépendante.
+
+**Verdict final R3 : FAIL.** Le patch ferme les trois formes précises de R2 testées : casse/espaces du hash `vt.file_report`, casse UUID de `figure_plan.finding_refs`, et valeurs omises/explicites de `review_text` (`opinion_id`, `opinion_version`, `form`). La garde reste toutefois contournable par d’autres représentations admises par les adaptateurs, ce qui laisse ouverte la porte HIGH « nouvelle clé après résultat ambigu » requise par B1A1.
+
+### Constats R3
+
+| Sujet | Statut | Sévérité | Preuve et conclusion |
+|---|---|---:|---|
+| Sélecteurs `review_text` non canoniques | **CONFIRMED** | HIGH | Le normaliseur fixe l’opinion, retire la version et fixe `form`, mais conserve les autres paramètres bruts (`backend/src/cti_app/application/operator_tool_invocation.py:1076-1102`). Sans `units`, l’adaptateur synthétise U1 à partir de `block_type`, `form` et `anchor` (`backend/src/cti_app/application/investigation_advisor_tools.py:1612-1623`). Pour `form="body"`, `anchor` ne sélectionne rien et la cible renvoyée porte `anchor=None` (`:1656-1681`) : une requête ambiguë sans `anchor` et une nouvelle clé avec `anchor="x"` ont le même effet mais des empreintes différentes. Omettre `block_type` choisit le premier bloc éligible; nommer explicitement ce bloc donne aussi la même cible (`:1657-1678`). La représentation `units` d’un seul U1 équivalent n’est pas repliée par l’empreinte (`:1700-1703`; schéma `:3318-3321`). Le test R3 ne couvre que les défauts opinion/version/form (`backend/tests/test_b1_admission_durability.py:675-703`). |
+| UUID imbriqués dans `draft_text` | **CONFIRMED** | HIGH | L’empreinte ne canonicalise que les références de premier niveau et `figure_plan.finding_refs` (`operator_tool_invocation.py:1051-1075`). Le schéma `advisor.consult` accepte des UUID dans `assertions[].refs[].id` (`investigation_advisor_tools.py:3204-3211,3313-3317`); l’adaptateur les parse en `UUID` puis réécrit leur chaîne canonique (`:1510-1528`). Une casse UUID différente dans une assertion valable donne donc la même référence vérifiée et un fingerprint différent; une nouvelle clé peut passer. |
+| Références `figure_plan` dupliquées après canonicalisation | **CONFIRMED** | HIGH | Le normaliseur trie les UUID canonicalisés, mais ne retire pas les doublons (`operator_tool_invocation.py:1063-1075`). Le schéma n’interdit que les éléments JSON identiques, donc une même UUID en casse haute et basse est admise (`investigation_advisor_tools.py:3323-3327`). L’adaptateur parse la liste en UUID puis sélectionne les findings par appartenance (`:286-309`); le doublon canonicalisé ne change pas la sélection. Une liste `finding_refs` contenant une référence et une autre contenant ses deux casses peut ainsi produire le même effet avec des empreintes distinctes. |
+| Champs normalisés des autres outils VT | **CONFIRMED** | HIGH | La branche hash du fingerprint ne traite que `vt.file_report` (`operator_tool_invocation.py:1098-1102`). `vt.behaviour` et `vt.behaviour_pcap` appellent aussi `normalize_file_hash` (`investigation_vt_tools.py:1186-1187,1348-1350`). `vt.relationships` normalise `object_id` et met `relation` en minuscules après `strip()` (`:862-869,1790-1809`); `vt.object_report` normalise aussi les identifiants IP, domaines et URL (`:746-755,1790-1847`). `vt.intelligence_search` normalise la requête, la justification, les références UUID et `order` (`:998-1022,1158-1178,1732-1763`). Ces variantes passent sous une nouvelle clé puisque l’empreinte ne les traite pas pour ces noms d’outils; le cas d’un hash de fichier via `vt.relationships.object_id` ou `vt.behaviour.file_hash` est un exemple direct. |
+| Ordre de listes et alias d’outil | **PAS DE CONTOURNEMENT ACTUEL ÉTABLI** | LOW | `figure_plan` sélectionne les findings par appartenance, donc le tri de `finding_refs` rend l’ordre neutre (`investigation_advisor_tools.py:286-309`). Le tri des `evidence_refs` peut bloquer une requête dont l’ordre aurait influencé le prompt : c’est une sur-restriction conservatrice, pas un nouvel appel permis. Le registre intégré recherche par paire exacte `(name, schema_version)` (`investigation_tools.py:379-409`); l’alias legacy trouvé porte sur la version de schéma d’un même outil (`operator_tool_invocation.py:463-476`), pas sur son nom. Aucun alias de nom d’outil intégré n’a été trouvé; les registres injectés hors de ce parcours ne sont pas couverts. |
+| Preuve `pre_submission`, coût/clé, crash, extension G2 | **CONFIRMED** | LOW | La preuve reste un `StrEnum`; `ToolResult` refuse un autre type, le dispatcher efface tout champ retourné par un adaptateur, et seul un résultat attesté par le framework est accepté (`domain/investigation.py:30-42`; `investigation_tools.py:200-208,779-801`; `investigation_service.py:3317-3319`). Le writer canonique rattache l’observation à l’invocation et à la clé (`:204-239`), puis le rejeu vérifie investigation, invocation, outil, version, clé, réserve `RELEASED` de montant égal et valeur enum allowlistée (`operator_tool_invocation.py:478-521`). La réserve et l’appel dispatcher réutilisent le coût journalisé et la même clé (`tests/test_b1_admission_durability.py:182-233`); le rejeu après crash reste `NEEDS_REVIEW`, réserve non consommée, sans dispatch (`:368-413`). L’extension passe par `InvestigationEnvelopeService.extend`, et son acteur, motif, corrélation et décision G2 sont vérifiés (`:334-364`). |
+| CAS et révocation | **CONFIRMED — toujours BLOCKED à la frontière** | BLOCKER | Le CAS d’enveloppe obsolète conserve la révocation et évite dispatch/transport (`tests/test_b1_admission_durability.py:865-901`); la révocation visible au contrôle précédant l’entrée adaptateur est aussi refusée (`:905-960`). Ces vérifications ne rendent pas atomique la fenêtre après le contrôle et avant le transport; le statut `BLOCKED` antérieur reste correctement borné (`docs/mission01/TASKS.md:62`; `investigation_advisor_tools.py:548-578`). |
+| Dette `EvidenceObservation.object_type` | **CONFIRMED — non bloquante** | MEDIUM | La preuve est persistée dans `object_type` comme chaîne puis reconstruite par l’enum; la lecture rejette les valeurs hors allowlist et exige les liens canoniques ci-dessus (`investigation_service.py:211-239`; `operator_tool_invocation.py:500-520`). La dette de type reste documentée dans la section R2; aucun contournement par cette représentation n’est établi. |
+
+### Vérifications R3
+
+Archive exacte de `2cafb37` sous `/tmp/m01-b1a1-review-r3.pO0mpb`; lien `.venv` vers `/home/nill/perso/work/AutoWork/backend/.venv`. Commande demandée :
+
+```text
+PYTHONPATH=$PWD/src .venv/bin/python -m pytest \
+  tests/test_b1_admission_durability.py \
+  tests/test_investigation_service.py \
+  tests/test_investigation_tools_contract.py \
+  tests/test_operator_tool_invocation.py -q --tb=short
+125 passed, 2 failed in 2.91s
+```
+
+Les deux échecs sont `test_operator_dispatcher_wires_minimal_advisor_request_to_strict_bridge_transport` et `test_advisor_recommendations_record_acceptance_refusal_and_empirical_outcomes`; les deux retournent `required_canonical_evidence_not_in_payload`. Leur cause est **UNKNOWN**; les tests de durabilité, dont les nouveaux cas R3, passent dans cette exécution.
+
+Ruff ciblé sur les deux fichiers modifiés :
+
+```text
+.venv/bin/ruff check \
+  src/cti_app/application/operator_tool_invocation.py \
+  tests/test_b1_admission_durability.py
+All checks passed!
+```
+
+**UNKNOWN :** cause des deux échecs advisor ci-dessus; comportement concurrent avec dépôt PostgreSQL multi-processus; durée runtime effective face aux valeurs 3 600/7 200 s; coût/tokens. Aucun fournisseur, transport live ou état opérationnel n’a été contacté ou modifié. Le delta R3 ne mérite pas d’être accepté tant que les contournements HIGH de fingerprint ne sont pas fermés.
