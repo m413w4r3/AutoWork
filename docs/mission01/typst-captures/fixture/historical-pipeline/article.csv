@@ -1,0 +1,4 @@
+[Synthetic actor|M01-T parity fixture — synthetic only|Synthetic publisher|https://example.invalid/reference]
+isNew,type,value
+0,ip,192.0.2.17
+0,ip,198.51.100.21
