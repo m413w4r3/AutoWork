@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 
+import cti_app.application.bridge_investigator as bridge_investigator
 import cti_app.application.investigation_advisor_tools as advisor_tools
+from cti_app.application.bridge_investigator import BridgeSubmissionPacer
 from cti_app.application.investigation_advisor_tools import (
     ADVISOR_SCHEMA_VERSION,
     ADVISOR_TOOL_NAME,
@@ -15,15 +18,19 @@ from cti_app.application.investigation_tools import (
     InMemoryToolRegistry,
     RegistryToolDispatcher,
     ToolExecutionContext,
+    ToolResult,
 )
+from cti_app.application.operator_tool_invocation import OperatorToolInvocationError
 from cti_app.domain.investigation import (
     BudgetDimension,
+    BudgetReservationStatus,
     DisclosureBounds,
     InvestigationBudget,
     InvestigationEnvelope,
     TLPLevel,
     ToolInvocationStatus,
 )
+from tests.test_b1_admission_durability import _external_fixture
 from tests.test_investigation_advisor_tools import (
     Transport,
     advisor_response,
@@ -41,6 +48,9 @@ class FakeClock:
 
     def advance(self, seconds: float) -> None:
         self.now += seconds
+
+    async def sleep(self, seconds: float) -> None:
+        self.advance(seconds)
 
 
 def _context(investigation_id, *, key: str, tool_seconds: int) -> ToolExecutionContext:
@@ -196,6 +206,194 @@ async def test_role_timeout_below_reservation_is_propagated(monkeypatch) -> None
     assert len(transport.calls) == 1
     assert result.status is ToolInvocationStatus.SUCCEEDED
     assert result.budget_consumed[BudgetDimension.TOOL_SECONDS] == 1_799
+
+
+def test_minimum_execution_window_tracks_bridge_phase_limits_and_boundaries() -> None:
+    settings = SimpleNamespace(
+        openai_bridge_min_submission_interval_seconds=0,
+        openai_bridge_submission_jitter_fraction=0,
+        openai_bridge_connect_timeout_seconds=3,
+        openai_bridge_capabilities_timeout_seconds=2,
+        openai_bridge_archive_timeout_seconds=60,
+        openai_bridge_wait_timeout_research_seconds=7_200,
+    )
+    minimum = advisor_tools._advisor_minimum_execution_seconds(settings)
+    assert minimum == 65
+
+    too_small_context = _context(uuid4(), key="minimum-64", tool_seconds=minimum - 1)
+    timeout, refusal = advisor_tools._advisor_execution_timeout(too_small_context, settings)
+    assert timeout == 0
+    assert refusal is not None
+    assert refusal.output["failure_reason"] == "tool_seconds_reservation_below_minimum"
+
+    exact_context = _context(uuid4(), key="minimum-65", tool_seconds=minimum)
+    timeout, refusal = advisor_tools._advisor_execution_timeout(exact_context, settings)
+    assert timeout == minimum
+    assert refusal is None
+
+    settings.openai_bridge_connect_timeout_seconds = 4
+    assert advisor_tools._advisor_minimum_execution_seconds(settings) == minimum + 1
+    settings.openai_bridge_connect_timeout_seconds = 3
+    settings.openai_bridge_min_submission_interval_seconds = 20
+    settings.openai_bridge_submission_jitter_fraction = 0.3
+    assert advisor_tools._advisor_minimum_execution_seconds(settings) == 91
+
+
+@pytest.mark.asyncio
+async def test_response_at_exact_deadline_is_ambiguous(monkeypatch) -> None:
+    clock = FakeClock()
+    monkeypatch.setattr(advisor_tools.time, "monotonic", clock)
+    investigation_id = uuid4()
+    observation, raw = make_observation(investigation_id, _evidence_payload("0" * 64))
+    transport = _valid_submission(clock, 3_600, observation.id)
+    tool, _ = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+
+    result = await tool.execute(
+        {"consultation_type": "pivot_strategy", "evidence_refs": [str(observation.id)]},
+        _context(investigation_id, key="exact-deadline", tool_seconds=3_600),
+    )
+
+    assert len(transport.calls) == 1
+    assert result.status is ToolInvocationStatus.NEEDS_REVIEW
+    assert result.output["failure_reason"] == "execution_deadline_exceeded"
+    assert result.budget_consumed[BudgetDimension.TOOL_SECONDS] == 3_600
+
+
+@pytest.mark.asyncio
+async def test_pacer_and_preparation_are_inside_the_hard_deadline(monkeypatch) -> None:
+    clock = FakeClock()
+    monkeypatch.setattr(advisor_tools.time, "monotonic", clock)
+    pacer = BridgeSubmissionPacer(
+        minimum_interval_seconds=20,
+        jitter_fraction=0,
+        clock=clock,
+        sleeper=clock.sleep,
+        rng=lambda: 0,
+    )
+    await pacer.defer_submissions(30)
+    monkeypatch.setattr(bridge_investigator, "_shared_bridge_pacer", lambda **_kwargs: pacer)
+
+    investigation_id = uuid4()
+    observation, raw = make_observation(investigation_id, _evidence_payload("e" * 64))
+    transport = _valid_submission(clock, 3_571, observation.id)
+    tool, _ = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+        role_timeout_seconds=7_200,
+    )
+    original_load = tool._load_evidence
+
+    async def load_evidence(investigation_id_arg, evidence_refs):
+        clock.advance(10)
+        return await original_load(investigation_id_arg, evidence_refs)
+
+    tool._load_evidence = load_evidence
+    result = await tool.execute(
+        {"consultation_type": "pivot_strategy", "evidence_refs": [str(observation.id)]},
+        _context(investigation_id, key="pacing-and-prep-deadline", tool_seconds=3_600),
+    )
+
+    assert len(transport.calls) == 1
+    assert transport.calls[0]["timeout_seconds"] == 3_570
+    assert clock() == 3_601
+    assert result.status is ToolInvocationStatus.NEEDS_REVIEW
+    assert result.output["failure_reason"] == "execution_deadline_exceeded"
+    assert result.budget_consumed[BudgetDimension.TOOL_SECONDS] <= 3_600
+
+
+@pytest.mark.asyncio
+async def test_planned_pacing_past_deadline_refuses_before_transport(monkeypatch) -> None:
+    clock = FakeClock()
+    monkeypatch.setattr(advisor_tools.time, "monotonic", clock)
+    pacer = BridgeSubmissionPacer(
+        minimum_interval_seconds=20,
+        jitter_fraction=0,
+        clock=clock,
+        sleeper=clock.sleep,
+        rng=lambda: 0,
+    )
+    await pacer.defer_submissions(66)
+    monkeypatch.setattr(bridge_investigator, "_shared_bridge_pacer", lambda **_kwargs: pacer)
+
+    investigation_id = uuid4()
+    observation, raw = make_observation(investigation_id, _evidence_payload("f" * 64))
+    transport = _valid_submission(clock, 0, observation.id)
+    tool, _ = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+
+    result = await tool.execute(
+        {"consultation_type": "pivot_strategy", "evidence_refs": [str(observation.id)]},
+        _context(investigation_id, key="pacer-exceeds-deadline", tool_seconds=65),
+    )
+
+    assert len(transport.calls) == 0
+    assert result.output["failure_stage"] == "budget_admission"
+    assert result.output["failure_reason"] == "pacing_exceeds_execution_deadline"
+    assert result.output["confirmed_non_execution"] is True
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_bounded_timeout_keeps_reservation_and_blocks_fresh_key() -> None:
+    fixture, state, service = await _external_fixture(
+        cost={BudgetDimension.BRIDGE_TURNS: 1, BudgetDimension.TOOL_SECONDS: 3_600}
+    )
+    tool = fixture.tools["vt.file_report"]
+    tool.result = ToolResult(
+        status=ToolInvocationStatus.NEEDS_REVIEW,
+        error_code="advisor_timeout_or_ambiguous",
+        output={
+            "advisor_status": "needs_review",
+            "failure_stage": "bridge_execution",
+            "failure_reason": "execution_deadline_exceeded",
+            "external_state_unknown": True,
+            "confirmed_non_execution": False,
+            "bridge_turns_consumed": 1,
+        },
+        budget_consumed={BudgetDimension.BRIDGE_TURNS: 1},
+    )
+    request = {
+        "tool_name": "vt.file_report",
+        "schema_version": "1",
+        "arguments": {"query": "bounded ambiguous consultation"},
+        "purpose": "prove bounded ambiguous consultation is not rearmed",
+        "expected_version": state.version,
+        "idempotency_key": "bounded-ambiguous-first-key",
+    }
+
+    first = await service.invoke(**request)
+    envelope = await fixture.envelopes.get(fixture.investigation_id)
+    reservation = next(
+        item
+        for item in envelope.budget.reservations
+        if item.operation_key == first.invocation.operation_key
+    )
+    latest_state = await fixture.states.get(fixture.investigation_id)
+    with pytest.raises(OperatorToolInvocationError) as error:
+        await service.invoke(
+            tool_name=request["tool_name"],
+            schema_version=request["schema_version"],
+            arguments=request["arguments"],
+            purpose=request["purpose"],
+            expected_version=latest_state.version,
+            idempotency_key="bounded-ambiguous-new-key",
+        )
+
+    assert error.value.code == "ambiguous_tool_invocation_requires_reconciliation"
+    assert first.invocation.status is ToolInvocationStatus.NEEDS_REVIEW
+    assert reservation.status is BudgetReservationStatus.RESERVED
+    assert envelope.budget.consumed.get(BudgetDimension.BRIDGE_TURNS, 0) == 0
+    assert len(tool.calls) == 1
 
 
 @pytest.mark.asyncio

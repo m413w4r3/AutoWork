@@ -43,13 +43,14 @@ class _ManualClock:
 
 
 @pytest.mark.asyncio
-async def test_advisor_waits_for_provider_pacing_slot_without_timing_out(monkeypatch) -> None:
+async def test_advisor_refuses_pacing_wait_beyond_deadline_before_transport(monkeypatch) -> None:
     class _StuckPacer:
         def __init__(self) -> None:
             self.ready = asyncio.Event()
 
-        async def wait_for_next_submission(self) -> None:
+        async def wait_for_next_submission(self, *, deadline_monotonic=None) -> bool:
             await self.ready.wait()
+            return True
 
     pacer = _StuckPacer()
     monkeypatch.setattr(bridge_module, "_shared_bridge_pacer", lambda **_kwargs: pacer)
@@ -73,13 +74,14 @@ async def test_advisor_waits_for_provider_pacing_slot_without_timing_out(monkeyp
         )
     )
     await asyncio.sleep(0.02)
-    assert not task.done()
     assert transport.submission_count == 0
-    pacer.ready.set()
     result = await task
 
-    assert result.status is TurnSubmissionStatus.SUCCEEDED
-    assert transport.submission_count == 1
+    assert result.status is TurnSubmissionStatus.UNAVAILABLE
+    assert result.error_code == "bridge_execution_budget_exhausted"
+    assert result.submission_state == "pre_submission"
+    assert result.failure_reason == "pacing_exceeds_execution_deadline"
+    assert transport.submission_count == 0
 
 
 def _context(investigation_id, *, claims=()):
