@@ -223,3 +223,41 @@ Les vérifications sont offline; aucun fournisseur, réseau, PostgreSQL ou Docke
 ## Verdict final après 27db077
 
 **FAIL — A1-R3 conserve un constat confirmé HIGH : des références SHA de forme valide sans résolution canonique et les métadonnées d’outil reflètent du contenu choisi dans `experiment.list` et GET.** Le cas des longs `step_ids` non conformes est fermé. A1-R2 a un libellé correct dans les sorties backend, mais l’interface continue d’afficher le verdict sans ce libellé (**CONFIRMED · LOW**). Le lifespan reste UNKNOWN et documenté. Coût : **UNKNOWN**.
+
+## Re-revue finale après 4a71f45
+
+Cette re-revue examine `4a71f45c5a03761357f74ec363cb80b96cfb85b5`, enfant direct de `27db077daf79455c6e3ca668501fb6722638653f`. Le worktree de revue est resté sur `47a0ef9`; le code cible a été testé depuis une archive temporaire exacte de `4a71f45`.
+
+### Résolution des références et contournements résiduels
+
+**CONFIRMED · fermeture partielle de A1-R3, deux contournements restent ouverts.** Le projecteur constitue ses références UUID/SHA à partir des expériences du timeline et des observations/invocations canoniques de la même investigation ([`investigation_experiments.py`](../../backend/src/cti_app/application/investigation_experiments.py#L186)). Les références étrangères réellement fournies comme observations ou invocations sont filtrées par `investigation_id`. Les références SHA qui ne figurent dans aucune observation canonique deviennent `[redacted]`; `deadbeef` répété huit fois est testé dans `record`, `list` et GET. Les références tronquées par les limites des listes reçoivent un marqueur `[redacted]` ([même fichier](../../backend/src/cti_app/application/investigation_experiments.py#L503)). Les appels `record`, `experiment.list` et GET passent par le projecteur avec les observations/invocations chargées pour l’investigation ([`record`/`list`](../../backend/src/cti_app/application/investigation_experiments.py#L1067), [GET](../../backend/src/cti_app/api/investigation.py#L1091)).
+
+**CONFIRMED · HIGH — un UUID canonique mais non lié peut sortir en clair.** Le projecteur place tous les UUID d’expérience, d’observation, de blob d’observation et d’invocation dans un seul ensemble, sans conserver leur type ni le lien avec l’expérience projetée ([`investigation_experiments.py`](../../backend/src/cti_app/application/investigation_experiments.py#L198)). `step_ids` accepte ensuite tout UUID présent dans cet ensemble ([même fichier](../../backend/src/cti_app/application/investigation_experiments.py#L439)). Vérification directe sur `4a71f45` : un UUID d’observation canonique de la même investigation, absent de `observation_refs`, est restitué sans masquage dans `step_ids`. Le test demandé pour un UUID valide d’invocation absent du dépôt n’est pas présent; les tests vérifient plutôt une liste d’invocations vide et un identifiant hostile de forme invalide.
+
+**CONFIRMED · HIGH — le SHA d’une observation d’un autre type peut être présenté comme entrée.** `_safe_experiment_input_references()` cherche une observation uniquement par SHA, puis accepte `sample_sha256` ou `capture_sha256` sans valider `kind`, `object_type` ni leur correspondance avec le type déclaré ([`investigation_experiments.py`](../../backend/src/cti_app/application/investigation_experiments.py#L584)). Vérification directe : le SHA canonique d’une observation `vt_file_report` ressort avec `input_type: capture_sha256`, `input_id` et `sha256` en clair. Le type d’objet n’est pas comparé à la déclaration d’entrée.
+
+L’API filtre bien une observation appartenant à une autre investigation, mais le test existant ne vérifie que `strategy.claims.status == UNKNOWN`, pas que la référence sérialisée `observation_refs` soit `[redacted]` ([`test_investigation_experiment_api.py`](../../backend/tests/test_investigation_experiment_api.py#L704)). Je n’ai pas trouvé de fuite de `tool_name` provenant d’une autre investigation : les invocations étrangères sont exclues de la table de correspondance. Les références d’invocation partielles sont résolues individuellement et les entrées hors limite sont masquées.
+
+### Métadonnées d’outil et libellé
+
+**CONFIRMED.** `tool_name` et `tool_schema_version` ne sortent que si une référence pointe vers une invocation canonique de la même investigation, à la même version d’invocation, avec le même nom et le même schéma ([`investigation_experiments.py`](../../backend/src/cti_app/application/investigation_experiments.py#L241)). Sans invocation, `secret.payload`, `SensitiveData-1` et `sensitive.payload.v1` sont absents des réponses `record`, `list` et GET; les champs sont masqués. `tool_version` reste toujours `[redacted]`, car `ToolInvocation` ne porte pas de version d’outil canonique ([même fichier](../../backend/src/cti_app/application/investigation_experiments.py#L467)).
+
+Le libellé « assertion, non conclusion » est généré dans la projection backend ([`investigation_experiments.py`](../../backend/src/cti_app/application/investigation_experiments.py#L578)), déclaré dans le type frontend ([`investigationExperiments.ts`](../../frontend/src/api/investigationExperiments.ts#L60)), rendu par le composant ([`InvestigationLabViews.tsx`](../../frontend/src/features/investigation/InvestigationLabViews.tsx#L449)) et recherché par son test ([`InvestigationLabViews.test.tsx`](../../frontend/src/features/investigation/InvestigationLabViews.test.tsx#L519)). Le défaut d’affichage frontend du rapport précédent est corrigé.
+
+### Contrats conservés et limites
+
+**CONFIRMED dans le delta inspecté.** Sans stratégie vérifiée, les claims restent `inconclusive`. `tool_arguments` demeure `{}` et `redact_operational_secrets()` reste appliqué ([`investigation_experiments.py`](../../backend/src/cti_app/application/investigation_experiments.py#L427)). La validation `source_ref`/snapshot et les raisons opérateur antérieurement vérifiées ne sont pas modifiées. Le GET reste en lecture seule; l’écriture exige toujours l’enveloppe G2 courante ([même fichier](../../backend/src/cti_app/application/investigation_experiments.py#L934)). Le delta ne touche ni B0A, ni B1A, ni migration. Le lifespan PostgreSQL de production reste **UNKNOWN**, comme documenté dans le rapport précédent.
+
+Depuis une archive de `4a71f45c5a03761357f74ec363cb80b96cfb85b5`, avec le `.venv` existant lié :
+
+- La commande pytest demandée — **63 passed in 5.31s**.
+- `.venv/bin/ruff check .` — **All checks passed**; `.venv/bin/ruff format --check .` — **829 files already formatted**.
+- `pnpm test --run src/features/investigation/InvestigationLabViews.test.tsx` — **UNKNOWN** : Vite n’a pas démarré, écriture temporaire refusée (`EROFS`) sous le lien `node_modules/.vite-temp`.
+- `pnpm typecheck` — **UNKNOWN** : TypeScript n’a pas pu écrire ses fichiers `.tsbuildinfo` sous le lien `node_modules/.tmp` (`EROFS`).
+- Vérification directe du projecteur : l’UUID canonique mais non lié et le SHA canonique présenté sous un autre type ressortent en clair.
+
+Les tests backend et checks Ruff sont offline; aucun fournisseur, réseau, PostgreSQL ou Docker n’a été démarré. Les checks frontend n’ont pas abouti et ne sont pas comptés comme passés. Coût : **UNKNOWN**.
+
+## Verdict final après 4a71f45
+
+**FAIL — deux contournements confirmés restent ouverts : un UUID canonique de même investigation mais non lié à l’expérience peut être réfléchi, et un SHA d’observation est accepté sous un type d’entrée incompatible.** Les métadonnées d’outil sont liées aux invocations canoniques, le libellé assertion/non-conclusion est affiché frontend, et les protections `tool_arguments`, secrets, source/snapshot, G2 et lecture seule sont conservées. Les checks frontend et le lifespan réel restent UNKNOWN. Coût : **UNKNOWN**.
