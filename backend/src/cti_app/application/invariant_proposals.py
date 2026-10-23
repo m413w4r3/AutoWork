@@ -220,6 +220,21 @@ class ProposalConversationService:
                 raise ProposalConversationError(
                     "The persisted proposal turn does not match its idempotency key"
                 )
+            if "BEGIN_P10_SNAPSHOT_DATA\n" in content.input_text:
+                historical_sources = await self._historical_claim_sources(
+                    subject_id=investigation.subject_id,
+                    current_snapshot=snapshot,
+                    persisted_snapshot=persisted_snapshot,
+                )
+                historical_policy = derived_policy((*samples, *historical_sources))
+                if (
+                    not historical_policy.external_llm_allowed
+                    or historical_policy.do_not_submit
+                    or historical_policy.tlp is TLP.RED
+                ):
+                    raise ProposalContractError(
+                        "P10 historical snapshot replay is refused by the aggregate policy"
+                    )
             persisted_provenances = _snapshot_provenance_catalog(persisted_snapshot)
             if content.output_text is None:
                 raise ProposalOutputValidationError("The proposal turn has no persisted output")
@@ -583,11 +598,11 @@ class ProposalConversationService:
             source_documents = await _claim_source_documents(
                 uow,
                 investigation.subject_id,
-                context.get("report_claims"),
+                context,
             )
             # Recalculate on every call, including idempotent replay. The
-            # effective policy covers retained Samples and every source in the
-            # final, bounded report-claim context.
+            # effective policy covers retained Samples and every source named
+            # by a report claim or report-claim provenance in the final context.
             policy = derived_policy((*retained_samples, *source_documents))
             snapshot = ProposalInputSnapshot(
                 input_pack_sha256=investigation.input_sha256,
@@ -599,6 +614,22 @@ class ProposalConversationService:
                 context=context,
             )
             return investigation, snapshot, policy, provenance_by_ref, retained_samples
+
+    async def _historical_claim_sources(
+        self,
+        *,
+        subject_id: UUID,
+        current_snapshot: ProposalInputSnapshot,
+        persisted_snapshot: ProposalInputSnapshot,
+    ) -> tuple[Any, ...]:
+        persisted_references = _claim_source_references(persisted_snapshot.context)
+        current_references = _claim_source_references(current_snapshot.context)
+        if not persisted_references.issubset(current_references):
+            raise ProposalContractError(
+                "P10 historical snapshot claim provenance is absent from the current context"
+            )
+        async with self._uow_factory() as uow:
+            return await _claim_source_documents(uow, subject_id, persisted_snapshot.context)
 
     async def _measure_candidate(
         self,
@@ -2250,8 +2281,10 @@ def _invariant_context(value: Any) -> dict[str, Any]:
     for provenance in getattr(value, "provenances", ()):
         try:
             provenance_values.append(canonical_provenance(provenance))
-        except (TypeError, ValueError):
-            continue
+        except (TypeError, ValueError) as exc:
+            raise ProposalContractError(
+                "An existing invariant provenance cannot be resolved for P10"
+            ) from exc
     return {
         "id": str(_value(value, "id")),
         "type": _enum_value(_value(value, "type")),
@@ -2290,29 +2323,44 @@ def _rejection_context(value: Any) -> dict[str, Any]:
 async def _claim_source_documents(
     uow: Any,
     subject_id: UUID,
-    report_claims: Any,
+    context: Any,
 ) -> tuple[Any, ...]:
-    if not isinstance(report_claims, list):
-        raise ProposalContractError("The P10 report-claim source policy cannot be resolved")
-    if not report_claims:
+    references = _claim_source_references(context)
+    if not references:
         return ()
 
-    repository = getattr(uow, "source_documents", None)
-    get_source_document = getattr(repository, "get", None)
+    claims_repository = getattr(uow, "claims", None)
+    get_claim = getattr(claims_repository, "get", None)
+    if not callable(get_claim):
+        raise ProposalContractError("The P10 claim repository is unavailable")
+    source_repository = getattr(uow, "source_documents", None)
+    get_source_document = getattr(source_repository, "get", None)
     if not callable(get_source_document):
         raise ProposalContractError("The P10 source-document repository is unavailable")
 
     resolved: dict[UUID, Any] = {}
-    for claim in report_claims:
-        source_id_value = _value(claim, "source_document_id", _MISSING)
+    for claim_id, source_id in sorted(references, key=lambda item: (str(item[0]), str(item[1]))):
         try:
-            source_id = (
-                source_id_value if isinstance(source_id_value, UUID) else UUID(source_id_value)
-            )
-        except (TypeError, ValueError, AttributeError) as exc:
+            claim = await get_claim(claim_id)
+        except Exception as exc:
+            raise ProposalContractError(f"P10 claim {claim_id} could not be resolved") from exc
+        if claim is None:
+            raise ProposalContractError(f"P10 claim {claim_id} does not exist")
+        if _value(claim, "id", _MISSING) != claim_id:
+            raise ProposalContractError(f"P10 claim {claim_id} has an invalid identity")
+        if _value(claim, "subject_id", _MISSING) != subject_id:
             raise ProposalContractError(
-                "A P10 report claim has no resolvable source document id"
-            ) from exc
+                f"P10 claim {claim_id} does not belong to the investigation subject"
+            )
+        claim_source_id = _as_uuid(
+            _value(claim, "source_document_id", _MISSING),
+            "claim source document id",
+        )
+        if claim_source_id != source_id:
+            raise ProposalContractError(
+                f"P10 claim {claim_id} source does not match its provenance"
+            )
+
         if source_id in resolved:
             continue
         try:
@@ -2323,6 +2371,8 @@ async def _claim_source_documents(
             ) from exc
         if source_document is None:
             raise ProposalContractError(f"P10 source document {source_id} does not exist")
+        if _value(source_document, "id", _MISSING) != source_id:
+            raise ProposalContractError(f"P10 source document {source_id} has an invalid identity")
         if _value(source_document, "subject_id", _MISSING) != subject_id:
             raise ProposalContractError(
                 f"P10 source document {source_id} does not belong to the investigation subject"
@@ -2341,6 +2391,64 @@ async def _claim_source_documents(
             )
         resolved[source_id] = source_document
     return tuple(resolved.values())
+
+
+def _claim_source_references(context: Any) -> set[tuple[UUID, UUID]]:
+    if not isinstance(context, Mapping):
+        raise ProposalContractError("The P10 claim source policy cannot be resolved")
+    report_claims = context.get("report_claims", [])
+    if not isinstance(report_claims, list):
+        raise ProposalContractError("The P10 report-claim source policy cannot be resolved")
+    references: set[tuple[UUID, UUID]] = set()
+    source_by_claim: dict[UUID, UUID] = {}
+    for claim in report_claims:
+        if not isinstance(claim, Mapping):
+            raise ProposalContractError("A P10 report claim has an invalid representation")
+        claim_id = _as_uuid(_value(claim, "id", _MISSING), "report claim id")
+        source_id = _as_uuid(
+            _value(claim, "source_document_id", _MISSING), "claim source document id"
+        )
+        previous_source = source_by_claim.get(claim_id)
+        if previous_source is not None and previous_source != source_id:
+            raise ProposalContractError(f"P10 claim {claim_id} has conflicting source references")
+        references.add((claim_id, source_id))
+        source_by_claim[claim_id] = source_id
+
+    def visit(value: Any) -> None:
+        if isinstance(value, Mapping):
+            if value.get("kind") == ReportClaimProvenance.kind:
+                claim_id = _as_uuid(value.get("claim_id", _MISSING), "report provenance claim id")
+                source_id = _as_uuid(
+                    value.get("source_document", _MISSING),
+                    "report provenance source document id",
+                )
+                previous_source = source_by_claim.get(claim_id)
+                if previous_source is not None and previous_source != source_id:
+                    raise ProposalContractError(
+                        f"P10 claim {claim_id} has conflicting source provenance"
+                    )
+                source_by_claim[claim_id] = source_id
+                references.add((claim_id, source_id))
+                return
+            for nested in value.values():
+                visit(nested)
+        elif isinstance(value, (list, tuple)):
+            for nested in value:
+                visit(nested)
+
+    visit(context)
+    return references
+
+
+def _as_uuid(value: Any, description: str) -> UUID:
+    if isinstance(value, UUID):
+        return value
+    if not isinstance(value, str):
+        raise ProposalContractError(f"P10 {description} is not a UUID")
+    try:
+        return UUID(value)
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise ProposalContractError(f"P10 {description} is not a UUID") from exc
 
 
 def _bound_context(value: dict[str, Any]) -> dict[str, Any]:
