@@ -96,7 +96,8 @@ Luna déjà livrés restent inchangés.
 | Session | TASK_ID | Worktree | Objet |
 |---|---|---|---|
 | `98446181` | M01-REG-FIX | `fix/mission01-regressions` (`wks_cbcdaa104d853d74`) | WIP 849cfa0 + 5 régressions + suite backend |
-| `75a283e7` | M01-B0A-R4 | `feat/mission01-b0-bridge-chain` | data URL base64 >512 + allocation avant check |
+| `75a283e7` | M01-B0A-R4 | `feat/mission01-b0-bridge-chain` | data URL base64 >512 + allocation avant check — livré `cd69eca`, 153 tests |
+| `dbed9da5` | M01-B0A-REVIEW-R5 | `audit-mission01-b0a-review` | re-revue ciblée data URL `cd69eca` |
 | `03cab396` | M01-A1-R5 | `feat/mission01-a1-strategy-projection` | UUID/SHA canoniques non liés à l'expérience — livré `1f0e813`, 64 tests |
 | `534b4bd1` | M01-A1-REVIEW-R6 | `audit-mission01-a1-review` | re-revue ciblée des références liées `1f0e813` |
 | `24a6d5ba` | M01-B1A2-REVIEW-R2 | `audit-mission01-b1a2-review` | verdict final `01346e2`/`5484375` |
