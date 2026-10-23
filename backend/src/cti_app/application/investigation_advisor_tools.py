@@ -22,6 +22,7 @@ from cti_app.application.advisor_contracts import (
     parse_typed_advisor_response,
 )
 from cti_app.application.advisor_dossier import (
+    ContentExcerptLimitExceeded,
     build_advisor_dossier,
     evaluate_advisor_evidence_preflight,
     extract_content_excerpts,
@@ -84,6 +85,8 @@ _TYPED_CONSULTATION_TYPES = frozenset(
     {"draft_text", "review_text", "yara_draft", "suricata_draft", "figure_plan"}
 )
 MAX_ADVISOR_INPUT_BYTES = 4_000_000
+# Match the existing typed content-pattern measurement ceiling for binary values.
+MAX_ADVISOR_BINARY_MEASUREMENT_BYTES = 512
 MAX_ADVISOR_TOOL_SECONDS = 3_600
 MIN_ADVISOR_EXECUTION_SECONDS = 60
 _SECRET = re.compile(
@@ -1909,6 +1912,8 @@ class InvestigationAdvisorTool:
                 ) = await self._observation_content_projection(item)
                 try:
                     measured_rows = await self._measurement_rows(item)
+                except _AdvisorInputValidationError:
+                    raise
                 except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
                     measured_rows = []
                 sample_blob = None
@@ -2207,6 +2212,8 @@ class InvestigationAdvisorTool:
 
             try:
                 measurements = await self._measurement_rows(item)
+            except _AdvisorInputValidationError:
+                raise
             except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
                 measurements = []
             for measurement in measurements:
@@ -2537,7 +2544,11 @@ class InvestigationAdvisorTool:
             payload = None
         if payload is None:
             return [], False
-        return extract_content_excerpts(payload), True
+        try:
+            excerpts = extract_content_excerpts(payload)
+        except ContentExcerptLimitExceeded as exc:
+            raise _AdvisorInputValidationError(exc.reason_code) from None
+        return excerpts, True
 
     async def _measurement_payload(
         self, observation: EvidenceObservation
@@ -2585,6 +2596,8 @@ class InvestigationAdvisorTool:
         evidence_sha256: str,
         extractor_version: str,
     ) -> dict[str, Any]:
+        if measurement.bridge_kind.casefold() in {"hex", "hex_bytes", "bytes_hex"}:
+            _reject_oversized_hex_measurement(measurement.bridge_value, index=-1)
         return {
             **({"blob_id": str(blob_id)} if blob_id is not None else {}),
             "kind": measurement.bridge_kind,
@@ -2638,11 +2651,19 @@ class InvestigationAdvisorTool:
                 if target_key == "hex" and not _valid_hex_measurement(label):
                     continue
                 if target_key == "base64":
+                    max_encoded_chars = ((MAX_ADVISOR_BINARY_MEASUREMENT_BYTES + 2) // 3) * 4
+                    if len(label) > max_encoded_chars:
+                        _raise_oversized_binary_measurement(len(rows))
                     try:
-                        if not base64.b64decode(label, validate=True):
+                        decoded = base64.b64decode(label, validate=True)
+                        if not decoded:
                             continue
                     except (ValueError, binascii.Error):
                         continue
+                    if len(decoded) > MAX_ADVISOR_BINARY_MEASUREMENT_BYTES:
+                        _raise_oversized_binary_measurement(len(rows))
+                if target_key == "hex":
+                    _reject_oversized_hex_measurement(label, index=len(rows))
                 rows.append(
                     {
                         "kind": target_key,
@@ -5725,6 +5746,21 @@ def _valid_hex_measurement(value: str) -> bool:
     return bool(tokens) and all(
         len(token) % 2 == 0 and re.fullmatch(r"(?i)[0-9a-f]+", token) is not None
         for token in tokens
+    )
+
+
+def _reject_oversized_hex_measurement(value: str, *, index: int) -> None:
+    compact = "".join(value.split())
+    if len(compact) // 2 > MAX_ADVISOR_BINARY_MEASUREMENT_BYTES:
+        _raise_oversized_binary_measurement(index)
+
+
+def _raise_oversized_binary_measurement(index: int) -> None:
+    raise _AdvisorInputValidationError(
+        "binary_measurement_exceeds_limit",
+        measurement_errors=(
+            {"index": index, "reason": "binary_measurement_exceeds_512_byte_limit"},
+        ),
     )
 
 
