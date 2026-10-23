@@ -176,3 +176,55 @@ Les tests de rejet F6 vérifient les résultats sans fuite de la valeur ni appel
 - **UNKNOWN** : réception par un fournisseur réel, présence de tels contenus dans des observations runtime canoniques, et coût tokens/fournisseur. Aucune donnée runtime ni service externe n’a été consulté.
 
 **Verdict final R3 : FAIL** — ne pas considérer F6 fermé avant qu’une borne cumulative et une règle pour les représentations encodées soient appliquées à tous les chemins d’extraction avant dossier/prompt, avec des tests de liste neutre imbriquée et de base64 générique vérifiant zéro transport.
+
+## Re-revue finale après df1bd8f
+
+- **TASK_ID** : M01-B0A-REVIEW-R4.
+- **Cible** : `df1bd8f3d5f60ea10b645eb6614c9d4f0a891f9e`; delta `c561f04e5eaa29869ff53ec2372f7d7872c3a334..df1bd8f3d5f60ea10b645eb6614c9d4f0a891f9e`.
+- **Verdict** : **FAIL** — F6b est fermé et le base64 pur est borné, mais une représentation mixte (data URL ou texte autour du payload) atteint encore le transport simulé.
+- **Portée** : lecture seule du code et tests hors ligne. Le diff examiné touche les deux modules advisor et leurs tests. Aucun fournisseur, Bridge réel, donnée runtime, PostgreSQL ou échantillon n’a été consulté.
+
+### Revue des standards
+
+Aucun écart aux règles de code documentées dans `AGENTS.md` et `backend/AGENTS.md` n’a été relevé. Ruff et `git diff --check` sont propres.
+
+### Vérification des constats
+
+| Constat | Résultat final | Preuve |
+|---|---|---|
+| F6b — budget cumulatif des extraits | **CORRIGÉ** | L’extraction additionne les octets rendus, titres compris, à travers les clés et listes d’une observation (`advisor_dossier.py:159-195`); le dossier vérifie aussi le total des observations sélectionnées (`:888-894`). Les cas de deux chaînes de 15 907 octets sous clé neutre, dont une liste imbriquée dans un objet neutre, échouent avant le dossier : valeurs absentes du résultat, omission explicitée, `dossier_text` absent et zéro appel du transport factice (`test_investigation_advisor_tools.py:1957-2001`). |
+| F6c — base64 pur >512 octets | **CORRIGÉ pour les valeurs entières** | La projection rejette le base64 pur avec ou sans padding ajouté (`advisor_dossier.py:48-67`). Les tests couvrent `content` et `strings[].value`, 600 octets décodés (forme canonique sans `=` car 600 est divisible par 3) et 514 octets sans padding. Ils vérifient l’omission explicite, l’absence de la valeur et du dossier, et zéro transport (`test_investigation_advisor_tools.py:2015-2062`). L’objet neutre avec une liste imbriquée et le contenu sous `content` imbriqué sont également rejetés par l’oracle de projection synthétique. |
+| F6c — base64 mélangé à du texte ou à une data URL | **CONFIRMÉ / HIGH, encore ouvert** | Le détecteur vérifie que toute la chaîne (après suppression des espaces) est dans l’alphabet base64 (`advisor_dossier.py:54-65`). Avec une ponctuation comme `data:application/octet-stream;base64,`, il retourne sans rejet et l’extrait passe dans le dossier. Oracle `execute` avec observation synthétique explicitement référencée et transport factice : une valeur base64 de 600 octets dans une data URL a été incluse intégralement dans le prompt; **1 appel** au transport factice. La réponse `partial` provient de la réponse factice `unused`; aucune requête fournisseur réelle n’a eu lieu. |
+| F1–F4 — régressions | **Aucune régression observée** | Le delta ne modifie pas les règles correspondantes et les quatre fichiers demandés passent ensemble, dont les cas de complétude, de blob, d’omission et de reparse. |
+| F5 — nombre exact d’IOC omis | **UNKNOWN, accepté et non bloquant** | Le delta ne modifie pas le contrat d’inventaire ni le renderer Bridge et n’invente aucun compte. Les drapeaux et comptes effectivement fournis restent couverts par le test Bridge existant. |
+| Dossier >200 000 octets et seuil Bridge | **SIMULATION INTACTE** | `test_large_dossier_crosses_bridge_file_threshold_without_omission` conserve un dossier d’article supérieur à 200 000 octets, choisit le mode simulé `text_file` et vérifie que le transport scripté reçoit le prompt entier (`test_advisor_completeness.py:521-565`). Cela ne prouve pas le comportement d’un Bridge réel. |
+| Extraits courts | **PRÉSERVÉS** | Le test garde le xxd vérifié court comme mesure (`test_investigation_advisor_tools.py:1740-1782`), le MD5 décodé comme IOC textuel (`test_advisor_completeness.py:474-480`) et le test d’extrait générique court (`:436-443`). |
+
+Point secondaire de ressources : le décodeur alloue les octets décodés avant de tester le seuil de 512 octets (`advisor_dossier.py:59-67`). La lecture canonique est bornée par `model_output_max_bytes` (512 MiB par défaut; `investigation_advisor_tools.py:2474-2480`), mais une valeur base64 entière très grande peut encore produire une allocation transitoire proportionnelle avant le refus. Ce point n’explique pas le contournement de transport ci-dessus.
+
+### Vérifications R4
+
+Le commit cible a été archivé sous `/tmp`, avec le lien `.venv` demandé; les variables Conda ont été retirées.
+
+```text
+PYTHONPATH=$PWD/src .venv/bin/python -m pytest tests/test_advisor_completeness.py tests/test_bridge_investigator.py tests/test_investigation_advisor_tools.py tests/test_advisor_output_reparse.py -q --tb=short
+141 passed in 2.08s
+
+PYTHONPATH=$PWD/src .venv/bin/python -m ruff check src/cti_app/application/advisor_dossier.py src/cti_app/application/investigation_advisor_tools.py tests/test_advisor_completeness.py tests/test_investigation_advisor_tools.py
+All checks passed!
+
+git diff --check c561f04..df1bd8f
+clean
+```
+
+L’oracle du cas mixte et le scénario neutre imbriqué utilisent uniquement des données synthétiques et un transport factice, sans effet externe.
+
+### UNKNOWN R4 et coût
+
+- **UNKNOWN** : le nombre exact d’IOC omis par la chaîne de production; aucun compte n’est fabriqué.
+- **UNKNOWN** : livraison réelle d’un dossier >200 000 octets, présence de ce type de contenu dans les données runtime canoniques et coût éventuel de tokens/fournisseur.
+- **Action avant PASS** : reconnaître et borner/refuser le base64 incorporé dans les chaînes mixtes, puis vérifier par un test explicite que l’observation est omise et que le transport reste à zéro appel.
+
+**Coût : UNKNOWN** — aucun coût fournisseur n’est observable dans cette revue hors ligne.
+
+**Verdict final R4 : FAIL** — F6b est corrigé et les cas base64 purs testés sont refusés, mais F6c reste contournable avec du base64 mélangé à du texte.
