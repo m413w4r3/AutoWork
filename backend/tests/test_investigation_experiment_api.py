@@ -445,10 +445,15 @@ def test_timeline_route_redacts_free_text_and_payload_arguments() -> None:
     experiment.actual = f"actual proof {secret}"
     experiment.scope = f"scope {secret}"
     experiment.implication = f"implication {secret}"
+    linked_observation_id = UUID("70000000-0000-4000-8000-000000000001")
     unsafe_reference = "deadbeef" * 16
     experiment.input_refs = (
         ExperimentInputRefV1("sample_sha256", unsafe_reference, "a" * 64),
         ExperimentInputRefV1("capture_sha256", "b" * 64, "b" * 64),
+        ExperimentInputRefV1("capture_sha256", "c" * 64, "c" * 64),
+    )
+    experiment.observation_refs = (
+        SimpleNamespace(observation_id=linked_observation_id, sha256="b" * 64),
     )
     experiment.tool_arguments = {
         "payload": f"0000 4d5a {secret}",
@@ -460,12 +465,21 @@ def test_timeline_route_redacts_free_text_and_payload_arguments() -> None:
     }
 
     canonical_observation = SimpleNamespace(
-        id=UUID("70000000-0000-4000-8000-000000000001"),
+        id=linked_observation_id,
         investigation_id=INVESTIGATION_ID,
         blob_id=UUID("70000000-0000-4000-8000-000000000002"),
         sha256="b" * 64,
     )
-    with _client((experiment,), observations=(canonical_observation,)) as client:
+    unlinked_observation = SimpleNamespace(
+        id=UUID("70000000-0000-4000-8000-000000000003"),
+        investigation_id=INVESTIGATION_ID,
+        kind="vt_file_report",
+        object_type="vt_file_report",
+        sha256="c" * 64,
+    )
+    with _client(
+        (experiment,), observations=(canonical_observation, unlinked_observation)
+    ) as client:
         response = client.get(f"/api/investigations/{INVESTIGATION_ID}/experiments")
 
     assert response.status_code == 200
@@ -482,6 +496,14 @@ def test_timeline_route_redacts_free_text_and_payload_arguments() -> None:
             "sha256": "[redacted]",
         },
         {"input_type": "capture_sha256", "input_id": "b" * 64, "sha256": "b" * 64},
+        {
+            "input_type": "capture_sha256",
+            "input_id": "[redacted]",
+            "sha256": "[redacted]",
+        },
+    ]
+    assert projected["observation_refs"] == [
+        {"observation_id": str(linked_observation_id), "sha256": "b" * 64}
     ]
     assert projected["prediction"] == "[redacted]"
     assert projected["expected"] == "[redacted]"
@@ -505,6 +527,7 @@ def test_timeline_exposes_only_tool_identity_resolved_by_persisted_invocation() 
         verdict=ExperimentVerdict.INCONCLUSIVE,
     )
     experiment.tool_invocation_refs = ({"invocation_id": str(invocation_id), "version": 2},)
+    experiment.step_ids = (str(invocation_id),)
     experiment.tool_name = "protocol.validate"
     experiment.tool_schema_version = "protocol-validation.v1"
 
@@ -516,6 +539,7 @@ def test_timeline_exposes_only_tool_identity_resolved_by_persisted_invocation() 
     assert projected["tool_invocation_refs"] == [
         {"invocation_id": str(invocation_id), "version": 2}
     ]
+    assert projected["step_ids"] == [str(invocation_id)]
     assert projected["tool_name"] == "protocol.validate"
     assert projected["tool_schema_version"] == "protocol-validation.v1"
     # ToolInvocation has no canonical tool-version property.
@@ -725,6 +749,98 @@ def test_strategy_projection_keeps_foreign_observation_reference_unknown() -> No
         response = client.get(f"/api/investigations/{INVESTIGATION_ID}/experiments")
 
     assert response.status_code == 200
+    projected = response.json()["experiments"][0]
+    assert projected["observation_refs"] == [
+        {"observation_id": "[redacted]", "sha256": "[redacted]"}
+    ]
     claim = response.json()["strategy"]["claims"][0]
     assert claim["status"] == "UNKNOWN"
     assert claim["attempted_experiments"][0]["matrix_status"] == "UNKNOWN"
+
+
+def test_timeline_only_exposes_experiment_linked_and_resolved_references() -> None:
+    linked_invocation_id = UUID("80000000-0000-4000-8000-000000000001")
+    unlinked_invocation_id = UUID("80000000-0000-4000-8000-000000000002")
+    missing_invocation_id = UUID("80000000-0000-4000-8000-000000000003")
+    linked_observation_id = UUID("70000000-0000-4000-8000-000000000001")
+    unlinked_observation_id = UUID("70000000-0000-4000-8000-000000000002")
+    experiment = _experiment(
+        experiment_id=NEW_EXPERIMENT_ID,
+        version=1,
+        verdict=ExperimentVerdict.INCONCLUSIVE,
+        observation_refs=(SimpleNamespace(observation_id=linked_observation_id, sha256="b" * 64),),
+    )
+    experiment.tool_invocation_refs = (
+        {"invocation_id": str(linked_invocation_id), "version": 1},
+        {"invocation_id": str(missing_invocation_id), "version": 1},
+    )
+    experiment.step_ids = (
+        str(unlinked_invocation_id),
+        str(missing_invocation_id),
+        str(linked_invocation_id),
+    )
+    experiment.input_refs = (
+        ExperimentInputRefV1("capture_sha256", "b" * 64, "b" * 64),
+        ExperimentInputRefV1("capture_sha256", "c" * 64, "c" * 64),
+    )
+    experiment.next_pivots = ("b" * 64, "c" * 64)
+    linked_invocation = SimpleNamespace(
+        id=linked_invocation_id,
+        investigation_id=INVESTIGATION_ID,
+        version=1,
+        tool_name="protocol.validate",
+        schema_version="protocol-validation.v1",
+    )
+    unlinked_invocation = SimpleNamespace(
+        id=unlinked_invocation_id,
+        investigation_id=INVESTIGATION_ID,
+        version=1,
+        tool_name="protocol.validate",
+        schema_version="protocol-validation.v1",
+    )
+    linked_observation = SimpleNamespace(
+        id=linked_observation_id,
+        investigation_id=INVESTIGATION_ID,
+        sha256="b" * 64,
+    )
+    unlinked_vt_observation = SimpleNamespace(
+        id=unlinked_observation_id,
+        investigation_id=INVESTIGATION_ID,
+        kind="vt_file_report",
+        object_type="vt_file_report",
+        sha256="c" * 64,
+    )
+
+    with _client(
+        (experiment,),
+        observations=(linked_observation, unlinked_vt_observation),
+        invocations=(linked_invocation, unlinked_invocation),
+    ) as client:
+        response = client.get(f"/api/investigations/{INVESTIGATION_ID}/experiments")
+
+    assert response.status_code == 200
+    projected = response.json()["experiments"][0]
+    assert projected["step_ids"] == [
+        "[redacted]",
+        "[redacted]",
+        str(linked_invocation_id),
+    ]
+    assert projected["tool_invocation_refs"] == [
+        {"invocation_id": str(linked_invocation_id), "version": 1},
+        {"invocation_id": "[redacted]", "version": "[redacted]"},
+    ]
+    assert projected["observation_refs"] == [
+        {"observation_id": str(linked_observation_id), "sha256": "b" * 64}
+    ]
+    assert projected["input_refs"] == [
+        {"input_type": "capture_sha256", "input_id": "b" * 64, "sha256": "b" * 64},
+        {
+            "input_type": "capture_sha256",
+            "input_id": "[redacted]",
+            "sha256": "[redacted]",
+        },
+    ]
+    assert projected["next_pivots"] == ["b" * 64, "[redacted]"]
+    assert str(unlinked_invocation_id) not in response.text
+    assert str(missing_invocation_id) not in response.text
+    assert "c" * 64 not in response.text

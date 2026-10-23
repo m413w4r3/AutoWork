@@ -35,7 +35,7 @@ B0, B1, L, A, Q, T.
 | TASK_ID | Dep. | Question / livrable | Propriétaire | Base SHA | Fichiers cibles | Oracle | Droits | Résultat SHA | Statut | Coût |
 |---|---|---|---|---|---|---|---|---|---|---|
 | M01-S0 | — | BASELINE.md : SHA local/runtime, écarts, skills/profils, matrice corpus, contradictions doc prouvées | Luna Audit xhigh | 058bb4a | `docs/mission01/BASELINE.md` | faits référencés `paths:lines` ; liens docs valides ; statut PASS/FAIL/BLOCKED/UNKNOWN | worktree lecture + 1 fichier | `e26c9a7` + `0074706`, intégré `48ba143` | PASS (runtime UNKNOWN) | UNKNOWN |
-| M01-B0A | S0 | Chaîne de complétude : cartographie B0.1, contrat par question B0.2, suppression plafond renderer 96k B0.3, préflight preuves B0.5, oracles B0.8 (1–4, 7) | Luna Implementer xhigh | 058bb4a | `backend/src/cti_app/application/{bridge_investigator,advisor_dossier,advisor_wire,investigation_advisor_tools,research_context_builder}.py`, tests ciblés | tests offline : preuve manquante/récupérée, contradiction multi-claim, statuts cohérents, N−1/N/N+1, >200k simulé, hexdump borné, reparse | worktree write, tests offline | `9774680` → `df1bd8f`, intégré `66be3f8` | R3 livré (141 tests), revue fallback Claude en cours | UNKNOWN |
+| M01-B0A | S0 | Chaîne de complétude : cartographie B0.1, contrat par question B0.2, suppression plafond renderer 96k B0.3, préflight preuves B0.5, oracles B0.8 (1–4, 7) | Luna Implementer xhigh | 058bb4a | `backend/src/cti_app/application/{bridge_investigator,advisor_dossier,advisor_wire,investigation_advisor_tools,research_context_builder}.py`, tests ciblés | tests offline : preuve manquante/récupérée, contradiction multi-claim, statuts cohérents, N−1/N/N+1, >200k simulé, hexdump borné, reparse | worktree write, tests offline | `9774680` → `cd69eca` + format `498c2da`, intégré `f67181e` | F1–F5 acceptés (153 tests) ; **F6 FAIL/PARTIAL arrêté après 3 tentatives** : URL dans titre, percent sans `;base64`, base64 fragmenté documentés | UNKNOWN |
 | M01-B0A-REVIEW | B0A | Revue critique indépendante de B0A : omissions silencieuses, manifeste, contradictions, pas de Bridge réimplémenté, tests, complexité | Luna Audit xhigh | 058bb4a | `docs/mission01/B0A_REVIEW.md` | constats + verdict PASS/PASS_WITH_CHANGES/FAIL ; tests rejoués | lecture seule | `6411e1e`, intégré `a9c5a22` | DONE : FAIL, 2 HIGH + 4 MEDIUM | UNKNOWN |
 | M01-B0A-R1 | B0A-REVIEW | Réparation B0A : 24 échecs, multi-claim, statuts MISSING/RETRIEVABLE, sélection lexicale, troncature IOC, hexdump | Luna Implementer xhigh | `9774680` | `advisor_dossier.py`, `bridge_investigator.py`, `investigation_advisor_tools.py`, tests | suite trois fichiers verte ; 116 passed ; zéro omission silencieuse | worktree write | `fbc0f24`, intégré `9761998` | DONE, revue R2 FAIL F6 | UNKNOWN |
 | M01-B0A-REVIEW-R2 | B0A-R1 | Re-revue B0A après réparation | Luna Audit xhigh | `fbc0f24` | `docs/mission01/B0A_REVIEW.md` | verdict PASS/PASS_WITH_CHANGES/FAIL ; tests rejoués | lecture seule | `09f1c38`, intégré `3da31ec` | DONE : FAIL, F1–F4 OK, F6 HIGH, F5 UNKNOWN | UNKNOWN |
@@ -74,13 +74,13 @@ B0, B1, L, A, Q, T.
 | M01-A | B0A | Stratégie CTI : matrice claim/hypothèse/preuve, scénarios sans sample/avec sample/contradiction/YARA/goodware ; réutiliser runtime existant | Luna Implementer xhigh | B0A SHA | `investigation_*`, `rule_workbench`, tests scénarios | 5 scénarios offline déterministes avec raisons d'abandon | worktree write | — | PENDING | UNKNOWN |
 | M01-Q | B0A, L, A | Éval anti-slop baseline vs patch, jeu versionné, métriques et diff de complexité | Luna Implementer xhigh | SHA intégration | `docs/mission01/`, tests eval | oracle déterministe faits/ref ; zéro fuite ; comparaison baseline/patch | worktree write | — | PENDING | UNKNOWN |
 | M01-T | S0 | Parité Typst : inventaire SHA/versions, fixture identique, comparaison texte/sections/figures/IOC + captures, classification | Luna Audit/Implementer xhigh | 058bb4a | `docs/mission01/TYPST_REFERENCE_PARITY.md`, renderer ciblé | rapport par page/section + captures ; aucun comptage de pages seul | worktree write | `cae3115`, intégré `7dc4b0e` | PASS rapport ; restauration V4 BLOCKED (validation éditoriale) ; pipeline réel UNKNOWN (font bundle) | UNKNOWN |
-| M01-A1 | S0 | Projection read-only stratégie CTI : issues, source_refs conditionnels, raisons de blocage, API lecture, 5 scénarios offline | Luna Implementer xhigh | 058bb4a | `domain/investigation_experiment.py`, `application/investigation_experiments.py`, `application/investigation_operator_view.py`, `api/investigation.py`, tests | partial/missing → UNKNOWN, jamais REFUTED ; zéro réseau ; métriques YARA avec dénominateurs | worktree write | `cd34474` → `4a71f45`, intégré `00a78b8` | R4 livré (63 backend + 3 frontend + typecheck), revue fallback en cours | UNKNOWN |
+| M01-A1 | S0 | Projection read-only stratégie CTI : issues, source_refs conditionnels, raisons de blocage, API lecture, 5 scénarios offline | Luna Implementer xhigh | 058bb4a | `domain/investigation_experiment.py`, `application/investigation_experiments.py`, `application/investigation_operator_view.py`, `api/investigation.py`, tests | partial/missing → UNKNOWN, jamais REFUTED ; zéro réseau ; métriques YARA avec dénominateurs | worktree write | `cd34474` → `1f0e813`, intégré `545d32a` | **PASS_WITH_CHANGES** (64 tests, Ruff) ; résiduel MEDIUM `capture_sha256`/`next_pivots` documenté | UNKNOWN |
 | M01-A1-REVIEW | A1 | Revue critique A1 : sémantique verdicts, source_ref, API read-only, scénarios, interaction B0A | Luna Audit xhigh | 058bb4a | `docs/mission01/A1_REVIEW.md` | verdict PASS/PASS_WITH_CHANGES/FAIL ; tests rejoués | lecture seule | `5c81019`, intégré `4ec85aa` | DONE : FAIL, 1 BLOCKER + 2 HIGH | UNKNOWN |
 | M01-A1-R1 | A1-REVIEW | Réparation A1 : cohérence claims/stratégie, critère de falsification, projection expurgée, test route réelle | Luna Implementer xhigh | `cd34474` | `investigation_experiments.py`, `investigation_experiment.py`, `api/investigation.py`, tests | claims.status ne peut pas être refuted sans preuve ; zéro contenu libre sensible ; tests route | worktree write | `da79486` | DONE, re-revue FAIL (A1-R2/R3 HIGH) | UNKNOWN |
 | M01-A1-R2 | A1-REVIEW-2 | Réparation : projeter record/list, supprimer scalaires génériques, valider input_id, timeline sûr, lifespan UNKNOWN | Luna Implementer xhigh | `da79486` | `investigation_experiments.py`, `api/investigation.py`, tests | record/list sans refuted non prouvé ; aucune valeur/ID sensible ; lifespan documenté | worktree write | `a0aaee6` | DONE, re-revue FAIL (step_ids HIGH) | UNKNOWN |
 | M01-A1-R3 | A1-REVIEW-3 | Validation canonique de step_ids et métadonnées identifiantes, libellé assertion | Luna Implementer xhigh | `a0aaee6` | `investigation_experiments.py`, `api/investigation.py`, tests | identifiants arbitraires absents des trois sorties ; verdict étiqueté assertion | worktree write | `27db077`, intégré `3473413` | DONE, re-revue FAIL (SHA non résolus HIGH) | UNKNOWN |
 | M01-A1-R4 | A1-REVIEW-4 | Durcissement final : `[redacted]` pour SHA/IDs non résolus et métadonnées outil non canoniques ; libellé frontend | Luna Implementer xhigh | `27db077` | `investigation_experiments.py`, `api/investigation.py`, frontend, tests | références non résolues absentes ; tool metadata canoniques seulement | worktree write | `4a71f45`, intégré `00a78b8` | DONE (63 backend + 3 frontend + typecheck), revue fallback en cours | UNKNOWN |
-| M01-FINAL | tous | FINAL_AUDIT.md : tests réellement exécutés, restes, coûts, diff complexité, branches/approbations | Parent | intégration | `docs/mission01/FINAL_AUDIT.md` | matrice vérifiée ; aucun PASS sans exécution | lecture/intégration | — | PENDING | UNKNOWN |
+| M01-FINAL | tous | FINAL_AUDIT.md : tests réellement exécutés, restes, coûts, diff complexité, branches/approbations | Parent | intégration | `docs/mission01/FINAL_AUDIT.md` | matrice vérifiée ; aucun PASS sans exécution | lecture/intégration | `3e15193` | PROVISOIRE (verdicts Luna en attente) | UNKNOWN |
 
 ## Incident de capacité (2026-10-23)
 
@@ -90,6 +90,41 @@ B0A/A1 ont été confiés à des sessions **Claude Opus 5.5 xhigh** via Paseo,
 conformément à la règle de fallback Claude autorisée. Ces revues sont
 explicitement identifiées comme non-Luna dans leurs rapports. Les travaux
 Luna déjà livrés restent inchangés.
+
+## Reprise Luna 2026-10-24 00:50 — sessions actives
+
+| Session | TASK_ID | Worktree | Objet |
+|---|---|---|---|
+| `98446181` | M01-REG-FIX | `fix/mission01-regressions` (`wks_cbcdaa104d853d74`) | 5 régressions fermées `89eb3a5` (4589 passed / 34 env.) ; fusion intégration en cours |
+| `75a283e7` | M01-B0A-R4 | `feat/mission01-b0-bridge-chain` | data URL base64 >512 + allocation avant check — livré `cd69eca`, 153 tests |
+| `dbed9da5` | M01-B0A-REVIEW-R5 | `audit-mission01-b0a-review` | re-revue ciblée data URL `cd69eca` |
+| `03cab396` | M01-A1-R5 | `feat/mission01-a1-strategy-projection` | UUID/SHA canoniques non liés à l'expérience — livré `1f0e813`, 64 tests |
+| `534b4bd1` | M01-A1-REVIEW-R6 | `audit-mission01-a1-review` | re-revue ciblée des références liées `1f0e813` |
+| `24a6d5ba` | M01-B1A2-REVIEW-R2 | `audit-mission01-b1a2-review` | verdict final `01346e2`/`5484375` |
+
+**B1A1-REVIEW-R3 : FAIL** (`4317f46`). Protections confirmées : preuve
+`pre_submission` typée, coût/clé, crash→`NEEDS_REVIEW`, extension G2, CAS ;
+atomicité révocation/transport `BLOCKED` ; dette `object_type` documentée.
+Résiduels HIGH : équivalences `review_text` (`anchor`/`block_type`), UUID
+imbriqués `draft_text`, doublons `finding_refs` avec casse différente, champs
+normalisés d'autres outils VT. **Décision parent : arrêt de l'heuristique
+après 3 tentatives** ; B1A1 reste `FAIL/PARTIAL` sur l'équivalence sémantique
+et exige une clé d'effet canonique fournie par l'adaptateur (lot dédié). Les
+deux échecs `required_canonical_evidence_not_in_payload` sont traités par
+M01-REG-FIX.
+
+Verdicts déjà reçus : **A1-REVIEW-R6 PASS_WITH_CHANGES** (`2e75d94`,
+64 tests ; résiduel MEDIUM : un `vt_file_report` lié peut ressortir comme
+`capture_sha256`/`next_pivots` avec un type/provenance mal représenté, tests
+de version d'invocation à compléter) ; **B0A-REVIEW-R4 FAIL** (`ca78ded`,
+data URL base64 ; corrigé `cd69eca`, re-revue en cours) ; **B1A1-REVIEW-R3
+FAIL** (`4317f46`, équivalence sémantique résiduelle, arrêt après 3
+tentatives) ; **B1A2-REVIEW-R2 PASS_WITH_CHANGES** (`8597053`, 217/220 tests ;
+plancher conservateur, `BridgeInvestigator.turn` hors borne et état ambigu en
+chaîne documentés).
+
+Aucun push/live. Les verdicts ne seront intégrés qu'après examen du compte
+rendu ; `PASS` seulement si tests verts et revue effective.
 
 ## Régressions en attente (reprise Luna 2026-10-24 00:50)
 

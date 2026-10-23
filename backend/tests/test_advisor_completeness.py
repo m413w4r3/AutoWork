@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 from typing import Any
 from uuid import uuid4
@@ -11,6 +12,7 @@ from cti_app.application.advisor_dossier import (
     ContentExcerptLimitExceeded,
     build_advisor_dossier,
     evaluate_advisor_evidence_preflight,
+    extract_content_excerpts,
 )
 from cti_app.application.bridge_investigator import (
     ScriptedTurnTransport,
@@ -437,13 +439,70 @@ def test_generic_content_hexdump_is_rejected_with_a_reason() -> None:
 
 
 def test_short_generic_content_excerpt_is_preserved() -> None:
-    from cti_app.application.advisor_dossier import extract_content_excerpts
-
     short_content = "A short synthetic observation excerpt."
 
     projected = extract_content_excerpts({"content": short_content})
 
     assert any(row["kind"] == "text" and row["text"] == short_content for row in projected)
+
+
+def test_short_base64_and_textual_data_url_content_are_preserved() -> None:
+    proof = "SyntheticTextualProofMarker"
+    encoded = base64.b64encode(proof.encode("ascii")).decode("ascii")
+    percent_encoded = "".join(f"%{ord(character):02X}" for character in encoded)
+    short_data_url = f"data:text/plain;base64,{encoded}"
+    short_percent_encoded_data_url = f"data:text/plain;base64,{percent_encoded}"
+    short_values = (encoded, short_data_url, short_percent_encoded_data_url)
+
+    for value in short_values:
+        projected = extract_content_excerpts({"content": value})
+
+        assert any(row["text"] == value for row in projected)
+
+    nested = extract_content_excerpts({"outer": {"strings": [{"value": short_data_url}]}})
+    assert any(row["text"] == short_data_url for row in nested)
+
+
+def test_oversized_base64_is_size_checked_before_decode(monkeypatch: pytest.MonkeyPatch) -> None:
+    import cti_app.application.advisor_dossier as advisor_dossier
+
+    encoded = base64.b64encode(b"A" * 600).decode("ascii")
+    percent_encoded = "".join(f"%{ord(character):02X}" for character in encoded)
+    newline_wrapped = f"{encoded[:400]}\n{encoded[400:]}"
+    space_wrapped = f"{encoded[:400]} {encoded[400:]}"
+    tab_wrapped = f"{encoded[:400]}\t{encoded[400:]}"
+    cases = (
+        (encoded, "base64_content_exceeds_512_byte_decoded_limit"),
+        (
+            f"data:application/octet-stream;base64,{encoded}",
+            "data_url_base64_exceeds_512_byte_decoded_limit",
+        ),
+        (
+            f"data:application/octet-stream;base64,{percent_encoded}",
+            "data_url_base64_exceeds_512_byte_decoded_limit",
+        ),
+        (
+            f"data:application/octet-stream;base64,{newline_wrapped}",
+            "data_url_base64_exceeds_512_byte_decoded_limit",
+        ),
+        (
+            f"data:application/octet-stream;base64,{space_wrapped}",
+            "data_url_base64_exceeds_512_byte_decoded_limit",
+        ),
+        (
+            f"data:application/octet-stream;base64,{tab_wrapped}",
+            "data_url_base64_exceeds_512_byte_decoded_limit",
+        ),
+    )
+
+    def fail_if_decoded(*_args: Any, **_kwargs: Any) -> bytes:
+        pytest.fail("oversized base64 reached the decoder before its size check")
+
+    monkeypatch.setattr(advisor_dossier.base64, "b64decode", fail_if_decoded)
+
+    for value, reason in cases:
+        with pytest.raises(ContentExcerptLimitExceeded, match=reason):
+            extract_content_excerpts({"content": value})
 
 
 def test_dossier_applies_excerpt_budget_across_observations() -> None:

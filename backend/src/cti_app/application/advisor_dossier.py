@@ -30,6 +30,8 @@ _HEXDUMP_LINE = re.compile(r"(?im)^\s*(?:0x)?[0-9a-f]{4,16}:\s+(?:[0-9a-f]{2,8}\
 # Aggregate rendered observation-excerpt cap; dossier size remains uncapped.
 MAX_OBSERVATION_EXCERPT_BYTES = 16_384
 MAX_GENERIC_BINARY_CONTENT_BYTES = 512
+_MAX_GENERIC_BASE64_ENCODED_CHARS = ((MAX_GENERIC_BINARY_CONTENT_BYTES + 2) // 3) * 4
+_DATA_URL_BASE64 = re.compile(r"(?i)\bdata:[^,\s]*;base64,")
 _STOP = frozenset(
     "avec dans pour sans cette celui celle sont être avoir mais comme dans sur sous une des les "
     "aux par que qui quoi dont alors leur leurs elles ils cela ceci nous vous elle lui son sa "
@@ -51,11 +53,107 @@ def _reject_oversized_base64_content(value: str, *, encoding: object = None) -> 
         "base64url",
         "base64_url",
     }
-    candidate = re.sub(r"\s+", "", value)
-    if not candidate or re.fullmatch(r"[A-Za-z0-9+/=_-]+", candidate) is None:
+
+    data_url_found = False
+    for match in _DATA_URL_BASE64.finditer(value):
+        data_url_found = True
+        encoded_length = 0
+        padding = 0
+        padding_started = False
+        cursor = match.end()
+        while cursor < len(value):
+            character = value[cursor]
+            if character in "\r\n":
+                if character == "\r" and cursor + 1 < len(value) and value[cursor + 1] == "\n":
+                    cursor += 2
+                else:
+                    cursor += 1
+                if padding_started:
+                    break
+                continue
+            if character.isspace():
+                cursor += 1
+                if padding_started:
+                    break
+                continue
+            if character in "\"'<>":
+                break
+            if character == "%":
+                if cursor + 2 >= len(value):
+                    raise ContentExcerptLimitExceeded("data_url_base64_is_invalid")
+                try:
+                    character = chr(int(value[cursor + 1 : cursor + 3], 16))
+                except ValueError:
+                    raise ContentExcerptLimitExceeded("data_url_base64_is_invalid") from None
+                cursor += 3
+                if character.isspace():
+                    if padding_started:
+                        break
+                    continue
+            else:
+                cursor += 1
+            if character == "=":
+                padding_started = True
+                padding += 1
+                encoded_length += 1
+            elif character in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/_-":
+                if padding_started:
+                    raise ContentExcerptLimitExceeded("data_url_base64_is_invalid")
+                encoded_length += 1
+            else:
+                break
+        if (
+            padding > 2
+            or (padding and encoded_length % 4 != 0)
+            or (not padding and encoded_length % 4 == 1)
+        ):
+            raise ContentExcerptLimitExceeded("data_url_base64_is_invalid")
+        decoded_length = (encoded_length * 3) // 4 - min(padding, 2)
+        if (
+            encoded_length > _MAX_GENERIC_BASE64_ENCODED_CHARS
+            or decoded_length > MAX_GENERIC_BINARY_CONTENT_BYTES
+        ):
+            raise ContentExcerptLimitExceeded("data_url_base64_exceeds_512_byte_decoded_limit")
+    if data_url_found:
+        return
+
+    encoded_length = 0
+    padding = 0
+    padding_started = False
+    invalid = False
+    for character in value:
+        if character.isspace():
+            continue
+        if character == "=":
+            padding_started = True
+            padding += 1
+            encoded_length += 1
+        elif character in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/_-":
+            if padding_started:
+                invalid = True
+                break
+            encoded_length += 1
+        else:
+            invalid = True
+            break
+
+    structurally_valid = (
+        not invalid
+        and encoded_length > 0
+        and padding <= 2
+        and (encoded_length % 4 == 0 if padding else encoded_length % 4 != 1)
+    )
+    if not structurally_valid:
         if declared_base64:
             raise ContentExcerptLimitExceeded("declared_base64_content_is_invalid")
         return
+
+    decoded_length = (encoded_length * 3) // 4 - padding
+    if decoded_length > MAX_GENERIC_BINARY_CONTENT_BYTES:
+        raise ContentExcerptLimitExceeded("base64_content_exceeds_512_byte_decoded_limit")
+
+    # Construct the normalized value only after its decoded size is known to fit.
+    candidate = "".join(character for character in value if not character.isspace())
     padded = candidate + ("=" * (-len(candidate) % 4))
     try:
         decoded = base64.b64decode(padded, altchars=b"-_", validate=True)
@@ -63,8 +161,7 @@ def _reject_oversized_base64_content(value: str, *, encoding: object = None) -> 
         if declared_base64:
             raise ContentExcerptLimitExceeded("declared_base64_content_is_invalid") from None
         return
-    if len(decoded) > MAX_GENERIC_BINARY_CONTENT_BYTES:
-        raise ContentExcerptLimitExceeded("base64_content_exceeds_512_byte_decoded_limit")
+    assert len(decoded) <= MAX_GENERIC_BINARY_CONTENT_BYTES
 
 
 _DEFAULT_TASKS = {
@@ -166,6 +263,7 @@ def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]
             return
         if kind != "hex":
             _reject_oversized_base64_content(value, encoding=encoding)
+        # Hex excerpts are already token-validated and byte-capped by add_short_hex_rows.
         text = value.replace("\r\n", "\n").replace("\r", "\n").strip()
         if _HEXDUMP_LINE.search(text):
             raise ContentExcerptLimitExceeded("raw_hexdump_content_rejected")
@@ -212,6 +310,8 @@ def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]
             return
         rows = value if isinstance(value, (list, tuple)) else (value,)
         for row in rows:
+            if short_hex_payload_exceeds_limit:
+                return
             if not isinstance(row, Mapping):
                 continue
             raw = row.get("value", row.get("bytes", row.get("hex")))
