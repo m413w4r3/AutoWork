@@ -51,6 +51,7 @@ from cti_app.application.research_context_builder import (
     InvestigationContextTooLarge,
     ResearchContextBuilder,
 )
+from cti_app.domain.analyst_opinion import investigation_opinion_id
 from cti_app.domain.investigation import (
     BudgetReservationStatus,
     FrameworkPreSubmissionProof,
@@ -576,12 +577,16 @@ class OperatorToolInvocationService:
                 await self._execution.commit_current_uow()
             return await self._result(existing, state.version, replay=True)
 
-        semantic_parameters = _semantic_parameters_fingerprint(tool_name, arguments)
+        semantic_parameters = _semantic_parameters_fingerprint(
+            tool_name, arguments, self._investigation_id
+        )
         for existing in await self._invocations.list_for_investigation(self._investigation_id):
             if (
                 existing.tool_name != tool_name
                 or _semantic_parameters_fingerprint(
-                    existing.tool_name, existing.normalized_parameters
+                    existing.tool_name,
+                    existing.normalized_parameters,
+                    self._investigation_id,
                 )
                 != semantic_parameters
                 or existing.status
@@ -1015,7 +1020,24 @@ class OperatorToolInvocationService:
         )
 
 
-def _semantic_parameters_fingerprint(tool_name: str, parameters: Mapping[str, Any]) -> bytes:
+def _canonical_uuid_reference(value: object) -> str | None:
+    try:
+        return str(UUID(str(value)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _semantic_parameters_fingerprint(
+    tool_name: str,
+    parameters: Mapping[str, Any],
+    investigation_id: UUID,
+) -> bytes:
+    """Return the conservative effect identity of a tool request.
+
+    The fingerprint folds representations that the adapters treat as
+    equivalent. Over-blocking a genuinely different request only forces an
+    explicit reconciliation; under-blocking would allow a second external call.
+    """
     normalized = dict(parameters)
     if tool_name == "advisor.consult":
         question = normalized.get("question", "")
@@ -1028,12 +1050,55 @@ def _semantic_parameters_fingerprint(tool_name: str, parameters: Mapping[str, An
 
         evidence_refs = normalized.get("evidence_refs", ())
         if isinstance(evidence_refs, list | tuple):
-            try:
-                normalized["evidence_refs"] = [str(UUID(str(item))) for item in evidence_refs]
-            except (TypeError, ValueError):
-                pass
-            if not evidence_refs:
+            canonical_refs: list[str] = []
+            for item in evidence_refs:
+                canonical = _canonical_uuid_reference(item)
+                canonical_refs.append(canonical if canonical is not None else str(item))
+            if canonical_refs:
+                normalized["evidence_refs"] = sorted(canonical_refs)
+            else:
                 normalized.pop("evidence_refs", None)
+
+        consultation_type = normalized.get("consultation_type")
+        if consultation_type == "figure_plan":
+            finding_refs = normalized.get("finding_refs", ())
+            if isinstance(finding_refs, list | tuple):
+                canonical_findings: list[str] = []
+                for item in finding_refs:
+                    canonical = _canonical_uuid_reference(item)
+                    canonical_findings.append(
+                        canonical if canonical is not None else str(item)
+                    )
+                if canonical_findings:
+                    normalized["finding_refs"] = sorted(canonical_findings)
+                else:
+                    normalized.pop("finding_refs", None)
+        elif consultation_type == "review_text":
+            opinion_id = normalized.get("opinion_id")
+            default_opinion_id = str(investigation_opinion_id(investigation_id))
+            if opinion_id is None:
+                normalized["opinion_id"] = default_opinion_id
+            else:
+                canonical_opinion = _canonical_uuid_reference(opinion_id)
+                normalized["opinion_id"] = (
+                    canonical_opinion
+                    if canonical_opinion is not None
+                    else default_opinion_id
+                )
+            # Omitted means "latest"; an explicit version is resolved by the
+            # adapter. Treating all versions as equivalent is conservative: it
+            # blocks a fresh key until reconciliation and closes the omitted
+            # versus explicit bypass.
+            normalized.pop("opinion_version", None)
+            form = normalized.get("form")
+            if form is None:
+                normalized["form"] = "body"
+            elif isinstance(form, str):
+                normalized["form"] = form.strip().lower() or "body"
+    elif tool_name == "vt.file_report":
+        file_hash = normalized.get("file_hash")
+        if isinstance(file_hash, str):
+            normalized["file_hash"] = file_hash.strip().lower()
     return canonical_json_bytes(normalized)
 
 
