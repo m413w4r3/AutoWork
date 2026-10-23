@@ -1315,8 +1315,8 @@ async def test_untyped_download_refusal_requires_reconciliation_before_retry() -
     assert stopped.stop_reason is StopReason.SUBMISSION_NEEDS_REVIEW
     assert len(invocations) == 1
     assert invocations[0].status is ToolInvocationStatus.NEEDS_REVIEW
-    assert len(observations) == 1
-    assert {item.object_type for item in observations} == {"provider_download_route_refused"}
+    assert invocations[0].response_refs == ()
+    assert observations == ()
     assert envelope is not None
     assert envelope.budget.consumed[BudgetDimension.VT_UNITS] == 0
     assert envelope.budget.consumed[BudgetDimension.DOWNLOADS] == 0

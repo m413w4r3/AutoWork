@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import replace
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -32,6 +33,7 @@ from cti_app.application.investigation_tools import (
     RegistryToolDispatcher,
     ToolEffect,
     ToolExecutionContext,
+    ToolResult,
     validate_json_schema,
 )
 from cti_app.application.virustotal import VirusTotalHttpError
@@ -134,6 +136,13 @@ class _RouteRefusedPort(FakeVirusTotalPort):
             code="virustotal_not_found",
             status_code=404,
         )
+
+
+class _PartialDownloadTimeoutPort(FakeVirusTotalPort):
+    async def file_download(self, file_hash: str, *, sink) -> None:
+        self.download_calls.append(file_hash)
+        sink.write(self.sample_bytes[:8])
+        raise TimeoutError("synthetic partial download timeout")
 
 
 @pytest.mark.asyncio
@@ -383,6 +392,112 @@ async def test_invalid_download_retry_is_bounded() -> None:
     assert "purpose" in fixture.bridge_transport.prompts[1]
     assert "expected string" in fixture.bridge_transport.prompts[1]
     assert "failed definitively twice" in fixture.bridge_transport.prompts[3]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reported_status",
+    (ToolInvocationStatus.NEEDS_REVIEW, ToolInvocationStatus.FAILED),
+)
+async def test_ambiguous_download_failure_stops_without_persisting_a_response(
+    reported_status: ToolInvocationStatus,
+) -> None:
+    database = FakeDatabase()
+    sample = b"synthetic acquisition timeout sample"
+    sha256 = hashlib.sha256(sample).hexdigest()
+    arguments = {"sha256": sha256, "purpose": "Request the synthetic sample.", "evidence_refs": []}
+    fixture = _Fixture(
+        responses=[
+            _decision(
+                goal="Request the synthetic sample.",
+                next_action="continue",
+                tools=(
+                    {
+                        "tool_name": "vt.download_sample",
+                        "schema_version": "1",
+                        "arguments": arguments,
+                        "purpose": "Request the synthetic sample.",
+                    },
+                ),
+            ),
+            _decision(
+                goal="Retry the same sample download.",
+                next_action="continue",
+                tools=(
+                    {
+                        "tool_name": "vt.download_sample",
+                        "schema_version": "1",
+                        "arguments": arguments,
+                        "purpose": "Retry the synthetic sample.",
+                    },
+                ),
+            ),
+        ],
+        tools=(
+            (
+                "vt.download_sample",
+                "vt",
+                ToolEffect.ACQUIRE,
+                VT_FILE_DOWNLOAD_CAPABILITY,
+                {BudgetDimension.VT_UNITS: 1, BudgetDimension.DOWNLOADS: 1},
+            ),
+        ),
+    )
+    fixture.envelope = replace(fixture.envelope, acquire_hits_allowed=True)
+    database.investigations[fixture.investigation_id] = make_investigation()
+    port = _PartialDownloadTimeoutPort(sample)
+    hits = HitAcquisitionService(
+        lambda: FakeUow(database),
+        acquisition=make_sample_acquisition_service(database, port),
+        recorder=make_evidence_recorder(database),
+    )
+    actual_registry = _register(database, hits)
+    definition, adapter = actual_registry.get("vt.download_sample", "1")
+    fixture.registry.unregister("vt.download_sample", "1")
+
+    class _PersistedEnvelopeAdapter:
+        async def execute(
+            self, call_arguments: Mapping[str, Any], context: ToolExecutionContext
+        ) -> ToolResult:
+            # Production repositories share this versioned envelope snapshot.
+            database.envelopes[context.investigation_id] = context.envelope
+            result = cast(ToolResult, await adapter.execute(call_arguments, context))
+            if reported_status is ToolInvocationStatus.FAILED:
+                return replace(
+                    result,
+                    status=reported_status,
+                    output={**result.output, "adapter_detail": "partial response is ambiguous"},
+                )
+            return result
+
+    fixture.registry.register(definition, _PersistedEnvelopeAdapter())
+
+    initial = await fixture.start()
+    state = await fixture.service.run(initial.investigation_id)
+
+    invocations = await fixture.invocations.list_for_investigation(fixture.investigation_id)
+    envelope = await fixture.envelopes.get(fixture.investigation_id)
+    assert state.stop_reason is StopReason.SUBMISSION_NEEDS_REVIEW
+    assert len(invocations) == 1
+    assert invocations[0].status is ToolInvocationStatus.NEEDS_REVIEW
+    assert invocations[0].response_refs == ()
+    assert invocations[0].consumed_budget == {}
+    assert await fixture.observations.list_for_investigation(fixture.investigation_id) == ()
+    assert envelope is not None
+    reservation = next(
+        item
+        for item in envelope.budget.reservations
+        if item.operation_key == invocations[0].operation_key
+    )
+    assert reservation.status is BudgetReservationStatus.RESERVED
+    assert reservation.committed_amounts == {}
+    assert envelope.budget.reserved[BudgetDimension.VT_UNITS] == 1
+    assert envelope.budget.reserved[BudgetDimension.DOWNLOADS] == 1
+    assert envelope.budget.consumed[BudgetDimension.VT_UNITS] == 0
+    assert envelope.budget.consumed[BudgetDimension.DOWNLOADS] == 0
+    assert port.download_calls == [sha256]
+    assert fixture.bridge_transport.prompts
+    assert len(fixture.bridge_transport.prompts) == 1
 
 
 @pytest.mark.asyncio

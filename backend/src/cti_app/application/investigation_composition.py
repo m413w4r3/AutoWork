@@ -757,6 +757,7 @@ class _PermissionAwareInvestigationTransport:
         context_sha256: str,
         prompt: str,
         external_llm_allowed: bool,
+        timeout_seconds: float | None = None,
     ) -> TurnSubmission:
         result = await self._transport.submit(
             investigation_id=investigation_id,
@@ -765,6 +766,7 @@ class _PermissionAwareInvestigationTransport:
             context_sha256=context_sha256,
             prompt=prompt,
             external_llm_allowed=external_llm_allowed,
+            timeout_seconds=timeout_seconds,
         )
         if result.status is not TurnSubmissionStatus.BLOCKED:
             return result

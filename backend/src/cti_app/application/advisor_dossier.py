@@ -145,6 +145,10 @@ def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]
     excerpts: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
     total_excerpt_bytes = 0
+    short_hex_rows: list[tuple[str, str]] = []
+    short_hex_identities: set[tuple[int | None, str]] = set()
+    short_hex_payload_bytes = 0
+    short_hex_payload_exceeds_limit = False
     assembly_name = next(
         (
             value.strip()
@@ -160,7 +164,8 @@ def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]
         nonlocal total_excerpt_bytes
         if not isinstance(value, str) or not value.strip():
             return
-        _reject_oversized_base64_content(value, encoding=encoding)
+        if kind != "hex":
+            _reject_oversized_base64_content(value, encoding=encoding)
         text = value.replace("\r\n", "\n").replace("\r", "\n").strip()
         if _HEXDUMP_LINE.search(text):
             raise ContentExcerptLimitExceeded("raw_hexdump_content_rejected")
@@ -181,7 +186,7 @@ def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]
                 )
             chunks = sentence_chunks or chunks
         for index, chunk in enumerate(chunks, start=1):
-            identity = (kind, chunk)
+            identity = (kind, f"{title.strip()}\n{chunk}" if kind == "hex" else chunk)
             if identity in seen:
                 continue
             suffix = f" {index}" if len(chunks) > 1 else ""
@@ -200,6 +205,51 @@ def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]
             if isinstance(value, str) and value.strip():
                 return value.strip()
         return fallback
+
+    def add_short_hex_rows(value: object) -> None:
+        nonlocal short_hex_payload_bytes, short_hex_payload_exceeds_limit
+        if short_hex_payload_exceeds_limit:
+            return
+        rows = value if isinstance(value, (list, tuple)) else (value,)
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            raw = row.get("value", row.get("bytes", row.get("hex")))
+            if not isinstance(raw, str):
+                continue
+            if re.fullmatch(
+                r"(?i)(?:0x)?[0-9a-f]{2}(?:(?:[\s,:-]+)(?:0x)?[0-9a-f]{2}|[0-9a-f]{2})*",
+                raw.strip(),
+            ) is None:
+                continue
+            compact = re.sub(r"[^0-9a-fA-F]", "", raw)
+            if (
+                re.fullmatch(r"[0-9a-fA-F]+", compact) is None
+                or len(compact) % 2
+                or len(compact) > MAX_GENERIC_BINARY_CONTENT_BYTES * 2
+            ):
+                # Full or malformed dumps are not evidence excerpts.
+                continue
+            offset = row.get("offset")
+            normalized_offset = offset if type(offset) is int and offset >= 0 else None
+            identity = (normalized_offset, compact.casefold())
+            if identity in short_hex_identities:
+                continue
+            short_hex_identities.add(identity)
+            short_hex_payload_bytes += len(compact) // 2
+            if short_hex_payload_bytes > MAX_GENERIC_BINARY_CONTENT_BYTES:
+                # A dump split across offset rows is still too large to include.
+                short_hex_payload_exceeds_limit = True
+                short_hex_rows.clear()
+                continue
+            if short_hex_payload_exceeds_limit:
+                continue
+            title = (
+                f"Octets observés — offset {normalized_offset}"
+                if normalized_offset is not None
+                else "Octets observés"
+            )
+            short_hex_rows.append((title, raw))
 
     def walk(value: Any, path: tuple[str, ...] = ()) -> None:
         if any(
@@ -238,7 +288,8 @@ def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]
                     add("method", f"{method_kind} — {name}", child)
                     continue
                 if key in {"hex", "hex_bytes", "bytes_hex", "hexdump"}:
-                    # Generic excerpts never carry raw or complete byte dumps.
+                    # Preserve bounded offset measurements; reject complete dumps.
+                    add_short_hex_rows(child)
                     continue
                 if key in _METHOD_CONTAINER_KEYS:
                     walk(child, (*path, key))
@@ -293,6 +344,9 @@ def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]
                 add("method", f"Méthode {path[-2] if len(path) > 1 else 'observée'}", value)
 
     walk(payload)
+    if not short_hex_payload_exceeds_limit:
+        for title, raw in short_hex_rows:
+            add("hex", title, raw)
     return excerpts
 
 

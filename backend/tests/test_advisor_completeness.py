@@ -422,6 +422,9 @@ def test_generic_content_projection_omits_full_hexdumps_and_raw_bytes() -> None:
     )
 
     assert projected == []
+    assert (
+        extract_content_excerpts({"hex": [{"offset": 0, "value": "41" * 16_384}]}) == []
+    )
 
 
 def test_generic_content_hexdump_is_rejected_with_a_reason() -> None:

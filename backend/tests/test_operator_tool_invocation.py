@@ -554,7 +554,16 @@ async def test_operator_led_experiment_record_uses_declared_hypothesis_and_strea
 
 @pytest.mark.asyncio
 async def test_operator_dispatcher_wires_minimal_advisor_request_to_strict_bridge_transport():
-    fixture, state, _ = await _fixture()
+    fixture = _Fixture(responses=[], tools=[("vt.file_report", "vt")])
+    state = await fixture.start(
+        execution_mode=InvestigationExecutionMode.OPERATOR_LED,
+        hypotheses=(
+            Hypothesis(
+                id="H-loader-chain",
+                statement="The article's loader chain may explain the observed pivot.",
+            ),
+        ),
+    )
     article_port = fixture.context_builder.article_snapshots
     article_port.snapshot = replace(
         article_port.snapshot,
@@ -610,8 +619,12 @@ async def test_operator_dispatcher_wires_minimal_advisor_request_to_strict_bridg
                 "context_sha256",
                 "prompt",
                 "external_llm_allowed",
+                "timeout_seconds",
             }
             assert kwargs["external_llm_allowed"] is True
+            assert isinstance(kwargs["timeout_seconds"], int | float)
+            assert not isinstance(kwargs["timeout_seconds"], bool)
+            assert 0 < kwargs["timeout_seconds"] <= 3_600
             assert len(kwargs["prompt"].encode()) <= 32 * 1024 * 1024
             self.calls.append(kwargs)
             article_ref = next(
@@ -667,6 +680,7 @@ async def test_operator_dispatcher_wires_minimal_advisor_request_to_strict_bridg
             openai_bridge_submission_jitter_fraction=0,
         ),
         investigations=fixture.investigations,
+        investigation_states=fixture.states,
         observations=fixture.observations,
         findings=fixture.findings,
         opinions=fixture.opinions,
@@ -726,7 +740,15 @@ async def test_advisor_recommendations_record_acceptance_refusal_and_empirical_o
             ("sample.analyze", "local"),
         ),
     )
-    state = await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
+    state = await fixture.start(
+        execution_mode=InvestigationExecutionMode.OPERATOR_LED,
+        hypotheses=(
+            Hypothesis(
+                id="H-init-mutex",
+                statement="The measured InitMutex may identify a sample-specific loader.",
+            ),
+        ),
+    )
     fixture.envelope = replace(
         fixture.envelope,
         allowed_providers=("bridge", "local", "vt"),
@@ -885,6 +907,7 @@ async def test_advisor_recommendations_record_acceptance_refusal_and_empirical_o
             openai_bridge_submission_jitter_fraction=0,
         ),
         investigations=fixture.investigations,
+        investigation_states=fixture.states,
         observations=fixture.observations,
         findings=fixture.findings,
         opinions=fixture.opinions,
@@ -919,6 +942,7 @@ async def test_advisor_recommendations_record_acceptance_refusal_and_empirical_o
         if item.source == "advisor.consult"
     ]
     assert advice.invocation.status is ToolInvocationStatus.PARTIAL, advice.output
+    assert len(transport.calls) == 1
     assert persisted_advice
     assert advice.invocation.consumed_budget[BudgetDimension.BRIDGE_TURNS] == 1
     advisor_observation = next(
