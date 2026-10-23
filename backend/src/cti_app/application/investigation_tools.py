@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any, Literal, Protocol, cast
@@ -413,6 +413,9 @@ class ToolDispatcher(Protocol):
         arguments: Mapping[str, Any],
         purpose: str,
         operation_key: str,
+        reservation_amounts: Mapping[BudgetDimension, int] | None = None,
+        pre_dispatch_check: Callable[[ToolExecutionContext], Awaitable[ToolResult | None]]
+        | None = None,
     ) -> ToolResult: ...
 
 
@@ -622,6 +625,9 @@ class RegistryToolDispatcher:
         arguments: Mapping[str, Any],
         purpose: str,
         operation_key: str,
+        reservation_amounts: Mapping[BudgetDimension, int] | None = None,
+        pre_dispatch_check: Callable[[ToolExecutionContext], Awaitable[ToolResult | None]]
+        | None = None,
     ) -> ToolResult:
         async with self._lock:
             if not operation_key.strip() or not purpose.strip():
@@ -654,6 +660,8 @@ class RegistryToolDispatcher:
                 purpose=purpose,
                 operation_key=operation_key,
                 identity=identity,
+                reservation_amounts=reservation_amounts,
+                pre_dispatch_check=pre_dispatch_check,
             )
 
     async def _dispatch_once(
@@ -666,6 +674,8 @@ class RegistryToolDispatcher:
         purpose: str,
         operation_key: str,
         identity: bytes,
+        reservation_amounts: Mapping[BudgetDimension, int] | None,
+        pre_dispatch_check: Callable[[ToolExecutionContext], Awaitable[ToolResult | None]] | None,
     ) -> ToolResult:
         replay = self._completed.get(operation_key)
         if replay is not None:
@@ -708,6 +718,7 @@ class RegistryToolDispatcher:
                 f"Policy does not allow {definition.name}.",
                 alternatives,
                 request_permission=True,
+                pre_submission_reason="policy_denied",
             )
         try:
             validate_json_schema(arguments, thaw_json(definition.input_schema))
@@ -733,15 +744,23 @@ class RegistryToolDispatcher:
                 error_code="invalid_tool_arguments",
             )
 
+        reserved_amounts = (
+            thaw_json(definition.cost_model) if reservation_amounts is None else reservation_amounts
+        )
         try:
-            context.budget.reserve(operation_key, thaw_json(definition.cost_model))
+            context.budget.reserve(operation_key, reserved_amounts)
         except BudgetExceeded as exc:
             return self._local_result(
                 ToolInvocationStatus.NEEDS_REVIEW,
                 f"Budget limit reached for {exc.dimension.value}.",
                 alternatives,
                 request_permission=True,
+                pre_submission_reason="budget_exceeded",
             )
+        if pre_dispatch_check is not None:
+            refusal = await pre_dispatch_check(context)
+            if refusal is not None:
+                return refusal
         try:
             result = await adapter.execute(arguments, context)
         except Exception as exc:
@@ -758,8 +777,17 @@ class RegistryToolDispatcher:
             )
             self._completed[operation_key] = (identity, result)
             return result
+        if result.output.get("pre_submission_reason") in {
+            "budget_exceeded",
+            "policy_denied",
+        }:
+            # These markers belong to dispatcher-owned admission refusals. An
+            # adapter result is untrusted and cannot assert the same proof.
+            safe_output = dict(result.output)
+            safe_output.pop("pre_submission_reason", None)
+            result = replace(result, output=safe_output)
         try:
-            consumed = result.budget_consumed or thaw_json(definition.cost_model)
+            consumed = result.budget_consumed or reserved_amounts
             context.budget.commit(operation_key, consumed)
         except (KeyError, ValueError):
             context.budget.commit(operation_key)
@@ -820,8 +848,17 @@ class RegistryToolDispatcher:
         alternatives: tuple[str, ...] = (),
         *,
         request_permission: bool = False,
+        pre_submission_reason: str | None = None,
     ) -> ToolResult:
-        output = {"request_permission": True} if request_permission else {}
+        output: dict[str, Any] = {"request_permission": True} if request_permission else {}
+        if pre_submission_reason is not None:
+            output.update(
+                {
+                    "pre_submission_reason": pre_submission_reason,
+                    "failure_stage": "pre_submission",
+                    "confirmed_non_execution": True,
+                }
+            )
         return ToolResult(
             status,
             suggested_alternatives=alternatives,
