@@ -41,26 +41,36 @@ reports and JSON notes are not CTI evidence.
 
 ## Delegation and context
 
-- Prefer a single agent for short, sequential changes. Delegate independent,
-  verifiable exploration, bounded implementation or critical review when it
-  improves coverage or keeps the parent context focused.
-- Use Paseo's *verified* native profiles, delegation and isolated worktrees
-  when running under Paseo. Do not assume a particular tool or API exists.
-  Avoid nesting an unbounded second orchestration tree inside Codex/Claude.
-- Each child gets ONE question, base commit SHA, relevant paths/IDs and
-  versions, allowed tools/paths, expected oracle, stop conditions and a
-  concise output contract. Scouts and reviewers should receive technical
-  read-only permissions, not merely a read-only sentence in a prompt.
-- No overlapping writes or simultaneous mutations of the live DB. Parent
-  integrates, verifies and decides. Children never approve, merge, publish
-  or widen scope on their own.
-- Return paths:lines, facts vs assumptions, patch/commit SHA, tests actually
-  run, risks, blockers and next action. Keep raw logs and long transcripts
-  outside the parent context; retrieve excerpts on demand.
-- For deterministic failures only: failed oracle -> minimal fix -> focused
-  test -> diff review. Stop after at most three repair attempts per oracle;
-  seek independent diagnosis after two attempts without improvement.
-  Do not turn a Ralph loop into permission to retry ambiguous external effects.
+- Proactively delegate one sharply bounded, independently checkable task to a
+  fresh GPT-6 Luna **high** sub-session for source tracing, mechanical edits,
+  narrow tests, comparison, API contract checks or a self-contained patch.
+  Use Luna **xhigh** for consequential architecture, migrations, G2/TLP,
+  concurrency, CTI provenance or a difficult independent review.
+- Prefer Paseo profiles and true isolated sessions/worktrees for coding
+  orchestration; Codex-native agents are an optional local fallback. Verify the
+  runtime/provider capabilities; Claude-native subagents are not GPT-6 Luna.
+  Six concurrent Codex helpers is a ceiling, not a minimum or an invitation
+  to spawn on trivial sequential changes. Parent supervises all children.
+- Give each child ONE question, base commit SHA, exact paths/IDs and version
+  pointers, permissions, a deterministic oracle or explicit review gate, and a
+  concise expected output. Scouts/reviewers should be technically read-only.
+  Worktree writers must not overlap files; no parallel changes to live state.
+- Parent keeps ONE compact task registry, integrates diffs and verifies outputs.
+  Children never approve, merge, publish, widen scope or retry ambiguous live
+  effects. Keep raw logs and whole transcripts out of the parent context.
+- **Fresh-context discipline:** reassess context size after each major
+  exploration, large tool output or completed lot; when irrelevant history
+  accumulates, proactively prepare a SHA-based handoff and start a truly NEW
+  session instead of relying indefinitely on compaction. With visible usage,
+  roughly 50–60% occupied is a review cue, not a hard threshold; hand off
+  earlier at clean task boundaries. Use `autowork-context-handoff` when useful.
+- For a deterministic offline failure use `autowork-ralph-gate`:
+  failing oracle -> minimal patch -> focused test -> diff review.
+  At most 3 repair attempts, obtain independent diagnosis after 2 without
+  progress. A long Ralph-style mission must use new sessions *per gated lot*.
+- Return paths:lines, verified facts vs inference, output SHA, tests actually
+  run, risks, blockers and the next permissible action. Tokens/costs are
+  measured when reported, otherwise UNKNOWN.
 
 ## Validation and delivery
 

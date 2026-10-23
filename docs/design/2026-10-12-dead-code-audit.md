@@ -192,7 +192,7 @@ arbitrage produit.
 
 - `docs/brief_workflow.md:3-5` porte déjà le bandeau `Document historique /
   legacy` et dit que ses endpoints sont hors du workflow cible. Le conserver ;
-  ne pas supprimer sur cette base.
+  ne pas supprimer sur cette base (constat daté). Ce fichier legacy a depuis été retiré lors du nettoyage agentique du 2026-10-23 ; l'original reste consultable dans Git à `1e825f84f08e806df495fc17c937ab19ba696b4c`.
 
 ### Contrats actifs — corrections
 

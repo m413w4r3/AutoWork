@@ -26,24 +26,33 @@ report or workspace is primary CTI evidence.
 
 ## Delegation policy
 
-Paseo is the top-level coding orchestrator when enabled. Create independent
-scout/reviewer sessions for questions that would pollute the parent context.
-Use isolated worktrees for parallel coding tasks and a single parent for
-integration. One child = one bounded question; no overlapping edits.
-Avoid unconstrained nested Codex/Claude delegation inside each Paseo worker.
+Paseo is the outer coding orchestrator when enabled. **Prefer GPT-6 Luna
+high sub-sessions for bounded, independent tasks**, even mechanical file
+edits, reproducible checks, focused comparisons and scoped source mapping:
+these are useful places to keep noisy intermediate context away from the
+parent. Use **Luna xhigh** for high-risk code, difficult contradictions,
+G2/TLP, migrations, provenance and independent review.
 
-Suggested host-side profiles, **not executable project configuration**:
+Concurrent agents: start at up to **6** independent workers; consider
+**8** only after measuring rate limits, time, cost, worktree and test
+contention. A ceiling is not a task quota. Keep a single parent integrating
+changes. Don't create overlapping write owners or concurrently mutate live
+state, and do not nest unlimited trees of Codex/Claude agents inside Paseo.
 
-| Profile | Typical reasoning | Access | Use |
+Configure actual provider/model IDs in **Paseo Agent Profiles on the host**.
+Repository `.codex/config.toml` separately enables up to 6 native Codex
+helpers defaulting to `gpt-6-luna` high. This is a fallback, not proof
+that Paseo loaded the settings. Claude-native subagents run Claude models;
+for Luna, start a Paseo Codex worker.
+
+| Profile | Preferred model/effort | Access | When |
 |---|---|---|---|
-| lead | high, xhigh only when warranted | scoped coding worktree | coordinate, reconcile, verify |
-| scout | low/medium | technically read-only | locate paths, symbols and contradictory evidence |
-| implementer | medium/high | isolated writable worktree | small patch + focused oracle |
-| critical-reviewer | high/xhigh where provider supports it | technically read-only | DB migration, G2, provenance, auth |
-| tester | low/medium | isolated disposable environment | targeted tests and failures |
-
-Use the *actual* provider/model IDs and effort levels advertised by Paseo.
-A model or effort override does not grant permissions.
+| coordinator | GPT-6 Luna high/xhigh | scoped integration worktree | planning, parent decisions |
+| scout | GPT-6 Luna high | actually read-only | trace code/evidence, map APIs |
+| mechanical | GPT-6 Luna high | isolated write worktree | small repeatable changes |
+| implementer | GPT-6 Luna high | isolated write worktree | bounded implementation |
+| tester | GPT-6 Luna high | disposable test environment | one oracle, concise results |
+| critical-reviewer | GPT-6 Luna xhigh | actually read-only | security, G2, migrations, provenance |
 
 ## Child task contract
 
@@ -63,28 +72,42 @@ Parent retains task registry, reviews every patch, checks source links
 and tests, and requests any necessary authorization. Do not import entire
 child transcripts into the parent. Read targeted ranges on demand.
 
-## Context and budgets
+## Fresh sessions and context pressure
 
-- Start from known paths or `scripts/ctx/ctx.py` as a **locator** only.
-  Verify actual code and DB contracts. Navigation optimizes reading, not
-  completeness of Bridge evidence.
-- Pass immutable pointers, versions and hashes. Keep one compact registry:
-  `TASK_ID / owner / deps / base SHA / scope / oracle / state / output SHA /
-   measured cost or UNKNOWN / next`.
-- On context compaction or fresh Ralph iteration, reload the registry, task
-  specification, relevant AGENTS/ADR and exact evidence pointers; never use
-  model memory or previous success claims as an oracle.
-- Track Paseo/Codex/Claude coding costs separately from Bridge, VT and
-  AutoWork workers. Never report estimated bytes/token conversion as
-  observed provider billing.
+A child starts with its own narrow context; its output does not copy its
+transcript into the parent. **Start a new session proactively**, not just
+after forced compaction: after one completed meaningful lot, switching to a
+different subsystem, after a log-heavy investigation, or once unrelated
+history begins to crowd out the current task. If context usage is visible,
+~50–60% occupancy is a cue to evaluate a handoff, never a hard threshold or
+permission to omit evidence. At any earlier natural boundary, prefer a
+fresh session if continuation would require remembering substantial obsolete
+history.
 
-## Ralph loops
+Use `autowork-context-handoff`: commit/check current worktree, record task
+ID, exact base/output SHA, relevant contracts, paths:lines, actual oracle
+results, blockers, permissions and next step. The receiving **new** session
+re-verifies the SHA and reads only relevant instructions/evidence pointers.
+Do not merely ask the same bloated thread to "forget". If the runtime can't
+launch sessions, finish with a handoff; don't claim a handoff occurred.
 
-Only repair against deterministic oracles, e.g. `focused failing test ->
-small fix -> focused rerun -> diff inspection`. Maximum three attempts;
-after two attempts without improvement, obtain independent diagnosis.
-No automatic retries of ambiguous external effects (`needs_review`), no
-live-provider experimentation, no automatic G3 or release.
+Track Codex/Claude/Paseo costs independently of Bridge, VT and AutoWork
+worker costs; report unknown values as UNKNOWN. Delegate safely, never
+disclose private CTI evidence to an unapproved provider.
+
+## Ralph loops: two distinct mechanisms
+
+- **Micro repair**: only an offline deterministic oracle; fail ->
+  minimal patch -> narrow test -> diff review. Maximum 3 attempts per oracle.
+  After 2 without improvement, independent Luna xhigh diagnosis.
+- **Long mission**: one persisted task registry; pick one unblocked lot,
+  launch a fresh Luna high session, implement and verify its oracle,
+  record DONE/FAIL/BLOCKED/UNKNOWN with output SHA, and start another
+  fresh session for the next independent lot. No unbounded self-scored loop.
+
+Never loop ambiguous `needs_review`, live CTI effects, provider uploads,
+publication, G2/G3 approvals, destructive database work, or non-deterministic
+judgments. Read `autowork-ralph-gate` only when a gated loop applies.
 
 ## Exit gate
 

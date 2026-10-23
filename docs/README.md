@@ -58,22 +58,41 @@ separate approval and state/backup preflight.
 | Source collection | [`source_collection_and_evidence.md`](source_collection_and_evidence.md) | ACTIVE_REFERENCE; older workflow statements may be historical |
 | Other accepted ADRs | [`adr/`](adr/) | ACTIVE_REFERENCE unless expressly superseded; dated decisions must be interpreted in sequence |
 
-## Historical / non-normative
+## Historical documents and intentional deletions
 
-| Document or family | Status | Replacement / reason |
-|---|---|---|
-| [`agent/CONTRACT.md`](agent/CONTRACT.md), especially M2/M3 | HISTORICAL | Migration statements contradict ADR-0007; use backend AGENTS + ADR-0007 |
-| [`operations/operator-sessions-config.md`](operations/operator-sessions-config.md) | HISTORICAL | Nimbalyst-specific model/`spawn_session` settings; use Paseo guide |
-| [`operations/investigation-supervised-first-run.md`](operations/investigation-supervised-first-run.md) | HISTORICAL | Initial-run reset instructions are not authorization for the existing live state |
-| [`operations/operator-led-investigation-design.md`](operations/operator-led-investigation-design.md) | HISTORICAL (design snapshot, 2026-10-18) | Compare with current API and operator playbook |
-| [`operations/run12-editorial-closure-2026-10-22.md`](operations/run12-editorial-closure-2026-10-22.md) | HISTORICAL (run evidence/index) | Preserve observed limitations and original evidence links |
-| [`brief_workflow.md`](brief_workflow.md) | HISTORICAL | File itself notes legacy AW-008 workflow |
-| `design/YYYY-MM-DD-*` and `operations/*-YYYY-MM-DD*` | HISTORICAL by default | Design snapshots/journals, unless a newer explicit accepted decision promotes one |
+The 2026-10-23 coding-agent cleanup deleted these non-authoritative files
+(after checking known link consumers) so agents cannot apply their obsolete
+instructions. They remain recoverable from Git history at
+[the pre-cleanup commit](https://github.com/m413w4r3/AutoWork/tree/1e825f84f08e806df495fc17c937ab19ba696b4c):
+
+- `docs/agent/CONTRACT.md`: obsolete M2/M3 migration directions.
+- `docs/operations/operator-sessions-config.md`: Nimbalyst-specific launcher.
+- `docs/operations/investigation-supervised-first-run.md`: obsolete initial reset.
+- `docs/operations/operator-led-investigation-design.md`: early design snapshot.
+- `docs/brief_workflow.md`: superseded AW-008 workflow.
+- `.agents/skills/caveman/` and `skills-lock.json`: obsolete style skill.
+
+**Retained historical evidence**: `operations/run12-editorial-closure-2026-10-22.md`
+and dated run journals/incidents/ADRs. They document earlier states, not
+instructions for current mutations. Do not delete CTI evidence/incident
+records solely because they are historical. Dated design documents are
+historical by default unless superseded or explicitly accepted.
 
 Other `docs/` files are **UNREVIEWED** in this focused remediation; do
-not infer their authority from a filename. No deletion, archive move or
-broken-link cleanup was performed. A full D1 document-by-document
-consumer/links audit is still needed.
+not infer their authority from a filename. No full consumer/links/runtime
+audit was performed. Any historic path listed in an old audit is a
+historical statement, not necessarily a current live link.
+
+## Agent skills
+
+Six narrowly triggered, on-demand workflows live in `.agents/skills/`:
+`autowork-context-handoff`, `autowork-ralph-gate`,
+`autowork-run-audit`, `autowork-bridge-dossier-review`,
+`autowork-cti-evidence-gate`, `autowork-typst-parity`.
+Claude Code discovers symlinks to these same skills from `.claude/skills/`
+when supported by its installed version; no duplicated skill bodies.
+Follow the [Paseo coding orchestration guide](operations/paseo-agent-orchestration.md)
+for profiles, Luna high/xhigh delegation and fresh context.
 
 ## External references
 
