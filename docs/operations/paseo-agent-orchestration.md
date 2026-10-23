@@ -133,16 +133,51 @@ project `.codex/config.toml` (only after the corresponding checkout/PR is
 present). Do not assume work in a draft GitHub PR already changed a local
 checkout.
 
-In Paseo Desktop open Settings -> host -> Agents -> Agent profiles ->
-New profile. Create these entries using the **detected** provider/model:
+### What is a profile, and who orchestrates?
 
-| Profile name | Provider | Model | Thinking | When to use (profile notes) |
+A Paseo **Agent Profile** is a convenient saved bundle of launch settings:
+provider, model, mode, thinking level, available features, and a `When to use`
+note that the orchestrator can inspect. A profile is **not** an autonomous
+agent, a new provider, a mandatory setup step or an execution policy. A
+main/parent coding session becomes an *orchestrator* by using Paseo tools
+or the installed orchestration skills and delegating actual work.
+
+Profiles can be created manually in Paseo Desktop at
+Settings -> host -> Agents -> Agent profiles -> New profile, or omitted:
+when no matching profile is available, the Paseo orchestration skill can
+discover configured providers/models and launch workers with explicit
+settings. Prefer creating **three small worker profiles** rather than
+duplicating every conceivable parent/worker role.
+
+**User's preferred architecture (2026-10-23):** the coordinating session
+uses either Claude Sonnet 5.5 medium/high (if the installed Claude provider
+offers that model) or the existing `deepseek-claude` custom provider
+(`deepseek-flash[1m]`, maximum offered thinking/effort). These are
+**alternative parent sessions**, not Luna leads. The parent is responsible
+for splitting tasks, dependencies, context freshness, permission boundaries,
+integrating and checking outputs. GPT-6 Luna high/xhigh is preferred for
+specialized **workers and independent review**.
+
+| Optional profile | Provider ID | Selected model | Thinking | When to use |
 |---|---|---|---|---|
-| Luna lead | codex | gpt-6-luna | high | Parent coordination, acceptance criteria, dependency frontier and handoffs; integrate only accepted worktree diffs |
-| Luna focused | codex | gpt-6-luna | high | One independent source-trace, small code edit, mechanical transformation or focused oracle; use a new session and a narrow context |
-| Luna implementer | codex | gpt-6-luna | high | One bounded change in an isolated writable worktree with tests and no parallel writer |
-| Luna critical review | codex | gpt-6-luna | xhigh | Independent critical review of migrations, G2/G3, TLP, evidence, concurrency, security; no writes |
-| Claude alternative review | claude | installed supported Claude model | high (if available) | Independent provider-family review when disagreement or correlated errors matter; no secret CTI material without approval |
+| Luna focused | `codex` | `gpt-6-luna` | high | Independent small task, code tracing, mechanical change or focused offline test, fresh context |
+| Luna implementer | `codex` | `gpt-6-luna` | high | Single bounded implementation, isolated writable worktree, verifiable oracle |
+| Luna critical review | `codex` | `gpt-6-luna` | xhigh | Independent read-only review of G2/G3, TLP, migrations, provenance or security |
+
+Optional **parent presets**, only if the user wants one-click launching:
+
+| Parent preset | Provider ID | Model | Thinking |
+|---|---|---|---|
+| Orchestrator Sonnet | `claude` | Sonnet 5.5 *only if listed as available* | medium or high |
+| Orchestrator DeepSeek | `deepseek-claude` | `deepseek-flash[1m]` | maximum *supported* by that provider |
+
+The `deepseek-claude` provider already exists in the user's private
+`~/.paseo/config.json`. **Do not duplicate it** as a new provider alias and
+do not put credentials in the repo. The config's environment variable
+`CLAUDE_CODE_EFFORT_LEVEL=max` does not by itself prove that Paseo or the
+upstream model implements max reasoning; verify selectable options and
+effective session metadata. Likewise do not invent a Sonnet model ID.
+
 
 Choose compatible mode and effective permissions in the UI. The profile
 notes are selection guidance, **not a sandbox**. Test that a spawned worker's
@@ -154,6 +189,10 @@ reimplementing their CLI/MCP. Use AutoWork skills for **domain gates** and
 SHA-aware handoff format; avoid two skills trying to create the same session.
 When changing provider/tool profiles, new settings affect new launches, not
 already running agents.
+
+Choose compatible mode and effective permissions in the UI. Profile notes
+are selection hints, not a sandbox, and they never start agents by themselves.
+A new agent must actually be launched, and its runtime model/effort verified.
 
 ### Concurrency is a system budget
 
