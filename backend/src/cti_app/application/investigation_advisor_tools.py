@@ -88,7 +88,16 @@ MAX_ADVISOR_INPUT_BYTES = 4_000_000
 # Match the existing typed content-pattern measurement ceiling for binary values.
 MAX_ADVISOR_BINARY_MEASUREMENT_BYTES = 512
 MAX_ADVISOR_TOOL_SECONDS = 3_600
-MIN_ADVISOR_EXECUTION_SECONDS = 60
+# Keep and strengthen the prior admission floor by deriving it from the Bridge
+# phase envelope: maximum paced wait + connect + capabilities + the larger of
+# the archive timeout and the 35s advisor preparation/scheduling margin. This
+# covers the bounded phases inside the transport and preserves extra room for
+# local dossier and prompt preparation. Configured phase limits can only raise it.
+DEFAULT_ADVISOR_PACING_SECONDS = 20
+DEFAULT_ADVISOR_CONNECT_SECONDS = 3
+DEFAULT_ADVISOR_CAPABILITIES_SECONDS = 2
+DEFAULT_ADVISOR_ARCHIVE_SECONDS = 60
+MIN_ADVISOR_PREPARATION_MARGIN_SECONDS = 35
 _SECRET = re.compile(
     r"(?i)\b(api[_ -]?key|private[_ -]?key|access[_ -]?token|client[_ -]?secret|"
     r"authorization|credential|password|secret)\s*[:=]\s*[^\s,;]+"
@@ -163,6 +172,7 @@ class InvestigationAdvisorTool:
         *,
         _editorial_batch_child: bool = False,
         _execution_timeout_seconds: int | None = None,
+        _execution_deadline_monotonic: float | None = None,
         _bridge_turns_remaining: int | None = None,
     ) -> ToolResult:
         try:
@@ -204,6 +214,8 @@ class InvestigationAdvisorTool:
             return await self._input_failure(context, "advisor_arguments_invalid")
         evidence: tuple[EvidenceObservation, ...]
         try:
+            execution_clock = time.monotonic
+            started_at = execution_clock()
             if _execution_timeout_seconds is None:
                 execution_timeout_seconds, budget_refusal = _advisor_execution_timeout(
                     context, self._settings
@@ -212,6 +224,24 @@ class InvestigationAdvisorTool:
                     return self._finish(context, budget_refusal)
             else:
                 execution_timeout_seconds = _execution_timeout_seconds
+            minimum_execution_seconds = _advisor_minimum_execution_seconds(self._settings)
+            if minimum_execution_seconds is None:
+                return self._finish(
+                    context, _advisor_budget_refusal("bridge_phase_timeout_settings_invalid")
+                )
+            execution_deadline_monotonic = (
+                _execution_deadline_monotonic
+                if _execution_deadline_monotonic is not None
+                else started_at + execution_timeout_seconds
+            )
+            if (
+                execution_timeout_seconds < minimum_execution_seconds
+                or execution_deadline_monotonic - execution_clock() < minimum_execution_seconds
+            ):
+                return self._finish(
+                    context,
+                    _advisor_budget_refusal("execution_window_below_minimum_before_preparation"),
+                )
             bridge_turns_remaining = (
                 _bridge_turns_remaining
                 if _bridge_turns_remaining is not None
@@ -230,6 +260,7 @@ class InvestigationAdvisorTool:
                     editorial_units,
                     maximum_units=len(editorial_units),
                     execution_timeout_seconds=execution_timeout_seconds,
+                    execution_deadline_monotonic=execution_deadline_monotonic,
                     bridge_turns_remaining=bridge_turns_remaining,
                 )
             pacing_result = await self._check_advisor_limits(
@@ -381,6 +412,7 @@ class InvestigationAdvisorTool:
                         editorial_units,
                         maximum_units=max(1, len(editorial_units) // 2),
                         execution_timeout_seconds=execution_timeout_seconds,
+                        execution_deadline_monotonic=execution_deadline_monotonic,
                         bridge_turns_remaining=bridge_turns_remaining,
                     )
                 failure_reason = "input_exceeds_configured_limit"
@@ -652,9 +684,7 @@ class InvestigationAdvisorTool:
                 error_code="advisor_prompt_persistence_failed",
                 exception_class=type(exc).__name__,
             )
-        started_at = time.monotonic()
         submission_started_at = time.perf_counter()
-        execution_clock = time.monotonic
         submission = await submit_bridge_consultation_once(
             self._transport,
             investigation_id=context.investigation_id,
@@ -665,6 +695,8 @@ class InvestigationAdvisorTool:
             external_llm_allowed=True,
             settings=self._settings,
             timeout_seconds=execution_timeout_seconds,
+            deadline_monotonic=execution_deadline_monotonic,
+            minimum_timeout_seconds=minimum_execution_seconds,
             clock=execution_clock,
         )
         evidence_preflight = evaluate_advisor_evidence_preflight(
@@ -1093,12 +1125,15 @@ class InvestigationAdvisorTool:
         *,
         maximum_units: int,
         execution_timeout_seconds: int = MAX_ADVISOR_TOOL_SECONDS,
+        execution_deadline_monotonic: float | None = None,
         bridge_turns_remaining: int | None = None,
     ) -> ToolResult:
         units = list(units)
         chunks = [
             units[index : index + maximum_units] for index in range(0, len(units), maximum_units)
         ]
+        if execution_deadline_monotonic is None:
+            execution_deadline_monotonic = time.monotonic() + execution_timeout_seconds
         available_bridge_turns = (
             bridge_turns_remaining
             if bridge_turns_remaining is not None
@@ -1127,11 +1162,22 @@ class InvestigationAdvisorTool:
         results: list[ToolResult] = []
         unprocessed_units: list[str] = []
         consumed_execution_seconds = 0
+        minimum_execution_seconds = _advisor_minimum_execution_seconds(self._settings)
+        if minimum_execution_seconds is None:
+            return self._finish(
+                context, _advisor_budget_refusal("bridge_phase_timeout_settings_invalid")
+            )
         for index, chunk in enumerate(chunks, start=1):
-            remaining_execution_seconds = execution_timeout_seconds - consumed_execution_seconds
-            if remaining_execution_seconds < MIN_ADVISOR_EXECUTION_SECONDS:
+            deadline_remaining_seconds = math.floor(execution_deadline_monotonic - time.monotonic())
+            remaining_execution_seconds = min(
+                execution_timeout_seconds - consumed_execution_seconds,
+                deadline_remaining_seconds,
+            )
+            if remaining_execution_seconds < minimum_execution_seconds:
                 prior_batch_was_submitted = bool(results)
-                results.append(_advisor_budget_refusal("tool_seconds_remaining_below_minimum"))
+                results.append(
+                    _advisor_budget_refusal("execution_window_below_minimum_before_next_batch")
+                )
                 combined = _combine_editorial_batch_results(results)
                 # This is a mixed outcome: earlier batches already reached Bridge,
                 # while the next batch was refused locally. Preserve their usage
@@ -1152,7 +1198,7 @@ class InvestigationAdvisorTool:
                                 "partial" if prior_batch_was_submitted else "needs_review"
                             ),
                             "failure_stage": "budget_admission",
-                            "failure_reason": "tool_seconds_remaining_below_minimum",
+                            "failure_reason": "execution_window_below_minimum_before_next_batch",
                             "confirmed_non_execution": not prior_batch_was_submitted,
                             "unprocessed_unit_ids": [
                                 str(item.get("id"))
@@ -1181,6 +1227,7 @@ class InvestigationAdvisorTool:
                 child_context,
                 _editorial_batch_child=True,
                 _execution_timeout_seconds=remaining_execution_seconds,
+                _execution_deadline_monotonic=execution_deadline_monotonic,
                 # The outer plan allocates one reserved Bridge turn to each
                 # child. A child cannot recursively multiply that allowance.
                 _bridge_turns_remaining=1,
@@ -3963,6 +4010,41 @@ def _advisor_tool_seconds_limit(settings: Any) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 3_600
 
 
+def _advisor_minimum_execution_seconds(settings: Any) -> int | None:
+    """Return a conservative full-operation window from configured Bridge phases.
+
+    The deadline covers maximum pacing jitter, connection and capability
+    preflight, Bridge archival, and the documented local preparation margin.
+    Invalid phase settings fail closed instead of lowering the admission floor.
+    """
+    pacing = getattr(
+        settings, "openai_bridge_min_submission_interval_seconds", DEFAULT_ADVISOR_PACING_SECONDS
+    )
+    jitter = getattr(settings, "openai_bridge_submission_jitter_fraction", 0.3)
+    connect = getattr(
+        settings, "openai_bridge_connect_timeout_seconds", DEFAULT_ADVISOR_CONNECT_SECONDS
+    )
+    capabilities = getattr(
+        settings,
+        "openai_bridge_capabilities_timeout_seconds",
+        DEFAULT_ADVISOR_CAPABILITIES_SECONDS,
+    )
+    archive = getattr(
+        settings, "openai_bridge_archive_timeout_seconds", DEFAULT_ADVISOR_ARCHIVE_SECONDS
+    )
+    values = (pacing, jitter, connect, capabilities, archive)
+    if any(
+        isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value)
+        for value in values
+    ):
+        return None
+    if pacing < 0 or not 0 <= jitter <= 0.3 or min(connect, capabilities, archive) <= 0:
+        return None
+    maximum_paced_wait = pacing * (1 + jitter)
+    protected_phase = max(archive, MIN_ADVISOR_PREPARATION_MARGIN_SECONDS)
+    return math.ceil(maximum_paced_wait + connect + capabilities + protected_phase)
+
+
 def _advisor_execution_timeout(
     context: ToolExecutionContext,
     settings: Any,
@@ -3985,8 +4067,11 @@ def _advisor_execution_timeout(
         return 0, _advisor_budget_refusal(reason)
     if reservation.amounts.get(BudgetDimension.BRIDGE_TURNS, 0) < 1:
         return 0, _advisor_budget_refusal("bridge_turn_reservation_missing_or_insufficient")
+    minimum_execution_seconds = _advisor_minimum_execution_seconds(settings)
+    if minimum_execution_seconds is None:
+        return 0, _advisor_budget_refusal("bridge_phase_timeout_settings_invalid")
     reserved_seconds = reservation.amounts.get(BudgetDimension.TOOL_SECONDS, 0)
-    if reserved_seconds < MIN_ADVISOR_EXECUTION_SECONDS:
+    if reserved_seconds < minimum_execution_seconds:
         return 0, _advisor_budget_refusal("tool_seconds_reservation_below_minimum")
 
     role_timeout = getattr(settings, "openai_bridge_wait_timeout_research_seconds", 7_200.0)
@@ -3998,7 +4083,7 @@ def _advisor_execution_timeout(
     ):
         return 0, _advisor_budget_refusal("research_role_timeout_invalid")
     effective_timeout = math.floor(min(reserved_seconds, role_timeout))
-    if effective_timeout < MIN_ADVISOR_EXECUTION_SECONDS:
+    if effective_timeout < minimum_execution_seconds:
         return 0, _advisor_budget_refusal("effective_execution_timeout_below_minimum")
     return effective_timeout, None
 

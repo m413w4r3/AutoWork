@@ -88,9 +88,9 @@ class BridgeSubmissionPacer:
         async with self._lock:
             self._blocked_until = max(self._blocked_until, self._clock() + seconds)
 
-    async def wait_for_next_submission(self) -> None:
+    async def wait_for_next_submission(self, *, deadline_monotonic: float | None = None) -> bool:
         if self._minimum_interval_seconds == 0 and self._blocked_until <= self._clock():
-            return
+            return deadline_monotonic is None or self._clock() < deadline_monotonic
         async with self._lock:
             target = self._blocked_until
             if self._last_submission_at is not None:
@@ -102,11 +102,18 @@ class BridgeSubmissionPacer:
                 # jitter gives competing workers more room to spread request starts.
                 target = max(target, self._last_submission_at + jittered)
             while (remaining := target - self._clock()) > 0:
+                if deadline_monotonic is not None:
+                    deadline_remaining = deadline_monotonic - self._clock()
+                    if deadline_remaining <= 0 or remaining >= deadline_remaining:
+                        return False
                 if self._sleeper is None:
                     await asyncio.sleep(remaining)
                 else:
                     await self._sleeper(remaining)
+            if deadline_monotonic is not None and self._clock() >= deadline_monotonic:
+                return False
             self._last_submission_at = self._clock()
+            return True
 
 
 _SHARED_BRIDGE_PACERS: weakref.WeakKeyDictionary[
@@ -192,6 +199,8 @@ async def submit_bridge_consultation_once(
     external_llm_allowed: bool,
     settings: Settings | None = None,
     timeout_seconds: float | None = None,
+    deadline_monotonic: float | None = None,
+    minimum_timeout_seconds: float = 0,
     clock: Callable[[], float] | None = None,
 ) -> TurnSubmission:
     """Submit one non-decision consultation using Bridge's shared pacing and transport."""
@@ -218,22 +227,71 @@ async def submit_bridge_consultation_once(
         sleeper=None,
         rng=None,
     )
-    await pacer.wait_for_next_submission()
-    execution_started_at = (clock or time.monotonic)()
+    operation_clock = clock or time.monotonic
+    deadline = deadline_monotonic
+    transport_timeout: float | None = timeout_seconds
+    if timeout_seconds is not None and deadline is None:
+        deadline = operation_clock() + timeout_seconds
+    if deadline is not None:
+        pacing_remaining = deadline - operation_clock()
+        if pacing_remaining <= 0:
+            return _bridge_execution_budget_refusal(
+                key,
+                conversation_id,
+                "execution_deadline_exhausted_before_pacing",
+            )
+        pacing_scope = asyncio.timeout(pacing_remaining)
+        try:
+            async with pacing_scope:
+                pacing_allowed = await pacer.wait_for_next_submission(deadline_monotonic=deadline)
+        except TimeoutError:
+            return _bridge_execution_budget_refusal(
+                key,
+                conversation_id,
+                "pacing_exceeds_execution_deadline",
+            )
+        if not pacing_allowed:
+            return _bridge_execution_budget_refusal(
+                key,
+                conversation_id,
+                "pacing_exceeds_execution_deadline",
+            )
+        transport_timeout = deadline - operation_clock()
+        if transport_timeout < minimum_timeout_seconds:
+            return _bridge_execution_budget_refusal(
+                key,
+                conversation_id,
+                "execution_window_below_minimum_after_preparation_and_pacing",
+            )
+    else:
+        await pacer.wait_for_next_submission()
+        transport_timeout = timeout_seconds
+
     try:
-        submission = await transport.submit(
-            investigation_id=investigation_id,
-            subject_id=subject_id,
-            turn_index=turn_index,
-            context_sha256=context_sha256,
-            prompt=prompt,
-            external_llm_allowed=True,
-            timeout_seconds=timeout_seconds,
-        )
-        if (
-            timeout_seconds is not None
-            and (clock or time.monotonic)() - execution_started_at > timeout_seconds
-        ):
+        if deadline is None:
+            submission = await transport.submit(
+                investigation_id=investigation_id,
+                subject_id=subject_id,
+                turn_index=turn_index,
+                context_sha256=context_sha256,
+                prompt=prompt,
+                external_llm_allowed=True,
+                timeout_seconds=transport_timeout,
+            )
+        else:
+            assert transport_timeout is not None
+            transport_scope = asyncio.timeout(transport_timeout)
+            async with transport_scope:
+                submission = await transport.submit(
+                    investigation_id=investigation_id,
+                    subject_id=subject_id,
+                    turn_index=turn_index,
+                    context_sha256=context_sha256,
+                    prompt=prompt,
+                    external_llm_allowed=True,
+                    timeout_seconds=transport_timeout,
+                )
+        if deadline is not None and operation_clock() >= deadline:
             # A transport that returns after its advertised deadline is still
             # ambiguous. Never let its late text reach advisor parsing.
             return TurnSubmission(
@@ -297,6 +355,24 @@ async def submit_bridge_consultation_once(
             failure_stage=str(getattr(exc, "phase", "bridge_transport"))[:64],
             failure_reason=code,
         )
+
+
+def _bridge_execution_budget_refusal(
+    idempotency_key: str,
+    conversation_id: UUID,
+    reason: str,
+) -> TurnSubmission:
+    return TurnSubmission(
+        TurnSubmissionStatus.UNAVAILABLE,
+        idempotency_key=idempotency_key,
+        conversation_id=conversation_id,
+        detail="Bridge consultation refused before transport: bounded execution budget exhausted.",
+        error_code="bridge_execution_budget_exhausted",
+        retryable=False,
+        submission_state="pre_submission",
+        failure_stage="budget_admission",
+        failure_reason=reason,
+    )
 
 
 @dataclass(frozen=True, slots=True)

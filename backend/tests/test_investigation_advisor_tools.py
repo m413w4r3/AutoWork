@@ -3599,6 +3599,7 @@ async def test_editorial_batch_retains_cursor_and_stops_after_ambiguous_result()
         *,
         _editorial_batch_child=False,
         _execution_timeout_seconds=None,
+        _execution_deadline_monotonic=None,
         _bridge_turns_remaining=None,
     ):
         submitted.append((arguments, context))
@@ -3646,6 +3647,7 @@ async def test_editorial_batch_keeps_prior_consumption_when_remaining_budget_is_
         *,
         _editorial_batch_child=False,
         _execution_timeout_seconds=None,
+        _execution_deadline_monotonic=None,
         _bridge_turns_remaining=None,
     ):
         submitted.append((arguments, _execution_timeout_seconds))
@@ -3684,7 +3686,7 @@ async def test_editorial_batch_keeps_prior_consumption_when_remaining_budget_is_
     assert result.budget_consumed[BudgetDimension.TOOL_SECONDS] <= 3_600
     assert result.output["advisor_status"] == "partial"
     assert result.output["failure_stage"] == "budget_admission"
-    assert result.output["failure_reason"] == "tool_seconds_remaining_below_minimum"
+    assert result.output["failure_reason"] == "execution_window_below_minimum_before_next_batch"
     assert result.output["confirmed_non_execution"] is False
     assert result.output["unprocessed_unit_ids"] == ("U2",)
 
@@ -4387,21 +4389,17 @@ async def test_advisor_transport_failures_are_explicit_and_never_retried(
     assert len(transport.calls) == 1
 
 
-def test_advisor_does_not_parse_persisted_output_for_ambiguous_rate_limit() -> None:
-    observation_id = uuid4()
-    prompt_data = {
-        "units": [{"id": "U1", "block_type": "key_findings", "form": "body", "anchor": None}],
-        "assertions": [
-            {
-                "id": "assertion-1",
-                "unit_id": "U1",
-                "block_type": "key_findings",
-                "form": "body",
-                "anchor": None,
-                "refs": [{"kind": "observation", "id": str(observation_id), "sha256": "a" * 64}],
-            }
-        ],
-    }
+@pytest.mark.asyncio
+async def test_advisor_does_not_parse_persisted_output_for_ambiguous_rate_limit() -> None:
+    investigation_id = uuid4()
+    observation, raw_evidence = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": "a" * 64,
+            "strings": [{"value": "MeasuredSampleMarker", "offset": 128}],
+        },
+    )
     raw = """advisor-wire.v1
 TYPE: draft_text
 STATUS: succeeded
@@ -4417,21 +4415,19 @@ LIMITATION: none
         submission_state="external_state_unknown",
     )
 
+    transport = Transport(submission)
     tool, _ = make_tool(
-        investigation_id=uuid4(),
-        transport=Transport(submission),
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw_evidence,
     )
-    result = tool._submission_result(
-        submission,
-        "prompt",
-        (observation_id,),
-        (),
-        len(raw.encode("utf-8")),
-        "draft_text",
-        1,
-        {},
-        {},
-        prompt_data=prompt_data,
+    result = await tool.execute(
+        {
+            "consultation_type": "pivot_strategy",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id),
     )
 
     assert result.status is ToolInvocationStatus.NEEDS_REVIEW
@@ -4439,6 +4435,7 @@ LIMITATION: none
     assert "blocks" not in result.output
     assert result.output["bridge_turns_consumed"] == 1
     assert result.budget_consumed[BudgetDimension.BRIDGE_TURNS] == 1
+    assert len(transport.calls) == 1
 
 
 def test_yara_v3_preserves_complete_rule_over_summary_limit_and_checks_measurement_refs() -> None:
