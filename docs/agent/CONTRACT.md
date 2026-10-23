@@ -1,3 +1,9 @@
+# ARCHIVE — Historical M2/M3 instructions (NON-NORMATIVE)
+
+> Historical only. The M2/M3 statement allowing edits to `0001_baseline` is **superseded** by `backend/AGENTS.md` and ADR-0007; it must never be applied to current changes. Other M2/M3 restrictions apply only to the historical bounded lots for which they were written. See [documentation authority index](../README.md). No live/database changes are authorized by this file.
+
+---
+
 # Analyst investigation contract
 
 - An investigation is unique for a production run and is anchored to that run's verified SYNTHESIS artifact for the same subject.

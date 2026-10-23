@@ -1,3 +1,9 @@
+# ARCHIVE — Initial supervised-run procedure (NON-NORMATIVE)
+
+> This document records an earlier **first-run** scenario. Its one-time `make up-clean` reset instruction is **not authorized** for an existing/live run and must not be executed during the Paseo V2 documentation cleanup or subsequent development. Use the current state, G2/G3 gates and [documentation index](../README.md); any destructive operation requires an independent human authorization and verified target.
+
+---
+
 # Runbook — premier run CTI supervisé
 
 ## État de départ

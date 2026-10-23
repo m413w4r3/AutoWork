@@ -1,5 +1,7 @@
 # CTI Bulletin
 
+> Agent and operator documentation authority: [docs/README.md](docs/README.md). Dated runbooks and design plans do not supersede accepted ADRs, migration contracts or current code.
+
 Application interne de production de bulletins CTI mensuels. Elle fournit l'environnement
 local, la persistance canonique (PostgreSQL, MinIO), les jobs asynchrones observables et le
 workflow éditorial complet, avec une décision humaine à chaque frontière métier :
@@ -125,7 +127,9 @@ applicative et est supprimé même en cas d'échec lorsque la commande l'a déma
 modification volontaire de l'état local des migrations, `make up-clean` recrée
 les volumes applicatifs ; cette commande est destructive.
 
-## Développement automatisé avec MetaHarness
+## Historique — développement automatisé avec MetaHarness
+
+Cette section décrit le fonctionnement historique de MetaHarness et n'est pas une configuration de Paseo. Pour l'orchestration actuelle, voir [docs/operations/paseo-agent-orchestration.md](docs/operations/paseo-agent-orchestration.md).
 
 AutoWork peut être utilisé comme dépôt cible de MetaHarness.
 

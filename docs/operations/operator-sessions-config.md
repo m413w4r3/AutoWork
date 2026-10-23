@@ -1,3 +1,9 @@
+# ARCHIVE — Nimbalyst operator session configuration (NON-NORMATIVE)
+
+> This is a retained historical Nimbalyst-specific reference. `spawn_session(model=..., effortLevel=...)` and its default model/effort are **not** Paseo configuration. For current coding orchestration see [Paseo agent orchestration](paseo-agent-orchestration.md) and the host's effective profiles. Do not copy these settings into AutoWork API payloads.
+
+---
+
 # Modèles opérateur et sous-sessions Nimbalyst
 
 ## Propriété des réglages
