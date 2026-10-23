@@ -23,6 +23,7 @@ from cti_app.application.operator_tool_invocation import (
 )
 from cti_app.application.research_context_builder import CanonicalEvidenceSummaryPort
 from cti_app.config import Settings
+from cti_app.domain.analyst_opinion import investigation_opinion_id
 from cti_app.domain.editorial import AnalystDecisionType
 from cti_app.domain.investigation import (
     BudgetDimension,
@@ -552,6 +553,154 @@ async def test_advisor_semantic_normalization_blocks_equivalent_new_key(
     assert adapter.calls == []
     assert fixture.bridge_transport.submission_count == 0
     assert (await fixture.states.get(fixture.investigation_id)).version == state.version
+
+
+class _NeverDispatchedAdapter:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    async def execute(self, arguments, _context):
+        self.calls.append(dict(arguments))
+        return ToolResult(ToolInvocationStatus.SUCCEEDED)
+
+
+def _register_dummy_advisor(fixture, service) -> _NeverDispatchedAdapter:
+    adapter = _NeverDispatchedAdapter()
+    fixture.registry.register(
+        ToolDefinition(
+            name="advisor.consult",
+            schema_version="advisor-consult.v1",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "consultation_type": {"type": "string"},
+                    "question": {"type": "string"},
+                    "finding_refs": {"type": "array"},
+                    "opinion_id": {"type": "string"},
+                    "opinion_version": {"type": "integer"},
+                    "form": {"type": "string"},
+                },
+                "required": ["consultation_type"],
+                "additionalProperties": True,
+            },
+            effect=ToolEffect.EXTERNAL_READ,
+            cost_model={BudgetDimension.TOOL_SECONDS: 1},
+            confidentiality=ToolConfidentiality.INTERNAL,
+            limitations=("Offline semantic-identity oracle",),
+            capability_key="vt.advisor",
+        ),
+        adapter,
+    )
+    fixture.service._available_capabilities |= {"bridge.advisor", "vt.advisor"}
+    service._available_capabilities |= {"bridge.advisor", "vt.advisor"}
+    return adapter
+
+
+async def _store_ambiguous_invocation(
+    fixture, *, tool_name: str, schema_version: str, arguments
+) -> None:
+    ambiguous = (
+        ToolInvocation(
+            investigation_id=fixture.investigation_id,
+            operation_key=f"operator:{tool_name}-old-key:old-payload",
+            tool_name=tool_name,
+            schema_version=schema_version,
+            normalized_parameters=arguments,
+            purpose="earlier ambiguous request",
+            reserved_budget={BudgetDimension.TOOL_SECONDS: 1},
+            created_at=_FIXED_TIME,
+            updated_at=_FIXED_TIME,
+        )
+        .transition(ToolInvocationStatus.RUNNING, now=_FIXED_TIME)
+        .transition(ToolInvocationStatus.NEEDS_REVIEW, now=_FIXED_TIME)
+    )
+    await fixture.invocations.add_if_absent(ambiguous)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "schema_version", "old_arguments", "new_arguments", "needs_advisor"),
+    [
+        (
+            "vt.file_report",
+            "1",
+            {"file_hash": "A" * 64},
+            {"file_hash": "a" * 64},
+            False,
+        ),
+        (
+            "advisor.consult",
+            "advisor-consult.v1",
+            {
+                "consultation_type": "figure_plan",
+                "finding_refs": ["ABCDEF01-2345-4678-9ABC-DEF012345678"],
+            },
+            {
+                "consultation_type": "figure_plan",
+                "finding_refs": ["abcdef01-2345-4678-9abc-def012345678"],
+            },
+            True,
+        ),
+    ],
+)
+async def test_effect_equivalent_representations_block_a_fresh_key(
+    tool_name, schema_version, old_arguments, new_arguments, needs_advisor
+) -> None:
+    fixture, state, service = await _external_fixture()
+    adapter = _register_dummy_advisor(fixture, service) if needs_advisor else None
+    await _store_ambiguous_invocation(
+        fixture,
+        tool_name=tool_name,
+        schema_version=schema_version,
+        arguments=old_arguments,
+    )
+
+    with pytest.raises(OperatorToolInvocationError) as error:
+        await service.invoke(
+            tool_name=tool_name,
+            schema_version=schema_version,
+            arguments=new_arguments,
+            purpose="retry the same effect under a fresh key",
+            expected_version=state.version,
+            idempotency_key="effect-equivalent-fresh-key",
+        )
+
+    assert error.value.code == "ambiguous_tool_invocation_requires_reconciliation"
+    if adapter is not None:
+        assert adapter.calls == []
+    assert fixture.bridge_transport.submission_count == 0
+
+
+@pytest.mark.asyncio
+async def test_review_text_omitted_defaults_match_explicit_equivalent_new_key() -> None:
+    fixture, state, service = await _external_fixture()
+    adapter = _register_dummy_advisor(fixture, service)
+    await _store_ambiguous_invocation(
+        fixture,
+        tool_name="advisor.consult",
+        schema_version="advisor-consult.v1",
+        arguments={"consultation_type": "review_text"},
+    )
+    default_opinion_id = str(investigation_opinion_id(fixture.investigation_id))
+
+    with pytest.raises(OperatorToolInvocationError) as error:
+        await service.invoke(
+            tool_name="advisor.consult",
+            schema_version="advisor-consult.v1",
+            arguments={
+                "consultation_type": "review_text",
+                "opinion_id": default_opinion_id,
+                "opinion_version": 3,
+                "form": "body",
+            },
+            purpose="retry review_text with explicit default values",
+            expected_version=state.version,
+            idempotency_key="review-text-explicit-defaults-key",
+        )
+
+    assert error.value.code == "ambiguous_tool_invocation_requires_reconciliation"
+    assert adapter.calls == []
+    assert fixture.bridge_transport.submission_count == 0
 
 
 @pytest.mark.asyncio
