@@ -96,10 +96,15 @@ Luna déjà livrés restent inchangés.
 | Session | TASK_ID | Worktree | Objet |
 |---|---|---|---|
 | `98446181` | M01-REG-FIX | `fix/mission01-regressions` (`wks_cbcdaa104d853d74`) | WIP 849cfa0 + 5 régressions + suite backend |
-| `d19feb46` | M01-B0A-REVIEW-R4 | `audit-mission01-b0a-review` | verdict final `df1bd8f` |
-| `f0710b24` | M01-A1-REVIEW-R5 | `audit-mission01-a1-review` | verdict final `4a71f45` |
+| `75a283e7` | M01-B0A-R4 | `feat/mission01-b0-bridge-chain` | data URL base64 >512 + allocation avant check |
+| `03cab396` | M01-A1-R5 | `feat/mission01-a1-strategy-projection` | UUID/SHA canoniques non liés à l'expérience |
 | `d5cdbcc8` | M01-B1A1-REVIEW-R3 | `audit-mission01-b1a1-review` | verdict final `2f88a42` |
 | `24a6d5ba` | M01-B1A2-REVIEW-R2 | `audit-mission01-b1a2-review` | verdict final `01346e2`/`5484375` |
+
+Verdicts déjà reçus : **A1-REVIEW-R5 FAIL** (`426e7a9`, deux
+contournements UUID/SHA non liés, en correction) ; **B0A-REVIEW-R4 FAIL**
+(`ca78ded`, data URL base64, en correction). Ces correctifs ne sont pas
+encore revus : ne pas les compter comme PASS.
 
 Aucun push/live. Les verdicts ne seront intégrés qu'après examen du compte
 rendu ; `PASS` seulement si tests verts et revue effective.
