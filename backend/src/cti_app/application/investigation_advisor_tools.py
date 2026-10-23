@@ -2843,27 +2843,6 @@ class InvestigationAdvisorTool:
                     "bridge_turns_consumed": bridge_turns_consumed,
                 },
             )
-        if submission.status is not TurnSubmissionStatus.SUCCEEDED:
-            return ToolResult(
-                ToolInvocationStatus.FAILED
-                if submission.status is TurnSubmissionStatus.INVALID_OUTPUT
-                else ToolInvocationStatus.UNAVAILABLE,
-                observation_refs=evidence_refs,
-                budget_consumed=usage,
-                error_code="advisor_output_invalid"
-                if submission.status is TurnSubmissionStatus.INVALID_OUTPUT
-                else "advisor_unavailable",
-                output={
-                    "advisor_status": "output_invalid"
-                    if submission.status is TurnSubmissionStatus.INVALID_OUTPUT
-                    else "unavailable",
-                    "retry": False,
-                    "failure_stage": failure_stage,
-                    "failure_reason": failure_reason,
-                    "confirmed_non_execution": submission.submission_state == "pre_submission",
-                    "bridge_turns_consumed": bridge_turns_consumed,
-                },
-            )
         if submission.output_text is None and (
             submission.submission_state != "pre_submission"
             and (
@@ -2901,6 +2880,27 @@ class InvestigationAdvisorTool:
                     "retry_after_seconds": None,
                     "failure_stage": failure_stage,
                     "failure_reason": failure_reason,
+                    "bridge_turns_consumed": bridge_turns_consumed,
+                },
+            )
+        if submission.status is not TurnSubmissionStatus.SUCCEEDED:
+            return ToolResult(
+                ToolInvocationStatus.FAILED
+                if submission.status is TurnSubmissionStatus.INVALID_OUTPUT
+                else ToolInvocationStatus.UNAVAILABLE,
+                observation_refs=evidence_refs,
+                budget_consumed=usage,
+                error_code="advisor_output_invalid"
+                if submission.status is TurnSubmissionStatus.INVALID_OUTPUT
+                else "advisor_unavailable",
+                output={
+                    "advisor_status": "output_invalid"
+                    if submission.status is TurnSubmissionStatus.INVALID_OUTPUT
+                    else "unavailable",
+                    "retry": False,
+                    "failure_stage": failure_stage,
+                    "failure_reason": failure_reason,
+                    "confirmed_non_execution": submission.submission_state == "pre_submission",
                     "bridge_turns_consumed": bridge_turns_consumed,
                 },
             )
