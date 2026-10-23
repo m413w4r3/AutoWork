@@ -7,6 +7,8 @@ must never be appended to the Bridge prompt.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import re
@@ -25,8 +27,9 @@ _CLAIM_ID = re.compile(r"\b(?:S\d+P\d+(?:\.\d+)?|L\d+(?:\.\d+)?|T\d+)\b", re.I)
 _UUID = re.compile(r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")
 _INTERNAL_SHA = re.compile(r"(?i)\b(?:sha(?:-?256)?\s*[:=]\s*)?[0-9a-f]{64}\b")
 _HEXDUMP_LINE = re.compile(r"(?im)^\s*(?:0x)?[0-9a-f]{4,16}:\s+(?:[0-9a-f]{2,8}\s+){4,}")
-# Per-field aggregate cap for generic content excerpts; not a dossier-size limit.
-MAX_GENERIC_CONTENT_EXCERPT_BYTES = 16_384
+# Aggregate rendered observation-excerpt cap; dossier size remains uncapped.
+MAX_OBSERVATION_EXCERPT_BYTES = 16_384
+MAX_GENERIC_BINARY_CONTENT_BYTES = 512
 _STOP = frozenset(
     "avec dans pour sans cette celui celle sont être avoir mais comme dans sur sous une des les "
     "aux par que qui quoi dont alors leur leurs elles ils cela ceci nous vous elle lui son sa "
@@ -40,6 +43,28 @@ class ContentExcerptLimitExceeded(ValueError):
     def __init__(self, reason_code: str) -> None:
         self.reason_code = reason_code
         super().__init__(reason_code)
+
+
+def _reject_oversized_base64_content(value: str, *, encoding: object = None) -> None:
+    declared_base64 = isinstance(encoding, str) and encoding.casefold() in {
+        "base64",
+        "base64url",
+        "base64_url",
+    }
+    candidate = re.sub(r"\s+", "", value)
+    if not candidate or re.fullmatch(r"[A-Za-z0-9+/=_-]+", candidate) is None:
+        if declared_base64:
+            raise ContentExcerptLimitExceeded("declared_base64_content_is_invalid")
+        return
+    padded = candidate + ("=" * (-len(candidate) % 4))
+    try:
+        decoded = base64.b64decode(padded, altchars=b"-_", validate=True)
+    except (ValueError, binascii.Error):
+        if declared_base64:
+            raise ContentExcerptLimitExceeded("declared_base64_content_is_invalid") from None
+        return
+    if len(decoded) > MAX_GENERIC_BINARY_CONTENT_BYTES:
+        raise ContentExcerptLimitExceeded("base64_content_exceeds_512_byte_decoded_limit")
 
 
 _DEFAULT_TASKS = {
@@ -119,7 +144,7 @@ def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]
     """Extract complete methods, decoded values, and sentence-bounded text."""
     excerpts: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
-    content_field_bytes: dict[tuple[str, ...], int] = {}
+    total_excerpt_bytes = 0
     assembly_name = next(
         (
             value.strip()
@@ -131,14 +156,14 @@ def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]
         "",
     )
 
-    def add(kind: str, title: str, value: object) -> None:
+    def add(kind: str, title: str, value: object, *, encoding: object = None) -> None:
+        nonlocal total_excerpt_bytes
         if not isinstance(value, str) or not value.strip():
             return
+        _reject_oversized_base64_content(value, encoding=encoding)
         text = value.replace("\r\n", "\n").replace("\r", "\n").strip()
         if _HEXDUMP_LINE.search(text):
             raise ContentExcerptLimitExceeded("raw_hexdump_content_rejected")
-        if len(text.encode("utf-8")) > MAX_GENERIC_CONTENT_EXCERPT_BYTES:
-            raise ContentExcerptLimitExceeded("generic_content_excerpt_exceeds_16384_byte_limit")
         prefix = (
             f"{assembly_name} — "
             if assembly_name and assembly_name.casefold() not in title.casefold()
@@ -159,11 +184,15 @@ def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]
             identity = (kind, chunk)
             if identity in seen:
                 continue
-            seen.add(identity)
             suffix = f" {index}" if len(chunks) > 1 else ""
-            excerpts.append(
-                {"kind": kind, "title": f"{prefix}{title.strip()}{suffix}", "text": chunk}
-            )
+            rendered_title = f"{prefix}{title.strip()}{suffix}"
+            excerpt_piece = f"{rendered_title}:\n{_quote(chunk)}"
+            chunk_bytes = len(excerpt_piece.encode("utf-8"))
+            if total_excerpt_bytes + chunk_bytes > MAX_OBSERVATION_EXCERPT_BYTES:
+                raise ContentExcerptLimitExceeded("content_excerpt_budget_exceeds_16384_bytes")
+            total_excerpt_bytes += chunk_bytes
+            seen.add(identity)
+            excerpts.append({"kind": kind, "title": rendered_title, "text": chunk})
 
     def display_name(row: Mapping[str, Any], fallback: str) -> str:
         for key in ("name", "method", "function", "symbol", "member", "key"):
@@ -172,23 +201,11 @@ def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]
                 return value.strip()
         return fallback
 
-    def add_content(field_path: tuple[str, ...], kind: str, title: str, value: str) -> None:
-        normalized = value.replace("\r\n", "\n").replace("\r", "\n").strip()
-        total_bytes = content_field_bytes.get(field_path, 0) + len(normalized.encode("utf-8"))
-        if total_bytes > MAX_GENERIC_CONTENT_EXCERPT_BYTES:
-            raise ContentExcerptLimitExceeded("generic_content_excerpt_exceeds_16384_byte_limit")
-        content_field_bytes[field_path] = total_bytes
-        add(kind, title, value)
-
-    def walk(
-        value: Any,
-        path: tuple[str, ...] = (),
-        content_field: tuple[str, ...] | None = None,
-    ) -> None:
+    def walk(value: Any, path: tuple[str, ...] = ()) -> None:
         if any(
             token in part.casefold().replace("_", " ")
             for part in path
-            for token in ("hex", "byte", "hexdump")
+            for token in ("hex", "byte", "hexdump", "base64")
         ):
             return
         if isinstance(value, Mapping):
@@ -235,25 +252,22 @@ def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]
                         # A nested textual rendering of bytes is raw material too.
                         continue
                     elif any(token in content_path for token in ("string", "decoded", "config")):
-                        add_content(
-                            content_field or (*path, key),
+                        add(
                             "decoded",
                             f"Valeur décodée — {name}",
                             child,
+                            encoding=value.get("encoding"),
                         )
                     else:
-                        add_content(
-                            content_field or (*path, key),
+                        add(
                             "text",
                             f"Texte observé — {name}",
                             child,
+                            encoding=value.get("encoding"),
                         )
                     continue
                 if isinstance(child, (Mapping, list, tuple)):
-                    nested_content_field = content_field
-                    if key in _CONTENT_KEYS and nested_content_field is None:
-                        nested_content_field = (*path, key)
-                    walk(child, (*path, key), nested_content_field)
+                    walk(child, (*path, key))
             return
         if isinstance(value, (list, tuple)):
             for index, child in enumerate(value, start=1):
@@ -263,25 +277,15 @@ def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]
                         if path and any("string" in item or "decoded" in item for item in path)
                         else "text"
                     )
-                    if content_field is not None:
-                        add_content(
-                            content_field,
-                            kind,
-                            f"Valeur décodée {index}"
-                            if kind == "decoded"
-                            else f"Texte observé {index}",
-                            child,
-                        )
-                    else:
-                        add(
-                            kind,
-                            f"Valeur décodée {index}"
-                            if kind == "decoded"
-                            else f"Texte observé {index}",
-                            child,
-                        )
+                    add(
+                        kind,
+                        f"Valeur décodée {index}"
+                        if kind == "decoded"
+                        else f"Texte observé {index}",
+                        child,
+                    )
                 else:
-                    walk(child, (*path, str(index)), content_field)
+                    walk(child, (*path, str(index)))
             return
         if isinstance(value, str) and path:
             key = path[-1].casefold()
@@ -880,6 +884,14 @@ def build_advisor_dossier(prompt_data: Mapping[str, Any]) -> AdvisorDossier:
                 selected.append(dict(best))
         elif kind == "observation":
             unavailable_observations.add(identifier)
+
+    retained_excerpt_bytes = sum(
+        len(f"[E] {item['label']}\n{_quote(item['body'])}".encode())
+        for item in selected
+        if item["kind"] == "observation"
+    )
+    if retained_excerpt_bytes > MAX_OBSERVATION_EXCERPT_BYTES:
+        raise ContentExcerptLimitExceeded("dossier_content_excerpt_budget_exceeds_16384_bytes")
 
     # Keep a stable alias for each displayed fact. The mapping stays local and
     # carries only the data needed by output validation and provenance.
