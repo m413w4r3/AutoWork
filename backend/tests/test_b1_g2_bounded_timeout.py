@@ -25,6 +25,7 @@ from cti_app.domain.investigation import (
     BudgetDimension,
     BudgetReservationStatus,
     DisclosureBounds,
+    FrameworkPreSubmissionProof,
     InvestigationBudget,
     InvestigationEnvelope,
     TLPLevel,
@@ -446,8 +447,11 @@ async def test_remaining_capacity_below_minimum_is_refused_before_reservation_or
     )
 
     assert result.status is ToolInvocationStatus.NEEDS_REVIEW
-    assert result.output["pre_submission_reason"] == "budget_exceeded"
+    assert result.framework_pre_submission_proof is FrameworkPreSubmissionProof.BUDGET_REJECTED
+    assert "pre_submission_reason" not in result.output
+    assert result.output["request_permission"] is True
     assert "tool_seconds" in result.message
+    assert budget.consumed[BudgetDimension.TOOL_SECONDS] == 3_600
     assert len(transport.calls) == 0
     assert all(
         reservation.operation_key != context.idempotency_key for reservation in budget.reservations
