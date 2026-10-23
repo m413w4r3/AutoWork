@@ -62,6 +62,14 @@ class ConsolidatedClaimStatus(StrEnum):
     INCONCLUSIVE = "inconclusive"
 
 
+class AnalysisMatrixStatus(StrEnum):
+    """Read-only analysis status; this enum is not persisted."""
+
+    SUPPORTED = "supported"
+    REFUTED = "refuted"
+    UNKNOWN = "UNKNOWN"
+
+
 class ExperimentReferenceErrorCode(StrEnum):
     UNKNOWN_HYPOTHESIS = "experiment_hypothesis_unknown"
     UNKNOWN_CLAIM = "experiment_claim_unknown"
@@ -515,12 +523,91 @@ def consolidate_claim_experiments(
     return tuple(result)
 
 
+def project_experiment_matrix_status(
+    experiment: InvestigationExperimentV1,
+    *,
+    persisted_observations: Mapping[UUID, Any] | None = None,
+) -> AnalysisMatrixStatus:
+    """Project one persisted experiment conservatively into the analysis matrix.
+
+    A record's verdict is an operator assertion. This projection only accepts it
+    when the cited observation is still present with the recorded digest, the
+    measurement is complete, and the outcome is structurally compatible with
+    the verdict. In particular, only complete persisted non-observation can
+    project to ``REFUTED``.
+    """
+    if experiment.availability is not ExperimentAvailability.AVAILABLE:
+        return AnalysisMatrixStatus.UNKNOWN
+    if experiment.observation_coverage is not ObservationCoverage.COMPLETE:
+        return AnalysisMatrixStatus.UNKNOWN
+    if not experiment.observation_refs or persisted_observations is None:
+        return AnalysisMatrixStatus.UNKNOWN
+
+    for reference in experiment.observation_refs:
+        observation = persisted_observations.get(reference.observation_id)
+        if observation is None:
+            return AnalysisMatrixStatus.UNKNOWN
+        observation_id: Any = reference.observation_id
+        observation_sha256: Any = (
+            observation if isinstance(observation, str) else getattr(observation, "sha256", None)
+        )
+        if not isinstance(observation, str):
+            observation_id = getattr(observation, "id", None)
+        if observation_id != reference.observation_id or observation_sha256 != reference.sha256:
+            return AnalysisMatrixStatus.UNKNOWN
+
+    if (
+        experiment.verdict is ExperimentVerdict.SUPPORTS
+        and experiment.actual_outcome is ObservationOutcome.OBSERVED
+    ):
+        return AnalysisMatrixStatus.SUPPORTED
+    if (
+        experiment.verdict is ExperimentVerdict.REFUTES
+        and experiment.actual_outcome is ObservationOutcome.NOT_OBSERVED
+        and experiment.falsification_criterion.strip()
+        and experiment.falsification_criterion.strip().casefold()
+        not in {"none", "unknown", "n/a", "not applicable"}
+    ):
+        return AnalysisMatrixStatus.REFUTED
+    return AnalysisMatrixStatus.UNKNOWN
+
+
+def project_claim_matrix_status(
+    experiments: tuple[InvestigationExperimentV1, ...],
+    claim_id: str,
+    *,
+    persisted_observations: Mapping[UUID, Any] | None = None,
+) -> AnalysisMatrixStatus:
+    """Project active experiments for one claim; contradictions remain unknown."""
+    ordered = tuple(sorted(experiments, key=lambda item: (item.version, str(item.id))))
+    superseded = {
+        superseded_id
+        for experiment in ordered
+        for superseded_id in experiment.supersedes_experiment_ids
+    }
+    active = tuple(
+        experiment
+        for experiment in ordered
+        if claim_id in experiment.claim_ids and experiment.id not in superseded
+    )
+    if not active:
+        return AnalysisMatrixStatus.UNKNOWN
+    statuses = {
+        project_experiment_matrix_status(experiment, persisted_observations=persisted_observations)
+        for experiment in active
+    }
+    if AnalysisMatrixStatus.UNKNOWN in statuses or len(statuses) != 1:
+        return AnalysisMatrixStatus.UNKNOWN
+    return next(iter(statuses))
+
+
 __all__ = [
     "EXPERIMENT_SCHEMA_VERSION",
     "EXPERIMENT_TIMELINE_SCHEMA_VERSION",
     "EXPERIMENT_TOOL_SCHEMA_VERSION",
     "HYPOTHESIS_DECLARE_TOOL_SCHEMA_VERSION",
     "HYPOTHESIS_ID_PATTERN",
+    "AnalysisMatrixStatus",
     "ClaimExperimentScopeV1",
     "ConsolidatedClaimStatus",
     "ConsolidatedClaimVerdictV1",
@@ -534,4 +621,6 @@ __all__ = [
     "ObservationCoverage",
     "ObservationOutcome",
     "consolidate_claim_experiments",
+    "project_claim_matrix_status",
+    "project_experiment_matrix_status",
 ]

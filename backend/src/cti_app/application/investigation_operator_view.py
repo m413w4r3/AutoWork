@@ -55,6 +55,92 @@ class InvestigationOperatorView:
     payload: dict[str, Any]
 
 
+def build_investigation_operator_strategy_checkpoint(
+    strategy: dict[str, Any],
+    *,
+    state: InvestigationWorkingState | None,
+    g2_blocked: bool = False,
+    unavailable_tools: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Add an operator checkpoint using only persisted strategy and control facts."""
+    claim_rows = tuple(item for item in strategy.get("claims", ()) if isinstance(item, dict))
+    statuses = {str(item.get("status", "UNKNOWN")) for item in claim_rows}
+    strategy_status = (
+        next(iter(statuses)) if len(statuses) == 1 and "UNKNOWN" not in statuses else "UNKNOWN"
+    )
+    experiment_rows: dict[str, dict[str, Any]] = {}
+    for claim in claim_rows:
+        for experiment in claim.get("attempted_experiments", ()):
+            if isinstance(experiment, dict) and isinstance(experiment.get("id"), str):
+                experiment_rows[experiment["id"]] = experiment
+
+    if not experiment_rows or all(
+        item.get("coverage") == "none" for item in experiment_rows.values()
+    ):
+        coverage = "none"
+    elif all(item.get("coverage") == "complete" for item in experiment_rows.values()):
+        coverage = "complete"
+    else:
+        coverage = "limited"
+
+    reasons: list[str] = []
+    if state is not None and state.stop_reason is StopReason.BUDGET_EXHAUSTED:
+        reasons.append("budget")
+    if g2_blocked:
+        reasons.append("refus_g2")
+    unavailable = {item.split(":", 1)[0] for item in unavailable_tools}
+    if any(
+        item.get("availability") == "unavailable" or item.get("tool_name") in unavailable
+        for item in experiment_rows.values()
+    ):
+        reasons.append("indisponible")
+
+    seen_attempts: set[bytes] = set()
+    repeated = False
+    for item in sorted(
+        experiment_rows.values(), key=lambda row: (row.get("version", 0), row["id"])
+    ):
+        attempt_key = canonical_json_bytes(
+            {
+                "hypothesis_id": item.get("hypothesis_id"),
+                "tool_name": item.get("tool_name"),
+                "attempt_identity_sha256": item.get("attempt_identity_sha256"),
+            }
+        )
+        repeated = repeated or attempt_key in seen_attempts
+        seen_attempts.add(attempt_key)
+    if repeated:
+        reasons.append("deja_testee")
+    if not reasons:
+        reasons.append("inconnue")
+
+    known_blockers = set(reasons) - {"inconnue"}
+    next_action = {
+        "code": (
+            "resolve_blocker"
+            if known_blockers
+            else "review_existing_experiments"
+            if experiment_rows
+            else "select_discriminating_experiment"
+        ),
+        "status": "blocked"
+        if known_blockers
+        else "ready"
+        if strategy_status != "UNKNOWN"
+        else "unknown",
+        "reason": reasons[0],
+    }
+    return {
+        "checkpoint": {
+            "status": strategy_status,
+            "coverage": coverage,
+            "attempted_experiment_ids": sorted(experiment_rows),
+            "blocking_reasons": reasons,
+        },
+        "next_action": next_action,
+    }
+
+
 def build_investigation_operator_view(
     *,
     investigation: AnalystInvestigation,

@@ -147,8 +147,15 @@ class ArticleSnapshot:
     confirmed_iocs: tuple[ConfirmedIOCContextV1, ...] = ()
     confirmed_iocs_truncated: bool = False
     article_passages: tuple[ArticlePassageSnapshot, ...] = ()
+    synthesis_version: int | None = None
 
     def __post_init__(self) -> None:
+        if self.synthesis_version is not None and (
+            isinstance(self.synthesis_version, bool)
+            or not isinstance(self.synthesis_version, int)
+            or self.synthesis_version <= 0
+        ):
+            raise ValueError("Article snapshot synthesis version must be positive")
         if (self.base_publication_artifact_id is None) != (self.base_publication_sha256 is None):
             raise ValueError("Base publication identity and SHA-256 must be supplied together")
         for value in (self.synthesis_sha256, self.base_publication_sha256):

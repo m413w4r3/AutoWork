@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -26,12 +27,17 @@ from cti_app.application.investigation_tools import (
     ToolResult,
 )
 from cti_app.application.research_context_builder import ArticleSnapshotPort
-from cti_app.domain.investigation import InvestigationExecutionMode, ToolInvocationStatus
+from cti_app.domain.investigation import (
+    InvestigationExecutionMode,
+    ToolInvocationStatus,
+    canonical_json_bytes,
+)
 from cti_app.domain.investigation_experiment import (
     EXPERIMENT_TIMELINE_SCHEMA_VERSION,
     EXPERIMENT_TOOL_SCHEMA_VERSION,
     HYPOTHESIS_DECLARE_TOOL_SCHEMA_VERSION,
     HYPOTHESIS_ID_PATTERN,
+    AnalysisMatrixStatus,
     ExperimentAvailability,
     ExperimentInputRefV1,
     ExperimentInvocationRefV1,
@@ -43,14 +49,18 @@ from cti_app.domain.investigation_experiment import (
     ObservationCoverage,
     ObservationOutcome,
     consolidate_claim_experiments,
+    project_claim_matrix_status,
+    project_experiment_matrix_status,
 )
 
 _EXPERIMENT_NAMESPACE = UUID("f8f1e82e-9025-42c7-a864-ea8fdbe54f3e")
+STRATEGY_PROJECTION_SCHEMA_VERSION = "investigation-strategy-projection.v1"
 _UUID_SCHEMA = {
     "type": "string",
     "pattern": r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
 }
 _SHA256_SCHEMA = {"type": "string", "pattern": r"^[0-9a-f]{64}$"}
+_SAFE_SOURCE_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 EXPERIMENT_RECORD_TOOL = "experiment.record"
 EXPERIMENT_LIST_TOOL = "experiment.list"
 HYPOTHESIS_DECLARE_TOOL = "hypothesis.declare"
@@ -150,13 +160,198 @@ class InvestigationExperimentTimelineV1:
 async def build_investigation_experiment_timeline(
     repository: InvestigationExperimentRepository, investigation_id: UUID
 ) -> InvestigationExperimentTimelineV1:
-    experiments = await repository.list_for_investigation(investigation_id)
+    experiments = tuple(
+        item
+        for item in await repository.list_for_investigation(investigation_id)
+        if item.investigation_id == investigation_id
+    )
     return InvestigationExperimentTimelineV1(
         schema_version=EXPERIMENT_TIMELINE_SCHEMA_VERSION,
         investigation_id=investigation_id,
         stream_version=await repository.version(investigation_id),
         experiments=experiments,
         claims=consolidate_claim_experiments(experiments),
+    )
+
+
+def build_investigation_strategy_projection(
+    *,
+    investigation_id: UUID,
+    subject_id: UUID,
+    production_run_id: UUID,
+    synthesis_artifact_id: UUID,
+    snapshot: Any | None,
+    snapshot_version: int | None,
+    hypotheses: tuple[Any, ...],
+    experiments: tuple[InvestigationExperimentV1, ...],
+    observations: tuple[Any, ...],
+) -> dict[str, Any]:
+    """Build an audit-friendly strategy view from already loaded canonical objects.
+
+    Only claim IDs and source references are projected. Claim, observation and
+    sample bodies remain in their canonical stores.
+    """
+    snapshot_sha256 = getattr(snapshot, "synthesis_sha256", None)
+    snapshot_id = getattr(snapshot, "synthesis_artifact_id", None)
+    snapshot_matches = bool(
+        snapshot is not None
+        and snapshot_id == synthesis_artifact_id
+        and getattr(snapshot, "subject_id", None) == subject_id
+        and getattr(snapshot, "production_run_id", None) == production_run_id
+        and isinstance(snapshot_version, int)
+        and not isinstance(snapshot_version, bool)
+        and snapshot_version > 0
+        and getattr(snapshot, "synthesis_version", None) == snapshot_version
+        and isinstance(snapshot_sha256, str)
+        and re.fullmatch(r"[0-9a-f]{64}", snapshot_sha256) is not None
+    )
+    snapshot_claims = tuple(getattr(getattr(snapshot, "article", None), "claims", ()))
+    claims_by_id = {str(item.id): item for item in snapshot_claims if getattr(item, "id", None)}
+    declared_hypotheses = {str(item.id): item for item in hypotheses if getattr(item, "id", None)}
+    persisted_observations = {
+        item.id: item
+        for item in observations
+        if getattr(item, "investigation_id", None) == investigation_id
+        and isinstance(getattr(item, "id", None), UUID)
+        and isinstance(getattr(item, "sha256", None), str)
+    }
+
+    relevant_experiments = tuple(
+        sorted(
+            (item for item in experiments if item.investigation_id == investigation_id),
+            key=lambda item: (item.version, str(item.id)),
+        )
+    )
+    foreign_experiment_count = sum(
+        item.investigation_id != investigation_id for item in experiments
+    )
+    claim_ids = set(claims_by_id)
+    claim_ids.update(claim_id for item in relevant_experiments for claim_id in item.claim_ids)
+    matrix_claims: list[dict[str, Any]] = []
+    for claim_id in sorted(claim_ids):
+        claim = claims_by_id.get(claim_id)
+        raw_source_refs = tuple(getattr(claim, "source_refs", ())) if claim is not None else ()
+        safe_source_refs = bool(raw_source_refs) and all(
+            isinstance(reference, str) and _SAFE_SOURCE_REF.fullmatch(reference)
+            for reference in raw_source_refs
+        )
+        source_resolved = snapshot_matches and claim is not None and safe_source_refs
+        claim_experiments = tuple(
+            item for item in relevant_experiments if claim_id in item.claim_ids
+        )
+        valid_hypothesis_experiments = tuple(
+            item for item in claim_experiments if item.hypothesis_id in declared_hypotheses
+        )
+        undeclared_links = len(valid_hypothesis_experiments) != len(claim_experiments)
+        matrix_status = (
+            AnalysisMatrixStatus.UNKNOWN
+            if not source_resolved or undeclared_links
+            else _project_claim_status(
+                valid_hypothesis_experiments,
+                claim_id,
+                persisted_observations=persisted_observations,
+            )
+        )
+        active_experiments = _active_experiments_for_claim(claim_experiments, claim_id)
+        coverage_values = tuple(item.observation_coverage for item in active_experiments)
+        if not coverage_values or all(
+            coverage is ObservationCoverage.NONE for coverage in coverage_values
+        ):
+            coverage = ObservationCoverage.NONE
+        elif all(coverage is ObservationCoverage.COMPLETE for coverage in coverage_values):
+            coverage = ObservationCoverage.COMPLETE
+        else:
+            coverage = ObservationCoverage.LIMITED
+        matrix_claims.append(
+            {
+                "claim_id": claim_id,
+                "source_ref_status": "resolved" if source_resolved else "UNKNOWN",
+                "source_refs": list(raw_source_refs) if source_resolved else [],
+                "status": matrix_status.value,
+                "coverage": coverage.value,
+                "experiment_ids": [str(item.id) for item in claim_experiments],
+                "attempted_experiments": [
+                    {
+                        "id": str(item.id),
+                        "version": item.version,
+                        "hypothesis_id": item.hypothesis_id,
+                        "hypothesis_declared": item.hypothesis_id in declared_hypotheses,
+                        "tool_name": item.tool_name,
+                        "attempt_identity_sha256": hashlib.sha256(
+                            canonical_json_bytes(
+                                {
+                                    "hypothesis_id": item.hypothesis_id,
+                                    "tool_name": item.tool_name,
+                                    "tool_version": item.tool_version,
+                                    "tool_schema_version": item.tool_schema_version,
+                                    "method": item.method,
+                                    "method_mode": item.method_mode.value,
+                                    "scope": item.scope,
+                                    "falsification_criterion": item.falsification_criterion,
+                                    "input_refs": [
+                                        reference.to_payload() for reference in item.input_refs
+                                    ],
+                                    "tool_arguments": item.tool_arguments,
+                                }
+                            )
+                        ).hexdigest(),
+                        "verdict": item.verdict.value,
+                        "outcome": item.actual_outcome.value,
+                        "coverage": item.observation_coverage.value,
+                        "availability": item.availability.value,
+                        "matrix_status": (
+                            project_experiment_matrix_status(
+                                item, persisted_observations=persisted_observations
+                            ).value
+                            if item.hypothesis_id in declared_hypotheses
+                            else AnalysisMatrixStatus.UNKNOWN.value
+                        ),
+                    }
+                    for item in claim_experiments
+                ],
+            }
+        )
+
+    return {
+        "schema_version": STRATEGY_PROJECTION_SCHEMA_VERSION,
+        "investigation_id": str(investigation_id),
+        "snapshot": {
+            "artifact_id": str(snapshot_id) if snapshot_id is not None else None,
+            "version": snapshot_version if snapshot_matches else None,
+            "sha256": snapshot_sha256 if snapshot_matches else None,
+            "verified_identity": snapshot_matches,
+        },
+        "foreign_experiments_ignored": foreign_experiment_count,
+        "hypotheses": [
+            {"id": item.id, "status": getattr(item.status, "value", str(item.status))}
+            for item in hypotheses
+            if getattr(item, "id", None) is not None
+        ],
+        "claims": matrix_claims,
+    }
+
+
+def _active_experiments_for_claim(
+    experiments: tuple[InvestigationExperimentV1, ...], claim_id: str
+) -> tuple[InvestigationExperimentV1, ...]:
+    superseded = {
+        superseded_id for item in experiments for superseded_id in item.supersedes_experiment_ids
+    }
+    return tuple(
+        item for item in experiments if claim_id in item.claim_ids and item.id not in superseded
+    )
+
+
+def _project_claim_status(
+    experiments: tuple[InvestigationExperimentV1, ...],
+    claim_id: str,
+    *,
+    persisted_observations: Mapping[UUID, Any],
+) -> AnalysisMatrixStatus:
+    return project_claim_matrix_status(
+        experiments,
+        claim_id,
+        persisted_observations=persisted_observations,
     )
 
 
@@ -732,10 +927,12 @@ __all__ = [
     "EXPERIMENT_LIST_TOOL",
     "EXPERIMENT_RECORD_TOOL",
     "HYPOTHESIS_DECLARE_TOOL",
+    "STRATEGY_PROJECTION_SCHEMA_VERSION",
     "InMemoryInvestigationExperimentRepository",
     "InvestigationExperimentTimelineV1",
     "OperatorExperimentToolAdapter",
     "OperatorHypothesisDeclareToolAdapter",
     "build_investigation_experiment_timeline",
+    "build_investigation_strategy_projection",
     "register_operator_experiment_tools",
 ]
