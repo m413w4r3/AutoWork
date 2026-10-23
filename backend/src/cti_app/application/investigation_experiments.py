@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import re
 from collections.abc import Mapping
@@ -26,6 +27,7 @@ from cti_app.application.investigation_tools import (
     ToolRegistry,
     ToolResult,
 )
+from cti_app.application.publication_secret_guard import redact_operational_secrets
 from cti_app.application.research_context_builder import ArticleSnapshotPort
 from cti_app.domain.investigation import (
     InvestigationExecutionMode,
@@ -61,6 +63,12 @@ _UUID_SCHEMA = {
 }
 _SHA256_SCHEMA = {"type": "string", "pattern": r"^[0-9a-f]{64}$"}
 _SAFE_SOURCE_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+_SAFE_TIMELINE_REFERENCE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+_SHA256_REFERENCE = re.compile(r"^[0-9a-f]{64}$")
+_CANONICAL_UUID_REFERENCE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+_SAFE_EXPERIMENT_INPUT_TYPES = frozenset({"sample_sha256", "capture_sha256"})
 EXPERIMENT_RECORD_TOOL = "experiment.record"
 EXPERIMENT_LIST_TOOL = "experiment.list"
 HYPOTHESIS_DECLARE_TOOL = "hypothesis.declare"
@@ -155,6 +163,138 @@ class InvestigationExperimentTimelineV1:
             "experiments": experiment_payloads,
             "claims": [item.to_payload() for item in self.claims],
         }
+
+
+def project_safe_investigation_experiment_timeline(
+    payload: Mapping[str, Any], *, strategy: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    """Return the operator timeline without raw proof text, bodies, or untrusted refs.
+
+    Without a verified strategy, claim statuses stay inconclusive. Operational-secret
+    redaction is an additional guard; it does not detect encoded sample bodies.
+    """
+    projected = copy.deepcopy(dict(payload))
+    strategy_claims = {
+        str(item.get("claim_id")): str(item.get("status", "UNKNOWN"))
+        for item in (strategy or {}).get("claims", ())
+        if isinstance(item, Mapping) and item.get("claim_id") is not None
+    }
+    status_projection = {
+        "supported": "supported",
+        "refuted": "refuted",
+        "UNKNOWN": "inconclusive",
+    }
+    for claim in projected.get("claims", ()):
+        if not isinstance(claim, dict):
+            continue
+        strategy_status = strategy_claims.get(str(claim.get("claim_id")), "UNKNOWN")
+        claim["status"] = status_projection.get(strategy_status, "inconclusive")
+        for scope in claim.get("scopes", ()):
+            if isinstance(scope, dict):
+                scope["scope"] = "[redacted]"
+
+    free_text_fields = (
+        "prediction",
+        "falsification_criterion",
+        "method",
+        "expected",
+        "actual",
+        "scope",
+        "implication",
+    )
+    for experiment in projected.get("experiments", ()):
+        if not isinstance(experiment, dict):
+            continue
+        for field_name in free_text_fields:
+            experiment[field_name] = "[redacted]" if experiment.get(field_name) else ""
+        experiment["preconditions"] = []
+        experiment["limitations"] = []
+        for field_name in (
+            "input_type",
+            "tool_name",
+            "tool_version",
+            "tool_schema_version",
+            "author",
+            "origin",
+        ):
+            value = experiment.get(field_name)
+            if not isinstance(value, str) or not _SAFE_TIMELINE_REFERENCE.fullmatch(value):
+                experiment[field_name] = "[redacted]"
+            elif field_name == "input_type" and value not in _SAFE_EXPERIMENT_INPUT_TYPES:
+                experiment[field_name] = "[redacted]"
+        experiment["claim_ids"] = [
+            item
+            if isinstance(item, str) and _SAFE_TIMELINE_REFERENCE.fullmatch(item)
+            else "[redacted]"
+            for item in experiment.get("claim_ids", ())
+        ]
+        hypothesis_id = experiment.get("hypothesis_id")
+        if not isinstance(hypothesis_id, str) or not _SAFE_TIMELINE_REFERENCE.fullmatch(
+            hypothesis_id
+        ):
+            experiment["hypothesis_id"] = "[redacted]"
+        # No arbitrary scalars: byte arrays can be encoded as integers or booleans.
+        experiment["tool_arguments"] = {}
+        experiment["input_refs"] = _safe_experiment_input_references(
+            experiment.get("input_refs")
+        )
+        experiment["next_pivots"] = [
+            item
+            for item in experiment.get("next_pivots", ())
+            if isinstance(item, str) and _SHA256_REFERENCE.fullmatch(item)
+        ]
+        experiment["step_ids"] = [
+            item
+            for item in experiment.get("step_ids", ())
+            if isinstance(item, str) and _SAFE_TIMELINE_REFERENCE.fullmatch(item)
+        ]
+
+    redacted, _ = redact_operational_secrets(projected)
+    return redacted if isinstance(redacted, dict) else projected
+
+
+def _safe_experiment_input_references(value: Any) -> list[dict[str, str | None]]:
+    if not isinstance(value, (tuple, list)):
+        return []
+    result: list[dict[str, str | None]] = []
+    for item in value[:64]:
+        if not isinstance(item, Mapping):
+            continue
+        input_type = item.get("input_type")
+        input_id = item.get("input_id")
+        sha256 = item.get("sha256")
+        canonical_uuid = (
+            isinstance(input_id, str)
+            and _CANONICAL_UUID_REFERENCE.fullmatch(input_id) is not None
+        )
+        canonical_sha256 = (
+            isinstance(input_id, str) and _SHA256_REFERENCE.fullmatch(input_id) is not None
+        )
+        if isinstance(input_id, str) and (canonical_uuid or canonical_sha256):
+            safe_input_id = input_id
+            safe_sha256 = (
+                sha256
+                if isinstance(sha256, str)
+                and _SHA256_REFERENCE.fullmatch(sha256)
+                and (not canonical_sha256 or sha256 == input_id)
+                else None
+            )
+        else:
+            safe_input_id = "[redacted]"
+            safe_sha256 = None
+        safe_input_type = (
+            input_type
+            if isinstance(input_type, str) and input_type in _SAFE_EXPERIMENT_INPUT_TYPES
+            else "[redacted]"
+        )
+        result.append(
+            {
+                "input_type": safe_input_type,
+                "input_id": safe_input_id,
+                "sha256": safe_sha256,
+            }
+        )
+    return result
 
 
 async def build_investigation_experiment_timeline(
@@ -553,19 +693,22 @@ class OperatorExperimentToolAdapter:
         timeline = await build_investigation_experiment_timeline(
             self._experiments, context.investigation_id
         )
-        claims_by_id = {item.claim_id: item for item in timeline.claims}
+        safe_timeline = project_safe_investigation_experiment_timeline(timeline.to_payload())
+        claims_by_id = {item["claim_id"]: item for item in safe_timeline["claims"]}
+        output = {
+            "schema_version": saved.schema_version,
+            "experiment_id": str(saved.id),
+            "version": saved.version,
+            "verdict": saved.verdict.value,
+            "claim_verdicts": [claims_by_id[item] for item in saved.claim_ids],
+        }
+        safe_output, _ = redact_operational_secrets(output)
         return ToolResult(
             ToolInvocationStatus.SUCCEEDED,
             observation_refs=tuple(
                 reference.observation_id for reference in saved.observation_refs
             ),
-            output={
-                "schema_version": saved.schema_version,
-                "experiment_id": str(saved.id),
-                "version": saved.version,
-                "verdict": saved.verdict.value,
-                "claim_verdicts": [claims_by_id[item].to_payload() for item in saved.claim_ids],
-            },
+            output=safe_output,
         )
 
 
@@ -582,7 +725,7 @@ class _ExperimentListToolAdapter:
         )
         return ToolResult(
             ToolInvocationStatus.SUCCEEDED,
-            output=timeline.to_payload(),
+            output=project_safe_investigation_experiment_timeline(timeline.to_payload()),
         )
 
 

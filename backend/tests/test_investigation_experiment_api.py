@@ -16,6 +16,7 @@ from cti_app.api.main import create_app
 from cti_app.application.identity import StaticTokenIdentityProvider
 from cti_app.domain.investigation_experiment import (
     ExperimentAvailability,
+    ExperimentInputRefV1,
     ExperimentVerdict,
     ObservationCoverage,
     ObservationOutcome,
@@ -56,7 +57,7 @@ class _Experiment:
         self.availability = ExperimentAvailability.AVAILABLE
         self.actual_outcome = actual_outcome
         self.observation_coverage = observation_coverage
-        self.input_refs = ()
+        self.input_refs: tuple[ExperimentInputRefV1, ...] = ()
         self.tool_name = "local.sample.inspect"
         self.tool_version = "1.0.0"
         self.tool_schema_version = "local-sample-inspect.v1"
@@ -86,7 +87,7 @@ class _Experiment:
             "method": self.method,
             "method_mode": "passive",
             "input_type": "sample_sha256",
-            "input_refs": [],
+            "input_refs": [item.to_payload() for item in self.input_refs],
             "preconditions": list(self.preconditions),
             "availability": "available",
             "tool_name": "network.capture.inspect",
@@ -349,6 +350,13 @@ def test_get_experiments_exposes_replacement_links_in_timeline_and_claims() -> N
 
 
 def test_mounted_route_applies_identity_middleware_and_response_model() -> None:
+    """The lifespan is not entered offline; production UOW installation is UNKNOWN.
+
+    The request uses `_client`'s injected test UOW. This verifies the mounted route,
+    identity middleware, and response model only. ASGITransport skips the
+    PostgreSQL-dependent lifespan, so production wiring remains UNKNOWN; no fake
+    engine represents the production path.
+    """
     with _client(()) as client:
         unauthorized = client.get_without_authorization(
             f"/api/investigations/{INVESTIGATION_ID}/experiments"
@@ -423,9 +431,17 @@ def test_timeline_route_redacts_free_text_and_payload_arguments() -> None:
     experiment.actual = f"actual proof {secret}"
     experiment.scope = f"scope {secret}"
     experiment.implication = f"implication {secret}"
+    unsafe_reference = "deadbeef" * 16
+    experiment.input_refs = (
+        ExperimentInputRefV1("sample_sha256", unsafe_reference, "a" * 64),
+        ExperimentInputRefV1("capture_sha256", "b" * 64, "b" * 64),
+    )
     experiment.tool_arguments = {
         "payload": f"0000 4d5a {secret}",
-        "limit": 512,
+        "byte_0": 77,
+        "byte_1": 90,
+        "byte_2": 0,
+        "flag_0": True,
         "mode": f"signed-url https://example.invalid/?token={secret}",
     }
 
@@ -437,7 +453,12 @@ def test_timeline_route_redacts_free_text_and_payload_arguments() -> None:
     serialized = response.text
     projected = payload["experiments"][0]
     assert secret not in serialized
-    assert projected["tool_arguments"] == {"limit": 512}
+    assert unsafe_reference not in serialized
+    assert projected["tool_arguments"] == {}
+    assert projected["input_refs"] == [
+        {"input_type": "sample_sha256", "input_id": "[redacted]", "sha256": None},
+        {"input_type": "capture_sha256", "input_id": "b" * 64, "sha256": "b" * 64},
+    ]
     assert projected["prediction"] == "[redacted]"
     assert projected["expected"] == "[redacted]"
     assert projected["actual"] == "[redacted]"
