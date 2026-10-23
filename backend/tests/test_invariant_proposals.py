@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from cti_app.application.invariant_proposals import (
+    ProposalContractError,
     ProposalConversationService,
     ProposalOutputValidationError,
     _parse_proposal_response_details,
@@ -445,13 +446,17 @@ async def test_second_valid_bridge_turn_uses_continue() -> None:
 
 
 @pytest.mark.asyncio
-async def test_application_managed_later_turn_uses_fresh() -> None:
+async def test_external_forbidden_policy_prevents_application_managed_turn() -> None:
     state = _State(samples=[_sample(uuid4(), external=False)])
     service, _, conversation, _ = _service(state)
-    await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=1)
-    result = await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=2)
-    assert result.mode is ConversationMode.FRESH
-    assert conversation.modes == [ConversationMode.FRESH, ConversationMode.FRESH]
+    with pytest.raises(ProposalContractError, match="refused by the aggregate policy"):
+        await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=1)
+    state.investigations.investigation.cycle_number = 2
+    with pytest.raises(ProposalContractError, match="refused by the aggregate policy"):
+        await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=2)
+    assert conversation.external_calls == 0
+    assert conversation.local_calls == 0
+    assert conversation.conversations == {}
 
 
 @pytest.mark.asyncio
@@ -683,13 +688,13 @@ async def test_replay_uses_original_turn_before_policy_routing() -> None:
     pivot_id = state.investigations.investigation.pivot_conversation_id
     state._samples[0].external_llm_allowed = False
 
-    replay = await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=1)
+    with pytest.raises(ProposalContractError, match="refused by the aggregate policy"):
+        await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=1)
 
-    assert replay.conversation_id == first.conversation_id == pivot_id
-    assert replay.turn.id == first.turn.id
-    assert replay.mode is ConversationMode.FRESH
+    assert first.conversation_id == pivot_id
     assert conversation.external_calls == 1
     assert conversation.local_calls == 0
+    assert len(conversation.prompts) == 1
     assert state.investigations.investigation.pivot_conversation_id == pivot_id
 
 
@@ -763,20 +768,22 @@ async def test_derived_policy_is_recalculated_each_turn() -> None:
     service, _, conversation, _ = _service(state)
     await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=1)
     state._samples[0].external_llm_allowed = False
-    await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=2)
-    assert conversation.external_allowed == [True, False]
+    with pytest.raises(ProposalContractError, match="refused by the aggregate policy"):
+        await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=2)
+    assert conversation.external_allowed == [True]
     assert conversation.external_calls == 1
-    assert conversation.local_calls == 1
+    assert conversation.local_calls == 0
 
 
 @pytest.mark.asyncio
 async def test_external_forbidden_policy_never_reaches_external_call() -> None:
     state = _State(samples=[_sample(uuid4(), external=False)])
     service, _, conversation, _ = _service(state)
-    await service.propose(investigation_id=INVESTIGATION_ID)
+    with pytest.raises(ProposalContractError, match="refused by the aggregate policy"):
+        await service.propose(investigation_id=INVESTIGATION_ID)
     assert conversation.external_calls == 0
-    assert conversation.local_calls == 1
-    assert conversation.external_allowed == [False]
+    assert conversation.local_calls == 0
+    assert conversation.external_allowed == []
 
 
 @pytest.mark.asyncio

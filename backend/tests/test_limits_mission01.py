@@ -10,6 +10,7 @@ import pytest
 import cti_app.application.invariant_proposals as p10
 from cti_app.application.invariant_proposals import ProposalContractError
 from cti_app.application.investigation_advisor_tools import InvestigationAdvisorTool
+from cti_app.domain.classification import TLP
 from cti_app.domain.investigation import ToolInvocationStatus
 
 _HELPERS_SPEC = importlib.util.spec_from_file_location(
@@ -41,6 +42,7 @@ def _provenance_refs(context: dict[str, object]) -> tuple[str, ...]:
 async def test_p10_default_bound_is_utf8_byte_exact_and_refuses_before_fake_transport(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.delenv(p10._DEV_LIMITS_ENABLED_ENV, raising=False)
     monkeypatch.delenv(p10._DEV_P10_PROMPT_BYTES_ENV, raising=False)
     assert p10._p10_prompt_max_bytes() == 96_000
 
@@ -96,21 +98,23 @@ async def test_p10_default_bound_is_utf8_byte_exact_and_refuses_before_fake_tran
 async def test_p10_dev_override_accepts_within_hard_memory_bound(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv(p10._DEV_P10_PROMPT_BYTES_ENV, raising=False)
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv(p10._DEV_LIMITS_ENABLED_ENV, "1")
+    monkeypatch.setenv(p10._DEV_P10_PROMPT_BYTES_ENV, str(p10._MAX_DEV_P10_PROMPT_BYTES))
     original_render_facts = p10._render_p10_facts
     service, _, conversation, _ = _service()
     first = await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=1)
     baseline_size = len(conversation.prompts[0].encode("utf-8"))
-    target_size = 100_000
+    target_size = p10._MAX_DEV_P10_PROMPT_BYTES
     assert baseline_size < target_size <= p10._MAX_DEV_P10_PROMPT_BYTES
 
-    monkeypatch.setenv(p10._DEV_P10_PROMPT_BYTES_ENV, str(target_size))
     assert p10._p10_prompt_max_bytes() == target_size
+    requested_size = target_size
 
     def padded_render_facts(context: dict[str, object], alias_map: dict[str, str]) -> str:
         facts = original_render_facts(context, alias_map)
         assert _provenance_refs(context) == _provenance_refs(first.snapshot.context)
-        return facts + _utf8_padding(target_size - baseline_size)
+        return facts + _utf8_padding(requested_size - baseline_size)
 
     monkeypatch.setattr(p10, "_render_p10_facts", padded_render_facts)
     result = await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=2)
@@ -118,12 +122,85 @@ async def test_p10_dev_override_accepts_within_hard_memory_bound(
     assert _provenance_refs(result.snapshot.context) == _provenance_refs(first.snapshot.context)
     assert conversation.external_calls == 2
 
-    monkeypatch.setattr(p10, "_render_p10_facts", original_render_facts)
-    monkeypatch.setenv(p10._DEV_P10_PROMPT_BYTES_ENV, str(p10._MAX_DEV_P10_PROMPT_BYTES + 1))
+    requested_size = target_size + 1
     calls_before_refusal = conversation.external_calls
-    with pytest.raises(ProposalContractError, match="1048576"):
+    prompts_before_refusal = len(conversation.prompts)
+    with pytest.raises(ProposalContractError, match=r"1048577 UTF-8 bytes.*1048576 bytes"):
         await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=3)
     assert conversation.external_calls == calls_before_refusal
+    assert len(conversation.prompts) == prompts_before_refusal
+
+
+@pytest.mark.parametrize(
+    "configured",
+    ("", "0", "-1", "1_000", "+5", " 5", "5 ", "1.5", "1048577"),
+)
+def test_p10_dev_override_rejects_noncanonical_or_over_bound_values_at_service_creation(
+    monkeypatch: pytest.MonkeyPatch,
+    configured: str,
+) -> None:
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv(p10._DEV_LIMITS_ENABLED_ENV, "1")
+    monkeypatch.setenv(p10._DEV_P10_PROMPT_BYTES_ENV, configured)
+
+    with pytest.raises(ProposalContractError, match=p10._DEV_P10_PROMPT_BYTES_ENV):
+        _service()
+
+
+def test_p10_dev_override_is_ignored_without_explicit_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.delenv(p10._DEV_LIMITS_ENABLED_ENV, raising=False)
+    monkeypatch.setenv(p10._DEV_P10_PROMPT_BYTES_ENV, str(p10._MAX_DEV_P10_PROMPT_BYTES))
+
+    service, _, _, _ = _service()
+
+    assert p10._p10_prompt_max_bytes() == p10._MAX_P10_PROMPT_BYTES
+    assert service._max_p10_prompt_bytes == p10._MAX_P10_PROMPT_BYTES
+
+
+def test_p10_dev_override_requires_development_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv(p10._DEV_LIMITS_ENABLED_ENV, "1")
+
+    with pytest.raises(ProposalContractError, match="requires APP_ENV=development"):
+        _service()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("do_not_submit", "tlp"),
+    ((True, TLP.GREEN), (False, TLP.RED)),
+)
+async def test_p10_aggregate_policy_refuses_before_any_route_or_transport(
+    monkeypatch: pytest.MonkeyPatch,
+    do_not_submit: bool,
+    tlp: TLP,
+) -> None:
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv(p10._DEV_LIMITS_ENABLED_ENV, "1")
+    monkeypatch.setenv(p10._DEV_P10_PROMPT_BYTES_ENV, str(p10._MAX_DEV_P10_PROMPT_BYTES))
+    sample = _HELPERS._sample(
+        _HELPERS.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+        external=True,
+    )
+    sample.do_not_submit = do_not_submit
+    sample.tlp = tlp
+    state = _HELPERS._State(samples=[sample])
+    service, _, conversation, _ = _service(state)
+    assert service._max_p10_prompt_bytes == p10._MAX_DEV_P10_PROMPT_BYTES
+
+    with pytest.raises(ProposalContractError, match="refused by the aggregate policy"):
+        await service.propose(investigation_id=INVESTIGATION_ID)
+
+    assert conversation.external_calls == 0
+    assert conversation.local_calls == 0
+    assert conversation.prompts == []
+    assert conversation.conversations == {}
+    assert state.investigations.investigation.pivot_conversation_id is None
 
 
 def test_unused_advisor_environment_is_absent_from_compose_and_source() -> None:

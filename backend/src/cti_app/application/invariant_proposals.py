@@ -25,7 +25,7 @@ from cti_app.application.goodware import GoodwareMeasurementService, PreparedGoo
 from cti_app.application.invariants import InvariantProposalResult, InvariantRegistryService
 from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.persistence import UnitOfWorkFactory
-from cti_app.domain.classification import DerivedPolicy, derived_policy
+from cti_app.domain.classification import TLP, DerivedPolicy, derived_policy
 from cti_app.domain.goodware import Banality
 from cti_app.domain.goodware_index import GoodwareMeasurementError
 from cti_app.domain.invariant_proposals import (
@@ -142,6 +142,7 @@ class ProposalConversationService:
         self._local_transport = ConversationTransport(local_transport)
         self._requested_model = requested_model
         self._prompt_version = prompt_version
+        self._max_p10_prompt_bytes = _p10_prompt_max_bytes()
 
     async def propose(
         self,
@@ -167,6 +168,12 @@ class ProposalConversationService:
         effective_cycle = cycle_number if cycle_number is not None else investigation.cycle_number
         if effective_cycle < 1:
             raise ProposalContractError("cycle_number must be positive")
+        if not policy.external_llm_allowed or policy.do_not_submit or policy.tlp is TLP.RED:
+            raise ProposalContractError(
+                "P10 submission is refused by the aggregate policy: "
+                "external_llm_allowed must be true, do_not_submit must be false, "
+                "and TLP must not be RED"
+            )
 
         idempotency_key = make_proposal_turn_idempotency_key(
             investigation_id=investigation_id,
@@ -197,7 +204,10 @@ class ProposalConversationService:
                 provenance_aliases: Mapping[str, str] = {}
             else:
                 persisted_snapshot = snapshot
-                _, provenance_aliases = _render_p10_prompt(persisted_snapshot)
+                _, provenance_aliases = _render_p10_prompt(
+                    persisted_snapshot,
+                    max_prompt_bytes=self._max_p10_prompt_bytes,
+                )
             if (
                 make_proposal_turn_idempotency_key(
                     investigation_id=investigation_id,
@@ -251,7 +261,10 @@ class ProposalConversationService:
         )
         await self._persist_pivot_conversation(investigation_id, conversation.id)
 
-        prompt, provenance_aliases = _render_p10_prompt(snapshot)
+        prompt, provenance_aliases = _render_p10_prompt(
+            snapshot,
+            max_prompt_bytes=self._max_p10_prompt_bytes,
+        )
         turn = await self._model_conversations.add_turn(
             conversation.id,
             message=prompt,
@@ -950,19 +963,24 @@ def _render_prompt(snapshot: ProposalInputSnapshot) -> str:
 _MAX_P10_PROMPT_BYTES = 96_000
 _MAX_DEV_P10_PROMPT_BYTES = 1_048_576
 _DEV_P10_PROMPT_BYTES_ENV = "AUTOWORK_DEV_P10_MAX_PROMPT_BYTES"
+_DEV_LIMITS_ENABLED_ENV = "AUTOWORK_DEV_LIMITS_ENABLED"
+_APP_ENV = "APP_ENV"
 
 
 def _p10_prompt_max_bytes() -> int:
+    if os.getenv(_DEV_LIMITS_ENABLED_ENV) != "1":
+        return _MAX_P10_PROMPT_BYTES
+    if os.getenv(_APP_ENV) != "development":
+        raise ProposalContractError(f"{_DEV_LIMITS_ENABLED_ENV}=1 requires {_APP_ENV}=development")
     configured = os.getenv(_DEV_P10_PROMPT_BYTES_ENV)
     if configured is None:
         return _MAX_P10_PROMPT_BYTES
-    try:
-        limit = int(configured, 10)
-    except ValueError as exc:
+    if re.fullmatch(r"[1-9][0-9]*", configured) is None:
         raise ProposalContractError(
-            f"{_DEV_P10_PROMPT_BYTES_ENV} must be an integer between 1 and "
+            f"{_DEV_P10_PROMPT_BYTES_ENV} must be a canonical positive decimal between 1 and "
             f"{_MAX_DEV_P10_PROMPT_BYTES}"
-        ) from exc
+        )
+    limit = int(configured, 10)
     if not 1 <= limit <= _MAX_DEV_P10_PROMPT_BYTES:
         raise ProposalContractError(
             f"{_DEV_P10_PROMPT_BYTES_ENV} must be between 1 and {_MAX_DEV_P10_PROMPT_BYTES}"
@@ -970,7 +988,11 @@ def _p10_prompt_max_bytes() -> int:
     return limit
 
 
-def _render_p10_prompt(snapshot: ProposalInputSnapshot) -> tuple[str, dict[str, str]]:
+def _render_p10_prompt(
+    snapshot: ProposalInputSnapshot,
+    *,
+    max_prompt_bytes: int | None = None,
+) -> tuple[str, dict[str, str]]:
     context = snapshot.context
     provenances = context.get("provenances", ())
     if not isinstance(provenances, list):
@@ -1012,11 +1034,13 @@ def _render_p10_prompt(snapshot: ProposalInputSnapshot) -> tuple[str, dict[str, 
         "Do not include raw bytes, secrets, signed URLs, or executable YARA code."
     )
     prompt_bytes = len(prompt.encode("utf-8"))
-    max_prompt_bytes = _p10_prompt_max_bytes()
-    if prompt_bytes > max_prompt_bytes:
+    effective_max_prompt_bytes = (
+        _p10_prompt_max_bytes() if max_prompt_bytes is None else max_prompt_bytes
+    )
+    if prompt_bytes > effective_max_prompt_bytes:
         raise ProposalContractError(
             f"P10 prompt is {prompt_bytes} UTF-8 bytes; configured per-turn bound is "
-            f"{max_prompt_bytes} bytes"
+            f"{effective_max_prompt_bytes} bytes"
         )
     return prompt, {alias: ref for ref, alias in alias_by_ref.items()}
 

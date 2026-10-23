@@ -71,6 +71,15 @@ La décision `external_llm_allowed` est réévaluée à chaque tour. L’appelan
 la calculer depuis la classification et la politique de diffusion du nouveau
 contenu ; `false` bloque le ModelRun avant tout appel externe.
 
+P10 refuse toute soumission si la politique agrégée n’autorise pas le modèle
+externe, si `do_not_submit` est vrai ou si le TLP est RED. Sa limite de prompt
+est de 96 000 octets UTF-8. Pour un développement local uniquement, un
+processus explicitement lancé avec `APP_ENV=development` et
+`AUTOWORK_DEV_LIMITS_ENABLED=1` peut définir
+`AUTOWORK_DEV_P10_MAX_PROMPT_BYTES` en décimal canonique, de 1 à 1 048 576.
+Sans le drapeau, toute valeur de plafond est ignorée. Ne placez pas ces variables
+dans Compose ni dans un profil de production.
+
 ## Routage ChatGPT
 
 Le bridge accepte un objet `conversation` avec `mode`, UUID applicatif
