@@ -25,11 +25,13 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+from cti_app.domain.advisor_completeness import AdvisorEvidenceStatus, AdvisorPreflightStatus
 from cti_app.domain.analyst_opinion import (
     AnalystOpinionStatus,
     OpinionBlockType,
     OpinionClaimQualification,
 )
+from cti_app.domain.editorial import AnalystDecisionTargetType, AnalystDecisionType
 from cti_app.domain.investigation import (
     BudgetDimension,
     BudgetReservationStatus,
@@ -66,6 +68,7 @@ from cti_app.domain.model_runs import (
     ModelSubmissionState,
     ModelTransport,
 )
+from cti_app.domain.production import AnalystInvestigationStatus
 
 AUDIT_EVENT_SCHEMA = "autowork.investigation-audit-event.v1"
 AUDIT_MANIFEST_SCHEMA = "autowork.investigation-audit-manifest.v1"
@@ -103,11 +106,74 @@ _SAFE_CONSULTATION_TYPES = frozenset(
         "yara_draft",
     }
 )
+_ADVISOR_STATUS_VALUES = frozenset(
+    {
+        "context_too_large",
+        "context_unavailable",
+        "invalid_input",
+        "needs_review",
+        "output_invalid",
+        "output_not_processed",
+        "partial",
+        "policy_denied",
+        "prompt_archive_failed",
+        "rate_limited",
+        "refused",
+        "succeeded",
+        "unavailable",
+        "needs_retrieval",
+        "insufficient_evidence",
+        "technical_blocked",
+        "policy_blocked",
+    }
+)
+_ADVISOR_SUBMISSION_STATUS_VALUES = frozenset(
+    {
+        "succeeded",
+        "needs_review",
+        "blocked",
+        "unavailable",
+        "invalid_output",
+        "pre_submission_retry_exhausted",
+    }
+)
+_ADVISOR_SUBMISSION_STATE_VALUES = frozenset(
+    {
+        "pre_submission",
+        "submission_attempted",
+        "post_submission",
+        "external_state_unknown",
+    }
+)
+_ADVISOR_INVOCATION_STAGES = frozenset(
+    {
+        "prevalidation",
+        "pretransport_failure",
+        "timeout_ambiguous",
+        "submitted",
+        "submission_failed",
+        "run_confirmed",
+    }
+)
+_COMPLETENESS_KINDS = frozenset(
+    {
+        "article",
+        "hypothesis",
+        "observation",
+        "finding",
+        "opinion",
+        "measurement",
+        "fact",
+        "contradiction",
+        "claim",
+    }
+)
 _SOURCE_VERSION_ALLOWLIST = {
     "investigation_state": "investigation-state.v1",
     "investigation_experiment": "investigation-experiment.v1",
     "analyst_opinion": "analyst-opinion.v1",
     "model_conversation": "model-conversation.repository.v1",
+    "advisor_call_payload": "operator-advisor-call.v1",
     "audit_projection": AUDIT_EVENT_SCHEMA,
 }
 
@@ -131,6 +197,9 @@ class AuditSourceSnapshot:
     conversation: Any | None = None
     conversation_turns: Sequence[Any] = ()
     model_runs: Sequence[Any] = ()
+    advisor_call_metadata: Sequence[Mapping[str, Any]] = ()
+    analyst_decisions: Sequence[Any] = ()
+    input_pack: Mapping[str, Any] | None = None
     source_versions: Mapping[str, str] = field(default_factory=dict)
 
 
@@ -281,7 +350,474 @@ def _material_stage(reason: str) -> dict[str, Any]:
             "sent",
             "omitted",
             "sha256",
+            "bytes",
         )
+    }
+
+
+def _measurement(value: Any, reason: str) -> dict[str, Any]:
+    known = value is not None and value != "UNKNOWN"
+    return {"value": value if known else "UNKNOWN", "reason": None if known else reason}
+
+
+def _safe_count(value: Any) -> int | None:
+    return value if type(value) is int and value >= 0 else None
+
+
+def _safe_count_map(value: Any, allowed_keys: frozenset[str]) -> dict[str, int]:
+    if not isinstance(value, Mapping):
+        return {}
+    result: dict[str, int] = {}
+    for raw_key, raw_value in sorted(value.items(), key=lambda pair: str(pair[0])):
+        key = _text(raw_key)
+        amount = _safe_count(raw_value)
+        if key in allowed_keys and amount is not None:
+            result[key] = amount
+    return result
+
+
+def _safe_source_ref(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    kind = _text(value.get("kind"))
+    return {
+        "kind": kind if kind in _COMPLETENESS_KINDS else "UNKNOWN",
+        "id": _opaque_id(value.get("id")) or "UNKNOWN",
+        "sha256": _sha_value(value.get("sha256")),
+        "version": _safe_count(value.get("version")),
+    }
+
+
+def _safe_completeness_item(value: Any, *, dossier_entry: bool = False) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    raw_kind = _text(value.get("kind"))
+    statuses = []
+    raw_statuses = value.get("statuses", ())
+    if isinstance(raw_statuses, (tuple, list)):
+        for row in raw_statuses:
+            if not isinstance(row, Mapping):
+                continue
+            status = _enum_token(row.get("status"), AdvisorEvidenceStatus)
+            if status is not None:
+                statuses.append(
+                    {
+                        "status": status,
+                        "reason_sha256": _sha256_value(row.get("reason")) or "UNKNOWN",
+                    }
+                )
+    item = {
+        "kind": raw_kind if raw_kind in _COMPLETENESS_KINDS else "UNKNOWN",
+        "id": _opaque_id(value.get("id")) or "UNKNOWN",
+        "sha256": _sha_value(value.get("sha256")),
+        "required": _boolean_or_unknown(value.get("required")),
+        "verified": _boolean_or_unknown(value.get("verified")),
+        "retrieval_available": _boolean_or_unknown(value.get("retrieval_available")),
+        "selected": dossier_entry
+        or AdvisorEvidenceStatus.IN_DOSSIER.value in {row["status"] for row in statuses},
+        "rendered": dossier_entry
+        or AdvisorEvidenceStatus.IN_DOSSIER.value in {row["status"] for row in statuses},
+        "sent": AdvisorEvidenceStatus.SENT_TO_BRIDGE.value in {row["status"] for row in statuses},
+        "omitted": AdvisorEvidenceStatus.INTENTIONALLY_OMITTED.value
+        in {row["status"] for row in statuses},
+        "statuses": statuses,
+        "source_ref": _safe_source_ref(value.get("source_ref")),
+    }
+    for key in ("claim_id", "evidence_id", "candidate_id", "fact_id"):
+        if value.get(key) is not None:
+            item[key] = _opaque_id(value.get(key)) or "UNKNOWN"
+    for key in ("claim_refs",):
+        refs = value.get(key)
+        if isinstance(refs, (tuple, list)):
+            item[key] = sorted({_opaque_id(ref) or "UNKNOWN" for ref in refs})
+    for key in ("assessment", "block_type"):
+        if value.get(key) is not None:
+            token = _text(value.get(key))
+            item[key] = token if token in {
+                "supported",
+                "refuted",
+                "qualified",
+                "inconclusive",
+                "key_findings",
+                "evidence",
+                "limitations",
+                "recommendations",
+            } else "UNKNOWN"
+    for key in ("section_index", "offset", "state_version", "opinion_version", "candidate_version"):
+        number = _safe_count(value.get(key))
+        if number is not None:
+            item[key] = number
+    for key in (
+        "sample_sha256",
+        "evidence_sha256",
+        "reviewed_text_sha256",
+        "corpus_sha256",
+    ):
+        if value.get(key) is not None:
+            item[key] = _sha_value(value.get(key))
+    return item
+
+
+def _safe_completeness_manifest(value: Any, *, dossier_entries: bool = False) -> dict[str, Any]:
+    items = value if isinstance(value, (tuple, list)) else ()
+    projected = [
+        item
+        for raw in items
+        if (item := _safe_completeness_item(raw, dossier_entry=dossier_entries)) is not None
+    ]
+    projected.sort(key=lambda item: (item["kind"], item["id"], item["sha256"] or ""))
+    maximum_items = 2048
+    return {
+        "available": isinstance(value, (tuple, list)),
+        "items": projected[:maximum_items],
+        "item_count": len(projected),
+        "required_item_count": sum(item["required"] is True for item in projected),
+        "selected_item_count": sum(item["selected"] is True for item in projected),
+        "rendered_item_count": sum(item["rendered"] is True for item in projected),
+        "sent_item_count": sum(item["sent"] is True for item in projected),
+        "omitted_item_count": sum(item["omitted"] is True for item in projected),
+        "truncated_item_count": max(0, len(projected) - maximum_items),
+    }
+
+
+def _advisor_transport_state(submission_state: str, status: str, raw_sha256: str) -> str:
+    if status == "succeeded" and raw_sha256 != "UNKNOWN":
+        return "result_obtained"
+    if submission_state == "pre_submission":
+        return "not_sent"
+    if submission_state == "post_submission":
+        return "sent"
+    if submission_state in {"submission_attempted", "external_state_unknown"}:
+        return "uncertain"
+    return "UNKNOWN"
+
+
+def _advisor_materials(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    completeness = metadata.get("completeness_manifest", {})
+    manifest_available = (
+        isinstance(completeness, Mapping) and completeness.get("available") is True
+    )
+    counts = metadata.get("completeness_counts", {})
+    counts = counts if isinstance(counts, Mapping) else {}
+    selected_count = completeness.get("selected_item_count") if manifest_available else None
+    rendered_count = completeness.get("rendered_item_count") if manifest_available else None
+    transport_state = metadata.get("transport_state", "UNKNOWN")
+    sent = (
+        True
+        if transport_state in {"sent", "result_obtained"}
+        else False
+        if transport_state == "not_sent"
+        else "UNKNOWN"
+    )
+    dossier_sha256 = metadata.get("dossier_sha256", "UNKNOWN")
+    dossier_bytes = metadata.get("dossier_bytes")
+    prompt_sha256 = metadata.get("prompt_sha256", "UNKNOWN")
+    prompt_blob_id = metadata.get("prompt_blob_id", "UNKNOWN")
+    prompt_bytes = metadata.get("prompt_bytes")
+    raw_sha256 = metadata.get("raw_response_sha256", "UNKNOWN")
+    raw_blob_id = metadata.get("raw_response_blob_id", "UNKNOWN")
+    raw_bytes = metadata.get("raw_response_bytes")
+    normalized_sha256 = metadata.get("normalized_output_sha256", "UNKNOWN")
+    blob_verified = metadata.get("advisor_blob_available") is True
+
+    def present(*values: Any) -> bool | None:
+        if any(value is not None and value != "UNKNOWN" for value in values):
+            return True
+        return False if blob_verified else None
+
+    def stage(
+        *,
+        available: Any,
+        required: Any,
+        selected: Any,
+        rendered: Any,
+        sent: Any,
+        omitted: Any,
+        sha256: Any,
+        bytes_value: Any = None,
+        reason: str,
+    ) -> dict[str, Any]:
+        result = {
+            key: _measurement(value, reason)
+            for key, value in (
+                ("available", available),
+                ("required", required),
+                ("selected", selected),
+                ("rendered", rendered),
+                ("sent", sent),
+                ("omitted", omitted),
+                ("sha256", sha256),
+            )
+        }
+        result["bytes"] = _measurement(bytes_value, reason)
+        return result
+
+    def completeness_count(key: str, item_key: str) -> int | None:
+        value = _safe_count(counts.get(key))
+        if value is not None:
+            return value
+        if manifest_available:
+            return _safe_count(completeness.get(item_key))
+        return None
+
+    shared = {
+        "required": completeness_count("required", "required_item_count"),
+        "selected": selected_count if manifest_available else None,
+        "sent": completeness_count("sent", "sent_item_count"),
+        "omitted": completeness_count("omitted", "omitted_item_count"),
+    }
+    return {
+        "dossier": stage(
+            available=present(dossier_sha256, dossier_bytes),
+            required=shared["required"],
+            selected=shared["selected"],
+            rendered=rendered_count if manifest_available else None,
+            sent=shared["sent"],
+            omitted=shared["omitted"],
+            sha256=dossier_sha256,
+            bytes_value=dossier_bytes,
+            reason="advisor-call metadata does not record this dossier-stage measurement",
+        ),
+        "rendered_prompt": stage(
+            available=present(prompt_blob_id, prompt_sha256, prompt_bytes),
+            required=shared["required"],
+            selected=shared["selected"],
+            rendered=present(prompt_blob_id, prompt_sha256, prompt_bytes),
+            sent=sent,
+            omitted=shared["omitted"],
+            sha256=prompt_sha256,
+            bytes_value=prompt_bytes,
+            reason="advisor-call metadata does not record this prompt-stage measurement",
+        ),
+        "http_payload": _material_stage("no observed HTTP payload record is persisted"),
+        "raw_response": stage(
+            available=present(raw_sha256, raw_blob_id, raw_bytes),
+            required=None,
+            selected=None,
+            rendered=None,
+            sent=None,
+            omitted=None,
+            sha256=raw_sha256,
+            bytes_value=raw_bytes,
+            reason="advisor-call metadata does not record this response-stage measurement",
+        ),
+        "normalized_output": stage(
+            available=present(normalized_sha256, metadata.get("normalized_output_bytes")),
+            required=None,
+            selected=None,
+            rendered=None,
+            sent=None,
+            omitted=None,
+            sha256=normalized_sha256,
+            bytes_value=metadata.get("normalized_output_bytes"),
+            reason="normalized output digest is derived from the persisted advisor output mapping",
+        ),
+        "redacted_copy": _material_stage("no redacted-copy record is persisted"),
+    }
+
+
+def project_advisor_call_blob_metadata(
+    observation: Any,
+    raw: bytes | None,
+    *,
+    read_error: str | None = None,
+) -> dict[str, Any]:
+    """Verify and whitelist metadata from an advisor-call JSON blob.
+
+    The returned structure contains no source text, prompt body, model message,
+    output body, or HTTP payload.
+    """
+    observation_id = _uuid_value(_get(observation, "id"))
+    expected_sha256 = _sha_value(_get(observation, "sha256"))
+    actual_sha256 = _sha256_bytes(raw) if raw is not None else None
+    read_status = "unavailable"
+    read_reason = {
+        "artifact_reader_unconfigured": "canonical artifact reader was not configured",
+        "blob_read_failed": "canonical advisor-call blob could not be read",
+        "blob_read_limit": "advisor-call blob exceeds the bounded metadata read size",
+    }.get(read_error, "canonical advisor-call blob was not read")
+    payload: Mapping[str, Any] | None = None
+    if raw is not None and actual_sha256 != expected_sha256:
+        read_status = "hash_mismatch"
+        read_reason = "blob bytes do not match the canonical observation SHA-256"
+    elif raw is not None:
+        try:
+            decoded = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            read_status = "invalid_json"
+            read_reason = "verified blob does not contain a JSON object"
+        else:
+            if (
+                not isinstance(decoded, Mapping)
+                or decoded.get("schema") != "operator-advisor-call.v1"
+            ):
+                read_status = "unsupported_schema"
+                read_reason = "verified blob schema is not operator-advisor-call.v1"
+            else:
+                payload = decoded
+                read_status = "verified"
+                read_reason = "metadata allowlist projected after observation SHA-256 verification"
+
+    metadata: dict[str, Any] = {
+        "advisor_blob_available": payload is not None,
+        "consultation_type": "UNKNOWN",
+        "advisor_status": "UNKNOWN",
+        "bridge_invocation_id": "UNKNOWN",
+        "bridge_invocation_id_uuid": "UNKNOWN",
+        "bridge_invocation_id_kind": "UNKNOWN",
+        "idempotency_key_sha256": "UNKNOWN",
+        "prompt_blob_id": "UNKNOWN",
+        "prompt_sha256": "UNKNOWN",
+        "prompt_bytes": None,
+        "dossier_sha256": "UNKNOWN",
+        "dossier_bytes": None,
+        "raw_response_blob_id": "UNKNOWN",
+        "raw_response_sha256": "UNKNOWN",
+        "raw_response_bytes": None,
+        "normalized_output_sha256": "UNKNOWN",
+        "normalized_output_bytes": None,
+        "submission_status": "UNKNOWN",
+        "submission_state": "UNKNOWN",
+        "invocation_stage": "UNKNOWN",
+        "preflight_status": "UNKNOWN",
+        "completeness_counts": {},
+        "completeness_counts_available": False,
+        "completeness_manifest": _safe_completeness_manifest(None),
+        "dossier_manifest": _safe_completeness_manifest(None, dossier_entries=True),
+        "durations_ms": {},
+        "provider_usage": {},
+        "bridge_turns_consumed": None,
+        "reparsed_from_observation_id": "UNKNOWN",
+        "parser_version_sha256": None,
+    }
+    if payload is not None:
+        raw_bridge_id = payload.get("bridge_invocation_id")
+        bridge_id_kind = _text(payload.get("bridge_invocation_id_kind"))
+        metadata.update({
+            "consultation_type": _safe_consultation_type(payload.get("consultation_type")),
+            "advisor_status": _text(payload.get("advisor_status"))
+            if _text(payload.get("advisor_status")) in _ADVISOR_STATUS_VALUES
+            else "UNKNOWN",
+            "bridge_invocation_id": _opaque_id(raw_bridge_id) or "UNKNOWN",
+            "bridge_invocation_id_uuid": _uuid_value(raw_bridge_id)
+            if bridge_id_kind == "conversation_turn"
+            else "UNKNOWN",
+            "bridge_invocation_id_kind": bridge_id_kind
+            if bridge_id_kind in {"conversation_turn", "unavailable"}
+            else "UNKNOWN",
+            "idempotency_key_sha256": _sha256_value(payload.get("idempotency_key")) or "UNKNOWN",
+            "prompt_blob_id": _uuid_value(payload.get("prompt_blob_id")),
+            "prompt_sha256": _sha_value(
+                payload.get("prompt_sha256") or payload.get("input_sha256")
+            ),
+            "prompt_bytes": _safe_count(payload.get("prompt_bytes")),
+            "dossier_sha256": _sha_value(payload.get("dossier_sha256")),
+            "dossier_bytes": _safe_count(payload.get("dossier_bytes")),
+            "raw_response_blob_id": _uuid_value(payload.get("output_blob_id")),
+            "raw_response_sha256": _sha_value(payload.get("output_sha256")),
+            "raw_response_bytes": _safe_count(payload.get("response_bytes")),
+            "normalized_output_sha256": _sha256_value(payload.get("output")) or "UNKNOWN",
+            "normalized_output_bytes": len(_canonical_bytes(payload["output"]))
+            if "output" in payload
+            else None,
+            "submission_status": _text(payload.get("submission_status"))
+            if _text(payload.get("submission_status")) in _ADVISOR_SUBMISSION_STATUS_VALUES
+            else "UNKNOWN",
+            "submission_state": _text(payload.get("submission_state"))
+            if _text(payload.get("submission_state")) in _ADVISOR_SUBMISSION_STATE_VALUES
+            else "UNKNOWN",
+            "invocation_stage": _text(payload.get("invocation_stage"))
+            if _text(payload.get("invocation_stage")) in _ADVISOR_INVOCATION_STAGES
+            else "UNKNOWN",
+            "preflight_status": _enum_token(payload.get("preflight_status"), AdvisorPreflightStatus)
+            or "UNKNOWN",
+            "completeness_counts": _safe_count_map(
+                payload.get("completeness_counts"),
+                frozenset(
+                    {
+                        "required",
+                        "present",
+                        "sent",
+                        "omitted",
+                        "missing",
+                        "assertions_required",
+                        "assertions_present",
+                        "assertions_sent",
+                    }
+                ),
+            ),
+            "completeness_counts_available": isinstance(
+                payload.get("completeness_counts"), Mapping
+            ),
+            "completeness_manifest": _safe_completeness_manifest(
+                payload.get("completeness_manifest")
+            ),
+            "dossier_manifest": _safe_completeness_manifest(
+                payload.get("dossier_manifest"), dossier_entries=True
+            ),
+            "durations_ms": _safe_count_map(
+                payload.get("durations_ms"),
+                frozenset({"submission", "parse", "persistence", "elapsed_before_manifest"}),
+            ),
+            "provider_usage": _safe_count_map(
+                payload.get("provider_usage"),
+                frozenset(
+                    {
+                        "input_tokens",
+                        "output_tokens",
+                        "total_tokens",
+                        "cached_input_tokens",
+                        "reasoning_tokens",
+                    }
+                ),
+            ),
+            "bridge_turns_consumed": _safe_count(payload.get("bridge_turns_consumed")),
+            "reparsed_from_observation_id": _uuid_value(
+                payload.get("reparsed_from_observation_id")
+            ),
+            "parser_version_sha256": _sha256_value(payload.get("parser_version")),
+        })
+    metadata["transport_state"] = _advisor_transport_state(
+        metadata["submission_state"],
+        metadata["submission_status"],
+        metadata["raw_response_sha256"],
+    )
+    metadata["materials"] = _advisor_materials(metadata)
+    metadata["gaps"] = [
+        {
+            "field": field_name,
+            "value": "UNKNOWN",
+            "reason": (
+                read_reason
+                if payload is None
+                else "field is absent or outside the allowlisted advisor-call schema"
+            ),
+        }
+        for field_name in (
+            "bridge_invocation_id",
+            "idempotency_key_sha256",
+            "prompt_blob_id",
+            "prompt_sha256",
+            "prompt_bytes",
+            "dossier_sha256",
+            "dossier_bytes",
+            "raw_response_sha256",
+            "raw_response_bytes",
+        )
+        if metadata.get(field_name) in {None, "UNKNOWN"}
+    ]
+    return {
+        "observation_id": observation_id,
+        "occurred_at": _iso(_get(observation, "observed_at")),
+        "invocation_ref": _uuid_value(_get(observation, "invocation_ref"))
+        if _get(observation, "invocation_ref") is not None
+        else "UNKNOWN",
+        "blob_id": _uuid_value(_get(observation, "blob_id")),
+        "expected_sha256": expected_sha256,
+        "read_sha256": actual_sha256 or "UNKNOWN",
+        "read_status": read_status,
+        "read_reason": read_reason,
+        "metadata": metadata,
     }
 
 
@@ -541,6 +1077,126 @@ def _observation_event(investigation_id: str, observation: Any) -> dict[str, Any
     )
 
 
+def _advisor_call_event(
+    investigation_id: str,
+    projection: Mapping[str, Any],
+    linked_invocation_ids: Sequence[str],
+    turns_by_id: Mapping[str, Any],
+) -> dict[str, Any]:
+    metadata = projection.get("metadata")
+    metadata = metadata if isinstance(metadata, Mapping) else {}
+    observation_id = _uuid_value(projection.get("observation_id"))
+    linked_invocations = sorted(
+        {_uuid_value(item) for item in linked_invocation_ids if _uuid_value(item) != "UNKNOWN"}
+    )
+    invocation_ref = _uuid_value(projection.get("invocation_ref"))
+    if invocation_ref != "UNKNOWN":
+        linked_invocations = sorted(set((*linked_invocations, invocation_ref)))
+
+    bridge_invocation_id = _text(metadata.get("bridge_invocation_id"))
+    bridge_invocation_uuid = _uuid_value(metadata.get("bridge_invocation_id_uuid"))
+    turn = turns_by_id.get(bridge_invocation_uuid) if bridge_invocation_uuid != "UNKNOWN" else None
+    model_run_id = (
+        _uuid_value(_get(turn, "model_run_id"))
+        if turn is not None and _get(turn, "model_run_id") is not None
+        else None
+    )
+    correlation = _correlation(
+        investigation_id,
+        invocation_id=linked_invocations[0] if len(linked_invocations) == 1 else None,
+        model_run_id=model_run_id,
+        turn_id=bridge_invocation_uuid if bridge_invocation_uuid != "UNKNOWN" else None,
+    )
+    if bridge_invocation_id and bridge_invocation_id != "UNKNOWN":
+        correlation["bridge_invocation_id"] = bridge_invocation_id
+    idempotency_sha256 = _text(metadata.get("idempotency_key_sha256"))
+    if idempotency_sha256 and _SHA256.fullmatch(idempotency_sha256):
+        correlation["bridge_idempotency_key_sha256"] = idempotency_sha256
+    return _event(
+        "advisor_call.metadata",
+        observation_id,
+        projection.get("occurred_at"),
+        correlation,
+        {
+            "observation_id": observation_id,
+            "linked_invocation_ids": linked_invocations,
+            "blob_id": _uuid_value(projection.get("blob_id")),
+            "expected_sha256": _sha_value(projection.get("expected_sha256")),
+            "read_sha256": _sha_value(projection.get("read_sha256")),
+            "read_status": projection.get("read_status")
+            if projection.get("read_status")
+            in {"verified", "unavailable", "hash_mismatch", "invalid_json", "unsupported_schema"}
+            else "UNKNOWN",
+            "read_reason": projection.get("read_reason")
+            if projection.get("read_status") != "verified"
+            else "metadata read and verified",
+            "bridge_turn_link": "linked" if turn is not None else "UNKNOWN",
+            "metadata": dict(metadata),
+            "content_included": False,
+        },
+    )
+
+
+def _decision_event(investigation_id: str, decision: Any) -> dict[str, Any]:
+    authorization = _get(decision, "retrohunt_authorization")
+    authorization_value = None
+    if authorization is not None:
+        authorization_value = {
+            "authorized": _boolean_or_unknown(_get(authorization, "authorized")),
+            "rule_version_id": _uuid_value(_get(authorization, "rule_version_id")),
+            "source_sha256": _sha_value(_get(authorization, "source_sha256")),
+        }
+    return _event(
+        "operator.decision_recorded",
+        _uuid_value(_get(decision, "id")),
+        _get(decision, "occurred_at"),
+        _correlation(investigation_id),
+        {
+            "decision_type": _enum_token(_get(decision, "decision_type"), AnalystDecisionType)
+            or "UNKNOWN",
+            "target_type": _enum_token(_get(decision, "target_type"), AnalystDecisionTargetType)
+            or "UNKNOWN",
+            "target_id": _uuid_value(_get(decision, "target_id")),
+            "actor_id_sha256": _sha256_value(_get(decision, "actor_id")),
+            "reason_sha256": _sha256_value(_get(decision, "reason")),
+            "correlation_id_sha256": _sha256_value(_get(decision, "correlation_id")),
+            "details_sha256": _sha256_value(_get(decision, "details", {})),
+            "retrohunt_authorization": authorization_value,
+            "content_included": False,
+        },
+    )
+
+
+def _input_pack_event(
+    investigation_id: str, input_pack: Mapping[str, Any] | None
+) -> dict[str, Any]:
+    values = input_pack if isinstance(input_pack, Mapping) else {}
+    blob_id = _uuid_value(values.get("blob_id"))
+    record_id = blob_id if blob_id != "UNKNOWN" else investigation_id
+    return _event(
+        "input_pack.snapshot",
+        record_id,
+        values.get("created_at"),
+        _correlation(investigation_id),
+        {
+            "blob_id": blob_id,
+            "sha256": _sha_value(values.get("sha256")),
+            "synthesis_artifact_id": _uuid_value(values.get("synthesis_artifact_id")),
+            "investigation_version": _safe_count(values.get("investigation_version"))
+            if _safe_count(values.get("investigation_version")) is not None
+            else "UNKNOWN",
+            "investigation_status": _enum_token(
+                values.get("investigation_status"), AnalystInvestigationStatus
+            )
+            or "UNKNOWN",
+            "schema_version_sha256": _sha256_value(values.get("schema_version")),
+            "input_pack_record_id": _uuid_value(values.get("input_pack_record_id")),
+            "content_included": False,
+        },
+        version=_safe_count(values.get("investigation_version")),
+    )
+
+
 def _finding_event(investigation_id: str, finding: Any) -> dict[str, Any]:
     return _event(
         "finding.version_recorded",
@@ -603,6 +1259,11 @@ def _experiment_event(investigation_id: str, experiment: Any) -> dict[str, Any]:
             "negative_result": (
                 _enum_token(_get(experiment, "actual_outcome"), ObservationOutcome)
                 == ObservationOutcome.NOT_OBSERVED.value
+                and _enum_token(_get(experiment, "observation_coverage"), ObservationCoverage)
+                == ObservationCoverage.COMPLETE.value
+                and _enum_token(_get(experiment, "verdict"), ExperimentVerdict)
+                == ExperimentVerdict.REFUTES.value
+                and bool((_text(_get(experiment, "falsification_criterion")) or "").strip())
             ),
             "invocation_refs": [
                 {
@@ -1005,6 +1666,16 @@ def project_audit_events(snapshot: AuditSourceSnapshot) -> list[dict[str, Any]]:
     investigation_id = _required_uuid(snapshot.investigation_id, "investigation_id")
     reservations = _reservation_map(snapshot.budget_snapshot)
 
+    invocation_links: dict[str, set[str]] = {}
+    for invocation in snapshot.invocations:
+        invocation_id = _uuid_value(_get(invocation, "id"))
+        if invocation_id == "UNKNOWN":
+            continue
+        for ref in _get(invocation, "response_refs", ()) or ():
+            observation_id = _uuid_value(ref)
+            if observation_id != "UNKNOWN":
+                invocation_links.setdefault(observation_id, set()).add(invocation_id)
+
     attachments: dict[str, list[dict[str, str]]] = {}
     for opinion in snapshot.opinions:
         opinion_id = _uuid_value(_get(opinion, "id"))
@@ -1024,6 +1695,19 @@ def project_audit_events(snapshot: AuditSourceSnapshot) -> list[dict[str, Any]]:
         for item in snapshot.invocations
     ]
     events.extend(_observation_event(investigation_id, item) for item in snapshot.observations)
+    turns_by_id = {_uuid_value(_get(item, "id")): item for item in snapshot.conversation_turns}
+    events.extend(
+        _advisor_call_event(
+            investigation_id,
+            item,
+            sorted(invocation_links.get(_uuid_value(item.get("observation_id")), set())),
+            turns_by_id,
+        )
+        for item in snapshot.advisor_call_metadata
+    )
+    events.extend(_decision_event(investigation_id, item) for item in snapshot.analyst_decisions)
+    if snapshot.input_pack is not None:
+        events.append(_input_pack_event(investigation_id, snapshot.input_pack))
     events.extend(_finding_event(investigation_id, item) for item in snapshot.findings)
     events.extend(_experiment_event(investigation_id, item) for item in snapshot.experiments)
     events.extend(
@@ -1238,6 +1922,53 @@ def _resource_index(events: Sequence[Mapping[str, Any]], investigation_id: str) 
                         "included": False,
                     },
                 )
+        elif event_type == "advisor_call.metadata":
+            metadata = details.get("metadata", {})
+            for resource_kind, id_key, sha_key in (
+                ("advisor_prompt", "prompt_blob_id", "prompt_sha256"),
+                ("advisor_raw_response", "raw_response_blob_id", "raw_response_sha256"),
+            ):
+                blob_id = metadata.get(id_key)
+                if blob_id and blob_id != "UNKNOWN":
+                    key = (resource_kind, str(blob_id), "")
+                    resources[key] = {
+                        "kind": resource_kind,
+                        "id": str(blob_id),
+                        "sha256": metadata.get(sha_key),
+                        "retrieval": "canonical advisor artifact blob repository",
+                        "authorization": "existing application authorization required",
+                        "included": False,
+                    }
+        elif event_type == "operator.decision_recorded":
+            target_id = details.get("target_id")
+            if target_id and target_id != "UNKNOWN":
+                key = ("operator_decision_target", str(target_id), "")
+                resources.setdefault(
+                    key,
+                    {
+                        "kind": key[0],
+                        "id": str(target_id),
+                        "target_type": details.get("target_type"),
+                        "retrieval": (
+                            "canonical investigation decision target; type-specific lookup"
+                        ),
+                        "authorization": "existing application authorization required",
+                        "included": False,
+                    },
+                )
+        elif event_type == "input_pack.snapshot":
+            blob_id = details.get("blob_id")
+            if blob_id and blob_id != "UNKNOWN":
+                key = ("investigation_input_pack", str(blob_id), "")
+                resources[key] = {
+                    "kind": key[0],
+                    "id": str(blob_id),
+                    "sha256": details.get("sha256"),
+                    "synthesis_artifact_id": details.get("synthesis_artifact_id"),
+                    "retrieval": "canonical investigation input-pack blob repository",
+                    "authorization": "existing application authorization required",
+                    "included": False,
+                }
         elif event_type == "detection_candidate.version_recorded":
             key = ("detection_candidate", str(record["id"]), str(record.get("version") or ""))
             resources[key] = {
@@ -1385,6 +2116,25 @@ def _safe_summary(event: Mapping[str, Any]) -> str:
             f"tool={details.get('tool', 'UNKNOWN')} "
             f"status={details.get('status_at_snapshot', 'UNKNOWN')} operation_key={key}"
         )
+    if kind == "advisor_call.metadata":
+        metadata = details.get("metadata", {})
+        return (
+            f"consultation={metadata.get('consultation_type', 'UNKNOWN')} "
+            f"submission={metadata.get('submission_state', 'UNKNOWN')} "
+            f"blob_read={details.get('read_status', 'UNKNOWN')}"
+        )
+    if kind == "operator.decision_recorded":
+        return (
+            f"decision={details.get('decision_type', 'UNKNOWN')} "
+            f"target={details.get('target_type', 'UNKNOWN')}:{details.get('target_id', 'UNKNOWN')} "
+            f"reason_sha256={details.get('reason_sha256') or 'UNKNOWN'}"
+        )
+    if kind == "input_pack.snapshot":
+        return (
+            f"blob={details.get('blob_id', 'UNKNOWN')} "
+            f"sha256={details.get('sha256', 'UNKNOWN')} "
+            f"version={details.get('investigation_version', 'UNKNOWN')}"
+        )
     if kind == "evidence_observation.recorded":
         return (
             f"kind={details.get('kind', 'UNKNOWN')} "
@@ -1496,13 +2246,46 @@ def _trace_bytes(events: Sequence[Mapping[str, Any]], investigation_id: str) -> 
                 f"{len(details.get('observation_refs', []))}."
             )
         elif event["type"] == "experiment.version_recorded":
-            result_type = "negative" if details.get("negative_result") else "recorded"
+            if details.get("negative_result") is True:
+                result_type = "negative"
+            elif details.get("actual_outcome") == ObservationOutcome.NOT_OBSERVED.value:
+                result_type = "not observed"
+            else:
+                result_type = "recorded"
             lines.append(
                 f"- Experiment `{event['record']['id']}` ({result_type}): "
                 f"verdict {details.get('verdict', 'UNKNOWN')}, outcome "
                 f"{details.get('actual_outcome', 'UNKNOWN')}, coverage "
                 f"{details.get('observation_coverage', 'UNKNOWN')}."
             )
+    lines.extend(["", "## Bridge call metadata", ""])
+    for event in events:
+        if event["type"] != "advisor_call.metadata":
+            continue
+        details = _details(event)
+        metadata = details.get("metadata", {})
+        lines.append(
+            f"- Advisor observation `{details.get('observation_id', 'UNKNOWN')}`: "
+            f"consultation {metadata.get('consultation_type', 'UNKNOWN')}; "
+            f"Bridge invocation `{metadata.get('bridge_invocation_id', 'UNKNOWN')}`; "
+            f"submission {metadata.get('submission_state', 'UNKNOWN')}; "
+            f"dossier `{metadata.get('dossier_sha256', 'UNKNOWN')}`; "
+            f"prompt `{metadata.get('prompt_sha256', 'UNKNOWN')}`; "
+            f"raw response `{metadata.get('raw_response_sha256', 'UNKNOWN')}`; "
+            f"blob read {details.get('read_status', 'UNKNOWN')}."
+        )
+    lines.extend(["", "## Operator decisions", ""])
+    for event in events:
+        if event["type"] != "operator.decision_recorded":
+            continue
+        details = _details(event)
+        lines.append(
+            f"- `{event.get('occurred_at') or 'timestamp UNKNOWN'}` "
+            f"{details.get('decision_type', 'UNKNOWN')} on "
+            f"{details.get('target_type', 'UNKNOWN')}:{details.get('target_id', 'UNKNOWN')}; "
+            f"actor sha256 `{details.get('actor_id_sha256') or 'UNKNOWN'}`; "
+            f"reason sha256 `{details.get('reason_sha256') or 'UNKNOWN'}`."
+        )
     lines.extend(["", "## Sample qualification and detection candidates", ""])
     for event in events:
         details = _details(event)
@@ -1622,33 +2405,27 @@ def _manifest_bytes(
         },
         {
             "field": "bridge_invocation_id",
-            "value": "UNKNOWN when only present inside the referenced advisor-call blob",
+            "value": "UNKNOWN when the advisor-call blob is unavailable or marks it unavailable",
             "reason": (
-                "standard audit reader projects observation metadata and hashes, but does not load "
-                "operator-advisor-call.v1 blob contents"
-            ),
-        },
-        {
-            "field": "advisor_call_embedded_artifact_refs",
-            "value": "UNKNOWN",
-            "reason": (
-                "standard audit reader indexes the containing observation blob without unpacking it"
+                "the value is projected only after the canonical observation SHA-256 verifies"
             ),
         },
         {
             "field": "invocation_to_model_run",
-            "value": "UNKNOWN",
+            "value": "UNKNOWN unless linked advisor metadata exposes a conversation turn ID",
             "reason": (
-                "No ToolInvocation-to-ModelRun foreign key; a pivot conversation may link both "
-                "records independently"
+                "No direct ToolInvocation-to-ModelRun foreign key; explicit response refs and "
+                "advisor-call conversation_turn metadata may provide a chain"
             ),
         },
         {
             "field": "turn_id",
-            "value": "UNKNOWN when no pivot conversation is linked",
+            "value": (
+                "UNKNOWN when absent from advisor-call metadata and no pivot conversation is linked"
+            ),
             "reason": (
-                "Investigation persistence exposes only pivot_conversation_id, not general "
-                "conversation membership"
+                "Investigation persistence exposes only pivot_conversation_id; the advisor-call "
+                "blob may independently expose a typed conversation turn ID"
             ),
         },
         {
@@ -1657,14 +2434,20 @@ def _manifest_bytes(
             "reason": "no durable Bridge-run record is linked to this investigation",
         },
         {
-            "field": "prompt_as_file_and_prompt_bytes",
+            "field": "bridge_prompt_as_file_observation",
             "value": "UNKNOWN",
-            "reason": "Bridge prompt file/byte observations are not persisted",
+            "reason": (
+                "Bridge prompt-file observations are not persisted; advisor prompt hash/size "
+                "are projected when present"
+            ),
         },
         {
-            "field": "rendered_prompt_and_http_payload_hashes",
+            "field": "observed_http_payload_hash",
             "value": "UNKNOWN",
-            "reason": "No stage-specific prompt/payload hash is linked to ToolInvocation",
+            "reason": (
+                "the advisor-call schema stores the rendered prompt hash, not an observed HTTP "
+                "body hash"
+            ),
         },
         {
             "field": "tool_invocation_raw_and_normalized_outputs",
@@ -1680,9 +2463,12 @@ def _manifest_bytes(
             "reason": "no separate reparse history or monetary price/charge is stored",
         },
         {
-            "field": "objective_and_decision_reasons",
+            "field": "investigation_objective",
             "value": "UNKNOWN",
-            "reason": "State stores questions/statuses, not a separate objective/reason",
+            "reason": (
+                "no dedicated objective field is stored; operator decision reasons are hashed "
+                "in events"
+            ),
         },
         {
             "field": "parent_child_sessions",
@@ -1702,6 +2488,21 @@ def _manifest_bytes(
             "projected_source_sha256": details.get("projected_source_sha256"),
             "versions": details.get("source_versions", {}),
             "pivot_conversation_id": details.get("direct_pivot_conversation_id"),
+            "input_pack": next(
+                (
+                    _details(event)
+                    for event in events
+                    if event["type"] == "input_pack.snapshot"
+                ),
+                {
+                    "blob_id": "UNKNOWN",
+                    "sha256": "UNKNOWN",
+                    "synthesis_artifact_id": "UNKNOWN",
+                    "investigation_version": "UNKNOWN",
+                    "investigation_status": "UNKNOWN",
+                    "reason": "no input-pack metadata was supplied to this projection",
+                },
+            ),
             "record_refs": record_refs,
             "idempotency": "SHA-256 of stable projected events; no primary record is created",
         },
@@ -1732,6 +2533,8 @@ def _manifest_bytes(
             "investigation_id",
             "invocation_id",
             "operation_key_sha256",
+            "bridge_invocation_id",
+            "bridge_idempotency_key_sha256",
             "consultation_id",
             "model_run_id",
             "turn_id",
