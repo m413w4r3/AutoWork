@@ -1,0 +1,21 @@
+{
+  "scripts": {
+    "Audit preflight": {
+      "command": "git rev-parse HEAD && GIT_OPTIONAL_LOCKS=0 git status --short"
+    },
+    "Diff check": {
+      "command": "git diff --check"
+    }
+  },
+  "metadataGeneration": {
+    "branchName": {
+      "instructions": "Use lowercase kebab-case with a short scope: feat/area-description, fix/area-description, refactor/area-description, docs/area-description, test/area-description, or audit/area-description. Keep names concise, specific and free of secrets or sensitive CTI identifiers. Never reuse an existing branch name."
+    },
+    "commitMessage": {
+      "instructions": "Use Conventional Commits: type(scope): concise imperative summary. Explain meaningful architectural changes in the body. Reference relevant issue or ADR when available. Do not claim tests passed unless they actually ran. Never include secrets, private CTI data or sensitive identifiers."
+    },
+    "pullRequest": {
+      "instructions": "Write a concise technical PR with sections: Summary, Scope, Evidence, Tests Run, Risks and Limitations, and Human Approvals Required. Link relevant issues and ADRs. Clearly distinguish verified results from assumptions, skipped tests and unverified live behavior. Highlight CTI provenance, database migrations, G2/G3 and provider boundaries when relevant. Never imply approval, deployment or publication."
+    }
+  }
+}
