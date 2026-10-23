@@ -49,6 +49,7 @@ from cti_app.application.investigation_contracts import (
 from cti_app.application.investigation_experiments import (
     build_investigation_experiment_timeline,
     build_investigation_strategy_projection,
+    project_safe_investigation_experiment_timeline,
 )
 from cti_app.application.investigation_governance import (
     EnvelopeDecisionConflictError,
@@ -305,12 +306,12 @@ class ExperimentInputRefView(BaseModel):
 
 
 class ExperimentInvocationRefView(BaseModel):
-    invocation_id: UUID
-    version: int
+    invocation_id: UUID | Literal["[redacted]"]
+    version: int | Literal["[redacted]"]
 
 
 class ExperimentObservationRefView(BaseModel):
-    observation_id: UUID
+    observation_id: UUID | Literal["[redacted]"]
     sha256: str
 
 
@@ -318,8 +319,8 @@ class InvestigationExperimentViewV1(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
 
     schema_version: str = Field(pattern=r"^investigation-experiment\.v1$")
-    id: UUID
-    investigation_id: UUID
+    id: UUID | Literal["[redacted]"]
+    investigation_id: UUID | Literal["[redacted]"]
     version: int
     hypothesis_id: str
     claim_ids: list[str]
@@ -350,22 +351,24 @@ class InvestigationExperimentViewV1(BaseModel):
     scope: str
     limitations: list[str]
     verdict: ExperimentVerdict
-    supersedes_experiment_ids: list[UUID] = Field(default_factory=list)
-    superseded_by: list[UUID] = Field(default_factory=list)
+    supersedes_experiment_ids: list[UUID | Literal["[redacted]"]] = Field(default_factory=list)
+    superseded_by: list[UUID | Literal["[redacted]"]] = Field(default_factory=list)
     implication: str
     next_pivots: list[str]
     author: str
     origin: str
+    verdict_assertion_label: str | None = None
 
 
 class ClaimExperimentScopeViewV1(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
 
-    experiment_id: UUID
+    experiment_id: UUID | Literal["[redacted]"]
     scope: str
     verdict: ExperimentVerdict
-    observation_ids: list[UUID]
-    superseded_by: list[UUID] = Field(default_factory=list)
+    observation_ids: list[UUID | Literal["[redacted]"]]
+    superseded_by: list[UUID | Literal["[redacted]"]] = Field(default_factory=list)
+    verdict_assertion_label: str | None = None
 
 
 class ConsolidatedClaimVerdictViewV1(BaseModel):
@@ -374,10 +377,11 @@ class ConsolidatedClaimVerdictViewV1(BaseModel):
     claim_id: str
     status: ConsolidatedClaimStatus
     verdicts: list[ExperimentVerdict]
-    experiment_ids: list[UUID]
+    experiment_ids: list[UUID | Literal["[redacted]"]]
     scopes: list[ClaimExperimentScopeViewV1]
     contradictory: bool
-    superseded_by: list[UUID] = Field(default_factory=list)
+    superseded_by: list[UUID | Literal["[redacted]"]] = Field(default_factory=list)
+    verdict_assertion_labels: list[str] = Field(default_factory=list)
 
 
 class InvestigationExperimentTimelineResponseV1(BaseModel):
@@ -387,7 +391,7 @@ class InvestigationExperimentTimelineResponseV1(BaseModel):
         default=EXPERIMENT_TIMELINE_SCHEMA_VERSION,
         pattern=r"^investigation-experiment-timeline\.v1$",
     )
-    investigation_id: UUID
+    investigation_id: UUID | Literal["[redacted]"]
     stream_version: int
     experiments: list[InvestigationExperimentViewV1]
     claims: list[ConsolidatedClaimVerdictViewV1]
@@ -1077,8 +1081,11 @@ async def get_investigation_experiments(
                 g2_blocked=authorization.revoked,
             )
         )
+        timeline_payload = project_safe_investigation_experiment_timeline(
+            timeline.to_payload(), strategy=strategy
+        )
     return InvestigationExperimentTimelineResponseV1.model_validate(
-        {**timeline.to_payload(), "strategy": strategy}, strict=False
+        {**timeline_payload, "strategy": strategy}, strict=False
     )
 
 

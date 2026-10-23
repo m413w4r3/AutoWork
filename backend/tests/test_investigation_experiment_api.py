@@ -7,15 +7,16 @@ from uuid import UUID
 
 import pytest
 from fastapi import FastAPI
+from httpx import ASGITransport, AsyncClient, Response
 from pydantic import ValidationError
-from starlette.requests import Request
 
-from cti_app.api.investigation import (
-    InvestigationExperimentTimelineResponseV1,
-    get_investigation_experiments,
-)
+import cti_app.api.main as api_main
+from cti_app.api.investigation import InvestigationExperimentTimelineResponseV1
+from cti_app.api.main import create_app
+from cti_app.application.identity import StaticTokenIdentityProvider
 from cti_app.domain.investigation_experiment import (
     ExperimentAvailability,
+    ExperimentInputRefV1,
     ExperimentVerdict,
     ObservationCoverage,
     ObservationOutcome,
@@ -49,6 +50,7 @@ class _Experiment:
         self.hypothesis_id = "H1"
         self.version = version
         self.claim_ids = ("S3P3.1",)
+        self.next_pivots: tuple[str, ...] = ()
         self.verdict = verdict
         self.scope = f"Scope for experiment v{version}"
         self.observation_refs = observation_refs
@@ -56,14 +58,24 @@ class _Experiment:
         self.availability = ExperimentAvailability.AVAILABLE
         self.actual_outcome = actual_outcome
         self.observation_coverage = observation_coverage
-        self.input_refs = ()
-        self.tool_name = "local.sample.inspect"
-        self.tool_version = "1.0.0"
-        self.tool_schema_version = "local-sample-inspect.v1"
+        self.input_refs: tuple[ExperimentInputRefV1, ...] = ()
+        self.step_ids: tuple[str, ...] = ()
+        self.tool_invocation_refs: tuple[object, ...] = ()
         self.method = "Inspect the persisted observation."
+        self.prediction = "The claim is supported."
+        self.expected = "Expected outcome."
+        self.actual = "Observed outcome."
+        self.implication = "Update the claim assessment."
+        self.preconditions: tuple[str, ...] = ()
+        self.limitations: tuple[str, ...] = ()
         self.method_mode = SimpleNamespace(value="passive")
         self.falsification_criterion = "A complete observation contradicts the claim."
         self.tool_arguments = {}
+        self.tool_name = "network.capture.inspect"
+        self.tool_version = "1.0.0"
+        self.tool_schema_version = "network-capture-inspect.v1"
+        self.author = "operator-led"
+        self.origin = "experiment.record"
 
     def to_payload(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -71,42 +83,45 @@ class _Experiment:
             "id": str(self.id),
             "investigation_id": str(self.investigation_id),
             "version": self.version,
-            "hypothesis_id": "H1",
+            "hypothesis_id": self.hypothesis_id,
             "claim_ids": list(self.claim_ids),
             "working_state_version": 451,
             "g2_envelope_version": 3,
-            "prediction": "The claim is supported.",
-            "falsification_criterion": "A complete observation contradicts the claim.",
-            "method": "Inspect the persisted observation.",
+            "prediction": self.prediction,
+            "falsification_criterion": self.falsification_criterion,
+            "method": self.method,
             "method_mode": "passive",
             "input_type": "sample_sha256",
-            "input_refs": [],
-            "preconditions": [],
+            "input_refs": [item.to_payload() for item in self.input_refs],
+            "preconditions": list(self.preconditions),
             "availability": "available",
-            "tool_name": "network.capture.inspect",
-            "tool_version": "1.0.0",
-            "tool_schema_version": "network-capture-inspect.v1",
-            "tool_arguments": {},
-            "step_ids": [],
-            "tool_invocation_refs": [],
+            "tool_name": self.tool_name,
+            "tool_version": self.tool_version,
+            "tool_schema_version": self.tool_schema_version,
+            "tool_arguments": self.tool_arguments,
+            "step_ids": list(self.step_ids),
+            "tool_invocation_refs": [
+                item.to_payload() if hasattr(item, "to_payload") else item
+                for item in self.tool_invocation_refs
+            ],
             "observation_refs": [
                 {"observation_id": str(item.observation_id), "sha256": item.sha256}
                 for item in self.observation_refs
             ],
-            "expected": "Expected outcome.",
-            "actual": "Observed outcome.",
-            "actual_outcome": "observed",
-            "observation_coverage": "complete",
+            "expected": self.expected,
+            "actual": self.actual,
+            "actual_outcome": self.actual_outcome.value,
+            "observation_coverage": self.observation_coverage.value,
             "started_at": NOW.isoformat(),
             "completed_at": NOW.isoformat(),
             "recorded_at": NOW.isoformat(),
             "scope": self.scope,
-            "limitations": [],
+            "limitations": list(self.limitations),
             "verdict": self.verdict.value,
-            "implication": "Update the claim assessment.",
-            "next_pivots": [],
-            "author": "operator-led",
-            "origin": "experiment.record",
+            "implication": self.implication,
+            "next_pivots": list(self.next_pivots),
+            "author": self.author,
+            "origin": self.origin,
         }
         if self.supersedes_experiment_ids:
             payload["supersedes_experiment_ids"] = [
@@ -214,29 +229,32 @@ class _ApiClient:
     def __exit__(self, *_args: object) -> None:
         return None
 
-    def get(self, path: str) -> SimpleNamespace:
-        investigation_id = UUID(path.split("/")[3])
-        request = Request(
-            {
-                "type": "http",
-                "asgi": {"version": "3.0"},
-                "http_version": "1.1",
-                "method": "GET",
-                "scheme": "http",
-                "path": path,
-                "raw_path": path.encode(),
-                "query_string": b"",
-                "headers": [],
-                "client": ("test", 0),
-                "server": ("test", 80),
-                "app": self.app,
-            }
-        )
-        response = asyncio.run(get_investigation_experiments(investigation_id, request))
-        return SimpleNamespace(
-            status_code=200,
-            json=lambda: response.model_dump(mode="json"),
-        )
+    async def _get(self, path: str, *, authorized: bool) -> Response:
+        headers = {"Authorization": "Bearer " + "c" * 40} if authorized else {}
+        async with AsyncClient(
+            transport=ASGITransport(app=self.app), base_url="http://127.0.0.1"
+        ) as client:
+            return await client.get(path, headers=headers)
+
+    def get(self, path: str) -> Response:
+        return asyncio.run(self._get(path, authorized=True))
+
+    def get_without_authorization(self, path: str) -> Response:
+        return asyncio.run(self._get(path, authorized=False))
+
+
+@pytest.fixture(autouse=True)
+def _safe_app_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = api_main.settings.model_copy(
+        update={
+            "app_env": "development",
+            "api_bind_host": "127.0.0.1",
+            "diagnostics_log_root": None,
+            "operator_api_token": None,
+            "operator_client_api_token": None,
+        }
+    )
+    monkeypatch.setattr(api_main, "get_settings", lambda: settings)
 
 
 def _client(
@@ -247,7 +265,10 @@ def _client(
     snapshot_version: int = 1,
     observations: tuple[object, ...] = (),
 ) -> _ApiClient:
-    app = FastAPI()
+    app = create_app()
+    app.state.identity_provider = StaticTokenIdentityProvider(
+        "h" * 40, operator_client_token="c" * 40
+    )
     repository = _Experiments(experiments)
     app.state.uow_factory = lambda: _UnitOfWork(
         repository,
@@ -329,11 +350,187 @@ def test_get_experiments_exposes_replacement_links_in_timeline_and_claims() -> N
     assert current["superseded_by"] == []
 
     claim = payload["claims"][0]
-    assert claim["status"] == "supported"
+    assert claim["status"] == "inconclusive"
     assert claim["verdicts"] == ["supports"]
     assert claim["superseded_by"] == [str(NEW_EXPERIMENT_ID)]
     assert claim["scopes"][0]["superseded_by"] == [str(NEW_EXPERIMENT_ID)]
     assert claim["scopes"][1]["superseded_by"] == []
+
+
+def test_mounted_route_applies_identity_middleware_and_response_model() -> None:
+    """The lifespan is not entered offline; production UOW installation is UNKNOWN.
+
+    The request uses `_client`'s injected test UOW. This verifies the mounted route,
+    identity middleware, and response model only. ASGITransport skips the
+    PostgreSQL-dependent lifespan, so production wiring remains UNKNOWN; no fake
+    engine represents the production path.
+    """
+    with _client(()) as client:
+        unauthorized = client.get_without_authorization(
+            f"/api/investigations/{INVESTIGATION_ID}/experiments"
+        )
+        authorized = client.get(f"/api/investigations/{INVESTIGATION_ID}/experiments")
+
+    assert unauthorized.status_code == 401
+    assert authorized.status_code == 200
+    assert authorized.json()["schema_version"] == "investigation-experiment-timeline.v1"
+
+
+@pytest.mark.parametrize(
+    ("coverage", "outcome", "observation_sha", "include_observation"),
+    (
+        (ObservationCoverage.LIMITED, ObservationOutcome.NOT_OBSERVED, "a" * 64, True),
+        (ObservationCoverage.COMPLETE, ObservationOutcome.NOT_OBSERVED, "a" * 64, False),
+        (ObservationCoverage.COMPLETE, ObservationOutcome.NOT_OBSERVED, "b" * 64, True),
+        (ObservationCoverage.COMPLETE, ObservationOutcome.OBSERVED, "a" * 64, True),
+    ),
+    ids=("partial-coverage", "missing-observation", "sha-mismatch", "incompatible-outcome"),
+)
+def test_full_api_claim_status_uses_conservative_strategy_projection(
+    coverage: ObservationCoverage,
+    outcome: ObservationOutcome,
+    observation_sha: str,
+    include_observation: bool,
+) -> None:
+    observation_id = UUID("80000000-0000-4000-8000-000000000001")
+    experiment = _experiment(
+        experiment_id=NEW_EXPERIMENT_ID,
+        version=1,
+        verdict=ExperimentVerdict.REFUTES,
+        actual_outcome=outcome,
+        observation_coverage=coverage,
+        observation_refs=(SimpleNamespace(observation_id=observation_id, sha256="a" * 64),),
+    )
+    observations = (
+        SimpleNamespace(
+            id=observation_id,
+            investigation_id=INVESTIGATION_ID,
+            sha256=observation_sha,
+        ),
+    ) if include_observation else ()
+
+    with _client(
+        (experiment,), snapshot_mode="verified", observations=observations
+    ) as client:
+        response = client.get(f"/api/investigations/{INVESTIGATION_ID}/experiments")
+
+    assert response.status_code == 200
+    payload = response.json()
+    strategy_claim = payload["strategy"]["claims"][0]
+    timeline_claim = payload["claims"][0]
+    expected_status = (
+        "supported" if strategy_claim["status"] == "supported" else "inconclusive"
+    )
+    assert timeline_claim["status"] == expected_status
+    assert timeline_claim["status"] != "refuted"
+    assert strategy_claim["status"] == "UNKNOWN"
+    assert timeline_claim["verdicts"] == ["refutes"]
+
+
+def test_timeline_route_redacts_free_text_and_payload_arguments() -> None:
+    secret = "SENSITIVE-OPAQUE-HEX-8f30d2"
+    experiment = _experiment(
+        experiment_id=NEW_EXPERIMENT_ID,
+        version=1,
+        verdict=ExperimentVerdict.INCONCLUSIVE,
+    )
+    experiment.prediction = f"payload evidence {secret}"
+    experiment.expected = f"expected {secret}"
+    experiment.actual = f"actual proof {secret}"
+    experiment.scope = f"scope {secret}"
+    experiment.implication = f"implication {secret}"
+    unsafe_reference = "deadbeef" * 16
+    experiment.input_refs = (
+        ExperimentInputRefV1("sample_sha256", unsafe_reference, "a" * 64),
+        ExperimentInputRefV1("capture_sha256", "b" * 64, "b" * 64),
+    )
+    experiment.tool_arguments = {
+        "payload": f"0000 4d5a {secret}",
+        "byte_0": 77,
+        "byte_1": 90,
+        "byte_2": 0,
+        "flag_0": True,
+        "mode": f"signed-url https://example.invalid/?token={secret}",
+    }
+
+    with _client((experiment,)) as client:
+        response = client.get(f"/api/investigations/{INVESTIGATION_ID}/experiments")
+
+    assert response.status_code == 200
+    payload = response.json()
+    serialized = response.text
+    projected = payload["experiments"][0]
+    assert secret not in serialized
+    assert unsafe_reference not in serialized
+    assert projected["tool_arguments"] == {}
+    assert projected["input_refs"] == [
+        {"input_type": "sample_sha256", "input_id": "[redacted]", "sha256": None},
+        {"input_type": "capture_sha256", "input_id": "b" * 64, "sha256": "b" * 64},
+    ]
+    assert projected["prediction"] == "[redacted]"
+    assert projected["expected"] == "[redacted]"
+    assert projected["actual"] == "[redacted]"
+    assert projected["scope"] == "[redacted]"
+    assert payload["claims"][0]["scopes"][0]["scope"] == "[redacted]"
+
+
+def test_timeline_route_redacts_unvalidated_step_ids_and_labels_refutes_as_assertion() -> None:
+    hostile_step_id = "deadbeef" * 16 + "OPERATOR_TEST_SECRET"
+    experiment = _experiment(
+        experiment_id=NEW_EXPERIMENT_ID,
+        version=1,
+        verdict=ExperimentVerdict.REFUTES,
+    )
+    experiment.step_ids = (hostile_step_id,)
+    experiment.claim_ids = (hostile_step_id,)
+    experiment.next_pivots = (hostile_step_id,)
+    experiment.supersedes_experiment_ids = (hostile_step_id,)
+    experiment.tool_invocation_refs = ({"invocation_id": hostile_step_id, "version": 1},)
+    experiment.observation_refs = (
+        SimpleNamespace(observation_id=hostile_step_id, sha256=hostile_step_id),
+    )
+    experiment.hypothesis_id = hostile_step_id
+    experiment.tool_name = hostile_step_id
+    experiment.tool_version = hostile_step_id
+    experiment.tool_schema_version = hostile_step_id
+    experiment.author = hostile_step_id
+    experiment.origin = hostile_step_id
+
+    with _client((experiment,)) as client:
+        response = client.get(f"/api/investigations/{INVESTIGATION_ID}/experiments")
+
+    assert response.status_code == 200
+    payload = response.json()
+    projected = payload["experiments"][0]
+    assert hostile_step_id not in response.text
+    assert projected["step_ids"] == ["[redacted]"]
+    assert projected["claim_ids"] == ["[redacted]"]
+    assert projected["next_pivots"] == ["[redacted]"]
+    assert projected["supersedes_experiment_ids"] == ["[redacted]"]
+    assert projected["tool_invocation_refs"] == [
+        {"invocation_id": "[redacted]", "version": 1}
+    ]
+    assert projected["observation_refs"] == [
+        {"observation_id": "[redacted]", "sha256": "[redacted]"}
+    ]
+    assert projected["hypothesis_id"] == "[redacted]"
+    assert projected["author"] == "[redacted]"
+    assert projected["origin"] == "[redacted]"
+    assert projected["tool_name"] == "[redacted]"
+    assert projected["tool_version"] == "[redacted]"
+    assert projected["tool_schema_version"] == "[redacted]"
+    assert projected["verdict"] == "refutes"
+    assert projected["verdict_assertion_label"] == (
+        "Verdict enregistré : refutes (assertion, non conclusion)"
+    )
+    assert payload["claims"][0]["scopes"][0]["verdict"] == "refutes"
+    assert payload["claims"][0]["scopes"][0]["verdict_assertion_label"] == (
+        "Verdict enregistré : refutes (assertion, non conclusion)"
+    )
+    assert payload["claims"][0]["verdicts"] == ["refutes"]
+    assert payload["claims"][0]["verdict_assertion_labels"] == [
+        "Verdict enregistré : refutes (assertion, non conclusion)"
+    ]
 
 
 def test_get_experiments_accepts_legacy_payloads_without_replacement_fields() -> None:

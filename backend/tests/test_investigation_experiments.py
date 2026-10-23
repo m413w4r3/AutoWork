@@ -14,6 +14,7 @@ from cti_app.application.investigation_experiments import (
     HYPOTHESIS_DECLARE_TOOL,
     InMemoryInvestigationExperimentRepository,
     OperatorExperimentToolAdapter,
+    _ExperimentListToolAdapter,
     _validate_supersedes_experiments,
     build_investigation_experiment_timeline,
     register_operator_experiment_tools,
@@ -158,7 +159,7 @@ def test_limited_not_observed_cannot_be_marked_refuted() -> None:
             ObservationCoverage.COMPLETE,
             ExperimentVerdict.REFUTES,
             True,
-            AnalysisMatrixStatus.REFUTED,
+            AnalysisMatrixStatus.UNKNOWN,
         ),
         (
             ObservationOutcome.NOT_OBSERVED,
@@ -223,6 +224,26 @@ def test_matrix_projection_keeps_support_refute_conflict_unknown() -> None:
     assert (
         project_claim_matrix_status(
             (supported, refuted), CLAIM_ID, persisted_observations=observations
+        )
+        is AnalysisMatrixStatus.UNKNOWN
+    )
+
+
+def test_free_text_falsification_criterion_cannot_prove_refutation() -> None:
+    experiment = replace(
+        _experiment(
+            1,
+            ExperimentVerdict.REFUTES,
+            actual_outcome=ObservationOutcome.NOT_OBSERVED,
+        ),
+        falsification_criterion="The unrelated host has a blue status page.",
+    )
+    reference = experiment.observation_refs[0]
+
+    assert (
+        project_experiment_matrix_status(
+            experiment,
+            persisted_observations={reference.observation_id: reference.sha256},
         )
         is AnalysisMatrixStatus.UNKNOWN
     )
@@ -462,34 +483,41 @@ async def test_record_tool_requires_g2_and_persisted_investigation_observations(
         budget=budget,
         idempotency_key="record-observation-1",
     )
+    hostile_step_id = "deadbeef" * 16 + "OPERATOR_TEST_SECRET"
     arguments = {
         "expected_version": 0,
         "hypothesis_id": "hypothesis-network",
         "claim_ids": [CLAIM_ID],
         "prediction": "The sample emits the marker.",
-        "falsification_criterion": "A complete capture contains no marker.",
+        "falsification_criterion": "The unrelated host has a blue status page.",
         "method": "Passively inspect the persisted capture with parser 4.4.1.",
         "method_mode": "passive",
         "input_type": "sample_sha256",
-        "input_refs": [{"input_type": "sample_sha256", "input_id": "a" * 64, "sha256": "a" * 64}],
+        "input_refs": [
+            {
+                "input_type": "sample_sha256",
+                "input_id": "deadbeef" * 16,
+                "sha256": "a" * 64,
+            }
+        ],
         "preconditions": ["The observation is bound to the current investigation."],
         "availability": "available",
         "tool_name": "network.capture.inspect",
         "tool_version": "4.4.1",
         "tool_schema_version": "network-capture-inspect.v1",
-        "tool_arguments": {"max_packets": 500},
-        "step_ids": ["step-1"],
+        "tool_arguments": {"byte_0": 77, "byte_1": 90, "byte_2": 0, "flag_0": True},
+        "step_ids": [hostile_step_id],
         "tool_invocation_refs": [],
         "observation_refs": [{"observation_id": str(observation_id), "sha256": "b" * 64}],
         "expected": "The marker is present.",
-        "actual": "The marker is present in the persisted observation.",
-        "actual_outcome": "observed",
+        "actual": "Persisted proof text: OPERATOR_TEST_SECRET",
+        "actual_outcome": "not_observed",
         "observation_coverage": "complete",
         "started_at": NOW.isoformat(),
         "completed_at": (NOW + timedelta(seconds=1)).isoformat(),
         "scope": "Static capture inspection; execution remains unverified.",
         "limitations": [],
-        "verdict": "supports",
+        "verdict": "refutes",
         "implication": "The cited capture supports this bounded claim.",
         "next_pivots": ["c" * 64],
     }
@@ -500,6 +528,37 @@ async def test_record_tool_requires_g2_and_persisted_investigation_observations(
 
     saved = await adapter.execute(arguments, context)
     assert saved.status is ToolInvocationStatus.SUCCEEDED
+    claim_verdict = saved.output["claim_verdicts"][0]
+    assert claim_verdict["status"] == "inconclusive"
+    assert claim_verdict["verdicts"] == ("refutes",)
+    assert claim_verdict["verdict_assertion_labels"] == (
+        "Verdict enregistré : refutes (assertion, non conclusion)",
+    )
+    assert saved.output["verdict"] == "refutes"
+    assert saved.output["verdict_assertion_label"] == (
+        "Verdict enregistré : refutes (assertion, non conclusion)"
+    )
+    assert hostile_step_id not in repr(saved.output)
+    assert "OPERATOR_TEST_SECRET" not in repr(saved.output)
+    listed = await _ExperimentListToolAdapter(experiments).execute({}, context)
+    list_payload = listed.output
+    assert list_payload["claims"][0]["status"] == "inconclusive"
+    assert list_payload["claims"][0]["verdicts"] == ("refutes",)
+    projected_experiment = list_payload["experiments"][0]
+    assert projected_experiment["verdict"] == "refutes"
+    assert projected_experiment["verdict_assertion_label"] == (
+        "Verdict enregistré : refutes (assertion, non conclusion)"
+    )
+    assert projected_experiment["step_ids"] == ("[redacted]",)
+    assert projected_experiment["falsification_criterion"] == "[redacted]"
+    assert projected_experiment["actual"] == "[redacted]"
+    assert projected_experiment["tool_arguments"] == {}
+    assert "OPERATOR_TEST_SECRET" not in repr(list_payload)
+    assert hostile_step_id not in repr(list_payload)
+    assert "deadbeef" * 16 not in repr(list_payload)
+    assert projected_experiment["input_refs"] == (
+        {"input_type": "sample_sha256", "input_id": "[redacted]", "sha256": None},
+    )
     assert (await experiments.list_for_investigation(investigation_id))[0].observation_refs[
         0
     ].sha256 == "b" * 64

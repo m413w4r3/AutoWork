@@ -89,6 +89,7 @@ def _experiment(
     coverage: ObservationCoverage = ObservationCoverage.NONE,
     availability: ExperimentAvailability = ExperimentAvailability.AVAILABLE,
     observation_refs: tuple[ExperimentObservationRefV1, ...] = (),
+    supersedes_experiment_ids: tuple[UUID, ...] = (),
 ) -> InvestigationExperimentV1:
     return InvestigationExperimentV1(
         id=UUID(f"20000000-0000-4000-8000-{version:012x}"),
@@ -112,6 +113,7 @@ def _experiment(
         step_ids=(f"step-{version}",),
         tool_invocation_refs=(),
         observation_refs=observation_refs,
+        supersedes_experiment_ids=supersedes_experiment_ids,
         expected="Marker appears in the synthetic input.",
         actual=f"Fake result {version}.",
         actual_outcome=outcome,
@@ -241,7 +243,7 @@ def test_support_refute_contradiction_stays_unknown(offline_only: list[str]) -> 
     assert strategy["claims"][0]["status"] == "UNKNOWN"
     assert [item["matrix_status"] for item in strategy["claims"][0]["attempted_experiments"]] == [
         "supported",
-        "refuted",
+        "UNKNOWN",
     ]
     assert providers.calls == []
     assert offline_only == []
@@ -268,6 +270,33 @@ def test_blocked_acquisition_is_not_a_refutation(offline_only: list[str]) -> Non
     }
     assert providers.calls == []
     assert offline_only == []
+
+
+def test_checkpoint_coverage_uses_active_strategy_attempts_but_lists_history() -> None:
+    superseded = _experiment(
+        1,
+        verdict=ExperimentVerdict.INCONCLUSIVE,
+        outcome=ObservationOutcome.UNKNOWN,
+        coverage=ObservationCoverage.LIMITED,
+    )
+    active = _experiment(
+        2,
+        verdict=ExperimentVerdict.INCONCLUSIVE,
+        outcome=ObservationOutcome.OBSERVED,
+        coverage=ObservationCoverage.COMPLETE,
+        supersedes_experiment_ids=(superseded.id,),
+    )
+    strategy = _projection((superseded, active))
+    checkpoint = build_investigation_operator_strategy_checkpoint(
+        strategy, state=SimpleNamespace(stop_reason=None)
+    )
+
+    assert strategy["claims"][0]["coverage"] == "complete"
+    assert checkpoint["checkpoint"]["coverage"] == "complete"
+    assert checkpoint["checkpoint"]["attempted_experiment_ids"] == [
+        str(superseded.id),
+        str(active.id),
+    ]
 
 
 @pytest.mark.asyncio
