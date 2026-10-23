@@ -52,6 +52,7 @@ from cti_app.application.research_context_builder import (
     ResearchContextBuilder,
 )
 from cti_app.domain.investigation import (
+    BudgetReservationStatus,
     InvestigationExecutionMode,
     ToolInvocation,
     ToolInvocationStatus,
@@ -501,6 +502,49 @@ class OperatorToolInvocationService:
                 return True
         return False
 
+    async def _is_proven_pre_submission_failure(self, invocation: ToolInvocation) -> bool:
+        if await self._is_proven_pre_submit_advisor_failure(invocation):
+            return True
+        if self._observations is None or self._evidence_summaries is None:
+            return False
+        envelope = await self._envelopes.get(self._investigation_id)
+        if envelope is None:
+            return False
+        reservation = next(
+            (
+                item
+                for item in envelope.budget.reservations
+                if item.operation_key == invocation.operation_key
+            ),
+            None,
+        )
+        if reservation is None or reservation.status is not BudgetReservationStatus.RELEASED:
+            return False
+        for observation_id in invocation.response_refs:
+            observation = await self._observations.get(observation_id)
+            if (
+                observation is None
+                or observation.investigation_id != self._investigation_id
+                or observation.invocation_ref != invocation.id
+                or observation.source != invocation.tool_name
+                or observation.object_type != "tool_call"
+                or observation.object_id != invocation.operation_key
+            ):
+                continue
+            try:
+                summary = await self._evidence_summaries.summary(observation)
+            except Exception:
+                continue
+            if (
+                isinstance(summary, Mapping)
+                and summary.get("pre_submission_reason") == "budget_exceeded"
+                and summary.get("failure_stage") == "pre_submission"
+                and summary.get("confirmed_non_execution") is True
+                and summary.get("request_permission") is True
+            ):
+                return True
+        return False
+
     async def _invoke_locked(
         self,
         *,
@@ -598,6 +642,51 @@ class OperatorToolInvocationService:
                     tool_result=failure,
                 )
             return await self._result(existing, state.version, replay=True)
+
+        semantic_parameters = canonical_json_bytes(arguments)
+        for existing in await self._invocations.list_for_investigation(self._investigation_id):
+            if (
+                existing.tool_name != tool_name
+                or existing.schema_version != schema_version
+                or canonical_json_bytes(dict(existing.normalized_parameters)) != semantic_parameters
+                or existing.status
+                not in {ToolInvocationStatus.RUNNING, ToolInvocationStatus.NEEDS_REVIEW}
+            ):
+                continue
+            if (
+                existing.status is ToolInvocationStatus.NEEDS_REVIEW
+                and await self._is_proven_pre_submission_failure(existing)
+            ):
+                resolved = existing.resolve_pre_submission_failure()
+                existing = await self._invocations.update_if_version(
+                    resolved, expected_version=existing.version
+                )
+                failure = ToolResult(
+                    ToolInvocationStatus.FAILED,
+                    error_code="prior_invocation_proven_unsubmitted",
+                    message=(
+                        "Persisted evidence proves the prior invocation did not reach "
+                        "external submission."
+                    ),
+                    output={
+                        "failure_stage": "pre_submission",
+                        "confirmed_non_execution": True,
+                    },
+                )
+                await self._execution._complete_tool_reservation(
+                    investigation_id=self._investigation_id,
+                    operation_key=existing.operation_key,
+                    result=failure,
+                    reserved_amounts=existing.reserved_budget,
+                    uncertain=False,
+                )
+                await self._execution.commit_current_uow()
+                continue
+            raise OperatorToolInvocationError(
+                "ambiguous_tool_invocation_requires_reconciliation",
+                409,
+                details={"existing_invocation_id": str(existing.id)},
+            )
 
         if state.version != expected_version:
             raise OperatorToolInvocationError("stale_working_state", 409)

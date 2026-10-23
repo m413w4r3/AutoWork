@@ -1014,18 +1014,13 @@ class InvestigationService:
         """Persist budget and RUNNING invocation before using the shared dispatcher."""
         registered = self._registry.get(tool_name, schema_version)
         definition = registered[0] if registered else None
-        cost = thaw_json(definition.cost_model) if definition is not None else {}
+        requested_cost = thaw_json(definition.cost_model) if definition is not None else {}
         external_effect = definition is not None and definition.effect in {
             ToolEffect.EXTERNAL_READ,
             ToolEffect.ACQUIRE,
             ToolEffect.EXTERNAL_ACTIVE,
             ToolEffect.EXTERNAL_SUBMIT,
         }
-        try:
-            budget.reserve(operation_key, cost)
-        except BudgetExceeded:
-            # The dispatcher repeats the budget preflight and returns a typed result.
-            pass
         invocation = ToolInvocation(
             investigation_id=investigation.id,
             operation_key=operation_key,
@@ -1033,10 +1028,43 @@ class InvestigationService:
             schema_version=schema_version,
             normalized_parameters=arguments,
             purpose=purpose,
-            reserved_budget=cost,
+            reserved_budget=requested_cost,
         )
         invocation = await self._invocations.add_if_absent(invocation)
+        admission_reservation: BudgetReservation | None = None
         if invocation.status is ToolInvocationStatus.PENDING:
+            # A durable invocation is the source of truth for an operation's cost.
+            # This also makes a replay safe if the registry's cost model changed
+            # after the original request was journaled.
+            cost = invocation.reserved_budget
+            try:
+                admission_reservation = budget.reserve(operation_key, cost)
+            except BudgetExceeded:
+                # The dispatcher repeats the same admission check and returns a
+                # typed pre-dispatch refusal. No reservation is created here.
+                pass
+            if (
+                admission_reservation is not None
+                and admission_reservation.status is not BudgetReservationStatus.RESERVED
+            ):
+                reviewed = invocation.transition(ToolInvocationStatus.NEEDS_REVIEW)
+                invocation = await self._invocations.update_if_version(
+                    reviewed, expected_version=invocation.version
+                )
+                await self._commit_current_uow()
+                return (
+                    invocation,
+                    ToolResult(
+                        status=ToolInvocationStatus.NEEDS_REVIEW,
+                        message=(
+                            "The operation already has a terminal budget reservation; "
+                            "reconcile it before dispatch."
+                        ),
+                        error_code="reservation_not_active",
+                    ),
+                    invocation.response_refs,
+                    external_effect,
+                )
             running = invocation.transition(ToolInvocationStatus.RUNNING)
             invocation = await self._invocations.update_if_version(
                 running, expected_version=invocation.version
@@ -1072,9 +1100,49 @@ class InvestigationService:
                 False,
             )
 
+        cost = invocation.reserved_budget
         if envelope is not None:
-            envelope = await self._save_envelope_version(envelope)
+            try:
+                envelope = await self._save_envelope_version(envelope)
+            except VersionConflictError:
+                # Admission did not reach durable storage, so the adapter is
+                # provably unreachable. Persist that pre-submission outcome rather
+                # than leaving a RUNNING invocation that would block a safe retry.
+                budget.release_confirmed_non_submission(operation_key)
+                failed = invocation.transition(ToolInvocationStatus.FAILED)
+                invocation = await self._invocations.update_if_version(
+                    failed, expected_version=invocation.version
+                )
+                await self._commit_current_uow()
+                failure = ToolResult(
+                    status=ToolInvocationStatus.FAILED,
+                    error_code="envelope_admission_conflict",
+                    message=(
+                        "The approved envelope changed before the reservation was persisted; "
+                        "the tool was not dispatched."
+                    ),
+                    output={
+                        "reason": "envelope_admission_conflict",
+                        "failure_stage": "pre_submission",
+                        "confirmed_non_execution": True,
+                    },
+                )
+                _log_terminal_tool_failure(invocation, failure)
+                return invocation, failure, (), external_effect
             budget = envelope.budget
+        persisted_reservation = next(
+            (
+                item
+                for item in (envelope.budget.reservations if envelope is not None else ())
+                if item.operation_key == operation_key
+            ),
+            None,
+        )
+        reservation_persisted = (
+            persisted_reservation is not None
+            and persisted_reservation.status is BudgetReservationStatus.RESERVED
+            and dict(persisted_reservation.amounts) == dict(cost)
+        )
         # The RUNNING journal and its reservation are committed before the effect.
         await self._commit_current_uow()
 
@@ -1109,6 +1177,79 @@ class InvestigationService:
             idempotency_key=operation_key,
             available_capabilities=self._available_capabilities,
         )
+
+        async def check_current_admission(
+            _context: ToolExecutionContext,
+        ) -> ToolResult | None:
+            if not external_effect or envelope is None:
+                return None
+            current_envelope = await self._envelopes.get(investigation.id)
+            if (
+                current_envelope is None
+                or current_envelope.approval_decision_id != envelope.approval_decision_id
+                or _envelope_reduced_since(envelope, current_envelope)
+            ):
+                return ToolResult(
+                    status=ToolInvocationStatus.POLICY_DENIED,
+                    error_code="envelope_revoked_before_dispatch",
+                    message="The approved envelope changed before tool dispatch.",
+                    output={
+                        "reason": "envelope_revoked_before_dispatch",
+                        "failure_stage": "pre_submission",
+                        "confirmed_non_execution": True,
+                    },
+                )
+            if reservation_persisted:
+                current_reservation = next(
+                    (
+                        item
+                        for item in current_envelope.budget.reservations
+                        if item.operation_key == operation_key
+                    ),
+                    None,
+                )
+                if (
+                    current_reservation is None
+                    or current_reservation.status is not BudgetReservationStatus.RESERVED
+                    or dict(current_reservation.amounts) != dict(cost)
+                ):
+                    return ToolResult(
+                        status=ToolInvocationStatus.NEEDS_REVIEW,
+                        error_code="reservation_changed_before_dispatch",
+                        message=(
+                            "The durable reservation changed after admission; "
+                            "reconcile it before dispatch."
+                        ),
+                    )
+            if tool_name == "advisor.consult":
+                current_investigation = await self._investigations.get(investigation.id)
+                if current_investigation is None:
+                    return ToolResult(
+                        status=ToolInvocationStatus.POLICY_DENIED,
+                        error_code="investigation_missing_before_dispatch",
+                        message="The investigation is unavailable before tool dispatch.",
+                        output={
+                            "reason": "investigation_missing_before_dispatch",
+                            "failure_stage": "pre_submission",
+                            "confirmed_non_execution": True,
+                        },
+                    )
+                snapshot = await self._context_builder.article_snapshots.resolve(
+                    current_investigation.synthesis_artifact_id
+                )
+                if not self.external_llm_allowed(snapshot, current_envelope):
+                    return ToolResult(
+                        status=ToolInvocationStatus.POLICY_DENIED,
+                        error_code="external_disclosure_revoked_before_dispatch",
+                        message="External LLM disclosure is no longer allowed.",
+                        output={
+                            "reason": "external_disclosure_revoked_before_dispatch",
+                            "failure_stage": "pre_submission",
+                            "confirmed_non_execution": True,
+                        },
+                    )
+            return None
+
         result = await self._dispatcher.dispatch(
             tool_context,
             tool_name=tool_name,
@@ -1116,6 +1257,8 @@ class InvestigationService:
             arguments=arguments,
             purpose=purpose,
             operation_key=operation_key,
+            reservation_amounts=cost,
+            pre_dispatch_check=check_current_admission,
         )
         uncertain_external = external_effect and (
             (
@@ -1124,7 +1267,7 @@ class InvestigationService:
             )
             or (
                 result.status is ToolInvocationStatus.NEEDS_REVIEW
-                and not result.output.get("request_permission", False)
+                and not _confirmed_external_non_execution(result)
             )
         )
         if (
@@ -1185,7 +1328,7 @@ class InvestigationService:
             response_refs=valid_refs,
             consumed_budget=(
                 {}
-                if uncertain_external
+                if uncertain_external or _confirmed_external_non_execution(result)
                 else _actual_tool_consumption(tool_context.budget, operation_key, result)
             ),
         )
@@ -3206,6 +3349,22 @@ def _confirmed_external_non_execution(result: ToolResult) -> bool:
         )
         or (
             result.error_code in {"advisor_rate_limited", "advisor_unavailable"}
+            and result.output.get("confirmed_non_execution") is True
+        )
+        or (
+            result.error_code
+            in {
+                "envelope_revoked_before_dispatch",
+                "envelope_admission_conflict",
+                "external_disclosure_revoked_before_dispatch",
+                "investigation_missing_before_dispatch",
+            }
+            and result.output.get("failure_stage") == "pre_submission"
+            and result.output.get("confirmed_non_execution") is True
+        )
+        or (
+            result.output.get("pre_submission_reason") in {"budget_exceeded", "policy_denied"}
+            and result.output.get("failure_stage") == "pre_submission"
             and result.output.get("confirmed_non_execution") is True
         )
     )
