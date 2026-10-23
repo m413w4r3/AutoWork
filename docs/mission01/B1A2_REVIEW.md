@@ -7,7 +7,7 @@
 **Commit examiné :** 3c2ff0e91248e7272e83670c5698a4a7ad796490
 
 **Intégration indiquée :** 723b761cab8ce36580bcb9e8c14f16d08a151017
-**Verdict : FAIL**
+**Verdict initial (historique) : FAIL — supersédé par la re-revue finale ci-dessous.**
 
 La borne choisit bien le minimum entre la réservation G2 active et le timeout
 Research, puis transmet cette durée au transport. Elle ne constitue toutefois
@@ -170,3 +170,88 @@ des arguments équivalents après normalisation. Le seuil fixe de 60 s manque
 de justification et le test combiné de rate-limit ne compte pas le transport.
 Le changement de classification est correct, mais le gate B1A2 reste **FAIL**
 jusqu’à fermeture de F1.
+
+## Re-revue finale après 01346e2/5484375
+
+**TASK_ID :** M01-B1A2-REVIEW-R2
+
+**Commits vérifiés :** `01346e28e001c170b919c970a90f3a1c21c291d8` (intégré par
+`91db0f3d90b0f0186bfef441e412532ae128c3e4`) et
+`54843750029a04b063b5a2e3f93c7feeff3960c5` (intégré par
+`591eeca061607649f84ac641e3b04a67ac62d1b1`). Les deux intégrations sont dans
+`3e15193a9d5dafdadf41a472699768cede164d35`, qui ajoute ensuite trois tests
+B1A1-R2 de normalisation sémantique. `git diff --check` de la base de revue à
+cette intégration passe.
+
+**Verdict final : PASS_WITH_CHANGES**
+
+### Résultat
+
+- Sur le chemin de production `advisor.consult`, l’horloge monotone démarre
+  avant la préparation, puis la même deadline absolue est transmise au helper
+  Bridge (`investigation_advisor_tools.py:217-240,688-700`). Le pacer compare
+  son attente prévue au temps restant et refuse avant transport si elle
+  atteindrait la deadline (`bridge_investigator.py:91-116,235-255`). Après le
+  pacing, le helper calcule le timeout transport restant, le passe au transport
+  et l’encadre aussi par `asyncio.timeout`; une réponse retournée à la deadline
+  ou après devient `NEEDS_REVIEW`, sans texte réussi à parser
+  (`bridge_investigator.py:256-305`). Le gateway borne également l’appel
+  d’adaptateur par le plus petit des timeouts de requête et de rôle.
+- Les retours ambigus passent avant la classification `http_429`; seul le 429
+  confirmé devient `advisor_rate_limited`. Un résultat ambigu consomme un tour
+  réservé et n’est pas retenté avec un second transport. Les tests couvrent
+  aussi le succès avant borne, la réponse à 3601 s pour un budget de 3600 s,
+  l’unique appel transport et la consommation plafonnée à la réserve.
+- Le plancher est calculé depuis pacing, jitter, connect, capabilities,
+  archive et marge (`investigation_advisor_tools.py:4013-4045`). Les refus
+  d’admission exigent une réservation G2 active avec au moins un tour et assez
+  de `tool_seconds`; l’exécution est plafonnée par le minimum entre réserve et
+  timeout Research (`:4048-4088`). L’estimateur historique de coût basé sur
+  `ModelRun.duration_ms` reste explicitement **DEFER**. Aucun changement de
+  migration ou contournement G2 n’a été trouvé dans ces commits.
+- Le test
+  `test_remaining_capacity_below_minimum_is_refused_before_reservation_or_transport`
+  vérifie désormais `FrameworkPreSubmissionProof.BUDGET_REJECTED`, conserve la
+  dépense existante, et vérifie l’absence de nouvelle réservation et d’appel
+  transport (ainsi que le compteur Bridge). Il n’emploie plus le champ libre
+  `pre_submission_reason`; l’assertion de refus avant réservation/transport
+  n’est pas affaiblie. Les cas de capacité insuffisante ne remplacent toutefois
+  pas les tests séparés du calcul du plancher.
+
+### Changements encore recommandés
+
+- Le calcul du plancher (`:4017-4045`) additionne le pacing maximal, connect et
+  capabilities, mais utilise `max(archive, 35 s)` pour archive et marge. La
+  justification de la constante de 35 s et le fait que ces deux phases soient
+  alternatives plutôt que séquentielles ne sont pas établis dans les contrats
+  consultés. De plus, après préparation et pacing, le helper compare le temps
+  restant au plancher complet, qui inclut déjà pacing et marge
+  (`bridge_investigator.py:259-265`). Cela peut refuser conservativement un
+  transport encore possible; aucun dépassement n’en résulte. Clarifier les
+  phases et tester un cas de pacing consommé près du plancher.
+- Le chemin distinct `BridgeInvestigator.turn` conserve un pacer sans deadline
+  puis un appel transport sans timeout (`bridge_investigator.py:1082,1125` dans
+  l’intégration vérifiée). L’unique appel de production à
+  `submit_bridge_consultation_once` est `advisor.consult` et lui passe la
+  deadline; ce chemin distinct n’est donc pas un contournement de cet appel
+  B1A2. La borne ne doit pas être présentée comme couvrant tous les tours
+  Bridge de l’investigation.
+- La valeur `submission_state="external_state_unknown"` est encore affectée
+  comme chaîne dans le résultat ambigu (`bridge_investigator.py:303`), alors
+  que le domaine expose `ModelSubmissionState.EXTERNAL_STATE_UNKNOWN` et que
+  `backend/AGENTS.md` demande des StrEnums pour les états de contrôle. C’est une
+  incohérence de typage de faible gravité, sans échec observé dans la suite.
+
+### Vérifications exécutées
+
+Les archives exactes des commits d’intégration ont été testées sous
+`/tmp/m01-b1a2-review-591eeca-r2` et
+`/tmp/m01-b1a2-review-3e15193-r2`, avec les liens `.venv` et `.autowork-runs`
+indiqués dans la mission. Sur `591eeca`, les neuf fichiers demandés donnent
+**217 passed**; sur l’intégration finale `3e15193`, la même suite donne
+**220 passed** (les trois tests supplémentaires sont ceux de normalisation
+B1A1-R2). Ruff sur tout le backend passe aux deux révisions (`All checks
+passed!`). Aucun fournisseur ou service live n’a été appelé.
+
+**UNKNOWN :** tests PostgreSQL et runtime/provider non exécutés; aucun résultat
+de transport live n’est inféré de ces tests hors ligne. **Coût : UNKNOWN.**
