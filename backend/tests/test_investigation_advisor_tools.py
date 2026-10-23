@@ -173,7 +173,15 @@ def make_observation(investigation_id, payload):
     )
 
 
-def make_tool(*, investigation_id, transport, observation=None, raw=None, allowed=True):
+def make_tool(
+    *,
+    investigation_id,
+    transport,
+    observation=None,
+    raw=None,
+    allowed=True,
+    role_timeout_seconds=7_200,
+):
     class _Hypothesis:
         def to_payload(self):
             return {
@@ -219,6 +227,7 @@ def make_tool(*, investigation_id, transport, observation=None, raw=None, allowe
         settings=SimpleNamespace(
             openai_bridge_min_submission_interval_seconds=0,
             openai_bridge_submission_jitter_fraction=0,
+            openai_bridge_wait_timeout_research_seconds=role_timeout_seconds,
             operator_advisor_checkpoint_tool_threshold=12,
         ),
         investigations=SimpleNamespace(get=lambda _id: None),
@@ -247,11 +256,26 @@ def async_get(value):
     return get
 
 
-def make_context(investigation_id, key="operator:advisor:test", capabilities=()):
+def make_context(
+    investigation_id,
+    key="operator:advisor:test",
+    capabilities=(),
+    *,
+    tool_seconds=3_600,
+    bridge_turns=1,
+):
+    budget = InvestigationBudget(limits={})
+    budget.reserve(
+        key,
+        {
+            BudgetDimension.BRIDGE_TURNS: bridge_turns,
+            BudgetDimension.TOOL_SECONDS: tool_seconds,
+        },
+    )
     return ToolExecutionContext(
         investigation_id=investigation_id,
         envelope=None,
-        budget=InvestigationBudget(limits={}),
+        budget=budget,
         idempotency_key=key,
         available_capabilities=frozenset(capabilities),
     )
@@ -3078,7 +3102,14 @@ async def test_editorial_batch_retains_cursor_and_stops_after_ambiguous_result()
     )
     submitted: list[tuple[Mapping[str, Any], ToolExecutionContext]] = []
 
-    async def needs_review(arguments, context, *, _editorial_batch_child=False):
+    async def needs_review(
+        arguments,
+        context,
+        *,
+        _editorial_batch_child=False,
+        _execution_timeout_seconds=None,
+        _bridge_turns_remaining=None,
+    ):
         submitted.append((arguments, context))
         return ToolResult(
             ToolInvocationStatus.NEEDS_REVIEW,
@@ -3088,7 +3119,11 @@ async def test_editorial_batch_retains_cursor_and_stops_after_ambiguous_result()
 
     tool.execute = needs_review
     units = [{"id": f"U{index}"} for index in range(1, 4)]
-    context = make_context(investigation_id, key="operator:advisor:cursor")
+    context = make_context(
+        investigation_id,
+        key="operator:advisor:cursor",
+        bridge_turns=3,
+    )
 
     result = await tool._execute_editorial_batches(
         {"consultation_type": "draft_text"},
@@ -3103,6 +3138,64 @@ async def test_editorial_batch_retains_cursor_and_stops_after_ambiguous_result()
     assert result.output["unprocessed_unit_ids"] == ("U1", "U2", "U3")
     assert result.output["batch_cursor"]["next_batch_index"] == 1
     assert result.output["batch_cursor"]["idempotency_key"]
+
+
+@pytest.mark.asyncio
+async def test_editorial_batch_keeps_prior_consumption_when_remaining_budget_is_too_small() -> None:
+    investigation_id = uuid4()
+    tool, _sample_blob = make_tool(
+        investigation_id=investigation_id,
+        transport=Transport(None),
+    )
+    submitted: list[tuple[Mapping[str, Any], int | None]] = []
+
+    async def succeed_first(
+        arguments,
+        context,
+        *,
+        _editorial_batch_child=False,
+        _execution_timeout_seconds=None,
+        _bridge_turns_remaining=None,
+    ):
+        submitted.append((arguments, _execution_timeout_seconds))
+        return ToolResult(
+            ToolInvocationStatus.SUCCEEDED,
+            budget_consumed={
+                BudgetDimension.BRIDGE_TURNS: 1,
+                BudgetDimension.TOOL_SECONDS: 3_541,
+            },
+            output={
+                "advisor_status": "succeeded",
+                "consultation_type": "draft_text",
+                "usable": True,
+                "blocks": [{"unit_id": "U1"}],
+            },
+        )
+
+    tool.execute = succeed_first
+    units = [{"id": "U1"}, {"id": "U2"}]
+    result = await tool._execute_editorial_batches(
+        {"consultation_type": "draft_text"},
+        make_context(
+            investigation_id,
+            key="operator:advisor:budget-exhaustion",
+            bridge_turns=2,
+        ),
+        units,
+        maximum_units=1,
+        execution_timeout_seconds=3_600,
+    )
+
+    assert len(submitted) == 1
+    assert submitted[0][0]["units"] == [units[0]]
+    assert result.status is ToolInvocationStatus.PARTIAL
+    assert result.budget_consumed[BudgetDimension.TOOL_SECONDS] == 3_541
+    assert result.budget_consumed[BudgetDimension.TOOL_SECONDS] <= 3_600
+    assert result.output["advisor_status"] == "partial"
+    assert result.output["failure_stage"] == "budget_admission"
+    assert result.output["failure_reason"] == "tool_seconds_remaining_below_minimum"
+    assert result.output["confirmed_non_execution"] is False
+    assert result.output["unprocessed_unit_ids"] == ("U2",)
 
 
 @pytest.mark.asyncio
@@ -3271,8 +3364,11 @@ async def test_editorial_batch_stops_on_oversized_shared_context_with_observatio
 
     assert result.status is ToolInvocationStatus.UNAVAILABLE
     assert transport.calls == []
-    assert result.output["failure_stage"] == "prompt_size_preflight"
-    assert result.output["failure_reason"] == "shared_context_exceeds_input_limit"
+    assert result.output["failure_stage"] == "budget_admission"
+    assert (
+        result.output["failure_reason"]
+        == "bridge_turn_reservation_insufficient_for_editorial_batches"
+    )
     assert result.output["confirmed_non_execution"] is True
     assert result.output["unprocessed_unit_ids"] == ("U1", "U2")
     assert result.output["batch_cursor"]["next_batch_index"] == 1
@@ -3284,8 +3380,10 @@ async def test_editorial_batch_stops_on_oversized_shared_context_with_observatio
     persisted = json.loads(
         await tool._artifact_store.read_bytes(advisor_call.blob_id, max_bytes=16 * 1024)
     )
-    assert persisted["failure_stage"] == "prompt_size_preflight"
-    assert persisted["failure_reason"] == "shared_context_exceeds_input_limit"
+    assert persisted["failure_stage"] == "budget_admission"
+    assert (
+        persisted["failure_reason"] == "bridge_turn_reservation_insufficient_for_editorial_batches"
+    )
 
 
 @pytest.mark.asyncio
@@ -3739,7 +3837,7 @@ async def test_advisor_transport_failures_are_explicit_and_never_retried(
     assert len(transport.calls) == 1
 
 
-def test_advisor_parses_persisted_output_even_when_bridge_turn_needs_review() -> None:
+def test_advisor_does_not_parse_persisted_output_when_bridge_turn_needs_review() -> None:
     observation_id = uuid4()
     prompt_data = {
         "units": [{"id": "U1", "block_type": "key_findings", "form": "body", "anchor": None}],
@@ -3785,9 +3883,9 @@ LIMITATION: none
         prompt_data=prompt_data,
     )
 
-    assert result.status is ToolInvocationStatus.SUCCEEDED
-    assert result.output["advisor_status"] == "succeeded"
-    assert result.output["blocks"][0]["sentences"][0]["assertion_ids"] == ("assertion-1",)
+    assert result.status is ToolInvocationStatus.NEEDS_REVIEW
+    assert result.output["advisor_status"] == "needs_review"
+    assert "blocks" not in result.output
     assert result.output["bridge_turns_consumed"] == 1
     assert result.budget_consumed[BudgetDimension.BRIDGE_TURNS] == 1
 

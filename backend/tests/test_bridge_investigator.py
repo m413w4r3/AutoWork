@@ -64,13 +64,14 @@ async def test_advisor_waits_for_provider_pacing_slot_without_timing_out(monkeyp
             context_sha256="a" * 64,
             prompt="Synthetic pacing wait test.",
             external_llm_allowed=True,
+            timeout_seconds=0.001,
             settings=SimpleNamespace(
                 openai_bridge_min_submission_interval_seconds=0.05,
                 openai_bridge_submission_jitter_fraction=0,
             ),
         )
     )
-    await asyncio.sleep(0)
+    await asyncio.sleep(0.02)
     assert not task.done()
     assert transport.submission_count == 0
     pacer.ready.set()
@@ -799,6 +800,7 @@ class _PersistedConversationService:
         self.add_turn_count = 0
         self.targeted_lookup_count = 0
         self.prompts = []
+        self.add_turn_kwargs = []
 
     async def get_or_create(self, conversation_id, **kwargs):
         return SimpleNamespace(
@@ -826,6 +828,7 @@ class _PersistedConversationService:
     async def add_turn(self, conversation_id, *, idempotency_key, **kwargs):
         self.add_turn_count += 1
         self.prompts.append(kwargs["message"])
+        self.add_turn_kwargs.append(kwargs)
         turn = SimpleNamespace(
             id=uuid4(),
             idempotency_key=idempotency_key,
@@ -878,6 +881,7 @@ async def test_model_transport_reuses_successful_persisted_turn_without_add_turn
         "context_sha256": hashlib.sha256(context.canonical_bytes()).hexdigest(),
         "prompt": "canonical prompt",
         "external_llm_allowed": True,
+        "timeout_seconds": 321,
     }
 
     first = await transport.submit(**args)
@@ -887,6 +891,7 @@ async def test_model_transport_reuses_successful_persisted_turn_without_add_turn
     assert second.status is TurnSubmissionStatus.SUCCEEDED
     assert second.output_text == output
     assert conversations.add_turn_count == 1
+    assert conversations.add_turn_kwargs[0]["timeout_seconds"] == 321
     assert conversations.targeted_lookup_count >= 3
 
 

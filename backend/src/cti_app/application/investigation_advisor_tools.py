@@ -64,6 +64,7 @@ from cti_app.config import Settings
 from cti_app.domain.analyst_opinion import OpinionBlockType, investigation_opinion_id
 from cti_app.domain.investigation import (
     BudgetDimension,
+    BudgetReservationStatus,
     EvidenceKind,
     EvidenceObservation,
     ToolInvocationStatus,
@@ -84,6 +85,7 @@ _TYPED_CONSULTATION_TYPES = frozenset(
 )
 MAX_ADVISOR_INPUT_BYTES = 4_000_000
 MAX_ADVISOR_TOOL_SECONDS = 3_600
+MIN_ADVISOR_EXECUTION_SECONDS = 60
 _SECRET = re.compile(
     r"(?i)\b(api[_ -]?key|private[_ -]?key|access[_ -]?token|client[_ -]?secret|"
     r"authorization|credential|password|secret)\s*[:=]\s*[^\s,;]+"
@@ -157,6 +159,8 @@ class InvestigationAdvisorTool:
         context: ToolExecutionContext,
         *,
         _editorial_batch_child: bool = False,
+        _execution_timeout_seconds: int | None = None,
+        _bridge_turns_remaining: int | None = None,
     ) -> ToolResult:
         try:
             raw_consultation_type = arguments.get("consultation_type")
@@ -197,6 +201,19 @@ class InvestigationAdvisorTool:
             return await self._input_failure(context, "advisor_arguments_invalid")
         evidence: tuple[EvidenceObservation, ...]
         try:
+            if _execution_timeout_seconds is None:
+                execution_timeout_seconds, budget_refusal = _advisor_execution_timeout(
+                    context, self._settings
+                )
+                if budget_refusal is not None:
+                    return self._finish(context, budget_refusal)
+            else:
+                execution_timeout_seconds = _execution_timeout_seconds
+            bridge_turns_remaining = (
+                _bridge_turns_remaining
+                if _bridge_turns_remaining is not None
+                else _advisor_reserved_bridge_turns(context)
+            )
             editorial_units = arguments.get("units")
             if (
                 consultation_type in {"draft_text", "review_text"}
@@ -209,6 +226,8 @@ class InvestigationAdvisorTool:
                     context,
                     editorial_units,
                     maximum_units=len(editorial_units),
+                    execution_timeout_seconds=execution_timeout_seconds,
+                    bridge_turns_remaining=bridge_turns_remaining,
                 )
             pacing_result = await self._check_advisor_limits(
                 context.investigation_id,
@@ -355,6 +374,8 @@ class InvestigationAdvisorTool:
                         context,
                         editorial_units,
                         maximum_units=max(1, len(editorial_units) // 2),
+                        execution_timeout_seconds=execution_timeout_seconds,
+                        bridge_turns_remaining=bridge_turns_remaining,
                     )
                 return await self._persist_preflight_failure(
                     context,
@@ -621,6 +642,7 @@ class InvestigationAdvisorTool:
             )
         started_at = time.monotonic()
         submission_started_at = time.perf_counter()
+        execution_clock = time.monotonic
         submission = await submit_bridge_consultation_once(
             self._transport,
             investigation_id=context.investigation_id,
@@ -630,13 +652,19 @@ class InvestigationAdvisorTool:
             prompt=prompt,
             external_llm_allowed=True,
             settings=self._settings,
+            timeout_seconds=execution_timeout_seconds,
+            clock=execution_clock,
         )
         evidence_preflight = evaluate_advisor_evidence_preflight(
             prompt_data, dossier, prompt, submitted=_advisor_payload_was_submitted(submission)
         )
         prompt_data["evidence_preflight"] = evidence_preflight
         submission_elapsed_ms = round((time.perf_counter() - submission_started_at) * 1000)
-        raw_output = submission.output_text
+        # A recovered response attached to NEEDS_REVIEW is still ambiguous. It
+        # must not be archived or parsed as a successful advisor answer.
+        raw_output = (
+            submission.output_text if submission.status is TurnSubmissionStatus.SUCCEEDED else None
+        )
         raw_output_bytes = raw_output.encode("utf-8") if raw_output is not None else None
         output_sha256 = (
             hashlib.sha256(raw_output_bytes).hexdigest() if raw_output_bytes is not None else None
@@ -668,7 +696,7 @@ class InvestigationAdvisorTool:
                     BudgetDimension.CONTEXT_BYTES: len(encoded),
                     BudgetDimension.CONTEXT_TOKENS: max(1, (len(encoded) + 3) // 4),
                     BudgetDimension.TOOL_SECONDS: min(
-                        _advisor_tool_seconds_limit(self._settings),
+                        execution_timeout_seconds,
                         max(1, math.ceil(time.monotonic() - started_at)),
                     ),
                 },
@@ -697,7 +725,7 @@ class InvestigationAdvisorTool:
                     BudgetDimension.CONTEXT_BYTES: len(encoded),
                     BudgetDimension.CONTEXT_TOKENS: max(1, (len(encoded) + 3) // 4),
                     BudgetDimension.TOOL_SECONDS: min(
-                        _advisor_tool_seconds_limit(self._settings),
+                        execution_timeout_seconds,
                         max(1, math.ceil(time.monotonic() - started_at)),
                     ),
                 },
@@ -725,7 +753,7 @@ class InvestigationAdvisorTool:
                 advisor_source_refs,
                 len(encoded),
                 consultation_type,
-                math.ceil(time.monotonic() - started_at),
+                min(execution_timeout_seconds, math.ceil(time.monotonic() - started_at)),
                 {item.name: item.schema_version for item in available_tool_definitions},
                 {
                     item.name: item.input_schema
@@ -733,6 +761,7 @@ class InvestigationAdvisorTool:
                     if isinstance(getattr(item, "input_schema", None), Mapping)
                 },
                 prompt_data=prompt_data,
+                execution_timeout_seconds=execution_timeout_seconds,
             )
         parse_elapsed_ms = round((time.perf_counter() - parse_started_at) * 1000)
         input_refs = tuple(persisted_input_refs)
@@ -1051,14 +1080,77 @@ class InvestigationAdvisorTool:
         units: list[Any] | tuple[Any, ...],
         *,
         maximum_units: int,
+        execution_timeout_seconds: int = MAX_ADVISOR_TOOL_SECONDS,
+        bridge_turns_remaining: int | None = None,
     ) -> ToolResult:
         units = list(units)
         chunks = [
             units[index : index + maximum_units] for index in range(0, len(units), maximum_units)
         ]
+        available_bridge_turns = (
+            bridge_turns_remaining
+            if bridge_turns_remaining is not None
+            else _advisor_reserved_bridge_turns(context)
+        )
+        if len(chunks) > available_bridge_turns:
+            return await self._persist_preflight_failure(
+                context,
+                consultation_type=str(arguments.get("consultation_type", "unknown")),
+                evidence_refs=(),
+                output={
+                    "advisor_status": "unavailable",
+                    "usable": False,
+                    "failure_stage": "budget_admission",
+                    "failure_reason": "bridge_turn_reservation_insufficient_for_editorial_batches",
+                    "confirmed_non_execution": True,
+                    "bridge_turns_consumed": 0,
+                    "retry": False,
+                    "unprocessed_unit_ids": [
+                        str(item.get("id")) for item in units if isinstance(item, Mapping)
+                    ],
+                    "next_batch_index": 1,
+                },
+                error_code="advisor_unavailable",
+            )
         results: list[ToolResult] = []
         unprocessed_units: list[str] = []
+        consumed_execution_seconds = 0
         for index, chunk in enumerate(chunks, start=1):
+            remaining_execution_seconds = execution_timeout_seconds - consumed_execution_seconds
+            if remaining_execution_seconds < MIN_ADVISOR_EXECUTION_SECONDS:
+                prior_batch_was_submitted = bool(results)
+                results.append(_advisor_budget_refusal("tool_seconds_remaining_below_minimum"))
+                combined = _combine_editorial_batch_results(results)
+                # This is a mixed outcome: earlier batches already reached Bridge,
+                # while the next batch was refused locally. Preserve their usage
+                # and never let the local refusal clear the whole operation's charge.
+                status = (
+                    ToolInvocationStatus.PARTIAL
+                    if prior_batch_was_submitted
+                    else ToolInvocationStatus.NEEDS_REVIEW
+                )
+                return self._finish(
+                    context,
+                    replace(
+                        combined,
+                        status=status,
+                        output={
+                            **combined.output,
+                            "advisor_status": (
+                                "partial" if prior_batch_was_submitted else "needs_review"
+                            ),
+                            "failure_stage": "budget_admission",
+                            "failure_reason": "tool_seconds_remaining_below_minimum",
+                            "confirmed_non_execution": not prior_batch_was_submitted,
+                            "unprocessed_unit_ids": [
+                                str(item.get("id"))
+                                for later_chunk in chunks[index - 1 :]
+                                for item in later_chunk
+                                if isinstance(item, Mapping)
+                            ],
+                        },
+                    ),
+                )
             child_arguments = dict(arguments)
             child_arguments["units"] = chunk
             child_arguments.pop("assertions", None)
@@ -1076,6 +1168,13 @@ class InvestigationAdvisorTool:
                 child_arguments,
                 child_context,
                 _editorial_batch_child=True,
+                _execution_timeout_seconds=remaining_execution_seconds,
+                # The outer plan allocates one reserved Bridge turn to each
+                # child. A child cannot recursively multiply that allowance.
+                _bridge_turns_remaining=1,
+            )
+            consumed_execution_seconds += batch_result.budget_consumed.get(
+                BudgetDimension.TOOL_SECONDS, 0
             )
             batch_result = replace(
                 batch_result,
@@ -1101,12 +1200,34 @@ class InvestigationAdvisorTool:
                     if isinstance(item, Mapping)
                 ]
                 combined = _combine_editorial_batch_results(results)
+                prior_bridge_submission = any(
+                    item.budget_consumed.get(BudgetDimension.BRIDGE_TURNS, 0) > 0
+                    for item in results[:-1]
+                )
+                mixed_budget_refusal = (
+                    prior_bridge_submission
+                    and batch_result.output.get("failure_stage") == "budget_admission"
+                    and batch_result.output.get("confirmed_non_execution") is True
+                )
                 return self._finish(
                     context,
                     replace(
                         combined,
+                        status=(
+                            ToolInvocationStatus.PARTIAL
+                            if mixed_budget_refusal
+                            else combined.status
+                        ),
                         output={
                             **combined.output,
+                            **(
+                                {
+                                    "advisor_status": "partial",
+                                    "confirmed_non_execution": False,
+                                }
+                                if mixed_budget_refusal
+                                else {}
+                            ),
                             "unprocessed_unit_ids": unprocessed_units,
                             "next_batch_index": index,
                             "batch_cursor": {
@@ -2662,6 +2783,7 @@ class InvestigationAdvisorTool:
         available_tool_schemas: Mapping[str, Mapping[str, Any]],
         *,
         prompt_data: Mapping[str, Any],
+        execution_timeout_seconds: int | None = None,
     ) -> ToolResult:
         code = (submission.error_code or "").casefold()
         bridge_turns_consumed = _bridge_turns_consumed(submission)
@@ -2669,13 +2791,14 @@ class InvestigationAdvisorTool:
         failure_reason = (
             submission.failure_reason or submission.error_code or submission.status.value
         )
+        tool_seconds_ceiling = _advisor_tool_seconds_limit(self._settings)
+        if execution_timeout_seconds is not None:
+            tool_seconds_ceiling = min(tool_seconds_ceiling, execution_timeout_seconds)
         usage = {
             BudgetDimension.BRIDGE_TURNS: bridge_turns_consumed,
             BudgetDimension.CONTEXT_BYTES: input_bytes,
             BudgetDimension.CONTEXT_TOKENS: max(1, (input_bytes + 3) // 4),
-            BudgetDimension.TOOL_SECONDS: min(
-                _advisor_tool_seconds_limit(self._settings), max(1, elapsed_seconds)
-            ),
+            BudgetDimension.TOOL_SECONDS: min(tool_seconds_ceiling, max(1, elapsed_seconds)),
         }
         if submission.status is TurnSubmissionStatus.BLOCKED:
             return ToolResult(
@@ -2684,11 +2807,46 @@ class InvestigationAdvisorTool:
                 error_code="POLICY_DENIED",
                 output={"advisor_status": "policy_denied"},
             )
+        if submission.status is TurnSubmissionStatus.NEEDS_REVIEW:
+            return ToolResult(
+                ToolInvocationStatus.NEEDS_REVIEW,
+                observation_refs=evidence_refs,
+                budget_consumed=usage,
+                error_code="advisor_timeout_or_ambiguous",
+                output={
+                    "advisor_status": "needs_review",
+                    "retry": False,
+                    "failure_stage": failure_stage,
+                    "failure_reason": failure_reason,
+                    "confirmed_non_execution": False,
+                    "bridge_turns_consumed": bridge_turns_consumed,
+                },
+            )
+        if submission.status is not TurnSubmissionStatus.SUCCEEDED:
+            return ToolResult(
+                ToolInvocationStatus.FAILED
+                if submission.status is TurnSubmissionStatus.INVALID_OUTPUT
+                else ToolInvocationStatus.UNAVAILABLE,
+                observation_refs=evidence_refs,
+                budget_consumed=usage,
+                error_code="advisor_output_invalid"
+                if submission.status is TurnSubmissionStatus.INVALID_OUTPUT
+                else "advisor_unavailable",
+                output={
+                    "advisor_status": "output_invalid"
+                    if submission.status is TurnSubmissionStatus.INVALID_OUTPUT
+                    else "unavailable",
+                    "retry": False,
+                    "failure_stage": failure_stage,
+                    "failure_reason": failure_reason,
+                    "confirmed_non_execution": submission.submission_state == "pre_submission",
+                    "bridge_turns_consumed": bridge_turns_consumed,
+                },
+            )
         if submission.output_text is None and (
             submission.submission_state != "pre_submission"
             and (
-                submission.status is TurnSubmissionStatus.NEEDS_REVIEW
-                or any(term in code for term in ("timeout", "ui_timeout", "submission_unknown"))
+                any(term in code for term in ("timeout", "ui_timeout", "submission_unknown"))
                 or submission.submission_state
                 in {"submission_attempted", "post_submission", "external_state_unknown"}
             )
@@ -2925,6 +3083,7 @@ def register_investigation_advisor_tool(
     max_input_bytes = int(
         getattr(adapter._settings, "operator_advisor_max_input_bytes", MAX_ADVISOR_INPUT_BYTES)
     )
+    max_tool_seconds = _advisor_tool_seconds_limit(adapter._settings)
     uuid_schema = {
         "type": "string",
         "pattern": r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
@@ -3062,7 +3221,7 @@ def register_investigation_advisor_tool(
                 BudgetDimension.BRIDGE_TURNS: 1,
                 BudgetDimension.CONTEXT_BYTES: max_input_bytes,
                 BudgetDimension.CONTEXT_TOKENS: (max_input_bytes + 3) // 4,
-                BudgetDimension.TOOL_SECONDS: _advisor_tool_seconds_limit(adapter._settings),
+                BudgetDimension.TOOL_SECONDS: max_tool_seconds,
             },
             confidentiality=ToolConfidentiality.CONFIDENTIAL,
             limitations=(
@@ -3717,6 +3876,80 @@ def _advisor_reserved_budget(registry: ToolRegistry) -> dict[str, int]:
 def _advisor_tool_seconds_limit(settings: Any) -> int:
     value = getattr(settings, "investigation_max_tool_seconds", MAX_ADVISOR_TOOL_SECONDS)
     return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 3_600
+
+
+def _advisor_execution_timeout(
+    context: ToolExecutionContext,
+    settings: Any,
+) -> tuple[int, ToolResult | None]:
+    """Return the hard call cap from this operation's live G2 reservation.
+
+    Duration-based cost estimation from ModelRun.duration_ms is DEFERred; this
+    enforces only the hard execution bound and never predicts provider cost.
+    """
+    reservation = next(
+        (
+            item
+            for item in context.budget.reservations
+            if item.operation_key == context.idempotency_key
+        ),
+        None,
+    )
+    if reservation is None or reservation.status is not BudgetReservationStatus.RESERVED:
+        reason = "tool_seconds_reservation_missing_or_inactive"
+        return 0, _advisor_budget_refusal(reason)
+    if reservation.amounts.get(BudgetDimension.BRIDGE_TURNS, 0) < 1:
+        return 0, _advisor_budget_refusal("bridge_turn_reservation_missing_or_insufficient")
+    reserved_seconds = reservation.amounts.get(BudgetDimension.TOOL_SECONDS, 0)
+    if reserved_seconds < MIN_ADVISOR_EXECUTION_SECONDS:
+        return 0, _advisor_budget_refusal("tool_seconds_reservation_below_minimum")
+
+    role_timeout = getattr(settings, "openai_bridge_wait_timeout_research_seconds", 7_200.0)
+    if (
+        isinstance(role_timeout, bool)
+        or not isinstance(role_timeout, int | float)
+        or not math.isfinite(role_timeout)
+        or role_timeout <= 0
+    ):
+        return 0, _advisor_budget_refusal("research_role_timeout_invalid")
+    effective_timeout = math.floor(min(reserved_seconds, role_timeout))
+    if effective_timeout < MIN_ADVISOR_EXECUTION_SECONDS:
+        return 0, _advisor_budget_refusal("effective_execution_timeout_below_minimum")
+    return effective_timeout, None
+
+
+def _advisor_reserved_bridge_turns(context: ToolExecutionContext) -> int:
+    reservation = next(
+        (
+            item
+            for item in context.budget.reservations
+            if item.operation_key == context.idempotency_key
+        ),
+        None,
+    )
+    if reservation is None or reservation.status is not BudgetReservationStatus.RESERVED:
+        return 0
+    return reservation.amounts.get(BudgetDimension.BRIDGE_TURNS, 0)
+
+
+def _advisor_budget_refusal(reason: str) -> ToolResult:
+    return ToolResult(
+        ToolInvocationStatus.NEEDS_REVIEW,
+        error_code="advisor_unavailable",
+        message=(
+            "Bridge consultation refused before transport because the approved G2 "
+            "budget does not cover the bounded operation."
+        ),
+        output={
+            "advisor_status": "needs_review",
+            "failure_stage": "budget_admission",
+            "failure_reason": reason,
+            "confirmed_non_execution": True,
+            "bridge_turns_consumed": 0,
+            "retry": False,
+        },
+        budget_consumed={dimension: 0 for dimension in BudgetDimension},
+    )
 
 
 def _advisor_reparse_context(
