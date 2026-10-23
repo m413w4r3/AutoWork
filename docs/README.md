@@ -94,6 +94,15 @@ when supported by its installed version; no duplicated skill bodies.
 Follow the [Paseo coding orchestration guide](operations/paseo-agent-orchestration.md)
 for profiles, Luna high/xhigh delegation and fresh context.
 
+## Curated engineering skills
+
+Seven pinned, adapted Matt Pocock skills are listed in
+[the local skills index](../.agents/skills/README.md): `code-review`,
+`diagnosing-bugs`, `to-tickets`, `implement-spec`, `retro`,
+`domain-modeling` and `writing-for-agents`. They supplement, not
+supersede, AutoWork's CTI governance and accepted ADRs. They only become
+available in an agent session that loads the corresponding project files.
+
 ## External references
 
 - [Codex custom subagents](https://learn.chatgpt.com/docs/agent-configuration/subagents) — EXTERNAL_REFERENCE.
