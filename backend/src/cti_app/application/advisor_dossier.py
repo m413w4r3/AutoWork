@@ -61,8 +61,23 @@ def _reject_oversized_base64_content(value: str, *, encoding: object = None) -> 
         padding = 0
         padding_started = False
         cursor = match.end()
-        while cursor < len(value) and not value[cursor].isspace() and value[cursor] not in "\"'<>":
+        while cursor < len(value):
             character = value[cursor]
+            if character in "\r\n":
+                if character == "\r" and cursor + 1 < len(value) and value[cursor + 1] == "\n":
+                    cursor += 2
+                else:
+                    cursor += 1
+                if padding_started:
+                    break
+                continue
+            if character.isspace():
+                cursor += 1
+                if padding_started:
+                    break
+                continue
+            if character in "\"'<>":
+                break
             if character == "%":
                 if cursor + 2 >= len(value):
                     raise ContentExcerptLimitExceeded("data_url_base64_is_invalid")
@@ -72,6 +87,8 @@ def _reject_oversized_base64_content(value: str, *, encoding: object = None) -> 
                     raise ContentExcerptLimitExceeded("data_url_base64_is_invalid") from None
                 cursor += 3
                 if character.isspace():
+                    if padding_started:
+                        break
                     continue
             else:
                 cursor += 1

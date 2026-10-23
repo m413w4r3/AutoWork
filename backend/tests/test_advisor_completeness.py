@@ -465,6 +465,9 @@ def test_oversized_base64_is_size_checked_before_decode(monkeypatch: pytest.Monk
 
     encoded = base64.b64encode(b"A" * 600).decode("ascii")
     percent_encoded = "".join(f"%{ord(character):02X}" for character in encoded)
+    newline_wrapped = f"{encoded[:400]}\n{encoded[400:]}"
+    space_wrapped = f"{encoded[:400]} {encoded[400:]}"
+    tab_wrapped = f"{encoded[:400]}\t{encoded[400:]}"
     cases = (
         (encoded, "base64_content_exceeds_512_byte_decoded_limit"),
         (
@@ -473,6 +476,18 @@ def test_oversized_base64_is_size_checked_before_decode(monkeypatch: pytest.Monk
         ),
         (
             f"data:application/octet-stream;base64,{percent_encoded}",
+            "data_url_base64_exceeds_512_byte_decoded_limit",
+        ),
+        (
+            f"data:application/octet-stream;base64,{newline_wrapped}",
+            "data_url_base64_exceeds_512_byte_decoded_limit",
+        ),
+        (
+            f"data:application/octet-stream;base64,{space_wrapped}",
+            "data_url_base64_exceeds_512_byte_decoded_limit",
+        ),
+        (
+            f"data:application/octet-stream;base64,{tab_wrapped}",
             "data_url_base64_exceeds_512_byte_decoded_limit",
         ),
     )

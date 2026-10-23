@@ -2063,16 +2063,33 @@ async def test_oversized_generic_base64_is_rejected_before_prompt(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("field", "percent_encode"),
-    [("content", False), ("content", True), ("strings", False), ("strings", True)],
+    ("field", "representation"),
+    [
+        ("content", "plain"),
+        ("content", "percent_encoded"),
+        ("content", "newline_wrapped"),
+        ("content", "space_wrapped"),
+        ("content", "tab_wrapped"),
+        ("strings", "plain"),
+        ("strings", "percent_encoded"),
+        ("strings", "newline_wrapped"),
+        ("strings", "space_wrapped"),
+        ("strings", "tab_wrapped"),
+    ],
 )
 async def test_oversized_data_url_base64_is_rejected_before_prompt(
-    field: str, percent_encode: bool
+    field: str, representation: str
 ) -> None:
     investigation_id = uuid4()
     encoded_content = base64.b64encode(b"A" * 600).decode("ascii")
-    if percent_encode:
+    if representation == "percent_encoded":
         encoded_content = "".join(f"%{ord(character):02X}" for character in encoded_content)
+    elif representation == "newline_wrapped":
+        encoded_content = f"{encoded_content[:400]}\n{encoded_content[400:]}"
+    elif representation == "space_wrapped":
+        encoded_content = f"{encoded_content[:400]} {encoded_content[400:]}"
+    elif representation == "tab_wrapped":
+        encoded_content = f"{encoded_content[:400]}\t{encoded_content[400:]}"
     data_url = f"data:application/octet-stream;base64,{encoded_content}"
     if field == "content":
         generic_content: dict[str, Any] = {"outer": {"content": data_url}}
