@@ -91,6 +91,17 @@ conformément à la règle de fallback Claude autorisée. Ces revues sont
 explicitement identifiées comme non-Luna dans leurs rapports. Les travaux
 Luna déjà livrés restent inchangés.
 
+## Régressions en attente (reprise Luna 2026-10-24 00:50)
+
+La suite backend hors intégration donne 4579 passed / 39 failed. 24 échecs
+sont Typst (bundle CascadiaCode absent), 2 sont préexistants sur `058bb4a`
+(worker confined/mwcp), et **5 régressions réelles** restent à traiter :
+hex court `advisor_wire` (corrigé WIP `849cfa0`), alias C01 `T1` non résolu
+par `advisor_wire_aliases`, retry d'acquisition devenu `NEEDS_REVIEW`,
+préflight advisor minimal sans preuve canonique, et résultat advisor `PARTIAL`
+devenu `NEEDS_REVIEW`. Détail et SHA dans `HANDOFF.md`. Ne pas déclarer PASS
+avant correction, suite verte et revue indépendante Luna xhigh.
+
 ## Conventions de compte rendu
 
 Chaque worker renvoie au parent : TASK_ID, statut
