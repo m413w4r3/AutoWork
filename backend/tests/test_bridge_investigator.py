@@ -21,6 +21,7 @@ from cti_app.application.investigation_contracts import (
     ArticleClaimV1,
     ArticleContextV1,
     ContextInvestigationV1,
+    IndicatorInventoryV1,
     InvestigationContextV1,
     InvestigationSourceV1,
 )
@@ -207,6 +208,30 @@ def test_rendered_prompt_has_no_autowork_96000_byte_ceiling() -> None:
 
     for target in (95_999, 96_000, 96_001):
         assert len(render_at_size(target).encode("utf-8")) == target
+
+
+def test_rendered_prompt_discloses_truncated_ioc_inventory_and_counts() -> None:
+    context = _context(uuid4())
+    investigation = context.investigation.model_copy(
+        update={
+            "evidence_index_truncated": True,
+            "truncation_counts": {"evidence_index": 3},
+        }
+    )
+    context = context.model_copy(
+        update={
+            "investigation": investigation,
+            "indicator_inventory": IndicatorInventoryV1(truncated=True),
+        }
+    )
+
+    prompt = bridge_module.render_investigation_prompt(context).casefold()
+
+    assert "indicator inventory" in prompt
+    assert "truncated: oui" in prompt
+    assert "evidence index truncated: oui" in prompt
+    assert "truncation counts" in prompt
+    assert "evidence index=3" in prompt
 
 
 @pytest.mark.asyncio

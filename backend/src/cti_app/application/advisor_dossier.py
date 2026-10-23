@@ -24,6 +24,7 @@ _WORD = re.compile(r"[\w.+#/-]+", re.UNICODE)
 _CLAIM_ID = re.compile(r"\b(?:S\d+P\d+(?:\.\d+)?|L\d+(?:\.\d+)?|T\d+)\b", re.I)
 _UUID = re.compile(r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")
 _INTERNAL_SHA = re.compile(r"(?i)\b(?:sha(?:-?256)?\s*[:=]\s*)?[0-9a-f]{64}\b")
+_HEXDUMP_LINE = re.compile(r"(?im)^\s*(?:0x)?[0-9a-f]{4,16}:\s+(?:[0-9a-f]{2,8}\s+){4,}")
 _STOP = frozenset(
     "avec dans pour sans cette celui celle sont être avoir mais comme dans sur sous une des les "
     "aux par que qui quoi dont alors leur leurs elles ils cela ceci nous vous elle lui son sa "
@@ -121,6 +122,8 @@ def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]
         if not isinstance(value, str) or not value.strip():
             return
         text = value.replace("\r\n", "\n").replace("\r", "\n").strip()
+        if _HEXDUMP_LINE.search(text):
+            return
         prefix = (
             f"{assembly_name} — "
             if assembly_name and assembly_name.casefold() not in title.casefold()
@@ -155,11 +158,30 @@ def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]
         return fallback
 
     def walk(value: Any, path: tuple[str, ...] = ()) -> None:
+        if any(
+            token in part.casefold().replace("_", " ")
+            for part in path
+            for token in ("hex", "byte", "hexdump")
+        ):
+            return
         if isinstance(value, Mapping):
             name = display_name(value, path[-1] if path else "contenu observé")
             for raw_key, child in value.items():
                 key = str(raw_key).casefold().replace("-", "_")
                 if key in _OMIT_KEYS or "sha256" in key or key.endswith("_id"):
+                    continue
+                if payload.get("schema") == "local-command-execution.v1" and key in {
+                    "command",
+                    "command_id",
+                    "output",
+                    "output_chunks",
+                    "output_encoding",
+                    "output_byte_length",
+                    "output_truncated",
+                    "output_truncated_by_evidence_limit",
+                    "output_truncated_by_response",
+                }:
+                    # Command bytes and their encodings use the verified measurement path.
                     continue
                 if key in _METHOD_KEYS and isinstance(child, str):
                     method_kind = (
@@ -171,18 +193,8 @@ def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]
                     )
                     add("method", f"{method_kind} — {name}", child)
                     continue
-                if key in {"hex", "hex_bytes", "bytes_hex", "hexdump"} and isinstance(child, str):
-                    offset = next(
-                        (
-                            offset_value
-                            for name, offset_value in value.items()
-                            if str(name).casefold() in {"offset", "file_offset"}
-                            and type(offset_value) is int
-                        ),
-                        None,
-                    )
-                    suffix = f", offset {offset}" if type(offset) is int else ""
-                    add("hex", f"Octets observés{suffix}", child)
+                if key in {"hex", "hex_bytes", "bytes_hex", "hexdump"}:
+                    # Generic excerpts never carry raw or complete byte dumps.
                     continue
                 if key in _METHOD_CONTAINER_KEYS:
                     walk(child, (*path, key))
@@ -193,17 +205,8 @@ def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]
                 if key in _CONTENT_KEYS and isinstance(child, str):
                     content_path = " ".join(path).casefold()
                     if any(token in content_path for token in ("hex", "byte", "hexdump")):
-                        offset = next(
-                            (
-                                offset_value
-                                for offset_key, offset_value in value.items()
-                                if str(offset_key).casefold() in {"offset", "file_offset"}
-                                and type(offset_value) is int
-                            ),
-                            None,
-                        )
-                        suffix = f", offset {offset}" if type(offset) is int else ""
-                        add("hex", f"Octets observés{suffix}", child)
+                        # A nested textual rendering of bytes is raw material too.
+                        continue
                     elif any(token in content_path for token in ("string", "decoded", "config")):
                         add("decoded", f"Valeur décodée — {name}", child)
                     else:
@@ -1064,10 +1067,12 @@ def evaluate_advisor_evidence_preflight(
                 if isinstance(item.get("claim_refs", ()), (list, tuple))
                 else [],
                 verified=bool(re.fullmatch(r"[0-9a-f]{64}", sha)),
+                blob_read_verified=item.get("blob_read_verified"),
                 retrieval_available=(
                     kind == "observation"
                     and bool(identifier)
                     and bool(re.fullmatch(r"[0-9a-f]{64}", sha))
+                    and item.get("blob_read_verified") is True
                 ),
             )
 
@@ -1338,33 +1343,38 @@ def evaluate_advisor_evidence_preflight(
                 "this question."
             ),
         )
-    matching_contradiction = next(
-        (
-            item
-            for item in records
-            if item["kind"] == "finding"
-            and item.get("assessment") == "refuted"
-            and _finding_matches_requested_claims(item, claim_ids)
-        ),
-        None,
-    )
-    if contradiction_required and matching_contradiction is None:
-        claim_reason = (
-            "No refuted finding is linked to requested claim passage(s): "
-            + ", ".join(sorted(claim_ids))
-            + "."
-            if claim_ids
-            else "No refuted finding was loaded for the requested contradiction."
-        )
-        add(
-            "contradiction",
-            "required-contradiction",
-            "",
-            None,
-            False,
-            True,
-            claim_reason,
-        )
+    if contradiction_required:
+        if claim_ids:
+            covered_claims = {
+                claim
+                for item in records
+                if item["kind"] == "finding" and item.get("assessment") == "refuted"
+                for claim in claim_ids
+                if _finding_matches_requested_claims(item, {claim})
+            }
+            for claim_id in sorted(claim_ids - covered_claims):
+                add(
+                    "contradiction",
+                    f"required-contradiction:{claim_id}",
+                    "",
+                    {"kind": "claim", "id": claim_id},
+                    False,
+                    True,
+                    f"No refuted finding is linked to requested claim passage {claim_id}.",
+                    claim_id=claim_id,
+                )
+        elif not any(
+            item["kind"] == "finding" and item.get("assessment") == "refuted" for item in records
+        ):
+            add(
+                "contradiction",
+                "required-contradiction",
+                "",
+                None,
+                False,
+                True,
+                "No refuted finding was loaded for the requested contradiction.",
+            )
 
     known = {(item["kind"], item["id"]) for item in records}
     for kind, identifier in sorted(references - known):
@@ -1433,10 +1443,10 @@ def evaluate_advisor_evidence_preflight(
                     "is invalid."
                 ),
             )
-        else:
+        elif item["required"]:
             mark(
                 AdvisorEvidenceStatus.MISSING,
-                "A reference without its body is not a present proof.",
+                "A required reference without its body is not a present proof.",
             )
         if matches:
             mark(
@@ -1481,10 +1491,17 @@ def evaluate_advisor_evidence_preflight(
             )
         elif item["body_present"] and sha_valid and not item["required"]:
             mark(
+                AdvisorEvidenceStatus.NOT_VERIFIED,
+                (
+                    "The bounded lexical selection did not include this proof; semantic "
+                    "relevance to the question was not verified."
+                ),
+            )
+            mark(
                 AdvisorEvidenceStatus.INTENTIONALLY_OMITTED,
                 (
-                    "Canonical proof was omitted because the question does not require it and "
-                    "dossier relevance did not select it."
+                    "Canonical proof was omitted by bounded lexical selection; this omission "
+                    "does not establish semantic irrelevance."
                 ),
             )
         elif item["required"] and item.get("retrieval_available") and not item["body_present"]:
@@ -1504,6 +1521,24 @@ def evaluate_advisor_evidence_preflight(
                     ),
                 }
             )
+        elif (
+            item["required"]
+            and item["kind"] == "observation"
+            and item.get("blob_read_verified") is False
+        ):
+            mark(
+                AdvisorEvidenceStatus.NOT_VERIFIED,
+                "The canonical blob reader did not verify that this source can be read.",
+            )
+            missing_refs.append(
+                {
+                    "ref": _display_source_ref(item["source_ref"] or item["id"]),
+                    "reason": (
+                        "Required canonical blob is unreadable or its read capability was not "
+                        "verified."
+                    ),
+                }
+            )
         elif item["required"]:
             missing_refs.append(
                 {
@@ -1520,10 +1555,23 @@ def evaluate_advisor_evidence_preflight(
                     "reason": "Required canonical proof lacks verifiable metadata.",
                 }
             )
+        elif (
+            not item["required"]
+            and item["kind"] == "observation"
+            and item.get("blob_read_verified") is False
+        ):
+            mark(
+                AdvisorEvidenceStatus.NOT_VERIFIED,
+                "The optional observation blob reader failed; its body could not be verified.",
+            )
+            mark(
+                AdvisorEvidenceStatus.INTENTIONALLY_OMITTED,
+                "This optional reference was omitted after its canonical blob read failed.",
+            )
         elif not item["required"] and not item["body_present"]:
             mark(
                 AdvisorEvidenceStatus.INTENTIONALLY_OMITTED,
-                "This unrequired reference has no body available in the consultation snapshot.",
+                "This unrequired reference has no body loaded in the consultation snapshot.",
             )
         item["statuses"] = statuses
 

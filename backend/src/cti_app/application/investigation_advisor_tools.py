@@ -356,6 +356,12 @@ class InvestigationAdvisorTool:
                         editorial_units,
                         maximum_units=max(1, len(editorial_units) // 2),
                     )
+                failure_reason = "input_exceeds_configured_limit"
+                if (
+                    consultation_type in {"draft_text", "review_text"}
+                    and _shared_advisor_context_bytes(prompt_data) > max_input_bytes
+                ):
+                    failure_reason = "shared_context_exceeds_input_limit"
                 return await self._persist_preflight_failure(
                     context,
                     consultation_type=consultation_type,
@@ -365,7 +371,7 @@ class InvestigationAdvisorTool:
                         "preflight_status": "TECHNICAL_BLOCKED",
                         "usable": False,
                         "failure_stage": "prompt_size_preflight",
-                        "failure_reason": "input_exceeds_configured_limit",
+                        "failure_reason": failure_reason,
                         "context_bytes_after_fit": len(encoded),
                         "max_input_bytes": max_input_bytes,
                         "dossier_sha256": dossier.sha256,
@@ -1776,7 +1782,10 @@ class InvestigationAdvisorTool:
                     "sha256": item.sha256,
                     "source": _safe_text(item.source, 96),
                 }
-                row["content_excerpts"] = await self._observation_content_excerpts(item)
+                (
+                    row["content_excerpts"],
+                    row["blob_read_verified"],
+                ) = await self._observation_content_projection(item)
                 try:
                     measured_rows = await self._measurement_rows(item)
                 except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
@@ -2069,7 +2078,10 @@ class InvestigationAdvisorTool:
                 "object_type": _safe_text(item.object_type, 48),
                 "source": _safe_text(item.source, 48),
             }
-            row["content_excerpts"] = await self._observation_content_excerpts(item)
+            (
+                row["content_excerpts"],
+                row["blob_read_verified"],
+            ) = await self._observation_content_projection(item)
             observation_payload.append(row)
 
             try:
@@ -2391,11 +2403,20 @@ class InvestigationAdvisorTool:
         self, observation: EvidenceObservation
     ) -> list[dict[str, str]]:
         """Read only integrity-verified JSON evidence and retain its content facts."""
+        excerpts, _read_verified = await self._observation_content_projection(observation)
+        return excerpts
+
+    async def _observation_content_projection(
+        self, observation: EvidenceObservation
+    ) -> tuple[list[dict[str, str]], bool]:
+        """Return extracted facts and whether the canonical blob read verified."""
         try:
             payload = await self._measurement_payload(observation)
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
             payload = None
-        return extract_content_excerpts(payload) if payload is not None else []
+        if payload is None:
+            return [], False
+        return extract_content_excerpts(payload), True
 
     async def _measurement_payload(
         self, observation: EvidenceObservation
@@ -3507,6 +3528,28 @@ def _fit_advisor_prompt(
     if isinstance(raw_data, dict):
         raw_data["truncation"] = dict(data.get("truncation", {}))
     return prompt
+
+
+def _shared_advisor_context_bytes(data: Mapping[str, Any]) -> int:
+    """Measure shared dossier inputs apart from unit-specific editorial material."""
+    shared = copy.deepcopy(dict(data))
+    for key in (
+        "units",
+        "assertions",
+        "review_text",
+        "dossier_manifest",
+        "dossier_text",
+        "dossier_sha256",
+        "dossier_bytes",
+        "transmitted_refs",
+        "observation_refs",
+    ):
+        shared.pop(key, None)
+    return len(
+        json.dumps(shared, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    )
 
 
 def _critical_prompt_data_was_truncated(
