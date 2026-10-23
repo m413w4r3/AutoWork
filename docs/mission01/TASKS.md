@@ -113,9 +113,12 @@ deux échecs `required_canonical_evidence_not_in_payload` sont traités par
 M01-REG-FIX.
 
 Verdicts déjà reçus : **A1-REVIEW-R5 FAIL** (`426e7a9`, deux
-contournements UUID/SHA non liés, en correction) ; **B0A-REVIEW-R4 FAIL**
-(`ca78ded`, data URL base64, en correction). Ces correctifs ne sont pas
-encore revus : ne pas les compter comme PASS.
+contournements UUID/SHA non liés ; corrigé `1f0e813`, re-revue en cours) ;
+**B0A-REVIEW-R4 FAIL** (`ca78ded`, data URL base64 ; correction en cours) ;
+**B1A1-REVIEW-R3 FAIL** (`4317f46`, équivalence sémantique résiduelle,
+arrêt après 3 tentatives) ; **B1A2-REVIEW-R2 PASS_WITH_CHANGES**
+(`8597053`, 217/220 tests ; plancher conservateur, `BridgeInvestigator.turn`
+hors borne et état ambigu en chaîne documentés).
 
 Aucun push/live. Les verdicts ne seront intégrés qu'après examen du compte
 rendu ; `PASS` seulement si tests verts et revue effective.
