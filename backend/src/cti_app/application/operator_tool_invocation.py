@@ -53,6 +53,7 @@ from cti_app.application.research_context_builder import (
 )
 from cti_app.domain.investigation import (
     BudgetReservationStatus,
+    FrameworkPreSubmissionProof,
     InvestigationExecutionMode,
     ToolInvocation,
     ToolInvocationStatus,
@@ -473,43 +474,14 @@ class OperatorToolInvocationService:
         )
         return definitions[0].schema_version if len(definitions) == 1 else schema_version
 
-    async def _is_proven_pre_submit_advisor_failure(self, invocation: ToolInvocation) -> bool:
-        if (
-            invocation.tool_name != "advisor.consult"
-            or self._observations is None
-            or self._evidence_summaries is None
-        ):
-            return False
-        for observation_id in invocation.response_refs:
-            observation = await self._observations.get(observation_id)
-            if (
-                observation is None
-                or observation.investigation_id != self._investigation_id
-                or observation.source != "advisor.consult"
-                or observation.object_type != "tool_call"
-            ):
-                continue
-            try:
-                summary = await self._evidence_summaries.summary(observation)
-            except Exception:
-                continue
-            if (
-                isinstance(summary, Mapping)
-                and summary.get("advisor_status") == "invalid_input"
-                and summary.get("bridge_invocation_id") is None
-                and summary.get("failure_stage") in {None, "pre_transport_validation"}
-            ):
-                return True
-        return False
-
-    async def _is_proven_pre_submission_failure(self, invocation: ToolInvocation) -> bool:
-        if await self._is_proven_pre_submit_advisor_failure(invocation):
-            return True
+    async def _framework_pre_submission_proof(
+        self, invocation: ToolInvocation
+    ) -> FrameworkPreSubmissionProof | None:
         if self._observations is None or self._evidence_summaries is None:
-            return False
+            return None
         envelope = await self._envelopes.get(self._investigation_id)
         if envelope is None:
-            return False
+            return None
         reservation = next(
             (
                 item
@@ -518,8 +490,12 @@ class OperatorToolInvocationService:
             ),
             None,
         )
-        if reservation is None or reservation.status is not BudgetReservationStatus.RELEASED:
-            return False
+        if (
+            reservation is None
+            or reservation.status is not BudgetReservationStatus.RELEASED
+            or dict(reservation.amounts) != dict(invocation.reserved_budget)
+        ):
+            return None
         for observation_id in invocation.response_refs:
             observation = await self._observations.get(observation_id)
             if (
@@ -527,23 +503,21 @@ class OperatorToolInvocationService:
                 or observation.investigation_id != self._investigation_id
                 or observation.invocation_ref != invocation.id
                 or observation.source != invocation.tool_name
-                or observation.object_type != "tool_call"
+                or observation.source_version != invocation.schema_version
                 or observation.object_id != invocation.operation_key
             ):
+                continue
+            try:
+                proof = FrameworkPreSubmissionProof(observation.object_type)
+            except ValueError:
                 continue
             try:
                 summary = await self._evidence_summaries.summary(observation)
             except Exception:
                 continue
-            if (
-                isinstance(summary, Mapping)
-                and summary.get("pre_submission_reason") == "budget_exceeded"
-                and summary.get("failure_stage") == "pre_submission"
-                and summary.get("confirmed_non_execution") is True
-                and summary.get("request_permission") is True
-            ):
-                return True
-        return False
+            if isinstance(summary, Mapping):
+                return proof
+        return None
 
     async def _invoke_locked(
         self,
@@ -600,78 +574,34 @@ class OperatorToolInvocationService:
                     reviewed, expected_version=existing.version
                 )
                 await self._execution.commit_current_uow()
-            if (
-                existing.status is ToolInvocationStatus.NEEDS_REVIEW
-                and await self._is_proven_pre_submit_advisor_failure(existing)
-            ):
-                resolved = existing.resolve_pre_submission_failure()
-                existing = await self._invocations.update_if_version(
-                    resolved, expected_version=existing.version
-                )
-                failure = ToolResult(
-                    ToolInvocationStatus.FAILED,
-                    error_code="advisor_input_invalid",
-                    message=(
-                        "Persisted advisor invalid_input proves the invocation failed "
-                        "before Bridge submission; its legacy reason detail is unavailable."
-                    ),
-                    output={
-                        "advisor_status": "invalid_input",
-                        "failure_stage": "pre_transport_validation",
-                        "confirmed_non_execution": True,
-                        "bridge_invocation_id": None,
-                        "provider_usage": {"status": "not_submitted"},
-                        "context_estimate": {
-                            "status": "not_available",
-                            "reason": "pre_transport_validation",
-                        },
-                    },
-                )
-                await self._execution._complete_tool_reservation(
-                    investigation_id=self._investigation_id,
-                    operation_key=existing.operation_key,
-                    result=failure,
-                    reserved_amounts=existing.reserved_budget,
-                    uncertain=False,
-                )
-                await self._execution.commit_current_uow()
-                return await self._result(
-                    existing,
-                    state.version,
-                    replay=True,
-                    tool_result=failure,
-                )
             return await self._result(existing, state.version, replay=True)
 
-        semantic_parameters = canonical_json_bytes(arguments)
+        semantic_parameters = _semantic_parameters_fingerprint(tool_name, arguments)
         for existing in await self._invocations.list_for_investigation(self._investigation_id):
             if (
                 existing.tool_name != tool_name
-                or existing.schema_version != schema_version
-                or canonical_json_bytes(dict(existing.normalized_parameters)) != semantic_parameters
+                or _semantic_parameters_fingerprint(
+                    existing.tool_name, existing.normalized_parameters
+                )
+                != semantic_parameters
                 or existing.status
                 not in {ToolInvocationStatus.RUNNING, ToolInvocationStatus.NEEDS_REVIEW}
             ):
                 continue
-            if (
-                existing.status is ToolInvocationStatus.NEEDS_REVIEW
-                and await self._is_proven_pre_submission_failure(existing)
-            ):
+            proof = await self._framework_pre_submission_proof(existing)
+            if existing.status is ToolInvocationStatus.NEEDS_REVIEW and proof is not None:
                 resolved = existing.resolve_pre_submission_failure()
                 existing = await self._invocations.update_if_version(
                     resolved, expected_version=existing.version
                 )
                 failure = ToolResult(
                     ToolInvocationStatus.FAILED,
-                    error_code="prior_invocation_proven_unsubmitted",
+                    error_code=proof.value,
                     message=(
                         "Persisted evidence proves the prior invocation did not reach "
                         "external submission."
                     ),
-                    output={
-                        "failure_stage": "pre_submission",
-                        "confirmed_non_execution": True,
-                    },
+                    framework_pre_submission_proof=proof,
                 )
                 await self._execution._complete_tool_reservation(
                     investigation_id=self._investigation_id,
@@ -1083,6 +1013,28 @@ class OperatorToolInvocationService:
             idempotent_replay=replay,
             output=output,
         )
+
+
+def _semantic_parameters_fingerprint(tool_name: str, parameters: Mapping[str, Any]) -> bytes:
+    normalized = dict(parameters)
+    if tool_name == "advisor.consult":
+        question = normalized.get("question", "")
+        if isinstance(question, str):
+            question = question.strip()
+            if question:
+                normalized["question"] = question
+            else:
+                normalized.pop("question", None)
+
+        evidence_refs = normalized.get("evidence_refs", ())
+        if isinstance(evidence_refs, list | tuple):
+            try:
+                normalized["evidence_refs"] = [str(UUID(str(item))) for item in evidence_refs]
+            except (TypeError, ValueError):
+                pass
+            if not evidence_refs:
+                normalized.pop("evidence_refs", None)
+    return canonical_json_bytes(normalized)
 
 
 def _operator_output_kind(tool_name: str) -> str:

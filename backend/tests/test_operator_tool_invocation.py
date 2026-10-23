@@ -1230,7 +1230,7 @@ async def test_replay_after_persisted_running_marks_review_without_redispatch() 
 
 
 @pytest.mark.asyncio
-async def test_replay_releases_legacy_advisor_reservation_with_proven_pre_submit_failure() -> None:
+async def test_legacy_advisor_summary_is_not_framework_pre_submission_proof() -> None:
     fixture, state, _ = await _fixture()
     idempotency_key = "legacy-invalid-advisor-input"
     schema_version = ADVISOR_SCHEMA_VERSION
@@ -1306,10 +1306,20 @@ async def test_replay_releases_legacy_advisor_reservation_with_proven_pre_submit
         item for item in latest_envelope.budget.reservations if item.operation_key == operation_key
     )
     assert replay.idempotent_replay is True
-    assert replay.invocation.status is ToolInvocationStatus.FAILED
-    assert reservation.status.value == "released"
-    assert latest_envelope.budget.reserved[BudgetDimension.BRIDGE_TURNS] == 0
+    assert replay.invocation.status is ToolInvocationStatus.NEEDS_REVIEW
+    assert reservation.status.value == "reserved"
+    assert latest_envelope.budget.reserved[BudgetDimension.BRIDGE_TURNS] == 1
     assert fixture.bridge_transport.submission_count == 0
+    with pytest.raises(OperatorToolInvocationError) as error:
+        await service.invoke(
+            tool_name="advisor.consult",
+            schema_version=schema_version,
+            arguments=arguments,
+            purpose=purpose,
+            expected_version=state.version,
+            idempotency_key=f"{idempotency_key}-fresh",
+        )
+    assert error.value.code == "ambiguous_tool_invocation_requires_reconciliation"
 
 
 class _IdentityProvider:
