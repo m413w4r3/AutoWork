@@ -1,3 +1,9 @@
+# ARCHIVE — operator-led design snapshot (NON-NORMATIVE)
+
+> Design-only document dated 2026-10-18. Descriptions of then-current APIs and Bridge control are a historical snapshot, not authority for current execution. Consult the [documentation index](../README.md), current API, code and G2/G3 controls before operational changes.
+
+---
+
 # Conception — investigation pilotée par un opérateur local
 
 **Lot K0 — conception uniquement · 18 octobre 2026**
