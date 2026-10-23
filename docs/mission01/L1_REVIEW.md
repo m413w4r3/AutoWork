@@ -8,9 +8,12 @@
 
 **Verdict R2:** `FAIL` — remplacé par les re-revues R3 et R4 ci-dessous.
 
-**Verdict R3:** `FAIL` — remplacé par le verdict final R4 ci-dessous.
+**Verdict R3:** `FAIL` — historique; voir les re-revues R4 et R5 ci-dessous.
 
-**Verdict final (R4):** `FAIL` — 2 `HIGH`, 0 `MEDIUM`.
+**Verdict R4:** `FAIL` — 2 `HIGH`, 0 `MEDIUM` sur le relèvement P10 abandonné.
+
+**Verdict final R5 (périmètre L06):** `PASS_WITH_CHANGES` — le repli L06
+est conforme; la commande ciblée exécute 2 tests, pas les 43 annoncés.
 
 **Constats R1:** 0 `BLOCKER`, 1 `HIGH`, 1 `MEDIUM` (6 `LOW`; dont 1 `REJECTED`).
 
@@ -496,3 +499,88 @@ des provenances dans les déploiements, et configuration/provider runtime. Ces
 informations opérationnelles ne sont pas nécessaires pour établir les deux
 chemins de code manquants; aucun runtime/secret n’a été inspecté.
 **Coût R4:** UNKNOWN.
+
+## Repli final e4772fa
+
+**Commit examiné:** `e4772fae3f041e6e66dc087f404a8b4417854c94`, comparé à
+`main@058bb4af2278e3941956e523c5a1d560208de228`.
+**Verdict pour le périmètre restreint L06:** **`PASS_WITH_CHANGES`** — le
+retrait des deux réglages Advisor inutilisés est cohérent et le contrôle G2
+reste en place. Réserve de validation : le test ciblé exécute 2 tests, pas les
+43 annoncés.
+
+### Constats
+
+1. **[CONFIRMED] [LOW] P10 et sa documentation sont restaurés à la base; les anciens défauts restent DEFER.**
+
+   `backend/src/cti_app/application/invariant_proposals.py` et
+   `docs/model_conversations.md` sont identiques à la base
+   (comparaison ciblée de ces deux chemins avec la base, sans différence).
+   Le code conserve donc le défaut P10 de 96 000 octets UTF-8 et ne contient
+   aucun override ni garde partielle nouvelle (`invariant_proposals.py:945-993`).
+   Aucun nom `AUTOWORK_DEV_*P10*` n’est injecté dans Compose ou `.env.example`;
+   une recherche Git suivie des sources ne trouve aucun consommateur de ces
+   variables. Le delta n’inclut aucun des deux fichiers P10.
+
+   **Les défauts P10 de provenance tronquée et de rejeu markerless documentés
+   en R4 (ci-dessus, constats HIGH) restent préexistants à ce patch.** Le
+   correctif de relèvement P10 est abandonné et le statut est **DEFER**; cette
+   restauration ne résout pas ces défauts. Ils doivent être repris dans un lot
+   dédié avec un nouveau contrôle de provenance et de rejeu.
+
+2. **[CONFIRMED] [LOW] Le delta contient uniquement les quatre changements L06 demandés.**
+
+   `git diff 058bb4a..e4772fa --stat` donne exactement quatre chemins :
+   `.env.example`, `compose.yaml`, `docs/operations/operator-playbook-medium.md`
+   et `backend/tests/test_limits_mission01.py`. Compose et `.env.example`
+   retirent `OPERATOR_ADVISOR_MAX_TURNS_PER_INVESTIGATION` et
+   `OPERATOR_ADVISOR_MIN_CONSULTATION_INTERVAL_SECONDS`
+   (`compose.yaml:125-133`, `.env.example:57-62`). Dans l’arbre suivi, les
+   deux noms ne subsistent que comme littéraux des tests; aucun consommateur
+   backend, frontend, script, worker ou Makefile n’est présent.
+
+   Le playbook actif indique que ces réglages Advisor sans consommateur sont
+   retirés et que le budget de tours G2 demeure la garde d’autorisation
+   (`docs/operations/operator-playbook-medium.md:105-108`). La seule mention
+   générique d’anciens `OPERATOR_ADVISOR_*` hors des tests est dans
+   `docs/operations/correction-state-2026-10-19.md:8`, que l’index documentaire
+   classe comme journal historique, non normatif (`docs/README.md:78-82`). Je
+   n’ai trouvé aucun document actif qui présente « advisor max 100 » ou une
+   limite locale Advisor retirée comme étant active.
+
+3. **[REJECTED] [LOW] Aucun contrôle G2/TLP/provider n’est supprimé et aucun autre document actif ne casse.**
+
+   Le seul changement de source Python est le nouveau test; l’implémentation
+   Advisor, P10, la passerelle provider et l’agrégation TLP sont byte-à-byte
+   inchangées par rapport à la base. `_check_advisor_limits` continue de
+   renvoyer `UNAVAILABLE` quand le budget G2 est épuisé
+   (`backend/src/cti_app/application/investigation_advisor_tools.py:1106-1143`);
+   le nouveau test couvre le refus à zéro tour et vérifie qu’aucune limite
+   Advisor locale n’est annoncée (`backend/tests/test_limits_mission01.py:47-61`).
+   Les références documentaires actives aux modèles de conversation P10 ne
+   sont pas modifiées; le playbook reste cohérent avec le retrait L06.
+
+4. **[CONFIRMED] [LOW] La recette ciblée passe, mais son nombre réel diffère de l’annonce.**
+
+   Le fichier ajouté ne contient que deux tests : absence de consommateurs
+   (lignes 15-45) et garde G2 (lignes 47-61). La commande demandée a rendu
+   **2 passed**; elle n’a pas rendu les **43 passed annoncés**. Ces deux tests
+   sont pertinents pour L06, et la recherche Git indépendante couvre aussi
+   les documents suivis, mais la différence de compte doit rester explicite.
+
+### Exécution R5
+
+Exécution dans le worktree de l’implémenteur au SHA
+`e4772fae3f041e6e66dc087f404a8b4417854c94`, avec `.venv`; aucun fournisseur,
+PostgreSQL, Docker ou réseau n’a été contacté.
+
+- `PYTHONPATH=$PWD/src .venv/bin/python -m pytest tests/test_limits_mission01.py -q --tb=short` — **2 passed** en 0,52 s, code retour 0. Pytest signale seulement que le worktree cible en lecture seule ne peut écrire `.pytest_cache`.
+- `.venv/bin/ruff check --no-cache src/cti_app/application/investigation_advisor_tools.py tests/test_limits_mission01.py` — **All checks passed**.
+- `git diff --check 058bb4a..e4772fa` — aucune erreur; `git diff --stat` — exactement les quatre fichiers L06 ci-dessus.
+- Comparaison ciblée avec la base — P10 (`invariant_proposals.py`, `docs/model_conversations.md`), Advisor, passerelle provider et agrégation de classification inchangés.
+
+**UNKNOWN:** l’état réel de `.env` et du déploiement n’a pas été inspecté; les
+références externes ou privées aux anciennes variables ne sont pas vérifiées.
+Le compte « 43 passed » ne correspond pas à la commande et au fichier du
+commit; aucune source alternative de ce compte n’a été fournie.
+**Coût R5:** UNKNOWN.
