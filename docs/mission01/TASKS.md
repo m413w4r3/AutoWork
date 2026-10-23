@@ -91,6 +91,19 @@ conformément à la règle de fallback Claude autorisée. Ces revues sont
 explicitement identifiées comme non-Luna dans leurs rapports. Les travaux
 Luna déjà livrés restent inchangés.
 
+## Reprise Luna 2026-10-24 00:50 — sessions actives
+
+| Session | TASK_ID | Worktree | Objet |
+|---|---|---|---|
+| `98446181` | M01-REG-FIX | `fix/mission01-regressions` (`wks_cbcdaa104d853d74`) | WIP 849cfa0 + 5 régressions + suite backend |
+| `d19feb46` | M01-B0A-REVIEW-R4 | `audit-mission01-b0a-review` | verdict final `df1bd8f` |
+| `f0710b24` | M01-A1-REVIEW-R5 | `audit-mission01-a1-review` | verdict final `4a71f45` |
+| `d5cdbcc8` | M01-B1A1-REVIEW-R3 | `audit-mission01-b1a1-review` | verdict final `2f88a42` |
+| `24a6d5ba` | M01-B1A2-REVIEW-R2 | `audit-mission01-b1a2-review` | verdict final `01346e2`/`5484375` |
+
+Aucun push/live. Les verdicts ne seront intégrés qu'après examen du compte
+rendu ; `PASS` seulement si tests verts et revue effective.
+
 ## Régressions en attente (reprise Luna 2026-10-24 00:50)
 
 La suite backend hors intégration donne 4579 passed / 39 failed. 24 échecs
