@@ -78,8 +78,17 @@ class _BlockedTransport:
         context_sha256: str,
         prompt: str,
         external_llm_allowed: bool,
+        timeout_seconds: float | None = None,
     ) -> TurnSubmission:
-        del investigation_id, subject_id, turn_index, context_sha256, prompt, external_llm_allowed
+        del (
+            investigation_id,
+            subject_id,
+            turn_index,
+            context_sha256,
+            prompt,
+            external_llm_allowed,
+            timeout_seconds,
+        )
         return TurnSubmission(
             status=TurnSubmissionStatus.BLOCKED,
             idempotency_key="blocked-at-approval-gate",

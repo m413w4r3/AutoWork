@@ -1247,6 +1247,7 @@ class InvestigationService:
             }
             and not framework_proves_non_execution
         )
+        ambiguous_adapter_response = unproven_external_failure
         if unproven_external_failure and result.status is not ToolInvocationStatus.NEEDS_REVIEW:
             result = replace(
                 result,
@@ -1265,7 +1266,11 @@ class InvestigationService:
         }:
             budget.release(operation_key)
         try:
-            persisted_observations = await self._persist_result_observations(invocation, result)
+            persisted_observations = (
+                ()
+                if ambiguous_adapter_response
+                else await self._persist_result_observations(invocation, result)
+            )
         except Exception as exc:
             valid_refs = await self._valid_observation_refs(
                 investigation.id, result.observation_refs
@@ -2032,12 +2037,13 @@ class InvestigationService:
     async def _persist_result_observations(
         self, invocation: ToolInvocation, result: ToolResult
     ) -> tuple[EvidenceObservation, ...]:
-        if result.framework_pre_submission_proof is None and (
+        if (
             result.error_code == "invalid_tool_arguments"
             or result.output.get("error_code") == "invalid_tool_arguments"
         ):
             # Local schema rejection is a correction signal, not evidence about
-            # the external subject or the provider's response.
+            # the external subject or the provider's response. Keep it local
+            # even when the framework also carries typed pre-submission proof.
             return ()
         provider_auth_refusal = (
             result.status is ToolInvocationStatus.UNAVAILABLE

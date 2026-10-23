@@ -226,12 +226,18 @@ def advisor_wire_aliases(prompt_data: Mapping[str, Any]) -> dict[str, dict[str, 
         }
         fact_rows = [item for item in fact_rows if item.get("fact_id") in selected_fact_ids]
         fact_aliases = {f"F{index}": item for index, item in enumerate(fact_rows, start=1)}
-    evidence_aliases = {}
+    evidence_aliases: dict[str, dict[str, Any]] = {}
+    evidence_alias_identities: dict[str, tuple[object, object, object]] = {}
+    ambiguous_evidence_aliases: set[str] = set()
     for item in manifest:
         alias = item.get("alias")
         if not isinstance(alias, str):
             continue
-        if item.get("origin") == "versioned_review_target":
+        if item.get("origin") == "versioned_review_target" and (
+            item.get("kind") != "opinion"
+            or not isinstance(item.get("source_ref"), str)
+            or not item.get("source_ref")
+        ):
             continue
         evidence = dict(item)
         if evidence.get("kind") == "article" and isinstance(evidence.get("id"), str):
@@ -240,7 +246,15 @@ def advisor_wire_aliases(prompt_data: Mapping[str, Any]) -> dict[str, dict[str, 
                 evidence["id"] = f"article:{identifier}"
         elif evidence.get("kind") == "opinion" and isinstance(evidence.get("source_ref"), str):
             evidence["id"] = evidence["source_ref"]
-        evidence_aliases[alias] = evidence
+        identity = (evidence.get("kind"), evidence.get("id"), evidence.get("sha256"))
+        existing_identity = evidence_alias_identities.get(alias)
+        if existing_identity is not None and existing_identity != identity:
+            evidence_aliases.pop(alias, None)
+            ambiguous_evidence_aliases.add(alias)
+            continue
+        if alias not in ambiguous_evidence_aliases:
+            evidence_alias_identities.setdefault(alias, identity)
+            evidence_aliases[alias] = evidence
     return {
         "refs": ref_aliases,
         "measurements": measurement_aliases,
