@@ -261,3 +261,33 @@ Les tests backend et checks Ruff sont offline; aucun fournisseur, réseau, Postg
 ## Verdict final après 4a71f45
 
 **FAIL — deux contournements confirmés restent ouverts : un UUID canonique de même investigation mais non lié à l’expérience peut être réfléchi, et un SHA d’observation est accepté sous un type d’entrée incompatible.** Les métadonnées d’outil sont liées aux invocations canoniques, le libellé assertion/non-conclusion est affiché frontend, et les protections `tool_arguments`, secrets, source/snapshot, G2 et lecture seule sont conservées. Les checks frontend et le lifespan réel restent UNKNOWN. Coût : **UNKNOWN**.
+
+## Re-revue après 1f0e813
+
+Cette re-revue cible `1f0e81344e73e4d3db128bf8a7dfd74b11740849`, delta `4a71f45c5a03761357f74ec363cb80b96cfb85b5..1f0e81344e73e4d3db128bf8a7dfd74b11740849`.
+
+### Résolution des références
+
+**CONFIRMED · R5 fermé pour les références non liées.** Le projecteur construit les ensembles autorisés par expérience depuis ses seuls `observation_refs` et `tool_invocation_refs`, puis résout les observations par ID et SHA exacts, et les invocations par ID et version exacte, dans les objets rattachés à la même investigation ([`investigation_experiments.py:185-256`](../../../feat-mission01-a1-strategy-projection/backend/src/cti_app/application/investigation_experiments.py#L185)). `step_ids` n’accepte que les invocations liées; les `input_refs` et `next_pivots` n’acceptent que les SHA des observations liées ([même fichier:454-474](../../../feat-mission01-a1-strategy-projection/backend/src/cti_app/application/investigation_experiments.py#L454)). `record`, `experiment.list` et GET utilisent le projecteur ([même fichier:1111-1116,1155-1182](../../../feat-mission01-a1-strategy-projection/backend/src/cti_app/application/investigation_experiments.py#L1111), [`investigation.py:1091-1099`](../../../feat-mission01-a1-strategy-projection/backend/src/cti_app/api/investigation.py#L1091)).
+
+Les UUID d’invocation canoniques de la même investigation mais absents des refs de l’expérience, et les UUID d’invocation absents du dépôt, ressortent `[redacted]`. Les références liées et résolues restent visibles. Un UUID d’observation dans `step_ids` est masqué. Les SHA d’observations non liées, y compris `vt_file_report`, sont masquées dans `input_refs`, `next_pivots` et les refs; une observation liée avec SHA exact reste visible.
+
+**CONFIRMED · MEDIUM — type d’observation non vérifié pour les entrées et pivots liés.** `_safe_experiment_input_references()` vérifie que `input_type` vaut `sample_sha256` ou `capture_sha256`, puis cherche le SHA dans les observations liées; il ne compare pas `kind`/`object_type` au type déclaré ([`investigation_experiments.py:608-655`](../../../feat-mission01-a1-strategy-projection/backend/src/cti_app/application/investigation_experiments.py#L608)). `next_pivots` accepte également le SHA de toute observation liée ([même fichier:457-467](../../../feat-mission01-a1-strategy-projection/backend/src/cti_app/application/investigation_experiments.py#L457)). Une vérification directe via GET avec un `vt_file_report` lié a renvoyé son SHA sous `capture_sha256` et dans `next_pivots`, tandis que son ID dans `step_ids` était bien masqué. La SHA était aussi publiée comme observation liée; le défaut restant est une attribution de type/provenance erronée, pas une divulgation d’une observation non liée. Le test ajouté ne couvre que le cas `vt_file_report` non lié ([`test_investigation_experiment_api.py:761-846`](../../../feat-mission01-a1-strategy-projection/backend/tests/test_investigation_experiment_api.py#L761)).
+
+Pas de contournement trouvé par casse ou référence imbriquée : les formes UUID/SHA sont minuscules et canoniques, et la projection reconstruit les champs fixes des refs d’entrée. Les SHA d’invocation ne sont pas utilisés pour autoriser les `input_refs`/pivots. Le contrôle de version d’invocation est exact; aucun test dédié ne vérifie une version erronée.
+
+### Couverture et protections conservées
+
+Le test GET couvre les cas lié, canonique non lié et absent pour `step_ids`/invocations, ainsi que les observations liées et non liées. Les tests `record` et `list` vérifient le masquage des invocations non liées/absentes et gardent visibles les observations liées; ils ne vérifient pas directement une invocation liée visible dans ces deux sorties. `tool_arguments` reste vide; secrets et texte libre restent masqués; les claims non prouvés restent `inconclusive`. Les protections source/snapshot, G2 et GET en lecture seule ne sont pas modifiées par ce delta. Aucun fichier B0A/B1A ni migration n’est touché. Le lifespan de production reste **UNKNOWN**.
+
+Depuis une archive exacte du commit cible, avec le `.venv` relié conformément à la consigne :
+
+- `PYTHONPATH=$PWD/src .venv/bin/python -m pytest tests/test_investigation_strategy_scenarios.py tests/test_investigation_experiments.py tests/test_investigation_experiment_api.py tests/test_operator_tool_invocation.py -q --tb=short` — **64 passed in 5.25s**.
+- `.venv/bin/ruff check .` — **All checks passed**.
+- Vérification directe GET du cas `vt_file_report` lié — UUID d’observation dans `step_ids` masqué; SHA visible avec le mauvais `input_type` et dans `next_pivots`.
+
+Les checks sont offline; aucun fournisseur, PostgreSQL, Docker ou transport live n’a été démarré. Coût : **UNKNOWN**.
+
+## Verdict après 1f0e813
+
+**PASS_WITH_CHANGES — les fuites R5 de références non liées sont fermées.** Reste un défaut **MEDIUM** de cohérence de type/provenance pour une observation liée utilisée sous `sample_sha256`/`capture_sha256` ou comme pivot. Corriger/valider la correspondance du type d’observation avant de qualifier la projection entièrement sûre. Le lifespan de production reste **UNKNOWN**. Coût : **UNKNOWN**.
