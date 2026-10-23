@@ -158,6 +158,8 @@ function mockResponse(url: string): Response {
           scope: "Capture de contrôle, pas le trafic de la victime.",
           limitations: ["Ne décrit pas les communications hors capture."],
           verdict: "refutes",
+          verdict_assertion_label:
+            "Verdict enregistré : refutes (assertion, non conclusion)",
           implication: "Cette capture ne confirme pas le serveur indiqué.",
           next_pivots: [CANDIDATE_ID],
           author: "analyst-1",
@@ -517,6 +519,9 @@ describe("InvestigationLabViews", () => {
       screen.getByText("99999999-9999-4999-8999-999999999999"),
     ).toBeInTheDocument();
     expect(screen.getByText(/Expérience v1 · Réfute/)).toBeInTheDocument();
+    expect(
+      screen.getByText("Verdict enregistré : refutes (assertion, non conclusion)"),
+    ).toHaveAttribute("role", "note");
     expect(screen.getByText(/Expérience v2 · Soutient/)).toBeInTheDocument();
   });
 

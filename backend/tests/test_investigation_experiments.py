@@ -483,7 +483,7 @@ async def test_record_tool_requires_g2_and_persisted_investigation_observations(
         budget=budget,
         idempotency_key="record-observation-1",
     )
-    hostile_step_id = "deadbeef" * 16 + "OPERATOR_TEST_SECRET"
+    hostile_step_id = "deadbeef" * 8
     arguments = {
         "expected_version": 0,
         "hypothesis_id": "hypothesis-network",
@@ -496,15 +496,15 @@ async def test_record_tool_requires_g2_and_persisted_investigation_observations(
         "input_refs": [
             {
                 "input_type": "sample_sha256",
-                "input_id": "deadbeef" * 16,
-                "sha256": "a" * 64,
+                "input_id": hostile_step_id,
+                "sha256": hostile_step_id,
             }
         ],
         "preconditions": ["The observation is bound to the current investigation."],
         "availability": "available",
-        "tool_name": "network.capture.inspect",
-        "tool_version": "4.4.1",
-        "tool_schema_version": "network-capture-inspect.v1",
+        "tool_name": "secret.payload",
+        "tool_version": "SensitiveData-1",
+        "tool_schema_version": "sensitive.payload.v1",
         "tool_arguments": {"byte_0": 77, "byte_1": 90, "byte_2": 0, "flag_0": True},
         "step_ids": [hostile_step_id],
         "tool_invocation_refs": [],
@@ -519,7 +519,7 @@ async def test_record_tool_requires_g2_and_persisted_investigation_observations(
         "limitations": [],
         "verdict": "refutes",
         "implication": "The cited capture supports this bounded claim.",
-        "next_pivots": ["c" * 64],
+        "next_pivots": [hostile_step_id],
     }
 
     denied = await adapter.execute(arguments, replace(context, envelope=None))
@@ -538,7 +538,23 @@ async def test_record_tool_requires_g2_and_persisted_investigation_observations(
     assert saved.output["verdict_assertion_label"] == (
         "Verdict enregistré : refutes (assertion, non conclusion)"
     )
-    assert hostile_step_id not in repr(saved.output)
+    recorded_experiment = saved.output["experiment"]
+    assert recorded_experiment["step_ids"] == ("[redacted]",)
+    assert recorded_experiment["next_pivots"] == ("[redacted]",)
+    assert recorded_experiment["input_refs"] == (
+        {
+            "input_type": "sample_sha256",
+            "input_id": "[redacted]",
+            "sha256": "[redacted]",
+        },
+    )
+    assert recorded_experiment["tool_name"] == "[redacted]"
+    assert recorded_experiment["tool_version"] == "[redacted]"
+    assert recorded_experiment["tool_schema_version"] == "[redacted]"
+    assert all(
+        value not in repr(saved.output)
+        for value in (hostile_step_id, "secret.payload", "SensitiveData-1", "sensitive.payload.v1")
+    )
     assert "OPERATOR_TEST_SECRET" not in repr(saved.output)
     listed = await _ExperimentListToolAdapter(experiments).execute({}, context)
     list_payload = listed.output
@@ -550,14 +566,25 @@ async def test_record_tool_requires_g2_and_persisted_investigation_observations(
         "Verdict enregistré : refutes (assertion, non conclusion)"
     )
     assert projected_experiment["step_ids"] == ("[redacted]",)
+    assert projected_experiment["next_pivots"] == ("[redacted]",)
     assert projected_experiment["falsification_criterion"] == "[redacted]"
     assert projected_experiment["actual"] == "[redacted]"
     assert projected_experiment["tool_arguments"] == {}
+    assert projected_experiment["tool_name"] == "[redacted]"
+    assert projected_experiment["tool_version"] == "[redacted]"
+    assert projected_experiment["tool_schema_version"] == "[redacted]"
     assert "OPERATOR_TEST_SECRET" not in repr(list_payload)
     assert hostile_step_id not in repr(list_payload)
-    assert "deadbeef" * 16 not in repr(list_payload)
     assert projected_experiment["input_refs"] == (
-        {"input_type": "sample_sha256", "input_id": "[redacted]", "sha256": None},
+        {
+            "input_type": "sample_sha256",
+            "input_id": "[redacted]",
+            "sha256": "[redacted]",
+        },
+    )
+    assert all(
+        value not in repr(list_payload)
+        for value in ("secret.payload", "SensitiveData-1", "sensitive.payload.v1")
     )
     assert (await experiments.list_for_investigation(investigation_id))[0].observation_refs[
         0
