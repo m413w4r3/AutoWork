@@ -25,6 +25,7 @@ from cti_app.application.evidence_recorder import sanitize_evidence_text
 from cti_app.domain.investigation import (
     BudgetDimension,
     BudgetExceeded,
+    FrameworkPreSubmissionProof,
     InvestigationBudget,
     InvestigationEnvelope,
     TLPLevel,
@@ -196,10 +197,15 @@ class ToolResult:
     message: str = ""
     exception_class: str | None = None
     error_code: str | None = None
+    framework_pre_submission_proof: FrameworkPreSubmissionProof | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.status, ToolInvocationStatus):
             raise TypeError("status must use ToolInvocationStatus")
+        if self.framework_pre_submission_proof is not None and not isinstance(
+            self.framework_pre_submission_proof, FrameworkPreSubmissionProof
+        ):
+            raise TypeError("framework_pre_submission_proof must use FrameworkPreSubmissionProof")
         if not isinstance(self.output, Mapping):
             raise TypeError("output must be a JSON object")
         normalized: dict[BudgetDimension, int] = {}
@@ -414,7 +420,9 @@ class ToolDispatcher(Protocol):
         purpose: str,
         operation_key: str,
         reservation_amounts: Mapping[BudgetDimension, int] | None = None,
-        pre_dispatch_check: Callable[[ToolExecutionContext], Awaitable[ToolResult | None]]
+        pre_dispatch_check: Callable[
+            [ToolExecutionContext], Awaitable[FrameworkPreSubmissionProof | None]
+        ]
         | None = None,
     ) -> ToolResult: ...
 
@@ -626,7 +634,9 @@ class RegistryToolDispatcher:
         purpose: str,
         operation_key: str,
         reservation_amounts: Mapping[BudgetDimension, int] | None = None,
-        pre_dispatch_check: Callable[[ToolExecutionContext], Awaitable[ToolResult | None]]
+        pre_dispatch_check: Callable[
+            [ToolExecutionContext], Awaitable[FrameworkPreSubmissionProof | None]
+        ]
         | None = None,
     ) -> ToolResult:
         async with self._lock:
@@ -634,6 +644,7 @@ class RegistryToolDispatcher:
                 return self._local_result(
                     ToolInvocationStatus.FAILED,
                     "Tool purpose and operation key must not be empty.",
+                    pre_submission_proof=FrameworkPreSubmissionProof.INVALID_ARGUMENTS,
                 )
             try:
                 identity = canonical_json_bytes(
@@ -647,7 +658,9 @@ class RegistryToolDispatcher:
                 )
             except (TypeError, ValueError):
                 return self._local_result(
-                    ToolInvocationStatus.FAILED, "Tool arguments must contain only JSON values."
+                    ToolInvocationStatus.FAILED,
+                    "Tool arguments must contain only JSON values.",
+                    pre_submission_proof=FrameworkPreSubmissionProof.INVALID_ARGUMENTS,
                 )
             return await self._dispatch_once(
                 replace(
@@ -675,7 +688,10 @@ class RegistryToolDispatcher:
         operation_key: str,
         identity: bytes,
         reservation_amounts: Mapping[BudgetDimension, int] | None,
-        pre_dispatch_check: Callable[[ToolExecutionContext], Awaitable[ToolResult | None]] | None,
+        pre_dispatch_check: Callable[
+            [ToolExecutionContext], Awaitable[FrameworkPreSubmissionProof | None]
+        ]
+        | None,
     ) -> ToolResult:
         replay = self._completed.get(operation_key)
         if replay is not None:
@@ -702,6 +718,7 @@ class RegistryToolDispatcher:
                 if unavailable_reason is not None
                 else "Tool is not registered.",
                 alternatives,
+                pre_submission_proof=FrameworkPreSubmissionProof.TOOL_UNAVAILABLE,
             )
         definition, adapter = registered
         unavailable_reason = tool_unavailability_reason(definition, context)
@@ -710,6 +727,7 @@ class RegistryToolDispatcher:
                 ToolInvocationStatus.UNAVAILABLE,
                 f"Tool is unavailable: {unavailable_reason}.",
                 alternatives,
+                pre_submission_proof=FrameworkPreSubmissionProof.TOOL_UNAVAILABLE,
             )
         policy_status = self._policy_status(definition, context.envelope)
         if policy_status is not None:
@@ -718,7 +736,7 @@ class RegistryToolDispatcher:
                 f"Policy does not allow {definition.name}.",
                 alternatives,
                 request_permission=True,
-                pre_submission_reason="policy_denied",
+                pre_submission_proof=FrameworkPreSubmissionProof.POLICY_REJECTED,
             )
         try:
             validate_json_schema(arguments, thaw_json(definition.input_schema))
@@ -742,6 +760,7 @@ class RegistryToolDispatcher:
                 message=f"invalid_tool_arguments: {summary or 'arguments do not match the schema'}",
                 exception_class=type(exc).__name__,
                 error_code="invalid_tool_arguments",
+                framework_pre_submission_proof=FrameworkPreSubmissionProof.INVALID_ARGUMENTS,
             )
 
         reserved_amounts = (
@@ -755,12 +774,12 @@ class RegistryToolDispatcher:
                 f"Budget limit reached for {exc.dimension.value}.",
                 alternatives,
                 request_permission=True,
-                pre_submission_reason="budget_exceeded",
+                pre_submission_proof=FrameworkPreSubmissionProof.BUDGET_REJECTED,
             )
         if pre_dispatch_check is not None:
-            refusal = await pre_dispatch_check(context)
-            if refusal is not None:
-                return refusal
+            proof = await pre_dispatch_check(context)
+            if proof is not None:
+                return self._pre_submission_result(proof, alternatives)
         try:
             result = await adapter.execute(arguments, context)
         except Exception as exc:
@@ -777,15 +796,9 @@ class RegistryToolDispatcher:
             )
             self._completed[operation_key] = (identity, result)
             return result
-        if result.output.get("pre_submission_reason") in {
-            "budget_exceeded",
-            "policy_denied",
-        }:
-            # These markers belong to dispatcher-owned admission refusals. An
-            # adapter result is untrusted and cannot assert the same proof.
-            safe_output = dict(result.output)
-            safe_output.pop("pre_submission_reason", None)
-            result = replace(result, output=safe_output)
+        # Adapters may return arbitrary ToolResult fields. Only the dispatcher
+        # can attest that it refused before adapter entry.
+        result = replace(result, framework_pre_submission_proof=None)
         try:
             consumed = result.budget_consumed or reserved_amounts
             context.budget.commit(operation_key, consumed)
@@ -797,6 +810,57 @@ class RegistryToolDispatcher:
             )
         self._completed[operation_key] = (identity, result)
         return result
+
+    @staticmethod
+    def _pre_submission_result(
+        proof: FrameworkPreSubmissionProof,
+        alternatives: tuple[str, ...],
+    ) -> ToolResult:
+        statuses = {
+            FrameworkPreSubmissionProof.INVALID_ARGUMENTS: ToolInvocationStatus.FAILED,
+            FrameworkPreSubmissionProof.TOOL_UNAVAILABLE: ToolInvocationStatus.UNAVAILABLE,
+            FrameworkPreSubmissionProof.POLICY_REJECTED: ToolInvocationStatus.POLICY_DENIED,
+            FrameworkPreSubmissionProof.BUDGET_REJECTED: ToolInvocationStatus.NEEDS_REVIEW,
+            FrameworkPreSubmissionProof.ENVELOPE_ADMISSION_CONFLICT: ToolInvocationStatus.FAILED,
+            FrameworkPreSubmissionProof.ENVELOPE_REVOKED: ToolInvocationStatus.POLICY_DENIED,
+            FrameworkPreSubmissionProof.RESERVATION_CHANGED: ToolInvocationStatus.NEEDS_REVIEW,
+            FrameworkPreSubmissionProof.INVESTIGATION_MISSING: ToolInvocationStatus.POLICY_DENIED,
+            FrameworkPreSubmissionProof.DISCLOSURE_REVOKED: ToolInvocationStatus.POLICY_DENIED,
+            FrameworkPreSubmissionProof.OPERATOR_INTERRUPTED: ToolInvocationStatus.FAILED,
+        }
+        status = statuses[proof]
+        reasons = {
+            FrameworkPreSubmissionProof.INVALID_ARGUMENTS: "invalid_tool_arguments",
+            FrameworkPreSubmissionProof.TOOL_UNAVAILABLE: "tool_unavailable",
+            FrameworkPreSubmissionProof.POLICY_REJECTED: "policy_denied",
+            FrameworkPreSubmissionProof.BUDGET_REJECTED: "budget_exceeded",
+            FrameworkPreSubmissionProof.ENVELOPE_ADMISSION_CONFLICT: (
+                "envelope_admission_conflict"
+            ),
+            FrameworkPreSubmissionProof.ENVELOPE_REVOKED: "envelope_revoked_before_dispatch",
+            FrameworkPreSubmissionProof.RESERVATION_CHANGED: "reservation_changed_before_dispatch",
+            FrameworkPreSubmissionProof.INVESTIGATION_MISSING: (
+                "investigation_missing_before_dispatch"
+            ),
+            FrameworkPreSubmissionProof.DISCLOSURE_REVOKED: (
+                "external_disclosure_revoked_before_dispatch"
+            ),
+            FrameworkPreSubmissionProof.OPERATOR_INTERRUPTED: (
+                "operator_interrupted_before_tool_dispatch"
+            ),
+        }
+        result = RegistryToolDispatcher._local_result(
+            status,
+            "The framework stopped the tool before adapter execution.",
+            alternatives,
+            request_permission=status
+            in {
+                ToolInvocationStatus.NEEDS_REVIEW,
+                ToolInvocationStatus.POLICY_DENIED,
+            },
+            pre_submission_proof=proof,
+        )
+        return replace(result, output={**result.output, "reason": reasons[proof]})
 
     @staticmethod
     def _policy_status(
@@ -848,22 +912,15 @@ class RegistryToolDispatcher:
         alternatives: tuple[str, ...] = (),
         *,
         request_permission: bool = False,
-        pre_submission_reason: str | None = None,
+        pre_submission_proof: FrameworkPreSubmissionProof | None = None,
     ) -> ToolResult:
         output: dict[str, Any] = {"request_permission": True} if request_permission else {}
-        if pre_submission_reason is not None:
-            output.update(
-                {
-                    "pre_submission_reason": pre_submission_reason,
-                    "failure_stage": "pre_submission",
-                    "confirmed_non_execution": True,
-                }
-            )
         return ToolResult(
             status,
             suggested_alternatives=alternatives,
             output=output,
             message=message,
+            framework_pre_submission_proof=pre_submission_proof,
         )
 
 

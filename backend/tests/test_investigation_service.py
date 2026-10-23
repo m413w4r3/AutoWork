@@ -1265,7 +1265,7 @@ async def test_download_route_refusal_archives_scoped_untrusted_observation() ->
 
 
 @pytest.mark.asyncio
-async def test_download_refusals_flow_through_service_budget_and_blocked_context() -> None:
+async def test_untyped_download_refusal_requires_reconciliation_before_retry() -> None:
     first_call = _tool_call(
         "vt.download_sample", "synthetic-hash-one", "review first synthetic hit"
     )
@@ -1312,33 +1312,24 @@ async def test_download_refusals_flow_through_service_budget_and_blocked_context
     invocations = await fixture.invocations.list_for_investigation(state.investigation_id)
     observations = await fixture.observations.list_for_investigation(state.investigation_id)
     envelope = await fixture.envelopes.get(state.investigation_id)
-    assert stopped.stop_reason is StopReason.AGENT_FINISHED
-    assert len(invocations) == 2
-    assert all(item.status is ToolInvocationStatus.UNAVAILABLE for item in invocations)
-    assert len(observations) == 2
+    assert stopped.stop_reason is StopReason.SUBMISSION_NEEDS_REVIEW
+    assert len(invocations) == 1
+    assert invocations[0].status is ToolInvocationStatus.NEEDS_REVIEW
+    assert len(observations) == 1
     assert {item.object_type for item in observations} == {"provider_download_route_refused"}
     assert envelope is not None
-    assert envelope.budget.consumed[BudgetDimension.VT_UNITS] == 2
+    assert envelope.budget.consumed[BudgetDimension.VT_UNITS] == 0
     assert envelope.budget.consumed[BudgetDimension.DOWNLOADS] == 0
-    for invocation in invocations:
-        reservation = next(
-            item
-            for item in envelope.budget.reservations
-            if item.operation_key == invocation.operation_key
-        )
-        assert reservation.status is BudgetReservationStatus.COMMITTED
-        assert reservation.committed_amounts == {
-            BudgetDimension.VT_UNITS: 1,
-            BudgetDimension.DOWNLOADS: 0,
-        }
-    assert (
-        "vt.file_download: provider download route unavailable"
-        in (fixture.bridge_transport.prompts[-1])
+    reservation = next(
+        item
+        for item in envelope.budget.reservations
+        if item.operation_key == invocations[0].operation_key
     )
+    assert reservation.status is BudgetReservationStatus.RESERVED
 
 
 @pytest.mark.asyncio
-async def test_two_shodan_authorization_refusals_block_later_calls_in_the_same_turn() -> None:
+async def test_untyped_shodan_authorization_refusal_blocks_later_calls() -> None:
     calls = tuple(
         _tool_call("shodan.host", f"synthetic:{index}", f"check synthetic host {index}")
         for index in range(3)
@@ -1370,11 +1361,10 @@ async def test_two_shodan_authorization_refusals_block_later_calls_in_the_same_t
     result = await fixture.service.run(state.investigation_id)
 
     invocations = await fixture.invocations.list_for_investigation(state.investigation_id)
-    assert result.stop_reason is StopReason.AGENT_FINISHED
-    assert len(tool.calls) == 2
-    assert len(invocations) == 2
-    assert all(item.status is ToolInvocationStatus.UNAVAILABLE for item in invocations)
-    assert "shodan: provider authorization refused" in fixture.bridge_transport.prompts[1]
+    assert result.stop_reason is StopReason.SUBMISSION_NEEDS_REVIEW
+    assert len(tool.calls) == 1
+    assert len(invocations) == 1
+    assert invocations[0].status is ToolInvocationStatus.NEEDS_REVIEW
 
 
 @pytest.mark.asyncio
@@ -2434,15 +2424,26 @@ async def test_final_empty_or_unavailable_result_is_replayed_without_another_cal
     result = await fixture.service.run(state.investigation_id)
 
     invocations = await fixture.invocations.list_for_investigation(state.investigation_id)
-    assert result.stop_reason is StopReason.AGENT_FINISHED
+    expected_stop = (
+        StopReason.SUBMISSION_NEEDS_REVIEW
+        if terminal_status is ToolInvocationStatus.UNAVAILABLE
+        else StopReason.AGENT_FINISHED
+    )
+    assert result.stop_reason is expected_stop
     assert len(tool.calls) == 1
     assert len(invocations) == 1
-    assert invocations[0].status is terminal_status
-    assert "already executed" in fixture.bridge_transport.prompts[2].lower()
+    expected_status = (
+        ToolInvocationStatus.NEEDS_REVIEW
+        if terminal_status is ToolInvocationStatus.UNAVAILABLE
+        else terminal_status
+    )
+    assert invocations[0].status is expected_status
+    if terminal_status is ToolInvocationStatus.EMPTY:
+        assert "already executed" in fixture.bridge_transport.prompts[2].lower()
 
 
 @pytest.mark.asyncio
-async def test_confirmed_transient_failure_is_retried_with_a_new_operation_attempt() -> None:
+async def test_untyped_transient_failure_waits_for_reconciliation() -> None:
     call = _tool_call("vt.search", "synthetic:retry", "retry a rejected local attempt")
     fixture = _Fixture(
         responses=[
@@ -2473,15 +2474,19 @@ async def test_confirmed_transient_failure_is_retried_with_a_new_operation_attem
 
     invocations = await fixture.invocations.list_for_investigation(state.investigation_id)
     envelope = await fixture.envelopes.get(state.investigation_id)
-    assert result.stop_reason is StopReason.AGENT_FINISHED
-    assert len(tool.calls) == 1
-    assert [item.status for item in invocations] == [
-        ToolInvocationStatus.FAILED,
-        ToolInvocationStatus.SUCCEEDED,
-    ]
-    assert len({item.operation_key for item in invocations}) == 2
+    assert result.stop_reason is StopReason.SUBMISSION_NEEDS_REVIEW
+    assert attempts == 1
+    assert tool.calls == []
+    assert [item.status for item in invocations] == [ToolInvocationStatus.NEEDS_REVIEW]
+    assert len({item.operation_key for item in invocations}) == 1
     assert envelope is not None
-    assert envelope.budget.consumed[BudgetDimension.VT_UNITS] == 1
+    assert envelope.budget.consumed[BudgetDimension.VT_UNITS] == 0
+    reservation = next(
+        item
+        for item in envelope.budget.reservations
+        if item.operation_key == invocations[0].operation_key
+    )
+    assert reservation.status is BudgetReservationStatus.RESERVED
 
 
 @pytest.mark.asyncio
@@ -3011,7 +3016,7 @@ async def test_reconciliation_uses_cas_and_commits_or_releases_ambiguous_budget(
 
 
 @pytest.mark.asyncio
-async def test_confirmed_nonexecution_commits_only_consumed_provider_budget() -> None:
+async def test_adapter_nonexecution_claim_does_not_commit_external_budget() -> None:
     fixture = _Fixture(responses=[], tools=(("vt.download_sample", "vt", ToolEffect.ACQUIRE),))
     state = await fixture.start()
     operation_key = "synthetic-definitive-download-refusal"
@@ -3036,23 +3041,22 @@ async def test_confirmed_nonexecution_commits_only_consumed_provider_budget() ->
         result=result,
         reserved_amounts=reserved,
         uncertain=False,
+        external_effect=True,
     )
 
     latest_envelope = await fixture.envelopes.get(state.investigation_id)
     reservation = next(
         item for item in latest_envelope.budget.reservations if item.operation_key == operation_key
     )
-    assert reservation.status is BudgetReservationStatus.COMMITTED
-    assert reservation.committed_amounts == {
-        BudgetDimension.VT_UNITS: 1,
-        BudgetDimension.DOWNLOADS: 0,
-    }
-    assert latest_envelope.budget.consumed[BudgetDimension.VT_UNITS] == 1
+    assert reservation.status is BudgetReservationStatus.RESERVED
+    assert reservation.committed_amounts == {}
+    assert latest_envelope.budget.reserved[BudgetDimension.VT_UNITS] == 1
+    assert latest_envelope.budget.consumed[BudgetDimension.VT_UNITS] == 0
     assert latest_envelope.budget.consumed[BudgetDimension.DOWNLOADS] == 0
 
 
 @pytest.mark.asyncio
-async def test_confirmed_nonexecution_without_provider_call_releases_reservation() -> None:
+async def test_adapter_cached_claim_without_framework_proof_keeps_reservation() -> None:
     fixture = _Fixture(responses=[], tools=(("vt.download_sample", "vt", ToolEffect.ACQUIRE),))
     state = await fixture.start()
     operation_key = "synthetic-cached-download-refusal"
@@ -3077,19 +3081,22 @@ async def test_confirmed_nonexecution_without_provider_call_releases_reservation
         ),
         reserved_amounts=reserved,
         uncertain=False,
+        external_effect=True,
     )
 
     latest_envelope = await fixture.envelopes.get(state.investigation_id)
     reservation = next(
         item for item in latest_envelope.budget.reservations if item.operation_key == operation_key
     )
-    assert reservation.status is BudgetReservationStatus.RELEASED
+    assert reservation.status is BudgetReservationStatus.RESERVED
+    assert latest_envelope.budget.reserved[BudgetDimension.VT_UNITS] == 1
+    assert latest_envelope.budget.reserved[BudgetDimension.DOWNLOADS] == 1
     assert latest_envelope.budget.consumed[BudgetDimension.VT_UNITS] == 0
     assert latest_envelope.budget.consumed[BudgetDimension.DOWNLOADS] == 0
 
 
 @pytest.mark.asyncio
-async def test_pre_transport_advisor_input_failure_releases_every_reserved_unit() -> None:
+async def test_untyped_advisor_failure_does_not_release_reserved_units() -> None:
     fixture = _Fixture(responses=[], tools=())
     state = await fixture.start()
     operation_key = "synthetic-advisor-pre-transport-rejection"
@@ -3119,23 +3126,24 @@ async def test_pre_transport_advisor_input_failure_releases_every_reserved_unit(
         },
     )
 
-    assert _confirmed_external_non_execution(result) is True
+    assert _confirmed_external_non_execution(result) is False
     await fixture.service._complete_tool_reservation(
         investigation_id=state.investigation_id,
         operation_key=operation_key,
         result=result,
         reserved_amounts=reserved,
         uncertain=False,
+        external_effect=True,
     )
 
     latest_envelope = await fixture.envelopes.get(state.investigation_id)
     reservation = next(
         item for item in latest_envelope.budget.reservations if item.operation_key == operation_key
     )
-    assert reservation.status is BudgetReservationStatus.RELEASED
-    assert latest_envelope.budget.reserved[BudgetDimension.BRIDGE_TURNS] == 0
-    assert latest_envelope.budget.reserved[BudgetDimension.TOOL_SECONDS] == 0
-    assert latest_envelope.budget.reserved[BudgetDimension.CONTEXT_BYTES] == 0
+    assert reservation.status is BudgetReservationStatus.RESERVED
+    assert latest_envelope.budget.reserved[BudgetDimension.BRIDGE_TURNS] == 1
+    assert latest_envelope.budget.reserved[BudgetDimension.TOOL_SECONDS] == 240
+    assert latest_envelope.budget.reserved[BudgetDimension.CONTEXT_BYTES] == 110_592
 
 
 @pytest.mark.asyncio

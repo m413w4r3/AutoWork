@@ -103,6 +103,7 @@ from cti_app.domain.investigation import (
     EvidenceObservation,
     FindingAssessment,
     FindingKind,
+    FrameworkPreSubmissionProof,
     InvestigationAgenda,
     InvestigationBudget,
     InvestigationEnvelope,
@@ -197,7 +198,9 @@ class ProductionArtifactObservationWriter:
             return ()
         safe_result = _sanitize_json(thaw_json(result.output))
         if not safe_result:
-            return ()
+            if result.framework_pre_submission_proof is None:
+                return ()
+            safe_result = {}
         payload = {
             "schema": "investigation-tool-observation.v1",
             "tool_name": invocation.tool_name,
@@ -212,7 +215,9 @@ class ProductionArtifactObservationWriter:
             source=invocation.tool_name,
             source_version=invocation.schema_version,
             object_type=(
-                PROVIDER_AUTHORIZATION_REFUSAL_OBJECT_TYPE
+                result.framework_pre_submission_proof.value
+                if result.framework_pre_submission_proof is not None
+                else PROVIDER_AUTHORIZATION_REFUSAL_OBJECT_TYPE
                 if provider_auth_refusal
                 else download_refusal_object_type
                 or (
@@ -222,7 +227,9 @@ class ProductionArtifactObservationWriter:
                 )
             ),
             object_id=(
-                invocation.tool_name
+                invocation.operation_key
+                if result.framework_pre_submission_proof is not None
+                else invocation.tool_name
                 if invocation.tool_name in {"vt.download_sample", "sample.analyze"}
                 else invocation.operation_key
             ),
@@ -1117,15 +1124,14 @@ class InvestigationService:
                 failure = ToolResult(
                     status=ToolInvocationStatus.FAILED,
                     error_code="envelope_admission_conflict",
+                    framework_pre_submission_proof=(
+                        FrameworkPreSubmissionProof.ENVELOPE_ADMISSION_CONFLICT
+                    ),
                     message=(
                         "The approved envelope changed before the reservation was persisted; "
                         "the tool was not dispatched."
                     ),
-                    output={
-                        "reason": "envelope_admission_conflict",
-                        "failure_stage": "pre_submission",
-                        "confirmed_non_execution": True,
-                    },
+                    output={"reason": "envelope_admission_conflict"},
                 )
                 _log_terminal_tool_failure(invocation, failure)
                 return invocation, failure, (), external_effect
@@ -1164,6 +1170,9 @@ class InvestigationService:
                     status=ToolInvocationStatus.FAILED,
                     exception_class="OperatorInterruption",
                     error_code="operator_interrupted_before_tool_dispatch",
+                    framework_pre_submission_proof=(
+                        FrameworkPreSubmissionProof.OPERATOR_INTERRUPTED
+                    ),
                 )
                 _log_terminal_tool_failure(invocation, failure)
                 return invocation, failure, (), external_effect
@@ -1180,7 +1189,7 @@ class InvestigationService:
 
         async def check_current_admission(
             _context: ToolExecutionContext,
-        ) -> ToolResult | None:
+        ) -> FrameworkPreSubmissionProof | None:
             if not external_effect or envelope is None:
                 return None
             current_envelope = await self._envelopes.get(investigation.id)
@@ -1189,16 +1198,7 @@ class InvestigationService:
                 or current_envelope.approval_decision_id != envelope.approval_decision_id
                 or _envelope_reduced_since(envelope, current_envelope)
             ):
-                return ToolResult(
-                    status=ToolInvocationStatus.POLICY_DENIED,
-                    error_code="envelope_revoked_before_dispatch",
-                    message="The approved envelope changed before tool dispatch.",
-                    output={
-                        "reason": "envelope_revoked_before_dispatch",
-                        "failure_stage": "pre_submission",
-                        "confirmed_non_execution": True,
-                    },
-                )
+                return FrameworkPreSubmissionProof.ENVELOPE_REVOKED
             if reservation_persisted:
                 current_reservation = next(
                     (
@@ -1213,41 +1213,16 @@ class InvestigationService:
                     or current_reservation.status is not BudgetReservationStatus.RESERVED
                     or dict(current_reservation.amounts) != dict(cost)
                 ):
-                    return ToolResult(
-                        status=ToolInvocationStatus.NEEDS_REVIEW,
-                        error_code="reservation_changed_before_dispatch",
-                        message=(
-                            "The durable reservation changed after admission; "
-                            "reconcile it before dispatch."
-                        ),
-                    )
+                    return FrameworkPreSubmissionProof.RESERVATION_CHANGED
             if tool_name == "advisor.consult":
                 current_investigation = await self._investigations.get(investigation.id)
                 if current_investigation is None:
-                    return ToolResult(
-                        status=ToolInvocationStatus.POLICY_DENIED,
-                        error_code="investigation_missing_before_dispatch",
-                        message="The investigation is unavailable before tool dispatch.",
-                        output={
-                            "reason": "investigation_missing_before_dispatch",
-                            "failure_stage": "pre_submission",
-                            "confirmed_non_execution": True,
-                        },
-                    )
+                    return FrameworkPreSubmissionProof.INVESTIGATION_MISSING
                 snapshot = await self._context_builder.article_snapshots.resolve(
                     current_investigation.synthesis_artifact_id
                 )
                 if not self.external_llm_allowed(snapshot, current_envelope):
-                    return ToolResult(
-                        status=ToolInvocationStatus.POLICY_DENIED,
-                        error_code="external_disclosure_revoked_before_dispatch",
-                        message="External LLM disclosure is no longer allowed.",
-                        output={
-                            "reason": "external_disclosure_revoked_before_dispatch",
-                            "failure_stage": "pre_submission",
-                            "confirmed_non_execution": True,
-                        },
-                    )
+                    return FrameworkPreSubmissionProof.DISCLOSURE_REVOKED
             return None
 
         result = await self._dispatcher.dispatch(
@@ -1260,21 +1235,19 @@ class InvestigationService:
             reservation_amounts=cost,
             pre_dispatch_check=check_current_admission,
         )
-        uncertain_external = external_effect and (
-            (
-                result.status is ToolInvocationStatus.FAILED
-                and not _confirmed_external_non_execution(result)
-            )
-            or (
-                result.status is ToolInvocationStatus.NEEDS_REVIEW
-                and not _confirmed_external_non_execution(result)
-            )
-        )
-        if (
+        framework_proves_non_execution = _confirmed_external_non_execution(result)
+        unproven_external_failure = (
             external_effect
-            and result.status is ToolInvocationStatus.FAILED
-            and not _confirmed_external_non_execution(result)
-        ):
+            and result.status
+            in {
+                ToolInvocationStatus.FAILED,
+                ToolInvocationStatus.UNAVAILABLE,
+                ToolInvocationStatus.POLICY_DENIED,
+                ToolInvocationStatus.NEEDS_REVIEW,
+            }
+            and not framework_proves_non_execution
+        )
+        if unproven_external_failure and result.status is not ToolInvocationStatus.NEEDS_REVIEW:
             result = replace(
                 result,
                 status=ToolInvocationStatus.NEEDS_REVIEW,
@@ -1283,18 +1256,13 @@ class InvestigationService:
                     "reconcile it before resuming. " + result.message
                 )[:2_000],
             )
-        confirmed_partial_external_result = (
-            result.status is ToolInvocationStatus.UNAVAILABLE
-            and any(amount > 0 for amount in result.budget_consumed.values())
-        )
-        if (
-            result.status
-            in {
-                ToolInvocationStatus.UNAVAILABLE,
-                ToolInvocationStatus.POLICY_DENIED,
-            }
-            and not confirmed_partial_external_result
-        ):
+        uncertain_external = unproven_external_failure
+        if framework_proves_non_execution:
+            budget.release_confirmed_non_submission(operation_key)
+        elif not uncertain_external and result.status in {
+            ToolInvocationStatus.UNAVAILABLE,
+            ToolInvocationStatus.POLICY_DENIED,
+        }:
             budget.release(operation_key)
         try:
             persisted_observations = await self._persist_result_observations(invocation, result)
@@ -1341,6 +1309,7 @@ class InvestigationService:
             result=result,
             reserved_amounts=invocation.reserved_budget,
             uncertain=uncertain_external,
+            external_effect=external_effect,
         )
         await self._commit_current_uow()
         _log_terminal_tool_failure(invocation, result)
@@ -2063,7 +2032,7 @@ class InvestigationService:
     async def _persist_result_observations(
         self, invocation: ToolInvocation, result: ToolResult
     ) -> tuple[EvidenceObservation, ...]:
-        if (
+        if result.framework_pre_submission_proof is None and (
             result.error_code == "invalid_tool_arguments"
             or result.output.get("error_code") == "invalid_tool_arguments"
         ):
@@ -2791,6 +2760,7 @@ class InvestigationService:
         result: ToolResult,
         reserved_amounts: Mapping[BudgetDimension, int],
         uncertain: bool,
+        external_effect: bool = False,
     ) -> None:
         for _ in range(3):
             envelope = await self._envelopes.get(investigation_id)
@@ -2820,6 +2790,18 @@ class InvestigationService:
                 reservation = expected_reservation
             if reservation.status is not BudgetReservationStatus.RESERVED or uncertain:
                 return
+            if (
+                external_effect
+                and result.status
+                in {
+                    ToolInvocationStatus.FAILED,
+                    ToolInvocationStatus.UNAVAILABLE,
+                    ToolInvocationStatus.POLICY_DENIED,
+                    ToolInvocationStatus.NEEDS_REVIEW,
+                }
+                and not _confirmed_external_non_execution(result)
+            ):
+                return
             if _confirmed_external_non_execution(result):
                 envelope.budget.release_confirmed_non_submission(operation_key)
                 try:
@@ -2831,11 +2813,7 @@ class InvestigationService:
                 ToolInvocationStatus.SUCCEEDED,
                 ToolInvocationStatus.EMPTY,
                 ToolInvocationStatus.PARTIAL,
-            } or (
-                result.status is ToolInvocationStatus.UNAVAILABLE
-                and result.output.get("confirmed_non_execution") is True
-                and any(amount > 0 for amount in result.budget_consumed.values())
-            ):
+            }:
                 consumed = dict(result.budget_consumed or reserved_amounts)
                 envelope.budget.commit(operation_key, consumed)
             else:
@@ -3337,37 +3315,8 @@ def _copy_investigation_budget(budget: InvestigationBudget) -> InvestigationBudg
 
 
 def _confirmed_external_non_execution(result: ToolResult) -> bool:
-    """Return true for an explicit local/provider rejection known to have no effect."""
-    return (
-        result.error_code == "invalid_tool_arguments"
-        or result.output.get("error_code") == "invalid_tool_arguments"
-        or result.output.get("reason") == "subject_slot_limit"
-        or (
-            result.error_code == "advisor_input_invalid"
-            and result.output.get("failure_stage") == "pre_transport_validation"
-            and result.output.get("confirmed_non_execution") is True
-        )
-        or (
-            result.error_code in {"advisor_rate_limited", "advisor_unavailable"}
-            and result.output.get("confirmed_non_execution") is True
-        )
-        or (
-            result.error_code
-            in {
-                "envelope_revoked_before_dispatch",
-                "envelope_admission_conflict",
-                "external_disclosure_revoked_before_dispatch",
-                "investigation_missing_before_dispatch",
-            }
-            and result.output.get("failure_stage") == "pre_submission"
-            and result.output.get("confirmed_non_execution") is True
-        )
-        or (
-            result.output.get("pre_submission_reason") in {"budget_exceeded", "policy_denied"}
-            and result.output.get("failure_stage") == "pre_submission"
-            and result.output.get("confirmed_non_execution") is True
-        )
-    )
+    """Accept only framework-attested, typed proof; adapter output is untrusted."""
+    return result.framework_pre_submission_proof is not None
 
 
 def _action_summary(tool_name: str, status: ToolInvocationStatus, message: str) -> str:

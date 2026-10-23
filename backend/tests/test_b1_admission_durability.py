@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -8,9 +9,12 @@ from uuid import uuid4
 import pytest
 
 import cti_app.application.investigation_service as investigation_service_module
+from cti_app.application.investigation_governance import InvestigationEnvelopeService
 from cti_app.application.investigation_tools import (
     InMemoryToolRegistry,
     RegistryToolDispatcher,
+    ToolConfidentiality,
+    ToolDefinition,
     ToolEffect,
     ToolResult,
 )
@@ -18,12 +22,15 @@ from cti_app.application.operator_tool_invocation import (
     OperatorToolInvocationError,
 )
 from cti_app.application.research_context_builder import CanonicalEvidenceSummaryPort
+from cti_app.config import Settings
+from cti_app.domain.editorial import AnalystDecisionType
 from cti_app.domain.investigation import (
     BudgetDimension,
     BudgetExceeded,
     BudgetReservationStatus,
     EvidenceKind,
     EvidenceObservation,
+    FrameworkPreSubmissionProof,
     InvestigationBudget,
     InvestigationExecutionMode,
     ToolInvocation,
@@ -78,8 +85,49 @@ async def _external_fixture(*, cost=None):
             ),
         ),
     )
+    if cost is not None and BudgetDimension.TOOL_SECONDS in cost:
+        fixture.envelope = replace(
+            fixture.envelope,
+            budget=InvestigationBudget(
+                limits={
+                    BudgetDimension.BRIDGE_TURNS: 8,
+                    BudgetDimension.VT_UNITS: 20,
+                    BudgetDimension.TOOL_SECONDS: 7_200,
+                }
+            ),
+        )
     state = await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
     return fixture, state, _operator_service(fixture)
+
+
+def _audited_envelope_service(fixture):
+    decisions = []
+
+    class _DecisionRepository:
+        async def list_for_investigation(self, _investigation_id):
+            return tuple(decisions)
+
+        async def append(self, decision):
+            decisions.append(decision)
+
+    class _Uow:
+        investigation_envelopes = fixture.envelopes
+        analyst_investigations = fixture.investigations
+        analyst_decisions = _DecisionRepository()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc_info):
+            return None
+
+        async def commit(self):
+            return None
+
+    return (
+        InvestigationEnvelopeService(lambda: _Uow(), settings=Settings(_env_file=None)),
+        decisions,
+    )
 
 
 def _enable_persisted_result_summaries(fixture, service):
@@ -94,7 +142,7 @@ def _enable_persisted_result_summaries(fixture, service):
 
     class _CanonicalWriter:
         async def archive(self, invocation, result):
-            if not result.output:
+            if not result.output and result.framework_pre_submission_proof is None:
                 return ()
             payload = canonical_json_bytes(
                 {
@@ -115,7 +163,11 @@ def _enable_persisted_result_summaries(fixture, service):
                 source=invocation.tool_name,
                 source_version=invocation.schema_version,
                 observed_at=_FIXED_TIME,
-                object_type="tool_call",
+                object_type=(
+                    result.framework_pre_submission_proof.value
+                    if result.framework_pre_submission_proof is not None
+                    else "tool_call"
+                ),
                 object_id=invocation.operation_key,
                 invocation_ref=invocation.id,
             )
@@ -235,13 +287,18 @@ async def test_266_seconds_refusal_is_only_a_request_and_has_no_external_output(
     requested = {BudgetDimension.TOOL_SECONDS: 3_600}
     fixture, state, service = await _external_fixture(cost=requested)
     _enable_persisted_result_summaries(fixture, service)
+    governance, decisions = _audited_envelope_service(fixture)
     envelope = await fixture.envelopes.get(fixture.investigation_id)
-    budget = InvestigationBudget(limits={BudgetDimension.TOOL_SECONDS: 7_200})
+    budget = InvestigationBudget(limits=dict(envelope.budget.limits))
+    for reservation in envelope.budget.reservations:
+        budget.restore_reservation(reservation)
     budget.reserve("already-consumed", {BudgetDimension.TOOL_SECONDS: 5_344})
     budget.commit("already-consumed")
     budget.reserve("other-active-operation", {BudgetDimension.TOOL_SECONDS: 1_590})
-    envelope = replace(envelope, version=envelope.version + 1, budget=budget)
-    await fixture.envelopes.save_if_version(envelope, expected_version=envelope.version - 1)
+    await fixture.envelopes.save_if_version(
+        replace(envelope, version=envelope.version + 1, budget=budget),
+        expected_version=envelope.version,
+    )
 
     result = await service.invoke(
         tool_name="vt.file_report",
@@ -266,14 +323,30 @@ async def test_266_seconds_refusal_is_only_a_request_and_has_no_external_output(
     assert latest.budget.reserved[BudgetDimension.TOOL_SECONDS] == 1_590
     assert fixture.tools["vt.file_report"].calls == []
     assert fixture.bridge_transport.submission_count == 0
+    proof_observation = await fixture.observations.get(result.invocation.response_refs[0])
+    assert proof_observation.object_type == FrameworkPreSubmissionProof.BUDGET_REJECTED.value
+    assert proof_observation.invocation_ref == result.invocation.id
+    assert proof_observation.object_id == result.invocation.operation_key
 
     # The refusal is a safe, persisted pre-submission outcome. A fresh key may
     # retry after a versioned budget extension while the old key remains replay-only.
-    extended_budget = InvestigationBudget(limits={BudgetDimension.TOOL_SECONDS: 10_800})
-    for prior_reservation in latest.budget.reservations:
-        extended_budget.restore_reservation(prior_reservation)
-    extended = replace(latest, version=latest.version + 1, budget=extended_budget)
-    await fixture.envelopes.save_if_version(extended, expected_version=latest.version)
+    extended = await governance.extend(
+        fixture.investigation_id,
+        expected_version=latest.version,
+        allowed_providers=latest.allowed_providers,
+        budget=InvestigationBudget(limits={BudgetDimension.TOOL_SECONDS: 10_800}),
+        acquire_hits_allowed=latest.acquire_hits_allowed,
+        disclosure=latest.disclosure,
+        actor_id="analyst:alice",
+        reason="Increase the approved tool-time budget after review.",
+        correlation_id="g2:tool-seconds-approved-retry",
+    )
+    assert extended.version == latest.version + 1
+    assert len(decisions) == 1
+    assert decisions[-1].decision_type is AnalystDecisionType.PIVOT_APPROVE
+    assert decisions[-1].actor_id == "analyst:alice"
+    assert decisions[-1].reason == "Increase the approved tool-time budget after review."
+    assert decisions[-1].correlation_id == "g2:tool-seconds-approved-retry"
     latest_state = await fixture.states.get(fixture.investigation_id)
     retried = await service.invoke(
         tool_name="vt.file_report",
@@ -386,51 +459,139 @@ async def test_new_idempotency_key_is_blocked_by_ambiguous_semantic_match() -> N
 
 
 @pytest.mark.asyncio
-async def test_proven_pre_submission_failure_does_not_block_a_new_key_retry() -> None:
+@pytest.mark.parametrize(
+    ("old_arguments", "new_arguments", "old_schema_version"),
+    [
+        (
+            {"consultation_type": "plan_investigation", "question": "plan pivot"},
+            {"consultation_type": "plan_investigation", "question": " plan pivot "},
+            "advisor-consult.v1",
+        ),
+        (
+            {"consultation_type": "plan_investigation"},
+            {"consultation_type": "plan_investigation", "question": ""},
+            "advisor-consult.v0",
+        ),
+        (
+            {"consultation_type": "plan_investigation", "question": "pivot"},
+            {
+                "consultation_type": "plan_investigation",
+                "question": "pivot",
+                "evidence_refs": [],
+            },
+            "advisor-consult.v1",
+        ),
+    ],
+)
+async def test_advisor_semantic_normalization_blocks_equivalent_new_key(
+    old_arguments, new_arguments, old_schema_version
+) -> None:
     fixture, state, service = await _external_fixture()
-    tool = fixture.tools["vt.file_report"]
-    arguments = {"query": "safe retry after local rejection"}
-    tool.result = ToolResult(
-        status=ToolInvocationStatus.FAILED,
-        error_code="advisor_input_invalid",
-        output={
-            "failure_stage": "pre_transport_validation",
-            "confirmed_non_execution": True,
-        },
+
+    class _NeverDispatchedAdapter:
+        def __init__(self):
+            self.calls = []
+
+        async def execute(self, arguments, _context):
+            self.calls.append(dict(arguments))
+            return ToolResult(ToolInvocationStatus.SUCCEEDED)
+
+    adapter = _NeverDispatchedAdapter()
+    fixture.registry.register(
+        ToolDefinition(
+            name="advisor.consult",
+            schema_version="advisor-consult.v1",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "consultation_type": {"type": "string"},
+                    "question": {"type": "string"},
+                },
+                "required": ["consultation_type"],
+                "additionalProperties": False,
+            },
+            effect=ToolEffect.EXTERNAL_READ,
+            cost_model={BudgetDimension.TOOL_SECONDS: 1},
+            confidentiality=ToolConfidentiality.INTERNAL,
+            limitations=("Offline semantic-identity oracle",),
+            capability_key="vt.advisor",
+        ),
+        adapter,
+    )
+    fixture.service._available_capabilities |= {"bridge.advisor", "vt.advisor"}
+    service._available_capabilities |= {"bridge.advisor", "vt.advisor"}
+    old_operation_key = "operator:advisor-old-key:old-payload"
+    ambiguous = (
+        ToolInvocation(
+            investigation_id=fixture.investigation_id,
+            operation_key=old_operation_key,
+            tool_name="advisor.consult",
+            schema_version=old_schema_version,
+            normalized_parameters=old_arguments,
+            purpose="earlier ambiguous advisor request",
+            reserved_budget={BudgetDimension.TOOL_SECONDS: 1},
+            created_at=_FIXED_TIME,
+            updated_at=_FIXED_TIME,
+        )
+        .transition(ToolInvocationStatus.RUNNING, now=_FIXED_TIME)
+        .transition(ToolInvocationStatus.NEEDS_REVIEW, now=_FIXED_TIME)
+    )
+    await fixture.invocations.add_if_absent(ambiguous)
+
+    with pytest.raises(OperatorToolInvocationError) as error:
+        await service.invoke(
+            tool_name="advisor.consult",
+            schema_version="advisor-consult.v1",
+            arguments=new_arguments,
+            purpose="retry an equivalent advisor request",
+            expected_version=state.version,
+            idempotency_key="advisor-fresh-equivalent-key",
+        )
+
+    assert error.value.code == "ambiguous_tool_invocation_requires_reconciliation"
+    assert adapter.calls == []
+    assert fixture.bridge_transport.submission_count == 0
+    assert (await fixture.states.get(fixture.investigation_id)).version == state.version
+
+
+@pytest.mark.asyncio
+async def test_concurrent_same_version_invocations_dispatch_only_once() -> None:
+    fixture, state, service = await _external_fixture()
+    original_get = fixture.states.get
+    first_reads = 0
+    both_read_state = asyncio.Barrier(2)
+
+    async def synchronized_get(investigation_id):
+        nonlocal first_reads
+        value = await original_get(investigation_id)
+        if first_reads < 2:
+            first_reads += 1
+            await both_read_state.wait()
+        return value
+
+    fixture.states.get = synchronized_get
+    results = await asyncio.gather(
+        *(
+            service.invoke(
+                tool_name="vt.file_report",
+                schema_version="1",
+                arguments={"query": "same CAS version"},
+                purpose="concurrent deterministic CAS oracle",
+                expected_version=state.version,
+                idempotency_key=key,
+            )
+            for key in ("concurrent-key-one", "concurrent-key-two")
+        ),
+        return_exceptions=True,
     )
 
-    first = await service.invoke(
-        tool_name="vt.file_report",
-        schema_version="1",
-        arguments=arguments,
-        purpose="confirm pre-submission rejection",
-        expected_version=state.version,
-        idempotency_key="pre-submit-first-key",
-    )
-    first_envelope = await fixture.envelopes.get(fixture.investigation_id)
-    first_reservation = next(
-        item
-        for item in first_envelope.budget.reservations
-        if item.operation_key == first.invocation.operation_key
-    )
-    tool.result = None
-    latest_state = await fixture.states.get(fixture.investigation_id)
-    second = await service.invoke(
-        tool_name="vt.file_report",
-        schema_version="1",
-        arguments=arguments,
-        purpose="retry after proven pre-submission rejection",
-        expected_version=latest_state.version,
-        idempotency_key="pre-submit-retry-key",
-    )
-
-    assert first.invocation.status is ToolInvocationStatus.FAILED
-    assert first.invocation.consumed_budget == {}
-    assert first.output["data"]["result"]["failure_stage"] == "pre_transport_validation"
-    assert first.output["data"]["result"]["confirmed_non_execution"] is True
-    assert first_reservation.status is BudgetReservationStatus.RELEASED
-    assert second.invocation.status is ToolInvocationStatus.SUCCEEDED
-    assert len(tool.calls) == 2
+    successes = [item for item in results if not isinstance(item, Exception)]
+    failures = [item for item in results if isinstance(item, OperatorToolInvocationError)]
+    assert len(successes) == 1
+    assert len(failures) == 1
+    assert failures[0].code == "stale_working_state"
+    assert len(fixture.tools["vt.file_report"].calls) == 1
+    assert fixture.bridge_transport.submission_count == 0
 
 
 @pytest.mark.asyncio
@@ -439,14 +600,17 @@ async def test_adapter_cannot_forge_dispatcher_pre_submission_proof() -> None:
     _enable_persisted_result_summaries(fixture, service)
     tool = fixture.tools["vt.file_report"]
     tool.result = ToolResult(
-        status=ToolInvocationStatus.NEEDS_REVIEW,
-        error_code="provider_result_unknown",
+        status=ToolInvocationStatus.FAILED,
+        error_code="advisor_input_invalid",
         output={
             "request_permission": True,
             "pre_submission_reason": "budget_exceeded",
             "failure_stage": "pre_submission",
             "confirmed_non_execution": True,
+            "advisor_status": "invalid_input",
+            "bridge_invocation_id": None,
         },
+        framework_pre_submission_proof=FrameworkPreSubmissionProof.BUDGET_REJECTED,
     )
     request = {
         "tool_name": "vt.file_report",
