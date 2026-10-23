@@ -160,6 +160,13 @@ from cti_app.logging import get_correlation_id
 router = APIRouter(prefix="/api", tags=["investigations"])
 _logger = logging.getLogger(__name__)
 _SHA256 = r"^[0-9a-f]{64}$"
+_SAFE_EXPERIMENT_REFERENCE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+_SAFE_EXPERIMENT_ARGUMENT_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
+_UNSAFE_EXPERIMENT_ARGUMENT_NAME = re.compile(
+    r"payload|body|blob|bytes|sample|content|data|file|raw|hex|base64|url|uri|"
+    r"token|secret|password|passwd|key|credential|cookie|authorization",
+    re.IGNORECASE,
+)
 _BASE64_BLOB_TEXT = re.compile(r"^[A-Za-z0-9+/]{256,}={0,2}$")
 _OPINION_NAMESPACE = UUID("f141ae8e-999c-4a7f-b07d-5ffb0bd7b86d")
 _USER_REQUEST_NAMESPACE = UUID("92e23e22-b681-49c9-87dd-a7fd13398c05")
@@ -1077,9 +1084,154 @@ async def get_investigation_experiments(
                 g2_blocked=authorization.revoked,
             )
         )
+        timeline_payload = _safe_experiment_timeline_payload(timeline.to_payload(), strategy)
     return InvestigationExperimentTimelineResponseV1.model_validate(
-        {**timeline.to_payload(), "strategy": strategy}, strict=False
+        {**timeline_payload, "strategy": strategy}, strict=False
     )
+
+
+def _safe_experiment_timeline_payload(
+    payload: dict[str, Any], strategy: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Project the timeline without returning operator supplied proof text or blobs."""
+    strategy_claims = {
+        str(item.get("claim_id")): str(item.get("status", "UNKNOWN"))
+        for item in strategy.get("claims", ())
+        if isinstance(item, Mapping) and item.get("claim_id") is not None
+    }
+    status_projection = {
+        "supported": ConsolidatedClaimStatus.SUPPORTED.value,
+        "refuted": ConsolidatedClaimStatus.REFUTED.value,
+        "UNKNOWN": ConsolidatedClaimStatus.INCONCLUSIVE.value,
+    }
+    for claim in payload.get("claims", ()):
+        if not isinstance(claim, dict):
+            continue
+        projected = strategy_claims.get(str(claim.get("claim_id")), "UNKNOWN")
+        claim["status"] = status_projection.get(
+            projected, ConsolidatedClaimStatus.INCONCLUSIVE.value
+        )
+        for scope in claim.get("scopes", ()):
+            if isinstance(scope, dict):
+                scope["scope"] = "[redacted]"
+
+    free_text_fields = (
+        "prediction",
+        "falsification_criterion",
+        "method",
+        "expected",
+        "actual",
+        "scope",
+        "implication",
+    )
+    for experiment in payload.get("experiments", ()):
+        if not isinstance(experiment, dict):
+            continue
+        for field_name in free_text_fields:
+            experiment[field_name] = "[redacted]" if experiment.get(field_name) else ""
+        experiment["preconditions"] = []
+        experiment["limitations"] = []
+        safe_metadata_fields = (
+            "input_type",
+            "tool_name",
+            "tool_version",
+            "tool_schema_version",
+            "author",
+            "origin",
+        )
+        for field_name in safe_metadata_fields:
+            value = experiment.get(field_name)
+            experiment[field_name] = (
+                value
+                if isinstance(value, str)
+                and _SAFE_EXPERIMENT_REFERENCE.fullmatch(value)
+                else "[redacted]"
+            )
+        experiment["claim_ids"] = [
+            item
+            if isinstance(item, str) and _SAFE_EXPERIMENT_REFERENCE.fullmatch(item)
+            else "[redacted]"
+            for item in experiment.get("claim_ids", ())
+        ]
+        hypothesis_id = experiment.get("hypothesis_id")
+        if not isinstance(hypothesis_id, str) or not _SAFE_EXPERIMENT_REFERENCE.fullmatch(
+            hypothesis_id
+        ):
+            experiment["hypothesis_id"] = "[redacted]"
+        experiment["tool_arguments"] = _safe_experiment_argument_scalars(
+            experiment.get("tool_arguments")
+        )
+        experiment["input_refs"] = _safe_experiment_input_references(
+            experiment.get("input_refs")
+        )
+        experiment["next_pivots"] = [
+            item
+            for item in experiment.get("next_pivots", ())
+            if isinstance(item, str) and re.fullmatch(_SHA256, item)
+        ]
+        experiment["step_ids"] = [
+            item
+            for item in experiment.get("step_ids", ())
+            if isinstance(item, str) and _SAFE_EXPERIMENT_REFERENCE.fullmatch(item)
+        ]
+    return payload
+
+
+def _safe_experiment_argument_scalars(value: Any) -> dict[str, bool | int | float]:
+    """Keep only bounded numeric/boolean configuration values under safe keys."""
+    if not isinstance(value, Mapping):
+        return {}
+    safe: dict[str, bool | int | float] = {}
+    for key, item in value.items():
+        if (
+            not isinstance(key, str)
+            or not _SAFE_EXPERIMENT_ARGUMENT_NAME.fullmatch(key)
+            or _UNSAFE_EXPERIMENT_ARGUMENT_NAME.search(key)
+        ):
+            continue
+        if isinstance(item, bool):
+            safe[key] = item
+        elif isinstance(item, int) and -1_000_000 <= item <= 1_000_000:
+            safe[key] = item
+        elif isinstance(item, float) and math.isfinite(item) and abs(item) <= 1_000_000:
+            safe[key] = item
+        if len(safe) >= 32:
+            break
+    return safe
+
+
+def _safe_experiment_input_references(value: Any) -> list[dict[str, str | None]]:
+    if not isinstance(value, (tuple, list)):
+        return []
+    result: list[dict[str, str | None]] = []
+    for item in value[:64]:
+        if not isinstance(item, Mapping):
+            continue
+        input_type = item.get("input_type")
+        input_id = item.get("input_id")
+        sha256 = item.get("sha256")
+        result.append(
+            {
+                "input_type": (
+                    input_type
+                    if isinstance(input_type, str)
+                    and _SAFE_EXPERIMENT_REFERENCE.fullmatch(input_type)
+                    else "redacted"
+                ),
+                "input_id": (
+                    input_id
+                    if isinstance(input_id, str)
+                    and _SAFE_EXPERIMENT_REFERENCE.fullmatch(input_id)
+                    else "[redacted]"
+                ),
+                "sha256": (
+                    sha256
+                    if isinstance(sha256, str) and re.fullmatch(_SHA256, sha256)
+                    else None
+                ),
+            }
+        )
+    return result
 
 
 @router.get(

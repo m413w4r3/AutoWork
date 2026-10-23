@@ -158,7 +158,7 @@ def test_limited_not_observed_cannot_be_marked_refuted() -> None:
             ObservationCoverage.COMPLETE,
             ExperimentVerdict.REFUTES,
             True,
-            AnalysisMatrixStatus.REFUTED,
+            AnalysisMatrixStatus.UNKNOWN,
         ),
         (
             ObservationOutcome.NOT_OBSERVED,
@@ -223,6 +223,26 @@ def test_matrix_projection_keeps_support_refute_conflict_unknown() -> None:
     assert (
         project_claim_matrix_status(
             (supported, refuted), CLAIM_ID, persisted_observations=observations
+        )
+        is AnalysisMatrixStatus.UNKNOWN
+    )
+
+
+def test_free_text_falsification_criterion_cannot_prove_refutation() -> None:
+    experiment = replace(
+        _experiment(
+            1,
+            ExperimentVerdict.REFUTES,
+            actual_outcome=ObservationOutcome.NOT_OBSERVED,
+        ),
+        falsification_criterion="The unrelated host has a blue status page.",
+    )
+    reference = experiment.observation_refs[0]
+
+    assert (
+        project_experiment_matrix_status(
+            experiment,
+            persisted_observations={reference.observation_id: reference.sha256},
         )
         is AnalysisMatrixStatus.UNKNOWN
     )

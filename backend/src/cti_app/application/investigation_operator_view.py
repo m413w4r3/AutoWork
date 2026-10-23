@@ -62,7 +62,12 @@ def build_investigation_operator_strategy_checkpoint(
     g2_blocked: bool = False,
     unavailable_tools: tuple[str, ...] = (),
 ) -> dict[str, Any]:
-    """Add an operator checkpoint using only persisted strategy and control facts."""
+    """Add a checkpoint using active-strategy coverage and all persisted attempts.
+
+    ``attempted_experiment_ids`` is historical. Coverage follows the strategy
+    projection, which excludes superseded experiments, so both views use one
+    interpretation of the current claim state.
+    """
     claim_rows = tuple(item for item in strategy.get("claims", ()) if isinstance(item, dict))
     statuses = {str(item.get("status", "UNKNOWN")) for item in claim_rows}
     strategy_status = (
@@ -74,11 +79,10 @@ def build_investigation_operator_strategy_checkpoint(
             if isinstance(experiment, dict) and isinstance(experiment.get("id"), str):
                 experiment_rows[experiment["id"]] = experiment
 
-    if not experiment_rows or all(
-        item.get("coverage") == "none" for item in experiment_rows.values()
-    ):
+    coverage_values = {str(item.get("coverage", "none")) for item in claim_rows}
+    if not coverage_values or coverage_values == {"none"}:
         coverage = "none"
-    elif all(item.get("coverage") == "complete" for item in experiment_rows.values()):
+    elif coverage_values == {"complete"}:
         coverage = "complete"
     else:
         coverage = "limited"

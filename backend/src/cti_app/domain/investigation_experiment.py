@@ -533,8 +533,9 @@ def project_experiment_matrix_status(
     A record's verdict is an operator assertion. This projection only accepts it
     when the cited observation is still present with the recorded digest, the
     measurement is complete, and the outcome is structurally compatible with
-    the verdict. In particular, only complete persisted non-observation can
-    project to ``REFUTED``.
+    the verdict. Refutation also requires a verifiable falsification criterion;
+    the current free-text criterion has no semantic oracle, so it never proves
+    ``REFUTED`` by itself.
     """
     if experiment.availability is not ExperimentAvailability.AVAILABLE:
         return AnalysisMatrixStatus.UNKNOWN
@@ -561,14 +562,8 @@ def project_experiment_matrix_status(
         and experiment.actual_outcome is ObservationOutcome.OBSERVED
     ):
         return AnalysisMatrixStatus.SUPPORTED
-    if (
-        experiment.verdict is ExperimentVerdict.REFUTES
-        and experiment.actual_outcome is ObservationOutcome.NOT_OBSERVED
-        and experiment.falsification_criterion.strip()
-        and experiment.falsification_criterion.strip().casefold()
-        not in {"none", "unknown", "n/a", "not applicable"}
-    ):
-        return AnalysisMatrixStatus.REFUTED
+    # Persisted criteria are operator prose. Without a structured predicate
+    # checked against the observation, projection cannot establish relevance.
     return AnalysisMatrixStatus.UNKNOWN
 
 
