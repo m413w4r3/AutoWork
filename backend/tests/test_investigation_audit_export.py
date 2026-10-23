@@ -770,7 +770,14 @@ def test_projection_correlates_only_persisted_ids_and_omits_private_text(tmp_pat
     assert input_pack_event["details"]["investigation_version"] == 17
     assert input_pack_event["details"]["investigation_status"] == "completed"
     assert experiment_event["details"]["negative_result"] is False
-    assert f"Experiment `{experiment.id}` (not observed)" in bundle.trace.decode("utf-8")
+    trace_text = bundle.trace.decode("utf-8")
+    assert f"Experiment `{experiment.id}` (not observed)" in trace_text
+    assert "Dossier, rendered prompt, observed HTTP payload" not in trace_text
+    assert "six material-stage hashes" not in trace_text
+    assert "does not unpack its inner" not in trace_text
+    assert "allowlisted metadata from SHA-verified" in trace_text
+    assert "Typed operator decisions and input-pack identity" in trace_text
+    assert "No provider or actual Bridge receipt is asserted" in trace_text
     hypothesis_event = next(row for row in rows if row["type"] == "operator_state.snapshot")
     assert (
         experiment_event["details"]["hypothesis_id"]

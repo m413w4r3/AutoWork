@@ -2350,13 +2350,17 @@ def _trace_bytes(events: Sequence[Mapping[str, Any]], investigation_id: str) -> 
             "## Transport and material completeness",
             "",
             (
-                "Dossier, rendered prompt, observed HTTP payload, raw response, normalized output, "
-                "redacted copy, consultation ID, Bridge invocation ID inside advisor-call blobs, "
-                "model run ID, turn ID, and Bridge run ID are "
-                "UNKNOWN unless a direct persisted record exists. This schema does not store the "
-                "six material-stage hashes or Bridge prompt-as-file/prompt-bytes observations. "
-                "The index lists the advisor-call observation blob but does not unpack its inner "
-                "prompt/output artifact references."
+                "Advisor-call events project allowlisted metadata from SHA-verified "
+                "`operator-advisor-call.v1` blobs, including dossier/prompt/raw-response hashes "
+                "and sizes, submission state, durations, completeness, and parser/reparse fields "
+                "when present. Typed operator decisions and input-pack identity (blob ID/SHA, "
+                "synthesis artifact, investigation version/status) are also projected. No provider "
+                "or actual Bridge receipt is asserted. Full prompt/dossier/message/response "
+                "bodies, normalized output content, and HTTP payloads are excluded. HTTP payload "
+                "hashes and redacted-copy records, consultation IDs, and Bridge run IDs remain "
+                "UNKNOWN when "
+                "no canonical measurement or identifier is stored. Bridge prompt-as-file and "
+                "prompt-bytes observations are not persisted."
             ),
             (
                 "Admission amounts and current reservation status are separate. Submission state, "
