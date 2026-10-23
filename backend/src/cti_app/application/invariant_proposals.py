@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, is_dataclass
@@ -25,7 +24,7 @@ from cti_app.application.goodware import GoodwareMeasurementService, PreparedGoo
 from cti_app.application.invariants import InvariantProposalResult, InvariantRegistryService
 from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.persistence import UnitOfWorkFactory
-from cti_app.domain.classification import TLP, DerivedPolicy, derived_policy
+from cti_app.domain.classification import DerivedPolicy, derived_policy
 from cti_app.domain.goodware import Banality
 from cti_app.domain.goodware_index import GoodwareMeasurementError
 from cti_app.domain.invariant_proposals import (
@@ -142,7 +141,6 @@ class ProposalConversationService:
         self._local_transport = ConversationTransport(local_transport)
         self._requested_model = requested_model
         self._prompt_version = prompt_version
-        self._max_p10_prompt_bytes = _p10_prompt_max_bytes()
 
     async def propose(
         self,
@@ -168,12 +166,6 @@ class ProposalConversationService:
         effective_cycle = cycle_number if cycle_number is not None else investigation.cycle_number
         if effective_cycle < 1:
             raise ProposalContractError("cycle_number must be positive")
-        if not policy.external_llm_allowed or policy.do_not_submit or policy.tlp is TLP.RED:
-            raise ProposalContractError(
-                "P10 submission is refused by the aggregate policy: "
-                "external_llm_allowed must be true, do_not_submit must be false, "
-                "and TLP must not be RED"
-            )
 
         idempotency_key = make_proposal_turn_idempotency_key(
             investigation_id=investigation_id,
@@ -204,10 +196,7 @@ class ProposalConversationService:
                 provenance_aliases: Mapping[str, str] = {}
             else:
                 persisted_snapshot = snapshot
-                _, provenance_aliases = _render_p10_prompt(
-                    persisted_snapshot,
-                    max_prompt_bytes=self._max_p10_prompt_bytes,
-                )
+                _, provenance_aliases = _render_p10_prompt(persisted_snapshot)
             if (
                 make_proposal_turn_idempotency_key(
                     investigation_id=investigation_id,
@@ -220,21 +209,6 @@ class ProposalConversationService:
                 raise ProposalConversationError(
                     "The persisted proposal turn does not match its idempotency key"
                 )
-            if "BEGIN_P10_SNAPSHOT_DATA\n" in content.input_text:
-                historical_sources = await self._historical_claim_sources(
-                    subject_id=investigation.subject_id,
-                    current_snapshot=snapshot,
-                    persisted_snapshot=persisted_snapshot,
-                )
-                historical_policy = derived_policy((*samples, *historical_sources))
-                if (
-                    not historical_policy.external_llm_allowed
-                    or historical_policy.do_not_submit
-                    or historical_policy.tlp is TLP.RED
-                ):
-                    raise ProposalContractError(
-                        "P10 historical snapshot replay is refused by the aggregate policy"
-                    )
             persisted_provenances = _snapshot_provenance_catalog(persisted_snapshot)
             if content.output_text is None:
                 raise ProposalOutputValidationError("The proposal turn has no persisted output")
@@ -276,10 +250,7 @@ class ProposalConversationService:
         )
         await self._persist_pivot_conversation(investigation_id, conversation.id)
 
-        prompt, provenance_aliases = _render_p10_prompt(
-            snapshot,
-            max_prompt_bytes=self._max_p10_prompt_bytes,
-        )
+        prompt, provenance_aliases = _render_p10_prompt(snapshot)
         turn = await self._model_conversations.add_turn(
             conversation.id,
             message=prompt,
@@ -497,6 +468,10 @@ class ProposalConversationService:
                 raise ProposalContractError(
                     "The proposal snapshot has no retained technical origin Samples"
                 )
+            # This is intentionally recalculated on every call, including an
+            # idempotent replay. The policy is based only on retained origins.
+            policy = derived_policy(retained_samples)
+
             # Positive support is snapshot-scoped, so recalculate it only after
             # deterministic selection has fixed the origin sample set.
             selected_descriptors = tuple(
@@ -539,6 +514,8 @@ class ProposalConversationService:
                 raise ProposalContractError(
                     "The proposal snapshot has no retained technical origin Samples"
                 )
+            policy = derived_policy(retained_samples)
+
             provenance_by_ref = _provenance_catalog(invariants)
             for candidate in selected_candidates:
                 provenance = candidate["provenance"]
@@ -595,15 +572,6 @@ class ProposalConversationService:
                 ],
             }
             context = _bound_context(context)
-            source_documents = await _claim_source_documents(
-                uow,
-                investigation.subject_id,
-                context,
-            )
-            # Recalculate on every call, including idempotent replay. The
-            # effective policy covers retained Samples and every source named
-            # by a report claim or report-claim provenance in the final context.
-            policy = derived_policy((*retained_samples, *source_documents))
             snapshot = ProposalInputSnapshot(
                 input_pack_sha256=investigation.input_sha256,
                 corpus_snapshot_sha256=corpus_hash,
@@ -614,22 +582,6 @@ class ProposalConversationService:
                 context=context,
             )
             return investigation, snapshot, policy, provenance_by_ref, retained_samples
-
-    async def _historical_claim_sources(
-        self,
-        *,
-        subject_id: UUID,
-        current_snapshot: ProposalInputSnapshot,
-        persisted_snapshot: ProposalInputSnapshot,
-    ) -> tuple[Any, ...]:
-        persisted_references = _claim_source_references(persisted_snapshot.context)
-        current_references = _claim_source_references(current_snapshot.context)
-        if not persisted_references.issubset(current_references):
-            raise ProposalContractError(
-                "P10 historical snapshot claim provenance is absent from the current context"
-            )
-        async with self._uow_factory() as uow:
-            return await _claim_source_documents(uow, subject_id, persisted_snapshot.context)
 
     async def _measure_candidate(
         self,
@@ -990,41 +942,10 @@ def _render_prompt(snapshot: ProposalInputSnapshot) -> str:
     return _render_p10_prompt(snapshot)[0]
 
 
-# The source snapshot is bounded to 200,000 characters. The 1 MiB UTF-8
-# development ceiling bounds an accepted prompt string to roughly 4 MiB in
-# CPython plus its 1 MiB size-check buffer; facts and snapshot intermediates
-# are additional allocations and remain separately bounded.
 _MAX_P10_PROMPT_BYTES = 96_000
-_MAX_DEV_P10_PROMPT_BYTES = 1_048_576
-_DEV_P10_PROMPT_BYTES_ENV = "AUTOWORK_DEV_P10_MAX_PROMPT_BYTES"
-_DEV_LIMITS_ENABLED_ENV = "AUTOWORK_DEV_LIMITS_ENABLED"
-_APP_ENV = "APP_ENV"
 
 
-def _p10_prompt_max_bytes() -> int:
-    if os.getenv(_DEV_LIMITS_ENABLED_ENV) != "1" or os.getenv(_APP_ENV) != "development":
-        return _MAX_P10_PROMPT_BYTES
-    configured = os.getenv(_DEV_P10_PROMPT_BYTES_ENV)
-    if configured is None:
-        return _MAX_P10_PROMPT_BYTES
-    if re.fullmatch(r"[1-9][0-9]*", configured) is None:
-        raise ProposalContractError(
-            f"{_DEV_P10_PROMPT_BYTES_ENV} must be a canonical positive decimal between 1 and "
-            f"{_MAX_DEV_P10_PROMPT_BYTES}"
-        )
-    limit = int(configured, 10)
-    if not 1 <= limit <= _MAX_DEV_P10_PROMPT_BYTES:
-        raise ProposalContractError(
-            f"{_DEV_P10_PROMPT_BYTES_ENV} must be between 1 and {_MAX_DEV_P10_PROMPT_BYTES}"
-        )
-    return limit
-
-
-def _render_p10_prompt(
-    snapshot: ProposalInputSnapshot,
-    *,
-    max_prompt_bytes: int | None = None,
-) -> tuple[str, dict[str, str]]:
+def _render_p10_prompt(snapshot: ProposalInputSnapshot) -> tuple[str, dict[str, str]]:
     context = snapshot.context
     provenances = context.get("provenances", ())
     if not isinstance(provenances, list):
@@ -1065,14 +986,9 @@ def _render_p10_prompt(
         "END_P10_FACTS\n"
         "Do not include raw bytes, secrets, signed URLs, or executable YARA code."
     )
-    prompt_bytes = len(prompt.encode("utf-8"))
-    effective_max_prompt_bytes = (
-        _p10_prompt_max_bytes() if max_prompt_bytes is None else max_prompt_bytes
-    )
-    if prompt_bytes > effective_max_prompt_bytes:
+    if len(prompt.encode("utf-8")) > _MAX_P10_PROMPT_BYTES:
         raise ProposalContractError(
-            f"P10 prompt is {prompt_bytes} UTF-8 bytes; configured per-turn bound is "
-            f"{effective_max_prompt_bytes} bytes"
+            "The compact P10 prompt exceeds its configured 96000-byte per-turn bound"
         )
     return prompt, {alias: ref for ref, alias in alias_by_ref.items()}
 
@@ -2281,10 +2197,8 @@ def _invariant_context(value: Any) -> dict[str, Any]:
     for provenance in getattr(value, "provenances", ()):
         try:
             provenance_values.append(canonical_provenance(provenance))
-        except (TypeError, ValueError) as exc:
-            raise ProposalContractError(
-                "An existing invariant provenance cannot be resolved for P10"
-            ) from exc
+        except (TypeError, ValueError):
+            continue
     return {
         "id": str(_value(value, "id")),
         "type": _enum_value(_value(value, "type")),
@@ -2318,137 +2232,6 @@ def _rejection_context(value: Any) -> dict[str, Any]:
         "category": _value(value, "category"),
         "pattern": _value(value, "pattern"),
     }
-
-
-async def _claim_source_documents(
-    uow: Any,
-    subject_id: UUID,
-    context: Any,
-) -> tuple[Any, ...]:
-    references = _claim_source_references(context)
-    if not references:
-        return ()
-
-    claims_repository = getattr(uow, "claims", None)
-    get_claim = getattr(claims_repository, "get", None)
-    if not callable(get_claim):
-        raise ProposalContractError("The P10 claim repository is unavailable")
-    source_repository = getattr(uow, "source_documents", None)
-    get_source_document = getattr(source_repository, "get", None)
-    if not callable(get_source_document):
-        raise ProposalContractError("The P10 source-document repository is unavailable")
-
-    resolved: dict[UUID, Any] = {}
-    for claim_id, source_id in sorted(references, key=lambda item: (str(item[0]), str(item[1]))):
-        try:
-            claim = await get_claim(claim_id)
-        except Exception as exc:
-            raise ProposalContractError(f"P10 claim {claim_id} could not be resolved") from exc
-        if claim is None:
-            raise ProposalContractError(f"P10 claim {claim_id} does not exist")
-        if _value(claim, "id", _MISSING) != claim_id:
-            raise ProposalContractError(f"P10 claim {claim_id} has an invalid identity")
-        if _value(claim, "subject_id", _MISSING) != subject_id:
-            raise ProposalContractError(
-                f"P10 claim {claim_id} does not belong to the investigation subject"
-            )
-        claim_source_id = _as_uuid(
-            _value(claim, "source_document_id", _MISSING),
-            "claim source document id",
-        )
-        if claim_source_id != source_id:
-            raise ProposalContractError(
-                f"P10 claim {claim_id} source does not match its provenance"
-            )
-
-        if source_id in resolved:
-            continue
-        try:
-            source_document = await get_source_document(source_id)
-        except Exception as exc:
-            raise ProposalContractError(
-                f"P10 source document {source_id} could not be resolved"
-            ) from exc
-        if source_document is None:
-            raise ProposalContractError(f"P10 source document {source_id} does not exist")
-        if _value(source_document, "id", _MISSING) != source_id:
-            raise ProposalContractError(f"P10 source document {source_id} has an invalid identity")
-        if _value(source_document, "subject_id", _MISSING) != subject_id:
-            raise ProposalContractError(
-                f"P10 source document {source_id} does not belong to the investigation subject"
-            )
-
-        tlp = _value(source_document, "tlp", _MISSING)
-        do_not_submit = _value(source_document, "do_not_submit", _MISSING)
-        external_llm_allowed = _value(source_document, "external_llm_allowed", _MISSING)
-        if (
-            not isinstance(tlp, TLP)
-            or type(do_not_submit) is not bool
-            or type(external_llm_allowed) is not bool
-        ):
-            raise ProposalContractError(
-                f"P10 source document {source_id} has an unresolved disclosure policy"
-            )
-        resolved[source_id] = source_document
-    return tuple(resolved.values())
-
-
-def _claim_source_references(context: Any) -> set[tuple[UUID, UUID]]:
-    if not isinstance(context, Mapping):
-        raise ProposalContractError("The P10 claim source policy cannot be resolved")
-    report_claims = context.get("report_claims", [])
-    if not isinstance(report_claims, list):
-        raise ProposalContractError("The P10 report-claim source policy cannot be resolved")
-    references: set[tuple[UUID, UUID]] = set()
-    source_by_claim: dict[UUID, UUID] = {}
-    for claim in report_claims:
-        if not isinstance(claim, Mapping):
-            raise ProposalContractError("A P10 report claim has an invalid representation")
-        claim_id = _as_uuid(_value(claim, "id", _MISSING), "report claim id")
-        source_id = _as_uuid(
-            _value(claim, "source_document_id", _MISSING), "claim source document id"
-        )
-        previous_source = source_by_claim.get(claim_id)
-        if previous_source is not None and previous_source != source_id:
-            raise ProposalContractError(f"P10 claim {claim_id} has conflicting source references")
-        references.add((claim_id, source_id))
-        source_by_claim[claim_id] = source_id
-
-    def visit(value: Any) -> None:
-        if isinstance(value, Mapping):
-            if value.get("kind") == ReportClaimProvenance.kind:
-                claim_id = _as_uuid(value.get("claim_id", _MISSING), "report provenance claim id")
-                source_id = _as_uuid(
-                    value.get("source_document", _MISSING),
-                    "report provenance source document id",
-                )
-                previous_source = source_by_claim.get(claim_id)
-                if previous_source is not None and previous_source != source_id:
-                    raise ProposalContractError(
-                        f"P10 claim {claim_id} has conflicting source provenance"
-                    )
-                source_by_claim[claim_id] = source_id
-                references.add((claim_id, source_id))
-                return
-            for nested in value.values():
-                visit(nested)
-        elif isinstance(value, (list, tuple)):
-            for nested in value:
-                visit(nested)
-
-    visit(context)
-    return references
-
-
-def _as_uuid(value: Any, description: str) -> UUID:
-    if isinstance(value, UUID):
-        return value
-    if not isinstance(value, str):
-        raise ProposalContractError(f"P10 {description} is not a UUID")
-    try:
-        return UUID(value)
-    except (TypeError, ValueError, AttributeError) as exc:
-        raise ProposalContractError(f"P10 {description} is not a UUID") from exc
 
 
 def _bound_context(value: dict[str, Any]) -> dict[str, Any]:

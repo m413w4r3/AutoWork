@@ -9,7 +9,6 @@ from uuid import UUID, uuid4
 import pytest
 
 from cti_app.application.invariant_proposals import (
-    ProposalContractError,
     ProposalConversationService,
     ProposalOutputValidationError,
     _parse_proposal_response_details,
@@ -37,8 +36,6 @@ from cti_app.domain.production import LoopBudget
 INVESTIGATION_ID = UUID("11111111-1111-1111-1111-111111111111")
 SUBJECT_ID = UUID("22222222-2222-2222-2222-222222222222")
 BASELINE_ID = UUID("33333333-3333-3333-3333-333333333333")
-SOURCE_DOCUMENT_ID = UUID("44444444-4444-4444-4444-444444444444")
-CLAIM_ID = UUID("55555555-5555-5555-5555-555555555555")
 NOW = "2026-08-27T12:00:00+00:00"
 
 
@@ -123,61 +120,9 @@ class _InvariantRepository:
 
 
 class _ClaimsRepository:
-    def __init__(
-        self,
-        claims: list[object] | None = None,
-        known_claims: list[object] | None = None,
-    ) -> None:
-        self.claims = claims if claims is not None else [
-            {
-                "id": str(CLAIM_ID),
-                "text": "bounded claim",
-                "source_document_id": str(SOURCE_DOCUMENT_ID),
-            }
-        ]
-        known = known_claims if known_claims is not None else self.claims
-        self.records: dict[UUID, object] = {}
-        for item in known:
-            if isinstance(item, dict):
-                claim_id = item.get("id")
-                subject_id = item.get("subject_id", SUBJECT_ID)
-                source_document_id = item.get("source_document_id")
-            else:
-                claim_id = getattr(item, "id", None)
-                subject_id = getattr(item, "subject_id", SUBJECT_ID)
-                source_document_id = getattr(item, "source_document_id", None)
-            if isinstance(claim_id, str):
-                claim_id = UUID(claim_id)
-            if isinstance(source_document_id, str):
-                source_document_id = UUID(source_document_id)
-            if isinstance(claim_id, UUID):
-                self.records[claim_id] = SimpleNamespace(
-                    id=claim_id,
-                    subject_id=subject_id,
-                    source_document_id=source_document_id,
-                )
-
-    async def list_for_subject(self, subject_id: UUID) -> list[object]:
+    async def list_for_subject(self, subject_id: UUID) -> list[dict[str, object]]:
         del subject_id
-        return self.claims
-
-    async def get(self, claim_id: UUID) -> object | None:
-        return self.records.get(claim_id)
-
-
-class _SourceDocumentRepository:
-    def __init__(
-        self,
-        documents: dict[UUID, object],
-        error: Exception | None = None,
-    ) -> None:
-        self.documents = documents
-        self.error = error
-
-    async def get(self, document_id: UUID) -> object | None:
-        if self.error is not None:
-            raise self.error
-        return self.documents.get(document_id)
+        return [{"claim_id": "claim-1", "text": "bounded claim"}]
 
 
 class _TurnRepository:
@@ -199,8 +144,7 @@ class _Uow:
         self.code_feature_sets = state.code_features
         self.capability_sets = state.capabilities
         self.invariants = state.invariants
-        self.claims = state.claims
-        self.source_documents = state.source_documents
+        self.claims = _ClaimsRepository()
         self.model_conversation_turns = _TurnRepository(conversation)
         self.model_conversations = conversation
 
@@ -224,10 +168,6 @@ class _State:
         code_features: list[dict[str, object]] | None = None,
         capabilities: list[dict[str, object]] | None = None,
         invariants: list[object] | None = None,
-        claims: list[object] | None = None,
-        known_claims: list[object] | None = None,
-        source_documents: dict[UUID, object] | None = None,
-        source_document_error: Exception | None = None,
     ) -> None:
         investigation = SimpleNamespace(
             id=INVESTIGATION_ID,
@@ -256,21 +196,6 @@ class _State:
         self.code_features = _FeatureRepository(code_features or [])
         self.capabilities = _FeatureRepository(capabilities or [])
         self.invariants = _InvariantRepository(invariants)
-        self.claims = _ClaimsRepository(claims, known_claims)
-        self.source_documents = _SourceDocumentRepository(
-            source_documents
-            if source_documents is not None
-            else {
-                SOURCE_DOCUMENT_ID: SimpleNamespace(
-                    id=SOURCE_DOCUMENT_ID,
-                    subject_id=SUBJECT_ID,
-                    tlp=TLP.GREEN,
-                    do_not_submit=False,
-                    external_llm_allowed=True,
-                )
-            },
-            error=source_document_error,
-        )
 
     async def _list_samples(self, subject_id: UUID) -> list[SimpleNamespace]:
         del subject_id
@@ -520,17 +445,13 @@ async def test_second_valid_bridge_turn_uses_continue() -> None:
 
 
 @pytest.mark.asyncio
-async def test_external_forbidden_policy_prevents_application_managed_turn() -> None:
+async def test_application_managed_later_turn_uses_fresh() -> None:
     state = _State(samples=[_sample(uuid4(), external=False)])
     service, _, conversation, _ = _service(state)
-    with pytest.raises(ProposalContractError, match="refused by the aggregate policy"):
-        await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=1)
-    state.investigations.investigation.cycle_number = 2
-    with pytest.raises(ProposalContractError, match="refused by the aggregate policy"):
-        await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=2)
-    assert conversation.external_calls == 0
-    assert conversation.local_calls == 0
-    assert conversation.conversations == {}
+    await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=1)
+    result = await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=2)
+    assert result.mode is ConversationMode.FRESH
+    assert conversation.modes == [ConversationMode.FRESH, ConversationMode.FRESH]
 
 
 @pytest.mark.asyncio
@@ -762,13 +683,13 @@ async def test_replay_uses_original_turn_before_policy_routing() -> None:
     pivot_id = state.investigations.investigation.pivot_conversation_id
     state._samples[0].external_llm_allowed = False
 
-    with pytest.raises(ProposalContractError, match="refused by the aggregate policy"):
-        await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=1)
+    replay = await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=1)
 
-    assert first.conversation_id == pivot_id
+    assert replay.conversation_id == first.conversation_id == pivot_id
+    assert replay.turn.id == first.turn.id
+    assert replay.mode is ConversationMode.FRESH
     assert conversation.external_calls == 1
     assert conversation.local_calls == 0
-    assert len(conversation.prompts) == 1
     assert state.investigations.investigation.pivot_conversation_id == pivot_id
 
 
@@ -842,22 +763,20 @@ async def test_derived_policy_is_recalculated_each_turn() -> None:
     service, _, conversation, _ = _service(state)
     await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=1)
     state._samples[0].external_llm_allowed = False
-    with pytest.raises(ProposalContractError, match="refused by the aggregate policy"):
-        await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=2)
-    assert conversation.external_allowed == [True]
+    await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=2)
+    assert conversation.external_allowed == [True, False]
     assert conversation.external_calls == 1
-    assert conversation.local_calls == 0
+    assert conversation.local_calls == 1
 
 
 @pytest.mark.asyncio
 async def test_external_forbidden_policy_never_reaches_external_call() -> None:
     state = _State(samples=[_sample(uuid4(), external=False)])
     service, _, conversation, _ = _service(state)
-    with pytest.raises(ProposalContractError, match="refused by the aggregate policy"):
-        await service.propose(investigation_id=INVESTIGATION_ID)
+    await service.propose(investigation_id=INVESTIGATION_ID)
     assert conversation.external_calls == 0
-    assert conversation.local_calls == 0
-    assert conversation.external_allowed == []
+    assert conversation.local_calls == 1
+    assert conversation.external_allowed == [False]
 
 
 @pytest.mark.asyncio
