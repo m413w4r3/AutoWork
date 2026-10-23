@@ -2,9 +2,9 @@
 
 **Cible :** `cd344743e9ba12d01d509cc8b5f9e42a0f3cb239` (`feat/mission01-a1-strategy-projection`), base `058bb4af2278e3941956e523c5a1d560208de228`. Intégration examinée : `27e99e4769e1f12ca9b717342dbad0e0eefc6fcb`.
 
-**Re-revue :** `da79486dd19cb4f01ecebfb01fa199a282f47472`.
+**Re-revues :** `da79486dd19cb4f01ecebfb01fa199a282f47472`, puis `a0aaee626206169401b3607eedd7807644ae1dbe`.
 
-**Verdict initial sur cd34474 : FAIL. Verdict final après da79486 : FAIL.** Le correctif ferme la divergence `claims`/`strategy` dans la route HTTP, mais les outils opérateur `experiment.record/list` exposent encore `REFUTED` depuis le verdict persisté seul. La nouvelle expurgation de la réponse HTTP filtre les textes et chaînes de paramètres testés; elle conserve cependant des valeurs scalaires arbitraires et des identifiants d’entrée sans validation canonique.
+**Verdicts historiques : FAIL après cd34474 et après da79486. Verdict final après a0aaee6 : FAIL.** Le dernier delta ferme la projection non conservatrice de `experiment.record/list` et supprime les arguments/outils libres des sorties. Une fuite subsiste par `step_ids` et autres métadonnées acceptant toute chaîne conforme à une regex permissive; elles peuvent encore porter un contenu alphanumérique arbitraire dans `experiment.list` et la route HTTP.
 
 Les statuts ci-dessous qualifient les constats de revue; `CONFIRMED` indique un comportement directement établi par le code ou les tests, pas une validation en production.
 
@@ -147,3 +147,43 @@ Le test API vérifie bien 401/200 et `response_model`, mais il n’exécute pas 
 ## Verdict final après da79486
 
 **FAIL — 3 constats résiduels :** A1-R2 **HIGH**, A1-R3 **HIGH**, A1-R4 **MEDIUM** (route HTTP couverte; lifespan non vérifié). A1-R1 et A1-R5 sont fermés pour les chemins projetés par la route GET. Le coût est **UNKNOWN**.
+
+## Re-revue finale après a0aaee6
+
+Cette re-revue examine le delta `da79486dd19cb4f01ecebfb01fa199a282f47472..a0aaee626206169401b3607eedd7807644ae1dbe`. Le delta touche quatre fichiers : `backend/src/cti_app/api/investigation.py`, `backend/src/cti_app/application/investigation_experiments.py` et leurs deux fichiers de tests. Aucun changement de production hors de ces deux modules.
+
+### A1-R1 — `payload.claims` et stratégie conservatrice
+
+**REJECTED · fermé, sans régression.** La route GET passe maintenant le timeline complet par le même projecteur de sécurité que les outils, en lui fournissant la stratégie calculée ([api/investigation.py:1081-1085](../../../feat-mission01-a1-strategy-projection/backend/src/cti_app/api/investigation.py#L1081)). Le statut d’un claim vient de la stratégie; en absence de statut vérifié il devient `inconclusive` ([investigation_experiments.py:177-191](../../../feat-mission01-a1-strategy-projection/backend/src/cti_app/application/investigation_experiments.py#L177)). La projection domaine exige disponibilité, couverture complète, observations persistées présentes et correspondance ID/SHA; elle ne retourne `SUPPORTED` que pour `SUPPORTS` + `OBSERVED`, et laisse les autres cas à `UNKNOWN` ([investigation_experiment.py:531-567](../../../feat-mission01-a1-strategy-projection/backend/src/cti_app/domain/investigation_experiment.py#L531)). Les tests vérifient la réponse API complète pour couverture partielle, observation absente, SHA discordant et outcome incompatible : aucun ne donne `refuted` ([test_investigation_experiment_api.py:371-420](../../../feat-mission01-a1-strategy-projection/backend/tests/test_investigation_experiment_api.py#L371)).
+
+### A1-R2 — `experiment.record/list` et critère libre
+
+**REJECTED · risque HIGH fermé. PLAUSIBLE · LOW sur la présentation.** `record` et `list` appellent tous deux `project_safe_investigation_experiment_timeline()` sans stratégie; le statut de claim retombe donc sur `inconclusive` ([investigation_experiments.py:696-704,723-729](../../../feat-mission01-a1-strategy-projection/backend/src/cti_app/application/investigation_experiments.py#L696)). Le test utilise un critère hors sujet et vérifie les deux sorties : les statuts restent inconclusifs tandis que `refutes` demeure présent dans les champs de verdict enregistré ([test_investigation_experiments.py:486-547](../../../feat-mission01-a1-strategy-projection/backend/tests/test_investigation_experiments.py#L486)). La limitation est documentée : la prose d’un critère n’a pas d’oracle sémantique et ne peut établir une réfutation ([investigation_experiment.py:531-538](../../../feat-mission01-a1-strategy-projection/backend/src/cti_app/domain/investigation_experiment.py#L531)).
+
+Le verdict persisté reste séparé du statut calculé, mais le champ est nommé `verdict`/`verdicts` sans marqueur explicite « assertion ». Le frontend affiche une expérience comme « Réfute » ([InvestigationLabViews.tsx:48-60,445-451](../../../feat-mission01-a1-strategy-projection/frontend/src/features/investigation/InvestigationLabViews.tsx#L48)); le statut agrégé affiché pour le claim peut toutefois rester « Non concluant ». C’est une ambiguïté de présentation plausible, pas une fausse conclusion de projection.
+
+### A1-R3 — assainissement des sorties et références
+
+**CONFIRMED · HIGH — reste ouvert.** `tool_arguments` est vidé dans le projecteur commun, les champs libres sont remplacés avant l’appel à `redact_operational_secrets()`, et les préconditions/limitations sont retirées ([investigation_experiments.py:196-253](../../../feat-mission01-a1-strategy-projection/backend/src/cti_app/application/investigation_experiments.py#L196)). `record`, `list` et GET utilisent ce projecteur. Les tests attaquent les valeurs de paramètres sous clé neutre, un hexdump/URL dans les arguments, des scalaires numériques et le secret factice dans du texte; ces valeurs sont absentes. Un `input_id` hexadécimal de 128 caractères est expurgé, tandis qu’une paire SHA-256 de 64 caractères cohérente est conservée ([test_investigation_experiment_api.py:422-466](../../../feat-mission01-a1-strategy-projection/backend/tests/test_investigation_experiment_api.py#L422), [test_investigation_experiments.py:486-547](../../../feat-mission01-a1-strategy-projection/backend/tests/test_investigation_experiments.py#L486)).
+
+En revanche, `step_ids` accepte jusqu’à 256 caractères quelconques dans le schéma d’écriture ([investigation_experiments.py:890-894](../../../feat-mission01-a1-strategy-projection/backend/src/cti_app/application/investigation_experiments.py#L890)) et le projecteur les conserve s’ils ne contiennent que lettres, chiffres, `.`, `_`, `:` ou `-` ([investigation_experiments.py:246-250](../../../feat-mission01-a1-strategy-projection/backend/src/cti_app/application/investigation_experiments.py#L246)). Le domaine stocke ces IDs tels quels ([investigation_experiments.py:653-661](../../../feat-mission01-a1-strategy-projection/backend/src/cti_app/application/investigation_experiments.py#L653)). Vérification directe du projecteur avec `step_ids=["deadbeef" * 16]` : cette valeur de 128 caractères reste dans la sortie; le même projecteur sert à `experiment.list` et au GET. Les tests ne couvrent pas ce chemin. `tool_name`, `tool_version` et `tool_schema_version` suivent aussi une validation de caractères permissive sans liaison à une invocation canonique ([investigation_experiments.py:212-224,886-888](../../../feat-mission01-a1-strategy-projection/backend/src/cti_app/application/investigation_experiments.py#L212)). Ce chemin permet un reflet de contenu alphanumérique sous des clés qui ne sont pas des champs de preuve libres; le contrat « aucun contenu de sample/secret dans la réponse » n’est donc pas garanti.
+
+### A1-R4 — route montée et lifespan
+
+**CONFIRMED pour la route HTTP; UNKNOWN pour le câblage de production.** Le test passe par `create_app()`, ASGI, le middleware d’identité et le `response_model`, avec `401` sans jeton et `200` avec jeton. Il documente explicitement que le lifespan PostgreSQL n’est pas démarré et que le UOW est injecté dans le test ([test_investigation_experiment_api.py:352-368](../../../feat-mission01-a1-strategy-projection/backend/tests/test_investigation_experiment_api.py#L352)). Cette limite est acceptée comme UNKNOWN, conformément à la portée offline; aucun moteur factice n’est présenté comme preuve du lifespan réel.
+
+### Non-régression, frontend et tests
+
+**CONFIRMED dans le delta inspecté.** La validation source/snapshot et les liens avec versions/SHA de stratégie ne sont pas changés; les raisons opérateur, règles G2, écriture canonique et endpoint GET ne sont pas modifiés par ce delta. Il ne touche ni `research_context_builder.py` (B0A), ni les fichiers B1A, migration, schéma, UOW ou modèle SQL; il n’ajoute ni seconde base, ni framework, ni API de spawn. Les sorties gardent les types attendus par `frontend/src/api/investigationExperiments.ts` (`tool_arguments` reste un objet, champs texte des chaînes, `input_refs` garde `input_id` et `sha256|null`); aucune incompatibilité de type n’est apparue. L’UI reçoit des champs masqués sous forme de chaînes compatibles.
+
+Depuis une archive de `a0aaee626206169401b3607eedd7807644ae1dbe`, avec le `.venv` du dépôt lié :
+
+- `PYTHONPATH=$PWD/src .venv/bin/python -m pytest tests/test_investigation_strategy_scenarios.py tests/test_investigation_experiments.py tests/test_investigation_experiment_api.py tests/test_operator_tool_invocation.py -q --tb=short` — **61 passed in 5.20s**.
+- `.venv/bin/ruff check src/cti_app/api/investigation.py src/cti_app/application/investigation_experiments.py tests/test_investigation_experiment_api.py tests/test_investigation_experiments.py` — **All checks passed**.
+- Vérification directe du projecteur avec un ID alphanumérique long dans `step_ids` — la valeur passe, confirmant le constat A1-R3.
+
+Les tests ont été exécutés hors ligne avec les doubles de test existants; aucun fournisseur, réseau, PostgreSQL ou Docker n’a été démarré. Le lifespan réel reste UNKNOWN. Coût : **UNKNOWN**.
+
+## Verdict final après a0aaee6
+
+**FAIL — 1 constat confirmé HIGH reste ouvert (A1-R3 : contenu alphanumérique arbitraire réfléchi via `step_ids` et métadonnées similaires).** A1-R1 et le risque de fausse réfutation dans `experiment.record/list` sont fermés; A1-R4 est limité à l’UNKNOWN documenté du lifespan. A1-R2 garde une ambiguïté de présentation PLAUSIBLE/LOW. Coût : **UNKNOWN**.
