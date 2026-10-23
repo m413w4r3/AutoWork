@@ -86,7 +86,7 @@ Défauts trouvés par l'orchestrateur lors de la revue (non vus par les workers)
   `97924484…18f9`). L'ORM contenait déjà `paused_at`, `paused_by`, le CHECK
   `paused` et le CHECK d'identité jointe. Nouveaux tests : identité de pause,
   refus d'un schéma incompatible (SQLSTATE 42P07), head == `0001_baseline`.
-- **Code supprimé** (preuve par candidat : `2026-10-12-dead-code-removals.md`) :
+- **Code supprimé** (preuve par candidat : [preuve historique de suppressions (Git)](https://github.com/m413w4r3/AutoWork/blob/2b3df6d286cc364a17e1d5072f3b1248bd836394/docs/design/2026-10-12-dead-code-removals.md)) :
   `french_typography.py`, `_ImageElementParser`, `mapping_to_tuple`,
   `assert_adapter_contract`, `ExtractionResult`, `hash_bundle_files`,
   `StructuredModelUnavailableError`, `_target_value_for_display`.
@@ -186,7 +186,7 @@ Non vérifié / non exécuté :
 `0002_production_batch_pause`. Le service `migrate` (`alembic upgrade head`)
 échouera tant que le restamp n'est pas fait. Procédure préparée, non appliquée,
 qui requiert l'accord explicite de l'utilisateur :
-`2026-10-12-baseline-collapse-live-db-note.md`.
+[ancienne note de restamp (Git, OBSOLÈTE)](https://github.com/m413w4r3/AutoWork/blob/2b3df6d286cc364a17e1d5072f3b1248bd836394/docs/design/2026-10-12-baseline-collapse-live-db-note.md) — ne pas appliquer; migrations courantes : `docs/adr/ADR-0007-frozen-baseline-and-c2-migration.md`.
 
 **Préparation au pivot** : bonne. Le chemin produire → observer → corriger →
 vérifier est démontré. Les points d'extension (provenance, identité de

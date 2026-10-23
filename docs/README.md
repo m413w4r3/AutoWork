@@ -21,8 +21,9 @@ observations are canonical only in their authorized application stores.
   endpoints, versions and live status against code before acting.
 - `HISTORICAL`: dated run, proposal, deprecated workflow or prior configuration;
   never normative for current mutations.
-- `OBSOLETE_CONFIRMED`: obsolete after consumer/reference audit; none certified
-  for removal in this documentation-only change.
+- `OBSOLETE_CONFIRMED`: legacy instruction, duplicate, or superseded plan
+  with no current runtime dependency found during a focused reference audit;
+  removed only with a Git-history recovery pointer.
 - `EXTERNAL_REFERENCE`: provider documentation external to this repository,
   version-specific and non-normative for AutoWork domain behavior.
 - `UNREVIEWED`: other material not explicitly assessed here; **not** an
@@ -78,10 +79,38 @@ instructions for current mutations. Do not delete CTI evidence/incident
 records solely because they are historical. Dated design documents are
 historical by default unless superseded or explicitly accepted.
 
-Other `docs/` files are **UNREVIEWED** in this focused remediation; do
-not infer their authority from a filename. No full consumer/links/runtime
-audit was performed. Any historic path listed in an old audit is a
-historical statement, not necessarily a current live link.
+## Pre-Mission-00 removal sweep (2026-10-23)
+
+**Scope:** 98 tracked `docs/` files on
+[`2b3df6d286cc364a17e1d5072f3b1248bd836394`](https://github.com/m413w4r3/AutoWork/tree/2b3df6d286cc364a17e1d5072f3b1248bd836394).
+Ten files were deleted after checking known in-repo text references.
+Any previously cited paths in retained journals were replaced with
+immutable Git-history links or active source/ADR pointers. This is **not**
+proof that no external/private consumer exists.
+
+| Removed path (relative to `docs/`) | Why removed |
+|---|---|
+| `Architecture.txt` | Obsolete technology outline duplicating root README/accepted ADRs |
+| `retex_01.md` | Orphaned Pandoc version output, not a retrospective |
+| `design/09-invariant-thresholds.example.md` | Unused `CHOOSE_ME` example superseded by the frozen thresholds decision |
+| `design/2026-10-05-plan-corrections-rendu-cti.md` | Stale executable work plan superseded by later run records and current code |
+| `design/2026-10-12-baseline-collapse-live-db-note.md` | Legacy mutable-baseline/restamp playbook superseded by ADR-0007 |
+| `design/2026-10-12-multibatch-composition-deployment-note.md` | Legacy migration/deployment instructions superseded by ADR-0007 |
+| `design/2026-10-12-dead-code-audit.md` | Completed one-off code-removal candidate list (Git history remains) |
+| `design/2026-10-12-dead-code-removals.md` | Completed removal log/candidate rationale (Git history remains) |
+| `design/2026-10-12-deliverable-inspection-audit.md` | Exploratory feasibility plan replaced by `design/2026-10-12-pdf-inspection-api.md` and code |
+| `design/extraction-wire-format-recovery.md` | Superseded actionable recovery plan; current parser code + retained dated audit remain |
+
+See [the design index](design/README.md) for retained contracts vs historical
+audit evidence. **Do not delete** run journals, SHA-bearing observations,
+ADR decisions or migration files merely for age. Obsolete instructions in
+retained dated journals are still historical **data**, not steps to execute.
+
+Other docs may remain `UNREVIEWED`: this pass checked the candidate
+documents and known in-repo text references, not every file's runtime
+consumer or every private archive. A focused review after Mission 00 may
+identify further safe deletions, but must preserve the evidence needed to
+understand Run12.
 
 ## Agent skills
 

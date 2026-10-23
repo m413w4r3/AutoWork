@@ -47,7 +47,7 @@ localement. Le bridge annonce
 validé côté AutoWork. `STRUCTURED_EXTRACTION` conserve `OPENAI_STRUCTURED_MODEL`.
 L'extraction canonique des sources (production) n'utilise pas ce rôle : elle passe par `draft` en texte
 libre (format compact `FACT`/`EVENT`/`IOC`/`RULE`/`UNCERTAINTIES`, parsé localement de façon tolérante),
-car le bridge ne produit pas de JSON fiable (voir `docs/design/extraction-wire-format-recovery.md`).
+car le bridge ne produit pas de JSON fiable (voir le parseur effectif `backend/src/cti_app/application/production_parsers.py` et ses tests ; le plan de reprise de 2026-10-02 a été archivé dans Git).
 `MODEL_FORCE_ADAPTER=chatgpt_bridge|gemini_webai|qwen|fake` permet un forçage uniquement lorsque
 `APP_ENV=development`; `openai` et `gemini` restent des alias de compatibilité. `auto` conserve
 la politique ci-dessus.
