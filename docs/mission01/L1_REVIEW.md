@@ -6,7 +6,9 @@
 
 **Verdict initial (R1):** `FAIL` — remplacé par la re-revue R2 ci-dessous.
 
-**Verdict final (R2):** `FAIL`
+**Verdict R2:** `FAIL` — remplacé par la re-revue finale R3 ci-dessous.
+
+**Verdict final (R3):** `FAIL`
 
 **Constats R1:** 0 `BLOCKER`, 1 `HIGH`, 1 `MEDIUM` (6 `LOW`; dont 1 `REJECTED`).
 
@@ -270,3 +272,108 @@ PostgreSQL, Docker ou réseau n’a été contacté.
 présentes dans les déploiements; l’utilisation runtime réelle de P10 et le
 provider configuré. Aucun provider ou profil runtime n’a été inspecté.
 **Coût R2:** UNKNOWN.
+
+## Re-revue après a3d17f8
+
+**Delta examiné:** `01946483dba171a3c468c1b14c8ea8ae0b8931d1..a3d17f81bdd26bbc8f50e16668762cc47c1ec1c4`.
+Le contrôle direct des claims bornés ferme le HIGH R2 pour ces claims, mais
+deux chemins de contenu dérivé/historique échappent encore à cette résolution.
+Verdict final R3 : **`FAIL` — 2 HIGH, 0 MEDIUM, 1 LOW**.
+
+### Constats reclassés
+
+1. **[CONFIRMED] [HIGH] Les invariants déjà persistés peuvent divulguer des données de claims dont la source n’est pas agrégée.**
+
+   Le nouveau chemin résout les SourceDocuments des seuls claims présents dans
+   `context.report_claims` après bornage (`backend/src/cti_app/application/invariant_proposals.py:575-591`).
+   Or P10 charge séparément les invariants existants, leurs provenances et
+   leurs patterns (`:389-409,527-535,573-580`). P09 accepte une
+   `ReportClaimProvenance` sur un candidat et la transmet au registre
+   (`backend/src/cti_app/application/invariants.py:425-438`;
+   `backend/src/cti_app/application/invariant_proposals.py:929-937`;
+   type canonique à `backend/src/cti_app/domain/invariants.py:206-223`). Le
+   contexte des invariants inclut `pattern` et provenance (`invariant_proposals.py:2248-2261`)
+   et le rendu P10 inclut les invariants et le manifeste des claims
+   (`:1049-1059,1080-1094,1158-1171`).
+
+   Les claims sont d’abord plafonnées séparément des invariants à 64
+   (`:407-415`), puis le bornage peut couper `report_claims` à 32 tout en
+   conservant `existing_invariants` (`:2346-2363`). Un invariant provenant
+   d’une claim RED, `do_not_submit` ou externe-interdite peut donc laisser son
+   pattern et son identifiant de claim dans le prompt sans que la source soit
+   résolue par `_claim_source_documents`.
+
+   **Action requise:** inclure les `source_document` de toutes les
+   `ReportClaimProvenance` présentes dans le contexte final — notamment les
+   invariants existants — dans l’agrégation, ou retirer/refuser ces éléments
+   quand la politique source ne peut être établie. Ajouter un test avec un
+   invariant existant référant une claim restrictive absente de la liste
+   `report_claims` finale et prouver zéro conversation/transport.
+
+2. **[PLAUSIBLE] [HIGH] Un rejeu historique peut réutiliser une snapshot de claims non vérifiée par la politique courante.**
+
+   À chaque appel, la politique courante est recalculée avant la recherche de
+   rejeu (`invariant_proposals.py:162-188`). Toutefois le rejeu d’un ancien
+   prompt contenant `BEGIN_P10_SNAPSHOT_DATA` reparcourt sa snapshot persistée
+   (`:199-218`) et en passe les candidats à P09 (`:223-243`). La clé
+   d’idempotence n’inclut pas le `context` (`backend/src/cti_app/domain/invariant_proposals.py:287-289`;
+   construction à `invariant_proposals.py:942-955`). Si un claim présent dans
+   l’ancien prompt a depuis disparu ou a été écarté du contexte courant borné,
+   sa source n’est pas dans l’agrégation courante, alors que l’ancien résultat
+   peut encore être rejoué et traité. Ce chemin ne fait pas un nouvel appel
+   fournisseur, mais permet de réutiliser une sortie produite à partir d’un
+   contexte dont la politique n’a pas été revérifiée.
+
+   **Action requise:** avant de réutiliser un tour historique, résoudre et
+   agréger aussi les sources de claims de la snapshot persistée; tester un
+   tour historique dont le claim restreint n’apparaît plus dans le contexte
+   courant.
+
+3. **[CONFIRMED] [LOW] Le chemin direct des claims est fail-closed, mais quelques cas exigés ne sont pas testés explicitement.**
+
+   Le helper refuse liste/repository/ID manquants, exceptions ou source
+   absente, sujet différent et champs de politique absents ou invalides
+   (`invariant_proposals.py:2290-2343`). Les tests couvrent les trois états
+   restrictifs avec plafond maximal, source absente, `tlp=None`, puis un
+   rejeu où la source devient RED (`backend/tests/test_limits_mission01.py:222-359`).
+   Je n’ai trouvé aucun test qui donne une claim sans `source_document_id`,
+   une source d’un autre sujet ou une erreur du dépôt; l’implémentation
+   correspondante lève bien avant sélection de route. C’est une lacune de
+   preuve, distincte des deux chemins HIGH ci-dessus.
+
+4. **[REJECTED] [LOW] Pas de régression du plafond ou du confinement de développement.**
+
+   Le défaut reste 96 000 octets; seules les deux conditions exactes
+   `AUTOWORK_DEV_LIMITS_ENABLED=1` et `APP_ENV=development` autorisent le
+   plafond de développement, borné à 1 048 576 (`invariant_proposals.py:963-988`).
+   Hors de ce cas l’override est ignoré et le défaut s’applique
+   (`test_limits_mission01.py:150-186`). Le parse décimal strict, les cas
+   invalides et les frontières testées en R2 restent inchangés
+   (`test_limits_mission01.py:41-160`). Le commentaire mémoire précise
+   désormais que `facts` et les intermédiaires s’ajoutent (`invariant_proposals.py:959-962`).
+
+5. **[REJECTED] [LOW] Aucun élargissement G2/L06 ou du périmètre dans le delta.**
+
+   Le delta touche uniquement `invariant_proposals.py` et ses deux tests; il
+   ne modifie pas Compose, `.env.example`, ni les consommateurs Advisor retirés.
+   Le test G2 reste présent (`test_limits_mission01.py:395-409`), et les tests
+   ciblés couvrent les refus TLP, `do_not_submit`, routage local et rejeu.
+   La garde de source ne modifie pas les contrôles de sortie ni le passage
+   P09. Le constat HIGH reste toutefois bloquant pour les sources de claims
+   dérivées décrites aux constats 1 et 2.
+
+### Exécution R3
+
+Tests exécutés dans le worktree de l’implémenteur au SHA
+`a3d17f81bdd26bbc8f50e16668762cc47c1ec1c4`, avec le `.venv` du worktree.
+Les fakes en mémoire sont utilisés; aucun fournisseur, PostgreSQL, Docker ou
+réseau n’a été contacté.
+
+- `PYTHONPATH=$PWD/src .venv/bin/python -m pytest tests/test_limits_mission01.py tests/test_invariant_proposals.py -q --tb=short` — **69 passed** en 0,77 s. Pytest a émis un avertissement de cache en lecture seule (`.pytest_cache`); le code de retour est 0.
+- `.venv/bin/ruff check --no-cache src/cti_app/application/invariant_proposals.py tests/test_limits_mission01.py tests/test_invariant_proposals.py` — **All checks passed**.
+- Aucun test ne couvre un invariant persistant avec `ReportClaimProvenance` hors de `report_claims` bornés, ni le rejeu d’une ancienne snapshot contenant un claim devenu absent ou tronqué.
+
+**UNKNOWN:** volume et politique réels des claims/invariants dans les
+déploiements, présence de tours historiques au format snapshot complet, et
+provider runtime. Aucun état runtime ou secret n’a été inspecté.
+**Coût R3:** UNKNOWN.
