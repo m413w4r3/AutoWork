@@ -25,28 +25,26 @@ uv run --no-sync python -m cti_app.workers.scheduler
 
 ## Migrations
 
-PostgreSQL est la base principale. La migration initiale est appliquée automatiquement par le service Compose `migrate`.
+PostgreSQL utilise une chaîne Alembic **versionnée et additive**.
+`0001_baseline` est gelée à la forme pré-C2 ; `0002_c2_experiments`
+est propriétaire du DDL C2. Voir `AGENTS.md` et
+`../docs/adr/ADR-0007-frozen-baseline-and-c2-migration.md`.
 
-`0001_baseline` constitue le schéma complet destiné à une base vide, et
-`alembic upgrade head` doit toujours créer ce schéma cible. La baseline
-`0001_baseline` reste volontairement mutable jusqu'au gate de stabilisation
-pré-première édition prévu après AW-024. Tant que cette stabilisation n'est pas
-explicitement déclarée, toute évolution du schéma cible modifie cette baseline ;
-aucune migration de compatibilité avec une ancienne base AutoWork n'est requise
-et aucune migration différée ne doit porter un changement de la nouvelle baseline.
+Une installation estampillée `0001_baseline` peut déjà contenir les objets
+C2 appliqués manuellement. `0002` vérifie alors **toute** leur forme
+avant de considérer l'opération comme conforme ; les états partiels
+échouent sans réparation implicite. Aucune migration, rétrogradation ou
+réinitialisation n'est autorisée sur la base live dans un chantier agentique.
 
-La baseline mutable doit décrire directement le schéma cible. Il ne faut pas
-ajouter de détection des anciennes bases, de backfills de compatibilité, de
-branches de réparation ni de prise en charge de mise à niveau d'anciennes
-bases. Les protections de downgrade et les gardes qui appartiennent au schéma
-actuel à baseline unique sont conservés ; les tests destinés uniquement à la
-compatibilité avec des révisions supprimées ne le sont pas.
+Sur une base neuve ou d'intégration uniquement, le schéma se construit
+avec `alembic upgrade head`. Le service Compose `migrate` appartient
+au parcours de déploiement approuvé; ne pas l'invoquer pendant un audit
+sans vérifier cible et autorisation.
 
-Hors Compose :
+Hors Compose, sur base jetable approuvée :
 
 ```bash
 uv run alembic upgrade head
-uv run alembic downgrade base
 ```
 
 Le workflow local recommandé lance automatiquement un PostgreSQL éphémère séparé :
@@ -72,7 +70,7 @@ La commande manuelle cible explicitement `tests/integration` avec le marqueur
 
 Les tests créent une base temporaire dans ce serveur. `POSTGRES_DSN` est la connexion à la DB applicative ; `TEST_POSTGRES_ADMIN_DSN` est la connexion ADMIN réservée à pytest pour `CREATE DATABASE` / `DROP DATABASE`. Ces deux URLs ne sont pas interchangeables. Un DSN explicite peut remplacer le service local : `TEST_POSTGRES_ADMIN_DSN=<dsn> make test-integration`.
 
-Après réécriture de l'historique des migrations, `make up-clean` est nécessaire pour recréer la DB applicative. Cette commande est destructive : elle supprime les volumes PostgreSQL, Redis, MinIO et workspaces. Sauvegarder les données locales importantes avant de l'utiliser.
+Ne pas utiliser `make up-clean` comme mécanisme de migration : cette commande supprime des données et des volumes. Elle requiert une autorisation distincte et une cible jetable vérifiée.
 
 Les octets des documents et échantillons ne sont jamais stockés dans PostgreSQL.
 
@@ -116,7 +114,7 @@ triggers PostgreSQL définis dans le schéma de base. Les packs JSON immuables s
 contenu dans le bucket logique `brief-evidence-packs`; PostgreSQL conserve leur version et la
 référence de blob. Les brouillons versionnés sont invalidés par lecture dès qu’un pack plus
 récent existe. Le parcours, la politique Qwen/OpenAI, les contrôles QA et l’export sont
-décrits dans `../docs/brief_workflow.md`.
+décrits dans l'ancien parcours désormais retiré ; consulter le code et `../docs/workflow.md` avant toute modification de ce flux legacy.
 
 Le collecteur accepte uniquement HTTP(S), refuse credentials, localhost, metadata cloud et plages
 privées, loopback, link-local, multicast ou réservées IPv4/IPv6. Il contrôle deux réponses DNS puis

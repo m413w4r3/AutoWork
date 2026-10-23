@@ -44,6 +44,6 @@ These instructions preserve the architectural split during refactoring.
 
 ## Alembic and migrations
 
-- The database is assumed empty for migrations. Alembic is never a backfill tool.
+- **Do not assume an existing database is empty.** `0001_baseline` is frozen; follow `backend/AGENTS.md` and `docs/adr/ADR-0007-frozen-baseline-and-c2-migration.md`. `0002_c2_experiments` explicitly checks already-stamped installations and existing objects before applying additive DDL. Never alter or downgrade live schema without separately approved preflight.
 - ORM/DB drifts inventoried by `test_migrations` are noted but not opportunistically
   repaired during refactoring.

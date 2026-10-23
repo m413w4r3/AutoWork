@@ -1,5 +1,7 @@
 # CTI Bulletin
 
+> Agent and operator documentation authority: [docs/README.md](docs/README.md). Dated runbooks and design plans do not supersede accepted ADRs, migration contracts or current code.
+
 Application interne de production de bulletins CTI mensuels. Elle fournit l'environnement
 local, la persistance canonique (PostgreSQL, MinIO), les jobs asynchrones observables et le
 workflow éditorial complet, avec une décision humaine à chaque frontière métier :
@@ -125,7 +127,9 @@ applicative et est supprimé même en cas d'échec lorsque la commande l'a déma
 modification volontaire de l'état local des migrations, `make up-clean` recrée
 les volumes applicatifs ; cette commande est destructive.
 
-## Développement automatisé avec MetaHarness
+## Historique — développement automatisé avec MetaHarness
+
+Cette section décrit le fonctionnement historique de MetaHarness et n'est pas une configuration de Paseo. Pour l'orchestration actuelle, voir [docs/operations/paseo-agent-orchestration.md](docs/operations/paseo-agent-orchestration.md).
 
 AutoWork peut être utilisé comme dépôt cible de MetaHarness.
 
@@ -157,9 +161,9 @@ dépôt MetaHarness ; ce README reste la documentation d'AutoWork lui-même.
 
 L'état de production est canonique dans PostgreSQL, les fichiers versionnés et les evidence packs. Les workspaces matérialisés, conversations LLM, files Redis et réponses de services externes ne sont jamais des sources de vérité. Les représentations HTTP encodée et décodée sont archivées séparément par SHA-256 dans MinIO ; les observations d'URL, textes dérivés versionnés, claims, IOC et décisions humaines restent des objets canoniques distincts. La collecte utilise des baux récupérables, épingle une adresse DNS publique contrôlée à chaque connexion et redirection, borne durée, octets, décompression et parsing PDF, puis segmente l'extraction Qwen sans exécuter le contenu distant. Voir [backend/README.md](backend/README.md) pour les tables et limites configurables.
 
-La stratégie et les invariants de l'incrément sont détaillés dans
+La collecte de sources et le workflow actuel sont détaillés dans
 [docs/source_collection_and_evidence.md](docs/source_collection_and_evidence.md) et
-[docs/brief_workflow.md](docs/brief_workflow.md). Les conversations persistantes,
+[docs/workflow.md](docs/workflow.md). Les conversations persistantes,
 leur politique `fresh`/`continue` et leurs limites sont documentées dans
 [docs/model_conversations.md](docs/model_conversations.md).
 

@@ -9,6 +9,8 @@ Code lives under `src/cti_app/`.
 
 ## Rules
 
+- For document precedence and historical M2/M3 conflicts, consult `docs/README.md` and ADR-0007 when relevant. Do not infer that a previously stamped database is empty.
+
 - Control enums are typed `StrEnum` values in `domain/`.
   Do not encode control state as free-form strings or metadata keys.
 - Business decisions never belong in `infrastructure/`.

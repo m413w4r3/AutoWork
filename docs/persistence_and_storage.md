@@ -164,11 +164,11 @@ Pandoc est l'ancien renderer supprimé en AW-020.
 
 ## Migrations
 
-`backend/migrations/versions/0001_baseline.py` est l’unique head Alembic et définit la cible
-complète depuis une base vide. La validation vérifie les tables, colonnes, contraintes
-d’idempotence et triggers d’immutabilité de cette baseline.
-
-Cette baseline reste mutable jusqu'au gate de stabilisation pré-première édition prévu après
-AW-024. Tant que la stabilisation n'est pas explicitement déclarée, tout changement du schéma
-cible modifie `0001_baseline` ; aucune migration de compatibilité avec une ancienne base AutoWork
-ni migration différée pour la nouvelle baseline n'est requise.
+`backend/migrations/versions/0001_baseline.py` est gelée dans son état pré-C2.
+`backend/migrations/versions/0002_c2_experiments.py` est une révision additive
+et vérifie l'existence de DDL C2 appliquée manuellement avant toute mutation.
+Les révisions suivantes ne doivent pas réécrire l'historique.
+Voir [ADR-0007](adr/ADR-0007-frozen-baseline-and-c2-migration.md) et
+[backend/AGENTS.md](../backend/AGENTS.md). Un état incompatible bloque
+l'évolution ; les migrations live exigent un préflight et une autorisation
+humains distincts.
