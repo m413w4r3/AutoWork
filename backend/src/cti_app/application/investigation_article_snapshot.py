@@ -251,6 +251,7 @@ class ProductionArticleSnapshotAdapter:
             confirmed_iocs=tuple(confirmed_iocs),
             confirmed_iocs_truncated=confirmed_iocs_truncated,
             article_passages=_synthesis_passages(synthesis_payload),
+            synthesis_version=synthesis.version,
         )
 
     async def get_claims(

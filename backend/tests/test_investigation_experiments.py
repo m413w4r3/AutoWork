@@ -32,6 +32,7 @@ from cti_app.domain.investigation import (
 )
 from cti_app.domain.investigation_experiment import (
     HYPOTHESIS_DECLARE_TOOL_SCHEMA_VERSION,
+    AnalysisMatrixStatus,
     ConsolidatedClaimStatus,
     ExperimentAvailability,
     ExperimentInputRefV1,
@@ -40,6 +41,8 @@ from cti_app.domain.investigation_experiment import (
     InvestigationExperimentV1,
     ObservationCoverage,
     ObservationOutcome,
+    project_claim_matrix_status,
+    project_experiment_matrix_status,
 )
 
 NOW = datetime(2026, 10, 19, 12, 0, tzinfo=UTC)
@@ -145,6 +148,84 @@ def test_limited_not_observed_cannot_be_marked_refuted() -> None:
             coverage=ObservationCoverage.LIMITED,
             limitations=("Only a partial capture was available.",),
         )
+
+
+@pytest.mark.parametrize(
+    ("outcome", "coverage", "verdict", "persisted", "expected"),
+    (
+        (
+            ObservationOutcome.NOT_OBSERVED,
+            ObservationCoverage.COMPLETE,
+            ExperimentVerdict.REFUTES,
+            True,
+            AnalysisMatrixStatus.REFUTED,
+        ),
+        (
+            ObservationOutcome.NOT_OBSERVED,
+            ObservationCoverage.LIMITED,
+            ExperimentVerdict.INCONCLUSIVE,
+            True,
+            AnalysisMatrixStatus.UNKNOWN,
+        ),
+        (
+            ObservationOutcome.NOT_OBSERVED,
+            ObservationCoverage.COMPLETE,
+            ExperimentVerdict.REFUTES,
+            False,
+            AnalysisMatrixStatus.UNKNOWN,
+        ),
+        (
+            ObservationOutcome.NOT_OBSERVED,
+            ObservationCoverage.COMPLETE,
+            ExperimentVerdict.BLOCKED,
+            True,
+            AnalysisMatrixStatus.UNKNOWN,
+        ),
+    ),
+)
+def test_matrix_projection_requires_complete_persisted_observation(
+    outcome: ObservationOutcome,
+    coverage: ObservationCoverage,
+    verdict: ExperimentVerdict,
+    persisted: bool,
+    expected: AnalysisMatrixStatus,
+) -> None:
+    experiment = _experiment(
+        1,
+        verdict,
+        actual_outcome=outcome,
+        coverage=coverage,
+        limitations=("Coverage was partial.",) if coverage is ObservationCoverage.LIMITED else (),
+    )
+    reference = experiment.observation_refs[0]
+    observations = {reference.observation_id: reference.sha256} if persisted else {}
+
+    assert (
+        project_experiment_matrix_status(experiment, persisted_observations=observations)
+        is expected
+    )
+
+
+def test_matrix_projection_keeps_support_refute_conflict_unknown() -> None:
+    investigation_id = uuid4()
+    supported = _experiment(1, ExperimentVerdict.SUPPORTS, investigation_id=investigation_id)
+    refuted = _experiment(
+        2,
+        ExperimentVerdict.REFUTES,
+        investigation_id=investigation_id,
+        actual_outcome=ObservationOutcome.NOT_OBSERVED,
+    )
+    observations = {
+        item.observation_refs[0].observation_id: item.observation_refs[0].sha256
+        for item in (supported, refuted)
+    }
+
+    assert (
+        project_claim_matrix_status(
+            (supported, refuted), CLAIM_ID, persisted_observations=observations
+        )
+        is AnalysisMatrixStatus.UNKNOWN
+    )
 
 
 def test_tool_arguments_reject_secret_fields_and_round_trip_hashes() -> None:
