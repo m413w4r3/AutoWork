@@ -160,14 +160,30 @@ def test_p10_dev_override_is_ignored_without_explicit_flag(
     assert service._max_p10_prompt_bytes == p10._MAX_P10_PROMPT_BYTES
 
 
-def test_p10_dev_override_requires_development_environment(
+def test_p10_dev_override_is_ignored_outside_development(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("APP_ENV", "production")
     monkeypatch.setenv(p10._DEV_LIMITS_ENABLED_ENV, "1")
+    monkeypatch.setenv(p10._DEV_P10_PROMPT_BYTES_ENV, str(p10._MAX_DEV_P10_PROMPT_BYTES))
 
-    with pytest.raises(ProposalContractError, match="requires APP_ENV=development"):
-        _service()
+    service, _, _, _ = _service()
+
+    assert service._max_p10_prompt_bytes == p10._MAX_P10_PROMPT_BYTES
+
+
+@pytest.mark.parametrize("enabled", ("0", "true", "yes", " 1"))
+def test_p10_dev_override_requires_flag_exactly_one(
+    monkeypatch: pytest.MonkeyPatch,
+    enabled: str,
+) -> None:
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv(p10._DEV_LIMITS_ENABLED_ENV, enabled)
+    monkeypatch.setenv(p10._DEV_P10_PROMPT_BYTES_ENV, str(p10._MAX_DEV_P10_PROMPT_BYTES))
+
+    service, _, _, _ = _service()
+
+    assert service._max_p10_prompt_bytes == p10._MAX_P10_PROMPT_BYTES
 
 
 @pytest.mark.asyncio
@@ -201,6 +217,146 @@ async def test_p10_aggregate_policy_refuses_before_any_route_or_transport(
     assert conversation.prompts == []
     assert conversation.conversations == {}
     assert state.investigations.investigation.pivot_conversation_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source_tlp", "source_do_not_submit", "source_external_allowed"),
+    (
+        (TLP.RED, False, True),
+        (TLP.GREEN, True, True),
+        (TLP.GREEN, False, False),
+    ),
+)
+async def test_restricted_claim_source_refuses_even_with_development_prompt_override(
+    monkeypatch: pytest.MonkeyPatch,
+    source_tlp: TLP,
+    source_do_not_submit: bool,
+    source_external_allowed: bool,
+) -> None:
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv(p10._DEV_LIMITS_ENABLED_ENV, "1")
+    monkeypatch.setenv(p10._DEV_P10_PROMPT_BYTES_ENV, str(p10._MAX_DEV_P10_PROMPT_BYTES))
+    sample = _HELPERS._sample(
+        _HELPERS.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+        external=True,
+    )
+    source_document = SimpleNamespace(
+        id=_HELPERS.SOURCE_DOCUMENT_ID,
+        subject_id=_HELPERS.SUBJECT_ID,
+        tlp=source_tlp,
+        do_not_submit=source_do_not_submit,
+        external_llm_allowed=source_external_allowed,
+    )
+    state = _HELPERS._State(
+        samples=[sample],
+        source_documents={_HELPERS.SOURCE_DOCUMENT_ID: source_document},
+    )
+    service, _, conversation, _ = _service(state)
+
+    with pytest.raises(ProposalContractError, match="refused by the aggregate policy"):
+        await service.propose(investigation_id=INVESTIGATION_ID)
+
+    assert conversation.conversations == {}
+    assert conversation.prompts == []
+    assert conversation.external_calls == 0
+    assert conversation.local_calls == 0
+    assert state.investigations.investigation.pivot_conversation_id is None
+
+
+@pytest.mark.asyncio
+async def test_missing_claim_source_refuses_before_route_or_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv(p10._DEV_LIMITS_ENABLED_ENV, "1")
+    monkeypatch.setenv(p10._DEV_P10_PROMPT_BYTES_ENV, str(p10._MAX_DEV_P10_PROMPT_BYTES))
+    state = _HELPERS._State(
+        samples=[
+            _HELPERS._sample(
+                _HELPERS.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+                external=True,
+            )
+        ],
+        source_documents={},
+    )
+    service, _, conversation, _ = _service(state)
+
+    with pytest.raises(ProposalContractError, match=r"source document .* does not exist"):
+        await service.propose(investigation_id=INVESTIGATION_ID)
+
+    assert conversation.conversations == {}
+    assert conversation.prompts == []
+    assert conversation.external_calls == 0
+    assert conversation.local_calls == 0
+    assert state.investigations.investigation.pivot_conversation_id is None
+
+
+@pytest.mark.asyncio
+async def test_unresolved_claim_source_policy_refuses_before_route_or_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv(p10._DEV_LIMITS_ENABLED_ENV, "1")
+    monkeypatch.setenv(p10._DEV_P10_PROMPT_BYTES_ENV, str(p10._MAX_DEV_P10_PROMPT_BYTES))
+    source_document = SimpleNamespace(
+        id=_HELPERS.SOURCE_DOCUMENT_ID,
+        subject_id=_HELPERS.SUBJECT_ID,
+        tlp=None,
+        do_not_submit=False,
+        external_llm_allowed=True,
+    )
+    state = _HELPERS._State(source_documents={_HELPERS.SOURCE_DOCUMENT_ID: source_document})
+    service, _, conversation, _ = _service(state)
+
+    with pytest.raises(ProposalContractError, match="unresolved disclosure policy"):
+        await service.propose(investigation_id=INVESTIGATION_ID)
+
+    assert conversation.conversations == {}
+    assert conversation.prompts == []
+    assert conversation.external_calls == 0
+    assert conversation.local_calls == 0
+    assert state.investigations.investigation.pivot_conversation_id is None
+
+
+@pytest.mark.asyncio
+async def test_green_claim_source_is_included_and_passes_with_development_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv(p10._DEV_LIMITS_ENABLED_ENV, "1")
+    monkeypatch.setenv(p10._DEV_P10_PROMPT_BYTES_ENV, str(p10._MAX_DEV_P10_PROMPT_BYTES))
+    service, _, conversation, _ = _service()
+
+    await service.propose(investigation_id=INVESTIGATION_ID)
+
+    assert conversation.external_calls == 1
+    assert conversation.local_calls == 0
+    assert len(conversation.prompts) == 1
+    assert "bounded claim" in conversation.prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_claim_source_policy_is_rechecked_before_idempotent_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv(p10._DEV_LIMITS_ENABLED_ENV, "1")
+    monkeypatch.setenv(p10._DEV_P10_PROMPT_BYTES_ENV, str(p10._MAX_DEV_P10_PROMPT_BYTES))
+    state = _HELPERS._State()
+    service, _, conversation, _ = _service(state)
+    first = await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=1)
+    source_document = state.source_documents.documents[_HELPERS.SOURCE_DOCUMENT_ID]
+    source_document.tlp = TLP.RED
+
+    with pytest.raises(ProposalContractError, match="refused by the aggregate policy"):
+        await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=1)
+
+    assert len(conversation.conversations) == 1
+    assert first.conversation_id in conversation.conversations
+    assert len(conversation.prompts) == 1
+    assert conversation.external_calls == 1
+    assert conversation.local_calls == 0
 
 
 def test_unused_advisor_environment_is_absent_from_compose_and_source() -> None:

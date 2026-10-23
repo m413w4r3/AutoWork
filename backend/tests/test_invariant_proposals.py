@@ -37,6 +37,7 @@ from cti_app.domain.production import LoopBudget
 INVESTIGATION_ID = UUID("11111111-1111-1111-1111-111111111111")
 SUBJECT_ID = UUID("22222222-2222-2222-2222-222222222222")
 BASELINE_ID = UUID("33333333-3333-3333-3333-333333333333")
+SOURCE_DOCUMENT_ID = UUID("44444444-4444-4444-4444-444444444444")
 NOW = "2026-08-27T12:00:00+00:00"
 
 
@@ -121,9 +122,26 @@ class _InvariantRepository:
 
 
 class _ClaimsRepository:
-    async def list_for_subject(self, subject_id: UUID) -> list[dict[str, object]]:
+    def __init__(self, claims: list[object] | None = None) -> None:
+        self.claims = claims or [
+            {
+                "claim_id": "claim-1",
+                "text": "bounded claim",
+                "source_document_id": str(SOURCE_DOCUMENT_ID),
+            }
+        ]
+
+    async def list_for_subject(self, subject_id: UUID) -> list[object]:
         del subject_id
-        return [{"claim_id": "claim-1", "text": "bounded claim"}]
+        return self.claims
+
+
+class _SourceDocumentRepository:
+    def __init__(self, documents: dict[UUID, object]) -> None:
+        self.documents = documents
+
+    async def get(self, document_id: UUID) -> object | None:
+        return self.documents.get(document_id)
 
 
 class _TurnRepository:
@@ -145,7 +163,8 @@ class _Uow:
         self.code_feature_sets = state.code_features
         self.capability_sets = state.capabilities
         self.invariants = state.invariants
-        self.claims = _ClaimsRepository()
+        self.claims = state.claims
+        self.source_documents = state.source_documents
         self.model_conversation_turns = _TurnRepository(conversation)
         self.model_conversations = conversation
 
@@ -169,6 +188,8 @@ class _State:
         code_features: list[dict[str, object]] | None = None,
         capabilities: list[dict[str, object]] | None = None,
         invariants: list[object] | None = None,
+        claims: list[object] | None = None,
+        source_documents: dict[UUID, object] | None = None,
     ) -> None:
         investigation = SimpleNamespace(
             id=INVESTIGATION_ID,
@@ -197,6 +218,20 @@ class _State:
         self.code_features = _FeatureRepository(code_features or [])
         self.capabilities = _FeatureRepository(capabilities or [])
         self.invariants = _InvariantRepository(invariants)
+        self.claims = _ClaimsRepository(claims)
+        self.source_documents = _SourceDocumentRepository(
+            source_documents
+            if source_documents is not None
+            else {
+                SOURCE_DOCUMENT_ID: SimpleNamespace(
+                    id=SOURCE_DOCUMENT_ID,
+                    subject_id=SUBJECT_ID,
+                    tlp=TLP.GREEN,
+                    do_not_submit=False,
+                    external_llm_allowed=True,
+                )
+            }
+        )
 
     async def _list_samples(self, subject_id: UUID) -> list[SimpleNamespace]:
         del subject_id

@@ -482,10 +482,6 @@ class ProposalConversationService:
                 raise ProposalContractError(
                     "The proposal snapshot has no retained technical origin Samples"
                 )
-            # This is intentionally recalculated on every call, including an
-            # idempotent replay. The policy is based only on retained origins.
-            policy = derived_policy(retained_samples)
-
             # Positive support is snapshot-scoped, so recalculate it only after
             # deterministic selection has fixed the origin sample set.
             selected_descriptors = tuple(
@@ -528,8 +524,6 @@ class ProposalConversationService:
                 raise ProposalContractError(
                     "The proposal snapshot has no retained technical origin Samples"
                 )
-            policy = derived_policy(retained_samples)
-
             provenance_by_ref = _provenance_catalog(invariants)
             for candidate in selected_candidates:
                 provenance = candidate["provenance"]
@@ -586,6 +580,15 @@ class ProposalConversationService:
                 ],
             }
             context = _bound_context(context)
+            source_documents = await _claim_source_documents(
+                uow,
+                investigation.subject_id,
+                context.get("report_claims"),
+            )
+            # Recalculate on every call, including idempotent replay. The
+            # effective policy covers retained Samples and every source in the
+            # final, bounded report-claim context.
+            policy = derived_policy((*retained_samples, *source_documents))
             snapshot = ProposalInputSnapshot(
                 input_pack_sha256=investigation.input_sha256,
                 corpus_snapshot_sha256=corpus_hash,
@@ -956,10 +959,10 @@ def _render_prompt(snapshot: ProposalInputSnapshot) -> str:
     return _render_p10_prompt(snapshot)[0]
 
 
-# The source snapshot is bounded to 200,000 characters. A 1 MiB UTF-8 prompt
-# cap leaves room for the worst-case four-byte encoding and prompt framing,
-# while keeping the prompt string plus its UTF-8 size-check buffer to about
-# 5 MiB at most (excluding the separately bounded snapshot).
+# The source snapshot is bounded to 200,000 characters. The 1 MiB UTF-8
+# development ceiling bounds an accepted prompt string to roughly 4 MiB in
+# CPython plus its 1 MiB size-check buffer; facts and snapshot intermediates
+# are additional allocations and remain separately bounded.
 _MAX_P10_PROMPT_BYTES = 96_000
 _MAX_DEV_P10_PROMPT_BYTES = 1_048_576
 _DEV_P10_PROMPT_BYTES_ENV = "AUTOWORK_DEV_P10_MAX_PROMPT_BYTES"
@@ -968,10 +971,8 @@ _APP_ENV = "APP_ENV"
 
 
 def _p10_prompt_max_bytes() -> int:
-    if os.getenv(_DEV_LIMITS_ENABLED_ENV) != "1":
+    if os.getenv(_DEV_LIMITS_ENABLED_ENV) != "1" or os.getenv(_APP_ENV) != "development":
         return _MAX_P10_PROMPT_BYTES
-    if os.getenv(_APP_ENV) != "development":
-        raise ProposalContractError(f"{_DEV_LIMITS_ENABLED_ENV}=1 requires {_APP_ENV}=development")
     configured = os.getenv(_DEV_P10_PROMPT_BYTES_ENV)
     if configured is None:
         return _MAX_P10_PROMPT_BYTES
@@ -2284,6 +2285,62 @@ def _rejection_context(value: Any) -> dict[str, Any]:
         "category": _value(value, "category"),
         "pattern": _value(value, "pattern"),
     }
+
+
+async def _claim_source_documents(
+    uow: Any,
+    subject_id: UUID,
+    report_claims: Any,
+) -> tuple[Any, ...]:
+    if not isinstance(report_claims, list):
+        raise ProposalContractError("The P10 report-claim source policy cannot be resolved")
+    if not report_claims:
+        return ()
+
+    repository = getattr(uow, "source_documents", None)
+    get_source_document = getattr(repository, "get", None)
+    if not callable(get_source_document):
+        raise ProposalContractError("The P10 source-document repository is unavailable")
+
+    resolved: dict[UUID, Any] = {}
+    for claim in report_claims:
+        source_id_value = _value(claim, "source_document_id", _MISSING)
+        try:
+            source_id = (
+                source_id_value if isinstance(source_id_value, UUID) else UUID(source_id_value)
+            )
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise ProposalContractError(
+                "A P10 report claim has no resolvable source document id"
+            ) from exc
+        if source_id in resolved:
+            continue
+        try:
+            source_document = await get_source_document(source_id)
+        except Exception as exc:
+            raise ProposalContractError(
+                f"P10 source document {source_id} could not be resolved"
+            ) from exc
+        if source_document is None:
+            raise ProposalContractError(f"P10 source document {source_id} does not exist")
+        if _value(source_document, "subject_id", _MISSING) != subject_id:
+            raise ProposalContractError(
+                f"P10 source document {source_id} does not belong to the investigation subject"
+            )
+
+        tlp = _value(source_document, "tlp", _MISSING)
+        do_not_submit = _value(source_document, "do_not_submit", _MISSING)
+        external_llm_allowed = _value(source_document, "external_llm_allowed", _MISSING)
+        if (
+            not isinstance(tlp, TLP)
+            or type(do_not_submit) is not bool
+            or type(external_llm_allowed) is not bool
+        ):
+            raise ProposalContractError(
+                f"P10 source document {source_id} has an unresolved disclosure policy"
+            )
+        resolved[source_id] = source_document
+    return tuple(resolved.values())
 
 
 def _bound_context(value: dict[str, Any]) -> dict[str, Any]:
