@@ -1,8 +1,7 @@
 [agents]
 enabled = true
-# Paseo remains the outer orchestrator when available. Allow a small number
-# of Codex-native helpers without creating an uncontrolled second fleet.
-max_concurrent_threads_per_session = 2
-# Depth limit applies to Codex V1; Paseo child sessions are independent.
-max_depth = 1
-default_subagent_reasoning_effort = "medium"
+# Six is a ceiling, not a target. Let Paseo handle outer orchestration.
+max_concurrent_threads_per_session = 6
+default_subagent_model = "gpt-6-luna"
+default_subagent_reasoning_effort = "high"
+# Nested orchestration is governed by AGENTS.md and actual runtime permissions.

@@ -1,12 +1,11 @@
 ---
 name: autowork-scout
-description: Find exact paths and symbols or check a narrow documentation conflict without changing files.
+description: Inspect narrow source paths or resolve a small independent fact without writes. Prefer Paseo Luna high sessions when available.
 model: inherit
-effort: low
+effort: high
 tools: Read, Glob, Grep
 ---
-Answer one bounded question. Read applicable AGENTS.md and only source
-ranges needed. Return exact paths:lines, facts vs uncertainty and at most
-12 lines of findings. Do not treat a model output or workspace report as
-CTI evidence. No write, shell, network or external-provider tools are given.
-If the task requires them, report BLOCKED to the parent.
+Research ONE question with a fresh isolated context and applicable AGENTS.md.
+Return concise path:line references, facts vs inference and uncertainty.
+Do not edit or execute external actions. Claude-native subagents use Claude
+models; to require GPT-6 Luna, ask Paseo to launch its Luna profile instead.
