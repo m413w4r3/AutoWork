@@ -98,8 +98,18 @@ Luna déjà livrés restent inchangés.
 | `98446181` | M01-REG-FIX | `fix/mission01-regressions` (`wks_cbcdaa104d853d74`) | WIP 849cfa0 + 5 régressions + suite backend |
 | `75a283e7` | M01-B0A-R4 | `feat/mission01-b0-bridge-chain` | data URL base64 >512 + allocation avant check |
 | `03cab396` | M01-A1-R5 | `feat/mission01-a1-strategy-projection` | UUID/SHA canoniques non liés à l'expérience |
-| `d5cdbcc8` | M01-B1A1-REVIEW-R3 | `audit-mission01-b1a1-review` | verdict final `2f88a42` |
 | `24a6d5ba` | M01-B1A2-REVIEW-R2 | `audit-mission01-b1a2-review` | verdict final `01346e2`/`5484375` |
+
+**B1A1-REVIEW-R3 : FAIL** (`4317f46`). Protections confirmées : preuve
+`pre_submission` typée, coût/clé, crash→`NEEDS_REVIEW`, extension G2, CAS ;
+atomicité révocation/transport `BLOCKED` ; dette `object_type` documentée.
+Résiduels HIGH : équivalences `review_text` (`anchor`/`block_type`), UUID
+imbriqués `draft_text`, doublons `finding_refs` avec casse différente, champs
+normalisés d'autres outils VT. **Décision parent : arrêt de l'heuristique
+après 3 tentatives** ; B1A1 reste `FAIL/PARTIAL` sur l'équivalence sémantique
+et exige une clé d'effet canonique fournie par l'adaptateur (lot dédié). Les
+deux échecs `required_canonical_evidence_not_in_payload` sont traités par
+M01-REG-FIX.
 
 Verdicts déjà reçus : **A1-REVIEW-R5 FAIL** (`426e7a9`, deux
 contournements UUID/SHA non liés, en correction) ; **B0A-REVIEW-R4 FAIL**
