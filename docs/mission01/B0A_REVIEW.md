@@ -228,3 +228,55 @@ L’oracle du cas mixte et le scénario neutre imbriqué utilisent uniquement de
 **Coût : UNKNOWN** — aucun coût fournisseur n’est observable dans cette revue hors ligne.
 
 **Verdict final R4 : FAIL** — F6b est corrigé et les cas base64 purs testés sont refusés, mais F6c reste contournable avec du base64 mélangé à du texte.
+
+## Re-revue après cd69eca
+
+- **TASK_ID** : M01-B0A-REVIEW-R5.
+- **Cible** : `cd69eca29c0e2ab905254654d9a488e28422aab4`; delta `df1bd8f3d5f60ea10b645eb6614c9d4f0a891f9e..cd69eca29c0e2ab905254654d9a488e28422aab4`.
+- **Verdict** : **FAIL** — les data URLs `;base64,` de forme reconnue sont maintenant bornées avant décodage, mais les métadonnées de titre, les data URLs sans `;base64` et le fractionnement entre champs laissent encore du contenu de plus de 512 octets dans le dossier.
+- **Portée** : lecture du delta et oracle synthétique hors ligne. Aucun échantillon, runtime, fournisseur ni Bridge réel n’a été consulté. Le checkout de revue reste sur `ca78ded`; les tests ont été lancés sur une archive temporaire exacte de `cd69eca`.
+
+### Vérification des constats R5
+
+| Constat | Résultat | Preuve |
+|---|---|---|
+| F6c — data URL Base64 standard >512 octets, champs imbriqués | **CORRIGÉ pour la forme reconnue** | `_DATA_URL_BASE64` reconnaît `data:…;base64,`; le scanner compte les caractères Base64 décodés depuis les caractères encodés avant tout appel au décodeur (`advisor_dossier.py:33-34,57-118`). Le spy du décodeur échoue si un 600-octets atteint `b64decode`, pour la valeur pure, la data URL canonique, le payload percent-encodé, LF, espaces et tabulations (`test_advisor_completeness.py:463-503`). L’oracle d’exécution couvre `content` imbriqué et `strings[].value` imbriqué; la valeur complète est absente du résultat, `dossier_text` est absent et le transport factice a zéro appel (`test_investigation_advisor_tools.py:2064-2132`). L’omission est explicite via `data_url_base64_exceeds_512_byte_decoded_limit` (`investigation_advisor_tools.py:1144-1152`). |
+| Base64 URL-safe et padding | **CORRIGÉ par l’oracle** | Le scanner accepte `-_` et calcule le seuil avant le décodage. Oracle sur la source exacte : 600 octets URL-safe, et 601/602 octets standard ou URL-safe avec padding et sans padding, sont tous refusés avec le code de dépassement. Ces variantes ne sont pas toutes des tests automatisés. |
+| F6c — URL de 600 octets dans un titre (`strings[].name`) | **CONFIRMÉ / HIGH** | `add()` vérifie le contenu `value`, mais `display_name()` incorpore `name` dans le titre sans appliquer le contrôle; le titre rendu devient une partie de l’extrait (`advisor_dossier.py:260-265,284-303,350-368`). Oracle synthétique `extract_content_excerpts` puis `build_advisor_dossier` : la data URL complète de 600 octets apparaît dans `dossier.text`. Cela viole directement l’exigence d’absence de la valeur dans le dossier/prompt. |
+| Data URL sans `;base64` | **CONFIRMÉ / MEDIUM** | `data:application/octet-stream,` suivi de `%41` répété 600 fois n’est pas reconnu par le seul motif `;base64,`; l’extrait de 1 830 caractères et l’URL complète restent dans le dossier (oracle synthétique). Une URI de données peut donc porter plus de 512 octets sans omission explicite. |
+| Valeur Base64 fractionnée entre champs / plusieurs URL | **CONFIRMÉ / MEDIUM; portée agrégée UNKNOWN** | Les compteurs sont réinitialisés pour chaque correspondance et chaque appel à `add()` (`advisor_dossier.py:57-63,260-265`). L’oracle fractionne un Base64 valide de 600 octets en deux champs de 400 caractères; chaque champ passe et les deux parties apparaissent dans le dossier. Deux URL de 300 octets dans un même champ passent aussi séparément. Le contrat observé plafonne une valeur individuelle; l’intention d’un plafond agrégé sur les parties reconstituables n’est pas définie ici. |
+| Double encodage percent | **ACCEPTÉ par la projection; UNKNOWN en aval** | Un payload dont chaque octet Base64 est doublement percent-encodé est conservé comme texte. Le scanner ne fait qu’un décodage percent à la fois (`advisor_dossier.py:81-104`); je n’ai pas trouvé de second décodage dans le chemin applicatif examiné. La présence de ce texte dans le prompt est vérifiée par l’oracle, mais son interprétation comme 600 octets décodés par le consommateur reste UNKNOWN. |
+| Clé inconnue et listes imbriquées | **Pas de fuite pour un scalaire inconnu; structures parcourues** | Un scalaire direct sous `payload` ne produit aucun extrait. Les mappings/listes imbriqués sont parcourus, et leurs descendants `content`/`value` passent par le contrôle (`advisor_dossier.py:305-372`; test imbriqué ci-dessus). Le champ `name` constitue toutefois la voie de fuite décrite plus haut. |
+| Budget 16 384, base64 pur, hexdump/xxd/MD5 courts | **PRÉSERVÉS** | Le budget d’extraits reste cumulatif et les cas >16 384 octets échouent (`advisor_dossier.py:260-296`; `test_advisor_completeness.py:505-530`; `test_investigation_advisor_tools.py:1900-2001`). Le base64 pur >512 reste refusé avant le prompt (`test_investigation_advisor_tools.py:2015-2062`). Les hexdumps sont omis; le xxd vérifié court reste une mesure et le MD5 décodé reste un IOC textuel (`test_advisor_completeness.py:411-435,533-539`; `test_investigation_advisor_tools.py:1740-1782`). |
+| Dossier >200 000 octets et seuil Bridge | **SIMULATION INTACTE** | Le test conserve un dossier supérieur à 200 000 octets, choisit le mode simulé `text_file` et vérifie la réception complète par le transport scripté (`test_advisor_completeness.py:580-624`). Aucun Bridge réel n’a été sollicité. |
+| F1–F4, F5, G2/TLP/provider | **F1–F4 sans régression; F5 UNKNOWN non bloquant; contrôles inchangés** | Les quatre suites passent ensemble. Le delta ne change pas les gates de divulgation `external_llm_allowed`, TLP ni la frontière provider; il ajoute seulement les codes d’omission au refus pré-transport. Le compte exact des IOC omis reste UNKNOWN, conformément à R4 (`bridge_investigator.py:1512-1579`; `tests/test_bridge_investigator.py:213-234`). |
+
+### Vérifications R5
+
+```text
+PYTHONPATH=$PWD/src .venv/bin/python -m pytest tests/test_advisor_completeness.py tests/test_bridge_investigator.py tests/test_investigation_advisor_tools.py tests/test_advisor_output_reparse.py -q --tb=short
+153 passed in 2.00s
+
+.venv/bin/ruff check src/cti_app/application/advisor_dossier.py src/cti_app/application/investigation_advisor_tools.py tests/test_advisor_completeness.py tests/test_investigation_advisor_tools.py
+All checks passed!
+
+.venv/bin/ruff format --check src/cti_app/application/advisor_dossier.py src/cti_app/application/investigation_advisor_tools.py tests/test_advisor_completeness.py tests/test_investigation_advisor_tools.py
+ÉCHEC : advisor_dossier.py serait reformaté (3 différences de formatage signalées).
+
+PYTHONPATH=$PWD/src .venv/bin/mypy src/cti_app/application/advisor_dossier.py src/cti_app/application/investigation_advisor_tools.py
+Success: no issues found in 2 source files
+
+git diff --check df1bd8f..cd69eca
+clean
+```
+
+Les tests et oracles utilisent uniquement des données synthétiques et un transport factice. Aucun coût fournisseur n’est observable.
+
+### UNKNOWN R5 et action suivante
+
+- **UNKNOWN** : si la limite de 512 octets doit s’appliquer au total des segments encodés séparément; aucun contrat d’agrégation n’a été établi.
+- **UNKNOWN** : si un consommateur en aval décodera le texte doublement percent-encodé.
+- **À corriger avant PASS** : contrôler les champs utilisés dans les titres, borner les payloads `data:` non Base64, et définir/implémenter la limite attendue pour les valeurs fractionnées. Corriger aussi le formatage Ruff de `advisor_dossier.py`.
+- **Coût : UNKNOWN** — aucun appel fournisseur réel n’a eu lieu.
+
+**Verdict final R5 : FAIL** — le contournement R4 par data URL Base64 canonique est fermé avant décodage et soumission, mais des formes encore incluses dans le dossier maintiennent F6c ouvert.
