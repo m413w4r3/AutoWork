@@ -2062,6 +2062,60 @@ async def test_oversized_generic_base64_is_rejected_before_prompt(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "percent_encode"),
+    [("content", False), ("content", True), ("strings", False), ("strings", True)],
+)
+async def test_oversized_data_url_base64_is_rejected_before_prompt(
+    field: str, percent_encode: bool
+) -> None:
+    investigation_id = uuid4()
+    encoded_content = base64.b64encode(b"A" * 600).decode("ascii")
+    if percent_encode:
+        encoded_content = "".join(f"%{ord(character):02X}" for character in encoded_content)
+    data_url = f"data:application/octet-stream;base64,{encoded_content}"
+    if field == "content":
+        generic_content: dict[str, Any] = {"outer": {"content": data_url}}
+    else:
+        generic_content = {"outer": {"strings": [{"metadata": {"value": data_url}}]}}
+    observation, raw = make_observation(
+        investigation_id,
+        {"schema": "generic-observation.v1", **generic_content},
+    )
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    tool, _sample_blob = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Review this nested synthetic data URL.",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, key=f"operator:advisor:generic-data-url:{field}"),
+    )
+
+    assert result.status is ToolInvocationStatus.FAILED
+    assert result.error_code == "advisor_input_invalid"
+    assert result.output["input_error_code"] == "data_url_base64_exceeds_512_byte_decoded_limit"
+    assert [dict(item) for item in result.output["omitted_evidence"]] == [
+        {
+            "kind": "observation",
+            "id": str(observation.id),
+            "status": "INTENTIONALLY_OMITTED",
+            "reason": "data_url_base64_exceeds_512_byte_decoded_limit",
+        }
+    ]
+    assert data_url not in repr(result.output)
+    assert "dossier_text" not in result.output
+    assert transport.calls == []
+
+
+@pytest.mark.asyncio
 async def test_oversized_method_title_is_rejected_before_prompt() -> None:
     investigation_id = uuid4()
     oversized_name = "X" * 20_000

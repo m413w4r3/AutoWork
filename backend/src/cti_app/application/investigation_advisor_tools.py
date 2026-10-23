@@ -1145,6 +1145,8 @@ class InvestigationAdvisorTool:
             "content_excerpt_budget_exceeds_16384_bytes",
             "dossier_content_excerpt_budget_exceeds_16384_bytes",
             "base64_content_exceeds_512_byte_decoded_limit",
+            "data_url_base64_exceeds_512_byte_decoded_limit",
+            "data_url_base64_is_invalid",
             "declared_base64_content_is_invalid",
             "raw_hexdump_content_rejected",
         }
