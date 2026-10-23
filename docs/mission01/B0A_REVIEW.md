@@ -97,7 +97,7 @@ Le registre indique 17 tests dans `docs/mission01/TASKS.md:38`; le run demandé 
 ## Re-revue après fbc0f24
 
 - **Cible** : `fbc0f241408a649f0024464a07d2ee4b6a528fe1`; delta examiné `977468078379cdc90ab7897d80bf0e739968e8f8..fbc0f241408a649f0024464a07d2ee4b6a528fe1`.
-- **Verdict final** : **FAIL**. Les corrections F1–F4 sont confirmées et les drapeaux de troncature F5 sont rendus. F6 reste un défaut HIGH : un canal séparé de mesures hex legacy laisse passer des valeurs sans borne.
+- **Verdict à la clôture R2** : **FAIL**. Les corrections F1–F4 sont confirmées et les drapeaux de troncature F5 sont rendus. F6 reste un défaut HIGH : un canal séparé de mesures hex legacy laisse passer des valeurs sans borne.
 
 | Constat | Reclassification R2 | Preuve et résultat |
 |---|---|---|
@@ -135,3 +135,44 @@ Le delta contient seulement les trois modules applicatifs B0A, trois fichiers de
 - **UNKNOWN** : coût de tokens/fournisseur.
 
 **Action requise avant PASS** : borner ou refuser les valeurs hex dans `_legacy_measurement_rows`, avec un test qui suit cette mesure jusqu’au dossier/prompt; préciser si un compte numérique d’IOC omis est exigé et l’ajouter au contrat/test si oui.
+
+## Re-revue après c561f04
+
+- **Cible** : `c561f04e5eaa29869ff53ec2372f7d7872c3a334`; delta examiné `fbc0f241408a649f0024464a07d2ee4b6a528fe1..c561f04e5eaa29869ff53ec2372f7d7872c3a334`.
+- **Verdict final** : **FAIL**. Les trois types de mesures nommés sont maintenant bornés et leurs tests de refus sont solides, mais une clé neutre et le texte base64 générique contournent encore F6. Les deux chemins ont été suivis jusqu’au prompt avec le transport factice, sans appel fournisseur.
+- **Portée** : le delta touche uniquement `backend/src/cti_app/application/advisor_dossier.py`, `backend/src/cti_app/application/investigation_advisor_tools.py` et leurs deux fichiers de tests. Aucun fichier hors B0A, aucune migration, aucun changement Bridge/provider/service.
+
+| Constat | Statut / sévérité R3 | Preuve et résultat |
+|---|---|---|
+| F1–F4 — corrections précédentes | **CONFIRMED / MEDIUM, toujours fermés** | Le delta R3 ne touche pas leurs règles. La suite combinée compte 133 succès, dont les cas de couverture multi-claim, blob indisponible, omission honnête et reparse. Aucun changement observé ne réintroduit les défauts R2. |
+| F5 — drapeaux et compte IOC omis | **CONFIRMED pour les drapeaux; UNKNOWN / LOW pour le compte IOC exact** | Le renderer et son test exposent toujours `truncated`, `truncation_counts` et le compte d’éléments de l’index omis (`bridge_investigator.py:1512-1579`; `tests/test_bridge_investigator.py:213-234`). Le contrat amont ne fournit toujours pas le nombre exact d’IOC supprimés, comme documenté en R2. C’est accepté comme limite non bloquante, sans compte inventé ni élargissement au-delà de B0A. |
+| F6a — mesures hex/base64 nommées >512 octets | **CONFIRMED / corrigé** | Les mesures `hex`, `hex_bytes` et `base64` sont rejetées avec `binary_measurement_exceeds_512_byte_limit` avant la construction du dossier (`investigation_advisor_tools.py:2528-2545,5522-5534`). Les tests couvrent ces champs sur trois types de consultation, vérifient l’absence de la valeur et du dossier dans le résultat, et zéro appel au transport factice (`tests/test_investigation_advisor_tools.py:1785-1873`). Le xxd court et le MD5 décodé sont conservés : les tests existants les vérifient respectivement à l’étape mesure et à l’étape projection (`tests/test_investigation_advisor_tools.py:1740-1782`; `tests/test_advisor_completeness.py:445-451`). Oracle synthétique indépendant via `execute`/transport factice : chaque valeur courte apparaît bien dans le prompt. |
+| F6b — plafond générique contourné par clés neutres/listes | **CONFIRMED / HIGH, non corrigé** | `add()` refuse une chaîne individuelle de plus de 16 384 octets (`advisor_dossier.py:134-141`), mais l’agrégat n’est compté que par `add_content()` (`:175-181`). Une liste sous clé neutre conserve `content_field=None` et appelle `add()` élément par élément (`:252-284`); deux chaînes de 15 907 octets passent donc séparément. Oracle synthétique via `extract_content_excerpts` puis `build_advisor_dossier` : 31 814 octets d’extraits sont retenus. Oracle `execute` avec une observation factice et le transport factice : **33 083 octets de prompt**, les deux valeurs présentes, un appel transport. Le test ajouté ne couvre que la liste sous `content` (`tests/test_investigation_advisor_tools.py:1910-1944`), pas une clé neutre ou une liste imbriquée neutre. Une valeur hex compacte de 600 octets sous clé neutre est également admise par la projection, car la regex ne reconnaît que les lignes hexdump avec offset (`advisor_dossier.py:138-139`). |
+| F6c — contenu base64 non typé | **CONFIRMED / HIGH, non corrigé** | Les chemins génériques ne décodent ni ne bornent la taille binaire encodée. Un `content` base64 représentant 600 octets et une entrée `strings:[{value, encoding:"base64"}]` traversent tous deux `execute`; dans les deux cas le prompt factice contient l’encodage complet et un appel transport a lieu. Le champ `encoding` ne déclenche aucune validation dans le chemin legacy des chaînes (`investigation_advisor_tools.py:2505-2545`); le texte générique reste sous le plafond par chaîne (`advisor_dossier.py:232-250`). Ces valeurs sont entièrement synthétiques; aucun provider ni échantillon réel n’a été utilisé. |
+| Valeurs numériques | **REJECTED / LOW** | Le parcours ignore les scalaires numériques et les listes d’entiers ne génèrent aucun extrait (`advisor_dossier.py:258-289`). L’oracle `{"content": [65] * 20_000}` produit zéro extrait. |
+| F7/F8 — transport, protocole et scope | **CONFIRMED / LOW, aucun changement** | Le patch n’ajoute ni persistance de run, pagination, récupération, chunking, accusé de lecture ou reçu fournisseur. Les appels observés sont uniquement ceux de transports factices dans des tests/oracles hors ligne. Le diff se limite aux quatre fichiers listés ci-dessus; aucune migration ni modification des services Bridge. Les gates `external_llm_allowed`, `do_not_submit`, TLP rouge et provider restent avant le transport (`investigation_advisor_tools.py:278-293`; `investigation_service.py:2437-2452,2884-2901`). |
+
+### Vérifications R3
+
+Le commit `c561f04` a été archivé dans `/tmp/autowork-m01-b0a-review-c561f04`; les liens `.venv` et `.autowork-runs` prescrits ont été créés. Les variables Conda ont été retirées et les commandes ont utilisé le Python du venv.
+
+```text
+PYTHONPATH=$PWD/src .venv/bin/python -m pytest tests/test_advisor_completeness.py tests/test_bridge_investigator.py tests/test_investigation_advisor_tools.py tests/test_advisor_output_reparse.py -q --tb=short
+133 passed in 1.99s
+
+PYTHONPATH=$PWD/src .venv/bin/python -m pytest tests/test_advisor_output_reparse.py -q --tb=short
+4 passed in 0.52s
+
+PYTHONPATH=$PWD/src .venv/bin/python -m ruff check --cache-dir /tmp/ruff-m01-b0a-c561 src/cti_app/application/advisor_dossier.py src/cti_app/application/investigation_advisor_tools.py tests/test_advisor_completeness.py tests/test_investigation_advisor_tools.py
+All checks passed!
+```
+
+Les tests de rejet F6 vérifient les résultats sans fuite de la valeur ni appel au transport. Les oracles synthétiques additionnels ont démontré une soumission au **transport simulé** de la liste neutre et des valeurs base64; ils ne prouvent aucune livraison réelle à Bridge. Aucun test ni oracle n’a utilisé réseau, PostgreSQL, Docker, fournisseur, donnée canonique réelle ou échantillon réel.
+
+### Constats restants et UNKNOWN R3
+
+- **HIGH / CONFIRMED** : F6 reste ouvert pour les listes sous clé neutre et les encodages base64 intégrés au contenu générique ou au chemin legacy `strings`. La limite par item ne couvre pas le total injecté dans le prompt, et une valeur encodée peut dépasser 512 octets binaires tout en restant sous 16 384 octets texte.
+- **LOW / UNKNOWN non bloquant** : le producteur ne fournit pas le compte exact d’IOC omis; les drapeaux et comptes disponibles sont rendus.
+- **UNKNOWN** : réception par un fournisseur réel, présence de tels contenus dans des observations runtime canoniques, et coût tokens/fournisseur. Aucune donnée runtime ni service externe n’a été consulté.
+
+**Verdict final R3 : FAIL** — ne pas considérer F6 fermé avant qu’une borne cumulative et une règle pour les représentations encodées soient appliquées à tous les chemins d’extraction avant dossier/prompt, avec des tests de liste neutre imbriquée et de base64 générique vérifiant zéro transport.
