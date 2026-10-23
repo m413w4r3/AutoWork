@@ -24,28 +24,28 @@ régressions en cours y seront reportés après réception des comptes rendus.
 | Vérification | Résultat | Portée |
 |---|---|---|
 | Suite croisée 9 lots | **220 passed** | `test_b1_admission_durability`, `test_b1_g2_bounded_timeout`, `test_advisor_completeness`, `test_bridge_investigator`, `test_investigation_advisor_tools`, `test_investigation_strategy_scenarios`, `test_investigation_experiments`, `test_investigation_experiment_api`, `test_investigation_audit_export` |
-| Backend hors intégration | **4579 passed, 39 failed, 2 skipped** | `pytest --ignore=tests/integration -m "not integration"` |
+| Backend hors intégration (après correctifs régressions) | **4589 passed, 34 failed, 2 skipped** | `pytest --ignore=tests/integration -m "not integration"` sur `89eb3a5` ; à re-exécuter après fusion finale |
 | Frontend | **293 passed**, `pnpm typecheck` OK | suite complète |
-| B0A ciblé | **141 passed** | `test_advisor_completeness`, `test_bridge_investigator`, `test_investigation_advisor_tools`, `test_advisor_output_reparse` |
+| B0A ciblé | **153 passed** | `test_advisor_completeness`, `test_bridge_investigator`, `test_investigation_advisor_tools`, `test_advisor_output_reparse` |
 | B0B ciblé | **14 passed** | `test_investigation_audit_export` |
 | B1A1 ciblé | **127 passed** | `test_b1_admission_durability`, `test_investigation_service`, `test_investigation_tools_contract`, `test_operator_tool_invocation` |
 | B1A2 ciblé | **138 passed** puis **220 croisés** | suite G2 + suites croisées |
-| A1 ciblé | **63 backend + 3 frontend + typecheck** | scénarios, expériences, API |
+| A1 ciblé | **64 backend + 3 frontend + typecheck** | scénarios, expériences, API |
 | L1 L06 | **2 + 41 passed** | `test_limits_mission01`, `test_invariant_proposals` |
 
-### Triage des 39 échecs backend
+### Triage des 34 échecs backend restants
 
-- **24** échecs Typst réels : `FontBundleInvalidError: Manifest-listed file is
+- **32** échecs Typst réels : `FontBundleInvalidError: Manifest-listed file is
   missing: 'CascadiaCode/ttf/CascadiaCode.ttf'`. Environnement documenté par T ;
-  ce n'est pas une régression de code. Le pipeline réel reste `UNKNOWN`.
+  ce n'est pas une régression de code. Le worker a reproduit ces 32 échecs sur
+  `058bb4a`. Le pipeline réel reste `UNKNOWN`.
 - **2** échecs préexistants prouvés sur `058bb4a` :
   `test_confined_analysis_dispatch.py::test_tool_registry_dispatch_runs_capa_and_strings_through_worker`
-  et `::test_mwcp_allowlisted_fixture_parser_is_invoked_in_worker`.
-- **5** régressions réelles : hex court `advisor_wire` (corrigé WIP `849cfa0`),
-  alias C01 `T1` non résolu par `advisor_wire_aliases`, retry d'acquisition
-  devenu `NEEDS_REVIEW`, préflight advisor minimal sans preuve canonique,
-  résultat advisor `PARTIAL` devenu `NEEDS_REVIEW`. Correction en cours dans
-  `fix/mission01-regressions`.
+  (CAPA indisponible) et `::test_mwcp_allowlisted_fixture_parser_is_invoked_in_worker`
+  (parseur MWCP de fixture absent).
+- Les **5 régressions réelles** (hex court, alias C01 `T1`, retry d'acquisition,
+  préflight advisor minimal, résultat `PARTIAL`) sont corrigées par `89eb3a5`
+  et testées ; fusion avec l'intégration courante en cours.
 
 ## Livrables
 
@@ -69,10 +69,10 @@ régressions en cours y seront reportés après réception des comptes rendus.
 | B1 admission map | ADEQUATE_WITH_CHANGES | `94d6706` |
 | L1 | PASS_WITH_CHANGES (L06), P10 DEFER après 3 FAIL | `bb7b8b4` |
 | B0B | PASS_WITH_CHANGES | `230380d` |
-| B0A | FAIL R3 (F6b/F6c) → **verdict final Luna en cours** | `a00d2b8`, `df1bd8f` |
-| A1 | FAIL R4 → **verdict final Luna en cours** | `47a0ef9`, `4a71f45` |
-| B1A1 | FAIL R2 → **verdict final Luna en cours** | `7af9e98`, `2f88a42` |
-| B1A2 | FAIL R1 → **verdict final Luna en cours** | `2ca858e`, `01346e2`/`5484375` |
+| B0A | **FAIL/PARTIAL** : F1–F5 acceptés ; F6 arrêté après 3 tentatives (URL dans titre, percent sans `;base64`, base64 fragmenté) | `b149aa3`, code `cd69eca`/`498c2da` intégré `f67181e` |
+| A1 | **PASS_WITH_CHANGES** : résiduel MEDIUM `capture_sha256`/`next_pivots` | `2e75d94`, code `1f0e813` intégré `545d32a` |
+| B1A1 | **FAIL/PARTIAL** : protections principales confirmées, équivalence sémantique résiduelle, arrêt après 3 tentatives ; atomicité `BLOCKED` | `4317f46`, code `2f88a42` intégré `2cafb37` |
+| B1A2 | **PASS_WITH_CHANGES** : plancher conservateur, `BridgeInvestigator.turn` hors borne, état ambigu en chaîne | `8597053`, code `01346e2`/`5484375` intégré `591eeca` |
 
 Le quota Claude a été épuisé le 2026-10-23 ; les revues finales sont
 exclusivement Luna xhigh depuis le reset du 2026-10-24. Aucune revue Claude
@@ -81,16 +81,19 @@ n'est comptée comme revue Luna.
 ## Gates et restes
 
 - **B0** : chaîne dossier/manifeste/préflight/transport simulé livrée ; mode
-  fichier >200 000 o simulé, aucun reçu Bridge inventé ; F5 compte IOC exact
-  `UNKNOWN` (non disponible en amont) ; verdict final en attente.
+  fichier >200 000 o simulé, aucun reçu Bridge inventé ; F1–F5 acceptés ;
+  **F6 `FAIL/PARTIAL`** (URL dans un titre, percent sans `;base64`, base64
+  fragmenté) après arrêt à trois tentatives ; F5 compte IOC exact `UNKNOWN`.
 - **B1** : refus 266/3600 sans réserve active ni sortie fictive ; preuve
   `pre_submission` typée non forgeable ; atomicité révocation/dispatch
-  **`BLOCKED`** (aucune primitive atomique) ; borne G2 incluant pacing ;
-  verdict final en attente.
+  **`BLOCKED`** (aucune primitive atomique) ; B1A2 `PASS_WITH_CHANGES` avec
+  borne G2 incluant pacing ; B1A1 `FAIL/PARTIAL` sur l'équivalence sémantique
+  (clé d'effet canonique requise) ; 3 600/7 200 borné pour `advisor.consult`.
 - **L** : suppression du plafond renderer 96 k et du réglage L06 inerte ;
   protections G2/TLP conservées ; P10 `DEFER`.
 - **A** : projection read-only, cinq scénarios offline, YARA synthetic-only
-  sans `REAL_VALIDATED` ; verdict final en attente.
+  sans `REAL_VALIDATED` ; `PASS_WITH_CHANGES` avec résiduel MEDIUM de
+  provenance `capture_sha256`/`next_pivots`.
 - **T** : rapport et captures livrés ; restauration `category`/numéro/`overview`
   `BLOCKED` derrière validation éditoriale ; pipeline réel `UNKNOWN`.
 - **Non démarrés** : B1B (temporalité/reprise), L2 (pagination keyset), Q
