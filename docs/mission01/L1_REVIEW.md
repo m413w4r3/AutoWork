@@ -2,11 +2,13 @@
 
 **Base:** `058bb4af2278e3941956e523c5a1d560208de228`
 
-**Commit revu:** `3b43c9f2fba48b98dc7c109365624eac74cf7a0e`
+**Commit initial examiné:** `3b43c9f2fba48b98dc7c109365624eac74cf7a0e`
 
-**Verdict:** `FAIL`
+**Verdict initial (R1):** `FAIL` — remplacé par la re-revue R2 ci-dessous.
 
-**Constats:** 0 `BLOCKER`, 1 `HIGH`, 1 `MEDIUM` (6 `LOW`; dont 1 `REJECTED`).
+**Verdict final (R2):** `FAIL`
+
+**Constats R1:** 0 `BLOCKER`, 1 `HIGH`, 1 `MEDIUM` (6 `LOW`; dont 1 `REJECTED`).
 
 Revue en lecture seule du commit avec ses sources réelles. Les décisions et le
 registre demandés ont été lus dans le worktree d’intégration
@@ -144,3 +146,127 @@ fakes en mémoire de `backend/tests/test_invariant_proposals.py:205-284,372-394`
 **UNKNOWN:** valeur d’environnement réellement déployée, profils runtime actifs et
 route provider effective; aucun répertoire runtime/secret n’a été inspecté.
 **Coût:** UNKNOWN.
+
+## Re-revue après 0194648
+
+**Delta examiné:** `3b43c9f2fba48b98dc7c109365624eac74cf7a0e..01946483dba171a3c468c1b14c8ea8ae0b8931d1`.
+Le correctif ferme plusieurs constats R1, mais un chemin de divulgation reste
+hors de la nouvelle agrégation. Verdict final R2 : **`FAIL` — 1 HIGH, 0 MEDIUM, 6 LOW**.
+
+### Constats reclassés
+
+1. **[CONFIRMED] [HIGH] La garde agrège les Samples, pas la politique des Sources des claims envoyés à P10.**
+
+   La nouvelle garde refuse correctement la politique calculée avant rejeu,
+   sélection de route et ajout de tour (`backend/src/cti_app/application/invariant_proposals.py:171-176,184-188,256-276`).
+   Cette politique est toutefois calculée uniquement à partir des Samples
+   d’origine retenus (`:474-487,520-531`; agrégation à
+   `backend/src/cti_app/domain/classification.py:39-47`). En parallèle, P10
+   charge tous les claims du sujet sans joindre leur SourceDocument
+   (`invariant_proposals.py:399-403`; dépôt
+   `backend/src/cti_app/infrastructure/database/repositories/collection.py:185-191`),
+   les insère dans le snapshot (`invariant_proposals.py:579-582`) et les rend
+   dans le prompt (`:1079-1093`). Un Claim porte un `source_document_id`
+   (`backend/src/cti_app/domain/collection.py:559-573`) et chaque SourceDocument
+   a ses propres `tlp`, `do_not_submit` et `external_llm_allowed`
+   (`backend/src/cti_app/domain/entities.py:67-76`). Aucun contrôle P10 ne
+   récupère ni n’agrège cette politique de source.
+
+   Donc un Sample vert autorisé peut faire passer la garde tandis qu’un claim
+   issu d’une source RED, `do_not_submit` ou interdite au modèle est tout de
+   même inclus dans la requête externe. Avec le plafond de développement élevé,
+   davantage de ces faits peuvent tenir dans le prompt. Le test d’agrégation
+   élève le plafond et couvre les seuls champs du Sample (`backend/tests/test_limits_mission01.py:173-203`);
+   le faux dépôt de claims ne fournit aucun état de politique de source
+   (`backend/tests/test_invariant_proposals.py:123-126`). Il manque un refus
+   avant transport pour un claim dont la SourceDocument est restrictive.
+
+   **Action requise:** inclure la politique de chaque source de contenu rendu
+   dans l’admission P10, ou exclure/refuser les claims dont la politique ne
+   permet pas cette soumission, puis tester zéro routage/transport. Ce défaut
+   laisse un chemin de divulgation provider non couvert et empêche de déclarer
+   le correctif sûr.
+
+2. **[CONFIRMED] [LOW] L’override est confiné, avec un cas de configuration fail-closed distinct du défaut.**
+
+   La construction du service capture la limite (`invariant_proposals.py:145`).
+   Sans `AUTOWORK_DEV_LIMITS_ENABLED=1`, toute valeur de plafond est ignorée et
+   96 000 s’applique (`:970-972`; test `backend/tests/test_limits_mission01.py:150-160`).
+   L’override nécessite aussi `APP_ENV=development`; le plafond est alors
+   limité à 1 048 576 (`:973-988`). Compose et `.env.example` n’injectent plus
+   la variable (`compose.yaml:126-133`, `.env.example:54-67`), et la doc active
+   décrit les deux conditions (`docs/model_conversations.md:74-81`).
+
+   Nuance vérifiée : avec le drapeau exactement égal à `1` mais un autre
+   `APP_ENV`, le constructeur lève une `ProposalContractError` (`:973-974`,
+   test `test_limits_mission01.py:163-170`) au lieu de retomber sur 96 000.
+   Cela ne permet pas d’élargir le prompt, mais une configuration résiduelle
+   du drapeau peut rendre P10 indisponible à sa construction.
+
+3. **[CONFIRMED] [LOW] La validation stricte et les frontières demandées sont réparées.**
+
+   La regex n’accepte que les décimaux canoniques positifs ASCII et la plage
+   est contrôlée à la construction (`invariant_proposals.py:975-988,145`).
+   Les tests refusent `""`, `0`, `-1`, `1_000`, `+5`, espaces, `1.5` et
+   `1048577` (`test_limits_mission01.py:134-147`). La valeur max exacte
+   `1048576` est acceptée; max+1 est refusé explicitement avant ajout de tour
+   ou appel fournisseur (`:97-131`). Le défaut garde N−1/N/N+1 en octets UTF-8
+   et refuse sans troncature (`:41-95`; code `invariant_proposals.py:1036-1045`).
+
+4. **[PLAUSIBLE] [LOW] L’estimation d’environ 5 MiB ne borne pas le pic de rendu complet.**
+
+   À 1 MiB UTF-8 maximum, l’ordre de grandeur est raisonnable pour la seule
+   chaîne prompt (jusqu’à environ 4 MiB si les caractères sont stockés sur
+   quatre octets dans CPython) et son buffer d’encodage de 1 MiB
+   (`invariant_proposals.py:959-962,1012-1036`). `facts` et les chaînes
+   intermédiaires peuvent aussi être vivants pendant la concaténation; le
+   commentaire exclut le snapshot mais ne quantifie pas ces intermédiaires.
+   C’est une estimation limitée, pas une borne mémoire du rendu total.
+
+5. **[REJECTED] [LOW] Le delta n’affaiblit pas les protections existantes de G2, TLP ou du routage.**
+
+   La garde de Sample est ajoutée avant rejeu/routage/transport; les contrôles
+   de sortie et de passage par P09 ne sont pas changés dans le delta. Le test
+   G2 existant reste présent (`test_limits_mission01.py:239-253`). Le test
+   élevé couvre la combinaison Sample `external_llm_allowed=True` et
+   `do_not_submit=True`, puis TLP RED, sans transport/prompt/conversation/pivot
+   (`test_limits_mission01.py:173-203`); le chemin Sample correspond à celui
+   produit par l’acquisition (`backend/src/cti_app/application/sample_acquisition.py:572-588`).
+   Les attentes de routage local mises à jour renforcent le refus lorsque
+   `external_llm_allowed` est faux (`test_invariant_proposals.py:448-459,779-786`).
+   Une révocation bloque aussi le rejeu avant transport (`:684-698`).
+   Cette conclusion ne neutralise pas le chemin de divulgation par claims au
+   constat 1.
+
+6. **[CONFIRMED] [LOW] L06 et les mentions Advisor restent propres.**
+
+   Le delta retire encore l’injection P10 de Compose et `.env.example`;
+   aucune occurrence active des deux variables Advisor retirées ni de
+   « advisor max 100 » n’a été trouvée dans le code, les scripts, Compose ou
+   les docs actives. Les références restantes aux anciens réglages sont des
+   tests/explications de retrait; le changement documentaire P10 se limite
+   à `docs/model_conversations.md:74-81`.
+
+7. **[PLAUSIBLE] [LOW] Le changement reste simple, avec une petite divergence de style.**
+
+   La validation est un helper borné et lisible; `os.getenv` direct reste
+   cohérent avec des usages directs existants mais diverge du `Settings`
+   central. Pas de machinerie inutile ni d’élargissement de périmètre détecté
+   dans le delta de six fichiers.
+
+### Exécution R2
+
+Les commandes ont été exécutées sur une archive du commit cible
+`01946483dba171a3c468c1b14c8ea8ae0b8931d1` sous `/tmp`, avec le `.venv`
+validé du worktree de l’implémenteur. Aucun symlink `.autowork-runs` n’était
+nécessaire. Les tests utilisent des fakes en mémoire; aucun fournisseur,
+PostgreSQL, Docker ou réseau n’a été contacté.
+
+- `PYTHONPATH=$PWD/src .venv/bin/python -m pytest tests/test_limits_mission01.py tests/test_invariant_proposals.py -q --tb=short` — **58 passed** en 1,13 s.
+- `.venv/bin/ruff check --no-cache src/cti_app/application/invariant_proposals.py tests/test_limits_mission01.py tests/test_invariant_proposals.py` — **All checks passed**.
+- Aucun test n’exerce un Claim relié à une SourceDocument restrictive; ce cas est le bloqueur non couvert décrit au constat 1.
+
+**UNKNOWN:** politiques des Sources et variables d’environnement effectivement
+présentes dans les déploiements; l’utilisation runtime réelle de P10 et le
+provider configuré. Aucun provider ou profil runtime n’a été inspecté.
+**Coût R2:** UNKNOWN.
