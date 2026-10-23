@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, is_dataclass
@@ -943,31 +942,7 @@ def _render_prompt(snapshot: ProposalInputSnapshot) -> str:
     return _render_p10_prompt(snapshot)[0]
 
 
-# The source snapshot is bounded to 200,000 characters. A 1 MiB UTF-8 prompt
-# cap leaves room for the worst-case four-byte encoding and prompt framing,
-# while keeping the prompt string plus its UTF-8 size-check buffer to about
-# 5 MiB at most (excluding the separately bounded snapshot).
 _MAX_P10_PROMPT_BYTES = 96_000
-_MAX_DEV_P10_PROMPT_BYTES = 1_048_576
-_DEV_P10_PROMPT_BYTES_ENV = "AUTOWORK_DEV_P10_MAX_PROMPT_BYTES"
-
-
-def _p10_prompt_max_bytes() -> int:
-    configured = os.getenv(_DEV_P10_PROMPT_BYTES_ENV)
-    if configured is None:
-        return _MAX_P10_PROMPT_BYTES
-    try:
-        limit = int(configured, 10)
-    except ValueError as exc:
-        raise ProposalContractError(
-            f"{_DEV_P10_PROMPT_BYTES_ENV} must be an integer between 1 and "
-            f"{_MAX_DEV_P10_PROMPT_BYTES}"
-        ) from exc
-    if not 1 <= limit <= _MAX_DEV_P10_PROMPT_BYTES:
-        raise ProposalContractError(
-            f"{_DEV_P10_PROMPT_BYTES_ENV} must be between 1 and {_MAX_DEV_P10_PROMPT_BYTES}"
-        )
-    return limit
 
 
 def _render_p10_prompt(snapshot: ProposalInputSnapshot) -> tuple[str, dict[str, str]]:
@@ -1011,12 +986,9 @@ def _render_p10_prompt(snapshot: ProposalInputSnapshot) -> tuple[str, dict[str, 
         "END_P10_FACTS\n"
         "Do not include raw bytes, secrets, signed URLs, or executable YARA code."
     )
-    prompt_bytes = len(prompt.encode("utf-8"))
-    max_prompt_bytes = _p10_prompt_max_bytes()
-    if prompt_bytes > max_prompt_bytes:
+    if len(prompt.encode("utf-8")) > _MAX_P10_PROMPT_BYTES:
         raise ProposalContractError(
-            f"P10 prompt is {prompt_bytes} UTF-8 bytes; configured per-turn bound is "
-            f"{max_prompt_bytes} bytes"
+            "The compact P10 prompt exceeds its configured 96000-byte per-turn bound"
         )
     return prompt, {alias: ref for ref, alias in alias_by_ref.items()}
 

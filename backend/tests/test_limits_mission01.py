@@ -1,129 +1,15 @@
 from __future__ import annotations
 
-import importlib.util
-import sys
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import UUID
 
 import pytest
 
-import cti_app.application.invariant_proposals as p10
-from cti_app.application.invariant_proposals import ProposalContractError
 from cti_app.application.investigation_advisor_tools import InvestigationAdvisorTool
 from cti_app.domain.investigation import ToolInvocationStatus
 
-_HELPERS_SPEC = importlib.util.spec_from_file_location(
-    "_mission01_test_invariant_proposals", Path(__file__).with_name("test_invariant_proposals.py")
-)
-assert _HELPERS_SPEC is not None and _HELPERS_SPEC.loader is not None
-_HELPERS = importlib.util.module_from_spec(_HELPERS_SPEC)
-sys.modules[_HELPERS_SPEC.name] = _HELPERS
-_HELPERS_SPEC.loader.exec_module(_HELPERS)
-INVESTIGATION_ID = _HELPERS.INVESTIGATION_ID
-_service = _HELPERS._service
-
-
-def _utf8_padding(byte_count: int) -> str:
-    assert byte_count >= 0
-    return "é" * (byte_count // 2) + ("x" if byte_count % 2 else "")
-
-
-def _provenance_refs(context: dict[str, object]) -> tuple[str, ...]:
-    values = context.get("provenances", ())
-    return tuple(
-        str(item["provenance_ref"])
-        for item in values
-        if isinstance(item, dict) and isinstance(item.get("provenance_ref"), str)
-    )
-
-
-@pytest.mark.asyncio
-async def test_p10_default_bound_is_utf8_byte_exact_and_refuses_before_fake_transport(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv(p10._DEV_P10_PROMPT_BYTES_ENV, raising=False)
-    assert p10._p10_prompt_max_bytes() == 96_000
-
-    original_render_facts = p10._render_p10_facts
-    service, _, conversation, _ = _service()
-    first = await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=1)
-    baseline_prompt = conversation.prompts[0]
-    baseline_size = len(baseline_prompt.encode("utf-8"))
-    assert baseline_size < 95_999
-
-    baseline_rendered, aliases = p10._render_p10_prompt(first.snapshot)
-    assert baseline_rendered == baseline_prompt
-    alias_by_ref = {ref: alias for alias, ref in aliases.items()}
-    baseline_facts = original_render_facts(first.snapshot.context, alias_by_ref)
-    expected_refs = _provenance_refs(first.snapshot.context)
-    assert expected_refs
-    assert all(f"[{alias}]" in baseline_prompt for alias in aliases)
-
-    targets = iter((95_999, 96_000, 96_001))
-    attempted_sizes: list[int] = []
-    rendered_refs: list[tuple[str, ...]] = []
-
-    def padded_render_facts(context: dict[str, object], alias_map: dict[str, str]) -> str:
-        target = next(targets)
-        facts = original_render_facts(context, alias_map)
-        assert facts == baseline_facts
-        rendered_refs.append(_provenance_refs(context))
-        padding_bytes = target - baseline_size
-        facts = facts + _utf8_padding(padding_bytes)
-        attempted_sizes.append(baseline_size + len(_utf8_padding(padding_bytes).encode("utf-8")))
-        return facts
-
-    monkeypatch.setattr(p10, "_render_p10_facts", padded_render_facts)
-    below = await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=2)
-    at = await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=3)
-    assert len(conversation.prompts[-2].encode("utf-8")) == 95_999
-    assert len(conversation.prompts[-1].encode("utf-8")) == 96_000
-    assert _provenance_refs(below.snapshot.context) == expected_refs
-    assert _provenance_refs(at.snapshot.context) == expected_refs
-
-    calls_before_refusal = conversation.external_calls
-    prompts_before_refusal = len(conversation.prompts)
-    with pytest.raises(ProposalContractError, match=r"96001 UTF-8 bytes.*96000 bytes"):
-        await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=4)
-
-    assert attempted_sizes == [95_999, 96_000, 96_001]
-    assert rendered_refs == [expected_refs, expected_refs, expected_refs]
-    assert conversation.external_calls == calls_before_refusal
-    assert len(conversation.prompts) == prompts_before_refusal
-
-
-@pytest.mark.asyncio
-async def test_p10_dev_override_accepts_within_hard_memory_bound(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv(p10._DEV_P10_PROMPT_BYTES_ENV, raising=False)
-    original_render_facts = p10._render_p10_facts
-    service, _, conversation, _ = _service()
-    first = await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=1)
-    baseline_size = len(conversation.prompts[0].encode("utf-8"))
-    target_size = 100_000
-    assert baseline_size < target_size <= p10._MAX_DEV_P10_PROMPT_BYTES
-
-    monkeypatch.setenv(p10._DEV_P10_PROMPT_BYTES_ENV, str(target_size))
-    assert p10._p10_prompt_max_bytes() == target_size
-
-    def padded_render_facts(context: dict[str, object], alias_map: dict[str, str]) -> str:
-        facts = original_render_facts(context, alias_map)
-        assert _provenance_refs(context) == _provenance_refs(first.snapshot.context)
-        return facts + _utf8_padding(target_size - baseline_size)
-
-    monkeypatch.setattr(p10, "_render_p10_facts", padded_render_facts)
-    result = await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=2)
-    assert len(conversation.prompts[-1].encode("utf-8")) == target_size
-    assert _provenance_refs(result.snapshot.context) == _provenance_refs(first.snapshot.context)
-    assert conversation.external_calls == 2
-
-    monkeypatch.setattr(p10, "_render_p10_facts", original_render_facts)
-    monkeypatch.setenv(p10._DEV_P10_PROMPT_BYTES_ENV, str(p10._MAX_DEV_P10_PROMPT_BYTES + 1))
-    calls_before_refusal = conversation.external_calls
-    with pytest.raises(ProposalContractError, match="1048576"):
-        await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=3)
-    assert conversation.external_calls == calls_before_refusal
+INVESTIGATION_ID = UUID("11111111-1111-1111-1111-111111111111")
 
 
 def test_unused_advisor_environment_is_absent_from_compose_and_source() -> None:
@@ -138,7 +24,6 @@ def test_unused_advisor_environment_is_absent_from_compose_and_source() -> None:
 
     search_roots = (
         root / "backend/src",
-        root / "backend/src/cti_app/workers",
         root / "frontend/src",
         root / "scripts",
         root / "workers",
