@@ -1876,7 +1876,7 @@ async def test_oversized_legacy_hex_measurement_is_rejected_before_prompt(
 @pytest.mark.asyncio
 async def test_oversized_generic_content_is_rejected_before_prompt() -> None:
     investigation_id = uuid4()
-    oversized_content = "41" * 16_384
+    oversized_content = "41!" * 6_000
     observation, raw = make_observation(
         investigation_id,
         {"schema": "generic-observation.v1", "content": oversized_content},
@@ -1900,7 +1900,7 @@ async def test_oversized_generic_content_is_rejected_before_prompt() -> None:
 
     assert result.status is ToolInvocationStatus.FAILED
     assert result.error_code == "advisor_input_invalid"
-    assert result.output["input_error_code"] == ("generic_content_excerpt_exceeds_16384_byte_limit")
+    assert result.output["input_error_code"] == "content_excerpt_budget_exceeds_16384_bytes"
     assert oversized_content not in repr(result.output)
     assert "dossier_text" not in result.output
     assert transport.calls == []
@@ -1909,8 +1909,8 @@ async def test_oversized_generic_content_is_rejected_before_prompt() -> None:
 @pytest.mark.asyncio
 async def test_aggregate_generic_content_list_is_rejected_before_prompt() -> None:
     investigation_id = uuid4()
-    first_content = "A" * 16_000
-    second_content = "B" * 16_000
+    first_content = "A!" * 7_953 + "A"
+    second_content = "B!" * 7_953 + "B"
     observation, raw = make_observation(
         investigation_id,
         {
@@ -1937,9 +1937,170 @@ async def test_aggregate_generic_content_list_is_rejected_before_prompt() -> Non
 
     assert result.status is ToolInvocationStatus.FAILED
     assert result.error_code == "advisor_input_invalid"
-    assert result.output["input_error_code"] == ("generic_content_excerpt_exceeds_16384_byte_limit")
+    assert result.output["input_error_code"] == "content_excerpt_budget_exceeds_16384_bytes"
+    assert [dict(item) for item in result.output["omitted_evidence"]] == [
+        {
+            "kind": "observation",
+            "id": str(observation.id),
+            "status": "INTENTIONALLY_OMITTED",
+            "reason": "content_excerpt_budget_exceeds_16384_bytes",
+        }
+    ]
     assert first_content not in repr(result.output)
     assert second_content not in repr(result.output)
+    assert "dossier_text" not in result.output
+    assert transport.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("nested", [False, True], ids=["neutral-list", "nested-neutral-list"])
+async def test_aggregate_neutral_content_list_is_rejected_before_prompt(nested: bool) -> None:
+    investigation_id = uuid4()
+    first_content = "A!" * 7_953 + "A"
+    second_content = "B!" * 7_953 + "B"
+    content = (
+        {"outer": {"items": [[first_content], {"leaf": [second_content]}]}}
+        if nested
+        else {"neutral": [first_content, second_content]}
+    )
+    observation, raw = make_observation(
+        investigation_id,
+        {"schema": "generic-observation.v1", **content},
+    )
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    tool, _sample_blob = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Review both synthetic markers from this observation.",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, key=f"operator:advisor:aggregate-neutral-list:{nested}"),
+    )
+
+    assert result.status is ToolInvocationStatus.FAILED
+    assert result.error_code == "advisor_input_invalid"
+    assert result.output["input_error_code"] == "content_excerpt_budget_exceeds_16384_bytes"
+    assert [dict(item) for item in result.output["omitted_evidence"]] == [
+        {
+            "kind": "observation",
+            "id": str(observation.id),
+            "status": "INTENTIONALLY_OMITTED",
+            "reason": "content_excerpt_budget_exceeds_16384_bytes",
+        }
+    ]
+    assert first_content not in repr(result.output)
+    assert second_content not in repr(result.output)
+    assert "dossier_text" not in result.output
+    assert transport.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "raw_size", "strip_padding"),
+    [
+        ("content", 600, False),
+        ("content", 514, True),
+        ("strings", 600, False),
+        ("strings", 514, True),
+    ],
+    ids=["content-padded", "content-unpadded", "strings-padded", "strings-unpadded"],
+)
+async def test_oversized_generic_base64_is_rejected_before_prompt(
+    field: str, raw_size: int, strip_padding: bool
+) -> None:
+    investigation_id = uuid4()
+    encoded_content = base64.b64encode(b"A" * raw_size).decode("ascii")
+    if strip_padding:
+        encoded_content = encoded_content.rstrip("=")
+    field_value: Any = (
+        encoded_content
+        if field == "content"
+        else [{"value": encoded_content, "encoding": "base64"}]
+    )
+    observation, raw = make_observation(
+        investigation_id,
+        {"schema": "generic-observation.v1", field: field_value},
+    )
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    tool, _sample_blob = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Review this encoded synthetic content.",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, key=f"operator:advisor:generic-base64:{field}"),
+    )
+
+    assert result.status is ToolInvocationStatus.FAILED
+    assert result.error_code == "advisor_input_invalid"
+    assert result.output["input_error_code"] == "base64_content_exceeds_512_byte_decoded_limit"
+    assert [dict(item) for item in result.output["omitted_evidence"]] == [
+        {
+            "kind": "observation",
+            "id": str(observation.id),
+            "status": "INTENTIONALLY_OMITTED",
+            "reason": "base64_content_exceeds_512_byte_decoded_limit",
+        }
+    ]
+    assert encoded_content not in repr(result.output)
+    assert "dossier_text" not in result.output
+    assert transport.calls == []
+
+
+@pytest.mark.asyncio
+async def test_oversized_method_title_is_rejected_before_prompt() -> None:
+    investigation_id = uuid4()
+    oversized_name = "X" * 20_000
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "generic-observation.v1",
+            "methods": [{"name": oversized_name, "body": "short synthetic method body"}],
+        },
+    )
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    tool, _sample_blob = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Review this synthetic method.",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, key="operator:advisor:oversized-method-title"),
+    )
+
+    assert result.status is ToolInvocationStatus.FAILED
+    assert result.error_code == "advisor_input_invalid"
+    assert result.output["input_error_code"] == "content_excerpt_budget_exceeds_16384_bytes"
+    assert [dict(item) for item in result.output["omitted_evidence"]] == [
+        {
+            "kind": "observation",
+            "id": str(observation.id),
+            "status": "INTENTIONALLY_OMITTED",
+            "reason": "content_excerpt_budget_exceeds_16384_bytes",
+        }
+    ]
+    assert oversized_name not in repr(result.output)
     assert "dossier_text" not in result.output
     assert transport.calls == []
 

@@ -8,6 +8,7 @@ import pytest
 
 from cti_app.application.advisor_dossier import (
     AdvisorDossier,
+    ContentExcerptLimitExceeded,
     build_advisor_dossier,
     evaluate_advisor_evidence_preflight,
 )
@@ -442,6 +443,34 @@ def test_short_generic_content_excerpt_is_preserved() -> None:
     assert any(row["kind"] == "text" and row["text"] == short_content for row in projected)
 
 
+def test_dossier_applies_excerpt_budget_across_observations() -> None:
+    evidence = [
+        {
+            "evidence_id": str(uuid4()),
+            "sha256": marker * 64,
+            "source": "synthetic.fixture",
+            "object_type": "observation",
+            "blob_read_verified": True,
+            "content_excerpts": [
+                {
+                    "kind": "text",
+                    "title": "Synthetic marker",
+                    "text": f"synthetic marker {marker * 9_000}",
+                }
+            ],
+        }
+        for marker in ("a", "b")
+    ]
+    data = _planning_data(
+        question="Include both synthetic markers.", evidence=evidence, findings=[]
+    )
+
+    with pytest.raises(ContentExcerptLimitExceeded) as exc:
+        build_advisor_dossier(data)
+
+    assert exc.value.reason_code == "dossier_content_excerpt_budget_exceeds_16384_bytes"
+
+
 def test_decoded_hex_ioc_is_not_mistaken_for_raw_bytes() -> None:
     from cti_app.application.advisor_dossier import extract_content_excerpts
 
@@ -491,34 +520,22 @@ def test_pre_submission_failure_does_not_mark_proof_as_sent() -> None:
 @pytest.mark.asyncio
 async def test_large_dossier_crosses_bridge_file_threshold_without_omission() -> None:
     body = "SYNTHETIC_ONLY " + ("proof-marker " * 17_000)
-    evidence_id = str(uuid4())
-    evidence_sha = hashlib.sha256(b"synthetic canonical observation").hexdigest()
+    article_sha = hashlib.sha256(b"synthetic canonical article").hexdigest()
+    article_ref = f"article:{article_sha}"
     data: dict[str, Any] = {
         "consultation_type": "draft_text",
         "question": "proof-marker",
-        "evidence": [
-            {
-                "evidence_id": evidence_id,
-                "sha256": evidence_sha,
-                "source": "synthetic.fixture",
-                "object_type": "observation",
-                "content_excerpts": [{"kind": "text", "title": "Synthetic proof", "text": body}],
-            }
-        ],
+        "article_source_ref": article_ref,
+        "article_sha256": article_sha,
+        "article_passages": [{"claim_id": "S1P1", "heading": "Synthetic proof", "text": body}],
     }
     dossier = build_advisor_dossier(data)
     manifest = dossier.manifest[0]
-    expected_body = "Synthetic proof:\n" + "\n".join(
-        f"| {line}" for line in body.strip().splitlines()
-    )
+    expected_body = body.strip()
     assert dossier.byte_size > 200_000
     assert manifest["body_bytes"] == len(expected_body.encode("utf-8"))
     assert manifest["body_sha256"] == hashlib.sha256(expected_body.encode("utf-8")).hexdigest()
-    assert manifest["source_ref"] == {
-        "kind": "observation",
-        "id": evidence_id,
-        "sha256": evidence_sha,
-    }
+    assert manifest["source_ref"] == article_ref
 
     data.update(
         dossier_text=dossier.text,

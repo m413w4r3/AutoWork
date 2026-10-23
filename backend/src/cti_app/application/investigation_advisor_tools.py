@@ -321,7 +321,10 @@ class InvestigationAdvisorTool:
                     reason="secret_field_remaining",
                     redacted_secret_count=redacted_secret_count,
                 )
-            dossier = build_advisor_dossier(prompt_data)
+            try:
+                dossier = build_advisor_dossier(prompt_data)
+            except ContentExcerptLimitExceeded as exc:
+                raise _AdvisorInputValidationError(exc.reason_code) from None
             prompt_data["dossier_manifest"] = [dict(item) for item in dossier.manifest]
             prompt_data["dossier_text"] = dossier.text
             prompt_data["dossier_sha256"] = dossier.sha256
@@ -1138,6 +1141,26 @@ class InvestigationAdvisorTool:
         measurement_errors: tuple[dict[str, int | str], ...] = (),
     ) -> ToolResult:
         """Record a safe, definitive local rejection before any Bridge transport."""
+        content_omission_codes = {
+            "content_excerpt_budget_exceeds_16384_bytes",
+            "dossier_content_excerpt_budget_exceeds_16384_bytes",
+            "base64_content_exceeds_512_byte_decoded_limit",
+            "declared_base64_content_is_invalid",
+            "raw_hexdump_content_rejected",
+        }
+        omitted_evidence = (
+            [
+                {
+                    "kind": "observation",
+                    "id": str(reference),
+                    "status": "INTENTIONALLY_OMITTED",
+                    "reason": reason_code,
+                }
+                for reference in observation_refs
+            ]
+            if reason_code in content_omission_codes
+            else []
+        )
         message = (
             "Advisor input rejected before Bridge submission: "
             + "; ".join(
@@ -1158,6 +1181,7 @@ class InvestigationAdvisorTool:
                 "confirmed_non_execution": True,
                 "invocation_stage": "prevalidation",
                 "bridge_turns_consumed": 0,
+                **({"omitted_evidence": omitted_evidence} if omitted_evidence else {}),
                 **({"measurement_errors": list(measurement_errors)} if measurement_errors else {}),
                 "bridge_invocation_id": None,
                 "provider_usage": {"status": "not_submitted"},
