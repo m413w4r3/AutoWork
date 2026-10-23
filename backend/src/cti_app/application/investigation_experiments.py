@@ -63,7 +63,19 @@ _UUID_SCHEMA = {
 }
 _SHA256_SCHEMA = {"type": "string", "pattern": r"^[0-9a-f]{64}$"}
 _SAFE_SOURCE_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
-_SAFE_TIMELINE_REFERENCE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+_SAFE_ARTICLE_CLAIM_ID = re.compile(
+    r"^(?:C[1-9][0-9]{0,5}|T[1-9][0-9]{0,5}|"
+    r"S[1-9][0-9]{0,5}P[1-9][0-9]{0,5}(?:\.[1-9][0-9]{0,5})?|"
+    r"claim:[a-z0-9]+(?:-[a-z0-9]+)*|fixture:C[1-9][0-9]{0,5})$"
+)
+_SAFE_TOOL_NAME = re.compile(r"^[a-z][a-z0-9]{0,31}(?:[._-][a-z0-9]{1,31}){1,8}$")
+_SAFE_TOOL_VERSION = re.compile(
+    r"^(?:v?\d+(?:\.\d+){0,3}(?:[-+][A-Za-z0-9.-]{1,24})?|"
+    r"[A-Za-z][A-Za-z0-9]{0,23}-\d+(?:\.\d+){0,3})$"
+)
+_SAFE_TOOL_SCHEMA_VERSION = re.compile(
+    r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*\.v[1-9][0-9]{0,3}$"
+)
 _SHA256_REFERENCE = re.compile(r"^[0-9a-f]{64}$")
 _CANONICAL_UUID_REFERENCE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
@@ -174,10 +186,15 @@ def project_safe_investigation_experiment_timeline(
     redaction is an additional guard; it does not detect encoded sample bodies.
     """
     projected = copy.deepcopy(dict(payload))
+    projected["investigation_id"] = _redact_untrusted_identifier(
+        projected.get("investigation_id"), _is_canonical_uuid_reference
+    )
     strategy_claims = {
         str(item.get("claim_id")): str(item.get("status", "UNKNOWN"))
         for item in (strategy or {}).get("claims", ())
-        if isinstance(item, Mapping) and item.get("claim_id") is not None
+        if isinstance(item, Mapping)
+        and isinstance(item.get("claim_id"), str)
+        and _SAFE_ARTICLE_CLAIM_ID.fullmatch(item["claim_id"])
     }
     status_projection = {
         "supported": "supported",
@@ -187,11 +204,40 @@ def project_safe_investigation_experiment_timeline(
     for claim in projected.get("claims", ()):
         if not isinstance(claim, dict):
             continue
+        claim_id = claim.get("claim_id")
+        if not isinstance(claim_id, str) or not _SAFE_ARTICLE_CLAIM_ID.fullmatch(claim_id):
+            claim["claim_id"] = "[redacted]"
         strategy_status = strategy_claims.get(str(claim.get("claim_id")), "UNKNOWN")
         claim["status"] = status_projection.get(strategy_status, "inconclusive")
+        claim["verdict_assertion_labels"] = [
+            label
+            for verdict in _bounded_sequence(claim.get("verdicts"), limit=16)
+            if (label := _verdict_assertion_label(verdict)) is not None
+        ]
+        claim["experiment_ids"] = _project_identifier_array(
+            claim.get("experiment_ids"), _is_canonical_uuid_reference, limit=256
+        )
+        claim["superseded_by"] = _project_identifier_array(
+            claim.get("superseded_by"), _is_canonical_uuid_reference, limit=256
+        )
+        safe_scopes = []
         for scope in claim.get("scopes", ()):
             if isinstance(scope, dict):
                 scope["scope"] = "[redacted]"
+                scope["experiment_id"] = _redact_untrusted_identifier(
+                    scope.get("experiment_id"), _is_canonical_uuid_reference
+                )
+                scope["observation_ids"] = _project_identifier_array(
+                    scope.get("observation_ids"), _is_canonical_uuid_reference, limit=128
+                )
+                scope["superseded_by"] = _project_identifier_array(
+                    scope.get("superseded_by"), _is_canonical_uuid_reference, limit=256
+                )
+                scope["verdict_assertion_label"] = _verdict_assertion_label(
+                    scope.get("verdict")
+                )
+                safe_scopes.append(scope)
+        claim["scopes"] = safe_scopes
 
     free_text_fields = (
         "prediction",
@@ -205,32 +251,60 @@ def project_safe_investigation_experiment_timeline(
     for experiment in projected.get("experiments", ()):
         if not isinstance(experiment, dict):
             continue
+        experiment["id"] = _redact_untrusted_identifier(
+            experiment.get("id"), _is_canonical_uuid_reference
+        )
+        experiment["investigation_id"] = _redact_untrusted_identifier(
+            experiment.get("investigation_id"), _is_canonical_uuid_reference
+        )
         for field_name in free_text_fields:
             experiment[field_name] = "[redacted]" if experiment.get(field_name) else ""
         experiment["preconditions"] = []
         experiment["limitations"] = []
-        for field_name in (
-            "input_type",
-            "tool_name",
-            "tool_version",
-            "tool_schema_version",
-            "author",
-            "origin",
-        ):
+        for field_name in ("input_type", "tool_name", "tool_version", "tool_schema_version"):
             value = experiment.get(field_name)
-            if not isinstance(value, str) or not _SAFE_TIMELINE_REFERENCE.fullmatch(value):
+            safe_value = (
+                field_name == "input_type"
+                and isinstance(value, str)
+                and value in _SAFE_EXPERIMENT_INPUT_TYPES
+            ) or (
+                field_name == "tool_name"
+                and isinstance(value, str)
+                and _SAFE_TOOL_NAME.fullmatch(value) is not None
+            ) or (
+                field_name == "tool_version"
+                and isinstance(value, str)
+                and _SAFE_TOOL_VERSION.fullmatch(value) is not None
+            ) or (
+                field_name == "tool_schema_version"
+                and isinstance(value, str)
+                and _SAFE_TOOL_SCHEMA_VERSION.fullmatch(value) is not None
+            )
+            if not safe_value:
                 experiment[field_name] = "[redacted]"
-            elif field_name == "input_type" and value not in _SAFE_EXPERIMENT_INPUT_TYPES:
-                experiment[field_name] = "[redacted]"
-        experiment["claim_ids"] = [
-            item
-            if isinstance(item, str) and _SAFE_TIMELINE_REFERENCE.fullmatch(item)
+        experiment["author"] = (
+            experiment["author"]
+            if experiment.get("author") == "operator-led"
             else "[redacted]"
-            for item in experiment.get("claim_ids", ())
+        )
+        experiment["origin"] = (
+            experiment["origin"]
+            if experiment.get("origin") == EXPERIMENT_RECORD_TOOL
+            else "[redacted]"
+        )
+        raw_claim_ids = experiment.get("claim_ids")
+        safe_claim_ids = [
+            item
+            if isinstance(item, str) and _SAFE_ARTICLE_CLAIM_ID.fullmatch(item)
+            else "[redacted]"
+            for item in _bounded_sequence(raw_claim_ids, limit=128)
         ]
+        if isinstance(raw_claim_ids, (tuple, list)) and len(raw_claim_ids) > 128:
+            safe_claim_ids.append("[redacted]")
+        experiment["claim_ids"] = safe_claim_ids
         hypothesis_id = experiment.get("hypothesis_id")
-        if not isinstance(hypothesis_id, str) or not _SAFE_TIMELINE_REFERENCE.fullmatch(
-            hypothesis_id
+        if not isinstance(hypothesis_id, str) or not re.fullmatch(
+            HYPOTHESIS_ID_PATTERN, hypothesis_id
         ):
             experiment["hypothesis_id"] = "[redacted]"
         # No arbitrary scalars: byte arrays can be encoded as integers or booleans.
@@ -238,19 +312,130 @@ def project_safe_investigation_experiment_timeline(
         experiment["input_refs"] = _safe_experiment_input_references(
             experiment.get("input_refs")
         )
-        experiment["next_pivots"] = [
-            item
-            for item in experiment.get("next_pivots", ())
-            if isinstance(item, str) and _SHA256_REFERENCE.fullmatch(item)
-        ]
-        experiment["step_ids"] = [
-            item
-            for item in experiment.get("step_ids", ())
-            if isinstance(item, str) and _SAFE_TIMELINE_REFERENCE.fullmatch(item)
-        ]
+        experiment["next_pivots"] = _project_identifier_array(
+            experiment.get("next_pivots"), _is_canonical_sha256_reference, limit=128
+        )
+        # The persisted step_ids contract has no canonical identifier grammar.
+        # Only UUID/SHA references are reflected; other values get an explicit marker.
+        experiment["step_ids"] = _project_identifier_array(
+            experiment.get("step_ids"), _is_canonical_reference, limit=64
+        )
+        experiment["supersedes_experiment_ids"] = _project_identifier_array(
+            experiment.get("supersedes_experiment_ids"),
+            _is_canonical_uuid_reference,
+            limit=64,
+        )
+        experiment["superseded_by"] = _project_identifier_array(
+            experiment.get("superseded_by"), _is_canonical_uuid_reference, limit=256
+        )
+        experiment["tool_invocation_refs"] = _safe_experiment_invocation_references(
+            experiment.get("tool_invocation_refs")
+        )
+        experiment["observation_refs"] = _safe_experiment_observation_references(
+            experiment.get("observation_refs")
+        )
+        experiment["verdict_assertion_label"] = _verdict_assertion_label(
+            experiment.get("verdict")
+        )
 
     redacted, _ = redact_operational_secrets(projected)
     return redacted if isinstance(redacted, dict) else projected
+
+
+def _bounded_sequence(value: Any, *, limit: int) -> tuple[Any, ...]:
+    if not isinstance(value, (tuple, list)):
+        return ()
+    return tuple(value[:limit])
+
+
+def _is_canonical_uuid_reference(value: Any) -> bool:
+    return isinstance(value, str) and _CANONICAL_UUID_REFERENCE.fullmatch(value) is not None
+
+
+def _is_canonical_sha256_reference(value: Any) -> bool:
+    return isinstance(value, str) and _SHA256_REFERENCE.fullmatch(value) is not None
+
+
+def _is_canonical_reference(value: Any) -> bool:
+    return _is_canonical_uuid_reference(value) or _is_canonical_sha256_reference(value)
+
+
+def _is_safe_hypothesis_id(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(HYPOTHESIS_ID_PATTERN, value) is not None
+
+
+def _is_safe_tool_name(value: Any) -> bool:
+    return isinstance(value, str) and _SAFE_TOOL_NAME.fullmatch(value) is not None
+
+
+def _redact_untrusted_identifier(value: Any, predicate: Any) -> Any:
+    return value if predicate(value) else "[redacted]"
+
+
+def _project_identifier_array(value: Any, predicate: Any, *, limit: int) -> list[Any]:
+    projected = [
+        item if predicate(item) else "[redacted]"
+        for item in _bounded_sequence(value, limit=limit)
+    ]
+    if isinstance(value, (tuple, list)) and len(value) > limit:
+        projected.append("[redacted]")
+    return projected
+
+
+def _safe_experiment_invocation_references(value: Any) -> list[dict[str, int | str]]:
+    result: list[dict[str, int | str]] = []
+    for item in _bounded_sequence(value, limit=64):
+        if not isinstance(item, Mapping):
+            continue
+        version = item.get("version")
+        safe_version = (
+            version
+            if isinstance(version, int)
+            and not isinstance(version, bool)
+            and 1 <= version <= 1_000_000
+            else "[redacted]"
+        )
+        result.append(
+            {
+                "invocation_id": _redact_untrusted_identifier(
+                    item.get("invocation_id"), _is_canonical_uuid_reference
+                ),
+                "version": safe_version,
+            }
+        )
+    if isinstance(value, (tuple, list)) and len(value) > 64:
+        result.append({"invocation_id": "[redacted]", "version": "[redacted]"})
+    return result
+
+
+def _safe_experiment_observation_references(value: Any) -> list[dict[str, str]]:
+    result: list[dict[str, str]] = []
+    for item in _bounded_sequence(value, limit=128):
+        if not isinstance(item, Mapping):
+            continue
+        sha256 = item.get("sha256")
+        safe_sha256 = (
+            sha256
+            if isinstance(sha256, str) and _is_canonical_sha256_reference(sha256)
+            else "[redacted]"
+        )
+        result.append(
+            {
+                "observation_id": _redact_untrusted_identifier(
+                    item.get("observation_id"), _is_canonical_uuid_reference
+                ),
+                "sha256": safe_sha256,
+            }
+        )
+    if isinstance(value, (tuple, list)) and len(value) > 128:
+        result.append({"observation_id": "[redacted]", "sha256": "[redacted]"})
+    return result
+
+
+def _verdict_assertion_label(value: Any) -> str | None:
+    if value == ExperimentVerdict.REFUTES.value:
+        return "Verdict enregistré : refutes (assertion, non conclusion)"
+    return None
 
 
 def _safe_experiment_input_references(value: Any) -> list[dict[str, str | None]]:
@@ -294,6 +479,8 @@ def _safe_experiment_input_references(value: Any) -> list[dict[str, str | None]]
                 "sha256": safe_sha256,
             }
         )
+    if len(value) > 64:
+        result.append({"input_type": "[redacted]", "input_id": "[redacted]", "sha256": None})
     return result
 
 
@@ -346,8 +533,17 @@ def build_investigation_strategy_projection(
         and re.fullmatch(r"[0-9a-f]{64}", snapshot_sha256) is not None
     )
     snapshot_claims = tuple(getattr(getattr(snapshot, "article", None), "claims", ()))
-    claims_by_id = {str(item.id): item for item in snapshot_claims if getattr(item, "id", None)}
-    declared_hypotheses = {str(item.id): item for item in hypotheses if getattr(item, "id", None)}
+    claims_by_id = {
+        str(item.id): item
+        for item in snapshot_claims
+        if isinstance(getattr(item, "id", None), str)
+        and _SAFE_ARTICLE_CLAIM_ID.fullmatch(item.id)
+    }
+    declared_hypotheses = {
+        str(item.id): item
+        for item in hypotheses
+        if _is_safe_hypothesis_id(getattr(item, "id", None))
+    }
     persisted_observations = {
         item.id: item
         for item in observations
@@ -366,7 +562,12 @@ def build_investigation_strategy_projection(
         item.investigation_id != investigation_id for item in experiments
     )
     claim_ids = set(claims_by_id)
-    claim_ids.update(claim_id for item in relevant_experiments for claim_id in item.claim_ids)
+    claim_ids.update(
+        claim_id
+        for item in relevant_experiments
+        for claim_id in item.claim_ids
+        if _SAFE_ARTICLE_CLAIM_ID.fullmatch(claim_id)
+    )
     matrix_claims: list[dict[str, Any]] = []
     for claim_id in sorted(claim_ids):
         claim = claims_by_id.get(claim_id)
@@ -414,9 +615,13 @@ def build_investigation_strategy_projection(
                     {
                         "id": str(item.id),
                         "version": item.version,
-                        "hypothesis_id": item.hypothesis_id,
+                        "hypothesis_id": _redact_untrusted_identifier(
+                            item.hypothesis_id, _is_safe_hypothesis_id
+                        ),
                         "hypothesis_declared": item.hypothesis_id in declared_hypotheses,
-                        "tool_name": item.tool_name,
+                        "tool_name": _redact_untrusted_identifier(
+                            item.tool_name, _is_safe_tool_name
+                        ),
                         "attempt_identity_sha256": hashlib.sha256(
                             canonical_json_bytes(
                                 {
@@ -463,7 +668,10 @@ def build_investigation_strategy_projection(
         },
         "foreign_experiments_ignored": foreign_experiment_count,
         "hypotheses": [
-            {"id": item.id, "status": getattr(item.status, "value", str(item.status))}
+            {
+                "id": _redact_untrusted_identifier(item.id, _is_safe_hypothesis_id),
+                "status": getattr(item.status, "value", str(item.status)),
+            }
             for item in hypotheses
             if getattr(item, "id", None) is not None
         ],
@@ -700,6 +908,7 @@ class OperatorExperimentToolAdapter:
             "experiment_id": str(saved.id),
             "version": saved.version,
             "verdict": saved.verdict.value,
+            "verdict_assertion_label": _verdict_assertion_label(saved.verdict.value),
             "claim_verdicts": [claims_by_id[item] for item in saved.claim_ids],
         }
         safe_output, _ = redact_operational_secrets(output)

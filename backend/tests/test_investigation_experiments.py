@@ -483,6 +483,7 @@ async def test_record_tool_requires_g2_and_persisted_investigation_observations(
         budget=budget,
         idempotency_key="record-observation-1",
     )
+    hostile_step_id = "deadbeef" * 16 + "OPERATOR_TEST_SECRET"
     arguments = {
         "expected_version": 0,
         "hypothesis_id": "hypothesis-network",
@@ -505,7 +506,7 @@ async def test_record_tool_requires_g2_and_persisted_investigation_observations(
         "tool_version": "4.4.1",
         "tool_schema_version": "network-capture-inspect.v1",
         "tool_arguments": {"byte_0": 77, "byte_1": 90, "byte_2": 0, "flag_0": True},
-        "step_ids": ["step-1"],
+        "step_ids": [hostile_step_id],
         "tool_invocation_refs": [],
         "observation_refs": [{"observation_id": str(observation_id), "sha256": "b" * 64}],
         "expected": "The marker is present.",
@@ -530,6 +531,14 @@ async def test_record_tool_requires_g2_and_persisted_investigation_observations(
     claim_verdict = saved.output["claim_verdicts"][0]
     assert claim_verdict["status"] == "inconclusive"
     assert claim_verdict["verdicts"] == ("refutes",)
+    assert claim_verdict["verdict_assertion_labels"] == (
+        "Verdict enregistré : refutes (assertion, non conclusion)",
+    )
+    assert saved.output["verdict"] == "refutes"
+    assert saved.output["verdict_assertion_label"] == (
+        "Verdict enregistré : refutes (assertion, non conclusion)"
+    )
+    assert hostile_step_id not in repr(saved.output)
     assert "OPERATOR_TEST_SECRET" not in repr(saved.output)
     listed = await _ExperimentListToolAdapter(experiments).execute({}, context)
     list_payload = listed.output
@@ -537,10 +546,15 @@ async def test_record_tool_requires_g2_and_persisted_investigation_observations(
     assert list_payload["claims"][0]["verdicts"] == ("refutes",)
     projected_experiment = list_payload["experiments"][0]
     assert projected_experiment["verdict"] == "refutes"
+    assert projected_experiment["verdict_assertion_label"] == (
+        "Verdict enregistré : refutes (assertion, non conclusion)"
+    )
+    assert projected_experiment["step_ids"] == ("[redacted]",)
     assert projected_experiment["falsification_criterion"] == "[redacted]"
     assert projected_experiment["actual"] == "[redacted]"
     assert projected_experiment["tool_arguments"] == {}
     assert "OPERATOR_TEST_SECRET" not in repr(list_payload)
+    assert hostile_step_id not in repr(list_payload)
     assert "deadbeef" * 16 not in repr(list_payload)
     assert projected_experiment["input_refs"] == (
         {"input_type": "sample_sha256", "input_id": "[redacted]", "sha256": None},

@@ -50,6 +50,7 @@ class _Experiment:
         self.hypothesis_id = "H1"
         self.version = version
         self.claim_ids = ("S3P3.1",)
+        self.next_pivots: tuple[str, ...] = ()
         self.verdict = verdict
         self.scope = f"Scope for experiment v{version}"
         self.observation_refs = observation_refs
@@ -58,9 +59,8 @@ class _Experiment:
         self.actual_outcome = actual_outcome
         self.observation_coverage = observation_coverage
         self.input_refs: tuple[ExperimentInputRefV1, ...] = ()
-        self.tool_name = "local.sample.inspect"
-        self.tool_version = "1.0.0"
-        self.tool_schema_version = "local-sample-inspect.v1"
+        self.step_ids: tuple[str, ...] = ()
+        self.tool_invocation_refs: tuple[object, ...] = ()
         self.method = "Inspect the persisted observation."
         self.prediction = "The claim is supported."
         self.expected = "Expected outcome."
@@ -71,6 +71,11 @@ class _Experiment:
         self.method_mode = SimpleNamespace(value="passive")
         self.falsification_criterion = "A complete observation contradicts the claim."
         self.tool_arguments = {}
+        self.tool_name = "network.capture.inspect"
+        self.tool_version = "1.0.0"
+        self.tool_schema_version = "network-capture-inspect.v1"
+        self.author = "operator-led"
+        self.origin = "experiment.record"
 
     def to_payload(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -78,7 +83,7 @@ class _Experiment:
             "id": str(self.id),
             "investigation_id": str(self.investigation_id),
             "version": self.version,
-            "hypothesis_id": "H1",
+            "hypothesis_id": self.hypothesis_id,
             "claim_ids": list(self.claim_ids),
             "working_state_version": 451,
             "g2_envelope_version": 3,
@@ -90,12 +95,15 @@ class _Experiment:
             "input_refs": [item.to_payload() for item in self.input_refs],
             "preconditions": list(self.preconditions),
             "availability": "available",
-            "tool_name": "network.capture.inspect",
-            "tool_version": "1.0.0",
-            "tool_schema_version": "network-capture-inspect.v1",
+            "tool_name": self.tool_name,
+            "tool_version": self.tool_version,
+            "tool_schema_version": self.tool_schema_version,
             "tool_arguments": self.tool_arguments,
-            "step_ids": [],
-            "tool_invocation_refs": [],
+            "step_ids": list(self.step_ids),
+            "tool_invocation_refs": [
+                item.to_payload() if hasattr(item, "to_payload") else item
+                for item in self.tool_invocation_refs
+            ],
             "observation_refs": [
                 {"observation_id": str(item.observation_id), "sha256": item.sha256}
                 for item in self.observation_refs
@@ -111,9 +119,9 @@ class _Experiment:
             "limitations": list(self.limitations),
             "verdict": self.verdict.value,
             "implication": self.implication,
-            "next_pivots": [],
-            "author": "operator-led",
-            "origin": "experiment.record",
+            "next_pivots": list(self.next_pivots),
+            "author": self.author,
+            "origin": self.origin,
         }
         if self.supersedes_experiment_ids:
             payload["supersedes_experiment_ids"] = [
@@ -464,6 +472,65 @@ def test_timeline_route_redacts_free_text_and_payload_arguments() -> None:
     assert projected["actual"] == "[redacted]"
     assert projected["scope"] == "[redacted]"
     assert payload["claims"][0]["scopes"][0]["scope"] == "[redacted]"
+
+
+def test_timeline_route_redacts_unvalidated_step_ids_and_labels_refutes_as_assertion() -> None:
+    hostile_step_id = "deadbeef" * 16 + "OPERATOR_TEST_SECRET"
+    experiment = _experiment(
+        experiment_id=NEW_EXPERIMENT_ID,
+        version=1,
+        verdict=ExperimentVerdict.REFUTES,
+    )
+    experiment.step_ids = (hostile_step_id,)
+    experiment.claim_ids = (hostile_step_id,)
+    experiment.next_pivots = (hostile_step_id,)
+    experiment.supersedes_experiment_ids = (hostile_step_id,)
+    experiment.tool_invocation_refs = ({"invocation_id": hostile_step_id, "version": 1},)
+    experiment.observation_refs = (
+        SimpleNamespace(observation_id=hostile_step_id, sha256=hostile_step_id),
+    )
+    experiment.hypothesis_id = hostile_step_id
+    experiment.tool_name = hostile_step_id
+    experiment.tool_version = hostile_step_id
+    experiment.tool_schema_version = hostile_step_id
+    experiment.author = hostile_step_id
+    experiment.origin = hostile_step_id
+
+    with _client((experiment,)) as client:
+        response = client.get(f"/api/investigations/{INVESTIGATION_ID}/experiments")
+
+    assert response.status_code == 200
+    payload = response.json()
+    projected = payload["experiments"][0]
+    assert hostile_step_id not in response.text
+    assert projected["step_ids"] == ["[redacted]"]
+    assert projected["claim_ids"] == ["[redacted]"]
+    assert projected["next_pivots"] == ["[redacted]"]
+    assert projected["supersedes_experiment_ids"] == ["[redacted]"]
+    assert projected["tool_invocation_refs"] == [
+        {"invocation_id": "[redacted]", "version": 1}
+    ]
+    assert projected["observation_refs"] == [
+        {"observation_id": "[redacted]", "sha256": "[redacted]"}
+    ]
+    assert projected["hypothesis_id"] == "[redacted]"
+    assert projected["author"] == "[redacted]"
+    assert projected["origin"] == "[redacted]"
+    assert projected["tool_name"] == "[redacted]"
+    assert projected["tool_version"] == "[redacted]"
+    assert projected["tool_schema_version"] == "[redacted]"
+    assert projected["verdict"] == "refutes"
+    assert projected["verdict_assertion_label"] == (
+        "Verdict enregistré : refutes (assertion, non conclusion)"
+    )
+    assert payload["claims"][0]["scopes"][0]["verdict"] == "refutes"
+    assert payload["claims"][0]["scopes"][0]["verdict_assertion_label"] == (
+        "Verdict enregistré : refutes (assertion, non conclusion)"
+    )
+    assert payload["claims"][0]["verdicts"] == ["refutes"]
+    assert payload["claims"][0]["verdict_assertion_labels"] == [
+        "Verdict enregistré : refutes (assertion, non conclusion)"
+    ]
 
 
 def test_get_experiments_accepts_legacy_payloads_without_replacement_fields() -> None:
