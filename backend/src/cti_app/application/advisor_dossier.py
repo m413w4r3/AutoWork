@@ -102,8 +102,10 @@ def _reject_oversized_base64_content(value: str, *, encoding: object = None) -> 
                 encoded_length += 1
             else:
                 break
-        if padding > 2 or (padding and encoded_length % 4 != 0) or (
-            not padding and encoded_length % 4 == 1
+        if (
+            padding > 2
+            or (padding and encoded_length % 4 != 0)
+            or (not padding and encoded_length % 4 == 1)
         ):
             raise ContentExcerptLimitExceeded("data_url_base64_is_invalid")
         decoded_length = (encoded_length * 3) // 4 - min(padding, 2)
@@ -111,9 +113,7 @@ def _reject_oversized_base64_content(value: str, *, encoding: object = None) -> 
             encoded_length > _MAX_GENERIC_BASE64_ENCODED_CHARS
             or decoded_length > MAX_GENERIC_BINARY_CONTENT_BYTES
         ):
-            raise ContentExcerptLimitExceeded(
-                "data_url_base64_exceeds_512_byte_decoded_limit"
-            )
+            raise ContentExcerptLimitExceeded("data_url_base64_exceeds_512_byte_decoded_limit")
     if data_url_found:
         return
 
@@ -141,11 +141,7 @@ def _reject_oversized_base64_content(value: str, *, encoding: object = None) -> 
         not invalid
         and encoded_length > 0
         and padding <= 2
-        and (
-            encoded_length % 4 == 0
-            if padding
-            else encoded_length % 4 != 1
-        )
+        and (encoded_length % 4 == 0 if padding else encoded_length % 4 != 1)
     )
     if not structurally_valid:
         if declared_base64:
