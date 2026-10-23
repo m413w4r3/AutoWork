@@ -4064,7 +4064,7 @@ async def test_advisor_transport_failures_are_explicit_and_never_retried(
     assert len(transport.calls) == 1
 
 
-def test_advisor_does_not_parse_persisted_output_when_bridge_turn_needs_review() -> None:
+def test_advisor_does_not_parse_persisted_output_for_ambiguous_rate_limit() -> None:
     observation_id = uuid4()
     prompt_data = {
         "units": [{"id": "U1", "block_type": "key_findings", "form": "body", "anchor": None}],
@@ -4090,7 +4090,8 @@ LIMITATION: none
         TurnSubmissionStatus.NEEDS_REVIEW,
         output_text=raw,
         idempotency_key="persisted-turn-key",
-        submission_state="post_submission",
+        error_code="bridge_rate_limited",
+        submission_state="external_state_unknown",
     )
 
     tool, _ = make_tool(

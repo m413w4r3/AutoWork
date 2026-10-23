@@ -3853,9 +3853,6 @@ def _advisor_unit_provenance(
 def _bridge_turns_consumed(submission: TurnSubmission) -> int:
     if submission.status is TurnSubmissionStatus.BLOCKED:
         return 0
-    code = (submission.error_code or "").casefold()
-    if any(term in code for term in ("429", "rate_limit", "too_many_requests")):
-        return 0
     if submission.submission_state == "pre_submission":
         return 0
     if submission.status in {
