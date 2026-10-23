@@ -104,7 +104,7 @@ Observation de preuve : <référence de l’observation source>
 
 Vérifier le déploiement et les capacités live avant d’utiliser ces comportements; ce playbook ne les suppose pas déjà actifs.
 
-- **Après vague A** : comptabilité par invocation, stockage intégral avant parsing/reparse et retrait des quotas advisor locaux. Avant cela, réconcilier toute réponse ambiguë et ne pas compter sur une sortie longue complète.
+- **Après vague A** : comptabilité par invocation et stockage intégral avant parsing/reparse. Les deux anciens réglages Advisor sans consommateur ont été retirés de Compose ; le budget de tours G2 reste le contrôle d'autorisation. Avant cela, réconcilier toute réponse ambiguë et ne pas compter sur une sortie longue complète.
 - **Après vague B** : constitution automatique de dossiers de faits typés pour Bridge, avec provenance et sélection d’extraits. Avant cela, assembler manuellement le texte factuel indispensable, sans dump JSON ni secret opérationnel.
 - **Après vague C** : pacing, attente et reprise de lots multi-unités, plus contexte/pagination ciblés. Avant cela, faire une unité par appel, ou seulement un lot dont le support et le curseur de reprise sont confirmés; ne pas laisser tomber les unités non rendues.
 - **Après vague D** : guidance Investigator/P10 simplifiée. Jusque-là, la session opérateur décide à partir du résumé, des pointeurs et des faits vérifiés; elle ne suppose pas que l’agent Investigator pilote la session `operator_led`.
