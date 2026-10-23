@@ -9,12 +9,18 @@ import sys
 from pathlib import Path
 from uuid import UUID
 
+from minio import Minio
+
+from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.investigation_audit_export import write_audit_bundle
+from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.config import get_settings
+from cti_app.infrastructure.blob_storage.minio import MinioBlobStore
 from cti_app.infrastructure.database.investigation_audit_reader import (
     read_investigation_audit_snapshot,
 )
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
+from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -38,8 +44,21 @@ async def _run(investigation_id: UUID, output_dir: Path, *, resume: bool) -> int
         settings = get_settings()
         engine = create_postgres_engine(settings.postgres_dsn)
         try:
+            session_factory = create_session_factory(engine)
+            blob_store = MinioBlobStore(
+                Minio(
+                    settings.s3_endpoint,
+                    access_key=settings.s3_access_key,
+                    secret_key=settings.s3_secret_key,
+                    secure=settings.s3_secure,
+                ),
+                physical_bucket=settings.s3_bucket,
+            )
+            artifact_store = ProductionArtifactStore(
+                BlobCatalogService(blob_store, lambda: SqlAlchemyUnitOfWork(session_factory))
+            )
             snapshot = await read_investigation_audit_snapshot(
-                create_session_factory(engine), investigation_id
+                session_factory, investigation_id, artifact_store
             )
         finally:
             await engine.dispose()

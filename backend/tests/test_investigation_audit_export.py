@@ -15,6 +15,7 @@ from cti_app.application.investigation_audit_export import (
     AuditSourceSnapshot,
     build_audit_bundle,
     load_audit_events,
+    project_advisor_call_blob_metadata,
     write_audit_bundle,
 )
 
@@ -148,7 +149,146 @@ def test_concurrent_exports_leave_one_coherent_bundle(tmp_path: Path) -> None:
     assert files["RUN_EVENTS.jsonl.gz"]["records"] == len(events)
 
 
-def test_projection_correlates_only_persisted_ids_and_omits_private_text() -> None:
+def test_advisor_blob_hash_mismatch_keeps_payload_unavailable() -> None:
+    observation = SimpleNamespace(
+        id=_id("advisor-blob-mismatch-observation"),
+        sha256=_RAW_HASH,
+        blob_id=_id("advisor-blob-mismatch-blob"),
+        invocation_ref=None,
+        observed_at=datetime(2026, 10, 23, tzinfo=UTC),
+    )
+    raw = b'{"schema":"operator-advisor-call.v1","output":"PRIVATE_BLOB_BODY_MARKER"}'
+    projection = project_advisor_call_blob_metadata(observation, raw)
+
+    assert projection["read_status"] == "hash_mismatch"
+    assert projection["metadata"]["advisor_blob_available"] is False
+    assert projection["metadata"]["raw_response_sha256"] == "UNKNOWN"
+    assert (
+        projection["metadata"]["materials"]["raw_response"]["available"]["value"]
+        == "UNKNOWN"
+    )
+    assert projection["expected_sha256"] == _RAW_HASH
+    assert projection["read_sha256"] == hashlib.sha256(raw).hexdigest()
+    bundle = build_audit_bundle(
+        AuditSourceSnapshot(
+            investigation_id=_INVESTIGATION_ID,
+            advisor_call_metadata=(projection,),
+        )
+    )
+    exported = gzip.decompress(bundle.events) + bundle.trace + bundle.index + bundle.manifest
+    assert b"PRIVATE_BLOB_BODY_MARKER" not in exported
+    assert b"hash_mismatch" in exported
+
+
+def test_large_advisor_completeness_counts_cover_items_beyond_export_cap() -> None:
+    observation = SimpleNamespace(
+        id=_id("large-advisor-manifest-observation"),
+        sha256="UNKNOWN",
+        blob_id=_id("large-advisor-manifest-blob"),
+        invocation_ref=None,
+        observed_at=datetime(2026, 10, 23, tzinfo=UTC),
+    )
+    payload = {
+        "schema": "operator-advisor-call.v1",
+        "submission_status": "succeeded",
+        "submission_state": "post_submission",
+        "output_sha256": _RAW_HASH,
+        "completeness_manifest": [
+            {
+                "kind": "observation",
+                "id": _id(f"large-manifest-item-{index}"),
+                "required": True,
+                "statuses": [{"status": "IN_DOSSIER"}, {"status": "SENT_TO_BRIDGE"}],
+            }
+            for index in range(2050)
+        ],
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    observation.sha256 = hashlib.sha256(raw).hexdigest()
+
+    projection = project_advisor_call_blob_metadata(observation, raw)
+    completeness = projection["metadata"]["completeness_manifest"]
+    materials = projection["metadata"]["materials"]["dossier"]
+
+    assert len(completeness["items"]) == 2048
+    assert completeness["truncated_item_count"] == 2
+    assert completeness["selected_item_count"] == 2050
+    assert completeness["rendered_item_count"] == 2050
+    assert materials["selected"]["value"] == 2050
+    assert materials["rendered"]["value"] == 2050
+
+
+@pytest.mark.parametrize(
+    ("outcome", "coverage", "verdict", "expected_negative"),
+    (
+        ("not_observed", "limited", "inconclusive", False),
+        ("not_observed", "limited", "refutes", False),
+        ("not_observed", "none", "inconclusive", False),
+        ("not_observed", "none", "refutes", False),
+        ("observed", "complete", "refutes", False),
+        ("not_observed", "complete", "refutes", True),
+    ),
+)
+def test_negative_result_requires_complete_non_observation_and_refuting_verdict(
+    outcome: str, coverage: str, verdict: str, expected_negative: bool
+) -> None:
+    experiment = SimpleNamespace(
+        id=_id(f"negative-{outcome}-{coverage}-{verdict}"),
+        version=1,
+        recorded_at=datetime(2026, 10, 23, tzinfo=UTC),
+        hypothesis_id="hypothesis-synthetic-1",
+        claim_ids=("claim-synthetic-1",),
+        verdict=verdict,
+        actual_outcome=outcome,
+        observation_coverage=coverage,
+        availability="available",
+        tool_name="vt.lookup",
+        prediction="synthetic prediction",
+        expected="synthetic expected",
+        actual="synthetic actual",
+        falsification_criterion="synthetic criterion",
+        tool_invocation_refs=(),
+        observation_refs=(),
+    )
+    bundle = build_audit_bundle(
+        AuditSourceSnapshot(_INVESTIGATION_ID, experiments=(experiment,))
+    )
+    rows = [json.loads(line) for line in gzip.decompress(bundle.events).splitlines()]
+    event = next(row for row in rows if row["type"] == "experiment.version_recorded")
+    assert event["details"]["negative_result"] is expected_negative
+
+
+def test_negative_result_requires_a_falsification_criterion() -> None:
+    experiment = SimpleNamespace(
+        id=_id("negative-missing-criterion"),
+        version=1,
+        recorded_at=datetime(2026, 10, 23, tzinfo=UTC),
+        hypothesis_id="hypothesis-synthetic-1",
+        claim_ids=(),
+        verdict="refutes",
+        actual_outcome="not_observed",
+        observation_coverage="complete",
+        availability="available",
+        tool_name="vt.lookup",
+        prediction="synthetic prediction",
+        expected="synthetic expected",
+        actual="synthetic actual",
+        falsification_criterion="  ",
+        tool_invocation_refs=(),
+        observation_refs=(),
+    )
+    bundle = build_audit_bundle(
+        AuditSourceSnapshot(_INVESTIGATION_ID, experiments=(experiment,))
+    )
+    event = next(
+        row for row in map(json.loads, gzip.decompress(bundle.events).splitlines())
+        if row["type"] == "experiment.version_recorded"
+    )
+
+    assert event["details"]["negative_result"] is False
+
+
+def test_projection_correlates_only_persisted_ids_and_omits_private_text(tmp_path: Path) -> None:
     invocation = _invocation(0)
     invocation.tool_name = "PRIVATE_SYNTHETIC_TOOL_NAME_MARKER"
     invocation.schema_version = "PRIVATE_SYNTHETIC_SCHEMA_VERSION_MARKER"
@@ -171,7 +311,7 @@ def test_projection_correlates_only_persisted_ids_and_omits_private_text() -> No
         kind="tool_response",
         blob_id=_id("advisor-call-observation-blob"),
         sha256=_RAW_HASH,
-        source="advisor_tool",
+        source="advisor.consult",
         source_version="operator-advisor-call.v1",
         observed_at=datetime(2026, 10, 23, 1, 1, tzinfo=UTC),
         object_type="advisor_call",
@@ -299,6 +439,66 @@ def test_projection_correlates_only_persisted_ids_and_omits_private_text() -> No
         output_blob_reference=f"blob://{_id('turn-output-blob')}",
         created_at=datetime(2026, 10, 23, 4, tzinfo=UTC),
     )
+    advisor_payload = {
+        "schema": "operator-advisor-call.v1",
+        "consultation_type": "review_text",
+        "advisor_status": "succeeded",
+        "bridge_invocation_id": turn.id,
+        "bridge_invocation_id_kind": "conversation_turn",
+        "idempotency_key": "PRIVATE_SYNTHETIC_ADVISOR_IDEMPOTENCY_MARKER",
+        "prompt_blob_id": _id("advisor-prompt-blob"),
+        "prompt_sha256": _INPUT_HASH,
+        "prompt_bytes": 456,
+        "dossier_sha256": _NORMALIZED_HASH,
+        "dossier_bytes": 321,
+        "preflight_status": "READY",
+        "completeness_counts": {"required": 1, "present": 1, "sent": 1, "omitted": 0},
+        "completeness_manifest": [
+            {
+                "kind": "observation",
+                "id": observation.id,
+                "sha256": _OUTPUT_HASH,
+                "required": True,
+                "verified": True,
+                "retrieval_available": True,
+                "statuses": [
+                    {"status": "REQUIRED", "reason": "PRIVATE_SYNTHETIC_REASON_IN_BLOB"},
+                    {"status": "IN_DOSSIER", "reason": "PRIVATE_SYNTHETIC_DOSSIER_REASON"},
+                    {"status": "SENT_TO_BRIDGE", "reason": "PRIVATE_SYNTHETIC_SENT_REASON"},
+                ],
+                "source_ref": {"kind": "observation", "id": observation.id, "sha256": _OUTPUT_HASH},
+                "claim_id": "PRIVATE_SYNTHETIC_COMPLETENESS_CLAIM_MARKER",
+            }
+        ],
+        "dossier_manifest": [
+            {
+                "kind": "observation",
+                "id": observation.id,
+                "sha256": _OUTPUT_HASH,
+                "label": "PRIVATE_SYNTHETIC_DOSSIER_LABEL_MARKER",
+                "body": "PRIVATE_SYNTHETIC_DOSSIER_BODY_MARKER",
+            }
+        ],
+        "output_blob_id": _id("advisor-response-blob"),
+        "output_sha256": _RAW_HASH,
+        "response_bytes": 789,
+        "submission_status": "succeeded",
+        "submission_state": "post_submission",
+        "invocation_stage": "run_confirmed",
+        "durations_ms": {"submission": 81, "parse": 22, "persistence": 15},
+        "provider_usage": {"input_tokens": 123, "output_tokens": 45, "token_marker": 999},
+        "bridge_turns_consumed": 1,
+        "output": {"content": "PRIVATE_SYNTHETIC_BRIDGE_OUTPUT_MARKER"},
+        "http_payload": {"body": "PRIVATE_SYNTHETIC_HTTP_PAYLOAD_MARKER"},
+    }
+    advisor_blob_bytes = json.dumps(
+        advisor_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    advisor_observation.sha256 = hashlib.sha256(advisor_blob_bytes).hexdigest()
+    advisor_projection = project_advisor_call_blob_metadata(
+        advisor_observation, advisor_blob_bytes
+    )
+    invocation.response_refs = (UUID(advisor_observation.id),)
     model_run = SimpleNamespace(
         id=turn.model_run_id,
         provider="openai",
@@ -327,6 +527,18 @@ def test_projection_correlates_only_persisted_ids_and_omits_private_text() -> No
         usage={"input_tokens": 12, "output_tokens": 7, "total_tokens": 19, "estimated": False},
         raw_output_chars=90,
         started_at=datetime(2026, 10, 23, 4, tzinfo=UTC),
+    )
+    decision = SimpleNamespace(
+        id=_id("analyst-decision"),
+        decision_type="pivot_reject",
+        target_type="pivot",
+        target_id=_id("decision-target"),
+        actor_id="PRIVATE_SYNTHETIC_DECISION_ACTOR_MARKER",
+        reason="PRIVATE_SYNTHETIC_DECISION_REASON_MARKER",
+        correlation_id="PRIVATE_SYNTHETIC_DECISION_CORRELATION_MARKER",
+        details={"secret_context": "PRIVATE_SYNTHETIC_DECISION_DETAILS_MARKER"},
+        occurred_at=datetime(2026, 10, 23, 4, 30, tzinfo=UTC),
+        retrohunt_authorization=None,
     )
     snapshot = AuditSourceSnapshot(
         investigation_id=_INVESTIGATION_ID,
@@ -367,6 +579,18 @@ def test_projection_correlates_only_persisted_ids_and_omits_private_text() -> No
             ),
         ),
         opinions=(opinion,),
+        analyst_decisions=(decision,),
+        advisor_call_metadata=(advisor_projection,),
+        input_pack={
+            "blob_id": _id("input-pack-blob"),
+            "sha256": _NORMALIZED_HASH,
+            "synthesis_artifact_id": _id("input-pack-synthesis-artifact"),
+            "investigation_version": 17,
+            "investigation_status": "completed",
+            "schema_version": "PRIVATE_SYNTHETIC_INPUT_PACK_SCHEMA_MARKER",
+            "input_pack_record_id": _id("input-pack-record"),
+            "created_at": datetime(2026, 10, 23, 4, 10, tzinfo=UTC),
+        },
         envelope=SimpleNamespace(
             version=1,
             approved_at=None,
@@ -390,6 +614,7 @@ def test_projection_correlates_only_persisted_ids_and_omits_private_text() -> No
         conversation_turns=(turn,),
         model_runs=(model_run,),
         source_versions={
+            "advisor_call_payload": "operator-advisor-call.v1",
             "audit_projection": "autowork.investigation-audit-event.v1",
             "unknown_version_key": "PRIVATE_SYNTHETIC_SOURCE_VERSION_MAP_MARKER",
         },
@@ -405,6 +630,9 @@ def test_projection_correlates_only_persisted_ids_and_omits_private_text() -> No
         if row["type"] == "evidence_observation.recorded"
         and row["record"]["id"] == advisor_observation.id
     )
+    advisor_call_event = next(row for row in rows if row["type"] == "advisor_call.metadata")
+    decision_event = next(row for row in rows if row["type"] == "operator.decision_recorded")
+    input_pack_event = next(row for row in rows if row["type"] == "input_pack.snapshot")
     experiment_event = next(row for row in rows if row["type"] == "experiment.version_recorded")
     finding_event = next(row for row in rows if row["type"] == "finding.version_recorded")
     candidate_event = next(
@@ -485,7 +713,64 @@ def test_projection_correlates_only_persisted_ids_and_omits_private_text() -> No
     )
     assert advisor_observation_event["details"]["consultation_type"] == "review_text"
     assert advisor_observation_event["correlation"]["invocation_id"] == invocation_id
-    assert experiment_event["details"]["negative_result"] is True
+    assert advisor_call_event["details"]["read_status"] == "verified"
+    assert advisor_call_event["details"]["observation_id"] == advisor_observation.id
+    assert advisor_call_event["correlation"]["invocation_id"] == invocation_id
+    assert advisor_call_event["correlation"]["bridge_invocation_id"] == turn.id
+    assert advisor_call_event["correlation"]["turn_id"] == turn.id
+    assert advisor_call_event["correlation"]["model_run_id"] == str(turn.model_run_id)
+    assert advisor_call_event["correlation"]["bridge_idempotency_key_sha256"] == hashlib.sha256(
+        b"PRIVATE_SYNTHETIC_ADVISOR_IDEMPOTENCY_MARKER"
+    ).hexdigest()
+    advisor_metadata = advisor_call_event["details"]["metadata"]
+    assert advisor_metadata["prompt_sha256"] == _INPUT_HASH
+    assert advisor_metadata["dossier_sha256"] == _NORMALIZED_HASH
+    assert advisor_metadata["raw_response_sha256"] == _RAW_HASH
+    assert (
+        advisor_call_event["details"]["expected_sha256"]
+        != advisor_metadata["raw_response_sha256"]
+    )
+    assert advisor_metadata["normalized_output_sha256"] == hashlib.sha256(
+        b'{"content":"PRIVATE_SYNTHETIC_BRIDGE_OUTPUT_MARKER"}'
+    ).hexdigest()
+    assert advisor_metadata["prompt_bytes"] == 456
+    assert advisor_metadata["dossier_bytes"] == 321
+    assert advisor_metadata["raw_response_bytes"] == 789
+    assert advisor_metadata["transport_state"] == "result_obtained"
+    assert advisor_metadata["materials"]["dossier"]["sha256"]["value"] == _NORMALIZED_HASH
+    assert advisor_metadata["materials"]["rendered_prompt"]["sha256"]["value"] == _INPUT_HASH
+    assert advisor_metadata["materials"]["raw_response"]["sha256"]["value"] == _RAW_HASH
+    assert advisor_metadata["materials"]["normalized_output"]["sha256"]["value"] != _RAW_HASH
+    assert advisor_metadata["materials"]["http_payload"]["sha256"]["value"] == "UNKNOWN"
+    assert advisor_metadata["materials"]["dossier"]["available"]["value"] is True
+    assert advisor_metadata["materials"]["rendered_prompt"]["rendered"]["value"] is True
+    assert advisor_metadata["materials"]["raw_response"]["sent"]["value"] == "UNKNOWN"
+    assert advisor_metadata["materials"]["normalized_output"]["sent"]["value"] == "UNKNOWN"
+    assert advisor_metadata["completeness_counts"]["sent"] == 1
+    assert advisor_metadata["completeness_manifest"]["items"][0]["sent"] is True
+    assert advisor_call_event["details"]["expected_sha256"] == advisor_observation.sha256
+    assert advisor_call_event["details"]["read_sha256"] == advisor_observation.sha256
+    assert decision_event["details"]["decision_type"] == "pivot_reject"
+    assert decision_event["details"]["target_type"] == "pivot"
+    assert decision_event["details"]["target_id"] == decision.target_id
+    assert decision_event["details"]["reason_sha256"] == hashlib.sha256(
+        decision.reason.encode()
+    ).hexdigest()
+    assert decision_event["details"]["actor_id_sha256"] == hashlib.sha256(
+        decision.actor_id.encode()
+    ).hexdigest()
+    assert decision_event["details"]["correlation_id_sha256"] == hashlib.sha256(
+        decision.correlation_id.encode()
+    ).hexdigest()
+    assert input_pack_event["details"]["blob_id"] == _id("input-pack-blob")
+    assert input_pack_event["details"]["sha256"] == _NORMALIZED_HASH
+    assert input_pack_event["details"]["synthesis_artifact_id"] == _id(
+        "input-pack-synthesis-artifact"
+    )
+    assert input_pack_event["details"]["investigation_version"] == 17
+    assert input_pack_event["details"]["investigation_status"] == "completed"
+    assert experiment_event["details"]["negative_result"] is False
+    assert f"Experiment `{experiment.id}` (not observed)" in bundle.trace.decode("utf-8")
     hypothesis_event = next(row for row in rows if row["type"] == "operator_state.snapshot")
     assert (
         experiment_event["details"]["hypothesis_id"]
@@ -580,6 +865,20 @@ def test_projection_correlates_only_persisted_ids_and_omits_private_text() -> No
         "PRIVATE_SYNTHETIC_HYPOTHESIS_MARKER",
         "PRIVATE_SYNTHETIC_ACTION_MARKER",
         "PRIVATE_SYNTHETIC_OPINION_MARKER",
+        "PRIVATE_SYNTHETIC_ADVISOR_IDEMPOTENCY_MARKER",
+        "PRIVATE_SYNTHETIC_REASON_IN_BLOB",
+        "PRIVATE_SYNTHETIC_DOSSIER_REASON",
+        "PRIVATE_SYNTHETIC_SENT_REASON",
+        "PRIVATE_SYNTHETIC_COMPLETENESS_CLAIM_MARKER",
+        "PRIVATE_SYNTHETIC_DOSSIER_LABEL_MARKER",
+        "PRIVATE_SYNTHETIC_DOSSIER_BODY_MARKER",
+        "PRIVATE_SYNTHETIC_BRIDGE_OUTPUT_MARKER",
+        "PRIVATE_SYNTHETIC_HTTP_PAYLOAD_MARKER",
+        "PRIVATE_SYNTHETIC_DECISION_ACTOR_MARKER",
+        "PRIVATE_SYNTHETIC_DECISION_REASON_MARKER",
+        "PRIVATE_SYNTHETIC_DECISION_CORRELATION_MARKER",
+        "PRIVATE_SYNTHETIC_DECISION_DETAILS_MARKER",
+        "PRIVATE_SYNTHETIC_INPUT_PACK_SCHEMA_MARKER",
         "a" * 64,
         invocation.operation_key,
     ):
@@ -601,6 +900,18 @@ def test_projection_correlates_only_persisted_ids_and_omits_private_text() -> No
         item["kind"] == "detection_candidate_test_reference" and item["id"] == candidate_test_ref
         for item in index["resources"]
     )
+    assert any(
+        item["kind"] == "advisor_prompt" and item["id"] == _id("advisor-prompt-blob")
+        for item in index["resources"]
+    )
+    assert any(
+        item["kind"] == "advisor_raw_response" and item["id"] == _id("advisor-response-blob")
+        for item in index["resources"]
+    )
+    assert any(
+        item["kind"] == "investigation_input_pack" and item["id"] == _id("input-pack-blob")
+        for item in index["resources"]
+    )
     assert all(
         item.get("authorization") == "existing application authorization required"
         for item in index["resources"]
@@ -609,9 +920,21 @@ def test_projection_correlates_only_persisted_ids_and_omits_private_text() -> No
     assert manifest["counts"]["events"] == len(rows)
     assert "operation_key_sha256" in manifest["correlation_keys"]
     assert manifest["source_snapshot"]["versions"] == {
-        "audit_projection": "autowork.investigation-audit-event.v1"
+        "advisor_call_payload": "operator-advisor-call.v1",
+        "audit_projection": "autowork.investigation-audit-event.v1",
     }
+    assert manifest["source_snapshot"]["input_pack"]["blob_id"] == _id("input-pack-blob")
     assert manifest["files"]["RUN_EVENTS.jsonl.gz"]["records"] == len(rows)
     assert any(
         gap["field"] == "consultation_id" and gap["value"] == "UNKNOWN" for gap in manifest["gaps"]
     )
+    output_dir = tmp_path / "advisor-audit"
+    write_audit_bundle(snapshot, output_dir, _INVESTIGATION_ID)
+    for filename in ("RUN_TRACE.md", "RUN_INDEX.json", "RUN_MANIFEST.json"):
+        (output_dir / filename).unlink()
+    resumed = write_audit_bundle(None, output_dir, _INVESTIGATION_ID, resume=True)
+    assert resumed.resumed_from_events
+    assert (output_dir / "RUN_EVENTS.jsonl.gz").read_bytes() == bundle.events
+    assert (output_dir / "RUN_TRACE.md").read_bytes() == bundle.trace
+    assert (output_dir / "RUN_INDEX.json").read_bytes() == bundle.index
+    assert (output_dir / "RUN_MANIFEST.json").read_bytes() == bundle.manifest
