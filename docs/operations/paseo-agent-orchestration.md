@@ -26,8 +26,9 @@ report or workspace is primary CTI evidence.
 
 ## Delegation policy
 
-Paseo is the outer coding orchestrator when enabled. **Prefer GPT-6 Luna
-high sub-sessions for bounded, independent tasks**, even mechanical file
+Paseo provides the outer orchestration tools; the **parent coding agent**
+may be Claude Sonnet or the user's custom DeepSeek Flash provider.
+**Prefer GPT-6 Luna high sub-sessions for bounded, independent tasks**, even mechanical file
 edits, reproducible checks, focused comparisons and scoped source mapping:
 these are useful places to keep noisy intermediate context away from the
 parent. Use **Luna xhigh** for high-risk code, difficult contradictions,
@@ -47,7 +48,7 @@ for Luna, start a Paseo Codex worker.
 
 | Profile | Preferred model/effort | Access | When |
 |---|---|---|---|
-| coordinator | GPT-6 Luna high/xhigh | scoped integration worktree | planning, parent decisions |
+| coordinator | Claude Sonnet 5.5 medium/high or custom DeepSeek Flash max (when supported) | scoped integration worktree | planning, parent decisions; user picks main session |
 | scout | GPT-6 Luna high | actually read-only | trace code/evidence, map APIs |
 | mechanical | GPT-6 Luna high | isolated write worktree | small repeatable changes |
 | implementer | GPT-6 Luna high | isolated write worktree | bounded implementation |
@@ -189,10 +190,6 @@ reimplementing their CLI/MCP. Use AutoWork skills for **domain gates** and
 SHA-aware handoff format; avoid two skills trying to create the same session.
 When changing provider/tool profiles, new settings affect new launches, not
 already running agents.
-
-Choose compatible mode and effective permissions in the UI. Profile notes
-are selection hints, not a sandbox, and they never start agents by themselves.
-A new agent must actually be launched, and its runtime model/effort verified.
 
 ### Concurrency is a system budget
 
