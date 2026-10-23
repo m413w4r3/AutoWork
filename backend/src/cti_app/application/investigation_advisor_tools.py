@@ -23,6 +23,7 @@ from cti_app.application.advisor_contracts import (
 )
 from cti_app.application.advisor_dossier import (
     build_advisor_dossier,
+    evaluate_advisor_evidence_preflight,
     extract_content_excerpts,
 )
 from cti_app.application.advisor_wire import (
@@ -118,6 +119,7 @@ class InvestigationAdvisorTool:
         investigations: Any,
         observations: Any,
         findings: Any,
+        investigation_states: Any | None = None,
         experiments: Any | None = None,
         opinions: Any,
         sample_associations: Any,
@@ -132,6 +134,7 @@ class InvestigationAdvisorTool:
         self._investigations = investigations
         self._observations = observations
         self._findings = findings
+        self._investigation_states = investigation_states
         self._experiments = experiments
         self._opinions = opinions
         self._sample_associations = sample_associations
@@ -226,6 +229,38 @@ class InvestigationAdvisorTool:
                 "suricata_draft",
             }:
                 evidence = await self._auto_evidence(context.investigation_id)
+            if consultation_type in {"plan_investigation", "pivot_strategy", "figure_plan"}:
+                if consultation_type == "figure_plan":
+                    raw_finding_refs = arguments.get("finding_refs", ())
+                    if not isinstance(raw_finding_refs, (tuple, list)):
+                        raise _AdvisorInputValidationError("figure_finding_refs_invalid")
+                    requested_ids = tuple(UUID(str(item)) for item in raw_finding_refs)
+                else:
+                    requested_ids = ()
+                finding_rows = self._latest_findings(
+                    tuple(
+                        item
+                        for item in await self._findings.list_for_investigation(
+                            context.investigation_id
+                        )
+                        if getattr(item, "investigation_id", context.investigation_id)
+                        == context.investigation_id
+                    )
+                )
+                linked_observation_ids = tuple(
+                    dict.fromkeys(
+                        ref
+                        for finding in finding_rows
+                        if not requested_ids or finding.id in requested_ids
+                        for ref in getattr(finding, "observation_refs", ())
+                    )
+                )
+                if linked_observation_ids:
+                    linked_evidence = await self._load_evidence(
+                        context.investigation_id, linked_observation_ids
+                    )
+                    evidence_by_id = {item.id: item for item in (*evidence, *linked_evidence)}
+                    evidence = tuple(evidence_by_id.values())
             investigation = await self._investigations.get(context.investigation_id)
             if investigation is None:
                 return self._finish(
@@ -244,7 +279,11 @@ class InvestigationAdvisorTool:
                         ToolInvocationStatus.POLICY_DENIED,
                         observation_refs=evidence_refs,
                         error_code="POLICY_DENIED",
-                        output={"advisor_status": "policy_denied"},
+                        output={
+                            "advisor_status": "policy_denied",
+                            "preflight_status": "POLICY_BLOCKED",
+                            "missing_refs": [],
+                        },
                         message="External disclosure policy denied this Bridge consultation.",
                     ),
                 )
@@ -258,6 +297,16 @@ class InvestigationAdvisorTool:
                 context=context,
                 question=question,
             )
+            explicit_observation_refs = list(dict.fromkeys(str(item) for item in evidence_refs))
+            if consultation_type == "figure_plan":
+                explicit_observation_refs.extend(
+                    str(reference)
+                    for finding in prompt_data.get("findings", ())
+                    if isinstance(finding, Mapping)
+                    for reference in finding.get("observation_refs", ())
+                    if isinstance(reference, str)
+                )
+            prompt_data["evidence_refs"] = list(dict.fromkeys(explicit_observation_refs))
             prompt_data, redacted_secret_count = _redact_advisor_payload(
                 prompt_data, settings=self._settings
             )
@@ -271,6 +320,9 @@ class InvestigationAdvisorTool:
                 )
             dossier = build_advisor_dossier(prompt_data)
             prompt_data["dossier_manifest"] = [dict(item) for item in dossier.manifest]
+            prompt_data["dossier_text"] = dossier.text
+            prompt_data["dossier_sha256"] = dossier.sha256
+            prompt_data["dossier_bytes"] = dossier.byte_size
             prompt_data["transmitted_refs"] = _transmitted_refs_for_dossier(
                 prompt_data, snapshot, dossier.manifest
             )
@@ -279,11 +331,6 @@ class InvestigationAdvisorTool:
                 for item in prompt_data["transmitted_refs"]
                 if item["kind"] == "observation"
             ]
-            shared_context_bytes = (
-                _editorial_shared_prompt_bytes(prompt_data)
-                if consultation_type == "draft_text"
-                else None
-            )
             max_input_bytes = int(
                 getattr(self._settings, "operator_advisor_max_input_bytes", MAX_ADVISOR_INPUT_BYTES)
             )
@@ -295,32 +342,9 @@ class InvestigationAdvisorTool:
                 _critical_prompt_data_was_truncated(consultation_type, prompt_data)
                 or len(encoded) > max_input_bytes
             ):
-                if (
-                    consultation_type == "draft_text"
-                    and shared_context_bytes is not None
-                    and shared_context_bytes > max_input_bytes
-                ):
-                    return await self._persist_preflight_failure(
-                        context,
-                        consultation_type=consultation_type,
-                        evidence_refs=tuple(item.id for item in evidence),
-                        output={
-                            "advisor_status": "context_too_large",
-                            "usable": False,
-                            "failure_stage": "prompt_size_preflight",
-                            "failure_reason": "shared_context_exceeds_input_limit",
-                            "shared_context_bytes": shared_context_bytes,
-                            "max_input_bytes": max_input_bytes,
-                            "truncated_fields": sorted(
-                                key
-                                for key, value in prompt_data.get("truncation", {}).items()
-                                if value is True
-                            ),
-                            "confirmed_non_execution": True,
-                            "bridge_turns_consumed": 0,
-                        },
-                        error_code="advisor_context_too_large",
-                    )
+                size_block_completeness = evaluate_advisor_evidence_preflight(
+                    prompt_data, dossier, prompt
+                )
                 if (
                     consultation_type in {"draft_text", "review_text"}
                     and isinstance(editorial_units, (list, tuple))
@@ -338,11 +362,18 @@ class InvestigationAdvisorTool:
                     evidence_refs=tuple(item.id for item in evidence),
                     output={
                         "advisor_status": "context_too_large",
+                        "preflight_status": "TECHNICAL_BLOCKED",
                         "usable": False,
                         "failure_stage": "prompt_size_preflight",
                         "failure_reason": "input_exceeds_configured_limit",
                         "context_bytes_after_fit": len(encoded),
                         "max_input_bytes": max_input_bytes,
+                        "dossier_sha256": dossier.sha256,
+                        "dossier_bytes": dossier.byte_size,
+                        "dossier_manifest": [dict(item) for item in dossier.manifest],
+                        "missing_refs": size_block_completeness["missing_refs"],
+                        "completeness_counts": size_block_completeness["counts"],
+                        "completeness_manifest": size_block_completeness["items"],
                         "truncated_fields": sorted(
                             key
                             for key, value in prompt_data.get("truncation", {}).items()
@@ -352,6 +383,30 @@ class InvestigationAdvisorTool:
                         "bridge_turns_consumed": 0,
                     },
                     error_code="advisor_context_too_large",
+                )
+            evidence_preflight = evaluate_advisor_evidence_preflight(prompt_data, dossier, prompt)
+            prompt_data["evidence_preflight"] = evidence_preflight
+            if evidence_preflight["status"] != "READY":
+                preflight_status = str(evidence_preflight["status"])
+                return await self._persist_preflight_failure(
+                    context,
+                    consultation_type=consultation_type,
+                    evidence_refs=tuple(item.id for item in evidence),
+                    output={
+                        "advisor_status": preflight_status.casefold(),
+                        "preflight_status": preflight_status,
+                        "failure_stage": "evidence_preflight",
+                        "failure_reason": "required_canonical_evidence_not_in_payload",
+                        "missing_refs": evidence_preflight["missing_refs"],
+                        "completeness_counts": evidence_preflight["counts"],
+                        "completeness_manifest": evidence_preflight["items"],
+                        "dossier_sha256": dossier.sha256,
+                        "dossier_bytes": dossier.byte_size,
+                        "confirmed_non_execution": True,
+                        "bridge_turns_consumed": 0,
+                        "usable": False,
+                    },
+                    error_code=f"advisor_preflight_{preflight_status.casefold()}",
                 )
             if consultation_type == "suricata_draft" and not prompt_data.get("network_facts"):
                 return self._finish(
@@ -576,6 +631,10 @@ class InvestigationAdvisorTool:
             external_llm_allowed=True,
             settings=self._settings,
         )
+        evidence_preflight = evaluate_advisor_evidence_preflight(
+            prompt_data, dossier, prompt, submitted=_advisor_payload_was_submitted(submission)
+        )
+        prompt_data["evidence_preflight"] = evidence_preflight
         submission_elapsed_ms = round((time.perf_counter() - submission_started_at) * 1000)
         raw_output = submission.output_text
         raw_output_bytes = raw_output.encode("utf-8") if raw_output is not None else None
@@ -717,6 +776,11 @@ class InvestigationAdvisorTool:
                 for item in prompt_data.get("dossier_manifest", ())
                 if isinstance(item, Mapping)
             ],
+            "dossier_sha256": dossier.sha256,
+            "dossier_bytes": dossier.byte_size,
+            "preflight_status": evidence_preflight["status"],
+            "completeness_counts": evidence_preflight["counts"],
+            "completeness_manifest": evidence_preflight["items"],
         }
         if consultation_type == "yara_draft":
             provenance["measurement_catalog"] = _advisor_bridge_measurement_catalog(prompt_data)
@@ -791,6 +855,11 @@ class InvestigationAdvisorTool:
                     "prompt_blob_id": str(prompt_blob_id),
                     "prompt_sha256": input_sha256,
                     "prompt_bytes": len(encoded),
+                    "dossier_sha256": dossier.sha256,
+                    "dossier_bytes": dossier.byte_size,
+                    "preflight_status": evidence_preflight["status"],
+                    "completeness_counts": evidence_preflight["counts"],
+                    "completeness_manifest": evidence_preflight["items"],
                     "output_blob_id": str(output_blob_id) if output_blob_id else None,
                     "output_sha256": output_sha256,
                     "response_bytes": response_bytes,
@@ -864,6 +933,10 @@ class InvestigationAdvisorTool:
                     "prompt_sha256": input_sha256,
                     "output_sha256": output_sha256,
                     "prompt_bytes": len(encoded),
+                    "dossier_sha256": dossier.sha256,
+                    "dossier_bytes": dossier.byte_size,
+                    "preflight_status": evidence_preflight["status"],
+                    "completeness_counts": evidence_preflight["counts"],
                     "response_bytes": response_bytes,
                     "invocation_stage": invocation_stage,
                     "submission_status": submission.status.value,
@@ -1290,6 +1363,11 @@ class InvestigationAdvisorTool:
                     "claim_id": getattr(item, "claim_id", ""),
                     "heading": getattr(item, "heading", ""),
                     "text": getattr(item, "text", ""),
+                    **(
+                        {"section_index": item.section_index}
+                        if type(getattr(item, "section_index", None)) is int
+                        else {}
+                    ),
                 }
                 for item in getattr(snapshot, "article_passages", ())
             ],
@@ -1456,6 +1534,21 @@ class InvestigationAdvisorTool:
                     }
                 )
             base["opinion_sections"] = opinion_sections
+        if consultation_type in {"plan_investigation", "pivot_strategy"}:
+            state = (
+                await self._investigation_states.get(investigation_id)
+                if self._investigation_states is not None
+                else None
+            )
+            if state is not None and state.investigation_id == investigation_id:
+                base["working_state_ref"] = (
+                    f"investigation-state:{investigation_id}:v{state.version}:{state.sha256}"
+                )
+                base["working_state_version"] = state.version
+                base["working_state_sha256"] = state.sha256
+                base["hypotheses"] = [item.to_payload() for item in state.hypotheses]
+            else:
+                base["hypotheses"] = []
         draft_assertions: list[dict[str, Any]] = []
         if consultation_type == "draft_text":
             raw_units = arguments.get("units")
@@ -1739,9 +1832,12 @@ class InvestigationAdvisorTool:
             base["findings"] = [
                 {
                     "finding_id": str(item.id),
+                    "sha256": _advisor_source_sha256("finding", item),
                     "kind": item.kind.value,
                     "assessment": item.assessment.value,
                     "line": item.statement,
+                    "observation_refs": [str(value) for value in item.observation_refs],
+                    "claim_refs": [str(value) for value in item.claim_refs],
                     "limitations": list(item.limitations),
                 }
                 for item in findings
@@ -1782,6 +1878,8 @@ class InvestigationAdvisorTool:
                 "question": question,
                 "article_source_ref": f"article:{snapshot.synthesis_sha256}",
                 "article_sha256": snapshot.synthesis_sha256,
+                "evidence": base["evidence"],
+                "measured_facts": base["measured_facts"],
                 "samples": await self._sample_inventory(investigation_id, evidence),
                 "measurements": measurements,
                 "tools": tool_inventory,
@@ -1840,6 +1938,8 @@ class InvestigationAdvisorTool:
                     "kind": item.kind.value,
                     "assessment": item.assessment.value,
                     "line": item.statement,
+                    "observation_refs": [str(value) for value in item.observation_refs],
+                    "claim_refs": [str(value) for value in item.claim_refs],
                     "limitations": list(item.limitations),
                 }
                 for item in findings
@@ -2116,6 +2216,7 @@ class InvestigationAdvisorTool:
     async def _candidate_rule_summary(self, observation: EvidenceObservation) -> dict[str, Any]:
         facts: dict[str, Any] = {
             "evidence_id": str(observation.id),
+            "sha256": observation.sha256,
             "source": _safe_text(observation.source, 48),
             "status": "measured",
         }
@@ -2132,6 +2233,10 @@ class InvestigationAdvisorTool:
                 if isinstance(result, Mapping):
                     for field in (
                         "status",
+                        "candidate_id",
+                        "candidate_version",
+                        "corpus_sha256",
+                        "corpus_sha256s_by_role",
                         "false_positives",
                         "false_negatives",
                         "false_positives_added",
@@ -2139,8 +2244,26 @@ class InvestigationAdvisorTool:
                         "fp",
                         "fn",
                     ):
-                        if field in result:
-                            facts[field] = _safe_text(str(result[field]), 48)
+                        if field not in result:
+                            continue
+                        value = result[field]
+                        if field in {"corpus_sha256", "candidate_id"}:
+                            facts[field] = _safe_text(str(value), 128)
+                        elif field == "candidate_version" and type(value) is int:
+                            facts[field] = value
+                        elif field == "corpus_sha256s_by_role" and isinstance(value, Mapping):
+                            facts[field] = {
+                                _safe_text(str(role), 32): [
+                                    digest
+                                    for digest in hashes
+                                    if isinstance(digest, str)
+                                    and re.fullmatch(r"[0-9a-f]{64}", digest)
+                                ]
+                                for role, hashes in value.items()
+                                if isinstance(hashes, (list, tuple))
+                            }
+                        elif field == "status" or isinstance(value, int | float):
+                            facts[field] = _safe_text(str(value), 48)
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
             pass
         return facts
@@ -2501,7 +2624,14 @@ class InvestigationAdvisorTool:
                     "FAITS TRANSMIS (chaque extrait est une source distincte; citer uniquement "
                     "ses alias [E#]):"
                 ),
-                render_advisor_wire_input(data),
+                render_advisor_wire_input(
+                    data,
+                    dossier_text=(
+                        data.get("dossier_text")
+                        if isinstance(data.get("dossier_text"), str)
+                        else None
+                    ),
+                ),
                 (
                     "QUALITÉ: réponse vérifiable, précise et concise; distinguer observation, "
                     "interprétation et hypothèse."
@@ -3406,15 +3536,6 @@ def _critical_prompt_data_was_truncated(
     return bool(truncation.get("brief")) or any(truncation.get(item) for item in required)
 
 
-def _editorial_shared_prompt_bytes(prompt_data: Mapping[str, Any]) -> int:
-    """Measure the common draft context without unit-specific targets or assertions."""
-    shared = copy.deepcopy(dict(prompt_data))
-    shared.pop("units", None)
-    shared.pop("assertions", None)
-    shared["truncation"] = {}
-    return len(InvestigationAdvisorTool._prompt("draft_text", shared).encode("utf-8"))
-
-
 def _validate_editorial_unit_targets(units: list[Any] | tuple[Any, ...]) -> None:
     seen: set[str] = set()
     seen_targets: set[tuple[Any, Any, Any]] = set()
@@ -3544,6 +3665,22 @@ def _bridge_turns_consumed(submission: TurnSubmission) -> int:
         submission.submission_state
         in {"submission_attempted", "post_submission", "external_state_unknown"}
     )
+
+
+def _advisor_payload_was_submitted(submission: TurnSubmission) -> bool:
+    if (
+        submission.status
+        in {
+            TurnSubmissionStatus.BLOCKED,
+            TurnSubmissionStatus.PRE_SUBMISSION_RETRY_EXHAUSTED,
+        }
+        or submission.submission_state == "pre_submission"
+    ):
+        return False
+    return submission.status is TurnSubmissionStatus.SUCCEEDED or submission.submission_state in {
+        "submission_attempted",
+        "post_submission",
+    }
 
 
 def _advisor_invocation_stage(submission: TurnSubmission) -> str:

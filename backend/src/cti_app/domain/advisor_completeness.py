@@ -1,0 +1,22 @@
+"""Typed states for the local adviser evidence preflight projection."""
+
+from enum import StrEnum
+
+
+class AdvisorEvidenceStatus(StrEnum):
+    REQUIRED = "REQUIRED"
+    PRESENT_IN_CANONICAL = "PRESENT_IN_CANONICAL"
+    IN_DOSSIER = "IN_DOSSIER"
+    SENT_TO_BRIDGE = "SENT_TO_BRIDGE"
+    RETRIEVABLE = "RETRIEVABLE"
+    INTENTIONALLY_OMITTED = "INTENTIONALLY_OMITTED"
+    MISSING = "MISSING"
+    NOT_VERIFIED = "NOT_VERIFIED"
+
+
+class AdvisorPreflightStatus(StrEnum):
+    READY = "READY"
+    NEEDS_RETRIEVAL = "NEEDS_RETRIEVAL"
+    INSUFFICIENT_EVIDENCE = "INSUFFICIENT_EVIDENCE"
+    POLICY_BLOCKED = "POLICY_BLOCKED"
+    TECHNICAL_BLOCKED = "TECHNICAL_BLOCKED"

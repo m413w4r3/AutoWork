@@ -1272,9 +1272,6 @@ def _scripted_wire_scalar(value: Any) -> str:
     return rendered
 
 
-_MAX_INVESTIGATION_PROMPT_BYTES = 96_000
-
-
 def render_investigation_prompt(context: InvestigationContextV1) -> str:
     context_payload = json.loads(context.canonical_bytes())
     priority_requests = context_payload.pop("operator_requests", [])
@@ -1428,10 +1425,6 @@ def render_investigation_prompt(context: InvestigationContextV1) -> str:
         "CONTEXTE FACTUEL CANONIQUE — TEXTE\n"
         f"{investigation_payload}"
     )
-    if len(prompt.encode("utf-8")) > _MAX_INVESTIGATION_PROMPT_BYTES:
-        raise ValueError(
-            "The compact investigation prompt exceeds its configured 96000-byte per-turn bound"
-        )
     return prompt
 
 

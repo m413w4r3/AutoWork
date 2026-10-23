@@ -18,6 +18,7 @@ from cti_app.application.bridge_investigator import (
     submit_bridge_consultation_once,
 )
 from cti_app.application.investigation_contracts import (
+    ArticleClaimV1,
     ArticleContextV1,
     ContextInvestigationV1,
     InvestigationContextV1,
@@ -79,7 +80,7 @@ async def test_advisor_waits_for_provider_pacing_slot_without_timing_out(monkeyp
     assert transport.submission_count == 1
 
 
-def _context(investigation_id):
+def _context(investigation_id, *, claims=()):
     return InvestigationContextV1(
         view="full",
         investigation_id=investigation_id,
@@ -91,7 +92,7 @@ def _context(investigation_id):
         ),
         article=ArticleContextV1(
             short_summary="A bounded source narrative.",
-            claims=(),
+            claims=tuple(claims),
             documented_samples=(),
             known_chain=(),
             open_questions=(),
@@ -156,6 +157,56 @@ async def test_turn_is_structured_and_replayed_by_deterministic_identity() -> No
     assert len(transport.prompts[0].encode("utf-8")) <= 96_000
     assert "only existing hypothesis IDs listed in the context" in transport.prompts[0]
     assert "do not create hypothesis labels" in transport.prompts[0].lower()
+
+
+def test_rendered_prompt_has_no_autowork_96000_byte_ceiling() -> None:
+    from cti_app.application.bridge_investigator import render_investigation_prompt
+
+    def render_at_size(target: int) -> str:
+        investigation_id = uuid4()
+        for count in range(1, 40):
+            fixed = [
+                ArticleClaimV1(id=f"C{index}", statement="x" * 3_999, source_refs=())
+                for index in range(count - 1)
+            ]
+
+            def render(
+                last_size: int,
+                *,
+                fixed_claims: list[ArticleClaimV1] = fixed,
+                claim_index: int = count,
+            ) -> str:
+                context = _context(
+                    investigation_id,
+                    claims=(
+                        *fixed_claims,
+                        ArticleClaimV1(
+                            id=f"C{claim_index}", statement="x" * last_size, source_refs=()
+                        ),
+                    ),
+                )
+                return render_investigation_prompt(context)
+
+            smallest = render(1)
+            largest = render(3_999)
+            smallest_bytes = len(smallest.encode("utf-8"))
+            largest_bytes = len(largest.encode("utf-8"))
+            if smallest_bytes <= target <= largest_bytes:
+                low, high = 1, 3_999
+                while low <= high:
+                    middle = (low + high) // 2
+                    rendered = render(middle)
+                    size = len(rendered.encode("utf-8"))
+                    if size == target:
+                        return rendered
+                    if size < target:
+                        low = middle + 1
+                    else:
+                        high = middle - 1
+        raise AssertionError(f"Could not construct a {target}-byte synthetic prompt")
+
+    for target in (95_999, 96_000, 96_001):
+        assert len(render_at_size(target).encode("utf-8")) == target
 
 
 @pytest.mark.asyncio
