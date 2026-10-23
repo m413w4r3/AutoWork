@@ -1,0 +1,86 @@
+# Revue indépendante M01-A1
+
+**Cible :** `cd344743e9ba12d01d509cc8b5f9e42a0f3cb239` (`feat/mission01-a1-strategy-projection`), base `058bb4af2278e3941956e523c5a1d560208de228`. Intégration examinée : `27e99e4769e1f12ca9b717342dbad0e0eefc6fcb`.
+
+**Verdict : FAIL.** La route expose une consolidation qui peut marquer un claim `refuted` sans passer les gardes de preuve de la stratégie. Des champs libres non filtrés peuvent aussi transporter un corps de sample ou d’observation dans sa réponse.
+
+Les statuts ci-dessous qualifient les constats de revue; `CONFIRMED` indique un comportement directement établi par le code ou les tests, pas une validation en production.
+
+## Constats
+
+### A1-R1 — La réponse peut retourner `REFUTED` sans preuve complète et persistée
+
+**CONFIRMED · BLOCKER**
+
+`build_investigation_experiment_timeline()` calcule `claims` par `consolidate_claim_experiments()` ([investigation_experiments.py:160-174](../../backend/src/cti_app/application/investigation_experiments.py#L160)). Le consolidateur choisit `REFUTED` depuis le seul verdict du dernier enregistrement actif ([investigation_experiment.py:463-496](../../backend/src/cti_app/domain/investigation_experiment.py#L463)); il ne consulte ni les observations persistées, ni leur SHA, ni la disponibilité, ni la couverture, ni le résultat observé, ni le critère.
+
+La stratégie parallèle applique ces gardes ([investigation_experiment.py:526-572](../../backend/src/cti_app/domain/investigation_experiment.py#L526)). L’API renvoie les deux calculs dans la même réponse ([api/investigation.py:1062-1082](../../backend/src/cti_app/api/investigation.py#L1062)). Une expérience `REFUTES` à couverture limitée avec résultat `OBSERVED` et une référence d’observation satisfait les validations de construction ([investigation_experiment.py:284-303](../../backend/src/cti_app/domain/investigation_experiment.py#L284)), mais la matrice la garde `UNKNOWN` tandis que `claims.status` devient `refuted`. De même, un objet d’observation référencé absent ou avec un SHA incorrect laisse `claims` à `refuted` même si la matrice retourne `UNKNOWN`.
+
+Le test d’observation étrangère ne vérifie que `strategy.claims.status` et `matrix_status`, pas `payload["claims"]` ([test_investigation_experiment_api.py:444-470](../../backend/tests/test_investigation_experiment_api.py#L444)). Cela laisse passer le cas fautif.
+
+**Correction requise :** calculer le statut de `claims` avec la même projection conservatrice et les mêmes objets d’observation vérifiés, ou ne pas émettre de statut concluant dans cette liste. Ajouter les cas couverture partielle, observation absente/mismatch et outcome incompatible sur la réponse API complète.
+
+### A1-R2 — Le critère de falsification n’est pas contrôlé pour sa pertinence
+
+**CONFIRMED · HIGH**
+
+La projection accepte tout critère non vide autre que quatre chaînes génériques (`none`, `unknown`, `n/a`, `not applicable`) avant de retourner `REFUTED` ([investigation_experiment.py:559-572](../../backend/src/cti_app/domain/investigation_experiment.py#L559)). La construction borne sa longueur mais ne relie pas le critère à la prédiction ou au claim ([investigation_experiment.py:212-218](../../backend/src/cti_app/domain/investigation_experiment.py#L212)). Un texte sans rapport peut donc satisfaire la garde.
+
+La carte de stratégie demandait un critère pertinent et signalait déjà que le texte du critère/verdict reste une assertion opérateur sans oracle sémantique ([CTI_STRATEGY_MAP.md:7,17,101](../../docs/mission01/CTI_STRATEGY_MAP.md#L7)). Les tests vérifient les valeurs structurelles, pas la pertinence de la falsification. Pour respecter le contrat, la pertinence doit être une décision explicitement qualifiée ou un champ structuré vérifiable; le texte libre seul ne suffit pas.
+
+### A1-R3 — Le timeline API peut renvoyer du contenu libre non expurgé
+
+**CONFIRMED · HIGH**
+
+Le schéma autorise toute propriété dans `tool_arguments` ([investigation_experiments.py:743-746](../../backend/src/cti_app/application/investigation_experiments.py#L743)). Le validateur interdit plusieurs noms de clés sensibles et les préfixes `Bearer`/`Basic`, mais accepte toute autre chaîne JSON jusqu’à 4 096 caractères ([investigation_experiment.py:91-108](../../backend/src/cti_app/domain/investigation_experiment.py#L91)). Le sérialiseur rend les arguments sans transformation ([investigation_experiment.py:315-340](../../backend/src/cti_app/domain/investigation_experiment.py#L315)); le timeline inclut aussi les champs libres `prediction`, `expected`, `actual`, `scope`, `limitations` et `implication` ([investigation_experiments.py:140-157](../../backend/src/cti_app/application/investigation_experiments.py#L140)). La route retourne le timeline entier ([api/investigation.py:1080-1082](../../backend/src/cti_app/api/investigation.py#L1080)).
+
+La route ne lit pas les blobs d’observation et ne renvoie leurs références que sous forme d’IDs/SHA; toutefois, un sample encodé sous une clé neutre comme `payload`, ou du texte de preuve copié dans `actual`, traverse ces validations et est renvoyé. Les fixtures API utilisent `tool_arguments={}` et ne testent pas cette frontière ([test_investigation_experiment_api.py:68-110](../../backend/tests/test_investigation_experiment_api.py#L68)). La réponse devrait exposer une projection avec champs autorisés et des références, pas les arguments et textes libres intégraux.
+
+### A1-R4 — Les tests API n’exercent pas la route FastAPI réelle
+
+**CONFIRMED · MEDIUM**
+
+Le helper de test construit un `Request`, appelle directement `get_investigation_experiments()`, puis fait `model_dump()` lui-même ([test_investigation_experiment_api.py:207-239](../../backend/tests/test_investigation_experiment_api.py#L207)). Il ne passe pas par `create_app()`, l’inclusion du router, le middleware d’identité ou la sérialisation FastAPI `response_model`. Le test de l’allowlist opérateur couvre uniquement la fonction de décision, pas une requête authentifiée réelle ([test_operator_client_routes.py:11-45](../../backend/tests/test_operator_client_routes.py#L11)).
+
+Le middleware réel protège `/api/` et restreint le scope opérateur client ([api/main.py:631-657](../../backend/src/cti_app/api/main.py#L631)); la route `experiments` est dans son allowlist GET ([api/main.py:783-824](../../backend/src/cti_app/api/main.py#L783)). Je n’ai pas trouvé de contournement dans ce code. Il reste cependant un trou de test matériel pour l’authentification effective, le câblage UOW et la sérialisation HTTP de cette route.
+
+### A1-R5 — Agrégation de couverture du checkpoint dupliquée
+
+**PLAUSIBLE · LOW**
+
+La stratégie calcule sa couverture sur les expériences actives après supersession ([investigation_experiments.py:255-264](../../backend/src/cti_app/application/investigation_experiments.py#L255)); le checkpoint la recalcule sur toutes les expériences tentées, y compris celles supersédées ([investigation_operator_view.py:71-84](../../backend/src/cti_app/application/investigation_operator_view.py#L71)). Une ancienne tentative limitée peut donc afficher `limited` dans le checkpoint alors que la stratégie active est `complete`. Clarifier la sémantique cumulative ou mutualiser la réduction éviterait deux interprétations du même champ.
+
+### Complexité — amélioration, hors blocage supplémentaire
+
+Le commit ajoute **1 195 lignes** dans 9 fichiers : 450 lignes de production et 745 lignes de tests (avec 15 suppressions au total). Le défaut de statut distinct entre `claims` et `strategy` (A1-R1) est le risque principal et bloque l’acceptation. La consolidation du verdict et la projection de stratégie recalculent la même conclusion avec des gardes différentes; une projection unique éviterait cette divergence. À moindre sévérité, les deux réductions de couverture (A1-R5) peuvent être mutualisées ou leur portée documentée. Le reste de la taille vient surtout des scénarios offline et des tests API; aucune nouvelle couche de persistance n’est ajoutée.
+
+## Contrats vérifiés
+
+- **source_ref/snapshot — CONFIRMED, avec une limite de test.** La projection exige le même artifact, sujet, run, version positive égale à celle du snapshot, SHA de forme SHA-256 et références sûres non vides; sinon elle renvoie `UNKNOWN` et vide les refs ([investigation_experiments.py:194-207,231-269](../../backend/src/cti_app/application/investigation_experiments.py#L194)). Le resolver charge uniquement un artifact `SYNTHESIS` vérifié lié à l’investigation, calcule le SHA sur le contenu canonique et joint la version de cet artifact ([investigation_article_snapshot.py:62-76,146-150,233-255](../../backend/src/cti_app/application/investigation_article_snapshot.py#L62)). Les modes `wrong_snapshot`, `version_mismatch` et `bad_sha` restent `UNKNOWN`; une observation d’une autre investigation aussi ([test_investigation_experiment_api.py:386-470](../../backend/tests/test_investigation_experiment_api.py#L386)). Un snapshot sans version est également refusé par le garde d’égalité, mais aucun test distinct ne couvre un ancien objet sans `synthesis_version`.
+- **Raisons opérateur — CONFIRMED pour les raisons émises.** `budget` vient de `StopReason.BUDGET_EXHAUSTED`, `refus_g2` de l’état d’autorisation révoqué passé par la route, l’indisponibilité d’un champ persisté `availability`, et `deja_testee` d’une identité d’essai calculée depuis les enregistrements. Aucun `ABANDONED` n’est inféré; l’état d’hypothèse est seulement projeté depuis l’état de travail ([investigation_operator_view.py:58-141](../../backend/src/cti_app/application/investigation_operator_view.py#L58), [api/investigation.py:1061-1079](../../backend/src/cti_app/api/investigation.py#L1061)). `non_discriminante` n’est pas émis; les cas non prouvés retombent sur `inconnue`. Le motif G2 est limité à la révocation, pas à toute décision de refus.
+- **Lecture seule et primitives existantes — CONFIRMED.** La route est `GET` et ne fait que charger investigation, timeline, état, observations, snapshot, enveloppe et décisions avant projection ([api/investigation.py:1001-1082](../../backend/src/cti_app/api/investigation.py#L1001)). Le diff A1 ne touche ni migration, modèle SQL, UOW ni dépôt; les expériences réutilisent le protocole de persistance et le dépôt SQL déjà présents, ainsi que la table C2 existante ([investigation_persistence.py:70-82](../../backend/src/cti_app/application/investigation_persistence.py#L70), [repositories/investigation.py:536-570](../../backend/src/cti_app/infrastructure/database/repositories/investigation.py#L536), [models/investigation.py:230-256](../../backend/src/cti_app/infrastructure/database/models/investigation.py#L230)). Aucun endpoint de spawn opérateur ni stockage canonique secondaire n’est ajouté. Le garde d’écriture d’expérience exige toujours l’enveloppe G2 courante ([investigation_experiments.py:76-87,420-440](../../backend/src/cti_app/application/investigation_experiments.py#L76)).
+- **Scénarios/YARA — CONFIRMED au niveau des fixtures offline.** Les six scénarios utilisent des ports fake; la fixture interdit sockets et `urlopen` ([test_investigation_strategy_scenarios.py:48-68](../../backend/tests/test_investigation_strategy_scenarios.py#L48)). Le scénario YARA utilise un faux moteur/corpus, conserve `SYNTHETIC_ONLY`, vérifie les dénominateurs et les dénominateurs réels à zéro, sans promotion en `REAL_VALIDATED` ([test_investigation_strategy_scenarios.py:274-363](../../backend/tests/test_investigation_strategy_scenarios.py#L274)). Cela ne valide pas un transport live ni une généralisation YARA réelle.
+- **B0A/merge — REJECTED comme risque d’écrasement dans ce fichier.** Le blob `research_context_builder.py` au premier parent `f52e067` est identique à celui de la base `058bb4a`; il n’y a pas de delta B0A séparé sur ce fichier dans l’intégration inspectée. Le diff `f52e067..27e99e4` est l’ajout A1 de `synthesis_version` optionnelle et sa validation entière positive hors booléen ([research_context_builder.py:150-158](../../backend/src/cti_app/application/research_context_builder.py#L150)); le blob fusionné correspond à celui de `cd34474`. Aucun contenu de premier parent n’est écrasé. Les deux échecs de tests sur le merge sont déjà présents sur le parent B0A avant A1 (détails ci-dessous).
+
+## Tests et checks exécutés
+
+Depuis une archive de `cd34474`, avec le `.venv` existant et les tests configurés sans accès réseau ou base :
+
+- `PYTHONPATH=$PWD/src .venv/bin/python -m pytest tests/test_investigation_strategy_scenarios.py tests/test_investigation_experiments.py tests/test_investigation_experiment_api.py tests/test_operator_tool_invocation.py -q --tb=short` — **53 passed** : 6 scénarios, 25 tests domaine/API et 22 tests d’invocation opérateur.
+- Ruff ciblé sur les 9 fichiers A1 modifiés — **All checks passed**.
+- `PYTHONPATH=$PWD/src .venv/bin/python -m pytest tests/test_operator_client_routes.py -q --tb=short` — **42 passed** (allowlist fonctionnelle seulement).
+
+Depuis une archive de l’intégration `27e99e4`, la même commande pytest donne **51 passed, 2 failed** :
+
+- `test_operator_dispatcher_wires_minimal_advisor_request_to_strict_bridge_transport`
+- `test_advisor_recommendations_record_acceptance_refusal_and_empirical_outcomes`
+
+Les deux échouent dans le contrôle B0A `required_canonical_evidence_not_in_payload` / `tool_unavailable`. Les mêmes deux tests échouent sur le parent pré-A1 `f52e067`; ils ne sont donc pas une régression introduite par A1. Ruff ciblé sur le merge — **All checks passed**. Ces tests et fixtures ne contactent aucun fournisseur, PostgreSQL ou Docker. Le test d’API A1 appelle toutefois directement le handler, comme décrit en A1-R4. Le test PostgreSQL d’intégration n’a pas été exécuté.
+
+## Inconnues et suites
+
+- **UNKNOWN :** le comportement du dépôt PostgreSQL et de la route montée dans l’application n’est pas couvert par les tests offline exécutés; les tests d’API fournis utilisent un UOW fake.
+- **UNKNOWN :** la pertinence sémantique de tout critère de falsification et le contenu réel qui pourrait être enregistré dans les champs libres ne sont pas évalués par les fixtures.
+- Coût d’exécution : **UNKNOWN**.
+
+Le contrat d’intégration peut être retesté après correction de A1-R1 et A1-R3, puis ajout d’un test ASGI authentifié sur la route complète. Les deux tests B0A échouants doivent rester une réparation distincte du merge A1.
