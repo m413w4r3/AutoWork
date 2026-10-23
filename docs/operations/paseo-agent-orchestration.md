@@ -26,8 +26,9 @@ report or workspace is primary CTI evidence.
 
 ## Delegation policy
 
-Paseo is the outer coding orchestrator when enabled. **Prefer GPT-6 Luna
-high sub-sessions for bounded, independent tasks**, even mechanical file
+Paseo provides the outer orchestration tools; the **parent coding agent**
+may be Claude Sonnet or the user's custom DeepSeek Flash provider.
+**Prefer GPT-6 Luna high sub-sessions for bounded, independent tasks**, even mechanical file
 edits, reproducible checks, focused comparisons and scoped source mapping:
 these are useful places to keep noisy intermediate context away from the
 parent. Use **Luna xhigh** for high-risk code, difficult contradictions,
@@ -47,7 +48,7 @@ for Luna, start a Paseo Codex worker.
 
 | Profile | Preferred model/effort | Access | When |
 |---|---|---|---|
-| coordinator | GPT-6 Luna high/xhigh | scoped integration worktree | planning, parent decisions |
+| coordinator | Claude Sonnet 5.5 medium/high or custom DeepSeek Flash max (when supported) | scoped integration worktree | planning, parent decisions; user picks main session |
 | scout | GPT-6 Luna high | actually read-only | trace code/evidence, map APIs |
 | mechanical | GPT-6 Luna high | isolated write worktree | small repeatable changes |
 | implementer | GPT-6 Luna high | isolated write worktree | bounded implementation |
@@ -123,3 +124,119 @@ Passing offline tests does not establish live provider or CTI correctness.
   `CLAUDE.md`, `.claude/settings.json`, `.claude/agents/`.
 - Paseo **Agent Profiles** and daemon tool access: configured on the host,
   outside this repo. Do not pretend a repository TOML file is loaded by Paseo.
+
+## Applying this on Paseo 0.12.x / Codex 0.163.x
+
+This is a **host setup checklist**, not executable repo configuration.
+Paseo may have enabled orchestration skills but **zero agent profiles**.
+Codex also distinguishes `~/.codex/config.toml` (user defaults) from the
+project `.codex/config.toml` (only after the corresponding checkout/PR is
+present). Do not assume work in a draft GitHub PR already changed a local
+checkout.
+
+### What is a profile, and who orchestrates?
+
+A Paseo **Agent Profile** is a convenient saved bundle of launch settings:
+provider, model, mode, thinking level, available features, and a `When to use`
+note that the orchestrator can inspect. A profile is **not** an autonomous
+agent, a new provider, a mandatory setup step or an execution policy. A
+main/parent coding session becomes an *orchestrator* by using Paseo tools
+or the installed orchestration skills and delegating actual work.
+
+Profiles can be created manually in Paseo Desktop at
+Settings -> host -> Agents -> Agent profiles -> New profile, or omitted:
+when no matching profile is available, the Paseo orchestration skill can
+discover configured providers/models and launch workers with explicit
+settings. Prefer creating **three small worker profiles** rather than
+duplicating every conceivable parent/worker role.
+
+**User's preferred architecture (2026-10-23):** the coordinating session
+uses either Claude Sonnet 5.5 medium/high (if the installed Claude provider
+offers that model) or the existing `deepseek-claude` custom provider
+(`deepseek-flash[1m]`, maximum offered thinking/effort). These are
+**alternative parent sessions**, not Luna leads. The parent is responsible
+for splitting tasks, dependencies, context freshness, permission boundaries,
+integrating and checking outputs. GPT-6 Luna high/xhigh is preferred for
+specialized **workers and independent review**.
+
+| Optional profile | Provider ID | Selected model | Thinking | When to use |
+|---|---|---|---|---|
+| Luna focused | `codex` | `gpt-6-luna` | high | Independent small task, code tracing, mechanical change or focused offline test, fresh context |
+| Luna implementer | `codex` | `gpt-6-luna` | high | Single bounded implementation, isolated writable worktree, verifiable oracle |
+| Luna critical review | `codex` | `gpt-6-luna` | xhigh | Independent read-only review of G2/G3, TLP, migrations, provenance or security |
+
+Optional **parent presets**, only if the user wants one-click launching:
+
+| Parent preset | Provider ID | Model | Thinking |
+|---|---|---|---|
+| Orchestrator Sonnet | `claude` | Sonnet 5.5 *only if listed as available* | medium or high |
+| Orchestrator DeepSeek | `deepseek-claude` | `deepseek-flash[1m]` | maximum *supported* by that provider |
+
+The `deepseek-claude` provider already exists in the user's private
+`~/.paseo/config.json`. **Do not duplicate it** as a new provider alias and
+do not put credentials in the repo. The config's environment variable
+`CLAUDE_CODE_EFFORT_LEVEL=max` does not by itself prove that Paseo or the
+upstream model implements max reasoning; verify selectable options and
+effective session metadata. Likewise do not invent a Sonnet model ID.
+
+
+Choose compatible mode and effective permissions in the UI. The profile
+notes are selection guidance, **not a sandbox**. Test that a spawned worker's
+effective model and thinking appear in its actual session metadata.
+
+Before delegation: use the bundled Paseo skills (`/paseo`,
+`/paseo-handoff`, `/paseo-advisor`, `/paseo-committee`) instead of
+reimplementing their CLI/MCP. Use AutoWork skills for **domain gates** and
+SHA-aware handoff format; avoid two skills trying to create the same session.
+When changing provider/tool profiles, new settings affect new launches, not
+already running agents.
+
+### Concurrency is a system budget
+
+Six Codex-native threads per session and six Paseo agents do **not** mean
+36 independent child sessions are desirable. Start with **2–4 Paseo workers**
+plus one coordinating parent and independent review; raise to six **total**
+active coding workers after measurement and no worktree/CI contention. When
+Paseo is delegating, do not let its child agents launch additional fleets.
+The Codex six-thread setting is mainly useful for standalone Codex work.
+
+### Security and actual host configuration
+
+- Review *effective* Codex sandbox/approval mode **before** launch.
+  Codex subagents inherit parent permissions: a no-edit instruction does not
+  establish read-only tool access. Give review workers an isolated workspace
+  and an actually restricted permission mode when the host supports one.
+- Paseo browser tools, when enabled, control workspace browser tabs that may
+  hold login cookies. Keep disabled during sensitive CTI work. Turn them on
+  temporarily for deliberately scoped frontend verification if needed.
+- Only enable Paseo tool access to a provider after reviewing its permissions.
+  Use provider-specific `paseoTools` restrictions if supported by the host.
+- Relay access is optional and end-to-end encrypted; do not turn it off
+  automatically if used for remote access. Bound daemon listen to loopback
+  when operating locally. Verify CORS and pairing, never copy private keys.
+- If provider configs include inline API tokens, keep them outside Git,
+  restrict permissions on the local file and rotate any token actually
+  disclosed. This repo must never track host `~/.paseo/config.json`.
+- Keep personal Claude Code's historical command approvals **outside Git**.
+  Project `.claude/settings.json` adds scoped denies, but cannot magically
+  undo already permitted capabilities through other tools or agents.
+  Use `/permissions` to verify the effective merged rules.
+- If the user's tools are installed but project config is "No such file",
+  verify `pwd`, `git branch --show-current` and the checkout; the draft
+  PR's project files do not appear in `main` until checked out/merged.
+- Do not force a numeric compaction token limit just to trigger freshness.
+  Use explicit new sessions at bounded task transitions and SHA-based
+  handoffs. Record actual token ledger measurements or UNKNOWN.
+
+### Validation before calling this configuration ready
+
+1. Spawn one Luna focused session and inspect effective model/effort/mode.
+2. Spawn one read-only Luna critical reviewer with constrained tools; confirm
+   it cannot write and that it reports missing permissions as BLOCKED.
+3. Spawn two independent agents into different worktrees; verify no shared
+   dirty checkout, no simultaneous live DB accesses and no runaway children.
+4. Test `/paseo-handoff` to a **new** Luna high session, verifying exact
+   base/output SHAs and a reproducible offline oracle.
+5. Compare the same task under a solo Luna high agent, two Luna high
+   subagents and independent xhigh review. Record defects, total cost,
+   latency, attempts and session churn. Do not assume 6 is optimal.
