@@ -30,7 +30,7 @@ Les numéros L0 à L9 ci-dessous désignent les lots de ce document, sans créer
 - Captures HTML archivées du sujet `d9d24833`, notamment Chainalysis et Bitquery, et manifestes des sources.
 - Diffs non commités des composants concernés, code courant, templates Typst, comparaison ciblée avec `aw-001-complete` (`8700783`).
 - [Ancienne édition Word](/home/nill/work/fiches/special_iran/juin-juillet/bulletin-8a9e41c5-0ab9-4f37-a3c6-3127d9b83545.docx) : structure OOXML et styles examinés ; conversion locale en PDF de 137 pages ; inspection visuelle des pages 1 à 3, dont le début de la synthèse Ababil / Black Shadow.
-- [Plan des correctifs d'extraction déjà engagés](extraction-wire-format-recovery.md) et observations fournies avec la demande.
+- [plan d'extraction historique du 2026-10-02](https://github.com/m413w4r3/AutoWork/blob/2b3df6d286cc364a17e1d5072f3b1248bd836394/docs/design/extraction-wire-format-recovery.md) et observations fournies avec la demande.
 
 Les fichiers de `var/workspaces` portent explicitement `canonical: false` : ils constituent des projections d'observation, pas une autorité à réimporter automatiquement. L'audit n'a pas interrogé PostgreSQL ni MinIO. Les sorties brutes complètes de tous les appels modèle ne figurent pas dans les fichiers locaux examinés. Certaines observations du premier run restent donc rapportées par l'utilisateur, sans reconstitution indépendante de chaque réponse brute.
 
@@ -179,7 +179,7 @@ JSON reste le format interne strict des artifacts. La sortie du bridge devient u
 
 Rejouer hors modèle les réponses disponibles avec les parseurs actuels. Couvrir marqueurs bridge, guillemets, lien Markdown, chunking, batch, dates approximatives et relatives. Mesurer propositions brutes, retenues, rejetées et raisons. Un résultat sans warning ne prouve pas que le parseur n'a rien perdu.
 
-**Modules.** Extraction, parseurs, références, dates/incertitudes et tests déjà modifiés ; [plan d'extraction existant](extraction-wire-format-recovery.md).
+**Modules.** Extraction, parseurs, références, dates/incertitudes et tests déjà modifiés ; [plan d'extraction historique du 2026-10-02](https://github.com/m413w4r3/AutoWork/blob/2b3df6d286cc364a17e1d5072f3b1248bd836394/docs/design/extraction-wire-format-recovery.md).
 
 **Acceptation.** Statut séparé pour chaque correction : présence dans le code, test déterministe réussi, validation sur run réel. Aucune annonce de validation complète fondée uniquement sur `stage.success`. Aucun accès réseau dans les tests.
 

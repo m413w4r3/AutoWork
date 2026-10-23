@@ -157,7 +157,7 @@ Safe to parallelize: yes (worktrees séparés, base = commit A)
 Les mentions de la révision `0002_production_batch_pause` ci-dessus consignent l'état et
 l'estampille de la base au moment de la mise en service du 8 octobre. La réduction de la chaîne
 Alembic ne modifie pas cette base. La pré-vérification et le restamp éventuel sont décrits dans
-`docs/design/2026-10-12-baseline-collapse-live-db-note.md` ; ils ne sont pas appliqués et
+[ancienne note de restamp (Git, OBSOLÈTE)](https://github.com/m413w4r3/AutoWork/blob/2b3df6d286cc364a17e1d5072f3b1248bd836394/docs/design/2026-10-12-baseline-collapse-live-db-note.md) (procédure désormais remplacée par l'ADR-0007) ; ils ne sont pas appliqués et
 requièrent l'accord explicite de l'utilisateur. Le DDL additif du 8 octobre est déjà représenté
 dans la baseline actuelle et ne doit pas être rejoué.
 

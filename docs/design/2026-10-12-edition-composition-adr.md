@@ -2,6 +2,11 @@
 
 Date : 2026-10-12 · Branche : `chantier/multibatch-composition` · Base : `main@a0556c4`
 
+> **Décision historique de composition.** Les passages concernant une baseline Alembic 
+> mutable et les opérations de déploiement ne sont plus applicables. La référence 
+> actuelle pour toute migration est `docs/adr/ADR-0007-frozen-baseline-and-c2-migration.md`.
+> Ne jamais lancer un restamp, reset ou downgrade en suivant ce document.
+
 Statut : **Lots A à F implémentés dans l'arbre de travail ; validation et preuves consignées dans le journal de clôture.**
 
 ## 1. Diagnostic Phase 0 — points de couplage au « dernier batch »
@@ -96,7 +101,7 @@ commande explicite.
 
 La validation exacte, les IDs des fixtures A/B/C et les critères d'acceptation 1–14 sont consignés
 dans `2026-10-12-multibatch-composition-proof-journal.md`. La procédure proposée pour une base
-existante est dans `2026-10-12-multibatch-composition-deployment-note.md`.
+existante est dans [note de déploiement historique (Git)](https://github.com/m413w4r3/AutoWork/blob/2b3df6d286cc364a17e1d5072f3b1248bd836394/docs/design/2026-10-12-multibatch-composition-deployment-note.md); **ne pas exécuter** ses instructions obsolètes de restamp/migration. Voir l'ADR-0007 actuel.
 
 ## 6. Limites connues
 
