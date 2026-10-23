@@ -3,7 +3,12 @@
   "permissions": {
     "deny": [
       "Read(./.env)",
-      "Read(./.env.*)",
+      "Read(./.env.local)",
+      "Read(./.env.development)",
+      "Read(./.env.production)",
+      "Read(./.env.test)",
+      "Read(./backend/.env)",
+      "Read(./frontend/.env)",
       "Read(./.llms_key)",
       "Read(./.secrets/**)",
       "Read(./var/**)",
