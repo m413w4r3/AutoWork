@@ -6,7 +6,7 @@ import asyncio
 import copy
 import hashlib
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -67,14 +67,6 @@ _SAFE_ARTICLE_CLAIM_ID = re.compile(
     r"^(?:C[1-9][0-9]{0,5}|T[1-9][0-9]{0,5}|"
     r"S[1-9][0-9]{0,5}P[1-9][0-9]{0,5}(?:\.[1-9][0-9]{0,5})?|"
     r"claim:[a-z0-9]+(?:-[a-z0-9]+)*|fixture:C[1-9][0-9]{0,5})$"
-)
-_SAFE_TOOL_NAME = re.compile(r"^[a-z][a-z0-9]{0,31}(?:[._-][a-z0-9]{1,31}){1,8}$")
-_SAFE_TOOL_VERSION = re.compile(
-    r"^(?:v?\d+(?:\.\d+){0,3}(?:[-+][A-Za-z0-9.-]{1,24})?|"
-    r"[A-Za-z][A-Za-z0-9]{0,23}-\d+(?:\.\d+){0,3})$"
-)
-_SAFE_TOOL_SCHEMA_VERSION = re.compile(
-    r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*\.v[1-9][0-9]{0,3}$"
 )
 _SHA256_REFERENCE = re.compile(r"^[0-9a-f]{64}$")
 _CANONICAL_UUID_REFERENCE = re.compile(
@@ -177,8 +169,106 @@ class InvestigationExperimentTimelineV1:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class _CanonicalExperimentReferences:
+    uuid_references: frozenset[str]
+    sha256_references: frozenset[str]
+    observations_by_id: Mapping[str, Any]
+    invocations_by_id: Mapping[str, Any]
+
+
+def _object_value(item: Any, field_name: str) -> Any:
+    if isinstance(item, Mapping):
+        return item.get(field_name)
+    return getattr(item, field_name, None)
+
+
+def _canonical_experiment_references(
+    payload: Mapping[str, Any],
+    *,
+    observations: Sequence[Any],
+    invocations: Sequence[Any],
+) -> _CanonicalExperimentReferences:
+    investigation_id = str(payload.get("investigation_id", ""))
+    uuid_references: set[str] = set()
+    sha256_references: set[str] = set()
+    observations_by_id: dict[str, Any] = {}
+    invocations_by_id: dict[str, Any] = {}
+
+    for experiment in _bounded_sequence(payload.get("experiments"), limit=10_000):
+        if not isinstance(experiment, Mapping):
+            continue
+        experiment_id = experiment.get("id")
+        if (
+            experiment.get("investigation_id") == investigation_id
+            and isinstance(experiment_id, str)
+            and _is_canonical_uuid_reference(experiment_id)
+        ):
+            uuid_references.add(experiment_id)
+
+    for observation in observations:
+        if str(_object_value(observation, "investigation_id")) != investigation_id:
+            continue
+        observation_id = str(_object_value(observation, "id") or "")
+        if not _is_canonical_uuid_reference(observation_id):
+            continue
+        observations_by_id[observation_id] = observation
+        uuid_references.add(observation_id)
+        blob_id = str(_object_value(observation, "blob_id") or "")
+        if _is_canonical_uuid_reference(blob_id):
+            uuid_references.add(blob_id)
+        sha256 = _object_value(observation, "sha256")
+        if _is_canonical_sha256_reference(sha256):
+            sha256_references.add(sha256)
+
+    for invocation in invocations:
+        if str(_object_value(invocation, "investigation_id")) != investigation_id:
+            continue
+        invocation_id = str(_object_value(invocation, "id") or "")
+        if not _is_canonical_uuid_reference(invocation_id):
+            continue
+        invocations_by_id[invocation_id] = invocation
+        uuid_references.add(invocation_id)
+
+    return _CanonicalExperimentReferences(
+        uuid_references=frozenset(uuid_references),
+        sha256_references=frozenset(sha256_references),
+        observations_by_id=observations_by_id,
+        invocations_by_id=invocations_by_id,
+    )
+
+
+def _matching_canonical_tool_invocation(
+    experiment: Mapping[str, Any], invocations_by_id: Mapping[str, Any]
+) -> Any | None:
+    raw_refs = experiment.get("tool_invocation_refs")
+    if not isinstance(raw_refs, (tuple, list)) or not raw_refs:
+        return None
+    for reference in raw_refs[:64]:
+        if not isinstance(reference, Mapping):
+            continue
+        invocation = invocations_by_id.get(str(reference.get("invocation_id", "")))
+        reference_version = reference.get("version")
+        if (
+            invocation is not None
+            and isinstance(reference_version, int)
+            and not isinstance(reference_version, bool)
+            and 1 <= reference_version <= 1_000_000
+            and reference_version == _object_value(invocation, "version")
+            and experiment.get("tool_name") == _object_value(invocation, "tool_name")
+            and experiment.get("tool_schema_version") == _object_value(invocation, "schema_version")
+        ):
+            return invocation
+    return None
+
+
 def project_safe_investigation_experiment_timeline(
-    payload: Mapping[str, Any], *, strategy: Mapping[str, Any] | None = None
+    payload: Mapping[str, Any],
+    *,
+    strategy: Mapping[str, Any] | None = None,
+    observations: Sequence[Any] = (),
+    invocations: Sequence[Any] = (),
+    hypotheses: Sequence[Any] = (),
 ) -> dict[str, Any]:
     """Return the operator timeline without raw proof text, bodies, or untrusted refs.
 
@@ -186,6 +276,11 @@ def project_safe_investigation_experiment_timeline(
     redaction is an additional guard; it does not detect encoded sample bodies.
     """
     projected = copy.deepcopy(dict(payload))
+    canonical = _canonical_experiment_references(
+        projected,
+        observations=observations,
+        invocations=invocations,
+    )
     projected["investigation_id"] = _redact_untrusted_identifier(
         projected.get("investigation_id"), _is_canonical_uuid_reference
     )
@@ -196,6 +291,16 @@ def project_safe_investigation_experiment_timeline(
         and isinstance(item.get("claim_id"), str)
         and _SAFE_ARTICLE_CLAIM_ID.fullmatch(item["claim_id"])
     }
+    known_hypothesis_ids = {
+        str(_object_value(item, "id"))
+        for item in hypotheses
+        if _is_safe_hypothesis_id(_object_value(item, "id"))
+    }
+    known_hypothesis_ids.update(
+        str(item.get("id"))
+        for item in (strategy or {}).get("hypotheses", ())
+        if isinstance(item, Mapping) and _is_safe_hypothesis_id(item.get("id"))
+    )
     status_projection = {
         "supported": "supported",
         "refuted": "refuted",
@@ -215,27 +320,44 @@ def project_safe_investigation_experiment_timeline(
             if (label := _verdict_assertion_label(verdict)) is not None
         ]
         claim["experiment_ids"] = _project_identifier_array(
-            claim.get("experiment_ids"), _is_canonical_uuid_reference, limit=256
+            claim.get("experiment_ids"),
+            lambda value: (
+                _is_canonical_uuid_reference(value) and value in canonical.uuid_references
+            ),
+            limit=256,
         )
         claim["superseded_by"] = _project_identifier_array(
-            claim.get("superseded_by"), _is_canonical_uuid_reference, limit=256
+            claim.get("superseded_by"),
+            lambda value: (
+                _is_canonical_uuid_reference(value) and value in canonical.uuid_references
+            ),
+            limit=256,
         )
         safe_scopes = []
         for scope in claim.get("scopes", ()):
             if isinstance(scope, dict):
                 scope["scope"] = "[redacted]"
                 scope["experiment_id"] = _redact_untrusted_identifier(
-                    scope.get("experiment_id"), _is_canonical_uuid_reference
+                    scope.get("experiment_id"),
+                    lambda value: (
+                        _is_canonical_uuid_reference(value) and value in canonical.uuid_references
+                    ),
                 )
                 scope["observation_ids"] = _project_identifier_array(
-                    scope.get("observation_ids"), _is_canonical_uuid_reference, limit=128
+                    scope.get("observation_ids"),
+                    lambda value: (
+                        _is_canonical_uuid_reference(value) and value in canonical.uuid_references
+                    ),
+                    limit=128,
                 )
                 scope["superseded_by"] = _project_identifier_array(
-                    scope.get("superseded_by"), _is_canonical_uuid_reference, limit=256
+                    scope.get("superseded_by"),
+                    lambda value: (
+                        _is_canonical_uuid_reference(value) and value in canonical.uuid_references
+                    ),
+                    limit=256,
                 )
-                scope["verdict_assertion_label"] = _verdict_assertion_label(
-                    scope.get("verdict")
-                )
+                scope["verdict_assertion_label"] = _verdict_assertion_label(scope.get("verdict"))
                 safe_scopes.append(scope)
         claim["scopes"] = safe_scopes
 
@@ -251,11 +373,21 @@ def project_safe_investigation_experiment_timeline(
     for experiment in projected.get("experiments", ()):
         if not isinstance(experiment, dict):
             continue
+        tool_match = _matching_canonical_tool_invocation(
+            experiment,
+            canonical.invocations_by_id,
+        )
         experiment["id"] = _redact_untrusted_identifier(
-            experiment.get("id"), _is_canonical_uuid_reference
+            experiment.get("id"),
+            lambda value: (
+                _is_canonical_uuid_reference(value) and value in canonical.uuid_references
+            ),
         )
         experiment["investigation_id"] = _redact_untrusted_identifier(
-            experiment.get("investigation_id"), _is_canonical_uuid_reference
+            experiment.get("investigation_id"),
+            lambda value: (
+                _is_canonical_uuid_reference(value) and value == projected.get("investigation_id")
+            ),
         )
         for field_name in free_text_fields:
             experiment[field_name] = "[redacted]" if experiment.get(field_name) else ""
@@ -267,25 +399,11 @@ def project_safe_investigation_experiment_timeline(
                 field_name == "input_type"
                 and isinstance(value, str)
                 and value in _SAFE_EXPERIMENT_INPUT_TYPES
-            ) or (
-                field_name == "tool_name"
-                and isinstance(value, str)
-                and _SAFE_TOOL_NAME.fullmatch(value) is not None
-            ) or (
-                field_name == "tool_version"
-                and isinstance(value, str)
-                and _SAFE_TOOL_VERSION.fullmatch(value) is not None
-            ) or (
-                field_name == "tool_schema_version"
-                and isinstance(value, str)
-                and _SAFE_TOOL_SCHEMA_VERSION.fullmatch(value) is not None
             )
             if not safe_value:
                 experiment[field_name] = "[redacted]"
         experiment["author"] = (
-            experiment["author"]
-            if experiment.get("author") == "operator-led"
-            else "[redacted]"
+            experiment["author"] if experiment.get("author") == "operator-led" else "[redacted]"
         )
         experiment["origin"] = (
             experiment["origin"]
@@ -303,40 +421,58 @@ def project_safe_investigation_experiment_timeline(
             safe_claim_ids.append("[redacted]")
         experiment["claim_ids"] = safe_claim_ids
         hypothesis_id = experiment.get("hypothesis_id")
-        if not isinstance(hypothesis_id, str) or not re.fullmatch(
-            HYPOTHESIS_ID_PATTERN, hypothesis_id
-        ):
-            experiment["hypothesis_id"] = "[redacted]"
+        experiment["hypothesis_id"] = (
+            hypothesis_id if hypothesis_id in known_hypothesis_ids else "[redacted]"
+        )
         # No arbitrary scalars: byte arrays can be encoded as integers or booleans.
         experiment["tool_arguments"] = {}
         experiment["input_refs"] = _safe_experiment_input_references(
-            experiment.get("input_refs")
+            experiment.get("input_refs"), canonical.observations_by_id
         )
         experiment["next_pivots"] = _project_identifier_array(
-            experiment.get("next_pivots"), _is_canonical_sha256_reference, limit=128
+            experiment.get("next_pivots"),
+            lambda value: (
+                _is_canonical_sha256_reference(value) and value in canonical.sha256_references
+            ),
+            limit=128,
         )
-        # The persisted step_ids contract has no canonical identifier grammar.
-        # Only UUID/SHA references are reflected; other values get an explicit marker.
         experiment["step_ids"] = _project_identifier_array(
-            experiment.get("step_ids"), _is_canonical_reference, limit=64
+            experiment.get("step_ids"),
+            lambda value: (
+                (_is_canonical_uuid_reference(value) and value in canonical.uuid_references)
+                or (_is_canonical_sha256_reference(value) and value in canonical.sha256_references)
+            ),
+            limit=64,
         )
         experiment["supersedes_experiment_ids"] = _project_identifier_array(
             experiment.get("supersedes_experiment_ids"),
-            _is_canonical_uuid_reference,
+            lambda value: (
+                _is_canonical_uuid_reference(value) and value in canonical.uuid_references
+            ),
             limit=64,
         )
         experiment["superseded_by"] = _project_identifier_array(
-            experiment.get("superseded_by"), _is_canonical_uuid_reference, limit=256
+            experiment.get("superseded_by"),
+            lambda value: (
+                _is_canonical_uuid_reference(value) and value in canonical.uuid_references
+            ),
+            limit=256,
         )
         experiment["tool_invocation_refs"] = _safe_experiment_invocation_references(
-            experiment.get("tool_invocation_refs")
+            experiment.get("tool_invocation_refs"), canonical.invocations_by_id
         )
         experiment["observation_refs"] = _safe_experiment_observation_references(
-            experiment.get("observation_refs")
+            experiment.get("observation_refs"), canonical.observations_by_id
         )
-        experiment["verdict_assertion_label"] = _verdict_assertion_label(
-            experiment.get("verdict")
-        )
+        if tool_match is None:
+            experiment["tool_name"] = "[redacted]"
+            experiment["tool_schema_version"] = "[redacted]"
+        else:
+            experiment["tool_name"] = tool_match.tool_name
+            experiment["tool_schema_version"] = tool_match.schema_version
+        # ToolInvocation has no canonical tool-version field to resolve against.
+        experiment["tool_version"] = "[redacted]"
+        experiment["verdict_assertion_label"] = _verdict_assertion_label(experiment.get("verdict"))
 
     redacted, _ = redact_operational_secrets(projected)
     return redacted if isinstance(redacted, dict) else projected
@@ -356,16 +492,8 @@ def _is_canonical_sha256_reference(value: Any) -> bool:
     return isinstance(value, str) and _SHA256_REFERENCE.fullmatch(value) is not None
 
 
-def _is_canonical_reference(value: Any) -> bool:
-    return _is_canonical_uuid_reference(value) or _is_canonical_sha256_reference(value)
-
-
 def _is_safe_hypothesis_id(value: Any) -> bool:
     return isinstance(value, str) and re.fullmatch(HYPOTHESIS_ID_PATTERN, value) is not None
-
-
-def _is_safe_tool_name(value: Any) -> bool:
-    return isinstance(value, str) and _SAFE_TOOL_NAME.fullmatch(value) is not None
 
 
 def _redact_untrusted_identifier(value: Any, predicate: Any) -> Any:
@@ -374,32 +502,41 @@ def _redact_untrusted_identifier(value: Any, predicate: Any) -> Any:
 
 def _project_identifier_array(value: Any, predicate: Any, *, limit: int) -> list[Any]:
     projected = [
-        item if predicate(item) else "[redacted]"
-        for item in _bounded_sequence(value, limit=limit)
+        item if predicate(item) else "[redacted]" for item in _bounded_sequence(value, limit=limit)
     ]
     if isinstance(value, (tuple, list)) and len(value) > limit:
         projected.append("[redacted]")
     return projected
 
 
-def _safe_experiment_invocation_references(value: Any) -> list[dict[str, int | str]]:
+def _safe_experiment_invocation_references(
+    value: Any, invocations_by_id: Mapping[str, Any]
+) -> list[dict[str, int | str]]:
     result: list[dict[str, int | str]] = []
     for item in _bounded_sequence(value, limit=64):
         if not isinstance(item, Mapping):
             continue
         version = item.get("version")
-        safe_version = (
-            version
-            if isinstance(version, int)
+        invocation_id = item.get("invocation_id")
+        invocation = invocations_by_id.get(str(invocation_id))
+        resolved = (
+            invocation is not None
+            and version == _object_value(invocation, "version")
+            and isinstance(version, int)
             and not isinstance(version, bool)
             and 1 <= version <= 1_000_000
+        )
+        safe_invocation_id: str = (
+            invocation_id if resolved and isinstance(invocation_id, str) else "[redacted]"
+        )
+        safe_version: int | str = (
+            version
+            if resolved and isinstance(version, int) and not isinstance(version, bool)
             else "[redacted]"
         )
         result.append(
             {
-                "invocation_id": _redact_untrusted_identifier(
-                    item.get("invocation_id"), _is_canonical_uuid_reference
-                ),
+                "invocation_id": safe_invocation_id,
                 "version": safe_version,
             }
         )
@@ -408,22 +545,28 @@ def _safe_experiment_invocation_references(value: Any) -> list[dict[str, int | s
     return result
 
 
-def _safe_experiment_observation_references(value: Any) -> list[dict[str, str]]:
+def _safe_experiment_observation_references(
+    value: Any, observations_by_id: Mapping[str, Any]
+) -> list[dict[str, str]]:
     result: list[dict[str, str]] = []
     for item in _bounded_sequence(value, limit=128):
         if not isinstance(item, Mapping):
             continue
+        observation_id = item.get("observation_id")
         sha256 = item.get("sha256")
-        safe_sha256 = (
-            sha256
-            if isinstance(sha256, str) and _is_canonical_sha256_reference(sha256)
-            else "[redacted]"
+        observation = observations_by_id.get(str(observation_id))
+        resolved = (
+            observation is not None
+            and _object_value(observation, "sha256") == sha256
+            and _is_canonical_sha256_reference(sha256)
         )
+        safe_observation_id: str = (
+            observation_id if resolved and isinstance(observation_id, str) else "[redacted]"
+        )
+        safe_sha256: str = sha256 if resolved and isinstance(sha256, str) else "[redacted]"
         result.append(
             {
-                "observation_id": _redact_untrusted_identifier(
-                    item.get("observation_id"), _is_canonical_uuid_reference
-                ),
+                "observation_id": safe_observation_id,
                 "sha256": safe_sha256,
             }
         )
@@ -438,7 +581,9 @@ def _verdict_assertion_label(value: Any) -> str | None:
     return None
 
 
-def _safe_experiment_input_references(value: Any) -> list[dict[str, str | None]]:
+def _safe_experiment_input_references(
+    value: Any, observations_by_id: Mapping[str, Any]
+) -> list[dict[str, str | None]]:
     if not isinstance(value, (tuple, list)):
         return []
     result: list[dict[str, str | None]] = []
@@ -448,25 +593,30 @@ def _safe_experiment_input_references(value: Any) -> list[dict[str, str | None]]
         input_type = item.get("input_type")
         input_id = item.get("input_id")
         sha256 = item.get("sha256")
-        canonical_uuid = (
-            isinstance(input_id, str)
-            and _CANONICAL_UUID_REFERENCE.fullmatch(input_id) is not None
-        )
-        canonical_sha256 = (
-            isinstance(input_id, str) and _SHA256_REFERENCE.fullmatch(input_id) is not None
-        )
-        if isinstance(input_id, str) and (canonical_uuid or canonical_sha256):
-            safe_input_id = input_id
-            safe_sha256 = (
-                sha256
-                if isinstance(sha256, str)
-                and _SHA256_REFERENCE.fullmatch(sha256)
-                and (not canonical_sha256 or sha256 == input_id)
-                else None
+        canonical_observation = None
+        if isinstance(input_id, str) and _is_canonical_sha256_reference(input_id):
+            canonical_observation = next(
+                (
+                    observation
+                    for observation in observations_by_id.values()
+                    if _object_value(observation, "sha256") == input_id
+                ),
+                None,
             )
-        else:
-            safe_input_id = "[redacted]"
-            safe_sha256 = None
+        canonical_sha256 = (
+            _object_value(canonical_observation, "sha256")
+            if canonical_observation is not None
+            else None
+        )
+        resolved = (
+            canonical_observation is not None
+            and input_id == canonical_sha256
+            and (sha256 is None or sha256 == canonical_sha256)
+        )
+        safe_input_id: str = input_id if resolved and isinstance(input_id, str) else "[redacted]"
+        safe_sha256: str | None = (
+            sha256 if resolved and isinstance(sha256, str) else None if resolved else "[redacted]"
+        )
         safe_input_type = (
             input_type
             if isinstance(input_type, str) and input_type in _SAFE_EXPERIMENT_INPUT_TYPES
@@ -480,7 +630,9 @@ def _safe_experiment_input_references(value: Any) -> list[dict[str, str | None]]
             }
         )
     if len(value) > 64:
-        result.append({"input_type": "[redacted]", "input_id": "[redacted]", "sha256": None})
+        result.append(
+            {"input_type": "[redacted]", "input_id": "[redacted]", "sha256": "[redacted]"}
+        )
     return result
 
 
@@ -512,6 +664,7 @@ def build_investigation_strategy_projection(
     hypotheses: tuple[Any, ...],
     experiments: tuple[InvestigationExperimentV1, ...],
     observations: tuple[Any, ...],
+    invocations: tuple[Any, ...] = (),
 ) -> dict[str, Any]:
     """Build an audit-friendly strategy view from already loaded canonical objects.
 
@@ -536,8 +689,7 @@ def build_investigation_strategy_projection(
     claims_by_id = {
         str(item.id): item
         for item in snapshot_claims
-        if isinstance(getattr(item, "id", None), str)
-        and _SAFE_ARTICLE_CLAIM_ID.fullmatch(item.id)
+        if isinstance(getattr(item, "id", None), str) and _SAFE_ARTICLE_CLAIM_ID.fullmatch(item.id)
     }
     declared_hypotheses = {
         str(item.id): item
@@ -551,6 +703,11 @@ def build_investigation_strategy_projection(
         and isinstance(getattr(item, "id", None), UUID)
         and isinstance(getattr(item, "sha256", None), str)
     }
+    canonical_invocations = _canonical_experiment_references(
+        {"investigation_id": str(investigation_id), "experiments": ()},
+        observations=(),
+        invocations=invocations,
+    ).invocations_by_id
 
     relevant_experiments = tuple(
         sorted(
@@ -615,12 +772,21 @@ def build_investigation_strategy_projection(
                     {
                         "id": str(item.id),
                         "version": item.version,
-                        "hypothesis_id": _redact_untrusted_identifier(
-                            item.hypothesis_id, _is_safe_hypothesis_id
+                        "hypothesis_id": (
+                            item.hypothesis_id
+                            if item.hypothesis_id in declared_hypotheses
+                            else "[redacted]"
                         ),
                         "hypothesis_declared": item.hypothesis_id in declared_hypotheses,
-                        "tool_name": _redact_untrusted_identifier(
-                            item.tool_name, _is_safe_tool_name
+                        "tool_name": (
+                            matched_invocation.tool_name
+                            if (
+                                matched_invocation := _matching_canonical_tool_invocation(
+                                    item.to_payload(), canonical_invocations
+                                )
+                            )
+                            is not None
+                            else "[redacted]"
                         ),
                         "attempt_identity_sha256": hashlib.sha256(
                             canonical_json_bytes(
@@ -901,14 +1067,36 @@ class OperatorExperimentToolAdapter:
         timeline = await build_investigation_experiment_timeline(
             self._experiments, context.investigation_id
         )
-        safe_timeline = project_safe_investigation_experiment_timeline(timeline.to_payload())
+        observation_list = getattr(self._observations, "list_for_investigation", None)
+        invocation_list = getattr(self._invocations, "list_for_investigation", None)
+        canonical_observations = (
+            tuple(await observation_list(context.investigation_id))
+            if callable(observation_list)
+            else tuple(observations.values())
+        )
+        canonical_invocations = (
+            tuple(await invocation_list(context.investigation_id))
+            if callable(invocation_list)
+            else tuple(invocations.values())
+        )
+        safe_timeline = project_safe_investigation_experiment_timeline(
+            timeline.to_payload(),
+            observations=canonical_observations,
+            invocations=canonical_invocations,
+            hypotheses=tuple(state.hypotheses),
+        )
         claims_by_id = {item["claim_id"]: item for item in safe_timeline["claims"]}
+        experiment_projection = next(
+            (item for item in safe_timeline["experiments"] if item.get("id") == str(saved.id)),
+            None,
+        )
         output = {
             "schema_version": saved.schema_version,
             "experiment_id": str(saved.id),
             "version": saved.version,
             "verdict": saved.verdict.value,
             "verdict_assertion_label": _verdict_assertion_label(saved.verdict.value),
+            "experiment": experiment_projection,
             "claim_verdicts": [claims_by_id[item] for item in saved.claim_ids],
         }
         safe_output, _ = redact_operational_secrets(output)
@@ -922,8 +1110,18 @@ class OperatorExperimentToolAdapter:
 
 
 class _ExperimentListToolAdapter:
-    def __init__(self, experiments: InvestigationExperimentRepository) -> None:
+    def __init__(
+        self,
+        experiments: InvestigationExperimentRepository,
+        *,
+        observations: EvidenceObservationRepository | None = None,
+        invocations: ToolInvocationRepository | None = None,
+        states: InvestigationStateRepository | None = None,
+    ) -> None:
         self._experiments = experiments
+        self._observations = observations
+        self._invocations = invocations
+        self._states = states
 
     async def execute(
         self, arguments: Mapping[str, Any], context: ToolExecutionContext
@@ -932,9 +1130,27 @@ class _ExperimentListToolAdapter:
         timeline = await build_investigation_experiment_timeline(
             self._experiments, context.investigation_id
         )
+        canonical_observations = (
+            tuple(await self._observations.list_for_investigation(context.investigation_id))
+            if self._observations is not None
+            else ()
+        )
+        canonical_invocations = (
+            tuple(await self._invocations.list_for_investigation(context.investigation_id))
+            if self._invocations is not None
+            else ()
+        )
+        state = (
+            await self._states.get(context.investigation_id) if self._states is not None else None
+        )
         return ToolResult(
             ToolInvocationStatus.SUCCEEDED,
-            output=project_safe_investigation_experiment_timeline(timeline.to_payload()),
+            output=project_safe_investigation_experiment_timeline(
+                timeline.to_payload(),
+                observations=canonical_observations,
+                invocations=canonical_invocations,
+                hypotheses=tuple(state.hypotheses) if state is not None else (),
+            ),
         )
 
 
@@ -1212,7 +1428,12 @@ def register_operator_experiment_tools(
             limitations=("The response is a projection of persisted experiment history.",),
             capability_key="investigation.local_read",
         ),
-        _ExperimentListToolAdapter(experiments),
+        _ExperimentListToolAdapter(
+            experiments,
+            observations=observations,
+            invocations=invocations,
+            states=states,
+        ),
     )
 
 

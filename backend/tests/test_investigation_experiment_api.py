@@ -151,6 +151,7 @@ class _UnitOfWork:
         hypotheses: tuple[str, ...] = ("H1",),
         snapshot_version: int = 1,
         observations: tuple[object, ...] = (),
+        invocations: tuple[object, ...] = (),
     ) -> None:
         self.analyst_investigations = SimpleNamespace(
             get=self._get_investigation,
@@ -159,6 +160,9 @@ class _UnitOfWork:
         self.investigation_states = SimpleNamespace(get=lambda _id: self._get_state(hypotheses))
         self.evidence_observations = SimpleNamespace(
             list_for_investigation=lambda _id: self._get_observations(observations)
+        )
+        self.tool_invocations = SimpleNamespace(
+            list_for_investigation=lambda _id: self._get_observations(invocations)
         )
         self.production_artifacts = SimpleNamespace(
             get=lambda _id: self._get_artifact(snapshot_version)
@@ -264,6 +268,7 @@ def _client(
     hypotheses: tuple[str, ...] = ("H1",),
     snapshot_version: int = 1,
     observations: tuple[object, ...] = (),
+    invocations: tuple[object, ...] = (),
 ) -> _ApiClient:
     app = create_app()
     app.state.identity_provider = StaticTokenIdentityProvider(
@@ -275,6 +280,7 @@ def _client(
         hypotheses=hypotheses,
         snapshot_version=snapshot_version,
         observations=observations,
+        invocations=invocations,
     )
     if snapshot_mode != "missing":
         snapshot_id = (
@@ -402,25 +408,25 @@ def test_full_api_claim_status_uses_conservative_strategy_projection(
         observation_refs=(SimpleNamespace(observation_id=observation_id, sha256="a" * 64),),
     )
     observations = (
-        SimpleNamespace(
-            id=observation_id,
-            investigation_id=INVESTIGATION_ID,
-            sha256=observation_sha,
-        ),
-    ) if include_observation else ()
+        (
+            SimpleNamespace(
+                id=observation_id,
+                investigation_id=INVESTIGATION_ID,
+                sha256=observation_sha,
+            ),
+        )
+        if include_observation
+        else ()
+    )
 
-    with _client(
-        (experiment,), snapshot_mode="verified", observations=observations
-    ) as client:
+    with _client((experiment,), snapshot_mode="verified", observations=observations) as client:
         response = client.get(f"/api/investigations/{INVESTIGATION_ID}/experiments")
 
     assert response.status_code == 200
     payload = response.json()
     strategy_claim = payload["strategy"]["claims"][0]
     timeline_claim = payload["claims"][0]
-    expected_status = (
-        "supported" if strategy_claim["status"] == "supported" else "inconclusive"
-    )
+    expected_status = "supported" if strategy_claim["status"] == "supported" else "inconclusive"
     assert timeline_claim["status"] == expected_status
     assert timeline_claim["status"] != "refuted"
     assert strategy_claim["status"] == "UNKNOWN"
@@ -453,7 +459,13 @@ def test_timeline_route_redacts_free_text_and_payload_arguments() -> None:
         "mode": f"signed-url https://example.invalid/?token={secret}",
     }
 
-    with _client((experiment,)) as client:
+    canonical_observation = SimpleNamespace(
+        id=UUID("70000000-0000-4000-8000-000000000001"),
+        investigation_id=INVESTIGATION_ID,
+        blob_id=UUID("70000000-0000-4000-8000-000000000002"),
+        sha256="b" * 64,
+    )
+    with _client((experiment,), observations=(canonical_observation,)) as client:
         response = client.get(f"/api/investigations/{INVESTIGATION_ID}/experiments")
 
     assert response.status_code == 200
@@ -464,7 +476,11 @@ def test_timeline_route_redacts_free_text_and_payload_arguments() -> None:
     assert unsafe_reference not in serialized
     assert projected["tool_arguments"] == {}
     assert projected["input_refs"] == [
-        {"input_type": "sample_sha256", "input_id": "[redacted]", "sha256": None},
+        {
+            "input_type": "sample_sha256",
+            "input_id": "[redacted]",
+            "sha256": "[redacted]",
+        },
         {"input_type": "capture_sha256", "input_id": "b" * 64, "sha256": "b" * 64},
     ]
     assert projected["prediction"] == "[redacted]"
@@ -474,8 +490,40 @@ def test_timeline_route_redacts_free_text_and_payload_arguments() -> None:
     assert payload["claims"][0]["scopes"][0]["scope"] == "[redacted]"
 
 
+def test_timeline_exposes_only_tool_identity_resolved_by_persisted_invocation() -> None:
+    invocation_id = UUID("80000000-0000-4000-8000-000000000001")
+    invocation = SimpleNamespace(
+        id=invocation_id,
+        investigation_id=INVESTIGATION_ID,
+        version=2,
+        tool_name="protocol.validate",
+        schema_version="protocol-validation.v1",
+    )
+    experiment = _experiment(
+        experiment_id=NEW_EXPERIMENT_ID,
+        version=1,
+        verdict=ExperimentVerdict.INCONCLUSIVE,
+    )
+    experiment.tool_invocation_refs = ({"invocation_id": str(invocation_id), "version": 2},)
+    experiment.tool_name = "protocol.validate"
+    experiment.tool_schema_version = "protocol-validation.v1"
+
+    with _client((experiment,), invocations=(invocation,)) as client:
+        response = client.get(f"/api/investigations/{INVESTIGATION_ID}/experiments")
+
+    assert response.status_code == 200
+    projected = response.json()["experiments"][0]
+    assert projected["tool_invocation_refs"] == [
+        {"invocation_id": str(invocation_id), "version": 2}
+    ]
+    assert projected["tool_name"] == "protocol.validate"
+    assert projected["tool_schema_version"] == "protocol-validation.v1"
+    # ToolInvocation has no canonical tool-version property.
+    assert projected["tool_version"] == "[redacted]"
+
+
 def test_timeline_route_redacts_unvalidated_step_ids_and_labels_refutes_as_assertion() -> None:
-    hostile_step_id = "deadbeef" * 16 + "OPERATOR_TEST_SECRET"
+    hostile_step_id = "deadbeef" * 8
     experiment = _experiment(
         experiment_id=NEW_EXPERIMENT_ID,
         version=1,
@@ -486,13 +534,16 @@ def test_timeline_route_redacts_unvalidated_step_ids_and_labels_refutes_as_asser
     experiment.next_pivots = (hostile_step_id,)
     experiment.supersedes_experiment_ids = (hostile_step_id,)
     experiment.tool_invocation_refs = ({"invocation_id": hostile_step_id, "version": 1},)
+    experiment.input_refs = (
+        ExperimentInputRefV1("sample_sha256", hostile_step_id, hostile_step_id),
+    )
     experiment.observation_refs = (
         SimpleNamespace(observation_id=hostile_step_id, sha256=hostile_step_id),
     )
     experiment.hypothesis_id = hostile_step_id
-    experiment.tool_name = hostile_step_id
-    experiment.tool_version = hostile_step_id
-    experiment.tool_schema_version = hostile_step_id
+    experiment.tool_name = "secret.payload"
+    experiment.tool_version = "SensitiveData-1"
+    experiment.tool_schema_version = "sensitive.payload.v1"
     experiment.author = hostile_step_id
     experiment.origin = hostile_step_id
 
@@ -508,7 +559,7 @@ def test_timeline_route_redacts_unvalidated_step_ids_and_labels_refutes_as_asser
     assert projected["next_pivots"] == ["[redacted]"]
     assert projected["supersedes_experiment_ids"] == ["[redacted]"]
     assert projected["tool_invocation_refs"] == [
-        {"invocation_id": "[redacted]", "version": 1}
+        {"invocation_id": "[redacted]", "version": "[redacted]"}
     ]
     assert projected["observation_refs"] == [
         {"observation_id": "[redacted]", "sha256": "[redacted]"}
@@ -519,6 +570,9 @@ def test_timeline_route_redacts_unvalidated_step_ids_and_labels_refutes_as_asser
     assert projected["tool_name"] == "[redacted]"
     assert projected["tool_version"] == "[redacted]"
     assert projected["tool_schema_version"] == "[redacted]"
+    assert projected["input_refs"] == [
+        {"input_type": "sample_sha256", "input_id": "[redacted]", "sha256": "[redacted]"}
+    ]
     assert projected["verdict"] == "refutes"
     assert projected["verdict_assertion_label"] == (
         "Verdict enregistré : refutes (assertion, non conclusion)"
@@ -531,6 +585,15 @@ def test_timeline_route_redacts_unvalidated_step_ids_and_labels_refutes_as_asser
     assert payload["claims"][0]["verdict_assertion_labels"] == [
         "Verdict enregistré : refutes (assertion, non conclusion)"
     ]
+    assert all(
+        value not in response.text
+        for value in (
+            "secret.payload",
+            "SensitiveData-1",
+            "sensitive.payload.v1",
+            hostile_step_id,
+        )
+    )
 
 
 def test_get_experiments_accepts_legacy_payloads_without_replacement_fields() -> None:

@@ -302,7 +302,7 @@ class FindingView(BaseModel):
 class ExperimentInputRefView(BaseModel):
     input_type: str
     input_id: str
-    sha256: str | None
+    sha256: str | Literal["[redacted]"] | None
 
 
 class ExperimentInvocationRefView(BaseModel):
@@ -1027,6 +1027,12 @@ async def get_investigation_experiments(
             if observations_repository is not None
             else ()
         )
+        invocation_repository = getattr(uow, "tool_invocations", None)
+        invocations = (
+            tuple(await invocation_repository.list_for_investigation(investigation_id))
+            if invocation_repository is not None
+            else ()
+        )
         snapshot = None
         snapshot_version = None
         composition_factory = getattr(request.app.state, "investigation_composition_factory", None)
@@ -1073,6 +1079,7 @@ async def get_investigation_experiments(
             hypotheses=tuple(state.hypotheses) if state is not None else (),
             experiments=timeline.experiments,
             observations=observations,
+            invocations=invocations,
         )
         strategy.update(
             build_investigation_operator_strategy_checkpoint(
@@ -1082,7 +1089,11 @@ async def get_investigation_experiments(
             )
         )
         timeline_payload = project_safe_investigation_experiment_timeline(
-            timeline.to_payload(), strategy=strategy
+            timeline.to_payload(),
+            strategy=strategy,
+            observations=observations,
+            invocations=invocations,
+            hypotheses=tuple(state.hypotheses) if state is not None else (),
         )
     return InvestigationExperimentTimelineResponseV1.model_validate(
         {**timeline_payload, "strategy": strategy}, strict=False
