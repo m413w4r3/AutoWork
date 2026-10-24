@@ -8,6 +8,48 @@
 - Aucun changement de persistance, migration, wire output, parse/reparse, batching ou avis.
 - `prepare` n'accorde aucune autorisation G2/TLP, ne consomme aucun budget et n'archive ni n'envoie les octets.
 
+## Reprise après revue `M04_L20_REVIEW.md` — tentative de réparation 1
+
+La revue indépendante rendait `REVISE` pour une collision propre de mesure/fait omise par le ledger, l'absence de pièges pour certaines primitives I/O et l'absence d'un test d'alias ambigu. Ces trois points ont été traités dans le module et les tests uniquement.
+
+- `_manifest_refs` conserve le ref propre `(measurement|fact, id, sha256)` et le ref observation `(observation, evidence_id, evidence_sha256)`. Le ledger compare les deux pour le manifeste brut et le manifeste construit; `_projection_refs` ajoute également les refs propres des `network_facts`.
+- Le catalogue contient l'union des refs valides observés dans le projection, le manifeste brut, le manifeste construit, les refs transmis et les cibles review. Cette conservation n'élargit pas la résolution : seuls les refs transmis exacts et les review targets versionnés reçoivent un alias.
+- L'oracle d'ambiguïté passe deux identités transmises distinctes sous `E1` et vérifie que cet alias ne résout pas.
+- L'oracle sans I/O piège maintenant `builtins.open`, `io.open`, `os.open`, `Path.open`, `Path.resolve`, `socket.create_connection`, `socket.socket.connect`, `subprocess.run`, `subprocess.Popen` et `get_settings`. Il appelle aussi `prepare` avec un `MappingProxyType` pur, donc un `Mapping` qui n'est pas un `dict`.
+
+RED avant le correctif du ledger/catalogue :
+
+```text
+UV_CACHE_DIR=/tmp/autowork-m04-l20-uv-cache uv run --python 3.12 pytest tests/test_advisor_consultation.py -q --tb=short
+```
+
+`4 failed, 12 passed` : les deux collisions propres measurement/fact retournaient `PreparedConsultation`, et les deux cas du catalogue perdaient le ref observation dérivé.
+
+GREEN après la réparation :
+
+```text
+UV_CACHE_DIR=/tmp/autowork-m04-l20-uv-cache uv run --python 3.12 pytest tests/test_advisor_consultation.py -q --tb=short
+```
+
+`16 passed`.
+
+```text
+UV_CACHE_DIR=/tmp/autowork-m04-l20-uv-cache uv run --python 3.12 pytest tests/test_advisor_consultation.py tests/test_advisor_completeness.py tests/test_advisor_wire.py tests/test_publication_secret_guard.py tests/test_investigation_advisor_tools.py -q --tb=short -k 'not archived_corpus_c01_to_c13_replays_as_compact_resolvable_text_dossiers'
+```
+
+`168 passed, 1 deselected`.
+
+```text
+UV_CACHE_DIR=/tmp/autowork-m04-l20-uv-cache uv run --python 3.12 ruff check src/cti_app/application/advisor_consultation.py tests/test_advisor_consultation.py
+UV_CACHE_DIR=/tmp/autowork-m04-l20-uv-cache uv run --python 3.12 ruff format --check src/cti_app/application/advisor_consultation.py tests/test_advisor_consultation.py
+```
+
+`All checks passed!`; `2 files already formatted`.
+
+Risque résiduel inchangé : une valeur opaque disponible uniquement dans `.env` doit être filtrée par le caller avec ses settings runtime avant `prepare`; charger dotenv ici violerait la contrainte d'absence d'I/O.
+
+Relecture indépendante après réparation : aucun blocage résiduel sur les trois findings de `M04_L20_REVIEW.md`.
+
 ## API ajoutée
 
 Dans `backend/src/cti_app/application/advisor_consultation.py` :
@@ -41,7 +83,7 @@ Un premier essai de l'implémentation a appelé le `get_settings()` par défaut 
 
 La fonction ne persiste rien et n'appelle ni DB, transport, archive, Bridge, MinIO ou fournisseur. `rg` confirme qu'il n'existe aucun appel de production à `prepare` dans ce lot.
 
-La revue indépendante de Mission 04 doit encore statuer sur la fermeture des deux points catalogue/secret. Point à vérifier par le reviewer : le préfiltrage runtime existant et l'interdiction de lire dotenv font de la détection des valeurs dotenv-only une précondition du caller pour toute future intégration, pas un blocage de cette tranche dormante.
+La première revue indépendante a classé la détection des valeurs dotenv-only comme précondition du caller, après vérification du préfiltrage runtime existant et de l'interdiction de lire dotenv. Toute future intégration doit préserver et tester cet ordre.
 
 ## Preuve RED puis GREEN
 

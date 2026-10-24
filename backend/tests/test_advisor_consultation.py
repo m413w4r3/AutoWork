@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import builtins
 import hashlib
+import io
+import os
 import socket
 import subprocess
 from dataclasses import FrozenInstanceError
 from pathlib import Path
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -82,6 +84,63 @@ def test_ref_sha_conflicts_fail_closed_across_projection_manifest_and_transmitte
         {"kind": "observation", "id": identifier, "sha256": second_sha}
     ]
     _assert_conflict(manifest_transmitted)
+
+
+@pytest.mark.parametrize(
+    ("kind", "identifier", "source_identifier"),
+    (
+        ("measurement", "m001", "evidence-m001"),
+        ("fact", "nf001", "evidence-f001"),
+    ),
+)
+def test_manifest_owned_measurement_and_fact_identities_conflict_with_transmitted_refs(
+    kind: str, identifier: str, source_identifier: str
+) -> None:
+    data = _projection()
+    data["dossier_manifest"] = [
+        {
+            "alias": "E1",
+            "kind": kind,
+            "id": identifier,
+            "sha256": "a" * 64,
+            "evidence_id": source_identifier,
+            "evidence_sha256": "c" * 64,
+        }
+    ]
+    data["transmitted_refs"] = [{"kind": kind, "id": identifier, "sha256": "b" * 64}]
+
+    _assert_conflict(data)
+
+
+@pytest.mark.parametrize(
+    ("kind", "identifier", "source_identifier"),
+    (
+        ("measurement", "m002", "evidence-m002"),
+        ("fact", "nf002", "evidence-f002"),
+    ),
+)
+def test_catalog_preserves_manifest_owned_and_source_measurement_fact_refs(
+    kind: str, identifier: str, source_identifier: str
+) -> None:
+    data = _projection()
+    data["dossier_manifest"] = [
+        {
+            "alias": "E1",
+            "kind": kind,
+            "id": identifier,
+            "sha256": "b" * 64,
+            "evidence_id": source_identifier,
+            "evidence_sha256": "c" * 64,
+        }
+    ]
+    data["transmitted_refs"] = [{"kind": kind, "id": identifier, "sha256": "b" * 64}]
+
+    result = prepare(data)
+
+    assert isinstance(result, PreparedConsultation)
+    assert SourceRef(kind, identifier, "b" * 64) in result.source_catalog.refs
+    assert SourceRef("observation", source_identifier, "c" * 64) in result.source_catalog.refs
+    assert result.source_catalog.resolve_alias("E1") is None
 
 
 def test_aliases_resolve_only_to_transmitted_refs_and_matching_kinds() -> None:
@@ -187,6 +246,18 @@ def test_public_catalog_rejects_conflicting_digests_and_filters_non_transmitted_
     assert catalog.resolve_alias("E1") is None
 
 
+def test_public_catalog_drops_ambiguous_alias_for_two_transmitted_identities() -> None:
+    observation = SourceRef("observation", "observation:one", "1" * 64)
+    finding = SourceRef("finding", "finding:two", "2" * 64)
+    catalog = SourceRefCatalog(
+        refs=(observation, finding),
+        transmitted_refs=(observation, finding),
+        aliases=(("E1", observation), ("E1", finding)),
+    )
+
+    assert catalog.resolve_alias("E1") is None
+
+
 def test_opaque_configured_secret_is_redacted_without_loading_dotenv(monkeypatch) -> None:
     secret = "opaque-configured-secret-75b2ac4f"
     settings = SimpleNamespace(operator_api_token=SecretStr(secret))
@@ -219,20 +290,24 @@ def test_prompt_utf8_and_sha256_are_deterministic_without_newline_normalization(
         first.source_catalog.refs = ()
 
 
-def test_prepare_does_not_open_files_start_processes_or_create_network_connections(
+def test_prepare_accepts_pure_mapping_and_does_not_open_files_start_processes_or_connect(
     monkeypatch,
 ) -> None:
     def unexpected_io(*args, **kwargs):
         raise AssertionError("prepare attempted I/O")
 
     monkeypatch.setattr(builtins, "open", unexpected_io)
+    monkeypatch.setattr(io, "open", unexpected_io)
+    monkeypatch.setattr(os, "open", unexpected_io)
     monkeypatch.setattr(Path, "open", unexpected_io)
     monkeypatch.setattr(Path, "resolve", unexpected_io)
     monkeypatch.setattr(socket, "create_connection", unexpected_io)
+    monkeypatch.setattr(socket.socket, "connect", unexpected_io)
     monkeypatch.setattr(subprocess, "run", unexpected_io)
+    monkeypatch.setattr(subprocess, "Popen", unexpected_io)
     monkeypatch.setattr(publication_secret_guard, "get_settings", unexpected_io)
 
-    assert isinstance(prepare(_projection()), PreparedConsultation)
+    assert isinstance(prepare(MappingProxyType(_projection())), PreparedConsultation)
 
 
 def test_secret_guard_redactions_and_preflight_omissions_are_observable() -> None:

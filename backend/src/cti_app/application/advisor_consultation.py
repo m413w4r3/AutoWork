@@ -61,7 +61,7 @@ class SourceRefConflict:
 
 @dataclass(frozen=True, slots=True)
 class SourceRefCatalog:
-    """Immutable transmitted refs and the exact aliases allowed to resolve."""
+    """Immutable observed refs and the exact aliases allowed to resolve."""
 
     refs: tuple[SourceRef, ...]
     transmitted_refs: tuple[SourceRef, ...]
@@ -216,7 +216,7 @@ def _prepare_projection(projection: Mapping[str, Any]) -> PreparedConsultation |
             redacted_secret_count=redacted_secret_count,
         )
 
-    catalog = _source_catalog(prompt_data, dossier)
+    catalog = _source_catalog(prompt_data, dossier, raw_manifest=raw_manifest)
     return PreparedConsultation(
         prompt_utf8=prompt_utf8,
         prompt_sha256=hashlib.sha256(prompt_utf8).hexdigest(),
@@ -240,12 +240,10 @@ def _identity_conflicts(
     for candidate in _projection_refs(prompt_data):
         _record_identity(identities, candidate)
     for item in _mapping_rows(raw_manifest):
-        candidate = _manifest_ref(item)
-        if candidate is not None:
+        for candidate in _manifest_refs(item):
             _record_identity(identities, candidate)
     for item in dossier.manifest:
-        candidate = _manifest_ref(item)
-        if candidate is not None:
+        for candidate in _manifest_refs(item):
             _record_identity(identities, candidate)
 
     return tuple(
@@ -255,7 +253,12 @@ def _identity_conflicts(
     )
 
 
-def _source_catalog(prompt_data: Mapping[str, Any], dossier: AdvisorDossier) -> SourceRefCatalog:
+def _source_catalog(
+    prompt_data: Mapping[str, Any],
+    dossier: AdvisorDossier,
+    *,
+    raw_manifest: object,
+) -> SourceRefCatalog:
     transmitted = tuple(
         candidate
         for item in _mapping_rows(prompt_data.get("transmitted_refs"))
@@ -263,6 +266,11 @@ def _source_catalog(prompt_data: Mapping[str, Any], dossier: AdvisorDossier) -> 
     )
     transmitted_by_identity = {(item.kind, item.id): item for item in transmitted}
     restricted_identities = _restricted_identities(prompt_data)
+    refs = set(_projection_refs(prompt_data))
+    for item in _mapping_rows(raw_manifest):
+        refs.update(_manifest_refs(item))
+    for item in dossier.manifest:
+        refs.update(_manifest_refs(item))
     review_targets: set[SourceRef] = set()
     alias_candidates: list[tuple[str, SourceRef]] = []
     for item in dossier.manifest:
@@ -280,7 +288,7 @@ def _source_catalog(prompt_data: Mapping[str, Any], dossier: AdvisorDossier) -> 
             review_targets.add(candidate)
             alias_candidates.append((alias, candidate))
     return SourceRefCatalog(
-        refs=tuple(set(transmitted) | review_targets),
+        refs=tuple(refs | set(transmitted) | review_targets),
         transmitted_refs=transmitted,
         aliases=tuple(alias_candidates),
         review_targets=tuple(review_targets),
@@ -341,6 +349,7 @@ def _projection_refs(data: Mapping[str, Any]) -> tuple[SourceRef, ...]:
         if isinstance(measurement_id, str):
             add("measurement", measurement_id, hashlib.sha256(_canonical_bytes(item)).hexdigest())
     for item in _mapping_rows(data.get("network_facts")):
+        add("fact", item.get("fact_id"), item.get("observation_sha256"))
         add("observation", item.get("evidence_id"), item.get("observation_sha256"))
     article_id = data.get("article_source_ref")
     if isinstance(article_id, str) and article_id.startswith("article:"):
@@ -359,21 +368,32 @@ def _projection_refs(data: Mapping[str, Any]) -> tuple[SourceRef, ...]:
     return tuple(refs)
 
 
-def _manifest_ref(item: Mapping[str, Any]) -> SourceRef | None:
+def _manifest_refs(item: Mapping[str, Any]) -> tuple[SourceRef, ...]:
     kind = item.get("kind")
     if not isinstance(kind, str):
-        return None
+        return ()
     identifier = item.get("id")
     digest = item.get("sha256")
     if kind in {"measurement", "fact"}:
-        kind = "observation"
-        identifier = item.get("evidence_id")
-        digest = item.get("evidence_sha256")
+        own_ref = _make_ref(kind, identifier, digest)
+        observation_ref = _make_ref(
+            "observation", item.get("evidence_id"), item.get("evidence_sha256")
+        )
+        return tuple(ref for ref in (own_ref, observation_ref) if ref is not None)
     elif kind == "article" and isinstance(identifier, str) and identifier.startswith("article:"):
         identifier = identifier.partition(":")[2]
     elif kind == "opinion":
         identifier = item.get("source_ref")
-    return _make_ref(kind, identifier, digest)
+    candidate = _make_ref(kind, identifier, digest)
+    return (candidate,) if candidate is not None else ()
+
+
+def _manifest_ref(item: Mapping[str, Any]) -> SourceRef | None:
+    kind = item.get("kind")
+    if kind in {"measurement", "fact"}:
+        return _make_ref("observation", item.get("evidence_id"), item.get("evidence_sha256"))
+    refs = _manifest_refs(item)
+    return refs[0] if refs else None
 
 
 def _transmitted_ref(item: Mapping[str, Any]) -> SourceRef | None:
