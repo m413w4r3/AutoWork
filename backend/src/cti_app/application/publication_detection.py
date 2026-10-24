@@ -21,7 +21,7 @@ from cti_app.domain.publication_document import (
     PublicationDetectionV1,
 )
 from cti_app.domain.retrohunt import RetrohuntReservation, RetrohuntReservationState
-from cti_app.domain.rule_workbench import RuleValidationStatus
+from cti_app.domain.rule_workbench import RuleTestCorpusRole, RuleValidationStatus
 
 
 class _DetectionCandidateRepository(Protocol):
@@ -139,7 +139,9 @@ async def build_publication_detection(
 
     rule_status, reason = _validation_fields(report_payload)
     counts = _provenance_counts(report_payload)
-    positive_real_count, positive_synthetic_count = counts.get("confirmed_positive", (0, 0))
+    positive_real_count, positive_synthetic_count = counts.get(
+        RuleTestCorpusRole.HUMAN_CONFIRMED.value, (0, 0)
+    )
     goodware_counts = counts.get("goodware", (0, 0))
     goodware_tested_count = sum(goodware_counts)
     false_positive_count = _nonnegative_count(
@@ -286,13 +288,22 @@ def _provenance_counts(
     if not isinstance(raw, Mapping):
         raise PublicationDetectionDataError("YARA report provenance counts are invalid")
     result: dict[str, tuple[int, int]] = {}
-    for role in ("confirmed_positive", "goodware"):
-        counts = raw.get(role, {})
+    positive_role = RuleTestCorpusRole.HUMAN_CONFIRMED.value
+    legacy_positive_role = "confirmed_positive"
+    if positive_role in raw and legacy_positive_role in raw:
+        raise PublicationDetectionDataError(
+            "YARA report has both canonical and legacy positive role counts"
+        )
+    for role in (positive_role, RuleTestCorpusRole.GOODWARE.value):
+        raw_key = (
+            legacy_positive_role if role == positive_role and positive_role not in raw else role
+        )
+        counts = raw.get(raw_key, {})
         if not isinstance(counts, Mapping):
-            raise PublicationDetectionDataError(f"YARA report {role} counts are invalid")
+            raise PublicationDetectionDataError(f"YARA report {raw_key} counts are invalid")
         result[role] = (
-            _nonnegative_count(counts.get("real", 0), f"{role}.real"),
-            _nonnegative_count(counts.get("synthetic", 0), f"{role}.synthetic"),
+            _nonnegative_count(counts.get("real", 0), f"{raw_key}.real"),
+            _nonnegative_count(counts.get("synthetic", 0), f"{raw_key}.synthetic"),
         )
     return result
 

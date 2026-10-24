@@ -552,6 +552,8 @@ class _RuleCorpusSnapshot:
     selection_bias: str
     coverage_statement: str
     limitations: tuple[str, ...]
+    blocking_limitations: tuple[str, ...] = ()
+    measurement_limitations: tuple[str, ...] = ()
     holdout_overlap_sha256s: tuple[str, ...] = ()
     conflicting_role_sha256s: tuple[str, ...] = ()
     goodware_baseline_id: UUID | None = None
@@ -2072,7 +2074,15 @@ class _RuleTools:
     ) -> _RuleCorpusSnapshot:
         assert self.associations is not None
         limitations: list[str] = []
+        blocking_limitations: list[str] = []
+        measurement_limitations: list[str] = []
+
+        def add_limitation(message: str, *, blocking: bool) -> None:
+            limitations.append(message)
+            (blocking_limitations if blocking else measurement_limitations).append(message)
+
         manual_import_reader = getattr(self.corpus_inventory, "manual_rule_corpus_imports", None)
+        manual_import_read_failed = False
         try:
             manual_imports = tuple(
                 await manual_import_reader(investigation_id)
@@ -2081,7 +2091,10 @@ class _RuleTools:
             )
         except Exception:
             manual_imports = ()
-            limitations.append("L'inventaire des imports manuels du corpus n'a pas pu être lu.")
+            manual_import_read_failed = True
+            add_limitation(
+                "L'inventaire des imports manuels du corpus n'a pas pu être lu.", blocking=True
+            )
         all_manual_imports = manual_imports
         manual_import_hashes = {item.sample_sha256 for item in all_manual_imports}
         if tested_version is not None:
@@ -2092,8 +2105,9 @@ class _RuleTools:
                 and (item.designated_at is None or item.designated_at >= tested_version.created_at)
             )
             if late_holdouts:
-                limitations.append(
-                    "Des holdouts désignés à la date ou après la version testée ont été exclus."
+                add_limitation(
+                    "Des holdouts désignés à la date ou après la version testée ont été exclus.",
+                    blocking=True,
                 )
             manual_imports = tuple(item for item in all_manual_imports if item not in late_holdouts)
         associations = await self.associations.list_for_investigation(investigation_id)
@@ -2159,9 +2173,10 @@ class _RuleTools:
             )
             if role is RuleTestCorpusRole.HUMAN_CONFIRMED and not association_is_confirmed:
                 role = RuleTestCorpusRole.NEW_CANDIDATE_UNCONFIRMED
-                limitations.append(
+                add_limitation(
                     f"Le hash {item.sample_sha256} n'a pas de qualification humaine confirmée; "
-                    "son rôle positif a été rétrogradé en nouveau candidat non confirmé."
+                    "son rôle positif a été rétrogradé en nouveau candidat non confirmé.",
+                    blocking=True,
                 )
             elif (
                 role
@@ -2225,7 +2240,7 @@ class _RuleTools:
         )
         overlapping_holdout_hashes = tuple(sorted(development_hashes & holdout_hashes))
         if overlapping_holdout_hashes:
-            limitations.append("Holdout et développement se chevauchent par SHA-256.")
+            add_limitation("Holdout et développement se chevauchent par SHA-256.", blocking=True)
         roles_by_hash: dict[str, set[RuleTestCorpusRole]] = {
             sample_sha256: set(roles) for sample_sha256, roles in role_by_hash.items()
         }
@@ -2238,7 +2253,7 @@ class _RuleTools:
             )
         )
         if conflicting_role_hashes:
-            limitations.append("Un SHA-256 est déclaré avec plusieurs rôles de corpus.")
+            add_limitation("Un SHA-256 est déclaré avec plusieurs rôles de corpus.", blocking=True)
 
         try:
             legacy_holdout_hashes = await self.corpus_inventory.holdout_sample_sha256s(
@@ -2246,32 +2261,41 @@ class _RuleTools:
             )
         except Exception:
             legacy_holdout_hashes = ()
-            limitations.append("L'ancien fournisseur de hash holdout n'a pas pu être lu.")
+            add_limitation(
+                "L'ancien fournisseur de hash holdout n'a pas pu être lu.", blocking=True
+            )
         if legacy_holdout_hashes:
-            limitations.append(
+            add_limitation(
                 "Des hashes holdout sans rôle ni horodatage ont été ignorés; réimportez-les "
-                "avec holdout_positive ou holdout_negative avant de créer la règle."
+                "avec holdout_positive ou holdout_negative avant de créer la règle.",
+                blocking=False,
             )
 
         baseline_reader = getattr(self.corpus_inventory, "goodware_baseline_id", None)
+        goodware_baseline_read_failed = False
         try:
             goodware_baseline_id = (
                 await baseline_reader(investigation_id) if callable(baseline_reader) else None
             )
         except Exception:
             goodware_baseline_id = None
-            limitations.append("La baseline goodware liée à l'investigation n'a pas pu être lue.")
+            goodware_baseline_read_failed = True
+            add_limitation(
+                "La baseline goodware liée à l'investigation n'a pas pu être lue.", blocking=True
+            )
         manual_goodware_present = any(
             item.role is RuleTestCorpusRole.GOODWARE for item in all_manual_imports
         )
-        if not manual_goodware_present:
-            limitations.append(
-                "Aucun fichier binaire goodware n'est présent dans le corpus de règles."
+        if not manual_goodware_present and not manual_import_read_failed:
+            add_limitation(
+                "Aucun fichier binaire goodware n'est présent dans le corpus de règles.",
+                blocking=False,
             )
-        if goodware_baseline_id is None:
-            limitations.append(
+        if goodware_baseline_id is None and not goodware_baseline_read_failed:
+            add_limitation(
                 "Aucune goodware_baseline n'est liée à cette investigation; les tests goodware "
-                "restent limités aux imports par SHA."
+                "restent limités aux imports par SHA.",
+                blocking=False,
             )
         ordered_cases = tuple(
             cases[key] for key in sorted(cases, key=lambda item: (item[0].value, item[1]))
@@ -2291,6 +2315,8 @@ class _RuleTools:
             selection_bias=selection_bias,
             coverage_statement=coverage,
             limitations=tuple(dict.fromkeys(limitations)),
+            blocking_limitations=tuple(dict.fromkeys(blocking_limitations)),
+            measurement_limitations=tuple(dict.fromkeys(measurement_limitations)),
             holdout_overlap_sha256s=overlapping_holdout_hashes,
             conflicting_role_sha256s=conflicting_role_hashes,
             goodware_baseline_id=goodware_baseline_id,
@@ -2540,16 +2566,23 @@ def _candidate_status(
         return DetectionCandidateStatus.REJECTED
     if report.execution_status.value != "ok":
         return DetectionCandidateStatus.CANDIDATE
-    if len(positive.matches) == 1 and not positive.non_matches and not positive.non_measurable:
-        return DetectionCandidateStatus.EXPERIMENTAL
     goodware_has_errors = bool(goodware.non_measurable or goodware.errors)
+    if (
+        len(positive.matches) == 1
+        and not positive.non_matches
+        and not positive.non_measurable
+        and not positive.errors
+        and not goodware_has_errors
+        and not corpus.blocking_limitations
+    ):
+        return DetectionCandidateStatus.EXPERIMENTAL
     if (
         len(positive.matches) > 1
         and not positive.non_matches
         and not positive.non_measurable
         and not positive.errors
         and not goodware_has_errors
-        and not corpus.limitations
+        and not corpus.blocking_limitations
     ):
         return DetectionCandidateStatus.TESTED
     return DetectionCandidateStatus.CANDIDATE
@@ -2563,7 +2596,9 @@ def _status_for_report(report: RuleTestReport, corpus: _RuleCorpusSnapshot) -> T
     measurable = sum(len(role.matches) + len(role.non_matches) for role in report.roles)
     if not corpus.cases or measurable == 0:
         return ToolInvocationStatus.UNAVAILABLE
-    if corpus.limitations or any(role.non_measurable or role.errors for role in report.roles):
+    if corpus.blocking_limitations or any(
+        role.non_measurable or role.errors for role in report.roles
+    ):
         return ToolInvocationStatus.PARTIAL
     return ToolInvocationStatus.SUCCEEDED
 

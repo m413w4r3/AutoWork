@@ -1473,8 +1473,8 @@ async def test_w13_d7_tool_replay_ambiguous_bridge_resume_and_local_denials(
                 for item in policy_invocations
             )
 
-        # Quota is a local unavailable result; the loop still executes its independent
-        # Shodan branch, which keeps the investigation usable for opinion drafting.
+        # Adapter-originated quota failures have ambiguous external outcomes. The loop
+        # must stop for explicit reconciliation before trying the independent Shodan path.
         quota_material = SyntheticSampleMaterial.unique()
         quota_seed = await seed_verified_article(
             uow_factory,
@@ -1488,12 +1488,17 @@ async def test_w13_d7_tool_replay_ambiguous_bridge_resume_and_local_denials(
         quota_transport = ScriptedInvestigationTransport(
             [
                 {
-                    **decision("Try VT report and continue to the independent host lookup."),
+                    **decision(
+                        "Check the VT report; wait for reconciliation if its outcome is unclear."
+                    ),
                     "proposed_tool_calls": [
-                        _call("vt.file_report", {"file_hash": quota_material.seed_hash}),
-                        _call("shodan.host", {"ip": quota_material.ip}),
+                        _call("vt.file_report", {"file_hash": quota_material.seed_hash})
                     ],
                 },
+                decision(
+                    "After reconciling VT, use the independent passive host lookup.",
+                    tool_call=_call("shodan.host", {"ip": quota_material.ip}),
+                ),
                 decision("Finish after recording the local quota result.", next_action="finish"),
             ],
             uow_factory=uow_factory,
@@ -1541,12 +1546,70 @@ async def test_w13_d7_tool_replay_ambiguous_bridge_resume_and_local_denials(
                 quota_invocations = tuple(
                     await uow.tool_invocations.list_for_investigation(quota_seed.investigation.id)
                 )
+            quota_vt_invocation = next(
+                item for item in quota_invocations if item.tool_name == "vt.file_report"
+            )
+            assert quota_vt_invocation.status is ToolInvocationStatus.NEEDS_REVIEW
+            assert quota_vt.calls["file_report"] == 1
+            assert not any(item.tool_name == "shodan.host" for item in quota_invocations)
+            assert not quota_shodan.calls
+
+            stopped_state = await quota_client.get(
+                f"/api/investigations/{quota_seed.investigation.id}"
+            )
+            assert stopped_state.status_code == 200, stopped_state.text
+            assert stopped_state.json()["stop_reason"] == "submission_needs_review"
+            blocked_resume = await quota_client.post(
+                f"/api/investigations/{quota_seed.investigation.id}/resume",
+                json={"expected_version": stopped_state.json()["version"]},
+                headers={
+                    "Idempotency-Key": f"w13-quota-blocked-resume-{quota_seed.investigation.id}"
+                },
+            )
+            assert blocked_resume.status_code == 409, blocked_resume.text
+            assert "must be reconciled" in blocked_resume.json()["detail"]["message"]
+
+            reconciled = await quota_client.post(
+                f"/api/investigations/{quota_seed.investigation.id}/invocations/"
+                f"{quota_vt_invocation.id}/reconcile",
+                json={
+                    "expected_version": quota_vt_invocation.version,
+                    "outcome": "abandon",
+                    "reason": "Abandon the ambiguous synthetic quota result without retrying it.",
+                },
+                headers={"Idempotency-Key": f"w13-quota-abandon-{quota_vt_invocation.id}"},
+            )
+            assert reconciled.status_code == 200, reconciled.text
+            assert reconciled.json()["status"] == ToolInvocationStatus.FAILED.value
+
+            resumable_state = await quota_client.get(
+                f"/api/investigations/{quota_seed.investigation.id}"
+            )
+            assert resumable_state.status_code == 200, resumable_state.text
+            resumed = await quota_client.post(
+                f"/api/investigations/{quota_seed.investigation.id}/resume",
+                json={"expected_version": resumable_state.json()["version"]},
+                headers={"Idempotency-Key": f"w13-quota-resume-{quota_seed.investigation.id}"},
+            )
+            assert resumed.status_code == 200, resumed.text
+            await run_http_job(
+                quota_app,
+                uow_factory,
+                quota_registry,
+                quota_dispatcher,
+                UUID(resumed.json()["job_id"]),
+            )
+            assert quota_vt.calls["file_report"] == 1
+            async with uow_factory() as uow:
+                resumed_quota_invocations = tuple(
+                    await uow.tool_invocations.list_for_investigation(quota_seed.investigation.id)
+                )
             assert any(
-                item.tool_name == "vt.file_report"
-                and item.status is ToolInvocationStatus.UNAVAILABLE
-                for item in quota_invocations
+                item.tool_name == "vt.file_report" and item.status is ToolInvocationStatus.FAILED
+                for item in resumed_quota_invocations
             )
             assert any(
                 item.tool_name == "shodan.host" and item.status is ToolInvocationStatus.SUCCEEDED
-                for item in quota_invocations
+                for item in resumed_quota_invocations
             )
+            assert quota_shodan.calls and quota_shodan.calls[0][0] == "host"
