@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+import pytest
+
 from cti_app.application.advisor_contracts import (
     ADVISOR_RESPONSE_SCHEMA_V3,
     ADVISOR_SOURCE_PARSER_VERSION,
@@ -54,7 +56,8 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _FORBIDDEN_TEXT = re.compile(
     r"(?i)(?:https?://|data:[^\s,]+;base64,|\\x[0-9a-f]{2}|"
     r"(?:api[_ -]?key|private[_ -]?key|access[_ -]?token|client[_ -]?secret|"
-    r"authorization|credential|password|secret)\s*[:=])"
+    r"authorization|credential|password|secret)\s*[:=]|"
+    r"(?<![A-Za-z0-9+/_=-])[A-Za-z0-9+/_-]{200,}={0,2}(?![A-Za-z0-9+/=_-]))"
 )
 
 
@@ -67,6 +70,53 @@ def _walk(value: Any, path: str = "$"):
             yield from _walk(item, f"{path}[{index}]")
     else:
         yield path, value
+
+
+def _assert_fixture_string_safe(path: str, item: str) -> None:
+    assert "real_" not in item.casefold(), path
+    assert _FORBIDDEN_TEXT.search(item) is None, path
+    if path.endswith(".sha256"):
+        assert _SHA256.fullmatch(item), path
+    else:
+        assert re.search(r"(?i)(?:\b[0-9a-f]{2}\s+){8,}", item) is None, path
+
+
+def _validate_contradiction_pair(case: dict[str, Any]) -> None:
+    labels = case["labels"]
+    source_ids = labels["contradiction_source_ids"]
+    sources_by_id = {source["id"]: source for source in case["sources"]}
+    assert len(source_ids) == 2
+    assert set(source_ids) == set(sources_by_id)
+
+    subject = labels["contradiction_subject"]
+    property_name = labels["contradiction_property"]
+    values = []
+    for source_id in source_ids:
+        source = sources_by_id[source_id]
+        assert source["subject"] == subject
+        assert source["property"] == property_name
+        assert type(source["value"]) is int
+        assert subject in source["text"]
+        assert str(source["value"]) in source["text"]
+        values.append(source["value"])
+    assert len(set(values)) == 2
+    assert sorted(values) == labels["contradiction_values"]
+
+    assertions = case["context"]["assertions"]
+    assert len(assertions) == 2
+    for assertion in assertions:
+        refs = assertion["refs"]
+        assert len(refs) == 1
+        source = sources_by_id[refs[0]["id"]]
+        assert source["id"] in source_ids
+        assert subject in assertion["text"]
+        assert str(source["value"]) in assertion["text"]
+        assert "size" in assertion["text"].casefold()
+
+
+def test_fixture_string_guard_rejects_standalone_base64_like_text() -> None:
+    with pytest.raises(AssertionError):
+        _assert_fixture_string_safe("$.response_text", "A" * 200)
 
 
 def _load_cases() -> tuple[dict[str, Any], list[dict[str, Any]], str]:
@@ -119,14 +169,13 @@ def _load_cases() -> tuple[dict[str, Any], list[dict[str, Any]], str]:
                 r"[0-9a-f-]{36}", source["id"]
             )
         for path, item in _walk(case):
+            # JSON decoding cannot produce bytes. This post-decode check only guards
+            # parsed values and cannot detect raw byte payloads in the JSON source.
             assert not isinstance(item, bytes | bytearray | memoryview), path
             if isinstance(item, str):
-                assert "real_" not in item.casefold(), path
-                assert _FORBIDDEN_TEXT.search(item) is None, path
-                if path.endswith(".sha256"):
-                    assert _SHA256.fullmatch(item), path
-                else:
-                    assert re.search(r"(?i)(?:\b[0-9a-f]{2}\s+){8,}", item) is None, path
+                _assert_fixture_string_safe(path, item)
+        if case["labels"].get("contradiction_targeted") is True:
+            _validate_contradiction_pair(case)
     return manifest, cases, corpus_sha256
 
 
@@ -627,11 +676,31 @@ def test_versioned_anti_slop_corpus_has_deterministic_offline_oracle(capsys) -> 
 
     report = {
         "schema": "advisor-anti-slop-report.v1",
+        "variant": "baseline",
         "corpus_version": manifest["corpus_version"],
         "case_count": len(cases),
         "corpus_sha256": corpus_sha256,
         "prompt_fingerprints": _prompt_hashes(),
         "filler_list_version": FILLER_LIST_VERSION,
+        "cases": [
+            {
+                "case_id": case["case_id"],
+                "class": case["labels"]["class"],
+                "expected": {
+                    "parser_status": case["expected"]["parser_status"],
+                    "preflight_status": case["expected"]["preflight_status"],
+                    "usable": case["expected"]["usable"],
+                    "metrics": case["expected"]["metrics"],
+                },
+                "observed": {
+                    "parser_status": result_by_id[case["case_id"]]["parser_status"],
+                    "preflight_status": result_by_id[case["case_id"]]["preflight_status"],
+                    "usable": result_by_id[case["case_id"]]["usable"],
+                    "metrics": result_by_id[case["case_id"]]["metrics"],
+                },
+            }
+            for case in cases
+        ],
         "classes": {
             name: {
                 "cases": group["cases"],
@@ -643,5 +712,11 @@ def test_versioned_anti_slop_corpus_has_deterministic_offline_oracle(capsys) -> 
         },
         "metrics": metrics,
     }
+    assert report["variant"] == "baseline"
+    assert len(report["cases"]) == len(cases)
+    assert [item["case_id"] for item in report["cases"]] == [
+        case["case_id"] for case in cases
+    ]
+    assert all(item["expected"] == item["observed"] for item in report["cases"])
     with capsys.disabled():
         print("ANTI_SLOP_EVAL " + json.dumps(report, ensure_ascii=False, sort_keys=True))

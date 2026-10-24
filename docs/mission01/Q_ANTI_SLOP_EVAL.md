@@ -24,7 +24,8 @@ réseau ni base de données. Pour Bridge, il appelle
   nombre de cas et le SHA-256 des octets exacts du JSONL.
 - `backend/tests/test_advisor_anti_slop_eval.py` valide le manifeste, le
   contenu synthétique, les alias, les résultats par cas et les seuils; il
-  affiche aussi un rapport JSON compact.
+  affiche aussi un rapport JSON compact avec la variante, les résultats
+  attendus et observés par cas, et les agrégats.
 
 Chaque cas porte `schema`, `case_id`, `consultation_type` (`bridge` ou
 `advisor`), `sources`, `context`, `allowed_aliases`, `response_text`, `labels`
@@ -49,18 +50,28 @@ dénominateur et son seuil.
 | Références invalides | réponses utilisables malgré un alias advisor ou une référence Bridge inconnue / cas annotés `invalid_reference` | 0 |
 | Ancrage structurel | phrases factuelles exposées et liées à une assertion avec observation/SHA correspondants / phrases factuelles exposées par les parseurs | 1,0 |
 | Absence de preuve | cas sans preuve où le parseur donne une réponse utilisable ou où le préflight permettrait la soumission / cas annotés `no_proof` | 0 |
-| Contradiction et UNKNOWN | réponses qui citent les deux observations requises et indiquent `UNKNOWN` ainsi qu’une limite / cas annotés `contradiction_targeted` | 1,0 |
+| Contradiction et UNKNOWN | réponses qui citent deux observations du même sujet et de la même propriété, dont les valeurs diffèrent, et indiquent `UNKNOWN` ainsi qu’une limite / cas annotés `contradiction_targeted` | 1,0 |
 | Duplication exacte | répétitions factuelles après NFKC, casefold, réduction des espaces et retrait de la ponctuation finale / phrases factuelles des contrôles positifs | 0 |
 | Remplissage générique | clauses correspondant à la liste versionnée / clauses des contrôles positifs | 0 |
 | Overclaim synthétique | négatifs annotés overclaim qui restent utilisables / négatifs annotés `synthetic_overclaim` | 0 |
 | Contrôle positif sain | contrôles sains parseables, ancrés, sans remplissage ni répétition / contrôles annotés `healthy_positive` | 1,0 |
 
-Le dénominateur de contradiction ne comprend que le cas dont le contexte
-contient deux observations contradictoires et qui est explicitement annoté
-`contradiction_targeted`. Le contrôle à source unique vérifie qu’une
-contradiction n’est pas inventée, mais n’entre pas dans ce taux. Pour les
-répétitions et le remplissage, le dénominateur se limite aux contrôles positifs,
-comme demandé.
+Le dénominateur de contradiction ne comprend que le cas qui associe deux
+observations au même sujet et à la même propriété avec des valeurs distinctes,
+puis est explicitement annoté `contradiction_targeted`. Le cas cible utilise le
+même fichier synthétique `sample-synth.bin` et la propriété `file_size_bytes`,
+avec des relevés de 128 et 256 octets. Le test vérifie ces métadonnées, leur
+correspondance avec les assertions citées et les deux références de la réponse;
+il vérifie aussi `UNKNOWN` et une limite explicite. Le contrôle à source unique
+vérifie qu’une contradiction n’est pas inventée, mais n’entre pas dans ce taux.
+Pour les répétitions et le remplissage, le dénominateur se limite aux contrôles
+positifs, comme demandé.
+
+Le contrôle de fuite parcourt les chaînes après décodage JSON et rejette aussi
+les chaînes Base64-like isolées d’au moins 200 caractères. Son contrôle des
+types `bytes`/`bytearray`/`memoryview` est lui aussi post-décodage JSON : il ne
+détecte pas des octets bruts dans le fichier source. Le corpus est du JSON UTF-8
+synthétique et ne contient aucun contenu binaire.
 
 La liste générique est `generic-phrases.v1` :
 
@@ -81,7 +92,7 @@ Mesure des 16 réponses fixes au code source de base
 | Références invalides | 0/2 = 0,0 | 0 |
 | Ancrage structurel | 10/10 = 1,0 | 1,0 |
 | Absence de preuve | 0/2 = 0,0 | 0 |
-| Contradiction et UNKNOWN | 1/1 = 1,0 | 1,0 |
+| Contradiction et UNKNOWN | 1/1 = 1,0, même fichier/propriété avec tailles 128/256 | 1,0 |
 | Duplication, contrôles positifs | 0/2 = 0,0 | 0 |
 | Remplissage, contrôles positifs | 0/1 = 0,0 | 0 |
 | Overclaim synthétique | 0/1 = 0,0 | 0 |
@@ -109,16 +120,19 @@ stables :
 ## Comparaison Q2 et limites
 
 Pour Q2, conserver ces cas, les chaînes `response_text` et le SHA du corpus,
-puis exécuter le même test avant et après le changement de prompt. Comparer les
-empreintes rendues, les versions advisor et les résultats par classe. Les
-réponses de ce corpus restent fixes : les métriques identiques ne prouvent pas
+puis exécuter le même test avant et après le changement de prompt. Émettre la
+variante `baseline` pour Q1 et `patch` pour Q2. Comparer les empreintes rendues,
+les versions advisor et les résultats par cas et par classe. Les réponses de ce
+corpus restent fixes : les métriques identiques ne prouvent pas
 que le prompt patched réduit le slop produit par un modèle. Elles vérifient le
 comportement structurel des parseurs et des contrôles sur un jeu reproductible.
 
 Il n’y a pas de juge sémantique. L’overclaim est un négatif synthétique dont la
 forme échoue au contrat existant; ce résultat ne généralise pas aux affirmations
-plausibles mais fausses. Les marqueurs de contradiction/UNKNOWN et les
-formulations génériques sont des proxys lexicaux et structurels. Un
+plausibles mais fausses. La paire de contradiction vérifie une incohérence de
+métadonnées synthétiques et les références citées; les marqueurs `UNKNOWN` et de
+limite restent des proxys lexicaux. Les formulations génériques sont aussi des
+proxys lexicaux. Un
 `ScriptedTurnTransport`, même déterministe, ne démontrerait pas une baisse du
 slop réel d’un fournisseur. Ce livrable n’ajoute aucune dépendance et ne modifie
 aucun code de production : quatre fichiers, zéro dépendance.
