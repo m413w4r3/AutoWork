@@ -1,5 +1,9 @@
 # Mission 01 V3.2 — handoff final
 
+**Nouvel orchestrateur :** agent Paseo `3df5ffd3-3915-49b1-8308-cb00d26908f2`
+(DeepSeek Flash max), lancé le 2026-10-24 sur ce worktree. Il est le parent
+unique pour terminer B1B, L2, Q, F6, B1A1, P10, A1 et T.
+
 **Mis à jour :** 2026-10-24, intégration **`8fdb7a7`** (+ ce commit documentaire).
 **Base :** `main@058bb4af2278e3941956e523c5a1d560208de228`.
 **Branche :** `chore/mission01-integration`.
