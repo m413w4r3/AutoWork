@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
@@ -16,6 +17,7 @@ import pytest
 from pypdf import PdfReader
 
 from cti_app.application.production_normalization import normalize_indicator_value
+from cti_app.application.publication_augmentation import augment_publication_with_opinion
 from cti_app.application.typst_compilation import (
     TYPST_COMPILER_VERSION,
     TypstCompileRequest,
@@ -49,6 +51,7 @@ from cti_app.domain.semantic_annotation import (
 )
 from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
 from tests.test_publication_builder_v4 import _cited_technical_context_case
+from tests.test_publication_document_v6 import _approved_opinion, _base_v5
 from tests.test_publication_v4 import _SOURCE_ID
 from tests.test_typst_rendering import _full_document, _table
 
@@ -380,6 +383,115 @@ async def test_real_typst_article_preserves_copyable_technical_literals(
     assert "Narrow hash column" in extracted
     assert "Registre Windows" in extracted
     assert len(reader.pages) >= 1
+
+
+@pytest.mark.asyncio
+async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_once(
+    tmp_path: Path,
+    typst_binary: str,
+    font_bundle_root: Path,
+) -> None:
+
+    pdftotext = shutil.which("pdftotext")
+    if pdftotext is None:
+        pytest.skip("pdftotext is required for the compiled PDF completeness oracle")
+
+    title_marker = "M04_BASE_TITLE_7F32A9"
+    lead_marker = "M04_BASE_LEAD_1C8E45"
+    reference_marker = "M04_BASE_REFERENCE_6B0D21"
+    opinion_marker = "M04_APPROVED_OPINION_93F4C8"
+    base = _base_v5()
+    document = replace(
+        base.document,
+        title=title_marker,
+        lead=(replace(base.document.lead[0], text=lead_marker), *base.document.lead[1:]),
+    )
+    references = (replace(base.references[0], text=reference_marker), *base.references[1:])
+    anchors = publication_document_text_anchors(document, references=references)
+    assert set(anchors) == {"title", "lead:0001", "reference:0001"}
+    semantic_text = SemanticTextV1(
+        schema_version=SEMANTIC_ANNOTATION_SCHEMA_VERSION,
+        policy_version=SEMANTIC_ANNOTATION_POLICY_VERSION,
+        paragraphs=tuple(
+            SemanticParagraphV1(
+                anchor,
+                (SemanticTextSpanV1(SemanticRole.TEXT, text),),
+            )
+            for anchor, text in anchors.items()
+        ),
+    )
+    base = replace(base, document=document, references=references, semantic_text=semantic_text)
+    opinion, context = _approved_opinion(base)
+    opinion = replace(
+        opinion,
+        blocks=(replace(opinion.blocks[0], text=opinion_marker),),
+        content_sha256="",
+    )
+    augmented = augment_publication_with_opinion(base, opinion, context)
+    template_bundle = load_template_bundle(_REPOSITORY_ROOT / "chpTypst")
+    font_snapshot = load_font_bundle_snapshot(font_bundle_root, _FONT_BUNDLE_LOCK)
+    compiler = TypstSubprocessCompiler(binary=typst_binary)
+
+    async def compile_and_extract(document, name: str) -> str:
+        source = TypstRenderer().render(
+            document,
+            template_bundle,
+            document_label=f"Publication de test — {name}",
+        )
+        workspace = tmp_path / f"{name}-workspace"
+        _build_runtime_workspace(
+            _REPOSITORY_ROOT,
+            workspace,
+            render_data=json.loads(source.render_data_bytes),
+        )
+        compiled = await compiler.compile(
+            TypstCompileRequest(
+                workspace_root=workspace,
+                entrypoint_relative_path="RENDERER/publication.typ",
+                font_paths=materialize_font_bundle(font_snapshot, tmp_path / f"{name}-fonts"),
+            )
+        )
+        pdf_path = tmp_path / f"{name}.pdf"
+        pdf_path.write_bytes(compiled.content)
+        extracted = await asyncio.to_thread(
+            subprocess.run,
+            (pdftotext, "-layout", str(pdf_path), "-"),
+            capture_output=True,
+            check=True,
+            timeout=30,
+        )
+        return extracted.stdout.decode("utf-8", errors="replace")
+
+    base_text = await compile_and_extract(base, "mission04-base")
+    augmented_text = await compile_and_extract(augmented, "mission04-augmented")
+
+    # The existing references section remains the source presentation; this fixture adds no
+    # visible editorial appendix. Its title is rendered once as the article heading. The source
+    # URL is a PDF link target, so pdftotext does not verify that URL target's bytes.
+    base_expected_counts = {
+        title_marker: 1,
+        lead_marker: 1,
+        reference_marker: 1,
+        opinion_marker: 0,
+    }
+    augmented_expected_counts = {
+        title_marker: 1,
+        lead_marker: 1,
+        reference_marker: 1,
+        opinion_marker: 1,
+    }
+    for marker, expected_count in base_expected_counts.items():
+        assert base_text.count(marker) == expected_count, (
+            f"base PDF marker {marker!r}: expected {expected_count}, "
+            f"found {base_text.count(marker)}"
+        )
+    for marker, expected_count in augmented_expected_counts.items():
+        assert augmented_text.count(marker) == expected_count, (
+            f"augmented PDF marker {marker!r}: expected {expected_count}, "
+            f"found {augmented_text.count(marker)}"
+        )
+    assert "reviewer-1" not in augmented_text
+    assert "approver-1" not in augmented_text
 
 
 @pytest.mark.asyncio

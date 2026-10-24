@@ -688,6 +688,32 @@ class PublicationRenderService:
             target_artifact_identities = await publication_target_artifact_identities(
                 uow.production_artifacts, artifact
             )
+            base_publication_artifact_version: int | None = None
+            augmentation_metadata = artifact.metadata.get("publication_augmentation")
+            raw_base_publication_artifact_id = (
+                augmentation_metadata.get(
+                    "base_publication_artifact_id",
+                    artifact.metadata.get("previous_publication_artifact_id"),
+                )
+                if isinstance(augmentation_metadata, dict)
+                else artifact.metadata.get("previous_publication_artifact_id")
+            )
+            try:
+                base_publication_artifact_id = UUID(str(raw_base_publication_artifact_id))
+            except (TypeError, ValueError, AttributeError):
+                base_publication_artifact_id = None
+            if base_publication_artifact_id is not None:
+                base_publication_artifact = await uow.production_artifacts.get(
+                    base_publication_artifact_id
+                )
+                if (
+                    base_publication_artifact is not None
+                    and base_publication_artifact.id == base_publication_artifact_id
+                    and base_publication_artifact.stage is ProductionArtifactStage.PUBLICATION
+                    and base_publication_artifact.subject_id == artifact.subject_id
+                    and base_publication_artifact.production_run_id == artifact.production_run_id
+                ):
+                    base_publication_artifact_version = base_publication_artifact.version
             await uow.commit()
 
         try:
@@ -834,6 +860,34 @@ class PublicationRenderService:
             },
             "rendered_at": now.isoformat(),
         }
+        if isinstance(document, PublicationDocumentV6):
+            provenance = document.provenance
+            lineage["actors"] = {
+                "reviewer": {
+                    "actor_id": provenance.reviewer_id,
+                    "role": "reviewer",
+                    "decision_label": "opinion_approved",
+                    "investigation_id": str(provenance.investigation_id),
+                    "opinion_id": str(provenance.opinion_id),
+                    "opinion_version": provenance.opinion_version,
+                    "opinion_content_sha256": provenance.opinion_content_sha256,
+                },
+                "approver": {
+                    "actor_id": provenance.approver_id,
+                    "role": "approver",
+                    "decision_label": "publication_augmented",
+                    "base_publication": {
+                        "artifact_id": str(provenance.base_publication_artifact_id),
+                        "version": base_publication_artifact_version,
+                        "sha256": provenance.base_publication_sha256,
+                    },
+                    "augmented_publication": {
+                        "artifact_id": str(artifact.id),
+                        "version": artifact.version,
+                        "sha256": publication_content_sha256,
+                    },
+                },
+            }
         label = publication_identity_label(
             nature=nature,
             artifact_id=artifact.id,

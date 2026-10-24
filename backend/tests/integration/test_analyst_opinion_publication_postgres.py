@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 from dataclasses import replace
@@ -32,7 +33,9 @@ from cti_app.application.media_assets import MediaAssetStore
 from cti_app.application.network_protocol_model import render_protocol_model
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.publication_augmentation import PublicationAugmentationArtifactService
+from cti_app.application.publication_rendering import PublicationRenderService
 from cti_app.application.typst_compilation import CompiledTypstDocument
+from cti_app.application.typst_rendering import TypstRenderer
 from cti_app.domain.analyst_opinion import AnalystOpinionStatus
 from cti_app.domain.blobs import BlobDescriptor, BlobRecord
 from cti_app.domain.classification import TLP
@@ -87,8 +90,10 @@ from cti_app.domain.publication_document import (
     publication_document_from_json,
     serialize_publication_document,
 )
+from cti_app.infrastructure.d2_diagram_compiler import D2DiagramCompiler
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
+from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
 from tests.integration.edition_codes import reserve_edition_code
 from tests.test_protocol_diagrams_typst import (
     _D2_BINARY,
@@ -810,5 +815,66 @@ async def test_postgres_opinion_approval_publishes_new_v6_and_preserves_v5(
         assert {item.kind for item in parsed.analyst_opinion.protocol_figures} == set(
             ProtocolDiagramKind
         )
+
+        render_service = PublicationRenderService(
+            uow_factory=uow_factory,
+            artifact_store=cast(ProductionArtifactStore, store),
+            media_asset_store=MediaAssetStore(cast(ProductionArtifactStore, store), uow_factory),
+            renderer=TypstRenderer(),
+            compiler=TypstSubprocessCompiler(binary=_typst_binary()),
+            chp_typst_root=_REPOSITORY_ROOT / "chpTypst",
+            font_bundle_root=Path(
+                os.environ.get("FONT_BUNDLE_ROOT") or _REPOSITORY_ROOT / "chpTypst"
+            ),
+            typst_fonts_lock_path=_REPOSITORY_ROOT / "infra" / "typst-fonts.lock",
+            graph_diagram_compiler=D2DiagramCompiler(binary=cast(str, _D2_BINARY)),
+        )
+        base_render = await render_service.render_pdf(base_artifact.id)
+        augmented_render = await render_service.render_pdf(persisted_augmented.id)
+        base_lineage = await render_service.lineage_manifest_for_render(base_render)
+        augmented_lineage = await render_service.lineage_manifest_for_render(augmented_render)
+
+        assert base_lineage["nature"] == "base_publication"
+        assert "actors" not in base_lineage
+        actors = augmented_lineage["actors"]
+        assert actors["reviewer"] == {
+            "actor_id": parsed.provenance.reviewer_id,
+            "role": "reviewer",
+            "decision_label": "opinion_approved",
+            "investigation_id": str(parsed.provenance.investigation_id),
+            "opinion_id": str(parsed.provenance.opinion_id),
+            "opinion_version": parsed.provenance.opinion_version,
+            "opinion_content_sha256": parsed.provenance.opinion_content_sha256,
+        }
+        assert actors["approver"] == {
+            "actor_id": parsed.provenance.approver_id,
+            "role": "approver",
+            "decision_label": "publication_augmented",
+            "base_publication": {
+                "artifact_id": str(base_artifact.id),
+                "version": base_artifact.version,
+                "sha256": parsed.provenance.base_publication_sha256,
+            },
+            "augmented_publication": {
+                "artifact_id": str(persisted_augmented.id),
+                "version": persisted_augmented.version,
+                "sha256": hashlib.sha256(v6_bytes).hexdigest(),
+            },
+        }
+        pdftotext = shutil.which("pdftotext")
+        assert pdftotext is not None
+        assert augmented_render.output_blob_id is not None
+        augmented_pdf_path = tmp_path / "augmented-publication.pdf"
+        augmented_pdf_path.write_bytes(await store.read_bytes(augmented_render.output_blob_id))
+        extracted_pdf = await asyncio.to_thread(
+            subprocess.run,
+            (pdftotext, "-layout", str(augmented_pdf_path), "-"),
+            capture_output=True,
+            check=True,
+            timeout=30,
+        )
+        extracted_pdf_text = extracted_pdf.stdout.decode("utf-8", errors="replace")
+        assert parsed.provenance.reviewer_id not in extracted_pdf_text
+        assert parsed.provenance.approver_id not in extracted_pdf_text
     finally:
         await engine.dispose()

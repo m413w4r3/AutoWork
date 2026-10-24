@@ -19,6 +19,7 @@ from cti_app.application import publication_rendering, typst_render_execution
 from cti_app.application.media_assets import MediaAssetStore
 from cti_app.application.persistence import PublicationRenderUnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.publication_augmentation import augment_publication_with_opinion
 from cti_app.application.typst_bundle import hash_bundle_contents
 from cti_app.application.typst_compilation import (
     TYPST_COMPILER,
@@ -35,6 +36,7 @@ from cti_app.application.typst_compilation import (
     TypstOutputTooLargeError,
 )
 from cti_app.application.typst_rendering import (
+    TemplateFile,
     TypstMediaRef,
     TypstRenderer,
     TypstRenderSource,
@@ -50,6 +52,7 @@ from cti_app.domain.production import (
 from cti_app.domain.publication_document import (
     PublicationDocumentV4,
     publication_document_v4_to_json,
+    serialize_publication_document,
 )
 from cti_app.domain.publication_render import (
     PUBLICATION_RENDER_POLICY_VERSION,
@@ -65,6 +68,7 @@ from cti_app.domain.typst_render import (
     typst_render_acquisition_outcome,
     typst_render_retrying,
 )
+from tests.test_publication_document_v6 import _approved_opinion, _base_v5
 
 
 def _document() -> PublicationDocumentV4:
@@ -146,6 +150,129 @@ def test_lineage_render_data_carries_document_label_and_exact_render_hash() -> N
     assert payload["document_label"] == label
     assert payload["pdf_lineage"]["nature"] == "opinion_draft_preview"
     assert enriched.render_data_sha256 == hashlib.sha256(enriched.render_data_bytes).hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_prepare_lineage_records_only_canonical_augmentation_actors(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    base_document = _base_v5()
+    base_artifact_id = uuid4()
+    base_blob_id = uuid4()
+    run_id = uuid4()
+    base_bytes = ProductionArtifactStore.canonical_json_bytes(
+        serialize_publication_document(base_document)
+    )
+    base_artifact = ProductionArtifact(
+        id=base_artifact_id,
+        production_run_id=run_id,
+        subject_id=base_document.subject_id,
+        stage=ProductionArtifactStage.PUBLICATION,
+        version=1,
+        input_hash=hashlib.sha256(base_bytes).hexdigest(),
+        canonical_blob_id=base_blob_id,
+    )
+
+    opinion, context = _approved_opinion(base_document)
+    opinion = replace(
+        opinion,
+        base_publication_artifact_id=base_artifact_id,
+        content_sha256="",
+    )
+    context = replace(context, base_publication_artifact_id=base_artifact_id)
+    augmented_document = augment_publication_with_opinion(base_document, opinion, context)
+    augmented_bytes = ProductionArtifactStore.canonical_json_bytes(
+        serialize_publication_document(augmented_document)
+    )
+    augmented_blob_id = uuid4()
+    augmented_artifact = ProductionArtifact(
+        id=uuid4(),
+        production_run_id=run_id,
+        subject_id=base_document.subject_id,
+        stage=ProductionArtifactStage.PUBLICATION,
+        version=2,
+        input_hash=hashlib.sha256(augmented_bytes).hexdigest(),
+        canonical_blob_id=augmented_blob_id,
+        metadata={
+            "previous_publication_artifact_id": str(base_artifact.id),
+            "publication_augmentation": {
+                "base_publication_artifact_id": str(base_artifact.id),
+                "base_publication_sha256": opinion.base_publication_sha256,
+                "investigation_id": str(opinion.investigation_id),
+                "opinion_id": str(opinion.id),
+                "opinion_version": opinion.version,
+                "opinion_content_sha256": opinion.content_sha256,
+                "reviewer_id": opinion.reviewer_id,
+                "approver_id": context.approver_id,
+            },
+        },
+    )
+    artifact_store = FakeArtifactStore()
+    artifact_store.payloads[base_blob_id] = serialize_publication_document(base_document)
+    artifact_store.payloads[augmented_blob_id] = serialize_publication_document(augmented_document)
+    uow_factory = FakeUnitOfWorkFactory(
+        {base_artifact.id: base_artifact, augmented_artifact.id: augmented_artifact}
+    )
+    template_bundle = TypstTemplateBundle(
+        "unit-template-v1",
+        "c" * 64,
+        (TemplateFile("RENDERER/publication.typ", b'#let publication = json("render-data.json")'),),
+    )
+    monkeypatch.setattr(
+        publication_rendering, "load_template_bundle", lambda _root: template_bundle
+    )
+    monkeypatch.setattr(
+        publication_rendering,
+        "load_font_bundle_snapshot",
+        lambda *_args: FontBundleSnapshot("unit-fonts-v1", ()),
+    )
+
+    service = object.__new__(publication_rendering.PublicationRenderService)
+    service._uow_factory = uow_factory
+    service._artifact_store = artifact_store
+    service._renderer = FakeRenderer()
+    service._chp_typst_root = tmp_path
+    service._font_bundle_root = tmp_path
+    service._typst_fonts_lock_path = tmp_path / "typst-fonts.lock"
+    service._graph_diagram_compiler = None
+
+    base_prepared = await service._prepare(base_artifact.id)
+    base_lineage = json.loads(base_prepared.build_source().render_data_bytes)["pdf_lineage"]
+    augmented_prepared = await service._prepare(augmented_artifact.id)
+    augmented_lineage = json.loads(augmented_prepared.build_source().render_data_bytes)[
+        "pdf_lineage"
+    ]
+
+    assert base_lineage["nature"] == "base_publication"
+    assert base_lineage["opinion"] is None
+    assert "actors" not in base_lineage
+    assert augmented_lineage["nature"] == "augmented_publication"
+    assert augmented_lineage["actors"] == {
+        "reviewer": {
+            "actor_id": opinion.reviewer_id,
+            "role": "reviewer",
+            "decision_label": "opinion_approved",
+            "investigation_id": str(opinion.investigation_id),
+            "opinion_id": str(opinion.id),
+            "opinion_version": opinion.version,
+            "opinion_content_sha256": opinion.content_sha256,
+        },
+        "approver": {
+            "actor_id": context.approver_id,
+            "role": "approver",
+            "decision_label": "publication_augmented",
+            "base_publication": {
+                "artifact_id": str(base_artifact.id),
+                "version": base_artifact.version,
+                "sha256": opinion.base_publication_sha256,
+            },
+            "augmented_publication": {
+                "artifact_id": str(augmented_artifact.id),
+                "version": augmented_artifact.version,
+                "sha256": hashlib.sha256(augmented_bytes).hexdigest(),
+            },
+        },
+    }
 
 
 @pytest.mark.asyncio
@@ -235,6 +362,155 @@ async def test_lineage_marks_a_pinned_opinion_from_another_investigation_histori
     assert lineage["historical"] is True
     assert lineage["is_current"] is False
     assert "pinned_opinion_investigation_mismatch" in lineage["history_reasons"]
+
+
+@pytest.mark.asyncio
+async def test_lineage_reconstruction_preserves_stored_actors_without_inventing_legacy_actors() -> (
+    None
+):
+    run_id = uuid4()
+    subject_id = uuid4()
+    artifact_id = uuid4()
+    canonical_blob_id = uuid4()
+    render_data_blob_id = uuid4()
+    opinion_id = uuid4()
+    investigation_id = uuid4()
+    reviewer_id = "reviewer:canonical"
+    approver_id = "approver:canonical"
+    actors = {
+        "reviewer": {
+            "actor_id": reviewer_id,
+            "role": "reviewer",
+            "decision_label": "opinion_approved",
+            "investigation_id": str(investigation_id),
+            "opinion_id": str(opinion_id),
+            "opinion_version": 3,
+            "opinion_content_sha256": "a" * 64,
+        },
+        "approver": {
+            "actor_id": approver_id,
+            "role": "approver",
+            "decision_label": "publication_augmented",
+            "base_publication": {
+                "artifact_id": str(uuid4()),
+                "version": 1,
+                "sha256": "b" * 64,
+            },
+            "augmented_publication": {
+                "artifact_id": str(artifact_id),
+                "version": 2,
+                "sha256": "c" * 64,
+            },
+        },
+    }
+    artifact = ProductionArtifact(
+        id=artifact_id,
+        production_run_id=run_id,
+        subject_id=subject_id,
+        stage=ProductionArtifactStage.PUBLICATION,
+        version=2,
+        input_hash="d" * 64,
+        canonical_blob_id=canonical_blob_id,
+        metadata={
+            "publication_augmentation": {
+                "investigation_id": str(investigation_id),
+                "opinion_id": str(opinion_id),
+                "opinion_version": 3,
+                "opinion_content_sha256": "a" * 64,
+                "reviewer_id": reviewer_id,
+                "approver_id": approver_id,
+            }
+        },
+    )
+    opinion = SimpleNamespace(
+        id=opinion_id,
+        version=3,
+        content_sha256="a" * 64,
+        status=SimpleNamespace(value="approved"),
+        investigation_id=investigation_id,
+    )
+
+    class _UnitOfWork:
+        production_artifacts = SimpleNamespace(
+            get=lambda requested_id: _async_value(
+                artifact if requested_id == artifact_id else None
+            ),
+            get_current=lambda requested_run_id, _stage: _async_value(
+                artifact if requested_run_id == run_id else None
+            ),
+        )
+        production_runs = SimpleNamespace(
+            get_current_for_subject=lambda requested_subject_id: _async_value(
+                SimpleNamespace(id=run_id) if requested_subject_id == subject_id else None
+            )
+        )
+        analyst_investigations = SimpleNamespace(
+            get_for_run=lambda requested_run_id: _async_value(
+                SimpleNamespace(id=investigation_id) if requested_run_id == run_id else None
+            )
+        )
+        analyst_opinions = SimpleNamespace(get=lambda _opinion_id, **_kwargs: _async_value(opinion))
+
+        async def commit(self) -> None:
+            return None
+
+    class _Context:
+        def __init__(self, _lineage: dict[str, Any]) -> None:
+            self.lineage = _lineage
+
+        async def __aenter__(self) -> _UnitOfWork:
+            return _UnitOfWork()
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    class _Store:
+        def __init__(self, render_data: bytes) -> None:
+            self.render_data = render_data
+
+        async def read_bytes(self, blob_id: UUID) -> bytes:
+            return self.render_data if blob_id == render_data_blob_id else b"canonical"
+
+    for stored_actors in (actors, None):
+        stored_lineage: dict[str, Any] = {
+            "schema_version": "pdf-lineage.v1",
+            "nature": "augmented_publication",
+            "artifact": {
+                "id": str(artifact.id),
+                "version": artifact.version,
+                "sha256": "c" * 64,
+                "document_schema": "6",
+            },
+            "opinion": {
+                "id": str(opinion_id),
+                "version": 3,
+                "status": "approved",
+                "sha256": "a" * 64,
+                "investigation_id": str(investigation_id),
+            },
+            "investigation_id": str(investigation_id),
+        }
+        if stored_actors is not None:
+            stored_lineage["actors"] = stored_actors
+        render_data = json.dumps({"pdf_lineage": stored_lineage}).encode()
+        service = object.__new__(publication_rendering.PublicationRenderService)
+        service._uow_factory = lambda lineage=stored_lineage: _Context(lineage)
+        service._artifact_store = _Store(render_data)
+        render = replace(
+            _proposed_render(artifact_id),
+            render_data_blob_id=render_data_blob_id,
+            output_blob_id=uuid4(),
+            output_sha256="e" * 64,
+            output_byte_size=10,
+            status=TypstRenderStatus.SUCCEEDED,
+        )
+
+        lineage = await service.lineage_manifest_for_render(render)
+
+        if stored_actors is None:
+            assert "actors" not in lineage
+        else:
+            assert lineage["actors"] == stored_actors
 
 
 async def _async_value(value: Any) -> Any:
