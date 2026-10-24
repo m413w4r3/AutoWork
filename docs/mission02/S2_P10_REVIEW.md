@@ -47,3 +47,17 @@ Verdict: **REVISE**.
 - Required: `PYTHONPATH=$PWD/src /home/nill/perso/work/AutoWork/backend/.venv/bin/python -m pytest tests/test_invariant_proposals.py tests/test_bridge_investigator.py tests/test_research_context_builder.py -q --tb=short` — **133 passed in 2.46s**.
 - Offline synthetic renderer checks confirmed the remaining secret paths and `x-amz-algorithm` over-redaction. No provider or live runtime was called.
 - `git diff --check 4a13c5d4..d298d181` — passed.
+
+### Third pass after 44c1bfac
+
+Reviewed `44c1bfac` merged at worktree HEAD `fc2c1eb3961f2b186b0ca3f1e4ee68c1e6d32580`.
+Verdict: **REVISE**.
+
+- **VERIFIED — covered residuals closed:** flat text `auth=`, Basic authorization, `credential=`, `client_secret=`, and the tested HTTPS credential parameters are redacted. Benign prose (“Auth methodology”, “credential theft”) and `x-amz-algorithm` survive; uppercase labels and whitespace before `:` are redacted ([invariant_proposals.py:2292](/home/nill/.paseo/worktrees/0y1qsxa1/mission02-s2-p10-review/backend/src/cti_app/application/invariant_proposals.py:2292), [test_invariant_proposals.py:1029](/home/nill/.paseo/worktrees/0y1qsxa1/mission02-s2-p10-review/backend/tests/test_invariant_proposals.py:1029)).
+- **HIGH — VERIFIED, still in S2 scope:** synthetic `_normalize_context` → `_render_p10_prompt` checks show secrets survive when under a structured `auth` mapping key, in `auth_token=`, in percent-encoded `?%61uth=`, in username-only URL userinfo, in `#id_token=`, and in a scheme-less `www...?...sig=` URL. Mapping values are normalized without considering their keys ([invariant_proposals.py:2221](/home/nill/.paseo/worktrees/0y1qsxa1/mission02-s2-p10-review/backend/src/cti_app/application/invariant_proposals.py:2221)); generic claim rendering then emits key/value pairs ([invariant_proposals.py:1123](/home/nill/.paseo/worktrees/0y1qsxa1/mission02-s2-p10-review/backend/src/cti_app/application/invariant_proposals.py:1123)). URL handling requires an HTTP(S) scheme and literal matched parameter names ([invariant_proposals.py:2291](/home/nill/.paseo/worktrees/0y1qsxa1/mission02-s2-p10-review/backend/src/cti_app/application/invariant_proposals.py:2291)). Add key-aware normalization and cover these bypasses before S2 approval; these remain P10 disclosure-path defects, not separate cleanup.
+- **VERIFIED:** the updated tests add cases without weakening the prior assertions. Their render-path fixture covers flat claim text and HTTPS query credentials but not the structured/encoded/fragment cases above ([test_invariant_proposals.py:1049](/home/nill/.paseo/worktrees/0y1qsxa1/mission02-s2-p10-review/backend/tests/test_invariant_proposals.py:1049)). No provider or live runtime was called.
+
+### Third-pass checks
+
+- Required: `PYTHONPATH=$PWD/src /home/nill/perso/work/AutoWork/backend/.venv/bin/python -m pytest tests/test_invariant_proposals.py tests/test_bridge_investigator.py tests/test_research_context_builder.py -q --tb=short` — **134 passed in 2.13s**.
+- Offline synthetic renderer checks confirmed the remaining bypasses; no benign-prose over-redaction was observed.
