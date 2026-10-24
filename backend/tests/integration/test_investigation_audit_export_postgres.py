@@ -1168,7 +1168,7 @@ async def test_postgres_audit_snapshot_projects_scoped_rows_and_resumes_without_
             assert await session.get(ModelRunRow, foreign_run.id) is not None
             assert await session.get(EvidenceObservationRow, missing_response_ref) is None
 
-        expected = {
+        expected: dict[str, Any] = {
             "investigation_id": str(target.investigation.id),
             "conversation_id": str(conversation_row.id),
             "source_versions": {

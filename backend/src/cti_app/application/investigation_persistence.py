@@ -7,6 +7,7 @@ module intentionally does not modify or depend on application/persistence.py.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
@@ -198,22 +199,22 @@ def _copy_budget(budget: InvestigationBudget) -> InvestigationBudget:
     return copied
 
 
-def _memory_keyset_page(
-    items: tuple[object, ...],
+def _memory_keyset_page[T](
+    items: tuple[T, ...],
     *,
     section: str,
     investigation_id: UUID,
     cursor: str | None,
     limit: int,
     descending: bool,
-    position: object,
+    position: Callable[[T], tuple[datetime, UUID]],
     latest_only: bool = False,
-) -> KeysetPageV1:
+) -> KeysetPageV1[T]:
     """Page a materialized in-memory snapshot; this does not bound source memory."""
     if not 1 <= limit <= 1_000:
         raise ValueError("Context page limit must be between 1 and 1000")
-    position_fn = position  # keep the generic callback local for type-checkers
-    ordered = sorted(items, key=position_fn, reverse=descending)  # type: ignore[arg-type]
+    position_fn = position
+    ordered = sorted(items, key=position_fn, reverse=descending)
     if cursor is not None:
         decoded = decode_keyset_cursor(
             cursor,
@@ -221,6 +222,8 @@ def _memory_keyset_page(
             investigation_id=investigation_id,
             descending=descending,
         )
+        if decoded is None:
+            raise ValueError("Context keyset cursor is invalid")
         try:
             sort_key = datetime.fromisoformat(decoded["sort_key"])
             item_id = UUID(decoded["item_id"])
@@ -230,7 +233,7 @@ def _memory_keyset_page(
         ordered = [
             item
             for item in ordered
-            if (position_fn(item) < pivot if descending else position_fn(item) > pivot)  # type: ignore[operator]
+            if (position_fn(item) < pivot if descending else position_fn(item) > pivot)
         ]
     return make_keyset_page(
         section=section,

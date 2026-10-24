@@ -6,6 +6,7 @@ behavior remains UNKNOWN until exercised against a PostgreSQL test database.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import replace
 from uuid import UUID
 
@@ -20,6 +21,7 @@ from cti_app.application.investigation_audit_export import (
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.domain.investigation_experiment import EXPERIMENT_SCHEMA_VERSION
 from cti_app.domain.investigation_state import InvestigationWorkingState
+from cti_app.domain.model_conversations import ModelConversationTurn
 from cti_app.infrastructure.database.models.investigation import AnalystOpinionVersionRow
 from cti_app.infrastructure.database.models.production import AnalystInvestigationRow
 from cti_app.infrastructure.database.repositories.investigation import (
@@ -115,7 +117,7 @@ async def load_investigation_audit_snapshot(
 
     pivot_conversation_id = investigation_row.pivot_conversation_id
     conversation = None
-    turns = ()
+    turns: Sequence[ModelConversationTurn] = ()
     model_runs = []
     if pivot_conversation_id is not None:
         conversation = await SqlAlchemyModelConversationRepository(session).get(
@@ -177,10 +179,10 @@ async def read_investigation_audit_snapshot(
 
     projections = []
     for observation in snapshot.observations:
-        source = getattr(observation, "source", None)
-        object_type = getattr(observation, "object_type", None)
-        source = source.value if hasattr(source, "value") else source
-        object_type = object_type.value if hasattr(object_type, "value") else object_type
+        source: object = getattr(observation, "source", None)
+        object_type: object = getattr(observation, "object_type", None)
+        source = getattr(source, "value", source)
+        object_type = getattr(object_type, "value", object_type)
         if source != "advisor.consult" or object_type != "advisor_call":
             continue
         if artifact_store is None:

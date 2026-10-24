@@ -214,6 +214,21 @@ class InvestigationTurnTransport(Protocol):
     ) -> TurnSubmission: ...
 
 
+class _AttemptAwareInvestigationTurnTransport(Protocol):
+    async def submit_with_attempt(
+        self,
+        *,
+        investigation_id: UUID,
+        subject_id: UUID,
+        turn_index: int,
+        context_sha256: str,
+        prompt: str,
+        external_llm_allowed: bool,
+        timeout_seconds: float | None = None,
+        attempt: int,
+    ) -> TurnSubmission: ...
+
+
 @dataclass(frozen=True, slots=True)
 class TurnSubmission:
     status: TurnSubmissionStatus
@@ -330,7 +345,21 @@ async def submit_bridge_consultation_once(
         transport_timeout = timeout_seconds
 
     async def submit(attempt: int, call_timeout_seconds: float | None) -> TurnSubmission | None:
-        arguments = dict(
+        if attempt == 0:
+            return await transport.submit(
+                investigation_id=investigation_id,
+                subject_id=subject_id,
+                turn_index=turn_index,
+                context_sha256=context_sha256,
+                prompt=prompt,
+                external_llm_allowed=True,
+                timeout_seconds=call_timeout_seconds,
+            )
+        submit_with_attempt = getattr(transport, "submit_with_attempt", None)
+        if not callable(submit_with_attempt):
+            return None
+        attempt_aware_transport = cast(_AttemptAwareInvestigationTurnTransport, transport)
+        return await attempt_aware_transport.submit_with_attempt(
             investigation_id=investigation_id,
             subject_id=subject_id,
             turn_index=turn_index,
@@ -338,13 +367,8 @@ async def submit_bridge_consultation_once(
             prompt=prompt,
             external_llm_allowed=True,
             timeout_seconds=call_timeout_seconds,
+            attempt=attempt,
         )
-        if attempt == 0:
-            return await transport.submit(**arguments)
-        submit_with_attempt = getattr(transport, "submit_with_attempt", None)
-        if not callable(submit_with_attempt):
-            return None
-        return await submit_with_attempt(**arguments, attempt=attempt)
 
     def ambiguous_timeout(detail: str) -> TurnSubmission:
         return TurnSubmission(
@@ -536,7 +560,8 @@ def _normalize_bridge_submission_state(value: Any) -> BridgeSubmissionState | No
 def _bounded_retry_backoff(base: float, maximum: float, attempt: int) -> float:
     if not math.isfinite(base) or base <= 0 or not math.isfinite(maximum) or maximum <= 0:
         return 0.0
-    return min(base * (2 ** min(attempt, 30)), maximum)
+    factor: float = float(2 ** min(attempt, 30))
+    return min(base * factor, maximum)
 
 
 @dataclass(frozen=True, slots=True)

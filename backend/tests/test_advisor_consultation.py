@@ -287,7 +287,8 @@ def test_prompt_utf8_and_sha256_are_deterministic_without_newline_normalization(
     assert b"\r\n" in first.prompt_utf8
 
     with pytest.raises(FrozenInstanceError):
-        first.source_catalog.refs = ()
+        attribute_name = "refs"
+        setattr(first.source_catalog, attribute_name, ())
 
 
 def test_prepare_accepts_pure_mapping_and_does_not_open_files_start_processes_or_connect(

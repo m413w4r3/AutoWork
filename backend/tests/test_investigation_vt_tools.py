@@ -1262,6 +1262,7 @@ class _EvidenceAwareScriptedTransport(ScriptedTurnTransport):
         context_sha256: str,
         prompt: str,
         external_llm_allowed: bool,
+        timeout_seconds: float | None = None,
     ) -> Any:
         current = await self.evidence.list_for_investigation(investigation_id)
         if turn_index == 1:
@@ -1376,6 +1377,7 @@ class _EvidenceAwareScriptedTransport(ScriptedTurnTransport):
             context_sha256=context_sha256,
             prompt=prompt,
             external_llm_allowed=external_llm_allowed,
+            timeout_seconds=timeout_seconds,
         )
 
 
