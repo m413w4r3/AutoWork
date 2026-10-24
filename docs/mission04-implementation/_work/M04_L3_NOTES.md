@@ -2,16 +2,18 @@
 
 ## Status
 
-**PARENT_POSTGRES_RERUN_REQUIRED.** The parent ran the disposable
-`postgres-test` oracle. Its first run failed in the test fixture because
-`InvestigationAgenda` had one question; after adding a second valid question,
-the same command completed with **1 passed in 1.25s**. That was a fixture
-correction, not a production defect. After review repair attempt 1, the parent
-reran PostgreSQL and the exact resource-set assertion failed because the
-expected set omitted the synthesis artifact and base publication artifact
-already present in the bundle (**1 failed in 1.15s**). Repair attempt 2 below
-adds both expected keys from independently queried PostgreSQL rows. This latest
-revision still needs a PostgreSQL rerun.
+**PARENT_POSTGRES_GREEN.** The parent ran the disposable `postgres-test`
+oracle. Its first run failed in the test fixture because `InvestigationAgenda`
+had one question; after adding a second valid question, the same command
+completed with **1 passed in 1.25s**. That was a fixture correction, not a
+production defect. After review repair attempt 1, the parent reran PostgreSQL
+and the exact resource-set assertion failed because the expected set omitted
+the synthesis artifact and base publication artifact already present in the
+bundle (**1 failed in 1.15s**). Repair attempt 2 added both expected keys from
+independently queried PostgreSQL rows; the parent reran the oracle on that
+revision and it completed with **1 passed in 1.02s**. The independent R2 review
+then approved the lot. The fake artifact reader still does not prove real MinIO
+integration.
 
 Base SHA supplied for the lot: `e120a36f1afa08261fdf0276e0200872973ad8f2`.
 
