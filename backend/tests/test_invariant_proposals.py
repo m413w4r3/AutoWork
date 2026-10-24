@@ -1177,7 +1177,10 @@ def test_render_p10_prompt_redacts_escaped_json_credential_and_preserves_cti_evi
     ("escaped_value", "value_markers"),
     [
         ("FIXTURE_WITH SPACE_SUFFIX", ("FIXTURE_WITH", "SPACE_SUFFIX")),
-        (r"FIXTURE_WITH \"INNER\" QUOTED_SUFFIX", ("FIXTURE_WITH", "INNER", "QUOTED_SUFFIX")),
+        (
+            r"FIXTURE_WITH \\\"INNER\\\" QUOTED_SUFFIX",
+            ("FIXTURE_WITH", "INNER", "QUOTED_SUFFIX"),
+        ),
         (
             r"FIXTURE_WITH \\\"QUOTED\\\" TAIL_SUFFIX",
             ("FIXTURE_WITH", "QUOTED", "TAIL_SUFFIX"),
@@ -1201,6 +1204,23 @@ def test_render_p10_prompt_redacts_complete_escaped_json_scalar(
     assert all(marker not in prompt for marker in value_markers), prompt
     assert expected_redaction in prompt, prompt
     assert "CTI_ADJACENT_PRESERVE" in prompt
+
+
+@pytest.mark.parametrize("punctuation", ["}", "]", ","])
+def test_render_p10_prompt_redacts_valid_closed_scalar_with_punctuation(
+    punctuation: str,
+) -> None:
+    escaped_value = f"FIXTURE_WITH{punctuation}INSIDE"
+    serialized_auth = r"{\"auth\": \"" + escaped_value + r"\", \"adjacent cti\": \"CTI_ADJACENT\"}"
+    context = _normalize_context(
+        {"report_claims": [{"claim_id": "claim-punctuated", "text": serialized_auth}]}
+    )
+
+    prompt, _ = _render_p10_prompt(_proposal_snapshot(context))
+
+    assert "FIXTURE_WITH" not in prompt, prompt
+    assert "CTI_ADJACENT" in prompt, prompt
+    assert r"{\"auth\": \"[REDACTED]\", \"adjacent cti\": \"CTI_ADJACENT\"}" in prompt
 
 
 def test_render_p10_prompt_preserves_escaped_innocent_author_and_plain_assignment() -> None:

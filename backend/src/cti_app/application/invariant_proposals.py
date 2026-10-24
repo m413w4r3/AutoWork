@@ -2495,27 +2495,25 @@ def _escaped_assignment_boundary(value: str, after_quote: int) -> bool:
     return value[index] == ","
 
 
-def _escaped_assignment_closings(value: str) -> dict[str, list[tuple[int, int]]]:
-    """Index one-layer escaped scalar closes in one monotone pass."""
-    closings: dict[str, list[tuple[int, int]]] = {'"': [], "'": []}
+def _escaped_assignment_structural_quotes(value: str) -> list[int]:
+    """Index structural quotes of one escaped JSON layer in a monotone pass.
+
+    A quote is structural when it is preceded by a 1 mod 4 backslash run:
+    one layer of escaping. Quotes at 3 mod 4 are embedded in the scalar.
+    """
+    quotes: list[int] = []
     index = 0
     while index < len(value):
         if value[index] != "\\":
             index += 1
             continue
-
         slash_start = index
         while index < len(value) and value[index] == "\\":
             index += 1
-        slash_count = index - slash_start
-        if index < len(value) and value[index] in "\"'":
-            quote = value[index]
-            # One escaped JSON layer: structural quote runs are 1 mod 4;
-            # embedded quotes in the scalar are 3 mod 4.
-            if slash_count % 4 == 1 and _escaped_assignment_boundary(value, index + 1):
-                closings[quote].append((index - 1, index + 1))
+        if index < len(value) and value[index] in "\"'" and (index - slash_start) % 4 == 1:
+            quotes.append(index)
             index += 1
-    return closings
+    return quotes
 
 
 def _escaped_assignment_line_breaks(value: str) -> list[int]:
@@ -2523,65 +2521,40 @@ def _escaped_assignment_line_breaks(value: str) -> list[int]:
     return [index for index, char in enumerate(value) if char in "\r\n"]
 
 
-def _escaped_assignment_has_ambiguous_delimiter(
-    value: str, value_start: int, close_start: int
-) -> bool:
-    """A raw delimiter before the close may belong to the credential value.
-
-    A delimiter immediately after an embedded escaped quote (3 mod 4 backslashes)
-    is part of the scalar and is allowed; any other raw ``}``, ``]`` or ``,``
-    makes the later quote untrustworthy as this scalar's close.
-    """
-    for index in range(value_start, close_start):
-        if value[index] not in "}],":
-            continue
-        if value[max(0, index - 9) : index + 1] == "[REDACTED]":
-            # The literal redaction marker is not a structural delimiter.
-            continue
-        if index and value[index - 1] in "\"'":
-            quote_index = index - 1
-            slash_start = quote_index
-            while slash_start and value[slash_start - 1] == "\\":
-                slash_start -= 1
-            if (quote_index - slash_start) % 4 == 3:
-                continue
-        return True
-    return False
-
-
 def _escaped_assignment_close(
     value: str,
     value_start: int,
     quote: str,
-    closings: dict[str, list[tuple[int, int]]],
-    close_cursors: dict[str, int],
+    structural_quotes: list[int],
+    quote_cursor: int,
     line_breaks: list[int],
     line_cursor: int,
 ) -> tuple[tuple[int, int] | None, int]:
-    """Select a valid scalar close or a raw line boundary without rescanning.
+    """Find the first structural quote closing the scalar.
 
-    An unclosed scalar is ambiguous: ``}``, ``]`` and ``,`` may belong to the
-    credential value, so they are never treated as safe fallback boundaries.
-    Only a raw LF/CRLF (which cannot occur inside a valid escaped JSON scalar)
-    bounds the redaction; otherwise the caller must refuse explicitly.
+    The first structural quote of the same kind after the value start is the
+    JSON string's true close, even when the value contains raw ``}``, ``]`` or
+    ``,`` characters. It must be followed by a JSON boundary; otherwise the
+    quote belongs to a later key and the scalar is ambiguous. Only a raw
+    LF/CRLF can bound an unclosed scalar; anything else is an explicit refusal.
     """
-    candidates = closings[quote]
-    close_cursor = close_cursors[quote]
-    while close_cursor < len(candidates) and candidates[close_cursor][0] < value_start:
-        close_cursor += 1
-    close_cursors[quote] = close_cursor
+    while quote_cursor < len(structural_quotes):
+        candidate = structural_quotes[quote_cursor]
+        if candidate < value_start or value[candidate] != quote:
+            quote_cursor += 1
+            continue
+        break
     while line_cursor < len(line_breaks) and line_breaks[line_cursor] < value_start:
         line_cursor += 1
 
-    if close_cursor < len(candidates):
-        close_start, close_end = candidates[close_cursor]
-        if line_cursor < len(line_breaks) and line_breaks[line_cursor] < close_start:
+    if quote_cursor < len(structural_quotes):
+        close_index = structural_quotes[quote_cursor]
+        if line_cursor < len(line_breaks) and line_breaks[line_cursor] < close_index:
             line = line_breaks[line_cursor]
             return (line, line), line_cursor + 1
-        if _escaped_assignment_has_ambiguous_delimiter(value, value_start, close_start):
+        if not _escaped_assignment_boundary(value, close_index + 1):
             return None, line_cursor
-        close_cursors[quote] = close_cursor + 1
-        return (close_start, close_end), line_cursor
+        return (close_index - 1, close_index + 1), line_cursor
 
     if line_cursor < len(line_breaks):
         line = line_breaks[line_cursor]
@@ -2591,8 +2564,8 @@ def _escaped_assignment_close(
 
 def _redact_escaped_text_assignments(value: str) -> str:
     """Redact single-layer escaped assignments without regex suffix rescans."""
-    closings = _escaped_assignment_closings(value)
-    close_cursors = {'"': 0, "'": 0}
+    structural_quotes = _escaped_assignment_structural_quotes(value)
+    quote_cursor = 0
     line_breaks = _escaped_assignment_line_breaks(value)
     line_cursor = 0
     parts: list[str] = []
@@ -2625,8 +2598,8 @@ def _redact_escaped_text_assignments(value: str) -> str:
             value,
             value_start,
             quote,
-            closings,
-            close_cursors,
+            structural_quotes,
+            quote_cursor,
             line_breaks,
             line_cursor,
         )
@@ -2639,6 +2612,10 @@ def _redact_escaped_text_assignments(value: str) -> str:
             )
 
         close_start, close_end = close
+        while (
+            quote_cursor < len(structural_quotes) and structural_quotes[quote_cursor] <= close_start
+        ):
+            quote_cursor += 1
         if value[value_start:close_start] != "[REDACTED]":
             parts.extend((value[copied_through:value_start], "[REDACTED]"))
             copied_through = close_start
