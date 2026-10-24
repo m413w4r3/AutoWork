@@ -85,7 +85,7 @@ def test_content_excerpt_extraction_keeps_whole_methods_decoded_values_and_offse
     assert all("a" * 64 not in item["text"] for item in excerpts)
 
 
-def test_short_hex_excerpt_rejects_malformed_and_oversized_values() -> None:
+def test_hex_excerpt_preserves_full_and_malformed_values_with_offsets() -> None:
     excerpts = extract_content_excerpts(
         {
             "hex": [
@@ -98,15 +98,22 @@ def test_short_hex_excerpt_rejects_malformed_and_oversized_values() -> None:
         }
     )
 
-    assert len(excerpts) == 2
+    assert len(excerpts) == 5
     assert [excerpt["title"].rsplit("offset ", 1)[-1] for excerpt in excerpts] == [
         "64",
         "128",
+        "128",
+        "192",
+        "256",
     ]
-    assert all(excerpt["text"] == "AA BB" for excerpt in excerpts)
+    assert excerpts[0]["text"] == "AA BB"
+    assert excerpts[1]["text"] == "AA BB"
+    assert excerpts[2]["text"] == "AA" * 513
+    assert excerpts[3]["text"] == "zz00"
+    assert excerpts[4]["text"] == "A0xA"
 
 
-def test_split_hex_dump_exceeding_aggregate_cap_is_rejected() -> None:
+def test_split_hex_dump_over_aggregate_binary_budget_is_preserved() -> None:
     excerpts = extract_content_excerpts(
         {
             "hex": [
@@ -116,7 +123,8 @@ def test_split_hex_dump_exceeding_aggregate_cap_is_rejected() -> None:
         }
     )
 
-    assert excerpts == []
+    assert [excerpt["text"] for excerpt in excerpts] == ["AA" * 257, "BB" * 256]
+    assert [excerpt["title"].rsplit("offset ", 1)[-1] for excerpt in excerpts] == ["64", "321"]
 
 
 def test_advisor_bridge_provenance_keeps_internal_measurement_ids_and_exact_bytes() -> None:
@@ -396,6 +404,7 @@ def test_archived_corpus_c01_to_c13_replays_as_compact_resolvable_text_dossiers(
             ],
         )
         internal_values: list[tuple[str, str]] = []
+
         def collect_internal_values(value: object, collected: list[tuple[str, str]]) -> None:
             if isinstance(value, dict):
                 for key, child in value.items():
