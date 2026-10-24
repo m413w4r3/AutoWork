@@ -1147,6 +1147,22 @@ async def test_w18_supervised_first_run_recovers_without_replaying_confirmed_eff
         == status_after_crash["last_operation"]["id"]
     )
     assert status_after_worker_restart["stop_reason"] == StopReason.USER_INTERRUPT.value
+    resume_before_reconcile = await driver.client.post(
+        f"/api/investigations/{investigation_id}/resume",
+        json={"expected_version": status_after_worker_restart["working_state_version"]},
+        headers={"Idempotency-Key": f"w18-resume-before-reconcile-{investigation_id}"},
+    )
+    assert resume_before_reconcile.status_code == 409, resume_before_reconcile.text
+    assert resume_before_reconcile.json()["detail"]["code"] == "investigation_resume_conflict"
+    assert vt.download_calls == 1, "resume must not replay an ambiguous download"
+    assert shodan.calls == [], "no later external tool may run before reconciliation"
+    status_after_refused_resume = await _read_operator_status(
+        driver.client, uow_factory, investigation_id
+    )
+    assert (
+        status_after_refused_resume["working_state_version"]
+        == status_after_worker_restart["working_state_version"]
+    )
     reconcile = await driver.client.post(
         f"/api/investigations/{investigation_id}/invocations/{ambiguous_invocation.id}/reconcile",
         headers={"Idempotency-Key": f"w18-reconcile-{ambiguous_invocation.id}"},

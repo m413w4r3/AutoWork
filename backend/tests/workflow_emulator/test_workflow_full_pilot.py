@@ -1502,6 +1502,30 @@ async def test_workflow_full_supervised_first_run_dynamic_pilot(
             assert set(compared_hashes) == {sha_a, sha_b, sha_c}
             assert len(compared_hashes) == 3
             assert comparison_invocation.response_refs
+            comparison_observation = next(
+                item for item in observations if item.id == comparison_invocation.response_refs[0]
+            )
+            persisted_comparison = await artifact_store.read_json(comparison_observation.blob_id)
+            assert isinstance(persisted_comparison, Mapping)
+            assert set(persisted_comparison["comparison_sample_sha256s"]) == {
+                sha_a,
+                sha_b,
+                sha_c,
+            }
+            persisted_measurements: dict[str, set[bool]] = {
+                sample_hash: set() for sample_hash in (*compared_hashes, *capture_hashes)
+            }
+            for feature in persisted_comparison["features"]:
+                for presence in feature["sample_presence"]:
+                    sample_hash = presence["sample_sha256"]
+                    if sample_hash in persisted_measurements:
+                        persisted_measurements[sample_hash].add(presence["measured"])
+            assert all(
+                persisted_measurements[sample_hash] == {True} for sample_hash in compared_hashes
+            )
+            assert all(
+                persisted_measurements[sample_hash] == {False} for sample_hash in capture_hashes
+            )
             assert (
                 len([item for item in observations if item.source == "network.capture.inspect"])
                 == 2
@@ -1910,13 +1934,13 @@ async def test_workflow_full_supervised_first_run_dynamic_pilot(
             rendered_pages = tuple(sorted(output_root.glob("publication-v6-page-*.png")))
             assert len(rendered_pages) >= 1
             assert all(item.stat().st_size > 1_024 for item in rendered_pages)
-            figure_caption_parts = tuple(
-                " ".join(part.split()).casefold()
-                for figure in figures
-                for part in figure.caption.splitlines()
-                if part.strip()
-            )
-            assert all(caption_part in pdf_text for caption_part in figure_caption_parts)
+            caption_search_from = 0
+            for figure in figures:
+                caption = " ".join(figure.caption.casefold().split())
+                assert caption, "PDF captions must not be empty"
+                caption_position = pdf_text.find(caption, caption_search_from)
+                assert caption_position >= 0, caption
+                caption_search_from = caption_position + len(caption)
 
             manifest_after = await read_manifest(uow_factory, edition.id)
             assert manifest_after is not None

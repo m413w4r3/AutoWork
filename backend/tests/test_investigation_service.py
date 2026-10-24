@@ -1377,6 +1377,61 @@ async def test_ambiguous_external_result_preserves_only_valid_refs_without_archi
 
 
 @pytest.mark.asyncio
+async def test_unreconciled_review_with_refs_blocks_next_external_tool_call() -> None:
+    first = _tool_call("vt.search", "synthetic:ambiguous", "reuse the reviewed lookup")
+    second = _tool_call("vt.search", "synthetic:later", "start another external lookup")
+    fixture = _Fixture(
+        responses=[
+            _decision(
+                goal="continue after reviewed lookup", next_action="continue", tools=(first, second)
+            ),
+            _decision(goal="finish after reconciliation gate", next_action="finish"),
+        ],
+        tools=(("vt.search", "vt"),),
+    )
+    state = await fixture.start()
+    observation = EvidenceObservation(
+        investigation_id=state.investigation_id,
+        kind=EvidenceKind.OTHER,
+        blob_id=uuid4(),
+        sha256=hashlib.sha256(b"synthetic ambiguous lookup evidence").hexdigest(),
+        source="synthetic-vt-search",
+        source_version="1",
+        observed_at=datetime.now(UTC),
+        object_type="search_result",
+        object_id="synthetic:ambiguous",
+    )
+    await fixture.observations.append_if_absent(observation)
+    operation_key, _ = _operation_and_observation_id(state.investigation_id, first)
+    invocation = ToolInvocation(
+        investigation_id=state.investigation_id,
+        operation_key=operation_key,
+        tool_name=first["tool_name"],
+        schema_version=first["schema_version"],
+        normalized_parameters=first["arguments"],
+        purpose=first["purpose"],
+    )
+    invocation = await fixture.invocations.add_if_absent(invocation)
+    invocation = await fixture.invocations.update_if_version(
+        invocation.transition(ToolInvocationStatus.RUNNING), expected_version=invocation.version
+    )
+    reviewed = replace(
+        invocation.transition(ToolInvocationStatus.NEEDS_REVIEW),
+        response_refs=(observation.id,),
+    )
+    await fixture.invocations.update_if_version(reviewed, expected_version=invocation.version)
+
+    result = await fixture.service.run(state.investigation_id)
+
+    invocations = await fixture.invocations.list_for_investigation(state.investigation_id)
+    assert result.stop_reason is StopReason.SUBMISSION_NEEDS_REVIEW
+    assert fixture.tools["vt.search"].calls == []
+    assert len(invocations) == 1
+    assert invocations[0].status is ToolInvocationStatus.NEEDS_REVIEW
+    assert invocations[0].response_refs == (observation.id,)
+
+
+@pytest.mark.asyncio
 async def test_untyped_shodan_authorization_refusal_blocks_later_calls() -> None:
     calls = tuple(
         _tool_call("shodan.host", f"synthetic:{index}", f"check synthetic host {index}")

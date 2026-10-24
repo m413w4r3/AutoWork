@@ -454,14 +454,7 @@ class InvestigationService:
                 raise ValueError("The pending Bridge turn still has an active owner job")
             if disposition == "orphaned_running_turn":
                 state = await self._require_state(investigation_id)
-        # A linked observation proves there is evidence, not that an ambiguous external
-        # operation was reconciled. Keep a submission-review stop authoritative.
-        unresolved = tuple(
-            item
-            for item in await self._invocations.list_for_investigation(investigation_id)
-            if item.status in {ToolInvocationStatus.RUNNING, ToolInvocationStatus.NEEDS_REVIEW}
-            and (not item.response_refs or state.stop_reason is StopReason.SUBMISSION_NEEDS_REVIEW)
-        )
+        unresolved = await self._unresolved_tool_invocations(investigation_id)
         if unresolved:
             raise ValueError(
                 "Ambiguous tool invocations must be reconciled before resuming: "
@@ -488,6 +481,15 @@ class InvestigationService:
             investigation._bump()
             await self._investigations.save(investigation)
         return state
+
+    async def _unresolved_tool_invocations(
+        self, investigation_id: UUID
+    ) -> tuple[ToolInvocation, ...]:
+        return tuple(
+            item
+            for item in await self._invocations.list_for_investigation(investigation_id)
+            if item.status in {ToolInvocationStatus.RUNNING, ToolInvocationStatus.NEEDS_REVIEW}
+        )
 
     async def interrupt(
         self, investigation_id: UUID, *, expected_version: int | None = None
@@ -1477,6 +1479,24 @@ class InvestigationService:
                 ToolEffect.EXTERNAL_ACTIVE,
                 ToolEffect.EXTERNAL_SUBMIT,
             }
+            if external_effect:
+                unresolved = tuple(
+                    item
+                    for item in await self._unresolved_tool_invocations(investigation.id)
+                    if item.status is ToolInvocationStatus.NEEDS_REVIEW
+                    or not _operation_key_matches(item.operation_key, operation_key)
+                )
+                if unresolved:
+                    unresolved_ids = ", ".join(str(item.id) for item in unresolved[:8])
+                    action_summaries.append(
+                        _action_summary(
+                            proposed.tool_name,
+                            ToolInvocationStatus.NEEDS_REVIEW,
+                            "An earlier ambiguous tool invocation must be reconciled before "
+                            f"another external operation: {unresolved_ids}",
+                        )
+                    )
+                    return state, StopReason.SUBMISSION_NEEDS_REVIEW
             definitive_failures = sum(
                 item.status is ToolInvocationStatus.FAILED and not item.response_refs
                 for item in all_matching_invocations
@@ -1663,9 +1683,7 @@ class InvestigationService:
             action_summaries.append(
                 _action_summary(invocation.tool_name, result.status, outcome_message)
             )
-            if result.status is ToolInvocationStatus.NEEDS_REVIEW and not result.output.get(
-                "request_permission", False
-            ):
+            if result.status is ToolInvocationStatus.NEEDS_REVIEW:
                 return state, StopReason.SUBMISSION_NEEDS_REVIEW
             # An ordinary policy denial is local to the operation; G2 reductions above
             # end this turn before any other proposed external operation is started.
@@ -2017,11 +2035,10 @@ class InvestigationService:
                 ToolResult(
                     status=status,
                     observation_refs=invocation.response_refs,
-                    output={"request_permission": True},
-                    message="Prior tool result is awaiting an explicit permission decision.",
+                    message="Prior tool result requires explicit reconciliation before reuse.",
                 ),
                 invocation.response_refs,
-                None,
+                StopReason.SUBMISSION_NEEDS_REVIEW,
             )
         if status in {ToolInvocationStatus.PENDING, ToolInvocationStatus.NEEDS_REVIEW}:
             return (

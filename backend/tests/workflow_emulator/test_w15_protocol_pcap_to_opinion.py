@@ -812,6 +812,34 @@ def _extract_pdf_text(pdf_path: Path) -> str:
     return " ".join(result.stdout.decode("utf-8", errors="replace").split())
 
 
+def _normalized_pdf_text(text: str) -> str:
+    return " ".join(text.casefold().split())
+
+
+def _assert_pdf_captions_in_order(text: str, captions: Sequence[str]) -> None:
+    normalized_text = _normalized_pdf_text(text)
+    search_from = 0
+    for caption in captions:
+        normalized_caption = _normalized_pdf_text(caption)
+        assert normalized_caption, "PDF captions must not be empty"
+        position = normalized_text.find(normalized_caption, search_from)
+        assert position >= 0, (normalized_caption, text[-2_000:])
+        search_from = position + len(normalized_caption)
+
+
+def test_pdf_caption_check_rejects_shuffled_or_separated_lines() -> None:
+    caption = "Première ligne de légende\nSeconde ligne de légende"
+
+    with pytest.raises(AssertionError):
+        _assert_pdf_captions_in_order(
+            "Seconde ligne de légende Première ligne de légende", (caption,)
+        )
+    with pytest.raises(AssertionError):
+        _assert_pdf_captions_in_order(
+            "Première ligne de légende numéro 2 Seconde ligne de légende", (caption,)
+        )
+
+
 def _verify_pdf(
     pdf_path: Path, *, captions: Sequence[str], require_status_legend: bool = True
 ) -> str:
@@ -821,12 +849,8 @@ def _verify_pdf(
     pages_line = next((line for line in info.splitlines() if line.startswith("Pages:")), "Pages: 0")
     assert int(pages_line.split(":", 1)[1].strip()) > 0, info
     text = _extract_pdf_text(pdf_path)
-    normalized = text.casefold()
-    for caption in captions:
-        caption_parts = tuple(" ".join(part.split()).casefold() for part in caption.splitlines())
-        caption_parts = tuple(part for part in caption_parts if part)
-        for caption_part in caption_parts:
-            assert caption_part in normalized, (caption_part, text[-2_000:])
+    normalized = _normalized_pdf_text(text)
+    _assert_pdf_captions_in_order(text, captions)
     if require_status_legend:
         for status in ("observation étayée", "inférence", "non résolu", "contredit"):
             assert status in normalized, (status, text[-2_000:])
