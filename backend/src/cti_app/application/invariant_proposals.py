@@ -2298,7 +2298,10 @@ def _external_disclosure_allowed(policy: DerivedPolicy) -> bool:
 
 _URL_USERINFO = re.compile(r"(?i)(https?://|www\.)[^\s/@:]+(?::[^\s/@]*)?@")
 _URL_PARAM = re.compile(r"(?i)([?&#])([A-Za-z0-9_.%+-]+)=([^&#\s]*)")
-_TEXT_ASSIGNMENT = re.compile(r"(?i)\b([A-Za-z][A-Za-z0-9_.-]*)\s*[:=]\s*(\S+)")
+_TEXT_ASSIGNMENT = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])([\"']?)([A-Za-z][A-Za-z0-9_.-]*)"
+    r"([\"']?\s*[:=]\s*)([\"']?)([^\s,;}\"']+)"
+)
 _SENSITIVE_NAMES = frozenset(
     {
         "apikey",
@@ -2354,9 +2357,9 @@ def _redact_text(value: str) -> str:
     )
 
     def redact_assignment(match: re.Match[str]) -> str:
-        if not _sensitive_name(match.group(1)) or match.group(2).startswith("[REDACTED]"):
+        if not _sensitive_name(match.group(2)) or match.group(5).startswith("[REDACTED]"):
             return match.group(0)
-        return f"{match.group(1)}=[REDACTED]"
+        return f"{match.group(1)}{match.group(2)}{match.group(3)}{match.group(4)}[REDACTED]"
 
     return _TEXT_ASSIGNMENT.sub(redact_assignment, value)
 

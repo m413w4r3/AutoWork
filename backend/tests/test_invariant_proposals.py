@@ -1047,6 +1047,7 @@ def test_redact_text_redacts_credentials_without_erasing_surrounding_claims() ->
         "Constat auth=FIXTURE_AUTH_123 authorization: Basic ZmFrZQ== "
         "credential=FIXTURE_CREDENTIAL client_secret=FIXTURE_CLIENT_SECRET "
         "auth_token=FIXTURE_AUTH_TOKEN id_token=FIXTURE_ID_TOKEN "
+        '{"auth": "FIXTURE_JSON_AUTH", "token_count": 5} '
         "token_count=5 author=Jane fin du constat."
     )
 
@@ -1059,9 +1060,11 @@ def test_redact_text_redacts_credentials_without_erasing_surrounding_claims() ->
         "FIXTURE_CLIENT_SECRET",
         "FIXTURE_AUTH_TOKEN",
         "FIXTURE_ID_TOKEN",
+        "FIXTURE_JSON_AUTH",
     ):
         assert secret not in redacted
     assert "token_count=5" in redacted
+    assert '"token_count": 5' in redacted
     assert "author=Jane" in redacted
     assert "Constat" in redacted
     assert "fin du constat." in redacted
@@ -1093,6 +1096,7 @@ def test_render_p10_prompt_redacts_url_credentials_without_losing_claim_context(
         "Constat CVE-2025-7777 confirmé https://example.invalid/a"
         "?auth=FIXTURE_AUTH_TOKEN&sig=SECRET_SIG&client_secret=FIXTURE_CLIENT_SECRET "
         "auth_token=FIXTURE_AUTH_TOKEN id_token=FIXTURE_ID_TOKEN "
+        '{"auth": "FIXTURE_JSON_AUTH"} '
         "example.invalid/file?sig=SECRET_SCHEMELESS "
         "credential=FIXTURE_CREDENTIAL authorization: Basic ZmFrZQ== fin du constat."
     )
@@ -1107,6 +1111,7 @@ def test_render_p10_prompt_redacts_url_credentials_without_losing_claim_context(
         "SECRET_SIG",
         "FIXTURE_CLIENT_SECRET",
         "FIXTURE_ID_TOKEN",
+        "FIXTURE_JSON_AUTH",
         "SECRET_SCHEMELESS",
         "FIXTURE_CREDENTIAL",
         "ZmFrZQ==",
