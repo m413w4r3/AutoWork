@@ -837,6 +837,21 @@ async def test_postgres_opinion_approval_publishes_new_v6_and_preserves_v5(
         assert base_lineage["nature"] == "base_publication"
         assert "actors" not in base_lineage
         actors = augmented_lineage["actors"]
+        async with uow_factory() as uow:
+            approval_decisions = await uow.analyst_decisions.list_for_investigation(
+                parsed.provenance.investigation_id
+            )
+        approval_decision = max(
+            (
+                decision
+                for decision in approval_decisions
+                if decision.decision_type is AnalystDecisionType.NOTE_APPROVE
+                and decision.target_type is AnalystDecisionTargetType.NOTE
+                and decision.target_id == parsed.provenance.opinion_id
+            ),
+            key=lambda decision: (decision.occurred_at, decision.id),
+        )
+        assert approval_decision.actor_id == parsed.provenance.reviewer_id
         assert actors["reviewer"] == {
             "actor_id": parsed.provenance.reviewer_id,
             "role": "reviewer",
@@ -845,6 +860,9 @@ async def test_postgres_opinion_approval_publishes_new_v6_and_preserves_v5(
             "opinion_id": str(parsed.provenance.opinion_id),
             "opinion_version": parsed.provenance.opinion_version,
             "opinion_content_sha256": parsed.provenance.opinion_content_sha256,
+            "decision_id": str(approval_decision.id),
+            "occurred_at": approval_decision.occurred_at.isoformat(),
+            "decision_reference_status": "verified",
         }
         assert actors["approver"] == {
             "actor_id": parsed.provenance.approver_id,

@@ -42,6 +42,11 @@ from cti_app.application.typst_rendering import (
     TypstRenderSource,
     TypstTemplateBundle,
 )
+from cti_app.domain.editorial import (
+    AnalystDecision,
+    AnalystDecisionTargetType,
+    AnalystDecisionType,
+)
 from cti_app.domain.errors import BlobIntegrityError
 from cti_app.domain.media_assets import MediaAssetKind
 from cti_app.domain.production import (
@@ -153,8 +158,18 @@ def test_lineage_render_data_carries_document_label_and_exact_render_hash() -> N
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "base_artifact_resolution",
+    ("matched", "missing", "wrong_id", "wrong_stage", "wrong_subject", "wrong_run"),
+)
+@pytest.mark.parametrize(
+    "decision_event_state", ("found", "empty", "missing_repository", "wrong_actor")
+)
 async def test_prepare_lineage_records_only_canonical_augmentation_actors(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    base_artifact_resolution: str,
+    decision_event_state: str,
 ) -> None:
     base_document = _base_v5()
     base_artifact_id = uuid4()
@@ -171,6 +186,7 @@ async def test_prepare_lineage_records_only_canonical_augmentation_actors(
         version=1,
         input_hash=hashlib.sha256(base_bytes).hexdigest(),
         canonical_blob_id=base_blob_id,
+        metadata={"previous_publication_artifact_id": str(uuid4())},
     )
 
     opinion, context = _approved_opinion(base_document)
@@ -213,6 +229,37 @@ async def test_prepare_lineage_records_only_canonical_augmentation_actors(
     uow_factory = FakeUnitOfWorkFactory(
         {base_artifact.id: base_artifact, augmented_artifact.id: augmented_artifact}
     )
+    if base_artifact_resolution == "missing":
+        del uow_factory.production_artifacts.artifacts[base_artifact.id]
+    elif base_artifact_resolution != "matched":
+        mismatched_base = {
+            "wrong_id": replace(base_artifact, id=uuid4()),
+            "wrong_stage": replace(base_artifact, stage=ProductionArtifactStage.SYNTHESIS),
+            "wrong_subject": replace(base_artifact, subject_id=uuid4()),
+            "wrong_run": replace(base_artifact, production_run_id=uuid4()),
+        }[base_artifact_resolution]
+        uow_factory.production_artifacts.artifacts[base_artifact.id] = mismatched_base
+    approval_decision = AnalystDecision(
+        investigation_id=opinion.investigation_id,
+        decision_type=AnalystDecisionType.NOTE_APPROVE,
+        target_type=AnalystDecisionTargetType.NOTE,
+        target_id=opinion.id,
+        actor_id=(
+            "different-reviewer" if decision_event_state == "wrong_actor" else opinion.reviewer_id
+        ),
+        reason="Reviewed opinion approved",
+        correlation_id="mission04-review",
+        occurred_at=datetime(2026, 10, 24, tzinfo=UTC),
+    )
+    if decision_event_state != "missing_repository":
+        uow_factory.analyst_decisions = SimpleNamespace(
+            list_for_investigation=lambda requested_investigation_id: _async_value(
+                [approval_decision]
+                if requested_investigation_id == opinion.investigation_id
+                and decision_event_state in {"found", "wrong_actor"}
+                else []
+            )
+        )
     template_bundle = TypstTemplateBundle(
         "unit-template-v1",
         "c" * 64,
@@ -236,8 +283,26 @@ async def test_prepare_lineage_records_only_canonical_augmentation_actors(
     service._typst_fonts_lock_path = tmp_path / "typst-fonts.lock"
     service._graph_diagram_compiler = None
 
+    if base_artifact_resolution != "matched":
+        with pytest.raises(
+            publication_rendering.PublicationRenderArtifactInvalidError,
+            match=(
+                "V6 publication base artifact cannot be resolved to a matching publication artifact"
+            ),
+        ):
+            await service._prepare(augmented_artifact.id)
+        return
+
     base_prepared = await service._prepare(base_artifact.id)
     base_lineage = json.loads(base_prepared.build_source().render_data_bytes)["pdf_lineage"]
+    if decision_event_state == "wrong_actor":
+        with pytest.raises(
+            publication_rendering.PublicationRenderArtifactInvalidError,
+            match="V6 reviewer provenance does not match its NOTE_APPROVE decision",
+        ):
+            await service._prepare(augmented_artifact.id)
+        return
+
     augmented_prepared = await service._prepare(augmented_artifact.id)
     augmented_lineage = json.loads(augmented_prepared.build_source().render_data_bytes)[
         "pdf_lineage"
@@ -247,30 +312,36 @@ async def test_prepare_lineage_records_only_canonical_augmentation_actors(
     assert base_lineage["opinion"] is None
     assert "actors" not in base_lineage
     assert augmented_lineage["nature"] == "augmented_publication"
-    assert augmented_lineage["actors"] == {
-        "reviewer": {
-            "actor_id": opinion.reviewer_id,
-            "role": "reviewer",
-            "decision_label": "opinion_approved",
-            "investigation_id": str(opinion.investigation_id),
-            "opinion_id": str(opinion.id),
-            "opinion_version": opinion.version,
-            "opinion_content_sha256": opinion.content_sha256,
+    reviewer_lineage = augmented_lineage["actors"]["reviewer"]
+    assert reviewer_lineage == {
+        "actor_id": opinion.reviewer_id,
+        "role": "reviewer",
+        "decision_label": "opinion_approved",
+        "investigation_id": str(opinion.investigation_id),
+        "opinion_id": str(opinion.id),
+        "opinion_version": opinion.version,
+        "opinion_content_sha256": opinion.content_sha256,
+        "decision_id": str(approval_decision.id) if decision_event_state == "found" else None,
+        "occurred_at": approval_decision.occurred_at.isoformat()
+        if decision_event_state == "found"
+        else None,
+        "decision_reference_status": "verified"
+        if decision_event_state == "found"
+        else "unavailable",
+    }
+    assert augmented_lineage["actors"]["approver"] == {
+        "actor_id": context.approver_id,
+        "role": "approver",
+        "decision_label": "publication_augmented",
+        "base_publication": {
+            "artifact_id": str(base_artifact.id),
+            "version": base_artifact.version,
+            "sha256": opinion.base_publication_sha256,
         },
-        "approver": {
-            "actor_id": context.approver_id,
-            "role": "approver",
-            "decision_label": "publication_augmented",
-            "base_publication": {
-                "artifact_id": str(base_artifact.id),
-                "version": base_artifact.version,
-                "sha256": opinion.base_publication_sha256,
-            },
-            "augmented_publication": {
-                "artifact_id": str(augmented_artifact.id),
-                "version": augmented_artifact.version,
-                "sha256": hashlib.sha256(augmented_bytes).hexdigest(),
-            },
+        "augmented_publication": {
+            "artifact_id": str(augmented_artifact.id),
+            "version": augmented_artifact.version,
+            "sha256": hashlib.sha256(augmented_bytes).hexdigest(),
         },
     }
 
@@ -684,9 +755,12 @@ class FakeUnitOfWork:
         self,
         production_artifacts: FakeProductionArtifacts,
         publication_renders: FakePublicationRenders,
+        analyst_decisions: Any | None = None,
     ) -> None:
         self.production_artifacts = production_artifacts
         self.publication_renders = publication_renders
+        if analyst_decisions is not None:
+            self.analyst_decisions = analyst_decisions
 
     async def __aenter__(self) -> FakeUnitOfWork:
         return self
@@ -710,9 +784,14 @@ class FakeUnitOfWorkFactory:
     def __init__(self, artifacts: dict[UUID, ProductionArtifact]) -> None:
         self.production_artifacts = FakeProductionArtifacts(artifacts)
         self.publication_renders = FakePublicationRenders()
+        self.analyst_decisions: Any | None = None
 
     def __call__(self) -> FakeUnitOfWork:
-        return FakeUnitOfWork(self.production_artifacts, self.publication_renders)
+        return FakeUnitOfWork(
+            self.production_artifacts,
+            self.publication_renders,
+            self.analyst_decisions,
+        )
 
 
 class FakeArtifactStore:

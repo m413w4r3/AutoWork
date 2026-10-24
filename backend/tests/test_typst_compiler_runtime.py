@@ -34,6 +34,7 @@ from cti_app.domain.publication import (
     ArtifactType,
     PublicationIndicatorGroupV1,
     PublicationIndicatorV1,
+    PublicationTimelineEntryV1,
 )
 from cti_app.domain.publication_document import (
     PublicationDocumentV5,
@@ -398,6 +399,7 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
 
     title_marker = "M04_BASE_TITLE_7F32A9"
     lead_marker = "M04_BASE_LEAD_1C8E45"
+    timeline_marker = "M04_BASE_TIMELINE_5D7C32"
     reference_marker = "M04_BASE_REFERENCE_6B0D21"
     opinion_marker = "M04_APPROVED_OPINION_93F4C8"
     base = _base_v5()
@@ -405,10 +407,18 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
         base.document,
         title=title_marker,
         lead=(replace(base.document.lead[0], text=lead_marker), *base.document.lead[1:]),
+        timeline=(
+            PublicationTimelineEntryV1(
+                event_date=None,
+                date_text="2026-10-24",
+                text=timeline_marker,
+                evidence_refs=base.document.lead[0].evidence_refs,
+            ),
+        ),
     )
     references = (replace(base.references[0], text=reference_marker), *base.references[1:])
     anchors = publication_document_text_anchors(document, references=references)
-    assert set(anchors) == {"title", "lead:0001", "reference:0001"}
+    assert set(anchors) == {"title", "lead:0001", "timeline:0001", "reference:0001"}
     semantic_text = SemanticTextV1(
         schema_version=SEMANTIC_ANNOTATION_SCHEMA_VERSION,
         policy_version=SEMANTIC_ANNOTATION_POLICY_VERSION,
@@ -465,20 +475,49 @@ async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_o
     base_text = await compile_and_extract(base, "mission04-base")
     augmented_text = await compile_and_extract(augmented, "mission04-augmented")
 
-    # The existing references section remains the source presentation; this fixture adds no
-    # visible editorial appendix. Its title is rendered once as the article heading. The source
-    # URL is a PDF link target, so pdftotext does not verify that URL target's bytes.
+    def normalize_pdf_text(value: str) -> str:
+        return value.replace("\u2018", "'").replace("\u2019", "'")
+
+    base_text = normalize_pdf_text(base_text)
+    augmented_text = normalize_pdf_text(augmented_text)
+
+    # Existing references and opinion traceability sections remain unchanged; this adds no new
+    # editorial section. The source URL and opinion citation destinations are PDF link targets,
+    # so pdftotext checks visible labels/IDs but not destination bytes.
+    finding_id = str(context.findings[0].id)
+    evidence_id = str(context.observations[0].id)
     base_expected_counts = {
         title_marker: 1,
         lead_marker: 1,
+        timeline_marker: 1,
         reference_marker: 1,
+        "AVIS DE L'ANALYSTE": 0,
+        "Apports de l'enquête": 0,
+        "Fait étayé": 0,
+        "Confiance : 90%": 0,
         opinion_marker: 0,
+        "[F1]": 0,
+        "[E1]": 0,
+        finding_id: 0,
+        evidence_id: 0,
+        "ANNEXE DE TRAÇABILITÉ": 0,
     }
     augmented_expected_counts = {
         title_marker: 1,
         lead_marker: 1,
+        timeline_marker: 1,
         reference_marker: 1,
+        "AVIS DE L'ANALYSTE": 1,
+        "Apports de l'enquête": 1,
+        "Fait étayé": 1,
+        "Confiance : 90%": 1,
         opinion_marker: 1,
+        # The inline citations repeat as identifiers in the existing traceability annex.
+        "[F1]": 2,
+        "[E1]": 2,
+        finding_id: 1,
+        evidence_id: 1,
+        "ANNEXE DE TRAÇABILITÉ": 1,
     }
     for marker, expected_count in base_expected_counts.items():
         assert base_text.count(marker) == expected_count, (

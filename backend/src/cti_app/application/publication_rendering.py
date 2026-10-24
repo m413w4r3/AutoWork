@@ -60,6 +60,7 @@ from cti_app.application.typst_rendering import (
     load_template_bundle,
 )
 from cti_app.domain.analyst_opinion import AnalystOpinionV1
+from cti_app.domain.editorial import AnalystDecisionTargetType, AnalystDecisionType
 from cti_app.domain.investigation import EvidenceObservation, InvestigationFinding
 from cti_app.domain.investigation_graph import InvestigationGraph
 from cti_app.domain.media_assets import MediaAssetKind
@@ -689,6 +690,7 @@ class PublicationRenderService:
                 uow.production_artifacts, artifact
             )
             base_publication_artifact_version: int | None = None
+            base_publication_artifact_matches = False
             augmentation_metadata = artifact.metadata.get("publication_augmentation")
             raw_base_publication_artifact_id = (
                 augmentation_metadata.get(
@@ -714,6 +716,7 @@ class PublicationRenderService:
                     and base_publication_artifact.production_run_id == artifact.production_run_id
                 ):
                     base_publication_artifact_version = base_publication_artifact.version
+                    base_publication_artifact_matches = True
             await uow.commit()
 
         try:
@@ -732,6 +735,36 @@ class PublicationRenderService:
             raise PublicationRenderDocumentInvalidError(
                 "Publication artifact does not contain a valid canonical publication document"
             ) from exc
+
+        if isinstance(document, PublicationDocumentV6) and not base_publication_artifact_matches:
+            raise PublicationRenderArtifactInvalidError(
+                "V6 publication base artifact cannot be resolved to a matching publication artifact"
+            )
+
+        reviewer_approval_decision: Any | None = None
+        if isinstance(document, PublicationDocumentV6):
+            provenance = document.provenance
+            async with self._uow_factory() as uow:
+                analyst_decisions = getattr(uow, "analyst_decisions", None)
+                list_for_investigation = getattr(analyst_decisions, "list_for_investigation", None)
+                if callable(list_for_investigation):
+                    decisions = await list_for_investigation(provenance.investigation_id)
+                    approval_decisions = [
+                        decision
+                        for decision in decisions
+                        if decision.decision_type is AnalystDecisionType.NOTE_APPROVE
+                        and decision.target_type is AnalystDecisionTargetType.NOTE
+                        and decision.target_id == provenance.opinion_id
+                    ]
+                    if approval_decisions:
+                        reviewer_approval_decision = max(
+                            approval_decisions,
+                            key=lambda decision: (decision.occurred_at, decision.id),
+                        )
+                        if reviewer_approval_decision.actor_id != provenance.reviewer_id:
+                            raise PublicationRenderArtifactInvalidError(
+                                "V6 reviewer provenance does not match its NOTE_APPROVE decision"
+                            )
 
         publication_content_sha256 = hashlib.sha256(
             ProductionArtifactStore.canonical_json_bytes(serialize_publication_document(document))
@@ -871,6 +904,19 @@ class PublicationRenderService:
                     "opinion_id": str(provenance.opinion_id),
                     "opinion_version": provenance.opinion_version,
                     "opinion_content_sha256": provenance.opinion_content_sha256,
+                    "decision_id": (
+                        str(reviewer_approval_decision.id)
+                        if reviewer_approval_decision is not None
+                        else None
+                    ),
+                    "occurred_at": (
+                        reviewer_approval_decision.occurred_at.isoformat()
+                        if reviewer_approval_decision is not None
+                        else None
+                    ),
+                    "decision_reference_status": (
+                        "verified" if reviewer_approval_decision is not None else "unavailable"
+                    ),
                 },
                 "approver": {
                     "actor_id": provenance.approver_id,
