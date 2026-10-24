@@ -141,6 +141,7 @@ def _harness(
     response_schema: str = "advisor-response.v3",
     stored_parser_version: str = "advisor-source-parser.v3",
     reparse_context: dict | None = None,
+    settings: object | None = None,
 ):
     investigation_id = uuid4()
     original_id = uuid4()
@@ -207,6 +208,7 @@ def _harness(
         blobs=BlobRepository(raw_blob_id, output_sha256, len(raw_text.encode("utf-8"))),
         artifact_store=artifact_store,
         recorder=recorder,
+        settings=settings,
     )
     context = SimpleNamespace(investigation_id=investigation_id)
     return tool, recorder, original, context, output_sha256, artifact_store, raw_blob_id
@@ -275,6 +277,39 @@ async def test_explicit_v4_reparse_appends_verified_parse_without_bridge_or_egre
     assert recorded["payload"]["bridge_turns_consumed"] == 0
     assert recorded["payload"]["output"]["parser_version"] == ADVISOR_SOURCE_PARSER_VERSION_V4
     assert recorded["payload"]["output"]["candidates"][0]["validated"] is False
+
+
+@pytest.mark.asyncio
+async def test_reparse_passes_configured_credential_values_to_pure_v4_parser() -> None:
+    credential = "configured-only-reparse-token-508fb0e4"
+    raw_data = json.loads(_semantic_raw())
+    raw_data["opinions"][0]["text"] = f"Echoed value: {credential}"
+    raw = json.dumps(raw_data, ensure_ascii=False)
+    input_refs = [{"kind": "observation", "id": "observation:synthetic-1", "sha256": "a" * 64}]
+    tool, recorder, original, context, _, _, _ = _harness(
+        raw,
+        response_schema=ADVISOR_RESPONSE_SCHEMA_V4,
+        stored_parser_version=ADVISOR_SOURCE_PARSER_VERSION_V4,
+        reparse_context=_prompt_data(input_refs),
+        settings=SimpleNamespace(openai_bridge_api_key=credential),
+    )
+
+    result = await tool.execute(
+        {
+            "observation_id": str(original.id),
+            "parser_version": ADVISOR_SOURCE_PARSER_VERSION_V4,
+        },
+        context,
+    )
+
+    assert result.status is ToolInvocationStatus.PARTIAL
+    assert result.output["advisor_status"] == "refused"
+    assert result.output["output"]["raw_output"] is None
+    assert (
+        result.output["output"]["raw_output_sha256"]
+        == hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    )
+    assert len(recorder.calls) == 1
 
 
 @pytest.mark.asyncio

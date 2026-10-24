@@ -4,6 +4,7 @@ import hashlib
 import json
 import socket
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -12,7 +13,11 @@ from cti_app.application.advisor_semantic_parser import (
     ADVISOR_SOURCE_PARSER_VERSION_V4,
     parse_advisor_semantic_response,
 )
-from cti_app.application.investigation_advisor_tools import _parse_advisor_output
+from cti_app.application.investigation_advisor_tools import (
+    _advisor_output_result_status,
+    _parse_advisor_output,
+)
+from cti_app.domain.investigation import ToolInvocationStatus
 
 
 def _prompt_data() -> dict:
@@ -285,6 +290,23 @@ def test_wire_handles_unicode_crlf_whitespace_and_json_content_as_evidence() -> 
     assert result["raw_output_sha256"] == hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def test_wire_blank_incomplete_unit_is_invalid_before_partial_result() -> None:
+    raw = (
+        "advisor-wire.v1\nSCHEMA: advisor-response.v4\n"
+        "TYPE: plan_investigation\nSTATUS: partial\n"
+        "UNIT: U1\nUNIT_TEXT: An incomplete opinion.\n"
+        "UNIT_REF: E1\nINCOMPLETE_UNIT:\n"
+    )
+
+    result = parse_advisor_semantic_response(
+        raw, consultation_type="plan_investigation", prompt_data=_prompt_data()
+    )
+
+    assert result["status"] == "invalid"
+    assert result["opinions"] == []
+    assert result["candidates"] == []
+
+
 def test_parser_runs_without_egress_or_bridge_capabilities(monkeypatch) -> None:
     def forbidden(*_args, **_kwargs):
         raise AssertionError("semantic parser attempted egress")
@@ -319,6 +341,62 @@ def test_operational_secret_refusal_keeps_only_immutable_raw_provenance() -> Non
     assert result["raw_output_sha256"] == hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def test_explicitly_configured_credential_in_output_is_refused() -> None:
+    credential = "configured-only-synthetic-token-75b2ac4f"
+    raw = _response(
+        opinions=[
+            {
+                "unit_id": "U1",
+                "text": f"The configured credential is {credential}.",
+                "source_aliases": ["E1"],
+            }
+        ]
+    )
+
+    result = parse_advisor_semantic_response(
+        raw,
+        consultation_type="plan_investigation",
+        prompt_data=_prompt_data(),
+        operational_secret_values=(credential,),
+    )
+
+    assert result["status"] == "refused"
+    assert result["refusal_reason"] == "operational_secret_detected"
+    assert result["opinions"] == []
+    assert result["raw_output"] is None
+    assert result["raw_output_sha256"] == hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def test_benign_cwd_and_home_paths_do_not_change_parser_result(monkeypatch) -> None:
+    cwd_values = ["/synthetic/one/worktree", "/synthetic/two/worktree"]
+    home_values = ["/synthetic/one/home", "/synthetic/two/home"]
+    raw = _response(
+        opinions=[
+            {
+                "unit_id": "U1",
+                "text": "Benign paths: " + " ".join((*cwd_values, *home_values)),
+                "source_aliases": ["E1"],
+            }
+        ]
+    )
+    current = {"cwd": cwd_values[0], "home": home_values[0]}
+    monkeypatch.setattr(Path, "cwd", lambda: Path(current["cwd"]))
+    monkeypatch.setattr(Path, "home", lambda: Path(current["home"]))
+    monkeypatch.setenv("HOME", home_values[0])
+
+    first = parse_advisor_semantic_response(
+        raw, consultation_type="plan_investigation", prompt_data=_prompt_data()
+    )
+    current.update(cwd=cwd_values[1], home=home_values[1])
+    monkeypatch.setenv("HOME", home_values[1])
+    second = parse_advisor_semantic_response(
+        raw, consultation_type="plan_investigation", prompt_data=_prompt_data()
+    )
+
+    assert first["status"] == second["status"] == "succeeded"
+    assert first == second
+
+
 def test_existing_parse_caller_keeps_v3_default_and_requires_explicit_v4_selection() -> None:
     raw = _response()
     prompt_data = _prompt_data()
@@ -346,3 +424,31 @@ def test_existing_parse_caller_keeps_v3_default_and_requires_explicit_v4_selecti
     assert selected_result is not None
     assert selected_result["parser_version"] == ADVISOR_SOURCE_PARSER_VERSION_V4
     assert selected_result["status"] == "succeeded"
+
+
+@pytest.mark.parametrize("status", ["invalid", "ambiguous"])
+def test_explicit_v4_failures_map_to_needs_review_without_changing_v3_default(status: str) -> None:
+    caller_args = {
+        "raw": _response(status=status),
+        "prompt": "",
+        "available_tools": {},
+        "available_tool_schemas": {},
+        "evidence_refs": (),
+        "source_refs": (),
+        "consultation_type": "plan_investigation",
+        "prompt_data": _prompt_data(),
+    }
+
+    parsed_v4 = _parse_advisor_output(
+        **caller_args, parser_version=ADVISOR_SOURCE_PARSER_VERSION_V4
+    )
+    assert parsed_v4 is not None
+    advisor_status, invocation_status = _advisor_output_result_status(parsed_v4)
+
+    assert parsed_v4["status"] == status
+    assert advisor_status == status
+    assert invocation_status is ToolInvocationStatus.NEEDS_REVIEW
+    assert _advisor_output_result_status({"status": "invalid"}) == (
+        "succeeded",
+        ToolInvocationStatus.SUCCEEDED,
+    )

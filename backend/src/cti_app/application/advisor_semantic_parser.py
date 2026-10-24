@@ -10,15 +10,15 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Mapping
-from types import SimpleNamespace
+from collections.abc import Mapping, Sequence
+from collections.abc import Set as AbstractSet
 from typing import Any
 
 from cti_app.application.advisor_consultation import (
     SourceRef,
-    _identity_conflicts,
-    _restricted_identities,
-    _source_catalog,
+    build_source_ref_catalog,
+    find_source_ref_conflicts,
+    restricted_source_identities,
 )
 from cti_app.application.advisor_dossier import (
     AdvisorDossier,
@@ -26,7 +26,7 @@ from cti_app.application.advisor_dossier import (
     evaluate_advisor_evidence_preflight,
 )
 from cti_app.application.advisor_wire import advisor_wire_aliases, parse_advisor_wire
-from cti_app.application.publication_secret_guard import contains_operational_secrets
+from cti_app.application.publication_secret_guard import contains_explicit_operational_secrets
 
 ADVISOR_RESPONSE_SCHEMA_V4 = "advisor-response.v4"
 ADVISOR_SOURCE_PARSER_VERSION_V4 = "advisor-source-parser.v4"
@@ -57,6 +57,7 @@ def parse_advisor_semantic_response(
     *,
     consultation_type: str,
     prompt_data: Mapping[str, Any],
+    operational_secret_values: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Parse one v4 adviser response without I/O or canonical fact promotion."""
     raw_text = raw if isinstance(raw, str) else ""
@@ -99,12 +100,9 @@ def parse_advisor_semantic_response(
     if prompt_data.get("consultation_type") not in {None, consultation_type}:
         return terminal("invalid", reason="consultation_type_mismatch")
 
-    # Pass an empty settings view so this pure parser never loads application
-    # settings or dotenv files. The guard still checks operational values from
-    # the process environment and standard host paths.
-    if contains_operational_secrets(
+    if contains_explicit_operational_secrets(
         {"raw_output": raw_text, "prompt_data": dict(prompt_data)},
-        settings=SimpleNamespace(),
+        operational_secret_values=operational_secret_values,
     ):
         return terminal("refused", reason="operational_secret_detected", retain_raw=False)
 
@@ -145,7 +143,7 @@ def parse_advisor_semantic_response(
         return result
 
     raw_manifest = prompt_data.get("dossier_manifest")
-    conflicts = _identity_conflicts(prompt_data, dossier, raw_manifest=raw_manifest)
+    conflicts = find_source_ref_conflicts(prompt_data, dossier, raw_manifest=raw_manifest)
     if conflicts:
         result = terminal("refused", reason="source_identity_conflict")
         result["source_conflicts"] = [
@@ -165,12 +163,12 @@ def parse_advisor_semantic_response(
     canonical_context = dict(prompt_data)
     canonical_context["dossier_manifest"] = [dict(item) for item in dossier.manifest]
     aliases = advisor_wire_aliases(canonical_context)
-    catalog = _source_catalog(
+    catalog = build_source_ref_catalog(
         canonical_context,
         dossier,
         raw_manifest=raw_manifest,
     )
-    restricted = _restricted_identities(prompt_data)
+    restricted = restricted_source_identities(prompt_data)
     raw_aliases = _raw_manifest_aliases(raw_manifest)
 
     opinions_raw = response.get("opinions")
@@ -350,6 +348,9 @@ def _decode_response(raw: str, consultation_type: str) -> dict[str, Any] | None:
         return None
     opinions: list[dict[str, Any]] = []
     wire_incomplete: list[str] = list(fields.get("incomplete_unit", ()))
+    if not all(isinstance(unit_id, str) and unit_id.strip() for unit_id in wire_incomplete):
+        return None
+    wire_incomplete = list(dict.fromkeys(unit_id.strip() for unit_id in wire_incomplete))
     active: dict[str, Any] | None = None
     top_text = _single_field(fields, "opinion")
     top_aliases = list(fields.get("ref", ()))
@@ -405,7 +406,7 @@ def _resolve_alias(
     *,
     aliases: Mapping[str, Mapping[str, Any]],
     catalog: Any,
-    restricted: set[tuple[str, str]],
+    restricted: AbstractSet[tuple[str, str]],
     raw_aliases: Mapping[str, tuple[Mapping[str, Any], ...]],
 ) -> tuple[SourceRef | None, str | None]:
     if alias.startswith(("E", "T")):

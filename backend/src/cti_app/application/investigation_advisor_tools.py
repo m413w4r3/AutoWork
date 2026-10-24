@@ -1,4 +1,8 @@
-"""Bounded, non-authoritative Bridge consultations for operator-led cases."""
+"""Bounded, non-authoritative Bridge consultations for operator-led cases.
+
+The host retains its existing Bridge transport; the v4 parser is local and makes
+no egress calls.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +12,7 @@ import json
 import math
 import re
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any, cast
 from uuid import UUID
@@ -59,6 +63,7 @@ from cti_app.application.investigation_tools import (
 )
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.publication_secret_guard import (
+    configured_operational_secret_values,
     contains_operational_secrets,
     redact_operational_secrets,
 )
@@ -3106,6 +3111,7 @@ class InvestigationAdvisorTool:
             consultation_type=consultation_type,
             validation_rejection=validation_rejection,
             prompt_data=prompt_data,
+            operational_secret_values=configured_operational_secret_values(self._settings),
         )
         if parsed is None:
             return ToolResult(
@@ -3138,17 +3144,9 @@ class InvestigationAdvisorTool:
         else:
             display_text = f"Bridge a produit un artefact typé {consultation_type}."
         tagged = "[UNTRUSTED ADVISORY]\n" + display_text
-        partial = (
-            parsed.get("status") == "partial" or parsed.get("normalization_status") == "partial"
-        )
+        advisor_status, invocation_status = _advisor_output_result_status(parsed)
         advisor_output = {
-            "advisor_status": (
-                "refused"
-                if parsed.get("status") == "refused"
-                else "partial"
-                if partial
-                else "succeeded"
-            ),
+            "advisor_status": advisor_status,
             "consultation_type": consultation_type,
             "advisory_text": tagged,
             **parsed,
@@ -3158,9 +3156,7 @@ class InvestigationAdvisorTool:
             "bridge_turns_consumed": bridge_turns_consumed,
         }
         return ToolResult(
-            ToolInvocationStatus.PARTIAL
-            if parsed.get("status") == "refused" or partial
-            else ToolInvocationStatus.SUCCEEDED,
+            invocation_status,
             observation_refs=evidence_refs,
             budget_consumed={
                 BudgetDimension.BRIDGE_TURNS: 1,
@@ -3700,6 +3696,7 @@ class ReparsePersistedAdvisorOutputTool:
             raw_text,
             consultation_type=consultation_type,
             prompt_data=prompt_data,
+            operational_secret_values=configured_operational_secret_values(self._settings),
         )
         if parsed.get("status") in {"invalid", "ambiguous"}:
             return ToolResult(
@@ -4785,6 +4782,30 @@ def _advisor_source_sha256(kind: str, source: Any) -> str:
     return value
 
 
+def _advisor_output_result_status(
+    parsed: Mapping[str, Any],
+) -> tuple[str, ToolInvocationStatus]:
+    """Map parser outcomes without treating explicit v4 failures as success."""
+    status = parsed.get("status")
+    if parsed.get("parser_version") == ADVISOR_SOURCE_PARSER_VERSION_V4:
+        if status == "refused":
+            return "refused", ToolInvocationStatus.PARTIAL
+        if status == "partial":
+            return "partial", ToolInvocationStatus.PARTIAL
+        if status == "succeeded" and parsed.get("usable") is True:
+            return "succeeded", ToolInvocationStatus.SUCCEEDED
+        if status in {"invalid", "ambiguous"}:
+            return str(status), ToolInvocationStatus.NEEDS_REVIEW
+        return "needs_review", ToolInvocationStatus.NEEDS_REVIEW
+
+    partial = status == "partial" or parsed.get("normalization_status") == "partial"
+    if status == "refused":
+        return "refused", ToolInvocationStatus.PARTIAL
+    if partial:
+        return "partial", ToolInvocationStatus.PARTIAL
+    return "succeeded", ToolInvocationStatus.SUCCEEDED
+
+
 def _parse_advisor_output(
     raw: str,
     *,
@@ -4797,12 +4818,14 @@ def _parse_advisor_output(
     validation_rejection: dict[str, Any] | None = None,
     prompt_data: Mapping[str, Any] | None = None,
     parser_version: str = ADVISOR_SOURCE_PARSER_VERSION,
+    operational_secret_values: Sequence[str] = (),
 ) -> dict[str, Any] | None:
     if parser_version == ADVISOR_SOURCE_PARSER_VERSION_V4:
         return parse_advisor_semantic_response(
             raw,
             consultation_type=consultation_type,
             prompt_data=prompt_data or {},
+            operational_secret_values=operational_secret_values,
         )
     if parser_version != ADVISOR_SOURCE_PARSER_VERSION:
         if validation_rejection is not None:
