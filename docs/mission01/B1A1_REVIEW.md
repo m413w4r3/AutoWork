@@ -215,3 +215,39 @@ verrou déterministe. Risque : le verrou SQL est tenu pendant l'I/O, ce qui
 peut retarder la révocation et mobiliser une connexion ; le test offline
 prouve l'ordre local, pas l'acceptation côté fournisseur.
 
+## Revue du lot atomique `699200b` — FAIL
+
+**Revue :** agent `5d82f90d`, Luna xhigh, oracle rejoué **144 passed**.
+
+La séquence du chemin SQL est correcte : invocation `RUNNING` et réservation
+commitée avant dispatch, `SELECT … FOR UPDATE` sur la ligne d'enveloppe,
+revalidation de l'admission sous le verrou, transport, puis commit du UOW
+pour libérer. La révocation écrit la même ligne. Le `finally` commit aussi
+sur exception/annulation ; la reprise B1B conserve la clé `ModelRun.id:a1`
+et un seul dispatch.
+
+### HIGH — guard facultatif aux frontières
+
+`dispatch_guard_required` vaut `False` par défaut et l'admission pré-dispatch
+est optionnelle. Un appel direct au dispatcher sans guard ni callback peut
+atteindre l'adaptateur (`investigation_tools.py:788`). L'advisor ne refuse
+que si le bit est déjà vrai (`investigation_advisor_tools.py:664`). Un dépôt
+sans `dispatch_guard` fait retomber le service sur un comportement permissif
+(`investigation_service.py:1183`). Aucun test ne vérifie le refus sans
+guard. Correction R1 : rendre le guard obligatoire pour tout effet externe,
+refuser avant dispatch si le dépôt ne le fournit pas, tester dispatcher/
+advisor/service.
+
+### MEDIUM — verrou tenu pendant l'I/O
+
+Le verrou SQL et la connexion restent occupés pendant l'exécution de
+l'adaptateur, y compris le transport. Cela sérialise correctement la
+révocation mais peut la retarder et peser sur le pool. À documenter, non
+résolu.
+
+### UNKNOWN
+
+Verrouillage PostgreSQL réel, concurrence multi-processus, annulation pendant
+le commit, pression du pool, acceptation fournisseur.
+
+
