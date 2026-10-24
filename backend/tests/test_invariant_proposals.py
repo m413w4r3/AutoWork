@@ -15,6 +15,7 @@ from cti_app.application.invariant_proposals import (
     _bounded_pattern,
     _normalize_context,
     _parse_proposal_response_details,
+    _redact_url,
     _render_p10_prompt,
     _select_candidate_records,
     make_proposal_turn_idempotency_key,
@@ -45,7 +46,13 @@ BASELINE_ID = UUID("33333333-3333-3333-3333-333333333333")
 NOW = "2026-08-27T12:00:00+00:00"
 
 
-def _sample(sample_id: UUID, *, external: bool = True) -> SimpleNamespace:
+def _sample(
+    sample_id: UUID,
+    *,
+    external: bool = True,
+    tlp: TLP = TLP.GREEN,
+    do_not_submit: bool = False,
+) -> SimpleNamespace:
     return SimpleNamespace(
         id=sample_id,
         blob_id=uuid4(),
@@ -53,8 +60,8 @@ def _sample(sample_id: UUID, *, external: bool = True) -> SimpleNamespace:
         origin="fixture",
         origin_kind="source_seed",
         state="validated",
-        tlp=TLP.GREEN,
-        do_not_submit=False,
+        tlp=tlp,
+        do_not_submit=do_not_submit,
         external_llm_allowed=external,
     )
 
@@ -961,6 +968,67 @@ async def test_external_forbidden_policy_never_reaches_external_call() -> None:
     assert conversation.external_calls == 0
     assert conversation.local_calls == 1
     assert conversation.external_allowed == [False]
+
+
+@pytest.mark.asyncio
+async def test_do_not_submit_never_reaches_external_p10_call() -> None:
+    state = _State(samples=[_sample(uuid4(), external=True, do_not_submit=True)])
+    service, _, conversation, _ = _service(state)
+    await service.propose(investigation_id=INVESTIGATION_ID)
+    assert conversation.external_calls == 0
+    assert conversation.local_calls == 1
+    assert conversation.external_allowed == [False]
+
+
+@pytest.mark.asyncio
+async def test_tlp_red_never_reaches_external_p10_call() -> None:
+    state = _State(samples=[_sample(uuid4(), external=True, tlp=TLP.RED)])
+    service, _, conversation, _ = _service(state)
+    await service.propose(investigation_id=INVESTIGATION_ID)
+    assert conversation.external_calls == 0
+    assert conversation.local_calls == 1
+    assert conversation.external_allowed == [False]
+
+
+def test_redact_url_keeps_adjacent_evidence_and_redacts_credentials() -> None:
+    signed = (
+        "CVE-2025-1234 famille Blinder https://example.invalid/file"
+        "?sig=SECRET_SIGNATURE&foo=bar suite du constat"
+    )
+    redacted = _redact_url(signed)
+    assert "SECRET_SIGNATURE" not in redacted
+    assert "?sig=[REDACTED]&foo=bar" in redacted
+    assert "CVE-2025-1234" in redacted
+    assert "famille Blinder" in redacted
+    assert "suite du constat" in redacted
+    assert (
+        _redact_url("https://user:secret@example.invalid/path")
+        == "https://[REDACTED]@example.invalid/path"
+    )
+    assert (
+        _redact_url("https://example.invalid/path?auth=FIXTURE_AUTH_TOKEN_123")
+        == "https://example.invalid/path?auth=[REDACTED]"
+    )
+    assert _redact_url("https://example.invalid/path?q=test") == (
+        "https://example.invalid/path?q=test"
+    )
+
+
+def test_render_p10_prompt_redacts_url_credentials_without_losing_claim_context() -> None:
+    claim = (
+        "Constat CVE-2025-7777 confirmé https://example.invalid/a"
+        "?auth=FIXTURE_AUTH_TOKEN&sig=SECRET_SIG fin du constat."
+    )
+    snapshot = _proposal_snapshot(
+        _normalize_context({"report_claims": [{"claim_id": "claim-1", "text": claim}]})
+    )
+
+    prompt, _ = _render_p10_prompt(snapshot)
+
+    assert "FIXTURE_AUTH_TOKEN" not in prompt
+    assert "SECRET_SIG" not in prompt
+    assert "Constat CVE-2025-7777" in prompt
+    assert "fin du constat." in prompt
 
 
 @pytest.mark.asyncio

@@ -24,7 +24,7 @@ from cti_app.application.goodware import GoodwareMeasurementService, PreparedGoo
 from cti_app.application.invariants import InvariantProposalResult, InvariantRegistryService
 from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.persistence import UnitOfWorkFactory
-from cti_app.domain.classification import DerivedPolicy, derived_policy
+from cti_app.domain.classification import TLP, DerivedPolicy, derived_policy
 from cti_app.domain.goodware import Banality
 from cti_app.domain.goodware_index import GoodwareMeasurementError
 from cti_app.domain.invariant_proposals import (
@@ -159,6 +159,7 @@ class ProposalConversationService:
         policy = loaded[2]
         provenance_by_ref = loaded[3]
         samples = loaded[4]
+        external_allowed = _external_disclosure_allowed(policy)
         effective_cycle = cycle_number if cycle_number is not None else investigation.cycle_number
         if effective_cycle < 1:
             raise ProposalContractError("cycle_number must be positive")
@@ -242,7 +243,7 @@ class ProposalConversationService:
             investigation_id=investigation_id,
             subject_id=investigation.subject_id,
             cycle_number=effective_cycle,
-            external_allowed=policy.external_llm_allowed,
+            external_allowed=external_allowed,
         )
         await self._persist_pivot_conversation(investigation_id, conversation.id)
 
@@ -251,7 +252,7 @@ class ProposalConversationService:
             conversation.id,
             message=prompt,
             mode=mode,
-            external_llm_allowed=policy.external_llm_allowed,
+            external_llm_allowed=external_allowed,
             idempotency_key=idempotency_key,
             correlation_id=correlation_id or f"p10:{investigation_id}:{effective_cycle}",
             context_subject_id=investigation.subject_id,
@@ -2247,7 +2248,7 @@ def _bounded_json(value: Any, *, drop_timestamps: bool = False, depth: int = 0) 
             _bounded_json(item, drop_timestamps=drop_timestamps, depth=depth + 1) for item in values
         ]
     if isinstance(value, str):
-        return _redact_url(_redact_text(value))
+        return _redact_text(_redact_url(value))
     if isinstance(value, (int, float, bool)) or value is None:
         return value
     return str(value)
@@ -2281,30 +2282,32 @@ def _string_or_none(value: Any) -> str | None:
     return str(value) if value is not None else None
 
 
+def _external_disclosure_allowed(policy: DerivedPolicy) -> bool:
+    """External routing needs every explicitly applicable disclosure rule to pass."""
+    return policy.external_llm_allowed and not policy.do_not_submit and policy.tlp is not TLP.RED
+
+
+_URL_SCHEME = re.compile(r"https?://", re.IGNORECASE)
+_URL_USERINFO = re.compile(r"(?i)(https?://)[^/\s:@]+:[^@\s]*@")
+_URL_CREDENTIAL_PARAM = re.compile(
+    r"(?i)([?&](?:sig|signature|x-amz-[^=&\s]*|x-goog-[^=&\s]*|token|access_token"
+    r"|auth|authorization|api[_-]?key|apikey|credential|password|secret)=)[^&#\s]*"
+)
+
+
 def _redact_url(value: str) -> str:
-    lowered = value.lower()
-    if "http://" not in lowered and "https://" not in lowered:
+    """Redact credential-bearing URL parts without erasing surrounding evidence."""
+    if _URL_SCHEME.search(value) is None:
         return value
-    if re.search(r"https?://[^/\s:@]+:[^@\s]+@", value, flags=re.IGNORECASE) or any(
-        marker in lowered
-        for marker in (
-            "sig=",
-            "signature=",
-            "x-amz-",
-            "token=",
-            "access_token=",
-            "credential=",
-        )
-    ):
-        return "[SIGNED_URL_OMITTED]"
-    return value
+    value = _URL_USERINFO.sub(r"\1[REDACTED]@", value)
+    return _URL_CREDENTIAL_PARAM.sub(r"\1[REDACTED]", value)
 
 
 def _redact_text(value: str) -> str:
     value = re.sub(r"\bsk-[A-Za-z0-9_-]{8,}\b", "[REDACTED]", value)
     value = re.sub(r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]{8,}", "[REDACTED]", value)
     return re.sub(
-        r"(?i)\b(api[_-]?key|password|secret|token)\s*[:=]\s*\S+",
+        r"(?i)\b(api[_-]?key|password|secret|token)\s*[:=]\s*(?!\[REDACTED\])\S+",
         r"\1=[REDACTED]",
         value,
     )
