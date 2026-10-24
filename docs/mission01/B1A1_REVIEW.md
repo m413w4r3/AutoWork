@@ -321,7 +321,3 @@ ce n'est pas un défaut de production démontré.
   atomique n'est pas fusionnée.
 - Reprise future : capability/lease non forgeable, fixture de préflight
   valide, puis vérification PostgreSQL concurrente autorisée séparément.
-
-
-
-
