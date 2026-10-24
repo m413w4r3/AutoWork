@@ -3,8 +3,8 @@
 **Baseline vérifiée :** `d7cc6b590d3be41dae10299cc03364771fe6bda1`
 (`origin/main`, `git ls-remote`).
 **Branche de clôture :** `mission04/closure-after-main`.
-**HEAD de clôture au dernier point de contrôle :** `5a23a291`
-(`fix(p10): refuse ambiguous unclosed credentials...`).
+**HEAD de clôture au dernier point de contrôle :** `2a5987e4`
+(`fix(p10): accept valid closed credentials containing punctuation`).
 
 ## Intégré sur la branche de clôture
 
@@ -14,15 +14,16 @@
 | `f92d848d` | L1-R5 : scanner borné LF/CRLF, P10 v5 |
 | `a3b2860f` | CI-0a : dette mypy hors L4 (cherry-pick de `664674a4`) |
 | `e106adc2`, `76209ea9` | documentation de clôture |
-| `5a23a291` | correctif R5 : refus explicite des credentials non bornés/ambigus |
+| `5a23a291` | correctif R5 R1 : refus explicite des credentials non bornés/ambigus |
+| `2a5987e4` | correctif R5 R2 : accepte les scalaires fermés valides contenant `}`/`]`/`,` |
 
 ## Branches de travail non encore intégrées
 
 | Lot | Branche | Worktree | SHA / état |
 |---|---|---|---|
 | L4 D1–D4 | `mission04/l4-context` | `/home/nill/perso/work/AutoWork_l4` | en cours (PG réel + test integration ajouté) |
-| L5 D5–D6 | `mission04/l5-pdf` | `/home/nill/perso/work/AutoWork_l5` | en cours (56 tests ciblés verts, commit attendu) |
-| L21 D8–D9 | `mission04/l21-advisor` | `/home/nill/perso/work/AutoWork_l21` | commit `981632a7`, revue indépendante en cours |
+| L5 D5–D6 | `mission04/l5-pdf` | `/home/nill/perso/work/AutoWork_l5` | commit `c71e5c4a`, 56 tests ciblés verts, revue `cd40c7cf` en cours |
+| L21 D8–D9 | `mission04/l21-advisor` | `/home/nill/perso/work/AutoWork_l21` | commit `981632a7`, revue `fa293266` REVISE ; réparation R2 en cours |
 | CI-0b FAST | `mission04/ci0-workflow` | `/home/nill/perso/work/AutoWork_ci0b` | en cours (W13-D5/D7/W14-A verts ; W14-E qualité retrohunt) |
 | CI-0c FULL | `mission04/ci0-protocol` | `/home/nill/perso/work/AutoWork_ci0c` | en cours (W15/W18 corrigés ; pilote FULL) |
 | SAMPLE D7 | à créer après L4 | — | non commencé |
