@@ -138,3 +138,24 @@ proxys lexicaux. Un
 `ScriptedTurnTransport`, même déterministe, ne démontrerait pas une baisse du
 slop réel d’un fournisseur. Ce livrable n’ajoute aucune dépendance et ne modifie
 aucun code de production : quatre fichiers, zéro dépendance.
+
+## Q2 — décision DEFERRED / NO-GO offline
+
+Le lot Q2 (patch de prompt anti-slop) n'est **pas** exécuté dans cette mission.
+Motifs :
+
+- Le protocole actuel compare des réponses fixes via les parseurs ; il ne peut
+  pas établir qu'un prompt modifié réduit le slop produit par un modèle. Un
+  patch production changerait `INVESTIGATION_PROMPT_VERSION`, qui participe à
+  la clé d'idempotence et aux garanties B1A1/B1B, sans preuve déterministe de
+  bénéfice.
+- Le scout Q a conclu **GO conditionnel** pour le corpus/l'oracle et **NO-GO**
+  pour toute conclusion sémantique en offline. Q1 fournit le baseline
+  reproductible ; le harness accepte désormais `variant: patch` pour une
+  évaluation future.
+- Une évaluation modèle autorisée (fournisseur live, jeu de cas réel) reste
+  nécessaire et sort du périmètre offline de cette mission.
+
+Statut : Q est **PARTIAL** — Q1 livré et intégré ; Q2 `DEFERRED/NO-GO offline`,
+à reprendre avec une autorisation d'évaluation modèle distincte.
+
