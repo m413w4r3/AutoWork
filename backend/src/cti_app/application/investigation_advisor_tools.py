@@ -470,8 +470,8 @@ class InvestigationAdvisorTool:
                             break
                 restricted_evidence_refs = tuple(dict.fromkeys(restricted_ids))
                 if restricted_evidence_refs:
-                    restricted_ids = set(restricted_evidence_refs)
-                    evidence = tuple(item for item in evidence if item.id not in restricted_ids)
+                    restricted_id_set = set(restricted_evidence_refs)
+                    evidence = tuple(item for item in evidence if item.id not in restricted_id_set)
             explicit_restricted_refs = tuple(
                 reference
                 for reference in evidence_refs
@@ -746,11 +746,11 @@ class InvestigationAdvisorTool:
             sent_aliases = _advisor_prompt_wire_ref_aliases(prompt)
             if not transmitted_refs:
                 for alias in sent_aliases:
-                    item = input_aliases.get(alias)
-                    if item is None:
+                    alias_item = input_aliases.get(alias)
+                    if not isinstance(alias_item, Mapping):
                         continue
-                    identifier = item.get("id")
-                    kind = item.get("kind")
+                    identifier = alias_item.get("id")
+                    kind = alias_item.get("kind")
                     if not isinstance(identifier, str):
                         continue
                     if kind == "observation":
@@ -766,7 +766,7 @@ class InvestigationAdvisorTool:
                             else f"article:{identifier}",
                         )
                     elif kind == "opinion":
-                        source_ref = item.get("source_ref")
+                        source_ref = alias_item.get("source_ref")
                         if isinstance(source_ref, str):
                             if source_ref not in advisor_source_refs:
                                 advisor_source_refs = (*advisor_source_refs, source_ref)
@@ -795,11 +795,12 @@ class InvestigationAdvisorTool:
                                         advisor_source_refs = (*advisor_source_refs, source_ref)
             else:
                 for alias in sent_aliases:
-                    item = input_aliases.get(alias)
-                    source_ref = item.get("source_ref") if isinstance(item, Mapping) else None
+                    alias_item = input_aliases.get(alias)
+                    if not isinstance(alias_item, Mapping):
+                        continue
+                    source_ref = alias_item.get("source_ref")
                     if (
-                        isinstance(item, Mapping)
-                        and item.get("kind") == "opinion"
+                        alias_item.get("kind") == "opinion"
                         and isinstance(source_ref, str)
                         and source_ref not in advisor_source_refs
                     ):
@@ -2530,7 +2531,9 @@ class InvestigationAdvisorTool:
             if sample is None:
                 continue
             blob_id = getattr(sample, "blob_id", None)
-            blob = await self._blobs.get(blob_id) if blob_id is not None else None
+            if not isinstance(blob_id, UUID):
+                continue
+            blob = await self._blobs.get(blob_id)
             descriptor = getattr(blob, "descriptor", None)
             if (
                 descriptor is None
