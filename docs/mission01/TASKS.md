@@ -49,7 +49,7 @@ B0, B1, L, A, Q, T.
 | M01-B0B-R2 | B0B-REVIEW-R2 | Corriger le texte statique `RUN_TRACE.md` contredisant les métadonnées exportées | Luna Implementer xhigh | `41c8869` | `investigation_audit_export.py`, tests | texte cohérent ; 14 tests | worktree write | `5add5df`, intégré `a772cc9` | DONE, 14 tests vérifiés parent | UNKNOWN |
 | M01-B1-SCOUT | S0 | Carte admission/budget : chemin réel, source budget, incident 266/3600, durées distinctes, fixtures a–e | Luna Audit xhigh | 058bb4a | `docs/mission01/B1_ADMISSION_MAP.md` | paths:lines ; faits vs inférences vs UNKNOWN | lecture seule | `ad4da76`, intégré `464836a` | PASS (coût UNKNOWN) | UNKNOWN |
 | M01-B1A | — | SUPERSEDED par la revue `7a40943` : scindé en B1A1 (durabilité/unicité) et B1A2 (politique de coût bornée) | — | 058bb4a | — | — | — | — | SUPERSEDED | — |
-| M01-B1B | B1A | Reprise/temporalité : réponse tardive, 429/Retry-After, timeout, pacer Bridge, needs_review, crash-reprise, statut inconnu | Luna Implementer xhigh | B1A SHA | `bridge_investigator.py` (pacer/Retry-After), `model_conversations.py`, `model_gateway.py`, tests fake clock | aucun double appel externe en simulation ; états explicites ; `production_pacing.py` n'est PAS le pacer Bridge | worktree write | — | PENDING | UNKNOWN |
+| M01-B1B | B1A | Reprise/temporalité : réponse tardive, 429/Retry-After, timeout, pacer Bridge, needs_review, crash-reprise, statut inconnu | Luna Implementer xhigh | `6b19512` | `bridge_investigator.py` (pacer/Retry-After), `model_conversations.py`, `model_gateway.py`, `investigation_advisor_tools.py` si deadline, `tests/test_b1b_temporal_recovery.py` | aucun double appel externe en simulation ; états explicites ; `production_pacing.py` n'est PAS le pacer Bridge ; suites B1A1/B1A2 vertes | worktree write | — | RUNNING (agent `f4339c14`, worktree `m01-b1b`) | UNKNOWN |
 | M01-L-SCOUT | S0 | 42 limites : consommateur, décision motivée, plan de tests | Luna Audit xhigh | 058bb4a | `docs/mission01/LIMITS_DECISIONS.md` | paths:lines ; classification corrigée si preuve contraire | lecture seule | `7494406`, intégré `50eeb1c` | PASS (coût UNKNOWN) | UNKNOWN |
 | M01-L1 | S0 | L06 variables sans consommateur ; P10 relèvement ABANDONNÉ et documenté DEFER | Luna Implementer xhigh | 058bb4a | `compose.yaml`, `.env.example`, playbook, `test_limits_mission01.py` | diff base = 4 fichiers L06 ; 2 + 41 tests verts ; G2 intact | worktree write | `e4772fa`, intégré `0483f61` | PASS_WITH_CHANGES (L06) ; P10 DEFER préexistant | UNKNOWN |
 | M01-L1-REVIEW | L1 | Revue critique indépendante de L1 (borne P10, retrait variables, G2) | Luna Audit xhigh | 058bb4a | `docs/mission01/L1_REVIEW.md` | verdict PASS/PASS_WITH_CHANGES/FAIL + tests rejoués | lecture seule | `49b4de6` + `b541b75`, intégré `0d72923` | DONE : FAIL R2, 1 HIGH (politique sources P10) | UNKNOWN |
@@ -57,6 +57,7 @@ B0, B1, L, A, Q, T.
 | M01-L1-R2 | L1-REVIEW-2 | Inclure la politique des SourceDocuments des claims dans la garde P10 ; fail-closed source introuvable ; tests zéro transport | Luna Implementer xhigh | `0194648` | `invariant_proposals.py`, tests | source RED/do_not_submit/interdite → zéro routage/transport ; sources vertes → passe | worktree write | `a3d17f8` | DONE, re-revue R3 FAIL (2 HIGH) | UNKNOWN |
 | M01-L1-R3 | L1-REVIEW-3 | Dernière réparation : provenance des invariants existants + rejeu de snapshot historique ; tests fail-closed | Luna Implementer xhigh | `a3d17f8` | `invariant_proposals.py`, tests | invariant/claim restrictive → zéro transport ; rejeu snapshot devenu restrictif → refus | worktree write | `8d7c969` | FAIL re-revue R4 (2 HIGH) → P10 ABANDONNÉ | UNKNOWN |
 | M01-L1-FALLBACK | L1-REVIEW-4 | Repli : restauration P10 à la base, conservation L06 seul, P10 classé DEFER préexistant | Luna Implementer xhigh | `8d7c969` | `compose.yaml`, `.env.example`, playbook, test L06 | diff base = 4 fichiers L06 ; aucun code P10 ; 43 tests | worktree write | `e4772fa` | DONE, validation finale en cours | UNKNOWN |
+| M01-L2 | L1 | Pagination/keyset des sections de contexte : pages CAS, manifeste d'omissions typées, mémoire bornée à la source, protections et preuves récupérables | Luna Implementer xhigh | `6b19512` | `research_context_builder.py`, `operator_context_summary.py`, éventuel `context_pagination.py`, `tests/test_mission01_l2_context_pagination.py`, `tests/test_research_context_builder.py` | ordre keyset stable, bornes N−1/N/N+1, SHA CAS et falsification, sélectionnés+omis=total, aucun item sensible, appelants verts | worktree write | — | RUNNING (agent `6b9fefa0`, worktree `m01-l2`) | UNKNOWN |
 | M01-A-SCOUT | S0 | Primitive CTI existantes, matrice hypothèses/preuves, 5 scénarios, trous réels | Luna Audit xhigh | 058bb4a | `docs/mission01/CTI_STRATEGY_MAP.md` | paths:lines ; pas de nouveau framework | lecture seule | `54750b1`, intégré `f8f9575` | PASS (coût UNKNOWN) | UNKNOWN |
 | M01-B1-REVIEW | B1-SCOUT | Revue critique indépendante de la carte admission/budget avant B1A | Luna Audit xhigh | 058bb4a | `docs/mission01/B1_ADMISSION_REVIEW.md` | constats CONFIRMED/PLAUSIBLE/REJECTED + verdict ADEQUATE* | lecture seule | `94d6706`, intégré `7a40943` | DONE : ADEQUATE_WITH_CHANGES, 1 BLOCKER + 4 HIGH | UNKNOWN |
 | M01-B1A1 | B1-REVIEW | Durabilité admission : coût calculé une fois, réserve orpheline crash, double appel nouvelle clé, CAS/révocation, oracles offline | Luna Implementer xhigh | 058bb4a | `investigation_service.py`, `investigation_tools.py`, `operator_tool_invocation.py`, nouveau test | zéro transport avant réconciliation ; réserves demandée/persistée/consommée/libérée distinctes ; CAS stale et révocation bloquent | worktree write | `3a745de`, intégré `fe68c85` | PARTIAL : portes fermées, 121 tests ; atomicité révocation/dispatch BLOCKED ; revue en cours | UNKNOWN |
@@ -81,6 +82,35 @@ B0, B1, L, A, Q, T.
 | M01-A1-R3 | A1-REVIEW-3 | Validation canonique de step_ids et métadonnées identifiantes, libellé assertion | Luna Implementer xhigh | `a0aaee6` | `investigation_experiments.py`, `api/investigation.py`, tests | identifiants arbitraires absents des trois sorties ; verdict étiqueté assertion | worktree write | `27db077`, intégré `3473413` | DONE, re-revue FAIL (SHA non résolus HIGH) | UNKNOWN |
 | M01-A1-R4 | A1-REVIEW-4 | Durcissement final : `[redacted]` pour SHA/IDs non résolus et métadonnées outil non canoniques ; libellé frontend | Luna Implementer xhigh | `27db077` | `investigation_experiments.py`, `api/investigation.py`, frontend, tests | références non résolues absentes ; tool metadata canoniques seulement | worktree write | `4a71f45`, intégré `00a78b8` | DONE (63 backend + 3 frontend + typecheck), revue fallback en cours | UNKNOWN |
 | M01-FINAL | tous | FINAL_AUDIT.md : tests réellement exécutés, restes, coûts, diff complexité, branches/approbations | Parent | intégration | `docs/mission01/FINAL_AUDIT.md` | matrice vérifiée ; aucun PASS sans exécution | lecture/intégration | `8fdb7a7` + doc | DONE (audit livré) ; mission **PARTIAL** avec réserves documentées | UNKNOWN |
+
+## Reprise orchestrateur unique — 2026-10-24
+
+**Base d'intégration :** `6b195122`, branche `chore/mission01-integration`
+(commit documentaire Paseo au-dessus de `a81b96c` ; état code/tests vérifié
+`8fdb7a7`). Tous les lots de reprise partent de `6b19512`.
+
+DAG de reprise (priorité décroissante) :
+
+```text
+6b19512 ─┬─ B1B (temporalité/reprise) ─┬─ F6 (allowlist preuves, advisor tools)
+         │                              ├─ B1A1-clé canonique (adaptateur)
+         │                              └─ P10 (politique divulgation, après L1)
+         ├─ L2 (pagination keyset) ────── Q (éval anti-slop baseline vs patch)
+         ├─ A1-résiduel MEDIUM (fichiers expériences/API, disjoint)
+         └─ T (BLOCKED_MISSING_REFERENCE tant que bundle polices/validation
+              éditoriale absents)
+```
+
+Règles : un worktree par writer, aucun chevauchement de fichiers ; B1B et L2
+d'abord ; F6/B1A1/P10 attendent l'intégration B1B car ils partagent
+`investigation_advisor_tools.py`/l'adaptateur ; revue indépendante Luna xhigh
+distincte de l'implémenteur pour chaque lot critique ; le parent rejoue
+l'oracle après intégration. Aucun `PASS` sans test exécuté et revue effective.
+
+| Session Paseo | TASK_ID | Worktree | Objet |
+|---|---|---|---|
+| `f4339c14` | M01-B1B | `m01-b1b` | Temporalité, 429/Retry-After, timeout, pacing, crash-reprise |
+| `6b9fefa0` | M01-L2 | `m01-l2` | Pagination/keyset, pages CAS, manifeste d'omissions |
 
 ## Incident de capacité (2026-10-23)
 
