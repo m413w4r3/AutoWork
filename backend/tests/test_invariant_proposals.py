@@ -1473,6 +1473,59 @@ async def test_repeated_refusal_fields_keep_first_nonempty_values_and_warn_on_co
 
 
 @pytest.mark.asyncio
+async def test_refusal_canonical_fields_conflicting_with_aliases_warn_and_keep_canonical() -> None:
+    provenance_ref = _provenance_ref()
+    output = (
+        "advisor-wire.v1\n"
+        "TYPE: p10_proposal\n"
+        "STATUS: refused\n"
+        "REFUSAL_REASON: canonical reason\n"
+        "REASON: different reason\n"
+        "REFUSAL_CODE: canonical_code\n"
+        "CODE: different_code\n"
+        "CANDIDATE: literal_string | c2_indicator | exact | CreateMutexW | "
+        f"Mutex name distinguishes this sample. | refs={provenance_ref}\n"
+    )
+    conversation = _ConversationService(output=output)
+    service, _, _, registry = _service(conversation=conversation)
+
+    result = await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=1)
+
+    assert result.outcome is ProposalOutcome.REFUSED
+    assert result.refusal_reason == "canonical reason"
+    assert result.refusal_code == "canonical_code"
+    assert registry.calls == []
+    transformations = conversation.normalized_outputs[result.turn.id]["transformations"]
+    assert isinstance(transformations, tuple)
+    assert any("conflicting refusal_reason/reason" in item for item in transformations)
+    assert any("conflicting refusal_code/code" in item for item in transformations)
+
+
+@pytest.mark.asyncio
+async def test_refusal_alias_fields_without_canonical_are_used_without_conflict_warning() -> None:
+    output = (
+        "advisor-wire.v1\n"
+        "TYPE: p10_proposal\n"
+        "STATUS: refused\n"
+        "REASON: alias reason\n"
+        "CODE: alias_code\n"
+    )
+    conversation = _ConversationService(output=output)
+    service, _, _, registry = _service(conversation=conversation)
+
+    result = await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=1)
+
+    assert result.outcome is ProposalOutcome.REFUSED
+    assert result.refusal_reason == "alias reason"
+    assert result.refusal_code == "alias_code"
+    assert registry.calls == []
+    transformations = conversation.normalized_outputs[result.turn.id]["transformations"]
+    assert isinstance(transformations, tuple)
+    assert not any("conflicting refusal_reason/reason" in item for item in transformations)
+    assert not any("conflicting refusal_code/code" in item for item in transformations)
+
+
+@pytest.mark.asyncio
 async def test_partial_wire_without_refusal_still_passes_candidate_to_p09() -> None:
     provenance_ref = _provenance_ref()
     output = (

@@ -61,3 +61,28 @@ Résultat avant correctif : `2 failed, 1 passed, 64 deselected`. Le test d'absen
 Rollback : retirer ces changements de code, tests et note; aucun état persistant ni schéma DB n'a été modifié.
 
 Risques résiduels : le typecheck global reste rouge hors de ce lot. Par compatibilité acceptée, un wire sans `STATUS` conserve `SUCCEEDED` et peut transmettre un candidat à P09; le warning rend l'absence observable. Un statut inconnu est rejeté. Les réponses refusées conservent les candidats analysés dans `response`; les consommateurs doivent respecter l'outcome, tandis que le service garantit déjà qu'aucun candidat n'atteint P09.
+
+## Reprise R2 — conflits entre noms canoniques et alias
+
+Pour les métadonnées d'un refus, `REFUSAL_REASON` est prioritaire sur `REASON`, et `REFUSAL_CODE` sur `CODE`. Les deux champs de chaque paire sont maintenant évalués : la valeur canonique non vide est retenue; si l'alias est aussi non vide et différent, `transformations` archive un warning de conflit sans inclure les valeurs. Si le champ canonique est absent ou vide, l'alias non vide est utilisé sans warning de conflit. Les répétitions de chaque nom gardent séparément la règle précédente : première valeur non vide dans l'ordre du wire, warning si les valeurs non vides se contredisent.
+
+La politique de compatibilité antérieure reste inchangée : `STATUS` absent conserve `SUCCEEDED` avec warning et peut transmettre un candidat à P09; un `STATUS` inconnu lève `ProposalOutputValidationError` avant P09.
+
+### RED
+
+```text
+cd backend
+UV_CACHE_DIR=/tmp/uv-cache PYTHONDONTWRITEBYTECODE=1 PYTEST_ADDOPTS='-p no:cacheprovider' uv run --no-project --python 3.12 pytest tests/test_invariant_proposals.py -k 'canonical_fields_conflicting_with_aliases or alias_fields_without_canonical' -q --tb=short
+```
+
+Résultat avant le correctif : `1 failed, 1 passed, 67 deselected`. Le cas alias seul passait, mais le conflit canonique/alias n'était pas archivé dans `transformations`.
+
+### GREEN
+
+- Groupe ciblé de refus/statuts P10 : `12 passed, 57 deselected` avec `UV_CACHE_DIR=/tmp/uv-cache PYTHONDONTWRITEBYTECODE=1 PYTEST_ADDOPTS='-p no:cacheprovider' uv run --no-project --python 3.12 pytest tests/test_invariant_proposals.py -k 'refused_wire or refusal or missing_status or unknown_status or partial_wire_without_refusal or unrecognized_wire_output' -q --tb=short`.
+- Fichier P10 complet : `69 passed` avec `UV_CACHE_DIR=/tmp/uv-cache PYTHONDONTWRITEBYTECODE=1 PYTEST_ADDOPTS='-p no:cacheprovider' uv run --no-project --python 3.12 pytest tests/test_invariant_proposals.py -q --tb=short`.
+- `UV_CACHE_DIR=/tmp/uv-cache uv run --no-project --python 3.12 ruff check src/cti_app/application/invariant_proposals.py src/cti_app/domain/invariant_proposals.py tests/test_invariant_proposals.py` : **All checks passed**.
+- `UV_CACHE_DIR=/tmp/uv-cache uv run --no-project --python 3.12 ruff format --check src/cti_app/application/invariant_proposals.py src/cti_app/domain/invariant_proposals.py tests/test_invariant_proposals.py` : **3 files already formatted**.
+- `MYPY_CACHE_DIR=/tmp/mypy-cache UV_CACHE_DIR=/tmp/uv-cache uv run --no-project --python 3.12 mypy src/cti_app/application/invariant_proposals.py src/cti_app/domain/invariant_proposals.py` : **Success: no issues found in 2 source files**.
+
+Le replay et le parcours frais restent derrière le même gate P09; le refus explicite garde priorité sur les candidats et les statuts répétés. Aucun schéma, version wire, identifiant, provider ou état DB n'a été modifié.

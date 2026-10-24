@@ -1301,6 +1301,15 @@ def _proposal_wire_payload(
             add_warning(f"conflicting {field_name} fields; first non-empty value retained")
         return nonempty[0] if nonempty else None
 
+    def canonical_or_alias(canonical_field: str, alias_field: str) -> str | None:
+        canonical = first_nonempty(canonical_field)
+        alias = first_nonempty(alias_field)
+        if canonical and alias and canonical != alias:
+            add_warning(
+                f"conflicting {canonical_field}/{alias_field} fields; {canonical_field} retained"
+            )
+        return canonical or alias
+
     # A repeated affirmative/partial status must not override any explicit refusal.
     if "refused" in statuses:
         status = "refused"
@@ -1322,11 +1331,10 @@ def _proposal_wire_payload(
     elif status == "refused":
         outcome = ProposalOutcome.REFUSED
         refusal_reason = (
-            first_nonempty("refusal_reason")
-            or first_nonempty("reason")
+            canonical_or_alias("refusal_reason", "reason")
             or "Bridge refused the proposal without a stated reason."
         )
-        refusal_code = first_nonempty("refusal_code") or first_nonempty("code")
+        refusal_code = canonical_or_alias("refusal_code", "code")
         warnings.append("Bridge refused the proposal")
 
     def parts(value: str) -> list[str]:
