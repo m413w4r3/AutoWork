@@ -1890,6 +1890,83 @@ async def test_blocking_corpus_limit_makes_measured_rule_partial_and_candidate()
     assert any("goodware_baseline" in item for item in corpus.measurement_limitations)
 
 
+@pytest.mark.parametrize(
+    ("missing_role", "expected_role"),
+    [
+        ("holdout", RuleTestCorpusRole.HOLDOUT_POSITIVE),
+        ("candidate", RuleTestCorpusRole.NEW_CANDIDATE_UNCONFIRMED),
+    ],
+)
+@pytest.mark.asyncio
+async def test_missing_bytes_in_any_declared_role_blocks_tested_status(
+    missing_role: str, expected_role: RuleTestCorpusRole
+) -> None:
+    positive_bytes = (
+        b"first confirmed SharedMissingRoleMarker",
+        b"second confirmed SharedMissingRoleMarker",
+    )
+    goodware_bytes = b"ordinary synthetic goodware without the marker"
+    positive_hashes = tuple(_sha256(content) for content in positive_bytes)
+    goodware_hash = _sha256(goodware_bytes)
+    missing_hash = hashlib.sha256(f"missing {missing_role}".encode()).hexdigest()
+    harness = _harness(
+        samples={
+            **dict(zip(positive_hashes, positive_bytes, strict=True)),
+            goodware_hash: goodware_bytes,
+        },
+        goodware=(goodware_hash,),
+        holdout=(missing_hash,) if missing_role == "holdout" else (),
+    )
+    for sample_sha256 in positive_hashes:
+        association = await _associate(harness, sample_sha256)
+        confirmed_association = association.change_qualification(
+            SampleQualification.CONFIRMED,
+            actor_kind=QualificationActorKind.HUMAN,
+            actor_id="analyst-test",
+            reason="Confirm synthetic positives for the missing-role test.",
+        )
+        await harness.associations.append_version(
+            confirmed_association, expected_version=association.version
+        )
+    if missing_role == "candidate":
+        await _associate(harness, missing_hash, origin=SampleOrigin.MANUAL)
+
+    ref = await _source_observation(harness, "SharedMissingRoleMarker")
+    proposed = await _call(
+        harness,
+        "rule.propose",
+        {
+            "candidate_id": str(uuid4()),
+            "condition": "any",
+            "motifs": [_motif("SharedMissingRoleMarker", ref)],
+        },
+    )
+    tested = await _call(
+        harness,
+        "rule.test",
+        {"candidate_id": proposed.output["candidate_id"]},
+    )
+
+    assert tested.status is ToolInvocationStatus.PARTIAL
+    assert tested.output["report"]["candidate_status"] == "candidate"
+    missing_case = next(
+        case
+        for role in tested.output["report"]["roles"]
+        for case in role["test_cases"]
+        if case["sha256"] == missing_hash
+    )
+    assert missing_case["declared_role"] == expected_role.value
+    assert any(
+        missing_hash in limitation and expected_role.value in limitation
+        for limitation in tested.output["report"]["limitations"]
+    )
+    corpus = await harness.rule_tools._build_corpus(harness.investigation_id)
+    assert any(
+        missing_hash in limitation and expected_role.value in limitation
+        for limitation in corpus.blocking_limitations
+    )
+
+
 @pytest.mark.asyncio
 async def test_goodware_match_rejects_rule_without_an_approval_path() -> None:
     positive_bytes = b"synthetic cluster payload with SharedNoisyMarker"

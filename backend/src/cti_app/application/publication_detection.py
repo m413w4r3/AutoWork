@@ -138,11 +138,17 @@ async def build_publication_detection(
         report_observation = observation
 
     rule_status, reason = _validation_fields(report_payload)
-    counts = _provenance_counts(report_payload)
-    positive_real_count, positive_synthetic_count = counts.get(
-        RuleTestCorpusRole.HUMAN_CONFIRMED.value, (0, 0)
-    )
-    goodware_counts = counts.get("goodware", (0, 0))
+    if report_payload is None:
+        # The explicit-test gate below marks this rule untested; these are
+        # unmeasured display defaults, not counts inferred from a partial report.
+        counts = {
+            RuleTestCorpusRole.HUMAN_CONFIRMED.value: (0, 0),
+            RuleTestCorpusRole.GOODWARE.value: (0, 0),
+        }
+    else:
+        counts = _provenance_counts(report_payload)
+    positive_real_count, positive_synthetic_count = counts[RuleTestCorpusRole.HUMAN_CONFIRMED.value]
+    goodware_counts = counts[RuleTestCorpusRole.GOODWARE.value]
     goodware_tested_count = sum(goodware_counts)
     false_positive_count = _nonnegative_count(
         report_payload.get("false_positive_count", 0) if report_payload is not None else 0,
@@ -280,11 +286,9 @@ def _publication_status(status: RuleValidationStatus) -> PublicationDetectionSta
 
 
 def _provenance_counts(
-    payload: Mapping[str, Any] | None,
+    payload: Mapping[str, Any],
 ) -> dict[str, tuple[int, int]]:
-    if payload is None:
-        return {}
-    raw = payload.get("provenance_counts_by_role", {})
+    raw = payload.get("provenance_counts_by_role")
     if not isinstance(raw, Mapping):
         raise PublicationDetectionDataError("YARA report provenance counts are invalid")
     result: dict[str, tuple[int, int]] = {}
@@ -298,12 +302,21 @@ def _provenance_counts(
         raw_key = (
             legacy_positive_role if role == positive_role and positive_role not in raw else role
         )
-        counts = raw.get(raw_key, {})
+        if raw_key not in raw:
+            raise PublicationDetectionDataError(
+                f"YARA report is missing required {raw_key} provenance counts"
+            )
+        counts = raw[raw_key]
         if not isinstance(counts, Mapping):
             raise PublicationDetectionDataError(f"YARA report {raw_key} counts are invalid")
+        for count_name in ("real", "synthetic"):
+            if count_name not in counts:
+                raise PublicationDetectionDataError(
+                    f"YARA report {raw_key}.{count_name} provenance count is missing"
+                )
         result[role] = (
-            _nonnegative_count(counts.get("real", 0), f"{raw_key}.real"),
-            _nonnegative_count(counts.get("synthetic", 0), f"{raw_key}.synthetic"),
+            _nonnegative_count(counts["real"], f"{raw_key}.real"),
+            _nonnegative_count(counts["synthetic"], f"{raw_key}.synthetic"),
         )
     return result
 

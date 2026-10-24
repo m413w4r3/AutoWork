@@ -130,6 +130,38 @@ def test_publication_detection_rejects_canonical_and_legacy_positive_count_dupli
         )
 
 
+@pytest.mark.parametrize(
+    ("role", "count_name"),
+    [
+        ("human_confirmed", None),
+        ("goodware", None),
+        ("human_confirmed", "real"),
+        ("human_confirmed", "synthetic"),
+        ("goodware", "real"),
+        ("goodware", "synthetic"),
+    ],
+)
+def test_publication_detection_refuses_incomplete_provenance_counts(
+    role: str, count_name: str | None
+) -> None:
+    provenance = {
+        "human_confirmed": {"real": 2, "synthetic": 1},
+        "goodware": {"real": 3, "synthetic": 4},
+    }
+    if count_name is None:
+        provenance.pop(role)
+    else:
+        provenance[role].pop(count_name)
+
+    with pytest.raises(PublicationDetectionDataError, match="missing"):
+        _provenance_counts({"provenance_counts_by_role": provenance})
+
+
+def test_publication_detection_refuses_missing_provenance_count_map() -> None:
+    with pytest.raises(PublicationDetectionDataError, match="provenance counts are invalid"):
+        _provenance_counts({})
+
+
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 _CHP_TYPST_ROOT = _REPOSITORY_ROOT / "chpTypst"
 _FONT_BUNDLE_LOCK = _REPOSITORY_ROOT / "infra" / "typst-fonts.lock"

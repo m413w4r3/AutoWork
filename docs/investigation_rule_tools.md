@@ -81,10 +81,11 @@ Les statuts d’invocation et les statuts des versions sont distincts :
 | Situation | Invocation | Version candidate |
 | --- | --- | --- |
 | Moteur indisponible, aucun cas mesurable ou aucun octet exploitable | `unavailable` | Pas de nouvelle version sans exécution exploitable |
-| Rapport incomplet : octets non mesurables, erreurs de cas ou limites du corpus | `partial` | `candidate`, sauf signal de rejet ou statut expérimental/testé établi |
+| Limite bloquante : octets manquants pour un rôle déclaré, erreurs de cas, holdout tardif ou chevauchant le développement, positif non qualifié, rôles contradictoires ou fournisseur de corpus/baseline illisible | `partial` (ou `unavailable` si aucun cas n'est mesurable) | `candidate`, sauf signal de rejet |
+| Limite informative : hashes holdout sans rôle ignorés, aucun import manuel goodware ou aucune baseline goodware liée | `succeeded` si la mesure est complète | Le statut reflète les résultats mesurés; `validation_status` conserve `real_partial` et le rapport expose la limite |
 | Compilation invalide ou correspondance goodware | `succeeded` avec le rapport local | `rejected` |
 | Un seul positif correspondant, sans autres résultats positifs | `succeeded` ou `partial` selon la couverture | `experimental` |
-| Plusieurs positifs mesurés sans faux positif dans le corpus complet | `succeeded` | `tested` |
+| Plusieurs positifs mesurés sans faux positif dans le corpus complet et sans limite bloquante | `succeeded` | `tested` |
 | Pas de candidat pour `rule.get` | `empty` | — |
 
 Une correspondance goodware entraîne `rejected`, même si l’avis de l’enquête

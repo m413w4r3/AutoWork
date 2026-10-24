@@ -2132,6 +2132,14 @@ class _RuleTools:
                 return False
             return True
 
+        def record_missing_bytes(sample_sha256: str, declared_role: RuleTestCorpusRole) -> None:
+            add_limitation(
+                f"Les octets du hash {sample_sha256}, déclaré dans le rôle "
+                f"{declared_role.value}, sont indisponibles; ce rôle n'est pas entièrement "
+                "mesurable.",
+                blocking=True,
+            )
+
         for sample_sha256, matches in by_hash.items():
             if sample_sha256 in manual_import_hashes:
                 continue
@@ -2149,6 +2157,7 @@ class _RuleTools:
             assigned_role = role
             available = await bytes_available(sample_sha256)
             if not available:
+                record_missing_bytes(sample_sha256, assigned_role)
                 role = RuleTestCorpusRole.BYTES_MISSING
             cases[(role, sample_sha256)] = _rule_case(
                 investigation_id,
@@ -2191,6 +2200,7 @@ class _RuleTools:
             assigned_role = role
             available = await bytes_available(item.sample_sha256)
             if not available:
+                record_missing_bytes(item.sample_sha256, assigned_role)
                 role = RuleTestCorpusRole.BYTES_MISSING
             # Recompute the actual type from bytes, even when an older import journal
             # contains a caller supplied or legacy format label.
