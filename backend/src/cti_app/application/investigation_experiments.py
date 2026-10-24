@@ -454,13 +454,12 @@ def project_safe_investigation_experiment_timeline(
         experiment["input_refs"] = _safe_experiment_input_references(
             experiment.get("input_refs"), linked_observations
         )
-        linked_observation_shas = {
-            str(_object_value(observation, "sha256"))
-            for observation in linked_observations.values()
-        }
+        linked_observation_types_by_sha = _canonical_experiment_observation_types_by_sha(
+            linked_observations
+        )
         experiment["next_pivots"] = _project_identifier_array(
             experiment.get("next_pivots"),
-            lambda value, allowed=linked_observation_shas: (
+            lambda value, allowed=linked_observation_types_by_sha: (
                 _is_canonical_sha256_reference(value) and value in allowed
             ),
             limit=128,
@@ -605,47 +604,93 @@ def _verdict_assertion_label(value: Any) -> str | None:
     return None
 
 
+def _experiment_observation_input_type(observation: Any) -> str | None:
+    object_type = _object_value(observation, "object_type")
+    if not isinstance(object_type, str):
+        return None
+    if object_type == "sample":
+        return "sample_sha256"
+    if object_type in {"capture", "network_capture"}:
+        return "capture_sha256"
+    return None
+
+
+def _observations_by_sha256(observations_by_id: Mapping[str, Any]) -> dict[str, list[Any]]:
+    result: dict[str, list[Any]] = {}
+    for observation in observations_by_id.values():
+        sha256 = _object_value(observation, "sha256")
+        if _is_canonical_sha256_reference(sha256):
+            result.setdefault(sha256, []).append(observation)
+    return result
+
+
+def _canonical_experiment_observation_types_by_sha(
+    observations_by_id: Mapping[str, Any],
+) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for sha256, matches in _observations_by_sha256(observations_by_id).items():
+        if len(matches) != 1:
+            continue
+        input_type = _experiment_observation_input_type(matches[0])
+        if input_type is not None:
+            result[sha256] = input_type
+    return result
+
+
 def _safe_experiment_input_references(
     value: Any, observations_by_id: Mapping[str, Any]
 ) -> list[dict[str, str | None]]:
     if not isinstance(value, (tuple, list)):
         return []
     result: list[dict[str, str | None]] = []
+    observations_by_sha = _observations_by_sha256(observations_by_id)
     for item in value[:64]:
         if not isinstance(item, Mapping):
             continue
         input_type = item.get("input_type")
         input_id = item.get("input_id")
         sha256 = item.get("sha256")
-        canonical_observation = None
-        if isinstance(input_id, str) and _is_canonical_sha256_reference(input_id):
-            canonical_observation = next(
-                (
-                    observation
-                    for observation in observations_by_id.values()
-                    if _object_value(observation, "sha256") == input_id
-                ),
-                None,
-            )
+        matching_observations = (
+            observations_by_sha.get(input_id, [])
+            if isinstance(input_id, str) and _is_canonical_sha256_reference(input_id)
+            else []
+        )
+        canonical_observation = (
+            matching_observations[0] if len(matching_observations) == 1 else None
+        )
         canonical_sha256 = (
             _object_value(canonical_observation, "sha256")
             if canonical_observation is not None
             else None
         )
+        canonical_input_type = (
+            _experiment_observation_input_type(canonical_observation)
+            if canonical_observation is not None
+            else None
+        )
         resolved = (
             canonical_observation is not None
+            and canonical_input_type is not None
+            and isinstance(input_type, str)
+            and input_type in _SAFE_EXPERIMENT_INPUT_TYPES
             and input_id == canonical_sha256
             and (sha256 is None or sha256 == canonical_sha256)
+            and input_type == canonical_input_type
         )
         safe_input_id: str = input_id if resolved and isinstance(input_id, str) else "[redacted]"
         safe_sha256: str | None = (
             sha256 if resolved and isinstance(sha256, str) else None if resolved else "[redacted]"
         )
-        safe_input_type = (
-            input_type
-            if isinstance(input_type, str) and input_type in _SAFE_EXPERIMENT_INPUT_TYPES
-            else "[redacted]"
-        )
+        if resolved:
+            safe_input_type = canonical_input_type
+        elif matching_observations:
+            safe_input_type = "[redacted]"
+        else:
+            safe_input_type = (
+                input_type
+                if isinstance(input_type, str) and input_type in _SAFE_EXPERIMENT_INPUT_TYPES
+                else "[redacted]"
+            )
         result.append(
             {
                 "input_type": safe_input_type,
