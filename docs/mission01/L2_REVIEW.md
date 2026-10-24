@@ -154,4 +154,41 @@ constructeurs.
 PostgreSQL réel et performance : **UNKNOWN**. Coût : **UNKNOWN**.
 Réparation `M01-L2-R3` lancée (dernière tentative autorisée).
 
+## Quatrième revue après R3 — PASS_WITH_CHANGES (clôture)
+
+**Objet :** `0c54ed9857ad6b4d82d42912ffcb256efc924f02` (delta
+`6143099..0c54ed9`).
+**Revue :** agent `24b810f2-e2d0-4486-b22f-0c05887bdb1d`, Luna xhigh.
+**Oracle rejoué :** 342 passed.
+
+Le vérificateur recalcule page SHA et `source_ref` dans les quatre chemins
+(`make_keyset_page`, builder, opérateur offset, opérateur keyset) et lève
+des `ValueError` non avalées. Les tests couvrent manifeste cohérent accepté
+et falsifications de référence, SHA, comptes et raison. Le CAS, le chaînage
+des curseurs, `source_bounded=False` mémoire, les contrôles de divulgation et
+la compatibilité offset restent intacts.
+
+### MEDIUM résiduel documenté — catégorie d'omission reprise comme attendue
+
+`_assert_keyset_page_consistency` (`operator_tool_invocation.py:273`) passe
+`entry.omission_reasons` au vérificateur. Un constructeur qui émettrait une
+catégorie erronée mais cohérente avec les comptes, le SHA et `source_ref`
+serait accepté. Les chemins keyset produisent `PAGINATION` et
+`NOT_SELECTED` ; l'attendu devrait être dérivé du chemin, pas du manifeste.
+Le test ajouté injecte une raison vide mais pas une substitution de catégorie
+à comptes et SHA recalculés.
+
+**Décision :** la limite de trois réparations est atteinte ; ce MEDIUM est
+accepté comme résidu documenté, sans quatrième patch. Il ne permet pas
+d'obtenir une page ou une référence falsifiée, seulement un libellé
+d'omission erroné.
+
+### Résiduels
+
+PostgreSQL réel et performance : **UNKNOWN**. Coût : **UNKNOWN**.
+Intégration : `feat/mission01-l2-context-pagination` fusionnée dans
+`chore/mission01-integration` au commit `36eb5326`. Oracle combiné B1B+L2 sur
+l'intégration : **556 passed**.
+
+
 
