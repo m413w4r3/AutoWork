@@ -1289,8 +1289,28 @@ def _proposal_wire_payload(
     if declared_type.casefold() != "p10_proposal":
         warnings.append("proposal type missing or mismatched")
     statuses = tuple(value.casefold() for value in fields.get("status", ()))
+
+    def add_warning(value: str) -> None:
+        if value not in warnings:
+            warnings.append(value)
+
+    def first_nonempty(field_name: str) -> str | None:
+        values = tuple(value.strip() for value in fields.get(field_name, ()))
+        nonempty = tuple(value for value in values if value)
+        if len(set(nonempty)) > 1:
+            add_warning(f"conflicting {field_name} fields; first non-empty value retained")
+        return nonempty[0] if nonempty else None
+
     # A repeated affirmative/partial status must not override any explicit refusal.
-    status = "refused" if "refused" in statuses else next(iter(statuses), "")
+    if "refused" in statuses:
+        status = "refused"
+    elif not statuses:
+        # Preserve historical compatibility: missing STATUS succeeds with a warning.
+        status = ""
+    elif any(value not in {"succeeded", "partial"} for value in statuses):
+        raise ProposalOutputValidationError("The model output has an invalid P10 status")
+    else:
+        status = statuses[0]
     outcome = ProposalOutcome.SUCCEEDED
     refusal_reason: str | None = None
     refusal_code: str | None = None
@@ -1302,20 +1322,12 @@ def _proposal_wire_payload(
     elif status == "refused":
         outcome = ProposalOutcome.REFUSED
         refusal_reason = (
-            next(iter(fields.get("refusal_reason", ())), "").strip()
-            or next(iter(fields.get("reason", ())), "").strip()
+            first_nonempty("refusal_reason")
+            or first_nonempty("reason")
             or "Bridge refused the proposal without a stated reason."
         )
-        refusal_code = (
-            next(iter(fields.get("refusal_code", ())), "").strip()
-            or next(iter(fields.get("code", ())), "").strip()
-            or None
-        )
+        refusal_code = first_nonempty("refusal_code") or first_nonempty("code")
         warnings.append("Bridge refused the proposal")
-
-    def add_warning(value: str) -> None:
-        if value not in warnings:
-            warnings.append(value)
 
     def parts(value: str) -> list[str]:
         return [item.strip() for item in value.split("|")]

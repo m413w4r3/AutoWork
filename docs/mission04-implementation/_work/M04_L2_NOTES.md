@@ -10,7 +10,11 @@ Le statut wire `STATUS: refused` devient un outcome typé `ProposalOutcome.REFUS
 
 Les réponses `partial` exposent `ProposalOutcome.PARTIAL` et gardent leur passage antérieur vers P09. Les sorties JSON gardent le comportement existant et prennent l'outcome par défaut `SUCCEEDED`. Le schéma wire, la version de prompt/parser, les identifiants de candidat, l'idempotence et la persistance restent inchangés; aucune migration n'est requise.
 
+Politique des statuts : un `STATUS` absent reste permissif pour compatibilité historique : l'outcome est `SUCCEEDED`, le warning `proposal status missing` est archivé, et un candidat peut atteindre P09. Un statut présent hors de `succeeded`, `partial`, `refused` est un wire invalide et lève `ProposalOutputValidationError` avant P09; il n'est pas converti en refus. Ce choix garde l'absence distincte d'une valeur inconnue.
+
 Les parcours frais et replay appellent le même gate `_process_response_for_p09`. Un refus retourne `invariant_results == ()` avant la validation YARA/P09 et n'enregistre aucun candidat dans P09. Les candidats parsés restent disponibles dans `response` pour conserver le contenu normalisé et ses identifiants; le refus empêche leur handoff.
+
+Pour `REFUSAL_REASON` et `REFUSAL_CODE` répétés, la première valeur non vide dans l'ordre du wire est conservée. Si plusieurs valeurs non vides sont contradictoires, elles restent non divulguées dans un warning explicite et la première est utilisée; si aucune valeur n'est fournie, la raison générique existante s'applique et le code reste `None`.
 
 ## RED
 
@@ -25,11 +29,23 @@ Résultat : `4 failed, 1 passed, 58 deselected`. Le wire refusé avec candidat a
 
 La revue indépendante a ensuite trouvé le cas des champs `STATUS` répétés. L'oracle ajouté a échoué avant ce correctif : `test_later_refusal_status_is_terminal_for_p09` observait un appel P09 avec `STATUS: succeeded` suivi de `STATUS: refused`.
 
+Pour les trois findings de reprise, RED supplémentaire :
+
+```text
+cd backend
+UV_CACHE_DIR=/tmp/uv-cache PYTHONDONTWRITEBYTECODE=1 PYTEST_ADDOPTS='-p no:cacheprovider' uv run --no-project --python 3.12 pytest tests/test_invariant_proposals.py -k 'missing_status or unknown_status_wire or repeated_refusal_fields' -q --tb=short
+```
+
+Résultat avant correctif : `2 failed, 1 passed, 64 deselected`. Le test d'absence de statut confirmait déjà la compatibilité historique; `unknown` n'était pas rejeté et les premiers champs de refus vides masquaient les valeurs ultérieures.
+
 ## GREEN
 
 - Oracle ciblé après correctif, incluant statuts répétés : `6 passed, 58 deselected`.
-- Fichier P10 complet : `64 passed` avec `UV_CACHE_DIR=/tmp/uv-cache uv run --python 3.12 pytest tests/test_invariant_proposals.py -q --tb=short`.
-- `UV_CACHE_DIR=/tmp/uv-cache make lint-backend` : Ruff check réussi; format réussi (`845 files already formatted`).
+- `UV_CACHE_DIR=/tmp/uv-cache PYTHONDONTWRITEBYTECODE=1 PYTEST_ADDOPTS='-p no:cacheprovider' uv run --no-project --python 3.12 pytest tests/test_invariant_proposals.py -k 'refused_wire or later_refusal_status or missing_status or unknown_status_wire or repeated_refusal_fields or partial_wire_without_refusal' -q --tb=short` : `9 passed, 58 deselected`.
+- Fichier P10 complet après reprise : `67 passed` avec `UV_CACHE_DIR=/tmp/uv-cache PYTHONDONTWRITEBYTECODE=1 PYTEST_ADDOPTS='-p no:cacheprovider' uv run --no-project --python 3.12 pytest tests/test_invariant_proposals.py -q --tb=short`.
+- `UV_CACHE_DIR=/tmp/uv-cache uv run --no-project --python 3.12 ruff check src/cti_app/application/invariant_proposals.py src/cti_app/domain/invariant_proposals.py tests/test_invariant_proposals.py` : **All checks passed**.
+- `UV_CACHE_DIR=/tmp/uv-cache uv run --no-project --python 3.12 ruff format --check src/cti_app/application/invariant_proposals.py src/cti_app/domain/invariant_proposals.py tests/test_invariant_proposals.py` : **3 files already formatted**.
+- `MYPY_CACHE_DIR=/tmp/mypy-cache UV_CACHE_DIR=/tmp/uv-cache uv run --no-project --python 3.12 mypy src/cti_app/application/invariant_proposals.py src/cti_app/domain/invariant_proposals.py` : **Success: no issues found in 2 source files**.
 - `rg -n 'ProposalConversationResult|candidate_results|_pass_candidates_to_p09' backend/src backend/tests` : aucun consommateur additionnel hors du service P10; le fichier de tests P10 couvre les deux appels frais/replay.
 - Revue Luna xhigh en lecture seule : le gate partagé protège le parcours frais et replay; le cas de statuts répétés est corrigé; aucun autre problème de risque élevé relevé.
 
@@ -44,4 +60,4 @@ La revue indépendante a ensuite trouvé le cas des champs `STATUS` répétés. 
 
 Rollback : retirer ces changements de code, tests et note; aucun état persistant ni schéma DB n'a été modifié.
 
-Risques résiduels : le typecheck global reste rouge hors de ce lot. Les réponses refusées conservent les candidats analysés dans `response`; les consommateurs doivent respecter l'outcome, tandis que le service garantit déjà qu'aucun candidat n'atteint P09.
+Risques résiduels : le typecheck global reste rouge hors de ce lot. Par compatibilité acceptée, un wire sans `STATUS` conserve `SUCCEEDED` et peut transmettre un candidat à P09; le warning rend l'absence observable. Un statut inconnu est rejeté. Les réponses refusées conservent les candidats analysés dans `response`; les consommateurs doivent respecter l'outcome, tandis que le service garantit déjà qu'aucun candidat n'atteint P09.

@@ -1402,6 +1402,77 @@ async def test_refused_wire_without_candidate_has_explicit_outcome() -> None:
 
 
 @pytest.mark.asyncio
+async def test_missing_status_keeps_legacy_success_and_warning() -> None:
+    provenance_ref = _provenance_ref()
+    output = (
+        "advisor-wire.v1\n"
+        "TYPE: p10_proposal\n"
+        "CANDIDATE: literal_string | c2_indicator | exact | CreateMutexW | "
+        f"Mutex name distinguishes this sample. | refs={provenance_ref}\n"
+    )
+    conversation = _ConversationService(output=output)
+    service, _, _, registry = _service(conversation=conversation)
+
+    result = await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=1)
+
+    assert result.outcome is ProposalOutcome.SUCCEEDED
+    assert len(registry.calls) == 1
+    transformations = conversation.normalized_outputs[result.turn.id]["transformations"]
+    assert isinstance(transformations, tuple)
+    assert any("proposal status missing" in item for item in transformations)
+
+
+@pytest.mark.asyncio
+async def test_unknown_status_wire_raises_validation_error_before_p09() -> None:
+    provenance_ref = _provenance_ref()
+    output = (
+        "advisor-wire.v1\n"
+        "TYPE: p10_proposal\n"
+        "STATUS: unknown\n"
+        "CANDIDATE: literal_string | c2_indicator | exact | CreateMutexW | "
+        f"Mutex name distinguishes this sample. | refs={provenance_ref}\n"
+    )
+    service, _, _, registry = _service(conversation=_ConversationService(output=output))
+
+    with pytest.raises(ProposalOutputValidationError):
+        await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=1)
+
+    assert registry.calls == []
+
+
+@pytest.mark.asyncio
+async def test_repeated_refusal_fields_keep_first_nonempty_values_and_warn_on_conflicts() -> None:
+    provenance_ref = _provenance_ref()
+    output = (
+        "advisor-wire.v1\n"
+        "TYPE: p10_proposal\n"
+        "STATUS: refused\n"
+        "REFUSAL_REASON:\n"
+        "REFUSAL_REASON: specific reason omitted\n"
+        "REFUSAL_REASON: conflicting reason\n"
+        "REFUSAL_CODE:\n"
+        "REFUSAL_CODE: supplied_code\n"
+        "REFUSAL_CODE: conflicting_code\n"
+        "CANDIDATE: literal_string | c2_indicator | exact | CreateMutexW | "
+        f"Mutex name distinguishes this sample. | refs={provenance_ref}\n"
+    )
+    conversation = _ConversationService(output=output)
+    service, _, _, registry = _service(conversation=conversation)
+
+    result = await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=1)
+
+    assert result.outcome is ProposalOutcome.REFUSED
+    assert result.refusal_reason == "specific reason omitted"
+    assert result.refusal_code == "supplied_code"
+    assert registry.calls == []
+    assert result.invariant_results == ()
+    transformations = conversation.normalized_outputs[result.turn.id]["transformations"]
+    assert isinstance(transformations, tuple)
+    assert any("conflicting refusal_reason" in item for item in transformations)
+    assert any("conflicting refusal_code" in item for item in transformations)
+
+
+@pytest.mark.asyncio
 async def test_partial_wire_without_refusal_still_passes_candidate_to_p09() -> None:
     provenance_ref = _provenance_ref()
     output = (
