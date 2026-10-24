@@ -53,6 +53,15 @@ class ModelSubmissionState(StrEnum):
     VERIFIED_TERMINAL_FAILURE = "verified_terminal_failure"
 
 
+class BridgeSubmissionState(StrEnum):
+    """What the Bridge contract confirms about one submission attempt."""
+
+    PRE_SUBMISSION = "pre_submission"
+    SUBMISSION_ATTEMPTED = "submission_attempted"
+    POST_SUBMISSION = "post_submission"
+    EXTERNAL_STATE_UNKNOWN = "external_state_unknown"
+
+
 @dataclass(frozen=True, slots=True)
 class ModelUsage:
     input_tokens: int = 0

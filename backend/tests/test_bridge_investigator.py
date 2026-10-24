@@ -274,6 +274,67 @@ async def test_bridge_pacer_shares_provider_retry_after_with_later_calls() -> No
 
 
 @pytest.mark.asyncio
+async def test_bridge_pacer_releases_lock_while_waiters_sleep_and_serializes_starts() -> None:
+    now = 0.0
+    sleeper_entered = asyncio.Event()
+    release_sleepers = asyncio.Event()
+    sleep_calls = 0
+    starts: list[float] = []
+
+    async def sleeper(seconds: float) -> None:
+        nonlocal now, sleep_calls
+        sleep_calls += 1
+        sleeper_entered.set()
+        await release_sleepers.wait()
+        now += seconds
+
+    pacer = BridgeSubmissionPacer(
+        minimum_interval_seconds=10,
+        jitter_fraction=0,
+        clock=lambda: now,
+        sleeper=sleeper,
+        rng=lambda: 0,
+    )
+    assert await pacer.wait_for_next_submission()
+
+    async def wait_and_record() -> bool:
+        allowed = await pacer.wait_for_next_submission()
+        if allowed:
+            starts.append(now)
+        return allowed
+
+    first = asyncio.create_task(wait_and_record())
+    await asyncio.wait_for(sleeper_entered.wait(), timeout=0.1)
+    second = asyncio.create_task(wait_and_record())
+    await asyncio.sleep(0)
+    defer_completed = False
+    try:
+        defer_completed = await asyncio.wait_for(pacer.defer_submissions(20), timeout=0.05)
+    except TimeoutError:
+        pass
+    finally:
+        release_sleepers.set()
+
+    assert await asyncio.gather(first, second) == [True, True]
+    assert defer_completed is True
+    assert sleep_calls >= 2
+    assert len(starts) == 2
+    assert starts[0] >= 20
+    assert starts[0] != starts[1]
+
+
+@pytest.mark.asyncio
+async def test_bridge_pacer_deadline_bounds_lock_contention() -> None:
+    import time
+
+    pacer = BridgeSubmissionPacer(minimum_interval_seconds=0, jitter_fraction=0)
+    deadline = time.monotonic() + 0.02
+    async with pacer._lock:
+        assert await pacer.wait_for_next_submission(deadline_monotonic=deadline) is False
+        assert await pacer.defer_submissions(1, deadline_monotonic=deadline) is False
+
+
+@pytest.mark.asyncio
 async def test_pre_submission_retries_use_bounded_exponential_backoff() -> None:
     investigation_id = uuid4()
     context = _context(investigation_id)
@@ -330,7 +391,7 @@ async def test_pre_submission_retries_use_bounded_exponential_backoff() -> None:
 
 
 @pytest.mark.asyncio
-async def test_rate_limit_retries_honor_retry_after_without_abandoning_turn() -> None:
+async def test_rate_limit_retry_honors_retry_after_and_stops_after_one_retry() -> None:
     investigation_id = uuid4()
     context = _context(investigation_id)
     rejected = TurnSubmission(
@@ -370,9 +431,9 @@ async def test_rate_limit_retries_honor_retry_after_without_abandoning_turn() ->
         external_llm_allowed=True,
     )
 
-    assert result.status is TurnSubmissionStatus.SUCCEEDED
-    assert transport.submission_count == 6
-    assert clock.delays == [7] * 5
+    assert result.status is TurnSubmissionStatus.PRE_SUBMISSION_RETRY_EXHAUSTED
+    assert transport.submission_count == 2
+    assert clock.delays == [7]
 
 
 @pytest.mark.asyncio

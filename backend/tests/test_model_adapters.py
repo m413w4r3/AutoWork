@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from email.utils import format_datetime
 from typing import Any
 from uuid import UUID
 
@@ -793,6 +795,22 @@ def test_http_429_honors_retry_after_and_is_a_confirmed_rejection() -> None:
     assert error.submission_state == "pre_submission"
     assert error.retryable is True
     assert error.retry_after == 17
+
+
+def test_http_429_converts_retry_after_http_date() -> None:
+    future = datetime.now(UTC) + timedelta(seconds=45)
+    response = httpx.Response(
+        429,
+        request=httpx.Request("POST", "https://bridge.test/v1/responses"),
+        headers={"Retry-After": format_datetime(future, usegmt=True)},
+        json={"detail": {"code": "bridge_rate_limited", "retryable": True}},
+    )
+
+    error = _bridge_http_error(response, attempts=1)
+
+    assert error.submission_state == "pre_submission"
+    assert error.retry_after is not None
+    assert 0 < error.retry_after <= 45
 
 
 @pytest.mark.parametrize(
