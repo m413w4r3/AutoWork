@@ -178,6 +178,25 @@ l'oracle après intégration. Aucun `PASS` sans test exécuté et revue effectiv
 | `0bbe1e0e` | M01-A1-RES-R1-FIX2 | `m01-a1-res` | Canonicalisation 2 fixtures |
 | `cdb8f69e` | M01-A1-RES-REVIEW-R2 | `m01-a1-res-review-r2` | Revue finale A1 |
 
+## Porte finale — suite backend complète (avant B1A1 atomique)
+
+Exécutée le 2026-10-24 sur `chore/mission01-integration` (B1B + L2 + A1 + Q1
+intégrés), commande :
+
+```sh
+cd backend && PYTHONPATH=$PWD/src .venv/bin/python -m pytest \
+  --ignore=tests/integration -m "not integration" -q --tb=line
+```
+
+Résultat : **4667 passed, 34 failed, 2 skipped, 30 deselected** en 64,50 s.
+Les 34 échecs sont les échecs d'environnement déjà documentés : 32 tests
+Typst réels (`FontBundleInvalidError: Manifest-listed file is missing:
+'CascadiaCode/ttf/CascadiaCode.ttf'`) et 2 tests confined/mwcp préexistants
+sur `058bb4a` (`test_confined_analysis_dispatch`). Aucune régression nouvelle.
+Les 2 skips sont `test_confined_analysis_image` (image non construite) et
+`test_ghidra_service_real` (Ghidra absent). Les tests d'intégration PostgreSQL
+sont hors de cette commande et restent `UNKNOWN`.
+
 ## Incident de capacité (2026-10-23)
 
 Le quota Codex/Luna a été épuisé en cours de mission (reset annoncé le
