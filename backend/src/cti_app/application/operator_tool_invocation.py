@@ -19,8 +19,10 @@ from cti_app.application.advisor_checkpoint import (
 from cti_app.application.context_pagination import (
     ContextOmissionManifestEntryV1,
     ContextOmissionReason,
+    StaleContextCursorError,
     assert_manifest_consistency,
     canonical_page_sha256,
+    context_section_descending,
     decode_keyset_cursor,
     decode_offset_cursor,
     encode_offset_cursor,
@@ -132,6 +134,29 @@ _ADDITIONAL_CONTEXT_ITEM_SECTIONS = frozenset(
 _SOURCE_PAGED_CONTEXT_SECTIONS = frozenset(
     {"new_evidence", "evidence_index", "findings", "finding_versions", "tool_coverage"}
 )
+_CONTEXT_CONTENT_SCHEMA = "operator-context-content.v1"
+
+
+def _canonical_context_content_bytes(context: InvestigationContextV1) -> bytes:
+    """Serialize complete operator context content for pagination identity.
+
+    V1 includes the full ``investigation-context.v1`` model dump in JSON mode
+    with aliases enabled, plus its separately exposed ``current_opinion``.
+    Working-state metadata, page slicing, cursors and page proofs are excluded.
+    ``canonical_json_bytes`` sorts object keys and emits compact JSON.
+    """
+    current_opinion = context.current_opinion
+    return canonical_json_bytes(
+        {
+            "schema": _CONTEXT_CONTENT_SCHEMA,
+            "context": context.model_dump(mode="json", by_alias=True),
+            "current_opinion": (
+                current_opinion.model_dump(mode="json", by_alias=True)
+                if current_opinion is not None
+                else None
+            ),
+        }
+    )
 
 
 def _materialized_page_proof(
@@ -145,20 +170,25 @@ def _materialized_page_proof(
     items: tuple[Any, ...],
     cursor: str | None,
 ) -> tuple[str, str, str | None, ContextOmissionManifestEntryV1, dict[str, str], bool]:
-    previous_page_sha256 = (
+    decoded_cursor = (
         decode_offset_cursor(
             cursor,
             section=section,
             investigation_id=investigation_id,
             context_sha256=context_sha256,
-        )["previous_page_sha256"]
+        )
         if cursor
-        else "0" * 64
+        else None
+    )
+    previous_page_sha256 = (
+        decoded_cursor["previous_page_sha256"] if decoded_cursor is not None else "0" * 64
     )
     next_offset = offset + len(items)
     has_more = next_offset < total
     omitted = total - len(items)
-    omission_reasons = {ContextOmissionReason.SOURCE_NOT_PAGINATED: omitted} if omitted else {}
+    omission_reasons: dict[ContextOmissionReason, int] = (
+        {ContextOmissionReason.SOURCE_NOT_PAGINATED: omitted} if omitted else {}
+    )
     unbounded_reason = "The context section was materialized before page selection"
     pivot = {
         "kind": "offset",
@@ -257,16 +287,19 @@ def _assert_keyset_page_consistency(page: Any, *, section: str, investigation_id
     if len(entries) != 1:
         raise ValueError("Operator keyset page must have exactly one omission manifest")
     entry = entries[0]
-    previous_page_sha256 = (
+    decoded_cursor = (
         decode_keyset_cursor(
             page.cursor,
             section=section,
             investigation_id=investigation_id,
             descending=page.descending,
             context_sha256=page.context_sha256,
-        )["previous_page_sha256"]
+        )
         if page.cursor is not None
-        else "0" * 64
+        else None
+    )
+    previous_page_sha256 = (
+        decoded_cursor["previous_page_sha256"] if decoded_cursor is not None else "0" * 64
     )
     assert_manifest_consistency(
         section=section,
@@ -406,6 +439,7 @@ class OperatorToolInvocationService:
                 details={"dominant_sections": list(exc.dominant_sections)},
             ) from None
         context_bytes = context.canonical_bytes()
+        content_bytes = _canonical_context_content_bytes(context)
         if len(context_bytes) > MAX_CONTEXT_BYTES:
             raise OperatorToolInvocationError(
                 "operator_context_too_large",
@@ -420,7 +454,7 @@ class OperatorToolInvocationService:
             investigation_id=self._investigation_id,
             working_state_version=state.version,
             working_state_sha256=state.sha256,
-            context_sha256=hashlib.sha256(context_bytes).hexdigest(),
+            context_sha256=hashlib.sha256(content_bytes).hexdigest(),
             context_bytes=len(context_bytes),
             max_context_bytes=MAX_CONTEXT_BYTES,
             truncation=_truncation_flags(context),
@@ -484,15 +518,24 @@ class OperatorToolInvocationService:
 
         if section in _SOURCE_PAGED_CONTEXT_SECTIONS:
             keyset_cursor = cursor if isinstance(cursor, str) else None
+            operator_context = await self.get_context(
+                expected_version=state.version,
+                expected_sha256=state.sha256,
+            )
+            context_sha256 = operator_context.context_sha256
             if keyset_cursor is not None:
                 try:
                     decode_keyset_cursor(
                         keyset_cursor,
                         section=section,
                         investigation_id=self._investigation_id,
-                        descending=section != "finding_versions",
-                        context_sha256=state.sha256,
+                        descending=context_section_descending(section),
+                        context_sha256=context_sha256,
                     )
+                except StaleContextCursorError:
+                    raise OperatorToolInvocationError(
+                        "operator_context_cursor_stale", 409
+                    ) from None
                 except ValueError:
                     raise OperatorToolInvocationError(
                         "operator_context_cursor_invalid", 422
@@ -505,14 +548,22 @@ class OperatorToolInvocationService:
                     cursor=keyset_cursor,
                     offset=offset if legacy_offset_cursor or cursor is None else 0,
                     limit=limit,
-                    context_sha256=state.sha256,
+                    context_sha256=context_sha256,
                 )
+            except StaleContextCursorError:
+                raise OperatorToolInvocationError("operator_context_cursor_stale", 409) from None
             except ValueError as exc:
                 if str(exc) == "Section does not use source-bounded keyset pagination":
                     raise OperatorToolInvocationError(
                         "operator_context_section_unknown", 404
                     ) from None
                 raise OperatorToolInvocationError("operator_context_cursor_invalid", 422) from None
+            latest_operator_context = await self.get_context(
+                expected_version=state.version,
+                expected_sha256=state.sha256,
+            )
+            if latest_operator_context.context_sha256 != context_sha256:
+                raise OperatorToolInvocationError("operator_context_cursor_stale", 409)
             _assert_keyset_page_consistency(
                 page,
                 section=section,
@@ -525,10 +576,6 @@ class OperatorToolInvocationService:
                 else None
             )
             if section == "finding_versions":
-                operator_context = await self.get_context(
-                    expected_version=state.version,
-                    expected_sha256=state.sha256,
-                )
                 return OperatorContextItemPageV1(
                     investigation_id=self._investigation_id,
                     working_state_version=operator_context.working_state_version,

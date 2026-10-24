@@ -22,6 +22,7 @@ from cti_app.application.advisor_checkpoint import (
 from cti_app.application.bridge_investigator import TurnSubmission, TurnSubmissionStatus
 from cti_app.application.context_pagination import (
     ContextOmissionReason,
+    StaleContextCursorError,
     decode_keyset_cursor,
     encode_keyset_cursor,
     verify_page_sha256,
@@ -1564,7 +1565,15 @@ async def test_operator_http_routes_expose_bounded_context_and_idempotent_invoca
     assert summary.status_code == 200, summary.text
     assert summary_payload["schema"] == "investigation-operator-context-summary.v1"
     assert "context" not in summary_payload
-    assert summary_payload["context_sha256"] == context.json()["context_sha256"]
+    context_payload = context.json()
+    expected_context_content = canonical_json_bytes(
+        {
+            "schema": "operator-context-content.v1",
+            "context": context_payload["context"],
+            "current_opinion": context_payload["current_opinion"],
+        }
+    )
+    assert summary_payload["context_sha256"] == hashlib.sha256(expected_context_content).hexdigest()
     assert summary_payload["working_state_sha256"] == state.sha256
     assert summary_payload["delta_since_version"]["from_version"] == state.version
     evidence_cursor = summary_payload["pointers"]["section_cursors"]["evidence_index"]
@@ -1629,6 +1638,66 @@ async def test_operator_http_routes_expose_bounded_context_and_idempotent_invoca
 
 
 @pytest.mark.asyncio
+async def test_http_context_cursor_mutation_returns_stale_409() -> None:
+    fixture, state, service = await _fixture()
+    for index in range(2):
+        await fixture.observations.append_if_absent(
+            EvidenceObservation(
+                investigation_id=fixture.investigation_id,
+                kind=EvidenceKind.OTHER,
+                blob_id=uuid4(),
+                sha256=f"{index + 1:064x}",
+                source="test.source",
+                source_version="1",
+                observed_at=datetime(2026, 1, 1, tzinfo=UTC) + timedelta(seconds=index),
+                object_type="fixture",
+                object_id=str(index),
+            )
+        )
+    first_page = await service.get_context_section(
+        "evidence_index",
+        limit=1,
+        expected_version=state.version,
+        expected_sha256=state.sha256,
+    )
+    assert first_page.next_cursor is not None
+    await fixture.observations.append_if_absent(
+        EvidenceObservation(
+            investigation_id=fixture.investigation_id,
+            kind=EvidenceKind.OTHER,
+            blob_id=uuid4(),
+            sha256=f"{3:064x}",
+            source="test.source",
+            source_version="1",
+            observed_at=datetime(2026, 1, 1, tzinfo=UTC) + timedelta(seconds=2),
+            object_type="fixture",
+            object_id="2",
+        )
+    )
+
+    app = FastAPI()
+    app.include_router(router)
+    app.state.identity_provider = _IdentityProvider()
+    app.state.uow_factory = lambda: _Uow(fixture)
+    app.state.investigation_composition_factory = _CompositionFactory(service, fixture=fixture)
+
+    async with httpx.AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        stale_page = await client.get(
+            f"/api/investigations/{fixture.investigation_id}/operator/context/section/evidence_index",
+            params={
+                "cursor": first_page.next_cursor,
+                "expected_version": state.version,
+                "expected_sha256": state.sha256,
+            },
+        )
+
+    assert stale_page.status_code == 409
+    assert stale_page.json()["detail"]["code"] == "operator_context_cursor_stale"
+
+
+@pytest.mark.asyncio
 async def test_context_section_keyset_cursor_is_opaque_chained_and_offset_compatible() -> None:
     fixture, state, service = await _fixture()
     for index in range(25):
@@ -1672,7 +1741,7 @@ async def test_context_section_keyset_cursor_is_opaque_chained_and_offset_compat
         first.next_cursor,
         section="evidence_index",
         investigation_id=fixture.investigation_id,
-        descending=True,
+        descending=False,
     )
 
     assert first.total == second.total == 25
@@ -1713,8 +1782,8 @@ async def test_context_section_keyset_cursor_is_opaque_chained_and_offset_compat
         sort_key=(datetime.fromisoformat(chained["sort_key"]) + timedelta(seconds=2)).isoformat(),
         item_id=UUID(chained["item_id"]),
         previous_page_sha256=chained["previous_page_sha256"],
-        descending=True,
-        context_sha256=state.sha256,
+        descending=False,
+        context_sha256=first.context_sha256,
     )
     forged_page = await service.get_context_section(
         "evidence_index",
@@ -1759,33 +1828,42 @@ async def test_context_section_keyset_cursor_is_opaque_chained_and_offset_compat
         next_cursor=forged_page.next_cursor,
     )
 
-    for bad_scope in (
-        encode_keyset_cursor(
-            section="findings",
-            investigation_id=fixture.investigation_id,
-            sort_key=chained["sort_key"],
-            item_id=UUID(chained["item_id"]),
-            previous_page_sha256=chained["previous_page_sha256"],
-            descending=True,
-            context_sha256=state.sha256,
+    for bad_scope, expected_code in (
+        (
+            encode_keyset_cursor(
+                section="findings",
+                investigation_id=fixture.investigation_id,
+                sort_key=chained["sort_key"],
+                item_id=UUID(chained["item_id"]),
+                previous_page_sha256=chained["previous_page_sha256"],
+                descending=True,
+                context_sha256=first.context_sha256,
+            ),
+            "operator_context_cursor_invalid",
         ),
-        encode_keyset_cursor(
-            section="evidence_index",
-            investigation_id=uuid4(),
-            sort_key=chained["sort_key"],
-            item_id=UUID(chained["item_id"]),
-            previous_page_sha256=chained["previous_page_sha256"],
-            descending=True,
-            context_sha256=state.sha256,
+        (
+            encode_keyset_cursor(
+                section="evidence_index",
+                investigation_id=uuid4(),
+                sort_key=chained["sort_key"],
+                item_id=UUID(chained["item_id"]),
+                previous_page_sha256=chained["previous_page_sha256"],
+                descending=False,
+                context_sha256=first.context_sha256,
+            ),
+            "operator_context_cursor_invalid",
         ),
-        encode_keyset_cursor(
-            section="evidence_index",
-            investigation_id=fixture.investigation_id,
-            sort_key=chained["sort_key"],
-            item_id=UUID(chained["item_id"]),
-            previous_page_sha256=chained["previous_page_sha256"],
-            descending=True,
-            context_sha256="f" * 64,
+        (
+            encode_keyset_cursor(
+                section="evidence_index",
+                investigation_id=fixture.investigation_id,
+                sort_key=chained["sort_key"],
+                item_id=UUID(chained["item_id"]),
+                previous_page_sha256=chained["previous_page_sha256"],
+                descending=False,
+                context_sha256="f" * 64,
+            ),
+            "operator_context_cursor_stale",
         ),
     ):
         with pytest.raises(OperatorToolInvocationError) as bad_scope_error:
@@ -1795,7 +1873,7 @@ async def test_context_section_keyset_cursor_is_opaque_chained_and_offset_compat
                 expected_sha256=state.sha256,
                 cursor=bad_scope,
             )
-        assert bad_scope_error.value.code == "operator_context_cursor_invalid"
+        assert bad_scope_error.value.code == expected_code
     with pytest.raises(OperatorToolInvocationError) as invalid:
         await service.get_context_section(
             "evidence_index",
@@ -1804,6 +1882,97 @@ async def test_context_section_keyset_cursor_is_opaque_chained_and_offset_compat
             cursor="not-a-keyset-cursor",
         )
     assert invalid.value.code == "operator_context_cursor_invalid"
+
+
+@pytest.mark.asyncio
+async def test_context_cursor_binds_canonical_content_and_rejects_stale_continuations() -> None:
+    fixture, state, service = await _fixture()
+    for index in range(3):
+        await fixture.observations.append_if_absent(
+            EvidenceObservation(
+                investigation_id=fixture.investigation_id,
+                kind=EvidenceKind.OTHER,
+                blob_id=uuid4(),
+                sha256=f"{index + 1:064x}",
+                source="test.source",
+                source_version="1",
+                observed_at=datetime(2026, 1, 1, tzinfo=UTC) + timedelta(seconds=index),
+                object_type="fixture",
+                object_id=str(index),
+            )
+        )
+
+    first = await service.get_context_section(
+        "evidence_index",
+        limit=1,
+        expected_version=state.version,
+        expected_sha256=state.sha256,
+    )
+    different_page_size = await service.get_context_section(
+        "evidence_index",
+        limit=2,
+        expected_version=state.version,
+        expected_sha256=state.sha256,
+    )
+    assert first.next_cursor is not None
+    assert first.context_sha256 == different_page_size.context_sha256
+    assert first.context_sha256 != state.sha256
+    operator_context = await service.get_context(
+        expected_version=state.version,
+        expected_sha256=state.sha256,
+    )
+    current_opinion = operator_context.context.current_opinion
+    canonical_content = canonical_json_bytes(
+        {
+            "schema": "operator-context-content.v1",
+            "context": operator_context.context.model_dump(mode="json", by_alias=True),
+            "current_opinion": (
+                current_opinion.model_dump(mode="json", by_alias=True)
+                if current_opinion is not None
+                else None
+            ),
+        }
+    )
+    assert first.context_sha256 == hashlib.sha256(canonical_content).hexdigest()
+
+    await fixture.observations.append_if_absent(
+        EvidenceObservation(
+            investigation_id=fixture.investigation_id,
+            kind=EvidenceKind.OTHER,
+            blob_id=uuid4(),
+            sha256=f"{4:064x}",
+            source="test.source",
+            source_version="1",
+            observed_at=datetime(2026, 1, 1, tzinfo=UTC) + timedelta(seconds=4),
+            object_type="fixture",
+            object_id="4",
+        )
+    )
+    changed_context = await service.get_context_section(
+        "evidence_index",
+        limit=1,
+        expected_version=state.version,
+        expected_sha256=state.sha256,
+    )
+    assert changed_context.context_sha256 != first.context_sha256
+    with pytest.raises(StaleContextCursorError):
+        decode_keyset_cursor(
+            first.next_cursor,
+            section="evidence_index",
+            investigation_id=fixture.investigation_id,
+            descending=False,
+            context_sha256=changed_context.context_sha256,
+        )
+
+    with pytest.raises(OperatorToolInvocationError) as stale:
+        await service.get_context_section(
+            "evidence_index",
+            limit=1,
+            expected_version=state.version,
+            expected_sha256=state.sha256,
+            cursor=first.next_cursor,
+        )
+    assert stale.value.code == "operator_context_cursor_stale"
 
 
 @pytest.mark.asyncio

@@ -14,6 +14,12 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+NULL_SORT_KEY = "null"
+
+
+class StaleContextCursorError(ValueError):
+    """A valid keyset cursor belongs to a different canonical context version."""
+
 
 class ContextOmissionReason(StrEnum):
     BUDGET = "budget"
@@ -92,10 +98,11 @@ def encode_keyset_cursor(
     """Encode an unauthenticated position; authorization comes from the caller."""
     if not section or len(section) > 64 or not 1 <= len(sort_key) <= 256:
         raise ValueError("Context keyset cursor is invalid")
-    try:
-        datetime.fromisoformat(sort_key)
-    except ValueError:
-        raise ValueError("Context keyset cursor is invalid") from None
+    if sort_key != NULL_SORT_KEY:
+        try:
+            datetime.fromisoformat(sort_key)
+        except ValueError:
+            raise ValueError("Context keyset cursor is invalid") from None
     if not _is_sha256(previous_page_sha256):
         raise ValueError("Context keyset cursor is invalid")
     if context_sha256 is not None and not _is_sha256(context_sha256):
@@ -134,6 +141,9 @@ def decode_keyset_cursor(
     if cursor is None:
         return None
     payload = _decode_cursor(cursor)
+    context_mismatch = (
+        context_sha256 is not None and payload.get("context_sha256") != context_sha256
+    )
     if (
         payload.get("kind") != "keyset"
         or payload.get("section") != section
@@ -147,19 +157,73 @@ def decode_keyset_cursor(
         or not isinstance(payload.get("descending"), bool)
         or set(payload) != _keyset_cursor_fields(has_context="context_sha256" in payload)
         or (descending is not None and payload["descending"] is not descending)
-        or (context_sha256 is not None and payload.get("context_sha256") != context_sha256)
     ):
         raise ValueError("Context keyset cursor is invalid")
     try:
         item_id = UUID(payload["item_id"])
-        datetime.fromisoformat(payload["sort_key"])
+        if payload["sort_key"] != NULL_SORT_KEY:
+            datetime.fromisoformat(payload["sort_key"])
     except (TypeError, ValueError):
         raise ValueError("Context keyset cursor is invalid") from None
     if str(item_id) != payload["item_id"]:
         raise ValueError("Context keyset cursor is invalid")
     if "context_sha256" in payload and not _is_sha256(payload["context_sha256"]):
         raise ValueError("Context keyset cursor is invalid")
+    if context_mismatch:
+        raise StaleContextCursorError("Context keyset cursor is stale")
     return payload
+
+
+def decode_keyset_sort_key(sort_key: str) -> datetime | None:
+    """Decode a keyset timestamp, where ``null`` represents NULLS LAST."""
+    return None if sort_key == NULL_SORT_KEY else datetime.fromisoformat(sort_key)
+
+
+def context_section_descending(section: str) -> bool:
+    """Return the fixed repository ordering for each keyset context section."""
+    return section in {"new_evidence", "findings", "tool_coverage"}
+
+
+def keyset_position_after(
+    position: tuple[datetime | None, UUID],
+    pivot: tuple[datetime | None, UUID],
+    *,
+    descending: bool,
+) -> bool:
+    """Compare positions under timestamp order with NULLS LAST in both directions."""
+    position_time, position_id = position
+    pivot_time, pivot_id = pivot
+    if pivot_time is None:
+        return position_time is None and (
+            position_id.int < pivot_id.int if descending else position_id.int > pivot_id.int
+        )
+    if position_time is None:
+        return True
+    if descending:
+        return position_time < pivot_time or (
+            position_time == pivot_time and position_id.int < pivot_id.int
+        )
+    return position_time > pivot_time or (
+        position_time == pivot_time and position_id.int > pivot_id.int
+    )
+
+
+def order_keyset_items[T](
+    items: tuple[T, ...],
+    *,
+    position: Any,
+    descending: bool,
+) -> tuple[T, ...]:
+    """Order timestamp/UUID positions while keeping NULL timestamps last."""
+    dated = tuple(item for item in items if position(item)[0] is not None)
+    undated = tuple(item for item in items if position(item)[0] is None)
+    ordered_dated = sorted(dated, key=position, reverse=descending)
+    ordered_undated = sorted(
+        undated,
+        key=lambda item: position(item)[1].int,
+        reverse=descending,
+    )
+    return (*ordered_dated, *ordered_undated)
 
 
 def encode_offset_cursor(
@@ -476,7 +540,7 @@ def assert_manifest_consistency(
     total: int,
     has_more: bool,
     source_bounded: bool,
-    omission_reasons: Mapping[ContextOmissionReason | str, int],
+    omission_reasons: Mapping[ContextOmissionReason, int],
     unbounded_reason: str | None,
     selected: int,
     omitted: int,
@@ -621,16 +685,19 @@ def make_keyset_page[T](
 ) -> KeysetPageV1[T]:
     has_more = len(items) > limit
     selected = items[:limit]
-    previous_page_sha256 = (
+    decoded_cursor = (
         decode_keyset_cursor(
             cursor,
             section=section,
             investigation_id=investigation_id,
             descending=descending,
             context_sha256=context_sha256,
-        )["previous_page_sha256"]
+        )
         if cursor is not None
-        else "0" * 64
+        else None
+    )
+    previous_page_sha256 = (
+        decoded_cursor["previous_page_sha256"] if decoded_cursor is not None else "0" * 64
     )
     pivot = None
     if selected:
@@ -646,7 +713,9 @@ def make_keyset_page[T](
         if context_sha256 is not None:
             pivot["context_sha256"] = context_sha256
     omitted = max(0, total - len(selected))
-    omission_reasons = {ContextOmissionReason.PAGINATION: omitted} if omitted else {}
+    omission_reasons: dict[ContextOmissionReason, int] = (
+        {ContextOmissionReason.PAGINATION: omitted} if omitted else {}
+    )
     omission_summary = {
         "section": section,
         "total": total,
@@ -767,6 +836,8 @@ def keyset_pivot(payload: Mapping[str, Any]) -> dict[str, str]:
 
 
 def _sort_key_text(sort_key: Any) -> str:
+    if sort_key is None:
+        return NULL_SORT_KEY
     return sort_key.isoformat() if isinstance(sort_key, datetime | date) else str(sort_key)
 
 
@@ -833,13 +904,14 @@ def _canonical_omissions(value: Any) -> Any:
     """Hash omission counts and reasons, excluding the self-referential page proof."""
     if isinstance(value, ContextOmissionManifestEntryV1):
         value = value.model_dump(mode="python")
+    values: tuple[Any, ...] | list[Any]
     if isinstance(value, Mapping):
         values = (value,)
     elif isinstance(value, tuple | list):
         values = value
     else:
         return _canonicalize(value)
-    result = []
+    result: list[Any] = []
     for item in values:
         if isinstance(item, ContextOmissionManifestEntryV1):
             item = item.model_dump(mode="python")
