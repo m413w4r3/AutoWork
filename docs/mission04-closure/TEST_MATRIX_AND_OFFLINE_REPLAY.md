@@ -35,7 +35,7 @@ Cette matrice est mise à jour à chaque lot. Un test non exécuté est marqué
 |---|---|---|
 | Frontend lint | `cd frontend && pnpm lint` | **PASS** (ESLint + Prettier) |
 | Frontend typecheck/tests/build | `pnpm typecheck && pnpm test --run && pnpm build` | **PASS** : 39 fichiers / **293 tests**, build Vite vert |
-| Frontend e2e Playwright | `pnpm test:e2e` | **NON EXÉCUTÉ à ce stade** |
+| Frontend e2e Playwright | `pnpm test:e2e` | **NON EXÉCUTÉ — BLOCKED_ENV** : le webServer Vite échoue sur `EMFILE` d'inotify après deux tentatives, limites fd élevées ; l'environnement local héberge de nombreux watchers. À vérifier en CI. |
 | Import du serveur navigateur | parse AST + import des constantes publiques | **PASS** |
 | Smoke Typst inline (fixture canonique corrigée) | compilation Typst 0.15.1 + polices verrouillées + `pdftotext` | **PASS**, PDF non vide |
 | mypy repo-wide | `cd backend && uv run --python 3.12 mypy src tests` | **60 erreurs au départ → 35 après CI-0a, toutes dans les 5 fichiers L4 (attendu : 0 après L4)** |

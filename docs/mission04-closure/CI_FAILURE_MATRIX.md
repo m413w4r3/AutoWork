@@ -12,9 +12,9 @@ jour après chaque lot.
 | Job | Conclusion | Étape en échec | Classification initiale | Clôture |
 |---|---|---|---|---|
 | `compose` | success | — | n/a | vert, ne prouve pas l'applicatif |
-| `backend` | failure | `uv run mypy src tests` | PREEXISTING (dette de types) | en cours (CI-0a + L4) |
-| `backend` | failure | Workflow emulator FAST | PREEXISTING (contrat obsolète/mesures) | en cours (CI-0b) |
-| `backend` | failure | Workflow emulator FULL | PREEXISTING (observations/ambiguïté/config) | en cours (CI-0c) |
+| `backend` | failure | `uv run mypy src tests` | PREEXISTING (dette de types) | CI-0a intégré (35→0 hors L4) ; L4 doit ramener ses 5 fichiers à 0 |
+| `backend` | failure | Workflow emulator FAST | PREEXISTING (contrat obsolète/mesures) | corrigé sur `mission04/ci0-workflow` (vérification HEAD à faire) |
+| `backend` | failure | Workflow emulator FULL | PREEXISTING (observations/ambiguïté/config) | corrigé sur `mission04/ci0-protocol` (vérification HEAD à faire) |
 | `frontend` | failure | `pnpm lint` (`prettier --check .`) | PREEXISTING (formatage) | corrigé localement (ccff3444) |
 | `typst-renderer-smoke` | failure | compile production renderer | PREEXISTING (fixture sans `document_label`) | corrigé localement (ccff3444) |
 | `workflow-browser` | failure | J2 investigation/PDF | PREEXISTING (`_S2_BYTES` privé supprimé) | corrigé localement (ccff3444) |
@@ -76,18 +76,18 @@ ni affaibli.
 
 | Test | Symptôme exact | Cause | Correctif |
 |---|---|---|---|
-| `W13-D5` | `rule.test` attendu `SUCCEEDED`, obtenu `PARTIAL` | limitations de corpus informatives (holdout sans rôle, absence de baseline goodware) traitées comme échec de mesure | CI-0b |
-| `W13-D7` | `vt.file_report` attendu `UNAVAILABLE`, obtenu `NEEDS_REVIEW` | durcissement d'ambiguïté externe `d1580a93` : une erreur d'adaptateur sans preuve framework devient `NEEDS_REVIEW` | CI-0b |
-| `W14-A` | `candidate_status` `candidate` au lieu de `tested` | même cause que W13-D5 (`corpus.limitations` bloque `TESTED`) + clés de rôle obsolètes | CI-0b |
-| `W14-E` | `KeyError: 'confirmed_positive'` | les valeurs persistées canoniques sont `human_confirmed` / `new_candidate_unconfirmed` / `holdout_positive` ; les anciennes valeurs sont des alias | CI-0b |
+| `W13-D5` | `rule.test` attendu `SUCCEEDED`, obtenu `PARTIAL` | limitations de corpus informatives traitées comme échec de mesure ; classification `blocking_limitations` vs `measurement_limitations` ajoutée | CI-0b : W13-D5 vert |
+| `W13-D7` | `vt.file_report` attendu `UNAVAILABLE`, obtenu `NEEDS_REVIEW` | durcissement d'ambiguïté externe `d1580a93` : une erreur d'adaptateur sans preuve framework devient `NEEDS_REVIEW` | CI-0b : scénario réécrit avec refus de resume, reconcile abandon, zéro renvoi VT, Shodan ensuite ; vert |
+| `W14-A` | `candidate_status` `candidate` au lieu de `tested` | même cause que W13-D5 + clés de rôle obsolètes | CI-0b : vert |
+| `W14-E` | `KeyError: 'confirmed_positive'` | valeurs canoniques `human_confirmed`/`new_candidate_unconfirmed`/`holdout_positive` ; consommateurs `retrohunt`/`publication_detection` encore sur les alias | CI-0b : consommateurs corrigés + fixture quatre rôles ; en cours |
 
 ### 2.6 Workflow emulator FULL
 
 | Test | Symptôme exact | Cause | Correctif |
 |---|---|---|---|
-| `W15` | 2 observations `network.protocol.verify` au lieu de 1 | diagnostic en cours | CI-0c |
-| `W18` | `response_refs` vide sur une invocation `vt.download_sample` `NEEDS_REVIEW` | diagnostic en cours (références d'observation partielle possiblement perdues lors de la conversion d'ambiguïté) | CI-0c |
-| `FULL pilot` | approbation d'enveloppe 422 `provider_unavailable: vt` | diagnostic en cours (configuration de capacité fake vs gate de production) | CI-0c |
+| `W15` | 2 observations `network.protocol.verify` au lieu de 1 | deux invocations intentionnelles avant/après révision, chacune `PARTIAL` avec une ref distincte | CI-0c : oracle par phase corrigé ; en cours |
+| `W18` | `response_refs` vide sur une invocation `vt.download_sample` `NEEDS_REVIEW` | la branche ambiguë sautait l'écriture d'observation et ne conservait pas de ref valide | CI-0c : refs valides conservées + observation de statut cadre si aucune ref ; en cours |
+| `FULL pilot` | approbation d'enveloppe 422 `provider_unavailable: vt` | fixture fake VT sans routing policy ; puis corpus de similarité incluant les PCAP importés | CI-0c : routing policy + sélection explicite des 3 échantillons ; en cours |
 
 ## 3. Règle de clôture
 
