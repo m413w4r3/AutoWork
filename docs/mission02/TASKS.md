@@ -1,6 +1,7 @@
 # Mission 02 V2 — registre de lots
 
-**Base locale :** `main@e4abba495d9f5fdc296e2ba80b65442855625474` (2026-10-24).
+**Base de mission (S0) :** `main@e4abba495d9f5fdc296e2ba80b65442855625474` (2026-10-24).
+**Base de livraison docs :** `main@d4c4c2ed836d60eef150a0ce80f48ae171cee8e0`, branche `mission02/final-docs`.
 **Politique :** ALLOW par défaut pour les preuves CTI dans une consultation déjà autorisée ;
 les restrictions explicites (secrets, `do_not_submit`, `external_llm_allowed=false`, TLP,
 autorisation d'appel, G2) restent actives. Aucun push, déploiement ou mutation live.
@@ -22,8 +23,9 @@ autorisation d'appel, G2) restent actives. Aucun push, déploiement ou mutation 
 - **S1** : suppression nette de 697→183 lignes sur le lot ; 600 octets DNS
   `raw`, Base64 espacé/fragmenté, deux valeurs de 300 octets, extraits
   >512/>16 384 et preuves contradictoires atteignent le transport factice ;
-  refus secret/`POLICY_DENIED` conservés. Tests parent : 135 passed,
-  1 échec uniquement dû au corpus `.autowork-runs/` absent du worktree.
+  refus secret/`POLICY_DENIED` conservés. Exécution parent antérieure :
+  135 passed, 1 échec dû au corpus `.autowork-runs/` absent du worktree.
+  Le replay ciblé final sur main est distinct : 171 passed (voir gate final).
 - **S2** : plafond 96 000 supprimé, troncatures silencieuses retirées,
   `P10_PROMPT_VERSION` passé à 4. La revue indépendante a confirmé le no-cap
   mais trouvé trois défauts (gate `do_not_submit`/TLP, `auth=` non rédigé,
