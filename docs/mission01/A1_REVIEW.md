@@ -291,3 +291,34 @@ Les checks sont offline; aucun fournisseur, PostgreSQL, Docker ou transport live
 ## Verdict après 1f0e813
 
 **PASS_WITH_CHANGES — les fuites R5 de références non liées sont fermées.** Reste un défaut **MEDIUM** de cohérence de type/provenance pour une observation liée utilisée sous `sample_sha256`/`capture_sha256` ou comme pivot. Corriger/valider la correspondance du type d’observation avant de qualifier la projection entièrement sûre. Le lifespan de production reste **UNKNOWN**. Coût : **UNKNOWN**.
+
+## Résiduel A1-RES — réparation et revue
+
+**Réparation :** `fbe5d36904ee14d1c5467f475f9178565522d097` (branche
+`feat/mission01-a1-residual`, base `a1d263a0`), 3 fichiers.
+Le projecteur n’expose une entrée que si son SHA correspond à une
+observation liée et unique dont `object_type` correspond à
+`sample_sha256`/`capture_sha256`; les rapports, types incompatibles et
+correspondances ambiguës sont masqués; `next_pivots` est restreint aux
+observations sample/capture; la version d’invocation exacte reste visible.
+Tests: sample/capture liés visibles, `vt_file_report` lié incompatible
+masqué, SHA dupliqué/non lié masqué, invocation exacte/erronée/absente.
+
+**Revue indépendante :** agent `fe7f765f-1d6d-4e66-a24c-b5770e44b332`,
+Luna xhigh, oracle **57 passed**. Verdict **PASS_WITH_CHANGES**.
+
+### MEDIUM résiduel — `kind` non recoupé
+
+`investigation_experiments.py:607` déduit le type d’`object_type` seul.
+Une observation `vt_file_report` avec `object_type="sample"` serait classée
+`sample_sha256` et son SHA pourrait ressortir dans `input_refs`/
+`next_pivots`. Le domaine n’impose pas la correspondance
+`kind`↔`object_type` (`domain/investigation.py:528`) et l’enregistreur les
+accepte séparément (`evidence_recorder.py:112`). Le producteur VT fixe
+`object_type="file"` (`investigation_vt_tools.py:714`), donc le cas n’est
+pas démontré pour ce chemin; une observation incohérente/historique reste
+possible. Correction A1-RES-R1 : recouper `kind` et `object_type`, masquer
+les combinaisons incohérentes.
+
+Lifespan de production et PostgreSQL : **UNKNOWN**. Coût : **UNKNOWN**.
+
