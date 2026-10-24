@@ -6,6 +6,8 @@ import re
 from pathlib import Path
 from uuid import uuid4
 
+import pytest
+
 from cti_app.application.advisor_contracts import (
     extract_json_object,
     parse_typed_advisor_response,
@@ -21,6 +23,14 @@ from cti_app.application.investigation_advisor_tools import (
     InvestigationAdvisorTool,
     _parse_advisor_output,
     _safe_text,
+)
+
+_ARCHIVED_RUN12_CORPUS = (
+    Path(__file__).parents[2]
+    / ".autowork-runs"
+    / "run12-editorial-2026-10-20"
+    / "bridge-comms"
+    / "corpus"
 )
 
 
@@ -269,14 +279,12 @@ def test_unreadable_cited_observations_produce_one_relevant_limit_not_empty_card
     assert dossier.manifest == ()
 
 
+@pytest.mark.skipif(
+    not _ARCHIVED_RUN12_CORPUS.is_dir(),
+    reason="archived Run12 corpus is not present in this checkout",
+)
 def test_archived_corpus_c01_to_c13_replays_as_compact_resolvable_text_dossiers() -> None:
-    corpus = (
-        Path(__file__).parents[2]
-        / ".autowork-runs"
-        / "run12-editorial-2026-10-20"
-        / "bridge-comms"
-        / "corpus"
-    )
+    corpus = _ARCHIVED_RUN12_CORPUS
     size_comparison: list[tuple[int, int]] = []
     for case_number in range(1, 14):
         case_id = f"C{case_number:02d}"
