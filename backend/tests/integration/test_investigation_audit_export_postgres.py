@@ -5,6 +5,7 @@ import gzip
 import hashlib
 import io
 import json
+import re
 from collections import Counter
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
@@ -30,6 +31,11 @@ from cti_app.domain.analyst_opinion import (
 from cti_app.domain.blobs import BlobDescriptor, BlobRecord
 from cti_app.domain.classification import TLP
 from cti_app.domain.editions import Edition
+from cti_app.domain.editorial import (
+    AnalystDecision,
+    AnalystDecisionTargetType,
+    AnalystDecisionType,
+)
 from cti_app.domain.entities import Subject
 from cti_app.domain.investigation import (
     AgendaItem,
@@ -89,7 +95,10 @@ from cti_app.infrastructure.database.models.model_execution import (
     ModelConversationTurnRow,
     ModelRunRow,
 )
-from cti_app.infrastructure.database.models.production import AnalystInvestigationRow
+from cti_app.infrastructure.database.models.production import (
+    AnalystDecisionRow,
+    AnalystInvestigationRow,
+)
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
 from tests.integration.edition_codes import reserve_edition_code
@@ -251,6 +260,15 @@ def _canonical_bytes(value: Any) -> bytes:
     )
 
 
+def _fixture_blob_id(reference: str | None) -> str | None:
+    if not isinstance(reference, str) or not reference.startswith("blob://"):
+        return None
+    try:
+        return str(UUID(reference.removeprefix("blob://")))
+    except ValueError:
+        return None
+
+
 def _decoded_events(bundle: AuditBundle) -> list[dict[str, Any]]:
     return [json.loads(line) for line in gzip.decompress(bundle.events).splitlines() if line]
 
@@ -265,6 +283,10 @@ def _encode_events(rows: list[dict[str, Any]]) -> bytes:
 
 def _bundle_with_events(bundle: AuditBundle, rows: list[dict[str, Any]]) -> AuditBundle:
     return replace(bundle, events=_encode_events(rows), event_count=len(rows))
+
+
+def _bundle_with_index(bundle: AuditBundle, index_value: dict[str, Any]) -> AuditBundle:
+    return replace(bundle, index=_canonical_bytes(index_value) + b"\n")
 
 
 def _assert_bundle_matches_database_rows(bundle: AuditBundle, expected: dict[str, Any]) -> None:
@@ -343,6 +365,18 @@ def _assert_bundle_matches_database_rows(bundle: AuditBundle, expected: dict[str
         assert details["status"] == source["status"]
         assert details["content_included"] is False
 
+    decision_events = by_type.get("operator.decision_recorded", [])
+    assert len(decision_events) == len(expected["decisions"]), (
+        "analyst decision IDs or counts differ from canonical PostgreSQL rows"
+    )
+    decision_by_id = {row["record"]["id"]: row for row in decision_events}
+    for decision_id, source in expected["decisions"].items():
+        decision_event = decision_by_id[decision_id]
+        assert decision_event["record"]["version"] is source["version"]
+        assert decision_event["details"]["decision_type"] == source["decision_type"]
+        assert decision_event["details"]["target_type"] == source["target_type"]
+        assert decision_event["details"]["target_id"] == source["target_id"]
+
     opinion_block_events = {
         (row["record"]["id"], row["record"]["version"]): row
         for row in by_type.get("opinion.block_decision", [])
@@ -376,6 +410,10 @@ def _assert_bundle_matches_database_rows(bundle: AuditBundle, expected: dict[str
     assert (
         conversation_events[0]["details"]["head_turn_id"] == expected["conversation_head_turn_id"]
     )
+    for source in expected["decisions"].values():
+        assert source["target_id"] == expected["conversation_id"]
+        assert conversation_events[0]["record"]["id"] == source["target_id"]
+        assert conversation_events[0]["record"]["version"] == source["target_version"]
 
     turns_by_id = {row["record"]["id"]: row for row in turn_events}
     for turn_id, source in expected["turns"].items():
@@ -415,6 +453,61 @@ def _assert_bundle_matches_database_rows(bundle: AuditBundle, expected: dict[str
         for gap in advisor_details["metadata"]["gaps"]
     )
 
+    expected_event_identities: list[tuple[str, str, int | None]] = []
+    expected_event_identities.extend(
+        ("tool_invocation.snapshot", record_id, source["version"])
+        for record_id, source in expected["invocations"].items()
+    )
+    expected_event_identities.extend(
+        ("evidence_observation.recorded", record_id, None) for record_id in expected["observations"]
+    )
+    expected_event_identities.append(
+        ("advisor_call.metadata", expected["advisor_observation_id"], None)
+    )
+    expected_event_identities.extend(
+        ("finding.version_recorded", record_id, version)
+        for record_id, version in expected["findings"]
+    )
+    for record_id, version in expected["opinions"]:
+        expected_event_identities.extend(
+            (
+                ("opinion.version_recorded", record_id, version),
+                ("opinion.block_decision", record_id, version),
+            )
+        )
+    expected_event_identities.extend(
+        ("operator.decision_recorded", record_id, source["version"])
+        for record_id, source in expected["decisions"].items()
+    )
+    expected_event_identities.extend(
+        (
+            (
+                "input_pack.snapshot",
+                expected["investigation_id"],
+                expected["investigation_version"],
+            ),
+            (
+                "model_conversation.snapshot",
+                expected["conversation_id"],
+                expected["conversation_version"],
+            ),
+            ("operator_state.snapshot", expected["investigation_id"], expected["state_version"]),
+            ("audit.snapshot", expected["investigation_id"], None),
+        )
+    )
+    expected_event_identities.extend(
+        ("model_conversation.turn", record_id, None) for record_id in expected["turns"]
+    )
+    expected_event_identities.extend(
+        ("model_run.snapshot", record_id, None) for record_id in expected["model_runs"]
+    )
+    actual_event_identities = Counter(
+        (row["type"], row["record"]["id"], row["record"].get("version")) for row in rows
+    )
+    assert actual_event_identities == Counter(expected_event_identities), (
+        "RUN_EVENTS canonical event/version identities are missing, duplicated, or unexpected"
+    )
+
     counts = Counter(row["type"] for row in rows)
     expected_counts = Counter(
         {
@@ -424,6 +517,7 @@ def _assert_bundle_matches_database_rows(bundle: AuditBundle, expected: dict[str
             "finding.version_recorded": len(expected["findings"]),
             "opinion.version_recorded": len(expected["opinions"]),
             "opinion.block_decision": len(expected["opinions"]),
+            "operator.decision_recorded": len(expected["decisions"]),
             "input_pack.snapshot": 1,
             "model_conversation.snapshot": 1,
             "model_conversation.turn": len(expected["turns"]),
@@ -459,29 +553,61 @@ def _assert_bundle_matches_database_rows(bundle: AuditBundle, expected: dict[str
     index_value = json.loads(bundle.index)
     assert index_value["investigation_id"] == investigation_id
     resources = index_value["resources"]
+    published_opinion_source = next(
+        source
+        for source in expected["opinions"].values()
+        if source["status"] == AnalystOpinionStatus.APPROVED.value
+    )
     resource_keys = {
         (item["kind"], item["id"], str(item.get("version") or "")) for item in resources
     }
     assert all(item["included"] is False for item in resources)
-    assert {
+    expected_resource_keys = {
         ("evidence_observation", observation_id, "") for observation_id in expected["observations"]
-    } <= resource_keys
-    assert {
+    }
+    expected_resource_keys.update(
         ("finding", finding_id, str(version)) for finding_id, version in expected["findings"]
-    } <= resource_keys
-    assert {
+    )
+    expected_resource_keys.update(
         ("analyst_opinion", opinion_id, str(version))
         for opinion_id, version in expected["opinions"]
-    } <= resource_keys
-    assert {
+    )
+    expected_resource_keys.add(("synthesis_artifact", expected["synthesis_artifact_id"], ""))
+    expected_resource_keys.add(
+        (
+            "base_publication_artifact",
+            published_opinion_source["base_publication_artifact_id"],
+            "",
+        )
+    )
+    expected_resource_keys.update(
+        ("tool_response_reference", response_ref, "")
+        for source in expected["invocations"].values()
+        for response_ref in source["response_refs"]
+    )
+    expected_resource_keys.add(("model_conversation", expected["conversation_id"], ""))
+    expected_resource_keys.update(
         ("model_conversation_turn", turn_id, "") for turn_id in expected["turns"]
-    } <= resource_keys
-    assert {("model_run", run_id, "") for run_id in expected["model_runs"]} <= resource_keys
-    assert (
-        "tool_response_reference",
-        expected["missing_response_ref"],
-        "",
-    ) in resource_keys, "missing response reference was not retained in RUN_INDEX"
+    )
+    for _turn_id, source in expected["turns"].items():
+        if source["input_blob_id"] is not None:
+            expected_resource_keys.add(("model_input_blob", source["input_blob_id"], ""))
+        if source["output_blob_id"] is not None:
+            expected_resource_keys.add(("model_output_blob", source["output_blob_id"], ""))
+    expected_resource_keys.update(("model_run", run_id, "") for run_id in expected["model_runs"])
+    for source in expected["model_runs"].values():
+        if source["raw_output_blob_id"] is not None:
+            expected_resource_keys.add(("raw_output", source["raw_output_blob_id"], ""))
+        if source["normalized_output_blob_id"] is not None:
+            expected_resource_keys.add(
+                ("normalized_output", source["normalized_output_blob_id"], "")
+            )
+    for source in expected["decisions"].values():
+        expected_resource_keys.add(("operator_decision_target", source["target_id"], ""))
+    assert resource_keys == expected_resource_keys, (
+        "RUN_INDEX resources differ from the exact canonical PostgreSQL resource set"
+    )
+    assert len(resources) == len(expected_resource_keys), "RUN_INDEX contains duplicate resources"
     missing_reference = next(
         item
         for item in resources
@@ -489,6 +615,9 @@ def _assert_bundle_matches_database_rows(bundle: AuditBundle, expected: dict[str
         and item["id"] == expected["missing_response_ref"]
     )
     assert "target type may be UNKNOWN" in missing_reference["retrieval"]
+    assert expected["missing_response_ref"] in {
+        item["id"] for item in resources if item["kind"] == "tool_response_reference"
+    }, "missing response reference was not retained in RUN_INDEX"
     assert not any(row["record"]["id"] == expected["missing_response_ref"] for row in rows), (
         "missing response ref incorrectly resolved to a persisted event"
     )
@@ -510,6 +639,23 @@ def _assert_bundle_matches_database_rows(bundle: AuditBundle, expected: dict[str
             resources_by_key[("analyst_opinion", opinion_id, str(version))]["content_sha256"]
             == source["content_sha256"]
         )
+        assert source["synthesis_artifact_id"] == expected["synthesis_artifact_id"]
+        assert (
+            source["base_publication_artifact_id"]
+            == published_opinion_source["base_publication_artifact_id"]
+        )
+        assert (
+            resources_by_key[("synthesis_artifact", expected["synthesis_artifact_id"], "")][
+                "sha256"
+            ]
+            == source["synthesis_sha256"]
+        )
+        assert (
+            resources_by_key[
+                ("base_publication_artifact", source["base_publication_artifact_id"], "")
+            ]["sha256"]
+            == source["base_publication_sha256"]
+        )
     for turn_id, source in expected["turns"].items():
         resource = resources_by_key[("model_conversation_turn", turn_id, "")]
         assert resource["input_sha256"] == source["input_sha256"]
@@ -519,6 +665,10 @@ def _assert_bundle_matches_database_rows(bundle: AuditBundle, expected: dict[str
         resource = resources_by_key[("model_run", run_id, "")]
         assert resource["raw_output_sha256"] == source["raw_output_sha256"]
         assert resource["normalized_output_sha256"] == source["normalized_output_sha256"]
+    for source in expected["decisions"].values():
+        decision_target = resources_by_key[("operator_decision_target", source["target_id"], "")]
+        assert decision_target["target_type"] == source["target_type"]
+        assert "version" not in decision_target
     assert not any(item["id"] in expected["foreign_ids"] for item in resources)
     assert index_value["unavailable_resources"] == [
         {
@@ -538,6 +688,69 @@ def _assert_bundle_matches_database_rows(bundle: AuditBundle, expected: dict[str
     trace_text = bundle.trace.decode("utf-8")
     expected_record_ids = {row["record"]["id"] for row in source_events}
     assert all(record_id in trace_text for record_id in expected_record_ids)
+    chronology = trace_text.split("## Chronology\n", maxsplit=1)[1].split(
+        "\n## Questions and hypotheses", maxsplit=1
+    )[0]
+    trace_event_lines = [line for line in chronology.splitlines() if line.startswith("- `")]
+    trace_line_pattern = re.compile(
+        r"^- `[^`]+` \*\*(?P<event_type>[^*]+)\*\* `(?P<record_id>[^`]+)` — "
+    )
+    trace_matches = [trace_line_pattern.match(line) for line in trace_event_lines]
+    assert all(match is not None for match in trace_matches), (
+        "RUN_TRACE chronology contains an unparseable event line"
+    )
+    trace_event_identities = Counter(
+        (match["event_type"], match["record_id"]) for match in trace_matches if match is not None
+    )
+    expected_trace_identities = Counter(
+        (event_type, record_id)
+        for event_type, record_id, _version in expected_event_identities
+        if event_type != "audit.snapshot"
+    )
+    assert trace_event_identities == expected_trace_identities, (
+        "RUN_TRACE event type/ID lines are missing, duplicated, or unexpected"
+    )
+    assert len(trace_event_lines) == len(set(trace_event_lines)), (
+        "RUN_TRACE contains duplicate chronology lines"
+    )
+    expected_trace_type_counts = Counter(
+        event_type
+        for event_type, _record_id, _version in expected_event_identities
+        if event_type != "audit.snapshot"
+    )
+    assert Counter(event_type for event_type, _record_id in trace_event_identities.elements()) == (
+        expected_trace_type_counts
+    ), "RUN_TRACE line counts differ by event type"
+
+    opinion_version_pattern = re.compile(r"^- Opinion `([^`]+)` v(\d+):", re.MULTILINE)
+    trace_opinion_versions = Counter(
+        (match.group(1), int(match.group(2)))
+        for match in opinion_version_pattern.finditer(trace_text)
+    )
+    assert trace_opinion_versions == Counter(expected["opinions"].keys()), (
+        "RUN_TRACE omitted or duplicated an opinion version"
+    )
+    decision_id, decision_source = next(iter(expected["decisions"].items()))
+    decision_chronology_lines = [
+        line
+        for line in trace_event_lines
+        if f"**operator.decision_recorded** `{decision_id}`" in line
+    ]
+    assert len(decision_chronology_lines) == 1
+    assert (
+        f"decision={decision_source['decision_type']} "
+        f"target={decision_source['target_type']}:{decision_source['target_id']}"
+    ) in decision_chronology_lines[0]
+    decision_section = trace_text.split("## Operator decisions\n", maxsplit=1)[1].split(
+        "\n## Sample qualification and detection candidates", maxsplit=1
+    )[0]
+    decision_summary_lines = [
+        line
+        for line in decision_section.splitlines()
+        if f"{decision_source['decision_type']} on "
+        f"{decision_source['target_type']}:{decision_source['target_id']};" in line
+    ]
+    assert len(decision_summary_lines) == 1
     assert PRIVATE_MARKER not in trace_text
     assert PRIVATE_MARKER not in gzip.decompress(bundle.events).decode("utf-8")
     assert PRIVATE_MARKER not in bundle.index.decode("utf-8")
@@ -545,13 +758,17 @@ def _assert_bundle_matches_database_rows(bundle: AuditBundle, expected: dict[str
 
     manifest = json.loads(bundle.manifest)
     assert manifest["investigation_id"] == investigation_id
-    assert manifest["counts"]["events"] == len(rows)
+    assert manifest["counts"]["events"] == len(expected_event_identities)
     assert manifest["counts"]["by_type"] == dict(sorted(counts.items()))
-    assert manifest["counts"]["resources"] == len(resources)
+    assert manifest["counts"]["by_type"]["operator.decision_recorded"] == len(expected["decisions"])
+    assert manifest["counts"]["resources"] == len(expected_resource_keys)
     assert manifest["counts"]["unavailable_resources"] == len(index_value["unavailable_resources"])
     assert manifest["source_snapshot"]["versions"] == expected["source_versions"]
     assert manifest["source_snapshot"]["pivot_conversation_id"] == expected["conversation_id"]
     record_refs = manifest["source_snapshot"]["record_refs"]
+    assert Counter((ref["type"], ref["id"], ref["version"]) for ref in record_refs) == Counter(
+        identity for identity in expected_event_identities if identity[0] != "audit.snapshot"
+    ), "RUN_MANIFEST record refs differ from the exact canonical event/version set"
     assert record_refs == [
         {
             "event_id": row["event_id"],
@@ -561,6 +778,18 @@ def _assert_bundle_matches_database_rows(bundle: AuditBundle, expected: dict[str
         }
         for row in source_events
     ]
+    decision_refs = [
+        ref
+        for ref in record_refs
+        if ref["type"] == "operator.decision_recorded" and ref["id"] == decision_id
+    ]
+    assert len(decision_refs) == 1
+    assert decision_refs[0]["version"] is decision_source["version"]
+    assert decision_refs[0]["event_id"] == decision_by_id[decision_id]["event_id"]
+    assert (
+        manifest["source_snapshot"]["projected_source_sha256"]
+        == hashlib.sha256(_canonical_bytes(source_events)).hexdigest()
+    )
     expected_file_hashes = {
         "RUN_EVENTS.jsonl.gz": bundle.events,
         "RUN_TRACE.md": bundle.trace,
@@ -571,7 +800,7 @@ def _assert_bundle_matches_database_rows(bundle: AuditBundle, expected: dict[str
         assert entry["sha256"] == hashlib.sha256(contents).hexdigest()
         assert entry["bytes"] == len(contents)
     assert manifest["files"]["RUN_EVENTS.jsonl.gz"]["records"] == len(rows)
-    assert manifest["files"]["RUN_INDEX.json"]["resources"] == len(resources)
+    assert manifest["files"]["RUN_INDEX.json"]["resources"] == len(expected_resource_keys)
     assert manifest["files"]["RUN_MANIFEST.json"]["self_sha256"] == "NOT_COMPUTED"
 
 
@@ -824,6 +1053,18 @@ async def test_postgres_audit_snapshot_projects_scoped_rows_and_resumes_without_
                     last_used_at=NOW + timedelta(seconds=16),
                 )
             )
+            analyst_decision = AnalystDecision(
+                investigation_id=target.investigation.id,
+                decision_type=AnalystDecisionType.PIVOT_APPROVE,
+                target_type=AnalystDecisionTargetType.PIVOT,
+                target_id=target.conversation.id,
+                actor_id="synthetic-analyst",
+                reason="Synthetic approval for the pivot conversation",
+                correlation_id=f"l3-decision-{uuid4().hex}",
+                occurred_at=NOW + timedelta(seconds=17),
+                details={"fixture": "synthetic"},
+            )
+            await uow.analyst_decisions.append(analyst_decision)
 
             foreign_blob = _blob(b'{"fixture":"foreign"}', logical_bucket="investigation-test")
             await uow.blobs.add(foreign_blob)
@@ -890,6 +1131,13 @@ async def test_postgres_audit_snapshot_projects_scoped_rows_and_resumes_without_
                     )
                 )
             )
+            decision_rows = list(
+                await session.scalars(
+                    select(AnalystDecisionRow)
+                    .where(AnalystDecisionRow.investigation_id == target_id)
+                    .order_by(AnalystDecisionRow.occurred_at, AnalystDecisionRow.id)
+                )
+            )
             state_row = await session.get(InvestigationWorkingStateRow, target_id)
             investigation_row = await session.get(AnalystInvestigationRow, target_id)
             conversation_row = await session.get(ModelConversationRow, target.conversation.id)
@@ -911,6 +1159,9 @@ async def test_postgres_audit_snapshot_projects_scoped_rows_and_resumes_without_
             assert state_row is not None
             assert investigation_row is not None
             assert conversation_row is not None
+            assert len(decision_rows) == 1
+            assert decision_rows[0].id == analyst_decision.id
+            assert decision_rows[0].target_id == target.conversation.id
             assert await session.get(ToolInvocationRow, foreign_invocation.id) is not None
             assert await session.get(EvidenceObservationRow, foreign_observation.id) is not None
             assert await session.get(ModelConversationTurnRow, foreign_turn.id) is not None
@@ -955,10 +1206,28 @@ async def test_postgres_audit_snapshot_projects_scoped_rows_and_resumes_without_
                 (str(row.opinion_id), row.version): {
                     "content_sha256": row.content_sha256,
                     "status": row.status,
+                    "synthesis_artifact_id": str(row.content["synthesis_artifact_id"]),
+                    "synthesis_sha256": row.content["synthesis_sha256"],
+                    "base_publication_artifact_id": str(
+                        row.content["base_publication_artifact_id"]
+                    ),
+                    "base_publication_sha256": row.content["base_publication_sha256"],
                     "finding_refs": sorted(row.content["blocks"][0]["finding_refs"]),
                     "evidence_refs": sorted(row.content["blocks"][0]["evidence_refs"]),
                 }
                 for row in opinion_rows
+            },
+            "decisions": {
+                str(row.id): {
+                    "decision_type": row.decision_type,
+                    "target_type": row.target_type,
+                    "target_id": str(row.target_id),
+                    "version": None,
+                    "target_version": conversation_row.version
+                    if row.target_id == conversation_row.id
+                    else None,
+                }
+                for row in decision_rows
             },
             "state_version": state_row.version,
             "state_evidence_refs": sorted(state_row.state["hypotheses"][0]["evidence_refs"]),
@@ -970,6 +1239,8 @@ async def test_postgres_audit_snapshot_projects_scoped_rows_and_resumes_without_
                 str(row.id): {
                     "sequence": row.sequence,
                     "model_run_id": str(row.model_run_id),
+                    "input_blob_id": _fixture_blob_id(row.input_blob_reference),
+                    "output_blob_id": _fixture_blob_id(row.output_blob_reference),
                     "input_sha256": row.input_sha256,
                     "output_sha256": row.output_sha256,
                     "parent_turn_id": str(row.parent_turn_id) if row.parent_turn_id else None,
@@ -982,6 +1253,8 @@ async def test_postgres_audit_snapshot_projects_scoped_rows_and_resumes_without_
                     "evidence_pack_hash": row.evidence_pack_hash,
                     "raw_output_sha256": row.raw_output_sha256,
                     "normalized_output_sha256": row.normalized_output_sha256,
+                    "raw_output_blob_id": _fixture_blob_id(row.raw_output_reference),
+                    "normalized_output_blob_id": _fixture_blob_id(row.normalized_output_reference),
                     "turn_id": str(
                         next(turn.id for turn in turn_rows if turn.model_run_id == row.id)
                     ),
@@ -1025,6 +1298,15 @@ async def test_postgres_audit_snapshot_projects_scoped_rows_and_resumes_without_
         assert tuple((str(row.id), row.version) for row in snapshot.opinions) == tuple(
             expected["opinions"]
         )
+        assert tuple(str(row.id) for row in snapshot.analyst_decisions) == tuple(
+            expected["decisions"]
+        )
+        decision_by_id = {str(row.id): row for row in snapshot.analyst_decisions}
+        for decision_id, source in expected["decisions"].items():
+            decision_record = decision_by_id[decision_id]
+            assert decision_record.decision_type.value == source["decision_type"]
+            assert decision_record.target_type.value == source["target_type"]
+            assert str(decision_record.target_id) == source["target_id"]
         assert tuple(str(row.id) for row in snapshot.conversation_turns) == tuple(expected["turns"])
         assert {str(row.id) for row in snapshot.model_runs} == set(expected["model_runs"])
         assert snapshot.hypotheses_state is not None
@@ -1056,6 +1338,55 @@ async def test_postgres_audit_snapshot_projects_scoped_rows_and_resumes_without_
                 )
             )
             _assert_bundle_matches_database_rows(_bundle_with_events(bundle, omitted), expected)
+
+        with pytest.raises(AssertionError, match="analyst decision IDs or counts"):
+            omitted_decision = copy.deepcopy(untouched_rows)
+            omitted_decision.remove(
+                next(row for row in omitted_decision if row["type"] == "operator.decision_recorded")
+            )
+            _assert_bundle_matches_database_rows(
+                _bundle_with_events(bundle, omitted_decision), expected
+            )
+
+        with pytest.raises(AssertionError, match="opinion IDs, versions, or counts"):
+            wrong_opinion_version = copy.deepcopy(untouched_rows)
+            opinion_event = next(
+                row
+                for row in wrong_opinion_version
+                if row["type"] == "opinion.version_recorded" and row["record"]["version"] == 2
+            )
+            opinion_event["record"]["version"] = 1
+            _assert_bundle_matches_database_rows(
+                _bundle_with_events(bundle, wrong_opinion_version), expected
+            )
+
+        with pytest.raises(AssertionError, match="RUN_INDEX resources differ"):
+            omitted_decision_target = json.loads(bundle.index)
+            omitted_decision_target["resources"] = [
+                resource
+                for resource in omitted_decision_target["resources"]
+                if not (
+                    resource["kind"] == "operator_decision_target"
+                    and resource["id"] == str(target.conversation.id)
+                )
+            ]
+            _assert_bundle_matches_database_rows(
+                _bundle_with_index(bundle, omitted_decision_target), expected
+            )
+
+        with pytest.raises(
+            AssertionError, match="RUN_TRACE omitted or duplicated an opinion version"
+        ):
+            trace_lines = bundle.trace.decode("utf-8").splitlines()
+            opinion_id = next(
+                opinion_id for opinion_id, version in expected["opinions"] if version == 2
+            )
+            version_two_line = next(
+                line for line in trace_lines if line.startswith(f"- Opinion `{opinion_id}` v2:")
+            )
+            trace_lines.remove(version_two_line)
+            altered_trace = "\n".join(trace_lines).encode("utf-8")
+            _assert_bundle_matches_database_rows(replace(bundle, trace=altered_trace), expected)
 
         with pytest.raises(AssertionError, match="wrong investigation scope"):
             wrong_scope = copy.deepcopy(untouched_rows)
