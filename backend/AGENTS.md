@@ -51,3 +51,20 @@ For backend-only changes, use:
 Do not run frontend checks for a backend-only change.
 
 Use the full backend suite only when targeted tests are insufficient.
+
+## Advisor evidence and disclosure
+
+Advisor and Bridge dossiers are **permissive by default for CTI evidence** in
+an already-authorized consultation. Raw, hex, bytes, Base64, data URLs,
+network records and long excerpts are data, not format errors: do not
+reintroduce field-name allowlists, 512-byte/16 KiB budgets, silent truncation
+or size-based permission. Keep IDs, SHA-256, offsets, lengths, aliases,
+provenance and idempotence; a large prompt is a transport concern.
+
+Only explicit rules bind: AutoWork operational credentials (provider/service
+keys, tokens, passwords, signed URLs), `do_not_submit`,
+`external_llm_allowed=false`, TLP RED, sample-level restrictions and a denied
+external call. CTI-internal secrets that are part of the evidence (implant
+keys, attacker tokens, published material) are evidence, not AutoWork
+credentials. Every omission must be observable with its reason. P10 has no
+AutoWork prompt-byte ceiling; Bridge owns large-prompt transport.

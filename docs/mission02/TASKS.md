@@ -14,8 +14,8 @@ autorisation d'appel, G2) restent actives. Aucun push, déploiement ou mutation 
 | S6 PDF réel vs 4 références | S0, S4B | `TYPST_REAL_PDF_AUDIT.md`, corrections démontrées testées | Luna xhigh `M02-S6` | DONE `b102a9e6` ; 1 défaut démontré corrigé (chronologie) |
 | S7 code mort | S0 | inventaire preuve + suppressions atomiques testées | Luna xhigh `M02-S7` | DONE `76aefdee` ; 215 tests rejoués par le parent |
 | S4B PDF run (lecture) | S0 | PDF copié hors dépôt, SHA vérifié | parent | DONE |
-| S4A PostgreSQL jetable | S1/S2/S3 | tests ciblés sur base jetable | parent | TODO |
-| S5 scénarios CTI | S1/S2 | scénarios avec/sans échantillon, Bridge alimenté | parent/reviewer | TODO |
+| S4A PostgreSQL jetable | S1/S2/S3 | tests ciblés sur base jetable | parent | PARTIAL : 7 passed (keyset/context, persistance, concurrence invariants) ; export audit réel-DB TODO |
+| S5 scénarios CTI | S1/S2 | scénarios avec/sans échantillon, Bridge alimenté | parent/reviewer | PARTIAL : oracles S1 + anti-slop 16 cas ; scénario complet avec/sans échantillon non rejoué |
 
 ## Faits de revue (2026-10-24)
 
