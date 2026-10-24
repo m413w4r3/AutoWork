@@ -1066,6 +1066,107 @@ async def test_real_typst_pdf_preserves_chp_publication_structure(
 
 
 @pytest.mark.asyncio
+async def test_real_typst_chronology_keeps_month_only_events_beside_derived_figure(
+    tmp_path: Path,
+    typst_binary: str,
+    font_bundle_root: Path,
+) -> None:
+    exact_text = "Exact-dated chronology sentinel."
+    month_text = "Month-only chronology sentinel."
+    render_data = {
+        "schema_version": "typst-publication-model-test",
+        "language": "fr",
+        "title": "Chronology completeness fixture",
+        "document_label": "Test",
+        "document_header": "Publication",
+        "content_sections": [
+            {
+                "type": "references",
+                "show_heading": True,
+                "entries": [
+                    {
+                        "number": 4,
+                        "display_date": "1er mai 2026",
+                        "text": "Reference sentinel.",
+                        "source_urls": ["https://example.invalid/source"],
+                        "target_id": "source-4",
+                    }
+                ],
+                "timeline": [],
+                "blocks": [],
+                "sources": [],
+            },
+            {
+                "type": "chronology",
+                "heading": "Chronologie",
+                "timeline": [
+                    {
+                        "display_date": "18 novembre 2025",
+                        "text": exact_text,
+                        "source_urls": [],
+                        "source_refs": [{"number": 4, "target_id": "source-4"}],
+                    },
+                    {
+                        "display_date": "début mai 2026",
+                        "text": month_text,
+                        "source_urls": [],
+                        "source_refs": [{"number": 4, "target_id": "source-4"}],
+                    },
+                ],
+                "derived_timeline_figure": {
+                    "figure_id": "figure-timeline",
+                    "figure_number": 1,
+                    "title": "Événements datés",
+                    "caption": "Dates reprises des événements cités dans les sources.",
+                    "publication_sha256": "a" * 64,
+                    "events": [
+                        {
+                            "date": "2025-11-18",
+                            "text": exact_text,
+                            "source_refs": [{"number": 4, "target_id": "source-4"}],
+                        }
+                    ],
+                },
+            },
+            {
+                "type": "synthesis",
+                "blocks": [
+                    {
+                        "type": "paragraph",
+                        "text": "Body sentinel.",
+                        "anchor_target": None,
+                        "semantic_spans": [],
+                    }
+                ],
+            },
+        ],
+    }
+    template_bundle = load_template_bundle(_CHP_TYPST_ROOT)
+    workspace_root = tmp_path / "workspace"
+    _build_workspace(
+        workspace_root,
+        bundle_files=template_bundle.files,
+        render_data_bytes=json.dumps(render_data, ensure_ascii=False).encode("utf-8"),
+        media_refs=(),
+    )
+    font_snapshot = load_font_bundle_snapshot(font_bundle_root, _FONT_BUNDLE_LOCK)
+    font_root = tmp_path / "font-snapshot"
+    font_root.mkdir()
+    request = TypstCompileRequest(
+        workspace_root=workspace_root,
+        entrypoint_relative_path="RENDERER/publication.typ",
+        font_paths=materialize_font_bundle(font_snapshot, font_root),
+    )
+
+    compiled = await TypstSubprocessCompiler(binary=str(typst_binary)).compile(request)
+    text, _ = _normalized_pdf_text(PdfReader(BytesIO(compiled.content), strict=True))
+
+    assert "Événements datés" in text
+    assert text.count(exact_text) == 1
+    assert month_text in text
+
+
+@pytest.mark.asyncio
 async def test_real_typst_and_poppler_render_v6_opinion_without_changing_v5(
     tmp_path: Path,
     typst_binary: str,

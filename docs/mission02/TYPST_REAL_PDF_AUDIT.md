@@ -72,8 +72,34 @@ Checks actually run:
   ```
 - The direct offline pytest invocation succeeded without downloading dependencies. `uv run --python 3.12` could not prepare its environment offline: the default uv cache was read-only; with a `/tmp` cache, the required `numpy==2.5.4` wheel was unavailable.
 
-No provider, enrichment, database, MinIO, Docker, or live application path was used. No test file or renderer patch was added because inspection demonstrated no rendering defect to correct; layout differences are recorded for editorial decision.
+No provider, enrichment, database, MinIO, Docker, or live application path was used.
+
+## Correctif démontré — chronologie incomplète (revue parent)
+
+La vérification de complétude menée par le parent sur le document canonique du
+même render (`render-data.json`, SHA-256
+`707edbc814c1e8d873d2c9064e9fc1d27e2989991d60821db853e97f5935746e`) a montré
+un écart que l'inspection visuelle ne pouvait pas révéler : la section
+`chronology` contient **9** entrées `timeline`, mais la figure dérivée
+« Événements datés » n'en retient que **4** (celles avec une date ISO exacte).
+Le template rendait la figure **ou** la timeline, jamais les deux : 5 entrées
+canoniques (novembre 2025, mars 2026, fin mars 2026, avril 2026, début mai 2026)
+étaient absentes du PDF.
+
+Correctif minimal appliqué dans `chpTypst/RENDERER/publication_helpers.typ` :
+quand une figure dérivée existe, les entrées de timeline non représentées par
+un événement de la figure sont rendues à la suite sous forme de liste ordonnée.
+La figure et ses hashes de provenance ne changent pas ; aucun contenu n'est
+dupliqué (les événements datés restent uniquement dans la figure).
+
+Oracle : nouveau test
+`test_real_typst_chronology_keeps_month_only_events_beside_derived_figure`
+(`backend/tests/test_typst_chp_parity.py`). Il échoue sans le correctif
+(`Month-only chronology sentinel.` absent) et passe avec lui. Suite Typst
+complète : **43 passed** (30 render/parité + 12 auparavant bloqués + ce test).
+Statut : `RENDERED_OFFLINE` pour le correctif ; le PDF réel reste
+`INSPECTED_REAL_PDF_READ_ONLY` (il a été produit avant le correctif).
 
 ## Next permissible action
 
-Resolve the identity, reference placement, and provenance pagination choices before making any style changes. No renderer correction is indicated by the inspected subject PDF or successful synthetic render.
+Resolve the identity, reference placement, and provenance pagination choices before making any style changes. The chronology completeness correction above is independent of those editorial choices; no other renderer correction is indicated by the inspected subject PDF or the synthetic render.
