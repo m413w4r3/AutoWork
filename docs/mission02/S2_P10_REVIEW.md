@@ -61,3 +61,17 @@ Verdict: **REVISE**.
 
 - Required: `PYTHONPATH=$PWD/src /home/nill/perso/work/AutoWork/backend/.venv/bin/python -m pytest tests/test_invariant_proposals.py tests/test_bridge_investigator.py tests/test_research_context_builder.py -q --tb=short` — **134 passed in 2.13s**.
 - Offline synthetic renderer checks confirmed the remaining bypasses; no benign-prose over-redaction was observed.
+
+## Final verification after b344a185
+
+Reviewed `b344a185` merged at worktree HEAD `1107f12c66843ff170106809204d853b67fda568`.
+Verdict: **REVISE**; the redaction loop is **not closed**.
+
+- **VERIFIED — prior findings closed for tested forms:** structured sensitive mapping keys redact during normalization ([invariant_proposals.py:2222](/home/nill/.paseo/worktrees/0y1qsxa1/mission02-s2-p10-review/backend/src/cti_app/application/invariant_proposals.py:2222), [test_invariant_proposals.py:1070](/home/nill/.paseo/worktrees/0y1qsxa1/mission02-s2-p10-review/backend/tests/test_invariant_proposals.py:1070)). URL checks cover percent-encoded query names, fragments, scheme-less signed URLs, and username-only userinfo ([test_invariant_proposals.py:1027](/home/nill/.paseo/worktrees/0y1qsxa1/mission02-s2-p10-review/backend/tests/test_invariant_proposals.py:1027)). Representative mixed-case/separator text labels redact; `token_count`, `author`, and `client_id` controls remain intact.
+- **HIGH — VERIFIED residual, general free-text class:** quoted JSON credentials in claim text still reach the rendered prompt. Synthetic `_normalize_context` → `_render_p10_prompt` check: `{"auth": "FIXTURE_JSON_AUTH"}` preserves the fixture secret. `_TEXT_ASSIGNMENT` does not accept the quote after the key, so its matcher misses this common JSON-text form ([invariant_proposals.py:2301](/home/nill/.paseo/worktrees/0y1qsxa1/mission02-s2-p10-review/backend/src/cti_app/application/invariant_proposals.py:2301), [invariant_proposals.py:2361](/home/nill/.paseo/worktrees/0y1qsxa1/mission02-s2-p10-review/backend/src/cti_app/application/invariant_proposals.py:2361)). This is an in-scope P10 disclosure defect; add quoted assignment handling and renderer-path coverage before approval.
+- **VERIFIED:** representative `AuTh_ToKen`, `X-Amz-Security-Token`, and `client-Secret` values redact; benign `token_count=5`, `client_id=client-123`, and `author=Jane` remain. No provider or live runtime was called.
+
+### Final verification checks
+
+- Required: `PYTHONPATH=$PWD/src /home/nill/perso/work/AutoWork/backend/.venv/bin/python -m pytest tests/test_invariant_proposals.py tests/test_bridge_investigator.py tests/test_research_context_builder.py -q --tb=short` — **135 passed in 2.31s**.
+- Offline synthetic renderer check confirmed the quoted-JSON residual; `git diff --check` passed.
