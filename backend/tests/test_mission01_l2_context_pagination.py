@@ -13,9 +13,11 @@ import cti_app.infrastructure.database.repositories.investigation as investigati
 from cti_app.application.context_pagination import (
     ContextOmissionManifestEntryV1,
     ContextOmissionReason,
+    KeysetPageV1,
     decode_keyset_cursor,
     encode_keyset_cursor,
     make_keyset_page,
+    verify_manifest_entry,
     verify_page_sha256,
 )
 from cti_app.application.investigation_contracts import ArticleContextV1
@@ -355,6 +357,18 @@ def test_page_sha256_rejects_falsification_of_every_page_field() -> None:
     assert verify_page_sha256(**baseline)
 
     omission = page.omission_manifest[0]
+    assert verify_manifest_entry(
+        omission,
+        page,
+        section="findings",
+        investigation_id=investigation_id,
+    )
+    assert not verify_manifest_entry(
+        omission,
+        page.model_copy(update={"source_ref": "investigation:forged"}),
+        section="findings",
+        investigation_id=investigation_id,
+    )
     changed_counts = omission.model_copy(
         update={
             "selected": 0,
@@ -387,6 +401,28 @@ def test_page_sha256_rejects_falsification_of_every_page_field() -> None:
         descending=False,
         context_sha256="c" * 64,
     )
+    manifest_falsifications = (
+        {"source_ref": "investigation:forged"},
+        {"page_sha256": "d" * 64},
+        {"source_bounded": False},
+        {"unbounded_reason": "forged"},
+        {"context_sha256": "d" * 64},
+        {"cursor": changed_input_cursor},
+        {"pivot": {**page.pivot, "item_id": str(UUID(int=77))}},
+        {"descending": not page.descending},
+        {"limit": page.limit + 1},
+        {"has_more": not page.has_more},
+        {"cursor_authentication": None},
+    )
+    for changes in manifest_falsifications:
+        changed_entry = omission.model_copy(update=changes)
+        assert not verify_manifest_entry(
+            changed_entry,
+            page,
+            section="findings",
+            investigation_id=investigation_id,
+        ), changes
+
     falsifications = (
         {"pivot": {**page.pivot, "item_id": str(UUID(int=77))}},
         {"investigation_id": uuid4()},
@@ -402,9 +438,29 @@ def test_page_sha256_rejects_falsification_of_every_page_field() -> None:
         {"descending": not page.descending},
         {"section": "evidence_index"},
         {"next_cursor": changed_output_pivot},
+        *(
+            {"omission_manifest": (omission.model_copy(update=changes),)}
+            for changes in manifest_falsifications
+        ),
     )
     for changed in falsifications:
         assert not verify_page_sha256(**(baseline | changed)), changed
+
+
+def test_legacy_keyset_page_v1_payload_uses_new_field_defaults() -> None:
+    legacy_payload = {
+        "items": (),
+        "total": 0,
+        "has_more": False,
+        "page_sha256": "a" * 64,
+        "source_ref": "investigation:legacy:evidence_index:start=start:limit=1",
+    }
+
+    page = KeysetPageV1[dict[str, str]].model_validate(legacy_payload)
+
+    assert page.source_bounded is True
+    assert page.unbounded_reason is None
+    assert page.cursor_authentication == "unauthenticated_position"
 
 
 def test_disclosure_controls_refuse_external_context_submission() -> None:

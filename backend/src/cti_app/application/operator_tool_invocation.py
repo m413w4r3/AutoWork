@@ -23,6 +23,7 @@ from cti_app.application.context_pagination import (
     decode_keyset_cursor,
     decode_offset_cursor,
     encode_offset_cursor,
+    verify_manifest_entry,
 )
 from cti_app.application.evidence_recorder import _sanitize_json, sanitize_evidence_text
 from cti_app.application.investigation_contracts import (
@@ -160,6 +161,7 @@ def _materialized_page_proof(
     has_more = next_offset < total
     omitted = total - len(items)
     omission_reasons = {ContextOmissionReason.SOURCE_NOT_PAGINATED: omitted} if omitted else {}
+    unbounded_reason = "The context section was materialized before page selection"
     pivot = {
         "kind": "offset",
         "section": section,
@@ -174,7 +176,7 @@ def _materialized_page_proof(
         "omitted": omitted,
         "source_bounded": False,
         "omission_reasons": omission_reasons,
-        "unbounded_reason": "The context section was materialized before page selection",
+        "unbounded_reason": unbounded_reason,
     }
     page_sha256 = canonical_page_sha256(
         section=section,
@@ -202,27 +204,48 @@ def _materialized_page_proof(
         if next_offset < total
         else None
     )
+    entry = ContextOmissionManifestEntryV1(
+        section=section,
+        total=total,
+        selected=len(items),
+        omitted=omitted,
+        source_bounded=False,
+        source_ref=source_ref,
+        page_sha256=page_sha256,
+        omission_reasons=omission_reasons,
+        unbounded_reason=unbounded_reason,
+        context_sha256=context_sha256,
+        cursor=cursor,
+        pivot=pivot,
+        descending=False,
+        limit=limit,
+        has_more=has_more,
+    )
+    page_manifest = {
+        "section": section,
+        "total": total,
+        "selected": len(items),
+        "omitted": omitted,
+        "source_bounded": False,
+        "source_ref": source_ref,
+        "page_sha256": page_sha256,
+        "omission_reasons": omission_reasons,
+        "unbounded_reason": unbounded_reason,
+        "context_sha256": context_sha256,
+        "cursor": cursor,
+        "pivot": pivot,
+        "descending": False,
+        "limit": limit,
+        "has_more": has_more,
+        "cursor_authentication": None,
+    }
+    if not verify_manifest_entry(entry, page_manifest, expected_source_ref=source_ref):
+        raise ValueError("Operator context page manifest is inconsistent")
     return (
         page_sha256,
         source_ref,
         next_cursor,
-        ContextOmissionManifestEntryV1(
-            section=section,
-            total=total,
-            selected=len(items),
-            omitted=omitted,
-            source_bounded=False,
-            source_ref=source_ref,
-            page_sha256=page_sha256,
-            omission_reasons=(omission_reasons),
-            unbounded_reason=("The context section was materialized before page selection"),
-            context_sha256=context_sha256,
-            cursor=cursor,
-            pivot=pivot,
-            descending=False,
-            limit=limit,
-            has_more=has_more,
-        ),
+        entry,
         pivot,
         has_more,
     )

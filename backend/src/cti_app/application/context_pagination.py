@@ -311,7 +311,7 @@ def verify_page_sha256(
                 return False
         else:
             return False
-    return claimed_sha256 == canonical_page_sha256(
+    if claimed_sha256 != canonical_page_sha256(
         section=section,
         investigation_id=investigation_id,
         items=items,
@@ -324,7 +324,161 @@ def verify_page_sha256(
         total=total,
         has_more=has_more,
         omission_manifest=omission_manifest,
+    ):
+        return False
+
+    omission_entries = _manifest_entries(omission_manifest)
+    expected_source_ref = source_reference(
+        section=section,
+        investigation_id=investigation_id,
+        cursor=cursor,
+        page_sha256=claimed_sha256,
+        limit=limit,
     )
+    expected_omitted = max(0, total - len(items))
+    expected_page = {
+        "section": section,
+        "total": total,
+        "selected": len(items),
+        "omitted": expected_omitted,
+        "source_bounded": None,
+        "source_ref": expected_source_ref,
+        "page_sha256": claimed_sha256,
+        "omission_reasons": (
+            {ContextOmissionReason.PAGINATION: expected_omitted} if expected_omitted else {}
+        ),
+        "unbounded_reason": None,
+        "context_sha256": context_sha256,
+        "cursor": cursor,
+        "pivot": dict(pivot) if pivot is not None else None,
+        "descending": descending,
+        "limit": limit,
+        "has_more": has_more,
+        "cursor_authentication": "unauthenticated_position",
+    }
+    for entry in omission_entries:
+        entry_authentication = _field(entry, "cursor_authentication")
+        entry_pivot = _field(entry, "pivot")
+        is_keyset_manifest = (
+            entry_authentication == "unauthenticated_position"
+            or (isinstance(entry_pivot, Mapping) and entry_pivot.get("kind") == "keyset")
+            or (pivot is not None and pivot.get("kind") == "keyset")
+        )
+        if not is_keyset_manifest:
+            continue
+        # Boundedness is itself included in the page digest. Preserve the value
+        # from the entry here while checking every field that describes the page.
+        expected_page["source_bounded"] = _field(entry, "source_bounded")
+        expected_page["unbounded_reason"] = _field(entry, "unbounded_reason")
+        if not verify_manifest_entry(
+            entry,
+            expected_page,
+            section=section,
+            investigation_id=investigation_id,
+            expected_source_ref=expected_source_ref,
+        ):
+            return False
+    return True
+
+
+def verify_manifest_entry(
+    entry: Any,
+    page: Any,
+    *,
+    section: str | None = None,
+    investigation_id: UUID | None = None,
+    expected_source_ref: str | None = None,
+) -> bool:
+    """Check that a manifest row describes its page and its recomputed source reference."""
+    page_section = _field(page, "section", section)
+    page_investigation_id = _field(page, "investigation_id", investigation_id)
+    cursor = _field(page, "cursor")
+    page_sha256 = _field(page, "page_sha256")
+    limit = _field(page, "limit")
+    if expected_source_ref is None:
+        if page_section is None or page_investigation_id is None:
+            return False
+        try:
+            expected_source_ref = source_reference(
+                section=page_section,
+                investigation_id=page_investigation_id,
+                cursor=cursor,
+                page_sha256=page_sha256,
+                limit=limit,
+            )
+        except (TypeError, ValueError):
+            return False
+    page_source_ref = _field(page, "source_ref")
+    if page_source_ref is not _MISSING and page_source_ref != expected_source_ref:
+        return False
+
+    page_items = _field(page, "items", ())
+    total = _field(page, "total")
+    selected = _field(page, "selected", len(page_items))
+    omitted = _field(page, "omitted", total - selected if isinstance(total, int) else None)
+    omission_reasons = _field(
+        page,
+        "omission_reasons",
+        {ContextOmissionReason.PAGINATION: omitted} if omitted else {},
+    )
+    expected = {
+        "section": page_section,
+        "total": total,
+        "selected": selected,
+        "omitted": omitted,
+        "source_bounded": _field(page, "source_bounded"),
+        "source_ref": expected_source_ref,
+        "page_sha256": page_sha256,
+        "omission_reasons": omission_reasons,
+        "unbounded_reason": _field(page, "unbounded_reason"),
+        "context_sha256": _field(page, "context_sha256"),
+        "cursor": cursor,
+        "pivot": _field(page, "pivot"),
+        "descending": _field(page, "descending"),
+        "limit": limit,
+        "has_more": _field(page, "has_more"),
+        "cursor_authentication": _field(
+            page, "cursor_authentication", "unauthenticated_position"
+        ),
+    }
+    for field, expected_value in expected.items():
+        actual_value = _field(entry, field)
+        if actual_value is _MISSING:
+            if field in {
+                "section",
+                "total",
+                "selected",
+                "omitted",
+                "source_bounded",
+                "source_ref",
+                "page_sha256",
+                "omission_reasons",
+            }:
+                return False
+            continue
+        if field == "omission_reasons":
+            if _canonicalize(actual_value) != _canonicalize(expected_value):
+                return False
+        elif _canonicalize(actual_value) != _canonicalize(expected_value):
+            return False
+    return True
+
+
+_MISSING = object()
+
+
+def _field(value: Any, name: str, default: Any = _MISSING) -> Any:
+    if isinstance(value, Mapping):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+def _manifest_entries(value: Any) -> tuple[Any, ...]:
+    if isinstance(value, ContextOmissionManifestEntryV1 | Mapping):
+        return (value,)
+    if isinstance(value, tuple | list):
+        return tuple(value)
+    return ()
 
 
 def source_reference(

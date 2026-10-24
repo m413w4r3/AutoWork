@@ -241,6 +241,8 @@ def _memory_keyset_page(
         cursor=cursor,
         position=position_fn,
         descending=descending,
+        source_bounded=False,
+        unbounded_reason="In-memory repository materializes the full collection",
     )
 
 

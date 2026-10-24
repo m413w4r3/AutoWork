@@ -19,6 +19,7 @@ from cti_app.application.bridge_investigator import (
 from cti_app.application.context_pagination import (
     ContextOmissionReason,
     canonical_page_sha256,
+    make_keyset_page,
 )
 from cti_app.application.evidence_recorder import ProductionEvidenceRecorder
 from cti_app.application.investigation_acquisition_tools import (
@@ -3321,10 +3322,9 @@ async def test_small_context_hash_includes_bounded_advisor_guidance() -> None:
 
     assert context.advisor_guidance.checkpoint_due is False
     assert context.advisor_guidance.truncated is False
-    # The bounded reminder is part of canonical_bytes(); the D guidance update
-    # changes this deterministic fixture digest.
+    # The bounded reminder and source pagination flags are canonical context.
     assert hashlib.sha256(context.canonical_bytes()).hexdigest() == (
-        "67be1e93fe213b54ab3f6d1d95da6d7c2e535283273af27536164f325592ee6d"
+        "3f3c0fd550438a6f2b3b4cee31cad0e1dcc11c17e31775193366ec794ad99059"
     )
 
 
@@ -3653,21 +3653,15 @@ async def test_context_build_pages_large_sources_with_fixed_memory_budget_and_ma
         def __init__(self) -> None:
             super().__init__()
             self.observed_page_sizes = []
-            self.direct_list_calls = 0
-            self._inside_page = False
+            self.list_calls = 0
 
         async def page_for_investigation(self, investigation_id, **kwargs):
-            self._inside_page = True
-            try:
-                page = await super().page_for_investigation(investigation_id, **kwargs)
-                self.observed_page_sizes.append((kwargs["limit"], len(page.items)))
-                return page
-            finally:
-                self._inside_page = False
+            page = await super().page_for_investigation(investigation_id, **kwargs)
+            self.observed_page_sizes.append((kwargs["limit"], len(page.items)))
+            return page
 
         async def list_for_investigation(self, investigation_id):
-            if not self._inside_page:
-                self.direct_list_calls += 1
+            self.list_calls += 1
             return await super().list_for_investigation(investigation_id)
 
     class InstrumentedFindings(InMemoryFindingRepository):
@@ -3676,21 +3670,15 @@ async def test_context_build_pages_large_sources_with_fixed_memory_budget_and_ma
         def __init__(self) -> None:
             super().__init__()
             self.observed_page_sizes = []
-            self.direct_list_calls = 0
-            self._inside_page = False
+            self.list_calls = 0
 
         async def page_for_investigation(self, investigation_id, **kwargs):
-            self._inside_page = True
-            try:
-                page = await super().page_for_investigation(investigation_id, **kwargs)
-                self.observed_page_sizes.append((kwargs["limit"], len(page.items)))
-                return page
-            finally:
-                self._inside_page = False
+            page = await super().page_for_investigation(investigation_id, **kwargs)
+            self.observed_page_sizes.append((kwargs["limit"], len(page.items)))
+            return page
 
         async def list_for_investigation(self, investigation_id):
-            if not self._inside_page:
-                self.direct_list_calls += 1
+            self.list_calls += 1
             return await super().list_for_investigation(investigation_id)
 
     class InstrumentedInvocations(InMemoryToolInvocationRepository):
@@ -3699,21 +3687,15 @@ async def test_context_build_pages_large_sources_with_fixed_memory_budget_and_ma
         def __init__(self) -> None:
             super().__init__()
             self.observed_page_sizes = []
-            self.direct_list_calls = 0
-            self._inside_page = False
+            self.list_calls = 0
 
         async def page_for_investigation(self, investigation_id, **kwargs):
-            self._inside_page = True
-            try:
-                page = await super().page_for_investigation(investigation_id, **kwargs)
-                self.observed_page_sizes.append((kwargs["limit"], len(page.items)))
-                return page
-            finally:
-                self._inside_page = False
+            page = await super().page_for_investigation(investigation_id, **kwargs)
+            self.observed_page_sizes.append((kwargs["limit"], len(page.items)))
+            return page
 
         async def list_for_investigation(self, investigation_id):
-            if not self._inside_page:
-                self.direct_list_calls += 1
+            self.list_calls += 1
             return await super().list_for_investigation(investigation_id)
 
     observations = InstrumentedObservations()
@@ -3805,16 +3787,80 @@ async def test_context_build_pages_large_sources_with_fixed_memory_budget_and_ma
     assert observations.observed_page_sizes == [(MAX_CONTEXT_SOURCE_PAGE, MAX_CONTEXT_SOURCE_PAGE)]
     assert findings.observed_page_sizes == [(MAX_CONTEXT_SOURCE_PAGE, MAX_CONTEXT_SOURCE_PAGE)]
     assert invocations.observed_page_sizes == [(MAX_CONTEXT_SOURCE_PAGE, MAX_CONTEXT_SOURCE_PAGE)]
-    assert observations.direct_list_calls == findings.direct_list_calls == 0
-    assert invocations.direct_list_calls == 0
+    # In-memory page methods call list_for_investigation and materialize the full source.
+    assert observations.list_calls == findings.list_calls == invocations.list_calls == 1
     manifest = {entry.section: entry for entry in context.investigation.pagination_manifest}
     for section in ("evidence_index", "findings", "tool_coverage"):
         entry = manifest[section]
-        assert entry.source_bounded is True
+        assert entry.source_bounded is False
+        assert entry.unbounded_reason == (
+            "In-memory repository materializes the full collection"
+        )
         assert entry.total == MAX_CONTEXT_SOURCE_PAGE + 1
         assert entry.selected + entry.omitted == entry.total
         assert sum(entry.omission_reasons.values()) == entry.omitted
         assert ContextOmissionReason.PAGINATION in entry.omission_reasons
+
+    class BoundedPageRepository:
+        def __init__(self, delegate):
+            self.delegate = delegate
+            self.page_calls = 0
+            self.list_lookups = 0
+
+        def __getattr__(self, name):
+            if name == "list_for_investigation":
+                self.list_lookups += 1
+                raise AttributeError(name)
+            return getattr(self.delegate, name)
+
+        async def page_for_investigation(
+            self,
+            investigation_id,
+            *,
+            cursor,
+            limit,
+            descending=False,
+            section="evidence_observations",
+        ):
+            self.page_calls += 1
+            return make_keyset_page(
+                section=section,
+                investigation_id=investigation_id,
+                items=(),
+                total=0,
+                limit=limit,
+                cursor=cursor,
+                position=lambda item: (datetime.min.replace(tzinfo=UTC), UUID(int=0)),
+                descending=descending,
+                source_bounded=True,
+            )
+
+    bounded_observations = BoundedPageRepository(observations)
+    bounded_builder = ResearchContextBuilder(
+        article_snapshots=_SnapshotPort(snapshot),
+        observations=bounded_observations,
+        findings=findings,
+        invocations=invocations,
+    )
+    bounded_context = await bounded_builder.build(
+        investigation_id=investigation_id,
+        synthesis_artifact_id=snapshot.synthesis_artifact_id,
+        state=_state(investigation_id),
+        tool_context=ToolExecutionContext(
+            investigation_id=investigation_id,
+            envelope=envelope,
+            budget=envelope.budget,
+            idempotency_key="bounded-context-true-source-fixture",
+        ),
+        budget_remaining={},
+    )
+    bounded_entry = {
+        entry.section: entry for entry in bounded_context.investigation.pagination_manifest
+    }["evidence_index"]
+    assert bounded_observations.page_calls == 1
+    assert bounded_observations.list_lookups == 0
+    assert bounded_entry.source_bounded is True
+    assert bounded_entry.unbounded_reason is None
 
     class NoPageRepository:
         def __init__(self, delegate):
