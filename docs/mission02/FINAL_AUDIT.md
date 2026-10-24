@@ -3,7 +3,7 @@
 **Date :** 2026-10-24. **Périmètre :** intégration locale, documentation finale.
 **Base mission/S0 :** `e4abba495d9f5fdc296e2ba80b65442855625474`.
 **SHA du code intégré audité et du gate final :**
-`d4c4c2ed836d60eef150a0ce80f48ae171cee8e0`.
+`8574328c` (le commit documentaire final est au-dessus, sur `main`).
 
 ## Résultats par lot
 
@@ -62,19 +62,22 @@
   Exhaustivité des figures/sections au-delà de ces contrôles : `UNKNOWN`.
 - S7 : commit `76aefdee`; suppressions de `_source_figure_candidates` et
   `OperatorToolInvocationService.get_context_summary`, 54 LOC source.
+- Style : lot mécanique `1eaad508` sur 10 fichiers backend préexistants;
+  AST identiques avant/après, 166 tests ciblés passés, `make lint-backend`
+  vert (842 fichiers formatés).
 - Delta net estimé des lots : environ −99 LOC source (S1 −64, S2 +1, S7 −54,
   template S6 +18); aucun nouveau module ni moteur de politique.
 
 ## Résultats de vérification
 
 - Gate backend final sur le code intégré : **4708 passed, 2 skipped,
-  30 deselected** en 124 s avec Typst 0.15.1 fonctionnel et polices du
-  checkout principal. Résultats ciblés : S1 171; S2 135; S6 43; S7 215;
-  audit/L2/B1B 66; PostgreSQL jetable 7.
+  30 deselected** en 129 s avec Typst 0.15.1 fonctionnel et polices du
+  checkout principal, après le lot de formatage. Résultats ciblés : S1 171;
+  S2 135; S6 43; S7 215; audit/L2/B1B 66; PostgreSQL jetable 7; style 166.
 - Mypy ciblé propre sur `invariant_proposals.py`, `advisor_dossier.py`,
   `investigation_advisor_tools.py`, `publication_secret_guard.py`. Mypy
-  repo-wide : 58 erreurs préexistantes dans 11 fichiers. Ruff propre sur les
-  fichiers modifiés; formatage repo-wide : 10 fichiers préexistants.
+  repo-wide : 58 erreurs préexistantes dans 11 fichiers. Ruff repo-wide :
+  vert après `1eaad508` (check et format, 842 fichiers).
 - Les 33 échecs historiques liés à l'environnement Typst sont résolus sur
   cet hôte avec le binaire Typst indiqué dans `HANDOFF.md`; ce constat est
   local à cet hôte. Sans cet environnement, 5 tests Typst échouent sur le

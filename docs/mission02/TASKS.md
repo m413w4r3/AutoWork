@@ -1,7 +1,7 @@
 # Mission 02 V2 — registre de lots
 
 **Base de mission (S0) :** `main@e4abba495d9f5fdc296e2ba80b65442855625474` (2026-10-24).
-**Base de livraison docs :** `main@d4c4c2ed836d60eef150a0ce80f48ae171cee8e0`, branche `mission02/final-docs`.
+**Base du lot documentaire :** `d4c4c2ed`; **code final audité :** `8574328c`.
 **Politique :** ALLOW par défaut pour les preuves CTI dans une consultation déjà autorisée ;
 les restrictions explicites (secrets, `do_not_submit`, `external_llm_allowed=false`, TLP,
 autorisation d'appel, G2) restent actives. Aucun push, déploiement ou mutation live.
@@ -44,19 +44,19 @@ autorisation d'appel, G2) restent actives. Aucun push, déploiement ou mutation 
 
 ## Gate final (2026-10-24)
 
-- Suite backend complète sur main intégré, avec un Typst 0.15.1 fonctionnel
-  (`PATH`/`TYPST_BINARY=/snap/typst/current/bin/typst`,
+- Suite backend complète sur `main` intégré (`8574328c`), avec un Typst 0.15.1
+  fonctionnel (`PATH`/`TYPST_BINARY=/snap/typst/current/bin/typst`,
   `FONT_BUNDLE_ROOT=chpTypst`) :
-  **4708 passed, 2 skipped, 30 deselected** en 124 s.
+  **4708 passed, 2 skipped, 30 deselected** en 129 s.
 - Sans ce binôme d'environnement, 5 tests Typst échouent sur le snap
   `/snap/bin/typst` cassé (`snap-confine`), pas sur le code.
 - Tests ciblés : S1 171, S2 135, S6 43, S7 215, audit/L2/B1B 66,
-  intégration PostgreSQL jetable 7. Tous verts.
+  intégration PostgreSQL jetable 7, style 166. Tous verts.
 - Mypy ciblé : `invariant_proposals.py`, `advisor_dossier.py`,
   `investigation_advisor_tools.py`, `publication_secret_guard.py` propres.
   Le mypy repo-wide conserve 58 erreurs préexistantes dans 11 fichiers.
-- Ruff : fichiers modifiés propres ; le formatage repo-wide conserve
-  10 fichiers préexistants non formatés (lot mécanique séparé).
+- Ruff : lot mécanique `1eaad508` (AST identiques) ; `make lint-backend`
+  vert ensuite (`ruff check` et format, 842 fichiers).
 
 
 ## S0 — faits vérifiés (2026-10-24)

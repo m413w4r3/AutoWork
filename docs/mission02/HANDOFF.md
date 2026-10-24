@@ -5,9 +5,10 @@
 - SHA de base de mission/S0 :
   `e4abba495d9f5fdc296e2ba80b65442855625474`.
 - SHA exact du code intégré audité et du gate final :
-  `d4c4c2ed836d60eef150a0ce80f48ae171cee8e0`.
-- La branche `mission02/final-docs` part de ce dernier SHA; elle ne contient
-  que la livraison documentaire. Pas de push ni déploiement.
+  `8574328c` (le commit documentaire final est au-dessus, sur `main`).
+- La branche `mission02/final-docs` part de `d4c4c2ed`; le lot de style
+  mécanique `1eaad508` et les fusions locales la précèdent sur `main`.
+  Pas de push ni déploiement.
 - Registre des lots : [TASKS.md](TASKS.md). Résultats détaillés :
   [FINAL_AUDIT.md](FINAL_AUDIT.md), [TYPST_REAL_PDF_AUDIT.md](TYPST_REAL_PDF_AUDIT.md),
   [S1_PERMISSIVE_REVIEW.md](S1_PERMISSIVE_REVIEW.md),
@@ -30,11 +31,17 @@ make test-backend
 ```
 
 Résultat consigné sur le SHA ci-dessus : **4708 passed, 2 skipped,
-30 deselected** en 124 s. Sans ces variables, cinq tests Typst échouent sur
-`/snap/bin/typst` cassé. Les 33 échecs historiques liés à Typst sont résolus
-sur cet hôte avec le binaire fonctionnel; ce résultat n'est pas une preuve
-sur un autre hôte. Ne pas confondre ce gate hors intégration avec les 7 tests
-PostgreSQL exécutés séparément sur une base jetable.
+30 deselected** en 129 s, après le lot de formatage. Sans ces variables,
+cinq tests Typst échouent sur `/snap/bin/typst` cassé. Les 33 échecs
+historiques liés à Typst sont résolus sur cet hôte avec le binaire
+fonctionnel; ce résultat n'est pas une preuve sur un autre hôte. Ne pas
+confondre ce gate hors intégration avec les 7 tests PostgreSQL exécutés
+séparément sur une base jetable.
+
+Lint backend : `make lint-backend` vert après `1eaad508` (`ruff check` et
+`ruff format --check`, 842 fichiers). Le lot de style est AST-identique;
+166 tests ciblés ont été rejoués. Mypy repo-wide conserve 58 erreurs
+préexistantes dans 11 fichiers, hors modules Mission 02 modifiés.
 
 ## États, inconnues et risques ouverts
 
