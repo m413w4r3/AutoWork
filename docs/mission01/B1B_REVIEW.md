@@ -129,4 +129,25 @@ branche. Ajouter une assertion directe.
 
 PostgreSQL concurrent, transport Bridge réel, coût : **UNKNOWN**.
 
+## Vérification finale R4 — PASS
+
+**Objet :** `a94986fdd2f859c9bf05572cd3957ca3dbf13598` (delta
+`4604ac1..a94986f`).
+**Revue :** agent `772a15d5-b63a-4899-a6c2-559829f7bea7`, Luna xhigh.
+**Oracle rejoué :** 241 passed (ciblé), 294 passed / 6 skipped (élargi).
+
+Aucun constat BLOCKER/HIGH/MEDIUM/LOW. Tout 429 applique un cooldown partagé
+plafonné à 300 s avant décision ; au-delà du plafond, aucun retry ; le chemin
+retryable ne pose pas de second defer. Le LOW R3 est couvert par l'assertion
+du pacer dans le test paramétré. Contrôles G2/TLP/B1A1/B1A2 inchangés.
+
+Résiduels : `turn` sans deadline globale (attente jusqu'à 300 s), concurrence
+PostgreSQL et transport Bridge réel non vérifiés, coût **UNKNOWN**.
+
+## Intégration
+
+Branche `feat/mission01-b1b-temporal-recovery` fusionnée dans
+`chore/mission01-integration` au commit `10b0e35`. Oracle rejoué sur
+l'intégration : 241 passed, 294 passed / 6 skipped.
+
 
