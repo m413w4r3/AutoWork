@@ -5,7 +5,7 @@ from __future__ import annotations
 import ipaddress
 import os
 import re
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -156,6 +156,74 @@ def redact_operational_secrets(value: Any, *, settings: Any | None = None) -> tu
 def contains_operational_secrets(value: Any, *, settings: Any | None = None) -> bool:
     cleaned, count = redact_operational_secrets(value, settings=settings)
     return count > 0 or cleaned != value
+
+
+def configured_operational_secret_values(settings: Any | None) -> tuple[str, ...]:
+    """Return configured secret strings without consulting ambient process state."""
+    if settings is None:
+        return ()
+    model_fields = getattr(type(settings), "model_fields", {})
+    if isinstance(model_fields, Mapping) and model_fields:
+        field_names = model_fields.keys()
+    else:
+        try:
+            field_names = vars(settings)
+        except TypeError:
+            return ()
+
+    values: set[str] = set()
+    for name in field_names:
+        value = getattr(settings, name, None)
+        secret_value = getattr(value, "get_secret_value", None)
+        if callable(secret_value):
+            candidate = secret_value()
+            if isinstance(candidate, str) and candidate and candidate != _SECRET_REDACTION:
+                values.add(candidate)
+        elif isinstance(value, str) and (
+            _is_operational_field_name(str(name)) or _is_sensitive_url(value)
+        ):
+            if value and value != _SECRET_REDACTION:
+                values.add(value)
+    return tuple(sorted(values, key=lambda item: (-len(item), item)))
+
+
+def contains_explicit_operational_secrets(
+    value: Any, *, operational_secret_values: Sequence[str] = ()
+) -> bool:
+    """Check deterministic secret patterns and caller-supplied values only.
+
+    This guard is safe for pure parsing paths: it does not load settings, inspect
+    environment variables, or resolve current/home paths.
+    """
+    explicit_values = tuple(
+        (item, "service_credential", False)
+        for item in operational_secret_values
+        if isinstance(item, str) and item and item != _SECRET_REDACTION
+    )
+
+    def contains(item: Any, *, field_name: str = "") -> bool:
+        if isinstance(item, Mapping):
+            for key, child in item.items():
+                child_name = str(key)
+                if _is_operational_field_name(child_name) and child not in (
+                    None,
+                    False,
+                    True,
+                    _SECRET_REDACTION,
+                ):
+                    return True
+                if contains(child, field_name=child_name):
+                    return True
+            return False
+        if isinstance(item, (list, tuple)):
+            return any(contains(child, field_name=field_name) for child in item)
+        if isinstance(item, Path):
+            item = str(item)
+        if not isinstance(item, str):
+            return False
+        return _operational_secret_type(item, field_name, explicit_values) is not None
+
+    return contains(value)
 
 
 def _operational_values(settings: Any | None) -> tuple[tuple[str, str, bool], ...]:
@@ -492,6 +560,8 @@ def _valid_ioc_value(value: str, ioc_type: str | None) -> bool:
 __all__ = [
     "PublicationSecretDetectedError",
     "PublicationSecretFinding",
+    "configured_operational_secret_values",
+    "contains_explicit_operational_secrets",
     "contains_operational_secrets",
     "guard_publication_render_data",
     "redact_operational_secrets",

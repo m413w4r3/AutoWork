@@ -20,8 +20,12 @@ from cti_app.application.advisor_consultation import (
     PreparedConsultation,
     SourceRef,
     SourceRefCatalog,
+    build_source_ref_catalog,
+    find_source_ref_conflicts,
     prepare,
+    restricted_source_identities,
 )
+from cti_app.application.advisor_dossier import build_advisor_dossier
 
 
 def _projection(*, question: str = "synthetic CTI consultation") -> dict:
@@ -256,6 +260,38 @@ def test_public_catalog_drops_ambiguous_alias_for_two_transmitted_identities() -
     )
 
     assert catalog.resolve_alias("E1") is None
+
+
+def test_public_source_resolution_wrappers_expose_conflicts_restrictions_and_catalog() -> None:
+    conflicted = _projection()
+    conflicted["transmitted_refs"] = [
+        {"kind": "observation", "id": "observation:collision", "sha256": "1" * 64},
+        {"kind": "observation", "id": "observation:collision", "sha256": "2" * 64},
+    ]
+    conflicted["disclosure_restricted_refs"] = ["observation:collision"]
+    conflicted_dossier = build_advisor_dossier(conflicted)
+
+    conflicts = find_source_ref_conflicts(
+        conflicted, conflicted_dossier, raw_manifest=conflicted.get("dossier_manifest")
+    )
+
+    assert [(item.kind, item.id, item.sha256s) for item in conflicts] == [
+        ("observation", "observation:collision", ("1" * 64, "2" * 64))
+    ]
+    assert restricted_source_identities(conflicted) == frozenset({("observation", "collision")})
+
+    valid = _projection()
+    valid["transmitted_refs"] = [
+        {"kind": "observation", "id": "observation:available", "sha256": "3" * 64}
+    ]
+    valid_dossier = build_advisor_dossier(valid)
+    catalog = build_source_ref_catalog(
+        valid, valid_dossier, raw_manifest=valid.get("dossier_manifest")
+    )
+
+    assert catalog.transmitted_refs == (
+        SourceRef("observation", "observation:available", "3" * 64),
+    )
 
 
 def test_opaque_configured_secret_is_redacted_without_loading_dotenv(monkeypatch) -> None:
