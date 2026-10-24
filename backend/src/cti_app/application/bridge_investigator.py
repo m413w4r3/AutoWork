@@ -1317,7 +1317,23 @@ class BridgeInvestigator:
                     # turn because the provider may already have accepted them.
                     submissions_made += 1
                 is_rate_limited = submission.error_code == "bridge_rate_limited"
-                may_retry_rate_limit = is_rate_limited and rate_limit_retries < 1
+                raw_retry_delay = _retry_after_or_none(submission.retry_after_seconds)
+                if raw_retry_delay is None:
+                    raw_retry_delay = _bounded_retry_backoff(
+                        self._retry_backoff_base_seconds,
+                        self._retry_backoff_max_seconds,
+                        pre_submission_attempt,
+                    )
+                if is_rate_limited:
+                    shared_cooldown = min(
+                        raw_retry_delay, MAX_SHARED_RATE_LIMIT_COOLDOWN_SECONDS
+                    )
+                    await self._pacer.defer_submissions(shared_cooldown)
+                may_retry_rate_limit = (
+                    is_rate_limited
+                    and rate_limit_retries < 1
+                    and raw_retry_delay <= MAX_SHARED_RATE_LIMIT_COOLDOWN_SECONDS
+                )
                 may_retry_other_pre_submission = (
                     not is_rate_limited
                     and pre_submission_attempt < MAX_PRE_SUBMISSION_ATTEMPTS - 1
@@ -1328,17 +1344,11 @@ class BridgeInvestigator:
                     and (may_retry_rate_limit or may_retry_other_pre_submission)
                 ):
                     retry_offset += 1
-                    retry_delay = _retry_after_or_none(submission.retry_after_seconds)
-                    if retry_delay is None:
-                        retry_delay = _bounded_retry_backoff(
-                            self._retry_backoff_base_seconds,
-                            self._retry_backoff_max_seconds,
-                            pre_submission_attempt,
-                        )
                     pre_submission_attempt += 1
                     if is_rate_limited:
                         rate_limit_retries += 1
-                    await self._pacer.defer_submissions(retry_delay)
+                    else:
+                        await self._pacer.defer_submissions(raw_retry_delay)
                     continue
                 if confirmed_not_submitted and submission.retryable:
                     return BridgeTurnResult(

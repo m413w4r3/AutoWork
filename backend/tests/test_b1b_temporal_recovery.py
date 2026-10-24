@@ -10,6 +10,7 @@ import pytest
 
 from cti_app.application import bridge_investigator as bridge_module
 from cti_app.application.bridge_investigator import (
+    BridgeInvestigator,
     BridgeSubmissionPacer,
     ModelConversationTurnTransport,
     TurnSubmission,
@@ -18,6 +19,12 @@ from cti_app.application.bridge_investigator import (
     submit_bridge_consultation_once,
 )
 from cti_app.application.investigation_advisor_tools import InvestigationAdvisorTool
+from cti_app.application.investigation_contracts import (
+    ArticleContextV1,
+    ContextInvestigationV1,
+    InvestigationContextV1,
+    InvestigationSourceV1,
+)
 from cti_app.application.model_gateway import AdapterResult, AdapterResultStatus, ConversationResult
 from cti_app.domain.investigation import ToolInvocationStatus
 from cti_app.domain.model_conversations import (
@@ -149,6 +156,38 @@ def _advisor_result(submission: TurnSubmission):
     )
 
 
+def _turn_context(investigation_id) -> InvestigationContextV1:
+    return InvestigationContextV1(
+        view="full",
+        investigation_id=investigation_id,
+        source=InvestigationSourceV1(
+            subject_id=uuid4(),
+            production_run_id=uuid4(),
+            synthesis_artifact_id=uuid4(),
+            synthesis_sha256="a" * 64,
+        ),
+        article=ArticleContextV1(
+            short_summary="A synthetic bounded source narrative.",
+            claims=(),
+            documented_samples=(),
+            known_chain=(),
+            open_questions=(),
+        ),
+        investigation=ContextInvestigationV1(
+            agenda=("Check one synthetic question.", "Check one more question."),
+            hypotheses=(),
+            new_evidence=(),
+            findings=(),
+            sample_deltas=(),
+            rule_deltas=(),
+            previous_actions=(),
+            blocked_capabilities=(),
+            budget_remaining={},
+        ),
+        available_tools=(),
+    )
+
+
 @pytest.mark.asyncio
 async def test_pacing_that_exhausts_the_g2_window_refuses_before_dispatch(monkeypatch) -> None:
     clock = _FakeClock()
@@ -211,6 +250,92 @@ async def test_one_proven_pre_submission_429_retry_uses_retry_after_and_distinct
 
 
 @pytest.mark.asyncio
+async def test_bridge_turn_caps_large_retry_after_and_does_not_retry() -> None:
+    clock = _FakeClock()
+    investigation_id = uuid4()
+    context = _turn_context(investigation_id)
+    transport = _FakeTransport(
+        [
+            TurnSubmission(
+                TurnSubmissionStatus.UNAVAILABLE,
+                error_code="bridge_rate_limited",
+                submission_state=BridgeSubmissionState.PRE_SUBMISSION,
+                retryable=True,
+                retry_after_seconds=10_000,
+            )
+        ],
+        clock,
+    )
+    pacer = _pacer(clock, interval=0)
+    bridge = BridgeInvestigator(
+        transport,
+        submission_pacer=pacer,
+        pre_submission_retry_base_seconds=2,
+        pre_submission_retry_max_seconds=8,
+    )
+
+    result = await bridge.turn(
+        investigation_id=investigation_id,
+        subject_id=context.source.subject_id,
+        turn_index=0,
+        context=context,
+        external_llm_allowed=True,
+    )
+
+    assert result.status is TurnSubmissionStatus.PRE_SUBMISSION_RETRY_EXHAUSTED
+    assert transport.calls == [(0, None)]
+    assert transport.accepted_successes == 0
+    assert clock.sleeps == []
+    assert pacer._blocked_until <= clock.now + bridge_module.MAX_SHARED_RATE_LIMIT_COOLDOWN_SECONDS
+    assert pacer._blocked_until == bridge_module.MAX_SHARED_RATE_LIMIT_COOLDOWN_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_bridge_turn_retries_once_after_short_retry_after() -> None:
+    clock = _FakeClock()
+    investigation_id = uuid4()
+    context = _turn_context(investigation_id)
+    transport = _FakeTransport(
+        [
+            TurnSubmission(
+                TurnSubmissionStatus.UNAVAILABLE,
+                error_code="bridge_rate_limited",
+                submission_state=BridgeSubmissionState.PRE_SUBMISSION,
+                retryable=True,
+                retry_after_seconds=5,
+            ),
+            TurnSubmission(
+                TurnSubmissionStatus.SUCCEEDED,
+                output_text=(
+                    '{"reasoning_summary":"Synthetic success.",'
+                    '"goal":"Finish the synthetic investigation.",'
+                    '"hypothesis_refs":[],"proposed_tool_calls":[],'
+                    '"finding_proposals":[],"opinion_delta":null,'
+                    '"next_action":"finish"}'
+                ),
+            ),
+        ],
+        clock,
+    )
+    pacer = _pacer(clock, interval=0)
+    bridge = BridgeInvestigator(transport, submission_pacer=pacer)
+
+    result = await bridge.turn(
+        investigation_id=investigation_id,
+        subject_id=context.source.subject_id,
+        turn_index=0,
+        context=context,
+        external_llm_allowed=True,
+    )
+
+    assert result.status is TurnSubmissionStatus.SUCCEEDED
+    assert transport.calls == [(0, None), (1, None)]
+    assert transport.keys[0] != transport.keys[1]
+    assert clock.sleeps == [5]
+    assert pacer._blocked_until == 5
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "submission_state",
     [
@@ -225,6 +350,7 @@ async def test_429_without_pre_submission_proof_never_retries(
     monkeypatch, submission_state
 ) -> None:
     clock = _FakeClock()
+    pacer = _pacer(clock)
     transport = _FakeTransport(
         [
             TurnSubmission(
@@ -238,7 +364,14 @@ async def test_429_without_pre_submission_proof_never_retries(
         clock,
     )
 
-    result = await _submit(monkeypatch, clock, transport, deadline=20, minimum_timeout=1)
+    result = await _submit(
+        monkeypatch,
+        clock,
+        transport,
+        deadline=20,
+        minimum_timeout=1,
+        pacer=pacer,
+    )
 
     assert result.status is TurnSubmissionStatus.NEEDS_REVIEW
     assert result.retryable is False
@@ -250,6 +383,7 @@ async def test_429_without_pre_submission_proof_never_retries(
     assert result.submission_state is expected_state
     assert transport.calls == [(0, 20)]
     assert transport.accepted_successes == 0
+    assert pacer._blocked_until == 1
 
 
 @pytest.mark.asyncio
