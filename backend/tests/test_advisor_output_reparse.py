@@ -17,8 +17,10 @@ from cti_app.domain.investigation import EvidenceKind, EvidenceObservation, Tool
 class ObservationRepository:
     def __init__(self, observation: EvidenceObservation) -> None:
         self.observation = observation
+        self.calls = []
 
     async def get(self, observation_id):
+        self.calls.append(observation_id)
         return self.observation if observation_id == self.observation.id else None
 
 
@@ -27,8 +29,10 @@ class BlobRepository:
         self.blob_id = blob_id
         self.sha256 = sha256
         self.size = size
+        self.calls = []
 
     async def get_by_address(self, logical_bucket: str, sha256: str):
+        self.calls.append((logical_bucket, sha256))
         if logical_bucket != "model-outputs" or sha256 != self.sha256:
             return None
         return SimpleNamespace(
@@ -40,8 +44,10 @@ class BlobRepository:
 class ArtifactStore:
     def __init__(self, values: dict) -> None:
         self.values = values
+        self.calls = []
 
     async def read_bytes(self, blob_id, *, max_bytes: int):
+        self.calls.append(blob_id)
         value = self.values[blob_id]
         if len(value) > max_bytes:
             raise ValueError("read exceeds test limit")
@@ -61,6 +67,22 @@ class Recorder:
 def _fixture_raw() -> str:
     path = Path(__file__).parent / "fixtures" / "advisor_wire" / "bridge-yara-draft-347b29b2.txt"
     return path.read_text(encoding="utf-8")
+
+
+def _suricata_raw() -> str:
+    return (
+        "advisor-wire.v1\nTYPE: suricata_draft\nSTATUS: succeeded\n"
+        "```suricata\n"
+        "alert tls any any -> any any (\n"
+        '    msg:"Observed SNI";\n'
+        '    tls.sni; content:"updates.example.test";\n'
+        "    sid:9900001; rev:1;\n"
+        ")\n"
+        "```\n"
+        "FACT: F1\n"
+        "INVARIANT: Le SNI observé est discriminant. | facts=F1\n"
+        "LIMITATION: none\n"
+    )
 
 
 def _harness(
@@ -194,6 +216,121 @@ async def test_reparse_refuses_minio_bytes_that_do_not_match_observation_output_
 
     assert result.status is ToolInvocationStatus.FAILED
     assert result.error_code == "advisor_reparse_raw_output_sha256_mismatch"
+    assert recorder.calls == []
+
+
+@pytest.mark.asyncio
+async def test_reparse_accepts_verified_suricata_context_without_bridge() -> None:
+    raw = _suricata_raw()
+    input_refs = [{"kind": "observation", "id": str(uuid4()), "sha256": "d" * 64}]
+    network_facts = [
+        {
+            "fact_id": "nf001",
+            "evidence_id": input_refs[0]["id"],
+            "observation_sha256": input_refs[0]["sha256"],
+            "field": "tls.sni",
+            "value": "updates.example.test",
+        }
+    ]
+    tool, recorder, original, context, invocation_id, output_sha256, input_refs = _harness(
+        raw,
+        consultation_type="suricata_draft",
+        input_refs=input_refs,
+        reparse_context={
+            "transmitted_refs": input_refs,
+            "network_facts": network_facts,
+        },
+    )
+
+    result = await tool.execute({"observation_id": str(original.id)}, context)
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    assert result.output["usable"] is True
+    assert result.output["rule_source"].startswith("alert tls")
+    assert result.output["output"]["fact_refs"] == ("nf001",)
+    assert result.output["output"]["invariants"][0]["fact_refs"] == ("nf001",)
+    stored_fact_ids = {item["fact_id"] for item in network_facts}
+    assert set(result.output["output"]["fact_refs"]) <= stored_fact_ids
+    assert result.output["output_sha256"] == hashlib.sha256(raw.encode()).hexdigest()
+    assert result.output["output_sha256"] == output_sha256
+    assert result.output["bridge_invocation_id"] == invocation_id
+    assert len(recorder.calls) == 1
+    recorded = recorder.calls[0]
+    assert recorded["kind"] is EvidenceKind.OTHER
+    assert recorded["object_type"] == "advisor_call"
+    assert recorded["object_id"] == "suricata_draft"
+    assert recorded["source_version"] == ADVISOR_SOURCE_PARSER_VERSION
+    assert recorded["idempotency_key"] == (
+        f"advisor-reparse:{original.id}:{ADVISOR_SOURCE_PARSER_VERSION}"
+    )
+    assert recorded["payload"]["input_refs"] == input_refs
+    assert recorded["payload"]["output"]["bridge_provenance"]["input_refs"] == input_refs
+    assert recorded["payload"]["bridge_turns_consumed"] == 0
+    assert recorded["payload"]["output"]["fact_refs"] == ["nf001"]
+    assert tool._observations.calls == [original.id]
+    assert tool._blobs.calls == [("model-outputs", output_sha256)]
+    assert tool._artifact_store.calls == [original.blob_id, tool._blobs.blob_id]
+
+
+@pytest.mark.asyncio
+async def test_reparse_refuses_suricata_without_persisted_context() -> None:
+    tool, recorder, original, context, *_ = _harness(
+        _suricata_raw(), consultation_type="suricata_draft"
+    )
+
+    result = await tool.execute({"observation_id": str(original.id)}, context)
+
+    assert result.status is ToolInvocationStatus.FAILED
+    assert result.error_code == "advisor_reparse_context_unavailable"
+    assert recorder.calls == []
+
+
+@pytest.mark.parametrize("network_facts", [[], [{"fact_id": "nf001"}]])
+@pytest.mark.asyncio
+async def test_reparse_refuses_suricata_with_incomplete_network_facts(network_facts) -> None:
+    input_refs = [{"kind": "observation", "id": str(uuid4()), "sha256": "e" * 64}]
+    tool, recorder, original, context, *_ = _harness(
+        _suricata_raw(),
+        consultation_type="suricata_draft",
+        input_refs=input_refs,
+        reparse_context={"transmitted_refs": input_refs, "network_facts": network_facts},
+    )
+
+    result = await tool.execute({"observation_id": str(original.id)}, context)
+
+    assert result.status is ToolInvocationStatus.FAILED
+    assert result.error_code == "advisor_reparse_context_unavailable"
+    assert recorder.calls == []
+
+
+@pytest.mark.asyncio
+async def test_reparse_refuses_suricata_context_with_conflicting_references() -> None:
+    raw = _suricata_raw()
+    input_refs = [{"kind": "observation", "id": str(uuid4()), "sha256": "f" * 64}]
+    conflicting_refs = [{**input_refs[0], "sha256": "a" * 64}]
+    network_facts = [
+        {
+            "fact_id": "nf001",
+            "evidence_id": input_refs[0]["id"],
+            "observation_sha256": input_refs[0]["sha256"],
+            "field": "tls.sni",
+            "value": "updates.example.test",
+        }
+    ]
+    tool, recorder, original, context, *_ = _harness(
+        raw,
+        consultation_type="suricata_draft",
+        input_refs=input_refs,
+        reparse_context={
+            "transmitted_refs": conflicting_refs,
+            "network_facts": network_facts,
+        },
+    )
+
+    result = await tool.execute({"observation_id": str(original.id)}, context)
+
+    assert result.status is ToolInvocationStatus.FAILED
+    assert result.error_code == "advisor_reparse_context_refs_invalid"
     assert recorder.calls == []
 
 

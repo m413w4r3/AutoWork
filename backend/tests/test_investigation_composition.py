@@ -14,6 +14,7 @@ from cti_app.application.bridge_investigator import (
     TurnSubmissionStatus,
     submit_bridge_consultation_once,
 )
+from cti_app.application.investigation_advisor_tools import ADVISOR_REPARSE_SCHEMA_VERSION
 from cti_app.application.investigation_composition import (
     OPTIONAL_CAPABILITIES,
     InvestigationCompositionFactory,
@@ -193,6 +194,7 @@ def test_composition_announces_local_tools_and_only_configured_capabilities() ->
             "network.protocol.render",
         }
     )
+    assert composition.registry.get("advisor.reparse", ADVISOR_REPARSE_SCHEMA_VERSION) is None
     assert composition.service._no_progress_limit == 7
     assert composition.tool_dependencies.virustotal is None
     assert composition.tool_dependencies.shodan is None
@@ -295,7 +297,15 @@ async def test_operator_inventory_capabilities_match_the_dispatcher() -> None:
         idempotency_key="operator-tool-parity",
         available_capabilities=composition.available_capabilities,
     )
+    reparse_registration = composition.registry.get(
+        "advisor.reparse", ADVISOR_REPARSE_SCHEMA_VERSION
+    )
+    assert reparse_registration is not None
+    reparse_definition, _reparse_adapter = reparse_registration
+    assert reparse_definition.capability_key == "advisor.reparse"
+    assert reparse_definition.capability_key in composition.available_capabilities
     inventory = project_tool_availability(composition.registry, context)
+    assert "advisor.reparse" in inventory.available_names
     expected = {
         "finding.propose",
         "finding.revise",
