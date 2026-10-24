@@ -111,16 +111,12 @@ def advisor_wire_aliases(prompt_data: Mapping[str, Any]) -> dict[str, dict[str, 
     for unit in prompt_data.get("units", ()):
         if not isinstance(unit, Mapping):
             continue
-        if isinstance(unit.get("opinion_id"), str):
-            add("opinion", unit.get("opinion_id"))
         for key, kind in (("evidence_refs", "observation"), ("finding_refs", "finding")):
             for item in unit.get(key, ()):
                 if isinstance(item, str):
                     add(kind, item)
     review_text = prompt_data.get("review_text")
     if isinstance(review_text, Mapping):
-        if isinstance(review_text.get("opinion_id"), str):
-            add("opinion", review_text.get("opinion_id"))
         for key, kind in (("evidence_refs", "observation"), ("finding_refs", "finding")):
             for item in review_text.get(key, ()):
                 if isinstance(item, str):
@@ -167,6 +163,8 @@ def advisor_wire_aliases(prompt_data: Mapping[str, Any]) -> dict[str, dict[str, 
             manifest_kind = item.get("kind")
             identifier = item.get("id")
             digest = item.get("sha256")
+            if item.get("origin") == "versioned_review_target":
+                continue
             if manifest_kind in {"article", "observation", "finding", "opinion"}:
                 if (
                     manifest_kind == "article"
@@ -228,10 +226,18 @@ def advisor_wire_aliases(prompt_data: Mapping[str, Any]) -> dict[str, dict[str, 
         }
         fact_rows = [item for item in fact_rows if item.get("fact_id") in selected_fact_ids]
         fact_aliases = {f"F{index}": item for index, item in enumerate(fact_rows, start=1)}
-    evidence_aliases = {}
+    evidence_aliases: dict[str, dict[str, Any]] = {}
+    evidence_alias_identities: dict[str, tuple[object, object, object]] = {}
+    ambiguous_evidence_aliases: set[str] = set()
     for item in manifest:
         alias = item.get("alias")
         if not isinstance(alias, str):
+            continue
+        if item.get("origin") == "versioned_review_target" and (
+            item.get("kind") != "opinion"
+            or not isinstance(item.get("source_ref"), str)
+            or not item.get("source_ref")
+        ):
             continue
         evidence = dict(item)
         if evidence.get("kind") == "article" and isinstance(evidence.get("id"), str):
@@ -240,7 +246,15 @@ def advisor_wire_aliases(prompt_data: Mapping[str, Any]) -> dict[str, dict[str, 
                 evidence["id"] = f"article:{identifier}"
         elif evidence.get("kind") == "opinion" and isinstance(evidence.get("source_ref"), str):
             evidence["id"] = evidence["source_ref"]
-        evidence_aliases[alias] = evidence
+        identity = (evidence.get("kind"), evidence.get("id"), evidence.get("sha256"))
+        existing_identity = evidence_alias_identities.get(alias)
+        if existing_identity is not None and existing_identity != identity:
+            evidence_aliases.pop(alias, None)
+            ambiguous_evidence_aliases.add(alias)
+            continue
+        if alias not in ambiguous_evidence_aliases:
+            evidence_alias_identities.setdefault(alias, identity)
+            evidence_aliases[alias] = evidence
     return {
         "refs": ref_aliases,
         "measurements": measurement_aliases,
@@ -250,8 +264,12 @@ def advisor_wire_aliases(prompt_data: Mapping[str, Any]) -> dict[str, dict[str, 
     }
 
 
-def render_advisor_wire_input(prompt_data: Mapping[str, Any]) -> str:
+def render_advisor_wire_input(
+    prompt_data: Mapping[str, Any], *, dossier_text: str | None = None
+) -> str:
     """Render only selected, human-readable task facts; never serialize internal data."""
+    if dossier_text is not None:
+        return dossier_text
     return build_advisor_dossier(prompt_data).text
 
 

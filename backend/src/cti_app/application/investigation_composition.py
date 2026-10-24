@@ -757,6 +757,7 @@ class _PermissionAwareInvestigationTransport:
         context_sha256: str,
         prompt: str,
         external_llm_allowed: bool,
+        timeout_seconds: float | None = None,
     ) -> TurnSubmission:
         result = await self._transport.submit(
             investigation_id=investigation_id,
@@ -765,6 +766,7 @@ class _PermissionAwareInvestigationTransport:
             context_sha256=context_sha256,
             prompt=prompt,
             external_llm_allowed=external_llm_allowed,
+            timeout_seconds=timeout_seconds,
         )
         if result.status is not TurnSubmissionStatus.BLOCKED:
             return result
@@ -785,6 +787,7 @@ class _PermissionAwareInvestigationTransport:
         prompt: str,
         external_llm_allowed: bool,
         attempt: int,
+        timeout_seconds: float | None = None,
     ) -> TurnSubmission:
         submit_attempt = getattr(self._transport, "submit_with_attempt", None)
         if not callable(submit_attempt):
@@ -802,6 +805,7 @@ class _PermissionAwareInvestigationTransport:
                 prompt=prompt,
                 external_llm_allowed=external_llm_allowed,
                 attempt=attempt,
+                timeout_seconds=timeout_seconds,
             ),
         )
         if result.status is not TurnSubmissionStatus.BLOCKED:
@@ -1542,6 +1546,7 @@ def build_investigation_composition(
                 investigations=uow.analyst_investigations,
                 observations=uow.evidence_observations,
                 findings=uow.investigation_findings,
+                investigation_states=uow.investigation_states,
                 experiments=getattr(uow, "investigation_experiments", None),
                 opinions=uow.analyst_opinions,
                 sample_associations=uow.sample_associations,

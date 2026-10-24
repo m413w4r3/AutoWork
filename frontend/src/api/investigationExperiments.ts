@@ -16,7 +16,7 @@ export interface ExperimentInputRef {
 
 export interface ExperimentInvocationRef {
   invocation_id: string;
-  version: number;
+  version: number | "[redacted]";
 }
 
 export interface ExperimentObservationRef {
@@ -58,6 +58,8 @@ export interface InvestigationExperiment {
   scope: string;
   limitations: string[];
   verdict: ExperimentVerdict;
+  /** An explicit warning that `refutes` is a stored assertion, not a conclusion. */
+  verdict_assertion_label?: string | null;
   /** Additive fields; absent on legacy records and older timeline responses. */
   supersedes_experiment_ids?: string[];
   superseded_by?: string[];

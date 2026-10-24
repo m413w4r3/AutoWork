@@ -27,6 +27,21 @@ class ToolInvocationStatus(StrEnum):
     PARTIAL = "partial"
 
 
+class FrameworkPreSubmissionProof(StrEnum):
+    """Framework-attested outcomes proving an adapter was never entered."""
+
+    INVALID_ARGUMENTS = "framework_pre_submission_invalid_arguments"
+    TOOL_UNAVAILABLE = "framework_pre_submission_tool_unavailable"
+    POLICY_REJECTED = "framework_pre_submission_policy_rejected"
+    BUDGET_REJECTED = "framework_pre_submission_budget_rejected"
+    ENVELOPE_ADMISSION_CONFLICT = "framework_pre_submission_envelope_admission_conflict"
+    ENVELOPE_REVOKED = "framework_pre_submission_envelope_revoked"
+    RESERVATION_CHANGED = "framework_pre_submission_reservation_changed"
+    INVESTIGATION_MISSING = "framework_pre_submission_investigation_missing"
+    DISCLOSURE_REVOKED = "framework_pre_submission_disclosure_revoked"
+    OPERATOR_INTERRUPTED = "framework_pre_submission_operator_interrupted"
+
+
 class InvestigationExecutionMode(StrEnum):
     BRIDGE_LED = "bridge_led"
     OPERATOR_LED = "operator_led"

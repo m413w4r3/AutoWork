@@ -18,8 +18,10 @@ from cti_app.application.bridge_investigator import (
     submit_bridge_consultation_once,
 )
 from cti_app.application.investigation_contracts import (
+    ArticleClaimV1,
     ArticleContextV1,
     ContextInvestigationV1,
+    IndicatorInventoryV1,
     InvestigationContextV1,
     InvestigationSourceV1,
 )
@@ -41,13 +43,14 @@ class _ManualClock:
 
 
 @pytest.mark.asyncio
-async def test_advisor_waits_for_provider_pacing_slot_without_timing_out(monkeypatch) -> None:
+async def test_advisor_refuses_pacing_wait_beyond_deadline_before_transport(monkeypatch) -> None:
     class _StuckPacer:
         def __init__(self) -> None:
             self.ready = asyncio.Event()
 
-        async def wait_for_next_submission(self) -> None:
+        async def wait_for_next_submission(self, *, deadline_monotonic=None) -> bool:
             await self.ready.wait()
+            return True
 
     pacer = _StuckPacer()
     monkeypatch.setattr(bridge_module, "_shared_bridge_pacer", lambda **_kwargs: pacer)
@@ -63,23 +66,25 @@ async def test_advisor_waits_for_provider_pacing_slot_without_timing_out(monkeyp
             context_sha256="a" * 64,
             prompt="Synthetic pacing wait test.",
             external_llm_allowed=True,
+            timeout_seconds=0.001,
             settings=SimpleNamespace(
                 openai_bridge_min_submission_interval_seconds=0.05,
                 openai_bridge_submission_jitter_fraction=0,
             ),
         )
     )
-    await asyncio.sleep(0)
-    assert not task.done()
+    await asyncio.sleep(0.02)
     assert transport.submission_count == 0
-    pacer.ready.set()
     result = await task
 
-    assert result.status is TurnSubmissionStatus.SUCCEEDED
-    assert transport.submission_count == 1
+    assert result.status is TurnSubmissionStatus.UNAVAILABLE
+    assert result.error_code == "bridge_execution_budget_exhausted"
+    assert result.submission_state == "pre_submission"
+    assert result.failure_reason == "pacing_exceeds_execution_deadline"
+    assert transport.submission_count == 0
 
 
-def _context(investigation_id):
+def _context(investigation_id, *, claims=()):
     return InvestigationContextV1(
         view="full",
         investigation_id=investigation_id,
@@ -91,7 +96,7 @@ def _context(investigation_id):
         ),
         article=ArticleContextV1(
             short_summary="A bounded source narrative.",
-            claims=(),
+            claims=tuple(claims),
             documented_samples=(),
             known_chain=(),
             open_questions=(),
@@ -158,6 +163,80 @@ async def test_turn_is_structured_and_replayed_by_deterministic_identity() -> No
     assert "do not create hypothesis labels" in transport.prompts[0].lower()
 
 
+def test_rendered_prompt_has_no_autowork_96000_byte_ceiling() -> None:
+    from cti_app.application.bridge_investigator import render_investigation_prompt
+
+    def render_at_size(target: int) -> str:
+        investigation_id = uuid4()
+        for count in range(1, 40):
+            fixed = [
+                ArticleClaimV1(id=f"C{index}", statement="x" * 3_999, source_refs=())
+                for index in range(count - 1)
+            ]
+
+            def render(
+                last_size: int,
+                *,
+                fixed_claims: list[ArticleClaimV1] = fixed,
+                claim_index: int = count,
+            ) -> str:
+                context = _context(
+                    investigation_id,
+                    claims=(
+                        *fixed_claims,
+                        ArticleClaimV1(
+                            id=f"C{claim_index}", statement="x" * last_size, source_refs=()
+                        ),
+                    ),
+                )
+                return render_investigation_prompt(context)
+
+            smallest = render(1)
+            largest = render(3_999)
+            smallest_bytes = len(smallest.encode("utf-8"))
+            largest_bytes = len(largest.encode("utf-8"))
+            if smallest_bytes <= target <= largest_bytes:
+                low, high = 1, 3_999
+                while low <= high:
+                    middle = (low + high) // 2
+                    rendered = render(middle)
+                    size = len(rendered.encode("utf-8"))
+                    if size == target:
+                        return rendered
+                    if size < target:
+                        low = middle + 1
+                    else:
+                        high = middle - 1
+        raise AssertionError(f"Could not construct a {target}-byte synthetic prompt")
+
+    for target in (95_999, 96_000, 96_001):
+        assert len(render_at_size(target).encode("utf-8")) == target
+
+
+def test_rendered_prompt_discloses_truncated_ioc_inventory_and_counts() -> None:
+    context = _context(uuid4())
+    investigation = context.investigation.model_copy(
+        update={
+            "evidence_index_truncated": True,
+            "truncation_counts": {"evidence_index": 3},
+        }
+    )
+    context = context.model_copy(
+        update={
+            "investigation": investigation,
+            "indicator_inventory": IndicatorInventoryV1(truncated=True),
+        }
+    )
+
+    prompt = bridge_module.render_investigation_prompt(context).casefold()
+
+    assert "indicator inventory" in prompt
+    assert "truncated: oui" in prompt
+    assert "evidence index truncated: oui" in prompt
+    assert "truncation counts" in prompt
+    assert "evidence index=3" in prompt
+
+
 @pytest.mark.asyncio
 async def test_bridge_pacer_applies_minimum_interval_and_bounded_jitter() -> None:
     clock = _ManualClock()
@@ -192,6 +271,67 @@ async def test_bridge_pacer_shares_provider_retry_after_with_later_calls() -> No
     await pacer.wait_for_next_submission()
 
     assert clock.delays == [19]
+
+
+@pytest.mark.asyncio
+async def test_bridge_pacer_releases_lock_while_waiters_sleep_and_serializes_starts() -> None:
+    now = 0.0
+    sleeper_entered = asyncio.Event()
+    release_sleepers = asyncio.Event()
+    sleep_calls = 0
+    starts: list[float] = []
+
+    async def sleeper(seconds: float) -> None:
+        nonlocal now, sleep_calls
+        sleep_calls += 1
+        sleeper_entered.set()
+        await release_sleepers.wait()
+        now += seconds
+
+    pacer = BridgeSubmissionPacer(
+        minimum_interval_seconds=10,
+        jitter_fraction=0,
+        clock=lambda: now,
+        sleeper=sleeper,
+        rng=lambda: 0,
+    )
+    assert await pacer.wait_for_next_submission()
+
+    async def wait_and_record() -> bool:
+        allowed = await pacer.wait_for_next_submission()
+        if allowed:
+            starts.append(now)
+        return allowed
+
+    first = asyncio.create_task(wait_and_record())
+    await asyncio.wait_for(sleeper_entered.wait(), timeout=0.1)
+    second = asyncio.create_task(wait_and_record())
+    await asyncio.sleep(0)
+    defer_completed = False
+    try:
+        defer_completed = await asyncio.wait_for(pacer.defer_submissions(20), timeout=0.05)
+    except TimeoutError:
+        pass
+    finally:
+        release_sleepers.set()
+
+    assert await asyncio.gather(first, second) == [True, True]
+    assert defer_completed is True
+    assert sleep_calls >= 2
+    assert len(starts) == 2
+    assert starts[0] >= 20
+    assert starts[0] != starts[1]
+
+
+@pytest.mark.asyncio
+async def test_bridge_pacer_deadline_bounds_lock_contention() -> None:
+    import time
+
+    pacer = BridgeSubmissionPacer(minimum_interval_seconds=0, jitter_fraction=0)
+    deadline = time.monotonic() + 0.02
+    async with pacer._lock:
+        assert await pacer.wait_for_next_submission(deadline_monotonic=deadline) is False
+        assert await pacer.defer_submissions(1, deadline_monotonic=deadline) is False
 
 
 @pytest.mark.asyncio
@@ -251,7 +391,7 @@ async def test_pre_submission_retries_use_bounded_exponential_backoff() -> None:
 
 
 @pytest.mark.asyncio
-async def test_rate_limit_retries_honor_retry_after_without_abandoning_turn() -> None:
+async def test_rate_limit_retry_honors_retry_after_and_stops_after_one_retry() -> None:
     investigation_id = uuid4()
     context = _context(investigation_id)
     rejected = TurnSubmission(
@@ -291,9 +431,9 @@ async def test_rate_limit_retries_honor_retry_after_without_abandoning_turn() ->
         external_llm_allowed=True,
     )
 
-    assert result.status is TurnSubmissionStatus.SUCCEEDED
-    assert transport.submission_count == 6
-    assert clock.delays == [7] * 5
+    assert result.status is TurnSubmissionStatus.PRE_SUBMISSION_RETRY_EXHAUSTED
+    assert transport.submission_count == 2
+    assert clock.delays == [7]
 
 
 @pytest.mark.asyncio
@@ -748,6 +888,7 @@ class _PersistedConversationService:
         self.add_turn_count = 0
         self.targeted_lookup_count = 0
         self.prompts = []
+        self.add_turn_kwargs = []
 
     async def get_or_create(self, conversation_id, **kwargs):
         return SimpleNamespace(
@@ -775,6 +916,7 @@ class _PersistedConversationService:
     async def add_turn(self, conversation_id, *, idempotency_key, **kwargs):
         self.add_turn_count += 1
         self.prompts.append(kwargs["message"])
+        self.add_turn_kwargs.append(kwargs)
         turn = SimpleNamespace(
             id=uuid4(),
             idempotency_key=idempotency_key,
@@ -827,6 +969,7 @@ async def test_model_transport_reuses_successful_persisted_turn_without_add_turn
         "context_sha256": hashlib.sha256(context.canonical_bytes()).hexdigest(),
         "prompt": "canonical prompt",
         "external_llm_allowed": True,
+        "timeout_seconds": 321,
     }
 
     first = await transport.submit(**args)
@@ -836,6 +979,7 @@ async def test_model_transport_reuses_successful_persisted_turn_without_add_turn
     assert second.status is TurnSubmissionStatus.SUCCEEDED
     assert second.output_text == output
     assert conversations.add_turn_count == 1
+    assert conversations.add_turn_kwargs[0]["timeout_seconds"] == 321
     assert conversations.targeted_lookup_count >= 3
 
 

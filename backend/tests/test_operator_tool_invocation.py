@@ -5,7 +5,7 @@ import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -20,6 +20,12 @@ from cti_app.application.advisor_checkpoint import (
     format_advisor_trace_purpose,
 )
 from cti_app.application.bridge_investigator import TurnSubmission, TurnSubmissionStatus
+from cti_app.application.context_pagination import (
+    ContextOmissionReason,
+    decode_keyset_cursor,
+    encode_keyset_cursor,
+    verify_page_sha256,
+)
 from cti_app.application.identity import Identity, IdentityScope
 from cti_app.application.investigation_advisor_tools import (
     ADVISOR_RESPONSE_SCHEMA,
@@ -35,6 +41,7 @@ from cti_app.application.investigation_experiments import (
 )
 from cti_app.application.investigation_tools import ToolResult
 from cti_app.application.operator_advisor_guidance import build_advisor_guidance
+from cti_app.application.operator_context_summary import InvestigationOperatorContextSummaryV1
 from cti_app.application.operator_tool_invocation import (
     OperatorToolInvocationError,
     OperatorToolInvocationService,
@@ -497,7 +504,7 @@ async def test_operator_led_experiment_record_uses_declared_hypothesis_and_strea
         source="network.capture.inspect",
         source_version="network-capture-inspect.v1",
         observed_at=datetime.now(UTC),
-        object_type="capture",
+        object_type="network_capture",
         object_id="capture-sha256",
     )
     await fixture.observations.append_if_absent(observation)
@@ -554,7 +561,16 @@ async def test_operator_led_experiment_record_uses_declared_hypothesis_and_strea
 
 @pytest.mark.asyncio
 async def test_operator_dispatcher_wires_minimal_advisor_request_to_strict_bridge_transport():
-    fixture, state, _ = await _fixture()
+    fixture = _Fixture(responses=[], tools=[("vt.file_report", "vt")])
+    state = await fixture.start(
+        execution_mode=InvestigationExecutionMode.OPERATOR_LED,
+        hypotheses=(
+            Hypothesis(
+                id="H-loader-chain",
+                statement="The article's loader chain may explain the observed pivot.",
+            ),
+        ),
+    )
     article_port = fixture.context_builder.article_snapshots
     article_port.snapshot = replace(
         article_port.snapshot,
@@ -610,8 +626,12 @@ async def test_operator_dispatcher_wires_minimal_advisor_request_to_strict_bridg
                 "context_sha256",
                 "prompt",
                 "external_llm_allowed",
+                "timeout_seconds",
             }
             assert kwargs["external_llm_allowed"] is True
+            assert isinstance(kwargs["timeout_seconds"], int | float)
+            assert not isinstance(kwargs["timeout_seconds"], bool)
+            assert 0 < kwargs["timeout_seconds"] <= 3_600
             assert len(kwargs["prompt"].encode()) <= 32 * 1024 * 1024
             self.calls.append(kwargs)
             article_ref = next(
@@ -667,6 +687,7 @@ async def test_operator_dispatcher_wires_minimal_advisor_request_to_strict_bridg
             openai_bridge_submission_jitter_fraction=0,
         ),
         investigations=fixture.investigations,
+        investigation_states=fixture.states,
         observations=fixture.observations,
         findings=fixture.findings,
         opinions=fixture.opinions,
@@ -726,7 +747,15 @@ async def test_advisor_recommendations_record_acceptance_refusal_and_empirical_o
             ("sample.analyze", "local"),
         ),
     )
-    state = await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
+    state = await fixture.start(
+        execution_mode=InvestigationExecutionMode.OPERATOR_LED,
+        hypotheses=(
+            Hypothesis(
+                id="H-init-mutex",
+                statement="The measured InitMutex may identify a sample-specific loader.",
+            ),
+        ),
+    )
     fixture.envelope = replace(
         fixture.envelope,
         allowed_providers=("bridge", "local", "vt"),
@@ -885,6 +914,7 @@ async def test_advisor_recommendations_record_acceptance_refusal_and_empirical_o
             openai_bridge_submission_jitter_fraction=0,
         ),
         investigations=fixture.investigations,
+        investigation_states=fixture.states,
         observations=fixture.observations,
         findings=fixture.findings,
         opinions=fixture.opinions,
@@ -919,6 +949,7 @@ async def test_advisor_recommendations_record_acceptance_refusal_and_empirical_o
         if item.source == "advisor.consult"
     ]
     assert advice.invocation.status is ToolInvocationStatus.PARTIAL, advice.output
+    assert len(transport.calls) == 1
     assert persisted_advice
     assert advice.invocation.consumed_budget[BudgetDimension.BRIDGE_TURNS] == 1
     advisor_observation = next(
@@ -1161,6 +1192,43 @@ async def test_external_llm_disclosure_is_required_for_operator_client() -> None
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "policy",
+    ("red_tlp", "snapshot_do_not_submit", "envelope_do_not_submit", "external_llm_denied"),
+)
+async def test_disclosure_controls_block_context_before_external_tool_dispatch(policy: str) -> None:
+    fixture, state, service = await _fixture()
+    article_port = fixture.context_builder.article_snapshots
+    if policy == "red_tlp":
+        article_port.snapshot = replace(article_port.snapshot, tlp="RED")
+    elif policy == "snapshot_do_not_submit":
+        article_port.snapshot = replace(article_port.snapshot, do_not_submit=True)
+    else:
+        envelope = fixture.envelopes._items[fixture.investigation_id]
+        if policy == "envelope_do_not_submit":
+            disclosure = replace(envelope.disclosure, do_not_submit=True)
+        else:
+            disclosure = replace(envelope.disclosure, external_llm_allowed=False)
+        fixture.envelopes._items[fixture.investigation_id] = replace(
+            envelope, disclosure=disclosure
+        )
+
+    with pytest.raises(OperatorToolInvocationError) as error:
+        await service.invoke(
+            tool_name="vt.file_report",
+            schema_version="1",
+            arguments={"query": "sample hash"},
+            purpose="deny dispatch when disclosure policy blocks external sharing",
+            expected_version=state.version,
+            idempotency_key=f"disclosure-{policy}",
+        )
+
+    assert error.value.code == "external_disclosure_denied"
+    assert fixture.tools["vt.file_report"].calls == []
+    assert await fixture.invocations.list_for_investigation(fixture.investigation_id) == ()
+
+
+@pytest.mark.asyncio
 async def test_secret_fields_and_signed_urls_are_rejected_before_persistence() -> None:
     fixture, state, service = await _fixture()
 
@@ -1230,7 +1298,7 @@ async def test_replay_after_persisted_running_marks_review_without_redispatch() 
 
 
 @pytest.mark.asyncio
-async def test_replay_releases_legacy_advisor_reservation_with_proven_pre_submit_failure() -> None:
+async def test_legacy_advisor_summary_is_not_framework_pre_submission_proof() -> None:
     fixture, state, _ = await _fixture()
     idempotency_key = "legacy-invalid-advisor-input"
     schema_version = ADVISOR_SCHEMA_VERSION
@@ -1306,10 +1374,20 @@ async def test_replay_releases_legacy_advisor_reservation_with_proven_pre_submit
         item for item in latest_envelope.budget.reservations if item.operation_key == operation_key
     )
     assert replay.idempotent_replay is True
-    assert replay.invocation.status is ToolInvocationStatus.FAILED
-    assert reservation.status.value == "released"
-    assert latest_envelope.budget.reserved[BudgetDimension.BRIDGE_TURNS] == 0
+    assert replay.invocation.status is ToolInvocationStatus.NEEDS_REVIEW
+    assert reservation.status.value == "reserved"
+    assert latest_envelope.budget.reserved[BudgetDimension.BRIDGE_TURNS] == 1
     assert fixture.bridge_transport.submission_count == 0
+    with pytest.raises(OperatorToolInvocationError) as error:
+        await service.invoke(
+            tool_name="advisor.consult",
+            schema_version=schema_version,
+            arguments=arguments,
+            purpose=purpose,
+            expected_version=state.version,
+            idempotency_key=f"{idempotency_key}-fresh",
+        )
+    assert error.value.code == "ambiguous_tool_invocation_requires_reconciliation"
 
 
 class _IdentityProvider:
@@ -1416,7 +1494,7 @@ async def test_operator_http_routes_expose_bounded_context_and_idempotent_invoca
         summary_payload = summary.json()
         evidence_pointer = summary_payload["pointers"]["section_uri_template"].format(
             section="evidence_index",
-            cursor=summary_payload["pointers"]["section_cursors"]["evidence_index"],
+            cursor=summary_payload["pointers"]["section_keyset_cursors"]["evidence_index"],
             limit=summary_payload["pointers"]["section_limit"],
             version=state.version,
             sha256=state.sha256,
@@ -1491,6 +1569,14 @@ async def test_operator_http_routes_expose_bounded_context_and_idempotent_invoca
     assert summary_payload["delta_since_version"]["from_version"] == state.version
     evidence_cursor = summary_payload["pointers"]["section_cursors"]["evidence_index"]
     assert evidence_cursor == 0
+    assert summary_payload["pointers"]["section_keyset_cursors"]["evidence_index"] == ""
+    legacy_summary_payload = json.loads(json.dumps(summary_payload))
+    legacy_summary_payload.pop("pagination_manifest", None)
+    legacy_summary_payload["pointers"].pop("section_keyset_cursors", None)
+    legacy_summary = InvestigationOperatorContextSummaryV1.model_validate_json(
+        json.dumps(legacy_summary_payload)
+    )
+    assert legacy_summary.pointers.section_keyset_cursors == {}
     assert (
         "/operator/context/section/{section}" in summary_payload["pointers"]["section_uri_template"]
     )
@@ -1505,6 +1591,23 @@ async def test_operator_http_routes_expose_bounded_context_and_idempotent_invoca
     assert tool_section.json()["schema"] == "investigation-operator-context-item-page.v1"
     assert tool_section.json()["section"] == "available_tools"
     assert tool_section.json()["items"] == context.json()["context"]["available_tools"]
+    tool_section_payload = tool_section.json()
+    assert verify_page_sha256(
+        claimed_sha256=tool_section_payload["page_sha256"],
+        section="available_tools",
+        investigation_id=fixture.investigation_id,
+        items=tool_section_payload["items"],
+        previous_page_sha256="0" * 64,
+        context_sha256=tool_section_payload["context_sha256"],
+        cursor=tool_section_payload["cursor"],
+        pivot=tool_section_payload["pivot"],
+        descending=tool_section_payload["descending"],
+        limit=tool_section_payload["limit"],
+        total=tool_section_payload["total"],
+        has_more=tool_section_payload["has_more"],
+        omission_manifest=tool_section_payload["omission_manifest"],
+        next_cursor=tool_section_payload["next_cursor"],
+    )
     assert finding_versions_page.status_code == 200, finding_versions_page.text
     assert finding_versions_page.json()["schema"] == "investigation-operator-context-item-page.v1"
     assert finding_versions_page.json()["section"] == "finding_versions"
@@ -1523,6 +1626,184 @@ async def test_operator_http_routes_expose_bounded_context_and_idempotent_invoca
     assert saved_state.version == state.version + 1
     assert "sample hash" not in first.text
     assert fixture.tools["vt.file_report"].calls == [{"query": "sample hash"}]
+
+
+@pytest.mark.asyncio
+async def test_context_section_keyset_cursor_is_opaque_chained_and_offset_compatible() -> None:
+    fixture, state, service = await _fixture()
+    for index in range(25):
+        await fixture.observations.append_if_absent(
+            EvidenceObservation(
+                investigation_id=fixture.investigation_id,
+                kind=EvidenceKind.OTHER,
+                blob_id=uuid4(),
+                sha256=f"{index + 1:064x}",
+                source="test.source",
+                source_version="1",
+                observed_at=datetime(2026, 1, 1, tzinfo=UTC) + timedelta(seconds=index),
+                object_type="fixture",
+                object_id=str(index),
+            )
+        )
+
+    first = await service.get_context_section(
+        "evidence_index",
+        limit=20,
+        expected_version=state.version,
+        expected_sha256=state.sha256,
+    )
+    assert first.next_cursor is not None
+    assert not first.next_cursor.isdigit()
+    second = await service.get_context_section(
+        "evidence_index",
+        limit=20,
+        expected_version=state.version,
+        expected_sha256=state.sha256,
+        cursor=first.next_cursor,
+    )
+    offset_compatible = await service.get_context_section(
+        "evidence_index",
+        offset=20,
+        limit=20,
+        expected_version=state.version,
+        expected_sha256=state.sha256,
+    )
+    chained = decode_keyset_cursor(
+        first.next_cursor,
+        section="evidence_index",
+        investigation_id=fixture.investigation_id,
+        descending=True,
+    )
+
+    assert first.total == second.total == 25
+    assert len(first.items) == 20
+    assert len(second.items) == 5
+    assert first.omission_manifest[0].omission_reasons == {
+        ContextOmissionReason.PAGINATION: first.total - len(first.items)
+    }
+    assert ContextOmissionReason.BUDGET not in first.omission_manifest[0].omission_reasons
+    assert tuple(item["evidence_id"] for item in second.items) == tuple(
+        item["evidence_id"] for item in offset_compatible.items
+    )
+    assert set(item["evidence_id"] for item in first.items).isdisjoint(
+        item["evidence_id"] for item in second.items
+    )
+    assert chained is not None
+    assert verify_page_sha256(
+        claimed_sha256=second.page_sha256,
+        section="evidence_index",
+        investigation_id=fixture.investigation_id,
+        items=second.items,
+        previous_page_sha256=chained["previous_page_sha256"],
+        context_sha256=second.context_sha256,
+        cursor=second.cursor,
+        pivot=second.pivot,
+        descending=second.descending,
+        limit=second.limit,
+        total=second.total,
+        has_more=second.has_more,
+        omission_manifest=second.omission_manifest,
+        next_cursor=second.next_cursor,
+    )
+    assert second.omission_manifest[0].cursor_authentication == "unauthenticated_position"
+
+    forged_position = encode_keyset_cursor(
+        section="evidence_index",
+        investigation_id=fixture.investigation_id,
+        sort_key=(datetime.fromisoformat(chained["sort_key"]) + timedelta(seconds=2)).isoformat(),
+        item_id=UUID(chained["item_id"]),
+        previous_page_sha256=chained["previous_page_sha256"],
+        descending=True,
+        context_sha256=state.sha256,
+    )
+    forged_page = await service.get_context_section(
+        "evidence_index",
+        limit=20,
+        expected_version=state.version,
+        expected_sha256=state.sha256,
+        cursor=forged_position,
+    )
+    assert forged_page.section == second.section
+    assert forged_page.total == second.total
+    assert forged_page.page_sha256 != second.page_sha256
+    assert verify_page_sha256(
+        claimed_sha256=forged_page.page_sha256,
+        section="evidence_index",
+        investigation_id=fixture.investigation_id,
+        items=forged_page.items,
+        previous_page_sha256=chained["previous_page_sha256"],
+        context_sha256=forged_page.context_sha256,
+        cursor=forged_page.cursor,
+        pivot=forged_page.pivot,
+        descending=forged_page.descending,
+        limit=forged_page.limit,
+        total=forged_page.total,
+        has_more=forged_page.has_more,
+        omission_manifest=forged_page.omission_manifest,
+        next_cursor=forged_page.next_cursor,
+    )
+    assert not verify_page_sha256(
+        claimed_sha256=forged_page.page_sha256,
+        section="evidence_index",
+        investigation_id=fixture.investigation_id,
+        items=forged_page.items,
+        previous_page_sha256=chained["previous_page_sha256"],
+        context_sha256=forged_page.context_sha256,
+        cursor=first.next_cursor,
+        pivot=forged_page.pivot,
+        descending=forged_page.descending,
+        limit=forged_page.limit,
+        total=forged_page.total,
+        has_more=forged_page.has_more,
+        omission_manifest=forged_page.omission_manifest,
+        next_cursor=forged_page.next_cursor,
+    )
+
+    for bad_scope in (
+        encode_keyset_cursor(
+            section="findings",
+            investigation_id=fixture.investigation_id,
+            sort_key=chained["sort_key"],
+            item_id=UUID(chained["item_id"]),
+            previous_page_sha256=chained["previous_page_sha256"],
+            descending=True,
+            context_sha256=state.sha256,
+        ),
+        encode_keyset_cursor(
+            section="evidence_index",
+            investigation_id=uuid4(),
+            sort_key=chained["sort_key"],
+            item_id=UUID(chained["item_id"]),
+            previous_page_sha256=chained["previous_page_sha256"],
+            descending=True,
+            context_sha256=state.sha256,
+        ),
+        encode_keyset_cursor(
+            section="evidence_index",
+            investigation_id=fixture.investigation_id,
+            sort_key=chained["sort_key"],
+            item_id=UUID(chained["item_id"]),
+            previous_page_sha256=chained["previous_page_sha256"],
+            descending=True,
+            context_sha256="f" * 64,
+        ),
+    ):
+        with pytest.raises(OperatorToolInvocationError) as bad_scope_error:
+            await service.get_context_section(
+                "evidence_index",
+                expected_version=state.version,
+                expected_sha256=state.sha256,
+                cursor=bad_scope,
+            )
+        assert bad_scope_error.value.code == "operator_context_cursor_invalid"
+    with pytest.raises(OperatorToolInvocationError) as invalid:
+        await service.get_context_section(
+            "evidence_index",
+            expected_version=state.version,
+            expected_sha256=state.sha256,
+            cursor="not-a-keyset-cursor",
+        )
+    assert invalid.value.code == "operator_context_cursor_invalid"
 
 
 @pytest.mark.asyncio

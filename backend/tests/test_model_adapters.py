@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from email.utils import format_datetime
 from typing import Any
 from uuid import UUID
 
@@ -513,6 +515,8 @@ async def test_bridge_capabilities_and_archive_use_separate_timeouts() -> None:
     client = _TimeoutClient()
     transport = ChatGPTBridgeClient(
         "http://bridge.test/v1",
+        timeout_seconds=900,
+        connect_timeout_seconds=3,
         capabilities_timeout_seconds=2,
         archive_timeout_seconds=60,
         client=client,  # type: ignore[arg-type]
@@ -520,10 +524,13 @@ async def test_bridge_capabilities_and_archive_use_separate_timeouts() -> None:
 
     await transport.capabilities()
     await transport.archive_conversation(UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"))
+    await transport.create({"prompt": "offline timeout contract"}, timeout_seconds=123)
 
-    assert len(client.timeouts) == 2
+    assert len(client.timeouts) == 3
     assert client.timeouts[0].read == 2
     assert client.timeouts[1].read == 60
+    assert client.timeouts[2].read == 123
+    assert all(item.connect == 3 for item in client.timeouts)
 
 
 @pytest.mark.parametrize(
@@ -788,6 +795,22 @@ def test_http_429_honors_retry_after_and_is_a_confirmed_rejection() -> None:
     assert error.submission_state == "pre_submission"
     assert error.retryable is True
     assert error.retry_after == 17
+
+
+def test_http_429_converts_retry_after_http_date() -> None:
+    future = datetime.now(UTC) + timedelta(seconds=45)
+    response = httpx.Response(
+        429,
+        request=httpx.Request("POST", "https://bridge.test/v1/responses"),
+        headers={"Retry-After": format_datetime(future, usegmt=True)},
+        json={"detail": {"code": "bridge_rate_limited", "retryable": True}},
+    )
+
+    error = _bridge_http_error(response, attempts=1)
+
+    assert error.submission_state == "pre_submission"
+    assert error.retry_after is not None
+    assert 0 < error.retry_after <= 45
 
 
 @pytest.mark.parametrize(

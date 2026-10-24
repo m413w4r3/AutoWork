@@ -16,6 +16,15 @@ from cti_app.application.advisor_checkpoint import (
     format_advisor_trace_purpose,
     split_advisor_trace_purpose,
 )
+from cti_app.application.context_pagination import (
+    ContextOmissionManifestEntryV1,
+    ContextOmissionReason,
+    assert_manifest_consistency,
+    canonical_page_sha256,
+    decode_keyset_cursor,
+    decode_offset_cursor,
+    encode_offset_cursor,
+)
 from cti_app.application.evidence_recorder import _sanitize_json, sanitize_evidence_text
 from cti_app.application.investigation_contracts import (
     MAX_CONTEXT_BYTES,
@@ -51,7 +60,10 @@ from cti_app.application.research_context_builder import (
     InvestigationContextTooLarge,
     ResearchContextBuilder,
 )
+from cti_app.domain.analyst_opinion import investigation_opinion_id
 from cti_app.domain.investigation import (
+    BudgetReservationStatus,
+    FrameworkPreSubmissionProof,
     InvestigationExecutionMode,
     ToolInvocation,
     ToolInvocationStatus,
@@ -119,6 +131,167 @@ _ADDITIONAL_CONTEXT_ITEM_SECTIONS = frozenset(
         "source",
     }
 )
+_SOURCE_PAGED_CONTEXT_SECTIONS = frozenset(
+    {"new_evidence", "evidence_index", "findings", "finding_versions", "tool_coverage"}
+)
+
+
+def _materialized_page_proof(
+    *,
+    section: str,
+    investigation_id: UUID,
+    context_sha256: str,
+    offset: int,
+    limit: int,
+    total: int,
+    items: tuple[Any, ...],
+    cursor: str | None,
+) -> tuple[str, str, str | None, ContextOmissionManifestEntryV1, dict[str, str], bool]:
+    previous_page_sha256 = (
+        decode_offset_cursor(
+            cursor,
+            section=section,
+            investigation_id=investigation_id,
+            context_sha256=context_sha256,
+        )["previous_page_sha256"]
+        if cursor
+        else "0" * 64
+    )
+    next_offset = offset + len(items)
+    has_more = next_offset < total
+    omitted = total - len(items)
+    omission_reasons = {ContextOmissionReason.SOURCE_NOT_PAGINATED: omitted} if omitted else {}
+    unbounded_reason = "The context section was materialized before page selection"
+    pivot = {
+        "kind": "offset",
+        "section": section,
+        "investigation_id": str(investigation_id),
+        "context_sha256": context_sha256,
+        "offset": str(next_offset),
+    }
+    omission_summary = {
+        "section": section,
+        "total": total,
+        "selected": len(items),
+        "omitted": omitted,
+        "source_bounded": False,
+        "omission_reasons": omission_reasons,
+        "unbounded_reason": unbounded_reason,
+    }
+    page_sha256 = canonical_page_sha256(
+        section=section,
+        investigation_id=investigation_id,
+        context_sha256=context_sha256,
+        cursor=cursor,
+        pivot=pivot,
+        descending=False,
+        limit=limit,
+        total=total,
+        has_more=has_more,
+        items=items,
+        previous_page_sha256=previous_page_sha256,
+        omission_manifest=omission_summary,
+    )
+    source_ref = f"operator-context:{context_sha256}:{section}:offset={offset}:sha256={page_sha256}"
+    next_cursor = (
+        encode_offset_cursor(
+            section=section,
+            investigation_id=investigation_id,
+            context_sha256=context_sha256,
+            offset=next_offset,
+            previous_page_sha256=page_sha256,
+        )
+        if next_offset < total
+        else None
+    )
+    entry = ContextOmissionManifestEntryV1(
+        section=section,
+        total=total,
+        selected=len(items),
+        omitted=omitted,
+        source_bounded=False,
+        source_ref=source_ref,
+        page_sha256=page_sha256,
+        omission_reasons=omission_reasons,
+        unbounded_reason=unbounded_reason,
+        context_sha256=context_sha256,
+        cursor=cursor,
+        pivot=pivot,
+        descending=False,
+        limit=limit,
+        has_more=has_more,
+    )
+    assert_manifest_consistency(
+        section=section,
+        investigation_id=investigation_id,
+        items=items,
+        previous_page_sha256=previous_page_sha256,
+        context_sha256=context_sha256,
+        cursor=cursor,
+        pivot=pivot,
+        descending=False,
+        limit=limit,
+        total=total,
+        has_more=has_more,
+        source_bounded=False,
+        omission_reasons=omission_reasons,
+        unbounded_reason=unbounded_reason,
+        selected=len(items),
+        omitted=omitted,
+        claimed_page_sha256=page_sha256,
+        claimed_source_ref=source_ref,
+        manifest=entry,
+        source_ref_offset=offset,
+        cursor_authentication=None,
+    )
+    return (
+        page_sha256,
+        source_ref,
+        next_cursor,
+        entry,
+        pivot,
+        has_more,
+    )
+
+
+def _assert_keyset_page_consistency(page: Any, *, section: str, investigation_id: UUID) -> None:
+    entries = page.omission_manifest
+    if len(entries) != 1:
+        raise ValueError("Operator keyset page must have exactly one omission manifest")
+    entry = entries[0]
+    previous_page_sha256 = (
+        decode_keyset_cursor(
+            page.cursor,
+            section=section,
+            investigation_id=investigation_id,
+            descending=page.descending,
+            context_sha256=page.context_sha256,
+        )["previous_page_sha256"]
+        if page.cursor is not None
+        else "0" * 64
+    )
+    assert_manifest_consistency(
+        section=section,
+        investigation_id=investigation_id,
+        items=page.items,
+        previous_page_sha256=previous_page_sha256,
+        context_sha256=page.context_sha256,
+        cursor=page.cursor,
+        pivot=page.pivot,
+        descending=page.descending,
+        limit=page.limit,
+        total=page.total,
+        has_more=page.has_more,
+        source_bounded=page.source_bounded,
+        omission_reasons=entry.omission_reasons,
+        unbounded_reason=page.unbounded_reason,
+        selected=len(page.items),
+        omitted=page.total - len(page.items),
+        claimed_page_sha256=page.page_sha256,
+        claimed_source_ref=page.source_ref,
+        manifest=entry,
+        cursor_authentication="unauthenticated_position",
+    )
 
 
 class OperatorToolInvocationError(RuntimeError):
@@ -303,7 +476,7 @@ class OperatorToolInvocationService:
         limit: int = 20,
         expected_version: int | None = None,
         expected_sha256: str | None = None,
-        cursor: str | None = None,
+        cursor: str | int | None = None,
     ) -> OperatorContextSectionPageV1 | OperatorContextItemPageV1:
         state = await self._states.get(self._investigation_id)
         if state is None:
@@ -313,45 +486,170 @@ class OperatorToolInvocationService:
             raise OperatorToolInvocationError("stale_working_state", 409)
         if expected_sha256 is not None and state.sha256 != expected_sha256:
             raise OperatorToolInvocationError("stale_working_state", 409)
+        legacy_offset_cursor = False
         if cursor is not None:
             if expected_version is None or expected_sha256 is None:
                 raise OperatorToolInvocationError("operator_context_cursor_requires_cas", 422)
-            try:
-                cursor_offset = int(cursor)
-            except ValueError:
-                raise OperatorToolInvocationError("operator_context_cursor_invalid", 422) from None
-            if cursor_offset < 0:
+            if isinstance(cursor, bool):
                 raise OperatorToolInvocationError("operator_context_cursor_invalid", 422)
-            if offset not in {0, cursor_offset}:
+            if isinstance(cursor, int) or (isinstance(cursor, str) and cursor.isdecimal()):
+                legacy_offset_cursor = True
+                try:
+                    cursor_offset = int(cursor)
+                except ValueError:
+                    raise OperatorToolInvocationError(
+                        "operator_context_cursor_invalid", 422
+                    ) from None
+                if cursor_offset < 0 or offset not in {0, cursor_offset}:
+                    raise OperatorToolInvocationError("operator_context_cursor_invalid", 422)
+                offset = cursor_offset
+            elif cursor == "":
+                if offset != 0:
+                    raise OperatorToolInvocationError("operator_context_cursor_invalid", 422)
+                cursor = None
+            elif offset != 0:
                 raise OperatorToolInvocationError("operator_context_cursor_invalid", 422)
-            offset = cursor_offset
         if state.pending_context_sha256 is not None:
             raise OperatorToolInvocationError("bridge_checkpoint_pending", 409)
         investigation = await self._investigations.get(self._investigation_id)
         if investigation is None:
             raise OperatorToolInvocationError("investigation_not_found", 404)
+        if offset < 0 or not 1 <= limit <= 20:
+            raise OperatorToolInvocationError("operator_context_page_invalid", 422)
+
+        if section in _SOURCE_PAGED_CONTEXT_SECTIONS:
+            keyset_cursor = cursor if isinstance(cursor, str) else None
+            if keyset_cursor is not None:
+                try:
+                    decode_keyset_cursor(
+                        keyset_cursor,
+                        section=section,
+                        investigation_id=self._investigation_id,
+                        descending=section != "finding_versions",
+                        context_sha256=state.sha256,
+                    )
+                except ValueError:
+                    raise OperatorToolInvocationError(
+                        "operator_context_cursor_invalid", 422
+                    ) from None
+            try:
+                page = await self._context_builder.read_context_section_page(
+                    section=section,
+                    investigation_id=self._investigation_id,
+                    state=state,
+                    cursor=keyset_cursor,
+                    offset=offset if legacy_offset_cursor or cursor is None else 0,
+                    limit=limit,
+                    context_sha256=state.sha256,
+                )
+            except ValueError as exc:
+                if str(exc) == "Section does not use source-bounded keyset pagination":
+                    raise OperatorToolInvocationError(
+                        "operator_context_section_unknown", 404
+                    ) from None
+                raise OperatorToolInvocationError("operator_context_cursor_invalid", 422) from None
+            _assert_keyset_page_consistency(
+                page,
+                section=section,
+                investigation_id=self._investigation_id,
+            )
+            omission = page.omission_manifest[0]
+            next_offset = (
+                offset + len(page.items)
+                if page.has_more and (legacy_offset_cursor or cursor is None)
+                else None
+            )
+            if section == "finding_versions":
+                operator_context = await self.get_context(
+                    expected_version=state.version,
+                    expected_sha256=state.sha256,
+                )
+                return OperatorContextItemPageV1(
+                    investigation_id=self._investigation_id,
+                    working_state_version=operator_context.working_state_version,
+                    working_state_sha256=operator_context.working_state_sha256,
+                    context_sha256=operator_context.context_sha256,
+                    section=section,
+                    offset=offset,
+                    limit=limit,
+                    total=page.total,
+                    next_offset=next_offset,
+                    next_cursor=page.next_cursor,
+                    page_sha256=page.page_sha256,
+                    source_ref=page.source_ref,
+                    omission_manifest=(omission,),
+                    items=page.items,
+                    cursor=page.cursor,
+                    pivot=page.pivot,
+                    descending=page.descending,
+                    has_more=page.has_more,
+                    source_bounded=page.source_bounded,
+                    unbounded_reason=page.unbounded_reason,
+                    cursor_authentication=page.cursor_authentication,
+                    section_truncated=page.total > len(page.items),
+                )
+            return OperatorContextSectionPageV1(
+                investigation_id=self._investigation_id,
+                working_state_version=state.version,
+                working_state_sha256=state.sha256,
+                context_sha256=page.context_sha256,
+                section=cast(Any, section),
+                offset=offset,
+                limit=limit,
+                total=page.total,
+                next_offset=next_offset,
+                next_cursor=page.next_cursor,
+                page_sha256=page.page_sha256,
+                source_ref=page.source_ref,
+                omission_manifest=(omission,),
+                items=page.items,
+                cursor=page.cursor,
+                pivot=page.pivot,
+                descending=page.descending,
+                has_more=page.has_more,
+                source_bounded=page.source_bounded,
+                unbounded_reason=page.unbounded_reason,
+                cursor_authentication=page.cursor_authentication,
+            )
+
         if section in _ADDITIONAL_CONTEXT_ITEM_SECTIONS:
-            if offset < 0 or not 1 <= limit <= 20:
-                raise OperatorToolInvocationError("operator_context_page_invalid", 422)
             operator_context = await self.get_context(
                 expected_version=state.version,
                 expected_sha256=state.sha256,
             )
-            if section == "finding_versions":
-                total, page_items = await self._context_builder.read_context_section(
-                    section=section,
-                    investigation_id=self._investigation_id,
-                    state=state,
-                    offset=offset,
-                    limit=limit,
-                    synthesis_artifact_id=investigation.synthesis_artifact_id,
-                )
-            else:
-                all_items = _additional_context_items(operator_context, section)
-                total = len(all_items)
-                page_items = all_items[offset : offset + limit]
+            if isinstance(cursor, str) and cursor:
+                try:
+                    offset = decode_offset_cursor(
+                        cursor,
+                        section=section,
+                        investigation_id=self._investigation_id,
+                        context_sha256=operator_context.context_sha256,
+                    )["offset"]
+                except ValueError:
+                    raise OperatorToolInvocationError(
+                        "operator_context_cursor_invalid", 422
+                    ) from None
+            all_items = _additional_context_items(operator_context, section)
+            total = len(all_items)
+            page_items = all_items[offset : offset + limit]
             next_offset = offset + len(page_items) if offset + len(page_items) < total else None
-            next_cursor = str(next_offset) if next_offset is not None else None
+            (
+                page_sha256,
+                source_ref,
+                next_cursor,
+                omission,
+                pivot,
+                has_more,
+            ) = _materialized_page_proof(
+                section=section,
+                investigation_id=self._investigation_id,
+                context_sha256=operator_context.context_sha256,
+                offset=offset,
+                limit=limit,
+                total=total,
+                items=tuple(_context_item_json(item) for item in page_items),
+                cursor=cursor if isinstance(cursor, str) and cursor else None,
+            )
             return OperatorContextItemPageV1(
                 investigation_id=self._investigation_id,
                 working_state_version=operator_context.working_state_version,
@@ -363,9 +661,29 @@ class OperatorToolInvocationService:
                 total=total,
                 next_offset=next_offset,
                 next_cursor=next_cursor,
+                page_sha256=page_sha256,
+                source_ref=source_ref,
+                omission_manifest=(omission,),
                 items=tuple(_context_item_json(item) for item in page_items),
+                cursor=cursor if isinstance(cursor, str) and cursor else None,
+                pivot=pivot,
+                descending=False,
+                has_more=has_more,
+                source_bounded=False,
+                unbounded_reason=omission.unbounded_reason,
+                cursor_authentication=None,
                 section_truncated=_additional_context_section_truncated(operator_context, section),
             )
+        if isinstance(cursor, str) and cursor:
+            try:
+                offset = decode_offset_cursor(
+                    cursor,
+                    section=section,
+                    investigation_id=self._investigation_id,
+                    context_sha256=state.sha256,
+                )["offset"]
+            except ValueError:
+                raise OperatorToolInvocationError("operator_context_cursor_invalid", 422) from None
         try:
             total, items = await self._context_builder.read_context_section(
                 section=section,
@@ -380,7 +698,16 @@ class OperatorToolInvocationService:
                 raise OperatorToolInvocationError("operator_context_section_unknown", 404) from None
             raise
         next_offset = offset + len(items) if offset + len(items) < total else None
-        next_cursor = str(next_offset) if next_offset is not None else None
+        page_sha256, source_ref, next_cursor, omission, pivot, has_more = _materialized_page_proof(
+            section=section,
+            investigation_id=self._investigation_id,
+            context_sha256=state.sha256,
+            offset=offset,
+            limit=limit,
+            total=total,
+            items=items,
+            cursor=cursor if isinstance(cursor, str) and cursor else None,
+        )
         return OperatorContextSectionPageV1(
             investigation_id=self._investigation_id,
             working_state_version=state.version,
@@ -391,7 +718,18 @@ class OperatorToolInvocationService:
             total=total,
             next_offset=next_offset,
             next_cursor=next_cursor,
+            page_sha256=page_sha256,
+            source_ref=source_ref,
+            omission_manifest=(omission,),
             items=items,
+            context_sha256=state.sha256,
+            cursor=cursor if isinstance(cursor, str) and cursor else None,
+            pivot=pivot,
+            descending=False,
+            has_more=has_more,
+            source_bounded=False,
+            unbounded_reason=omission.unbounded_reason,
+            cursor_authentication=None,
         )
 
     async def invoke(
@@ -472,34 +810,50 @@ class OperatorToolInvocationService:
         )
         return definitions[0].schema_version if len(definitions) == 1 else schema_version
 
-    async def _is_proven_pre_submit_advisor_failure(self, invocation: ToolInvocation) -> bool:
+    async def _framework_pre_submission_proof(
+        self, invocation: ToolInvocation
+    ) -> FrameworkPreSubmissionProof | None:
+        if self._observations is None or self._evidence_summaries is None:
+            return None
+        envelope = await self._envelopes.get(self._investigation_id)
+        if envelope is None:
+            return None
+        reservation = next(
+            (
+                item
+                for item in envelope.budget.reservations
+                if item.operation_key == invocation.operation_key
+            ),
+            None,
+        )
         if (
-            invocation.tool_name != "advisor.consult"
-            or self._observations is None
-            or self._evidence_summaries is None
+            reservation is None
+            or reservation.status is not BudgetReservationStatus.RELEASED
+            or dict(reservation.amounts) != dict(invocation.reserved_budget)
         ):
-            return False
+            return None
         for observation_id in invocation.response_refs:
             observation = await self._observations.get(observation_id)
             if (
                 observation is None
                 or observation.investigation_id != self._investigation_id
-                or observation.source != "advisor.consult"
-                or observation.object_type != "tool_call"
+                or observation.invocation_ref != invocation.id
+                or observation.source != invocation.tool_name
+                or observation.source_version != invocation.schema_version
+                or observation.object_id != invocation.operation_key
             ):
+                continue
+            try:
+                proof = FrameworkPreSubmissionProof(observation.object_type)
+            except ValueError:
                 continue
             try:
                 summary = await self._evidence_summaries.summary(observation)
             except Exception:
                 continue
-            if (
-                isinstance(summary, Mapping)
-                and summary.get("advisor_status") == "invalid_input"
-                and summary.get("bridge_invocation_id") is None
-                and summary.get("failure_stage") in {None, "pre_transport_validation"}
-            ):
-                return True
-        return False
+            if isinstance(summary, Mapping):
+                return proof
+        return None
 
     async def _invoke_locked(
         self,
@@ -556,32 +910,38 @@ class OperatorToolInvocationService:
                     reviewed, expected_version=existing.version
                 )
                 await self._execution.commit_current_uow()
+            return await self._result(existing, state.version, replay=True)
+
+        semantic_parameters = _semantic_parameters_fingerprint(
+            tool_name, arguments, self._investigation_id
+        )
+        for existing in await self._invocations.list_for_investigation(self._investigation_id):
             if (
-                existing.status is ToolInvocationStatus.NEEDS_REVIEW
-                and await self._is_proven_pre_submit_advisor_failure(existing)
+                existing.tool_name != tool_name
+                or _semantic_parameters_fingerprint(
+                    existing.tool_name,
+                    existing.normalized_parameters,
+                    self._investigation_id,
+                )
+                != semantic_parameters
+                or existing.status
+                not in {ToolInvocationStatus.RUNNING, ToolInvocationStatus.NEEDS_REVIEW}
             ):
+                continue
+            proof = await self._framework_pre_submission_proof(existing)
+            if existing.status is ToolInvocationStatus.NEEDS_REVIEW and proof is not None:
                 resolved = existing.resolve_pre_submission_failure()
                 existing = await self._invocations.update_if_version(
                     resolved, expected_version=existing.version
                 )
                 failure = ToolResult(
                     ToolInvocationStatus.FAILED,
-                    error_code="advisor_input_invalid",
+                    error_code=proof.value,
                     message=(
-                        "Persisted advisor invalid_input proves the invocation failed "
-                        "before Bridge submission; its legacy reason detail is unavailable."
+                        "Persisted evidence proves the prior invocation did not reach "
+                        "external submission."
                     ),
-                    output={
-                        "advisor_status": "invalid_input",
-                        "failure_stage": "pre_transport_validation",
-                        "confirmed_non_execution": True,
-                        "bridge_invocation_id": None,
-                        "provider_usage": {"status": "not_submitted"},
-                        "context_estimate": {
-                            "status": "not_available",
-                            "reason": "pre_transport_validation",
-                        },
-                    },
+                    framework_pre_submission_proof=proof,
                 )
                 await self._execution._complete_tool_reservation(
                     investigation_id=self._investigation_id,
@@ -591,13 +951,12 @@ class OperatorToolInvocationService:
                     uncertain=False,
                 )
                 await self._execution.commit_current_uow()
-                return await self._result(
-                    existing,
-                    state.version,
-                    replay=True,
-                    tool_result=failure,
-                )
-            return await self._result(existing, state.version, replay=True)
+                continue
+            raise OperatorToolInvocationError(
+                "ambiguous_tool_invocation_requires_reconciliation",
+                409,
+                details={"existing_invocation_id": str(existing.id)},
+            )
 
         if state.version != expected_version:
             raise OperatorToolInvocationError("stale_working_state", 409)
@@ -994,6 +1353,84 @@ class OperatorToolInvocationService:
             idempotent_replay=replay,
             output=output,
         )
+
+
+def _canonical_uuid_reference(value: object) -> str | None:
+    try:
+        return str(UUID(str(value)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _semantic_parameters_fingerprint(
+    tool_name: str,
+    parameters: Mapping[str, Any],
+    investigation_id: UUID,
+) -> bytes:
+    """Return the conservative effect identity of a tool request.
+
+    The fingerprint folds representations that the adapters treat as
+    equivalent. Over-blocking a genuinely different request only forces an
+    explicit reconciliation; under-blocking would allow a second external call.
+    """
+    normalized = dict(parameters)
+    if tool_name == "advisor.consult":
+        question = normalized.get("question", "")
+        if isinstance(question, str):
+            question = question.strip()
+            if question:
+                normalized["question"] = question
+            else:
+                normalized.pop("question", None)
+
+        evidence_refs = normalized.get("evidence_refs", ())
+        if isinstance(evidence_refs, list | tuple):
+            canonical_refs: list[str] = []
+            for item in evidence_refs:
+                canonical = _canonical_uuid_reference(item)
+                canonical_refs.append(canonical if canonical is not None else str(item))
+            if canonical_refs:
+                normalized["evidence_refs"] = sorted(canonical_refs)
+            else:
+                normalized.pop("evidence_refs", None)
+
+        consultation_type = normalized.get("consultation_type")
+        if consultation_type == "figure_plan":
+            finding_refs = normalized.get("finding_refs", ())
+            if isinstance(finding_refs, list | tuple):
+                canonical_findings: list[str] = []
+                for item in finding_refs:
+                    canonical = _canonical_uuid_reference(item)
+                    canonical_findings.append(canonical if canonical is not None else str(item))
+                if canonical_findings:
+                    normalized["finding_refs"] = sorted(canonical_findings)
+                else:
+                    normalized.pop("finding_refs", None)
+        elif consultation_type == "review_text":
+            opinion_id = normalized.get("opinion_id")
+            default_opinion_id = str(investigation_opinion_id(investigation_id))
+            if opinion_id is None:
+                normalized["opinion_id"] = default_opinion_id
+            else:
+                canonical_opinion = _canonical_uuid_reference(opinion_id)
+                normalized["opinion_id"] = (
+                    canonical_opinion if canonical_opinion is not None else default_opinion_id
+                )
+            # Omitted means "latest"; an explicit version is resolved by the
+            # adapter. Treating all versions as equivalent is conservative: it
+            # blocks a fresh key until reconciliation and closes the omitted
+            # versus explicit bypass.
+            normalized.pop("opinion_version", None)
+            form = normalized.get("form")
+            if form is None:
+                normalized["form"] = "body"
+            elif isinstance(form, str):
+                normalized["form"] = form.strip().lower() or "body"
+    elif tool_name == "vt.file_report":
+        file_hash = normalized.get("file_hash")
+        if isinstance(file_hash, str):
+            normalized["file_hash"] = file_hash.strip().lower()
+    return canonical_json_bytes(normalized)
 
 
 def _operator_output_kind(tool_name: str) -> str:

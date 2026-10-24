@@ -449,6 +449,11 @@ function ExperimentDetail({
             {experiment.recorded_at}
           </time>
         </summary>
+        {experiment.verdict_assertion_label ? (
+          <p className="verification-warning" role="note">
+            {experiment.verdict_assertion_label}
+          </p>
+        ) : null}
         {experiment.superseded_by?.length ? (
           <p className="verification-warning" role="note">
             Remplacée par :{" "}

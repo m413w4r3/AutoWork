@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -273,6 +274,7 @@ def request(
     run_id: UUID | None = None,
     provider: ModelProvider | None = None,
     backend: ModelBackend | None = None,
+    timeout_seconds: float | None = None,
 ) -> ModelRequest:
     return ModelRequest(
         text="Analyse token=super-secret /home/analyst/private/report.txt",
@@ -292,6 +294,7 @@ def request(
         run_id=run_id,
         provider=provider,
         backend=backend,
+        timeout_seconds=timeout_seconds,
     )
 
 
@@ -1457,12 +1460,18 @@ class _RecordingResponsesTransport:
     def __init__(self, output_text: str) -> None:
         self._output_text = output_text
         self.payloads: list[dict[str, Any]] = []
+        self.timeout_seconds: list[float | None] = []
 
     async def create(
-        self, payload: dict[str, Any], *, idempotency_key: str | None = None
+        self,
+        payload: dict[str, Any],
+        *,
+        idempotency_key: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         del idempotency_key
         self.payloads.append(payload)
+        self.timeout_seconds.append(timeout_seconds)
         return {
             "id": f"resp_{len(self.payloads)}",
             "status": "completed",
@@ -1478,6 +1487,8 @@ class _RecordingResponsesTransport:
 
 def _chatgpt_bridge_gateway(
     transport: ResponsesTransport,
+    *,
+    research_timeout_seconds: float | None = None,
 ) -> tuple[ModelGateway, InMemoryModelRunUnitOfWorkFactory]:
     """Mirror the production composition: distinct drafting / structured models."""
     model_uow = InMemoryModelRunUnitOfWorkFactory()
@@ -1490,7 +1501,181 @@ def _chatgpt_bridge_gateway(
         qwen=QwenAdapter(NoCallChatTransport(), model="Qwen3-32B", is_external=False),
         fake=FakeModelAdapter(),
     )
-    return ModelGateway(router, model_uow, InMemoryModelOutputStore()), model_uow
+    role_timeouts = (
+        {ModelRole.RESEARCH: research_timeout_seconds}
+        if research_timeout_seconds is not None
+        else None
+    )
+    return (
+        ModelGateway(
+            router,
+            model_uow,
+            InMemoryModelOutputStore(),
+            bridge_wait_timeout_seconds_by_role=role_timeouts,
+        ),
+        model_uow,
+    )
+
+
+@pytest.mark.parametrize(
+    ("request_timeout", "role_timeout", "expected_timeout"),
+    [(3_600, 7_200, 3_600), (9_000, 7_200, 7_200)],
+)
+async def test_chatgpt_bridge_transport_receives_minimum_of_request_and_role_timeout(
+    request_timeout: float,
+    role_timeout: float,
+    expected_timeout: float,
+) -> None:
+    transport = _RecordingResponsesTransport("bounded response")
+    gateway, _ = _chatgpt_bridge_gateway(transport, research_timeout_seconds=role_timeout)
+
+    execution = await gateway.research(
+        request(
+            external_llm_allowed=True,
+            provider=ModelProvider.OPENAI,
+            backend=ModelBackend.CHATGPT_BRIDGE,
+            timeout_seconds=request_timeout,
+        )
+    )
+
+    assert execution.run.status is ModelRunStatus.SUCCEEDED
+    assert transport.timeout_seconds == [expected_timeout]
+    assert len(transport.payloads) == 1
+
+
+@pytest.mark.asyncio
+async def test_chatgpt_bridge_gateway_hard_timeout_cancels_one_transport_entry() -> None:
+    class HangingResponsesTransport:
+        def __init__(self) -> None:
+            self.calls: list[float | None] = []
+
+        async def create(
+            self,
+            payload: dict[str, Any],
+            *,
+            idempotency_key: str | None = None,
+            timeout_seconds: float | None = None,
+        ) -> dict[str, Any]:
+            del payload, idempotency_key
+            self.calls.append(timeout_seconds)
+            await asyncio.Event().wait()
+
+        async def retrieve(self, response_id: str) -> dict[str, Any]:
+            del response_id
+            raise AssertionError("not used")
+
+    transport = HangingResponsesTransport()
+    gateway, model_uow = _chatgpt_bridge_gateway(transport, research_timeout_seconds=5)
+
+    with pytest.raises(ModelSubmissionReconciliationRequiredError):
+        await gateway.research(
+            request(
+                external_llm_allowed=True,
+                provider=ModelProvider.OPENAI,
+                backend=ModelBackend.CHATGPT_BRIDGE,
+                timeout_seconds=0.05,
+            )
+        )
+
+    assert transport.calls == [0.05]
+    assert len(model_uow.state) == 1
+    run = next(iter(model_uow.state.values()))
+    assert run.status is ModelRunStatus.NEEDS_REVIEW
+    assert run.submission_state.value == "external_state_unknown"
+
+
+async def test_non_bridge_role_timeout_remains_a_transport_timeout_not_total_deadline(
+    monkeypatch,
+) -> None:
+    import cti_app.application.model_gateway as model_gateway_module
+
+    clock = [0.0]
+
+    class AdvancingChatTransport:
+        def __init__(self) -> None:
+            self.timeouts: list[float | None] = []
+
+        async def create(
+            self, payload: dict[str, Any], *, timeout_seconds: float | None = None
+        ) -> dict[str, Any]:
+            self.timeouts.append(timeout_seconds)
+            clock[0] += 6.0
+            return {
+                "id": "gemini-response",
+                "model": str(payload["model"]),
+                "choices": [{"message": {"content": "completed"}}],
+            }
+
+    monkeypatch.setattr(model_gateway_module.time, "monotonic", lambda: clock[0])
+    transport = AdvancingChatTransport()
+    gemini = OpenAICompatibleChatAdapter(
+        transport,
+        provider=ModelProvider.GEMINI,
+        backend=ModelBackend.GEMINI_WEBAI,
+        model="gemini-3-flash",
+        is_external=True,
+    )
+    gateway = ModelGateway(
+        ModelRouter(
+            openai_research=FakeModelAdapter(),
+            openai_structured=FakeModelAdapter(),
+            qwen=FakeModelAdapter(),
+            gemini=gemini,
+            fake=FakeModelAdapter(),
+        ),
+        InMemoryModelRunUnitOfWorkFactory(),
+        InMemoryModelOutputStore(),
+        request_timeout_seconds_by_role={ModelRole.DRAFTING: 5.0},
+    )
+
+    execution = await gateway.draft(
+        request(
+            external_llm_allowed=True,
+            routing_hint=ModelRoutingHint.PREMIUM_SYNTHESIS,
+            backend=ModelBackend.GEMINI_WEBAI,
+        )
+    )
+
+    assert execution.run.status is ModelRunStatus.SUCCEEDED
+    assert transport.timeouts == [5.0]
+
+
+async def test_bridge_role_default_remains_transport_timeout_without_explicit_deadline(
+    monkeypatch,
+) -> None:
+    import cti_app.application.model_gateway as model_gateway_module
+
+    clock = [0.0]
+
+    class AdvancingResponsesTransport(_RecordingResponsesTransport):
+        async def create(
+            self,
+            payload: dict[str, Any],
+            *,
+            idempotency_key: str | None = None,
+            timeout_seconds: float | None = None,
+        ) -> dict[str, Any]:
+            clock[0] += 6.0
+            return await super().create(
+                payload,
+                idempotency_key=idempotency_key,
+                timeout_seconds=timeout_seconds,
+            )
+
+    monkeypatch.setattr(model_gateway_module.time, "monotonic", lambda: clock[0])
+    transport = AdvancingResponsesTransport("completed")
+    gateway, _ = _chatgpt_bridge_gateway(transport, research_timeout_seconds=5.0)
+
+    execution = await gateway.research(
+        request(
+            external_llm_allowed=True,
+            provider=ModelProvider.OPENAI,
+            backend=ModelBackend.CHATGPT_BRIDGE,
+        )
+    )
+
+    assert execution.run.status is ModelRunStatus.SUCCEEDED
+    assert transport.timeout_seconds == [5.0]
 
 
 def test_production_factory_routes_chatgpt_drafting_by_structured_requirement() -> None:

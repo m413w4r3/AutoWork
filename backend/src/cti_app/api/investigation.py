@@ -48,6 +48,8 @@ from cti_app.application.investigation_contracts import (
 )
 from cti_app.application.investigation_experiments import (
     build_investigation_experiment_timeline,
+    build_investigation_strategy_projection,
+    project_safe_investigation_experiment_timeline,
 )
 from cti_app.application.investigation_governance import (
     EnvelopeDecisionConflictError,
@@ -69,6 +71,7 @@ from cti_app.application.investigation_jobs import (
 )
 from cti_app.application.investigation_operator_view import (
     InvestigationOperatorErrorCode,
+    build_investigation_operator_strategy_checkpoint,
     build_investigation_operator_view,
 )
 from cti_app.application.investigation_persistence import VersionConflictError
@@ -299,16 +302,16 @@ class FindingView(BaseModel):
 class ExperimentInputRefView(BaseModel):
     input_type: str
     input_id: str
-    sha256: str | None
+    sha256: str | Literal["[redacted]"] | None
 
 
 class ExperimentInvocationRefView(BaseModel):
-    invocation_id: UUID
-    version: int
+    invocation_id: UUID | Literal["[redacted]"]
+    version: int | Literal["[redacted]"]
 
 
 class ExperimentObservationRefView(BaseModel):
-    observation_id: UUID
+    observation_id: UUID | Literal["[redacted]"]
     sha256: str
 
 
@@ -316,8 +319,8 @@ class InvestigationExperimentViewV1(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
 
     schema_version: str = Field(pattern=r"^investigation-experiment\.v1$")
-    id: UUID
-    investigation_id: UUID
+    id: UUID | Literal["[redacted]"]
+    investigation_id: UUID | Literal["[redacted]"]
     version: int
     hypothesis_id: str
     claim_ids: list[str]
@@ -348,22 +351,24 @@ class InvestigationExperimentViewV1(BaseModel):
     scope: str
     limitations: list[str]
     verdict: ExperimentVerdict
-    supersedes_experiment_ids: list[UUID] = Field(default_factory=list)
-    superseded_by: list[UUID] = Field(default_factory=list)
+    supersedes_experiment_ids: list[UUID | Literal["[redacted]"]] = Field(default_factory=list)
+    superseded_by: list[UUID | Literal["[redacted]"]] = Field(default_factory=list)
     implication: str
     next_pivots: list[str]
     author: str
     origin: str
+    verdict_assertion_label: str | None = None
 
 
 class ClaimExperimentScopeViewV1(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
 
-    experiment_id: UUID
+    experiment_id: UUID | Literal["[redacted]"]
     scope: str
     verdict: ExperimentVerdict
-    observation_ids: list[UUID]
-    superseded_by: list[UUID] = Field(default_factory=list)
+    observation_ids: list[UUID | Literal["[redacted]"]]
+    superseded_by: list[UUID | Literal["[redacted]"]] = Field(default_factory=list)
+    verdict_assertion_label: str | None = None
 
 
 class ConsolidatedClaimVerdictViewV1(BaseModel):
@@ -372,10 +377,11 @@ class ConsolidatedClaimVerdictViewV1(BaseModel):
     claim_id: str
     status: ConsolidatedClaimStatus
     verdicts: list[ExperimentVerdict]
-    experiment_ids: list[UUID]
+    experiment_ids: list[UUID | Literal["[redacted]"]]
     scopes: list[ClaimExperimentScopeViewV1]
     contradictory: bool
-    superseded_by: list[UUID] = Field(default_factory=list)
+    superseded_by: list[UUID | Literal["[redacted]"]] = Field(default_factory=list)
+    verdict_assertion_labels: list[str] = Field(default_factory=list)
 
 
 class InvestigationExperimentTimelineResponseV1(BaseModel):
@@ -385,10 +391,11 @@ class InvestigationExperimentTimelineResponseV1(BaseModel):
         default=EXPERIMENT_TIMELINE_SCHEMA_VERSION,
         pattern=r"^investigation-experiment-timeline\.v1$",
     )
-    investigation_id: UUID
+    investigation_id: UUID | Literal["[redacted]"]
     stream_version: int
     experiments: list[InvestigationExperimentViewV1]
     claims: list[ConsolidatedClaimVerdictViewV1]
+    strategy: dict[str, Any] = Field(default_factory=dict)
 
 
 class ObservationView(BaseModel):
@@ -1010,8 +1017,86 @@ async def get_investigation_experiments(
         if repository is None:
             raise _http_error(503, "investigation_experiments_unavailable")
         timeline = await build_investigation_experiment_timeline(repository, investigation_id)
+        state_repository = getattr(uow, "investigation_states", None)
+        state = (
+            await state_repository.get(investigation_id) if state_repository is not None else None
+        )
+        observations_repository = getattr(uow, "evidence_observations", None)
+        observations = (
+            tuple(await observations_repository.list_for_investigation(investigation_id))
+            if observations_repository is not None
+            else ()
+        )
+        invocation_repository = getattr(uow, "tool_invocations", None)
+        invocations = (
+            tuple(await invocation_repository.list_for_investigation(investigation_id))
+            if invocation_repository is not None
+            else ()
+        )
+        snapshot = None
+        snapshot_version = None
+        composition_factory = getattr(request.app.state, "investigation_composition_factory", None)
+        snapshot_resolver = getattr(composition_factory, "article_snapshots", None)
+        resolve_snapshot = getattr(snapshot_resolver, "resolve", None)
+        if callable(resolve_snapshot):
+            try:
+                snapshot = await resolve_snapshot(investigation.synthesis_artifact_id)
+            except (KeyError, ValueError):
+                snapshot = None
+        artifact_repository = getattr(uow, "production_artifacts", None)
+        get_artifact = getattr(artifact_repository, "get", None)
+        if snapshot is not None and callable(get_artifact):
+            artifact = await get_artifact(investigation.synthesis_artifact_id)
+            if (
+                artifact is not None
+                and artifact.id == investigation.synthesis_artifact_id
+                and artifact.stage is ProductionArtifactStage.SYNTHESIS
+                and artifact.status is ProductionArtifactStatus.VERIFIED
+                and artifact.production_run_id == investigation.production_run_id
+                and artifact.subject_id == investigation.subject_id
+            ):
+                snapshot_version = artifact.version
+        envelope_repository = getattr(uow, "investigation_envelopes", None)
+        envelope = (
+            await envelope_repository.get(investigation_id)
+            if envelope_repository is not None
+            else None
+        )
+        decisions_repository = getattr(uow, "analyst_decisions", None)
+        decisions = (
+            tuple(await decisions_repository.list_for_investigation(investigation_id))
+            if decisions_repository is not None
+            else ()
+        )
+        authorization = g2_envelope_authorization_state(envelope, decisions)
+        strategy = build_investigation_strategy_projection(
+            investigation_id=investigation_id,
+            subject_id=investigation.subject_id,
+            production_run_id=investigation.production_run_id,
+            synthesis_artifact_id=investigation.synthesis_artifact_id,
+            snapshot=snapshot,
+            snapshot_version=snapshot_version,
+            hypotheses=tuple(state.hypotheses) if state is not None else (),
+            experiments=timeline.experiments,
+            observations=observations,
+            invocations=invocations,
+        )
+        strategy.update(
+            build_investigation_operator_strategy_checkpoint(
+                strategy,
+                state=state,
+                g2_blocked=authorization.revoked,
+            )
+        )
+        timeline_payload = project_safe_investigation_experiment_timeline(
+            timeline.to_payload(),
+            strategy=strategy,
+            observations=observations,
+            invocations=invocations,
+            hypotheses=tuple(state.hypotheses) if state is not None else (),
+        )
     return InvestigationExperimentTimelineResponseV1.model_validate(
-        timeline.to_payload(), strict=False
+        {**timeline_payload, "strategy": strategy}, strict=False
     )
 
 

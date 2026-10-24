@@ -13,6 +13,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from cti_app.application.context_pagination import ContextOmissionManifestEntryV1
 from cti_app.application.investigation_tools import ToolEffect
 from cti_app.domain.analyst_opinion import (
     AnalystObservationRelation,
@@ -221,6 +222,9 @@ class ContextInvestigationV1(_StrictContract):
     truncation_counts: dict[str, int] = Field(
         default_factory=dict, exclude_if=lambda value: not value
     )
+    pagination_manifest: tuple[ContextOmissionManifestEntryV1, ...] = Field(
+        default=(), max_length=32
+    )
     new_evidence_truncated: bool | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
@@ -354,6 +358,8 @@ class InvestigationOperatorContextV1(_StrictContract):
 
 
 class OperatorContextSectionPageV1(_StrictContract):
+    """Page response with defaulted v1 pagination metadata for old payload parsing."""
+
     schema_version: Literal["investigation-operator-context-section.v1"] = Field(
         default="investigation-operator-context-section.v1", alias="schema"
     )
@@ -381,7 +387,18 @@ class OperatorContextSectionPageV1(_StrictContract):
     total: int = Field(ge=0)
     next_offset: int | None = Field(default=None, ge=0)
     next_cursor: str | None = Field(default=None, max_length=1_024)
+    page_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_ref: str = Field(min_length=1, max_length=2_048)
+    omission_manifest: tuple[ContextOmissionManifestEntryV1, ...] = Field(default=(), max_length=8)
     items: tuple[dict[str, Any], ...] = Field(max_length=20)
+    context_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    cursor: str | None = Field(default=None, max_length=1_024)
+    pivot: dict[str, str] | None = None
+    descending: bool = False
+    has_more: bool = False
+    source_bounded: bool = True
+    unbounded_reason: str | None = Field(default=None, max_length=256)
+    cursor_authentication: Literal["unauthenticated_position"] | None = None
 
 
 class OperatorToolInvocationRequestV1(_StrictContract):

@@ -8,9 +8,15 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Protocol
 from uuid import UUID
 
+from cti_app.application.context_pagination import (
+    KeysetPageV1,
+    decode_keyset_cursor,
+    make_keyset_page,
+)
 from cti_app.domain.analyst_opinion import AnalystOpinionV1
 from cti_app.domain.investigation import (
     BudgetReservationStatus,
@@ -36,6 +42,16 @@ class ToolInvocationRepository(Protocol):
         self, investigation_id: UUID
     ) -> tuple[ToolInvocation, ...]: ...
 
+    async def page_for_investigation(
+        self,
+        investigation_id: UUID,
+        *,
+        cursor: str | None,
+        limit: int,
+        descending: bool = False,
+        section: str = "tool_invocations",
+    ) -> KeysetPageV1[ToolInvocation]: ...
+
     async def get_by_operation_key(self, operation_key: str) -> ToolInvocation | None: ...
 
     async def add_if_absent(self, invocation: ToolInvocation) -> ToolInvocation: ...
@@ -52,6 +68,16 @@ class EvidenceObservationRepository(Protocol):
         self, investigation_id: UUID
     ) -> tuple[EvidenceObservation, ...]: ...
 
+    async def page_for_investigation(
+        self,
+        investigation_id: UUID,
+        *,
+        cursor: str | None,
+        limit: int,
+        descending: bool = False,
+        section: str = "evidence_observations",
+    ) -> KeysetPageV1[EvidenceObservation]: ...
+
     async def append_if_absent(self, observation: EvidenceObservation) -> EvidenceObservation: ...
 
 
@@ -61,6 +87,17 @@ class FindingRepository(Protocol):
     async def list_for_investigation(
         self, investigation_id: UUID
     ) -> tuple[InvestigationFinding, ...]: ...
+
+    async def page_for_investigation(
+        self,
+        investigation_id: UUID,
+        *,
+        cursor: str | None,
+        limit: int,
+        descending: bool = False,
+        section: str = "findings",
+        latest_only: bool = False,
+    ) -> KeysetPageV1[InvestigationFinding]: ...
 
     async def append_version(
         self, finding: InvestigationFinding, *, expected_previous_id: UUID | None
@@ -161,6 +198,54 @@ def _copy_budget(budget: InvestigationBudget) -> InvestigationBudget:
     return copied
 
 
+def _memory_keyset_page(
+    items: tuple[object, ...],
+    *,
+    section: str,
+    investigation_id: UUID,
+    cursor: str | None,
+    limit: int,
+    descending: bool,
+    position: object,
+    latest_only: bool = False,
+) -> KeysetPageV1:
+    """Page a materialized in-memory snapshot; this does not bound source memory."""
+    if not 1 <= limit <= 1_000:
+        raise ValueError("Context page limit must be between 1 and 1000")
+    position_fn = position  # keep the generic callback local for type-checkers
+    ordered = sorted(items, key=position_fn, reverse=descending)  # type: ignore[arg-type]
+    if cursor is not None:
+        decoded = decode_keyset_cursor(
+            cursor,
+            section=section,
+            investigation_id=investigation_id,
+            descending=descending,
+        )
+        try:
+            sort_key = datetime.fromisoformat(decoded["sort_key"])
+            item_id = UUID(decoded["item_id"])
+        except (TypeError, ValueError):
+            raise ValueError("Context keyset cursor is invalid") from None
+        pivot = (sort_key, item_id)
+        ordered = [
+            item
+            for item in ordered
+            if (position_fn(item) < pivot if descending else position_fn(item) > pivot)  # type: ignore[operator]
+        ]
+    return make_keyset_page(
+        section=section,
+        investigation_id=investigation_id,
+        items=tuple(ordered[: limit + 1]),
+        total=len(items),
+        limit=limit,
+        cursor=cursor,
+        position=position_fn,
+        descending=descending,
+        source_bounded=False,
+        unbounded_reason="In-memory repository materializes the full collection",
+    )
+
+
 class InMemoryToolInvocationRepository:
     def __init__(self) -> None:
         self._items: dict[UUID, ToolInvocation] = {}
@@ -184,6 +269,26 @@ class InMemoryToolInvocationRepository:
                 ),
                 key=lambda item: (item.created_at, item.id.hex),
             )
+        )
+
+    async def page_for_investigation(
+        self,
+        investigation_id: UUID,
+        *,
+        cursor: str | None,
+        limit: int,
+        descending: bool = False,
+        section: str = "tool_invocations",
+    ) -> KeysetPageV1[ToolInvocation]:
+        items = await self.list_for_investigation(investigation_id)
+        return _memory_keyset_page(
+            items,
+            section=section,
+            investigation_id=investigation_id,
+            cursor=cursor,
+            limit=limit,
+            descending=descending,
+            position=lambda item: (item.created_at, item.id),
         )
 
     async def add_if_absent(self, invocation: ToolInvocation) -> ToolInvocation:
@@ -247,6 +352,26 @@ class InMemoryEvidenceObservationRepository:
             item for item in self._items.values() if item.investigation_id == investigation_id
         )
 
+    async def page_for_investigation(
+        self,
+        investigation_id: UUID,
+        *,
+        cursor: str | None,
+        limit: int,
+        descending: bool = False,
+        section: str = "evidence_observations",
+    ) -> KeysetPageV1[EvidenceObservation]:
+        items = await self.list_for_investigation(investigation_id)
+        return _memory_keyset_page(
+            items,
+            section=section,
+            investigation_id=investigation_id,
+            cursor=cursor,
+            limit=limit,
+            descending=descending,
+            position=lambda item: (item.observed_at, item.id),
+        )
+
     async def append_if_absent(self, observation: EvidenceObservation) -> EvidenceObservation:
         async with self._lock:
             existing = self._items.get(observation.id)
@@ -273,6 +398,30 @@ class InMemoryFindingRepository:
     ) -> tuple[InvestigationFinding, ...]:
         return tuple(
             item for item in self._items.values() if item.investigation_id == investigation_id
+        )
+
+    async def page_for_investigation(
+        self,
+        investigation_id: UUID,
+        *,
+        cursor: str | None,
+        limit: int,
+        descending: bool = False,
+        section: str = "findings",
+        latest_only: bool = False,
+    ) -> KeysetPageV1[InvestigationFinding]:
+        items = await self.list_for_investigation(investigation_id)
+        if latest_only:
+            superseded = {item.supersedes for item in items if item.supersedes is not None}
+            items = tuple(item for item in items if item.id not in superseded)
+        return _memory_keyset_page(
+            items,
+            section=section,
+            investigation_id=investigation_id,
+            cursor=cursor,
+            limit=limit,
+            descending=descending,
+            position=lambda item: (item.created_at, item.id),
         )
 
     async def append_version(

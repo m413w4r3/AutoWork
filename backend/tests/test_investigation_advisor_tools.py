@@ -173,7 +173,31 @@ def make_observation(investigation_id, payload):
     )
 
 
-def make_tool(*, investigation_id, transport, observation=None, raw=None, allowed=True):
+def make_tool(
+    *,
+    investigation_id,
+    transport,
+    observation=None,
+    raw=None,
+    allowed=True,
+    role_timeout_seconds=7_200,
+):
+    class _Hypothesis:
+        def to_payload(self):
+            return {
+                "id": "H_SYNTHETIC",
+                "statement": "Synthetic hypothesis for offline adviser tests.",
+                "status": "open",
+                "evidence_refs": [],
+                "finding_refs": [],
+            }
+
+    working_state = SimpleNamespace(
+        investigation_id=investigation_id,
+        version=1,
+        sha256="f" * 64,
+        hypotheses=(_Hypothesis(),),
+    )
     subject_id = uuid4()
     sample_blob_id = uuid4()
     snapshot = SimpleNamespace(
@@ -203,11 +227,13 @@ def make_tool(*, investigation_id, transport, observation=None, raw=None, allowe
         settings=SimpleNamespace(
             openai_bridge_min_submission_interval_seconds=0,
             openai_bridge_submission_jitter_fraction=0,
+            openai_bridge_wait_timeout_research_seconds=role_timeout_seconds,
             operator_advisor_checkpoint_tool_threshold=12,
         ),
         investigations=SimpleNamespace(get=lambda _id: None),
         observations=ObservationRepository((observation,) if observation else ()),
         findings=FindingRepository(),
+        investigation_states=SimpleNamespace(get=async_get(working_state)),
         opinions=SimpleNamespace(),
         sample_associations=SimpleNamespace(),
         samples=SimpleNamespace(),
@@ -230,11 +256,26 @@ def async_get(value):
     return get
 
 
-def make_context(investigation_id, key="operator:advisor:test", capabilities=()):
+def make_context(
+    investigation_id,
+    key="operator:advisor:test",
+    capabilities=(),
+    *,
+    tool_seconds=3_600,
+    bridge_turns=1,
+):
+    budget = InvestigationBudget(limits={})
+    budget.reserve(
+        key,
+        {
+            BudgetDimension.BRIDGE_TURNS: bridge_turns,
+            BudgetDimension.TOOL_SECONDS: tool_seconds,
+        },
+    )
     return ToolExecutionContext(
         investigation_id=investigation_id,
         envelope=None,
-        budget=InvestigationBudget(limits={}),
+        budget=budget,
         idempotency_key=key,
         available_capabilities=frozenset(capabilities),
     )
@@ -686,7 +727,7 @@ async def test_args_hint_contract_is_bounded_and_normalization_is_recorded(
         if item.source == "advisor.consult" and item.id in result.observation_refs
     )
     persisted = json.loads(
-        await tool._artifact_store.read_bytes(advisor_observation.blob_id, max_bytes=16 * 1024)
+        await tool._artifact_store.read_bytes(advisor_observation.blob_id, max_bytes=64 * 1024)
     )
     recommendation = result.output["recommended_next_tools"][0]
     stored_recommendation = persisted["output"]["recommended_next_tools"][0]
@@ -797,7 +838,7 @@ async def test_args_hint_is_normalized_against_recommended_tool_schema(
         if item.source == "advisor.consult" and item.id in result.observation_refs
     )
     persisted = json.loads(
-        await tool._artifact_store.read_bytes(advisor_observation.blob_id, max_bytes=16 * 1024)
+        await tool._artifact_store.read_bytes(advisor_observation.blob_id, max_bytes=64 * 1024)
     )
     recommendation = result.output["recommended_next_tools"][0]
     stored_recommendation = persisted["output"]["recommended_next_tools"][0]
@@ -844,6 +885,22 @@ async def test_yara_draft_sends_only_verified_offsets_and_returns_untrusted_text
         transport=transport,
         observation=observation,
         raw=raw,
+    )
+    unrelated, unrelated_raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": "9" * 64,
+            "strings": [{"value": "UnrelatedTelemetryMarker", "offset": 512}],
+        },
+    )
+    tool._observations.observations[unrelated.id] = unrelated
+    tool._artifact_store.values[unrelated.blob_id] = unrelated_raw
+    tool._blobs.add(
+        unrelated.blob_id,
+        sha256=unrelated.sha256,
+        size=len(unrelated_raw),
+        logical_bucket="evidence",
     )
     tool._registry = Registry(
         (
@@ -955,7 +1012,7 @@ async def test_yara_draft_sends_only_verified_offsets_and_returns_untrusted_text
         if item.source == "advisor.consult"
     ][-1]
     persisted = json.loads(
-        await tool._artifact_store.read_bytes(advisor_observation.blob_id, max_bytes=16 * 1024)
+        await tool._artifact_store.read_bytes(advisor_observation.blob_id, max_bytes=64 * 1024)
     )
     assert persisted["schema"] == "operator-advisor-call.v1"
     assert persisted["input_observation_refs"] == [str(observation.id)]
@@ -1049,10 +1106,12 @@ async def test_plan_investigation_selects_relevant_content_from_six_refs() -> No
             tuple(
                 SimpleNamespace(
                     id=uuid4(),
+                    version=1,
                     kind=SimpleNamespace(value="network_behaviour"),
                     assessment=SimpleNamespace(value="inconclusive"),
                     statement=(f"Measured finding {index}: " + "x" * 900),
                     observation_refs=(observations[index].id,),
+                    claim_refs=(),
                     limitations=("bounded",) * 8,
                 )
                 for index in range(6)
@@ -1117,6 +1176,30 @@ async def test_minimal_plan_assembles_evidence_and_parses_structured_output() ->
         observation=observation,
         raw=raw,
     )
+    unrelated, unrelated_raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": "9" * 64,
+            "strings": [{"value": "UnrelatedFindingObservationMarker", "offset": 512}],
+        },
+    )
+    tool._observations.observations[unrelated.id] = unrelated
+    tool._artifact_store.values[unrelated.blob_id] = unrelated_raw
+    tool._blobs.add(
+        unrelated.blob_id,
+        sha256=unrelated.sha256,
+        size=len(unrelated_raw),
+        logical_bucket="evidence",
+    )
+    unrelated_finding = InvestigationFinding(
+        investigation_id=investigation_id,
+        kind=FindingKind.CAPABILITY,
+        assessment=FindingAssessment.INCONCLUSIVE,
+        statement="Une activité sans rapport reste à qualifier.",
+        observation_refs=(unrelated.id,),
+    )
+    tool._findings = FindingRepository((unrelated_finding,))
     tool._registry = Registry(
         (
             SimpleNamespace(
@@ -1144,7 +1227,10 @@ async def test_minimal_plan_assembles_evidence_and_parses_structured_output() ->
     tool._blobs.add(sample_blob_id, sha256="c" * 64, size=4096)
 
     result = await tool.execute(
-        {"consultation_type": "plan_investigation", "question": "Quel pivot ensuite ?"},
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Plan autour de CreateMutexW.",
+        },
         make_context(
             investigation_id,
             key="operator:advisor:minimal-plan",
@@ -1157,8 +1243,10 @@ async def test_minimal_plan_assembles_evidence_and_parses_structured_output() ->
     assert str(observation.id) not in prompt
     assert str(sample_blob_id) not in prompt
     assert {"ref": "E1", "kind": "observation"} in typed_prompt_payload(prompt)["wire_ref_catalog"]
+    assert "UnrelatedTelemetryMarker" not in prompt
     assert "evidence_recorded" not in prompt
-    assert "Quel pivot ensuite ?" in prompt
+    assert "Plan autour de CreateMutexW." in prompt
+    assert str(unrelated.id) not in prompt
     assert result.output["summary"].startswith("Comparer")
     assert result.output["recommended_next_tools"][0]["tool"] == "sample.analyze"
     assert result.output["recommended_next_tools"][0]["schema_version"] == "1"
@@ -1166,6 +1254,21 @@ async def test_minimal_plan_assembles_evidence_and_parses_structured_output() ->
         str(observation.id),
     )
     assert result.output["untrusted"] is True
+    advisor_observation = [
+        item
+        for item in tool._observations.observations.values()
+        if item.source == "advisor.consult"
+    ][-1]
+    persisted = json.loads(
+        await tool._artifact_store.read_bytes(advisor_observation.blob_id, max_bytes=64 * 1024)
+    )
+    unrelated_status = next(
+        item
+        for item in persisted["completeness_manifest"]
+        if item["kind"] == "observation" and item["id"] == str(unrelated.id)
+    )
+    assert "REQUIRED" not in {row["status"] for row in unrelated_status["statuses"]}
+    assert "INTENTIONALLY_OMITTED" in {row["status"] for row in unrelated_status["statuses"]}
 
 
 @pytest.mark.asyncio
@@ -1250,7 +1353,11 @@ async def test_pivot_strategy_rejects_a_basis_reference_absent_from_observations
     investigation_id = uuid4()
     observation, raw = make_observation(
         investigation_id,
-        {"schema": "sample-obfuscated-strings.v1", "sample_sha256": "f" * 64, "strings": []},
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": "f" * 64,
+            "strings": [{"value": "SyntheticPivotEvidence", "offset": 64}],
+        },
     )
     unknown_ref = str(uuid4())
     transport = Transport(
@@ -1384,7 +1491,11 @@ async def test_recommendation_without_any_valid_observation_ref_is_dropped_and_t
     investigation_id = uuid4()
     observation, raw = make_observation(
         investigation_id,
-        {"schema": "sample-obfuscated-strings.v1", "sample_sha256": "b" * 64, "strings": []},
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": "b" * 64,
+            "strings": [{"value": "SyntheticPivotEvidence", "offset": 64}],
+        },
     )
     unknown_ref = str(uuid4())
     payload = json.loads(
@@ -1496,7 +1607,11 @@ async def test_article_source_ref_cannot_support_a_tool_recommendation() -> None
     investigation_id = uuid4()
     observation, raw = make_observation(
         investigation_id,
-        {"schema": "sample-obfuscated-strings.v1", "sample_sha256": "e" * 64, "strings": []},
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": "e" * 64,
+            "strings": [{"value": "SyntheticPivotEvidence", "offset": 64}],
+        },
     )
 
     class ArticleRecommendationTransport:
@@ -1569,7 +1684,11 @@ async def test_malformed_basis_ref_lists_remain_rejected(basis_refs, expected_co
     investigation_id = uuid4()
     observation, raw = make_observation(
         investigation_id,
-        {"schema": "sample-obfuscated-strings.v1", "sample_sha256": "c" * 64, "strings": []},
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": "c" * 64,
+            "strings": [{"value": "SyntheticPivotEvidence", "offset": 64}],
+        },
     )
     payload = json.loads(
         advisor_response("Keep the measured signal in view.", [str(observation.id)])
@@ -1642,6 +1761,495 @@ async def test_observation_excerpts_require_matching_blob_descriptor_and_digest(
 
 
 @pytest.mark.asyncio
+async def test_short_verified_xxd_signature_remains_a_selectable_measurement() -> None:
+    investigation_id = uuid4()
+    sample_sha256 = "e" * 64
+    output = b"00000080: 4372 6561 7465 4d75 7465 7841  CreateMutexA"
+    payload = {
+        "schema": "local-command-execution.v1",
+        "sample_sha256": sample_sha256,
+        "command_id": "xxd",
+        "command": ["xxd", "-s", "128", "-l", "12", "Setup.exe"],
+        "output_encoding": "base64-utf8",
+        "output_chunks": [base64.b64encode(output).decode("ascii")],
+        "output_byte_length": len(output),
+        "output_sha256": hashlib.sha256(output).hexdigest(),
+        "output_truncated": False,
+        "output_truncated_by_evidence_limit": False,
+    }
+    observation, raw = make_observation(investigation_id, payload)
+    observation = replace(
+        observation,
+        source="AutoWork local analysis",
+        kind=EvidenceKind.BINARY_ANALYSIS,
+        source_version="xxd-test-v1",
+        object_type="command",
+        object_id=sample_sha256,
+    )
+    tool, _sample_blob = make_tool(
+        investigation_id=investigation_id,
+        transport=Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused")),
+        observation=observation,
+        raw=raw,
+    )
+
+    measurements = await tool._measurement_rows(observation)
+    excerpts = await tool._observation_content_excerpts(observation)
+
+    assert any(
+        item["kind"] == "hex"
+        and item["value"] == "4372656174654d7574657841"
+        and item["offset"] == 128
+        and item["length"] == 12
+        for item in measurements
+    )
+    assert excerpts == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("consultation_type", ["plan_investigation", "draft_text", "yara_draft"])
+@pytest.mark.parametrize("measurement_key", ["hex", "hex_bytes", "base64"])
+async def test_oversized_legacy_hex_measurement_is_rejected_before_prompt(
+    consultation_type: str, measurement_key: str
+) -> None:
+    investigation_id = uuid4()
+    sample_sha256 = "a" * 64
+    oversized_hex = "41" * 262_144
+    measurement_value = (
+        base64.b64encode(b"A" * 513).decode() if measurement_key == "base64" else oversized_hex
+    )
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": sample_sha256,
+            measurement_key: [{"value": measurement_value, "offset": 128}],
+        },
+    )
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    tool, sample_blob = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+
+    tool._sample_associations.list_for_investigation = async_get(
+        (SimpleNamespace(sample_sha256=sample_sha256),)
+    )
+    tool._samples.list_for_subject = async_get(
+        (
+            SimpleNamespace(
+                expected_hash=sample_sha256,
+                source_object_id=None,
+                state="quarantined",
+                do_not_submit=True,
+                external_llm_allowed=False,
+                blob_id=sample_blob,
+            ),
+        )
+    )
+    tool._blobs.add(sample_blob, sha256=sample_sha256, size=4096)
+
+    arguments: dict[str, Any] = {
+        "consultation_type": consultation_type,
+        "question": "Use the oversized raw hex marker from this observation.",
+        "evidence_refs": [str(observation.id)],
+    }
+    if consultation_type == "draft_text":
+        arguments["units"] = [
+            {
+                "id": "U1",
+                "block_type": "key_findings",
+                "form": "body",
+                "anchor": None,
+                "assertions": [
+                    {
+                        "id": "a1",
+                        "text": "The oversized marker is relevant.",
+                        "nature": "analyse",
+                        "refs": [{"kind": "observation", "id": str(observation.id)}],
+                        "block_type": "key_findings",
+                        "form": "body",
+                        "anchor": None,
+                    }
+                ],
+            }
+        ]
+    result = await tool.execute(
+        arguments,
+        make_context(
+            investigation_id,
+            key=f"operator:advisor:oversized-legacy-hex:{consultation_type}",
+        ),
+    )
+
+    assert result.status is ToolInvocationStatus.FAILED
+    assert result.error_code == "advisor_input_invalid"
+    assert result.output["input_error_code"] == "binary_measurement_exceeds_limit", repr(
+        result.output
+    )
+    assert [dict(item) for item in result.output["measurement_errors"]] == [
+        {"index": 0, "reason": "binary_measurement_exceeds_512_byte_limit"}
+    ]
+    assert measurement_value not in repr(result.output)
+    assert "dossier_text" not in result.output
+    assert transport.calls == []
+
+
+@pytest.mark.asyncio
+async def test_oversized_generic_content_is_rejected_before_prompt() -> None:
+    investigation_id = uuid4()
+    oversized_content = "41!" * 6_000
+    observation, raw = make_observation(
+        investigation_id,
+        {"schema": "generic-observation.v1", "content": oversized_content},
+    )
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    tool, _sample_blob = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Review the content in this observation.",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, key="operator:advisor:oversized-generic-content"),
+    )
+
+    assert result.status is ToolInvocationStatus.FAILED
+    assert result.error_code == "advisor_input_invalid"
+    assert result.output["input_error_code"] == "content_excerpt_budget_exceeds_16384_bytes"
+    assert oversized_content not in repr(result.output)
+    assert "dossier_text" not in result.output
+    assert transport.calls == []
+
+
+@pytest.mark.asyncio
+async def test_aggregate_generic_content_list_is_rejected_before_prompt() -> None:
+    investigation_id = uuid4()
+    first_content = "A!" * 7_953 + "A"
+    second_content = "B!" * 7_953 + "B"
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "generic-observation.v1",
+            "content": [first_content, second_content],
+        },
+    )
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    tool, _sample_blob = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Review the listed content in this observation.",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, key="operator:advisor:oversized-content-list"),
+    )
+
+    assert result.status is ToolInvocationStatus.FAILED
+    assert result.error_code == "advisor_input_invalid"
+    assert result.output["input_error_code"] == "content_excerpt_budget_exceeds_16384_bytes"
+    assert [dict(item) for item in result.output["omitted_evidence"]] == [
+        {
+            "kind": "observation",
+            "id": str(observation.id),
+            "status": "INTENTIONALLY_OMITTED",
+            "reason": "content_excerpt_budget_exceeds_16384_bytes",
+        }
+    ]
+    assert first_content not in repr(result.output)
+    assert second_content not in repr(result.output)
+    assert "dossier_text" not in result.output
+    assert transport.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("nested", [False, True], ids=["neutral-list", "nested-neutral-list"])
+async def test_aggregate_neutral_content_list_is_rejected_before_prompt(nested: bool) -> None:
+    investigation_id = uuid4()
+    first_content = "A!" * 7_953 + "A"
+    second_content = "B!" * 7_953 + "B"
+    content = (
+        {"outer": {"items": [[first_content], {"leaf": [second_content]}]}}
+        if nested
+        else {"neutral": [first_content, second_content]}
+    )
+    observation, raw = make_observation(
+        investigation_id,
+        {"schema": "generic-observation.v1", **content},
+    )
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    tool, _sample_blob = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Review both synthetic markers from this observation.",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, key=f"operator:advisor:aggregate-neutral-list:{nested}"),
+    )
+
+    assert result.status is ToolInvocationStatus.FAILED
+    assert result.error_code == "advisor_input_invalid"
+    assert result.output["input_error_code"] == "content_excerpt_budget_exceeds_16384_bytes"
+    assert [dict(item) for item in result.output["omitted_evidence"]] == [
+        {
+            "kind": "observation",
+            "id": str(observation.id),
+            "status": "INTENTIONALLY_OMITTED",
+            "reason": "content_excerpt_budget_exceeds_16384_bytes",
+        }
+    ]
+    assert first_content not in repr(result.output)
+    assert second_content not in repr(result.output)
+    assert "dossier_text" not in result.output
+    assert transport.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "raw_size", "strip_padding"),
+    [
+        ("content", 600, False),
+        ("content", 514, True),
+        ("strings", 600, False),
+        ("strings", 514, True),
+    ],
+    ids=["content-padded", "content-unpadded", "strings-padded", "strings-unpadded"],
+)
+async def test_oversized_generic_base64_is_rejected_before_prompt(
+    field: str, raw_size: int, strip_padding: bool
+) -> None:
+    investigation_id = uuid4()
+    encoded_content = base64.b64encode(b"A" * raw_size).decode("ascii")
+    if strip_padding:
+        encoded_content = encoded_content.rstrip("=")
+    field_value: Any = (
+        encoded_content
+        if field == "content"
+        else [{"value": encoded_content, "encoding": "base64"}]
+    )
+    observation, raw = make_observation(
+        investigation_id,
+        {"schema": "generic-observation.v1", field: field_value},
+    )
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    tool, _sample_blob = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Review this encoded synthetic content.",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, key=f"operator:advisor:generic-base64:{field}"),
+    )
+
+    assert result.status is ToolInvocationStatus.FAILED
+    assert result.error_code == "advisor_input_invalid"
+    assert result.output["input_error_code"] == "base64_content_exceeds_512_byte_decoded_limit"
+    assert [dict(item) for item in result.output["omitted_evidence"]] == [
+        {
+            "kind": "observation",
+            "id": str(observation.id),
+            "status": "INTENTIONALLY_OMITTED",
+            "reason": "base64_content_exceeds_512_byte_decoded_limit",
+        }
+    ]
+    assert encoded_content not in repr(result.output)
+    assert "dossier_text" not in result.output
+    assert transport.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "representation"),
+    [
+        ("content", "plain"),
+        ("content", "percent_encoded"),
+        ("content", "newline_wrapped"),
+        ("content", "space_wrapped"),
+        ("content", "tab_wrapped"),
+        ("strings", "plain"),
+        ("strings", "percent_encoded"),
+        ("strings", "newline_wrapped"),
+        ("strings", "space_wrapped"),
+        ("strings", "tab_wrapped"),
+    ],
+)
+async def test_oversized_data_url_base64_is_rejected_before_prompt(
+    field: str, representation: str
+) -> None:
+    investigation_id = uuid4()
+    encoded_content = base64.b64encode(b"A" * 600).decode("ascii")
+    if representation == "percent_encoded":
+        encoded_content = "".join(f"%{ord(character):02X}" for character in encoded_content)
+    elif representation == "newline_wrapped":
+        encoded_content = f"{encoded_content[:400]}\n{encoded_content[400:]}"
+    elif representation == "space_wrapped":
+        encoded_content = f"{encoded_content[:400]} {encoded_content[400:]}"
+    elif representation == "tab_wrapped":
+        encoded_content = f"{encoded_content[:400]}\t{encoded_content[400:]}"
+    data_url = f"data:application/octet-stream;base64,{encoded_content}"
+    if field == "content":
+        generic_content: dict[str, Any] = {"outer": {"content": data_url}}
+    else:
+        generic_content = {"outer": {"strings": [{"metadata": {"value": data_url}}]}}
+    observation, raw = make_observation(
+        investigation_id,
+        {"schema": "generic-observation.v1", **generic_content},
+    )
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    tool, _sample_blob = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Review this nested synthetic data URL.",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, key=f"operator:advisor:generic-data-url:{field}"),
+    )
+
+    assert result.status is ToolInvocationStatus.FAILED
+    assert result.error_code == "advisor_input_invalid"
+    assert result.output["input_error_code"] == "data_url_base64_exceeds_512_byte_decoded_limit"
+    assert [dict(item) for item in result.output["omitted_evidence"]] == [
+        {
+            "kind": "observation",
+            "id": str(observation.id),
+            "status": "INTENTIONALLY_OMITTED",
+            "reason": "data_url_base64_exceeds_512_byte_decoded_limit",
+        }
+    ]
+    assert data_url not in repr(result.output)
+    assert "dossier_text" not in result.output
+    assert transport.calls == []
+
+
+@pytest.mark.asyncio
+async def test_oversized_method_title_is_rejected_before_prompt() -> None:
+    investigation_id = uuid4()
+    oversized_name = "X" * 20_000
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "generic-observation.v1",
+            "methods": [{"name": oversized_name, "body": "short synthetic method body"}],
+        },
+    )
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    tool, _sample_blob = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Review this synthetic method.",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, key="operator:advisor:oversized-method-title"),
+    )
+
+    assert result.status is ToolInvocationStatus.FAILED
+    assert result.error_code == "advisor_input_invalid"
+    assert result.output["input_error_code"] == "content_excerpt_budget_exceeds_16384_bytes"
+    assert [dict(item) for item in result.output["omitted_evidence"]] == [
+        {
+            "kind": "observation",
+            "id": str(observation.id),
+            "status": "INTENTIONALLY_OMITTED",
+            "reason": "content_excerpt_budget_exceeds_16384_bytes",
+        }
+    ]
+    assert oversized_name not in repr(result.output)
+    assert "dossier_text" not in result.output
+    assert transport.calls == []
+
+
+@pytest.mark.asyncio
+async def test_unavailable_observation_blob_is_not_marked_retrievable() -> None:
+    investigation_id = uuid4()
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": "f" * 64,
+            "strings": [{"value": "SyntheticUnavailableBlob", "offset": 64}],
+        },
+    )
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    tool, _sample_blob = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+    original_read_bytes = tool._artifact_store.read_bytes
+
+    async def fail_observation_read(blob_id, *, max_bytes):
+        if blob_id == observation.blob_id:
+            raise OSError("synthetic storage read failure")
+        return await original_read_bytes(blob_id, max_bytes=max_bytes)
+
+    tool._artifact_store.read_bytes = fail_observation_read
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Use SyntheticUnavailableBlob as the required observation.",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id),
+    )
+
+    assert result.status is ToolInvocationStatus.UNAVAILABLE
+    assert result.output["preflight_status"] == "TECHNICAL_BLOCKED"
+    assert transport.calls == []
+    item = next(
+        row
+        for row in result.output["completeness_manifest"]
+        if row["kind"] == "observation" and row["id"] == str(observation.id)
+    )
+    statuses = {row["status"] for row in item["statuses"]}
+    assert "NOT_VERIFIED" in statuses
+    assert "RETRIEVABLE" not in statuses
+    assert any("unreadable" in row["reason"].casefold() for row in result.output["missing_refs"])
+
+
+@pytest.mark.asyncio
 async def test_minimal_yara_draft_selects_measured_blob_offsets_server_side() -> None:
     investigation_id = uuid4()
     sample_sha256 = "d" * 64
@@ -1670,6 +2278,22 @@ async def test_minimal_yara_draft_selects_measured_blob_offsets_server_side() ->
         observation=observation,
         raw=raw,
     )
+    unmeasured, unmeasured_raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": "8" * 64,
+            "strings": [],
+        },
+    )
+    tool._observations.observations[unmeasured.id] = unmeasured
+    tool._artifact_store.values[unmeasured.blob_id] = unmeasured_raw
+    tool._blobs.add(
+        unmeasured.blob_id,
+        sha256=unmeasured.sha256,
+        size=len(unmeasured_raw),
+        logical_bucket="evidence",
+    )
     tool._sample_associations.list_for_investigation = async_get(
         (SimpleNamespace(sample_sha256=sample_sha256, id=uuid4()),)
     )
@@ -1697,6 +2321,21 @@ async def test_minimal_yara_draft_selects_measured_blob_offsets_server_side() ->
     assert "offset 128:" in prompt
     assert "offset 384:" in prompt
     assert result.output["rule_source"].rstrip("\n") == rule_source
+    advisor_observation = next(
+        item
+        for item in tool._observations.observations.values()
+        if item.source == "advisor.consult" and item.object_id == "yara_draft"
+    )
+    persisted = json.loads(
+        await tool._artifact_store.read_bytes(advisor_observation.blob_id, max_bytes=64 * 1024)
+    )
+    omitted = next(
+        item
+        for item in persisted["completeness_manifest"]
+        if item["kind"] == "observation" and item["id"] == str(unmeasured.id)
+    )
+    assert "REQUIRED" not in {row["status"] for row in omitted["statuses"]}
+    assert "INTENTIONALLY_OMITTED" in {row["status"] for row in omitted["statuses"]}
 
 
 @pytest.mark.parametrize(
@@ -1746,6 +2385,15 @@ async def test_verified_measurement_candidates_reach_pivot_and_v3_prompts(
         )
     )
     tool._blobs.add(sample_blob_id, sha256=sample_sha256, size=4096)
+    if consultation_type == "figure_plan":
+        finding = InvestigationFinding(
+            investigation_id=investigation_id,
+            kind=FindingKind.CAPABILITY,
+            assessment=FindingAssessment.INCONCLUSIVE,
+            statement="Synthetic figure finding for the offline fixture.",
+            observation_refs=(),
+        )
+        tool._findings = FindingRepository((finding,))
     candidate = {
         "blob_id": str(sample_blob_id),
         "kind": "string",
@@ -1757,6 +2405,8 @@ async def test_verified_measurement_candidates_reach_pivot_and_v3_prompts(
         "evidence_refs": [str(observation.id)],
         "measurements": [candidate],
     }
+    if consultation_type == "figure_plan":
+        arguments["finding_refs"] = [str(finding.id)]
     if consultation_type == "draft_text":
         arguments["assertions"] = [
             {
@@ -1948,10 +2598,21 @@ async def test_typed_floss_dotnet_and_verified_xxd_content_patterns_are_advisor_
         )
     )
     tool._blobs.add(sample_blob_id, sha256=sample_sha256, size=4096)
+    if consultation_type == "figure_plan":
+        finding = InvestigationFinding(
+            investigation_id=investigation_id,
+            kind=FindingKind.CAPABILITY,
+            assessment=FindingAssessment.INCONCLUSIVE,
+            statement="Synthetic figure finding for the offline fixture.",
+            observation_refs=(),
+        )
+        tool._findings = FindingRepository((finding,))
     arguments: dict[str, object] = {
         "consultation_type": consultation_type,
         "evidence_refs": [str(observation.id)],
     }
+    if consultation_type == "figure_plan":
+        arguments["finding_refs"] = [str(finding.id)]
     if consultation_type == "suricata_draft":
         arguments["measurements"] = [
             {
@@ -2009,7 +2670,11 @@ async def test_yara_advisor_verifies_pivot_candidate_outside_selected_evidence_r
     sample_sha256 = "e" * 64
     selected, selected_raw = make_observation(
         investigation_id,
-        {"schema": "sample-obfuscated-strings.v1", "sample_sha256": "d" * 64, "strings": []},
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": "d" * 64,
+            "strings": [{"value": "SyntheticSelectedEvidence", "offset": 32}],
+        },
     )
     measured = bytes.fromhex("ed c7 c7 cb cf c3 f0 cc 94 96 c2 93 91 92 c1 88")
     ascii_column = "".join(chr(byte) if 32 <= byte < 127 else "." for byte in measured)
@@ -2177,11 +2842,20 @@ async def test_measurement_rejections_report_indexes_without_echoing_candidate_s
 async def test_literal_json_advisor_reply_is_partial_and_not_retried() -> None:
     investigation_id = uuid4()
     raw_output = PERSISTED_RESPONSE_SHAPES["cd3ae038-77b6-4e2d-aab8-83b291bc2e23"]["raw_text"]
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "strings": [{"value": "SyntheticMarker", "offset": 8}],
+        },
+    )
     transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text=raw_output))
-    tool, _ = make_tool(investigation_id=investigation_id, transport=transport)
+    tool, _ = make_tool(
+        investigation_id=investigation_id, transport=transport, observation=observation, raw=raw
+    )
 
     result = await tool.execute(
-        {"consultation_type": "plan_investigation"},
+        {"consultation_type": "plan_investigation", "evidence_refs": [str(observation.id)]},
         make_context(investigation_id, key="operator:advisor:invalid-output"),
     )
 
@@ -2215,11 +2889,20 @@ async def test_invalid_json_schema_excerpt_omits_response_values() -> None:
             "untrusted": True,
         }
     )
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "strings": [{"value": "SyntheticMarker", "offset": 8}],
+        },
+    )
     transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text=raw_output))
-    tool, _ = make_tool(investigation_id=investigation_id, transport=transport)
+    tool, _ = make_tool(
+        investigation_id=investigation_id, transport=transport, observation=observation, raw=raw
+    )
 
     result = await tool.execute(
-        {"consultation_type": "plan_investigation"},
+        {"consultation_type": "plan_investigation", "evidence_refs": [str(observation.id)]},
         make_context(investigation_id, key="operator:advisor:schema-diagnostic"),
     )
 
@@ -2235,14 +2918,23 @@ async def test_invalid_json_schema_excerpt_omits_response_values() -> None:
 async def test_large_invalid_advisor_output_is_archived_without_content_limit() -> None:
     investigation_id = uuid4()
     raw_output = "private-response-marker " * 5_000
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "strings": [{"value": "SyntheticMarker", "offset": 8}],
+        },
+    )
     transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text=raw_output))
-    tool, _ = make_tool(investigation_id=investigation_id, transport=transport)
+    tool, _ = make_tool(
+        investigation_id=investigation_id, transport=transport, observation=observation, raw=raw
+    )
     tool._registry = Registry(
         (SimpleNamespace(name="advisor.consult", cost_model={BudgetDimension.BRIDGE_TURNS: 1}),)
     )
 
     result = await tool.execute(
-        {"consultation_type": "plan_investigation"},
+        {"consultation_type": "plan_investigation", "evidence_refs": [str(observation.id)]},
         make_context(investigation_id, key="operator:advisor:oversized-output"),
     )
 
@@ -2381,7 +3073,7 @@ async def test_review_text_passes_cited_refs_without_internal_provenance() -> No
         if item.source == "advisor.consult"
     )
     persisted = json.loads(
-        await tool._artifact_store.read_bytes(advisor_observation.blob_id, max_bytes=16 * 1024)
+        await tool._artifact_store.read_bytes(advisor_observation.blob_id, max_bytes=64 * 1024)
     )
     assert persisted["input_observation_refs"] == [str(observation.id)]
     assert persisted["input_source_refs"] == [source_ref]
@@ -2871,7 +3563,11 @@ async def test_draft_text_batches_units_and_keeps_provenance_per_unit() -> None:
     investigation_id = uuid4()
     observation, raw = make_observation(
         investigation_id,
-        {"schema": "sample-obfuscated-strings.v1", "sample_sha256": "7" * 64, "strings": []},
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": "7" * 64,
+            "strings": [{"value": "SyntheticDraftEvidence", "offset": 32}],
+        },
     )
     block_types = [
         item
@@ -2968,7 +3664,15 @@ async def test_editorial_batch_retains_cursor_and_stops_after_ambiguous_result()
     )
     submitted: list[tuple[Mapping[str, Any], ToolExecutionContext]] = []
 
-    async def needs_review(arguments, context, *, _editorial_batch_child=False):
+    async def needs_review(
+        arguments,
+        context,
+        *,
+        _editorial_batch_child=False,
+        _execution_timeout_seconds=None,
+        _execution_deadline_monotonic=None,
+        _bridge_turns_remaining=None,
+    ):
         submitted.append((arguments, context))
         return ToolResult(
             ToolInvocationStatus.NEEDS_REVIEW,
@@ -2978,7 +3682,11 @@ async def test_editorial_batch_retains_cursor_and_stops_after_ambiguous_result()
 
     tool.execute = needs_review
     units = [{"id": f"U{index}"} for index in range(1, 4)]
-    context = make_context(investigation_id, key="operator:advisor:cursor")
+    context = make_context(
+        investigation_id,
+        key="operator:advisor:cursor",
+        bridge_turns=3,
+    )
 
     result = await tool._execute_editorial_batches(
         {"consultation_type": "draft_text"},
@@ -2996,11 +3704,74 @@ async def test_editorial_batch_retains_cursor_and_stops_after_ambiguous_result()
 
 
 @pytest.mark.asyncio
+async def test_editorial_batch_keeps_prior_consumption_when_remaining_budget_is_too_small() -> None:
+    investigation_id = uuid4()
+    tool, _sample_blob = make_tool(
+        investigation_id=investigation_id,
+        transport=Transport(None),
+    )
+    submitted: list[tuple[Mapping[str, Any], int | None]] = []
+
+    async def succeed_first(
+        arguments,
+        context,
+        *,
+        _editorial_batch_child=False,
+        _execution_timeout_seconds=None,
+        _execution_deadline_monotonic=None,
+        _bridge_turns_remaining=None,
+    ):
+        submitted.append((arguments, _execution_timeout_seconds))
+        return ToolResult(
+            ToolInvocationStatus.SUCCEEDED,
+            budget_consumed={
+                BudgetDimension.BRIDGE_TURNS: 1,
+                BudgetDimension.TOOL_SECONDS: 3_541,
+            },
+            output={
+                "advisor_status": "succeeded",
+                "consultation_type": "draft_text",
+                "usable": True,
+                "blocks": [{"unit_id": "U1"}],
+            },
+        )
+
+    tool.execute = succeed_first
+    units = [{"id": "U1"}, {"id": "U2"}]
+    result = await tool._execute_editorial_batches(
+        {"consultation_type": "draft_text"},
+        make_context(
+            investigation_id,
+            key="operator:advisor:budget-exhaustion",
+            bridge_turns=2,
+        ),
+        units,
+        maximum_units=1,
+        execution_timeout_seconds=3_600,
+    )
+
+    assert len(submitted) == 1
+    assert submitted[0][0]["units"] == [units[0]]
+    assert result.status is ToolInvocationStatus.PARTIAL
+    assert result.budget_consumed[BudgetDimension.TOOL_SECONDS] == 3_541
+    assert result.budget_consumed[BudgetDimension.TOOL_SECONDS] <= 3_600
+    assert result.output["advisor_status"] == "partial"
+    assert result.output["failure_stage"] == "budget_admission"
+    assert result.output["failure_reason"] == "execution_window_below_minimum_before_next_batch"
+    assert result.output["confirmed_non_execution"] is False
+    assert result.output["unprocessed_unit_ids"] == ("U2",)
+
+
+@pytest.mark.asyncio
 async def test_six_unit_editorial_batch_includes_clear_implant_materials() -> None:
     investigation_id = uuid4()
     observation, raw = make_observation(
         investigation_id,
-        {"schema": "sample-obfuscated-strings.v1", "sample_sha256": "6" * 64, "strings": []},
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": "6" * 64,
+            "strings": [{"value": "SyntheticEditorialEvidence", "offset": 32}],
+        },
     )
     ordinary_types = [
         item
@@ -3161,8 +3932,11 @@ async def test_editorial_batch_stops_on_oversized_shared_context_with_observatio
 
     assert result.status is ToolInvocationStatus.UNAVAILABLE
     assert transport.calls == []
-    assert result.output["failure_stage"] == "prompt_size_preflight"
-    assert result.output["failure_reason"] == "shared_context_exceeds_input_limit"
+    assert result.output["failure_stage"] == "budget_admission"
+    assert (
+        result.output["failure_reason"]
+        == "bridge_turn_reservation_insufficient_for_editorial_batches"
+    )
     assert result.output["confirmed_non_execution"] is True
     assert result.output["unprocessed_unit_ids"] == ("U1", "U2")
     assert result.output["batch_cursor"]["next_batch_index"] == 1
@@ -3174,8 +3948,10 @@ async def test_editorial_batch_stops_on_oversized_shared_context_with_observatio
     persisted = json.loads(
         await tool._artifact_store.read_bytes(advisor_call.blob_id, max_bytes=16 * 1024)
     )
-    assert persisted["failure_stage"] == "prompt_size_preflight"
-    assert persisted["failure_reason"] == "shared_context_exceeds_input_limit"
+    assert persisted["failure_stage"] == "budget_admission"
+    assert (
+        persisted["failure_reason"] == "bridge_turn_reservation_insufficient_for_editorial_batches"
+    )
 
 
 @pytest.mark.asyncio
@@ -3183,7 +3959,11 @@ async def test_draft_text_uses_compact_context_for_multiple_units() -> None:
     investigation_id = uuid4()
     observation, raw = make_observation(
         investigation_id,
-        {"schema": "sample-obfuscated-strings.v1", "sample_sha256": "8" * 64, "strings": []},
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": "8" * 64,
+            "strings": [{"value": "SyntheticCompactEvidence", "offset": 32}],
+        },
     )
     block_types = [
         item
@@ -3260,7 +4040,11 @@ async def test_draft_text_preserves_bridge_output_above_legacy_limit() -> None:
     investigation_id = uuid4()
     observation, raw = make_observation(
         investigation_id,
-        {"schema": "sample-obfuscated-strings.v1", "sample_sha256": "9" * 64, "strings": []},
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": "9" * 64,
+            "strings": [{"value": "SyntheticLargeOutputEvidence", "offset": 32}],
+        },
     )
     block_types = [
         item
@@ -3437,6 +4221,13 @@ async def test_review_text_batches_selected_opinion_units_with_individual_hashes
 @pytest.mark.asyncio
 async def test_advisor_server_does_not_enforce_local_inter_call_pacing() -> None:
     investigation_id = uuid4()
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "strings": [{"value": "SyntheticPacingEvidence", "offset": 16}],
+        },
+    )
     transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
     prior_call = SimpleNamespace(
         id=uuid4(),
@@ -3445,11 +4236,20 @@ async def test_advisor_server_does_not_enforce_local_inter_call_pacing() -> None
         object_type="advisor_call",
         observed_at=datetime.now(UTC),
     )
-    tool, _sample_blob_id = make_tool(investigation_id=investigation_id, transport=transport)
-    tool._observations = ObservationRepository((prior_call,))
+    tool, _sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+    tool._observations = ObservationRepository((prior_call, observation))
 
     result = await tool.execute(
-        {"consultation_type": "pivot_strategy"}, make_context(investigation_id)
+        {
+            "consultation_type": "pivot_strategy",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id),
     )
 
     assert result.status is not ToolInvocationStatus.UNAVAILABLE
@@ -3459,6 +4259,13 @@ async def test_advisor_server_does_not_enforce_local_inter_call_pacing() -> None
 @pytest.mark.asyncio
 async def test_advisor_server_does_not_enforce_local_bridge_turn_ceiling() -> None:
     investigation_id = uuid4()
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "strings": [{"value": "SyntheticTurnEvidence", "offset": 16}],
+        },
+    )
     transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
     prior_calls = tuple(
         SimpleNamespace(
@@ -3470,11 +4277,20 @@ async def test_advisor_server_does_not_enforce_local_bridge_turn_ceiling() -> No
         )
         for _ in range(4)
     )
-    tool, _sample_blob_id = make_tool(investigation_id=investigation_id, transport=transport)
-    tool._observations = ObservationRepository(prior_calls)
+    tool, _sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+    tool._observations = ObservationRepository((*prior_calls, observation))
 
     result = await tool.execute(
-        {"consultation_type": "pivot_strategy"}, make_context(investigation_id)
+        {
+            "consultation_type": "pivot_strategy",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id),
     )
 
     assert result.error_code != "advisor_cap_exhausted"
@@ -3618,9 +4434,24 @@ async def test_advisor_transport_failures_are_explicit_and_never_retried(
 ) -> None:
     investigation_id = uuid4()
     transport = Transport(submission)
-    tool, _subject = make_tool(investigation_id=investigation_id, transport=transport)
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "strings": [{"value": "SyntheticTransportEvidence", "offset": 16}],
+        },
+    )
+    tool, _subject = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
     result = await tool.execute(
-        {"consultation_type": "plan_investigation", "evidence_refs": []},
+        {
+            "consultation_type": "plan_investigation",
+            "evidence_refs": [str(observation.id)],
+        },
         make_context(investigation_id),
     )
 
@@ -3629,21 +4460,17 @@ async def test_advisor_transport_failures_are_explicit_and_never_retried(
     assert len(transport.calls) == 1
 
 
-def test_advisor_parses_persisted_output_even_when_bridge_turn_needs_review() -> None:
-    observation_id = uuid4()
-    prompt_data = {
-        "units": [{"id": "U1", "block_type": "key_findings", "form": "body", "anchor": None}],
-        "assertions": [
-            {
-                "id": "assertion-1",
-                "unit_id": "U1",
-                "block_type": "key_findings",
-                "form": "body",
-                "anchor": None,
-                "refs": [{"kind": "observation", "id": str(observation_id), "sha256": "a" * 64}],
-            }
-        ],
-    }
+@pytest.mark.asyncio
+async def test_advisor_does_not_parse_persisted_output_for_ambiguous_rate_limit() -> None:
+    investigation_id = uuid4()
+    observation, raw_evidence = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": "a" * 64,
+            "strings": [{"value": "MeasuredSampleMarker", "offset": 128}],
+        },
+    )
     raw = """advisor-wire.v1
 TYPE: draft_text
 STATUS: succeeded
@@ -3655,31 +4482,31 @@ LIMITATION: none
         TurnSubmissionStatus.NEEDS_REVIEW,
         output_text=raw,
         idempotency_key="persisted-turn-key",
-        submission_state="post_submission",
+        error_code="bridge_rate_limited",
+        submission_state="external_state_unknown",
     )
 
+    transport = Transport(submission)
     tool, _ = make_tool(
-        investigation_id=uuid4(),
-        transport=Transport(submission),
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw_evidence,
     )
-    result = tool._submission_result(
-        submission,
-        "prompt",
-        (observation_id,),
-        (),
-        len(raw.encode("utf-8")),
-        "draft_text",
-        1,
-        {},
-        {},
-        prompt_data=prompt_data,
+    result = await tool.execute(
+        {
+            "consultation_type": "pivot_strategy",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id),
     )
 
-    assert result.status is ToolInvocationStatus.SUCCEEDED
-    assert result.output["advisor_status"] == "succeeded"
-    assert result.output["blocks"][0]["sentences"][0]["assertion_ids"] == ("assertion-1",)
+    assert result.status is ToolInvocationStatus.NEEDS_REVIEW
+    assert result.output["advisor_status"] == "needs_review"
+    assert "blocks" not in result.output
     assert result.output["bridge_turns_consumed"] == 1
     assert result.budget_consumed[BudgetDimension.BRIDGE_TURNS] == 1
+    assert len(transport.calls) == 1
 
 
 def test_yara_v3_preserves_complete_rule_over_summary_limit_and_checks_measurement_refs() -> None:
@@ -3869,7 +4696,15 @@ async def test_suricata_draft_refuses_before_bridge_without_measured_network_fac
         make_context(investigation_id),
     )
 
-    assert result.status is ToolInvocationStatus.FAILED
-    assert result.output["refusal_code"] == "SURICATA_NOT_JUSTIFIED"
+    assert result.status is ToolInvocationStatus.UNAVAILABLE
+    assert result.output["preflight_status"] == "INSUFFICIENT_EVIDENCE"
+    assert result.error_code == "advisor_preflight_insufficient_evidence"
+    assert result.output["missing_refs"] == (
+        {
+            "ref": "network-fact",
+            "reason": "No measured network fact was loaded for Suricata drafting.",
+        },
+    )
+    assert result.output["bridge_turns_consumed"] == 0
     assert result.output["usable"] is False
     assert transport.calls == []

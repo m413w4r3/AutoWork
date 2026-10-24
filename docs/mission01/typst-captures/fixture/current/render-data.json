@@ -1,0 +1,115 @@
+{
+  "document_label": "SYNTHETIC-M01-T-FIXTURE-NOT-EVIDENCE",
+  "document_header": "Synthetic document",
+  "draft_watermark": "SYNTHETIC FIXTURE — NOT CTI EVIDENCE",
+  "title": "M01-T parity fixture — synthetic only",
+  "content_sections": [
+    {
+      "type": "references",
+      "show_heading": true,
+      "entries": [
+        {
+          "number": 1,
+          "display_date": "2026-10-01",
+          "text": "Synthetic event; no external observations.",
+          "source_urls": [
+            "https://example.invalid/reference"
+          ],
+          "target_id": "synthetic-source-1"
+        }
+      ],
+      "blocks": []
+    },
+    {
+      "type": "synthesis",
+      "blocks": [
+        {
+          "type": "paragraph",
+          "text": "Synthetic lead paragraph for layout comparison."
+        },
+        {
+          "type": "table",
+          "title": "Synthetic IOC status matrix — test labels only",
+          "columns": [
+            "Indicator value",
+            "Evidence level"
+          ],
+          "column_weights": [
+            1.2,
+            1.0
+          ],
+          "rows": [
+            [
+              "192.0.2.17",
+              "sourcé (test only)"
+            ],
+            [
+              "198.51.100.21",
+              "validé (test only)"
+            ],
+            [
+              "203.0.113.31",
+              "candidat (test only)"
+            ],
+            [
+              "192.0.2.41",
+              "écarté (test only)"
+            ]
+          ],
+          "caption": "All values use RFC 5737 documentation ranges; they are not indicators or evidence."
+        },
+        {
+          "type": "chart",
+          "title": "Synthetic flow",
+          "figure_number": 1,
+          "caption": "Synthetic flow diagram; no observed infrastructure.",
+          "media_path": "fixture.svg"
+        },
+        {
+          "type": "analyst_observation",
+          "text": "Analyst note fixture; no external observations or evidence."
+        }
+      ]
+    },
+    {
+      "type": "ioc",
+      "source_indicators": [
+        {
+          "heading": "Documenté dans l'article",
+          "items": [
+            {
+              "value": "192.0.2.17",
+              "indicator_status_label": "Documenté dans l'article (test only)",
+              "relationship_status_label": "Synthetic fixture; no provenance.",
+              "source_refs": [],
+              "draft_refs": []
+            },
+            {
+              "value": "198.51.100.21",
+              "indicator_status_label": "Documenté dans l'article (test only)",
+              "relationship_status_label": "Synthetic fixture; no provenance.",
+              "source_refs": [],
+              "draft_refs": []
+            }
+          ]
+        }
+      ],
+      "original_indicators": [],
+      "candidate_indicators": [
+        {
+          "heading": "Piste non confirmée",
+          "items": [
+            {
+              "value": "203.0.113.31",
+              "indicator_status_label": "Piste non confirmée (test only)",
+              "relationship_status_label": "Synthetic fixture; no provenance.",
+              "source_refs": [],
+              "draft_refs": []
+            }
+          ]
+        }
+      ],
+      "omitted_invalid_url_count": 0
+    }
+  ]
+}

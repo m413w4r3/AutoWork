@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import re
 import time
 from collections.abc import Callable, Mapping
@@ -37,6 +38,12 @@ class ModelGatewayError(RuntimeError):
     provider = "unknown"
     phase = "model_call"
     attempts = 1
+
+
+class ModelExecutionDeadlineExceeded(ModelGatewayError):
+    code = "model_execution_deadline_exceeded"
+    phase = "generation"
+    submission_state = "external_state_unknown"
 
 
 class ModelProviderNotConfiguredError(ModelGatewayError):
@@ -201,6 +208,7 @@ class ModelRequest:
     # A failed request is never retried implicitly.  This escape hatch is only
     # for a caller that has proved no provider submission took place.
     allow_failed_resubmit: bool = False
+    timeout_seconds: float | None = None
 
     def __post_init__(self) -> None:
         if not self.text.strip():
@@ -211,6 +219,13 @@ class ModelRequest:
             raise ValueError("evidence_pack_hash must be a lowercase SHA-256")
         if _contains_binary(self.metadata) or _contains_binary(self.parameters):
             raise BinaryModelInputError("Binary values cannot be sent to a model")
+        if self.timeout_seconds is not None and (
+            isinstance(self.timeout_seconds, bool)
+            or not isinstance(self.timeout_seconds, int | float)
+            or not math.isfinite(self.timeout_seconds)
+            or self.timeout_seconds <= 0
+        ):
+            raise ValueError("timeout_seconds must be a finite positive number")
 
 
 @dataclass(frozen=True, slots=True)
@@ -991,8 +1006,20 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
             if adapter.backend is ModelBackend.CHATGPT_BRIDGE
             else self._request_timeout_seconds_by_role
         )
-        if role in timeout_map:
-            safe_request = replace(safe_request, timeout_seconds=timeout_map[role])
+        role_timeout = timeout_map.get(role)
+        request_timeout = safe_request.timeout_seconds
+        effective_timeout = min(
+            (value for value in (role_timeout, request_timeout) if value is not None),
+            default=None,
+        )
+        if effective_timeout is not None:
+            safe_request = replace(safe_request, timeout_seconds=effective_timeout)
+        # An explicit caller deadline on Bridge requests is a hard whole-
+        # operation bound. Role defaults and non-Bridge limits remain adapter
+        # transport timeouts; making them total deadlines would widen this path.
+        enforce_hard_deadline = (
+            adapter.backend is ModelBackend.CHATGPT_BRIDGE and request.timeout_seconds is not None
+        )
         run = self.build_run(request, role, structured_output=requires_structured_output)
         persisted_success: ModelRun | None = None
         resume_run_id: UUID | None = None
@@ -1139,7 +1166,28 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                 # generation POST has happened. A cheap capability probe can
                 # fail here without losing the identity or resubmitting.
                 await self.preflight(request, role, structured_output=requires_structured_output)
-                result = await adapter.invoke(safe_request, role=role, output_schema=output_schema)
+                if safe_request.timeout_seconds is None or not enforce_hard_deadline:
+                    result = await adapter.invoke(
+                        safe_request, role=role, output_schema=output_schema
+                    )
+                else:
+                    invoke_started = time.monotonic()
+                    timeout_scope = asyncio.timeout(safe_request.timeout_seconds)
+                    try:
+                        async with timeout_scope:
+                            result = await adapter.invoke(
+                                safe_request, role=role, output_schema=output_schema
+                            )
+                    except TimeoutError as exc:
+                        if not timeout_scope.expired():
+                            raise
+                        raise ModelExecutionDeadlineExceeded(
+                            "The model operation exceeded its bounded execution deadline."
+                        ) from exc
+                    if time.monotonic() - invoke_started > safe_request.timeout_seconds:
+                        raise ModelExecutionDeadlineExceeded(
+                            "The model operation returned after its bounded execution deadline."
+                        )
                 async with self._uow_factory() as uow:
                     persisted = await uow.model_runs.get_for_update(run.id)
                     if persisted is None:
@@ -1454,6 +1502,7 @@ def sanitize_model_request(request: ModelRequest) -> SafeModelRequest:
         background=request.background,
         authorized_input_hash=digest,
         conversation=request.conversation,
+        timeout_seconds=request.timeout_seconds,
     )
 
 

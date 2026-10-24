@@ -85,6 +85,40 @@ def test_content_excerpt_extraction_keeps_whole_methods_decoded_values_and_offse
     assert all("a" * 64 not in item["text"] for item in excerpts)
 
 
+def test_short_hex_excerpt_rejects_malformed_and_oversized_values() -> None:
+    excerpts = extract_content_excerpts(
+        {
+            "hex": [
+                {"offset": 64, "value": "AA BB"},
+                {"offset": 128, "value": "AA BB"},
+                {"offset": 128, "value": "AA" * 513},
+                {"offset": 192, "value": "zz00"},
+                {"offset": 256, "value": "A0xA"},
+            ]
+        }
+    )
+
+    assert len(excerpts) == 2
+    assert [excerpt["title"].rsplit("offset ", 1)[-1] for excerpt in excerpts] == [
+        "64",
+        "128",
+    ]
+    assert all(excerpt["text"] == "AA BB" for excerpt in excerpts)
+
+
+def test_split_hex_dump_exceeding_aggregate_cap_is_rejected() -> None:
+    excerpts = extract_content_excerpts(
+        {
+            "hex": [
+                {"offset": 64, "value": "AA" * 257},
+                {"offset": 321, "value": "BB" * 256},
+            ]
+        }
+    )
+
+    assert excerpts == []
+
+
 def test_advisor_bridge_provenance_keeps_internal_measurement_ids_and_exact_bytes() -> None:
     from cti_app.application.investigation_advisor_tools import _advisor_bridge_measurement_catalog
 
@@ -343,7 +377,7 @@ def test_archived_corpus_c01_to_c13_replays_as_compact_resolvable_text_dossiers(
         new_prompt_bytes = len(prompt.encode("utf-8"))
         size_comparison.append((old_prompt_bytes, new_prompt_bytes))
         dossier_region = prompt.split("DOSSIER DE FAITS\n", 1)[1].split("\nQUALITÉ:", 1)[0]
-        aliases = set(re.findall(r"^\[(E[1-9][0-9]*)\] ", dossier_region, re.M))
+        aliases = set(re.findall(r"^\[([A-Z][1-9][0-9]*)\] ", dossier_region, re.M))
         manifest_aliases = {str(item["alias"]) for item in dossier.manifest}
         resolved = advisor_wire_aliases(replay)["evidence"]
 
@@ -362,7 +396,6 @@ def test_archived_corpus_c01_to_c13_replays_as_compact_resolvable_text_dossiers(
             ],
         )
         internal_values: list[tuple[str, str]] = []
-
         def collect_internal_values(value: object, collected: list[tuple[str, str]]) -> None:
             if isinstance(value, dict):
                 for key, child in value.items():
@@ -409,6 +442,29 @@ def test_archived_corpus_c01_to_c13_replays_as_compact_resolvable_text_dossiers(
         assert new_prompt_bytes > 0, case_id
     assert len(size_comparison) == 13
     assert all(before > 0 and after > 0 for before, after in size_comparison)
+
+
+def test_advisor_wire_does_not_resolve_conflicting_manifest_aliases() -> None:
+    aliases = advisor_wire_aliases(
+        {
+            "dossier_manifest": [
+                {
+                    "alias": "E1",
+                    "kind": "observation",
+                    "id": "observation:one",
+                    "sha256": "a" * 64,
+                },
+                {
+                    "alias": "E1",
+                    "kind": "finding",
+                    "id": "finding:two",
+                    "sha256": "b" * 64,
+                },
+            ]
+        }
+    )
+
+    assert "E1" not in aliases["evidence"]
 
 
 def _parse_v2(raw: str, *, prompt_data: dict | None = None, observation_refs=()):

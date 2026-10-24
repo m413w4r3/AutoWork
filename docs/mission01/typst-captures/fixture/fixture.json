@@ -1,0 +1,27 @@
+{
+  "title": "M01-T parity fixture — synthetic only",
+  "category": "Article",
+  "number": "07",
+  "overview": [
+    ["Victimologie", "Synthetic target class only."],
+    ["Arsenal", "Synthetic mechanism only."],
+    ["Objectif principal", "Exercise layout; no threat claim."]
+  ],
+  "date": "2026-10-01",
+  "event_text": "Synthetic event; no external observations.",
+  "source_url": "https://example.invalid/reference",
+  "lead": "Synthetic lead paragraph for layout comparison.",
+  "table_title": "Synthetic IOC status matrix — test labels only",
+  "table_caption": "All values use RFC 5737 documentation ranges; they are not indicators or evidence.",
+  "ioc_statuses": [
+    {"value": "192.0.2.17", "status": "sourcé"},
+    {"value": "198.51.100.21", "status": "validé"},
+    {"value": "203.0.113.31", "status": "candidat"},
+    {"value": "192.0.2.41", "status": "écarté"}
+  ],
+  "figure_caption": "Synthetic flow diagram; no observed infrastructure.",
+  "analyst_note": "Analyst note fixture; no external observations or evidence.",
+  "render_document_label": "SYNTHETIC-M01-T-FIXTURE-NOT-EVIDENCE",
+  "render_document_header": "Synthetic document",
+  "render_draft_watermark": "SYNTHETIC FIXTURE — NOT CTI EVIDENCE"
+}

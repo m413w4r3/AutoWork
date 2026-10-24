@@ -22,7 +22,9 @@ from cti_app.application.advisor_contracts import (
     parse_typed_advisor_response,
 )
 from cti_app.application.advisor_dossier import (
+    ContentExcerptLimitExceeded,
     build_advisor_dossier,
+    evaluate_advisor_evidence_preflight,
     extract_content_excerpts,
 )
 from cti_app.application.advisor_wire import (
@@ -63,6 +65,7 @@ from cti_app.config import Settings
 from cti_app.domain.analyst_opinion import OpinionBlockType, investigation_opinion_id
 from cti_app.domain.investigation import (
     BudgetDimension,
+    BudgetReservationStatus,
     EvidenceKind,
     EvidenceObservation,
     ToolInvocationStatus,
@@ -82,7 +85,19 @@ _TYPED_CONSULTATION_TYPES = frozenset(
     {"draft_text", "review_text", "yara_draft", "suricata_draft", "figure_plan"}
 )
 MAX_ADVISOR_INPUT_BYTES = 4_000_000
+# Match the existing typed content-pattern measurement ceiling for binary values.
+MAX_ADVISOR_BINARY_MEASUREMENT_BYTES = 512
 MAX_ADVISOR_TOOL_SECONDS = 3_600
+# Keep and strengthen the prior admission floor by deriving it from the Bridge
+# phase envelope: maximum paced wait + connect + capabilities + the larger of
+# the archive timeout and the 35s advisor preparation/scheduling margin. This
+# covers the bounded phases inside the transport and preserves extra room for
+# local dossier and prompt preparation. Configured phase limits can only raise it.
+DEFAULT_ADVISOR_PACING_SECONDS = 20
+DEFAULT_ADVISOR_CONNECT_SECONDS = 3
+DEFAULT_ADVISOR_CAPABILITIES_SECONDS = 2
+DEFAULT_ADVISOR_ARCHIVE_SECONDS = 60
+MIN_ADVISOR_PREPARATION_MARGIN_SECONDS = 35
 _SECRET = re.compile(
     r"(?i)\b(api[_ -]?key|private[_ -]?key|access[_ -]?token|client[_ -]?secret|"
     r"authorization|credential|password|secret)\s*[:=]\s*[^\s,;]+"
@@ -118,6 +133,7 @@ class InvestigationAdvisorTool:
         investigations: Any,
         observations: Any,
         findings: Any,
+        investigation_states: Any | None = None,
         experiments: Any | None = None,
         opinions: Any,
         sample_associations: Any,
@@ -132,6 +148,7 @@ class InvestigationAdvisorTool:
         self._investigations = investigations
         self._observations = observations
         self._findings = findings
+        self._investigation_states = investigation_states
         self._experiments = experiments
         self._opinions = opinions
         self._sample_associations = sample_associations
@@ -154,6 +171,9 @@ class InvestigationAdvisorTool:
         context: ToolExecutionContext,
         *,
         _editorial_batch_child: bool = False,
+        _execution_timeout_seconds: int | None = None,
+        _execution_deadline_monotonic: float | None = None,
+        _bridge_turns_remaining: int | None = None,
     ) -> ToolResult:
         try:
             raw_consultation_type = arguments.get("consultation_type")
@@ -194,6 +214,39 @@ class InvestigationAdvisorTool:
             return await self._input_failure(context, "advisor_arguments_invalid")
         evidence: tuple[EvidenceObservation, ...]
         try:
+            execution_clock = time.monotonic
+            started_at = execution_clock()
+            if _execution_timeout_seconds is None:
+                execution_timeout_seconds, budget_refusal = _advisor_execution_timeout(
+                    context, self._settings
+                )
+                if budget_refusal is not None:
+                    return self._finish(context, budget_refusal)
+            else:
+                execution_timeout_seconds = _execution_timeout_seconds
+            minimum_execution_seconds = _advisor_minimum_execution_seconds(self._settings)
+            if minimum_execution_seconds is None:
+                return self._finish(
+                    context, _advisor_budget_refusal("bridge_phase_timeout_settings_invalid")
+                )
+            execution_deadline_monotonic = (
+                _execution_deadline_monotonic
+                if _execution_deadline_monotonic is not None
+                else started_at + execution_timeout_seconds
+            )
+            if (
+                execution_timeout_seconds < minimum_execution_seconds
+                or execution_deadline_monotonic - execution_clock() < minimum_execution_seconds
+            ):
+                return self._finish(
+                    context,
+                    _advisor_budget_refusal("execution_window_below_minimum_before_preparation"),
+                )
+            bridge_turns_remaining = (
+                _bridge_turns_remaining
+                if _bridge_turns_remaining is not None
+                else _advisor_reserved_bridge_turns(context)
+            )
             editorial_units = arguments.get("units")
             if (
                 consultation_type in {"draft_text", "review_text"}
@@ -206,6 +259,9 @@ class InvestigationAdvisorTool:
                     context,
                     editorial_units,
                     maximum_units=len(editorial_units),
+                    execution_timeout_seconds=execution_timeout_seconds,
+                    execution_deadline_monotonic=execution_deadline_monotonic,
+                    bridge_turns_remaining=bridge_turns_remaining,
                 )
             pacing_result = await self._check_advisor_limits(
                 context.investigation_id,
@@ -226,6 +282,38 @@ class InvestigationAdvisorTool:
                 "suricata_draft",
             }:
                 evidence = await self._auto_evidence(context.investigation_id)
+            if consultation_type in {"plan_investigation", "pivot_strategy", "figure_plan"}:
+                if consultation_type == "figure_plan":
+                    raw_finding_refs = arguments.get("finding_refs", ())
+                    if not isinstance(raw_finding_refs, (tuple, list)):
+                        raise _AdvisorInputValidationError("figure_finding_refs_invalid")
+                    requested_ids = tuple(UUID(str(item)) for item in raw_finding_refs)
+                else:
+                    requested_ids = ()
+                finding_rows = self._latest_findings(
+                    tuple(
+                        item
+                        for item in await self._findings.list_for_investigation(
+                            context.investigation_id
+                        )
+                        if getattr(item, "investigation_id", context.investigation_id)
+                        == context.investigation_id
+                    )
+                )
+                linked_observation_ids = tuple(
+                    dict.fromkeys(
+                        ref
+                        for finding in finding_rows
+                        if not requested_ids or finding.id in requested_ids
+                        for ref in getattr(finding, "observation_refs", ())
+                    )
+                )
+                if linked_observation_ids:
+                    linked_evidence = await self._load_evidence(
+                        context.investigation_id, linked_observation_ids
+                    )
+                    evidence_by_id = {item.id: item for item in (*evidence, *linked_evidence)}
+                    evidence = tuple(evidence_by_id.values())
             investigation = await self._investigations.get(context.investigation_id)
             if investigation is None:
                 return self._finish(
@@ -244,7 +332,11 @@ class InvestigationAdvisorTool:
                         ToolInvocationStatus.POLICY_DENIED,
                         observation_refs=evidence_refs,
                         error_code="POLICY_DENIED",
-                        output={"advisor_status": "policy_denied"},
+                        output={
+                            "advisor_status": "policy_denied",
+                            "preflight_status": "POLICY_BLOCKED",
+                            "missing_refs": [],
+                        },
                         message="External disclosure policy denied this Bridge consultation.",
                     ),
                 )
@@ -258,6 +350,16 @@ class InvestigationAdvisorTool:
                 context=context,
                 question=question,
             )
+            explicit_observation_refs = list(dict.fromkeys(str(item) for item in evidence_refs))
+            if consultation_type == "figure_plan":
+                explicit_observation_refs.extend(
+                    str(reference)
+                    for finding in prompt_data.get("findings", ())
+                    if isinstance(finding, Mapping)
+                    for reference in finding.get("observation_refs", ())
+                    if isinstance(reference, str)
+                )
+            prompt_data["evidence_refs"] = list(dict.fromkeys(explicit_observation_refs))
             prompt_data, redacted_secret_count = _redact_advisor_payload(
                 prompt_data, settings=self._settings
             )
@@ -269,8 +371,14 @@ class InvestigationAdvisorTool:
                     reason="secret_field_remaining",
                     redacted_secret_count=redacted_secret_count,
                 )
-            dossier = build_advisor_dossier(prompt_data)
+            try:
+                dossier = build_advisor_dossier(prompt_data)
+            except ContentExcerptLimitExceeded as exc:
+                raise _AdvisorInputValidationError(exc.reason_code) from None
             prompt_data["dossier_manifest"] = [dict(item) for item in dossier.manifest]
+            prompt_data["dossier_text"] = dossier.text
+            prompt_data["dossier_sha256"] = dossier.sha256
+            prompt_data["dossier_bytes"] = dossier.byte_size
             prompt_data["transmitted_refs"] = _transmitted_refs_for_dossier(
                 prompt_data, snapshot, dossier.manifest
             )
@@ -279,11 +387,6 @@ class InvestigationAdvisorTool:
                 for item in prompt_data["transmitted_refs"]
                 if item["kind"] == "observation"
             ]
-            shared_context_bytes = (
-                _editorial_shared_prompt_bytes(prompt_data)
-                if consultation_type == "draft_text"
-                else None
-            )
             max_input_bytes = int(
                 getattr(self._settings, "operator_advisor_max_input_bytes", MAX_ADVISOR_INPUT_BYTES)
             )
@@ -295,32 +398,9 @@ class InvestigationAdvisorTool:
                 _critical_prompt_data_was_truncated(consultation_type, prompt_data)
                 or len(encoded) > max_input_bytes
             ):
-                if (
-                    consultation_type == "draft_text"
-                    and shared_context_bytes is not None
-                    and shared_context_bytes > max_input_bytes
-                ):
-                    return await self._persist_preflight_failure(
-                        context,
-                        consultation_type=consultation_type,
-                        evidence_refs=tuple(item.id for item in evidence),
-                        output={
-                            "advisor_status": "context_too_large",
-                            "usable": False,
-                            "failure_stage": "prompt_size_preflight",
-                            "failure_reason": "shared_context_exceeds_input_limit",
-                            "shared_context_bytes": shared_context_bytes,
-                            "max_input_bytes": max_input_bytes,
-                            "truncated_fields": sorted(
-                                key
-                                for key, value in prompt_data.get("truncation", {}).items()
-                                if value is True
-                            ),
-                            "confirmed_non_execution": True,
-                            "bridge_turns_consumed": 0,
-                        },
-                        error_code="advisor_context_too_large",
-                    )
+                size_block_completeness = evaluate_advisor_evidence_preflight(
+                    prompt_data, dossier, prompt
+                )
                 if (
                     consultation_type in {"draft_text", "review_text"}
                     and isinstance(editorial_units, (list, tuple))
@@ -331,18 +411,34 @@ class InvestigationAdvisorTool:
                         context,
                         editorial_units,
                         maximum_units=max(1, len(editorial_units) // 2),
+                        execution_timeout_seconds=execution_timeout_seconds,
+                        execution_deadline_monotonic=execution_deadline_monotonic,
+                        bridge_turns_remaining=bridge_turns_remaining,
                     )
+                failure_reason = "input_exceeds_configured_limit"
+                if (
+                    consultation_type in {"draft_text", "review_text"}
+                    and _shared_advisor_context_bytes(prompt_data) > max_input_bytes
+                ):
+                    failure_reason = "shared_context_exceeds_input_limit"
                 return await self._persist_preflight_failure(
                     context,
                     consultation_type=consultation_type,
                     evidence_refs=tuple(item.id for item in evidence),
                     output={
                         "advisor_status": "context_too_large",
+                        "preflight_status": "TECHNICAL_BLOCKED",
                         "usable": False,
                         "failure_stage": "prompt_size_preflight",
-                        "failure_reason": "input_exceeds_configured_limit",
+                        "failure_reason": failure_reason,
                         "context_bytes_after_fit": len(encoded),
                         "max_input_bytes": max_input_bytes,
+                        "dossier_sha256": dossier.sha256,
+                        "dossier_bytes": dossier.byte_size,
+                        "dossier_manifest": [dict(item) for item in dossier.manifest],
+                        "missing_refs": size_block_completeness["missing_refs"],
+                        "completeness_counts": size_block_completeness["counts"],
+                        "completeness_manifest": size_block_completeness["items"],
                         "truncated_fields": sorted(
                             key
                             for key, value in prompt_data.get("truncation", {}).items()
@@ -352,6 +448,30 @@ class InvestigationAdvisorTool:
                         "bridge_turns_consumed": 0,
                     },
                     error_code="advisor_context_too_large",
+                )
+            evidence_preflight = evaluate_advisor_evidence_preflight(prompt_data, dossier, prompt)
+            prompt_data["evidence_preflight"] = evidence_preflight
+            if evidence_preflight["status"] != "READY":
+                preflight_status = str(evidence_preflight["status"])
+                return await self._persist_preflight_failure(
+                    context,
+                    consultation_type=consultation_type,
+                    evidence_refs=tuple(item.id for item in evidence),
+                    output={
+                        "advisor_status": preflight_status.casefold(),
+                        "preflight_status": preflight_status,
+                        "failure_stage": "evidence_preflight",
+                        "failure_reason": "required_canonical_evidence_not_in_payload",
+                        "missing_refs": evidence_preflight["missing_refs"],
+                        "completeness_counts": evidence_preflight["counts"],
+                        "completeness_manifest": evidence_preflight["items"],
+                        "dossier_sha256": dossier.sha256,
+                        "dossier_bytes": dossier.byte_size,
+                        "confirmed_non_execution": True,
+                        "bridge_turns_consumed": 0,
+                        "usable": False,
+                    },
+                    error_code=f"advisor_preflight_{preflight_status.casefold()}",
                 )
             if consultation_type == "suricata_draft" and not prompt_data.get("network_facts"):
                 return self._finish(
@@ -564,7 +684,6 @@ class InvestigationAdvisorTool:
                 error_code="advisor_prompt_persistence_failed",
                 exception_class=type(exc).__name__,
             )
-        started_at = time.monotonic()
         submission_started_at = time.perf_counter()
         submission = await submit_bridge_consultation_once(
             self._transport,
@@ -575,9 +694,21 @@ class InvestigationAdvisorTool:
             prompt=prompt,
             external_llm_allowed=True,
             settings=self._settings,
+            timeout_seconds=execution_timeout_seconds,
+            deadline_monotonic=execution_deadline_monotonic,
+            minimum_timeout_seconds=minimum_execution_seconds,
+            clock=execution_clock,
         )
+        evidence_preflight = evaluate_advisor_evidence_preflight(
+            prompt_data, dossier, prompt, submitted=_advisor_payload_was_submitted(submission)
+        )
+        prompt_data["evidence_preflight"] = evidence_preflight
         submission_elapsed_ms = round((time.perf_counter() - submission_started_at) * 1000)
-        raw_output = submission.output_text
+        # A recovered response attached to NEEDS_REVIEW is still ambiguous. It
+        # must not be archived or parsed as a successful advisor answer.
+        raw_output = (
+            submission.output_text if submission.status is TurnSubmissionStatus.SUCCEEDED else None
+        )
         raw_output_bytes = raw_output.encode("utf-8") if raw_output is not None else None
         output_sha256 = (
             hashlib.sha256(raw_output_bytes).hexdigest() if raw_output_bytes is not None else None
@@ -609,7 +740,7 @@ class InvestigationAdvisorTool:
                     BudgetDimension.CONTEXT_BYTES: len(encoded),
                     BudgetDimension.CONTEXT_TOKENS: max(1, (len(encoded) + 3) // 4),
                     BudgetDimension.TOOL_SECONDS: min(
-                        _advisor_tool_seconds_limit(self._settings),
+                        execution_timeout_seconds,
                         max(1, math.ceil(time.monotonic() - started_at)),
                     ),
                 },
@@ -638,7 +769,7 @@ class InvestigationAdvisorTool:
                     BudgetDimension.CONTEXT_BYTES: len(encoded),
                     BudgetDimension.CONTEXT_TOKENS: max(1, (len(encoded) + 3) // 4),
                     BudgetDimension.TOOL_SECONDS: min(
-                        _advisor_tool_seconds_limit(self._settings),
+                        execution_timeout_seconds,
                         max(1, math.ceil(time.monotonic() - started_at)),
                     ),
                 },
@@ -666,7 +797,7 @@ class InvestigationAdvisorTool:
                 advisor_source_refs,
                 len(encoded),
                 consultation_type,
-                math.ceil(time.monotonic() - started_at),
+                min(execution_timeout_seconds, math.ceil(time.monotonic() - started_at)),
                 {item.name: item.schema_version for item in available_tool_definitions},
                 {
                     item.name: item.input_schema
@@ -674,6 +805,7 @@ class InvestigationAdvisorTool:
                     if isinstance(getattr(item, "input_schema", None), Mapping)
                 },
                 prompt_data=prompt_data,
+                execution_timeout_seconds=execution_timeout_seconds,
             )
         parse_elapsed_ms = round((time.perf_counter() - parse_started_at) * 1000)
         input_refs = tuple(persisted_input_refs)
@@ -717,6 +849,11 @@ class InvestigationAdvisorTool:
                 for item in prompt_data.get("dossier_manifest", ())
                 if isinstance(item, Mapping)
             ],
+            "dossier_sha256": dossier.sha256,
+            "dossier_bytes": dossier.byte_size,
+            "preflight_status": evidence_preflight["status"],
+            "completeness_counts": evidence_preflight["counts"],
+            "completeness_manifest": evidence_preflight["items"],
         }
         if consultation_type == "yara_draft":
             provenance["measurement_catalog"] = _advisor_bridge_measurement_catalog(prompt_data)
@@ -791,6 +928,11 @@ class InvestigationAdvisorTool:
                     "prompt_blob_id": str(prompt_blob_id),
                     "prompt_sha256": input_sha256,
                     "prompt_bytes": len(encoded),
+                    "dossier_sha256": dossier.sha256,
+                    "dossier_bytes": dossier.byte_size,
+                    "preflight_status": evidence_preflight["status"],
+                    "completeness_counts": evidence_preflight["counts"],
+                    "completeness_manifest": evidence_preflight["items"],
                     "output_blob_id": str(output_blob_id) if output_blob_id else None,
                     "output_sha256": output_sha256,
                     "response_bytes": response_bytes,
@@ -864,6 +1006,10 @@ class InvestigationAdvisorTool:
                     "prompt_sha256": input_sha256,
                     "output_sha256": output_sha256,
                     "prompt_bytes": len(encoded),
+                    "dossier_sha256": dossier.sha256,
+                    "dossier_bytes": dossier.byte_size,
+                    "preflight_status": evidence_preflight["status"],
+                    "completeness_counts": evidence_preflight["counts"],
                     "response_bytes": response_bytes,
                     "invocation_stage": invocation_stage,
                     "submission_status": submission.status.value,
@@ -978,14 +1124,91 @@ class InvestigationAdvisorTool:
         units: list[Any] | tuple[Any, ...],
         *,
         maximum_units: int,
+        execution_timeout_seconds: int = MAX_ADVISOR_TOOL_SECONDS,
+        execution_deadline_monotonic: float | None = None,
+        bridge_turns_remaining: int | None = None,
     ) -> ToolResult:
         units = list(units)
         chunks = [
             units[index : index + maximum_units] for index in range(0, len(units), maximum_units)
         ]
+        if execution_deadline_monotonic is None:
+            execution_deadline_monotonic = time.monotonic() + execution_timeout_seconds
+        available_bridge_turns = (
+            bridge_turns_remaining
+            if bridge_turns_remaining is not None
+            else _advisor_reserved_bridge_turns(context)
+        )
+        if len(chunks) > available_bridge_turns:
+            return await self._persist_preflight_failure(
+                context,
+                consultation_type=str(arguments.get("consultation_type", "unknown")),
+                evidence_refs=(),
+                output={
+                    "advisor_status": "unavailable",
+                    "usable": False,
+                    "failure_stage": "budget_admission",
+                    "failure_reason": "bridge_turn_reservation_insufficient_for_editorial_batches",
+                    "confirmed_non_execution": True,
+                    "bridge_turns_consumed": 0,
+                    "retry": False,
+                    "unprocessed_unit_ids": [
+                        str(item.get("id")) for item in units if isinstance(item, Mapping)
+                    ],
+                    "next_batch_index": 1,
+                },
+                error_code="advisor_unavailable",
+            )
         results: list[ToolResult] = []
         unprocessed_units: list[str] = []
+        consumed_execution_seconds = 0
+        minimum_execution_seconds = _advisor_minimum_execution_seconds(self._settings)
+        if minimum_execution_seconds is None:
+            return self._finish(
+                context, _advisor_budget_refusal("bridge_phase_timeout_settings_invalid")
+            )
         for index, chunk in enumerate(chunks, start=1):
+            deadline_remaining_seconds = math.floor(execution_deadline_monotonic - time.monotonic())
+            remaining_execution_seconds = min(
+                execution_timeout_seconds - consumed_execution_seconds,
+                deadline_remaining_seconds,
+            )
+            if remaining_execution_seconds < minimum_execution_seconds:
+                prior_batch_was_submitted = bool(results)
+                results.append(
+                    _advisor_budget_refusal("execution_window_below_minimum_before_next_batch")
+                )
+                combined = _combine_editorial_batch_results(results)
+                # This is a mixed outcome: earlier batches already reached Bridge,
+                # while the next batch was refused locally. Preserve their usage
+                # and never let the local refusal clear the whole operation's charge.
+                status = (
+                    ToolInvocationStatus.PARTIAL
+                    if prior_batch_was_submitted
+                    else ToolInvocationStatus.NEEDS_REVIEW
+                )
+                return self._finish(
+                    context,
+                    replace(
+                        combined,
+                        status=status,
+                        output={
+                            **combined.output,
+                            "advisor_status": (
+                                "partial" if prior_batch_was_submitted else "needs_review"
+                            ),
+                            "failure_stage": "budget_admission",
+                            "failure_reason": "execution_window_below_minimum_before_next_batch",
+                            "confirmed_non_execution": not prior_batch_was_submitted,
+                            "unprocessed_unit_ids": [
+                                str(item.get("id"))
+                                for later_chunk in chunks[index - 1 :]
+                                for item in later_chunk
+                                if isinstance(item, Mapping)
+                            ],
+                        },
+                    ),
+                )
             child_arguments = dict(arguments)
             child_arguments["units"] = chunk
             child_arguments.pop("assertions", None)
@@ -1003,6 +1226,14 @@ class InvestigationAdvisorTool:
                 child_arguments,
                 child_context,
                 _editorial_batch_child=True,
+                _execution_timeout_seconds=remaining_execution_seconds,
+                _execution_deadline_monotonic=execution_deadline_monotonic,
+                # The outer plan allocates one reserved Bridge turn to each
+                # child. A child cannot recursively multiply that allowance.
+                _bridge_turns_remaining=1,
+            )
+            consumed_execution_seconds += batch_result.budget_consumed.get(
+                BudgetDimension.TOOL_SECONDS, 0
             )
             batch_result = replace(
                 batch_result,
@@ -1028,12 +1259,34 @@ class InvestigationAdvisorTool:
                     if isinstance(item, Mapping)
                 ]
                 combined = _combine_editorial_batch_results(results)
+                prior_bridge_submission = any(
+                    item.budget_consumed.get(BudgetDimension.BRIDGE_TURNS, 0) > 0
+                    for item in results[:-1]
+                )
+                mixed_budget_refusal = (
+                    prior_bridge_submission
+                    and batch_result.output.get("failure_stage") == "budget_admission"
+                    and batch_result.output.get("confirmed_non_execution") is True
+                )
                 return self._finish(
                     context,
                     replace(
                         combined,
+                        status=(
+                            ToolInvocationStatus.PARTIAL
+                            if mixed_budget_refusal
+                            else combined.status
+                        ),
                         output={
                             **combined.output,
+                            **(
+                                {
+                                    "advisor_status": "partial",
+                                    "confirmed_non_execution": False,
+                                }
+                                if mixed_budget_refusal
+                                else {}
+                            ),
                             "unprocessed_unit_ids": unprocessed_units,
                             "next_batch_index": index,
                             "batch_cursor": {
@@ -1056,6 +1309,28 @@ class InvestigationAdvisorTool:
         measurement_errors: tuple[dict[str, int | str], ...] = (),
     ) -> ToolResult:
         """Record a safe, definitive local rejection before any Bridge transport."""
+        content_omission_codes = {
+            "content_excerpt_budget_exceeds_16384_bytes",
+            "dossier_content_excerpt_budget_exceeds_16384_bytes",
+            "base64_content_exceeds_512_byte_decoded_limit",
+            "data_url_base64_exceeds_512_byte_decoded_limit",
+            "data_url_base64_is_invalid",
+            "declared_base64_content_is_invalid",
+            "raw_hexdump_content_rejected",
+        }
+        omitted_evidence = (
+            [
+                {
+                    "kind": "observation",
+                    "id": str(reference),
+                    "status": "INTENTIONALLY_OMITTED",
+                    "reason": reason_code,
+                }
+                for reference in observation_refs
+            ]
+            if reason_code in content_omission_codes
+            else []
+        )
         message = (
             "Advisor input rejected before Bridge submission: "
             + "; ".join(
@@ -1076,6 +1351,7 @@ class InvestigationAdvisorTool:
                 "confirmed_non_execution": True,
                 "invocation_stage": "prevalidation",
                 "bridge_turns_consumed": 0,
+                **({"omitted_evidence": omitted_evidence} if omitted_evidence else {}),
                 **({"measurement_errors": list(measurement_errors)} if measurement_errors else {}),
                 "bridge_invocation_id": None,
                 "provider_usage": {"status": "not_submitted"},
@@ -1290,6 +1566,11 @@ class InvestigationAdvisorTool:
                     "claim_id": getattr(item, "claim_id", ""),
                     "heading": getattr(item, "heading", ""),
                     "text": getattr(item, "text", ""),
+                    **(
+                        {"section_index": item.section_index}
+                        if type(getattr(item, "section_index", None)) is int
+                        else {}
+                    ),
                 }
                 for item in getattr(snapshot, "article_passages", ())
             ],
@@ -1456,6 +1737,21 @@ class InvestigationAdvisorTool:
                     }
                 )
             base["opinion_sections"] = opinion_sections
+        if consultation_type in {"plan_investigation", "pivot_strategy"}:
+            state = (
+                await self._investigation_states.get(investigation_id)
+                if self._investigation_states is not None
+                else None
+            )
+            if state is not None and state.investigation_id == investigation_id:
+                base["working_state_ref"] = (
+                    f"investigation-state:{investigation_id}:v{state.version}:{state.sha256}"
+                )
+                base["working_state_version"] = state.version
+                base["working_state_sha256"] = state.sha256
+                base["hypotheses"] = [item.to_payload() for item in state.hypotheses]
+            else:
+                base["hypotheses"] = []
         draft_assertions: list[dict[str, Any]] = []
         if consultation_type == "draft_text":
             raw_units = arguments.get("units")
@@ -1683,9 +1979,14 @@ class InvestigationAdvisorTool:
                     "sha256": item.sha256,
                     "source": _safe_text(item.source, 96),
                 }
-                row["content_excerpts"] = await self._observation_content_excerpts(item)
+                (
+                    row["content_excerpts"],
+                    row["blob_read_verified"],
+                ) = await self._observation_content_projection(item)
                 try:
                     measured_rows = await self._measurement_rows(item)
+                except _AdvisorInputValidationError:
+                    raise
                 except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
                     measured_rows = []
                 sample_blob = None
@@ -1739,9 +2040,12 @@ class InvestigationAdvisorTool:
             base["findings"] = [
                 {
                     "finding_id": str(item.id),
+                    "sha256": _advisor_source_sha256("finding", item),
                     "kind": item.kind.value,
                     "assessment": item.assessment.value,
                     "line": item.statement,
+                    "observation_refs": [str(value) for value in item.observation_refs],
+                    "claim_refs": [str(value) for value in item.claim_refs],
                     "limitations": list(item.limitations),
                 }
                 for item in findings
@@ -1782,6 +2086,8 @@ class InvestigationAdvisorTool:
                 "question": question,
                 "article_source_ref": f"article:{snapshot.synthesis_sha256}",
                 "article_sha256": snapshot.synthesis_sha256,
+                "evidence": base["evidence"],
+                "measured_facts": base["measured_facts"],
                 "samples": await self._sample_inventory(investigation_id, evidence),
                 "measurements": measurements,
                 "tools": tool_inventory,
@@ -1840,6 +2146,8 @@ class InvestigationAdvisorTool:
                     "kind": item.kind.value,
                     "assessment": item.assessment.value,
                     "line": item.statement,
+                    "observation_refs": [str(value) for value in item.observation_refs],
+                    "claim_refs": [str(value) for value in item.claim_refs],
                     "limitations": list(item.limitations),
                 }
                 for item in findings
@@ -1969,11 +2277,16 @@ class InvestigationAdvisorTool:
                 "object_type": _safe_text(item.object_type, 48),
                 "source": _safe_text(item.source, 48),
             }
-            row["content_excerpts"] = await self._observation_content_excerpts(item)
+            (
+                row["content_excerpts"],
+                row["blob_read_verified"],
+            ) = await self._observation_content_projection(item)
             observation_payload.append(row)
 
             try:
                 measurements = await self._measurement_rows(item)
+            except _AdvisorInputValidationError:
+                raise
             except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
                 measurements = []
             for measurement in measurements:
@@ -2116,6 +2429,7 @@ class InvestigationAdvisorTool:
     async def _candidate_rule_summary(self, observation: EvidenceObservation) -> dict[str, Any]:
         facts: dict[str, Any] = {
             "evidence_id": str(observation.id),
+            "sha256": observation.sha256,
             "source": _safe_text(observation.source, 48),
             "status": "measured",
         }
@@ -2132,6 +2446,10 @@ class InvestigationAdvisorTool:
                 if isinstance(result, Mapping):
                     for field in (
                         "status",
+                        "candidate_id",
+                        "candidate_version",
+                        "corpus_sha256",
+                        "corpus_sha256s_by_role",
                         "false_positives",
                         "false_negatives",
                         "false_positives_added",
@@ -2139,8 +2457,26 @@ class InvestigationAdvisorTool:
                         "fp",
                         "fn",
                     ):
-                        if field in result:
-                            facts[field] = _safe_text(str(result[field]), 48)
+                        if field not in result:
+                            continue
+                        value = result[field]
+                        if field in {"corpus_sha256", "candidate_id"}:
+                            facts[field] = _safe_text(str(value), 128)
+                        elif field == "candidate_version" and type(value) is int:
+                            facts[field] = value
+                        elif field == "corpus_sha256s_by_role" and isinstance(value, Mapping):
+                            facts[field] = {
+                                _safe_text(str(role), 32): [
+                                    digest
+                                    for digest in hashes
+                                    if isinstance(digest, str)
+                                    and re.fullmatch(r"[0-9a-f]{64}", digest)
+                                ]
+                                for role, hashes in value.items()
+                                if isinstance(hashes, (list, tuple))
+                            }
+                        elif field == "status" or isinstance(value, int | float):
+                            facts[field] = _safe_text(str(value), 48)
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
             pass
         return facts
@@ -2268,11 +2604,24 @@ class InvestigationAdvisorTool:
         self, observation: EvidenceObservation
     ) -> list[dict[str, str]]:
         """Read only integrity-verified JSON evidence and retain its content facts."""
+        excerpts, _read_verified = await self._observation_content_projection(observation)
+        return excerpts
+
+    async def _observation_content_projection(
+        self, observation: EvidenceObservation
+    ) -> tuple[list[dict[str, str]], bool]:
+        """Return extracted facts and whether the canonical blob read verified."""
         try:
             payload = await self._measurement_payload(observation)
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
             payload = None
-        return extract_content_excerpts(payload) if payload is not None else []
+        if payload is None:
+            return [], False
+        try:
+            excerpts = extract_content_excerpts(payload)
+        except ContentExcerptLimitExceeded as exc:
+            raise _AdvisorInputValidationError(exc.reason_code) from None
+        return excerpts, True
 
     async def _measurement_payload(
         self, observation: EvidenceObservation
@@ -2320,6 +2669,8 @@ class InvestigationAdvisorTool:
         evidence_sha256: str,
         extractor_version: str,
     ) -> dict[str, Any]:
+        if measurement.bridge_kind.casefold() in {"hex", "hex_bytes", "bytes_hex"}:
+            _reject_oversized_hex_measurement(measurement.bridge_value, index=-1)
         return {
             **({"blob_id": str(blob_id)} if blob_id is not None else {}),
             "kind": measurement.bridge_kind,
@@ -2373,11 +2724,19 @@ class InvestigationAdvisorTool:
                 if target_key == "hex" and not _valid_hex_measurement(label):
                     continue
                 if target_key == "base64":
+                    max_encoded_chars = ((MAX_ADVISOR_BINARY_MEASUREMENT_BYTES + 2) // 3) * 4
+                    if len(label) > max_encoded_chars:
+                        _raise_oversized_binary_measurement(len(rows))
                     try:
-                        if not base64.b64decode(label, validate=True):
+                        decoded = base64.b64decode(label, validate=True)
+                        if not decoded:
                             continue
                     except (ValueError, binascii.Error):
                         continue
+                    if len(decoded) > MAX_ADVISOR_BINARY_MEASUREMENT_BYTES:
+                        _raise_oversized_binary_measurement(len(rows))
+                if target_key == "hex":
+                    _reject_oversized_hex_measurement(label, index=len(rows))
                 rows.append(
                     {
                         "kind": target_key,
@@ -2501,7 +2860,14 @@ class InvestigationAdvisorTool:
                     "FAITS TRANSMIS (chaque extrait est une source distincte; citer uniquement "
                     "ses alias [E#]):"
                 ),
-                render_advisor_wire_input(data),
+                render_advisor_wire_input(
+                    data,
+                    dossier_text=(
+                        data.get("dossier_text")
+                        if isinstance(data.get("dossier_text"), str)
+                        else None
+                    ),
+                ),
                 (
                     "QUALITÉ: réponse vérifiable, précise et concise; distinguer observation, "
                     "interprétation et hypothèse."
@@ -2532,6 +2898,7 @@ class InvestigationAdvisorTool:
         available_tool_schemas: Mapping[str, Mapping[str, Any]],
         *,
         prompt_data: Mapping[str, Any],
+        execution_timeout_seconds: int | None = None,
     ) -> ToolResult:
         code = (submission.error_code or "").casefold()
         bridge_turns_consumed = _bridge_turns_consumed(submission)
@@ -2539,13 +2906,14 @@ class InvestigationAdvisorTool:
         failure_reason = (
             submission.failure_reason or submission.error_code or submission.status.value
         )
+        tool_seconds_ceiling = _advisor_tool_seconds_limit(self._settings)
+        if execution_timeout_seconds is not None:
+            tool_seconds_ceiling = min(tool_seconds_ceiling, execution_timeout_seconds)
         usage = {
             BudgetDimension.BRIDGE_TURNS: bridge_turns_consumed,
             BudgetDimension.CONTEXT_BYTES: input_bytes,
             BudgetDimension.CONTEXT_TOKENS: max(1, (input_bytes + 3) // 4),
-            BudgetDimension.TOOL_SECONDS: min(
-                _advisor_tool_seconds_limit(self._settings), max(1, elapsed_seconds)
-            ),
+            BudgetDimension.TOOL_SECONDS: min(tool_seconds_ceiling, max(1, elapsed_seconds)),
         }
         if submission.status is TurnSubmissionStatus.BLOCKED:
             return ToolResult(
@@ -2554,11 +2922,25 @@ class InvestigationAdvisorTool:
                 error_code="POLICY_DENIED",
                 output={"advisor_status": "policy_denied"},
             )
+        if submission.status is TurnSubmissionStatus.NEEDS_REVIEW:
+            return ToolResult(
+                ToolInvocationStatus.NEEDS_REVIEW,
+                observation_refs=evidence_refs,
+                budget_consumed=usage,
+                error_code="advisor_timeout_or_ambiguous",
+                output={
+                    "advisor_status": "needs_review",
+                    "retry": False,
+                    "failure_stage": failure_stage,
+                    "failure_reason": failure_reason,
+                    "confirmed_non_execution": False,
+                    "bridge_turns_consumed": bridge_turns_consumed,
+                },
+            )
         if submission.output_text is None and (
             submission.submission_state != "pre_submission"
             and (
-                submission.status is TurnSubmissionStatus.NEEDS_REVIEW
-                or any(term in code for term in ("timeout", "ui_timeout", "submission_unknown"))
+                any(term in code for term in ("timeout", "ui_timeout", "submission_unknown"))
                 or submission.submission_state
                 in {"submission_attempted", "post_submission", "external_state_unknown"}
             )
@@ -2592,6 +2974,27 @@ class InvestigationAdvisorTool:
                     "retry_after_seconds": None,
                     "failure_stage": failure_stage,
                     "failure_reason": failure_reason,
+                    "bridge_turns_consumed": bridge_turns_consumed,
+                },
+            )
+        if submission.status is not TurnSubmissionStatus.SUCCEEDED:
+            return ToolResult(
+                ToolInvocationStatus.FAILED
+                if submission.status is TurnSubmissionStatus.INVALID_OUTPUT
+                else ToolInvocationStatus.UNAVAILABLE,
+                observation_refs=evidence_refs,
+                budget_consumed=usage,
+                error_code="advisor_output_invalid"
+                if submission.status is TurnSubmissionStatus.INVALID_OUTPUT
+                else "advisor_unavailable",
+                output={
+                    "advisor_status": "output_invalid"
+                    if submission.status is TurnSubmissionStatus.INVALID_OUTPUT
+                    else "unavailable",
+                    "retry": False,
+                    "failure_stage": failure_stage,
+                    "failure_reason": failure_reason,
+                    "confirmed_non_execution": submission.submission_state == "pre_submission",
                     "bridge_turns_consumed": bridge_turns_consumed,
                 },
             )
@@ -2795,6 +3198,7 @@ def register_investigation_advisor_tool(
     max_input_bytes = int(
         getattr(adapter._settings, "operator_advisor_max_input_bytes", MAX_ADVISOR_INPUT_BYTES)
     )
+    max_tool_seconds = _advisor_tool_seconds_limit(adapter._settings)
     uuid_schema = {
         "type": "string",
         "pattern": r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
@@ -2932,7 +3336,7 @@ def register_investigation_advisor_tool(
                 BudgetDimension.BRIDGE_TURNS: 1,
                 BudgetDimension.CONTEXT_BYTES: max_input_bytes,
                 BudgetDimension.CONTEXT_TOKENS: (max_input_bytes + 3) // 4,
-                BudgetDimension.TOOL_SECONDS: _advisor_tool_seconds_limit(adapter._settings),
+                BudgetDimension.TOOL_SECONDS: max_tool_seconds,
             },
             confidentiality=ToolConfidentiality.CONFIDENTIAL,
             limitations=(
@@ -3379,6 +3783,28 @@ def _fit_advisor_prompt(
     return prompt
 
 
+def _shared_advisor_context_bytes(data: Mapping[str, Any]) -> int:
+    """Measure shared dossier inputs apart from unit-specific editorial material."""
+    shared = copy.deepcopy(dict(data))
+    for key in (
+        "units",
+        "assertions",
+        "review_text",
+        "dossier_manifest",
+        "dossier_text",
+        "dossier_sha256",
+        "dossier_bytes",
+        "transmitted_refs",
+        "observation_refs",
+    ):
+        shared.pop(key, None)
+    return len(
+        json.dumps(shared, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    )
+
+
 def _critical_prompt_data_was_truncated(
     consultation_type: str, prompt_data: Mapping[str, Any]
 ) -> bool:
@@ -3404,15 +3830,6 @@ def _critical_prompt_data_was_truncated(
     if consultation_type in _TYPED_CONSULTATION_TYPES - {"review_text"}:
         required = set(required) | {"measurements"}
     return bool(truncation.get("brief")) or any(truncation.get(item) for item in required)
-
-
-def _editorial_shared_prompt_bytes(prompt_data: Mapping[str, Any]) -> int:
-    """Measure the common draft context without unit-specific targets or assertions."""
-    shared = copy.deepcopy(dict(prompt_data))
-    shared.pop("units", None)
-    shared.pop("assertions", None)
-    shared["truncation"] = {}
-    return len(InvestigationAdvisorTool._prompt("draft_text", shared).encode("utf-8"))
 
 
 def _validate_editorial_unit_targets(units: list[Any] | tuple[Any, ...]) -> None:
@@ -3530,9 +3947,6 @@ def _advisor_unit_provenance(
 def _bridge_turns_consumed(submission: TurnSubmission) -> int:
     if submission.status is TurnSubmissionStatus.BLOCKED:
         return 0
-    code = (submission.error_code or "").casefold()
-    if any(term in code for term in ("429", "rate_limit", "too_many_requests")):
-        return 0
     if submission.submission_state == "pre_submission":
         return 0
     if submission.status in {
@@ -3544,6 +3958,22 @@ def _bridge_turns_consumed(submission: TurnSubmission) -> int:
         submission.submission_state
         in {"submission_attempted", "post_submission", "external_state_unknown"}
     )
+
+
+def _advisor_payload_was_submitted(submission: TurnSubmission) -> bool:
+    if (
+        submission.status
+        in {
+            TurnSubmissionStatus.BLOCKED,
+            TurnSubmissionStatus.PRE_SUBMISSION_RETRY_EXHAUSTED,
+        }
+        or submission.submission_state == "pre_submission"
+    ):
+        return False
+    return submission.status is TurnSubmissionStatus.SUCCEEDED or submission.submission_state in {
+        "submission_attempted",
+        "post_submission",
+    }
 
 
 def _advisor_invocation_stage(submission: TurnSubmission) -> str:
@@ -3580,6 +4010,118 @@ def _advisor_reserved_budget(registry: ToolRegistry) -> dict[str, int]:
 def _advisor_tool_seconds_limit(settings: Any) -> int:
     value = getattr(settings, "investigation_max_tool_seconds", MAX_ADVISOR_TOOL_SECONDS)
     return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 3_600
+
+
+def _advisor_minimum_execution_seconds(settings: Any) -> int | None:
+    """Return a conservative full-operation window from configured Bridge phases.
+
+    The deadline covers maximum pacing jitter, connection and capability
+    preflight, Bridge archival, and the documented local preparation margin.
+    Invalid phase settings fail closed instead of lowering the admission floor.
+    """
+    pacing = getattr(
+        settings, "openai_bridge_min_submission_interval_seconds", DEFAULT_ADVISOR_PACING_SECONDS
+    )
+    jitter = getattr(settings, "openai_bridge_submission_jitter_fraction", 0.3)
+    connect = getattr(
+        settings, "openai_bridge_connect_timeout_seconds", DEFAULT_ADVISOR_CONNECT_SECONDS
+    )
+    capabilities = getattr(
+        settings,
+        "openai_bridge_capabilities_timeout_seconds",
+        DEFAULT_ADVISOR_CAPABILITIES_SECONDS,
+    )
+    archive = getattr(
+        settings, "openai_bridge_archive_timeout_seconds", DEFAULT_ADVISOR_ARCHIVE_SECONDS
+    )
+    values = (pacing, jitter, connect, capabilities, archive)
+    if any(
+        isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value)
+        for value in values
+    ):
+        return None
+    if pacing < 0 or not 0 <= jitter <= 0.3 or min(connect, capabilities, archive) <= 0:
+        return None
+    maximum_paced_wait = pacing * (1 + jitter)
+    protected_phase = max(archive, MIN_ADVISOR_PREPARATION_MARGIN_SECONDS)
+    return math.ceil(maximum_paced_wait + connect + capabilities + protected_phase)
+
+
+def _advisor_execution_timeout(
+    context: ToolExecutionContext,
+    settings: Any,
+) -> tuple[int, ToolResult | None]:
+    """Return the hard call cap from this operation's live G2 reservation.
+
+    Duration-based cost estimation from ModelRun.duration_ms is DEFERred; this
+    enforces only the hard execution bound and never predicts provider cost.
+    """
+    reservation = next(
+        (
+            item
+            for item in context.budget.reservations
+            if item.operation_key == context.idempotency_key
+        ),
+        None,
+    )
+    if reservation is None or reservation.status is not BudgetReservationStatus.RESERVED:
+        reason = "tool_seconds_reservation_missing_or_inactive"
+        return 0, _advisor_budget_refusal(reason)
+    if reservation.amounts.get(BudgetDimension.BRIDGE_TURNS, 0) < 1:
+        return 0, _advisor_budget_refusal("bridge_turn_reservation_missing_or_insufficient")
+    minimum_execution_seconds = _advisor_minimum_execution_seconds(settings)
+    if minimum_execution_seconds is None:
+        return 0, _advisor_budget_refusal("bridge_phase_timeout_settings_invalid")
+    reserved_seconds = reservation.amounts.get(BudgetDimension.TOOL_SECONDS, 0)
+    if reserved_seconds < minimum_execution_seconds:
+        return 0, _advisor_budget_refusal("tool_seconds_reservation_below_minimum")
+
+    role_timeout = getattr(settings, "openai_bridge_wait_timeout_research_seconds", 7_200.0)
+    if (
+        isinstance(role_timeout, bool)
+        or not isinstance(role_timeout, int | float)
+        or not math.isfinite(role_timeout)
+        or role_timeout <= 0
+    ):
+        return 0, _advisor_budget_refusal("research_role_timeout_invalid")
+    effective_timeout = math.floor(min(reserved_seconds, role_timeout))
+    if effective_timeout < minimum_execution_seconds:
+        return 0, _advisor_budget_refusal("effective_execution_timeout_below_minimum")
+    return effective_timeout, None
+
+
+def _advisor_reserved_bridge_turns(context: ToolExecutionContext) -> int:
+    reservation = next(
+        (
+            item
+            for item in context.budget.reservations
+            if item.operation_key == context.idempotency_key
+        ),
+        None,
+    )
+    if reservation is None or reservation.status is not BudgetReservationStatus.RESERVED:
+        return 0
+    return reservation.amounts.get(BudgetDimension.BRIDGE_TURNS, 0)
+
+
+def _advisor_budget_refusal(reason: str) -> ToolResult:
+    return ToolResult(
+        ToolInvocationStatus.NEEDS_REVIEW,
+        error_code="advisor_unavailable",
+        message=(
+            "Bridge consultation refused before transport because the approved G2 "
+            "budget does not cover the bounded operation."
+        ),
+        output={
+            "advisor_status": "needs_review",
+            "failure_stage": "budget_admission",
+            "failure_reason": reason,
+            "confirmed_non_execution": True,
+            "bridge_turns_consumed": 0,
+            "retry": False,
+        },
+        budget_consumed={dimension: 0 for dimension in BudgetDimension},
+    )
 
 
 def _advisor_reparse_context(
@@ -5315,6 +5857,21 @@ def _valid_hex_measurement(value: str) -> bool:
     return bool(tokens) and all(
         len(token) % 2 == 0 and re.fullmatch(r"(?i)[0-9a-f]+", token) is not None
         for token in tokens
+    )
+
+
+def _reject_oversized_hex_measurement(value: str, *, index: int) -> None:
+    compact = "".join(value.split())
+    if len(compact) // 2 > MAX_ADVISOR_BINARY_MEASUREMENT_BYTES:
+        _raise_oversized_binary_measurement(index)
+
+
+def _raise_oversized_binary_measurement(index: int) -> None:
+    raise _AdvisorInputValidationError(
+        "binary_measurement_exceeds_limit",
+        measurement_errors=(
+            {"index": index, "reason": "binary_measurement_exceeds_512_byte_limit"},
+        ),
     )
 
 
