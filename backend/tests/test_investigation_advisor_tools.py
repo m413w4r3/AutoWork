@@ -40,6 +40,7 @@ from cti_app.application.investigation_advisor_tools import (
 )
 from cti_app.application.investigation_tools import ToolExecutionContext, ToolResult
 from cti_app.domain.analyst_opinion import OpinionBlockType
+from cti_app.domain.classification import TLP
 from cti_app.domain.investigation import (
     BudgetDimension,
     EvidenceKind,
@@ -255,6 +256,43 @@ def async_get(value):
         return value
 
     return get
+
+
+class _SampleAssociations:
+    def __init__(self, hashes):
+        self.hashes = tuple(hashes)
+
+    async def list_for_investigation(self, _investigation_id):
+        return tuple(SimpleNamespace(sample_sha256=item) for item in self.hashes)
+
+
+class _Samples:
+    def __init__(self, samples):
+        self.samples = tuple(samples)
+
+    async def list_for_subject(self, _subject_id):
+        return self.samples
+
+
+def _attach_sample_policy(tool, sample_blob_id, sample_hash, **flags):
+    tool._blobs.add(
+        sample_blob_id,
+        sha256=sample_hash,
+        size=1,
+        logical_bucket="samples-quarantine",
+    )
+    tool._sample_associations = _SampleAssociations([sample_hash])
+    sample = {
+        "expected_hash": sample_hash,
+        "source_object_id": None,
+        "state": "quarantined",
+        "blob_id": sample_blob_id,
+        "tlp": TLP.GREEN,
+        "do_not_submit": False,
+        "external_llm_allowed": True,
+    }
+    sample.update(flags)
+    tool._samples = _Samples([SimpleNamespace(**sample)])
 
 
 def make_context(
@@ -921,8 +959,8 @@ async def test_yara_draft_sends_only_verified_offsets_and_returns_untrusted_text
                 expected_hash=sample_sha256,
                 source_object_id=None,
                 state="quarantined",
-                do_not_submit=True,
-                external_llm_allowed=False,
+                do_not_submit=False,
+                external_llm_allowed=True,
                 blob_id=sample_blob_id,
             ),
         )
@@ -1003,7 +1041,10 @@ async def test_yara_draft_sends_only_verified_offsets_and_returns_untrusted_text
         "wide",
         "base64",
     }
-    assert "ignored-without-offset" not in prompt
+    assert all(
+        item.get("value") != "ignored-without-offset"
+        for item in typed_prompt_payload(prompt)["measurements"]
+    )
     assert "UNTRUSTED ADVISORY" in result.output["advisory_text"]
     assert result.output["untrusted"] is True
     assert result.budget_consumed[BudgetDimension.BRIDGE_TURNS] == 1
@@ -2016,6 +2057,175 @@ async def test_contradictory_permitted_dns_evidence_pieces_are_both_transmitted(
     )
     assert manifest["body_bytes"] == len(expected_body.encode("utf-8"))
     assert manifest["body_sha256"] == hashlib.sha256(expected_body.encode("utf-8")).hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_nested_operational_secret_is_redacted_before_transport() -> None:
+    investigation_id = uuid4()
+    marker = "FIXTURE_OPERATIONAL_SECRET_123"
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "generic-observation.v1",
+            "vt_api_key": {"base64": marker},
+            "content": "CTI context remains visible.",
+        },
+    )
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=advisor_response(
+                "The context supports this review.", [str(observation.id)]
+            ),
+        )
+    )
+    tool, _sample_blob = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+
+    await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Review the CTI context.",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, key="operator:advisor:nested-secret"),
+    )
+
+    assert len(transport.calls) == 1
+    prompt = transport.calls[0]["prompt"]
+    assert marker not in prompt
+    assert "CTI context remains visible." in prompt
+
+
+@pytest.mark.asyncio
+async def test_generic_api_key_in_cti_evidence_is_not_an_autowork_secret() -> None:
+    investigation_id = uuid4()
+    marker = "ATTACKER_TOKEN_EVIDENCE"
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "generic-observation.v1",
+            "api_key": {"base64": marker},
+        },
+    )
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=advisor_response(
+                "The context supports this review.", [str(observation.id)]
+            ),
+        )
+    )
+    tool, _sample_blob = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+
+    await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Review the CTI context.",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, key="operator:advisor:cti-api-key"),
+    )
+
+    assert len(transport.calls) == 1
+    assert marker in transport.calls[0]["prompt"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "restriction",
+    [
+        {"do_not_submit": True},
+        {"external_llm_allowed": False},
+        {"tlp": TLP.RED},
+    ],
+)
+async def test_sample_level_restriction_blocks_explicit_observation(restriction) -> None:
+    investigation_id = uuid4()
+    sample_hash = "c" * 64
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": sample_hash,
+            "hex": [{"offset": 0, "value": "41" * 600}],
+        },
+    )
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    tool, sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+    _attach_sample_policy(tool, sample_blob_id, sample_hash, **restriction)
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Review the measured sample.",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, key="operator:advisor:restricted-sample"),
+    )
+
+    assert transport.calls == []
+    assert result.output["advisor_status"] == "disclosure_restricted"
+    assert result.output["preflight_status"] == "POLICY_BLOCKED"
+    assert tuple(result.output["disclosure_restricted_refs"]) == (str(observation.id),)
+    assert result.output["confirmed_non_execution"] is True
+
+
+@pytest.mark.asyncio
+async def test_unrestricted_sample_measurement_reaches_fake_transport() -> None:
+    investigation_id = uuid4()
+    sample_hash = "c" * 64
+    value = "41" * 600
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": sample_hash,
+            "hex": [{"offset": 0, "value": value}],
+        },
+    )
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=advisor_response(
+                "The measurement supports this review.", [str(observation.id)]
+            ),
+        )
+    )
+    tool, sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+    _attach_sample_policy(tool, sample_blob_id, sample_hash)
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Review the measured sample.",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, key="operator:advisor:allowed-sample"),
+    )
+
+    assert len(transport.calls) == 1
+    assert value in transport.calls[0]["prompt"]
+    assert result.output["bridge_provenance"]["preflight_status"] == "READY"
 
 
 @pytest.mark.asyncio

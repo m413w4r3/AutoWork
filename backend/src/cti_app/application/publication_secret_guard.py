@@ -229,6 +229,11 @@ def _is_operational_field_name(value: str) -> bool:
     return _OPERATIONAL_FIELD_NAME.fullmatch(_normalized_field_name(value)) is not None
 
 
+def is_operational_secret_field_name(value: str) -> bool:
+    """Expose the operational-secret label predicate to content projections."""
+    return _is_operational_field_name(value)
+
+
 def _operational_field_type(value: str) -> str:
     name = _normalized_field_name(value)
     if "dsn" in name or name.endswith("_url"):
