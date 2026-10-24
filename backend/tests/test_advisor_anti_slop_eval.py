@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import unicodedata
 from collections import Counter
@@ -456,6 +457,10 @@ def _evaluate_case(case: dict[str, Any]) -> dict[str, Any]:
             usable
             and len(required_sources) >= 2
             and required_sources.issubset(cited_sources)
+            and all(
+                str(value) in visible_text
+                for value in labels.get("contradiction_values", [])
+            )
             and explicit_unknown
             and explicit_limit
         )
@@ -506,6 +511,8 @@ def _rate(numerator: int, denominator: int) -> float | None:
 
 
 def test_versioned_anti_slop_corpus_has_deterministic_offline_oracle(capsys) -> None:
+    variant = os.environ.get("ANTI_SLOP_EVAL_VARIANT", "baseline")
+    assert variant in {"baseline", "patch"}
     manifest, cases, corpus_sha256 = _load_cases()
     results = [_evaluate_case(case) for case in cases]
     result_by_id = {item["case_id"]: item for item in results}
@@ -676,7 +683,7 @@ def test_versioned_anti_slop_corpus_has_deterministic_offline_oracle(capsys) -> 
 
     report = {
         "schema": "advisor-anti-slop-report.v1",
-        "variant": "baseline",
+        "variant": variant,
         "corpus_version": manifest["corpus_version"],
         "case_count": len(cases),
         "corpus_sha256": corpus_sha256,
@@ -712,7 +719,7 @@ def test_versioned_anti_slop_corpus_has_deterministic_offline_oracle(capsys) -> 
         },
         "metrics": metrics,
     }
-    assert report["variant"] == "baseline"
+    assert report["variant"] == variant
     assert len(report["cases"]) == len(cases)
     assert [item["case_id"] for item in report["cases"]] == [
         case["case_id"] for case in cases

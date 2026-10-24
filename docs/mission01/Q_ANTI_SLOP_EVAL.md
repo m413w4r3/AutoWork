@@ -25,7 +25,8 @@ réseau ni base de données. Pour Bridge, il appelle
 - `backend/tests/test_advisor_anti_slop_eval.py` valide le manifeste, le
   contenu synthétique, les alias, les résultats par cas et les seuils; il
   affiche aussi un rapport JSON compact avec la variante, les résultats
-  attendus et observés par cas, et les agrégats.
+  attendus et observés par cas, et les agrégats. La variable
+  `ANTI_SLOP_EVAL_VARIANT` choisit `baseline` (défaut) ou `patch`.
 
 Chaque cas porte `schema`, `case_id`, `consultation_type` (`bridge` ou
 `advisor`), `sources`, `context`, `allowed_aliases`, `response_text`, `labels`
@@ -61,8 +62,9 @@ observations au même sujet et à la même propriété avec des valeurs distinct
 puis est explicitement annoté `contradiction_targeted`. Le cas cible utilise le
 même fichier synthétique `sample-synth.bin` et la propriété `file_size_bytes`,
 avec des relevés de 128 et 256 octets. Le test vérifie ces métadonnées, leur
-correspondance avec les assertions citées et les deux références de la réponse;
-il vérifie aussi `UNKNOWN` et une limite explicite. Le contrôle à source unique
+correspondance avec les assertions citées, les deux références et la reprise
+des deux valeurs (128 et 256) dans la réponse; il vérifie aussi `UNKNOWN` et une
+limite explicite. Le contrôle à source unique
 vérifie qu’une contradiction n’est pas inventée, mais n’entre pas dans ce taux.
 Pour les répétitions et le remplissage, le dénominateur se limite aux contrôles
 positifs, comme demandé.
@@ -115,7 +117,7 @@ stables :
   `ADVISOR_SOURCE_PARSER_VERSION=advisor-source-parser.v3` — SHA-256 du prompt
   rendu `54c9f454f0e80c95e518279c6a3205a776714db84964039a1fdaa0c7ebecafab`.
 - Corpus `anti_slop.v1`, 16 cas — SHA-256 exact
-  `a80562385836b1a5cb2b186742f4d9f20a57acdeb418f74d00fd88cc7bbe77f9`.
+  `a73fdb97e4ec9503242af8c233af40afca9804383bf5697695ea9a90956d684e`.
 
 ## Comparaison Q2 et limites
 
