@@ -63,13 +63,9 @@ from cti_app.domain.model_runs import ModelProvider
 from cti_app.domain.reference_corpus import ReferenceCorpusVerdict, assess_reference_feature
 
 P10_PROMPT_TEMPLATE_ID = "invariant-proposal-conversation"
-P10_PROMPT_VERSION = "3"
+P10_PROMPT_VERSION = "4"
 P10_PARSER_STAGE = "p10_strict_proposal"
 _CONVERSATION_NAMESPACE = UUID("0f52a3a8-6cc8-5f4d-8ed5-1c2c3d4e5f60")
-_MAX_CONTEXT_CHARS = 200_000
-_MAX_STRING_CHARS = 2_048
-_MAX_CANDIDATE_RECORDS = 256
-_MAX_AUXILIARY_CONTEXT_RECORDS = 64
 _MISSING = object()
 _NOISE_CATEGORIES = frozenset(
     {
@@ -115,7 +111,7 @@ class ProposalConversationResult:
 
 
 class ProposalConversationService:
-    """Build and submit one bounded P10 proposal turn for an investigation."""
+    """Build and submit one P10 proposal turn for an investigation."""
 
     def __init__(
         self,
@@ -392,13 +388,11 @@ class ProposalConversationService:
             capabilities = tuple(sorted(capabilities, key=lambda item: _canonical_json(item)))
             invariants = tuple(
                 sorted(invariants, key=lambda item: _canonical_json(_invariant_context(item)))
-            )[:_MAX_AUXILIARY_CONTEXT_RECORDS]
+            )
             rejections = tuple(
                 sorted(rejections, key=lambda item: _canonical_json(_rejection_context(item)))
-            )[:_MAX_AUXILIARY_CONTEXT_RECORDS]
-            claims = tuple(sorted(claims, key=lambda item: _canonical_json(item)))[
-                :_MAX_AUXILIARY_CONTEXT_RECORDS
-            ]
+            )
+            claims = tuple(sorted(claims, key=lambda item: _canonical_json(item)))
 
             candidate_records: list[dict[str, Any]] = []
             for item in static_features:
@@ -571,7 +565,7 @@ class ProposalConversationService:
                     if ref == _provenance_ref(value)
                 ],
             }
-            context = _bound_context(context)
+            context = _normalize_context(context)
             snapshot = ProposalInputSnapshot(
                 input_pack_sha256=investigation.input_sha256,
                 corpus_snapshot_sha256=corpus_hash,
@@ -942,9 +936,6 @@ def _render_prompt(snapshot: ProposalInputSnapshot) -> str:
     return _render_p10_prompt(snapshot)[0]
 
 
-_MAX_P10_PROMPT_BYTES = 96_000
-
-
 def _render_p10_prompt(snapshot: ProposalInputSnapshot) -> tuple[str, dict[str, str]]:
     context = snapshot.context
     provenances = context.get("provenances", ())
@@ -986,10 +977,6 @@ def _render_p10_prompt(snapshot: ProposalInputSnapshot) -> tuple[str, dict[str, 
         "END_P10_FACTS\n"
         "Do not include raw bytes, secrets, signed URLs, or executable YARA code."
     )
-    if len(prompt.encode("utf-8")) > _MAX_P10_PROMPT_BYTES:
-        raise ProposalContractError(
-            "The compact P10 prompt exceeds its configured 96000-byte per-turn bound"
-        )
     return prompt, {alias: ref for ref, alias in alias_by_ref.items()}
 
 
@@ -1111,10 +1098,10 @@ def _p10_provenance_label(item: Mapping[str, Any]) -> str:
             details.append(value)
     offsets = item.get("offsets")
     if isinstance(offsets, list) and offsets:
-        details.append("offset " + ",".join(f"0x{int(value):x}" for value in offsets[:8]))
+        details.append("offset " + ",".join(f"0x{int(value):x}" for value in offsets))
     addresses = item.get("addresses")
     if isinstance(addresses, list) and addresses:
-        details.append("address " + ",".join(str(value) for value in addresses[:8]))
+        details.append("address " + ",".join(str(value) for value in addresses))
     return kind + (" — " + ", ".join(details) if details else "")
 
 
@@ -1510,7 +1497,7 @@ def _bounded_pattern(value: Any) -> str | None:
         return None
     text = value if isinstance(value, str) else str(value)
     text = text.strip()
-    if not text or len(text) > _MAX_STRING_CHARS:
+    if not text:
         return None
     return text
 
@@ -1966,28 +1953,7 @@ def _candidate_persisted_references(
 def _select_candidate_records(
     candidates: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
-    selected: list[dict[str, Any]] = []
-    for candidate in sorted(candidates, key=_candidate_sort_key):
-        if len(selected) >= _MAX_CANDIDATE_RECORDS:
-            break
-        trial = [*selected, dict(candidate)]
-        groups = {
-            "static_features": [
-                _candidate_context(item)
-                for item in trial
-                if item["source_kind"] == "static_features"
-            ],
-            "code_features": [
-                _candidate_context(item) for item in trial if item["source_kind"] == "code_features"
-            ],
-            "capabilities": [
-                _candidate_context(item) for item in trial if item["source_kind"] == "capabilities"
-            ],
-        }
-        if len(_canonical_json(groups)) > _MAX_CONTEXT_CHARS // 2:
-            continue
-        selected.append(dict(candidate))
-    return selected
+    return [dict(candidate) for candidate in sorted(candidates, key=_candidate_sort_key)]
 
 
 def _exclude_before_model(candidate: Mapping[str, Any]) -> bool:
@@ -2234,31 +2200,15 @@ def _rejection_context(value: Any) -> dict[str, Any]:
     }
 
 
-def _bound_context(value: dict[str, Any]) -> dict[str, Any]:
-    context = _bounded_json(value, drop_timestamps=True)
-    encoded = _canonical_json(context)
-    if len(encoded) > _MAX_CONTEXT_CHARS:
-        optional = (
-            "report_claims",
-            "prior_rejections",
-            "existing_invariants",
-        )
-        for key in optional:
-            if isinstance(context.get(key), list):
-                context[key] = context[key][:32]
-                encoded = _canonical_json(context)
-                if len(encoded) <= _MAX_CONTEXT_CHARS:
-                    break
-    if len(encoded) > _MAX_CONTEXT_CHARS:
-        raise ProposalContractError("The deterministic proposal context exceeds its bound")
-    return cast(dict[str, Any], context)
+def _normalize_context(value: dict[str, Any]) -> dict[str, Any]:
+    return cast(dict[str, Any], _bounded_json(value, drop_timestamps=True))
 
 
 def _bounded_json(value: Any, *, drop_timestamps: bool = False, depth: int = 0) -> Any:
     if depth > 8:
         return "[DEPTH_LIMIT]"
     if isinstance(value, bytes | bytearray | memoryview):
-        return "[BINARY_OMITTED]"
+        return bytes(value).hex()
     if isinstance(value, Enum):
         return _bounded_json(value.value, drop_timestamps=drop_timestamps, depth=depth + 1)
     if isinstance(value, UUID):
@@ -2288,22 +2238,19 @@ def _bounded_json(value: Any, *, drop_timestamps: bool = False, depth: int = 0) 
                     ),
                 )
             )
-            if len(pairs) >= 256:
-                break
         return dict(pairs)
     if isinstance(value, (list, tuple, set, frozenset)):
         values = list(value)
         if isinstance(value, (set, frozenset)):
             values.sort(key=_canonical_json)
         return [
-            _bounded_json(item, drop_timestamps=drop_timestamps, depth=depth + 1)
-            for item in values[:256]
+            _bounded_json(item, drop_timestamps=drop_timestamps, depth=depth + 1) for item in values
         ]
     if isinstance(value, str):
-        return _redact_url(_redact_text(value[:_MAX_STRING_CHARS]))
+        return _redact_url(_redact_text(value))
     if isinstance(value, (int, float, bool)) or value is None:
         return value
-    return str(value)[:_MAX_STRING_CHARS]
+    return str(value)
 
 
 def _mapping_or_attrs(value: Any) -> dict[str, Any]:
