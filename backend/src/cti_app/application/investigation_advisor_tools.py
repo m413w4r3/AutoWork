@@ -24,6 +24,11 @@ from cti_app.application.advisor_dossier import (
     evaluate_advisor_evidence_preflight,
     extract_content_excerpts,
 )
+from cti_app.application.advisor_semantic_parser import (
+    ADVISOR_RESPONSE_SCHEMA_V4,
+    ADVISOR_SOURCE_PARSER_VERSION_V4,
+    parse_advisor_semantic_response,
+)
 from cti_app.application.advisor_wire import (
     ADVISOR_WIRE_VERSION,
     advisor_wire_aliases,
@@ -3515,6 +3520,41 @@ class ReparsePersistedAdvisorOutputTool:
                 ToolInvocationStatus.FAILED,
                 error_code="advisor_reparse_provenance_invalid",
             )
+        selected_parser = arguments.get("parser_version")
+        if (
+            persisted.get("advisor_response_schema") != ADVISOR_RESPONSE_SCHEMA_V4
+            or output.get("parser_version") != ADVISOR_SOURCE_PARSER_VERSION_V4
+        ):
+            return ToolResult(
+                ToolInvocationStatus.PARTIAL,
+                error_code="unsupported_legacy_format",
+                output={
+                    "status": "unsupported_legacy_format",
+                    "reparsed_from_observation_id": str(original.id),
+                    "advisor_response_schema": persisted.get("advisor_response_schema"),
+                    "stored_parser_version": output.get("parser_version"),
+                    "selected_parser_version": selected_parser,
+                    "output_sha256": output_sha256,
+                    "bridge_turns_consumed": 0,
+                    "new_observation_written": False,
+                },
+                message=(
+                    "Le format advisor historique est conservé en lecture; "
+                    "aucun nouveau résultat n'a été écrit."
+                ),
+            )
+        if selected_parser != ADVISOR_SOURCE_PARSER_VERSION_V4:
+            return ToolResult(
+                ToolInvocationStatus.PARTIAL,
+                error_code="advisor_reparse_parser_version_required",
+                output={
+                    "status": "parser_version_required",
+                    "required_parser_version": ADVISOR_SOURCE_PARSER_VERSION_V4,
+                    "output_sha256": output_sha256,
+                    "bridge_turns_consumed": 0,
+                    "new_observation_written": False,
+                },
+            )
         raw_reader = getattr(self._blobs, "get_by_address", None)
         if not callable(raw_reader):
             return ToolResult(
@@ -3557,9 +3597,7 @@ class ReparsePersistedAdvisorOutputTool:
             )
 
         normalized_refs: list[dict[str, str]] = []
-        measurement_refs: list[dict[str, str]] = []
         seen_refs: set[tuple[str, str]] = set()
-        measurement_sha256: dict[str, str] = {}
         for item in input_refs:
             if (
                 not isinstance(item, Mapping)
@@ -3588,21 +3626,25 @@ class ReparsePersistedAdvisorOutputTool:
                         ToolInvocationStatus.FAILED,
                         error_code="advisor_reparse_measurement_refs_invalid",
                     )
-                measurement_refs.append(reference)
-                measurement_sha256[identifier] = reference["sha256"]
-        measurement_refs.sort(key=lambda item: int(item["id"][1:]))
         raw_reparse_context = persisted.get("reparse_context")
+        if not isinstance(raw_reparse_context, Mapping):
+            return ToolResult(
+                ToolInvocationStatus.PARTIAL,
+                error_code="legacy_context_unavailable",
+                output={
+                    "status": "legacy_context_unavailable",
+                    "reparsed_from_observation_id": str(original.id),
+                    "output_sha256": output_sha256,
+                    "bridge_turns_consumed": 0,
+                    "new_observation_written": False,
+                },
+            )
+        if raw_reparse_context.get("transmitted_refs") != normalized_refs:
+            return ToolResult(
+                ToolInvocationStatus.FAILED,
+                error_code="advisor_reparse_context_refs_invalid",
+            )
         if consultation_type == "suricata_draft":
-            if not isinstance(raw_reparse_context, Mapping):
-                return ToolResult(
-                    ToolInvocationStatus.FAILED,
-                    error_code="advisor_reparse_context_unavailable",
-                )
-            if raw_reparse_context.get("transmitted_refs") != normalized_refs:
-                return ToolResult(
-                    ToolInvocationStatus.FAILED,
-                    error_code="advisor_reparse_context_refs_invalid",
-                )
             network_facts = raw_reparse_context.get("network_facts")
             if not isinstance(network_facts, list) or not network_facts:
                 return ToolResult(
@@ -3651,87 +3693,28 @@ class ReparsePersistedAdvisorOutputTool:
                 seen_fact_ids.add(fact_id)
             prompt_data = dict(raw_reparse_context)
         elif consultation_type == "yara_draft":
-            if isinstance(raw_reparse_context, Mapping):
-                if raw_reparse_context.get("transmitted_refs") != normalized_refs:
-                    return ToolResult(
-                        ToolInvocationStatus.FAILED,
-                        error_code="advisor_reparse_context_refs_invalid",
-                    )
-                prompt_data = dict(raw_reparse_context)
-            else:
-                prompt_data = {
-                    "transmitted_refs": normalized_refs,
-                    "measurements": [{"measurement_id": item["id"]} for item in measurement_refs],
-                }
+            prompt_data = dict(raw_reparse_context)
         else:
-            if isinstance(raw_reparse_context, Mapping):
-                if raw_reparse_context.get("transmitted_refs") != normalized_refs:
-                    return ToolResult(
-                        ToolInvocationStatus.FAILED,
-                        error_code="advisor_reparse_context_refs_invalid",
-                    )
-                prompt_data = dict(raw_reparse_context)
-            else:
-                legacy_prompt_data = _legacy_advisor_reparse_context(
-                    consultation_type,
-                    output,
-                    normalized_refs,
-                    review_units=persisted.get("review_units"),
-                    review_target=persisted.get("review_target"),
-                    reviewed_text_sha256=persisted.get("reviewed_text_sha256"),
-                )
-                if legacy_prompt_data is None:
-                    return ToolResult(
-                        ToolInvocationStatus.FAILED,
-                        error_code="advisor_reparse_context_unavailable",
-                    )
-                prompt_data = legacy_prompt_data
-        parsed = parse_typed_advisor_response(
+            prompt_data = dict(raw_reparse_context)
+        parsed = parse_advisor_semantic_response(
             raw_text,
             consultation_type=consultation_type,
             prompt_data=prompt_data,
-            safe_text=_safe_text,
-            measurement_sha256_overrides=(
-                measurement_sha256 if consultation_type == "yara_draft" else None
-            ),
         )
-        if parsed is None:
-            parsed = {
-                "schema": ADVISOR_RESPONSE_SCHEMA_V3,
-                "consultation_type": consultation_type,
-                "status": "partial",
-                "untrusted": True,
-                "usable": False,
-                "limitations": ["Le parseur courant n'a pas produit de proposition typée."],
-                "warnings": ["advisor_reparse_parse_failed"],
-                "normalization_status": "partial",
-            }
-            if consultation_type == "yara_draft":
-                parsed.update(
-                    rule_source=None,
-                    rule_source_sha256=None,
-                    motifs=[],
-                    invariants=[],
-                )
-            elif consultation_type == "draft_text":
-                parsed["blocks"] = []
-            elif consultation_type == "review_text":
-                parsed["reviews"] = []
-            else:
-                parsed["figure_plan"] = None
-        source = parsed.get("rule_source")
-        source_sha256 = parsed.get("rule_source_sha256")
-        usable = parsed.get("usable") is True
-        if consultation_type == "yara_draft":
-            usable = (
-                usable
-                and isinstance(source, str)
-                and isinstance(source_sha256, str)
-                and hashlib.sha256(source.encode("utf-8")).hexdigest() == source_sha256
+        if parsed.get("status") in {"invalid", "ambiguous"}:
+            return ToolResult(
+                ToolInvocationStatus.NEEDS_REVIEW,
+                error_code=f"advisor_reparse_{parsed['status']}",
+                output={
+                    **parsed,
+                    "reparsed_from_observation_id": str(original.id),
+                    "output_sha256": output_sha256,
+                    "bridge_turns_consumed": 0,
+                    "new_observation_written": False,
+                },
             )
-        advisor_status = (
-            "succeeded" if usable and parsed.get("status") == "succeeded" else "partial"
-        )
+        usable = parsed.get("usable") is True
+        advisor_status = str(parsed.get("status", "invalid"))
         parsed_output = {
             **dict(parsed),
             "advisor_status": advisor_status,
@@ -3739,7 +3722,7 @@ class ReparsePersistedAdvisorOutputTool:
             "output_sha256": output_sha256,
             "untrusted": True,
             "usable": usable,
-            "parser_version": ADVISOR_SOURCE_PARSER_VERSION,
+            "parser_version": ADVISOR_SOURCE_PARSER_VERSION_V4,
             "bridge_provenance": {
                 "bridge_invocation_id": invocation_id,
                 "bridge_invocation_id_kind": persisted.get(
@@ -3760,7 +3743,7 @@ class ReparsePersistedAdvisorOutputTool:
         }
         appended_payload = {
             "schema": "operator-advisor-call.v1",
-            "advisor_response_schema": ADVISOR_RESPONSE_SCHEMA_V3,
+            "advisor_response_schema": ADVISOR_RESPONSE_SCHEMA_V4,
             "consultation_type": consultation_type,
             "advisor_status": parsed_output["advisor_status"],
             "bridge_invocation_id": invocation_id,
@@ -3784,7 +3767,7 @@ class ReparsePersistedAdvisorOutputTool:
             "measurement_catalog": persisted.get("measurement_catalog"),
             "bridge_turns_consumed": 0,
             "reparsed_from_observation_id": str(original.id),
-            "parser_version": ADVISOR_SOURCE_PARSER_VERSION,
+            "parser_version": ADVISOR_SOURCE_PARSER_VERSION_V4,
             "output": parsed_output,
         }
         if consultation_type == "review_text":
@@ -3803,7 +3786,7 @@ class ReparsePersistedAdvisorOutputTool:
                 kind=EvidenceKind.OTHER,
                 payload=appended_payload,
                 source=ADVISOR_TOOL_NAME,
-                source_version=ADVISOR_SOURCE_PARSER_VERSION,
+                source_version=ADVISOR_SOURCE_PARSER_VERSION_V4,
                 object_type="advisor_call",
                 object_id=consultation_type,
                 limitations=(
@@ -3812,7 +3795,9 @@ class ReparsePersistedAdvisorOutputTool:
                     "La sortie reste non fiable et ne modifie pas le corpus de règles.",
                 ),
                 invocation_ref=original.invocation_ref,
-                idempotency_key=(f"advisor-reparse:{original.id}:{ADVISOR_SOURCE_PARSER_VERSION}"),
+                idempotency_key=(
+                    f"advisor-reparse:{original.id}:{ADVISOR_SOURCE_PARSER_VERSION_V4}"
+                ),
             )
         except Exception as exc:
             return ToolResult(
@@ -3820,11 +3805,7 @@ class ReparsePersistedAdvisorOutputTool:
                 error_code="advisor_reparse_persistence_uncertain",
                 exception_class=type(exc).__name__,
             )
-        status = (
-            ToolInvocationStatus.SUCCEEDED
-            if usable and parsed.get("status") == "succeeded"
-            else ToolInvocationStatus.PARTIAL
-        )
+        status = ToolInvocationStatus.SUCCEEDED if usable else ToolInvocationStatus.PARTIAL
         return ToolResult(
             status,
             observation_refs=(original.id, reparsed_observation.id),
@@ -3834,10 +3815,8 @@ class ReparsePersistedAdvisorOutputTool:
                 "bridge_observation_id": str(reparsed_observation.id),
                 "bridge_invocation_id": invocation_id,
                 "output_sha256": output_sha256,
-                "parser_version": ADVISOR_SOURCE_PARSER_VERSION,
+                "parser_version": ADVISOR_SOURCE_PARSER_VERSION_V4,
                 "usable": usable,
-                "rule_source": source,
-                "rule_source_sha256": source_sha256,
                 "warnings": parsed_output.get("warnings", []),
                 "consultation_type": consultation_type,
                 "output": parsed_output,
@@ -3864,7 +3843,11 @@ def register_advisor_reparse_tool(
                             r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
                             r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
                         ),
-                    }
+                    },
+                    "parser_version": {
+                        "type": "string",
+                        "enum": [ADVISOR_SOURCE_PARSER_VERSION_V4],
+                    },
                 },
                 "required": ["observation_id"],
                 "additionalProperties": False,
@@ -4813,7 +4796,18 @@ def _parse_advisor_output(
     consultation_type: str,
     validation_rejection: dict[str, Any] | None = None,
     prompt_data: Mapping[str, Any] | None = None,
+    parser_version: str = ADVISOR_SOURCE_PARSER_VERSION,
 ) -> dict[str, Any] | None:
+    if parser_version == ADVISOR_SOURCE_PARSER_VERSION_V4:
+        return parse_advisor_semantic_response(
+            raw,
+            consultation_type=consultation_type,
+            prompt_data=prompt_data or {},
+        )
+    if parser_version != ADVISOR_SOURCE_PARSER_VERSION:
+        if validation_rejection is not None:
+            validation_rejection.update(code="advisor_parser_version_unsupported", path="$")
+        return None
     if consultation_type in _TYPED_CONSULTATION_TYPES:
         parsed_typed = parse_typed_advisor_response(
             raw,
