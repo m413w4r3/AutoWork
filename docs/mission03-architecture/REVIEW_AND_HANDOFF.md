@@ -277,7 +277,9 @@ advisor restent hors autorisation jusqu'à une nouvelle révision et revue.
 ```text
 Mission 04 — implémentation des lots approuvés de Mission 03.
 
-Base : main@<SHA de ce handoff>, docs/mission03-architecture/.
+Base code étudiée : aa0cef3ee07525ca77d6b1358252ebf5735a3dde.
+Merge documentaire Mission 03 sur main local : 3cdb5de62931c4c18fc65ddcc1ed3e86bff45a4b.
+Docs : docs/mission03-architecture/.
 Lire AGENTS.md, backend/AGENTS.md, ADRs applicables, puis :
 - BASELINE_AND_SCOPE.md
 - ARCHITECTURE_MAP.md (registre A/B/C/D)
@@ -286,11 +288,16 @@ Lire AGENTS.md, backend/AGENTS.md, ADRs applicables, puis :
 - IMPLEMENTATION_PLAN.md (lots, RED/GREEN, rollback)
 - REVIEW_AND_HANDOFF.md (verdicts, blocages, autorisations)
 
-Commencer par le premier lot explicitement approuvé. Ne pas élargir le
-périmètre. Pour chaque lot : branche locale, SHA de base, oracle RED,
-correctif minimal, GREEN ciblé, test PostgreSQL réel si requis, revue
-indépendante, rollback. Aucun appel fournisseur, aucune migration live,
-aucune publication/G3, aucun merge/push sans autorisation explicite.
+Verdict global Mission 03 : GO_NARROW_ONLY. S3 = S3_BLOCKED_DESIGN ;
+advisor cutover = REVISE ; seule la tranche pure `prepare` (L20) est
+approuvée pour l'advisor. Lots autorisés : L1, L2, L3, L20.
+Ne pas implémenter S3, le cutover advisor, une migration live, un appel
+fournisseur, une publication/G3 ou un rollback non permit-aware.
+
+Commencer par L1 (S2 credential JSON échappé), puis L2 (refus P10), puis L20
+(advisor prepare expand-only). Pour chaque lot : branche locale, SHA de base,
+oracle RED, correctif minimal, GREEN ciblé, test PostgreSQL réel si requis,
+revue indépendante, rollback. Aucun merge/push sans autorisation explicite.
 ```
 
 ## 9. État de livraison
@@ -298,4 +305,9 @@ aucune publication/G3, aucun merge/push sans autorisation explicite.
 Les six documents demandés sont dans `docs/mission03-architecture/` :
 `BASELINE_AND_SCOPE.md`, `ARCHITECTURE_MAP.md`, `TEST_SURFACE.md`,
 `DESIGN_OPTIONS.md`, `IMPLEMENTATION_PLAN.md`, `REVIEW_AND_HANDOFF.md`.
-Les artefacts détaillés et les revues restent sous `_work/`.
+Les artefacts détaillés, briefs et revues restent sous `_work/`.
+
+- Commit documentaire de branche : `b7f554238a8abecaae3a2f89108f54c558b24315`.
+- Merge local sur `main` : `3cdb5de62931c4c18fc65ddcc1ed3e86bff45a4b`.
+- Aucun push vers `origin` ; `main` local est en avance sur `origin/main`.
+- Aucun code, test, migration ou état live modifié.
