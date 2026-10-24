@@ -13,8 +13,8 @@ jour après chaque lot.
 |---|---|---|---|---|
 | `compose` | success | — | n/a | vert, ne prouve pas l'applicatif |
 | `backend` | failure | `uv run mypy src tests` | PREEXISTING (dette de types) | CI-0a intégré (35→0 hors L4) ; L4 doit ramener ses 5 fichiers à 0 |
-| `backend` | failure | Workflow emulator FAST | PREEXISTING (contrat obsolète/mesures) | corrigé sur `mission04/ci0-workflow` (vérification HEAD à faire) |
-| `backend` | failure | Workflow emulator FULL | PREEXISTING (observations/ambiguïté/config) | corrigé sur `mission04/ci0-protocol` (vérification HEAD à faire) |
+| `backend` | failure | Workflow emulator FAST | PREEXISTING (contrat obsolète/mesures) | `fe51494f` sur `mission04/ci0-workflow` ; 99 tests verts ; revue indépendante en cours |
+| `backend` | failure | Workflow emulator FULL | PREEXISTING (observations/ambiguïté/config) | `mission04/ci0-protocol` ; W15/W18/pilote verts ; commit + revue à faire |
 | `frontend` | failure | `pnpm lint` (`prettier --check .`) | PREEXISTING (formatage) | corrigé localement (ccff3444) |
 | `typst-renderer-smoke` | failure | compile production renderer | PREEXISTING (fixture sans `document_label`) | corrigé localement (ccff3444) |
 | `workflow-browser` | failure | J2 investigation/PDF | PREEXISTING (`_S2_BYTES` privé supprimé) | corrigé localement (ccff3444) |
@@ -88,6 +88,16 @@ ni affaibli.
 | `W15` | 2 observations `network.protocol.verify` au lieu de 1 | deux invocations intentionnelles avant/après révision, chacune `PARTIAL` avec une ref distincte | CI-0c : oracle par phase corrigé ; en cours |
 | `W18` | `response_refs` vide sur une invocation `vt.download_sample` `NEEDS_REVIEW` | la branche ambiguë sautait l'écriture d'observation et ne conservait pas de ref valide | CI-0c : refs valides conservées + observation de statut cadre si aucune ref ; en cours |
 | `FULL pilot` | approbation d'enveloppe 422 `provider_unavailable: vt` | fixture fake VT sans routing policy ; puis corpus de similarité incluant les PCAP importés | CI-0c : routing policy + sélection explicite des 3 échantillons ; en cours |
+
+### 2.7 Archive corpus replay — échec masqué par mypy
+
+Le run `40129845019` s'arrêtait à `mypy` avant la suite de tests. Un checkout
+propre (sans `.autowork-runs`, répertoire gitignoré) échoue sur
+`tests/test_advisor_wire.py::test_archived_corpus_c01_to_c13_replays_as_compact_resolvable_text_dossiers`
+avec `StopIteration` : le corpus Run12 n'est pas dans Git. `136defc9` conserve
+le replay actif quand l'archive locale existe et l'exclut explicitement, avec
+un motif visible, sinon. Aucune assertion ni donnée du corpus n'a été modifiée.
+À vérifier avec la commande CI exacte sur un checkout propre au HEAD final.
 
 ## 3. Règle de clôture
 
