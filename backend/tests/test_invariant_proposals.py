@@ -635,7 +635,7 @@ def test_context_normalization_preserves_large_values_and_hex_encodes_bytes() ->
     assert context["fact"] == long_fact
     assert context["large_text"] == large_text
     assert context["raw"] == "00ff"
-    assert context["secret"] == "api_key=[REDACTED]"
+    assert context["secret"] == "[REDACTED]"
     assert context["nested"]["a"]["b"]["c"]["d"]["e"]["f"]["g"]["h"] == "[DEPTH_LIMIT]"
     assert _bounded_pattern("P" * 4_097) == "P" * 4_097
 
@@ -1024,13 +1024,30 @@ def test_redact_url_keeps_adjacent_evidence_and_redacts_credentials() -> None:
     assert "X-Amz-Algorithm=AWS4-HMAC-SHA256" in signed_headers
     assert "FIXTURE_CREDENTIAL" not in signed_headers
     assert "SECRET_SIGNATURE" not in signed_headers
+    assert (
+        _redact_url("https://example.invalid/path?%61uth=SECRET")
+        == "https://example.invalid/path?%61uth=[REDACTED]"
+    )
+    assert (
+        _redact_url("https://token@example.invalid/path")
+        == "https://[REDACTED]@example.invalid/path"
+    )
+    assert (
+        _redact_url("https://example.invalid/path#id_token=SECRET")
+        == "https://example.invalid/path#id_token=[REDACTED]"
+    )
+    assert (
+        _redact_url("example.invalid/file?sig=SECRET&q=test")
+        == "example.invalid/file?sig=[REDACTED]&q=test"
+    )
 
 
 def test_redact_text_redacts_credentials_without_erasing_surrounding_claims() -> None:
     value = (
         "Constat auth=FIXTURE_AUTH_123 authorization: Basic ZmFrZQ== "
         "credential=FIXTURE_CREDENTIAL client_secret=FIXTURE_CLIENT_SECRET "
-        "fin du constat."
+        "auth_token=FIXTURE_AUTH_TOKEN id_token=FIXTURE_ID_TOKEN "
+        "token_count=5 author=Jane fin du constat."
     )
 
     redacted = _redact_text(value)
@@ -1040,16 +1057,43 @@ def test_redact_text_redacts_credentials_without_erasing_surrounding_claims() ->
         "ZmFrZQ==",
         "FIXTURE_CREDENTIAL",
         "FIXTURE_CLIENT_SECRET",
+        "FIXTURE_AUTH_TOKEN",
+        "FIXTURE_ID_TOKEN",
     ):
         assert secret not in redacted
+    assert "token_count=5" in redacted
+    assert "author=Jane" in redacted
     assert "Constat" in redacted
     assert "fin du constat." in redacted
+
+
+def test_normalize_context_redacts_structured_credentials() -> None:
+    context = _normalize_context(
+        {
+            "auth": "FIXTURE_AUTH",
+            "auth_token": "FIXTURE_AUTH_TOKEN",
+            "id_token": "FIXTURE_ID_TOKEN",
+            "client_secret": "FIXTURE_CLIENT_SECRET",
+            "token_count": 5,
+            "author": "Jane",
+            "nested": {"access_token": "FIXTURE_ACCESS_TOKEN", "algorithm": "AWS4"},
+        }
+    )
+
+    for key in ("auth", "auth_token", "id_token", "client_secret"):
+        assert context[key] == "[REDACTED]"
+    assert context["token_count"] == 5
+    assert context["author"] == "Jane"
+    assert context["nested"]["access_token"] == "[REDACTED]"
+    assert context["nested"]["algorithm"] == "AWS4"
 
 
 def test_render_p10_prompt_redacts_url_credentials_without_losing_claim_context() -> None:
     claim = (
         "Constat CVE-2025-7777 confirmé https://example.invalid/a"
         "?auth=FIXTURE_AUTH_TOKEN&sig=SECRET_SIG&client_secret=FIXTURE_CLIENT_SECRET "
+        "auth_token=FIXTURE_AUTH_TOKEN id_token=FIXTURE_ID_TOKEN "
+        "example.invalid/file?sig=SECRET_SCHEMELESS "
         "credential=FIXTURE_CREDENTIAL authorization: Basic ZmFrZQ== fin du constat."
     )
     snapshot = _proposal_snapshot(
@@ -1062,6 +1106,8 @@ def test_render_p10_prompt_redacts_url_credentials_without_losing_claim_context(
         "FIXTURE_AUTH_TOKEN",
         "SECRET_SIG",
         "FIXTURE_CLIENT_SECRET",
+        "FIXTURE_ID_TOKEN",
+        "SECRET_SCHEMELESS",
         "FIXTURE_CREDENTIAL",
         "ZmFrZQ==",
     ):

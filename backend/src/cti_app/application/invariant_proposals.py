@@ -15,6 +15,7 @@ from dataclasses import asdict, dataclass, is_dataclass
 from datetime import UTC, datetime
 from enum import Enum
 from typing import Any, cast
+from urllib.parse import unquote
 from uuid import UUID, uuid5
 
 from pydantic import ValidationError
@@ -2229,6 +2230,14 @@ def _bounded_json(value: Any, *, drop_timestamps: bool = False, depth: int = 0) 
                 "promoted_at",
             }:
                 continue
+            if (
+                _sensitive_name(key_text)
+                and item not in (None, "", [], {})
+                and item is not False
+                and item is not True
+            ):
+                pairs.append((key_text, "[REDACTED]"))
+                continue
             pairs.append(
                 (
                     key_text,
@@ -2287,22 +2296,52 @@ def _external_disclosure_allowed(policy: DerivedPolicy) -> bool:
     return policy.external_llm_allowed and not policy.do_not_submit and policy.tlp is not TLP.RED
 
 
-_URL_SCHEME = re.compile(r"https?://", re.IGNORECASE)
-_URL_USERINFO = re.compile(r"(?i)(https?://)[^/\s:@]+:[^@\s]*@")
-_URL_CREDENTIAL_PARAM = re.compile(
-    r"(?i)([?&](?:sig|signature|x-amz-(?:signature|credential|security-token)"
-    r"|x-goog-(?:signature|credential)|token|access[_-]?token|refresh[_-]?token"
-    r"|session[_-]?token|auth|authorization|api[_-]?key|apikey|client[_-]?secret"
-    r"|credential|password|secret|private[_-]?key)=)[^&#\s]*"
+_URL_USERINFO = re.compile(r"(?i)(https?://|www\.)[^\s/@:]+(?::[^\s/@]*)?@")
+_URL_PARAM = re.compile(r"(?i)([?&#])([A-Za-z0-9_.%+-]+)=([^&#\s]*)")
+_TEXT_ASSIGNMENT = re.compile(r"(?i)\b([A-Za-z][A-Za-z0-9_.-]*)\s*[:=]\s*(\S+)")
+_SENSITIVE_NAMES = frozenset(
+    {
+        "apikey",
+        "auth",
+        "authorization",
+        "credential",
+        "password",
+        "privatekey",
+        "secret",
+        "secretkey",
+        "sig",
+        "signature",
+        "token",
+    }
 )
+_SENSITIVE_SUFFIXES = (
+    "apikey",
+    "credential",
+    "password",
+    "privatekey",
+    "secret",
+    "secretkey",
+    "signature",
+    "token",
+)
+
+
+def _sensitive_name(name: str) -> bool:
+    """Match credential labels by normalized name, not by one-off key lists."""
+    compact = re.sub(r"[^a-z0-9]", "", unquote(name).casefold())
+    return compact in _SENSITIVE_NAMES or compact.endswith(_SENSITIVE_SUFFIXES)
 
 
 def _redact_url(value: str) -> str:
     """Redact credential-bearing URL parts without erasing surrounding evidence."""
-    if _URL_SCHEME.search(value) is None:
-        return value
+
+    def redact_param(match: re.Match[str]) -> str:
+        if not _sensitive_name(match.group(2)):
+            return match.group(0)
+        return f"{match.group(1)}{match.group(2)}=[REDACTED]"
+
     value = _URL_USERINFO.sub(r"\1[REDACTED]@", value)
-    return _URL_CREDENTIAL_PARAM.sub(r"\1[REDACTED]", value)
+    return _URL_PARAM.sub(redact_param, value)
 
 
 def _redact_text(value: str) -> str:
@@ -2313,13 +2352,13 @@ def _redact_text(value: str) -> str:
         r"\1=[REDACTED]",
         value,
     )
-    return re.sub(
-        r"(?i)\b(api[_-]?key|apikey|client[_-]?secret|private[_-]?key|password|secret"
-        r"|access[_-]?token|refresh[_-]?token|session[_-]?token|token"
-        r"|authorization|auth|credential)\s*[:=]\s*(?!\[REDACTED\])\S+",
-        r"\1=[REDACTED]",
-        value,
-    )
+
+    def redact_assignment(match: re.Match[str]) -> str:
+        if not _sensitive_name(match.group(1)) or match.group(2).startswith("[REDACTED]"):
+            return match.group(0)
+        return f"{match.group(1)}=[REDACTED]"
+
+    return _TEXT_ASSIGNMENT.sub(redact_assignment, value)
 
 
 def _canonical_json(value: Any) -> str:
