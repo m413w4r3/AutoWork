@@ -21,7 +21,7 @@ from cti_app.domain.publication_document import (
     PublicationDetectionV1,
 )
 from cti_app.domain.retrohunt import RetrohuntReservation, RetrohuntReservationState
-from cti_app.domain.rule_workbench import RuleValidationStatus
+from cti_app.domain.rule_workbench import RuleTestCorpusRole, RuleValidationStatus
 
 
 class _DetectionCandidateRepository(Protocol):
@@ -138,9 +138,17 @@ async def build_publication_detection(
         report_observation = observation
 
     rule_status, reason = _validation_fields(report_payload)
-    counts = _provenance_counts(report_payload)
-    positive_real_count, positive_synthetic_count = counts.get("confirmed_positive", (0, 0))
-    goodware_counts = counts.get("goodware", (0, 0))
+    if report_payload is None:
+        # The explicit-test gate below marks this rule untested; these are
+        # unmeasured display defaults, not counts inferred from a partial report.
+        counts = {
+            RuleTestCorpusRole.HUMAN_CONFIRMED.value: (0, 0),
+            RuleTestCorpusRole.GOODWARE.value: (0, 0),
+        }
+    else:
+        counts = _provenance_counts(report_payload)
+    positive_real_count, positive_synthetic_count = counts[RuleTestCorpusRole.HUMAN_CONFIRMED.value]
+    goodware_counts = counts[RuleTestCorpusRole.GOODWARE.value]
     goodware_tested_count = sum(goodware_counts)
     false_positive_count = _nonnegative_count(
         report_payload.get("false_positive_count", 0) if report_payload is not None else 0,
@@ -278,21 +286,37 @@ def _publication_status(status: RuleValidationStatus) -> PublicationDetectionSta
 
 
 def _provenance_counts(
-    payload: Mapping[str, Any] | None,
+    payload: Mapping[str, Any],
 ) -> dict[str, tuple[int, int]]:
-    if payload is None:
-        return {}
-    raw = payload.get("provenance_counts_by_role", {})
+    raw = payload.get("provenance_counts_by_role")
     if not isinstance(raw, Mapping):
         raise PublicationDetectionDataError("YARA report provenance counts are invalid")
     result: dict[str, tuple[int, int]] = {}
-    for role in ("confirmed_positive", "goodware"):
-        counts = raw.get(role, {})
+    positive_role = RuleTestCorpusRole.HUMAN_CONFIRMED.value
+    legacy_positive_role = "confirmed_positive"
+    if positive_role in raw and legacy_positive_role in raw:
+        raise PublicationDetectionDataError(
+            "YARA report has both canonical and legacy positive role counts"
+        )
+    for role in (positive_role, RuleTestCorpusRole.GOODWARE.value):
+        raw_key = (
+            legacy_positive_role if role == positive_role and positive_role not in raw else role
+        )
+        if raw_key not in raw:
+            raise PublicationDetectionDataError(
+                f"YARA report is missing required {raw_key} provenance counts"
+            )
+        counts = raw[raw_key]
         if not isinstance(counts, Mapping):
-            raise PublicationDetectionDataError(f"YARA report {role} counts are invalid")
+            raise PublicationDetectionDataError(f"YARA report {raw_key} counts are invalid")
+        for count_name in ("real", "synthetic"):
+            if count_name not in counts:
+                raise PublicationDetectionDataError(
+                    f"YARA report {raw_key}.{count_name} provenance count is missing"
+                )
         result[role] = (
-            _nonnegative_count(counts.get("real", 0), f"{role}.real"),
-            _nonnegative_count(counts.get("synthetic", 0), f"{role}.synthetic"),
+            _nonnegative_count(counts["real"], f"{raw_key}.real"),
+            _nonnegative_count(counts["synthetic"], f"{raw_key}.synthetic"),
         )
     return result
 
