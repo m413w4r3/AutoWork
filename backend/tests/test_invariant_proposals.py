@@ -11,6 +11,7 @@ import pytest
 
 from cti_app.application.invariant_proposals import (
     P10_PROMPT_VERSION,
+    ProposalContractError,
     ProposalConversationService,
     ProposalOutputValidationError,
     _bounded_pattern,
@@ -1256,13 +1257,11 @@ def test_render_p10_prompt_preserves_closing_delimiter_after_trailing_backslash(
     assert expected_redaction in prompt, prompt
 
 
-def test_render_p10_prompt_scans_many_unclosed_escaped_assignments_linearly() -> None:
+def test_render_p10_prompt_scans_many_bounded_escaped_assignments_linearly() -> None:
     assignment = r"{\"auth\":\"S"
-    repeated = " ".join([assignment] * 1600)
-    tail_secret = "FIXTURE_UNCLOSED_TAIL_SECRET"
-    claim_text = f"{repeated} {tail_secret}"
-    claim_text += "X" * (25_613 - len(claim_text))
-    assert len(claim_text) == 25_613
+    secret = "FIXTURE_UNCLOSED_LINE_SECRET"
+    evidence = "CVE-2025-31337: observed persistence"
+    claim_text = "\n".join(f"{assignment}{secret}" for _ in range(1600)) + "\n" + evidence
     started = perf_counter()
     context = _normalize_context(
         {"report_claims": [{"claim_id": "claim-unclosed-many", "text": claim_text}]}
@@ -1270,7 +1269,8 @@ def test_render_p10_prompt_scans_many_unclosed_escaped_assignments_linearly() ->
     prompt, _ = _render_p10_prompt(_proposal_snapshot(context))
     elapsed = perf_counter() - started
 
-    assert tail_secret not in prompt
+    assert secret not in prompt
+    assert evidence in prompt
     assert elapsed < 1.0, f"linear-scan DoS guard exceeded: {elapsed:.3f}s"
 
 
@@ -1337,28 +1337,21 @@ def test_render_p10_prompt_bounds_unclosed_auth_at_line_break_and_preserves_evid
     assert "unclosed_sensitive_assignment" not in prompt, prompt
 
 
-def test_render_p10_prompt_marks_unbounded_fail_closed_omission() -> None:
+def test_render_p10_prompt_refuses_unbounded_sensitive_assignment() -> None:
     claim = r"prefix {\"auth\":\"FIXTURE_AUTH_WITHOUT_ANY_BOUNDARY"
-    context = _normalize_context(
-        {"report_claims": [{"claim_id": "claim-r4-unbounded", "text": claim}]}
-    )
-
-    prompt, _ = _render_p10_prompt(_proposal_snapshot(context))
-
-    assert "FIXTURE_AUTH_WITHOUT_ANY_BOUNDARY" not in prompt, prompt
-    assert "[REDACTED](unclosed_sensitive_assignment)" in prompt, prompt
+    with pytest.raises(ProposalContractError, match="ambiguous_operational_credential"):
+        _normalize_context({"report_claims": [{"claim_id": "claim-r4-unbounded", "text": claim}]})
 
 
-def test_render_p10_prompt_bounds_unclosed_value_at_object_terminator() -> None:
-    claim = r"prefix {\"auth\":\"FIXTURE_UNCLOSED_OBJECT} CTI_AFTER_TERMINATOR"
-    context = _normalize_context(
-        {"report_claims": [{"claim_id": "claim-bounded-unclosed", "text": claim}]}
-    )
-
-    prompt, _ = _render_p10_prompt(_proposal_snapshot(context))
-
-    assert "FIXTURE_UNCLOSED_OBJECT" not in prompt
-    assert r"} CTI_AFTER_TERMINATOR" in prompt
+@pytest.mark.parametrize("delimiter", ["}", "]"])
+def test_render_p10_prompt_refuses_unclosed_credential_before_object_delimiter(
+    delimiter: str,
+) -> None:
+    # R5: an unclosed scalar makes a raw }/] ambiguous; the suffix could be
+    # credential bytes, so the consultation must refuse rather than leak it.
+    claim = r"prefix {\"auth\":\"FIXTURE_AUTH" + delimiter + "FIXTURE_AUTH_SUFFIX"
+    with pytest.raises(ProposalContractError, match="ambiguous_operational_credential"):
+        _normalize_context({"report_claims": [{"claim_id": "claim-r5-delimiter", "text": claim}]})
 
 
 @pytest.mark.parametrize(
@@ -1368,18 +1361,47 @@ def test_render_p10_prompt_bounds_unclosed_value_at_object_terminator() -> None:
         r", \"evidence\": \"CTI_EVIDENCE\"}",
     ],
 )
-def test_render_p10_prompt_bounds_unclosed_auth_before_later_evidence_quote(
+def test_render_p10_prompt_refuses_unclosed_auth_before_ambiguous_delimiter(
     evidence_tail: str,
 ) -> None:
     claim = r"prefix {\"auth\":\"FIXTURE_AUTH" + evidence_tail
-    context = _normalize_context(
-        {"report_claims": [{"claim_id": "claim-unclosed-before-evidence", "text": claim}]}
+    with pytest.raises(ProposalContractError, match="ambiguous_operational_credential"):
+        _normalize_context(
+            {"report_claims": [{"claim_id": "claim-unclosed-before-evidence", "text": claim}]}
+        )
+
+
+@pytest.mark.asyncio
+async def test_p10_refuses_ambiguous_credential_before_any_external_call() -> None:
+    class LeakyClaims(_ClaimsRepository):
+        async def list_for_subject(self, subject_id: UUID) -> list[dict[str, object]]:
+            del subject_id
+            return [
+                {
+                    "claim_id": "claim-r5-leak",
+                    "text": r"prefix {\"auth\":\"FIXTURE_AUTH}FIXTURE_AUTH_SUFFIX",
+                }
+            ]
+
+    state = _State(invariants=[SimpleNamespace(provenances=(_manual_ref(),))])
+    conversation = _ConversationService()
+    registry = _Registry()
+    goodware = _GoodwareMeasurement()
+    uow = _Uow(state, conversation)
+    uow.claims = LeakyClaims()
+    service = ProposalConversationService(
+        lambda: uow,
+        conversation,  # type: ignore[arg-type]
+        registry,  # type: ignore[arg-type]
+        goodware=goodware,  # type: ignore[arg-type]
     )
 
-    prompt, _ = _render_p10_prompt(_proposal_snapshot(context))
+    with pytest.raises(ProposalContractError, match="ambiguous_operational_credential"):
+        await service.propose(investigation_id=INVESTIGATION_ID)
 
-    assert "FIXTURE_AUTH" not in prompt
-    assert evidence_tail in prompt
+    assert conversation.external_calls == 0
+    assert conversation.local_calls == 0
+    assert conversation.turns_by_key == {}
 
 
 @pytest.mark.parametrize("trailing_backslashes", range(8))

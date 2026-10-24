@@ -2495,12 +2495,9 @@ def _escaped_assignment_boundary(value: str, after_quote: int) -> bool:
     return value[index] == ","
 
 
-def _escaped_assignment_closings(
-    value: str,
-) -> tuple[dict[str, list[tuple[int, int]]], list[int]]:
+def _escaped_assignment_closings(value: str) -> dict[str, list[tuple[int, int]]]:
     """Index one-layer escaped scalar closes in one monotone pass."""
     closings: dict[str, list[tuple[int, int]]] = {'"': [], "'": []}
-    structural_quotes: list[int] = []
     index = 0
     while index < len(value):
         if value[index] != "\\":
@@ -2515,53 +2512,41 @@ def _escaped_assignment_closings(
             quote = value[index]
             # One escaped JSON layer: structural quote runs are 1 mod 4;
             # embedded quotes in the scalar are 3 mod 4.
-            if slash_count % 4 == 1:
-                structural_quotes.append(index)
-                if _escaped_assignment_boundary(value, index + 1):
-                    closings[quote].append((index - 1, index + 1))
+            if slash_count % 4 == 1 and _escaped_assignment_boundary(value, index + 1):
+                closings[quote].append((index - 1, index + 1))
             index += 1
-    return closings, structural_quotes
+    return closings
 
 
-def _escaped_assignment_terminators(
-    value: str,
-    closings: dict[str, list[tuple[int, int]]],
-    structural_quotes: list[int],
-) -> list[int]:
-    """Index structural separators for bounded fail-closed redaction."""
-    structural_quote_set = set(structural_quotes)
-    closing_quote_set = {
-        close_end - 1 for candidates in closings.values() for _, close_end in candidates
-    }
-    terminators: list[int] = []
-    for index, char in enumerate(value):
-        if char in "}]":
-            terminators.append(index)
-            continue
-        if char in "\r\n":
-            # A raw line break cannot occur inside a valid escaped JSON scalar.
-            # Treat it as a claim boundary so an unclosed credential never
-            # erases adjacent CTI evidence until EOF (R4 condition).
-            terminators.append(index)
-            continue
-        if char != ",":
-            continue
+def _escaped_assignment_line_breaks(value: str) -> list[int]:
+    """Index raw line breaks; only these bound an unclosed credential safely."""
+    return [index for index, char in enumerate(value) if char in "\r\n"]
 
-        next_char = index + 1
-        while next_char < len(value) and value[next_char].isspace():
-            next_char += 1
-        quote_index = next_char
-        slash_start = quote_index
-        while quote_index < len(value) and value[quote_index] == "\\":
-            quote_index += 1
-        if (
-            quote_index - slash_start > 0
-            and (quote_index - slash_start) % 4 == 1
-            and quote_index in structural_quote_set
-            and quote_index not in closing_quote_set
-        ):
-            terminators.append(index)
-    return terminators
+
+def _escaped_assignment_has_ambiguous_delimiter(
+    value: str, value_start: int, close_start: int
+) -> bool:
+    """A raw delimiter before the close may belong to the credential value.
+
+    A delimiter immediately after an embedded escaped quote (3 mod 4 backslashes)
+    is part of the scalar and is allowed; any other raw ``}``, ``]`` or ``,``
+    makes the later quote untrustworthy as this scalar's close.
+    """
+    for index in range(value_start, close_start):
+        if value[index] not in "}],":
+            continue
+        if value[max(0, index - 9) : index + 1] == "[REDACTED]":
+            # The literal redaction marker is not a structural delimiter.
+            continue
+        if index and value[index - 1] in "\"'":
+            quote_index = index - 1
+            slash_start = quote_index
+            while slash_start and value[slash_start - 1] == "\\":
+                slash_start -= 1
+            if (quote_index - slash_start) % 4 == 3:
+                continue
+        return True
+    return False
 
 
 def _escaped_assignment_close(
@@ -2570,68 +2555,46 @@ def _escaped_assignment_close(
     quote: str,
     closings: dict[str, list[tuple[int, int]]],
     close_cursors: dict[str, int],
-    structural_quotes: list[int],
-    structural_quote_cursor: int,
-    terminators: list[int],
-    terminator_cursor: int,
-) -> tuple[tuple[int, int] | None, int, int]:
-    """Select the next structural close or bounded fallback without rescanning."""
+    line_breaks: list[int],
+    line_cursor: int,
+) -> tuple[tuple[int, int] | None, int]:
+    """Select a valid scalar close or a raw line boundary without rescanning.
+
+    An unclosed scalar is ambiguous: ``}``, ``]`` and ``,`` may belong to the
+    credential value, so they are never treated as safe fallback boundaries.
+    Only a raw LF/CRLF (which cannot occur inside a valid escaped JSON scalar)
+    bounds the redaction; otherwise the caller must refuse explicitly.
+    """
     candidates = closings[quote]
     close_cursor = close_cursors[quote]
     while close_cursor < len(candidates) and candidates[close_cursor][0] < value_start:
         close_cursor += 1
     close_cursors[quote] = close_cursor
-    while (
-        structural_quote_cursor < len(structural_quotes)
-        and structural_quotes[structural_quote_cursor] < value_start
-    ):
-        structural_quote_cursor += 1
-    while terminator_cursor < len(terminators) and terminators[terminator_cursor] < value_start:
-        terminator_cursor += 1
+    while line_cursor < len(line_breaks) and line_breaks[line_cursor] < value_start:
+        line_cursor += 1
 
     if close_cursor < len(candidates):
         close_start, close_end = candidates[close_cursor]
-        while terminator_cursor < len(terminators) and terminators[terminator_cursor] < close_start:
-            terminator = terminators[terminator_cursor]
-            if terminator > 0 and value[terminator - 1] in "\"'":
-                inner_quote = terminator - 1
-                slash_start = inner_quote
-                while slash_start and value[slash_start - 1] == "\\":
-                    slash_start -= 1
-                if (inner_quote - slash_start) % 4 == 3:
-                    terminator_cursor += 1
-                    continue
-
-            while (
-                structural_quote_cursor < len(structural_quotes)
-                and structural_quotes[structural_quote_cursor] <= terminator
-            ):
-                structural_quote_cursor += 1
-            if (
-                structural_quote_cursor < len(structural_quotes)
-                and structural_quotes[structural_quote_cursor] < close_start
-            ):
-                return (terminator, terminator), terminator_cursor + 1, structural_quote_cursor
-            terminator_cursor += 1
-
+        if line_cursor < len(line_breaks) and line_breaks[line_cursor] < close_start:
+            line = line_breaks[line_cursor]
+            return (line, line), line_cursor + 1
+        if _escaped_assignment_has_ambiguous_delimiter(value, value_start, close_start):
+            return None, line_cursor
         close_cursors[quote] = close_cursor + 1
-        while terminator_cursor < len(terminators) and terminators[terminator_cursor] < close_end:
-            terminator_cursor += 1
-        return (close_start, close_end), terminator_cursor, structural_quote_cursor
+        return (close_start, close_end), line_cursor
 
-    if terminator_cursor < len(terminators):
-        terminator = terminators[terminator_cursor]
-        return (terminator, terminator), terminator_cursor + 1, structural_quote_cursor
-    return None, terminator_cursor, structural_quote_cursor
+    if line_cursor < len(line_breaks):
+        line = line_breaks[line_cursor]
+        return (line, line), line_cursor + 1
+    return None, line_cursor
 
 
 def _redact_escaped_text_assignments(value: str) -> str:
     """Redact single-layer escaped assignments without regex suffix rescans."""
-    closings, structural_quotes = _escaped_assignment_closings(value)
+    closings = _escaped_assignment_closings(value)
     close_cursors = {'"': 0, "'": 0}
-    structural_quote_cursor = 0
-    terminators = _escaped_assignment_terminators(value, closings, structural_quotes)
-    terminator_cursor = 0
+    line_breaks = _escaped_assignment_line_breaks(value)
+    line_cursor = 0
     parts: list[str] = []
     copied_through = 0
     index = 0
@@ -2658,31 +2621,22 @@ def _redact_escaped_text_assignments(value: str) -> str:
             index = value_start
             continue
 
-        close, terminator_cursor, structural_quote_cursor = _escaped_assignment_close(
+        close, line_cursor = _escaped_assignment_close(
             value,
             value_start,
             quote,
             closings,
             close_cursors,
-            structural_quotes,
-            structural_quote_cursor,
-            terminators,
-            terminator_cursor,
+            line_breaks,
+            line_cursor,
         )
         if close is None:
-            escaped_value = value[value_start:]
-            if escaped_value == "[REDACTED]":
+            if value[value_start:] == "[REDACTED]":
                 return "".join(parts) + value[copied_through:]
-            # No structural, comma, or line boundary exists: the whole remaining
-            # claim is fail-closed. Keep the omission reason observable without
-            # matching the plain [REDACTED] marker prefix.
-            parts.extend(
-                (
-                    value[copied_through:value_start],
-                    "[REDACTED](unclosed_sensitive_assignment)",
-                )
+            raise ProposalContractError(
+                "ambiguous_operational_credential: an unclosed sensitive assignment "
+                "has no safe line boundary"
             )
-            return "".join(parts)
 
         close_start, close_end = close
         if value[value_start:close_start] != "[REDACTED]":
