@@ -87,3 +87,40 @@ parseur de lire d'anciens payloads ; un ancien consommateur strict
 Ne pas approuver avant d'authentifier les curseurs, d'inclure le manifeste et
 les métadonnées pertinentes dans le CAS après rédaction, et de traiter la
 compatibilité du contrat versionné. Réparation `M01-L2-R1` lancée.
+
+## Seconde revue après R1 — PASS_WITH_CHANGES
+
+**Objet :** `4f2a941bfe938dcc117388de9554d4d399f4fb39` (9 fichiers).
+**Revue :** agent `d676bd6a-46bd-4795-bb9c-7f61abe5e3a3`, Luna xhigh.
+**Oracle rejoué :** 325 passed.
+
+Les 3 HIGH et 3 MEDIUM R1 sont fermés : CAS lié à la portée, au curseur, au
+pivot, aux bornes, aux items post-rédaction et au manifeste ; omissions
+`PAGINATION` ; `section_cursors` int restauré et `section_keyset_cursors`
+additif ; ancien résumé v1 parsé ; curseur explicitement
+`unauthenticated_position`, lié à la section/investigation/contexte, ne
+permettant pas d'élargir la portée ; fallback sans pagination signalé
+`source_bounded=false` sans `AttributeError` ; tests SQL asc/desc et
+`limit + 1` via session espionne.
+
+### MEDIUM résiduel — manifeste non lié à `source_ref`/`page_sha256`
+
+`_canonical_omissions` (`context_pagination.py:542`) exclut `source_ref` et
+`page_sha256`; `verify_page_sha256` ne vérifie pas leur cohérence avec la
+page. Falsifier ces deux champs du manifeste renvoie encore `True`. Ajouter
+une vérification de cohérence et des assertions de falsification.
+
+### MEDIUM résiduel — `source_bounded=True` à tort en mémoire
+
+`_memory_keyset_page` (`investigation_persistence.py:212-240`) matérialise
+toute la collection via `list_for_investigation` mais conserve
+`source_bounded=True` par défaut. Le spy du test masque ces appels et attend
+`True` (`test_research_context_builder.py:3668/3813`). Passer explicitement
+`source_bounded=False` + raison pour les dépôts mémoire, et couvrir un faux
+dépôt réellement borné.
+
+### Résiduels
+
+PostgreSQL réel et performance : **UNKNOWN**. Coût : **UNKNOWN**.
+Réparation `M01-L2-R2` lancée.
+
