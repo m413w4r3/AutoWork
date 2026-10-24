@@ -16,7 +16,10 @@ from uuid import UUID
 from cti_app.application.context_pagination import (
     KeysetPageV1,
     decode_keyset_cursor,
+    decode_keyset_sort_key,
+    keyset_position_after,
     make_keyset_page,
+    order_keyset_items,
 )
 from cti_app.domain.analyst_opinion import AnalystOpinionV1
 from cti_app.domain.investigation import (
@@ -88,6 +91,8 @@ class FindingRepository(Protocol):
     async def list_for_investigation(
         self, investigation_id: UUID
     ) -> tuple[InvestigationFinding, ...]: ...
+
+    async def version_count_for_investigation(self, investigation_id: UUID) -> int: ...
 
     async def page_for_investigation(
         self,
@@ -207,14 +212,13 @@ def _memory_keyset_page[T](
     cursor: str | None,
     limit: int,
     descending: bool,
-    position: Callable[[T], tuple[datetime, UUID]],
+    position: Callable[[T], tuple[datetime | None, UUID]],
     latest_only: bool = False,
 ) -> KeysetPageV1[T]:
     """Page a materialized in-memory snapshot; this does not bound source memory."""
     if not 1 <= limit <= 1_000:
         raise ValueError("Context page limit must be between 1 and 1000")
-    position_fn = position
-    ordered = sorted(items, key=position_fn, reverse=descending)
+    ordered = list(order_keyset_items(items, position=position, descending=descending))
     if cursor is not None:
         decoded = decode_keyset_cursor(
             cursor,
@@ -225,7 +229,7 @@ def _memory_keyset_page[T](
         if decoded is None:
             raise ValueError("Context keyset cursor is invalid")
         try:
-            sort_key = datetime.fromisoformat(decoded["sort_key"])
+            sort_key = decode_keyset_sort_key(decoded["sort_key"])
             item_id = UUID(decoded["item_id"])
         except (TypeError, ValueError):
             raise ValueError("Context keyset cursor is invalid") from None
@@ -233,7 +237,7 @@ def _memory_keyset_page[T](
         ordered = [
             item
             for item in ordered
-            if (position_fn(item) < pivot if descending else position_fn(item) > pivot)
+            if keyset_position_after(position(item), pivot, descending=descending)
         ]
     return make_keyset_page(
         section=section,
@@ -242,7 +246,7 @@ def _memory_keyset_page[T](
         total=len(items),
         limit=limit,
         cursor=cursor,
-        position=position_fn,
+        position=position,
         descending=descending,
         source_bounded=False,
         unbounded_reason="In-memory repository materializes the full collection",
@@ -402,6 +406,9 @@ class InMemoryFindingRepository:
         return tuple(
             item for item in self._items.values() if item.investigation_id == investigation_id
         )
+
+    async def version_count_for_investigation(self, investigation_id: UUID) -> int:
+        return sum(item.investigation_id == investigation_id for item in self._items.values())
 
     async def page_for_investigation(
         self,

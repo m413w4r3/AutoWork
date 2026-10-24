@@ -1200,6 +1200,7 @@ async def get_investigation_operator_context(
                     working_state_version=operator_context.working_state_version,
                     working_state_sha256=operator_context.working_state_sha256,
                     state=state,
+                    context_sha256=operator_context.context_sha256,
                     since_version=since_version,
                     since_fingerprint=since_fingerprint,
                     invalidation_facts=invalidation_facts,

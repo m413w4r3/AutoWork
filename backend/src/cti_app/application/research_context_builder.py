@@ -7,20 +7,25 @@ import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import datetime
-from typing import Any, Literal, Protocol, TypeGuard
+from datetime import UTC, datetime
+from typing import Any, Literal, Protocol, TypeGuard, cast
 from uuid import UUID
 
 from cti_app.application.advisor_checkpoint import advisor_checkpoint_summary
 from cti_app.application.context_pagination import (
+    NULL_SORT_KEY,
     ContextOmissionManifestEntryV1,
     ContextOmissionReason,
     KeysetPageV1,
     assert_manifest_consistency,
     canonical_page_sha256,
+    context_section_descending,
     decode_keyset_cursor,
+    decode_keyset_sort_key,
     encode_keyset_cursor,
+    keyset_position_after,
     make_keyset_page,
+    order_keyset_items,
     source_reference,
 )
 from cti_app.application.investigation_contracts import (
@@ -1106,6 +1111,12 @@ class ResearchContextBuilder:
             limit=MAX_CONTEXT_SOURCE_PAGE,
             descending=True,
             position=lambda item: (item.created_at, item.id),
+            latest_only=True,
+        )
+        superseded_finding_count = max(
+            0,
+            await self._findings.version_count_for_investigation(investigation_id)
+            - finding_source_page.total,
         )
         findings = finding_source_page.items
         all_observation_ids = {item.id for item in observations}
@@ -1415,6 +1426,7 @@ class ResearchContextBuilder:
             context,
             observations=observations,
             findings=findings,
+            superseded_findings=superseded_finding_count,
             opinion=current_opinion,
         )
         context = self._attach_materialized_omission_manifest(
@@ -1680,7 +1692,7 @@ class ResearchContextBuilder:
             }
             if latest_only:
                 kwargs["latest_only"] = True
-            return await page_method(investigation_id, **kwargs)
+            return cast(KeysetPageV1[Any], await page_method(investigation_id, **kwargs))
 
         list_method = getattr(repository, "list_for_investigation", None)
         if not callable(list_method):
@@ -1694,7 +1706,7 @@ class ResearchContextBuilder:
                 if getattr(item, "supersedes", None) is not None
             }
             items = tuple(item for item in items if item.id not in superseded)
-        ordered = sorted(items, key=position, reverse=descending)
+        ordered = order_keyset_items(items, position=position, descending=descending)
         if cursor is not None:
             decoded = decode_keyset_cursor(
                 cursor,
@@ -1705,14 +1717,17 @@ class ResearchContextBuilder:
             )
             if decoded is not None:
                 try:
-                    pivot = (datetime.fromisoformat(decoded["sort_key"]), UUID(decoded["item_id"]))
+                    pivot = (
+                        decode_keyset_sort_key(decoded["sort_key"]),
+                        UUID(decoded["item_id"]),
+                    )
                 except (TypeError, ValueError):
                     raise ValueError("Context keyset cursor is invalid") from None
-                ordered = [
+                ordered = tuple(
                     item
                     for item in ordered
-                    if (position(item) < pivot if descending else position(item) > pivot)
-                ]
+                    if keyset_position_after(position(item), pivot, descending=descending)
+                )
         return make_keyset_page(
             section=section,
             investigation_id=investigation_id,
@@ -1940,7 +1955,7 @@ class ResearchContextBuilder:
             "finding_versions",
             "tool_coverage",
         }:
-            page = await self.read_context_section_page(
+            source_page = await self.read_context_section_page(
                 section=section,
                 investigation_id=investigation_id,
                 state=state,
@@ -1948,7 +1963,7 @@ class ResearchContextBuilder:
                 offset=offset,
                 limit=limit,
             )
-            return page.total, page.items
+            return source_page.total, source_page.items
         observations = tuple(
             sorted(
                 await self._observations.list_for_investigation(investigation_id),
@@ -1956,7 +1971,7 @@ class ResearchContextBuilder:
                 reverse=True,
             )
         )
-        page = slice(offset, offset + limit)
+        page_slice = slice(offset, offset + limit)
 
         article_sections = {
             "article_claims",
@@ -2019,7 +2034,7 @@ class ResearchContextBuilder:
                     for item in article.publication_anchors
                     if len(item.excerpt) > 96
                 )
-                return len(long_texts), tuple(long_texts[page])
+                return len(long_texts), tuple(long_texts[page_slice])
             if section == "article_claims":
                 claims = article.claims
                 claim_items = tuple(
@@ -2034,7 +2049,7 @@ class ResearchContextBuilder:
                             and not _SIGNED_QUERY.search(ref)
                         ),
                     ).model_dump(mode="json")
-                    for claim in claims[page]
+                    for claim in claims[page_slice]
                 )
                 return len(claims), claim_items
             if section == "documented_samples":
@@ -2045,7 +2060,7 @@ class ResearchContextBuilder:
                     and re.fullmatch(r"(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})", sample)
                 )
                 return len(sample_values), tuple(
-                    {"sample": sample} for sample in sample_values[page]
+                    {"sample": sample} for sample in sample_values[page_slice]
                 )
             if section == "known_chain":
                 chain_values = tuple(_prioritize_context_rows(article.known_chain))
@@ -2055,14 +2070,14 @@ class ResearchContextBuilder:
                             _truncate(json.dumps(_sanitize(chain_item), ensure_ascii=False), 4_000)
                         )
                     }
-                    for chain_item in chain_values[page]
+                    for chain_item in chain_values[page_slice]
                 )
                 return len(chain_values), chain_items
             if section == "open_questions":
                 question_values = article.open_questions
                 return len(question_values), tuple(
                     {"question": _safe_untrusted(_truncate(question, 4_000))}
-                    for question in question_values[page]
+                    for question in question_values[page_slice]
                 )
             anchor_values = tuple(
                 sorted(article.publication_anchors, key=lambda anchor: anchor.anchor)
@@ -2072,18 +2087,18 @@ class ResearchContextBuilder:
                     anchor=anchor.anchor,
                     excerpt=_safe_untrusted(_truncate(anchor.excerpt, 96)),
                 ).model_dump(mode="json")
-                for anchor in anchor_values[page]
+                for anchor in anchor_values[page_slice]
             )
             return len(anchor_values), anchor_items
 
         if section == "new_evidence":
-            new_evidence_observations = observations[page]
+            new_evidence_observations = observations[page_slice]
             new_evidence_items = await self._evidence_context(new_evidence_observations)
             return len(observations), tuple(
                 evidence_item.model_dump(mode="json") for evidence_item in new_evidence_items
             )
         if section == "evidence_index":
-            evidence_index_observations = observations[page]
+            evidence_index_observations = observations[page_slice]
             evidence_index_items = tuple(
                 self._evidence_index((observation,))[0][0]
                 for observation in evidence_index_observations
@@ -2096,7 +2111,7 @@ class ResearchContextBuilder:
                 await self._findings.list_for_investigation(investigation_id)
             )
             ordered_findings = tuple(self._order_findings(all_finding_values))
-            selected_findings = ordered_findings[page]
+            selected_findings = ordered_findings[page_slice]
             finding_rows, _ = self._finding_context(
                 selected_findings,
                 observation_ids={observation.id for observation in observations},
@@ -2116,7 +2131,7 @@ class ResearchContextBuilder:
                     latest_findings,
                     key=lambda finding: (finding.created_at, str(finding.id)),
                     reverse=True,
-                )[page]
+                )[page_slice]
             )
             finding_rows, _ = self._finding_context(
                 selected_findings,
@@ -2143,7 +2158,7 @@ class ResearchContextBuilder:
                 await self._findings.list_for_investigation(investigation_id)
             )
             opinion_notes = current_opinion.observations if current_opinion is not None else ()
-            selected_notes = opinion_notes[page]
+            selected_notes = opinion_notes[page_slice]
             note_rows, _ = self._opinion_note_index(
                 current_opinion,
                 finding_ids={finding.id for finding in all_finding_values},
@@ -2164,7 +2179,7 @@ class ResearchContextBuilder:
                     tool_invocations,
                     key=lambda invocation: (invocation.created_at, invocation.id.hex),
                     reverse=True,
-                )[page]
+                )[page_slice]
             )
             observation_by_id = {observation.id: observation for observation in observations}
             coverage_rows: list[ToolCoverageEntryV1] = []
@@ -2227,10 +2242,10 @@ class ResearchContextBuilder:
                 )
                 for item in state.hypotheses
             )
-            return len(hypothesis_rows), tuple(hypothesis_rows[page])
+            return len(hypothesis_rows), tuple(hypothesis_rows[page_slice])
         if section == "rule_deltas":
             rule_rows = await self._rule_corpus_inventory_context(investigation_id, observations)
-            return len(rule_rows), tuple(rule_rows[page])
+            return len(rule_rows), tuple(rule_rows[page_slice])
         raise ValueError("Unsupported operator context section")
 
     async def read_context_section_page(
@@ -2256,7 +2271,7 @@ class ResearchContextBuilder:
                 cursor,
                 section=section,
                 investigation_id=investigation_id,
-                descending=(section != "finding_versions"),
+                descending=context_section_descending(section),
                 context_sha256=context_sha256,
             )
         if offset:
@@ -2287,7 +2302,7 @@ class ResearchContextBuilder:
                         source_page=empty_after_last_page,
                         items=(),
                         position=lambda _item: (datetime.min, UUID(int=0)),
-                        descending=(section != "finding_versions"),
+                        descending=context_section_descending(section),
                         context_sha256=context_sha256,
                     )
             return await self.read_context_section_page(
@@ -2299,18 +2314,19 @@ class ResearchContextBuilder:
                 context_sha256=context_sha256,
             )
         if section in {"new_evidence", "evidence_index"}:
+            evidence_index_descending = section == "new_evidence"
             source_page = await self._page_source(
                 self._observations,
                 investigation_id=investigation_id,
                 cursor=cursor,
                 limit=limit,
-                descending=True,
+                descending=evidence_index_descending,
                 section=section,
                 position=lambda item: (item.observed_at, item.id),
                 context_sha256=context_sha256,
             )
             if section == "new_evidence":
-                serialized_items = []
+                serialized_items: list[dict[str, Any]] = []
                 for observation in source_page.items:
                     summaries = await self._evidence_context((observation,))
                     serialized_items.extend(item.model_dump(mode="json") for item in summaries)
@@ -2328,7 +2344,7 @@ class ResearchContextBuilder:
                 source_page=source_page,
                 items=items,
                 position=lambda item: (item.observed_at, item.id),
-                descending=True,
+                descending=evidence_index_descending,
                 context_sha256=context_sha256,
             )
         if section in {"findings", "finding_versions"}:
@@ -2366,7 +2382,7 @@ class ResearchContextBuilder:
             )
         if section == "tool_coverage":
             if self._invocations is None:
-                empty = make_keyset_page(
+                empty: KeysetPageV1[dict[str, Any]] = make_keyset_page(
                     section=section,
                     investigation_id=investigation_id,
                     items=(),
@@ -2423,22 +2439,25 @@ class ResearchContextBuilder:
         position: Any,
         descending: bool,
         context_sha256: str | None,
-    ):
-        previous_page_sha256 = (
+    ) -> KeysetPageV1[dict[str, Any]]:
+        decoded_cursor = (
             decode_keyset_cursor(
                 cursor,
                 section=section,
                 investigation_id=investigation_id,
                 descending=descending,
                 context_sha256=context_sha256,
-            )["previous_page_sha256"]
+            )
             if cursor is not None
-            else "0" * 64
+            else None
+        )
+        previous_page_sha256 = (
+            decoded_cursor["previous_page_sha256"] if decoded_cursor is not None else "0" * 64
         )
         if len(items) > len(source_page.items):
             raise ValueError("Projected context page cannot exceed its source page")
         omitted = source_page.total - len(items)
-        omission_reasons = {
+        omission_reasons: dict[ContextOmissionReason, int] = {
             ContextOmissionReason.PAGINATION: source_page.total - len(source_page.items),
             ContextOmissionReason.NOT_SELECTED: len(source_page.items) - len(items),
         }
@@ -2475,7 +2494,7 @@ class ResearchContextBuilder:
             next_cursor = encode_keyset_cursor(
                 section=section,
                 investigation_id=investigation_id,
-                sort_key=sort_key.isoformat(),
+                sort_key=sort_key.isoformat() if sort_key is not None else NULL_SORT_KEY,
                 item_id=item_id,
                 previous_page_sha256=page_sha256,
                 descending=descending,
@@ -2530,6 +2549,7 @@ class ResearchContextBuilder:
         *,
         observations: tuple[EvidenceObservation, ...],
         findings: tuple[InvestigationFinding, ...],
+        superseded_findings: int,
         opinion: AnalystOpinionV1 | None,
     ) -> InvestigationContextV1:
         if len(context.canonical_bytes()) <= INVESTIGATION_MAX_CONTEXT_BYTES:
@@ -2562,7 +2582,7 @@ class ResearchContextBuilder:
                 current,
                 observations=observations,
                 findings=latest_findings,
-                superseded_findings=len(findings) - len(latest_findings),
+                superseded_findings=superseded_findings + len(findings) - len(latest_findings),
                 opinion=opinion,
                 notes=all_notes,
                 evidence_index_limit=evidence_index_limit,
@@ -3189,7 +3209,14 @@ class ResearchContextBuilder:
         result: list[EvidenceSummaryV1] = []
         encoded_bytes = 2
         truncated = len(observations) > MAX_CONTEXT_EVIDENCE_INDEX
-        for observation in sorted(observations, key=lambda item: str(item.id)):
+        for observation in sorted(
+            observations,
+            key=lambda item: (
+                item.observed_at is None,
+                item.observed_at or datetime.min.replace(tzinfo=UTC),
+                item.id.int,
+            ),
+        ):
             summary = _safe_untrusted(
                 _truncate(
                     f"{observation.source} recorded {observation.kind.value} for "

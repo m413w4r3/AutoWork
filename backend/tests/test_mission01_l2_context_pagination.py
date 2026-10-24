@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -272,6 +273,32 @@ async def test_all_sql_keyset_adapters_call_the_shared_predicate_and_request_lim
     assert limits == [8, 8, 8]
 
 
+@pytest.mark.asyncio
+async def test_sql_evidence_index_page_declares_ascending_nulls_last_order() -> None:
+    statements = []
+
+    class SessionSpy:
+        async def scalar(self, _statement):
+            return 0
+
+        async def scalars(self, statement):
+            statements.append(str(statement.compile(dialect=postgresql.dialect())).lower())
+            return ()
+
+    repository = investigation_repositories.SqlAlchemyEvidenceObservationRepository(SessionSpy())
+    await repository.page_for_investigation(
+        uuid4(),
+        cursor=None,
+        limit=2,
+        descending=False,
+        section="evidence_index",
+    )
+
+    assert len(statements) == 1
+    assert "order by evidence_observations.observed_at asc nulls last" in statements[0]
+    assert "evidence_observations.id asc" in statements[0]
+
+
 def test_omission_manifest_rejects_silent_or_false_bounded_omissions() -> None:
     with pytest.raises(ValidationError):
         ContextOmissionManifestEntryV1(
@@ -395,6 +422,7 @@ def test_page_sha256_rejects_falsification_of_every_page_field() -> None:
         page.next_cursor, section="findings", investigation_id=investigation_id
     )
     assert output_payload is not None
+    assert page.pivot is not None
     changed_output_pivot = encode_keyset_cursor(
         section="findings",
         investigation_id=investigation_id,
@@ -426,7 +454,7 @@ def test_page_sha256_rejects_falsification_of_every_page_field() -> None:
             investigation_id=investigation_id,
         ), changes
 
-    falsifications = (
+    falsifications: tuple[dict[str, Any], ...] = (
         {"pivot": {**page.pivot, "item_id": str(UUID(int=77))}},
         {"investigation_id": uuid4()},
         {"previous_page_sha256": "f" * 64},
@@ -478,7 +506,7 @@ def test_context_page_constructors_assert_manifest_consistency(
         },
     )
 
-    def source_page():
+    def source_page() -> KeysetPageV1[dict[str, str]]:
         return make_keyset_page(
             section="findings",
             investigation_id=investigation_id,
@@ -492,7 +520,7 @@ def test_context_page_constructors_assert_manifest_consistency(
 
     page = source_page()
 
-    def construct() -> object:
+    def construct() -> object | None:
         if constructor == "make_keyset_page":
             return source_page()
         if constructor == "builder":
@@ -504,21 +532,25 @@ def test_context_page_constructors_assert_manifest_consistency(
                 investigation_id=investigation_id,
             )
         if constructor == "operator_offset":
-            return operator_tool_invocation._materialized_page_proof(
-                section="agenda",
-                investigation_id=investigation_id,
-                context_sha256="c" * 64,
-                offset=0,
-                limit=1,
-                total=2,
-                items=({"value": "one"},),
-                cursor=None,
+            return cast(
+                object,
+                operator_tool_invocation._materialized_page_proof(
+                    section="agenda",
+                    investigation_id=investigation_id,
+                    context_sha256="c" * 64,
+                    offset=0,
+                    limit=1,
+                    total=2,
+                    items=({"value": "one"},),
+                    cursor=None,
+                ),
             )
-        return operator_tool_invocation._assert_keyset_page_consistency(
+        operator_tool_invocation._assert_keyset_page_consistency(
             page,
             section="findings",
             investigation_id=investigation_id,
         )
+        return None
 
     construct()  # The same construction path accepts its coherent manifest.
 

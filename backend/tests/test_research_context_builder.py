@@ -1,8 +1,9 @@
 import hashlib
 import json
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -615,10 +616,11 @@ async def test_operator_context_summarizes_pcap_and_keeps_revised_finding() -> N
         approval_decision_id=uuid4(),
         approval_actor_id="analyst-1",
     )
+    state = _state(investigation_id)
     context = await builder.build(
         investigation_id=investigation_id,
         synthesis_artifact_id=snapshot.synthesis_artifact_id,
-        state=_state(investigation_id),
+        state=state,
         tool_context=ToolExecutionContext(
             investigation_id=investigation_id,
             envelope=envelope,
@@ -633,6 +635,26 @@ async def test_operator_context_summarizes_pcap_and_keeps_revised_finding() -> N
         "The VT sandbox PCAP contains a measured DNS request." in item.statement
         for item in context.investigation.findings
     )
+    assert tuple(item.finding_id for item in context.investigation.findings) == (revised.id,)
+    current_findings = await builder.read_context_section_page(
+        section="findings",
+        investigation_id=investigation_id,
+        state=state,
+        cursor=None,
+        limit=20,
+    )
+    historical_findings = await builder.read_context_section_page(
+        section="finding_versions",
+        investigation_id=investigation_id,
+        state=state,
+        cursor=None,
+        limit=20,
+    )
+    assert tuple(item["finding_id"] for item in current_findings.items) == (str(revised.id),)
+    assert {item["finding_id"] for item in historical_findings.items} == {
+        str(previous.id),
+        str(revised.id),
+    }
     assert capture_sha256 in rendered
     assert str(len(capture)) in rendered
     assert "network_capture" in rendered
@@ -3240,7 +3262,7 @@ async def test_large_operator_led_context_is_reduced_deterministically() -> None
     assert set(complete_note_ids) == {str(item.id) for item in notes}
     assert old_evidence_page_total == 220
     assert len(old_evidence_page) == 20
-    assert old_evidence_page[0]["evidence_id"] == str(observation_ids[19])
+    assert old_evidence_page[0]["evidence_id"] == str(observation_ids[200])
     assert latest_notes_total == 30
     assert latest_notes_page[-1]["note_id"] == str(notes[-1].id)
     assert context.current_opinion is not None
@@ -3502,9 +3524,19 @@ async def test_evidence_index_keeps_old_observation_references_compact_and_sanit
     assert len(context.investigation.new_evidence) == 16
     assert len(index) == 53
     assert {item.evidence_id for item in index} == set(observation_ids)
-    assert [item.evidence_id for item in index] == sorted(
-        (index_item.evidence_id for index_item in index), key=str
+    full_observations = await observations.list_for_investigation(investigation_id)
+    expected_observation_ids = tuple(
+        observation.id
+        for observation in sorted(
+            full_observations,
+            key=lambda observation: (
+                observation.observed_at is None,
+                observation.observed_at or datetime.min.replace(tzinfo=UTC),
+                observation.id.int,
+            ),
+        )
     )
+    assert tuple(item.evidence_id for item in index) == expected_observation_ids
     assert len(canonical_json_bytes([item.model_dump(mode="json") for item in index])) <= 24 * 1024
     serialized = context.canonical_bytes().decode("utf-8")
     assert "synthetic-placeholder" not in serialized
@@ -3985,6 +4017,7 @@ async def test_evidence_page_redacts_credentials_before_inclusion_and_hashing() 
         descending=True,
         section="evidence_observations",
     )
+    assert raw_page.pivot is not None
     manifest_page_sha256 = canonical_page_sha256(
         section=manifest.section,
         investigation_id=investigation_id,
@@ -4624,3 +4657,83 @@ async def test_article_sample_instruction_text_remains_untrusted_context() -> No
     assert injection in sample_claim
     assert sample_claim.startswith("[UNTRUSTED ARTICLE OR TOOL DATA]")
     assert sample_claim.endswith("[END UNTRUSTED DATA]")
+
+
+@pytest.mark.asyncio
+async def test_evidence_index_full_and_pages_share_ascending_nullable_timestamp_order() -> None:
+    investigation_id = uuid4()
+    first_time = datetime(2026, 1, 1, tzinfo=UTC)
+    later_time = datetime(2026, 1, 2, tzinfo=UTC)
+
+    @dataclass(frozen=True)
+    class ObservationFixture:
+        id: UUID
+        investigation_id: UUID
+        observed_at: datetime | None
+        kind: EvidenceKind
+        source: str
+        object_type: str
+        object_id: str
+
+    observations = tuple(
+        cast(
+            EvidenceObservation,
+            ObservationFixture(
+                id=UUID(int=item_id),
+                investigation_id=investigation_id,
+                observed_at=observed_at,
+                kind=EvidenceKind.OTHER,
+                source="test.source",
+                object_type="fixture",
+                object_id=str(item_id),
+            ),
+        )
+        for item_id, observed_at in (
+            (5, later_time),
+            (4, None),
+            (2, first_time),
+            (1, first_time),
+            (3, None),
+        )
+    )
+    repository = InMemoryEvidenceObservationRepository()
+    for observation in observations:
+        await repository.append_if_absent(observation)
+    builder = ResearchContextBuilder(
+        article_snapshots=cast(Any, None),
+        observations=repository,
+        findings=InMemoryFindingRepository(),
+    )
+    state = _state(investigation_id)
+
+    full_items, _ = builder._evidence_index(observations)
+    full_ids = tuple(str(item.evidence_id) for item in full_items)
+    expected_ids = tuple(
+        str(item.id)
+        for item in sorted(
+            observations,
+            key=lambda item: (
+                item.observed_at is None,
+                item.observed_at or datetime.min.replace(tzinfo=UTC),
+                item.id.int,
+            ),
+        )
+    )
+
+    assert full_ids == expected_ids
+    for limit in (1, 2, 3):
+        page_ids: list[str] = []
+        cursor = None
+        while True:
+            page = await builder.read_context_section_page(
+                section="evidence_index",
+                investigation_id=investigation_id,
+                state=state,
+                cursor=cursor,
+                limit=limit,
+            )
+            page_ids.extend(item["evidence_id"] for item in page.items)
+            if not page.has_more:
+                break
+            cursor = page.next_cursor
+        assert tuple(page_ids) == full_ids
