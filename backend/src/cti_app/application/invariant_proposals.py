@@ -66,7 +66,7 @@ from cti_app.domain.reference_corpus import ReferenceCorpusVerdict, assess_refer
 
 P10_PROMPT_TEMPLATE_ID = "invariant-proposal-conversation"
 # v5 bounds escaped-credential redaction at claim/line boundaries so adjacent CTI
-# evidence is preserved, and marks an unbounded fail-closed omission explicitly.
+# evidence is preserved, and explicitly refuses an unbounded sensitive assignment.
 # v4 turns remain auditable history; they are never replayed under v5 rules.
 P10_PROMPT_VERSION = "5"
 P10_PARSER_STAGE = "p10_strict_proposal"
