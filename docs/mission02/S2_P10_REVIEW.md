@@ -75,3 +75,16 @@ Verdict: **REVISE**; the redaction loop is **not closed**.
 
 - Required: `PYTHONPATH=$PWD/src /home/nill/perso/work/AutoWork/backend/.venv/bin/python -m pytest tests/test_invariant_proposals.py tests/test_bridge_investigator.py tests/test_research_context_builder.py -q --tb=short` — **135 passed in 2.31s**.
 - Offline synthetic renderer check confirmed the quoted-JSON residual; `git diff --check` passed.
+
+## Last check after 1246b25f
+
+Reviewed `1246b25f` merged at worktree HEAD `71753e011dd3f0676bf1d7bb0e39106bcb7182db`.
+Verdict: **REVISE** for one documented residual; close this bounded review loop: **YES**.
+
+- **VERIFIED — ordinary quoted-JSON finding closed:** double-quoted JSON, single-quoted JSON-like text, and spacing around the label/delimiter redact through `_normalize_context` → `_render_p10_prompt`; benign `token_count` remains. Existing structured-key and URL tests still pass ([test_invariant_proposals.py:1045](/home/nill/.paseo/worktrees/0y1qsxa1/mission02-s2-p10-review/backend/tests/test_invariant_proposals.py:1045), [test_invariant_proposals.py:1094](/home/nill/.paseo/worktrees/0y1qsxa1/mission02-s2-p10-review/backend/tests/test_invariant_proposals.py:1094)).
+- **VERIFIED residual — category (b), escaped serialization:** `{"auth": "FIXTURE_ESCAPED_AUTH"}` survives the actual render path; `_TEXT_ASSIGNMENT` accepts quote delimiters but not backslash-escaped quotes ([invariant_proposals.py:2301](/home/nill/.paseo/worktrees/0y1qsxa1/mission02-s2-p10-review/backend/src/cti_app/application/invariant_proposals.py:2301)). This is an escaped-serialization encoding residual, not a general sensitive-name matcher failure. Document and defer; do not add a decoder cascade. The bounded loop is closed with this limitation recorded.
+
+### Last-check results
+
+- Required: `PYTHONPATH=$PWD/src /home/nill/perso/work/AutoWork/backend/.venv/bin/python -m pytest tests/test_invariant_proposals.py tests/test_bridge_investigator.py tests/test_research_context_builder.py -q --tb=short` — **135 passed in 2.17s**.
+- Renderer spot checks: single-quoted and spaced assignments redacted; escaped-quote form survived. No provider or live runtime was called; `git diff --check` passed.
