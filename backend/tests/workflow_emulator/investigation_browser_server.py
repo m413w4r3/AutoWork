@@ -83,8 +83,6 @@ from tests.integration.test_edition_multibatch_publication_postgres import (
 )
 from tests.integration.test_investigation_vertical_postgres import (
     _IOC,
-    _S2_BYTES,
-    _S2_HASH,
     _SEED_HASH,
     _composition_factory,
     _decision,
@@ -94,6 +92,12 @@ from tests.integration.test_investigation_vertical_postgres import (
 )
 from tests.shodan_support import FakeShodanPort
 from tests.workflow_emulator.driver import build_emulator_app
+from tests.workflow_emulator.investigation_support import (
+    DEFAULT_SAMPLE_BYTES as _S2_BYTES,
+)
+from tests.workflow_emulator.investigation_support import (
+    DEFAULT_SAMPLE_HASH as _S2_HASH,
+)
 from tests.workflow_emulator.investigation_support import SyntheticSampleMaterial
 from tests.workflow_emulator.test_w11_analyst_opinion_repin import _article_v5
 
