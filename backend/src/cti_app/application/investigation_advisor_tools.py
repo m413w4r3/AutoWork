@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import base64
-import binascii
 import copy
 import hashlib
 import json
@@ -22,7 +20,6 @@ from cti_app.application.advisor_contracts import (
     parse_typed_advisor_response,
 )
 from cti_app.application.advisor_dossier import (
-    ContentExcerptLimitExceeded,
     build_advisor_dossier,
     evaluate_advisor_evidence_preflight,
     extract_content_excerpts,
@@ -85,8 +82,6 @@ _TYPED_CONSULTATION_TYPES = frozenset(
     {"draft_text", "review_text", "yara_draft", "suricata_draft", "figure_plan"}
 )
 MAX_ADVISOR_INPUT_BYTES = 4_000_000
-# Match the existing typed content-pattern measurement ceiling for binary values.
-MAX_ADVISOR_BINARY_MEASUREMENT_BYTES = 512
 MAX_ADVISOR_TOOL_SECONDS = 3_600
 # Keep and strengthen the prior admission floor by deriving it from the Bridge
 # phase envelope: maximum paced wait + connect + capabilities + the larger of
@@ -371,10 +366,7 @@ class InvestigationAdvisorTool:
                     reason="secret_field_remaining",
                     redacted_secret_count=redacted_secret_count,
                 )
-            try:
-                dossier = build_advisor_dossier(prompt_data)
-            except ContentExcerptLimitExceeded as exc:
-                raise _AdvisorInputValidationError(exc.reason_code) from None
+            dossier = build_advisor_dossier(prompt_data)
             prompt_data["dossier_manifest"] = [dict(item) for item in dossier.manifest]
             prompt_data["dossier_text"] = dossier.text
             prompt_data["dossier_sha256"] = dossier.sha256
@@ -1309,28 +1301,6 @@ class InvestigationAdvisorTool:
         measurement_errors: tuple[dict[str, int | str], ...] = (),
     ) -> ToolResult:
         """Record a safe, definitive local rejection before any Bridge transport."""
-        content_omission_codes = {
-            "content_excerpt_budget_exceeds_16384_bytes",
-            "dossier_content_excerpt_budget_exceeds_16384_bytes",
-            "base64_content_exceeds_512_byte_decoded_limit",
-            "data_url_base64_exceeds_512_byte_decoded_limit",
-            "data_url_base64_is_invalid",
-            "declared_base64_content_is_invalid",
-            "raw_hexdump_content_rejected",
-        }
-        omitted_evidence = (
-            [
-                {
-                    "kind": "observation",
-                    "id": str(reference),
-                    "status": "INTENTIONALLY_OMITTED",
-                    "reason": reason_code,
-                }
-                for reference in observation_refs
-            ]
-            if reason_code in content_omission_codes
-            else []
-        )
         message = (
             "Advisor input rejected before Bridge submission: "
             + "; ".join(
@@ -1351,7 +1321,6 @@ class InvestigationAdvisorTool:
                 "confirmed_non_execution": True,
                 "invocation_stage": "prevalidation",
                 "bridge_turns_consumed": 0,
-                **({"omitted_evidence": omitted_evidence} if omitted_evidence else {}),
                 **({"measurement_errors": list(measurement_errors)} if measurement_errors else {}),
                 "bridge_invocation_id": None,
                 "provider_usage": {"status": "not_submitted"},
@@ -2617,11 +2586,7 @@ class InvestigationAdvisorTool:
             payload = None
         if payload is None:
             return [], False
-        try:
-            excerpts = extract_content_excerpts(payload)
-        except ContentExcerptLimitExceeded as exc:
-            raise _AdvisorInputValidationError(exc.reason_code) from None
-        return excerpts, True
+        return extract_content_excerpts(payload), True
 
     async def _measurement_payload(
         self, observation: EvidenceObservation
@@ -2669,8 +2634,6 @@ class InvestigationAdvisorTool:
         evidence_sha256: str,
         extractor_version: str,
     ) -> dict[str, Any]:
-        if measurement.bridge_kind.casefold() in {"hex", "hex_bytes", "bytes_hex"}:
-            _reject_oversized_hex_measurement(measurement.bridge_value, index=-1)
         return {
             **({"blob_id": str(blob_id)} if blob_id is not None else {}),
             "kind": measurement.bridge_kind,
@@ -2723,20 +2686,6 @@ class InvestigationAdvisorTool:
                     continue
                 if target_key == "hex" and not _valid_hex_measurement(label):
                     continue
-                if target_key == "base64":
-                    max_encoded_chars = ((MAX_ADVISOR_BINARY_MEASUREMENT_BYTES + 2) // 3) * 4
-                    if len(label) > max_encoded_chars:
-                        _raise_oversized_binary_measurement(len(rows))
-                    try:
-                        decoded = base64.b64decode(label, validate=True)
-                        if not decoded:
-                            continue
-                    except (ValueError, binascii.Error):
-                        continue
-                    if len(decoded) > MAX_ADVISOR_BINARY_MEASUREMENT_BYTES:
-                        _raise_oversized_binary_measurement(len(rows))
-                if target_key == "hex":
-                    _reject_oversized_hex_measurement(label, index=len(rows))
                 rows.append(
                     {
                         "kind": target_key,
@@ -5857,21 +5806,6 @@ def _valid_hex_measurement(value: str) -> bool:
     return bool(tokens) and all(
         len(token) % 2 == 0 and re.fullmatch(r"(?i)[0-9a-f]+", token) is not None
         for token in tokens
-    )
-
-
-def _reject_oversized_hex_measurement(value: str, *, index: int) -> None:
-    compact = "".join(value.split())
-    if len(compact) // 2 > MAX_ADVISOR_BINARY_MEASUREMENT_BYTES:
-        _raise_oversized_binary_measurement(index)
-
-
-def _raise_oversized_binary_measurement(index: int) -> None:
-    raise _AdvisorInputValidationError(
-        "binary_measurement_exceeds_limit",
-        measurement_errors=(
-            {"index": index, "reason": "binary_measurement_exceeds_512_byte_limit"},
-        ),
     )
 
 

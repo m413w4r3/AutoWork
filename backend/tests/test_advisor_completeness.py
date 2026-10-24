@@ -9,7 +9,6 @@ import pytest
 
 from cti_app.application.advisor_dossier import (
     AdvisorDossier,
-    ContentExcerptLimitExceeded,
     build_advisor_dossier,
     evaluate_advisor_evidence_preflight,
     extract_content_excerpts,
@@ -408,34 +407,42 @@ def test_unrequired_canonical_proof_omission_has_count_and_reason() -> None:
     assert "semantic irrelevance" in status["reason"]
 
 
-def test_generic_content_projection_omits_full_hexdumps_and_raw_bytes() -> None:
+def test_generic_content_projection_preserves_full_hex_bytes_and_hexdumps() -> None:
     from cti_app.application.advisor_dossier import extract_content_excerpts
 
-    full_dump = "00000000: " + "41 " * 16_384 + "A" * 16_384
+    hex_value = "41" * 600
+    byte_value = "00ff" * 600
+    full_dump = "00000000: " + "41 " * 600
     projected = extract_content_excerpts(
         {
-            "hex": "41" * 16_384,
-            "hex_bytes": "41" * 16_384,
-            "bytes_hex": "41" * 16_384,
-            "hexdump": full_dump,
-            "nested": {"hexdump": {"content": full_dump}},
-            "raw_bytes": b"A" * 16_384,
+            "hex": [{"offset": 0, "value": hex_value}],
+            "bytes": [{"offset": 600, "value": byte_value}],
+            "nested": {"hexdump": {"offset": 1_200, "content": full_dump}},
         }
     )
 
-    assert projected == []
-    assert (
-        extract_content_excerpts({"hex": [{"offset": 0, "value": "41" * 16_384}]}) == []
+    assert any(row["kind"] == "hex" and row["text"] == hex_value for row in projected)
+    assert any(row["kind"] == "bytes" and row["text"] == byte_value for row in projected)
+    assert any(row["kind"] == "hex" and row["text"] == full_dump for row in projected)
+    assert any("offset 0" in row["title"] for row in projected)
+    assert any("offset 600" in row["title"] for row in projected)
+    assert any("offset 1200" in row["title"] for row in projected)
+
+    direct_hex = extract_content_excerpts({"hex": hex_value, "offset": 1_800})
+    assert any(
+        row["kind"] == "hex" and row["text"] == hex_value and "offset 1800" in row["title"]
+        for row in direct_hex
     )
 
 
-def test_generic_content_hexdump_is_rejected_with_a_reason() -> None:
+def test_generic_content_hexdump_is_preserved() -> None:
     from cti_app.application.advisor_dossier import extract_content_excerpts
 
-    dump = "00000000: " + "41 " * 16
+    dump = "00000000: " + "41 " * 600
 
-    with pytest.raises(ValueError, match="raw_hexdump_content_rejected"):
-        extract_content_excerpts({"content": dump})
+    projected = extract_content_excerpts({"content": dump})
+
+    assert any(row["kind"] == "text" and row["text"] == dump for row in projected)
 
 
 def test_short_generic_content_excerpt_is_preserved() -> None:
@@ -463,49 +470,20 @@ def test_short_base64_and_textual_data_url_content_are_preserved() -> None:
     assert any(row["text"] == short_data_url for row in nested)
 
 
-def test_oversized_base64_is_size_checked_before_decode(monkeypatch: pytest.MonkeyPatch) -> None:
-    import cti_app.application.advisor_dossier as advisor_dossier
-
+def test_oversized_and_fragmented_base64_is_preserved() -> None:
     encoded = base64.b64encode(b"A" * 600).decode("ascii")
-    percent_encoded = "".join(f"%{ord(character):02X}" for character in encoded)
-    newline_wrapped = f"{encoded[:400]}\n{encoded[400:]}"
-    space_wrapped = f"{encoded[:400]} {encoded[400:]}"
-    tab_wrapped = f"{encoded[:400]}\t{encoded[400:]}"
-    cases = (
-        (encoded, "base64_content_exceeds_512_byte_decoded_limit"),
-        (
-            f"data:application/octet-stream;base64,{encoded}",
-            "data_url_base64_exceeds_512_byte_decoded_limit",
-        ),
-        (
-            f"data:application/octet-stream;base64,{percent_encoded}",
-            "data_url_base64_exceeds_512_byte_decoded_limit",
-        ),
-        (
-            f"data:application/octet-stream;base64,{newline_wrapped}",
-            "data_url_base64_exceeds_512_byte_decoded_limit",
-        ),
-        (
-            f"data:application/octet-stream;base64,{space_wrapped}",
-            "data_url_base64_exceeds_512_byte_decoded_limit",
-        ),
-        (
-            f"data:application/octet-stream;base64,{tab_wrapped}",
-            "data_url_base64_exceeds_512_byte_decoded_limit",
-        ),
+    fragmented = f"{encoded[:200]} {encoded[200:400]} {encoded[400:]}"
+    data_url = f"data:application/octet-stream;base64,{fragmented}"
+
+    projected = extract_content_excerpts(
+        {"content": encoded, "other": {"base64": [{"value": data_url}]}}
     )
 
-    def fail_if_decoded(*_args: Any, **_kwargs: Any) -> bytes:
-        pytest.fail("oversized base64 reached the decoder before its size check")
-
-    monkeypatch.setattr(advisor_dossier.base64, "b64decode", fail_if_decoded)
-
-    for value, reason in cases:
-        with pytest.raises(ContentExcerptLimitExceeded, match=reason):
-            extract_content_excerpts({"content": value})
+    assert any(row["text"] == encoded for row in projected)
+    assert any(row["text"] == data_url for row in projected)
 
 
-def test_dossier_applies_excerpt_budget_across_observations() -> None:
+def test_dossier_preserves_all_large_observation_excerpts_with_manifest_hashes() -> None:
     evidence = [
         {
             "evidence_id": str(uuid4()),
@@ -527,10 +505,19 @@ def test_dossier_applies_excerpt_budget_across_observations() -> None:
         question="Include both synthetic markers.", evidence=evidence, findings=[]
     )
 
-    with pytest.raises(ContentExcerptLimitExceeded) as exc:
-        build_advisor_dossier(data)
+    dossier = build_advisor_dossier(data)
 
-    assert exc.value.reason_code == "dossier_content_excerpt_budget_exceeds_16384_bytes"
+    observation_manifest = [item for item in dossier.manifest if item["kind"] == "observation"]
+    assert len(observation_manifest) == 2
+    for item, marker in zip(observation_manifest, ("a", "b"), strict=True):
+        expected_body = f"Synthetic marker:\n| synthetic marker {marker * 9_000}"
+        assert item["kind"] == "observation"
+        assert item["body_bytes"] == len(expected_body.encode("utf-8"))
+        assert item["body_sha256"] == hashlib.sha256(expected_body.encode("utf-8")).hexdigest()
+        rendered_body = "\n".join(
+            f"| {line}" if line else "|" for line in expected_body.split("\n")
+        )
+        assert rendered_body in dossier.text
 
 
 def test_decoded_hex_ioc_is_not_mistaken_for_raw_bytes() -> None:

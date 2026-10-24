@@ -7,8 +7,6 @@ must never be appended to the Bridge prompt.
 
 from __future__ import annotations
 
-import base64
-import binascii
 import hashlib
 import json
 import re
@@ -26,142 +24,11 @@ _WORD = re.compile(r"[\w.+#/-]+", re.UNICODE)
 _CLAIM_ID = re.compile(r"\b(?:S\d+P\d+(?:\.\d+)?|L\d+(?:\.\d+)?|T\d+)\b", re.I)
 _UUID = re.compile(r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")
 _INTERNAL_SHA = re.compile(r"(?i)\b(?:sha(?:-?256)?\s*[:=]\s*)?[0-9a-f]{64}\b")
-_HEXDUMP_LINE = re.compile(r"(?im)^\s*(?:0x)?[0-9a-f]{4,16}:\s+(?:[0-9a-f]{2,8}\s+){4,}")
-# Aggregate rendered observation-excerpt cap; dossier size remains uncapped.
-MAX_OBSERVATION_EXCERPT_BYTES = 16_384
-MAX_GENERIC_BINARY_CONTENT_BYTES = 512
-_MAX_GENERIC_BASE64_ENCODED_CHARS = ((MAX_GENERIC_BINARY_CONTENT_BYTES + 2) // 3) * 4
-_DATA_URL_BASE64 = re.compile(r"(?i)\bdata:[^,\s]*;base64,")
 _STOP = frozenset(
     "avec dans pour sans cette celui celle sont être avoir mais comme dans sur sous une des les "
     "aux par que qui quoi dont alors leur leurs elles ils cela ceci nous vous elle lui son sa "
     "ses from that this those have with which what where when then than into over under".split()
 )
-
-
-class ContentExcerptLimitExceeded(ValueError):
-    """Reject oversized generic content before it can enter a dossier or prompt."""
-
-    def __init__(self, reason_code: str) -> None:
-        self.reason_code = reason_code
-        super().__init__(reason_code)
-
-
-def _reject_oversized_base64_content(value: str, *, encoding: object = None) -> None:
-    declared_base64 = isinstance(encoding, str) and encoding.casefold() in {
-        "base64",
-        "base64url",
-        "base64_url",
-    }
-
-    data_url_found = False
-    for match in _DATA_URL_BASE64.finditer(value):
-        data_url_found = True
-        encoded_length = 0
-        padding = 0
-        padding_started = False
-        cursor = match.end()
-        while cursor < len(value):
-            character = value[cursor]
-            if character in "\r\n":
-                if character == "\r" and cursor + 1 < len(value) and value[cursor + 1] == "\n":
-                    cursor += 2
-                else:
-                    cursor += 1
-                if padding_started:
-                    break
-                continue
-            if character.isspace():
-                cursor += 1
-                if padding_started:
-                    break
-                continue
-            if character in "\"'<>":
-                break
-            if character == "%":
-                if cursor + 2 >= len(value):
-                    raise ContentExcerptLimitExceeded("data_url_base64_is_invalid")
-                try:
-                    character = chr(int(value[cursor + 1 : cursor + 3], 16))
-                except ValueError:
-                    raise ContentExcerptLimitExceeded("data_url_base64_is_invalid") from None
-                cursor += 3
-                if character.isspace():
-                    if padding_started:
-                        break
-                    continue
-            else:
-                cursor += 1
-            if character == "=":
-                padding_started = True
-                padding += 1
-                encoded_length += 1
-            elif character in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/_-":
-                if padding_started:
-                    raise ContentExcerptLimitExceeded("data_url_base64_is_invalid")
-                encoded_length += 1
-            else:
-                break
-        if (
-            padding > 2
-            or (padding and encoded_length % 4 != 0)
-            or (not padding and encoded_length % 4 == 1)
-        ):
-            raise ContentExcerptLimitExceeded("data_url_base64_is_invalid")
-        decoded_length = (encoded_length * 3) // 4 - min(padding, 2)
-        if (
-            encoded_length > _MAX_GENERIC_BASE64_ENCODED_CHARS
-            or decoded_length > MAX_GENERIC_BINARY_CONTENT_BYTES
-        ):
-            raise ContentExcerptLimitExceeded("data_url_base64_exceeds_512_byte_decoded_limit")
-    if data_url_found:
-        return
-
-    encoded_length = 0
-    padding = 0
-    padding_started = False
-    invalid = False
-    for character in value:
-        if character.isspace():
-            continue
-        if character == "=":
-            padding_started = True
-            padding += 1
-            encoded_length += 1
-        elif character in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/_-":
-            if padding_started:
-                invalid = True
-                break
-            encoded_length += 1
-        else:
-            invalid = True
-            break
-
-    structurally_valid = (
-        not invalid
-        and encoded_length > 0
-        and padding <= 2
-        and (encoded_length % 4 == 0 if padding else encoded_length % 4 != 1)
-    )
-    if not structurally_valid:
-        if declared_base64:
-            raise ContentExcerptLimitExceeded("declared_base64_content_is_invalid")
-        return
-
-    decoded_length = (encoded_length * 3) // 4 - padding
-    if decoded_length > MAX_GENERIC_BINARY_CONTENT_BYTES:
-        raise ContentExcerptLimitExceeded("base64_content_exceeds_512_byte_decoded_limit")
-
-    # Construct the normalized value only after its decoded size is known to fit.
-    candidate = "".join(character for character in value if not character.isspace())
-    padded = candidate + ("=" * (-len(candidate) % 4))
-    try:
-        decoded = base64.b64decode(padded, altchars=b"-_", validate=True)
-    except (ValueError, binascii.Error):
-        if declared_base64:
-            raise ContentExcerptLimitExceeded("declared_base64_content_is_invalid") from None
-        return
-    assert len(decoded) <= MAX_GENERIC_BINARY_CONTENT_BYTES
 
 
 _DEFAULT_TASKS = {
@@ -192,6 +59,12 @@ _CONTENT_KEYS = frozenset(
         "content",
         "excerpt",
         "description",
+        "raw",
+        "raw_bytes",
+        "bytes",
+        "byte",
+        "base64",
+        "base64_bytes",
     }
 )
 _OMIT_KEYS = frozenset(
@@ -238,14 +111,11 @@ class AdvisorDossier:
 
 
 def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]:
-    """Extract complete methods, decoded values, and sentence-bounded text."""
+    """Extract complete observed methods, text, decoded values, and byte values."""
     excerpts: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
-    total_excerpt_bytes = 0
-    short_hex_rows: list[tuple[str, str]] = []
-    short_hex_identities: set[tuple[int | None, str]] = set()
-    short_hex_payload_bytes = 0
-    short_hex_payload_exceeds_limit = False
+    offset_rows: list[tuple[str, str, str]] = []
+    offset_row_identities: set[tuple[str, int | None, str]] = set()
     assembly_name = next(
         (
             value.strip()
@@ -257,45 +127,26 @@ def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]
         "",
     )
 
-    def add(kind: str, title: str, value: object, *, encoding: object = None) -> None:
-        nonlocal total_excerpt_bytes
+    def add(kind: str, title: str, value: object) -> None:
         if not isinstance(value, str) or not value.strip():
             return
-        if kind != "hex":
-            _reject_oversized_base64_content(value, encoding=encoding)
-        # Hex excerpts are already token-validated and byte-capped by add_short_hex_rows.
-        text = value.replace("\r\n", "\n").replace("\r", "\n").strip()
-        if _HEXDUMP_LINE.search(text):
-            raise ContentExcerptLimitExceeded("raw_hexdump_content_rejected")
+        text = value
         prefix = (
             f"{assembly_name} — "
             if assembly_name and assembly_name.casefold() not in title.casefold()
             else ""
         )
-        chunks = [text]
-        if kind == "text":
-            chunks = [line.strip() for line in text.splitlines() if line.strip()] or [text]
-            sentence_chunks: list[str] = []
-            for chunk in chunks:
-                sentence_chunks.extend(
-                    part.strip()
-                    for part in re.split(r"(?<=[.!?])\s+(?=[A-ZÀ-Þ0-9])", chunk)
-                    if part.strip()
-                )
-            chunks = sentence_chunks or chunks
-        for index, chunk in enumerate(chunks, start=1):
-            identity = (kind, f"{title.strip()}\n{chunk}" if kind == "hex" else chunk)
-            if identity in seen:
-                continue
-            suffix = f" {index}" if len(chunks) > 1 else ""
-            rendered_title = f"{prefix}{title.strip()}{suffix}"
-            excerpt_piece = f"{rendered_title}:\n{_quote(chunk)}"
-            chunk_bytes = len(excerpt_piece.encode("utf-8"))
-            if total_excerpt_bytes + chunk_bytes > MAX_OBSERVATION_EXCERPT_BYTES:
-                raise ContentExcerptLimitExceeded("content_excerpt_budget_exceeds_16384_bytes")
-            total_excerpt_bytes += chunk_bytes
-            seen.add(identity)
-            excerpts.append({"kind": kind, "title": rendered_title, "text": chunk})
+        identity = (
+            kind,
+            f"{title.strip()}\n{text}"
+            if kind in {"hex", "bytes"} or " — offset " in title
+            else text,
+        )
+        if identity in seen:
+            return
+        rendered_title = f"{prefix}{title.strip()}"
+        seen.add(identity)
+        excerpts.append({"kind": kind, "title": rendered_title, "text": text})
 
     def display_name(row: Mapping[str, Any], fallback: str) -> str:
         for key in ("name", "method", "function", "symbol", "member", "key"):
@@ -304,60 +155,52 @@ def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]
                 return value.strip()
         return fallback
 
-    def add_short_hex_rows(value: object) -> None:
-        nonlocal short_hex_payload_bytes, short_hex_payload_exceeds_limit
-        if short_hex_payload_exceeds_limit:
-            return
+    def add_short_hex_rows(
+        value: object, *, kind: str = "hex", inherited_offset: object = None
+    ) -> None:
         rows = value if isinstance(value, (list, tuple)) else (value,)
         for row in rows:
-            if short_hex_payload_exceeds_limit:
-                return
-            if not isinstance(row, Mapping):
-                continue
-            raw = row.get("value", row.get("bytes", row.get("hex")))
+            raw = (
+                row.get("value", row.get("bytes", row.get("hex", row.get("content"))))
+                if isinstance(row, Mapping)
+                else row
+            )
             if not isinstance(raw, str):
                 continue
-            if re.fullmatch(
-                r"(?i)(?:0x)?[0-9a-f]{2}(?:(?:[\s,:-]+)(?:0x)?[0-9a-f]{2}|[0-9a-f]{2})*",
-                raw.strip(),
-            ) is None:
-                continue
-            compact = re.sub(r"[^0-9a-fA-F]", "", raw)
-            if (
-                re.fullmatch(r"[0-9a-fA-F]+", compact) is None
-                or len(compact) % 2
-                or len(compact) > MAX_GENERIC_BINARY_CONTENT_BYTES * 2
-            ):
-                # Full or malformed dumps are not evidence excerpts.
-                continue
-            offset = row.get("offset")
+            offset = (
+                row.get("offset", inherited_offset)
+                if isinstance(row, Mapping)
+                else inherited_offset
+            )
             normalized_offset = offset if type(offset) is int and offset >= 0 else None
-            identity = (normalized_offset, compact.casefold())
-            if identity in short_hex_identities:
+            normalized_value = re.sub(r"\s+", "", raw).casefold() if kind == "hex" else raw.strip()
+            identity = (kind, normalized_offset, normalized_value)
+            if identity in offset_row_identities:
                 continue
-            short_hex_identities.add(identity)
-            short_hex_payload_bytes += len(compact) // 2
-            if short_hex_payload_bytes > MAX_GENERIC_BINARY_CONTENT_BYTES:
-                # A dump split across offset rows is still too large to include.
-                short_hex_payload_exceeds_limit = True
-                short_hex_rows.clear()
-                continue
-            if short_hex_payload_exceeds_limit:
-                continue
+            offset_row_identities.add(identity)
             title = (
                 f"Octets observés — offset {normalized_offset}"
                 if normalized_offset is not None
                 else "Octets observés"
             )
-            short_hex_rows.append((title, raw))
+            offset_rows.append((kind, title, raw))
+
+    def content_kind(path: tuple[str, ...], key: str, encoding: object = None) -> str:
+        names = (*path, key)
+        folded = tuple(name.casefold().replace("_", " ") for name in names)
+        if (isinstance(encoding, str) and "base64" in encoding.casefold()) or any(
+            "base64" in name for name in folded
+        ):
+            return "base64"
+        if any("hex" in name or "hexdump" in name for name in folded):
+            return "hex"
+        if any("byte" in name for name in folded):
+            return "bytes"
+        if any(token in name for name in folded for token in ("string", "decoded", "config")):
+            return "decoded"
+        return "text"
 
     def walk(value: Any, path: tuple[str, ...] = ()) -> None:
-        if any(
-            token in part.casefold().replace("_", " ")
-            for part in path
-            for token in ("hex", "byte", "hexdump", "base64")
-        ):
-            return
         if isinstance(value, Mapping):
             name = display_name(value, path[-1] if path else "contenu observé")
             for raw_key, child in value.items():
@@ -387,9 +230,21 @@ def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]
                     )
                     add("method", f"{method_kind} — {name}", child)
                     continue
-                if key in {"hex", "hex_bytes", "bytes_hex", "hexdump"}:
-                    # Preserve bounded offset measurements; reject complete dumps.
-                    add_short_hex_rows(child)
+                if key in {
+                    "hex",
+                    "hex_bytes",
+                    "bytes_hex",
+                    "hexdump",
+                    "bytes",
+                    "byte",
+                    "raw_bytes",
+                }:
+                    kind = "hex" if "hex" in key or key == "hexdump" else "bytes"
+                    add_short_hex_rows(
+                        child,
+                        kind=kind,
+                        inherited_offset=value.get("offset"),
+                    )
                     continue
                 if key in _METHOD_CONTAINER_KEYS:
                     walk(child, (*path, key))
@@ -398,24 +253,18 @@ def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]
                     walk(child, (*path, key))
                     continue
                 if key in _CONTENT_KEYS and isinstance(child, str):
-                    content_path = " ".join(path).casefold()
-                    if any(token in content_path for token in ("hex", "byte", "hexdump")):
-                        # A nested textual rendering of bytes is raw material too.
-                        continue
-                    elif any(token in content_path for token in ("string", "decoded", "config")):
-                        add(
-                            "decoded",
-                            f"Valeur décodée — {name}",
-                            child,
-                            encoding=value.get("encoding"),
-                        )
-                    else:
-                        add(
-                            "text",
-                            f"Texte observé — {name}",
-                            child,
-                            encoding=value.get("encoding"),
-                        )
+                    kind = content_kind(path, key, value.get("encoding"))
+                    title_prefix = {
+                        "decoded": "Valeur décodée",
+                        "base64": "Valeur Base64",
+                        "hex": "Octets observés",
+                        "bytes": "Octets observés",
+                    }.get(kind, "Texte observé")
+                    offset = value.get("offset")
+                    offset_suffix = (
+                        f" — offset {offset}" if type(offset) is int and offset >= 0 else ""
+                    )
+                    add(kind, f"{title_prefix} — {name}{offset_suffix}", child)
                     continue
                 if isinstance(child, (Mapping, list, tuple)):
                     walk(child, (*path, key))
@@ -423,16 +272,16 @@ def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]
         if isinstance(value, (list, tuple)):
             for index, child in enumerate(value, start=1):
                 if isinstance(child, str):
-                    kind = (
-                        "decoded"
-                        if path and any("string" in item or "decoded" in item for item in path)
-                        else "text"
-                    )
+                    kind = content_kind(path, "")
+                    title_prefix = {
+                        "decoded": "Valeur décodée",
+                        "base64": "Valeur Base64",
+                        "hex": "Octets observés",
+                        "bytes": "Octets observés",
+                    }.get(kind, "Texte observé")
                     add(
                         kind,
-                        f"Valeur décodée {index}"
-                        if kind == "decoded"
-                        else f"Texte observé {index}",
+                        f"{title_prefix} {index}",
                         child,
                     )
                 else:
@@ -444,9 +293,8 @@ def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]
                 add("method", f"Méthode {path[-2] if len(path) > 1 else 'observée'}", value)
 
     walk(payload)
-    if not short_hex_payload_exceeds_limit:
-        for title, raw in short_hex_rows:
-            add("hex", title, raw)
+    for kind, title, raw in offset_rows:
+        add(kind, title, raw)
     return excerpts
 
 
@@ -1038,14 +886,6 @@ def build_advisor_dossier(prompt_data: Mapping[str, Any]) -> AdvisorDossier:
                 selected.append(dict(best))
         elif kind == "observation":
             unavailable_observations.add(identifier)
-
-    retained_excerpt_bytes = sum(
-        len(f"[E] {item['label']}\n{_quote(item['body'])}".encode())
-        for item in selected
-        if item["kind"] == "observation"
-    )
-    if retained_excerpt_bytes > MAX_OBSERVATION_EXCERPT_BYTES:
-        raise ContentExcerptLimitExceeded("dossier_content_excerpt_budget_exceeds_16384_bytes")
 
     # Keep a stable alias for each displayed fact. The mapping stays local and
     # carries only the data needed by output validation and provenance.

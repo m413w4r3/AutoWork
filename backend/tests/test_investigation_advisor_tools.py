@@ -56,6 +56,7 @@ class Transport:
     def __init__(self, submission):
         self.submission = submission
         self.calls = []
+        self.real_network_calls = 0
 
     async def submit(self, **kwargs):
         self.calls.append(kwargs)
@@ -1806,24 +1807,119 @@ async def test_short_verified_xxd_signature_remains_a_selectable_measurement() -
     assert excerpts == []
 
 
+async def _submit_preservation_observation(payload, *, question: str, key: str):
+    investigation_id = uuid4()
+    observation, raw = make_observation(investigation_id, payload)
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=advisor_response(
+                "The submitted evidence supports this review.", [str(observation.id)]
+            ),
+        )
+    )
+    tool, _sample_blob = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": question,
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, key=key),
+    )
+
+    # Transport is the in-process fake above; no real network transport is configured.
+    assert transport.real_network_calls == 0
+    assert len(transport.calls) == 1
+    assert result.status in {ToolInvocationStatus.SUCCEEDED, ToolInvocationStatus.PARTIAL}
+    provenance = result.output["bridge_provenance"]
+    assert provenance["preflight_status"] == "READY"
+    manifest = next(
+        item
+        for item in provenance["dossier_manifest"]
+        if item["kind"] == "observation" and item["id"] == str(observation.id)
+    )
+    return transport.calls[0]["prompt"], manifest
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("consultation_type", ["plan_investigation", "draft_text", "yara_draft"])
-@pytest.mark.parametrize("measurement_key", ["hex", "hex_bytes", "base64"])
-async def test_oversized_legacy_hex_measurement_is_rejected_before_prompt(
-    consultation_type: str, measurement_key: str
-) -> None:
+async def test_600_byte_dns_raw_base64_reaches_fake_transport() -> None:
+    encoded = base64.b64encode(b"A" * 600).decode("ascii")
+
+    prompt, manifest = await _submit_preservation_observation(
+        {
+            "schema": "generic-observation.v1",
+            "dns": [{"name": "DNS raw evidence", "raw": encoded, "offset": 256}],
+        },
+        question="Review DNS raw evidence.",
+        key="operator:advisor:dns-raw-base64",
+    )
+
+    assert encoded in prompt
+    assert "Texte observé — DNS raw evidence — offset 256" in prompt
+    expected_body = f"Texte observé — DNS raw evidence — offset 256:\n| {encoded}"
+    assert manifest["body_bytes"] == len(expected_body.encode("utf-8"))
+    assert manifest["body_sha256"] == hashlib.sha256(expected_body.encode("utf-8")).hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_spaced_fragmented_600_byte_base64_reaches_fake_transport() -> None:
+    encoded = base64.b64encode(b"A" * 600).decode("ascii")
+    fragmented = " ".join(encoded[index : index + 60] for index in range(0, len(encoded), 60))
+
+    prompt, _manifest = await _submit_preservation_observation(
+        {
+            "schema": "generic-observation.v1",
+            "base64": [
+                {"name": "Fragmented Base64 evidence", "value": fragmented, "encoding": "base64"}
+            ],
+        },
+        question="Review fragmented Base64 evidence.",
+        key="operator:advisor:fragmented-base64",
+    )
+
+    assert fragmented in prompt
+
+
+@pytest.mark.asyncio
+async def test_two_independent_300_byte_base64_values_reach_fake_transport() -> None:
+    first = base64.b64encode(b"A" * 300).decode("ascii")
+    second = base64.b64encode(b"B" * 300).decode("ascii")
+
+    prompt, _manifest = await _submit_preservation_observation(
+        {
+            "schema": "generic-observation.v1",
+            "dns": [
+                {"name": "DNS evidence first", "raw": first},
+                {"name": "DNS evidence second", "raw": second},
+            ],
+        },
+        question="Review both DNS evidence values.",
+        key="operator:advisor:two-base64-values",
+    )
+
+    assert first in prompt
+    assert second in prompt
+
+
+@pytest.mark.asyncio
+async def test_large_legacy_hex_and_base64_measurements_reach_fake_transport() -> None:
     investigation_id = uuid4()
     sample_sha256 = "a" * 64
-    oversized_hex = "41" * 262_144
-    measurement_value = (
-        base64.b64encode(b"A" * 513).decode() if measurement_key == "base64" else oversized_hex
-    )
+    hex_value = "41" * 600
+    base64_value = base64.b64encode(b"B" * 600).decode("ascii")
     observation, raw = make_observation(
         investigation_id,
         {
             "schema": "sample-obfuscated-strings.v1",
             "sample_sha256": sample_sha256,
-            measurement_key: [{"value": measurement_value, "offset": 128}],
+            "hex": [{"value": hex_value, "offset": 128}],
+            "base64": [{"value": base64_value, "offset": 256}],
         },
     )
     transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
@@ -1833,7 +1929,6 @@ async def test_oversized_legacy_hex_measurement_is_rejected_before_prompt(
         observation=observation,
         raw=raw,
     )
-
     tool._sample_associations.list_for_investigation = async_get(
         (SimpleNamespace(sample_sha256=sample_sha256),)
     )
@@ -1843,361 +1938,84 @@ async def test_oversized_legacy_hex_measurement_is_rejected_before_prompt(
                 expected_hash=sample_sha256,
                 source_object_id=None,
                 state="quarantined",
-                do_not_submit=True,
-                external_llm_allowed=False,
+                do_not_submit=False,
+                external_llm_allowed=True,
                 blob_id=sample_blob,
             ),
         )
     )
     tool._blobs.add(sample_blob, sha256=sample_sha256, size=4096)
 
-    arguments: dict[str, Any] = {
-        "consultation_type": consultation_type,
-        "question": "Use the oversized raw hex marker from this observation.",
-        "evidence_refs": [str(observation.id)],
-    }
-    if consultation_type == "draft_text":
-        arguments["units"] = [
-            {
-                "id": "U1",
-                "block_type": "key_findings",
-                "form": "body",
-                "anchor": None,
-                "assertions": [
-                    {
-                        "id": "a1",
-                        "text": "The oversized marker is relevant.",
-                        "nature": "analyse",
-                        "refs": [{"kind": "observation", "id": str(observation.id)}],
-                        "block_type": "key_findings",
-                        "form": "body",
-                        "anchor": None,
-                    }
-                ],
-            }
-        ]
-    result = await tool.execute(
-        arguments,
-        make_context(
-            investigation_id,
-            key=f"operator:advisor:oversized-legacy-hex:{consultation_type}",
-        ),
-    )
-
-    assert result.status is ToolInvocationStatus.FAILED
-    assert result.error_code == "advisor_input_invalid"
-    assert result.output["input_error_code"] == "binary_measurement_exceeds_limit", repr(
-        result.output
-    )
-    assert [dict(item) for item in result.output["measurement_errors"]] == [
-        {"index": 0, "reason": "binary_measurement_exceeds_512_byte_limit"}
-    ]
-    assert measurement_value not in repr(result.output)
-    assert "dossier_text" not in result.output
-    assert transport.calls == []
-
-
-@pytest.mark.asyncio
-async def test_oversized_generic_content_is_rejected_before_prompt() -> None:
-    investigation_id = uuid4()
-    oversized_content = "41!" * 6_000
-    observation, raw = make_observation(
-        investigation_id,
-        {"schema": "generic-observation.v1", "content": oversized_content},
-    )
-    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
-    tool, _sample_blob = make_tool(
-        investigation_id=investigation_id,
-        transport=transport,
-        observation=observation,
-        raw=raw,
-    )
-
     result = await tool.execute(
         {
-            "consultation_type": "plan_investigation",
-            "question": "Review the content in this observation.",
+            "consultation_type": "yara_draft",
+            "question": "Use these long hex and Base64 measurements to draft a YARA rule.",
             "evidence_refs": [str(observation.id)],
         },
-        make_context(investigation_id, key="operator:advisor:oversized-generic-content"),
+        make_context(investigation_id, key="operator:advisor:large-legacy-measurements"),
     )
 
-    assert result.status is ToolInvocationStatus.FAILED
-    assert result.error_code == "advisor_input_invalid"
-    assert result.output["input_error_code"] == "content_excerpt_budget_exceeds_16384_bytes"
-    assert oversized_content not in repr(result.output)
-    assert "dossier_text" not in result.output
-    assert transport.calls == []
+    assert len(transport.calls) == 1
+    assert transport.real_network_calls == 0
+    assert result.status in {ToolInvocationStatus.SUCCEEDED, ToolInvocationStatus.PARTIAL}
+    measurements = typed_prompt_payload(transport.calls[0]["prompt"])["measurements"]
+    by_kind = {item["kind"]: item for item in measurements}
+    assert by_kind["hex"]["value"] == hex_value
+    assert by_kind["hex"]["offset"] == 128
+    assert by_kind["base64"]["value"] == base64_value
+    assert by_kind["base64"]["offset"] == 256
 
 
 @pytest.mark.asyncio
-async def test_aggregate_generic_content_list_is_rejected_before_prompt() -> None:
-    investigation_id = uuid4()
-    first_content = "A!" * 7_953 + "A"
-    second_content = "B!" * 7_953 + "B"
-    observation, raw = make_observation(
-        investigation_id,
+async def test_large_text_and_hex_reach_fake_transport_with_matching_manifest() -> None:
+    text_value = "DEADBEEF text marker " + "t" * 18_000
+    hex_value = " ".join("DEADBEEF" for _ in range(3_000))
+
+    prompt, manifest = await _submit_preservation_observation(
         {
             "schema": "generic-observation.v1",
-            "content": [first_content, second_content],
+            "text": [{"name": "Long text evidence", "value": text_value}],
+            "hex": [{"offset": 128, "value": hex_value}],
         },
-    )
-    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
-    tool, _sample_blob = make_tool(
-        investigation_id=investigation_id,
-        transport=transport,
-        observation=observation,
-        raw=raw,
+        question="Review DEADBEEF text and hex evidence.",
+        key="operator:advisor:large-text-and-hex",
     )
 
-    result = await tool.execute(
-        {
-            "consultation_type": "plan_investigation",
-            "question": "Review the listed content in this observation.",
-            "evidence_refs": [str(observation.id)],
-        },
-        make_context(investigation_id, key="operator:advisor:oversized-content-list"),
+    expected_body = (
+        f"Texte observé — Long text evidence:\n| {text_value}\n\n"
+        f"Octets observés — offset 128:\n| {hex_value}"
     )
-
-    assert result.status is ToolInvocationStatus.FAILED
-    assert result.error_code == "advisor_input_invalid"
-    assert result.output["input_error_code"] == "content_excerpt_budget_exceeds_16384_bytes"
-    assert [dict(item) for item in result.output["omitted_evidence"]] == [
-        {
-            "kind": "observation",
-            "id": str(observation.id),
-            "status": "INTENTIONALLY_OMITTED",
-            "reason": "content_excerpt_budget_exceeds_16384_bytes",
-        }
-    ]
-    assert first_content not in repr(result.output)
-    assert second_content not in repr(result.output)
-    assert "dossier_text" not in result.output
-    assert transport.calls == []
+    assert text_value in prompt
+    assert hex_value in prompt
+    assert manifest["body_bytes"] == len(expected_body.encode("utf-8"))
+    assert manifest["body_sha256"] == hashlib.sha256(expected_body.encode("utf-8")).hexdigest()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("nested", [False, True], ids=["neutral-list", "nested-neutral-list"])
-async def test_aggregate_neutral_content_list_is_rejected_before_prompt(nested: bool) -> None:
-    investigation_id = uuid4()
-    first_content = "A!" * 7_953 + "A"
-    second_content = "B!" * 7_953 + "B"
-    content = (
-        {"outer": {"items": [[first_content], {"leaf": [second_content]}]}}
-        if nested
-        else {"neutral": [first_content, second_content]}
-    )
-    observation, raw = make_observation(
-        investigation_id,
-        {"schema": "generic-observation.v1", **content},
-    )
-    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
-    tool, _sample_blob = make_tool(
-        investigation_id=investigation_id,
-        transport=transport,
-        observation=observation,
-        raw=raw,
-    )
+async def test_contradictory_permitted_dns_evidence_pieces_are_both_transmitted() -> None:
+    first = "DNS answer for example.invalid is 192.0.2.10."
+    second = "DNS answer for example.invalid is 198.51.100.20."
 
-    result = await tool.execute(
-        {
-            "consultation_type": "plan_investigation",
-            "question": "Review both synthetic markers from this observation.",
-            "evidence_refs": [str(observation.id)],
-        },
-        make_context(investigation_id, key=f"operator:advisor:aggregate-neutral-list:{nested}"),
-    )
-
-    assert result.status is ToolInvocationStatus.FAILED
-    assert result.error_code == "advisor_input_invalid"
-    assert result.output["input_error_code"] == "content_excerpt_budget_exceeds_16384_bytes"
-    assert [dict(item) for item in result.output["omitted_evidence"]] == [
-        {
-            "kind": "observation",
-            "id": str(observation.id),
-            "status": "INTENTIONALLY_OMITTED",
-            "reason": "content_excerpt_budget_exceeds_16384_bytes",
-        }
-    ]
-    assert first_content not in repr(result.output)
-    assert second_content not in repr(result.output)
-    assert "dossier_text" not in result.output
-    assert transport.calls == []
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("field", "raw_size", "strip_padding"),
-    [
-        ("content", 600, False),
-        ("content", 514, True),
-        ("strings", 600, False),
-        ("strings", 514, True),
-    ],
-    ids=["content-padded", "content-unpadded", "strings-padded", "strings-unpadded"],
-)
-async def test_oversized_generic_base64_is_rejected_before_prompt(
-    field: str, raw_size: int, strip_padding: bool
-) -> None:
-    investigation_id = uuid4()
-    encoded_content = base64.b64encode(b"A" * raw_size).decode("ascii")
-    if strip_padding:
-        encoded_content = encoded_content.rstrip("=")
-    field_value: Any = (
-        encoded_content
-        if field == "content"
-        else [{"value": encoded_content, "encoding": "base64"}]
-    )
-    observation, raw = make_observation(
-        investigation_id,
-        {"schema": "generic-observation.v1", field: field_value},
-    )
-    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
-    tool, _sample_blob = make_tool(
-        investigation_id=investigation_id,
-        transport=transport,
-        observation=observation,
-        raw=raw,
-    )
-
-    result = await tool.execute(
-        {
-            "consultation_type": "plan_investigation",
-            "question": "Review this encoded synthetic content.",
-            "evidence_refs": [str(observation.id)],
-        },
-        make_context(investigation_id, key=f"operator:advisor:generic-base64:{field}"),
-    )
-
-    assert result.status is ToolInvocationStatus.FAILED
-    assert result.error_code == "advisor_input_invalid"
-    assert result.output["input_error_code"] == "base64_content_exceeds_512_byte_decoded_limit"
-    assert [dict(item) for item in result.output["omitted_evidence"]] == [
-        {
-            "kind": "observation",
-            "id": str(observation.id),
-            "status": "INTENTIONALLY_OMITTED",
-            "reason": "base64_content_exceeds_512_byte_decoded_limit",
-        }
-    ]
-    assert encoded_content not in repr(result.output)
-    assert "dossier_text" not in result.output
-    assert transport.calls == []
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("field", "representation"),
-    [
-        ("content", "plain"),
-        ("content", "percent_encoded"),
-        ("content", "newline_wrapped"),
-        ("content", "space_wrapped"),
-        ("content", "tab_wrapped"),
-        ("strings", "plain"),
-        ("strings", "percent_encoded"),
-        ("strings", "newline_wrapped"),
-        ("strings", "space_wrapped"),
-        ("strings", "tab_wrapped"),
-    ],
-)
-async def test_oversized_data_url_base64_is_rejected_before_prompt(
-    field: str, representation: str
-) -> None:
-    investigation_id = uuid4()
-    encoded_content = base64.b64encode(b"A" * 600).decode("ascii")
-    if representation == "percent_encoded":
-        encoded_content = "".join(f"%{ord(character):02X}" for character in encoded_content)
-    elif representation == "newline_wrapped":
-        encoded_content = f"{encoded_content[:400]}\n{encoded_content[400:]}"
-    elif representation == "space_wrapped":
-        encoded_content = f"{encoded_content[:400]} {encoded_content[400:]}"
-    elif representation == "tab_wrapped":
-        encoded_content = f"{encoded_content[:400]}\t{encoded_content[400:]}"
-    data_url = f"data:application/octet-stream;base64,{encoded_content}"
-    if field == "content":
-        generic_content: dict[str, Any] = {"outer": {"content": data_url}}
-    else:
-        generic_content = {"outer": {"strings": [{"metadata": {"value": data_url}}]}}
-    observation, raw = make_observation(
-        investigation_id,
-        {"schema": "generic-observation.v1", **generic_content},
-    )
-    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
-    tool, _sample_blob = make_tool(
-        investigation_id=investigation_id,
-        transport=transport,
-        observation=observation,
-        raw=raw,
-    )
-
-    result = await tool.execute(
-        {
-            "consultation_type": "plan_investigation",
-            "question": "Review this nested synthetic data URL.",
-            "evidence_refs": [str(observation.id)],
-        },
-        make_context(investigation_id, key=f"operator:advisor:generic-data-url:{field}"),
-    )
-
-    assert result.status is ToolInvocationStatus.FAILED
-    assert result.error_code == "advisor_input_invalid"
-    assert result.output["input_error_code"] == "data_url_base64_exceeds_512_byte_decoded_limit"
-    assert [dict(item) for item in result.output["omitted_evidence"]] == [
-        {
-            "kind": "observation",
-            "id": str(observation.id),
-            "status": "INTENTIONALLY_OMITTED",
-            "reason": "data_url_base64_exceeds_512_byte_decoded_limit",
-        }
-    ]
-    assert data_url not in repr(result.output)
-    assert "dossier_text" not in result.output
-    assert transport.calls == []
-
-
-@pytest.mark.asyncio
-async def test_oversized_method_title_is_rejected_before_prompt() -> None:
-    investigation_id = uuid4()
-    oversized_name = "X" * 20_000
-    observation, raw = make_observation(
-        investigation_id,
+    prompt, manifest = await _submit_preservation_observation(
         {
             "schema": "generic-observation.v1",
-            "methods": [{"name": oversized_name, "body": "short synthetic method body"}],
+            "dns": [
+                {"name": "DNS answer observation", "raw": first},
+                {"name": "DNS answer observation", "raw": second},
+            ],
         },
-    )
-    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
-    tool, _sample_blob = make_tool(
-        investigation_id=investigation_id,
-        transport=transport,
-        observation=observation,
-        raw=raw,
+        question="Compare DNS answer observations for example.invalid.",
+        key="operator:advisor:contradictory-dns-evidence",
     )
 
-    result = await tool.execute(
-        {
-            "consultation_type": "plan_investigation",
-            "question": "Review this synthetic method.",
-            "evidence_refs": [str(observation.id)],
-        },
-        make_context(investigation_id, key="operator:advisor:oversized-method-title"),
+    assert first in prompt
+    assert second in prompt
+    expected_body = (
+        f"Texte observé — DNS answer observation:\n| {first}\n\n"
+        f"Texte observé — DNS answer observation:\n| {second}"
     )
-
-    assert result.status is ToolInvocationStatus.FAILED
-    assert result.error_code == "advisor_input_invalid"
-    assert result.output["input_error_code"] == "content_excerpt_budget_exceeds_16384_bytes"
-    assert [dict(item) for item in result.output["omitted_evidence"]] == [
-        {
-            "kind": "observation",
-            "id": str(observation.id),
-            "status": "INTENTIONALLY_OMITTED",
-            "reason": "content_excerpt_budget_exceeds_16384_bytes",
-        }
-    ]
-    assert oversized_name not in repr(result.output)
-    assert "dossier_text" not in result.output
-    assert transport.calls == []
+    assert manifest["body_bytes"] == len(expected_body.encode("utf-8"))
+    assert manifest["body_sha256"] == hashlib.sha256(expected_body.encode("utf-8")).hexdigest()
 
 
 @pytest.mark.asyncio
@@ -3343,21 +3161,33 @@ def test_context_truncation_stops_at_sentence_or_word_and_marks_ellipsis() -> No
 @pytest.mark.asyncio
 async def test_external_disclosure_denial_never_calls_bridge() -> None:
     investigation_id = uuid4()
+    observation, raw = make_observation(
+        investigation_id,
+        {"schema": "generic-observation.v1", "content": "Permitted but non-disclosable evidence."},
+    )
     transport = Transport(
         TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="should not run")
     )
     tool, _subject = make_tool(
         investigation_id=investigation_id,
         transport=transport,
+        observation=observation,
+        raw=raw,
         allowed=False,
     )
     result = await tool.execute(
-        {"consultation_type": "plan_investigation", "evidence_refs": []},
+        {
+            "consultation_type": "plan_investigation",
+            "evidence_refs": [str(observation.id)],
+        },
         make_context(investigation_id),
     )
 
     assert result.status is ToolInvocationStatus.POLICY_DENIED
     assert result.error_code == "POLICY_DENIED"
+    assert result.output["advisor_status"] == "policy_denied"
+    assert result.output["preflight_status"] == "POLICY_BLOCKED"
+    assert observation.id in result.observation_refs
     assert transport.calls == []
 
 
@@ -3496,6 +3326,7 @@ async def test_advisor_refuses_and_persists_when_marked_secret_survives(monkeypa
     assert result.status is ToolInvocationStatus.FAILED
     assert result.error_code == "advisor_secret_field_remaining"
     assert result.output["refusal_code"] == "secret_field_remaining"
+    assert "test sentinel" not in repr(result.output)
     assert transport.calls == []
     call = next(
         item
