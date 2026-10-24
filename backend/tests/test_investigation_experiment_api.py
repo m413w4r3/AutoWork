@@ -469,6 +469,8 @@ def test_timeline_route_redacts_free_text_and_payload_arguments() -> None:
         investigation_id=INVESTIGATION_ID,
         blob_id=UUID("70000000-0000-4000-8000-000000000002"),
         sha256="b" * 64,
+        kind="other",
+        object_type="network_capture",
     )
     unlinked_observation = SimpleNamespace(
         id=UUID("70000000-0000-4000-8000-000000000003"),
@@ -760,34 +762,77 @@ def test_strategy_projection_keeps_foreign_observation_reference_unknown() -> No
 
 def test_timeline_only_exposes_experiment_linked_and_resolved_references() -> None:
     linked_invocation_id = UUID("80000000-0000-4000-8000-000000000001")
-    unlinked_invocation_id = UUID("80000000-0000-4000-8000-000000000002")
-    missing_invocation_id = UUID("80000000-0000-4000-8000-000000000003")
+    wrong_version_invocation_id = UUID("80000000-0000-4000-8000-000000000002")
+    unlinked_invocation_id = UUID("80000000-0000-4000-8000-000000000003")
+    missing_invocation_id = UUID("80000000-0000-4000-8000-000000000004")
     linked_observation_id = UUID("70000000-0000-4000-8000-000000000001")
-    unlinked_observation_id = UUID("70000000-0000-4000-8000-000000000002")
+    linked_capture_observation_id = UUID("70000000-0000-4000-8000-000000000002")
+    linked_vt_observation_id = UUID("70000000-0000-4000-8000-000000000003")
+    unlinked_observation_id = UUID("70000000-0000-4000-8000-000000000004")
+    ambiguous_observation_id = UUID("70000000-0000-4000-8000-000000000005")
+    duplicate_observation_id = UUID("70000000-0000-4000-8000-000000000006")
+    incoherent_capture_observation_id = UUID("70000000-0000-4000-8000-000000000007")
+    unknown_capture_alias_observation_id = UUID("70000000-0000-4000-8000-000000000008")
     experiment = _experiment(
         experiment_id=NEW_EXPERIMENT_ID,
         version=1,
         verdict=ExperimentVerdict.INCONCLUSIVE,
-        observation_refs=(SimpleNamespace(observation_id=linked_observation_id, sha256="b" * 64),),
+        observation_refs=(
+            SimpleNamespace(observation_id=linked_observation_id, sha256="b" * 64),
+            SimpleNamespace(observation_id=linked_capture_observation_id, sha256="c" * 64),
+            SimpleNamespace(observation_id=linked_vt_observation_id, sha256="d" * 64),
+            SimpleNamespace(observation_id=ambiguous_observation_id, sha256="f" * 64),
+            SimpleNamespace(observation_id=duplicate_observation_id, sha256="f" * 64),
+            SimpleNamespace(
+                observation_id=incoherent_capture_observation_id, sha256="7" * 64
+            ),
+            SimpleNamespace(
+                observation_id=unknown_capture_alias_observation_id, sha256="8" * 64
+            ),
+        ),
     )
     experiment.tool_invocation_refs = (
-        {"invocation_id": str(linked_invocation_id), "version": 1},
+        {"invocation_id": str(linked_invocation_id), "version": 2},
+        {"invocation_id": str(wrong_version_invocation_id), "version": 1},
         {"invocation_id": str(missing_invocation_id), "version": 1},
     )
     experiment.step_ids = (
+        str(linked_invocation_id),
+        str(wrong_version_invocation_id),
         str(unlinked_invocation_id),
         str(missing_invocation_id),
-        str(linked_invocation_id),
     )
     experiment.input_refs = (
+        ExperimentInputRefV1("sample_sha256", "b" * 64, "b" * 64),
         ExperimentInputRefV1("capture_sha256", "b" * 64, "b" * 64),
         ExperimentInputRefV1("capture_sha256", "c" * 64, "c" * 64),
+        ExperimentInputRefV1("capture_sha256", "d" * 64, "d" * 64),
+        ExperimentInputRefV1("sample_sha256", "d" * 64, "d" * 64),
+        ExperimentInputRefV1("capture_sha256", "7" * 64, "7" * 64),
+        ExperimentInputRefV1("sample_sha256", "e" * 64, "e" * 64),
+        ExperimentInputRefV1("sample_sha256", "f" * 64, "f" * 64),
+        ExperimentInputRefV1("capture_sha256", "8" * 64, "8" * 64),
     )
-    experiment.next_pivots = ("b" * 64, "c" * 64)
+    experiment.next_pivots = (
+        "b" * 64,
+        "c" * 64,
+        "d" * 64,
+        "e" * 64,
+        "f" * 64,
+        "7" * 64,
+        "8" * 64,
+    )
     linked_invocation = SimpleNamespace(
         id=linked_invocation_id,
         investigation_id=INVESTIGATION_ID,
-        version=1,
+        version=2,
+        tool_name="protocol.validate",
+        schema_version="protocol-validation.v1",
+    )
+    wrong_version_invocation = SimpleNamespace(
+        id=wrong_version_invocation_id,
+        investigation_id=INVESTIGATION_ID,
+        version=2,
         tool_name="protocol.validate",
         schema_version="protocol-validation.v1",
     )
@@ -802,45 +847,146 @@ def test_timeline_only_exposes_experiment_linked_and_resolved_references() -> No
         id=linked_observation_id,
         investigation_id=INVESTIGATION_ID,
         sha256="b" * 64,
+        kind="binary_analysis",
+        object_type="sample",
+    )
+    linked_capture_observation = SimpleNamespace(
+        id=linked_capture_observation_id,
+        investigation_id=INVESTIGATION_ID,
+        sha256="c" * 64,
+        kind="other",
+        object_type="network_capture",
+    )
+    linked_vt_observation = SimpleNamespace(
+        id=linked_vt_observation_id,
+        investigation_id=INVESTIGATION_ID,
+        sha256="d" * 64,
+        kind="vt_file_report",
+        object_type="sample",
+    )
+    ambiguous_observation = SimpleNamespace(
+        id=ambiguous_observation_id,
+        investigation_id=INVESTIGATION_ID,
+        sha256="f" * 64,
+        kind="binary_analysis",
+        object_type="sample",
+    )
+    duplicate_observation = SimpleNamespace(
+        id=duplicate_observation_id,
+        investigation_id=INVESTIGATION_ID,
+        sha256="f" * 64,
+        kind="other",
+        object_type="network_capture",
+    )
+    incoherent_capture_observation = SimpleNamespace(
+        id=incoherent_capture_observation_id,
+        investigation_id=INVESTIGATION_ID,
+        sha256="7" * 64,
+        kind="binary_analysis",
+        object_type="network_capture",
+    )
+    unknown_capture_alias_observation = SimpleNamespace(
+        id=unknown_capture_alias_observation_id,
+        investigation_id=INVESTIGATION_ID,
+        sha256="8" * 64,
+        kind="other",
+        object_type="capture",
     )
     unlinked_vt_observation = SimpleNamespace(
         id=unlinked_observation_id,
         investigation_id=INVESTIGATION_ID,
+        sha256="e" * 64,
         kind="vt_file_report",
-        object_type="vt_file_report",
-        sha256="c" * 64,
+        object_type="file",
     )
 
     with _client(
         (experiment,),
-        observations=(linked_observation, unlinked_vt_observation),
-        invocations=(linked_invocation, unlinked_invocation),
+        observations=(
+            linked_observation,
+            linked_capture_observation,
+            linked_vt_observation,
+            unlinked_vt_observation,
+            ambiguous_observation,
+            duplicate_observation,
+            incoherent_capture_observation,
+            unknown_capture_alias_observation,
+        ),
+        invocations=(linked_invocation, wrong_version_invocation, unlinked_invocation),
     ) as client:
         response = client.get(f"/api/investigations/{INVESTIGATION_ID}/experiments")
 
     assert response.status_code == 200
     projected = response.json()["experiments"][0]
     assert projected["step_ids"] == [
-        "[redacted]",
-        "[redacted]",
         str(linked_invocation_id),
+        "[redacted]",
+        "[redacted]",
+        "[redacted]",
     ]
     assert projected["tool_invocation_refs"] == [
-        {"invocation_id": str(linked_invocation_id), "version": 1},
+        {"invocation_id": str(linked_invocation_id), "version": 2},
+        {"invocation_id": "[redacted]", "version": "[redacted]"},
         {"invocation_id": "[redacted]", "version": "[redacted]"},
     ]
     assert projected["observation_refs"] == [
-        {"observation_id": str(linked_observation_id), "sha256": "b" * 64}
+        {"observation_id": str(linked_observation_id), "sha256": "b" * 64},
+        {"observation_id": str(linked_capture_observation_id), "sha256": "c" * 64},
+        {"observation_id": str(linked_vt_observation_id), "sha256": "d" * 64},
+        {"observation_id": str(ambiguous_observation_id), "sha256": "f" * 64},
+        {"observation_id": str(duplicate_observation_id), "sha256": "f" * 64},
+        {"observation_id": str(incoherent_capture_observation_id), "sha256": "7" * 64},
+        {"observation_id": str(unknown_capture_alias_observation_id), "sha256": "8" * 64},
     ]
     assert projected["input_refs"] == [
-        {"input_type": "capture_sha256", "input_id": "b" * 64, "sha256": "b" * 64},
+        {"input_type": "sample_sha256", "input_id": "b" * 64, "sha256": "b" * 64},
         {
-            "input_type": "capture_sha256",
+            "input_type": "[redacted]",
+            "input_id": "[redacted]",
+            "sha256": "[redacted]",
+        },
+        {"input_type": "capture_sha256", "input_id": "c" * 64, "sha256": "c" * 64},
+        {
+            "input_type": "[redacted]",
+            "input_id": "[redacted]",
+            "sha256": "[redacted]",
+        },
+        {
+            "input_type": "[redacted]",
+            "input_id": "[redacted]",
+            "sha256": "[redacted]",
+        },
+        {
+            "input_type": "[redacted]",
+            "input_id": "[redacted]",
+            "sha256": "[redacted]",
+        },
+        {
+            "input_type": "sample_sha256",
+            "input_id": "[redacted]",
+            "sha256": "[redacted]",
+        },
+        {
+            "input_type": "[redacted]",
+            "input_id": "[redacted]",
+            "sha256": "[redacted]",
+        },
+        {
+            "input_type": "[redacted]",
             "input_id": "[redacted]",
             "sha256": "[redacted]",
         },
     ]
-    assert projected["next_pivots"] == ["b" * 64, "[redacted]"]
+    assert projected["next_pivots"] == [
+        "b" * 64,
+        "c" * 64,
+        "[redacted]",
+        "[redacted]",
+        "[redacted]",
+        "[redacted]",
+        "[redacted]",
+    ]
     assert str(unlinked_invocation_id) not in response.text
+    assert str(wrong_version_invocation_id) not in response.text
     assert str(missing_invocation_id) not in response.text
-    assert "c" * 64 not in response.text
+    assert "e" * 64 not in response.text

@@ -504,7 +504,7 @@ async def test_operator_led_experiment_record_uses_declared_hypothesis_and_strea
         source="network.capture.inspect",
         source_version="network-capture-inspect.v1",
         observed_at=datetime.now(UTC),
-        object_type="capture",
+        object_type="network_capture",
         object_id="capture-sha256",
     )
     await fixture.observations.append_if_absent(observation)
