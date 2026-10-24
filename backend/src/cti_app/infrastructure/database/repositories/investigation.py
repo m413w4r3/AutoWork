@@ -8,10 +8,16 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
+from cti_app.application.context_pagination import (
+    KeysetPageV1,
+    decode_keyset_cursor,
+    make_keyset_page,
+)
 from cti_app.application.investigation_persistence import (
     InvestigationBudgetSnapshot,
     VersionConflictError,
@@ -136,6 +142,20 @@ def _budget_amounts_to_json(value: Mapping[BudgetDimension, int]) -> dict[str, i
     return {dimension.value: amount for dimension, amount in value.items()}
 
 
+def _keyset_predicate(
+    sort_column: Any,
+    id_column: Any,
+    *,
+    sort_key: datetime,
+    item_id: UUID,
+    descending: bool,
+) -> Any:
+    """Build the stable (sort_key, id) seek predicate without database access."""
+    sort_after = sort_column < sort_key if descending else sort_column > sort_key
+    id_after = id_column < item_id if descending else id_column > item_id
+    return or_(sort_after, and_(sort_column == sort_key, id_after))
+
+
 class SqlAlchemyToolInvocationRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
@@ -164,6 +184,61 @@ class SqlAlchemyToolInvocationRepository:
             .execution_options(populate_existing=True)
         )
         return tuple(_tool_invocation_from_row(row) for row in rows)
+
+    async def page_for_investigation(
+        self,
+        investigation_id: UUID,
+        *,
+        cursor: str | None,
+        limit: int,
+        descending: bool = False,
+        section: str = "tool_invocations",
+    ) -> KeysetPageV1[ToolInvocation]:
+        if not 1 <= limit <= 1_000:
+            raise ValueError("Context page limit must be between 1 and 1000")
+        decoded = decode_keyset_cursor(
+            cursor,
+            section=section,
+            investigation_id=investigation_id,
+            descending=descending,
+        )
+        statement = select(ToolInvocationRow).where(
+            ToolInvocationRow.investigation_id == investigation_id
+        )
+        if decoded is not None:
+            statement = statement.where(
+                _keyset_predicate(
+                    ToolInvocationRow.created_at,
+                    ToolInvocationRow.id,
+                    sort_key=datetime.fromisoformat(decoded["sort_key"]),
+                    item_id=UUID(decoded["item_id"]),
+                    descending=descending,
+                )
+            )
+        total = await self._session.scalar(
+            select(func.count()).select_from(ToolInvocationRow).where(
+                ToolInvocationRow.investigation_id == investigation_id
+            )
+        )
+        order = (
+            (ToolInvocationRow.created_at.desc(), ToolInvocationRow.id.desc())
+            if descending
+            else (ToolInvocationRow.created_at, ToolInvocationRow.id)
+        )
+        rows = await self._session.scalars(
+            statement.order_by(*order).limit(limit + 1).execution_options(populate_existing=True)
+        )
+        items = tuple(_tool_invocation_from_row(row) for row in rows)
+        return make_keyset_page(
+            section=section,
+            investigation_id=investigation_id,
+            items=items,
+            total=int(total or 0),
+            limit=limit,
+            cursor=cursor,
+            position=lambda item: (item.created_at, item.id),
+            descending=descending,
+        )
 
     async def add_if_absent(self, invocation: ToolInvocation) -> ToolInvocation:
         existing_id = await self.get(invocation.id)
@@ -299,6 +374,61 @@ class SqlAlchemyEvidenceObservationRepository:
         )
         return tuple(_evidence_observation_from_row(row) for row in rows)
 
+    async def page_for_investigation(
+        self,
+        investigation_id: UUID,
+        *,
+        cursor: str | None,
+        limit: int,
+        descending: bool = False,
+        section: str = "evidence_observations",
+    ) -> KeysetPageV1[EvidenceObservation]:
+        if not 1 <= limit <= 1_000:
+            raise ValueError("Context page limit must be between 1 and 1000")
+        decoded = decode_keyset_cursor(
+            cursor,
+            section=section,
+            investigation_id=investigation_id,
+            descending=descending,
+        )
+        statement = select(EvidenceObservationRow).where(
+            EvidenceObservationRow.investigation_id == investigation_id
+        )
+        if decoded is not None:
+            statement = statement.where(
+                _keyset_predicate(
+                    EvidenceObservationRow.observed_at,
+                    EvidenceObservationRow.id,
+                    sort_key=datetime.fromisoformat(decoded["sort_key"]),
+                    item_id=UUID(decoded["item_id"]),
+                    descending=descending,
+                )
+            )
+        total = await self._session.scalar(
+            select(func.count()).select_from(EvidenceObservationRow).where(
+                EvidenceObservationRow.investigation_id == investigation_id
+            )
+        )
+        order = (
+            (EvidenceObservationRow.observed_at.desc(), EvidenceObservationRow.id.desc())
+            if descending
+            else (EvidenceObservationRow.observed_at, EvidenceObservationRow.id)
+        )
+        rows = await self._session.scalars(
+            statement.order_by(*order).limit(limit + 1).execution_options(populate_existing=True)
+        )
+        items = tuple(_evidence_observation_from_row(row) for row in rows)
+        return make_keyset_page(
+            section=section,
+            investigation_id=investigation_id,
+            items=items,
+            total=int(total or 0),
+            limit=limit,
+            cursor=cursor,
+            position=lambda item: (item.observed_at, item.id),
+            descending=descending,
+        )
+
     async def append_if_absent(self, observation: EvidenceObservation) -> EvidenceObservation:
         existing = await self.get(observation.id)
         if existing is not None:
@@ -412,6 +542,74 @@ class SqlAlchemyFindingRepository:
             .order_by(InvestigationFindingVersionRow.created_at, InvestigationFindingVersionRow.id)
         )
         return tuple([await self._finding_from_row(row) for row in rows])
+
+    async def page_for_investigation(
+        self,
+        investigation_id: UUID,
+        *,
+        cursor: str | None,
+        limit: int,
+        descending: bool = False,
+        section: str = "findings",
+        latest_only: bool = False,
+    ) -> KeysetPageV1[InvestigationFinding]:
+        if not 1 <= limit <= 1_000:
+            raise ValueError("Context page limit must be between 1 and 1000")
+        decoded = decode_keyset_cursor(
+            cursor,
+            section=section,
+            investigation_id=investigation_id,
+            descending=descending,
+        )
+        statement = select(InvestigationFindingVersionRow).where(
+            InvestigationFindingVersionRow.investigation_id == investigation_id
+        )
+        count_statement = select(func.count()).select_from(InvestigationFindingVersionRow).where(
+            InvestigationFindingVersionRow.investigation_id == investigation_id
+        )
+        if latest_only:
+            superseding_row = aliased(InvestigationFindingVersionRow)
+            superseding = select(superseding_row.id).where(
+                superseding_row.supersedes_id == InvestigationFindingVersionRow.id
+            ).exists()
+            statement = statement.where(~superseding)
+            count_statement = count_statement.where(~superseding)
+        if decoded is not None:
+            statement = statement.where(
+                _keyset_predicate(
+                    InvestigationFindingVersionRow.created_at,
+                    InvestigationFindingVersionRow.id,
+                    sort_key=datetime.fromisoformat(decoded["sort_key"]),
+                    item_id=UUID(decoded["item_id"]),
+                    descending=descending,
+                )
+            )
+        total = await self._session.scalar(count_statement)
+        order = (
+            (
+                InvestigationFindingVersionRow.created_at.desc(),
+                InvestigationFindingVersionRow.id.desc(),
+            )
+            if descending
+            else (
+                InvestigationFindingVersionRow.created_at,
+                InvestigationFindingVersionRow.id,
+            )
+        )
+        rows = await self._session.scalars(
+            statement.order_by(*order).limit(limit + 1).execution_options(populate_existing=True)
+        )
+        items = tuple([await self._finding_from_row(row) for row in rows])
+        return make_keyset_page(
+            section=section,
+            investigation_id=investigation_id,
+            items=items,
+            total=int(total or 0),
+            limit=limit,
+            cursor=cursor,
+            position=lambda item: (item.created_at, item.id),
+            descending=descending,
+        )
 
     async def append_version(
         self, finding: InvestigationFinding, *, expected_previous_id: UUID | None
