@@ -1315,8 +1315,8 @@ async def test_untyped_download_refusal_requires_reconciliation_before_retry() -
     assert stopped.stop_reason is StopReason.SUBMISSION_NEEDS_REVIEW
     assert len(invocations) == 1
     assert invocations[0].status is ToolInvocationStatus.NEEDS_REVIEW
-    assert invocations[0].response_refs == ()
-    assert observations == ()
+    assert len(invocations[0].response_refs) == 1
+    assert observations[0].id == invocations[0].response_refs[0]
     assert envelope is not None
     assert envelope.budget.consumed[BudgetDimension.VT_UNITS] == 0
     assert envelope.budget.consumed[BudgetDimension.DOWNLOADS] == 0
@@ -1326,6 +1326,54 @@ async def test_untyped_download_refusal_requires_reconciliation_before_retry() -
         if item.operation_key == invocations[0].operation_key
     )
     assert reservation.status is BudgetReservationStatus.RESERVED
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_external_result_preserves_only_valid_refs_without_archiving_output() -> (
+    None
+):
+    call = _tool_call(
+        "vt.download_sample", "synthetic-partial-download", "reconcile the interrupted download"
+    )
+    fixture = _Fixture(
+        responses=[_decision(goal="reconcile download", next_action="finish", tools=(call,))],
+        tools=(("vt.download_sample", "vt", ToolEffect.ACQUIRE),),
+    )
+    fixture.envelope = replace(fixture.envelope, acquire_hits_allowed=True)
+    recorded = EvidenceObservation(
+        investigation_id=fixture.investigation_id,
+        kind=EvidenceKind.OTHER,
+        blob_id=uuid4(),
+        sha256=hashlib.sha256(b"synthetic recorded partial observation").hexdigest(),
+        source="synthetic-download-adapter",
+        source_version="1",
+        observed_at=datetime.now(UTC),
+        object_type="download_result",
+        object_id="synthetic-partial-download",
+        limitations=("Synthetic pre-recorded observation.",),
+    )
+    foreign = replace(recorded, investigation_id=uuid4(), id=uuid4())
+    await fixture.observations.append_if_absent(recorded)
+    await fixture.observations.append_if_absent(foreign)
+    fixture.tools["vt.download_sample"].result = ToolResult(
+        status=ToolInvocationStatus.NEEDS_REVIEW,
+        observation_refs=(recorded.id, foreign.id),
+        output={"raw_adapter_payload": "UNTRUSTED-SYNTHETIC-OUTPUT"},
+    )
+    state = await fixture.start()
+
+    stopped = await fixture.service.run(state.investigation_id)
+
+    invocations = await fixture.invocations.list_for_investigation(state.investigation_id)
+    observations = await fixture.observations.list_for_investigation(state.investigation_id)
+    assert stopped.stop_reason is StopReason.SUBMISSION_NEEDS_REVIEW
+    assert len(invocations) == 1
+    assert invocations[0].status is ToolInvocationStatus.NEEDS_REVIEW
+    assert invocations[0].response_refs == (recorded.id,)
+    assert observations == (recorded,)
+    with pytest.raises(ValueError, match="reconciled before resuming"):
+        await fixture.service.resume(state.investigation_id)
+    assert fixture.tools["vt.download_sample"].calls == [call["arguments"]]
 
 
 @pytest.mark.asyncio

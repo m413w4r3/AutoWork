@@ -39,7 +39,10 @@ from cti_app.application.investigation_composition import (
 )
 from cti_app.application.jobs import JobExecutionContext
 from cti_app.application.media_assets import MediaAssetStore
-from cti_app.application.network_protocol_model import NetworkProtocolWorkbench
+from cti_app.application.network_protocol_model import (
+    NETWORK_PROTOCOL_RENDERER_VERSION,
+    NetworkProtocolWorkbench,
+)
 from cti_app.application.network_workbench import (
     NetworkWorkbench,
     ProductionNetworkCaptureBlobStore,
@@ -49,6 +52,8 @@ from cti_app.application.network_workbench import (
 from cti_app.application.pdf_inspection import PdfInspectionService
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.protocol_diagram_projection import (
+    PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION,
+    PROTOCOL_DIAGRAM_PROJECTION_VERSION,
     compile_protocol_render_result,
     opinion_protocol_figures,
 )
@@ -818,9 +823,12 @@ def _verify_pdf(
     text = _extract_pdf_text(pdf_path)
     normalized = text.casefold()
     for caption in captions:
-        assert caption.casefold() in normalized, (caption, text[-2_000:])
+        caption_parts = tuple(" ".join(part.split()).casefold() for part in caption.splitlines())
+        caption_parts = tuple(part for part in caption_parts if part)
+        for caption_part in caption_parts:
+            assert caption_part in normalized, (caption_part, text[-2_000:])
     if require_status_legend:
-        for status in ("observed", "inferred", "unresolved", "contradicted"):
+        for status in ("observation étayée", "inférence", "non résolu", "contredit"):
             assert status in normalized, (status, text[-2_000:])
     raster_prefix = pdf_path.with_name(f"{pdf_path.stem}-page")
     subprocess.run(
@@ -1080,20 +1088,40 @@ async def test_w15_protocol_pcap_to_opinion_with_real_d2_typst_and_multibatch_pd
                 by_source: dict[str, list[Any]] = {}
                 for observation in observations:
                     by_source.setdefault(observation.source, []).append(observation)
+                verification_ids_before_revision = set(transport.observations_before_turn[6])
                 verification_before_revision = [
-                    item.id
+                    item
                     for item in by_source["network.protocol.verify"]
-                    if item.id in set(transport.observations_before_turn[6])
+                    if item.id in verification_ids_before_revision
+                ]
+                verification_after_revision = [
+                    item
+                    for item in by_source["network.protocol.verify"]
+                    if item.id not in verification_ids_before_revision
                 ]
                 assert len(verification_before_revision) == 1
-                assert str(verification_before_revision[0]) in transport.prompts[6]
+                assert len(verification_after_revision) == 1
+                assert str(verification_before_revision[0].id) in transport.prompts[6]
+                assert verification_after_revision[0].id in set(
+                    transport.observations_before_turn[7]
+                )
                 assert len(by_source["network.capture.inspect"]) == 2
                 assert len(by_source["network.stream.reassemble"]) == 4
                 assert len(by_source["network.messages.segment"]) == 4
                 assert len(by_source["network.protocol.compare"]) == 1
                 assert len(by_source["network.protocol.hypothesize"]) == 1
-                assert len(by_source["network.protocol.verify"]) == 1
-                assert sum(item.tool_name == "network.protocol.verify" for item in invocations) == 2
+                verification_invocations = sorted(
+                    (item for item in invocations if item.tool_name == "network.protocol.verify"),
+                    key=lambda item: (item.created_at, str(item.id)),
+                )
+                assert len(verification_invocations) == 2
+                assert all(
+                    item.status is ToolInvocationStatus.PARTIAL for item in verification_invocations
+                )
+                assert [item.response_refs for item in verification_invocations] == [
+                    (verification_before_revision[0].id,),
+                    (verification_after_revision[0].id,),
+                ]
                 assert len(by_source["network.protocol.render"]) == 1
 
                 report_payloads = [
@@ -1210,7 +1238,29 @@ async def test_w15_protocol_pcap_to_opinion_with_real_d2_typst_and_multibatch_pd
                 render_observation = by_source["network.protocol.render"][0]
                 stored_render_result = await artifact_store.read_json(render_observation.blob_id)
                 semantic_render_result = NetworkProtocolWorkbench(capture_workbench).render(model)
-                assert stored_render_result == semantic_render_result.to_dict()
+                render_metadata = {
+                    "render_identity",
+                    "renderer_version",
+                    "projection_version",
+                    "figure_policy_version",
+                }
+                stored_semantics = {
+                    key: value
+                    for key, value in stored_render_result.items()
+                    if key not in render_metadata
+                }
+                assert stored_semantics == semantic_render_result.to_dict()
+                assert {
+                    "render_identity": stored_render_result["render_identity"],
+                    "renderer_version": stored_render_result["renderer_version"],
+                    "projection_version": stored_render_result["projection_version"],
+                    "figure_policy_version": stored_render_result["figure_policy_version"],
+                } == {
+                    "render_identity": render_observation.object_id,
+                    "renderer_version": NETWORK_PROTOCOL_RENDERER_VERSION,
+                    "projection_version": PROTOCOL_DIAGRAM_PROJECTION_VERSION,
+                    "figure_policy_version": PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION,
+                }
                 d2 = D2DiagramCompiler(binary=d2_path or d2_binary)
                 media_store = MediaAssetStore(artifact_store, uow_factory)
                 rendered_figures = await compile_protocol_render_result(

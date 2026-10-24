@@ -2146,7 +2146,9 @@ def build_analysis_worker_probe_payload(settings: Settings) -> dict[str, Any]:
             settings.analysis_suricata_rules_path / "autowork.rules",
             max_bytes=settings.model_output_max_bytes,
         ),
-        "floss": _distribution_version("flare-floss"),
+        "floss": (
+            _distribution_version("flare-floss") if shutil.which("floss") is not None else None
+        ),
         "mwcp": _distribution_version("mwcp"),
         "yara": _distribution_version("yara-python"),
     }

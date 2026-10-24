@@ -454,11 +454,13 @@ class InvestigationService:
                 raise ValueError("The pending Bridge turn still has an active owner job")
             if disposition == "orphaned_running_turn":
                 state = await self._require_state(investigation_id)
+        # A linked observation proves there is evidence, not that an ambiguous external
+        # operation was reconciled. Keep a submission-review stop authoritative.
         unresolved = tuple(
             item
             for item in await self._invocations.list_for_investigation(investigation_id)
             if item.status in {ToolInvocationStatus.RUNNING, ToolInvocationStatus.NEEDS_REVIEW}
-            and not item.response_refs
+            and (not item.response_refs or state.stop_reason is StopReason.SUBMISSION_NEEDS_REVIEW)
         )
         if unresolved:
             raise ValueError(
@@ -1266,11 +1268,17 @@ class InvestigationService:
         }:
             budget.release(operation_key)
         try:
-            persisted_observations = (
-                ()
-                if ambiguous_adapter_response
-                else await self._persist_result_observations(invocation, result)
-            )
+            if ambiguous_adapter_response:
+                recorded_refs = await self._valid_observation_refs(
+                    investigation.id, result.observation_refs
+                )
+                persisted_observations = (
+                    ()
+                    if recorded_refs
+                    else await self._persist_ambiguous_result_observation(invocation)
+                )
+            else:
+                persisted_observations = await self._persist_result_observations(invocation, result)
         except Exception as exc:
             valid_refs = await self._valid_observation_refs(
                 investigation.id, result.observation_refs
@@ -2066,6 +2074,21 @@ class InvestigationService:
         if self._observation_writer is None:
             raise RuntimeError("No observation archive is configured for tool output")
         return await self._observation_writer.archive(invocation, result)
+
+    async def _persist_ambiguous_result_observation(
+        self, invocation: ToolInvocation
+    ) -> tuple[EvidenceObservation, ...]:
+        """Record only framework status when an external result has no valid refs."""
+        safe_result = ToolResult(
+            status=ToolInvocationStatus.NEEDS_REVIEW,
+            output={
+                "status": ToolInvocationStatus.NEEDS_REVIEW.value,
+                "outcome": "external_effect_unconfirmed",
+                "adapter_output_archived": False,
+            },
+            message="The external result is ambiguous; adapter output was not archived.",
+        )
+        return await self._persist_result_observations(invocation, safe_result)
 
     async def _valid_observation_refs(
         self, investigation_id: UUID, refs: tuple[UUID, ...]
