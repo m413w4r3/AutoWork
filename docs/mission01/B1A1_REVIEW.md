@@ -250,4 +250,39 @@ résolu.
 Verrouillage PostgreSQL réel, concurrence multi-processus, annulation pendant
 le commit, pression du pool, acceptation fournisseur.
 
+## Revue fail-closed `7af1d62` — FAIL
+
+**Revue :** agent `c69e51e3`, Luna xhigh, oracle rejoué **148 passed**.
+
+Confirmés : le dispatcher déduit l'effet de `ToolDefinition.effect` enregistré
+et refuse avant l'adaptateur si guard/précontrôle manque, avec preuve typée ;
+aucun paramètre d'appel ne reclasse un outil externe en local. Le service
+refuse avant dispatcher si le dépôt n'a pas de guard (invocation `UNAVAILABLE`,
+réservation `RELEASED`). Le guard mémoire utilise le verrou de
+`save_if_version`; le wrapper de révocation délègue. L'admission reste
+commitée avant dispatch.
+
+### HIGH — advisor encore appelable sans guard
+
+Le refus advisor dépend de `dispatch_guard_required`
+(`investigation_advisor_tools.py:178`), qui vaut `False` par défaut
+(`investigation_tools.py:234`). L'advisor est `EXTERNAL_READ` et peut
+soumettre à Bridge plus loin : un appel direct avec un contexte approuvé mais
+sans guard peut passer le contrôle de divulgation sur une enveloppe périmée et
+atteindre le transport malgré une révocation concurrente. Le test
+`test_b1_admission_durability.py:416` ne vérifie ni preuve typée ni zéro appel
+transport avec une requête valide.
+
+Correction R2 : exiger le guard à l'entrée pour tout `EXTERNAL_READ`, dérivé
+du `ToolDefinition.effect`, refuser avant divulgation/transport, et tester un
+appel direct valide avec transport espion et guard absent.
+
+### UNKNOWN
+
+Annulation pendant le transport : le `finally` peut committer en laissant
+l'invocation `RUNNING` et sa réservation en attente de récupération
+(inférence, non vérifiée PostgreSQL). Concurrence multi-processus, pool et
+acceptation fournisseur restent `UNKNOWN`.
+
+
 
