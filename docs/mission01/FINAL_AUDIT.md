@@ -1,14 +1,15 @@
-# Mission 01 V3.2 — audit final (provisoire)
+# Mission 01 V3.2 — audit final
 
-**État :** en cours de clôture, 2026-10-24. Ce document ne déclare aucun `PASS`
-non vérifié. Les verdicts des revues finales Luna et le résultat des cinq
-régressions en cours y seront reportés après réception des comptes rendus.
+**État :** clôturé avec réserves, 2026-10-24. Ce document distingue les
+résultats réellement exécutés, les verdicts indépendants et les restes
+`BLOCKED/UNKNOWN`. Aucun `PASS` n'est déclaré sans test ou revue effective.
 
 **Base :** `main@058bb4af2278e3941956e523c5a1d560208de228`.
-**Intégration locale :** `chore/mission01-integration` @ `3e15193`.
-**Branche de correction en cours :** `fix/mission01-regressions`
-(worktree `wks_cbcdaa104d853d74`).
-**WIP parent :** `wip/mission01-parent-fixes` @ `849cfa0`.
+**Intégration locale vérifiée :** `chore/mission01-integration` @ `8fdb7a7`
+(cette documentation est committée dans le lot suivant).
+**Branche de correction :** `fix/mission01-regressions` @ `c15166e`, fusionnée.
+**WIP parent :** `wip/mission01-parent-fixes` @ `849cfa0` (relu/intégré via la
+branche de correction).
 
 ## Périmètre réellement exécuté
 
@@ -23,8 +24,8 @@ régressions en cours y seront reportés après réception des comptes rendus.
 
 | Vérification | Résultat | Portée |
 |---|---|---|
-| Suite croisée 9 lots | **220 passed** | `test_b1_admission_durability`, `test_b1_g2_bounded_timeout`, `test_advisor_completeness`, `test_bridge_investigator`, `test_investigation_advisor_tools`, `test_investigation_strategy_scenarios`, `test_investigation_experiments`, `test_investigation_experiment_api`, `test_investigation_audit_export` |
-| Backend hors intégration (après correctifs régressions) | **4589 passed, 34 failed, 2 skipped** | `pytest --ignore=tests/integration -m "not integration"` sur `89eb3a5` ; à re-exécuter après fusion finale |
+| Suite ciblée fusionnée (correctifs + lots) | **246 passed** | branche `c15166e`, incluse dans la suite complète |
+| Backend hors intégration (intégration finale) | **4602 passed, 34 failed, 2 skipped, 30 deselected** | `pytest --ignore=tests/integration -m "not integration"` sur `8fdb7a7` |
 | Frontend | **293 passed**, `pnpm typecheck` OK | suite complète |
 | B0A ciblé | **153 passed** | `test_advisor_completeness`, `test_bridge_investigator`, `test_investigation_advisor_tools`, `test_advisor_output_reparse` |
 | B0B ciblé | **14 passed** | `test_investigation_audit_export` |
@@ -109,6 +110,34 @@ n'est comptée comme revue Luna.
   exports standard ; le `.gz` n'est pas une mesure de confidentialité.
 - Les preuves CTI canoniques restent PostgreSQL/MinIO ; Paseo et les transcripts
   d'agents ne sont pas des preuves CTI.
+
+## Décision de clôture
+
+La mission est **partiellement réalisée**, avec des lots vérifiés et des
+résidus explicitement bornés. Elle ne doit pas être présentée comme un `PASS`
+global.
+
+- **Livrés et acceptés** : S0, B0B (`PASS_WITH_CHANGES`), B1A2
+  (`PASS_WITH_CHANGES`), L1/L06 (`PASS_WITH_CHANGES`, P10 `DEFER`), A1
+  (`PASS_WITH_CHANGES`), T (rapport ; restauration V4 `BLOCKED`).
+- **Livrés avec réserve** : B0A (F1–F5 acceptés ; F6 `FAIL/PARTIAL` arrêté
+  après trois tentatives) ; B1A1 (protections principales acceptées ;
+  équivalence sémantique `FAIL/PARTIAL` ; atomicité révocation/dispatch
+  `BLOCKED`).
+- **Non démarrés** : B1B (temporalité/reprise), L2 (pagination keyset), Q
+  (éval anti-slop). Ils restent `PENDING` et ne sont pas couverts par les
+  tests ci-dessus.
+- **Complexité** : aucune migration, aucun changement de `0001_baseline`/
+  `0002`, aucune table de logs ni seconde base de preuves. Les ajouts
+  principaux sont des modules de projection/export et des tests ; les
+  abstractions inutiles signalées (B0B, B1A1) restent des améliorations
+  différées, pas des blockers.
+- **Prochaines actions** : lot dédié F6 (liste blanche stricte des champs
+  d'évidence, y compris titres et champs fragmentés), clé d'effet canonique
+  fournie par l'adaptateur pour B1A1, pagination CAS L2, éval Q, puis B1B.
+  Toute mesure live (Bridge/VT/Shodan), toute réconciliation `needs_review`,
+  toute migration, publication/G3 et tout push/merge sur `main` exigent une
+  autorisation humaine distincte.
 
 ## Coûts et approbations
 
