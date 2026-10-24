@@ -14,6 +14,7 @@ from cti_app.application.bridge_investigator import (
     ModelConversationTurnTransport,
     TurnSubmission,
     TurnSubmissionStatus,
+    make_investigation_turn_idempotency_key,
     submit_bridge_consultation_once,
 )
 from cti_app.application.investigation_advisor_tools import InvestigationAdvisorTool
@@ -23,7 +24,7 @@ from cti_app.domain.model_conversations import (
     ConversationStatus,
     ConversationTurnStatus,
 )
-from cti_app.domain.model_runs import ModelRunStatus, ModelUsage
+from cti_app.domain.model_runs import BridgeSubmissionState, ModelRunStatus, ModelUsage
 from cti_app.integrations.models import _retry_after_seconds
 from tests.test_model_conversations import _build_service, _ScriptedBridgeAdapter
 
@@ -49,18 +50,27 @@ class _FakeTransport:
         self.outcomes = deque(outcomes)
         self.clock = clock
         self.calls: list[tuple[int, float | None]] = []
+        self.keys: list[str] = []
         self.accepted_successes = 0
 
-    async def submit(self, *, timeout_seconds: float | None = None, **_kwargs):
-        return await self._submit(0, timeout_seconds)
+    async def submit(self, *, timeout_seconds: float | None = None, **kwargs):
+        return await self._submit(0, timeout_seconds, kwargs)
 
     async def submit_with_attempt(
-        self, *, attempt: int, timeout_seconds: float | None = None, **_kwargs
+        self, *, attempt: int, timeout_seconds: float | None = None, **kwargs
     ):
-        return await self._submit(attempt, timeout_seconds)
+        return await self._submit(attempt, timeout_seconds, kwargs)
 
-    async def _submit(self, attempt: int, timeout_seconds: float | None):
+    async def _submit(self, attempt: int, timeout_seconds: float | None, arguments):
         self.calls.append((attempt, timeout_seconds))
+        self.keys.append(
+            make_investigation_turn_idempotency_key(
+                investigation_id=arguments["investigation_id"],
+                turn_index=arguments["turn_index"],
+                context_sha256=arguments["context_sha256"],
+                attempt=attempt,
+            )
+        )
         outcome = self.outcomes.popleft()
         if callable(outcome):
             outcome = await outcome()
@@ -98,8 +108,10 @@ async def _submit(
     deadline: float,
     minimum_timeout: float = 0,
     retry_base: float = 2,
+    retry_max: float = 8,
+    pacer: BridgeSubmissionPacer | None = None,
 ) -> TurnSubmission:
-    pacer = _pacer(clock)
+    pacer = pacer or _pacer(clock)
     monkeypatch.setattr(bridge_module, "_shared_bridge_pacer", lambda **_kwargs: pacer)
     return await submit_bridge_consultation_once(
         transport,
@@ -109,7 +121,10 @@ async def _submit(
         context_sha256="a" * 64,
         prompt="Synthetic temporal recovery test.",
         external_llm_allowed=True,
-        settings=_settings(openai_bridge_pre_submission_retry_base_seconds=retry_base),
+        settings=_settings(
+            openai_bridge_pre_submission_retry_base_seconds=retry_base,
+            openai_bridge_pre_submission_retry_max_seconds=retry_max,
+        ),
         timeout_seconds=deadline,
         deadline_monotonic=deadline,
         minimum_timeout_seconds=minimum_timeout,
@@ -165,7 +180,7 @@ async def test_pacing_that_exhausts_the_g2_window_refuses_before_dispatch(monkey
 
 
 @pytest.mark.asyncio
-async def test_one_proven_pre_submission_429_retry_uses_retry_after_and_existing_attempt_key(
+async def test_one_proven_pre_submission_429_retry_uses_retry_after_and_distinct_attempt_key(
     monkeypatch,
 ) -> None:
     clock = _FakeClock()
@@ -189,8 +204,52 @@ async def test_one_proven_pre_submission_429_retry_uses_retry_after_and_existing
 
     assert result.status is TurnSubmissionStatus.SUCCEEDED
     assert transport.calls == [(0, 20), (1, 17)]
+    assert transport.keys[0] != transport.keys[1]
+    assert [attempt for attempt, _timeout in transport.calls] == [0, 1]
     assert transport.accepted_successes == 1
     assert clock.sleeps == [2]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "submission_state",
+    [
+        None,
+        BridgeSubmissionState.SUBMISSION_ATTEMPTED,
+        BridgeSubmissionState.POST_SUBMISSION,
+        BridgeSubmissionState.EXTERNAL_STATE_UNKNOWN,
+        "unexpected_submission_state",
+    ],
+)
+async def test_429_without_pre_submission_proof_never_retries(
+    monkeypatch, submission_state
+) -> None:
+    clock = _FakeClock()
+    transport = _FakeTransport(
+        [
+            TurnSubmission(
+                TurnSubmissionStatus.UNAVAILABLE,
+                error_code="bridge_rate_limited",
+                submission_state=submission_state,
+                retryable=True,
+                retry_after_seconds=1,
+            )
+        ],
+        clock,
+    )
+
+    result = await _submit(monkeypatch, clock, transport, deadline=20, minimum_timeout=1)
+
+    assert result.status is TurnSubmissionStatus.NEEDS_REVIEW
+    assert result.retryable is False
+    expected_state = (
+        BridgeSubmissionState.EXTERNAL_STATE_UNKNOWN
+        if submission_state is None or submission_state == "unexpected_submission_state"
+        else BridgeSubmissionState(submission_state)
+    )
+    assert result.submission_state is expected_state
+    assert transport.calls == [(0, 20)]
+    assert transport.accepted_successes == 0
 
 
 @pytest.mark.asyncio
@@ -210,7 +269,15 @@ async def test_retry_after_beyond_remaining_budget_stays_rate_limited_without_sl
         )
 
     transport = _FakeTransport([rate_limited], clock)
-    result = await _submit(monkeypatch, clock, transport, deadline=5, minimum_timeout=2)
+    pacer = _pacer(clock)
+    result = await _submit(
+        monkeypatch,
+        clock,
+        transport,
+        deadline=5,
+        minimum_timeout=2,
+        pacer=pacer,
+    )
     advisor_result = _advisor_result(result)
 
     assert result.status is TurnSubmissionStatus.UNAVAILABLE
@@ -221,6 +288,44 @@ async def test_retry_after_beyond_remaining_budget_stays_rate_limited_without_sl
     assert transport.calls == [(0, 5)]
     assert transport.accepted_successes == 0
     assert clock.sleeps == []
+    assert pacer._blocked_until == 0
+
+
+@pytest.mark.asyncio
+async def test_large_finite_retry_after_is_capped_for_shared_pacer_without_retry(
+    monkeypatch,
+) -> None:
+    clock = _FakeClock()
+    transport = _FakeTransport(
+        [
+            TurnSubmission(
+                TurnSubmissionStatus.UNAVAILABLE,
+                error_code="bridge_rate_limited",
+                submission_state="pre_submission",
+                retryable=True,
+                retry_after_seconds=10_000,
+            )
+        ],
+        clock,
+    )
+    pacer = _pacer(clock)
+
+    result = await _submit(
+        monkeypatch,
+        clock,
+        transport,
+        deadline=20,
+        minimum_timeout=1,
+        retry_max=8,
+        pacer=pacer,
+    )
+
+    assert result.status is TurnSubmissionStatus.UNAVAILABLE
+    assert result.error_code == "bridge_rate_limited"
+    assert transport.calls == [(0, 20)]
+    assert transport.accepted_successes == 0
+    assert clock.sleeps == []
+    assert pacer._blocked_until == 8
 
 
 @pytest.mark.asyncio
@@ -361,10 +466,10 @@ async def test_late_adapter_reply_is_durably_rejected_as_needs_review(tmp_path) 
             del role, output_schema
             self.calls.append(request)
             try:
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.05)
             except asyncio.CancelledError:
                 # Simulate an adapter that returns after the timeout cancellation.
-                await asyncio.sleep(0.02)
+                await asyncio.sleep(0.01)
             context = request.conversation
             assert context is not None
             return AdapterResult(

@@ -41,7 +41,7 @@ from cti_app.domain.model_conversations import (
     ConversationTransport,
     ConversationTurnStatus,
 )
-from cti_app.domain.model_runs import ModelProvider, ModelSubmissionState
+from cti_app.domain.model_runs import BridgeSubmissionState, ModelProvider
 
 INVESTIGATION_PROMPT_VERSION = "investigation-agent-turn.v1"
 _CONVERSATION_NAMESPACE = UUID("c08dd95e-8ab9-4e8a-961c-787a79f86cde")
@@ -83,38 +83,74 @@ class BridgeSubmissionPacer:
         self._blocked_until = 0.0
         self._lock = asyncio.Lock()
 
-    async def defer_submissions(self, seconds: float) -> None:
+    async def defer_submissions(
+        self, seconds: float, *, deadline_monotonic: float | None = None
+    ) -> bool:
         if seconds <= 0:
-            return
-        async with self._lock:
-            self._blocked_until = max(self._blocked_until, self._clock() + seconds)
+            return True
+        if not await self._acquire_lock(deadline_monotonic):
+            return False
+        try:
+            now = self._clock()
+            if deadline_monotonic is not None and now >= deadline_monotonic:
+                return False
+            self._blocked_until = max(self._blocked_until, now + seconds)
+            return True
+        finally:
+            self._lock.release()
 
     async def wait_for_next_submission(self, *, deadline_monotonic: float | None = None) -> bool:
-        if self._minimum_interval_seconds == 0 and self._blocked_until <= self._clock():
-            return deadline_monotonic is None or self._clock() < deadline_monotonic
-        async with self._lock:
-            target = self._blocked_until
-            if self._last_submission_at is not None:
-                random_value = min(1.0, max(0.0, self._rng()))
-                jittered = self._minimum_interval_seconds * (
-                    1 + random_value * self._jitter_fraction
-                )
-                # The configured interval remains a real minimum; bounded positive
-                # jitter gives competing workers more room to spread request starts.
-                target = max(target, self._last_submission_at + jittered)
-            while (remaining := target - self._clock()) > 0:
-                if deadline_monotonic is not None:
-                    deadline_remaining = deadline_monotonic - self._clock()
-                    if deadline_remaining <= 0 or remaining >= deadline_remaining:
-                        return False
-                if self._sleeper is None:
-                    await asyncio.sleep(remaining)
-                else:
-                    await self._sleeper(remaining)
-            if deadline_monotonic is not None and self._clock() >= deadline_monotonic:
+        jitter_value: float | None = None
+        while True:
+            if not await self._acquire_lock(deadline_monotonic):
                 return False
-            self._last_submission_at = self._clock()
-            return True
+            try:
+                now = self._clock()
+                target = self._blocked_until
+                if self._last_submission_at is not None:
+                    if jitter_value is None:
+                        jitter_value = min(1.0, max(0.0, self._rng()))
+                    jittered = self._minimum_interval_seconds * (
+                        1 + jitter_value * self._jitter_fraction
+                    )
+                    # The configured interval remains a real minimum; bounded positive
+                    # jitter gives competing workers more room to spread request starts.
+                    target = max(target, self._last_submission_at + jittered)
+                remaining = target - now
+                if remaining <= 0:
+                    if deadline_monotonic is not None and now >= deadline_monotonic:
+                        return False
+                    self._last_submission_at = now
+                    return True
+            finally:
+                self._lock.release()
+
+            deadline_remaining: float | None = None
+            if deadline_monotonic is not None:
+                deadline_remaining = deadline_monotonic - self._clock()
+                if deadline_remaining <= 0 or remaining >= deadline_remaining:
+                    return False
+            try:
+                sleeper = asyncio.sleep if self._sleeper is None else self._sleeper
+                if deadline_remaining is None:
+                    await sleeper(remaining)
+                else:
+                    await asyncio.wait_for(sleeper(remaining), timeout=deadline_remaining)
+            except TimeoutError:
+                return False
+
+    async def _acquire_lock(self, deadline_monotonic: float | None) -> bool:
+        try:
+            if deadline_monotonic is None:
+                await self._lock.acquire()
+            else:
+                remaining = deadline_monotonic - self._clock()
+                if remaining <= 0:
+                    return False
+                await asyncio.wait_for(self._lock.acquire(), timeout=remaining)
+        except TimeoutError:
+            return False
+        return True
 
 
 _SHARED_BRIDGE_PACERS: weakref.WeakKeyDictionary[
@@ -180,13 +216,27 @@ class TurnSubmission:
     conversation_id: UUID | None = None
     detail: str = ""
     error_code: str | None = None
-    submission_state: str | None = None
+    submission_state: BridgeSubmissionState | None = None
     retryable: bool = False
     bridge_invocation_id: str | None = None
     provider_usage: Mapping[str, Any] | None = None
     retry_after_seconds: float | None = None
     failure_stage: str | None = None
     failure_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.submission_state is None:
+            return
+        try:
+            state = BridgeSubmissionState(self.submission_state)
+        except (TypeError, ValueError):
+            object.__setattr__(
+                self, "submission_state", BridgeSubmissionState.EXTERNAL_STATE_UNKNOWN
+            )
+            object.__setattr__(self, "status", TurnSubmissionStatus.NEEDS_REVIEW)
+            object.__setattr__(self, "retryable", False)
+        else:
+            object.__setattr__(self, "submission_state", state)
 
 
 async def submit_bridge_consultation_once(
@@ -299,7 +349,7 @@ async def submit_bridge_consultation_once(
             detail=detail,
             error_code="bridge_execution_timeout",
             retryable=False,
-            submission_state="external_state_unknown",
+            submission_state=BridgeSubmissionState.EXTERNAL_STATE_UNKNOWN,
             failure_stage="bridge_execution",
             failure_reason="execution_deadline_exceeded",
         )
@@ -318,14 +368,12 @@ async def submit_bridge_consultation_once(
             return ambiguous_timeout("Bridge consultation exceeded its bounded execution deadline.")
         except Exception as exc:
             code = str(getattr(exc, "code", ""))[:64] or "bridge_unavailable"
-            submission_state = getattr(exc, "submission_state", None)
+            submission_state = _normalize_bridge_submission_state(
+                getattr(exc, "submission_state", None)
+            )
             retry_after = getattr(exc, "retry_after", None)
             retryable = bool(getattr(exc, "retryable", False))
-            uncertain = submission_state in {
-                "submission_attempted",
-                "post_submission",
-                "external_state_unknown",
-            }
+            uncertain = submission_state is not BridgeSubmissionState.PRE_SUBMISSION
             result = TurnSubmission(
                 (
                     TurnSubmissionStatus.NEEDS_REVIEW
@@ -349,7 +397,7 @@ async def submit_bridge_consultation_once(
                 conversation_id=conversation_id,
                 detail="The transport cannot safely create a distinct retry attempt.",
                 error_code="bridge_retry_attempt_unavailable",
-                submission_state="pre_submission",
+                submission_state=BridgeSubmissionState.PRE_SUBMISSION,
                 failure_stage="retry_admission",
                 failure_reason="distinct_attempt_not_supported",
             )
@@ -363,30 +411,66 @@ async def submit_bridge_consultation_once(
     if (
         submission.status is not TurnSubmissionStatus.UNAVAILABLE
         or submission.error_code != "bridge_rate_limited"
-        or submission.submission_state != "pre_submission"
+        or submission.submission_state is not BridgeSubmissionState.PRE_SUBMISSION
     ):
+        if (
+            submission.status is TurnSubmissionStatus.UNAVAILABLE
+            and submission.error_code == "bridge_rate_limited"
+        ):
+            return TurnSubmission(
+                TurnSubmissionStatus.NEEDS_REVIEW,
+                idempotency_key=submission.idempotency_key or key,
+                conversation_id=submission.conversation_id or conversation_id,
+                detail=(
+                    submission.detail
+                    or "Bridge rate-limit rejection lacked proof of non-submission."
+                ),
+                error_code=submission.error_code,
+                submission_state=(
+                    submission.submission_state
+                    or BridgeSubmissionState.EXTERNAL_STATE_UNKNOWN
+                ),
+                retryable=False,
+                retry_after_seconds=submission.retry_after_seconds,
+                failure_stage=submission.failure_stage or "bridge_transport",
+                failure_reason=submission.failure_reason or submission.error_code,
+            )
         return submission
 
     retry_after = _retry_after_or_none(submission.retry_after_seconds)
+    retry_maximum = getattr(configured, "openai_bridge_pre_submission_retry_max_seconds", 8.0)
+    if not isinstance(retry_maximum, int | float) or not math.isfinite(retry_maximum):
+        retry_maximum = 0.0
+    retry_maximum = max(0.0, float(retry_maximum))
+    retry_after_exceeds_maximum = retry_after is not None and retry_after > retry_maximum
     retry_delay = (
-        retry_after
+        min(retry_after, retry_maximum)
         if retry_after is not None
         else _bounded_retry_backoff(
             getattr(configured, "openai_bridge_pre_submission_retry_base_seconds", 1.0),
-            getattr(configured, "openai_bridge_pre_submission_retry_max_seconds", 8.0),
+            retry_maximum,
             0,
         )
     )
-    await pacer.defer_submissions(retry_delay)
-    if not submission.retryable or not callable(
+    can_retry = submission.retryable and callable(
         getattr(transport, "submit_with_attempt", None)
-    ):
-        return submission
+    )
     if deadline is not None:
         remaining = deadline - operation_clock()
         # Keep a full minimum execution window after the server's wait. It
         # conservatively includes pacing and local/transport overhead.
-        if remaining <= retry_delay + minimum_timeout_seconds:
+        enough_budget = remaining > retry_delay + minimum_timeout_seconds
+    else:
+        enough_budget = True
+    if retry_after_exceeds_maximum:
+        await pacer.defer_submissions(retry_delay, deadline_monotonic=deadline)
+        return submission
+    if not can_retry or not enough_budget:
+        return submission
+    if not await pacer.defer_submissions(retry_delay, deadline_monotonic=deadline):
+        return submission
+    if deadline is not None:
+        if deadline - operation_clock() <= retry_delay + minimum_timeout_seconds:
             return submission
     if not await wait_for_pacing():
         return submission
@@ -408,7 +492,7 @@ def _bridge_execution_budget_refusal(
         detail="Bridge consultation refused before transport: bounded execution budget exhausted.",
         error_code="bridge_execution_budget_exhausted",
         retryable=False,
-        submission_state="pre_submission",
+        submission_state=BridgeSubmissionState.PRE_SUBMISSION,
         failure_stage="budget_admission",
         failure_reason=reason,
     )
@@ -423,6 +507,15 @@ def _retry_after_or_none(value: Any) -> float | None:
     ):
         return float(value)
     return None
+
+
+def _normalize_bridge_submission_state(value: Any) -> BridgeSubmissionState | None:
+    if value is None:
+        return None
+    try:
+        return BridgeSubmissionState(value)
+    except (TypeError, ValueError):
+        return BridgeSubmissionState.EXTERNAL_STATE_UNKNOWN
 
 
 def _bounded_retry_backoff(base: float, maximum: float, attempt: int) -> float:
@@ -507,7 +600,7 @@ class ModelConversationTurnTransport:
                 else "Recovered the persisted response from a Bridge turn needing review."
             ),
             error_code=getattr(content.turn, "error_code", None),
-            submission_state="post_submission",
+            submission_state=BridgeSubmissionState.POST_SUBMISSION,
             bridge_invocation_id=str(content.turn.id),
         )
 
@@ -601,7 +694,7 @@ class ModelConversationTurnTransport:
                         conversation_id=conversation_id,
                         detail="Reused the response already persisted for this Bridge turn.",
                         error_code=existing.turn.error_code,
-                        submission_state="post_submission",
+                        submission_state=BridgeSubmissionState.POST_SUBMISSION,
                         bridge_invocation_id=str(existing.turn.id),
                     )
                 if existing.turn.status is ConversationTurnStatus.RUNNING:
@@ -767,11 +860,8 @@ class ModelConversationTurnTransport:
             )
             if captured is not None:
                 return captured
-            submitted = exc.submission_state in {
-                "submission_attempted",
-                "post_submission",
-                "external_state_unknown",
-            }
+            submission_state = _normalize_bridge_submission_state(exc.submission_state)
+            submitted = submission_state is not BridgeSubmissionState.PRE_SUBMISSION
             status = (
                 TurnSubmissionStatus.NEEDS_REVIEW
                 if exc.status is ConversationTurnStatus.NEEDS_REVIEW or submitted
@@ -783,8 +873,8 @@ class ModelConversationTurnTransport:
                 conversation_id=conversation_id,
                 detail=str(exc),
                 error_code=exc.code,
-                submission_state=exc.submission_state,
-                retryable=exc.retryable,
+                submission_state=submission_state,
+                retryable=exc.retryable and not submitted,
                 retry_after_seconds=getattr(
                     exc, "retry_after_seconds", getattr(exc, "retry_after", None)
                 ),
@@ -808,15 +898,13 @@ class ModelConversationTurnTransport:
             )
             if captured is not None:
                 return captured
-            submission_state = getattr(exc, "submission_state", None)
+            submission_state = _normalize_bridge_submission_state(
+                getattr(exc, "submission_state", None)
+            )
             error_code = str(getattr(exc, "code", ""))[:64] or None
             if error_code == "model_submission_reconciliation_required":
-                submission_state = ModelSubmissionState.EXTERNAL_STATE_UNKNOWN.value
-            submitted = submission_state in {
-                "submission_attempted",
-                "post_submission",
-                "external_state_unknown",
-            }
+                submission_state = BridgeSubmissionState.EXTERNAL_STATE_UNKNOWN
+            submitted = submission_state is not BridgeSubmissionState.PRE_SUBMISSION
             return TurnSubmission(
                 (
                     TurnSubmissionStatus.NEEDS_REVIEW
@@ -828,7 +916,10 @@ class ModelConversationTurnTransport:
                 detail=type(exc).__name__,
                 error_code=error_code,
                 submission_state=submission_state,
-                retryable=bool(getattr(exc, "retryable", False)),
+                retryable=(
+                    bool(getattr(exc, "retryable", False))
+                    and submission_state is BridgeSubmissionState.PRE_SUBMISSION
+                ),
                 retry_after_seconds=getattr(exc, "retry_after", None),
                 failure_stage=str(getattr(exc, "phase", failure_stage))[:64],
                 failure_reason=str(getattr(exc, "code", None) or type(exc).__name__)[:128],
@@ -1192,7 +1283,7 @@ class BridgeInvestigator:
                 attempts_made += 1
                 confirmed_not_submitted = (
                     submission.status is TurnSubmissionStatus.UNAVAILABLE
-                    and submission.submission_state == "pre_submission"
+                    and submission.submission_state is BridgeSubmissionState.PRE_SUBMISSION
                 )
                 if (
                     not confirmed_not_submitted
@@ -1242,11 +1333,16 @@ class BridgeInvestigator:
             assert submission is not None
             uncertain_retryable_failure = (
                 submission.status is TurnSubmissionStatus.UNAVAILABLE
-                and submission.submission_state != "pre_submission"
+                and submission.submission_state is not BridgeSubmissionState.PRE_SUBMISSION
                 and (
                     submission.retryable
+                    or submission.submission_state is None
                     or submission.submission_state
-                    in {"submission_attempted", "post_submission", "external_state_unknown"}
+                    in {
+                        BridgeSubmissionState.SUBMISSION_ATTEMPTED,
+                        BridgeSubmissionState.POST_SUBMISSION,
+                        BridgeSubmissionState.EXTERNAL_STATE_UNKNOWN,
+                    }
                 )
             )
             if uncertain_retryable_failure:

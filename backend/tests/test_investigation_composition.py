@@ -6,10 +6,13 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from cti_app.application import bridge_investigator as bridge_module
 from cti_app.application.bridge_investigator import (
     BridgeInvestigator,
+    BridgeSubmissionPacer,
     TurnSubmission,
     TurnSubmissionStatus,
+    submit_bridge_consultation_once,
 )
 from cti_app.application.investigation_composition import (
     OPTIONAL_CAPABILITIES,
@@ -397,6 +400,83 @@ async def test_blocked_model_turn_becomes_a_persistable_review_outcome() -> None
 
     assert result.status is TurnSubmissionStatus.NEEDS_REVIEW
     assert result.idempotency_key == "blocked-at-approval-gate"
+
+
+@pytest.mark.asyncio
+async def test_permission_aware_transport_forwards_timeout_on_distinct_429_retry(
+    monkeypatch,
+) -> None:
+    class _Clock:
+        now = 0.0
+
+        def __call__(self) -> float:
+            return self.now
+
+        async def sleep(self, seconds: float) -> None:
+            self.now += seconds
+
+    class _RetryingTransport:
+        def __init__(self) -> None:
+            self.calls: list[tuple[int, float | None, str]] = []
+            self.successes = 0
+
+        async def submit(self, *, timeout_seconds: float | None = None, **_kwargs):
+            self.calls.append((0, timeout_seconds, "attempt=0"))
+            return TurnSubmission(
+                TurnSubmissionStatus.UNAVAILABLE,
+                idempotency_key="attempt=0",
+                error_code="bridge_rate_limited",
+                submission_state="pre_submission",
+                retryable=True,
+                retry_after_seconds=1,
+            )
+
+        async def submit_with_attempt(
+            self, *, attempt: int, timeout_seconds: float | None = None, **_kwargs
+        ):
+            self.calls.append((attempt, timeout_seconds, f"attempt={attempt}"))
+            self.successes += 1
+            return TurnSubmission(
+                TurnSubmissionStatus.SUCCEEDED,
+                idempotency_key=f"attempt={attempt}",
+                output_text="one accepted answer",
+            )
+
+    clock = _Clock()
+    pacer = BridgeSubmissionPacer(
+        minimum_interval_seconds=0,
+        jitter_fraction=0,
+        clock=clock,
+        sleeper=clock.sleep,
+    )
+    monkeypatch.setattr(bridge_module, "_shared_bridge_pacer", lambda **_kwargs: pacer)
+    underlying = _RetryingTransport()
+    transport = _PermissionAwareInvestigationTransport(underlying)
+
+    result = await submit_bridge_consultation_once(
+        transport,
+        investigation_id=uuid4(),
+        subject_id=uuid4(),
+        turn_index=0,
+        context_sha256="a" * 64,
+        prompt="Synthetic wrapper retry test.",
+        external_llm_allowed=True,
+        settings=SimpleNamespace(
+            openai_bridge_min_submission_interval_seconds=0,
+            openai_bridge_submission_jitter_fraction=0,
+            openai_bridge_pre_submission_retry_base_seconds=2,
+            openai_bridge_pre_submission_retry_max_seconds=8,
+        ),
+        timeout_seconds=10,
+        deadline_monotonic=10,
+        minimum_timeout_seconds=1,
+        clock=clock,
+    )
+
+    assert result.status is TurnSubmissionStatus.SUCCEEDED
+    assert underlying.calls == [(0, 10, "attempt=0"), (1, 9, "attempt=1")]
+    assert underlying.calls[0][2] != underlying.calls[1][2]
+    assert underlying.successes == 1
 
 
 @pytest.mark.asyncio

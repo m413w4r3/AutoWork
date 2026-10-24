@@ -787,6 +787,7 @@ class _PermissionAwareInvestigationTransport:
         prompt: str,
         external_llm_allowed: bool,
         attempt: int,
+        timeout_seconds: float | None = None,
     ) -> TurnSubmission:
         submit_attempt = getattr(self._transport, "submit_with_attempt", None)
         if not callable(submit_attempt):
@@ -804,6 +805,7 @@ class _PermissionAwareInvestigationTransport:
                 prompt=prompt,
                 external_llm_allowed=external_llm_allowed,
                 attempt=attempt,
+                timeout_seconds=timeout_seconds,
             ),
         )
         if result.status is not TurnSubmissionStatus.BLOCKED:
