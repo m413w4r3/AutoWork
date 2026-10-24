@@ -67,6 +67,14 @@ class ProposalOperator(StrEnum):
     HASH = "similarity_hash"
 
 
+class ProposalOutcome(StrEnum):
+    """Outcome of one P10 proposal response."""
+
+    SUCCEEDED = "succeeded"
+    PARTIAL = "partial"
+    REFUSED = "refused"
+
+
 # Stable public aliases make the contract convenient for callers without
 # introducing another operator vocabulary.
 InvariantProposalOperator = ProposalOperator

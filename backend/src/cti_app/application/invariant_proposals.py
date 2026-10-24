@@ -32,6 +32,7 @@ from cti_app.domain.invariant_proposals import (
     CandidateInvariantProposal,
     ProposalInputSnapshot,
     ProposalOperator,
+    ProposalOutcome,
     ProposalResponse,
     YaraDraftProposal,
     strip_known_estimate_fields,
@@ -90,6 +91,15 @@ class ProposalOutputValidationError(ProposalConversationError):
     pass
 
 
+@dataclass(frozen=True, slots=True)
+class _ParsedProposalResponse:
+    response: ProposalResponse
+    transformations: tuple[str, ...]
+    outcome: ProposalOutcome
+    refusal_reason: str | None = None
+    refusal_code: str | None = None
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ProposalConversationResult:
     investigation_id: UUID
@@ -101,6 +111,9 @@ class ProposalConversationResult:
     response: ProposalResponse
     turn: ModelConversationTurn
     invariant_results: tuple[InvariantProposalResult, ...]
+    outcome: ProposalOutcome = ProposalOutcome.SUCCEEDED
+    refusal_reason: str | None = None
+    refusal_code: str | None = None
 
     @property
     def proposal_snapshot_sha256(self) -> str:
@@ -210,22 +223,18 @@ class ProposalConversationService:
             persisted_provenances = _snapshot_provenance_catalog(persisted_snapshot)
             if content.output_text is None:
                 raise ProposalOutputValidationError("The proposal turn has no persisted output")
-            response, transformations = _parse_proposal_response_details(
+            parsed = _parse_proposal_response_details(
                 content.output_text, provenance_aliases=provenance_aliases
             )
             await self._archive_canonical_output(
-                existing_turn, response, transformations=transformations
+                existing_turn, parsed.response, transformations=parsed.transformations
             )
-            _validate_yara_references(
-                response.yara_draft,
-                response.candidate_invariants,
-                persisted_provenances,
-            )
-            results = await self._pass_candidates_to_p09(
+            results = await self._process_response_for_p09(
+                outcome=parsed.outcome,
+                response=parsed.response,
                 investigation_id=investigation_id,
                 cycle_number=effective_cycle,
                 sample_ids=_snapshot_origin_sample_ids(persisted_snapshot),
-                candidates=response.candidate_invariants,
                 provenance_by_ref=persisted_provenances,
             )
             return ProposalConversationResult(
@@ -235,9 +244,12 @@ class ProposalConversationService:
                 conversation_id=conversation.id,
                 idempotency_key=idempotency_key,
                 snapshot=persisted_snapshot,
-                response=response,
+                response=parsed.response,
                 turn=existing_turn,
-                invariant_results=tuple(results),
+                invariant_results=results,
+                outcome=parsed.outcome,
+                refusal_reason=parsed.refusal_reason,
+                refusal_code=parsed.refusal_code,
             )
 
         conversation, mode = await self._select_conversation(
@@ -260,18 +272,18 @@ class ProposalConversationService:
             lifecycle_policy=ConversationPolicy.KEEP,
         )
         output_text = await self._turn_output(conversation.id, turn)
-        response, transformations = _parse_proposal_response_details(
+        parsed = _parse_proposal_response_details(
             output_text, provenance_aliases=provenance_aliases
         )
-        await self._archive_canonical_output(turn, response, transformations=transformations)
-        _validate_yara_references(
-            response.yara_draft, response.candidate_invariants, provenance_by_ref
+        await self._archive_canonical_output(
+            turn, parsed.response, transformations=parsed.transformations
         )
-        results = await self._pass_candidates_to_p09(
+        results = await self._process_response_for_p09(
+            outcome=parsed.outcome,
+            response=parsed.response,
             investigation_id=investigation_id,
             cycle_number=effective_cycle,
             sample_ids=tuple(sample.id for sample in samples),
-            candidates=response.candidate_invariants,
             provenance_by_ref=provenance_by_ref,
         )
         return ProposalConversationResult(
@@ -281,9 +293,12 @@ class ProposalConversationService:
             conversation_id=conversation.id,
             idempotency_key=idempotency_key,
             snapshot=snapshot,
-            response=response,
+            response=parsed.response,
             turn=turn,
-            invariant_results=tuple(results),
+            invariant_results=results,
+            outcome=parsed.outcome,
+            refusal_reason=parsed.refusal_reason,
+            refusal_code=parsed.refusal_code,
         )
 
     async def _archive_canonical_output(
@@ -917,6 +932,31 @@ class ProposalConversationService:
             )
         return results
 
+    async def _process_response_for_p09(
+        self,
+        *,
+        outcome: ProposalOutcome,
+        response: ProposalResponse,
+        investigation_id: UUID,
+        cycle_number: int,
+        sample_ids: Sequence[UUID],
+        provenance_by_ref: Mapping[str, InvariantProvenance],
+    ) -> tuple[InvariantProposalResult, ...]:
+        """Apply the same P09 gate to both fresh and replayed P10 responses."""
+        if outcome is ProposalOutcome.REFUSED:
+            return ()
+        _validate_yara_references(
+            response.yara_draft, response.candidate_invariants, provenance_by_ref
+        )
+        results = await self._pass_candidates_to_p09(
+            investigation_id=investigation_id,
+            cycle_number=cycle_number,
+            sample_ids=sample_ids,
+            candidates=response.candidate_invariants,
+            provenance_by_ref=provenance_by_ref,
+        )
+        return tuple(results)
+
 
 def make_proposal_turn_idempotency_key(
     *,
@@ -1150,16 +1190,18 @@ def _p10_text(value: Any) -> str:
 
 
 def _parse_proposal_response(output_text: str) -> ProposalResponse:
-    response, _ = _parse_proposal_response_details(output_text)
-    return response
+    return _parse_proposal_response_details(output_text).response
 
 
 def _parse_proposal_response_details(
     output_text: str,
     *,
     provenance_aliases: Mapping[str, str] | None = None,
-) -> tuple[ProposalResponse, tuple[str, ...]]:
+) -> _ParsedProposalResponse:
     wire_warnings: tuple[str, ...] = ()
+    outcome = ProposalOutcome.SUCCEEDED
+    refusal_reason: str | None = None
+    refusal_code: str | None = None
     try:
         decoded = json.loads(
             output_text,
@@ -1167,7 +1209,13 @@ def _parse_proposal_response_details(
             parse_constant=_reject_non_finite_json,
         )
     except (TypeError, ValueError, json.JSONDecodeError):
-        decoded, wire_warnings = _proposal_wire_payload(output_text)
+        (
+            decoded,
+            wire_warnings,
+            outcome,
+            refusal_reason,
+            refusal_code,
+        ) = _proposal_wire_payload(output_text)
     if not isinstance(decoded, dict):
         raise ProposalOutputValidationError("The model output has no recognized proposal fields")
     cleaned = strip_known_estimate_fields(decoded)
@@ -1191,7 +1239,13 @@ def _parse_proposal_response_details(
     transformations = tuple(
         [f"ignored estimate fields: {', '.join(sorted(ignored_fields))}"] if ignored_fields else []
     ) + tuple(wire_warnings)
-    return response, transformations
+    return _ParsedProposalResponse(
+        response=response,
+        transformations=transformations,
+        outcome=outcome,
+        refusal_reason=refusal_reason,
+        refusal_code=refusal_code,
+    )
 
 
 def _resolve_p10_evidence_aliases(
@@ -1223,7 +1277,9 @@ def _resolve_p10_evidence_aliases(
         ) from exc
 
 
-def _proposal_wire_payload(output_text: str) -> tuple[dict[str, Any], tuple[str, ...]]:
+def _proposal_wire_payload(
+    output_text: str,
+) -> tuple[dict[str, Any], tuple[str, ...], ProposalOutcome, str | None, str | None]:
     document = parse_advisor_wire(output_text)
     fields = document.fields
     warnings: list[str] = []
@@ -1232,12 +1288,29 @@ def _proposal_wire_payload(output_text: str) -> tuple[dict[str, Any], tuple[str,
     declared_type = next(iter(fields.get("type", ())), "")
     if declared_type.casefold() != "p10_proposal":
         warnings.append("proposal type missing or mismatched")
-    status = next(iter(fields.get("status", ())), "").casefold()
+    statuses = tuple(value.casefold() for value in fields.get("status", ()))
+    # A repeated affirmative/partial status must not override any explicit refusal.
+    status = "refused" if "refused" in statuses else next(iter(statuses), "")
+    outcome = ProposalOutcome.SUCCEEDED
+    refusal_reason: str | None = None
+    refusal_code: str | None = None
     if not status:
         warnings.append("proposal status missing")
     elif status == "partial":
+        outcome = ProposalOutcome.PARTIAL
         warnings.append("Bridge returned a partial proposal")
     elif status == "refused":
+        outcome = ProposalOutcome.REFUSED
+        refusal_reason = (
+            next(iter(fields.get("refusal_reason", ())), "").strip()
+            or next(iter(fields.get("reason", ())), "").strip()
+            or "Bridge refused the proposal without a stated reason."
+        )
+        refusal_code = (
+            next(iter(fields.get("refusal_code", ())), "").strip()
+            or next(iter(fields.get("code", ())), "").strip()
+            or None
+        )
         warnings.append("Bridge refused the proposal")
 
     def add_warning(value: str) -> None:
@@ -1339,7 +1412,7 @@ def _proposal_wire_payload(output_text: str) -> tuple[dict[str, Any], tuple[str,
         ]
         if not field_values:
             add_warning(f"{wire_key} field missing")
-    return payload, tuple(warnings)
+    return payload, tuple(warnings), outcome, refusal_reason, refusal_code
 
 
 def _ignored_estimate_fields(original: Any, cleaned: Any) -> set[str]:

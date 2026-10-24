@@ -25,7 +25,11 @@ from cti_app.application.invariants import InvariantProposalResult
 from cti_app.application.model_conversations import ConversationPolicyError
 from cti_app.domain.classification import TLP
 from cti_app.domain.goodware_index import GoodwareMeasurementError
-from cti_app.domain.invariant_proposals import ProposalInputSnapshot, ProposalOperator
+from cti_app.domain.invariant_proposals import (
+    ProposalInputSnapshot,
+    ProposalOperator,
+    ProposalOutcome,
+)
 from cti_app.domain.invariants import (
     AnalystManualProvenance,
     InvariantCategory,
@@ -1307,12 +1311,13 @@ def test_p10_advisor_wire_response_parses_as_text_and_marks_missing_fields() -> 
         "QUESTION: none\n"
     )
 
-    response, transformations = _parse_proposal_response_details(raw)
+    parsed = _parse_proposal_response_details(raw)
 
-    assert response.candidate_invariants[0].pattern == "CreateMutexW"
-    assert response.candidate_invariants[0].provenance_refs == [provenance_ref]
-    assert transformations
-    assert any("partial" in item for item in transformations)
+    assert parsed.response.candidate_invariants[0].pattern == "CreateMutexW"
+    assert parsed.response.candidate_invariants[0].provenance_refs == [provenance_ref]
+    assert parsed.transformations
+    assert any("partial" in item for item in parsed.transformations)
+    assert parsed.outcome is ProposalOutcome.PARTIAL
 
 
 def test_p10_text_evidence_alias_resolves_through_local_manifest() -> None:
@@ -1325,11 +1330,136 @@ def test_p10_text_evidence_alias_resolves_through_local_manifest() -> None:
         "RISK: none\nVALIDATION: none\nQUESTION: none\n"
     )
 
-    response, _ = _parse_proposal_response_details(
+    parsed = _parse_proposal_response_details(
         raw, provenance_aliases={"E1": "canonical-provenance-reference"}
     )
 
-    assert response.candidate_invariants[0].provenance_refs == ["canonical-provenance-reference"]
+    assert parsed.response.candidate_invariants[0].provenance_refs == [
+        "canonical-provenance-reference"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_refused_wire_with_candidate_is_terminal_for_p09() -> None:
+    provenance_ref = _provenance_ref()
+    output = (
+        "advisor-wire.v1\n"
+        "TYPE: p10_proposal\n"
+        "STATUS: refused\n"
+        "REFUSAL_CODE: insufficient_evidence\n"
+        "REFUSAL_REASON: Insufficient evidence for a safe proposal.\n"
+        "CANDIDATE: literal_string | c2_indicator | exact | CreateMutexW | "
+        f"Mutex name distinguishes this sample. | refs={provenance_ref}\n"
+    )
+    service, _, _, registry = _service(conversation=_ConversationService(output=output))
+
+    result = await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=1)
+
+    assert registry.calls == []
+    assert result.invariant_results == ()
+    assert result.outcome is ProposalOutcome.REFUSED
+    assert result.refusal_reason == "Insufficient evidence for a safe proposal."
+    assert result.refusal_code == "insufficient_evidence"
+
+
+@pytest.mark.asyncio
+async def test_later_refusal_status_is_terminal_for_p09() -> None:
+    provenance_ref = _provenance_ref()
+    output = (
+        "advisor-wire.v1\n"
+        "TYPE: p10_proposal\n"
+        "STATUS: succeeded\n"
+        "STATUS: refused\n"
+        "REFUSAL_REASON: The response was explicitly refused.\n"
+        "CANDIDATE: literal_string | c2_indicator | exact | CreateMutexW | "
+        f"Mutex name distinguishes this sample. | refs={provenance_ref}\n"
+    )
+    service, _, _, registry = _service(conversation=_ConversationService(output=output))
+
+    result = await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=1)
+
+    assert registry.calls == []
+    assert result.invariant_results == ()
+    assert result.outcome is ProposalOutcome.REFUSED
+
+
+@pytest.mark.asyncio
+async def test_refused_wire_without_candidate_has_explicit_outcome() -> None:
+    output = (
+        "advisor-wire.v1\n"
+        "TYPE: p10_proposal\n"
+        "STATUS: refused\n"
+        "REFUSAL_REASON: No eligible evidence was available.\n"
+    )
+    service, _, _, registry = _service(conversation=_ConversationService(output=output))
+
+    result = await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=1)
+
+    assert registry.calls == []
+    assert result.invariant_results == ()
+    assert result.outcome is ProposalOutcome.REFUSED
+    assert result.refusal_reason == "No eligible evidence was available."
+
+
+@pytest.mark.asyncio
+async def test_partial_wire_without_refusal_still_passes_candidate_to_p09() -> None:
+    provenance_ref = _provenance_ref()
+    output = (
+        "advisor-wire.v1\n"
+        "TYPE: p10_proposal\n"
+        "STATUS: partial\n"
+        "CANDIDATE: literal_string | c2_indicator | exact | CreateMutexW | "
+        f"Mutex name distinguishes this sample. | refs={provenance_ref}\n"
+    )
+    service, _, _, registry = _service(conversation=_ConversationService(output=output))
+
+    result = await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=1)
+
+    assert len(registry.calls) == 1
+    assert result.outcome is ProposalOutcome.PARTIAL
+
+
+@pytest.mark.asyncio
+async def test_invalid_refused_wire_still_raises_validation_error() -> None:
+    provenance_ref = _provenance_ref()
+    output = (
+        "advisor-wire.v1\n"
+        "TYPE: p10_proposal\n"
+        "STATUS: refused\n"
+        "CANDIDATE: invalid_type | invalid_category | invalid_operator | pattern | reason | "
+        f"refs={provenance_ref}\n"
+    )
+    conversation = _ConversationService(output=output)
+    service, _, _, registry = _service(conversation=conversation)
+
+    with pytest.raises(ProposalOutputValidationError):
+        await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=1)
+
+    assert registry.calls == []
+
+
+@pytest.mark.asyncio
+async def test_replay_of_refused_wire_does_not_pass_candidate_to_p09() -> None:
+    provenance_ref = _provenance_ref()
+    output = (
+        "advisor-wire.v1\n"
+        "TYPE: p10_proposal\n"
+        "STATUS: refused\n"
+        "REFUSAL_CODE: insufficient_evidence\n"
+        "REFUSAL_REASON: Insufficient evidence for a safe proposal.\n"
+        "CANDIDATE: literal_string | c2_indicator | exact | CreateMutexW | "
+        f"Mutex name distinguishes this sample. | refs={provenance_ref}\n"
+    )
+    service, _, conversation, registry = _service(conversation=_ConversationService(output=output))
+
+    first = await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=1)
+    replay = await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=1)
+
+    assert registry.calls == []
+    assert conversation.external_calls == 1
+    assert first.outcome is replay.outcome is ProposalOutcome.REFUSED
+    assert first.refusal_reason == replay.refusal_reason
+    assert first.refusal_code == replay.refusal_code == "insufficient_evidence"
 
 
 async def _assert_delegated(
