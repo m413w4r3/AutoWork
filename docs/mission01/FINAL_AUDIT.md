@@ -1,14 +1,17 @@
 # Mission 01 V3.2 — audit final de reprise
 
 **État :** **PARTIAL**, clôturé le 2026-10-24 avec réserves et preuves.
-Aucun push, merge sur `main`, déploiement, accès live, appel fournisseur/CTI,
-acquisition, scan, upload ou donnée CTI privée n'a été effectué.
+Aucun push vers `origin`, déploiement, accès live, appel fournisseur/CTI,
+acquisition, scan, upload ou donnée CTI privée n'a été effectué. Le merge
+local dans `main` (`db9aa1d3`) a été effectué sur demande utilisateur
+explicite et n'a **pas** été poussé ; `origin/main` reste `31ceeac`.
 
 **Base :** `main@058bb4af2278e3941956e523c5a1d560208de228`.
 **Branche d'intégration :** `chore/mission01-integration`.
 **État code vérifié :** `9523cc4c` (dernier merge de code : B1B, L2, A1, Q1).
-Cette documentation est committée dans le lot suivant ; les SHA de merge et
-de revue sont cités ci-dessous.
+**`main` local fusionné :** `db9aa1d3` (merge de `chore/mission01-integration`,
+non poussé). Les branches F6 et B1A1 atomique ne sont **pas** dans `main`.
+Cette documentation est committée après ce merge.
 
 ## Périmètre réellement exécuté
 
@@ -43,7 +46,8 @@ de revue sont cités ci-dessous.
 
 | Vérification | Résultat | Portée |
 |---|---|---|
-| **Suite backend complète** | **4667 passed, 34 failed, 2 skipped, 30 deselected** (64,50 s) | `pytest --ignore=tests/integration -m "not integration"` sur l'intégration B1B+L2+A1+Q1 (`9523cc4`) |
+| **Suite backend complète (intégration)** | **4667 passed, 34 failed, 2 skipped, 30 deselected** (64,50 s) | `pytest --ignore=tests/integration -m "not integration"` sur l'intégration B1B+L2+A1+Q1 (`9523cc4`) |
+| **Suite backend complète (main fusionné)** | **4668 passed, 33 failed, 2 skipped, 30 deselected** (80,65 s) | même commande sur `main` @ `db9aa1d3` ; un test Typst `w17` passe sur main, aucun nouvel échec |
 | B1B oracle | **241 passed** | 8 fichiers B1B/B1A1/B1A2/gateway/bridge |
 | B1B élargi | **294 passed, 6 skipped** | sélection bridge/composition/service |
 | L2 oracle | **342 passed** | 14 fichiers contexte/operator/API |
@@ -55,18 +59,21 @@ de revue sont cités ci-dessous.
 | F6 (branche) | **162 passed** | 4 suites advisor ; revue FAIL malgré l'oracle |
 | B1A1 atomique (branche) | **148 passed** | 5 suites ; branche non intégrée |
 | B1A1 atomique WIP advisor | **1 failed, 4 passed** (`-k advisor`) | chemin positif `advisor_preflight_insufficient_evidence` |
-| Frontend | **293 passed + typecheck** (mission antérieure) | **non rejoué** : aucun changement frontend dans cette reprise |
+| Frontend | **293 passed + typecheck** | **rejoué sur main fusionné** (`pnpm test --run`, `pnpm typecheck`) |
 | PostgreSQL intégration | **non exécuté** | `UNKNOWN` |
 | Typst réel | **non exécuté** | bundle polices absent |
 
-### Triage des 34 échecs de la suite complète
+### Triage des échecs de la suite complète (34 intégration / 33 main)
 
-- **32** échecs Typst réels : `FontBundleInvalidError: Manifest-listed file is
-  missing: 'CascadiaCode/ttf/CascadiaCode.ttf'`, reproduits sur `058bb4a`.
+- **32** échecs Typst réels dans l'intégration : `FontBundleInvalidError:
+  Manifest-listed file is missing: 'CascadiaCode/ttf/CascadiaCode.ttf'`,
+  reproduits sur `058bb4a`.
 - **2** échecs préexistants : `test_confined_analysis_dispatch`
   (`test_tool_registry_dispatch_runs_capa_and_strings_through_worker`,
   CAPA indisponible ; `test_mwcp_allowlisted_fixture_parser_is_invoked_in_worker`,
   parseur MWCP absent).
+- Sur `main` fusionné, `test_w17_real_typst_draft_preview_preserves_structure_and_limits`
+  passe ; les **33** échecs restants sont 31 Typst + les 2 confined/mwcp.
 - **2 skips** : image analysis-worker non construite ; Ghidra absent.
 - Aucun échec nouveau attribuable aux lots B1B/L2/A1/Q1.
 
@@ -115,4 +122,7 @@ F6 avec nouvelle conception, capability/lease de dispatch, évaluation Q2 avec
 modèle autorisé, validation PostgreSQL concurrente, bundle de polices Typst
 et validation éditoriale V4, politique P10. Toute mesure live Bridge/VT/
 Shodan, réconciliation `needs_review`, migration, publication/G3, modification
-de budget G2 et tout push/merge sur `main` exigent une autorisation séparée.
+de budget G2 et tout **push vers `origin/main`** exigent une autorisation
+séparée. Le merge local dans `main` (`db9aa1d3`) a été effectué sur demande
+utilisateur explicite ; il n'a pas été poussé. F6 et B1A1 atomicité restent
+hors de `main`.

@@ -54,13 +54,18 @@ dans `/home/nill/perso/work/AutoWork/docs/references/mission00-2026-10-23/`.
 ## Porte finale
 
 Suite backend complète sur l'intégration B1B+L2+A1+Q1 :
-**4667 passed, 34 failed, 2 skipped, 30 deselected**. Les 34 échecs sont les
-32 échecs Typst (font bundle absent) + 2 confined/mwcp préexistants sur
-`058bb4a` ; aucun échec nouveau. PostgreSQL, transport Bridge réel et
+**4667 passed, 34 failed, 2 skipped, 30 deselected**. Sur `main` local fusionné
+(`db9aa1d3`, non poussé) : **4668 passed, 33 failed, 2 skipped, 30
+deselected** ; un test Typst (`w17`) passe sur main, aucun échec nouveau. Les
+échecs restants sont les tests Typst (font bundle absent) + les 2
+confined/mwcp préexistants sur `058bb4a`. PostgreSQL, transport Bridge réel et
 providers restent `UNKNOWN`.
 
-Frontend : 293 passed + typecheck lors de la mission antérieure ; non rejoué
-car aucun changement frontend dans cette reprise.
+Frontend : **293 passed + typecheck rejoués sur `main` fusionné**.
+
+**Merge local :** `main` @ `db9aa1d3` contient l'intégration acceptée (B1B,
+L2, A1, Q1). F6 et B1A1 atomicité sont **exclus** et restent sur leurs
+branches. `origin/main` reste `31ceeac` : aucun push effectué.
 
 ## Recette de test
 
