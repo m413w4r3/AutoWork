@@ -2229,6 +2229,144 @@ async def test_unrestricted_sample_measurement_reaches_fake_transport() -> None:
 
 
 @pytest.mark.asyncio
+async def test_dotnet_analysis_of_restricted_sample_is_blocked() -> None:
+    investigation_id = uuid4()
+    sample_hash = "c" * 64
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "dotnet-analysis-observation.v1",
+            "result": {
+                "methods": [
+                    {
+                        "name": "SyntheticRestrictedMethod",
+                        "body": "SyntheticRestrictedMethodBody",
+                    }
+                ]
+            },
+        },
+    )
+    observation = replace(
+        observation,
+        object_type="dotnet_analysis",
+        object_id=f"{sample_hash}:decompile:{'f' * 16}",
+    )
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    tool, _sample_blob = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+    tool._samples = _Samples(
+        [
+            SimpleNamespace(
+                expected_hash=sample_hash,
+                source_object_id=None,
+                state="quarantined",
+                blob_id=uuid4(),
+                tlp=TLP.GREEN,
+                do_not_submit=True,
+                external_llm_allowed=True,
+            )
+        ]
+    )
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Review the decompiled method.",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, key="operator:advisor:restricted-dotnet"),
+    )
+
+    assert transport.calls == []
+    assert result.output["advisor_status"] == "disclosure_restricted"
+    assert tuple(result.output["disclosure_restricted_refs"]) == (str(observation.id),)
+    assert result.output["confirmed_non_execution"] is True
+
+
+@pytest.mark.asyncio
+async def test_finding_linked_to_restricted_observation_is_dropped() -> None:
+    investigation_id = uuid4()
+    sample_hash = "c" * 64
+    restricted, restricted_raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": sample_hash,
+            "strings": [{"value": "RestrictedSampleMarker", "offset": 16}],
+        },
+    )
+    permitted, permitted_raw = make_observation(
+        investigation_id,
+        {
+            "schema": "generic-observation.v1",
+            "content": "Permitted observation content.",
+        },
+    )
+    finding = InvestigationFinding(
+        investigation_id=investigation_id,
+        kind=FindingKind.CAPABILITY,
+        assessment=FindingAssessment.SUPPORTED,
+        statement="RESTRICTED_FINDING_MARKER pivot derived from the restricted sample.",
+        observation_refs=(restricted.id,),
+    )
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=advisor_response("The permitted observation supports this plan.", ()),
+        )
+    )
+    tool, _sample_blob = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=permitted,
+        raw=permitted_raw,
+    )
+    tool._observations.observations[restricted.id] = restricted
+    tool._artifact_store.values[restricted.blob_id] = restricted_raw
+    tool._blobs.add(
+        restricted.blob_id,
+        sha256=restricted.sha256,
+        size=len(restricted_raw),
+        logical_bucket="evidence",
+    )
+    tool._findings = FindingRepository((finding,))
+    tool._samples = _Samples(
+        [
+            SimpleNamespace(
+                expected_hash=sample_hash,
+                source_object_id=None,
+                state="quarantined",
+                blob_id=uuid4(),
+                tlp=TLP.GREEN,
+                do_not_submit=True,
+                external_llm_allowed=True,
+            )
+        ]
+    )
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Plan the next pivot.",
+            "evidence_refs": [str(permitted.id)],
+        },
+        make_context(investigation_id, key="operator:advisor:restricted-finding"),
+    )
+
+    assert len(transport.calls) == 1
+    prompt = transport.calls[0]["prompt"]
+    assert "RESTRICTED_FINDING_MARKER" not in prompt
+    assert "Permitted observation content." in prompt
+    assert tuple(result.output["bridge_provenance"]["disclosure_restricted_finding_refs"]) == (
+        str(finding.id),
+    )
+
+
+@pytest.mark.asyncio
 async def test_unavailable_observation_blob_is_not_marked_retrievable() -> None:
     investigation_id = uuid4()
     observation, raw = make_observation(

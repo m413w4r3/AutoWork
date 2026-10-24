@@ -114,7 +114,7 @@ class AdvisorDossier:
 def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]:
     """Extract complete observed methods, text, decoded values, and byte values."""
     excerpts: list[dict[str, str]] = []
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[str, str, str]] = set()
     offset_rows: list[tuple[str, str, str]] = []
     offset_row_identities: set[tuple[str, int | None, str]] = set()
     assembly_name = next(
