@@ -98,3 +98,35 @@ et plafond de cooldown partagé, appliquer le cooldown avant tout retour.
 
 PostgreSQL concurrent, transport Bridge réel, coût : **UNKNOWN**.
 
+## Troisième revue ciblée après R2 — PASS_WITH_CHANGES
+
+**Objet :** `4604ac11347396f244cab3c950ec438ea374cf40` (delta `fd397de..4604ac1`).
+**Revue :** agent `e8bd922a-b161-48cc-a09b-2865a1bbf8cd`, Luna xhigh.
+**Oracle rejoué :** 239 passed (ciblé), 292 passed / 6 skipped (élargi).
+
+Le MEDIUM R2 est fermé sur le chemin advisor : cooldown partagé calculé
+séparément du délai de retry, plafonné à 300 s, enregistré avant les retours
+anticipés, `Retry-After=5` conservé, `Retry-After=10000` plafonné sans retry,
+cooldown au-delà de la deadline refusé.
+
+### MEDIUM résiduel — chemin `BridgeInvestigator.turn`
+
+`bridge_investigator.py:1331-1341` transmet encore le `Retry-After` brut à
+`defer_submissions`, sans plafond partagé ni deadline. Un 429
+pré-soumission retryable avec `Retry-After=10000` fixerait le pacer partagé
+pour 10 000 s ; les advisors échoueraient à leur admission pendant ce
+blocage et le retry de `turn` attendrait sans deadline. Correction R3 :
+appliquer le même plafond partagé, ne pas retenter au-delà, tester à horloge
+factice.
+
+### LOW — assertion pacer manquante
+
+Le test des 429 sans preuve de pré-soumission vérifie l'absence de retry mais
+pas l'état du pacer, alors que le cooldown est enregistré avant cette
+branche. Ajouter une assertion directe.
+
+### Résiduels
+
+PostgreSQL concurrent, transport Bridge réel, coût : **UNKNOWN**.
+
+
