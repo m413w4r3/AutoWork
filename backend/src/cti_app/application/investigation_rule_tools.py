@@ -1756,6 +1756,7 @@ class _RuleTools:
             )
         except (ValueError, TypeError, KeyError) as exc:
             raise _RuleTestInputFailure("yara_input_validation", exc) from exc
+        corpus = _corpus_with_measurement_blockers(corpus, report)
         evaluation = _status_for_report(report, corpus)
         signature = _signature_manifest(selected)
         # Candidate lifecycle records the measured outcome. Signature provenance and
@@ -2576,6 +2577,8 @@ def _candidate_status(
         return DetectionCandidateStatus.REJECTED
     if report.execution_status.value != "ok":
         return DetectionCandidateStatus.CANDIDATE
+    if any(role.non_measurable or role.errors for role in report.roles):
+        return DetectionCandidateStatus.CANDIDATE
     goodware_has_errors = bool(goodware.non_measurable or goodware.errors)
     if (
         len(positive.matches) == 1
@@ -2596,6 +2599,59 @@ def _candidate_status(
     ):
         return DetectionCandidateStatus.TESTED
     return DetectionCandidateStatus.CANDIDATE
+
+
+def _corpus_with_measurement_blockers(
+    corpus: _RuleCorpusSnapshot, report: RuleTestReport
+) -> _RuleCorpusSnapshot:
+    if report.execution_status is YaraExecutionStatus.COMPILE_ERROR:
+        return corpus
+
+    cases_by_role_hash: dict[tuple[RuleTestCorpusRole, str], RuleTestCase] = {}
+    for corpus_case in corpus.cases:
+        cases_by_role_hash[(corpus_case.role, corpus_case.sample_sha256)] = corpus_case
+        if corpus_case.declared_role is not None:
+            cases_by_role_hash[(corpus_case.declared_role, corpus_case.sample_sha256)] = corpus_case
+    blockers: list[str] = []
+    for role in report.roles:
+        for sample_sha256 in role.non_measurable:
+            matched_case = cases_by_role_hash.get((role.role, sample_sha256))
+            role_name = (
+                matched_case.declared_role.value
+                if matched_case is not None and matched_case.declared_role is not None
+                else role.role.value
+            )
+            blockers.append(
+                f"Le fichier {sample_sha256} du rôle {role_name} n'a pas pu être mesuré; "
+                "cette limite bloque le statut testé."
+            )
+        for error in role.errors:
+            matched_case = (
+                cases_by_role_hash.get((role.role, error.sample_sha256))
+                if error.sample_sha256 is not None
+                else None
+            )
+            role_name = (
+                matched_case.declared_role.value
+                if matched_case is not None and matched_case.declared_role is not None
+                else role.role.value
+            )
+            sample_detail = (
+                f" pour le hash {error.sample_sha256}" if error.sample_sha256 is not None else ""
+            )
+            blockers.append(
+                f"Une erreur de mesure dans le rôle {role_name}{sample_detail} bloque le "
+                "statut testé."
+            )
+
+    unique_blockers = tuple(dict.fromkeys(blockers))
+    if not unique_blockers:
+        return corpus
+    return replace(
+        corpus,
+        limitations=tuple(dict.fromkeys((*corpus.limitations, *unique_blockers))),
+        blocking_limitations=tuple(dict.fromkeys((*corpus.blocking_limitations, *unique_blockers))),
+    )
 
 
 def _status_for_report(report: RuleTestReport, corpus: _RuleCorpusSnapshot) -> ToolInvocationStatus:

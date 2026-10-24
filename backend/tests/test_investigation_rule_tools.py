@@ -1967,6 +1967,98 @@ async def test_missing_bytes_in_any_declared_role_blocks_tested_status(
     )
 
 
+@pytest.mark.parametrize(
+    ("late_failure_role", "expected_role"),
+    [
+        ("candidate", RuleTestCorpusRole.NEW_CANDIDATE_UNCONFIRMED),
+        ("holdout", RuleTestCorpusRole.HOLDOUT_POSITIVE),
+    ],
+)
+@pytest.mark.asyncio
+async def test_late_corpus_read_failure_blocks_tested_status(
+    late_failure_role: str, expected_role: RuleTestCorpusRole
+) -> None:
+    from cti_app.application.rule_workbench import RuleCorpusBytesUnavailable
+
+    positive_bytes = (
+        b"first confirmed SharedLateReadMarker",
+        b"second confirmed SharedLateReadMarker",
+    )
+    goodware_bytes = b"ordinary goodware without the marker"
+    late_failure_bytes = f"unreadable {late_failure_role} without the marker".encode()
+    positive_hashes = tuple(_sha256(content) for content in positive_bytes)
+    goodware_hash = _sha256(goodware_bytes)
+    late_failure_hash = _sha256(late_failure_bytes)
+    harness = _harness(
+        samples={
+            **dict(zip(positive_hashes, positive_bytes, strict=True)),
+            goodware_hash: goodware_bytes,
+            late_failure_hash: late_failure_bytes,
+        },
+        goodware=(goodware_hash,),
+        holdout=(late_failure_hash,) if late_failure_role == "holdout" else (),
+    )
+    for sample_sha256 in positive_hashes:
+        association = await _associate(harness, sample_sha256)
+        confirmed_association = association.change_qualification(
+            SampleQualification.CONFIRMED,
+            actor_kind=QualificationActorKind.HUMAN,
+            actor_id="analyst-test",
+            reason="Confirm synthetic positives for the late-read failure test.",
+        )
+        await harness.associations.append_version(
+            confirmed_association, expected_version=association.version
+        )
+    if late_failure_role == "candidate":
+        await _associate(harness, late_failure_hash, origin=SampleOrigin.MANUAL)
+
+    artifact_lookups: list[str] = []
+    original_artifact_lookup = harness.bytes_port.get_artifact_id_for_sample
+
+    async def tracked_artifact_lookup(sample_sha256: str) -> UUID:
+        artifact_lookups.append(sample_sha256)
+        return await original_artifact_lookup(sample_sha256)
+
+    original_byte_reader = harness.bytes_port.get_bytes_for_sample
+
+    async def fail_late_read(sample_sha256: str) -> bytes:
+        if sample_sha256 == late_failure_hash:
+            raise RuleCorpusBytesUnavailable("fixture read failure after artifact lookup")
+        return await original_byte_reader(sample_sha256)
+
+    harness.bytes_port.get_artifact_id_for_sample = tracked_artifact_lookup
+    harness.bytes_port.get_bytes_for_sample = fail_late_read
+    ref = await _source_observation(harness, "SharedLateReadMarker")
+    proposed = await _call(
+        harness,
+        "rule.propose",
+        {
+            "candidate_id": str(uuid4()),
+            "condition": "any",
+            "motifs": [_motif("SharedLateReadMarker", ref)],
+        },
+    )
+    tested = await _call(
+        harness,
+        "rule.test",
+        {"candidate_id": proposed.output["candidate_id"]},
+    )
+
+    assert late_failure_hash in artifact_lookups
+    assert tested.status is ToolInvocationStatus.PARTIAL
+    assert tested.output["report"]["candidate_status"] == "candidate"
+    role_result = next(
+        role for role in tested.output["report"]["roles"] if role["role"] == expected_role.value
+    )
+    assert role_result["non_measurable"] == (late_failure_hash,)
+    assert any(
+        "bloque le statut testé" in limitation
+        and late_failure_hash in limitation
+        and expected_role.value in limitation
+        for limitation in tested.output["report"]["limitations"]
+    )
+
+
 @pytest.mark.asyncio
 async def test_goodware_match_rejects_rule_without_an_approval_path() -> None:
     positive_bytes = b"synthetic cluster payload with SharedNoisyMarker"
