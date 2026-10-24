@@ -437,9 +437,7 @@ def verify_manifest_entry(
         "descending": _field(page, "descending"),
         "limit": limit,
         "has_more": _field(page, "has_more"),
-        "cursor_authentication": _field(
-            page, "cursor_authentication", "unauthenticated_position"
-        ),
+        "cursor_authentication": _field(page, "cursor_authentication", "unauthenticated_position"),
     }
     for field, expected_value in expected.items():
         actual_value = _field(entry, field)
@@ -541,11 +539,7 @@ def assert_manifest_consistency(
             limit=limit,
         )
     else:
-        if (
-            isinstance(source_ref_offset, bool)
-            or source_ref_offset < 0
-            or context_sha256 is None
-        ):
+        if isinstance(source_ref_offset, bool) or source_ref_offset < 0 or context_sha256 is None:
             raise ValueError("Operator context offset reference inputs are invalid")
         expected_source_ref = (
             f"operator-context:{context_sha256}:{section}:offset={source_ref_offset}:"

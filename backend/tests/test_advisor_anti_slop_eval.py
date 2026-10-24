@@ -348,9 +348,7 @@ def _evaluate_case(case: dict[str, Any]) -> dict[str, Any]:
     preflight_status = "NOT_APPLICABLE"
     preflight_allows_submission = False
     if case["consultation_type"] == "bridge":
-        assert case["allowed_aliases"] == sorted(
-            case["context"].get("known_hypothesis_ids", [])
-        )
+        assert case["allowed_aliases"] == sorted(case["context"].get("known_hypothesis_ids", []))
         try:
             decision = parse_agent_turn_decision(case["response_text"])
         except ValueError:
@@ -457,10 +455,7 @@ def _evaluate_case(case: dict[str, Any]) -> dict[str, Any]:
             usable
             and len(required_sources) >= 2
             and required_sources.issubset(cited_sources)
-            and all(
-                str(value) in visible_text
-                for value in labels.get("contradiction_values", [])
-            )
+            and all(str(value) in visible_text for value in labels.get("contradiction_values", []))
             and explicit_unknown
             and explicit_limit
         )
@@ -475,9 +470,7 @@ def _evaluate_case(case: dict[str, Any]) -> dict[str, Any]:
         "contradiction_unknown": contradiction_unknown,
         "duplicate_factual_sentence_count": duplicate_count,
         "generic_clause_count": filler_count,
-        "overclaim_usable": (
-            bool(usable) if labels.get("synthetic_overclaim") is True else None
-        ),
+        "overclaim_usable": (bool(usable) if labels.get("synthetic_overclaim") is True else None),
         "healthy_positive": (
             bool(
                 usable
@@ -540,8 +533,7 @@ def test_versioned_anti_slop_corpus_has_deterministic_offline_oracle(capsys) -> 
     anchored_total = sum(item["anchored_factual_sentence_count"] for item in results)
     no_proof_cases = [case for case in cases if case["labels"].get("no_proof") is True]
     no_proof_unsafe = sum(
-        bool(result_by_id[case["case_id"]]["metrics"]["no_proof_unsafe"])
-        for case in no_proof_cases
+        bool(result_by_id[case["case_id"]]["metrics"]["no_proof_unsafe"]) for case in no_proof_cases
     )
     contradiction_cases = [
         case for case in cases if case["labels"].get("contradiction_targeted") is True
@@ -575,16 +567,11 @@ def test_versioned_anti_slop_corpus_has_deterministic_offline_oracle(capsys) -> 
     filler_clauses = sum(
         result_by_id[case["case_id"]]["advisor_clause_count"] for case in filler_controls
     )
-    overclaim_cases = [
-        case for case in cases if case["labels"].get("synthetic_overclaim") is True
-    ]
-    overclaim_usable = sum(
-        result_by_id[case["case_id"]]["usable"] for case in overclaim_cases
-    )
+    overclaim_cases = [case for case in cases if case["labels"].get("synthetic_overclaim") is True]
+    overclaim_usable = sum(result_by_id[case["case_id"]]["usable"] for case in overclaim_cases)
     healthy_cases = [case for case in cases if case["labels"].get("healthy_positive") is True]
     healthy_ok = sum(
-        bool(result_by_id[case["case_id"]]["metrics"]["healthy_positive"])
-        for case in healthy_cases
+        bool(result_by_id[case["case_id"]]["metrics"]["healthy_positive"]) for case in healthy_cases
     )
 
     metrics = {
@@ -721,9 +708,7 @@ def test_versioned_anti_slop_corpus_has_deterministic_offline_oracle(capsys) -> 
     }
     assert report["variant"] == variant
     assert len(report["cases"]) == len(cases)
-    assert [item["case_id"] for item in report["cases"]] == [
-        case["case_id"] for case in cases
-    ]
+    assert [item["case_id"] for item in report["cases"]] == [case["case_id"] for case in cases]
     assert all(item["expected"] == item["observed"] for item in report["cases"])
     with capsys.disabled():
         print("ANTI_SLOP_EVAL " + json.dumps(report, ensure_ascii=False, sort_keys=True))

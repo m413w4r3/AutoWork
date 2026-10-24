@@ -783,12 +783,8 @@ def test_timeline_only_exposes_experiment_linked_and_resolved_references() -> No
             SimpleNamespace(observation_id=linked_vt_observation_id, sha256="d" * 64),
             SimpleNamespace(observation_id=ambiguous_observation_id, sha256="f" * 64),
             SimpleNamespace(observation_id=duplicate_observation_id, sha256="f" * 64),
-            SimpleNamespace(
-                observation_id=incoherent_capture_observation_id, sha256="7" * 64
-            ),
-            SimpleNamespace(
-                observation_id=unknown_capture_alias_observation_id, sha256="8" * 64
-            ),
+            SimpleNamespace(observation_id=incoherent_capture_observation_id, sha256="7" * 64),
+            SimpleNamespace(observation_id=unknown_capture_alias_observation_id, sha256="8" * 64),
         ),
     )
     experiment.tool_invocation_refs = (

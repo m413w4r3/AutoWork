@@ -163,10 +163,7 @@ def test_advisor_blob_hash_mismatch_keeps_payload_unavailable() -> None:
     assert projection["read_status"] == "hash_mismatch"
     assert projection["metadata"]["advisor_blob_available"] is False
     assert projection["metadata"]["raw_response_sha256"] == "UNKNOWN"
-    assert (
-        projection["metadata"]["materials"]["raw_response"]["available"]["value"]
-        == "UNKNOWN"
-    )
+    assert projection["metadata"]["materials"]["raw_response"]["available"]["value"] == "UNKNOWN"
     assert projection["expected_sha256"] == _RAW_HASH
     assert projection["read_sha256"] == hashlib.sha256(raw).hexdigest()
     bundle = build_audit_bundle(
@@ -250,9 +247,7 @@ def test_negative_result_requires_complete_non_observation_and_refuting_verdict(
         tool_invocation_refs=(),
         observation_refs=(),
     )
-    bundle = build_audit_bundle(
-        AuditSourceSnapshot(_INVESTIGATION_ID, experiments=(experiment,))
-    )
+    bundle = build_audit_bundle(AuditSourceSnapshot(_INVESTIGATION_ID, experiments=(experiment,)))
     rows = [json.loads(line) for line in gzip.decompress(bundle.events).splitlines()]
     event = next(row for row in rows if row["type"] == "experiment.version_recorded")
     assert event["details"]["negative_result"] is expected_negative
@@ -277,11 +272,10 @@ def test_negative_result_requires_a_falsification_criterion() -> None:
         tool_invocation_refs=(),
         observation_refs=(),
     )
-    bundle = build_audit_bundle(
-        AuditSourceSnapshot(_INVESTIGATION_ID, experiments=(experiment,))
-    )
+    bundle = build_audit_bundle(AuditSourceSnapshot(_INVESTIGATION_ID, experiments=(experiment,)))
     event = next(
-        row for row in map(json.loads, gzip.decompress(bundle.events).splitlines())
+        row
+        for row in map(json.loads, gzip.decompress(bundle.events).splitlines())
         if row["type"] == "experiment.version_recorded"
     )
 
@@ -495,9 +489,7 @@ def test_projection_correlates_only_persisted_ids_and_omits_private_text(tmp_pat
         advisor_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
     advisor_observation.sha256 = hashlib.sha256(advisor_blob_bytes).hexdigest()
-    advisor_projection = project_advisor_call_blob_metadata(
-        advisor_observation, advisor_blob_bytes
-    )
+    advisor_projection = project_advisor_call_blob_metadata(advisor_observation, advisor_blob_bytes)
     invocation.response_refs = (UUID(advisor_observation.id),)
     model_run = SimpleNamespace(
         id=turn.model_run_id,
@@ -719,20 +711,21 @@ def test_projection_correlates_only_persisted_ids_and_omits_private_text(tmp_pat
     assert advisor_call_event["correlation"]["bridge_invocation_id"] == turn.id
     assert advisor_call_event["correlation"]["turn_id"] == turn.id
     assert advisor_call_event["correlation"]["model_run_id"] == str(turn.model_run_id)
-    assert advisor_call_event["correlation"]["bridge_idempotency_key_sha256"] == hashlib.sha256(
-        b"PRIVATE_SYNTHETIC_ADVISOR_IDEMPOTENCY_MARKER"
-    ).hexdigest()
+    assert (
+        advisor_call_event["correlation"]["bridge_idempotency_key_sha256"]
+        == hashlib.sha256(b"PRIVATE_SYNTHETIC_ADVISOR_IDEMPOTENCY_MARKER").hexdigest()
+    )
     advisor_metadata = advisor_call_event["details"]["metadata"]
     assert advisor_metadata["prompt_sha256"] == _INPUT_HASH
     assert advisor_metadata["dossier_sha256"] == _NORMALIZED_HASH
     assert advisor_metadata["raw_response_sha256"] == _RAW_HASH
     assert (
-        advisor_call_event["details"]["expected_sha256"]
-        != advisor_metadata["raw_response_sha256"]
+        advisor_call_event["details"]["expected_sha256"] != advisor_metadata["raw_response_sha256"]
     )
-    assert advisor_metadata["normalized_output_sha256"] == hashlib.sha256(
-        b'{"content":"PRIVATE_SYNTHETIC_BRIDGE_OUTPUT_MARKER"}'
-    ).hexdigest()
+    assert (
+        advisor_metadata["normalized_output_sha256"]
+        == hashlib.sha256(b'{"content":"PRIVATE_SYNTHETIC_BRIDGE_OUTPUT_MARKER"}').hexdigest()
+    )
     assert advisor_metadata["prompt_bytes"] == 456
     assert advisor_metadata["dossier_bytes"] == 321
     assert advisor_metadata["raw_response_bytes"] == 789
@@ -753,15 +746,18 @@ def test_projection_correlates_only_persisted_ids_and_omits_private_text(tmp_pat
     assert decision_event["details"]["decision_type"] == "pivot_reject"
     assert decision_event["details"]["target_type"] == "pivot"
     assert decision_event["details"]["target_id"] == decision.target_id
-    assert decision_event["details"]["reason_sha256"] == hashlib.sha256(
-        decision.reason.encode()
-    ).hexdigest()
-    assert decision_event["details"]["actor_id_sha256"] == hashlib.sha256(
-        decision.actor_id.encode()
-    ).hexdigest()
-    assert decision_event["details"]["correlation_id_sha256"] == hashlib.sha256(
-        decision.correlation_id.encode()
-    ).hexdigest()
+    assert (
+        decision_event["details"]["reason_sha256"]
+        == hashlib.sha256(decision.reason.encode()).hexdigest()
+    )
+    assert (
+        decision_event["details"]["actor_id_sha256"]
+        == hashlib.sha256(decision.actor_id.encode()).hexdigest()
+    )
+    assert (
+        decision_event["details"]["correlation_id_sha256"]
+        == hashlib.sha256(decision.correlation_id.encode()).hexdigest()
+    )
     assert input_pack_event["details"]["blob_id"] == _id("input-pack-blob")
     assert input_pack_event["details"]["sha256"] == _NORMALIZED_HASH
     assert input_pack_event["details"]["synthesis_artifact_id"] == _id(

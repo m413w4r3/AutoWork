@@ -433,16 +433,21 @@ def _safe_completeness_item(value: Any, *, dossier_entry: bool = False) -> dict[
     for key in ("assessment", "block_type"):
         if value.get(key) is not None:
             token = _text(value.get(key))
-            item[key] = token if token in {
-                "supported",
-                "refuted",
-                "qualified",
-                "inconclusive",
-                "key_findings",
-                "evidence",
-                "limitations",
-                "recommendations",
-            } else "UNKNOWN"
+            item[key] = (
+                token
+                if token
+                in {
+                    "supported",
+                    "refuted",
+                    "qualified",
+                    "inconclusive",
+                    "key_findings",
+                    "evidence",
+                    "limitations",
+                    "recommendations",
+                }
+                else "UNKNOWN"
+            )
     for key in ("section_index", "offset", "state_version", "opinion_version", "candidate_version"):
         number = _safe_count(value.get(key))
         if number is not None:
@@ -494,9 +499,7 @@ def _advisor_transport_state(submission_state: str, status: str, raw_sha256: str
 
 def _advisor_materials(metadata: Mapping[str, Any]) -> dict[str, Any]:
     completeness = metadata.get("completeness_manifest", {})
-    manifest_available = (
-        isinstance(completeness, Mapping) and completeness.get("available") is True
-    )
+    manifest_available = isinstance(completeness, Mapping) and completeness.get("available") is True
     counts = metadata.get("completeness_counts", {})
     counts = counts if isinstance(counts, Mapping) else {}
     selected_count = completeness.get("selected_item_count") if manifest_available else None
@@ -693,90 +696,95 @@ def project_advisor_call_blob_metadata(
     if payload is not None:
         raw_bridge_id = payload.get("bridge_invocation_id")
         bridge_id_kind = _text(payload.get("bridge_invocation_id_kind"))
-        metadata.update({
-            "consultation_type": _safe_consultation_type(payload.get("consultation_type")),
-            "advisor_status": _text(payload.get("advisor_status"))
-            if _text(payload.get("advisor_status")) in _ADVISOR_STATUS_VALUES
-            else "UNKNOWN",
-            "bridge_invocation_id": _opaque_id(raw_bridge_id) or "UNKNOWN",
-            "bridge_invocation_id_uuid": _uuid_value(raw_bridge_id)
-            if bridge_id_kind == "conversation_turn"
-            else "UNKNOWN",
-            "bridge_invocation_id_kind": bridge_id_kind
-            if bridge_id_kind in {"conversation_turn", "unavailable"}
-            else "UNKNOWN",
-            "idempotency_key_sha256": _sha256_value(payload.get("idempotency_key")) or "UNKNOWN",
-            "prompt_blob_id": _uuid_value(payload.get("prompt_blob_id")),
-            "prompt_sha256": _sha_value(
-                payload.get("prompt_sha256") or payload.get("input_sha256")
-            ),
-            "prompt_bytes": _safe_count(payload.get("prompt_bytes")),
-            "dossier_sha256": _sha_value(payload.get("dossier_sha256")),
-            "dossier_bytes": _safe_count(payload.get("dossier_bytes")),
-            "raw_response_blob_id": _uuid_value(payload.get("output_blob_id")),
-            "raw_response_sha256": _sha_value(payload.get("output_sha256")),
-            "raw_response_bytes": _safe_count(payload.get("response_bytes")),
-            "normalized_output_sha256": _sha256_value(payload.get("output")) or "UNKNOWN",
-            "normalized_output_bytes": len(_canonical_bytes(payload["output"]))
-            if "output" in payload
-            else None,
-            "submission_status": _text(payload.get("submission_status"))
-            if _text(payload.get("submission_status")) in _ADVISOR_SUBMISSION_STATUS_VALUES
-            else "UNKNOWN",
-            "submission_state": _text(payload.get("submission_state"))
-            if _text(payload.get("submission_state")) in _ADVISOR_SUBMISSION_STATE_VALUES
-            else "UNKNOWN",
-            "invocation_stage": _text(payload.get("invocation_stage"))
-            if _text(payload.get("invocation_stage")) in _ADVISOR_INVOCATION_STAGES
-            else "UNKNOWN",
-            "preflight_status": _enum_token(payload.get("preflight_status"), AdvisorPreflightStatus)
-            or "UNKNOWN",
-            "completeness_counts": _safe_count_map(
-                payload.get("completeness_counts"),
-                frozenset(
-                    {
-                        "required",
-                        "present",
-                        "sent",
-                        "omitted",
-                        "missing",
-                        "assertions_required",
-                        "assertions_present",
-                        "assertions_sent",
-                    }
+        metadata.update(
+            {
+                "consultation_type": _safe_consultation_type(payload.get("consultation_type")),
+                "advisor_status": _text(payload.get("advisor_status"))
+                if _text(payload.get("advisor_status")) in _ADVISOR_STATUS_VALUES
+                else "UNKNOWN",
+                "bridge_invocation_id": _opaque_id(raw_bridge_id) or "UNKNOWN",
+                "bridge_invocation_id_uuid": _uuid_value(raw_bridge_id)
+                if bridge_id_kind == "conversation_turn"
+                else "UNKNOWN",
+                "bridge_invocation_id_kind": bridge_id_kind
+                if bridge_id_kind in {"conversation_turn", "unavailable"}
+                else "UNKNOWN",
+                "idempotency_key_sha256": _sha256_value(payload.get("idempotency_key"))
+                or "UNKNOWN",
+                "prompt_blob_id": _uuid_value(payload.get("prompt_blob_id")),
+                "prompt_sha256": _sha_value(
+                    payload.get("prompt_sha256") or payload.get("input_sha256")
                 ),
-            ),
-            "completeness_counts_available": isinstance(
-                payload.get("completeness_counts"), Mapping
-            ),
-            "completeness_manifest": _safe_completeness_manifest(
-                payload.get("completeness_manifest")
-            ),
-            "dossier_manifest": _safe_completeness_manifest(
-                payload.get("dossier_manifest"), dossier_entries=True
-            ),
-            "durations_ms": _safe_count_map(
-                payload.get("durations_ms"),
-                frozenset({"submission", "parse", "persistence", "elapsed_before_manifest"}),
-            ),
-            "provider_usage": _safe_count_map(
-                payload.get("provider_usage"),
-                frozenset(
-                    {
-                        "input_tokens",
-                        "output_tokens",
-                        "total_tokens",
-                        "cached_input_tokens",
-                        "reasoning_tokens",
-                    }
+                "prompt_bytes": _safe_count(payload.get("prompt_bytes")),
+                "dossier_sha256": _sha_value(payload.get("dossier_sha256")),
+                "dossier_bytes": _safe_count(payload.get("dossier_bytes")),
+                "raw_response_blob_id": _uuid_value(payload.get("output_blob_id")),
+                "raw_response_sha256": _sha_value(payload.get("output_sha256")),
+                "raw_response_bytes": _safe_count(payload.get("response_bytes")),
+                "normalized_output_sha256": _sha256_value(payload.get("output")) or "UNKNOWN",
+                "normalized_output_bytes": len(_canonical_bytes(payload["output"]))
+                if "output" in payload
+                else None,
+                "submission_status": _text(payload.get("submission_status"))
+                if _text(payload.get("submission_status")) in _ADVISOR_SUBMISSION_STATUS_VALUES
+                else "UNKNOWN",
+                "submission_state": _text(payload.get("submission_state"))
+                if _text(payload.get("submission_state")) in _ADVISOR_SUBMISSION_STATE_VALUES
+                else "UNKNOWN",
+                "invocation_stage": _text(payload.get("invocation_stage"))
+                if _text(payload.get("invocation_stage")) in _ADVISOR_INVOCATION_STAGES
+                else "UNKNOWN",
+                "preflight_status": _enum_token(
+                    payload.get("preflight_status"), AdvisorPreflightStatus
+                )
+                or "UNKNOWN",
+                "completeness_counts": _safe_count_map(
+                    payload.get("completeness_counts"),
+                    frozenset(
+                        {
+                            "required",
+                            "present",
+                            "sent",
+                            "omitted",
+                            "missing",
+                            "assertions_required",
+                            "assertions_present",
+                            "assertions_sent",
+                        }
+                    ),
                 ),
-            ),
-            "bridge_turns_consumed": _safe_count(payload.get("bridge_turns_consumed")),
-            "reparsed_from_observation_id": _uuid_value(
-                payload.get("reparsed_from_observation_id")
-            ),
-            "parser_version_sha256": _sha256_value(payload.get("parser_version")),
-        })
+                "completeness_counts_available": isinstance(
+                    payload.get("completeness_counts"), Mapping
+                ),
+                "completeness_manifest": _safe_completeness_manifest(
+                    payload.get("completeness_manifest")
+                ),
+                "dossier_manifest": _safe_completeness_manifest(
+                    payload.get("dossier_manifest"), dossier_entries=True
+                ),
+                "durations_ms": _safe_count_map(
+                    payload.get("durations_ms"),
+                    frozenset({"submission", "parse", "persistence", "elapsed_before_manifest"}),
+                ),
+                "provider_usage": _safe_count_map(
+                    payload.get("provider_usage"),
+                    frozenset(
+                        {
+                            "input_tokens",
+                            "output_tokens",
+                            "total_tokens",
+                            "cached_input_tokens",
+                            "reasoning_tokens",
+                        }
+                    ),
+                ),
+                "bridge_turns_consumed": _safe_count(payload.get("bridge_turns_consumed")),
+                "reparsed_from_observation_id": _uuid_value(
+                    payload.get("reparsed_from_observation_id")
+                ),
+                "parser_version_sha256": _sha256_value(payload.get("parser_version")),
+            }
+        )
     metadata["transport_state"] = _advisor_transport_state(
         metadata["submission_state"],
         metadata["submission_status"],
@@ -1604,12 +1612,8 @@ def _envelope_event(investigation_id: str, envelope: Any) -> dict[str, Any] | No
                 for value in (_get(envelope, "allowed_providers", ()) or ())
             ),
             "tlp": _enum_token(_get(disclosure, "tlp"), TLPLevel) or "UNKNOWN",
-            "do_not_submit": _boolean_or_unknown(
-                _get(disclosure, "do_not_submit")
-            ),
-            "external_llm_allowed": _boolean_or_unknown(
-                _get(disclosure, "external_llm_allowed")
-            ),
+            "do_not_submit": _boolean_or_unknown(_get(disclosure, "do_not_submit")),
+            "external_llm_allowed": _boolean_or_unknown(_get(disclosure, "external_llm_allowed")),
             "approval_decision_id": _opaque_id(_get(envelope, "approval_decision_id")),
             "approval_actor_id": "REDACTED" if _get(envelope, "approval_actor_id") else None,
         },
@@ -2493,11 +2497,7 @@ def _manifest_bytes(
             "versions": details.get("source_versions", {}),
             "pivot_conversation_id": details.get("direct_pivot_conversation_id"),
             "input_pack": next(
-                (
-                    _details(event)
-                    for event in events
-                    if event["type"] == "input_pack.snapshot"
-                ),
+                (_details(event) for event in events if event["type"] == "input_pack.snapshot"),
                 {
                     "blob_id": "UNKNOWN",
                     "sha256": "UNKNOWN",

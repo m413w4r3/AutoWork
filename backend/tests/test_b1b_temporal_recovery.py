@@ -618,9 +618,12 @@ async def test_invalid_or_negative_retry_after_uses_bounded_fallback(
         )
 
     transport = _FakeTransport(
-        [rate_limited, lambda: asyncio.sleep(0, result=TurnSubmission(
-            TurnSubmissionStatus.SUCCEEDED, output_text="one answer"
-        ))],
+        [
+            rate_limited,
+            lambda: asyncio.sleep(
+                0, result=TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="one answer")
+            ),
+        ],
         clock,
     )
     result = await _submit(monkeypatch, clock, transport, deadline=20, minimum_timeout=1)

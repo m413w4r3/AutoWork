@@ -534,9 +534,7 @@ def test_context_page_constructors_assert_manifest_consistency(
     def reject_corrupted_manifest(**kwargs: object) -> None:
         manifest = kwargs["manifest"]
         if isinstance(manifest, tuple | list):
-            kwargs["manifest"] = tuple(
-                entry.model_copy(update=changes) for entry in manifest
-            )
+            kwargs["manifest"] = tuple(entry.model_copy(update=changes) for entry in manifest)
         else:
             kwargs["manifest"] = manifest.model_copy(update=changes)
         original_assert(**kwargs)
