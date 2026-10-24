@@ -71,3 +71,30 @@ Ne pas accepter B1B avant : (1) verrou du pacer compatible avec la deadline,
 (3) Retry-After plafonné et dates HTTP testées, (4) wrapper
 `_PermissionAwareInvestigationTransport` corrigé, (5) sleeps de test
 réduits. Réparation `M01-B1B-R1` lancée sur la même branche.
+
+## Deuxième revue après R1 — PASS_WITH_CHANGES
+
+**Objet :** `fd397de12f27b90f0e1a2d3ba45a2538b2ccd08b`.
+**Revue :** agent `66c9488e-4eec-4a3b-96cf-4a1da6984e72`, Luna xhigh.
+**Oracle rejoué :** 236 passed (ciblé), 289 passed / 6 skipped (élargi).
+
+Les cinq constats R1 sont fermés dans le périmètre examiné : verrou du pacer
+relâché pendant l'attente, cible relue sous verrou, jitter conservé, borne
+deadline ; états ambigus non retentés ; clés/attempts distincts ; wrapper
+transmettant `timeout_seconds` et testé ; Retry-After HTTP-date ; sleeps
+≤ 50 ms. Aucun affaiblissement G2/TLP/B1A1/B1A2 observé.
+
+### MEDIUM résiduel — cooldown partagé `Retry-After`
+
+`bridge_investigator.py:441-447` utilise le plafond de retry local (8 s)
+comme plafond du cooldown partagé : un `Retry-After` de 10 000 s ne bloque
+le pacer que 8 s. Inversement, si le retry local est inéligible (pas de
+`submit_with_attempt`) ou si le budget est insuffisant, les retours
+`468-469` n'appliquent aucun cooldown partagé. Un `Retry-After=5 s` ne met
+donc pas le pacer en pause. Correction R2 : séparer plafond de retry local
+et plafond de cooldown partagé, appliquer le cooldown avant tout retour.
+
+### Résiduels
+
+PostgreSQL concurrent, transport Bridge réel, coût : **UNKNOWN**.
+
