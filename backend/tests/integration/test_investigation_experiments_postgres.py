@@ -84,7 +84,7 @@ async def test_operator_record_postgres_uses_persisted_hypothesis_refs_and_strea
         source="network.capture.inspect",
         source_version="network-capture-inspect.v1",
         observed_at=NOW,
-        object_type="capture",
+        object_type="network_capture",
         object_id="capture-operator-led",
     )
     envelope = InvestigationEnvelope(
