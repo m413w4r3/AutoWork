@@ -60,6 +60,7 @@ from cti_app.application.publication_secret_guard import (
 from cti_app.application.research_context_builder import ArticleSnapshotPort
 from cti_app.config import Settings
 from cti_app.domain.analyst_opinion import OpinionBlockType, investigation_opinion_id
+from cti_app.domain.classification import TLP
 from cti_app.domain.investigation import (
     BudgetDimension,
     BudgetReservationStatus,
@@ -320,6 +321,44 @@ class InvestigationAdvisorTool:
                     ),
                 )
             snapshot = await self._article_snapshots.resolve(investigation.synthesis_artifact_id)
+            restricted_sample_hashes = await self._restricted_sample_hashes(
+                investigation.subject_id
+            )
+            restricted_evidence_refs: tuple[UUID, ...] = ()
+            if restricted_sample_hashes:
+                restricted_evidence_refs = tuple(
+                    item.id
+                    for item in evidence
+                    if item.object_type == "sample" and item.object_id in restricted_sample_hashes
+                )
+                if restricted_evidence_refs:
+                    restricted_ids = set(restricted_evidence_refs)
+                    evidence = tuple(item for item in evidence if item.id not in restricted_ids)
+            explicit_restricted_refs = tuple(
+                reference
+                for reference in evidence_refs
+                if reference in set(restricted_evidence_refs)
+            )
+            if explicit_restricted_refs:
+                return await self._persist_preflight_failure(
+                    context,
+                    consultation_type=consultation_type,
+                    evidence_refs=tuple(item.id for item in evidence),
+                    output={
+                        "advisor_status": "disclosure_restricted",
+                        "preflight_status": "POLICY_BLOCKED",
+                        "failure_stage": "sample_disclosure_restricted",
+                        "failure_reason": "explicit_sample_restriction",
+                        "disclosure_restricted_refs": [
+                            str(item) for item in explicit_restricted_refs
+                        ],
+                        "missing_refs": [str(item) for item in explicit_restricted_refs],
+                        "confirmed_non_execution": True,
+                        "bridge_turns_consumed": 0,
+                        "usable": False,
+                    },
+                    error_code="advisor_disclosure_restricted",
+                )
             if not InvestigationService.external_llm_allowed(snapshot, context.envelope):
                 return self._finish(
                     context,
@@ -436,6 +475,15 @@ class InvestigationAdvisorTool:
                             for key, value in prompt_data.get("truncation", {}).items()
                             if value is True
                         ),
+                        **(
+                            {
+                                "disclosure_restricted_refs": [
+                                    str(item) for item in restricted_evidence_refs
+                                ]
+                            }
+                            if restricted_evidence_refs
+                            else {}
+                        ),
                         "confirmed_non_execution": True,
                         "bridge_turns_consumed": 0,
                     },
@@ -459,6 +507,15 @@ class InvestigationAdvisorTool:
                         "completeness_manifest": evidence_preflight["items"],
                         "dossier_sha256": dossier.sha256,
                         "dossier_bytes": dossier.byte_size,
+                        **(
+                            {
+                                "disclosure_restricted_refs": [
+                                    str(item) for item in restricted_evidence_refs
+                                ]
+                            }
+                            if restricted_evidence_refs
+                            else {}
+                        ),
                         "confirmed_non_execution": True,
                         "bridge_turns_consumed": 0,
                         "usable": False,
@@ -847,6 +904,10 @@ class InvestigationAdvisorTool:
             "completeness_counts": evidence_preflight["counts"],
             "completeness_manifest": evidence_preflight["items"],
         }
+        if restricted_evidence_refs:
+            provenance["disclosure_restricted_refs"] = [
+                str(item) for item in restricted_evidence_refs
+            ]
         if consultation_type == "yara_draft":
             provenance["measurement_catalog"] = _advisor_bridge_measurement_catalog(prompt_data)
         reparse_context = _advisor_reparse_context(consultation_type, prompt_data)
@@ -2699,6 +2760,23 @@ class InvestigationAdvisorTool:
                 )
         return rows
 
+    async def _restricted_sample_hashes(self, subject_id: UUID) -> set[str]:
+        """Collect sample hashes whose explicit policy forbids external disclosure."""
+        sample_list = getattr(self._samples, "list_for_subject", None)
+        if not callable(sample_list):
+            return set()
+        restricted: set[str] = set()
+        for sample in await sample_list(subject_id):
+            if _sample_policy_allows_external(sample):
+                continue
+            for value in (
+                getattr(sample, "expected_hash", None),
+                getattr(sample, "source_object_id", None),
+            ):
+                if isinstance(value, str) and value:
+                    restricted.add(value)
+        return restricted
+
     async def _sample_blob_for_hash(
         self,
         investigation_id: UUID,
@@ -2728,6 +2806,10 @@ class InvestigationAdvisorTool:
                 "quarantined",
                 "review_candidate",
             }:
+                continue
+            if not _sample_policy_allows_external(sample):
+                # A sample-level restriction binds this measurement even when
+                # the case envelope itself permits external disclosure.
                 continue
             blob = await self._blobs.get(sample.blob_id)
             if (
@@ -5771,6 +5853,15 @@ def _required_argument_names(tool: Any) -> list[str]:
     if not isinstance(required, (list, tuple)):
         return []
     return [_safe_text(name, 64) for name in required if isinstance(name, str)]
+
+
+def _sample_policy_allows_external(sample: object) -> bool:
+    """Apply every explicit sample-level rule before external disclosure."""
+    return not (
+        bool(getattr(sample, "do_not_submit", False))
+        or not bool(getattr(sample, "external_llm_allowed", True))
+        or getattr(sample, "tlp", None) is TLP.RED
+    )
 
 
 def _safe_text(value: str, max_chars: int) -> str:

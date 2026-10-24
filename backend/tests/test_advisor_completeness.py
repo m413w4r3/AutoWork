@@ -520,6 +520,59 @@ def test_dossier_preserves_all_large_observation_excerpts_with_manifest_hashes()
         assert rendered_body in dossier.text
 
 
+def test_explicit_observation_reference_keeps_every_permitted_excerpt() -> None:
+    observation_id = str(uuid4())
+    encoded = base64.b64encode(b"B" * 600).decode("ascii")
+    data = _planning_data(
+        question="Review the DNS evidence.",
+        evidence=[
+            {
+                "evidence_id": observation_id,
+                "sha256": "c" * 64,
+                "source": "synthetic.fixture",
+                "object_type": "observation",
+                "blob_read_verified": True,
+                "content_excerpts": [
+                    {"kind": "text", "title": "DNS evidence", "text": "DNS evidence text."},
+                    {"kind": "text", "title": "Second evidence", "text": encoded},
+                ],
+            }
+        ],
+        findings=[],
+    )
+
+    dossier = build_advisor_dossier(data)
+
+    assert "DNS evidence text." in dossier.text
+    assert encoded in dossier.text
+
+
+def test_bytes_rows_with_raw_field_keep_offset_and_value() -> None:
+    from cti_app.application.advisor_dossier import extract_content_excerpts
+
+    projected = extract_content_excerpts({"bytes": [{"offset": 4, "raw": "00ff"}]})
+
+    assert projected == [{"kind": "bytes", "title": "Octets observés — offset 4", "text": "00ff"}]
+
+
+def test_equal_text_under_distinct_labels_is_not_deduplicated() -> None:
+    from cti_app.application.advisor_dossier import extract_content_excerpts
+
+    projected = extract_content_excerpts(
+        {
+            "strings": [
+                {"name": "first_field", "value": "shared value"},
+                {"name": "second_field", "value": "shared value"},
+            ]
+        }
+    )
+
+    assert [row["title"] for row in projected] == [
+        "Valeur décodée — first_field",
+        "Valeur décodée — second_field",
+    ]
+
+
 def test_decoded_hex_ioc_is_not_mistaken_for_raw_bytes() -> None:
     from cti_app.application.advisor_dossier import extract_content_excerpts
 

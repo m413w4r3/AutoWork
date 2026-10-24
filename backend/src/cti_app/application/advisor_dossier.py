@@ -15,6 +15,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from cti_app.application.publication_secret_guard import is_operational_secret_field_name
 from cti_app.domain.advisor_completeness import (
     AdvisorEvidenceStatus,
     AdvisorPreflightStatus,
@@ -136,12 +137,7 @@ def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]
             if assembly_name and assembly_name.casefold() not in title.casefold()
             else ""
         )
-        identity = (
-            kind,
-            f"{title.strip()}\n{text}"
-            if kind in {"hex", "bytes"} or " — offset " in title
-            else text,
-        )
+        identity = (kind, title.strip(), text)
         if identity in seen:
             return
         rendered_title = f"{prefix}{title.strip()}"
@@ -161,7 +157,10 @@ def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]
         rows = value if isinstance(value, (list, tuple)) else (value,)
         for row in rows:
             raw = (
-                row.get("value", row.get("bytes", row.get("hex", row.get("content"))))
+                row.get(
+                    "value",
+                    row.get("bytes", row.get("hex", row.get("content", row.get("raw")))),
+                )
                 if isinstance(row, Mapping)
                 else row
             )
@@ -205,6 +204,10 @@ def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]
             name = display_name(value, path[-1] if path else "contenu observé")
             for raw_key, child in value.items():
                 key = str(raw_key).casefold().replace("-", "_")
+                if is_operational_secret_field_name(key):
+                    # Never project an AutoWork operational credential into a
+                    # dossier, even when it is nested under a neutral label.
+                    continue
                 if key in _OMIT_KEYS or "sha256" in key or key.endswith("_id"):
                     continue
                 if payload.get("schema") == "local-command-execution.v1" and key in {
@@ -471,17 +474,16 @@ def build_advisor_dossier(prompt_data: Mapping[str, Any]) -> AdvisorDossier:
             if isinstance(row, Mapping) and str(row.get("evidence_id")) == identifier
         ]
         pieces: list[str] = []
-        included_excerpts = False
+        explicitly_referenced_observation = ("observation", identifier) in explicitly_referenced
         label = _human_evidence_label(item, excerpts)
         row_score = _relevance_score(task_terms, label)
         for excerpt in excerpts:
             body = _as_text(excerpt.get("text"))
             title = _as_text(excerpt.get("title")) or "Extrait"
             score = _relevance_score(task_terms, f"{title} {body}")
-            if score > 0:
+            if score > 0 or explicitly_referenced_observation:
                 pieces.append(f"{title}:\n{_quote(body)}")
-                included_excerpts = True
-                row_score = max(row_score, score)
+                row_score = max(row_score, score, 1 if explicitly_referenced_observation else 0)
         for fact in (*measurement_rows, *typed_measurements):
             value = _as_text(fact.get("sample_material", fact.get("value")))
             if not value or value in {"…", "..."}:
@@ -495,14 +497,10 @@ def build_advisor_dossier(prompt_data: Mapping[str, Any]) -> AdvisorDossier:
             score = _relevance_score(task_terms, fact_text)
             if _numeric_targets_conflict(relevance_text, fact_text):
                 score = 0
-            if score > 0 or ("observation", identifier) in explicitly_referenced:
+            if score > 0 or explicitly_referenced_observation:
                 pieces.append(f"Mesure observée: {fact_text}")
                 row_score = max(row_score, score, 1)
-        if (
-            ("observation", identifier) in explicitly_referenced
-            and not included_excerpts
-            and excerpts
-        ):
+        if explicitly_referenced_observation and not pieces and excerpts:
             best = max(
                 excerpts, key=lambda row: _relevance_score(task_terms, _as_text(row.get("text")))
             )
