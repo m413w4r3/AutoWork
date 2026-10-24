@@ -464,6 +464,126 @@ def verify_manifest_entry(
     return True
 
 
+def assert_manifest_consistency(
+    *,
+    section: str,
+    investigation_id: UUID,
+    items: Any,
+    previous_page_sha256: str,
+    context_sha256: str | None,
+    cursor: str | None,
+    pivot: Mapping[str, Any] | None,
+    descending: bool,
+    limit: int,
+    total: int,
+    has_more: bool,
+    source_bounded: bool,
+    omission_reasons: Mapping[ContextOmissionReason | str, int],
+    unbounded_reason: str | None,
+    selected: int,
+    omitted: int,
+    claimed_page_sha256: str,
+    claimed_source_ref: str,
+    manifest: Any,
+    source_ref_offset: int | None = None,
+    cursor_authentication: str | None = "unauthenticated_position",
+) -> None:
+    """Recompute and assert that a constructed page and omission row agree."""
+    projected_items = tuple(items)
+    if selected != len(projected_items) or selected < 0 or omitted < 0 or total < 0:
+        raise ValueError("Context manifest selected and omitted counts are inconsistent")
+    if selected + omitted != total:
+        raise ValueError("Context manifest selected and omitted counts must equal total")
+    if not isinstance(omission_reasons, Mapping) or any(
+        isinstance(count, bool) or not isinstance(count, int) or count < 0
+        for count in omission_reasons.values()
+    ):
+        raise ValueError("Context manifest omission reasons are invalid")
+    if sum(omission_reasons.values()) != omitted:
+        raise ValueError("Context manifest omission reasons must account for omitted items")
+    if source_bounded and unbounded_reason is not None:
+        raise ValueError("Bounded context sources cannot declare an unbounded reason")
+    if not source_bounded and not unbounded_reason:
+        raise ValueError("Unbounded context sources require an explicit reason")
+
+    omission_summary = {
+        "section": section,
+        "total": total,
+        "selected": selected,
+        "omitted": omitted,
+        "source_bounded": source_bounded,
+        "omission_reasons": omission_reasons,
+        "unbounded_reason": unbounded_reason,
+    }
+    expected_page_sha256 = canonical_page_sha256(
+        section=section,
+        investigation_id=investigation_id,
+        items=projected_items,
+        previous_page_sha256=previous_page_sha256,
+        context_sha256=context_sha256,
+        cursor=cursor,
+        pivot=pivot,
+        descending=descending,
+        limit=limit,
+        total=total,
+        has_more=has_more,
+        omission_manifest=omission_summary,
+    )
+    if claimed_page_sha256 != expected_page_sha256:
+        raise ValueError("Context manifest page SHA-256 does not match its construction inputs")
+
+    if source_ref_offset is None:
+        expected_source_ref = source_reference(
+            section=section,
+            investigation_id=investigation_id,
+            cursor=cursor,
+            page_sha256=expected_page_sha256,
+            limit=limit,
+        )
+    else:
+        if (
+            isinstance(source_ref_offset, bool)
+            or source_ref_offset < 0
+            or context_sha256 is None
+        ):
+            raise ValueError("Operator context offset reference inputs are invalid")
+        expected_source_ref = (
+            f"operator-context:{context_sha256}:{section}:offset={source_ref_offset}:"
+            f"sha256={expected_page_sha256}"
+        )
+    if claimed_source_ref != expected_source_ref:
+        raise ValueError("Context manifest source reference does not match its construction inputs")
+
+    expected = {
+        "section": section,
+        "total": total,
+        "selected": selected,
+        "omitted": omitted,
+        "source_bounded": source_bounded,
+        "source_ref": expected_source_ref,
+        "page_sha256": expected_page_sha256,
+        "omission_reasons": omission_reasons,
+        "unbounded_reason": unbounded_reason,
+        "context_sha256": context_sha256,
+        "cursor": cursor,
+        "pivot": dict(pivot) if pivot is not None else None,
+        "descending": descending,
+        "limit": limit,
+        "has_more": has_more,
+        "cursor_authentication": cursor_authentication,
+    }
+    entries = _manifest_entries(manifest)
+    if not entries:
+        raise ValueError("Context omission manifest is missing")
+    for entry in entries:
+        for field, expected_value in expected.items():
+            actual_value = _field(entry, field)
+            if actual_value is _MISSING or _canonicalize(actual_value) != _canonicalize(
+                expected_value
+            ):
+                raise ValueError(f"Context omission manifest is inconsistent: {field}")
+
+
 _MISSING = object()
 
 
@@ -575,7 +695,7 @@ def make_keyset_page[T](
         page_sha256=page_sha256,
         limit=limit,
     )
-    return KeysetPageV1(
+    page = KeysetPageV1(
         items=selected,
         total=total,
         has_more=has_more,
@@ -610,6 +730,28 @@ def make_keyset_page[T](
         source_bounded=source_bounded,
         unbounded_reason=unbounded_reason,
     )
+    assert_manifest_consistency(
+        section=section,
+        investigation_id=investigation_id,
+        items=page.items,
+        previous_page_sha256=previous_page_sha256,
+        context_sha256=page.context_sha256,
+        cursor=page.cursor,
+        pivot=page.pivot,
+        descending=page.descending,
+        limit=page.limit,
+        total=page.total,
+        has_more=page.has_more,
+        source_bounded=page.source_bounded,
+        omission_reasons=omission_reasons,
+        unbounded_reason=page.unbounded_reason,
+        selected=len(page.items),
+        omitted=page.total - len(page.items),
+        claimed_page_sha256=page.page_sha256,
+        claimed_source_ref=page.source_ref,
+        manifest=page.omission_manifest,
+    )
+    return page
 
 
 def keyset_pivot(payload: Mapping[str, Any]) -> dict[str, str]:

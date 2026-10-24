@@ -16,6 +16,7 @@ from cti_app.application.context_pagination import (
     ContextOmissionManifestEntryV1,
     ContextOmissionReason,
     KeysetPageV1,
+    assert_manifest_consistency,
     canonical_page_sha256,
     decode_keyset_cursor,
     encode_keyset_cursor,
@@ -1793,7 +1794,7 @@ class ResearchContextBuilder:
             page_sha256=page_sha256,
             limit=page.limit,
         )
-        return ContextOmissionManifestEntryV1(
+        entry = ContextOmissionManifestEntryV1(
             section=section,
             total=page.total,
             selected=selected,
@@ -1811,6 +1812,28 @@ class ResearchContextBuilder:
             has_more=page.has_more,
             cursor_authentication="unauthenticated_position",
         )
+        assert_manifest_consistency(
+            section=section,
+            investigation_id=investigation_id,
+            items=selected_items,
+            previous_page_sha256=previous_page_sha256,
+            context_sha256=page.context_sha256,
+            cursor=page.cursor,
+            pivot=pivot,
+            descending=page.descending,
+            limit=page.limit,
+            total=page.total,
+            has_more=page.has_more,
+            source_bounded=page.source_bounded,
+            omission_reasons=reasons,
+            unbounded_reason=page.unbounded_reason,
+            selected=selected,
+            omitted=page.total - selected,
+            claimed_page_sha256=entry.page_sha256,
+            claimed_source_ref=entry.source_ref,
+            manifest=entry,
+        )
+        return entry
 
     @staticmethod
     def _unbounded_manifest_entry(

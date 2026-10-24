@@ -9,6 +9,9 @@ from pydantic import ValidationError
 from sqlalchemy import DateTime, Uuid, column, select, table
 from sqlalchemy.dialects import postgresql
 
+import cti_app.application.context_pagination as context_pagination
+import cti_app.application.operator_tool_invocation as operator_tool_invocation
+import cti_app.application.research_context_builder as research_context_builder
 import cti_app.infrastructure.database.repositories.investigation as investigation_repositories
 from cti_app.application.context_pagination import (
     ContextOmissionManifestEntryV1,
@@ -27,7 +30,7 @@ from cti_app.application.investigation_persistence import (
     InMemoryToolInvocationRepository,
 )
 from cti_app.application.investigation_service import InvestigationService
-from cti_app.application.research_context_builder import ArticleSnapshot
+from cti_app.application.research_context_builder import ArticleSnapshot, ResearchContextBuilder
 from cti_app.domain.investigation import (
     DisclosureBounds,
     EvidenceKind,
@@ -445,6 +448,102 @@ def test_page_sha256_rejects_falsification_of_every_page_field() -> None:
     )
     for changed in falsifications:
         assert not verify_page_sha256(**(baseline | changed)), changed
+
+
+@pytest.mark.parametrize(
+    ("constructor", "changes"),
+    [
+        (constructor, changes)
+        for constructor in ("make_keyset_page", "builder", "operator_offset", "operator_keyset")
+        for changes in (
+            {"source_ref": "investigation:forged"},
+            {"page_sha256": "d" * 64},
+            {"selected": 0, "omitted": 2},
+            {"omission_reasons": {}},
+        )
+    ],
+)
+def test_context_page_constructors_assert_manifest_consistency(
+    constructor: str,
+    changes: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    investigation_id = uuid4()
+    timestamp = datetime(2026, 1, 1, tzinfo=UTC)
+    source_items = (
+        {"id": str(UUID(int=1)), "created_at": timestamp.isoformat()},
+        {
+            "id": str(UUID(int=2)),
+            "created_at": (timestamp + timedelta(seconds=1)).isoformat(),
+        },
+    )
+
+    def source_page():
+        return make_keyset_page(
+            section="findings",
+            investigation_id=investigation_id,
+            items=source_items,
+            total=2,
+            limit=1,
+            cursor=None,
+            position=lambda item: (datetime.fromisoformat(item["created_at"]), UUID(item["id"])),
+            context_sha256="c" * 64,
+        )
+
+    page = source_page()
+
+    def construct() -> object:
+        if constructor == "make_keyset_page":
+            return source_page()
+        if constructor == "builder":
+            return ResearchContextBuilder._source_manifest_entry(
+                section="findings",
+                page=page,
+                selected=len(page.items),
+                selected_items=page.items,
+                investigation_id=investigation_id,
+            )
+        if constructor == "operator_offset":
+            return operator_tool_invocation._materialized_page_proof(
+                section="agenda",
+                investigation_id=investigation_id,
+                context_sha256="c" * 64,
+                offset=0,
+                limit=1,
+                total=2,
+                items=({"value": "one"},),
+                cursor=None,
+            )
+        return operator_tool_invocation._assert_keyset_page_consistency(
+            page,
+            section="findings",
+            investigation_id=investigation_id,
+        )
+
+    construct()  # The same construction path accepts its coherent manifest.
+
+    module = (
+        context_pagination
+        if constructor == "make_keyset_page"
+        else research_context_builder
+        if constructor == "builder"
+        else operator_tool_invocation
+    )
+    original_assert = module.assert_manifest_consistency
+
+    def reject_corrupted_manifest(**kwargs: object) -> None:
+        manifest = kwargs["manifest"]
+        if isinstance(manifest, tuple | list):
+            kwargs["manifest"] = tuple(
+                entry.model_copy(update=changes) for entry in manifest
+            )
+        else:
+            kwargs["manifest"] = manifest.model_copy(update=changes)
+        original_assert(**kwargs)
+
+    monkeypatch.setattr(module, "assert_manifest_consistency", reject_corrupted_manifest)
+    with pytest.raises(ValueError, match=r"Context manifest|Context omission manifest"):
+        construct()
 
 
 def test_legacy_keyset_page_v1_payload_uses_new_field_defaults() -> None:

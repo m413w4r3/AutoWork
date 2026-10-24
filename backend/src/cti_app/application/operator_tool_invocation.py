@@ -19,11 +19,11 @@ from cti_app.application.advisor_checkpoint import (
 from cti_app.application.context_pagination import (
     ContextOmissionManifestEntryV1,
     ContextOmissionReason,
+    assert_manifest_consistency,
     canonical_page_sha256,
     decode_keyset_cursor,
     decode_offset_cursor,
     encode_offset_cursor,
-    verify_manifest_entry,
 )
 from cti_app.application.evidence_recorder import _sanitize_json, sanitize_evidence_text
 from cti_app.application.investigation_contracts import (
@@ -221,26 +221,29 @@ def _materialized_page_proof(
         limit=limit,
         has_more=has_more,
     )
-    page_manifest = {
-        "section": section,
-        "total": total,
-        "selected": len(items),
-        "omitted": omitted,
-        "source_bounded": False,
-        "source_ref": source_ref,
-        "page_sha256": page_sha256,
-        "omission_reasons": omission_reasons,
-        "unbounded_reason": unbounded_reason,
-        "context_sha256": context_sha256,
-        "cursor": cursor,
-        "pivot": pivot,
-        "descending": False,
-        "limit": limit,
-        "has_more": has_more,
-        "cursor_authentication": None,
-    }
-    if not verify_manifest_entry(entry, page_manifest, expected_source_ref=source_ref):
-        raise ValueError("Operator context page manifest is inconsistent")
+    assert_manifest_consistency(
+        section=section,
+        investigation_id=investigation_id,
+        items=items,
+        previous_page_sha256=previous_page_sha256,
+        context_sha256=context_sha256,
+        cursor=cursor,
+        pivot=pivot,
+        descending=False,
+        limit=limit,
+        total=total,
+        has_more=has_more,
+        source_bounded=False,
+        omission_reasons=omission_reasons,
+        unbounded_reason=unbounded_reason,
+        selected=len(items),
+        omitted=omitted,
+        claimed_page_sha256=page_sha256,
+        claimed_source_ref=source_ref,
+        manifest=entry,
+        source_ref_offset=offset,
+        cursor_authentication=None,
+    )
     return (
         page_sha256,
         source_ref,
@@ -248,6 +251,46 @@ def _materialized_page_proof(
         entry,
         pivot,
         has_more,
+    )
+
+
+def _assert_keyset_page_consistency(page: Any, *, section: str, investigation_id: UUID) -> None:
+    entries = page.omission_manifest
+    if len(entries) != 1:
+        raise ValueError("Operator keyset page must have exactly one omission manifest")
+    entry = entries[0]
+    previous_page_sha256 = (
+        decode_keyset_cursor(
+            page.cursor,
+            section=section,
+            investigation_id=investigation_id,
+            descending=page.descending,
+            context_sha256=page.context_sha256,
+        )["previous_page_sha256"]
+        if page.cursor is not None
+        else "0" * 64
+    )
+    assert_manifest_consistency(
+        section=section,
+        investigation_id=investigation_id,
+        items=page.items,
+        previous_page_sha256=previous_page_sha256,
+        context_sha256=page.context_sha256,
+        cursor=page.cursor,
+        pivot=page.pivot,
+        descending=page.descending,
+        limit=page.limit,
+        total=page.total,
+        has_more=page.has_more,
+        source_bounded=page.source_bounded,
+        omission_reasons=entry.omission_reasons,
+        unbounded_reason=page.unbounded_reason,
+        selected=len(page.items),
+        omitted=page.total - len(page.items),
+        claimed_page_sha256=page.page_sha256,
+        claimed_source_ref=page.source_ref,
+        manifest=entry,
+        cursor_authentication="unauthenticated_position",
     )
 
 
@@ -505,6 +548,11 @@ class OperatorToolInvocationService:
                         "operator_context_section_unknown", 404
                     ) from None
                 raise OperatorToolInvocationError("operator_context_cursor_invalid", 422) from None
+            _assert_keyset_page_consistency(
+                page,
+                section=section,
+                investigation_id=self._investigation_id,
+            )
             omission = page.omission_manifest[0]
             next_offset = (
                 offset + len(page.items)
