@@ -3446,7 +3446,8 @@ class ReparsePersistedAdvisorOutputTool:
             or original.kind is not EvidenceKind.OTHER
             or original.source != ADVISOR_TOOL_NAME
             or original.object_type != "advisor_call"
-            or original.object_id not in {"yara_draft", "draft_text", "review_text", "figure_plan"}
+            or original.object_id
+            not in {"yara_draft", "draft_text", "review_text", "figure_plan", "suricata_draft"}
         ):
             return ToolResult(
                 ToolInvocationStatus.FAILED,
@@ -3478,7 +3479,8 @@ class ReparsePersistedAdvisorOutputTool:
         if (
             not isinstance(persisted, Mapping)
             or persisted.get("schema") != "operator-advisor-call.v1"
-            or consultation_type not in {"yara_draft", "draft_text", "review_text", "figure_plan"}
+            or consultation_type
+            not in {"yara_draft", "draft_text", "review_text", "figure_plan", "suricata_draft"}
             or original.object_id != consultation_type
             or persisted.get("reparsed_from_observation_id") is not None
         ):
@@ -3590,7 +3592,65 @@ class ReparsePersistedAdvisorOutputTool:
                 measurement_sha256[identifier] = reference["sha256"]
         measurement_refs.sort(key=lambda item: int(item["id"][1:]))
         raw_reparse_context = persisted.get("reparse_context")
-        if consultation_type == "yara_draft":
+        if consultation_type == "suricata_draft":
+            if not isinstance(raw_reparse_context, Mapping):
+                return ToolResult(
+                    ToolInvocationStatus.FAILED,
+                    error_code="advisor_reparse_context_unavailable",
+                )
+            if raw_reparse_context.get("transmitted_refs") != normalized_refs:
+                return ToolResult(
+                    ToolInvocationStatus.FAILED,
+                    error_code="advisor_reparse_context_refs_invalid",
+                )
+            network_facts = raw_reparse_context.get("network_facts")
+            if not isinstance(network_facts, list) or not network_facts:
+                return ToolResult(
+                    ToolInvocationStatus.FAILED,
+                    error_code="advisor_reparse_context_unavailable",
+                )
+            observation_refs = {
+                (item["id"], item["sha256"])
+                for item in normalized_refs
+                if item["kind"] == "observation"
+            }
+            seen_fact_ids: set[str] = set()
+            for fact in network_facts:
+                if not isinstance(fact, Mapping):
+                    return ToolResult(
+                        ToolInvocationStatus.FAILED,
+                        error_code="advisor_reparse_context_unavailable",
+                    )
+                fact_id = fact.get("fact_id")
+                evidence_id = fact.get("evidence_id")
+                observation_sha256 = fact.get("observation_sha256")
+                field = fact.get("field")
+                value = fact.get("value")
+                if (
+                    not isinstance(fact_id, str)
+                    or not fact_id.strip()
+                    or fact_id in seen_fact_ids
+                    or not isinstance(evidence_id, str)
+                    or not evidence_id.strip()
+                    or not isinstance(observation_sha256, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", observation_sha256) is None
+                    or not isinstance(field, str)
+                    or not field.strip()
+                    or not isinstance(value, str)
+                    or not value.strip()
+                ):
+                    return ToolResult(
+                        ToolInvocationStatus.FAILED,
+                        error_code="advisor_reparse_context_unavailable",
+                    )
+                if (evidence_id, observation_sha256) not in observation_refs:
+                    return ToolResult(
+                        ToolInvocationStatus.FAILED,
+                        error_code="advisor_reparse_context_refs_invalid",
+                    )
+                seen_fact_ids.add(fact_id)
+            prompt_data = dict(raw_reparse_context)
+        elif consultation_type == "yara_draft":
             if isinstance(raw_reparse_context, Mapping):
                 if raw_reparse_context.get("transmitted_refs") != normalized_refs:
                     return ToolResult(
