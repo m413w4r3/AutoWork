@@ -322,3 +322,25 @@ les combinaisons incohérentes.
 
 Lifespan de production et PostgreSQL : **UNKNOWN**. Coût : **UNKNOWN**.
 
+## Revue finale A1-RES-R1 — PASS
+
+**Objet :** `749a3f2fcbfbfc627831f1e0ff37afcb730b29e9` (base `a1d263a0`,
+deltas `fbe5d36` + `bd35278` + `749a3f2`).
+**Revue :** agent `cdb8f69e-be9c-4cce-b9e9-03d09989c391`, Luna xhigh.
+**Oracle rejoué :** 79 passed ; 3 tests PostgreSQL collectés, exécution
+**UNKNOWN** (`TEST_POSTGRES_ADMIN_DSN` absent).
+
+Aucun constat BLOCKER/HIGH/MEDIUM/LOW. Le mapping strict des quatre couples
+producteurs est partagé par `input_refs` et `next_pivots`; les SHA dupliqués
+et couples inconnus sont masqués. Les tests de route couvrent les couples
+positifs, `vt_file_report/sample`, `binary_analysis/network_capture`, l'alias
+`other/capture`, les SHA dupliqués et les versions d'invocation. Les fixtures
+corrigées vers `network_capture` ne relâchent pas leurs assertions. Claims/
+matrice, redaction et route GET restent inchangés.
+
+**Intégration :** branche `feat/mission01-a1-residual` fusionnée dans
+`chore/mission01-integration` au commit `69d3b904`. Oracle combiné
+A1+L2+B1B sur l'intégration : **194 passed**. Résiduel : PostgreSQL réel et
+lifespan de production `UNKNOWN`.
+
+
