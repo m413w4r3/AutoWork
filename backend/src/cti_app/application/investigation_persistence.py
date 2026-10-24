@@ -209,6 +209,7 @@ def _memory_keyset_page(
     position: object,
     latest_only: bool = False,
 ) -> KeysetPageV1:
+    """Page a materialized in-memory snapshot; this does not bound source memory."""
     if not 1 <= limit <= 1_000:
         raise ValueError("Context page limit must be between 1 and 1000")
     position_fn = position  # keep the generic callback local for type-checkers

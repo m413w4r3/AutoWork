@@ -16,7 +16,10 @@ from cti_app.application.bridge_investigator import (
     _minimal_schema_value,
     render_investigation_prompt,
 )
-from cti_app.application.context_pagination import ContextOmissionReason
+from cti_app.application.context_pagination import (
+    ContextOmissionReason,
+    canonical_page_sha256,
+)
 from cti_app.application.evidence_recorder import ProductionEvidenceRecorder
 from cti_app.application.investigation_acquisition_tools import (
     SAMPLE_ANALYSIS_CAPABILITY,
@@ -3200,7 +3203,8 @@ async def test_large_operator_led_context_is_reduced_deterministically() -> None
         == hashlib.sha256(summary.canonical_bytes(include_summary_hash=False)).hexdigest()
     )
     assert len(summary_bytes) * 20 < len(context.canonical_bytes())
-    assert summary.pointers.section_cursors["evidence_index"] == ""
+    assert summary.pointers.section_cursors["evidence_index"] == 0
+    assert summary.pointers.section_keyset_cursors["evidence_index"] == ""
     assert summary.pointers.section_limit == 20
     assert set(summary.pointers.endpoints) == {
         "pivot_frontier",
@@ -3320,7 +3324,7 @@ async def test_small_context_hash_includes_bounded_advisor_guidance() -> None:
     # The bounded reminder is part of canonical_bytes(); the D guidance update
     # changes this deterministic fixture digest.
     assert hashlib.sha256(context.canonical_bytes()).hexdigest() == (
-        "6cca7fce786c4d408c2b41c55ca08da18d731bf7674d82e2e55cfd4d48e3588e"
+        "67be1e93fe213b54ab3f6d1d95da6d7c2e535283273af27536164f325592ee6d"
     )
 
 
@@ -3639,6 +3643,7 @@ async def test_repository_graph_reads_edges_from_findings_and_sample_association
 
 @pytest.mark.asyncio
 async def test_context_build_pages_large_sources_with_fixed_memory_budget_and_manifest() -> None:
+    """Memory pages materialize internally; live PostgreSQL source bounds remain UNKNOWN."""
     investigation_id = uuid4()
     base_time = datetime(2026, 1, 1, tzinfo=UTC)
 
@@ -3648,11 +3653,22 @@ async def test_context_build_pages_large_sources_with_fixed_memory_budget_and_ma
         def __init__(self) -> None:
             super().__init__()
             self.observed_page_sizes = []
+            self.direct_list_calls = 0
+            self._inside_page = False
 
         async def page_for_investigation(self, investigation_id, **kwargs):
-            page = await super().page_for_investigation(investigation_id, **kwargs)
-            self.observed_page_sizes.append((kwargs["limit"], len(page.items)))
-            return page
+            self._inside_page = True
+            try:
+                page = await super().page_for_investigation(investigation_id, **kwargs)
+                self.observed_page_sizes.append((kwargs["limit"], len(page.items)))
+                return page
+            finally:
+                self._inside_page = False
+
+        async def list_for_investigation(self, investigation_id):
+            if not self._inside_page:
+                self.direct_list_calls += 1
+            return await super().list_for_investigation(investigation_id)
 
     class InstrumentedFindings(InMemoryFindingRepository):
         observed_page_sizes: list[tuple[int, int]]
@@ -3660,11 +3676,22 @@ async def test_context_build_pages_large_sources_with_fixed_memory_budget_and_ma
         def __init__(self) -> None:
             super().__init__()
             self.observed_page_sizes = []
+            self.direct_list_calls = 0
+            self._inside_page = False
 
         async def page_for_investigation(self, investigation_id, **kwargs):
-            page = await super().page_for_investigation(investigation_id, **kwargs)
-            self.observed_page_sizes.append((kwargs["limit"], len(page.items)))
-            return page
+            self._inside_page = True
+            try:
+                page = await super().page_for_investigation(investigation_id, **kwargs)
+                self.observed_page_sizes.append((kwargs["limit"], len(page.items)))
+                return page
+            finally:
+                self._inside_page = False
+
+        async def list_for_investigation(self, investigation_id):
+            if not self._inside_page:
+                self.direct_list_calls += 1
+            return await super().list_for_investigation(investigation_id)
 
     class InstrumentedInvocations(InMemoryToolInvocationRepository):
         observed_page_sizes: list[tuple[int, int]]
@@ -3672,11 +3699,22 @@ async def test_context_build_pages_large_sources_with_fixed_memory_budget_and_ma
         def __init__(self) -> None:
             super().__init__()
             self.observed_page_sizes = []
+            self.direct_list_calls = 0
+            self._inside_page = False
 
         async def page_for_investigation(self, investigation_id, **kwargs):
-            page = await super().page_for_investigation(investigation_id, **kwargs)
-            self.observed_page_sizes.append((kwargs["limit"], len(page.items)))
-            return page
+            self._inside_page = True
+            try:
+                page = await super().page_for_investigation(investigation_id, **kwargs)
+                self.observed_page_sizes.append((kwargs["limit"], len(page.items)))
+                return page
+            finally:
+                self._inside_page = False
+
+        async def list_for_investigation(self, investigation_id):
+            if not self._inside_page:
+                self.direct_list_calls += 1
+            return await super().list_for_investigation(investigation_id)
 
     observations = InstrumentedObservations()
     findings = InstrumentedFindings()
@@ -3767,6 +3805,8 @@ async def test_context_build_pages_large_sources_with_fixed_memory_budget_and_ma
     assert observations.observed_page_sizes == [(MAX_CONTEXT_SOURCE_PAGE, MAX_CONTEXT_SOURCE_PAGE)]
     assert findings.observed_page_sizes == [(MAX_CONTEXT_SOURCE_PAGE, MAX_CONTEXT_SOURCE_PAGE)]
     assert invocations.observed_page_sizes == [(MAX_CONTEXT_SOURCE_PAGE, MAX_CONTEXT_SOURCE_PAGE)]
+    assert observations.direct_list_calls == findings.direct_list_calls == 0
+    assert invocations.direct_list_calls == 0
     manifest = {entry.section: entry for entry in context.investigation.pagination_manifest}
     for section in ("evidence_index", "findings", "tool_coverage"):
         entry = manifest[section]
@@ -3774,7 +3814,48 @@ async def test_context_build_pages_large_sources_with_fixed_memory_budget_and_ma
         assert entry.total == MAX_CONTEXT_SOURCE_PAGE + 1
         assert entry.selected + entry.omitted == entry.total
         assert sum(entry.omission_reasons.values()) == entry.omitted
-        assert ContextOmissionReason.BUDGET in entry.omission_reasons
+        assert ContextOmissionReason.PAGINATION in entry.omission_reasons
+
+    class NoPageRepository:
+        def __init__(self, delegate):
+            self.delegate = delegate
+            self.list_calls = 0
+
+        def __getattr__(self, name):
+            if name == "page_for_investigation":
+                raise AttributeError(name)
+            return getattr(self.delegate, name)
+
+        async def list_for_investigation(self, investigation_id):
+            self.list_calls += 1
+            return await self.delegate.list_for_investigation(investigation_id)
+
+    no_page_observations = NoPageRepository(observations)
+    fallback_builder = ResearchContextBuilder(
+        article_snapshots=_SnapshotPort(snapshot),
+        observations=no_page_observations,
+        findings=findings,
+        invocations=invocations,
+    )
+    fallback_context = await fallback_builder.build(
+        investigation_id=investigation_id,
+        synthesis_artifact_id=snapshot.synthesis_artifact_id,
+        state=_state(investigation_id),
+        tool_context=ToolExecutionContext(
+            investigation_id=investigation_id,
+            envelope=envelope,
+            budget=envelope.budget,
+            idempotency_key="bounded-context-fallback-fixture",
+        ),
+        budget_remaining={},
+    )
+    fallback_manifest = {
+        entry.section: entry for entry in fallback_context.investigation.pagination_manifest
+    }
+    assert no_page_observations.list_calls == 1
+    assert fallback_manifest["evidence_index"].source_bounded is False
+    assert fallback_manifest["evidence_index"].unbounded_reason
+    assert ContextOmissionReason.PAGINATION in fallback_manifest["evidence_index"].omission_reasons
 
 
 @pytest.mark.asyncio
@@ -3825,6 +3906,60 @@ async def test_evidence_page_redacts_credentials_before_inclusion_and_hashing() 
     assert "credential-must-not-appear" not in serialized
     assert "[redacted]" in serialized
     assert page.page_sha256
+
+    envelope = InvestigationEnvelope(
+        investigation_id=investigation_id,
+        allowed_providers=(),
+        budget=InvestigationBudget(),
+        acquire_hits_allowed=False,
+        disclosure=DisclosureBounds(tlp=TLPLevel.GREEN),
+        approval_decision_id=uuid4(),
+        approval_actor_id="redaction-test",
+    )
+    context = await builder.build(
+        investigation_id=investigation_id,
+        synthesis_artifact_id=snapshot.synthesis_artifact_id,
+        state=_state(investigation_id),
+        tool_context=ToolExecutionContext(
+            investigation_id=investigation_id,
+            envelope=envelope,
+            budget=envelope.budget,
+            idempotency_key="redaction-manifest-test",
+        ),
+        budget_remaining={},
+    )
+    manifest = next(
+        entry
+        for entry in context.investigation.pagination_manifest
+        if entry.section == "evidence_index"
+    )
+    projected_items = context.investigation.evidence_index
+    raw_page = await observations.page_for_investigation(
+        investigation_id,
+        cursor=None,
+        limit=MAX_CONTEXT_SOURCE_PAGE,
+        descending=True,
+        section="evidence_observations",
+    )
+    manifest_page_sha256 = canonical_page_sha256(
+        section=manifest.section,
+        investigation_id=investigation_id,
+        context_sha256=None,
+        cursor=None,
+        pivot={**raw_page.pivot, "section": "evidence_index"},
+        descending=True,
+        limit=MAX_CONTEXT_SOURCE_PAGE,
+        total=manifest.total,
+        has_more=raw_page.has_more,
+        items=projected_items,
+        previous_page_sha256="0" * 64,
+        omission_manifest=(manifest,),
+    )
+    assert manifest.page_sha256 == manifest_page_sha256
+    assert manifest.page_sha256 != raw_page.page_sha256
+    manifest_text = json.dumps(manifest.model_dump(mode="json"), sort_keys=True)
+    assert "credential-must-not-appear" not in manifest_text
+    assert "credential-must-not-appear" not in manifest.source_ref
 
 
 class _AsyncContext:

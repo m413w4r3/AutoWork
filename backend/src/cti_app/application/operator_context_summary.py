@@ -115,9 +115,12 @@ class OperatorContextPointerV1(_OperatorContextContract):
 
 
 class OperatorContextPointerSetV1(_OperatorContextContract):
+    """Keep integer offsets at the v1 key while publishing keyset tokens separately."""
+
     section_uri_template: str = Field(min_length=1, max_length=2_048)
     section_limit: int = Field(default=20, ge=1, le=20)
-    section_cursors: dict[str, str]
+    section_cursors: dict[str, int]
+    section_keyset_cursors: dict[str, str] = Field(default_factory=dict)
     endpoints: dict[str, OperatorContextPointerV1]
 
 
@@ -192,6 +195,8 @@ class InvestigationOperatorContextSummaryV1(_OperatorContextContract):
 
 
 class OperatorContextItemPageV1(_OperatorContextContract):
+    """Paged response; added pagination metadata defaults preserve v1 payload parsing."""
+
     schema_version: Literal["investigation-operator-context-item-page.v1"] = Field(
         default="investigation-operator-context-item-page.v1", alias="schema"
     )
@@ -209,6 +214,13 @@ class OperatorContextItemPageV1(_OperatorContextContract):
     source_ref: str = Field(min_length=1, max_length=2_048)
     omission_manifest: tuple[ContextOmissionManifestEntryV1, ...] = Field(default=(), max_length=8)
     items: tuple[Any, ...]
+    cursor: str | None = Field(default=None, max_length=1_024)
+    pivot: dict[str, str] | None = None
+    descending: bool = False
+    has_more: bool = False
+    source_bounded: bool = True
+    unbounded_reason: str | None = Field(default=None, max_length=256)
+    cursor_authentication: Literal["unauthenticated_position"] | None = None
     section_truncated: bool = False
     untrusted_data: Literal[True] = True
 
@@ -561,7 +573,8 @@ def _pointers(
             "&expected_version={version}&expected_sha256={sha256}"
         ),
         section_limit=20,
-        section_cursors=dict.fromkeys(OPERATOR_CONTEXT_SECTIONS, ""),
+        section_cursors=dict.fromkeys(OPERATOR_CONTEXT_SECTIONS, 0),
+        section_keyset_cursors=dict.fromkeys(OPERATOR_CONTEXT_SECTIONS, ""),
         endpoints={
             "pivot_frontier": OperatorContextPointerV1(
                 kind="endpoint",

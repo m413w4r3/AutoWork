@@ -358,6 +358,8 @@ class InvestigationOperatorContextV1(_StrictContract):
 
 
 class OperatorContextSectionPageV1(_StrictContract):
+    """Page response with defaulted v1 pagination metadata for old payload parsing."""
+
     schema_version: Literal["investigation-operator-context-section.v1"] = Field(
         default="investigation-operator-context-section.v1", alias="schema"
     )
@@ -389,6 +391,14 @@ class OperatorContextSectionPageV1(_StrictContract):
     source_ref: str = Field(min_length=1, max_length=2_048)
     omission_manifest: tuple[ContextOmissionManifestEntryV1, ...] = Field(default=(), max_length=8)
     items: tuple[dict[str, Any], ...] = Field(max_length=20)
+    context_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    cursor: str | None = Field(default=None, max_length=1_024)
+    pivot: dict[str, str] | None = None
+    descending: bool = False
+    has_more: bool = False
+    source_bounded: bool = True
+    unbounded_reason: str | None = Field(default=None, max_length=256)
+    cursor_authentication: Literal["unauthenticated_position"] | None = None
 
 
 class OperatorToolInvocationRequestV1(_StrictContract):

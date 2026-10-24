@@ -141,10 +141,11 @@ def _materialized_page_proof(
     investigation_id: UUID,
     context_sha256: str,
     offset: int,
+    limit: int,
     total: int,
     items: tuple[Any, ...],
     cursor: str | None,
-) -> tuple[str, str, str | None, ContextOmissionManifestEntryV1]:
+) -> tuple[str, str, str | None, ContextOmissionManifestEntryV1, dict[str, str], bool]:
     previous_page_sha256 = (
         decode_offset_cursor(
             cursor,
@@ -155,16 +156,41 @@ def _materialized_page_proof(
         if cursor
         else "0" * 64
     )
+    next_offset = offset + len(items)
+    has_more = next_offset < total
+    omitted = total - len(items)
+    omission_reasons = {ContextOmissionReason.SOURCE_NOT_PAGINATED: omitted} if omitted else {}
+    pivot = {
+        "kind": "offset",
+        "section": section,
+        "investigation_id": str(investigation_id),
+        "context_sha256": context_sha256,
+        "offset": str(next_offset),
+    }
+    omission_summary = {
+        "section": section,
+        "total": total,
+        "selected": len(items),
+        "omitted": omitted,
+        "source_bounded": False,
+        "omission_reasons": omission_reasons,
+        "unbounded_reason": "The context section was materialized before page selection",
+    }
     page_sha256 = canonical_page_sha256(
         section=section,
         investigation_id=investigation_id,
+        context_sha256=context_sha256,
+        cursor=cursor,
+        pivot=pivot,
+        descending=False,
+        limit=limit,
+        total=total,
+        has_more=has_more,
         items=items,
         previous_page_sha256=previous_page_sha256,
+        omission_manifest=omission_summary,
     )
-    source_ref = (
-        f"operator-context:{context_sha256}:{section}:offset={offset}:sha256={page_sha256}"
-    )
-    next_offset = offset + len(items)
+    source_ref = f"operator-context:{context_sha256}:{section}:offset={offset}:sha256={page_sha256}"
     next_cursor = (
         encode_offset_cursor(
             section=section,
@@ -176,7 +202,6 @@ def _materialized_page_proof(
         if next_offset < total
         else None
     )
-    omitted = total - len(items)
     return (
         page_sha256,
         source_ref,
@@ -189,13 +214,17 @@ def _materialized_page_proof(
             source_bounded=False,
             source_ref=source_ref,
             page_sha256=page_sha256,
-            omission_reasons=(
-                {ContextOmissionReason.SOURCE_NOT_PAGINATED: omitted} if omitted else {}
-            ),
-            unbounded_reason=(
-                "The context section was materialized before page selection"
-            ),
+            omission_reasons=(omission_reasons),
+            unbounded_reason=("The context section was materialized before page selection"),
+            context_sha256=context_sha256,
+            cursor=cursor,
+            pivot=pivot,
+            descending=False,
+            limit=limit,
+            has_more=has_more,
         ),
+        pivot,
+        has_more,
     )
 
 
@@ -453,22 +482,7 @@ class OperatorToolInvocationService:
                         "operator_context_section_unknown", 404
                     ) from None
                 raise OperatorToolInvocationError("operator_context_cursor_invalid", 422) from None
-            omission = ContextOmissionManifestEntryV1(
-                section=section,
-                total=page.total,
-                selected=len(page.items),
-                omitted=page.total - len(page.items),
-                source_bounded=True,
-                source_ref=page.source_ref,
-                page_sha256=page.page_sha256,
-                omission_reasons=(
-                    {
-                        ContextOmissionReason.BUDGET: page.total - len(page.items)
-                    }
-                    if page.total > len(page.items)
-                    else {}
-                ),
-            )
+            omission = page.omission_manifest[0]
             next_offset = (
                 offset + len(page.items)
                 if page.has_more and (legacy_offset_cursor or cursor is None)
@@ -494,12 +508,20 @@ class OperatorToolInvocationService:
                     source_ref=page.source_ref,
                     omission_manifest=(omission,),
                     items=page.items,
+                    cursor=page.cursor,
+                    pivot=page.pivot,
+                    descending=page.descending,
+                    has_more=page.has_more,
+                    source_bounded=page.source_bounded,
+                    unbounded_reason=page.unbounded_reason,
+                    cursor_authentication=page.cursor_authentication,
                     section_truncated=page.total > len(page.items),
                 )
             return OperatorContextSectionPageV1(
                 investigation_id=self._investigation_id,
                 working_state_version=state.version,
                 working_state_sha256=state.sha256,
+                context_sha256=page.context_sha256,
                 section=cast(Any, section),
                 offset=offset,
                 limit=limit,
@@ -510,6 +532,13 @@ class OperatorToolInvocationService:
                 source_ref=page.source_ref,
                 omission_manifest=(omission,),
                 items=page.items,
+                cursor=page.cursor,
+                pivot=page.pivot,
+                descending=page.descending,
+                has_more=page.has_more,
+                source_bounded=page.source_bounded,
+                unbounded_reason=page.unbounded_reason,
+                cursor_authentication=page.cursor_authentication,
             )
 
         if section in _ADDITIONAL_CONTEXT_ITEM_SECTIONS:
@@ -533,11 +562,19 @@ class OperatorToolInvocationService:
             total = len(all_items)
             page_items = all_items[offset : offset + limit]
             next_offset = offset + len(page_items) if offset + len(page_items) < total else None
-            page_sha256, source_ref, next_cursor, omission = _materialized_page_proof(
+            (
+                page_sha256,
+                source_ref,
+                next_cursor,
+                omission,
+                pivot,
+                has_more,
+            ) = _materialized_page_proof(
                 section=section,
                 investigation_id=self._investigation_id,
                 context_sha256=operator_context.context_sha256,
                 offset=offset,
+                limit=limit,
                 total=total,
                 items=tuple(_context_item_json(item) for item in page_items),
                 cursor=cursor if isinstance(cursor, str) and cursor else None,
@@ -557,6 +594,13 @@ class OperatorToolInvocationService:
                 source_ref=source_ref,
                 omission_manifest=(omission,),
                 items=tuple(_context_item_json(item) for item in page_items),
+                cursor=cursor if isinstance(cursor, str) and cursor else None,
+                pivot=pivot,
+                descending=False,
+                has_more=has_more,
+                source_bounded=False,
+                unbounded_reason=omission.unbounded_reason,
+                cursor_authentication=None,
                 section_truncated=_additional_context_section_truncated(operator_context, section),
             )
         if isinstance(cursor, str) and cursor:
@@ -568,9 +612,7 @@ class OperatorToolInvocationService:
                     context_sha256=state.sha256,
                 )["offset"]
             except ValueError:
-                raise OperatorToolInvocationError(
-                    "operator_context_cursor_invalid", 422
-                ) from None
+                raise OperatorToolInvocationError("operator_context_cursor_invalid", 422) from None
         try:
             total, items = await self._context_builder.read_context_section(
                 section=section,
@@ -585,11 +627,12 @@ class OperatorToolInvocationService:
                 raise OperatorToolInvocationError("operator_context_section_unknown", 404) from None
             raise
         next_offset = offset + len(items) if offset + len(items) < total else None
-        page_sha256, source_ref, next_cursor, omission = _materialized_page_proof(
+        page_sha256, source_ref, next_cursor, omission, pivot, has_more = _materialized_page_proof(
             section=section,
             investigation_id=self._investigation_id,
             context_sha256=state.sha256,
             offset=offset,
+            limit=limit,
             total=total,
             items=items,
             cursor=cursor if isinstance(cursor, str) and cursor else None,
@@ -608,6 +651,14 @@ class OperatorToolInvocationService:
             source_ref=source_ref,
             omission_manifest=(omission,),
             items=items,
+            context_sha256=state.sha256,
+            cursor=cursor if isinstance(cursor, str) and cursor else None,
+            pivot=pivot,
+            descending=False,
+            has_more=has_more,
+            source_bounded=False,
+            unbounded_reason=omission.unbounded_reason,
+            cursor_authentication=None,
         )
 
     async def invoke(
@@ -1279,9 +1330,7 @@ def _semantic_parameters_fingerprint(
                 canonical_findings: list[str] = []
                 for item in finding_refs:
                     canonical = _canonical_uuid_reference(item)
-                    canonical_findings.append(
-                        canonical if canonical is not None else str(item)
-                    )
+                    canonical_findings.append(canonical if canonical is not None else str(item))
                 if canonical_findings:
                     normalized["finding_refs"] = sorted(canonical_findings)
                 else:
@@ -1294,9 +1343,7 @@ def _semantic_parameters_fingerprint(
             else:
                 canonical_opinion = _canonical_uuid_reference(opinion_id)
                 normalized["opinion_id"] = (
-                    canonical_opinion
-                    if canonical_opinion is not None
-                    else default_opinion_id
+                    canonical_opinion if canonical_opinion is not None else default_opinion_id
                 )
             # Omitted means "latest"; an explicit version is resolved by the
             # adapter. Treating all versions as equivalent is conservative: it

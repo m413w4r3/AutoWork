@@ -5,7 +5,7 @@ import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -20,7 +20,12 @@ from cti_app.application.advisor_checkpoint import (
     format_advisor_trace_purpose,
 )
 from cti_app.application.bridge_investigator import TurnSubmission, TurnSubmissionStatus
-from cti_app.application.context_pagination import decode_keyset_cursor, verify_page_sha256
+from cti_app.application.context_pagination import (
+    ContextOmissionReason,
+    decode_keyset_cursor,
+    encode_keyset_cursor,
+    verify_page_sha256,
+)
 from cti_app.application.identity import Identity, IdentityScope
 from cti_app.application.investigation_advisor_tools import (
     ADVISOR_RESPONSE_SCHEMA,
@@ -36,6 +41,7 @@ from cti_app.application.investigation_experiments import (
 )
 from cti_app.application.investigation_tools import ToolResult
 from cti_app.application.operator_advisor_guidance import build_advisor_guidance
+from cti_app.application.operator_context_summary import InvestigationOperatorContextSummaryV1
 from cti_app.application.operator_tool_invocation import (
     OperatorToolInvocationError,
     OperatorToolInvocationService,
@@ -1488,7 +1494,7 @@ async def test_operator_http_routes_expose_bounded_context_and_idempotent_invoca
         summary_payload = summary.json()
         evidence_pointer = summary_payload["pointers"]["section_uri_template"].format(
             section="evidence_index",
-            cursor=summary_payload["pointers"]["section_cursors"]["evidence_index"],
+            cursor=summary_payload["pointers"]["section_keyset_cursors"]["evidence_index"],
             limit=summary_payload["pointers"]["section_limit"],
             version=state.version,
             sha256=state.sha256,
@@ -1562,7 +1568,15 @@ async def test_operator_http_routes_expose_bounded_context_and_idempotent_invoca
     assert summary_payload["working_state_sha256"] == state.sha256
     assert summary_payload["delta_since_version"]["from_version"] == state.version
     evidence_cursor = summary_payload["pointers"]["section_cursors"]["evidence_index"]
-    assert evidence_cursor == ""
+    assert evidence_cursor == 0
+    assert summary_payload["pointers"]["section_keyset_cursors"]["evidence_index"] == ""
+    legacy_summary_payload = json.loads(json.dumps(summary_payload))
+    legacy_summary_payload.pop("pagination_manifest", None)
+    legacy_summary_payload["pointers"].pop("section_keyset_cursors", None)
+    legacy_summary = InvestigationOperatorContextSummaryV1.model_validate_json(
+        json.dumps(legacy_summary_payload)
+    )
+    assert legacy_summary.pointers.section_keyset_cursors == {}
     assert (
         "/operator/context/section/{section}" in summary_payload["pointers"]["section_uri_template"]
     )
@@ -1577,6 +1591,23 @@ async def test_operator_http_routes_expose_bounded_context_and_idempotent_invoca
     assert tool_section.json()["schema"] == "investigation-operator-context-item-page.v1"
     assert tool_section.json()["section"] == "available_tools"
     assert tool_section.json()["items"] == context.json()["context"]["available_tools"]
+    tool_section_payload = tool_section.json()
+    assert verify_page_sha256(
+        claimed_sha256=tool_section_payload["page_sha256"],
+        section="available_tools",
+        investigation_id=fixture.investigation_id,
+        items=tool_section_payload["items"],
+        previous_page_sha256="0" * 64,
+        context_sha256=tool_section_payload["context_sha256"],
+        cursor=tool_section_payload["cursor"],
+        pivot=tool_section_payload["pivot"],
+        descending=tool_section_payload["descending"],
+        limit=tool_section_payload["limit"],
+        total=tool_section_payload["total"],
+        has_more=tool_section_payload["has_more"],
+        omission_manifest=tool_section_payload["omission_manifest"],
+        next_cursor=tool_section_payload["next_cursor"],
+    )
     assert finding_versions_page.status_code == 200, finding_versions_page.text
     assert finding_versions_page.json()["schema"] == "investigation-operator-context-item-page.v1"
     assert finding_versions_page.json()["section"] == "finding_versions"
@@ -1647,6 +1678,10 @@ async def test_context_section_keyset_cursor_is_opaque_chained_and_offset_compat
     assert first.total == second.total == 25
     assert len(first.items) == 20
     assert len(second.items) == 5
+    assert first.omission_manifest[0].omission_reasons == {
+        ContextOmissionReason.PAGINATION: first.total - len(first.items)
+    }
+    assert ContextOmissionReason.BUDGET not in first.omission_manifest[0].omission_reasons
     assert tuple(item["evidence_id"] for item in second.items) == tuple(
         item["evidence_id"] for item in offset_compatible.items
     )
@@ -1660,7 +1695,107 @@ async def test_context_section_keyset_cursor_is_opaque_chained_and_offset_compat
         investigation_id=fixture.investigation_id,
         items=second.items,
         previous_page_sha256=chained["previous_page_sha256"],
+        context_sha256=second.context_sha256,
+        cursor=second.cursor,
+        pivot=second.pivot,
+        descending=second.descending,
+        limit=second.limit,
+        total=second.total,
+        has_more=second.has_more,
+        omission_manifest=second.omission_manifest,
+        next_cursor=second.next_cursor,
     )
+    assert second.omission_manifest[0].cursor_authentication == "unauthenticated_position"
+
+    forged_position = encode_keyset_cursor(
+        section="evidence_index",
+        investigation_id=fixture.investigation_id,
+        sort_key=(datetime.fromisoformat(chained["sort_key"]) + timedelta(seconds=2)).isoformat(),
+        item_id=UUID(chained["item_id"]),
+        previous_page_sha256=chained["previous_page_sha256"],
+        descending=True,
+        context_sha256=state.sha256,
+    )
+    forged_page = await service.get_context_section(
+        "evidence_index",
+        limit=20,
+        expected_version=state.version,
+        expected_sha256=state.sha256,
+        cursor=forged_position,
+    )
+    assert forged_page.section == second.section
+    assert forged_page.total == second.total
+    assert forged_page.page_sha256 != second.page_sha256
+    assert verify_page_sha256(
+        claimed_sha256=forged_page.page_sha256,
+        section="evidence_index",
+        investigation_id=fixture.investigation_id,
+        items=forged_page.items,
+        previous_page_sha256=chained["previous_page_sha256"],
+        context_sha256=forged_page.context_sha256,
+        cursor=forged_page.cursor,
+        pivot=forged_page.pivot,
+        descending=forged_page.descending,
+        limit=forged_page.limit,
+        total=forged_page.total,
+        has_more=forged_page.has_more,
+        omission_manifest=forged_page.omission_manifest,
+        next_cursor=forged_page.next_cursor,
+    )
+    assert not verify_page_sha256(
+        claimed_sha256=forged_page.page_sha256,
+        section="evidence_index",
+        investigation_id=fixture.investigation_id,
+        items=forged_page.items,
+        previous_page_sha256=chained["previous_page_sha256"],
+        context_sha256=forged_page.context_sha256,
+        cursor=first.next_cursor,
+        pivot=forged_page.pivot,
+        descending=forged_page.descending,
+        limit=forged_page.limit,
+        total=forged_page.total,
+        has_more=forged_page.has_more,
+        omission_manifest=forged_page.omission_manifest,
+        next_cursor=forged_page.next_cursor,
+    )
+
+    for bad_scope in (
+        encode_keyset_cursor(
+            section="findings",
+            investigation_id=fixture.investigation_id,
+            sort_key=chained["sort_key"],
+            item_id=UUID(chained["item_id"]),
+            previous_page_sha256=chained["previous_page_sha256"],
+            descending=True,
+            context_sha256=state.sha256,
+        ),
+        encode_keyset_cursor(
+            section="evidence_index",
+            investigation_id=uuid4(),
+            sort_key=chained["sort_key"],
+            item_id=UUID(chained["item_id"]),
+            previous_page_sha256=chained["previous_page_sha256"],
+            descending=True,
+            context_sha256=state.sha256,
+        ),
+        encode_keyset_cursor(
+            section="evidence_index",
+            investigation_id=fixture.investigation_id,
+            sort_key=chained["sort_key"],
+            item_id=UUID(chained["item_id"]),
+            previous_page_sha256=chained["previous_page_sha256"],
+            descending=True,
+            context_sha256="f" * 64,
+        ),
+    ):
+        with pytest.raises(OperatorToolInvocationError) as bad_scope_error:
+            await service.get_context_section(
+                "evidence_index",
+                expected_version=state.version,
+                expected_sha256=state.sha256,
+                cursor=bad_scope,
+            )
+        assert bad_scope_error.value.code == "operator_context_cursor_invalid"
     with pytest.raises(OperatorToolInvocationError) as invalid:
         await service.get_context_section(
             "evidence_index",

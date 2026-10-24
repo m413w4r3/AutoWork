@@ -7,7 +7,8 @@ import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Any, Protocol, TypeGuard
+from datetime import datetime
+from typing import Any, Literal, Protocol, TypeGuard
 from uuid import UUID
 
 from cti_app.application.advisor_checkpoint import advisor_checkpoint_summary
@@ -1086,18 +1087,24 @@ class ResearchContextBuilder:
         ):
             raise ValueError("Research context identity does not match its investigation")
         snapshot = await self.article_snapshots.resolve(synthesis_artifact_id)
-        observation_source_page = await self._observations.page_for_investigation(
-            investigation_id,
+        observation_source_page = await self._page_source(
+            self._observations,
+            investigation_id=investigation_id,
+            section="evidence_observations",
             cursor=None,
             limit=MAX_CONTEXT_SOURCE_PAGE,
             descending=True,
+            position=lambda item: (item.observed_at, item.id),
         )
         observations = tuple(reversed(observation_source_page.items))
-        finding_source_page = await self._findings.page_for_investigation(
-            investigation_id,
+        finding_source_page = await self._page_source(
+            self._findings,
+            investigation_id=investigation_id,
+            section="findings",
             cursor=None,
             limit=MAX_CONTEXT_SOURCE_PAGE,
             descending=True,
+            position=lambda item: (item.created_at, item.id),
         )
         findings = finding_source_page.items
         all_observation_ids = {item.id for item in observations}
@@ -1106,11 +1113,14 @@ class ResearchContextBuilder:
         # bounded evidence on every turn so the prompt remains self-contained.
         evidence_summary = await self._evidence_context(tuple(reversed(observations)))
         invocation_source_page = (
-            await self._invocations.page_for_investigation(
-                investigation_id,
+            await self._page_source(
+                self._invocations,
+                investigation_id=investigation_id,
+                section="tool_coverage",
                 cursor=None,
                 limit=MAX_CONTEXT_SOURCE_PAGE,
                 descending=True,
+                position=lambda item: (item.created_at, item.id),
             )
             if self._invocations is not None
             else None
@@ -1241,9 +1251,7 @@ class ResearchContextBuilder:
         opinion_note_count = len(current_opinion.observations) if current_opinion else 0
         if opinion_note_count > len(opinion_notes):
             truncation_counts["opinion_notes"] = opinion_note_count - len(opinion_notes)
-        invocation_total = (
-            invocation_source_page.total if invocation_source_page is not None else 0
-        )
+        invocation_total = invocation_source_page.total if invocation_source_page is not None else 0
         if invocation_total > len(tool_coverage):
             truncation_counts["tool_coverage"] = invocation_total - len(tool_coverage)
         if len(state.hypotheses) > len(hypothesis_payload):
@@ -1310,16 +1318,22 @@ class ResearchContextBuilder:
                     section="new_evidence",
                     page=observation_source_page,
                     selected=len(evidence_summary),
+                    selected_items=evidence_summary,
+                    investigation_id=investigation_id,
                 ),
                 self._source_manifest_entry(
                     section="evidence_index",
                     page=observation_source_page,
                     selected=len(evidence_index),
+                    selected_items=evidence_index,
+                    investigation_id=investigation_id,
                 ),
                 self._source_manifest_entry(
                     section="findings",
                     page=finding_source_page,
                     selected=len(finding_summary),
+                    selected_items=finding_summary,
+                    investigation_id=investigation_id,
                 ),
                 *(
                     (
@@ -1327,6 +1341,8 @@ class ResearchContextBuilder:
                             section="tool_coverage",
                             page=invocation_source_page,
                             selected=len(tool_coverage),
+                            selected_items=tool_coverage,
+                            investigation_id=investigation_id,
                         ),
                     )
                     if invocation_source_page is not None
@@ -1434,28 +1450,89 @@ class ResearchContextBuilder:
         }
         reconciled = []
         for entry in context.investigation.pagination_manifest:
-            selected = len(section_values.get(entry.section, ()))
+            selected_items = section_values.get(entry.section, ())
+            selected = len(selected_items)
             omitted = entry.total - selected
-            if entry.source_bounded:
+            if entry.cursor_authentication == "unauthenticated_position":
+                paginated = min(
+                    entry.omission_reasons.get(ContextOmissionReason.PAGINATION, 0),
+                    omitted,
+                )
                 prior_not_selected = entry.omission_reasons.get(
                     ContextOmissionReason.NOT_SELECTED, 0
                 )
-                not_selected = min(prior_not_selected, omitted)
+                not_selected = min(prior_not_selected, omitted - paginated)
+                reasons = {
+                    ContextOmissionReason.BUDGET: omitted - not_selected - paginated,
+                    ContextOmissionReason.PAGINATION: paginated,
+                    ContextOmissionReason.NOT_SELECTED: not_selected,
+                }
+                reasons = {reason: count for reason, count in reasons.items() if count}
+            elif entry.source_bounded:
+                not_selected = min(
+                    entry.omission_reasons.get(ContextOmissionReason.NOT_SELECTED, 0),
+                    omitted,
+                )
                 reasons = {
                     ContextOmissionReason.BUDGET: omitted - not_selected,
                     ContextOmissionReason.NOT_SELECTED: not_selected,
                 }
                 reasons = {reason: count for reason, count in reasons.items() if count}
             else:
-                reasons = (
-                    {ContextOmissionReason.SOURCE_NOT_PAGINATED: omitted} if omitted else {}
+                reasons = {ContextOmissionReason.SOURCE_NOT_PAGINATED: omitted} if omitted else {}
+            omission_summary = {
+                "section": entry.section,
+                "total": entry.total,
+                "selected": selected,
+                "omitted": omitted,
+                "source_bounded": entry.source_bounded,
+                "omission_reasons": reasons,
+                "unbounded_reason": entry.unbounded_reason,
+            }
+            previous_page_sha256 = "0" * 64
+            if entry.cursor is not None:
+                decoded = decode_keyset_cursor(
+                    entry.cursor,
+                    section=entry.section,
+                    investigation_id=context.investigation_id,
+                    descending=entry.descending,
+                    context_sha256=entry.context_sha256,
                 )
+                if decoded is not None:
+                    previous_page_sha256 = decoded["previous_page_sha256"]
+            page_sha256 = canonical_page_sha256(
+                section=entry.section,
+                investigation_id=context.investigation_id,
+                context_sha256=entry.context_sha256,
+                cursor=entry.cursor,
+                pivot=entry.pivot,
+                descending=entry.descending,
+                limit=entry.limit or 1,
+                total=entry.total,
+                has_more=entry.has_more,
+                items=selected_items,
+                previous_page_sha256=previous_page_sha256,
+                omission_manifest=omission_summary,
+            )
+            source_ref = (
+                source_reference(
+                    section=entry.section,
+                    investigation_id=context.investigation_id,
+                    cursor=entry.cursor,
+                    page_sha256=page_sha256,
+                    limit=entry.limit or 1,
+                )
+                if entry.cursor_authentication == "unauthenticated_position"
+                else entry.source_ref
+            )
             reconciled.append(
                 entry.model_copy(
                     update={
                         "selected": selected,
                         "omitted": omitted,
                         "omission_reasons": reasons,
+                        "page_sha256": page_sha256,
+                        "source_ref": source_ref,
                     }
                 )
             )
@@ -1490,8 +1567,7 @@ class ResearchContextBuilder:
                 previous_page_sha256="0" * 64,
             )
             article_source_ref = (
-                f"materialized-article:{context.investigation_id}:sha256="
-                f"{fallback_article_sha256}"
+                f"materialized-article:{context.investigation_id}:sha256={fallback_article_sha256}"
             )
         candidates = (
             (
@@ -1544,9 +1620,7 @@ class ResearchContextBuilder:
                 f"working-state:{state.sha256}:previous-actions",
             ),
         )
-        existing_sections = {
-            entry.section for entry in context.investigation.pagination_manifest
-        }
+        existing_sections = {entry.section for entry in context.investigation.pagination_manifest}
         additions = []
         for section, total, items, source_ref in candidates:
             selected = len(items)
@@ -1583,28 +1657,159 @@ class ResearchContextBuilder:
         )
 
     @staticmethod
+    async def _page_source(
+        repository: Any,
+        *,
+        investigation_id: UUID,
+        section: str,
+        cursor: str | None,
+        limit: int,
+        descending: bool,
+        position: Any,
+        context_sha256: str | None = None,
+        latest_only: bool = False,
+    ) -> KeysetPageV1[Any]:
+        page_method = getattr(repository, "page_for_investigation", None)
+        if callable(page_method):
+            kwargs: dict[str, Any] = {
+                "cursor": cursor,
+                "limit": limit,
+                "descending": descending,
+                "section": section,
+            }
+            if latest_only:
+                kwargs["latest_only"] = True
+            return await page_method(investigation_id, **kwargs)
+
+        list_method = getattr(repository, "list_for_investigation", None)
+        if not callable(list_method):
+            raise ValueError("Repository supports neither keyset pages nor materialized lists")
+        # Compatibility fallback: this materializes the full source and is not source-bounded.
+        items = tuple(await list_method(investigation_id))
+        if latest_only:
+            superseded = {
+                getattr(item, "supersedes", None)
+                for item in items
+                if getattr(item, "supersedes", None) is not None
+            }
+            items = tuple(item for item in items if item.id not in superseded)
+        ordered = sorted(items, key=position, reverse=descending)
+        if cursor is not None:
+            decoded = decode_keyset_cursor(
+                cursor,
+                section=section,
+                investigation_id=investigation_id,
+                descending=descending,
+                context_sha256=context_sha256,
+            )
+            if decoded is not None:
+                try:
+                    pivot = (datetime.fromisoformat(decoded["sort_key"]), UUID(decoded["item_id"]))
+                except (TypeError, ValueError):
+                    raise ValueError("Context keyset cursor is invalid") from None
+                ordered = [
+                    item
+                    for item in ordered
+                    if (position(item) < pivot if descending else position(item) > pivot)
+                ]
+        return make_keyset_page(
+            section=section,
+            investigation_id=investigation_id,
+            items=tuple(ordered[: limit + 1]),
+            total=len(items),
+            limit=limit,
+            cursor=cursor,
+            position=position,
+            descending=descending,
+            context_sha256=context_sha256,
+            source_bounded=False,
+            unbounded_reason=(
+                "Repository lacks page_for_investigation; the fallback materializes the full list"
+            ),
+        )
+
+    @staticmethod
     def _source_manifest_entry(
-        *, section: str, page: Any, selected: int
+        *,
+        section: str,
+        page: Any,
+        selected: int,
+        selected_items: Sequence[Any],
+        investigation_id: UUID,
     ) -> ContextOmissionManifestEntryV1:
         source_selected = len(page.items)
         if selected > source_selected:
             raise ValueError("Context selection cannot exceed the bounded source page")
-        omitted_for_budget = page.total - source_selected
+        if selected != len(selected_items):
+            raise ValueError("Context selection count must match its projected items")
+        pivot = dict(page.pivot) if page.pivot is not None else None
+        if pivot is not None:
+            pivot["section"] = section
+        omitted_for_pagination = page.total - source_selected
         omitted_not_selected = source_selected - selected
         reasons: dict[ContextOmissionReason, int] = {}
-        if omitted_for_budget:
-            reasons[ContextOmissionReason.BUDGET] = omitted_for_budget
+        if omitted_for_pagination:
+            reasons[ContextOmissionReason.PAGINATION] = omitted_for_pagination
         if omitted_not_selected:
             reasons[ContextOmissionReason.NOT_SELECTED] = omitted_not_selected
+        previous_page_sha256 = "0" * 64
+        if page.cursor is not None:
+            decoded = decode_keyset_cursor(
+                page.cursor,
+                section=section,
+                investigation_id=investigation_id,
+                descending=page.descending,
+                context_sha256=page.context_sha256,
+            )
+            if decoded is not None:
+                previous_page_sha256 = decoded["previous_page_sha256"]
+        omission_summary = {
+            "section": section,
+            "total": page.total,
+            "selected": selected,
+            "omitted": page.total - selected,
+            "source_bounded": page.source_bounded,
+            "omission_reasons": reasons,
+            "unbounded_reason": page.unbounded_reason,
+        }
+        page_sha256 = canonical_page_sha256(
+            section=section,
+            investigation_id=investigation_id,
+            context_sha256=page.context_sha256,
+            cursor=page.cursor,
+            pivot=pivot,
+            descending=page.descending,
+            limit=page.limit,
+            total=page.total,
+            has_more=page.has_more,
+            items=selected_items,
+            previous_page_sha256=previous_page_sha256,
+            omission_manifest=omission_summary,
+        )
+        source_ref = source_reference(
+            section=section,
+            investigation_id=investigation_id,
+            cursor=page.cursor,
+            page_sha256=page_sha256,
+            limit=page.limit,
+        )
         return ContextOmissionManifestEntryV1(
             section=section,
             total=page.total,
             selected=selected,
             omitted=page.total - selected,
-            source_bounded=True,
-            source_ref=page.source_ref,
-            page_sha256=page.page_sha256,
+            source_bounded=page.source_bounded,
+            source_ref=source_ref,
+            page_sha256=page_sha256,
             omission_reasons=reasons,
+            unbounded_reason=page.unbounded_reason,
+            context_sha256=page.context_sha256,
+            cursor=page.cursor,
+            pivot=pivot,
+            descending=page.descending,
+            limit=page.limit,
+            has_more=page.has_more,
+            cursor_authentication="unauthenticated_position",
         )
 
     @staticmethod
@@ -1620,17 +1825,60 @@ class ResearchContextBuilder:
         unbounded_reason: str = (
             "Current aggregate repository exposes a materialized sequence without keyset paging"
         ),
+        context_sha256: str | None = None,
+        cursor: str | None = None,
+        pivot: Mapping[str, str] | None = None,
+        descending: bool = False,
+        limit: int | None = None,
+        has_more: bool = False,
+        cursor_authentication: Literal["unauthenticated_position"] | None = None,
     ) -> ContextOmissionManifestEntryV1:
         omitted = total - selected
         if selected > total:
             raise ValueError("Selected and omitted counts must equal source total")
         reasons = {omission_reason: omitted} if omitted else {}
+        omission_summary = {
+            "section": section,
+            "total": total,
+            "selected": selected,
+            "omitted": omitted,
+            "source_bounded": False,
+            "omission_reasons": reasons,
+            "unbounded_reason": unbounded_reason,
+        }
+        previous_page_sha256 = "0" * 64
+        if cursor is not None:
+            decoded = decode_keyset_cursor(
+                cursor,
+                section=section,
+                investigation_id=investigation_id,
+                descending=descending,
+                context_sha256=context_sha256,
+            )
+            if decoded is not None:
+                previous_page_sha256 = decoded["previous_page_sha256"]
         page_sha256 = canonical_page_sha256(
             section=section,
             investigation_id=investigation_id,
             items=items,
-            previous_page_sha256="0" * 64,
+            previous_page_sha256=previous_page_sha256,
+            context_sha256=context_sha256,
+            cursor=cursor,
+            pivot=pivot,
+            descending=descending,
+            limit=limit or 1,
+            total=total,
+            has_more=has_more,
+            omission_manifest=omission_summary,
         )
+        if cursor_authentication == "unauthenticated_position":
+            source_ref = source_reference(
+                section=section,
+                investigation_id=investigation_id,
+                cursor=cursor,
+                page_sha256=page_sha256,
+                limit=limit or 1,
+            )
         return ContextOmissionManifestEntryV1(
             section=section,
             total=total,
@@ -1641,6 +1889,13 @@ class ResearchContextBuilder:
             page_sha256=page_sha256,
             omission_reasons=reasons,
             unbounded_reason=unbounded_reason,
+            context_sha256=context_sha256,
+            cursor=cursor,
+            pivot=dict(pivot) if pivot is not None else None,
+            descending=descending,
+            limit=limit,
+            has_more=has_more,
+            cursor_authentication=cursor_authentication,
         )
 
     async def read_context_section(
@@ -1994,24 +2249,23 @@ class ResearchContextBuilder:
                     context_sha256=context_sha256,
                 )
                 if not skipped.items:
-                    return KeysetPageV1[dict[str, Any]](
-                        items=(),
-                        total=skipped.total,
-                        has_more=False,
-                        next_cursor=None,
-                        page_sha256=skipped.page_sha256,
-                        source_ref=skipped.source_ref,
-                    )
+                    return skipped
                 remaining -= len(skipped.items)
                 seek_cursor = skipped.next_cursor
                 if seek_cursor is None:
-                    return KeysetPageV1[dict[str, Any]](
+                    empty_after_last_page = skipped.model_copy(
+                        update={"items": (), "has_more": False, "next_cursor": None}
+                    )
+                    return self._project_source_page(
+                        section=section,
+                        investigation_id=investigation_id,
+                        cursor=skipped.cursor,
+                        limit=limit,
+                        source_page=empty_after_last_page,
                         items=(),
-                        total=skipped.total,
-                        has_more=False,
-                        next_cursor=None,
-                        page_sha256=skipped.page_sha256,
-                        source_ref=skipped.source_ref,
+                        position=lambda _item: (datetime.min, UUID(int=0)),
+                        descending=(section != "finding_versions"),
+                        context_sha256=context_sha256,
                     )
             return await self.read_context_section_page(
                 section=section,
@@ -2022,20 +2276,21 @@ class ResearchContextBuilder:
                 context_sha256=context_sha256,
             )
         if section in {"new_evidence", "evidence_index"}:
-            source_page = await self._observations.page_for_investigation(
-                investigation_id,
+            source_page = await self._page_source(
+                self._observations,
+                investigation_id=investigation_id,
                 cursor=cursor,
                 limit=limit,
                 descending=True,
                 section=section,
+                position=lambda item: (item.observed_at, item.id),
+                context_sha256=context_sha256,
             )
             if section == "new_evidence":
                 serialized_items = []
                 for observation in source_page.items:
                     summaries = await self._evidence_context((observation,))
-                    serialized_items.extend(
-                        item.model_dump(mode="json") for item in summaries
-                    )
+                    serialized_items.extend(item.model_dump(mode="json") for item in summaries)
                 items = tuple(serialized_items)
             else:
                 items = tuple(
@@ -2054,13 +2309,16 @@ class ResearchContextBuilder:
                 context_sha256=context_sha256,
             )
         if section in {"findings", "finding_versions"}:
-            source_page = await self._findings.page_for_investigation(
-                investigation_id,
+            source_page = await self._page_source(
+                self._findings,
+                investigation_id=investigation_id,
                 cursor=cursor,
                 limit=limit,
                 descending=(section == "findings"),
                 section=section,
                 latest_only=(section == "findings"),
+                position=lambda item: (item.created_at, item.id),
+                context_sha256=context_sha256,
             )
             observation_ids = {
                 ref for finding in source_page.items for ref in finding.observation_refs
@@ -2094,14 +2352,18 @@ class ResearchContextBuilder:
                     cursor=cursor,
                     position=lambda item: (item.created_at, item.id),
                     descending=True,
+                    context_sha256=context_sha256,
                 )
                 return empty
-            source_page = await self._invocations.page_for_investigation(
-                investigation_id,
+            source_page = await self._page_source(
+                self._invocations,
+                investigation_id=investigation_id,
                 cursor=cursor,
                 limit=limit,
                 descending=True,
                 section=section,
+                position=lambda item: (item.created_at, item.id),
+                context_sha256=context_sha256,
             )
             observations_by_id: dict[UUID, EvidenceObservation] = {}
             for invocation in source_page.items:
@@ -2112,9 +2374,7 @@ class ResearchContextBuilder:
             coverage_items, _ = await self._tool_coverage(
                 tuple(reversed(source_page.items)), tuple(observations_by_id.values())
             )
-            items = tuple(
-                item.model_dump(mode="json") for item in reversed(coverage_items)
-            )
+            items = tuple(item.model_dump(mode="json") for item in reversed(coverage_items))
             return self._project_source_page(
                 section=section,
                 investigation_id=investigation_id,
@@ -2152,11 +2412,39 @@ class ResearchContextBuilder:
             if cursor is not None
             else "0" * 64
         )
+        if len(items) > len(source_page.items):
+            raise ValueError("Projected context page cannot exceed its source page")
+        omitted = source_page.total - len(items)
+        omission_reasons = {
+            ContextOmissionReason.PAGINATION: source_page.total - len(source_page.items),
+            ContextOmissionReason.NOT_SELECTED: len(source_page.items) - len(items),
+        }
+        omission_reasons = {reason: count for reason, count in omission_reasons.items() if count}
+        pivot = dict(source_page.pivot) if source_page.pivot is not None else None
+        if pivot is not None:
+            pivot["section"] = section
+        omission_summary = {
+            "section": section,
+            "total": source_page.total,
+            "selected": len(items),
+            "omitted": omitted,
+            "source_bounded": source_page.source_bounded,
+            "omission_reasons": omission_reasons,
+            "unbounded_reason": source_page.unbounded_reason,
+        }
         page_sha256 = canonical_page_sha256(
             section=section,
             investigation_id=investigation_id,
             items=items,
             previous_page_sha256=previous_page_sha256,
+            context_sha256=context_sha256,
+            cursor=cursor,
+            pivot=pivot,
+            descending=descending,
+            limit=limit,
+            total=source_page.total,
+            has_more=source_page.has_more,
+            omission_manifest=omission_summary,
         )
         next_cursor = None
         if source_page.has_more and source_page.items:
@@ -2184,6 +2472,33 @@ class ResearchContextBuilder:
             next_cursor=next_cursor,
             page_sha256=page_sha256,
             source_ref=final_source_ref,
+            cursor=cursor,
+            pivot=pivot,
+            descending=descending,
+            limit=limit,
+            context_sha256=context_sha256,
+            omission_manifest=(
+                ContextOmissionManifestEntryV1(
+                    section=section,
+                    total=source_page.total,
+                    selected=len(items),
+                    omitted=omitted,
+                    source_bounded=source_page.source_bounded,
+                    source_ref=final_source_ref,
+                    page_sha256=page_sha256,
+                    omission_reasons=omission_reasons,
+                    unbounded_reason=source_page.unbounded_reason,
+                    context_sha256=context_sha256,
+                    cursor=cursor,
+                    pivot=pivot,
+                    descending=descending,
+                    limit=limit,
+                    has_more=source_page.has_more,
+                    cursor_authentication="unauthenticated_position",
+                ),
+            ),
+            source_bounded=source_page.source_bounded,
+            unbounded_reason=source_page.unbounded_reason,
         )
 
     def _reduce_context_to_fit(
