@@ -2290,8 +2290,10 @@ def _external_disclosure_allowed(policy: DerivedPolicy) -> bool:
 _URL_SCHEME = re.compile(r"https?://", re.IGNORECASE)
 _URL_USERINFO = re.compile(r"(?i)(https?://)[^/\s:@]+:[^@\s]*@")
 _URL_CREDENTIAL_PARAM = re.compile(
-    r"(?i)([?&](?:sig|signature|x-amz-[^=&\s]*|x-goog-[^=&\s]*|token|access_token"
-    r"|auth|authorization|api[_-]?key|apikey|credential|password|secret)=)[^&#\s]*"
+    r"(?i)([?&](?:sig|signature|x-amz-(?:signature|credential|security-token)"
+    r"|x-goog-(?:signature|credential)|token|access[_-]?token|refresh[_-]?token"
+    r"|session[_-]?token|auth|authorization|api[_-]?key|apikey|client[_-]?secret"
+    r"|credential|password|secret|private[_-]?key)=)[^&#\s]*"
 )
 
 
@@ -2306,8 +2308,15 @@ def _redact_url(value: str) -> str:
 def _redact_text(value: str) -> str:
     value = re.sub(r"\bsk-[A-Za-z0-9_-]{8,}\b", "[REDACTED]", value)
     value = re.sub(r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]{8,}", "[REDACTED]", value)
+    value = re.sub(
+        r"(?i)\b(authorization|auth)\s*[:=]\s*basic\s+\S+",
+        r"\1=[REDACTED]",
+        value,
+    )
     return re.sub(
-        r"(?i)\b(api[_-]?key|password|secret|token)\s*[:=]\s*(?!\[REDACTED\])\S+",
+        r"(?i)\b(api[_-]?key|apikey|client[_-]?secret|private[_-]?key|password|secret"
+        r"|access[_-]?token|refresh[_-]?token|session[_-]?token|token"
+        r"|authorization|auth|credential)\s*[:=]\s*(?!\[REDACTED\])\S+",
         r"\1=[REDACTED]",
         value,
     )

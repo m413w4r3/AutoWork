@@ -15,6 +15,7 @@ from cti_app.application.invariant_proposals import (
     _bounded_pattern,
     _normalize_context,
     _parse_proposal_response_details,
+    _redact_text,
     _redact_url,
     _render_p10_prompt,
     _select_candidate_records,
@@ -1012,12 +1013,44 @@ def test_redact_url_keeps_adjacent_evidence_and_redacts_credentials() -> None:
     assert _redact_url("https://example.invalid/path?q=test") == (
         "https://example.invalid/path?q=test"
     )
+    assert (
+        _redact_url("https://example.invalid/path?client_secret=FIXTURE_CLIENT_SECRET&q=test")
+        == "https://example.invalid/path?client_secret=[REDACTED]&q=test"
+    )
+    signed_headers = _redact_url(
+        "https://example.invalid/file?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+        "&X-Amz-Credential=FIXTURE_CREDENTIAL&X-Amz-Signature=SECRET_SIGNATURE"
+    )
+    assert "X-Amz-Algorithm=AWS4-HMAC-SHA256" in signed_headers
+    assert "FIXTURE_CREDENTIAL" not in signed_headers
+    assert "SECRET_SIGNATURE" not in signed_headers
+
+
+def test_redact_text_redacts_credentials_without_erasing_surrounding_claims() -> None:
+    value = (
+        "Constat auth=FIXTURE_AUTH_123 authorization: Basic ZmFrZQ== "
+        "credential=FIXTURE_CREDENTIAL client_secret=FIXTURE_CLIENT_SECRET "
+        "fin du constat."
+    )
+
+    redacted = _redact_text(value)
+
+    for secret in (
+        "FIXTURE_AUTH_123",
+        "ZmFrZQ==",
+        "FIXTURE_CREDENTIAL",
+        "FIXTURE_CLIENT_SECRET",
+    ):
+        assert secret not in redacted
+    assert "Constat" in redacted
+    assert "fin du constat." in redacted
 
 
 def test_render_p10_prompt_redacts_url_credentials_without_losing_claim_context() -> None:
     claim = (
         "Constat CVE-2025-7777 confirmé https://example.invalid/a"
-        "?auth=FIXTURE_AUTH_TOKEN&sig=SECRET_SIG fin du constat."
+        "?auth=FIXTURE_AUTH_TOKEN&sig=SECRET_SIG&client_secret=FIXTURE_CLIENT_SECRET "
+        "credential=FIXTURE_CREDENTIAL authorization: Basic ZmFrZQ== fin du constat."
     )
     snapshot = _proposal_snapshot(
         _normalize_context({"report_claims": [{"claim_id": "claim-1", "text": claim}]})
@@ -1025,8 +1058,14 @@ def test_render_p10_prompt_redacts_url_credentials_without_losing_claim_context(
 
     prompt, _ = _render_p10_prompt(snapshot)
 
-    assert "FIXTURE_AUTH_TOKEN" not in prompt
-    assert "SECRET_SIG" not in prompt
+    for secret in (
+        "FIXTURE_AUTH_TOKEN",
+        "SECRET_SIG",
+        "FIXTURE_CLIENT_SECRET",
+        "FIXTURE_CREDENTIAL",
+        "ZmFrZQ==",
+    ):
+        assert secret not in prompt
     assert "Constat CVE-2025-7777" in prompt
     assert "fin du constat." in prompt
 
