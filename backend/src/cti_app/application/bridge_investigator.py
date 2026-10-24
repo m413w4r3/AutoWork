@@ -58,6 +58,9 @@ class TurnSubmissionStatus(StrEnum):
 
 MAX_PRE_SUBMISSION_ATTEMPTS = 3
 BRIDGE_PROVIDER_KEY = "openai_chatgpt_bridge"
+# Bound shared blocking caused by provider-supplied Retry-After values to avoid
+# an untrusted response stalling this process indefinitely; this is not a provider policy.
+MAX_SHARED_RATE_LIMIT_COOLDOWN_SECONDS = 300.0
 
 
 class BridgeSubmissionPacer:
@@ -94,7 +97,10 @@ class BridgeSubmissionPacer:
             now = self._clock()
             if deadline_monotonic is not None and now >= deadline_monotonic:
                 return False
-            self._blocked_until = max(self._blocked_until, now + seconds)
+            blocked_until = max(self._blocked_until, now + seconds)
+            if deadline_monotonic is not None and blocked_until > deadline_monotonic:
+                return False
+            self._blocked_until = blocked_until
             return True
         finally:
             self._lock.release()
@@ -408,14 +414,50 @@ async def submit_bridge_consultation_once(
         return result
 
     submission = await submit_with_deadline(0, transport_timeout)
+    is_rate_limited = submission.error_code == "bridge_rate_limited"
+    retry_after: float | None = None
+    retry_delay = 0.0
+    retry_after_exceeds_maximum = False
+    cooldown_accepted = False
+    if is_rate_limited:
+        retry_after = _retry_after_or_none(submission.retry_after_seconds)
+        retry_delay_maximum = getattr(
+            configured, "openai_bridge_pre_submission_retry_max_seconds", 8.0
+        )
+        if not isinstance(retry_delay_maximum, int | float) or not math.isfinite(
+            retry_delay_maximum
+        ):
+            retry_delay_maximum = 0.0
+        retry_delay_maximum = max(0.0, float(retry_delay_maximum))
+        retry_after_exceeds_maximum = (
+            retry_after is not None and retry_after > retry_delay_maximum
+        )
+        retry_delay = (
+            min(retry_after, retry_delay_maximum)
+            if retry_after is not None
+            else _bounded_retry_backoff(
+                getattr(configured, "openai_bridge_pre_submission_retry_base_seconds", 1.0),
+                retry_delay_maximum,
+                0,
+            )
+        )
+        shared_cooldown = (
+            min(retry_after, MAX_SHARED_RATE_LIMIT_COOLDOWN_SECONDS)
+            if retry_after is not None
+            else retry_delay
+        )
+        cooldown_accepted = await pacer.defer_submissions(
+            shared_cooldown, deadline_monotonic=deadline
+        )
+
     if (
         submission.status is not TurnSubmissionStatus.UNAVAILABLE
-        or submission.error_code != "bridge_rate_limited"
+        or not is_rate_limited
         or submission.submission_state is not BridgeSubmissionState.PRE_SUBMISSION
     ):
         if (
             submission.status is TurnSubmissionStatus.UNAVAILABLE
-            and submission.error_code == "bridge_rate_limited"
+            and is_rate_limited
         ):
             return TurnSubmission(
                 TurnSubmissionStatus.NEEDS_REVIEW,
@@ -437,24 +479,11 @@ async def submit_bridge_consultation_once(
             )
         return submission
 
-    retry_after = _retry_after_or_none(submission.retry_after_seconds)
-    retry_maximum = getattr(configured, "openai_bridge_pre_submission_retry_max_seconds", 8.0)
-    if not isinstance(retry_maximum, int | float) or not math.isfinite(retry_maximum):
-        retry_maximum = 0.0
-    retry_maximum = max(0.0, float(retry_maximum))
-    retry_after_exceeds_maximum = retry_after is not None and retry_after > retry_maximum
-    retry_delay = (
-        min(retry_after, retry_maximum)
-        if retry_after is not None
-        else _bounded_retry_backoff(
-            getattr(configured, "openai_bridge_pre_submission_retry_base_seconds", 1.0),
-            retry_maximum,
-            0,
-        )
-    )
     can_retry = submission.retryable and callable(
         getattr(transport, "submit_with_attempt", None)
     )
+    if retry_after_exceeds_maximum or not can_retry or not cooldown_accepted:
+        return submission
     if deadline is not None:
         remaining = deadline - operation_clock()
         # Keep a full minimum execution window after the server's wait. It
@@ -462,12 +491,7 @@ async def submit_bridge_consultation_once(
         enough_budget = remaining > retry_delay + minimum_timeout_seconds
     else:
         enough_budget = True
-    if retry_after_exceeds_maximum:
-        await pacer.defer_submissions(retry_delay, deadline_monotonic=deadline)
-        return submission
-    if not can_retry or not enough_budget:
-        return submission
-    if not await pacer.defer_submissions(retry_delay, deadline_monotonic=deadline):
+    if not enough_budget:
         return submission
     if deadline is not None:
         if deadline - operation_clock() <= retry_delay + minimum_timeout_seconds:

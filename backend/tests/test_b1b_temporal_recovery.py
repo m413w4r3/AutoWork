@@ -192,7 +192,7 @@ async def test_one_proven_pre_submission_429_retry_uses_retry_after_and_distinct
             error_code="bridge_rate_limited",
             submission_state="pre_submission",
             retryable=True,
-            retry_after_seconds=_retry_after_seconds("2"),
+            retry_after_seconds=_retry_after_seconds("5"),
         )
 
     async def success():
@@ -203,11 +203,11 @@ async def test_one_proven_pre_submission_429_retry_uses_retry_after_and_distinct
     result = await _submit(monkeypatch, clock, transport, deadline=20, minimum_timeout=2)
 
     assert result.status is TurnSubmissionStatus.SUCCEEDED
-    assert transport.calls == [(0, 20), (1, 17)]
+    assert transport.calls == [(0, 20), (1, 14)]
     assert transport.keys[0] != transport.keys[1]
     assert [attempt for attempt, _timeout in transport.calls] == [0, 1]
     assert transport.accepted_successes == 1
-    assert clock.sleeps == [2]
+    assert clock.sleeps == [5]
 
 
 @pytest.mark.asyncio
@@ -253,7 +253,7 @@ async def test_429_without_pre_submission_proof_never_retries(
 
 
 @pytest.mark.asyncio
-async def test_retry_after_beyond_remaining_budget_stays_rate_limited_without_sleep_or_retry(
+async def test_retry_after_that_leaves_no_execution_window_stays_rate_limited_without_retry(
     monkeypatch,
 ) -> None:
     clock = _FakeClock()
@@ -288,6 +288,72 @@ async def test_retry_after_beyond_remaining_budget_stays_rate_limited_without_sl
     assert transport.calls == [(0, 5)]
     assert transport.accepted_successes == 0
     assert clock.sleeps == []
+    assert pacer._blocked_until == 4
+
+
+@pytest.mark.asyncio
+async def test_retry_after_is_shared_even_when_retry_budget_is_insufficient(monkeypatch) -> None:
+    clock = _FakeClock()
+    transport = _FakeTransport(
+        [
+            TurnSubmission(
+                TurnSubmissionStatus.UNAVAILABLE,
+                error_code="bridge_rate_limited",
+                submission_state="pre_submission",
+                retryable=True,
+                retry_after_seconds=5,
+            )
+        ],
+        clock,
+    )
+    pacer = _pacer(clock)
+
+    result = await _submit(
+        monkeypatch,
+        clock,
+        transport,
+        deadline=8,
+        minimum_timeout=4,
+        pacer=pacer,
+    )
+
+    assert result.error_code == "bridge_rate_limited"
+    assert transport.calls == [(0, 8)]
+    assert clock.sleeps == []
+    assert pacer._blocked_until == 5
+
+
+@pytest.mark.asyncio
+async def test_shared_cooldown_that_exceeds_deadline_is_refused_without_extending_it(
+    monkeypatch,
+) -> None:
+    clock = _FakeClock()
+    transport = _FakeTransport(
+        [
+            TurnSubmission(
+                TurnSubmissionStatus.UNAVAILABLE,
+                error_code="bridge_rate_limited",
+                submission_state="pre_submission",
+                retryable=True,
+                retry_after_seconds=5,
+            )
+        ],
+        clock,
+    )
+    pacer = _pacer(clock)
+
+    result = await _submit(
+        monkeypatch,
+        clock,
+        transport,
+        deadline=4,
+        minimum_timeout=1,
+        pacer=pacer,
+    )
+
+    assert result.error_code == "bridge_rate_limited"
+    assert transport.calls == [(0, 4)]
+    assert clock.sleeps == []
     assert pacer._blocked_until == 0
 
 
@@ -314,7 +380,7 @@ async def test_large_finite_retry_after_is_capped_for_shared_pacer_without_retry
         monkeypatch,
         clock,
         transport,
-        deadline=20,
+        deadline=1000,
         minimum_timeout=1,
         retry_max=8,
         pacer=pacer,
@@ -322,15 +388,16 @@ async def test_large_finite_retry_after_is_capped_for_shared_pacer_without_retry
 
     assert result.status is TurnSubmissionStatus.UNAVAILABLE
     assert result.error_code == "bridge_rate_limited"
-    assert transport.calls == [(0, 20)]
+    assert transport.calls == [(0, 1000)]
     assert transport.accepted_successes == 0
     assert clock.sleeps == []
-    assert pacer._blocked_until == 8
+    assert pacer._blocked_until == bridge_module.MAX_SHARED_RATE_LIMIT_COOLDOWN_SECONDS
 
 
 @pytest.mark.asyncio
 async def test_429_without_distinct_attempt_support_stays_rate_limited(monkeypatch) -> None:
     clock = _FakeClock()
+    pacer = _pacer(clock)
 
     class SingleAttemptTransport:
         def __init__(self) -> None:
@@ -343,17 +410,51 @@ async def test_429_without_distinct_attempt_support_stays_rate_limited(monkeypat
                 error_code="bridge_rate_limited",
                 submission_state="pre_submission",
                 retryable=True,
-                retry_after_seconds=1,
+                retry_after_seconds=5,
             )
 
     transport = SingleAttemptTransport()
-    result = await _submit(monkeypatch, clock, transport, deadline=20, minimum_timeout=1)
+    result = await _submit(
+        monkeypatch, clock, transport, deadline=20, minimum_timeout=1, pacer=pacer
+    )
     advisor_result = _advisor_result(result)
 
     assert result.error_code == "bridge_rate_limited"
     assert advisor_result.output["advisor_status"] == "rate_limited"
     assert transport.calls == 1
     assert clock.sleeps == []
+    assert pacer._blocked_until == 5
+
+
+@pytest.mark.asyncio
+async def test_missing_retry_after_applies_bounded_backoff_to_shared_pacer(monkeypatch) -> None:
+    clock = _FakeClock()
+    pacer = _pacer(clock)
+
+    class SingleAttemptTransport:
+        async def submit(self, *, timeout_seconds=None, **_kwargs):
+            return TurnSubmission(
+                TurnSubmissionStatus.UNAVAILABLE,
+                error_code="bridge_rate_limited",
+                submission_state="pre_submission",
+                retryable=True,
+                retry_after_seconds=None,
+            )
+
+    result = await _submit(
+        monkeypatch,
+        clock,
+        SingleAttemptTransport(),
+        deadline=20,
+        minimum_timeout=1,
+        retry_base=2,
+        retry_max=8,
+        pacer=pacer,
+    )
+
+    assert result.error_code == "bridge_rate_limited"
+    assert clock.sleeps == []
+    assert pacer._blocked_until == 2
 
 
 @pytest.mark.asyncio
