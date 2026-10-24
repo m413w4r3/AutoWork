@@ -284,5 +284,44 @@ l'invocation `RUNNING` et sa réservation en attente de récupération
 (inférence, non vérifiée PostgreSQL). Concurrence multi-processus, pool et
 acceptation fournisseur restent `UNKNOWN`.
 
+## Clôture B1A1 atomicité — BLOCKED
+
+La réparation R2 s'arrête après **2 tentatives sans progrès** (sur 3
+autorisées), sans commit de l'agent. Le parent a préservé le travail non
+commité en WIP `32513ca` sur `feat/mission01-b1a1-atomic-dispatch`,
+**branche non intégrée**.
+
+Vérification parent du test advisor (`-k advisor`) : **1 failed, 4 passed**.
+Le refus direct sans guard passe avec `dispatch_guard_unavailable` et preuve
+typée `TOOL_UNAVAILABLE` ; le **chemin positif gardé** échoue en
+`advisor_preflight_insufficient_evidence` (`ToolInvocationStatus.UNAVAILABLE`,
+pas une erreur de guard).
+
+### Cause racine et primitive manquante
+
+L'état du guard est porté par des booléens `dispatch_guard_required` /
+`dispatch_guard_held` que l'appelant peut forger. Un appel direct à
+l'advisor avec ces booléens à `True` contourne le refus sans qu'un verrou
+réel soit tenu. La primitive correcte est un **capability/lease non
+forgeable créé par le dispatcher lors de l'entrée effective dans le
+`SELECT … FOR UPDATE`**, validé par l'advisor (objet opaque ou jeton
+enregistré), et non deux booléens de contexte. Le fixture du chemin positif
+doit aussi fournir une preuve canonique valide pour dépasser le préflight ;
+ce n'est pas un défaut de production démontré.
+
+### Décision
+
+- **B1A1 atomicité révocation/dispatch : BLOCKED.** La séquence SQL du
+  service/dispatcher est correcte et revue, mais la frontière advisor n'est
+  pas fail-closed de façon non forgeable. Aucune revendication d'atomicité.
+- **B1A1 clé d'effet canonique : BLOCKED** (seule `ModelRun run.id:aN` par
+  tentative ; `operation_key` client + fingerprint heuristique). Ne pas
+  rouvrir l'heuristique.
+- Les protections B1A1/B1B déjà intégrées restent en place ; la branche
+  atomique n'est pas fusionnée.
+- Reprise future : capability/lease non forgeable, fixture de préflight
+  valide, puis vérification PostgreSQL concurrente autorisée séparément.
+
+
 
 

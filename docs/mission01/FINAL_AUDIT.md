@@ -1,148 +1,118 @@
-# Mission 01 V3.2 — audit final
+# Mission 01 V3.2 — audit final de reprise
 
-**État :** clôturé avec réserves, 2026-10-24. Ce document distingue les
-résultats réellement exécutés, les verdicts indépendants et les restes
-`BLOCKED/UNKNOWN`. Aucun `PASS` n'est déclaré sans test ou revue effective.
+**État :** **PARTIAL**, clôturé le 2026-10-24 avec réserves et preuves.
+Aucun push, merge sur `main`, déploiement, accès live, appel fournisseur/CTI,
+acquisition, scan, upload ou donnée CTI privée n'a été effectué.
 
 **Base :** `main@058bb4af2278e3941956e523c5a1d560208de228`.
-**Intégration locale vérifiée :** `chore/mission01-integration` @ `8fdb7a7`
-(cette documentation est committée dans le lot suivant).
-**Branche de correction :** `fix/mission01-regressions` @ `c15166e`, fusionnée.
-**WIP parent :** `wip/mission01-parent-fixes` @ `849cfa0` (relu/intégré via la
-branche de correction).
+**Branche d'intégration :** `chore/mission01-integration`.
+**État code vérifié :** `9523cc4c` (dernier merge de code : B1B, L2, A1, Q1).
+Cette documentation est committée dans le lot suivant ; les SHA de merge et
+de revue sont cités ci-dessous.
 
 ## Périmètre réellement exécuté
 
-- Aucun push, merge sur `main`, déploiement, accès live, appel fournisseur,
-  acquisition, scan, upload ou donnée CTI privée.
-- Tests exclusivement hors ligne, avec fixtures synthétiques/expurgées ;
-  PostgreSQL et le transport Bridge réels restent `UNKNOWN`.
-- Les artefacts Mission 00 ont été lus en lecture seule ; ils ne sont ni
-  committés ni recopiés dans les livrables.
+- Tests exclusivement hors ligne, fixtures synthétiques/expurgées.
+- PostgreSQL réel, concurrence multi-processus, transport Bridge réel,
+  providers CTI et validateurs Typst réels restent **UNKNOWN**.
+- Aucune migration, aucun changement de `0001_baseline`/`0002`, aucun secret.
+- Les branches non acceptées (F6, B1A1 atomique) ne sont **pas** fusionnées.
 
-## Matrice des tests
+## Matrice des lots
+
+| Lot | Verdict final | Code / intégration | Revue indépendante | Restes |
+|---|---|---|---|---|
+| S0 baseline | PASS (runtime `UNKNOWN`) | `e26c9a7` → `48ba143` | PASS | runtime |
+| B0A F1–F5 | acceptés | `cd69eca`/`498c2da` → `f67181e` | FAIL/PARTIAL historique | F6 |
+| **B0A F6** | **BLOCKED/PARTIAL** | `83aa615`, **non intégré** | `2e22ca1b` **FAIL** : 3 HIGH + 2 MEDIUM | contournements `dns.raw`, base64 avec espaces, budget non cumulatif ; voir `F6_REVIEW.md` |
+| B0B | PASS_WITH_CHANGES | `41c8869`+`5add5df` → `a772cc9` | `230380d` | PostgreSQL réel `UNKNOWN` |
+| B1A1 (protections) | FAIL/PARTIAL historique | `2f88a42` → `2cafb37` | `4317f46` FAIL | clé canonique + atomicité |
+| **B1A1 clé canonique** | **BLOCKED** | aucune identité inter-appels | `95f180aa` PARTIAL | seule `ModelRun run.id:aN` par tentative ; `operation_key` client + fingerprint heuristique ; ne pas rouvrir l'heuristique |
+| **B1A1 atomicité** | **BLOCKED** | `699200b`→`7af1d62`→WIP `32513ca`, **non intégré** | `5d82f90d` FAIL puis `c69e51e3` FAIL | guard advisor non forgeable absent ; chemin positif au préflight ; voir `B1A1_REVIEW.md` |
+| B1A2 | PASS_WITH_CHANGES | `01346e2`/`5484375` → `591eeca` | `8597053` | `turn` sans deadline (≤300 s) |
+| **B1B temporalité/reprise** | **PASS** | `e4850d2`→`fd397de`→`4604ac1`→`a94986f`, intégré `10b0e35` | `b1a2f600` FAIL, `66c9488e` PASS_WITH_CHANGES, `e8bd922a` PASS_WITH_CHANGES, `772a15d5` **PASS** | PostgreSQL concurrent, transport réel |
+| L1 / L06 | PASS_WITH_CHANGES | `e4772fa` → `0483f61` | `bb7b8b4` | — |
+| P10 divulgation | **DEFER** (préexistant) | aucun override | 3 FAIL historiques | garde incomplète ; défaut 96 000 restauré |
+| **L2 pagination/keyset** | **PASS_WITH_CHANGES** | `ef1bc61`→`4f2a941`→`6143099`→`0c54ed9`, intégré `36eb5326` | `fd227a85` FAIL, `d676bd6a` PASS_WITH_CHANGES, `45b350c4` PASS_WITH_CHANGES, `24b810f2` PASS_WITH_CHANGES | 1 MEDIUM résiduel : catégorie d'omission reprise comme attendue (limite 3 réparations) ; PostgreSQL/perf `UNKNOWN` |
+| **A1 projection stratégie** | PASS_WITH_CHANGES → **résiduel corrigé** | `1f0e813` → `545d32a` ; résiduel `fbe5d36`+`bd35278`+`749a3f2` intégré `69d3b904` | `2e75d94` PASS_WITH_CHANGES ; `fe7f765f` PASS_WITH_CHANGES ; `cdb8f69e` **PASS** | PostgreSQL/lifespan `UNKNOWN` |
+| **Q1 éval anti-slop** | **PASS_WITH_CHANGES** | `dd925ff`→`e1779f8`→`a3976c3`, intégré `9523cc4` | `1c095748` PASS_WITH_CHANGES ; `cac542a0` PASS_WITH_CHANGES | 16 cas, SHA corpus `a73fdb9…684e` ; baseline et patch 2 passed |
+| **Q2 patch prompt** | **DEFERRED/NO-GO offline** | — | scout `a4991603` | aucune preuve sémantique offline ; changerait `INVESTIGATION_PROMPT_VERSION`/idempotence |
+| T Typst | rapport PASS ; **BLOCKED_MISSING_REFERENCE** | `cae3115` → `7dc4b0e` | rapport | bundle `CascadiaCode` absent, `var/` non inspectable ; V4 derrière validation éditoriale |
+
+## Tests réellement exécutés
 
 | Vérification | Résultat | Portée |
 |---|---|---|
-| Suite ciblée fusionnée (correctifs + lots) | **246 passed** | branche `c15166e`, incluse dans la suite complète |
-| Backend hors intégration (intégration finale) | **4602 passed, 34 failed, 2 skipped, 30 deselected** | `pytest --ignore=tests/integration -m "not integration"` sur `8fdb7a7` |
-| Frontend | **293 passed**, `pnpm typecheck` OK | suite complète |
-| B0A ciblé | **153 passed** | `test_advisor_completeness`, `test_bridge_investigator`, `test_investigation_advisor_tools`, `test_advisor_output_reparse` |
-| B0B ciblé | **14 passed** | `test_investigation_audit_export` |
-| B1A1 ciblé | **127 passed** | `test_b1_admission_durability`, `test_investigation_service`, `test_investigation_tools_contract`, `test_operator_tool_invocation` |
-| B1A2 ciblé | **138 passed** puis **220 croisés** | suite G2 + suites croisées |
-| A1 ciblé | **64 backend + 3 frontend + typecheck** | scénarios, expériences, API |
-| L1 L06 | **2 + 41 passed** | `test_limits_mission01`, `test_invariant_proposals` |
+| **Suite backend complète** | **4667 passed, 34 failed, 2 skipped, 30 deselected** (64,50 s) | `pytest --ignore=tests/integration -m "not integration"` sur l'intégration B1B+L2+A1+Q1 (`9523cc4`) |
+| B1B oracle | **241 passed** | 8 fichiers B1B/B1A1/B1A2/gateway/bridge |
+| B1B élargi | **294 passed, 6 skipped** | sélection bridge/composition/service |
+| L2 oracle | **342 passed** | 14 fichiers contexte/operator/API |
+| B1B+L2 combiné | **556 passed** | intégration `36eb5326` |
+| A1 oracle | **79 passed** | API/expériences/invitation/operator tool |
+| A1+L2+B1B combiné | **194 passed** | intégration `69d3b904` |
+| Q1 baseline | **2 passed**, seuils verts | 16 cas |
+| Q1 patch | **2 passed** | `ANTI_SLOP_EVAL_VARIANT=patch` |
+| F6 (branche) | **162 passed** | 4 suites advisor ; revue FAIL malgré l'oracle |
+| B1A1 atomique (branche) | **148 passed** | 5 suites ; branche non intégrée |
+| B1A1 atomique WIP advisor | **1 failed, 4 passed** (`-k advisor`) | chemin positif `advisor_preflight_insufficient_evidence` |
+| Frontend | **293 passed + typecheck** (mission antérieure) | **non rejoué** : aucun changement frontend dans cette reprise |
+| PostgreSQL intégration | **non exécuté** | `UNKNOWN` |
+| Typst réel | **non exécuté** | bundle polices absent |
 
-### Triage des 34 échecs backend restants
+### Triage des 34 échecs de la suite complète
 
 - **32** échecs Typst réels : `FontBundleInvalidError: Manifest-listed file is
-  missing: 'CascadiaCode/ttf/CascadiaCode.ttf'`. Environnement documenté par T ;
-  ce n'est pas une régression de code. Le worker a reproduit ces 32 échecs sur
-  `058bb4a`. Le pipeline réel reste `UNKNOWN`.
-- **2** échecs préexistants prouvés sur `058bb4a` :
-  `test_confined_analysis_dispatch.py::test_tool_registry_dispatch_runs_capa_and_strings_through_worker`
-  (CAPA indisponible) et `::test_mwcp_allowlisted_fixture_parser_is_invoked_in_worker`
-  (parseur MWCP de fixture absent).
-- Les **5 régressions réelles** (hex court, alias C01 `T1`, retry d'acquisition,
-  préflight advisor minimal, résultat `PARTIAL`) sont corrigées par `89eb3a5`
-  et testées ; fusion avec l'intégration courante en cours.
-
-## Livrables
-
-| Livrable | État | Référence |
-|---|---|---|
-| `BASELINE.md` | PASS (runtime `UNKNOWN`) | `docs/mission01/BASELINE.md`, `e26c9a7` |
-| `TASKS.md` | à jour, registre durable | `docs/mission01/TASKS.md` |
-| `BRIDGE_CHAIN_EVAL.md` | livré ; transport Bridge réel `UNKNOWN` | `df1bd8f`, `docs/mission01/BRIDGE_CHAIN_EVAL.md` |
-| Exports `RUN_TRACE.md`/`RUN_EVENTS.jsonl.gz`/`RUN_MANIFEST.json` | PASS_WITH_CHANGES ; PostgreSQL réel `UNKNOWN` | `41c8869`+`5add5df`, `docs/mission01/B0B_REVIEW.md` |
-| `RUN_TRACE_SCHEMA.md` | intégré aux exports ; à vérifier dans la revue finale | `investigation_audit_export.py` |
-| `LIMITS_DECISIONS.md` | 42 limites décidées ; L01 renderer `REMOVE`, P10 `DEFER` | `docs/mission01/LIMITS_DECISIONS.md` |
-| `CTI_STRATEGY_EVAL.md` | scénarios A1 livrés et testés ; doc de synthèse à finaliser | `docs/mission01/CTI_STRATEGY_MAP.md`, `4a71f45` |
-| `TYPST_REFERENCE_PARITY.md` | rapport PASS ; restauration V4 `BLOCKED` (validation éditoriale) ; pipeline réel `UNKNOWN` | `cae3115`, `docs/mission01/TYPST_REFERENCE_PARITY.md` |
-| `FINAL_AUDIT.md` | provisoire, ce document | — |
+  missing: 'CascadiaCode/ttf/CascadiaCode.ttf'`, reproduits sur `058bb4a`.
+- **2** échecs préexistants : `test_confined_analysis_dispatch`
+  (`test_tool_registry_dispatch_runs_capa_and_strings_through_worker`,
+  CAPA indisponible ; `test_mwcp_allowlisted_fixture_parser_is_invoked_in_worker`,
+  parseur MWCP absent).
+- **2 skips** : image analysis-worker non construite ; Ghidra absent.
+- Aucun échec nouveau attribuable aux lots B1B/L2/A1/Q1.
 
 ## Revues indépendantes
 
-| Revue | Verdict | Preuve |
-|---|---|---|
-| S0 baseline | PASS (runtime `UNKNOWN`) | `BASELINE.md` |
-| B1 admission map | ADEQUATE_WITH_CHANGES | `94d6706` |
-| L1 | PASS_WITH_CHANGES (L06), P10 DEFER après 3 FAIL | `bb7b8b4` |
-| B0B | PASS_WITH_CHANGES | `230380d` |
-| B0A | **FAIL/PARTIAL** : F1–F5 acceptés ; F6 arrêté après 3 tentatives (URL dans titre, percent sans `;base64`, base64 fragmenté) | `b149aa3`, code `cd69eca`/`498c2da` intégré `f67181e` |
-| A1 | **PASS_WITH_CHANGES** : résiduel MEDIUM `capture_sha256`/`next_pivots` | `2e75d94`, code `1f0e813` intégré `545d32a` |
-| B1A1 | **FAIL/PARTIAL** : protections principales confirmées, équivalence sémantique résiduelle, arrêt après 3 tentatives ; atomicité `BLOCKED` | `4317f46`, code `2f88a42` intégré `2cafb37` |
-| B1A2 | **PASS_WITH_CHANGES** : plancher conservateur, `BridgeInvestigator.turn` hors borne, état ambigu en chaîne | `8597053`, code `01346e2`/`5484375` intégré `591eeca` |
+Toutes les revues ci-dessus ont été exécutées par des sessions GPT-6 Luna
+xhigh distinctes des implémenteurs, en lecture seule, avec rejeu de l'oracle.
+Les verdicts et SHA sont consignés dans `B1B_REVIEW.md`, `L2_REVIEW.md`,
+`A1_REVIEW.md`, `F6_REVIEW.md`, `B1A1_REVIEW.md`, `Q_ANTI_SLOP_EVAL.md`.
+Aucun `PASS` n'est déclaré sans test exécuté ou revue effective.
 
-Le quota Claude a été épuisé le 2026-10-23 ; les revues finales sont
-exclusivement Luna xhigh depuis le reset du 2026-10-24. Aucune revue Claude
-n'est comptée comme revue Luna.
+## Résidus et gates
 
-## Gates et restes
-
-- **B0** : chaîne dossier/manifeste/préflight/transport simulé livrée ; mode
-  fichier >200 000 o simulé, aucun reçu Bridge inventé ; F1–F5 acceptés ;
-  **F6 `FAIL/PARTIAL`** (URL dans un titre, percent sans `;base64`, base64
-  fragmenté) après arrêt à trois tentatives ; F5 compte IOC exact `UNKNOWN`.
-- **B1** : refus 266/3600 sans réserve active ni sortie fictive ; preuve
-  `pre_submission` typée non forgeable ; atomicité révocation/dispatch
-  **`BLOCKED`** (aucune primitive atomique) ; B1A2 `PASS_WITH_CHANGES` avec
-  borne G2 incluant pacing ; B1A1 `FAIL/PARTIAL` sur l'équivalence sémantique
-  (clé d'effet canonique requise) ; 3 600/7 200 borné pour `advisor.consult`.
-- **L** : suppression du plafond renderer 96 k et du réglage L06 inerte ;
-  protections G2/TLP conservées ; P10 `DEFER`.
-- **A** : projection read-only, cinq scénarios offline, YARA synthetic-only
-  sans `REAL_VALIDATED` ; `PASS_WITH_CHANGES` avec résiduel MEDIUM de
-  provenance `capture_sha256`/`next_pivots`.
-- **T** : rapport et captures livrés ; restauration `category`/numéro/`overview`
-  `BLOCKED` derrière validation éditoriale ; pipeline réel `UNKNOWN`.
-- **Non démarrés** : B1B (temporalité/reprise), L2 (pagination keyset), Q
-  (éval anti-slop), `FINAL_AUDIT` définitif. Ils restent `PENDING` et ne
-  doivent pas être présentés comme réalisés.
-
-## Sécurité et provenance
-
-- G2/G3/TLP, `external_llm_allowed`, `do_not_submit`, restrictions fournisseur,
-  CAS, idempotence et append-only n'ont pas été affaiblis par les lots validés.
-- Aucune migration Alembic, aucun changement de `0001_baseline`/`0002`.
-- Aucun secret, URL signée, corps d'échantillon ou payload privé dans les
-  exports standard ; le `.gz` n'est pas une mesure de confidentialité.
-- Les preuves CTI canoniques restent PostgreSQL/MinIO ; Paseo et les transcripts
-  d'agents ne sont pas des preuves CTI.
+- **F6** : 3 HIGH confirmés (chemin `dns.raw`, base64 avec espaces, budget
+  décodé non cumulatif) + 2 MEDIUM. Lot arrêté après 3 tentatives, branche
+  non intégrée. Une reprise doit traiter structurellement ces chemins.
+- **B1A1 clé canonique** : `BLOCKED`. Aucun identifiant d'effet inter-appels
+  fourni par l'adaptateur ; seule une clé par tentative `ModelRun run.id:aN`.
+- **B1A1 atomicité** : `BLOCKED`. La séquence SQL du service/dispatcher est
+  correcte et revue, mais l'état du guard advisor est porté par des booléens
+  forgeables ; il faut un capability/lease non forgeable créé par le
+  dispatcher, plus une fixture de préflight valide. Branche non fusionnée.
+- **P10** : `DEFER` préexistant, aucun override ; garde de divulgation
+  incomplète.
+- **T** : `BLOCKED_MISSING_REFERENCE` ; aucun bundle `CascadiaCode` complet
+  dans le dépôt et `var/` n'est pas inspectable. V4 non restauré.
+- **Q2** : `DEFERRED/NO-GO offline` ; nécessite une évaluation modèle
+  autorisée séparément.
+- **PostgreSQL réel, concurrence multi-processus, pression du pool,
+  acceptation fournisseur, transport Bridge réel, providers CTI** :
+  `UNKNOWN`.
+- **Coûts** fournisseur, tokens et Paseo : **`UNKNOWN`**. Aucun reçu ni
+  facture consulté.
 
 ## Décision de clôture
 
-La mission est **partiellement réalisée**, avec des lots vérifiés et des
-résidus explicitement bornés. Elle ne doit pas être présentée comme un `PASS`
-global.
+La mission reste **PARTIAL**. Sont livrés et acceptés : B1B (PASS), L2
+(PASS_WITH_CHANGES avec résidu documenté), A1 + résiduel (PASS), Q1
+(PASS_WITH_CHANGES), les lots antérieurs B0B/B1A2/L1/T (rapport). Sont
+explicitement **non acceptés** : F6 (BLOCKED), B1A1 clé canonique (BLOCKED),
+B1A1 atomicité (BLOCKED), P10 (DEFER), Q2 (DEFER/NO-GO), T suite
+(BLOCKED_MISSING_REFERENCE).
 
-- **Livrés et acceptés** : S0, B0B (`PASS_WITH_CHANGES`), B1A2
-  (`PASS_WITH_CHANGES`), L1/L06 (`PASS_WITH_CHANGES`, P10 `DEFER`), A1
-  (`PASS_WITH_CHANGES`), T (rapport ; restauration V4 `BLOCKED`).
-- **Livrés avec réserve** : B0A (F1–F5 acceptés ; F6 `FAIL/PARTIAL` arrêté
-  après trois tentatives) ; B1A1 (protections principales acceptées ;
-  équivalence sémantique `FAIL/PARTIAL` ; atomicité révocation/dispatch
-  `BLOCKED`).
-- **Non démarrés** : B1B (temporalité/reprise), L2 (pagination keyset), Q
-  (éval anti-slop). Ils restent `PENDING` et ne sont pas couverts par les
-  tests ci-dessus.
-- **Complexité** : aucune migration, aucun changement de `0001_baseline`/
-  `0002`, aucune table de logs ni seconde base de preuves. Les ajouts
-  principaux sont des modules de projection/export et des tests ; les
-  abstractions inutiles signalées (B0B, B1A1) restent des améliorations
-  différées, pas des blockers.
-- **Prochaines actions** : lot dédié F6 (liste blanche stricte des champs
-  d'évidence, y compris titres et champs fragmentés), clé d'effet canonique
-  fournie par l'adaptateur pour B1A1, pagination CAS L2, éval Q, puis B1B.
-  Toute mesure live (Bridge/VT/Shodan), toute réconciliation `needs_review`,
-  toute migration, publication/G3 et tout push/merge sur `main` exigent une
-  autorisation humaine distincte.
-
-## Coûts et approbations
-
-- Coûts fournisseur, tokens par session et coûts Paseo : **`UNKNOWN`**. Aucun
-  reçu fournisseur ni facture indépendante n'a été consulté.
-- Approbations humaines encore requises : toute mesure live Bridge/VT/Shodan,
-  toute réconciliation `needs_review`, toute migration, toute publication/G3,
-  toute modification de budget G2 et tout push/merge sur `main`.
+Prochaines actions permises, sous autorisation humaine distincte : reprise
+F6 avec nouvelle conception, capability/lease de dispatch, évaluation Q2 avec
+modèle autorisé, validation PostgreSQL concurrente, bundle de polices Typst
+et validation éditoriale V4, politique P10. Toute mesure live Bridge/VT/
+Shodan, réconciliation `needs_review`, migration, publication/G3, modification
+de budget G2 et tout push/merge sur `main` exigent une autorisation séparée.
