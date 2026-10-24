@@ -715,7 +715,10 @@ test("Édition : production séquentielle de deux sujets, revue et PDF", async (
   await expect(page.getByText("Bulletin publié")).toBeVisible();
   await expect(
     page.getByRole("link", { name: "Télécharger le PDF" }),
-  ).toHaveAttribute("href", `/api/editions/${editionId}/release/pdf`);
+  ).toHaveAttribute(
+    "href",
+    `/api/editions/${editionId}/releases/release-1/pdf`,
+  );
 
   expect(seenPaths).toEqual(
     expect.arrayContaining([

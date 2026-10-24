@@ -200,6 +200,10 @@ test("enquête A, publication augmentée, repin humain et PDF réel", async ({
   expect(investigation.synthesis_sha256).toBe(displayedSynthesisHash);
   expect(investigation.synthesis_sha256).toBe(state.synthesis_sha256);
 
+  await page.getByRole("button", { name: "Journal & revue" }).click();
+  await expect(
+    page.getByRole("heading", { name: "Versions et dernières décisions" }),
+  ).toBeVisible();
   const envelope = page.locator("#investigation-envelope-panel");
   await expect(envelope).toContainText("Proposition locale non approuvée");
   await envelope
@@ -285,6 +289,7 @@ test("enquête A, publication augmentée, repin humain et PDF réel", async ({
       .getByText(state.candidate_sha256, { exact: true }),
   ).toBeVisible();
 
+  await page.getByRole("button", { name: "Échantillons" }).click();
   const sampleCard = page
     .locator('section[aria-labelledby="investigation-samples-heading"] li')
     .filter({ hasText: state.candidate_sha256 });
@@ -328,6 +333,7 @@ test("enquête A, publication augmentée, repin humain et PDF réel", async ({
     "Qualification enregistrée avec l’acteur authentifié.",
   );
 
+  await page.getByRole("button", { name: "Journal & revue" }).click();
   const opinionSection = page.locator(
     'section[aria-labelledby="analyst-opinion-heading"]',
   );

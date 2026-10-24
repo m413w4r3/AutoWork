@@ -115,6 +115,7 @@ interface InvestigationPayload {
   blocked_decisions: [];
   available_tools: ["article.get_claims"];
   unavailable_tools: ["shodan.host"];
+  unavailable_tool_reasons: Record<string, string>;
   envelope_approved: false;
   allowed_providers: [];
   acquire_hits_allowed: false;
@@ -384,6 +385,9 @@ export function createAnalystInvestigationApi() {
         blocked_decisions: [],
         available_tools: ["article.get_claims"],
         unavailable_tools: ["shodan.host"],
+        unavailable_tool_reasons: {
+          "shodan.host": "g2_disclosure_denied",
+        },
         envelope_approved: false,
         allowed_providers: [],
         acquire_hits_allowed: false,
