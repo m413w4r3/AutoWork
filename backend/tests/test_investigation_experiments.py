@@ -434,7 +434,7 @@ async def test_record_tool_requires_g2_and_persisted_investigation_observations(
         investigation_id=investigation_id,
         sha256="b" * 64,
         kind="other",
-        object_type="capture",
+        object_type="network_capture",
         invocation_ref=None,
     )
     unlinked_observation = SimpleNamespace(

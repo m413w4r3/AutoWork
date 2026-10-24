@@ -470,7 +470,7 @@ def test_timeline_route_redacts_free_text_and_payload_arguments() -> None:
         blob_id=UUID("70000000-0000-4000-8000-000000000002"),
         sha256="b" * 64,
         kind="other",
-        object_type="capture",
+        object_type="network_capture",
     )
     unlinked_observation = SimpleNamespace(
         id=UUID("70000000-0000-4000-8000-000000000003"),
@@ -771,6 +771,8 @@ def test_timeline_only_exposes_experiment_linked_and_resolved_references() -> No
     unlinked_observation_id = UUID("70000000-0000-4000-8000-000000000004")
     ambiguous_observation_id = UUID("70000000-0000-4000-8000-000000000005")
     duplicate_observation_id = UUID("70000000-0000-4000-8000-000000000006")
+    incoherent_capture_observation_id = UUID("70000000-0000-4000-8000-000000000007")
+    unknown_capture_alias_observation_id = UUID("70000000-0000-4000-8000-000000000008")
     experiment = _experiment(
         experiment_id=NEW_EXPERIMENT_ID,
         version=1,
@@ -781,6 +783,12 @@ def test_timeline_only_exposes_experiment_linked_and_resolved_references() -> No
             SimpleNamespace(observation_id=linked_vt_observation_id, sha256="d" * 64),
             SimpleNamespace(observation_id=ambiguous_observation_id, sha256="f" * 64),
             SimpleNamespace(observation_id=duplicate_observation_id, sha256="f" * 64),
+            SimpleNamespace(
+                observation_id=incoherent_capture_observation_id, sha256="7" * 64
+            ),
+            SimpleNamespace(
+                observation_id=unknown_capture_alias_observation_id, sha256="8" * 64
+            ),
         ),
     )
     experiment.tool_invocation_refs = (
@@ -799,10 +807,21 @@ def test_timeline_only_exposes_experiment_linked_and_resolved_references() -> No
         ExperimentInputRefV1("capture_sha256", "b" * 64, "b" * 64),
         ExperimentInputRefV1("capture_sha256", "c" * 64, "c" * 64),
         ExperimentInputRefV1("capture_sha256", "d" * 64, "d" * 64),
+        ExperimentInputRefV1("sample_sha256", "d" * 64, "d" * 64),
+        ExperimentInputRefV1("capture_sha256", "7" * 64, "7" * 64),
         ExperimentInputRefV1("sample_sha256", "e" * 64, "e" * 64),
         ExperimentInputRefV1("sample_sha256", "f" * 64, "f" * 64),
+        ExperimentInputRefV1("capture_sha256", "8" * 64, "8" * 64),
     )
-    experiment.next_pivots = ("b" * 64, "c" * 64, "d" * 64, "e" * 64, "f" * 64)
+    experiment.next_pivots = (
+        "b" * 64,
+        "c" * 64,
+        "d" * 64,
+        "e" * 64,
+        "f" * 64,
+        "7" * 64,
+        "8" * 64,
+    )
     linked_invocation = SimpleNamespace(
         id=linked_invocation_id,
         investigation_id=INVESTIGATION_ID,
@@ -843,7 +862,7 @@ def test_timeline_only_exposes_experiment_linked_and_resolved_references() -> No
         investigation_id=INVESTIGATION_ID,
         sha256="d" * 64,
         kind="vt_file_report",
-        object_type="file",
+        object_type="sample",
     )
     ambiguous_observation = SimpleNamespace(
         id=ambiguous_observation_id,
@@ -856,6 +875,20 @@ def test_timeline_only_exposes_experiment_linked_and_resolved_references() -> No
         id=duplicate_observation_id,
         investigation_id=INVESTIGATION_ID,
         sha256="f" * 64,
+        kind="other",
+        object_type="network_capture",
+    )
+    incoherent_capture_observation = SimpleNamespace(
+        id=incoherent_capture_observation_id,
+        investigation_id=INVESTIGATION_ID,
+        sha256="7" * 64,
+        kind="binary_analysis",
+        object_type="network_capture",
+    )
+    unknown_capture_alias_observation = SimpleNamespace(
+        id=unknown_capture_alias_observation_id,
+        investigation_id=INVESTIGATION_ID,
+        sha256="8" * 64,
         kind="other",
         object_type="capture",
     )
@@ -876,6 +909,8 @@ def test_timeline_only_exposes_experiment_linked_and_resolved_references() -> No
             unlinked_vt_observation,
             ambiguous_observation,
             duplicate_observation,
+            incoherent_capture_observation,
+            unknown_capture_alias_observation,
         ),
         invocations=(linked_invocation, wrong_version_invocation, unlinked_invocation),
     ) as client:
@@ -900,6 +935,8 @@ def test_timeline_only_exposes_experiment_linked_and_resolved_references() -> No
         {"observation_id": str(linked_vt_observation_id), "sha256": "d" * 64},
         {"observation_id": str(ambiguous_observation_id), "sha256": "f" * 64},
         {"observation_id": str(duplicate_observation_id), "sha256": "f" * 64},
+        {"observation_id": str(incoherent_capture_observation_id), "sha256": "7" * 64},
+        {"observation_id": str(unknown_capture_alias_observation_id), "sha256": "8" * 64},
     ]
     assert projected["input_refs"] == [
         {"input_type": "sample_sha256", "input_id": "b" * 64, "sha256": "b" * 64},
@@ -915,7 +952,22 @@ def test_timeline_only_exposes_experiment_linked_and_resolved_references() -> No
             "sha256": "[redacted]",
         },
         {
+            "input_type": "[redacted]",
+            "input_id": "[redacted]",
+            "sha256": "[redacted]",
+        },
+        {
+            "input_type": "[redacted]",
+            "input_id": "[redacted]",
+            "sha256": "[redacted]",
+        },
+        {
             "input_type": "sample_sha256",
+            "input_id": "[redacted]",
+            "sha256": "[redacted]",
+        },
+        {
+            "input_type": "[redacted]",
             "input_id": "[redacted]",
             "sha256": "[redacted]",
         },
@@ -928,6 +980,8 @@ def test_timeline_only_exposes_experiment_linked_and_resolved_references() -> No
     assert projected["next_pivots"] == [
         "b" * 64,
         "c" * 64,
+        "[redacted]",
+        "[redacted]",
         "[redacted]",
         "[redacted]",
         "[redacted]",

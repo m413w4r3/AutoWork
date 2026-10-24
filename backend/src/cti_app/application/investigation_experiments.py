@@ -30,6 +30,7 @@ from cti_app.application.investigation_tools import (
 from cti_app.application.publication_secret_guard import redact_operational_secrets
 from cti_app.application.research_context_builder import ArticleSnapshotPort
 from cti_app.domain.investigation import (
+    EvidenceKind,
     InvestigationExecutionMode,
     ToolInvocationStatus,
     canonical_json_bytes,
@@ -73,6 +74,12 @@ _CANONICAL_UUID_REFERENCE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
 _SAFE_EXPERIMENT_INPUT_TYPES = frozenset({"sample_sha256", "capture_sha256"})
+_CANONICAL_EXPERIMENT_OBSERVATION_INPUT_TYPES = {
+    (EvidenceKind.BINARY_ANALYSIS.value, "sample"): "sample_sha256",
+    (EvidenceKind.BINARY_STRING.value, "sample"): "sample_sha256",
+    (EvidenceKind.OTHER.value, "sample"): "sample_sha256",
+    (EvidenceKind.OTHER.value, "network_capture"): "capture_sha256",
+}
 EXPERIMENT_RECORD_TOOL = "experiment.record"
 EXPERIMENT_LIST_TOOL = "experiment.list"
 HYPOTHESIS_DECLARE_TOOL = "hypothesis.declare"
@@ -605,14 +612,13 @@ def _verdict_assertion_label(value: Any) -> str | None:
 
 
 def _experiment_observation_input_type(observation: Any) -> str | None:
+    kind = _object_value(observation, "kind")
     object_type = _object_value(observation, "object_type")
-    if not isinstance(object_type, str):
+    if isinstance(kind, EvidenceKind):
+        kind = kind.value
+    if not isinstance(kind, str) or not isinstance(object_type, str):
         return None
-    if object_type == "sample":
-        return "sample_sha256"
-    if object_type in {"capture", "network_capture"}:
-        return "capture_sha256"
-    return None
+    return _CANONICAL_EXPERIMENT_OBSERVATION_INPUT_TYPES.get((kind, object_type))
 
 
 def _observations_by_sha256(observations_by_id: Mapping[str, Any]) -> dict[str, list[Any]]:
