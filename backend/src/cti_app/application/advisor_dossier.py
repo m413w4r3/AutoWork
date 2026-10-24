@@ -7,6 +7,7 @@ must never be appended to the Bridge prompt.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import re
@@ -95,6 +96,36 @@ _OMIT_KEYS = frozenset(
         "source_version",
     }
 )
+_CTI_METADATA_KEYS = frozenset(
+    {
+        "sha256",
+        "sha256_short",
+        "sample_sha256",
+        "md5",
+        "sha1",
+        "hashes",
+        "mime_type",
+        "content_type",
+        "byte_length",
+        "size",
+        "size_bytes",
+        "offset",
+        "status",
+        "analysis_status",
+        "engine",
+        "engines",
+        "trace",
+        "traces",
+        "fragment",
+        "fragments",
+        "association",
+        "related_sample_sha256",
+        "related_sample_hashes",
+    }
+)
+_HASH_METADATA_KEYS = frozenset(
+    {"sha256", "sha256_short", "sample_sha256", "md5", "sha1", "hashes"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +144,7 @@ class AdvisorDossier:
 
 def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]:
     """Extract complete observed methods, text, decoded values, and byte values."""
+    sample_context = _contains_sample_context(payload)
     excerpts: list[dict[str, str]] = []
     seen: set[tuple[str, str, str]] = set()
     offset_rows: list[tuple[str, str, str]] = []
@@ -154,35 +186,82 @@ def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]
     def add_short_hex_rows(
         value: object, *, kind: str = "hex", inherited_offset: object = None
     ) -> None:
-        rows = value if isinstance(value, (list, tuple)) else (value,)
+        rows = (
+            (value,)
+            if _lossless_bytes(value) is not None
+            else value
+            if isinstance(value, (list, tuple))
+            else (value,)
+        )
         for row in rows:
             raw = (
                 row.get(
                     "value",
-                    row.get("bytes", row.get("hex", row.get("content", row.get("raw")))),
+                    row.get(
+                        "content_base64",
+                        row.get(
+                            "base64",
+                            row.get("bytes", row.get("hex", row.get("content", row.get("raw")))),
+                        ),
+                    ),
                 )
                 if isinstance(row, Mapping)
                 else row
             )
-            if not isinstance(raw, str):
-                continue
             offset = (
                 row.get("offset", inherited_offset)
                 if isinstance(row, Mapping)
                 else inherited_offset
             )
             normalized_offset = offset if type(offset) is int and offset >= 0 else None
-            normalized_value = re.sub(r"\s+", "", raw).casefold() if kind == "hex" else raw.strip()
-            identity = (kind, normalized_offset, normalized_value)
+            encoding = (
+                row.get("encoding")
+                if isinstance(row, Mapping) and isinstance(row.get("encoding"), str)
+                else None
+            )
+            byte_value = _lossless_bytes(raw)
+            row_kind = kind
+            if byte_value is not None:
+                raw_text = base64.b64encode(byte_value).decode("ascii")
+                byte_label = (
+                    f"encoding=base64; byte_length={len(byte_value)}; "
+                    f"sha256={hashlib.sha256(byte_value).hexdigest()}"
+                )
+                row_kind = "base64"
+            elif (
+                isinstance(raw, Mapping)
+                and raw.get("encoding") == "base64"
+                and isinstance(raw.get("content_base64"), str)
+            ):
+                raw_text = raw["content_base64"]
+                byte_label = (
+                    f"encoding=base64; byte_length={raw.get('byte_length')}; "
+                    f"sha256={raw.get('sha256')}"
+                )
+                row_kind = "base64"
+            elif isinstance(raw, str):
+                raw_text = raw
+                byte_label = (
+                    f"encoding={encoding}; byte_length={row.get('byte_length')}; "
+                    f"sha256={row.get('sha256')}"
+                    if isinstance(row, Mapping) and encoding
+                    else ""
+                )
+            else:
+                continue
+            normalized_value = (
+                re.sub(r"\s+", "", raw_text).casefold() if row_kind == "hex" else raw_text.strip()
+            )
+            identity = (row_kind, normalized_offset, normalized_value)
             if identity in offset_row_identities:
                 continue
             offset_row_identities.add(identity)
-            title = (
-                f"Octets observés — offset {normalized_offset}"
-                if normalized_offset is not None
-                else "Octets observés"
-            )
-            offset_rows.append((kind, title, raw))
+            title = "Octets observés"
+            if byte_label:
+                title = f"{title}; {byte_label}"
+            if normalized_offset is not None:
+                title = f"{title} — offset {normalized_offset}"
+            offset_rows.append((row_kind, title, raw_text))
 
     def content_kind(path: tuple[str, ...], key: str, encoding: object = None) -> str:
         names = (*path, key)
@@ -207,6 +286,17 @@ def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]
                 if is_operational_secret_field_name(key):
                     # Never project an AutoWork operational credential into a
                     # dossier, even when it is nested under a neutral label.
+                    continue
+                if sample_context and key in _CTI_METADATA_KEYS:
+                    if isinstance(child, (Mapping, list, tuple)):
+                        metadata_value = json.dumps(
+                            child, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                        )
+                    elif child is not None:
+                        metadata_value = str(child)
+                    else:
+                        metadata_value = ""
+                    add("metadata", f"Métadonnée CTI — {name}", f"{key}={metadata_value}")
                     continue
                 if key in _OMIT_KEYS or "sha256" in key or key.endswith("_id"):
                     continue
@@ -301,6 +391,29 @@ def extract_content_excerpts(payload: Mapping[str, Any]) -> list[dict[str, str]]
     return excerpts
 
 
+def _lossless_bytes(value: object) -> bytes | None:
+    if isinstance(value, bytes | bytearray | memoryview):
+        return bytes(value)
+    if isinstance(value, list | tuple) and all(
+        type(item) is int and 0 <= item <= 255 for item in value
+    ):
+        return bytes(value)
+    return None
+
+
+def _contains_sample_context(value: object) -> bool:
+    if isinstance(value, Mapping):
+        if isinstance(value.get("sample_sha256"), str):
+            return True
+        schema = value.get("schema")
+        if isinstance(schema, str) and schema.casefold().startswith("sample-"):
+            return True
+        return any(_contains_sample_context(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_sample_context(item) for item in value)
+    return False
+
+
 def build_advisor_dossier(prompt_data: Mapping[str, Any]) -> AdvisorDossier:
     """Select pertinent whole facts and render a shared French task dossier."""
     consultation_type = _as_text(prompt_data.get("consultation_type"))
@@ -352,6 +465,91 @@ def build_advisor_dossier(prompt_data: Mapping[str, Any]) -> AdvisorDossier:
                     },
                 )
             )
+
+    for sample in prompt_data.get("samples", ()):
+        if not isinstance(sample, Mapping) or sample.get("verified") is not True:
+            continue
+        sample_id = _as_text(sample.get("sample_id"))
+        association_id = _as_text(sample.get("association_id"))
+        sample_sha256 = _as_text(sample.get("sha256"))
+        blob_id = _as_text(sample.get("blob_id"))
+        byte_length = sample.get("byte_length")
+        mime_type = _as_text(sample.get("mime_type"))
+        content = _as_text(sample.get("content_base64"))
+        lines = [
+            "Verified sample provenance:",
+            f"sample_id={sample_id}",
+            f"association_id={association_id}",
+            f"blob_id={blob_id}",
+            f"blob_sha256={_as_text(sample.get('blob_sha256'))}",
+            f"sha256={sample_sha256}",
+            f"expected_hash={_as_text(sample.get('expected_hash'))}",
+            f"source_object_id={_as_text(sample.get('source_object_id'))}",
+            f"offset=0; length={byte_length}; mime_type={mime_type}",
+            f"association_status={_as_text(sample.get('association_status'))}",
+            f"content_status={_as_text(sample.get('content_status'))}",
+            f"state={_as_text(sample.get('state'))}",
+            f"origin={_as_text(sample.get('origin'))}",
+            f"original_name={_as_text(sample.get('original_name'))}",
+            f"source_service={_as_text(sample.get('source_service'))}",
+            f"tlp={_as_text(sample.get('tlp'))}",
+            f"do_not_submit={str(sample.get('do_not_submit')).lower()}",
+            f"external_llm_allowed={str(sample.get('external_llm_allowed')).lower()}",
+        ]
+        evidence_ids = sample.get("evidence_ids")
+        if isinstance(evidence_ids, (list, tuple)):
+            lines.append("evidence_ids=" + ",".join(_as_text(item) for item in evidence_ids))
+        evidence_blob_ids = sample.get("evidence_blob_ids")
+        if isinstance(evidence_blob_ids, (list, tuple)):
+            lines.append(
+                "evidence_blob_ids=" + ",".join(_as_text(item) for item in evidence_blob_ids)
+            )
+        evidence_hashes = sample.get("evidence_sha256s")
+        if isinstance(evidence_hashes, (list, tuple)):
+            lines.append("evidence_sha256s=" + ",".join(_as_text(item) for item in evidence_hashes))
+        related = sample.get("related_sample_sha256")
+        if isinstance(related, (list, tuple)):
+            lines.append("related_sample_sha256=" + ",".join(_as_text(item) for item in related))
+        engines = sample.get("analysis_engines")
+        if isinstance(engines, (list, tuple)):
+            lines.append("analysis_engines=" + ",".join(_as_text(item) for item in engines))
+        engine_statuses = sample.get("analysis_status_by_engine")
+        if isinstance(engine_statuses, (list, tuple)):
+            lines.append(
+                "analysis_status_by_engine="
+                + ",".join(
+                    f"{_as_text(item.get('engine'))}:{_as_text(item.get('status'))}"
+                    for item in engine_statuses
+                    if isinstance(item, Mapping)
+                )
+            )
+        if content:
+            lines.extend(["encoding=base64", "content_base64:", content])
+        body = "\n".join(lines)
+        candidates.append(
+            _candidate(
+                kind="sample",
+                identifier=sample_id or association_id,
+                sha256=sample_sha256,
+                label="Échantillon CTI vérifié",
+                body=body,
+                score=10_000,
+                origin="verified_sample_association",
+                extra={
+                    "sample_id": sample_id,
+                    "association_id": association_id,
+                    "blob_id": blob_id,
+                    "evidence_ids": list(evidence_ids)
+                    if isinstance(evidence_ids, (list, tuple))
+                    else [],
+                    "offset": 0,
+                    "length": byte_length,
+                    "mime_type": mime_type,
+                    "encoding": "base64",
+                    "content_status": _as_text(sample.get("content_status")),
+                },
+            )
+        )
 
     if consultation_type in {"plan_investigation", "pivot_strategy"}:
         for item in prompt_data.get("hypotheses", ()):
@@ -480,7 +678,7 @@ def build_advisor_dossier(prompt_data: Mapping[str, Any]) -> AdvisorDossier:
         for excerpt in excerpts:
             body = _as_text(excerpt.get("text"))
             title = _as_text(excerpt.get("title")) or "Extrait"
-            score = _relevance_score(task_terms, f"{title} {body}")
+            score = _relevance_score(task_terms, _excerpt_relevance_text(excerpt))
             if score > 0 or explicitly_referenced_observation:
                 pieces.append(f"{title}:\n{_quote(body)}")
                 row_score = max(row_score, score, 1 if explicitly_referenced_observation else 0)
@@ -770,8 +968,12 @@ def build_advisor_dossier(prompt_data: Mapping[str, Any]) -> AdvisorDossier:
             if excerpts:
                 best = max(
                     excerpts,
-                    key=lambda row: _relevance_score(
-                        task_terms, f"{row.get('title', '')} {row.get('text', '')}"
+                    key=lambda row: (
+                        _relevance_score(
+                            task_terms,
+                            _excerpt_relevance_text(row),
+                        ),
+                        row.get("kind") != "metadata",
                     ),
                 )
                 candidates.append(
@@ -1787,7 +1989,14 @@ def _human_evidence_label(item: Mapping[str, Any], excerpts: Sequence[Mapping[st
         # Unknown provider/tool identifiers are provenance details, not task
         # facts. Keep them in the local manifest and show a neutral label.
         product = "Observation"
-    title = next((_as_text(row.get("title")) for row in excerpts if _as_text(row.get("title"))), "")
+    title = next(
+        (
+            _as_text(row.get("title"))
+            for row in excerpts
+            if row.get("kind") != "metadata" and _as_text(row.get("title"))
+        ),
+        "",
+    )
     if title:
         title = re.sub(r"^(?:Méthode|Valeur décodée|Texte observé)\s*", "", title, flags=re.I)
         return _clean_label(f"{product} — {title}")
@@ -1820,9 +2029,11 @@ def _terms(value: str) -> set[str]:
     normalized = unicodedata.normalize("NFKD", value.casefold())
     normalized = "".join(char for char in normalized if not unicodedata.combining(char))
     return {
-        token
+        token.strip(".,:;!?")
         for token in _WORD.findall(normalized)
-        if len(token) > 2 and token not in _STOP and not token.isdigit()
+        if len(token.strip(".,:;!?")) > 2
+        and token.strip(".,:;!?") not in _STOP
+        and not token.strip(".,:;!?").isdigit()
     }
 
 
@@ -1831,6 +2042,16 @@ def _relevance_score(terms: set[str], value: str) -> int:
         return 0
     candidate = _terms(value)
     return sum(2 if term in candidate else 0 for term in terms)
+
+
+def _excerpt_relevance_text(excerpt: Mapping[str, Any]) -> str:
+    title = _as_text(excerpt.get("title"))
+    body = _as_text(excerpt.get("text"))
+    if excerpt.get("kind") == "metadata":
+        metadata_key, separator, metadata_value = body.partition("=")
+        if separator and metadata_key.casefold() in _HASH_METADATA_KEYS:
+            return metadata_value
+    return f"{title} {body}"
 
 
 def _numeric_targets_conflict(task: str, candidate: str) -> bool:

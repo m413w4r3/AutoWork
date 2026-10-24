@@ -763,9 +763,22 @@ class RegistryToolDispatcher:
                 framework_pre_submission_proof=FrameworkPreSubmissionProof.INVALID_ARGUMENTS,
             )
 
-        reserved_amounts = (
-            thaw_json(definition.cost_model) if reservation_amounts is None else reservation_amounts
-        )
+        if reservation_amounts is None:
+            reserved_amounts = thaw_json(definition.cost_model)
+            estimate_cost = getattr(adapter, "reservation_cost", None)
+            if callable(estimate_cost):
+                try:
+                    dynamic_cost = await estimate_cost(arguments, context)
+                    reserved_amounts.update(dynamic_cost)
+                except Exception as exc:
+                    return self._local_result(
+                        ToolInvocationStatus.NEEDS_REVIEW,
+                        f"Tool cost estimation failed: {type(exc).__name__}.",
+                        alternatives,
+                        pre_submission_proof=FrameworkPreSubmissionProof.BUDGET_REJECTED,
+                    )
+        else:
+            reserved_amounts = reservation_amounts
         try:
             context.budget.reserve(operation_key, reserved_amounts)
         except BudgetExceeded as exc:

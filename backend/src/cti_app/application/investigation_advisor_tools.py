@@ -6,6 +6,7 @@ no egress calls.
 
 from __future__ import annotations
 
+import base64
 import copy
 import hashlib
 import json
@@ -73,6 +74,7 @@ from cti_app.domain.analyst_opinion import OpinionBlockType, investigation_opini
 from cti_app.domain.classification import TLP
 from cti_app.domain.investigation import (
     BudgetDimension,
+    BudgetReservation,
     BudgetReservationStatus,
     EvidenceKind,
     EvidenceObservation,
@@ -92,7 +94,6 @@ ADVISOR_RESPONSE_SCHEMA = ADVISOR_RESPONSE_SCHEMA_V2
 _TYPED_CONSULTATION_TYPES = frozenset(
     {"draft_text", "review_text", "yara_draft", "suricata_draft", "figure_plan"}
 )
-MAX_ADVISOR_INPUT_BYTES = 4_000_000
 MAX_ADVISOR_TOOL_SECONDS = 3_600
 # Keep and strengthen the prior admission floor by deriving it from the Bridge
 # phase envelope: maximum paced wait + connect + capabilities + the larger of
@@ -171,6 +172,130 @@ class InvestigationAdvisorTool:
             return None
         return _AdvisorToolResultSnapshot(output=thaw_json(result.output))
 
+    async def reservation_cost(
+        self,
+        arguments: Mapping[str, Any],
+        context: ToolExecutionContext,
+    ) -> Mapping[BudgetDimension, int]:
+        """Measure the exact UTF-8 advisor prompt before G2 reserves its cost.
+
+        This method performs local reads and prompt construction only. It makes
+        no transport call and does not persist evidence. An incomplete, denied,
+        or secret-bearing input reserves zero context bytes; execute() repeats
+        its checks and will refuse before transport if the state has changed.
+        """
+        no_context_cost = {
+            BudgetDimension.CONTEXT_BYTES: 0,
+            BudgetDimension.CONTEXT_TOKENS: 0,
+        }
+        try:
+            consultation_type = arguments.get("consultation_type")
+            question = arguments.get("question", "")
+            raw_refs = arguments.get("evidence_refs", ())
+            if (
+                not isinstance(consultation_type, str)
+                or not isinstance(question, str)
+                or not isinstance(raw_refs, (list, tuple))
+            ):
+                return no_context_cost
+            evidence_refs = tuple(UUID(str(item)) for item in raw_refs)
+            investigation = await self._investigations.get(context.investigation_id)
+            if investigation is None:
+                return no_context_cost
+            snapshot = await self._article_snapshots.resolve(investigation.synthesis_artifact_id)
+            if not InvestigationService.external_llm_allowed(snapshot, context.envelope):
+                return no_context_cost
+            if await self._restricted_sample_hashes(
+                context.investigation_id, investigation.subject_id
+            ):
+                return no_context_cost
+            evidence = await self._load_evidence(context.investigation_id, evidence_refs)
+            if not evidence_refs and consultation_type not in {
+                "review_text",
+                "draft_text",
+                "figure_plan",
+                "suricata_draft",
+            }:
+                evidence = await self._auto_evidence(context.investigation_id)
+            if consultation_type in {"plan_investigation", "pivot_strategy", "figure_plan"}:
+                raw_finding_refs = arguments.get("finding_refs", ())
+                if consultation_type == "figure_plan" and not isinstance(
+                    raw_finding_refs, (tuple, list)
+                ):
+                    return no_context_cost
+                requested_ids = (
+                    tuple(UUID(str(item)) for item in raw_finding_refs)
+                    if consultation_type == "figure_plan"
+                    else ()
+                )
+                findings = self._latest_findings(
+                    tuple(
+                        item
+                        for item in await self._findings.list_for_investigation(
+                            context.investigation_id
+                        )
+                        if getattr(item, "investigation_id", context.investigation_id)
+                        == context.investigation_id
+                    )
+                )
+                findings = tuple(
+                    item for item in findings if not requested_ids or item.id in requested_ids
+                )
+                linked_ids = tuple(
+                    dict.fromkeys(ref for finding in findings for ref in finding.observation_refs)
+                )
+                if linked_ids:
+                    linked = await self._load_evidence(context.investigation_id, linked_ids)
+                    by_id = {item.id: item for item in (*evidence, *linked)}
+                    evidence = tuple(by_id.values())
+            prompt_data = await self._consultation_data(
+                consultation_type=consultation_type,
+                investigation_id=context.investigation_id,
+                investigation=investigation,
+                snapshot=snapshot,
+                evidence=evidence,
+                arguments=arguments,
+                context=context,
+                question=question.strip(),
+            )
+            observation_refs = list(dict.fromkeys(str(item) for item in evidence_refs))
+            if consultation_type == "figure_plan":
+                observation_refs.extend(
+                    str(reference)
+                    for finding in prompt_data.get("findings", ())
+                    if isinstance(finding, Mapping)
+                    for reference in finding.get("observation_refs", ())
+                    if isinstance(reference, str)
+                )
+            prompt_data["evidence_refs"] = list(dict.fromkeys(observation_refs))
+            prompt_data, redacted_count = _redact_advisor_payload(
+                prompt_data, settings=self._settings
+            )
+            if redacted_count or _marked_secret_field_survives(
+                prompt_data, settings=self._settings
+            ):
+                return no_context_cost
+            dossier = build_advisor_dossier(prompt_data)
+            prompt_data["dossier_manifest"] = [dict(item) for item in dossier.manifest]
+            prompt_data["dossier_text"] = dossier.text
+            prompt_data["dossier_sha256"] = dossier.sha256
+            prompt_data["dossier_bytes"] = dossier.byte_size
+            prompt_data["transmitted_refs"] = _transmitted_refs_for_dossier(
+                prompt_data, snapshot, dossier.manifest
+            )
+            prompt_data["observation_refs"] = [
+                item["id"]
+                for item in prompt_data["transmitted_refs"]
+                if item["kind"] == "observation"
+            ]
+            encoded = _fit_advisor_prompt(consultation_type, prompt_data).encode("utf-8")
+        except Exception:
+            return no_context_cost
+        return {
+            BudgetDimension.CONTEXT_BYTES: len(encoded),
+            BudgetDimension.CONTEXT_TOKENS: max(1, (len(encoded) + 3) // 4),
+        }
+
     async def execute(
         self,
         arguments: Mapping[str, Any],
@@ -180,6 +305,7 @@ class InvestigationAdvisorTool:
         _execution_timeout_seconds: int | None = None,
         _execution_deadline_monotonic: float | None = None,
         _bridge_turns_remaining: int | None = None,
+        _reservation_operation_key: str | None = None,
     ) -> ToolResult:
         try:
             raw_consultation_type = arguments.get("consultation_type")
@@ -332,15 +458,17 @@ class InvestigationAdvisorTool:
                 )
             snapshot = await self._article_snapshots.resolve(investigation.synthesis_artifact_id)
             restricted_sample_hashes = await self._restricted_sample_hashes(
-                investigation.subject_id
+                context.investigation_id, investigation.subject_id
             )
             restricted_evidence_refs: tuple[UUID, ...] = ()
             if restricted_sample_hashes:
-                restricted_evidence_refs = tuple(
-                    item.id
-                    for item in evidence
-                    if _object_id_references_sample(item.object_id, restricted_sample_hashes)
-                )
+                restricted_ids = []
+                for item in evidence:
+                    for sample_hash in restricted_sample_hashes:
+                        if await self._observation_references_sample(item, sample_hash):
+                            restricted_ids.append(item.id)
+                            break
+                restricted_evidence_refs = tuple(dict.fromkeys(restricted_ids))
                 if restricted_evidence_refs:
                     restricted_ids = set(restricted_evidence_refs)
                     evidence = tuple(item for item in evidence if item.id not in restricted_ids)
@@ -349,7 +477,7 @@ class InvestigationAdvisorTool:
                 for reference in evidence_refs
                 if reference in set(restricted_evidence_refs)
             )
-            if explicit_restricted_refs:
+            if explicit_restricted_refs or restricted_sample_hashes:
                 return await self._persist_preflight_failure(
                     context,
                     consultation_type=consultation_type,
@@ -362,6 +490,7 @@ class InvestigationAdvisorTool:
                         "disclosure_restricted_refs": [
                             str(item) for item in explicit_restricted_refs
                         ],
+                        "disclosure_restricted_sample_count": len(restricted_sample_hashes),
                         "missing_refs": [str(item) for item in explicit_restricted_refs],
                         "confirmed_non_execution": True,
                         "bridge_turns_consumed": 0,
@@ -435,12 +564,14 @@ class InvestigationAdvisorTool:
             prompt_data, redacted_secret_count = _redact_advisor_payload(
                 prompt_data, settings=self._settings
             )
-            if _marked_secret_field_survives(prompt_data, settings=self._settings):
+            if redacted_secret_count or _marked_secret_field_survives(
+                prompt_data, settings=self._settings
+            ):
                 return await self._persist_preflight_refusal(
                     context,
                     consultation_type=consultation_type,
                     evidence_refs=tuple(item.id for item in evidence),
-                    reason="secret_field_remaining",
+                    reason="autowork_credential_or_signed_url_detected",
                     redacted_secret_count=redacted_secret_count,
                 )
             dossier = build_advisor_dossier(prompt_data)
@@ -456,52 +587,57 @@ class InvestigationAdvisorTool:
                 for item in prompt_data["transmitted_refs"]
                 if item["kind"] == "observation"
             ]
-            max_input_bytes = int(
-                getattr(self._settings, "operator_advisor_max_input_bytes", MAX_ADVISOR_INPUT_BYTES)
-            )
-            prompt = _fit_advisor_prompt(
-                consultation_type, prompt_data, max_input_bytes=max_input_bytes
-            )
+            prompt = _fit_advisor_prompt(consultation_type, prompt_data)
             encoded = prompt.encode("utf-8")
-            if (
-                _critical_prompt_data_was_truncated(consultation_type, prompt_data)
-                or len(encoded) > max_input_bytes
+            reservation_key = _reservation_operation_key or context.idempotency_key
+            reservation = _advisor_context_reservation(context, reservation_key)
+            if reservation is not None and (
+                BudgetDimension.CONTEXT_BYTES in reservation.amounts
+                or BudgetDimension.CONTEXT_TOKENS in reservation.amounts
             ):
+                measured_tokens = max(1, (len(encoded) + 3) // 4)
+                if (
+                    reservation.amounts.get(BudgetDimension.CONTEXT_BYTES) != len(encoded)
+                    or reservation.amounts.get(BudgetDimension.CONTEXT_TOKENS) != measured_tokens
+                ):
+                    return await self._persist_preflight_failure(
+                        context,
+                        consultation_type=consultation_type,
+                        evidence_refs=tuple(item.id for item in evidence),
+                        output={
+                            "advisor_status": "budget_refused",
+                            "preflight_status": "BUDGET_BLOCKED",
+                            "failure_stage": "g2_context_reservation",
+                            "failure_reason": "measured_prompt_cost_does_not_match_reservation",
+                            "reserved_context_bytes": reservation.amounts.get(
+                                BudgetDimension.CONTEXT_BYTES, 0
+                            ),
+                            "measured_context_bytes": len(encoded),
+                            "reserved_context_tokens": reservation.amounts.get(
+                                BudgetDimension.CONTEXT_TOKENS, 0
+                            ),
+                            "measured_context_tokens": measured_tokens,
+                            "confirmed_non_execution": True,
+                            "bridge_turns_consumed": 0,
+                            "usable": False,
+                        },
+                        error_code="advisor_context_reservation_mismatch",
+                    )
+            if _critical_prompt_data_was_truncated(consultation_type, prompt_data):
                 size_block_completeness = evaluate_advisor_evidence_preflight(
                     prompt_data, dossier, prompt
                 )
-                if (
-                    consultation_type in {"draft_text", "review_text"}
-                    and isinstance(editorial_units, (list, tuple))
-                    and len(editorial_units) > 1
-                ):
-                    return await self._execute_editorial_batches(
-                        arguments,
-                        context,
-                        editorial_units,
-                        maximum_units=max(1, len(editorial_units) // 2),
-                        execution_timeout_seconds=execution_timeout_seconds,
-                        execution_deadline_monotonic=execution_deadline_monotonic,
-                        bridge_turns_remaining=bridge_turns_remaining,
-                    )
-                failure_reason = "input_exceeds_configured_limit"
-                if (
-                    consultation_type in {"draft_text", "review_text"}
-                    and _shared_advisor_context_bytes(prompt_data) > max_input_bytes
-                ):
-                    failure_reason = "shared_context_exceeds_input_limit"
                 return await self._persist_preflight_failure(
                     context,
                     consultation_type=consultation_type,
                     evidence_refs=tuple(item.id for item in evidence),
                     output={
-                        "advisor_status": "context_too_large",
+                        "advisor_status": "context_incomplete",
                         "preflight_status": "TECHNICAL_BLOCKED",
                         "usable": False,
-                        "failure_stage": "prompt_size_preflight",
-                        "failure_reason": failure_reason,
-                        "context_bytes_after_fit": len(encoded),
-                        "max_input_bytes": max_input_bytes,
+                        "failure_stage": "required_input_truncated",
+                        "failure_reason": "required_input_truncated",
+                        "context_bytes": len(encoded),
                         "dossier_sha256": dossier.sha256,
                         "dossier_bytes": dossier.byte_size,
                         "dossier_manifest": [dict(item) for item in dossier.manifest],
@@ -525,7 +661,7 @@ class InvestigationAdvisorTool:
                         "confirmed_non_execution": True,
                         "bridge_turns_consumed": 0,
                     },
-                    error_code="advisor_context_too_large",
+                    error_code="advisor_required_input_truncated",
                 )
             evidence_preflight = evaluate_advisor_evidence_preflight(prompt_data, dossier, prompt)
             prompt_data["evidence_preflight"] = evidence_preflight
@@ -904,7 +1040,9 @@ class InvestigationAdvisorTool:
             bridge_invocation_id = str(UUID(str(raw_invocation_id))) if raw_invocation_id else None
         except (TypeError, ValueError):
             bridge_invocation_id = None
-        reserved_budget = _advisor_reserved_budget(self._registry)
+        reserved_budget = _advisor_reserved_budget(
+            self._registry, context, reservation_key=reservation_key
+        )
         invocation_stage = _advisor_invocation_stage(submission)
         response_bytes = len(raw_output_bytes) if raw_output_bytes is not None else 0
         elapsed_before_persistence_ms = round((time.perf_counter() - submission_started_at) * 1000)
@@ -1076,6 +1214,7 @@ class InvestigationAdvisorTool:
                 limitations=(
                     "Bridge output is untrusted advisory text and is not canonical analysis.",
                     "Recommendations require independent measurement and explicit operator action.",
+                    "Advisor output cannot bypass G3 human qualification or publication approval.",
                 ),
                 idempotency_key=context.idempotency_key,
             )
@@ -1324,6 +1463,7 @@ class InvestigationAdvisorTool:
                 # The outer plan allocates one reserved Bridge turn to each
                 # child. A child cannot recursively multiply that allowance.
                 _bridge_turns_remaining=1,
+                _reservation_operation_key=context.idempotency_key,
             )
             consumed_execution_seconds += batch_result.budget_consumed.get(
                 BudgetDimension.TOOL_SECONDS, 0
@@ -1645,33 +1785,18 @@ class InvestigationAdvisorTool:
                 for item in getattr(snapshot, "article_passages", ())
             ],
             "open_questions": list(snapshot.article.open_questions),
-            "samples": (
-                []
-                if consultation_type
-                in {
-                    "draft_text",
-                    "figure_plan",
-                    "suricata_draft",
-                    "review_text",
-                }
-                else await self._sample_inventory(investigation_id, evidence)
-            ),
+            "samples": [],
             "evidence": [],
             "measured_facts": [],
             "findings": [],
             "candidate_rules": [],
             "gaps": [],
-            "budget_remaining": {
-                dimension.value: amount for dimension, amount in context.budget.remaining.items()
-            },
             "truncation": {},
         }
         editorial = consultation_type in {"draft_text", "review_text"}
         if editorial:
-            # Budget and availability state below describe this local advisor
-            # execution, not investigation facts that Bridge can verify.
+            # Local availability state is not an investigation fact Bridge can verify.
             base.pop("gaps")
-            base.pop("budget_remaining")
         if consultation_type == "review_text":
             opinion_id = UUID(
                 str(arguments.get("opinion_id", investigation_opinion_id(investigation_id)))
@@ -2158,12 +2283,10 @@ class InvestigationAdvisorTool:
                 "article_sha256": snapshot.synthesis_sha256,
                 "evidence": base["evidence"],
                 "measured_facts": base["measured_facts"],
-                "samples": await self._sample_inventory(investigation_id, evidence),
                 "measurements": measurements,
                 "tools": tool_inventory,
                 "candidate_rules": candidate_rules,
                 "gaps": base["gaps"],
-                "budget_remaining": base["budget_remaining"],
                 "limitation": "These measured fields are untrusted and may be incomplete.",
                 "truncation": {},
             }
@@ -2239,14 +2362,10 @@ class InvestigationAdvisorTool:
                 {**measurement, "measurement_id": f"m{index:03d}"}
                 for index, measurement in enumerate(measurements, start=1)
             ]
+        base["samples"] = await self._sample_inventory(investigation_id, evidence)
         compacted = _compact_advisor_data(base, consultation_type)
         if consultation_type in {"draft_text", "yara_draft", "suricata_draft", "figure_plan"}:
             compacted["transmitted_refs"] = _typed_transmitted_refs(compacted, snapshot)
-            compacted["observation_refs"] = [
-                item["id"]
-                for item in compacted["transmitted_refs"]
-                if item["kind"] == "observation"
-            ]
         return compacted
 
     async def _editorial_reference_facts(
@@ -2420,25 +2539,57 @@ class InvestigationAdvisorTool:
                 not in {"samples-quarantine", "network-captures-quarantine"}
             ):
                 continue
-            engines = sorted(
-                {
-                    _safe_text(item.source, 48)
-                    for item in observations
-                    if item.object_id == association.sample_sha256
-                    or association.sample_sha256 in item.object_id
-                }
-            )
+            associated_observations = [
+                item
+                for item in observations
+                if await self._observation_references_sample(item, association.sample_sha256)
+            ]
+            engines = sorted({_safe_text(item.source, 48) for item in associated_observations})
+            sample_state = getattr(sample, "state", "unknown")
+            sample_state = getattr(sample_state, "value", sample_state)
+            sample_origin = getattr(sample, "origin_kind", getattr(sample, "origin", "unknown"))
+            sample_origin = getattr(sample_origin, "value", sample_origin)
+            blob_content: bytes | None = None
+            content_status = "verified"
+            try:
+                blob_content = await self._artifact_store.read_bytes(
+                    blob_id, max_bytes=descriptor.size
+                )
+                if (
+                    len(blob_content) != descriptor.size
+                    or hashlib.sha256(blob_content).hexdigest() != association.sample_sha256
+                ):
+                    blob_content = None
+                    content_status = "blob_content_verification_failed"
+            except Exception:
+                content_status = "blob_content_unavailable"
             rows.append(
                 {
+                    "verified": True,
+                    "sample_id": str(getattr(sample, "id", "unknown")),
                     "association_id": str(getattr(association, "id", "unknown")),
-                    "sha256_short": association.sample_sha256[:12],
-                    "type": _safe_text(
+                    "sha256": association.sample_sha256,
+                    "blob_id": str(blob_id),
+                    "blob_sha256": descriptor.sha256,
+                    "expected_hash": getattr(sample, "expected_hash", None),
+                    "source_object_id": getattr(sample, "source_object_id", None),
+                    "evidence_ids": [str(item.id) for item in associated_observations],
+                    "evidence_blob_ids": [str(item.blob_id) for item in associated_observations],
+                    "evidence_sha256s": [item.sha256 for item in associated_observations],
+                    "mime_type": _safe_text(
                         getattr(descriptor, "mime_type", "application/octet-stream").split(";", 1)[
                             0
                         ],
                         64,
                     ),
-                    "size_bytes": getattr(descriptor, "size", None),
+                    "byte_length": descriptor.size,
+                    "encoding": "base64",
+                    "content_base64": (
+                        base64.b64encode(blob_content).decode("ascii")
+                        if blob_content is not None
+                        else ""
+                    ),
+                    "content_status": content_status,
                     "association_status": _safe_text(
                         getattr(
                             getattr(association, "qualification", "unknown"),
@@ -2451,6 +2602,23 @@ class InvestigationAdvisorTool:
                     "analysis_status_by_engine": [
                         {"engine": engine, "status": "evidence_recorded"} for engine in engines
                     ],
+                    "related_sample_sha256": list(
+                        getattr(association, "related_sample_sha256", ())
+                    ),
+                    "state": _safe_text(sample_state, 32),
+                    "origin": _safe_text(sample_origin, 64),
+                    "original_name": _safe_text(getattr(sample, "original_name", ""), 256),
+                    "source_service": _safe_text(getattr(sample, "source_service", ""), 64),
+                    "tlp": _safe_text(
+                        getattr(
+                            getattr(sample, "tlp", "unknown"),
+                            "value",
+                            getattr(sample, "tlp", "unknown"),
+                        ),
+                        16,
+                    ),
+                    "do_not_submit": bool(getattr(sample, "do_not_submit", False)),
+                    "external_llm_allowed": bool(getattr(sample, "external_llm_allowed", True)),
                 }
             )
         return rows
@@ -2800,22 +2968,78 @@ class InvestigationAdvisorTool:
                 )
         return rows
 
-    async def _restricted_sample_hashes(self, subject_id: UUID) -> set[str]:
-        """Collect sample hashes whose explicit policy forbids external disclosure."""
+    async def _restricted_sample_hashes(self, investigation_id: UUID, subject_id: UUID) -> set[str]:
+        """Return associated sample hashes blocked by an explicit disclosure rule.
+
+        Any non-empty sample license_restriction is treated as an explicit
+        owner/source restriction for externally disclosed sample content or
+        metadata. This targeted D7 mapping deliberately does not affect
+        unrelated investigations.
+        """
         sample_list = getattr(self._samples, "list_for_subject", None)
+        association_list = getattr(self._sample_associations, "list_for_investigation", None)
         if not callable(sample_list):
             return set()
+        associations = (
+            tuple(await association_list(investigation_id)) if callable(association_list) else ()
+        )
+        associated_hashes = {association.sample_sha256 for association in associations}
+        observation_list = getattr(self._observations, "list_for_investigation", None)
+        observations = (
+            tuple(await observation_list(investigation_id)) if callable(observation_list) else ()
+        )
         restricted: set[str] = set()
         for sample in await sample_list(subject_id):
+            sample_hashes = {
+                value
+                for value in (
+                    getattr(sample, "expected_hash", None),
+                    getattr(sample, "source_object_id", None),
+                )
+                if isinstance(value, str) and value
+            }
+            matched_hashes = sample_hashes.intersection(associated_hashes)
+            if not matched_hashes:
+                for sample_hash in sample_hashes:
+                    for observation in observations:
+                        if await self._observation_references_sample(observation, sample_hash):
+                            matched_hashes.add(sample_hash)
+                            break
+            if not matched_hashes:
+                continue
             if _sample_policy_allows_external(sample):
                 continue
-            for value in (
-                getattr(sample, "expected_hash", None),
-                getattr(sample, "source_object_id", None),
-            ):
-                if isinstance(value, str) and value:
-                    restricted.add(value)
+            restricted.update(matched_hashes)
         return restricted
+
+    async def _observation_references_sample(
+        self, observation: EvidenceObservation, sample_hash: str
+    ) -> bool:
+        """Match direct object IDs or a verified nested sample_sha256 field."""
+        if _object_id_references_sample(observation.object_id, {sample_hash}):
+            return True
+        if not re.fullmatch(r"[0-9a-f]{64}", sample_hash):
+            return False
+        blob = await self._blobs.get(observation.blob_id)
+        descriptor = getattr(blob, "descriptor", None)
+        if (
+            descriptor is None
+            or descriptor.logical_bucket not in {"evidence", "investigation-evidence"}
+            or descriptor.sha256 != observation.sha256
+            or type(descriptor.size) is not int
+            or descriptor.size < 0
+        ):
+            return False
+        try:
+            raw = await self._artifact_store.read_bytes(
+                observation.blob_id, max_bytes=descriptor.size
+            )
+            if len(raw) != descriptor.size or hashlib.sha256(raw).hexdigest() != observation.sha256:
+                return False
+            payload = json.loads(raw.decode("utf-8"))
+        except Exception:
+            return False
+        return _payload_references_sample_hash(payload, sample_hash)
 
     async def _sample_blob_for_hash(
         self,
@@ -3257,9 +3481,6 @@ def register_investigation_advisor_tool(
     *,
     adapter: InvestigationAdvisorTool,
 ) -> None:
-    max_input_bytes = int(
-        getattr(adapter._settings, "operator_advisor_max_input_bytes", MAX_ADVISOR_INPUT_BYTES)
-    )
     max_tool_seconds = _advisor_tool_seconds_limit(adapter._settings)
     uuid_schema = {
         "type": "string",
@@ -3396,8 +3617,6 @@ def register_investigation_advisor_tool(
             effect=ToolEffect.EXTERNAL_READ,
             cost_model={
                 BudgetDimension.BRIDGE_TURNS: 1,
-                BudgetDimension.CONTEXT_BYTES: max_input_bytes,
-                BudgetDimension.CONTEXT_TOKENS: (max_input_bytes + 3) // 4,
                 BudgetDimension.TOOL_SECONDS: max_tool_seconds,
             },
             confidentiality=ToolConfidentiality.CONFIDENTIAL,
@@ -3405,6 +3624,8 @@ def register_investigation_advisor_tool(
                 "Returns untrusted typed proposals only; no tool execution or canonical mutation.",
                 "The consultation is billed to the existing Bridge and context budgets.",
                 "Provider usage is recorded only when exposed by the Bridge transport.",
+                "Advisor output is non-authoritative and cannot satisfy the human G3 "
+                "qualification/publication gate.",
             ),
             capability_key="bridge.advisor",
         ),
@@ -3873,37 +4094,12 @@ def _compact_advisor_data(data: dict[str, Any], consultation_type: str) -> dict[
 def _fit_advisor_prompt(
     consultation_type: str,
     raw_data: Mapping[str, Any],
-    *,
-    max_input_bytes: int = MAX_ADVISOR_INPUT_BYTES,
 ) -> str:
-    del max_input_bytes
     data = copy.deepcopy(dict(raw_data))
     prompt = InvestigationAdvisorTool._prompt(consultation_type, data)
     if isinstance(raw_data, dict):
         raw_data["truncation"] = dict(data.get("truncation", {}))
     return prompt
-
-
-def _shared_advisor_context_bytes(data: Mapping[str, Any]) -> int:
-    """Measure shared dossier inputs apart from unit-specific editorial material."""
-    shared = copy.deepcopy(dict(data))
-    for key in (
-        "units",
-        "assertions",
-        "review_text",
-        "dossier_manifest",
-        "dossier_text",
-        "dossier_sha256",
-        "dossier_bytes",
-        "transmitted_refs",
-        "observation_refs",
-    ):
-        shared.pop(key, None)
-    return len(
-        json.dumps(shared, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
-            "utf-8"
-        )
-    )
 
 
 def _critical_prompt_data_was_truncated(
@@ -4097,7 +4293,32 @@ def _advisor_invocation_stage(submission: TurnSubmission) -> str:
     return "submission_failed"
 
 
-def _advisor_reserved_budget(registry: ToolRegistry) -> dict[str, int]:
+def _advisor_context_reservation(
+    context: ToolExecutionContext, operation_key: str
+) -> BudgetReservation | None:
+    return next(
+        (
+            item
+            for item in context.budget.reservations
+            if item.operation_key == operation_key
+            and item.status is BudgetReservationStatus.RESERVED
+        ),
+        None,
+    )
+
+
+def _advisor_reserved_budget(
+    registry: ToolRegistry,
+    context: ToolExecutionContext | None = None,
+    *,
+    reservation_key: str | None = None,
+) -> dict[str, int]:
+    if context is not None:
+        reservation = _advisor_context_reservation(
+            context, reservation_key or context.idempotency_key
+        )
+        if reservation is not None:
+            return {dimension.value: amount for dimension, amount in reservation.amounts.items()}
     try:
         definitions = registry.list_registered()
     except (AttributeError, TypeError):
@@ -4708,12 +4929,6 @@ def _prompt_transmitted_refs(prompt_data: Mapping[str, Any]) -> tuple[dict[str, 
 def _attach_advisor_provenance(result: ToolResult, provenance: Mapping[str, Any]) -> ToolResult:
     output = {**dict(result.output), "bridge_provenance": dict(provenance)}
     budget = dict(result.budget_consumed)
-    provenance_bytes = len(canonical_json_bytes(provenance))
-    if BudgetDimension.CONTEXT_BYTES in budget:
-        budget[BudgetDimension.CONTEXT_BYTES] += provenance_bytes
-    if BudgetDimension.CONTEXT_TOKENS in budget:
-        billed_context_bytes = budget.get(BudgetDimension.CONTEXT_BYTES, provenance_bytes)
-        budget[BudgetDimension.CONTEXT_TOKENS] = max(1, (billed_context_bytes + 3) // 4)
     return ToolResult(
         result.status,
         observation_refs=result.observation_refs,
@@ -5972,6 +6187,16 @@ def _object_id_references_sample(object_id: object, sample_hashes: set[str]) -> 
     )
 
 
+def _payload_references_sample_hash(value: object, sample_hash: str) -> bool:
+    if isinstance(value, Mapping):
+        if value.get("sample_sha256") == sample_hash:
+            return True
+        return any(_payload_references_sample_hash(item, sample_hash) for item in value.values())
+    if isinstance(value, list | tuple):
+        return any(_payload_references_sample_hash(item, sample_hash) for item in value)
+    return False
+
+
 def _drop_findings_linked_to_restricted_evidence(
     prompt_data: dict[str, Any],
     restricted_evidence_refs: tuple[UUID, ...],
@@ -6001,11 +6226,23 @@ def _drop_findings_linked_to_restricted_evidence(
 
 
 def _sample_policy_allows_external(sample: object) -> bool:
-    """Apply every explicit sample-level rule before external disclosure."""
+    """Apply explicit sample rules before disclosing associated sample data.
+
+    D7 maps every non-empty license_restriction to an explicit owner/source
+    veto when sample metadata or content would be sent externally. This
+    conservative mapping is intentionally sample-scoped.
+    """
+    tlp = getattr(sample, "tlp", None)
+    tlp_value = getattr(tlp, "value", tlp)
+    license_restriction = getattr(sample, "license_restriction", None)
+    has_license_restriction = license_restriction is not None and bool(
+        str(license_restriction).strip()
+    )
     return not (
         bool(getattr(sample, "do_not_submit", False))
         or not bool(getattr(sample, "external_llm_allowed", True))
-        or getattr(sample, "tlp", None) is TLP.RED
+        or (isinstance(tlp_value, str) and tlp_value.casefold() == TLP.RED.value.casefold())
+        or has_license_restriction
     )
 
 

@@ -1022,6 +1022,38 @@ class InvestigationService:
         registered = self._registry.get(tool_name, schema_version)
         definition = registered[0] if registered else None
         requested_cost = thaw_json(definition.cost_model) if definition is not None else {}
+        if registered is not None:
+            adapter = registered[1]
+            existing_lookup = getattr(self._invocations, "get_by_operation_key", None)
+            existing = await existing_lookup(operation_key) if callable(existing_lookup) else None
+            estimate_cost = getattr(adapter, "reservation_cost", None)
+            if existing is None and callable(estimate_cost):
+                estimate_budget = _copy_investigation_budget(budget)
+                estimate_envelope = (
+                    replace(envelope, budget=estimate_budget) if envelope is not None else None
+                )
+                estimate_context = ToolExecutionContext(
+                    investigation_id=investigation.id,
+                    envelope=estimate_envelope,
+                    budget=estimate_budget,
+                    idempotency_key=operation_key,
+                    available_capabilities=self._available_capabilities,
+                )
+                try:
+                    dynamic_cost = await estimate_cost(arguments, estimate_context)
+                except Exception as exc:
+                    # Fail closed. The adapter's pre-transport reservation check
+                    # will refuse any non-empty prompt without a measured cost.
+                    dynamic_cost = {
+                        BudgetDimension.CONTEXT_BYTES: 0,
+                        BudgetDimension.CONTEXT_TOKENS: 0,
+                    }
+                    _logger.info(
+                        "Tool dynamic cost estimation failed for %s (%s)",
+                        tool_name,
+                        type(exc).__name__,
+                    )
+                requested_cost.update(dynamic_cost)
         external_effect = definition is not None and definition.effect in {
             ToolEffect.EXTERNAL_READ,
             ToolEffect.ACQUIRE,
