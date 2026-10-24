@@ -14,7 +14,11 @@ Cette matrice est mise à jour à chaque lot. Un test non exécuté est marqué
 
 | Oracle | Commande | Résultat |
 |---|---|---|
-| Suite P10 (L1 + L2 + rendu) | `cd backend && uv run --python 3.12 pytest tests/test_invariant_proposals.py -q --tb=short` | **97 passed** |
+| Suite P10 (L1 + L2 + rendu) | `cd backend && uv run --python 3.12 pytest tests/test_invariant_proposals.py -q --tb=short` | **99 passed** après le correctif R5 |
+| R5 premier verdict | revue indépendante Luna xhigh | **REVISE (HIGH)** : suffixe `}FIXTURE_AUTH_SUFFIX` fuyait après un scalaire non fermé |
+| Correctif R5 | commit `5a23a291` | délimiteurs bruts avant quote de fermeture = ambigus ; scalaire non borné sans LF/CRLF → `ProposalContractError`, zéro tour externe |
+| Sonde R5 stricte | `_normalize_context → _render_p10_prompt` | **44/44 PASS** ; refus sur `}`/`]`/`,` non bornés ; LF/CRLF et preuve CVE préservés ; linéarité 0,0132/0,0266 s |
+| R5 re-revue | Luna xhigh | **en attente** |
 | Régressions P10/composition/signature | `pytest tests/test_invariant_proposals.py tests/test_investigation_composition.py tests/test_signature_bridge.py -q` | **111 passed** |
 | R4 seam réel : LF et CRLF, secret absent, CVE byte-for-byte, pas de marqueur non borné | sonde indépendante `_normalize_context → _render_p10_prompt` | **8/8 PASS** |
 | Guillemet interne + `}`/`]`, 8 variantes | sonde indépendante | **8/8 PASS** |
@@ -29,7 +33,9 @@ Cette matrice est mise à jour à chaque lot. Un test non exécuté est marqué
 
 | Oracle | Commande | Résultat |
 |---|---|---|
-| Frontend complet | `cd frontend && pnpm lint` | **PASS** (ESLint + Prettier) |
+| Frontend lint | `cd frontend && pnpm lint` | **PASS** (ESLint + Prettier) |
+| Frontend typecheck/tests/build | `pnpm typecheck && pnpm test --run && pnpm build` | **PASS** : 39 fichiers / **293 tests**, build Vite vert |
+| Frontend e2e Playwright | `pnpm test:e2e` | **NON EXÉCUTÉ à ce stade** |
 | Import du serveur navigateur | parse AST + import des constantes publiques | **PASS** |
 | Smoke Typst inline (fixture canonique corrigée) | compilation Typst 0.15.1 + polices verrouillées + `pdftotext` | **PASS**, PDF non vide |
 | mypy repo-wide | `cd backend && uv run --python 3.12 mypy src tests` | **60 erreurs au départ → 35 après CI-0a, toutes dans les 5 fichiers L4 (attendu : 0 après L4)** |
