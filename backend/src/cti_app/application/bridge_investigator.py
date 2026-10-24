@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import random
 import re
 import threading
@@ -40,7 +41,7 @@ from cti_app.domain.model_conversations import (
     ConversationTransport,
     ConversationTurnStatus,
 )
-from cti_app.domain.model_runs import ModelProvider
+from cti_app.domain.model_runs import ModelProvider, ModelSubmissionState
 
 INVESTIGATION_PROMPT_VERSION = "investigation-agent-turn.v1"
 _CONVERSATION_NAMESPACE = UUID("c08dd95e-8ab9-4e8a-961c-787a79f86cde")
@@ -232,6 +233,19 @@ async def submit_bridge_consultation_once(
     transport_timeout: float | None = timeout_seconds
     if timeout_seconds is not None and deadline is None:
         deadline = operation_clock() + timeout_seconds
+    async def wait_for_pacing() -> bool:
+        if deadline is None:
+            return await pacer.wait_for_next_submission()
+        pacing_remaining = deadline - operation_clock()
+        if pacing_remaining <= 0:
+            return False
+        pacing_scope = asyncio.timeout(pacing_remaining)
+        try:
+            async with pacing_scope:
+                return await pacer.wait_for_next_submission(deadline_monotonic=deadline)
+        except TimeoutError:
+            return False
+
     if deadline is not None:
         pacing_remaining = deadline - operation_clock()
         if pacing_remaining <= 0:
@@ -240,16 +254,7 @@ async def submit_bridge_consultation_once(
                 conversation_id,
                 "execution_deadline_exhausted_before_pacing",
             )
-        pacing_scope = asyncio.timeout(pacing_remaining)
-        try:
-            async with pacing_scope:
-                pacing_allowed = await pacer.wait_for_next_submission(deadline_monotonic=deadline)
-        except TimeoutError:
-            return _bridge_execution_budget_refusal(
-                key,
-                conversation_id,
-                "pacing_exceeds_execution_deadline",
-            )
+        pacing_allowed = await wait_for_pacing()
         if not pacing_allowed:
             return _bridge_execution_budget_refusal(
                 key,
@@ -264,97 +269,131 @@ async def submit_bridge_consultation_once(
                 "execution_window_below_minimum_after_preparation_and_pacing",
             )
     else:
-        await pacer.wait_for_next_submission()
+        await wait_for_pacing()
         transport_timeout = timeout_seconds
 
-    try:
-        if deadline is None:
-            submission = await transport.submit(
-                investigation_id=investigation_id,
-                subject_id=subject_id,
-                turn_index=turn_index,
-                context_sha256=context_sha256,
-                prompt=prompt,
-                external_llm_allowed=True,
-                timeout_seconds=transport_timeout,
-            )
-        else:
-            assert transport_timeout is not None
-            transport_scope = asyncio.timeout(transport_timeout)
-            async with transport_scope:
-                submission = await transport.submit(
-                    investigation_id=investigation_id,
-                    subject_id=subject_id,
-                    turn_index=turn_index,
-                    context_sha256=context_sha256,
-                    prompt=prompt,
-                    external_llm_allowed=True,
-                    timeout_seconds=transport_timeout,
-                )
-        if deadline is not None and operation_clock() >= deadline:
-            # A transport that returns after its advertised deadline is still
-            # ambiguous. Never let its late text reach advisor parsing.
-            return TurnSubmission(
-                TurnSubmissionStatus.NEEDS_REVIEW,
-                idempotency_key=submission.idempotency_key or key,
-                conversation_id=submission.conversation_id or conversation_id,
-                detail="Bridge returned after the bounded execution deadline.",
-                error_code="bridge_execution_timeout",
-                submission_state="external_state_unknown",
-                failure_stage="bridge_execution",
-                failure_reason="execution_deadline_exceeded",
-            )
-        if (
-            submission.error_code == "bridge_rate_limited"
-            and submission.submission_state == "pre_submission"
-        ):
-            await pacer.defer_submissions(
-                submission.retry_after_seconds
-                if submission.retry_after_seconds is not None
-                else configured.openai_bridge_pre_submission_retry_base_seconds
-            )
-        return submission
-    except TimeoutError:
-        # The per-call deadline can expire after transport entry. Keep this
-        # terminal and ambiguous; callers must not automatically submit again.
+    async def submit(
+        attempt: int, call_timeout_seconds: float | None
+    ) -> TurnSubmission | None:
+        arguments = dict(
+            investigation_id=investigation_id,
+            subject_id=subject_id,
+            turn_index=turn_index,
+            context_sha256=context_sha256,
+            prompt=prompt,
+            external_llm_allowed=True,
+            timeout_seconds=call_timeout_seconds,
+        )
+        if attempt == 0:
+            return await transport.submit(**arguments)
+        submit_with_attempt = getattr(transport, "submit_with_attempt", None)
+        if not callable(submit_with_attempt):
+            return None
+        return await submit_with_attempt(**arguments, attempt=attempt)
+
+    def ambiguous_timeout(detail: str) -> TurnSubmission:
         return TurnSubmission(
             TurnSubmissionStatus.NEEDS_REVIEW,
             idempotency_key=key,
             conversation_id=conversation_id,
-            detail="Bridge consultation exceeded its bounded execution deadline.",
+            detail=detail,
             error_code="bridge_execution_timeout",
             retryable=False,
             submission_state="external_state_unknown",
             failure_stage="bridge_execution",
             failure_reason="execution_deadline_exceeded",
         )
-    except Exception as exc:
-        code = str(getattr(exc, "code", ""))[:64] or "bridge_unavailable"
-        submission_state = getattr(exc, "submission_state", None)
-        retry_after = getattr(exc, "retry_after", None)
-        if code == "bridge_rate_limited" and submission_state == "pre_submission":
-            await pacer.defer_submissions(
-                retry_after
-                if isinstance(retry_after, int | float) and not isinstance(retry_after, bool)
-                else configured.openai_bridge_pre_submission_retry_base_seconds
+
+    async def submit_with_deadline(
+        attempt: int, call_timeout_seconds: float | None
+    ) -> TurnSubmission:
+        try:
+            if deadline is None:
+                result = await submit(attempt, call_timeout_seconds)
+            else:
+                assert call_timeout_seconds is not None
+                async with asyncio.timeout(call_timeout_seconds):
+                    result = await submit(attempt, call_timeout_seconds)
+        except TimeoutError:
+            return ambiguous_timeout("Bridge consultation exceeded its bounded execution deadline.")
+        except Exception as exc:
+            code = str(getattr(exc, "code", ""))[:64] or "bridge_unavailable"
+            submission_state = getattr(exc, "submission_state", None)
+            retry_after = getattr(exc, "retry_after", None)
+            retryable = bool(getattr(exc, "retryable", False))
+            uncertain = submission_state in {
+                "submission_attempted",
+                "post_submission",
+                "external_state_unknown",
+            }
+            result = TurnSubmission(
+                (
+                    TurnSubmissionStatus.NEEDS_REVIEW
+                    if uncertain
+                    else TurnSubmissionStatus.UNAVAILABLE
+                ),
+                idempotency_key=key,
+                conversation_id=conversation_id,
+                detail="Bridge consultation transport failed.",
+                error_code=code,
+                retryable=retryable,
+                retry_after_seconds=retry_after,
+                submission_state=submission_state,
+                failure_stage=str(getattr(exc, "phase", "bridge_transport"))[:64],
+                failure_reason=code,
             )
-        status = (
-            TurnSubmissionStatus.NEEDS_REVIEW
-            if bool(submission_state)
-            else TurnSubmissionStatus.UNAVAILABLE
+        if result is None:
+            return TurnSubmission(
+                TurnSubmissionStatus.UNAVAILABLE,
+                idempotency_key=key,
+                conversation_id=conversation_id,
+                detail="The transport cannot safely create a distinct retry attempt.",
+                error_code="bridge_retry_attempt_unavailable",
+                submission_state="pre_submission",
+                failure_stage="retry_admission",
+                failure_reason="distinct_attempt_not_supported",
+            )
+        if deadline is not None and operation_clock() >= deadline:
+            # A transport that returns after its advertised deadline is still
+            # ambiguous. Never let its late text reach advisor parsing.
+            return ambiguous_timeout("Bridge returned after the bounded execution deadline.")
+        return result
+
+    submission = await submit_with_deadline(0, transport_timeout)
+    if (
+        submission.status is not TurnSubmissionStatus.UNAVAILABLE
+        or submission.error_code != "bridge_rate_limited"
+        or submission.submission_state != "pre_submission"
+    ):
+        return submission
+
+    retry_after = _retry_after_or_none(submission.retry_after_seconds)
+    retry_delay = (
+        retry_after
+        if retry_after is not None
+        else _bounded_retry_backoff(
+            getattr(configured, "openai_bridge_pre_submission_retry_base_seconds", 1.0),
+            getattr(configured, "openai_bridge_pre_submission_retry_max_seconds", 8.0),
+            0,
         )
-        return TurnSubmission(
-            status,
-            idempotency_key=key,
-            conversation_id=conversation_id,
-            detail="Bridge consultation transport failed.",
-            error_code=code,
-            retryable=False,
-            retry_after_seconds=retry_after,
-            submission_state=submission_state,
-            failure_stage=str(getattr(exc, "phase", "bridge_transport"))[:64],
-            failure_reason=code,
-        )
+    )
+    await pacer.defer_submissions(retry_delay)
+    if not submission.retryable or not callable(
+        getattr(transport, "submit_with_attempt", None)
+    ):
+        return submission
+    if deadline is not None:
+        remaining = deadline - operation_clock()
+        # Keep a full minimum execution window after the server's wait. It
+        # conservatively includes pacing and local/transport overhead.
+        if remaining <= retry_delay + minimum_timeout_seconds:
+            return submission
+    if not await wait_for_pacing():
+        return submission
+    retry_timeout = deadline - operation_clock() if deadline is not None else timeout_seconds
+    if retry_timeout is not None and retry_timeout < minimum_timeout_seconds:
+        return submission
+    return await submit_with_deadline(1, retry_timeout)
 
 
 def _bridge_execution_budget_refusal(
@@ -373,6 +412,23 @@ def _bridge_execution_budget_refusal(
         failure_stage="budget_admission",
         failure_reason=reason,
     )
+
+
+def _retry_after_or_none(value: Any) -> float | None:
+    if (
+        isinstance(value, int | float)
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value > 0
+    ):
+        return float(value)
+    return None
+
+
+def _bounded_retry_backoff(base: float, maximum: float, attempt: int) -> float:
+    if not math.isfinite(base) or base <= 0 or not math.isfinite(maximum) or maximum <= 0:
+        return 0.0
+    return min(base * (2 ** min(attempt, 30)), maximum)
 
 
 @dataclass(frozen=True, slots=True)
@@ -753,6 +809,9 @@ class ModelConversationTurnTransport:
             if captured is not None:
                 return captured
             submission_state = getattr(exc, "submission_state", None)
+            error_code = str(getattr(exc, "code", ""))[:64] or None
+            if error_code == "model_submission_reconciliation_required":
+                submission_state = ModelSubmissionState.EXTERNAL_STATE_UNKNOWN.value
             submitted = submission_state in {
                 "submission_attempted",
                 "post_submission",
@@ -767,7 +826,7 @@ class ModelConversationTurnTransport:
                 idempotency_key=key,
                 conversation_id=conversation_id,
                 detail=type(exc).__name__,
-                error_code=(str(getattr(exc, "code", ""))[:64] or None),
+                error_code=error_code,
                 submission_state=submission_state,
                 retryable=bool(getattr(exc, "retryable", False)),
                 retry_after_seconds=getattr(exc, "retry_after", None),
@@ -1054,6 +1113,7 @@ class BridgeInvestigator:
             )
             submission: TurnSubmission | None = None
             pre_submission_attempt = 0
+            rate_limit_retries = 0
             while True:
                 request_attempt = attempt + retry_offset
                 idempotency_key = make_investigation_turn_idempotency_key(
@@ -1141,23 +1201,28 @@ class BridgeInvestigator:
                     # Unknown and ambiguous outcomes consume one logical Bridge
                     # turn because the provider may already have accepted them.
                     submissions_made += 1
+                is_rate_limited = submission.error_code == "bridge_rate_limited"
+                may_retry_rate_limit = is_rate_limited and rate_limit_retries < 1
+                may_retry_other_pre_submission = (
+                    not is_rate_limited
+                    and pre_submission_attempt < MAX_PRE_SUBMISSION_ATTEMPTS - 1
+                )
                 if (
                     confirmed_not_submitted
                     and submission.retryable
-                    and (
-                        submission.error_code == "bridge_rate_limited"
-                        or pre_submission_attempt < MAX_PRE_SUBMISSION_ATTEMPTS - 1
-                    )
+                    and (may_retry_rate_limit or may_retry_other_pre_submission)
                 ):
                     retry_offset += 1
-                    retry_delay = submission.retry_after_seconds
+                    retry_delay = _retry_after_or_none(submission.retry_after_seconds)
                     if retry_delay is None:
-                        retry_delay = min(
-                            self._retry_backoff_base_seconds
-                            * (2 ** min(pre_submission_attempt, 30)),
+                        retry_delay = _bounded_retry_backoff(
+                            self._retry_backoff_base_seconds,
                             self._retry_backoff_max_seconds,
+                            pre_submission_attempt,
                         )
                     pre_submission_attempt += 1
+                    if is_rate_limited:
+                        rate_limit_retries += 1
                     await self._pacer.defer_submissions(retry_delay)
                     continue
                 if confirmed_not_submitted and submission.retryable:

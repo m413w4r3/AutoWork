@@ -330,7 +330,7 @@ async def test_pre_submission_retries_use_bounded_exponential_backoff() -> None:
 
 
 @pytest.mark.asyncio
-async def test_rate_limit_retries_honor_retry_after_without_abandoning_turn() -> None:
+async def test_rate_limit_retry_honors_retry_after_and_stops_after_one_retry() -> None:
     investigation_id = uuid4()
     context = _context(investigation_id)
     rejected = TurnSubmission(
@@ -370,9 +370,9 @@ async def test_rate_limit_retries_honor_retry_after_without_abandoning_turn() ->
         external_llm_allowed=True,
     )
 
-    assert result.status is TurnSubmissionStatus.SUCCEEDED
-    assert transport.submission_count == 6
-    assert clock.delays == [7] * 5
+    assert result.status is TurnSubmissionStatus.PRE_SUBMISSION_RETRY_EXHAUSTED
+    assert transport.submission_count == 2
+    assert clock.delays == [7]
 
 
 @pytest.mark.asyncio
