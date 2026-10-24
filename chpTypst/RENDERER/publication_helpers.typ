@@ -869,15 +869,29 @@
       }
     ] else if content_section.type == "chronology" [
       #section-title[CHRONOLOGIE]
-      #if content_section.at("derived_timeline_figure", default: none) == none [
+      #let derived-figure = content_section.at("derived_timeline_figure", default: none)
+      #if derived-figure == none [
         #render-publication-timeline(
           content_section.timeline,
           ordered: true,
           reference-scope: reference-scope,
         )
-      ]
-      #if content_section.at("derived_timeline_figure", default: none) != none [
-        #render-derived-timeline-figure(content_section.derived_timeline_figure, reference-scope: reference-scope)
+      ] else [
+        #render-derived-timeline-figure(derived-figure, reference-scope: reference-scope)
+        // The derived figure only carries exact ISO-dated events.  Keep every
+        // other canonical chronology entry visible instead of dropping it.
+        #let figure-texts = derived-figure.at("events", default: ()).map(event => event.text)
+        #let undated-entries = content_section.timeline.filter(
+          entry => not figure-texts.contains(entry.text),
+        )
+        #if undated-entries.len() > 0 [
+          #v(8pt)
+          #render-publication-timeline(
+            undated-entries,
+            ordered: true,
+            reference-scope: reference-scope,
+          )
+        ]
       ]
     ] else if content_section.type == "limitations" [
       #section-title[LIMITES DES PREUVES]
