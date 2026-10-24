@@ -1,0 +1,6 @@
+{
+  "schema": "advisor-anti-slop-manifest.v1",
+  "corpus_version": "anti_slop.v1",
+  "corpus_sha256": "a80562385836b1a5cb2b186742f4d9f20a57acdeb418f74d00fd88cc7bbe77f9",
+  "case_count": 16
+}
