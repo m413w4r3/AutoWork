@@ -176,3 +176,42 @@ All checks passed!
 ```
 
 **UNKNOWN :** cause des deux échecs advisor ci-dessus; comportement concurrent avec dépôt PostgreSQL multi-processus; durée runtime effective face aux valeurs 3 600/7 200 s; coût/tokens. Aucun fournisseur, transport live ou état opérationnel n’a été contacté ou modifié. Le delta R3 ne mérite pas d’être accepté tant que les contournements HIGH de fingerprint ne sont pas fermés.
+
+## Scout de faisabilité clé canonique / atomicité — PARTIAL
+
+**Scout :** agent `95f180aa`, Luna xhigh, lecture seule, base `5f25b46`.
+
+### Clé d'effet canonique — non fournie
+
+- `operation_key` dérive de la clé fournie par le client et du SHA du payload ;
+  la garde d'équivalence utilise encore `_semantic_parameters_fingerprint`
+  (`operator_tool_invocation.py:753,1365`). L'heuristique reste arrêtée.
+- Une clé opaque **par tentative** existe : `ModelGateway` attribue
+  `run.id:aN`, la persiste avant l'appel et la transmet à l'adaptateur
+  (`model_gateway.py:1140,1151,1322`, `models.py:877`). Les retries du même
+  appel la réutilisent ; une nouvelle tentative après échec terminal vérifié
+  en reçoit une autre.
+- Cette clé identifie une tentative précise, **pas** deux appels
+  sémantiquement équivalents sous de nouvelles clés opérateur.
+  `bridge_invocation_id` est l'UUID local du tour, pas un identifiant
+  fournisseur pré-dispatch. **Aucune identité d'effet canonique inter-appels
+  n'est disponible offline : `BLOCKED` sur ce volet.** Ne pas rouvrir
+  l'heuristique.
+
+### Atomicité révocation/dispatch — faisable
+
+La révocation utilise CAS + `SELECT … FOR UPDATE`
+(`repositories/investigation.py:1422`, `investigation_governance.py:428`),
+mais le dispatch ne prend pas ce verrou et l'admission est commitée avant
+l'appel externe (`investigation_service.py:1031,1152,1190`,
+`investigation_tools.py:779`). La primitive manquante est un **permis de
+dispatch verrouillé et sérialisé avec le commit de révocation** : verrou de
+ligne tenu du contrôle final G2/TLP jusqu'au retour du transport. Si la
+révocation commit en premier, aucun appel transport ; sinon elle attend le
+retour. Aucun outbox n'existe.
+
+Lot `M01-B1A1-R1` lancé sur 7 fichiers avec oracle faux transport + faux
+verrou déterministe. Risque : le verrou SQL est tenu pendant l'I/O, ce qui
+peut retarder la révocation et mobiliser une connexion ; le test offline
+prouve l'ordre local, pas l'acceptation côté fournisseur.
+
