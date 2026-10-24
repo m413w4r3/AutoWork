@@ -8,8 +8,8 @@ autorisation d'appel, G2) restent actives. Aucun push, déploiement ou mutation 
 | TASK_ID | Dépendances | Oracle | Propriétaire | État |
 |---|---|---|---|---|
 | S0 état initial | — | HEAD propre, 4 références Typst présentes, PDF réel identifié | parent | DONE |
-| S1 preuves permissives | S0 | preuves autorisées intactes au faux transport ; secrets/refus toujours bloqués | Luna xhigh `M02-S1` | DONE `892e5f45` ; revue indépendante en cours |
-| S2 P10 sans plafond | S0 | 95 999/96 000/96 001, 199 999/200 000/200 001, MiB intacts ; idempotence | Luna xhigh `M02-S2` | DONE `d298d181` ; revue REVISE traitée, re-revue en cours |
+| S1 preuves permissives | S0 | preuves autorisées intactes au faux transport ; secrets/refus toujours bloqués | Luna xhigh `M02-S1` | DONE `50992eaf` ; revue indépendante **APPROVE** |
+| S2 P10 sans plafond | S0 | 95 999/96 000/96 001, 199 999/200 000/200 001, MiB intacts ; idempotence | Luna xhigh `M02-S2` | DONE `1246b25f` ; revue finale REVISE avec résidu d'échappement JSON documenté |
 | S3 dispatch/effect identité | S0 | spec design + verdict IMPLEMENTABLE/BLOCKED | Luna xhigh `M02-S3` | DESIGN `67f8c689` ; revue indépendante **BLOCKED_DESIGN** `6391159c` |
 | S6 PDF réel vs 4 références | S0, S4B | `TYPST_REAL_PDF_AUDIT.md`, corrections démontrées testées | Luna xhigh `M02-S6` | DONE `b102a9e6` ; 1 défaut démontré corrigé (chronologie) |
 | S7 code mort | S0 | inventaire preuve + suppressions atomiques testées | Luna xhigh `M02-S7` | DONE `76aefdee` ; 215 tests rejoués par le parent |
@@ -39,6 +39,22 @@ autorisation d'appel, G2) restent actives. Aucun push, déploiement ou mutation 
 - **S7** : deux suppressions prouvées (`_source_figure_candidates`,
   `get_context_summary`), 54 LOC source en moins ; 215 tests ciblés rejoués
   par le parent.
+
+## Gate final (2026-10-24)
+
+- Suite backend complète sur main intégré, avec un Typst 0.15.1 fonctionnel
+  (`PATH`/`TYPST_BINARY=/snap/typst/current/bin/typst`,
+  `FONT_BUNDLE_ROOT=chpTypst`) :
+  **4708 passed, 2 skipped, 30 deselected** en 124 s.
+- Sans ce binôme d'environnement, 5 tests Typst échouent sur le snap
+  `/snap/bin/typst` cassé (`snap-confine`), pas sur le code.
+- Tests ciblés : S1 171, S2 135, S6 43, S7 215, audit/L2/B1B 66,
+  intégration PostgreSQL jetable 7. Tous verts.
+- Mypy ciblé : `invariant_proposals.py`, `advisor_dossier.py`,
+  `investigation_advisor_tools.py`, `publication_secret_guard.py` propres.
+  Le mypy repo-wide conserve 58 erreurs préexistantes dans 11 fichiers.
+- Ruff : fichiers modifiés propres ; le formatage repo-wide conserve
+  10 fichiers préexistants non formatés (lot mécanique séparé).
 
 
 ## S0 — faits vérifiés (2026-10-24)
