@@ -329,7 +329,7 @@ class InvestigationAdvisorTool:
                 restricted_evidence_refs = tuple(
                     item.id
                     for item in evidence
-                    if item.object_type == "sample" and item.object_id in restricted_sample_hashes
+                    if _object_id_references_sample(item.object_id, restricted_sample_hashes)
                 )
                 if restricted_evidence_refs:
                     restricted_ids = set(restricted_evidence_refs)
@@ -384,6 +384,34 @@ class InvestigationAdvisorTool:
                 context=context,
                 question=question,
             )
+            restricted_finding_refs = _drop_findings_linked_to_restricted_evidence(
+                prompt_data, restricted_evidence_refs
+            )
+            requested_finding_refs = (
+                {str(item) for item in arguments.get("finding_refs", ()) if isinstance(item, str)}
+                if isinstance(arguments.get("finding_refs", ()), (list, tuple))
+                else set()
+            )
+            if restricted_finding_refs and requested_finding_refs.intersection(
+                restricted_finding_refs
+            ):
+                return await self._persist_preflight_failure(
+                    context,
+                    consultation_type=consultation_type,
+                    evidence_refs=tuple(item.id for item in evidence),
+                    output={
+                        "advisor_status": "disclosure_restricted",
+                        "preflight_status": "POLICY_BLOCKED",
+                        "failure_stage": "finding_disclosure_restricted",
+                        "failure_reason": "explicit_sample_restriction",
+                        "disclosure_restricted_finding_refs": list(restricted_finding_refs),
+                        "missing_refs": list(restricted_finding_refs),
+                        "confirmed_non_execution": True,
+                        "bridge_turns_consumed": 0,
+                        "usable": False,
+                    },
+                    error_code="advisor_disclosure_restricted",
+                )
             explicit_observation_refs = list(dict.fromkeys(str(item) for item in evidence_refs))
             if consultation_type == "figure_plan":
                 explicit_observation_refs.extend(
@@ -908,6 +936,8 @@ class InvestigationAdvisorTool:
             provenance["disclosure_restricted_refs"] = [
                 str(item) for item in restricted_evidence_refs
             ]
+        if restricted_finding_refs:
+            provenance["disclosure_restricted_finding_refs"] = list(restricted_finding_refs)
         if consultation_type == "yara_draft":
             provenance["measurement_catalog"] = _advisor_bridge_measurement_catalog(prompt_data)
         reparse_context = _advisor_reparse_context(consultation_type, prompt_data)
@@ -5853,6 +5883,44 @@ def _required_argument_names(tool: Any) -> list[str]:
     if not isinstance(required, (list, tuple)):
         return []
     return [_safe_text(name, 64) for name in required if isinstance(name, str)]
+
+
+def _object_id_references_sample(object_id: object, sample_hashes: set[str]) -> bool:
+    """Match exact sample hashes and sample-prefixed analysis object ids."""
+    if not isinstance(object_id, str):
+        return False
+    return any(
+        object_id == sample_hash or object_id.startswith(f"{sample_hash}:")
+        for sample_hash in sample_hashes
+    )
+
+
+def _drop_findings_linked_to_restricted_evidence(
+    prompt_data: dict[str, Any],
+    restricted_evidence_refs: tuple[UUID, ...],
+) -> tuple[str, ...]:
+    """Remove findings whose observations are disclosure-restricted."""
+    if not restricted_evidence_refs:
+        return ()
+    restricted_ids = {str(item) for item in restricted_evidence_refs}
+    kept: list[Any] = []
+    dropped: list[str] = []
+    for finding in prompt_data.get("findings", ()):
+        if not isinstance(finding, Mapping):
+            continue
+        refs = {
+            str(reference)
+            for reference in finding.get("observation_refs", ())
+            if isinstance(reference, str)
+        }
+        if restricted_ids & refs:
+            identifier = finding.get("finding_id")
+            if isinstance(identifier, str) and identifier:
+                dropped.append(identifier)
+            continue
+        kept.append(finding)
+    prompt_data["findings"] = kept
+    return tuple(dropped)
 
 
 def _sample_policy_allows_external(sample: object) -> bool:
