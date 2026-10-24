@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from copy import deepcopy
+from time import perf_counter
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
@@ -657,7 +658,7 @@ def test_candidate_selection_keeps_more_than_256_records() -> None:
     assert len(_select_candidate_records(candidates)) == 300
 
 
-def test_prompt_and_idempotency_key_are_deterministic_at_prompt_version_four() -> None:
+def test_prompt_and_idempotency_key_are_deterministic_at_prompt_version_five() -> None:
     snapshot = _proposal_snapshot({"report_claims": [{"claim_id": "claim-1", "text": "stable"}]})
     equal_snapshot = _proposal_snapshot(
         {"report_claims": [{"claim_id": "claim-1", "text": "stable"}]}
@@ -671,13 +672,21 @@ def test_prompt_and_idempotency_key_are_deterministic_at_prompt_version_four() -
         snapshot=snapshot,
     )
 
-    assert P10_PROMPT_VERSION == "4"
+    assert P10_PROMPT_VERSION == "5"
     assert first_prompt == second_prompt
     assert first_aliases == second_aliases
     assert key == make_proposal_turn_idempotency_key(
         investigation_id=INVESTIGATION_ID,
         cycle_number=1,
         snapshot=equal_snapshot,
+        prompt_version="5",
+    )
+    # The redaction semantics changed materially in v5: v4 inputs keep their old
+    # identity and are never silently reinterpreted or resubmitted under v5.
+    assert key != make_proposal_turn_idempotency_key(
+        investigation_id=INVESTIGATION_ID,
+        cycle_number=1,
+        snapshot=snapshot,
         prompt_version="4",
     )
     assert key != make_proposal_turn_idempotency_key(
@@ -1123,6 +1132,276 @@ def test_render_p10_prompt_redacts_url_credentials_without_losing_claim_context(
         assert secret not in prompt
     assert "Constat CVE-2025-7777" in prompt
     assert "fin du constat." in prompt
+
+
+def test_render_p10_prompt_redacts_escaped_json_credential_and_preserves_cti_evidence() -> None:
+    cve_marker = "CVE-2025-4242"
+    cti_marker = "CTI_EVIDENCE_MARKER: documented api_key/auth fields in malware config"
+    escaped_credential = r"{\"auth\": \"FIXTURE_ESCAPED_AUTH\"}"
+    escaped_single_credential = r"{\'auth\': \'FIXTURE_ESCAPED_SINGLE_AUTH\'}"
+    escaped_innocent = r"{\"author\": \"Jane\"}"
+    benign_assignment = "author=Jane"
+    signed_url = (
+        "https://example.invalid/download?X-Amz-Credential=FIXTURE_SIGNED_CREDENTIAL"
+        "&X-Amz-Signature=FIXTURE_SIGNED_SIGNATURE&response-content-type=application%2Fzip"
+    )
+    claim = " ".join(
+        (
+            cve_marker,
+            cti_marker,
+            escaped_credential,
+            escaped_single_credential,
+            escaped_innocent,
+            benign_assignment,
+            signed_url,
+        )
+    )
+    context = _normalize_context({"report_claims": [{"claim_id": "claim-escaped", "text": claim}]})
+    snapshot = _proposal_snapshot(context)
+
+    prompt, _ = _render_p10_prompt(snapshot)
+
+    assert "FIXTURE_ESCAPED_AUTH" not in prompt, prompt
+    assert "FIXTURE_ESCAPED_SINGLE_AUTH" not in prompt, prompt
+    assert cve_marker in prompt
+    assert cti_marker in prompt
+    assert escaped_innocent in prompt
+    assert benign_assignment in prompt
+    assert "X-Amz-Credential=[REDACTED]" in prompt
+    assert "X-Amz-Signature=[REDACTED]" in prompt
+    assert "response-content-type=application%2Fzip" in prompt
+
+
+@pytest.mark.parametrize(
+    ("escaped_value", "value_markers"),
+    [
+        ("FIXTURE_WITH SPACE_SUFFIX", ("FIXTURE_WITH", "SPACE_SUFFIX")),
+        (r"FIXTURE_WITH \"INNER\" QUOTED_SUFFIX", ("FIXTURE_WITH", "INNER", "QUOTED_SUFFIX")),
+        (
+            r"FIXTURE_WITH \\\"QUOTED\\\" TAIL_SUFFIX",
+            ("FIXTURE_WITH", "QUOTED", "TAIL_SUFFIX"),
+        ),
+        ("FIXTURE_ESCAPED_AUTH", ("FIXTURE_ESCAPED_AUTH",)),
+    ],
+)
+def test_render_p10_prompt_redacts_complete_escaped_json_scalar(
+    escaped_value: str, value_markers: tuple[str, ...]
+) -> None:
+    serialized_auth = (
+        r"{\"auth\": \"" + escaped_value + r"\", \"adjacent cti\": \"CTI_ADJACENT_PRESERVE\"}"
+    )
+    expected_redaction = r"{\"auth\": \"[REDACTED]\", \"adjacent cti\": \"CTI_ADJACENT_PRESERVE\"}"
+    context = _normalize_context(
+        {"report_claims": [{"claim_id": "claim-scalar", "text": serialized_auth}]}
+    )
+
+    prompt, _ = _render_p10_prompt(_proposal_snapshot(context))
+
+    assert all(marker not in prompt for marker in value_markers), prompt
+    assert expected_redaction in prompt, prompt
+    assert "CTI_ADJACENT_PRESERVE" in prompt
+
+
+def test_render_p10_prompt_preserves_escaped_innocent_author_and_plain_assignment() -> None:
+    cve_marker = "CVE-2025-31337"
+    cti_marker = "CTI_EVIDENCE_MARKER: api_key/auth field names documented in sample config"
+    escaped_author = r"{\"author\": \"Jane Doe\"}"
+    claim = f"{cve_marker} {cti_marker} {escaped_author} auth=FIXTURE_PLAIN_AUTH"
+    context = _normalize_context({"report_claims": [{"claim_id": "claim-innocent", "text": claim}]})
+
+    prompt, _ = _render_p10_prompt(_proposal_snapshot(context))
+
+    assert cve_marker in prompt
+    assert cti_marker in prompt
+    assert escaped_author in prompt
+    assert "FIXTURE_PLAIN_AUTH" not in prompt
+    assert "auth=[REDACTED]" in prompt
+
+
+def test_render_p10_prompt_redacts_marker_prefix_collision_only_when_not_exact() -> None:
+    serialized_auth = (
+        r"{\"auth\": \"[REDACTED]FIXTURE_MARKER_TAIL\", "
+        r"\"adjacent cti\": \"CTI_MARKER_ADJACENT\"}"
+    )
+    already_redacted = r"{\"auth\": \"[REDACTED]\"}"
+    context = _normalize_context(
+        {
+            "report_claims": [
+                {
+                    "claim_id": "claim-marker-collision",
+                    "text": serialized_auth + " " + already_redacted,
+                }
+            ]
+        }
+    )
+
+    prompt, _ = _render_p10_prompt(_proposal_snapshot(context))
+
+    assert "FIXTURE_MARKER_TAIL" not in prompt
+    assert r"{\"auth\": \"[REDACTED]\", \"adjacent cti\": \"CTI_MARKER_ADJACENT\"}" in prompt
+    assert already_redacted in prompt
+
+
+def test_render_p10_prompt_preserves_closing_delimiter_after_trailing_backslash() -> None:
+    inner = json.dumps({"auth": "FIXTURE_TRAILING_SLASH\\"})
+    serialized_auth = json.dumps(inner)[1:-1]
+    expected_redaction = r"{\"auth\": \"[REDACTED]\"}"
+    context = _normalize_context(
+        {"report_claims": [{"claim_id": "claim-trailing-slash", "text": serialized_auth}]}
+    )
+
+    prompt, _ = _render_p10_prompt(_proposal_snapshot(context))
+
+    assert "FIXTURE_TRAILING_SLASH" not in prompt
+    assert expected_redaction in prompt, prompt
+
+
+def test_render_p10_prompt_scans_many_unclosed_escaped_assignments_linearly() -> None:
+    assignment = r"{\"auth\":\"S"
+    repeated = " ".join([assignment] * 1600)
+    tail_secret = "FIXTURE_UNCLOSED_TAIL_SECRET"
+    claim_text = f"{repeated} {tail_secret}"
+    claim_text += "X" * (25_613 - len(claim_text))
+    assert len(claim_text) == 25_613
+    started = perf_counter()
+    context = _normalize_context(
+        {"report_claims": [{"claim_id": "claim-unclosed-many", "text": claim_text}]}
+    )
+    prompt, _ = _render_p10_prompt(_proposal_snapshot(context))
+    elapsed = perf_counter() - started
+
+    assert tail_secret not in prompt
+    assert elapsed < 1.0, f"linear-scan DoS guard exceeded: {elapsed:.3f}s"
+
+
+@pytest.mark.parametrize(
+    ("inner_terminator", "literal_backslashes"),
+    [("}", 0), ("]", 0), ("}", 1), ("]", 1)],
+)
+def test_render_p10_prompt_keeps_internal_escaped_quote_inside_auth_scalar(
+    inner_terminator: str, literal_backslashes: int
+) -> None:
+    inner_quote_prefix = "\\" * literal_backslashes
+    inner_value = f'FIXTURE_PREFIX {inner_quote_prefix}"{inner_terminator} CTI_AFTER_INNER_QUOTE'
+    inner = json.dumps({"auth": inner_value})
+    claim = json.dumps(inner)[1:-1] + " CTI_AFTER_OBJECT"
+    context = _normalize_context(
+        {"report_claims": [{"claim_id": "claim-inner-quote", "text": claim}]}
+    )
+
+    prompt, _ = _render_p10_prompt(_proposal_snapshot(context))
+
+    assert "FIXTURE_PREFIX" not in prompt
+    assert "CTI_AFTER_INNER_QUOTE" not in prompt
+    assert r"{\"auth\": \"[REDACTED]\"}" in prompt
+    assert "CTI_AFTER_OBJECT" in prompt
+
+
+def test_render_p10_prompt_preserves_evidence_after_malformed_adjacent_key() -> None:
+    malformed_tail = r", \"evidence\" CVE-2025-31337: observed persistence."
+    claim = r"prefix {\"auth\":\"FIXTURE_AUTH\"" + malformed_tail
+    context = _normalize_context(
+        {"report_claims": [{"claim_id": "claim-malformed-key", "text": claim}]}
+    )
+
+    prompt, _ = _render_p10_prompt(_proposal_snapshot(context))
+
+    assert "FIXTURE_AUTH" not in prompt
+    assert malformed_tail in prompt
+    assert "CVE-2025-31337" in prompt
+    assert "observed persistence." in prompt
+
+
+@pytest.mark.parametrize("line_break", ["\n", "\r\n"])
+def test_render_p10_prompt_bounds_unclosed_auth_at_line_break_and_preserves_evidence(
+    line_break: str,
+) -> None:
+    evidence = "CVE-2025-31337: observed persistence"
+    claim = r"prefix {\"auth\":\"FIXTURE_AUTH" + line_break + evidence
+    context = _normalize_context(
+        {"report_claims": [{"claim_id": "claim-r4-unclosed-line", "text": claim}]}
+    )
+
+    normalized_claim = context["report_claims"][0]["text"]
+    assert "FIXTURE_AUTH" not in normalized_claim, normalized_claim
+    assert line_break + evidence in normalized_claim, normalized_claim
+
+    prompt, _ = _render_p10_prompt(_proposal_snapshot(context))
+
+    assert "FIXTURE_AUTH" not in prompt, prompt
+    assert evidence in prompt, prompt
+    assert r"prefix {\"auth\":\"[REDACTED]" in prompt, prompt
+    # The renderer encodes raw line breaks for its line-oriented text format;
+    # the canonical normalized context above keeps the original LF/CRLF bytes.
+    assert "\\n" + evidence in prompt, prompt
+    assert "unclosed_sensitive_assignment" not in prompt, prompt
+
+
+def test_render_p10_prompt_marks_unbounded_fail_closed_omission() -> None:
+    claim = r"prefix {\"auth\":\"FIXTURE_AUTH_WITHOUT_ANY_BOUNDARY"
+    context = _normalize_context(
+        {"report_claims": [{"claim_id": "claim-r4-unbounded", "text": claim}]}
+    )
+
+    prompt, _ = _render_p10_prompt(_proposal_snapshot(context))
+
+    assert "FIXTURE_AUTH_WITHOUT_ANY_BOUNDARY" not in prompt, prompt
+    assert "[REDACTED](unclosed_sensitive_assignment)" in prompt, prompt
+
+
+def test_render_p10_prompt_bounds_unclosed_value_at_object_terminator() -> None:
+    claim = r"prefix {\"auth\":\"FIXTURE_UNCLOSED_OBJECT} CTI_AFTER_TERMINATOR"
+    context = _normalize_context(
+        {"report_claims": [{"claim_id": "claim-bounded-unclosed", "text": claim}]}
+    )
+
+    prompt, _ = _render_p10_prompt(_proposal_snapshot(context))
+
+    assert "FIXTURE_UNCLOSED_OBJECT" not in prompt
+    assert r"} CTI_AFTER_TERMINATOR" in prompt
+
+
+@pytest.mark.parametrize(
+    "evidence_tail",
+    [
+        r"} CVE-2025-31337, \"evidence\": \"CTI_EVIDENCE\"}",
+        r", \"evidence\": \"CTI_EVIDENCE\"}",
+    ],
+)
+def test_render_p10_prompt_bounds_unclosed_auth_before_later_evidence_quote(
+    evidence_tail: str,
+) -> None:
+    claim = r"prefix {\"auth\":\"FIXTURE_AUTH" + evidence_tail
+    context = _normalize_context(
+        {"report_claims": [{"claim_id": "claim-unclosed-before-evidence", "text": claim}]}
+    )
+
+    prompt, _ = _render_p10_prompt(_proposal_snapshot(context))
+
+    assert "FIXTURE_AUTH" not in prompt
+    assert evidence_tail in prompt
+
+
+@pytest.mark.parametrize("trailing_backslashes", range(8))
+def test_render_p10_prompt_preserves_delimiters_for_trailing_backslash_counts(
+    trailing_backslashes: int,
+) -> None:
+    secret = "FIXTURE_TRAILING_BACKSLASH" + "\\" * trailing_backslashes
+    inner = json.dumps({"auth": secret})
+    claim = json.dumps(inner)[1:-1] + " CTI_AFTER_OBJECT"
+    close_quote = claim.rfind('"')
+    slash_run_start = close_quote
+    while slash_run_start and claim[slash_run_start - 1] == "\\":
+        slash_run_start -= 1
+    assert close_quote - slash_run_start == 4 * trailing_backslashes + 1
+    context = _normalize_context(
+        {"report_claims": [{"claim_id": "claim-backslash-count", "text": claim}]}
+    )
+
+    prompt, _ = _render_p10_prompt(_proposal_snapshot(context))
+
+    assert "FIXTURE_TRAILING_BACKSLASH" not in prompt
+    assert r"{\"auth\": \"[REDACTED]\"} CTI_AFTER_OBJECT" in prompt
 
 
 @pytest.mark.asyncio
