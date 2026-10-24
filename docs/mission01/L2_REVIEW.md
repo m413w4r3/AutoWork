@@ -124,3 +124,34 @@ dépôt réellement borné.
 PostgreSQL réel et performance : **UNKNOWN**. Coût : **UNKNOWN**.
 Réparation `M01-L2-R2` lancée.
 
+## Troisième revue après R2 — PASS_WITH_CHANGES
+
+**Objet :** `6143099b8193fd01d56e59185cd2080aa944c897` (delta
+`4f2a941..6143099`).
+**Revue :** agent `45b350c4-d1fe-41d2-af31-03df58f3e1f1`, Luna xhigh.
+**Oracle rejoué :** 326 passed.
+
+Les deux MEDIUM R2 sont fermés : le vérificateur recalcule `source_ref` et
+lie `page_sha256`; les dépôts mémoire déclarent `source_bounded=False` avec
+raison, le test compte leurs appels à `list_for_investigation` et un faux
+dépôt réellement borné propage `True`; l'ancien payload page v1 est parsé.
+Cinq fichiers, aucun interdit, CAS et adaptateurs SQL intacts, protections
+inchangées.
+
+### MEDIUM résiduel — vérification absente aux constructeurs
+
+`make_keyset_page` (`context_pagination.py:578`) et
+`_source_manifest_entry` (`research_context_builder.py:1732`) construisent
+page et manifeste sans appeler le vérificateur. Le chemin opérateur
+(`operator_tool_invocation.py:242`) passe `source_ref` comme valeur attendue
+: il compare deux copies au lieu de recalculer la référence. Une divergence
+future entre champs construits pourrait être retournée sans refus. Les tests
+de falsification exercent le vérificateur isolément, pas son application aux
+constructeurs.
+
+### Résiduels
+
+PostgreSQL réel et performance : **UNKNOWN**. Coût : **UNKNOWN**.
+Réparation `M01-L2-R3` lancée (dernière tentative autorisée).
+
+
