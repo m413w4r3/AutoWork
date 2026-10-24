@@ -251,11 +251,11 @@ def decode_offset_cursor(
     cursor: str, *, section: str, investigation_id: UUID, context_sha256: str
 ) -> dict[str, Any]:
     payload = _decode_cursor(cursor)
+    context_mismatch = payload.get("context_sha256") != context_sha256
     if (
         payload.get("kind") != "offset"
         or payload.get("section") != section
         or payload.get("investigation_id") != str(investigation_id)
-        or payload.get("context_sha256") != context_sha256
         or isinstance(payload.get("offset"), bool)
         or not isinstance(payload.get("offset"), int)
         or payload["offset"] < 0
@@ -273,6 +273,8 @@ def decode_offset_cursor(
         }
     ):
         raise ValueError("Context offset cursor is invalid")
+    if context_mismatch:
+        raise StaleContextCursorError("Context offset cursor is stale")
     return payload
 
 
