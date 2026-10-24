@@ -32,7 +32,9 @@ Cette matrice est mise à jour à chaque lot. Un test non exécuté est marqué
 | Frontend complet | `cd frontend && pnpm lint` | **PASS** (ESLint + Prettier) |
 | Import du serveur navigateur | parse AST + import des constantes publiques | **PASS** |
 | Smoke Typst inline (fixture canonique corrigée) | compilation Typst 0.15.1 + polices verrouillées + `pdftotext` | **PASS**, PDF non vide |
-| mypy repo-wide | `cd backend && uv run --python 3.12 mypy src tests` | **60 erreurs restantes au départ ; en cours** |
+| mypy repo-wide | `cd backend && uv run --python 3.12 mypy src tests` | **60 erreurs au départ → 35 après CI-0a, toutes dans les 5 fichiers L4 (attendu : 0 après L4)** |
+| CI-0a tests ciblés | `pytest tests/test_model_gateway.py tests/test_investigation_vt_tools.py tests/test_advisor_consultation.py -q` | **104 passed** (vérifié parent) |
+| CI-0a integration audit export | collecte seulement | **NON EXÉCUTÉ en entier** (à rejouer sur HEAD intégrateur) |
 | Workflow FAST (W13-D5, W13-D7, W14-A, W14-E) | workflow emulator + PostgreSQL jetable | **en cours (CI-0b)** |
 | Workflow FULL (W15, W18, pilote) | workflow emulator + PostgreSQL/Typst/D2 jetables | **en cours (CI-0c)** |
 

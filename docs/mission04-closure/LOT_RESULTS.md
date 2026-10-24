@@ -8,7 +8,7 @@ GREEN réel et sa revue indépendante.
 | Lot | Owner | Branche / SHA | État | RED/GREEN réellement exécuté | Reviewer | Risque / dépendance |
 |---|---|---|---|---|---|---|
 | CI-0 petits correctifs | parent | `mission04/closure-after-main` / `ccff3444` | **CORRIGÉ, à vérifier sur HEAD intégrateur** | `pnpm lint` PASS ; import navigateur PASS ; compilation Typst + `pdftotext` PASS | gate parent | dépend du HEAD final |
-| CI-0a mypy mécanique | Luna high `1b63a297` | `mission04/ci0-mechanical` | **EN COURS** | mypy repo-wide 60 erreurs au départ | parent | ne touche pas les fichiers L4 |
+| CI-0a mypy mécanique | Luna high `1b63a297` | `mission04/ci0-mechanical` / `664674a4` (intégré `a3b2860f`) | **VÉRIFIÉ PARENT** | mypy changé : 8 fichiers `Success` ; repo-wide **35 erreurs restantes, toutes L4** ; 104 tests ciblés passed ; Ruff/format/diff-check verts | parent | intégration test PG non exécutée par le worker, à rejouer sur HEAD |
 | CI-0b workflow FAST | Luna xhigh `4a40947f` | `mission04/ci0-workflow` | **EN COURS** | W13-D5 et scénario quota verts au premier rerun ; 2 nœuds restants | parent | sémantique des statuts |
 | CI-0c workflow FULL | Luna xhigh `dcbc7694` | `mission04/ci0-protocol` | **EN COURS** | W15 reproduit : 2 vérifications intentionnelles (avant/après révision) | parent | W18/FULL à diagnostiquer |
 | L1-R5 + WIRE(P10) | parent | `mission04/closure-after-main` / `f92d848d` | **IMPLÉMENTÉ, revue R5 en attente** | 97 P10 passed ; 111 P10/composition/signature passed ; sonde R5 41/41 PASS ; linéarité 0,0049/0,0107 s | Luna xhigh à lancer | secret/CTI, P10 v5 |
