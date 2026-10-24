@@ -3793,9 +3793,7 @@ async def test_context_build_pages_large_sources_with_fixed_memory_budget_and_ma
     for section in ("evidence_index", "findings", "tool_coverage"):
         entry = manifest[section]
         assert entry.source_bounded is False
-        assert entry.unbounded_reason == (
-            "In-memory repository materializes the full collection"
-        )
+        assert entry.unbounded_reason == ("In-memory repository materializes the full collection")
         assert entry.total == MAX_CONTEXT_SOURCE_PAGE + 1
         assert entry.selected + entry.omitted == entry.total
         assert sum(entry.omission_reasons.values()) == entry.omitted

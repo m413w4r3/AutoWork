@@ -216,9 +216,9 @@ class SqlAlchemyToolInvocationRepository:
                 )
             )
         total = await self._session.scalar(
-            select(func.count()).select_from(ToolInvocationRow).where(
-                ToolInvocationRow.investigation_id == investigation_id
-            )
+            select(func.count())
+            .select_from(ToolInvocationRow)
+            .where(ToolInvocationRow.investigation_id == investigation_id)
         )
         order = (
             (ToolInvocationRow.created_at.desc(), ToolInvocationRow.id.desc())
@@ -405,9 +405,9 @@ class SqlAlchemyEvidenceObservationRepository:
                 )
             )
         total = await self._session.scalar(
-            select(func.count()).select_from(EvidenceObservationRow).where(
-                EvidenceObservationRow.investigation_id == investigation_id
-            )
+            select(func.count())
+            .select_from(EvidenceObservationRow)
+            .where(EvidenceObservationRow.investigation_id == investigation_id)
         )
         order = (
             (EvidenceObservationRow.observed_at.desc(), EvidenceObservationRow.id.desc())
@@ -564,14 +564,18 @@ class SqlAlchemyFindingRepository:
         statement = select(InvestigationFindingVersionRow).where(
             InvestigationFindingVersionRow.investigation_id == investigation_id
         )
-        count_statement = select(func.count()).select_from(InvestigationFindingVersionRow).where(
-            InvestigationFindingVersionRow.investigation_id == investigation_id
+        count_statement = (
+            select(func.count())
+            .select_from(InvestigationFindingVersionRow)
+            .where(InvestigationFindingVersionRow.investigation_id == investigation_id)
         )
         if latest_only:
             superseding_row = aliased(InvestigationFindingVersionRow)
-            superseding = select(superseding_row.id).where(
-                superseding_row.supersedes_id == InvestigationFindingVersionRow.id
-            ).exists()
+            superseding = (
+                select(superseding_row.id)
+                .where(superseding_row.supersedes_id == InvestigationFindingVersionRow.id)
+                .exists()
+            )
             statement = statement.where(~superseding)
             count_statement = count_statement.where(~superseding)
         if decoded is not None:

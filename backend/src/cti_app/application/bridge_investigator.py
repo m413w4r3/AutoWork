@@ -289,6 +289,7 @@ async def submit_bridge_consultation_once(
     transport_timeout: float | None = timeout_seconds
     if timeout_seconds is not None and deadline is None:
         deadline = operation_clock() + timeout_seconds
+
     async def wait_for_pacing() -> bool:
         if deadline is None:
             return await pacer.wait_for_next_submission()
@@ -328,9 +329,7 @@ async def submit_bridge_consultation_once(
         await wait_for_pacing()
         transport_timeout = timeout_seconds
 
-    async def submit(
-        attempt: int, call_timeout_seconds: float | None
-    ) -> TurnSubmission | None:
+    async def submit(attempt: int, call_timeout_seconds: float | None) -> TurnSubmission | None:
         arguments = dict(
             investigation_id=investigation_id,
             subject_id=subject_id,
@@ -429,9 +428,7 @@ async def submit_bridge_consultation_once(
         ):
             retry_delay_maximum = 0.0
         retry_delay_maximum = max(0.0, float(retry_delay_maximum))
-        retry_after_exceeds_maximum = (
-            retry_after is not None and retry_after > retry_delay_maximum
-        )
+        retry_after_exceeds_maximum = retry_after is not None and retry_after > retry_delay_maximum
         retry_delay = (
             min(retry_after, retry_delay_maximum)
             if retry_after is not None
@@ -455,10 +452,7 @@ async def submit_bridge_consultation_once(
         or not is_rate_limited
         or submission.submission_state is not BridgeSubmissionState.PRE_SUBMISSION
     ):
-        if (
-            submission.status is TurnSubmissionStatus.UNAVAILABLE
-            and is_rate_limited
-        ):
+        if submission.status is TurnSubmissionStatus.UNAVAILABLE and is_rate_limited:
             return TurnSubmission(
                 TurnSubmissionStatus.NEEDS_REVIEW,
                 idempotency_key=submission.idempotency_key or key,
@@ -469,8 +463,7 @@ async def submit_bridge_consultation_once(
                 ),
                 error_code=submission.error_code,
                 submission_state=(
-                    submission.submission_state
-                    or BridgeSubmissionState.EXTERNAL_STATE_UNKNOWN
+                    submission.submission_state or BridgeSubmissionState.EXTERNAL_STATE_UNKNOWN
                 ),
                 retryable=False,
                 retry_after_seconds=submission.retry_after_seconds,
@@ -479,9 +472,7 @@ async def submit_bridge_consultation_once(
             )
         return submission
 
-    can_retry = submission.retryable and callable(
-        getattr(transport, "submit_with_attempt", None)
-    )
+    can_retry = submission.retryable and callable(getattr(transport, "submit_with_attempt", None))
     if retry_after_exceeds_maximum or not can_retry or not cooldown_accepted:
         return submission
     if deadline is not None:
@@ -1325,9 +1316,7 @@ class BridgeInvestigator:
                         pre_submission_attempt,
                     )
                 if is_rate_limited:
-                    shared_cooldown = min(
-                        raw_retry_delay, MAX_SHARED_RATE_LIMIT_COOLDOWN_SECONDS
-                    )
+                    shared_cooldown = min(raw_retry_delay, MAX_SHARED_RATE_LIMIT_COOLDOWN_SECONDS)
                     await self._pacer.defer_submissions(shared_cooldown)
                 may_retry_rate_limit = (
                     is_rate_limited
@@ -1335,8 +1324,7 @@ class BridgeInvestigator:
                     and raw_retry_delay <= MAX_SHARED_RATE_LIMIT_COOLDOWN_SECONDS
                 )
                 may_retry_other_pre_submission = (
-                    not is_rate_limited
-                    and pre_submission_attempt < MAX_PRE_SUBMISSION_ATTEMPTS - 1
+                    not is_rate_limited and pre_submission_attempt < MAX_PRE_SUBMISSION_ATTEMPTS - 1
                 )
                 if (
                     confirmed_not_submitted
