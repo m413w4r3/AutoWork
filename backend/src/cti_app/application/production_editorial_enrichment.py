@@ -4176,25 +4176,6 @@ class EditorialEnrichmentValidationError(ValueError):
         self.code = code
 
 
-def _source_figure_candidates(
-    inventory: SourceFigureInventoryResult,
-) -> tuple[SourceFigureCandidateV1, ...]:
-    return tuple(
-        SourceFigureCandidateV1(
-            key=f"source_figure_{figure.figure_id.hex}",
-            source_document_id=figure.source_document_id,
-            source_url=figure.source,
-            caption=figure.locator.figure_label or "Archived source figure",
-            provenance=figure.provenance,
-            locator=figure.locator,
-            inclusion_status=SourceFigureInclusionStatus.PROPOSED,
-            placement=EnrichmentPlacementV1(EnrichmentPlacementKind.END),
-            resolved_figure=figure,
-        )
-        for figure in inventory.accepted
-    )
-
-
 def build_editorial_figure_catalog(
     extraction: ProductionExtractionV1,
     inventory: SourceFigureInventoryResult,

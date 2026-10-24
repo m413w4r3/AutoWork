@@ -50,9 +50,7 @@ from cti_app.application.investigation_tools import (
     ToolResult,
 )
 from cti_app.application.operator_context_summary import (
-    InvestigationOperatorContextSummaryV1,
     OperatorContextItemPageV1,
-    build_operator_context_summary,
 )
 from cti_app.application.persistence import AnalystInvestigationRepository
 from cti_app.application.research_context_builder import (
@@ -434,39 +432,6 @@ class OperatorToolInvocationService:
             current_opinion=context.current_opinion,
             context=context,
         )
-
-    async def get_context_summary(
-        self,
-        *,
-        expected_version: int | None = None,
-        expected_sha256: str | None = None,
-        since_version: int | None = None,
-    ) -> InvestigationOperatorContextSummaryV1:
-        state = await self._states.get(self._investigation_id)
-        if state is None:
-            raise OperatorToolInvocationError("investigation_not_started", 409)
-        self._require_operator_mode(state.execution_mode)
-        if expected_version is not None and state.version != expected_version:
-            raise OperatorToolInvocationError("stale_working_state", 409)
-        if expected_sha256 is not None and state.sha256 != expected_sha256:
-            raise OperatorToolInvocationError("stale_working_state", 409)
-        if since_version is not None and since_version > state.version:
-            raise OperatorToolInvocationError("operator_context_delta_base_invalid", 422)
-        operator_context = await self.get_context(
-            expected_version=state.version,
-            expected_sha256=state.sha256,
-        )
-        try:
-            return build_operator_context_summary(
-                operator_context.context,
-                investigation_id=self._investigation_id,
-                working_state_version=state.version,
-                working_state_sha256=state.sha256,
-                state=state,
-                since_version=since_version,
-            )
-        except ValueError as exc:
-            raise OperatorToolInvocationError("operator_context_summary_invalid", 503) from exc
 
     async def get_context_section(
         self,
