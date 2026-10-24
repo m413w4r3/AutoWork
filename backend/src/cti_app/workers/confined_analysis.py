@@ -2152,7 +2152,7 @@ def build_analysis_worker_probe_payload(settings: Settings) -> dict[str, Any]:
         "mwcp": _distribution_version("mwcp"),
         "yara": _distribution_version("yara-python"),
     }
-    registered_mwcp_parsers = _registered_mwcp_parsers()
+    registered_mwcp_parsers = _registered_mwcp_parsers(os.environ.get("ANALYSIS_MWCP_PARSER_DIR"))
     for parser_id, parser_version in sorted(settings.mwcp_parser_versions.items()):
         if (
             re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", parser_id)
@@ -2186,12 +2186,11 @@ def build_analysis_worker_probe_payload(settings: Settings) -> dict[str, Any]:
 
 
 @functools.cache
-def _registered_mwcp_parsers() -> frozenset[str]:
+def _registered_mwcp_parsers(parser_directory: str | None) -> frozenset[str]:
     executable = shutil.which("mwcp")
     if executable is None:
         return frozenset()
     command = [executable]
-    parser_directory = os.environ.get("ANALYSIS_MWCP_PARSER_DIR")
     if parser_directory:
         command.extend(("--parser-dir", parser_directory))
     command.extend(("list", "--json"))

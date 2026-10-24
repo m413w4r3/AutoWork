@@ -1035,6 +1035,24 @@ async def test_tool_registry_dispatch_runs_capa_and_strings_through_worker(
     )
 
 
+def test_mwcp_parser_probe_cache_is_keyed_by_parser_directory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture_directory = (Path(__file__).parent / "fixtures").resolve()
+    settings = Settings(
+        _env_file=None,
+        mwcp_parser_versions={"AutoworkSafeFixture": "fixture-v1"},
+    )
+
+    monkeypatch.delenv("ANALYSIS_MWCP_PARSER_DIR", raising=False)
+    without_fixture = build_analysis_worker_probe_payload(settings)
+    assert "mwcp_parser:AutoworkSafeFixture" not in without_fixture["versions"]
+
+    monkeypatch.setenv("ANALYSIS_MWCP_PARSER_DIR", str(fixture_directory))
+    with_fixture = build_analysis_worker_probe_payload(settings)
+    assert with_fixture["versions"]["mwcp_parser:AutoworkSafeFixture"] == "fixture-v1"
+
+
 @pytest.mark.asyncio
 async def test_mwcp_allowlisted_fixture_parser_is_invoked_in_worker(
     monkeypatch: pytest.MonkeyPatch,
