@@ -9,15 +9,23 @@ from uuid import UUID, uuid4
 import pytest
 
 from cti_app.application.invariant_proposals import (
+    P10_PROMPT_VERSION,
     ProposalConversationService,
     ProposalOutputValidationError,
+    _bounded_pattern,
+    _normalize_context,
     _parse_proposal_response_details,
+    _redact_text,
+    _redact_url,
+    _render_p10_prompt,
+    _select_candidate_records,
+    make_proposal_turn_idempotency_key,
 )
 from cti_app.application.invariants import InvariantProposalResult
 from cti_app.application.model_conversations import ConversationPolicyError
 from cti_app.domain.classification import TLP
 from cti_app.domain.goodware_index import GoodwareMeasurementError
-from cti_app.domain.invariant_proposals import ProposalOperator
+from cti_app.domain.invariant_proposals import ProposalInputSnapshot, ProposalOperator
 from cti_app.domain.invariants import (
     AnalystManualProvenance,
     InvariantCategory,
@@ -39,7 +47,13 @@ BASELINE_ID = UUID("33333333-3333-3333-3333-333333333333")
 NOW = "2026-08-27T12:00:00+00:00"
 
 
-def _sample(sample_id: UUID, *, external: bool = True) -> SimpleNamespace:
+def _sample(
+    sample_id: UUID,
+    *,
+    external: bool = True,
+    tlp: TLP = TLP.GREEN,
+    do_not_submit: bool = False,
+) -> SimpleNamespace:
     return SimpleNamespace(
         id=sample_id,
         blob_id=uuid4(),
@@ -47,8 +61,8 @@ def _sample(sample_id: UUID, *, external: bool = True) -> SimpleNamespace:
         origin="fixture",
         origin_kind="source_seed",
         state="validated",
-        tlp=TLP.GREEN,
-        do_not_submit=False,
+        tlp=tlp,
+        do_not_submit=do_not_submit,
         external_llm_allowed=external,
     )
 
@@ -394,6 +408,46 @@ def _service(
     return service, state, conversation, registry
 
 
+def _proposal_snapshot(context: dict[str, object]) -> ProposalInputSnapshot:
+    return ProposalInputSnapshot(
+        input_pack_sha256="a" * 64,
+        corpus_snapshot_sha256="b" * 64,
+        feature_pack_sha256="c" * 64,
+        code_feature_sha256="d" * 64,
+        capability_set_sha256="e" * 64,
+        goodware_baseline_id=BASELINE_ID,
+        context=context,
+    )
+
+
+def _prompt_snapshot_for_size(target_bytes: int) -> ProposalInputSnapshot:
+    ref = "sample-feature-volume-ref"
+    claim_prefix = "PROMPT_VOLUME_SENTINEL_BEGIN_"
+    claim_suffix = "_PROMPT_VOLUME_SENTINEL_END"
+    context: dict[str, object] = {
+        "provenances": [
+            {
+                "provenance_ref": ref,
+                "kind": "sample_feature",
+                "offsets": [1],
+                "addresses": ["0x1"],
+            }
+        ],
+        "static_features": [{"pattern": "feature-volume-sentinel", "provenance_refs": [ref]}],
+        "report_claims": [{"claim_id": "volume-claim", "text": claim_prefix + claim_suffix}],
+    }
+    base_prompt, _ = _render_p10_prompt(_proposal_snapshot(context))
+    padding_size = target_bytes - len(base_prompt.encode("utf-8"))
+    assert padding_size >= 0
+    context["report_claims"] = [
+        {
+            "claim_id": "volume-claim",
+            "text": claim_prefix + ("x" * padding_size) + claim_suffix,
+        }
+    ]
+    return _proposal_snapshot(context)
+
+
 @pytest.mark.asyncio
 async def test_p10_batches_goodware_descriptors_once() -> None:
     sample = _sample(UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"))
@@ -487,9 +541,147 @@ async def test_all_six_immutable_references_are_in_canonical_input() -> None:
     assert all("BEGIN_P10_FACTS" in prompt for prompt in conversation.prompts)
     assert all("do not return JSON" in prompt for prompt in conversation.prompts)
     assert all("BEGIN_P10_SNAPSHOT_DATA" not in prompt for prompt in conversation.prompts)
-    assert len(conversation.prompts[0].encode("utf-8")) <= 96_000
     assert '"snapshot_references":' not in conversation.prompts[0]
     assert str(INVESTIGATION_ID) not in conversation.prompts[0]
+
+
+@pytest.mark.parametrize(
+    "target_bytes",
+    [95_999, 96_000, 96_001, 199_999, 200_000, 200_001, 3 * 1024 * 1024 + 17],
+)
+def test_render_p10_prompt_preserves_volume_without_size_ceiling(target_bytes: int) -> None:
+    snapshot = _prompt_snapshot_for_size(target_bytes)
+
+    prompt, aliases = _render_p10_prompt(snapshot)
+
+    assert len(prompt.encode("utf-8")) == target_bytes
+    full_sentinel = snapshot.context["report_claims"][0]["text"]
+    assert full_sentinel in prompt
+    assert "PROMPT_VOLUME_SENTINEL_BEGIN_" in prompt
+    assert "_PROMPT_VOLUME_SENTINEL_END" in prompt
+    assert aliases == {"E1": "sample-feature-volume-ref"}
+    assert "[E1] sample feature — offset 0x1, address 0x1" in prompt
+    assert "pattern=feature-volume-sentinel; evidence=[E1]" in prompt
+
+
+def test_render_p10_prompt_preserves_long_facts_claims_provenances_offsets_and_addresses() -> None:
+    provenance_count = 260
+    refs = [f"sample-feature-ref-{index:03}" for index in range(provenance_count)]
+    offsets = list(range(300))
+    addresses = [f"0x{index:08x}" for index in range(300)]
+    provenances = [
+        {
+            "provenance_ref": ref,
+            "kind": "sample_feature",
+            "offsets": offsets if index == 0 else [index],
+            "addresses": addresses if index == 0 else [f"0x{index:08x}"],
+        }
+        for index, ref in enumerate(refs)
+    ]
+    long_fact = "LONG_FACT_" + ("f" * 2_050) + "_LONG_FACT_TAIL"
+    claims = [
+        {
+            "claim_id": f"claim-{index:03}",
+            "text": long_fact if index == 0 else f"claim fact {index:03}",
+        }
+        for index in range(provenance_count)
+    ]
+    claims[-1]["text"] = "CLAIM_LIST_FINAL_SENTINEL"
+    snapshot = _proposal_snapshot(
+        {
+            "provenances": provenances,
+            "static_features": [
+                {
+                    "pattern": "large-provenance-feature",
+                    "provenance_refs": refs,
+                    "offsets": offsets,
+                    "addresses": addresses,
+                }
+            ],
+            "report_claims": claims,
+        }
+    )
+
+    prompt, aliases = _render_p10_prompt(snapshot)
+
+    assert len(aliases) == provenance_count
+    assert aliases["E1"] == refs[0]
+    assert aliases[f"E{provenance_count}"] == refs[-1]
+    assert "evidence=[E1]" in prompt and f"[E{provenance_count}]" in prompt
+    assert long_fact in prompt
+    assert "CLAIM_LIST_FINAL_SENTINEL" in prompt
+    assert all(f"claim id=claim-{index:03}" in prompt for index in range(provenance_count))
+    assert all(f"0x{offset:x}" in prompt for offset in offsets)
+    assert all(address in prompt for address in addresses)
+
+
+def test_context_normalization_preserves_large_values_and_hex_encodes_bytes() -> None:
+    long_fact = "fact-" + ("x" * 2_050) + "-full-tail"
+    large_text = "L" * 200_001
+    context = _normalize_context(
+        {
+            "items": list(range(300)),
+            "mapping": {f"key-{index:03}": index for index in range(300)},
+            "fact": long_fact,
+            "large_text": large_text,
+            "raw": b"\x00\xff",
+            "secret": "api_key=fixture-secret-value",
+            "nested": {"a": {"b": {"c": {"d": {"e": {"f": {"g": {"h": {"i": "deep"}}}}}}}}},
+        }
+    )
+
+    assert len(context["items"]) == 300
+    assert len(context["mapping"]) == 300
+    assert context["fact"] == long_fact
+    assert context["large_text"] == large_text
+    assert context["raw"] == "00ff"
+    assert context["secret"] == "[REDACTED]"
+    assert context["nested"]["a"]["b"]["c"]["d"]["e"]["f"]["g"]["h"] == "[DEPTH_LIMIT]"
+    assert _bounded_pattern("P" * 4_097) == "P" * 4_097
+
+
+def test_candidate_selection_keeps_more_than_256_records() -> None:
+    candidates = [
+        {
+            "source_kind": "static_features",
+            "pattern": f"candidate-{index:03}",
+            "persisted_reference": {},
+        }
+        for index in range(300)
+    ]
+
+    assert len(_select_candidate_records(candidates)) == 300
+
+
+def test_prompt_and_idempotency_key_are_deterministic_at_prompt_version_four() -> None:
+    snapshot = _proposal_snapshot({"report_claims": [{"claim_id": "claim-1", "text": "stable"}]})
+    equal_snapshot = _proposal_snapshot(
+        {"report_claims": [{"claim_id": "claim-1", "text": "stable"}]}
+    )
+
+    first_prompt, first_aliases = _render_p10_prompt(snapshot)
+    second_prompt, second_aliases = _render_p10_prompt(snapshot)
+    key = make_proposal_turn_idempotency_key(
+        investigation_id=INVESTIGATION_ID,
+        cycle_number=1,
+        snapshot=snapshot,
+    )
+
+    assert P10_PROMPT_VERSION == "4"
+    assert first_prompt == second_prompt
+    assert first_aliases == second_aliases
+    assert key == make_proposal_turn_idempotency_key(
+        investigation_id=INVESTIGATION_ID,
+        cycle_number=1,
+        snapshot=equal_snapshot,
+        prompt_version="4",
+    )
+    assert key != make_proposal_turn_idempotency_key(
+        investigation_id=INVESTIGATION_ID,
+        cycle_number=1,
+        snapshot=snapshot,
+        prompt_version="3",
+    )
 
 
 @pytest.mark.asyncio
@@ -777,6 +969,156 @@ async def test_external_forbidden_policy_never_reaches_external_call() -> None:
     assert conversation.external_calls == 0
     assert conversation.local_calls == 1
     assert conversation.external_allowed == [False]
+
+
+@pytest.mark.asyncio
+async def test_do_not_submit_never_reaches_external_p10_call() -> None:
+    state = _State(samples=[_sample(uuid4(), external=True, do_not_submit=True)])
+    service, _, conversation, _ = _service(state)
+    await service.propose(investigation_id=INVESTIGATION_ID)
+    assert conversation.external_calls == 0
+    assert conversation.local_calls == 1
+    assert conversation.external_allowed == [False]
+
+
+@pytest.mark.asyncio
+async def test_tlp_red_never_reaches_external_p10_call() -> None:
+    state = _State(samples=[_sample(uuid4(), external=True, tlp=TLP.RED)])
+    service, _, conversation, _ = _service(state)
+    await service.propose(investigation_id=INVESTIGATION_ID)
+    assert conversation.external_calls == 0
+    assert conversation.local_calls == 1
+    assert conversation.external_allowed == [False]
+
+
+def test_redact_url_keeps_adjacent_evidence_and_redacts_credentials() -> None:
+    signed = (
+        "CVE-2025-1234 famille Blinder https://example.invalid/file"
+        "?sig=SECRET_SIGNATURE&foo=bar suite du constat"
+    )
+    redacted = _redact_url(signed)
+    assert "SECRET_SIGNATURE" not in redacted
+    assert "?sig=[REDACTED]&foo=bar" in redacted
+    assert "CVE-2025-1234" in redacted
+    assert "famille Blinder" in redacted
+    assert "suite du constat" in redacted
+    assert (
+        _redact_url("https://user:secret@example.invalid/path")
+        == "https://[REDACTED]@example.invalid/path"
+    )
+    assert (
+        _redact_url("https://example.invalid/path?auth=FIXTURE_AUTH_TOKEN_123")
+        == "https://example.invalid/path?auth=[REDACTED]"
+    )
+    assert _redact_url("https://example.invalid/path?q=test") == (
+        "https://example.invalid/path?q=test"
+    )
+    assert (
+        _redact_url("https://example.invalid/path?client_secret=FIXTURE_CLIENT_SECRET&q=test")
+        == "https://example.invalid/path?client_secret=[REDACTED]&q=test"
+    )
+    signed_headers = _redact_url(
+        "https://example.invalid/file?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+        "&X-Amz-Credential=FIXTURE_CREDENTIAL&X-Amz-Signature=SECRET_SIGNATURE"
+    )
+    assert "X-Amz-Algorithm=AWS4-HMAC-SHA256" in signed_headers
+    assert "FIXTURE_CREDENTIAL" not in signed_headers
+    assert "SECRET_SIGNATURE" not in signed_headers
+    assert (
+        _redact_url("https://example.invalid/path?%61uth=SECRET")
+        == "https://example.invalid/path?%61uth=[REDACTED]"
+    )
+    assert (
+        _redact_url("https://token@example.invalid/path")
+        == "https://[REDACTED]@example.invalid/path"
+    )
+    assert (
+        _redact_url("https://example.invalid/path#id_token=SECRET")
+        == "https://example.invalid/path#id_token=[REDACTED]"
+    )
+    assert (
+        _redact_url("example.invalid/file?sig=SECRET&q=test")
+        == "example.invalid/file?sig=[REDACTED]&q=test"
+    )
+
+
+def test_redact_text_redacts_credentials_without_erasing_surrounding_claims() -> None:
+    value = (
+        "Constat auth=FIXTURE_AUTH_123 authorization: Basic ZmFrZQ== "
+        "credential=FIXTURE_CREDENTIAL client_secret=FIXTURE_CLIENT_SECRET "
+        "auth_token=FIXTURE_AUTH_TOKEN id_token=FIXTURE_ID_TOKEN "
+        '{"auth": "FIXTURE_JSON_AUTH", "token_count": 5} '
+        "token_count=5 author=Jane fin du constat."
+    )
+
+    redacted = _redact_text(value)
+
+    for secret in (
+        "FIXTURE_AUTH_123",
+        "ZmFrZQ==",
+        "FIXTURE_CREDENTIAL",
+        "FIXTURE_CLIENT_SECRET",
+        "FIXTURE_AUTH_TOKEN",
+        "FIXTURE_ID_TOKEN",
+        "FIXTURE_JSON_AUTH",
+    ):
+        assert secret not in redacted
+    assert "token_count=5" in redacted
+    assert '"token_count": 5' in redacted
+    assert "author=Jane" in redacted
+    assert "Constat" in redacted
+    assert "fin du constat." in redacted
+
+
+def test_normalize_context_redacts_structured_credentials() -> None:
+    context = _normalize_context(
+        {
+            "auth": "FIXTURE_AUTH",
+            "auth_token": "FIXTURE_AUTH_TOKEN",
+            "id_token": "FIXTURE_ID_TOKEN",
+            "client_secret": "FIXTURE_CLIENT_SECRET",
+            "token_count": 5,
+            "author": "Jane",
+            "nested": {"access_token": "FIXTURE_ACCESS_TOKEN", "algorithm": "AWS4"},
+        }
+    )
+
+    for key in ("auth", "auth_token", "id_token", "client_secret"):
+        assert context[key] == "[REDACTED]"
+    assert context["token_count"] == 5
+    assert context["author"] == "Jane"
+    assert context["nested"]["access_token"] == "[REDACTED]"
+    assert context["nested"]["algorithm"] == "AWS4"
+
+
+def test_render_p10_prompt_redacts_url_credentials_without_losing_claim_context() -> None:
+    claim = (
+        "Constat CVE-2025-7777 confirmé https://example.invalid/a"
+        "?auth=FIXTURE_AUTH_TOKEN&sig=SECRET_SIG&client_secret=FIXTURE_CLIENT_SECRET "
+        "auth_token=FIXTURE_AUTH_TOKEN id_token=FIXTURE_ID_TOKEN "
+        '{"auth": "FIXTURE_JSON_AUTH"} '
+        "example.invalid/file?sig=SECRET_SCHEMELESS "
+        "credential=FIXTURE_CREDENTIAL authorization: Basic ZmFrZQ== fin du constat."
+    )
+    snapshot = _proposal_snapshot(
+        _normalize_context({"report_claims": [{"claim_id": "claim-1", "text": claim}]})
+    )
+
+    prompt, _ = _render_p10_prompt(snapshot)
+
+    for secret in (
+        "FIXTURE_AUTH_TOKEN",
+        "SECRET_SIG",
+        "FIXTURE_CLIENT_SECRET",
+        "FIXTURE_ID_TOKEN",
+        "FIXTURE_JSON_AUTH",
+        "SECRET_SCHEMELESS",
+        "FIXTURE_CREDENTIAL",
+        "ZmFrZQ==",
+    ):
+        assert secret not in prompt
+    assert "Constat CVE-2025-7777" in prompt
+    assert "fin du constat." in prompt
 
 
 @pytest.mark.asyncio

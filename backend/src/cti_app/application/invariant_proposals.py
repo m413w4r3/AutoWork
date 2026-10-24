@@ -15,6 +15,7 @@ from dataclasses import asdict, dataclass, is_dataclass
 from datetime import UTC, datetime
 from enum import Enum
 from typing import Any, cast
+from urllib.parse import unquote
 from uuid import UUID, uuid5
 
 from pydantic import ValidationError
@@ -24,7 +25,7 @@ from cti_app.application.goodware import GoodwareMeasurementService, PreparedGoo
 from cti_app.application.invariants import InvariantProposalResult, InvariantRegistryService
 from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.persistence import UnitOfWorkFactory
-from cti_app.domain.classification import DerivedPolicy, derived_policy
+from cti_app.domain.classification import TLP, DerivedPolicy, derived_policy
 from cti_app.domain.goodware import Banality
 from cti_app.domain.goodware_index import GoodwareMeasurementError
 from cti_app.domain.invariant_proposals import (
@@ -63,13 +64,9 @@ from cti_app.domain.model_runs import ModelProvider
 from cti_app.domain.reference_corpus import ReferenceCorpusVerdict, assess_reference_feature
 
 P10_PROMPT_TEMPLATE_ID = "invariant-proposal-conversation"
-P10_PROMPT_VERSION = "3"
+P10_PROMPT_VERSION = "4"
 P10_PARSER_STAGE = "p10_strict_proposal"
 _CONVERSATION_NAMESPACE = UUID("0f52a3a8-6cc8-5f4d-8ed5-1c2c3d4e5f60")
-_MAX_CONTEXT_CHARS = 200_000
-_MAX_STRING_CHARS = 2_048
-_MAX_CANDIDATE_RECORDS = 256
-_MAX_AUXILIARY_CONTEXT_RECORDS = 64
 _MISSING = object()
 _NOISE_CATEGORIES = frozenset(
     {
@@ -115,7 +112,7 @@ class ProposalConversationResult:
 
 
 class ProposalConversationService:
-    """Build and submit one bounded P10 proposal turn for an investigation."""
+    """Build and submit one P10 proposal turn for an investigation."""
 
     def __init__(
         self,
@@ -163,6 +160,7 @@ class ProposalConversationService:
         policy = loaded[2]
         provenance_by_ref = loaded[3]
         samples = loaded[4]
+        external_allowed = _external_disclosure_allowed(policy)
         effective_cycle = cycle_number if cycle_number is not None else investigation.cycle_number
         if effective_cycle < 1:
             raise ProposalContractError("cycle_number must be positive")
@@ -246,7 +244,7 @@ class ProposalConversationService:
             investigation_id=investigation_id,
             subject_id=investigation.subject_id,
             cycle_number=effective_cycle,
-            external_allowed=policy.external_llm_allowed,
+            external_allowed=external_allowed,
         )
         await self._persist_pivot_conversation(investigation_id, conversation.id)
 
@@ -255,7 +253,7 @@ class ProposalConversationService:
             conversation.id,
             message=prompt,
             mode=mode,
-            external_llm_allowed=policy.external_llm_allowed,
+            external_llm_allowed=external_allowed,
             idempotency_key=idempotency_key,
             correlation_id=correlation_id or f"p10:{investigation_id}:{effective_cycle}",
             context_subject_id=investigation.subject_id,
@@ -392,13 +390,11 @@ class ProposalConversationService:
             capabilities = tuple(sorted(capabilities, key=lambda item: _canonical_json(item)))
             invariants = tuple(
                 sorted(invariants, key=lambda item: _canonical_json(_invariant_context(item)))
-            )[:_MAX_AUXILIARY_CONTEXT_RECORDS]
+            )
             rejections = tuple(
                 sorted(rejections, key=lambda item: _canonical_json(_rejection_context(item)))
-            )[:_MAX_AUXILIARY_CONTEXT_RECORDS]
-            claims = tuple(sorted(claims, key=lambda item: _canonical_json(item)))[
-                :_MAX_AUXILIARY_CONTEXT_RECORDS
-            ]
+            )
+            claims = tuple(sorted(claims, key=lambda item: _canonical_json(item)))
 
             candidate_records: list[dict[str, Any]] = []
             for item in static_features:
@@ -571,7 +567,7 @@ class ProposalConversationService:
                     if ref == _provenance_ref(value)
                 ],
             }
-            context = _bound_context(context)
+            context = _normalize_context(context)
             snapshot = ProposalInputSnapshot(
                 input_pack_sha256=investigation.input_sha256,
                 corpus_snapshot_sha256=corpus_hash,
@@ -942,9 +938,6 @@ def _render_prompt(snapshot: ProposalInputSnapshot) -> str:
     return _render_p10_prompt(snapshot)[0]
 
 
-_MAX_P10_PROMPT_BYTES = 96_000
-
-
 def _render_p10_prompt(snapshot: ProposalInputSnapshot) -> tuple[str, dict[str, str]]:
     context = snapshot.context
     provenances = context.get("provenances", ())
@@ -986,10 +979,6 @@ def _render_p10_prompt(snapshot: ProposalInputSnapshot) -> tuple[str, dict[str, 
         "END_P10_FACTS\n"
         "Do not include raw bytes, secrets, signed URLs, or executable YARA code."
     )
-    if len(prompt.encode("utf-8")) > _MAX_P10_PROMPT_BYTES:
-        raise ProposalContractError(
-            "The compact P10 prompt exceeds its configured 96000-byte per-turn bound"
-        )
     return prompt, {alias: ref for ref, alias in alias_by_ref.items()}
 
 
@@ -1111,10 +1100,10 @@ def _p10_provenance_label(item: Mapping[str, Any]) -> str:
             details.append(value)
     offsets = item.get("offsets")
     if isinstance(offsets, list) and offsets:
-        details.append("offset " + ",".join(f"0x{int(value):x}" for value in offsets[:8]))
+        details.append("offset " + ",".join(f"0x{int(value):x}" for value in offsets))
     addresses = item.get("addresses")
     if isinstance(addresses, list) and addresses:
-        details.append("address " + ",".join(str(value) for value in addresses[:8]))
+        details.append("address " + ",".join(str(value) for value in addresses))
     return kind + (" — " + ", ".join(details) if details else "")
 
 
@@ -1510,7 +1499,7 @@ def _bounded_pattern(value: Any) -> str | None:
         return None
     text = value if isinstance(value, str) else str(value)
     text = text.strip()
-    if not text or len(text) > _MAX_STRING_CHARS:
+    if not text:
         return None
     return text
 
@@ -1966,28 +1955,7 @@ def _candidate_persisted_references(
 def _select_candidate_records(
     candidates: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
-    selected: list[dict[str, Any]] = []
-    for candidate in sorted(candidates, key=_candidate_sort_key):
-        if len(selected) >= _MAX_CANDIDATE_RECORDS:
-            break
-        trial = [*selected, dict(candidate)]
-        groups = {
-            "static_features": [
-                _candidate_context(item)
-                for item in trial
-                if item["source_kind"] == "static_features"
-            ],
-            "code_features": [
-                _candidate_context(item) for item in trial if item["source_kind"] == "code_features"
-            ],
-            "capabilities": [
-                _candidate_context(item) for item in trial if item["source_kind"] == "capabilities"
-            ],
-        }
-        if len(_canonical_json(groups)) > _MAX_CONTEXT_CHARS // 2:
-            continue
-        selected.append(dict(candidate))
-    return selected
+    return [dict(candidate) for candidate in sorted(candidates, key=_candidate_sort_key)]
 
 
 def _exclude_before_model(candidate: Mapping[str, Any]) -> bool:
@@ -2234,31 +2202,15 @@ def _rejection_context(value: Any) -> dict[str, Any]:
     }
 
 
-def _bound_context(value: dict[str, Any]) -> dict[str, Any]:
-    context = _bounded_json(value, drop_timestamps=True)
-    encoded = _canonical_json(context)
-    if len(encoded) > _MAX_CONTEXT_CHARS:
-        optional = (
-            "report_claims",
-            "prior_rejections",
-            "existing_invariants",
-        )
-        for key in optional:
-            if isinstance(context.get(key), list):
-                context[key] = context[key][:32]
-                encoded = _canonical_json(context)
-                if len(encoded) <= _MAX_CONTEXT_CHARS:
-                    break
-    if len(encoded) > _MAX_CONTEXT_CHARS:
-        raise ProposalContractError("The deterministic proposal context exceeds its bound")
-    return cast(dict[str, Any], context)
+def _normalize_context(value: dict[str, Any]) -> dict[str, Any]:
+    return cast(dict[str, Any], _bounded_json(value, drop_timestamps=True))
 
 
 def _bounded_json(value: Any, *, drop_timestamps: bool = False, depth: int = 0) -> Any:
     if depth > 8:
         return "[DEPTH_LIMIT]"
     if isinstance(value, bytes | bytearray | memoryview):
-        return "[BINARY_OMITTED]"
+        return bytes(value).hex()
     if isinstance(value, Enum):
         return _bounded_json(value.value, drop_timestamps=drop_timestamps, depth=depth + 1)
     if isinstance(value, UUID):
@@ -2278,6 +2230,14 @@ def _bounded_json(value: Any, *, drop_timestamps: bool = False, depth: int = 0) 
                 "promoted_at",
             }:
                 continue
+            if (
+                _sensitive_name(key_text)
+                and item not in (None, "", [], {})
+                and item is not False
+                and item is not True
+            ):
+                pairs.append((key_text, "[REDACTED]"))
+                continue
             pairs.append(
                 (
                     key_text,
@@ -2288,22 +2248,19 @@ def _bounded_json(value: Any, *, drop_timestamps: bool = False, depth: int = 0) 
                     ),
                 )
             )
-            if len(pairs) >= 256:
-                break
         return dict(pairs)
     if isinstance(value, (list, tuple, set, frozenset)):
         values = list(value)
         if isinstance(value, (set, frozenset)):
             values.sort(key=_canonical_json)
         return [
-            _bounded_json(item, drop_timestamps=drop_timestamps, depth=depth + 1)
-            for item in values[:256]
+            _bounded_json(item, drop_timestamps=drop_timestamps, depth=depth + 1) for item in values
         ]
     if isinstance(value, str):
-        return _redact_url(_redact_text(value[:_MAX_STRING_CHARS]))
+        return _redact_text(_redact_url(value))
     if isinstance(value, (int, float, bool)) or value is None:
         return value
-    return str(value)[:_MAX_STRING_CHARS]
+    return str(value)
 
 
 def _mapping_or_attrs(value: Any) -> dict[str, Any]:
@@ -2334,33 +2291,77 @@ def _string_or_none(value: Any) -> str | None:
     return str(value) if value is not None else None
 
 
+def _external_disclosure_allowed(policy: DerivedPolicy) -> bool:
+    """External routing needs every explicitly applicable disclosure rule to pass."""
+    return policy.external_llm_allowed and not policy.do_not_submit and policy.tlp is not TLP.RED
+
+
+_URL_USERINFO = re.compile(r"(?i)(https?://|www\.)[^\s/@:]+(?::[^\s/@]*)?@")
+_URL_PARAM = re.compile(r"(?i)([?&#])([A-Za-z0-9_.%+-]+)=([^&#\s]*)")
+_TEXT_ASSIGNMENT = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])([\"']?)([A-Za-z][A-Za-z0-9_.-]*)"
+    r"([\"']?\s*[:=]\s*)([\"']?)([^\s,;}\"']+)"
+)
+_SENSITIVE_NAMES = frozenset(
+    {
+        "apikey",
+        "auth",
+        "authorization",
+        "credential",
+        "password",
+        "privatekey",
+        "secret",
+        "secretkey",
+        "sig",
+        "signature",
+        "token",
+    }
+)
+_SENSITIVE_SUFFIXES = (
+    "apikey",
+    "credential",
+    "password",
+    "privatekey",
+    "secret",
+    "secretkey",
+    "signature",
+    "token",
+)
+
+
+def _sensitive_name(name: str) -> bool:
+    """Match credential labels by normalized name, not by one-off key lists."""
+    compact = re.sub(r"[^a-z0-9]", "", unquote(name).casefold())
+    return compact in _SENSITIVE_NAMES or compact.endswith(_SENSITIVE_SUFFIXES)
+
+
 def _redact_url(value: str) -> str:
-    lowered = value.lower()
-    if "http://" not in lowered and "https://" not in lowered:
-        return value
-    if re.search(r"https?://[^/\s:@]+:[^@\s]+@", value, flags=re.IGNORECASE) or any(
-        marker in lowered
-        for marker in (
-            "sig=",
-            "signature=",
-            "x-amz-",
-            "token=",
-            "access_token=",
-            "credential=",
-        )
-    ):
-        return "[SIGNED_URL_OMITTED]"
-    return value
+    """Redact credential-bearing URL parts without erasing surrounding evidence."""
+
+    def redact_param(match: re.Match[str]) -> str:
+        if not _sensitive_name(match.group(2)):
+            return match.group(0)
+        return f"{match.group(1)}{match.group(2)}=[REDACTED]"
+
+    value = _URL_USERINFO.sub(r"\1[REDACTED]@", value)
+    return _URL_PARAM.sub(redact_param, value)
 
 
 def _redact_text(value: str) -> str:
     value = re.sub(r"\bsk-[A-Za-z0-9_-]{8,}\b", "[REDACTED]", value)
     value = re.sub(r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]{8,}", "[REDACTED]", value)
-    return re.sub(
-        r"(?i)\b(api[_-]?key|password|secret|token)\s*[:=]\s*\S+",
+    value = re.sub(
+        r"(?i)\b(authorization|auth)\s*[:=]\s*basic\s+\S+",
         r"\1=[REDACTED]",
         value,
     )
+
+    def redact_assignment(match: re.Match[str]) -> str:
+        if not _sensitive_name(match.group(2)) or match.group(5).startswith("[REDACTED]"):
+            return match.group(0)
+        return f"{match.group(1)}{match.group(2)}{match.group(3)}{match.group(4)}[REDACTED]"
+
+    return _TEXT_ASSIGNMENT.sub(redact_assignment, value)
 
 
 def _canonical_json(value: Any) -> str:
