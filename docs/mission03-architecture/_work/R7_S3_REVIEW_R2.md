@@ -1,0 +1,72 @@
+# R7-S3-R2 — independent adversarial review of the revised hybrid
+
+**Study point:** `aa0cef3ee07525ca77d6b1358252ebf5735a3dde`, branch `mission03/architecture-design`.
+
+**Verdict: `REVISE`.** R2 closes the original last-mile transport bypass on paper and is much more specific about claims, recovery, and the first test. It is not yet safe to approve S3 implementation as a whole: the lock order conflicts with current settlement/reconciliation order, the owner-to-route binding and normalizer-version transition are not enforced precisely, and acquisition settlement remains a requirement to document rather than a resolved contract. The isolated fake-only first test can be prepared once the owner/route and transaction contract below are fixed; production egress remains unapproved.
+
+Evidence labels: **VERIFIED** = source/docs at the stated SHA; **INFERENCE** = consequence of the proposal or current source; **UNKNOWN** = not established by this read-only review.
+
+## F1–F4 closure
+
+| Finding | Status | Review |
+|---|---|---|
+| **F1 — mandatory last-mile gate, no caller transport, frozen route, retry, direct-entry zero-call** | **CLOSED (design)** | R2 removes the public `transport` argument, resolves a versioned route at composition, requires one-use permit checks at each physical send, binds the emitted bytes, and calls for direct-entry denial before activation ([DESIGN_OPTIONS.md](/home/nill/perso/work/AutoWork/docs/mission03-architecture/DESIGN_OPTIONS.md:342), [DESIGN_OPTIONS.md](/home/nill/perso/work/AutoWork/docs/mission03-architecture/DESIGN_OPTIONS.md:351), [DESIGN_OPTIONS.md](/home/nill/perso/work/AutoWork/docs/mission03-architecture/DESIGN_OPTIONS.md:416)). **UNKNOWN until implemented:** every actual raw send/redirect/SDK retry is covered. The required raw-entry zero-call test is still an implementation gate ([M2A_TEST_SURFACE_EXTERNAL.md](/home/nill/perso/work/AutoWork/docs/mission03-architecture/_work/M2A_TEST_SURFACE_EXTERNAL.md:80)). |
+| **F2 — complete lock set/order, stop state, reservation per path, owner and Bridge state** | **PARTIAL** | R2 names envelope → working state → invocation → dispatch → family attempt → Bridge turn/run, names the operator envelope snapshot and split reservation rows, and prohibits locks through transport ([DESIGN_OPTIONS.md](/home/nill/perso/work/AutoWork/docs/mission03-architecture/DESIGN_OPTIONS.md:359)). The exact transaction is feasible in principle because the SQLAlchemy UOW exposes the relevant repositories on one session ([uow.py](/home/nill/perso/work/AutoWork/backend/src/cti_app/infrastructure/database/uow.py:296), [uow.py](/home/nill/perso/work/AutoWork/backend/src/cti_app/infrastructure/database/uow.py:410)). But current reconciliation/finalization takes invocation before envelope; R2 does not name the necessary refactor or define the ModelGateway state handoff. See N1/N2 below. |
+| **F3 — cross-key claim, stable occurrence, use row, normalizer transition, no ambiguous reuse** | **PARTIAL** | R2 specifies a unique investigation/effect claim, stable default occurrence, workflow-owned child occurrences, claimant/use links, and no reuse of ambiguous results ([DESIGN_OPTIONS.md](/home/nill/perso/work/AutoWork/docs/mission03-architecture/DESIGN_OPTIONS.md:377)). The normalizer rule is internally inconsistent: version is included in effect identity, so a version bump changes the default claim/sentinel and can make an unchanged request eligible to send again without an explicit occurrence. The text says “explicit occurrence” is then required but does not enforce that against the new default key ([DESIGN_OPTIONS.md](/home/nill/perso/work/AutoWork/docs/mission03-architecture/DESIGN_OPTIONS.md:384)). |
+| **F4 — transitions, lost acknowledgement, late/partial response, settlement, acquisition ledgers** | **PARTIAL** | The transition graph, no-permit-on-lost-ack rule, late response CAS, partial evidence retention, framework-only not-sent proof, and unique Bridge usage/settlement keys close most of F4 ([DESIGN_OPTIONS.md](/home/nill/perso/work/AutoWork/docs/mission03-architecture/DESIGN_OPTIONS.md:394), [DESIGN_OPTIONS.md](/home/nill/perso/work/AutoWork/docs/mission03-architecture/DESIGN_OPTIONS.md:399), [DESIGN_OPTIONS.md](/home/nill/perso/work/AutoWork/docs/mission03-architecture/DESIGN_OPTIONS.md:406)). Acquisition is still only directed to “document the relation” between the outer operation reservation, the separate VT-read/hit ledger, and local reuse; the amount ownership and one-time settlement rule are not selected ([DESIGN_OPTIONS.md](/home/nill/perso/work/AutoWork/docs/mission03-architecture/DESIGN_OPTIONS.md:410)). Current acquisition commits its separate VT-read/hit consumption before download ([sample_acquisition.py](/home/nill/perso/work/AutoWork/backend/src/cti_app/application/sample_acquisition.py:349)); verified local reuse costs zero download/VT units ([investigation_acquisition.py](/home/nill/perso/work/AutoWork/backend/src/cti_app/application/investigation_acquisition.py:201)). |
+
+## New findings
+
+### N1 — HIGH: current reconciliation and settlement invert the proposed lock order
+
+**VERIFIED.** `reconcile_invocation` reads and updates `ToolInvocation`, then locks/saves the envelope ([investigation_service.py](/home/nill/perso/work/AutoWork/backend/src/cti_app/application/investigation_service.py:1800), [investigation_service.py](/home/nill/perso/work/AutoWork/backend/src/cti_app/application/investigation_service.py:1906)). Normal tool completion likewise updates the invocation before reservation settlement locks the envelope ([investigation_service.py](/home/nill/perso/work/AutoWork/backend/src/cti_app/application/investigation_service.py:1308), [investigation_service.py](/home/nill/perso/work/AutoWork/backend/src/cti_app/application/investigation_service.py:2827)). R2 consume locks envelope before invocation. **INFERENCE:** consume can hold envelope and wait on invocation while reconciliation/finalization holds invocation and waits on envelope, producing a deadlock. R2 says all writers follow one order but does not inventory or assign this refactor. The implementation plan must make reconciliation, settlement, denial, and consume use one lock order, with a PostgreSQL deadlock/barrier oracle before any route is enabled.
+
+### N2 — HIGH: owner and route must be bound together by durable validation
+
+The public shape `send_one(prepared)` is safe only if the `owner` in the prepared value is a locator, never authority. R2 says to lock the invocation or Bridge turn/run, but does not fully specify a closed owner sum/FK and validation that the owner, investigation, tool/schema, reservation key, operation/family, route ID, and request digest all match the durable rows ([DESIGN_OPTIONS.md](/home/nill/perso/work/AutoWork/docs/mission03-architecture/DESIGN_OPTIONS.md:342), [DESIGN_OPTIONS.md](/home/nill/perso/work/AutoWork/docs/mission03-architecture/DESIGN_OPTIONS.md:364)). Bind exactly one invocation owner or one Bridge turn/ModelRun owner and reject any mismatch before permit issuance. Current tool classification lives separately in mutable registry definitions ([investigation_tools.py](/home/nill/perso/work/AutoWork/backend/src/cti_app/application/investigation_tools.py:150), [investigation_tools.py](/home/nill/perso/work/AutoWork/backend/src/cti_app/application/investigation_tools.py:379)); the route catalog must not let a caller select a route that is valid but unrelated to its owner.
+
+### N3 — HIGH: ModelGateway’s persisted submission state needs an explicit consume protocol
+
+**VERIFIED.** ModelConversationService persists a turn/run before invoking ModelGateway ([model_conversations.py](/home/nill/perso/work/AutoWork/backend/src/cti_app/application/model_conversations.py:1282)). ModelGateway accepts a RUNNING run only when `submission_state` is `NOT_SUBMITTED`, then changes it to submission-in-progress in its own transaction ([model_gateway.py](/home/nill/perso/work/AutoWork/backend/src/cti_app/application/model_gateway.py:1051), [model_gateway.py](/home/nill/perso/work/AutoWork/backend/src/cti_app/application/model_gateway.py:1140)). R2 locks Bridge turn/run but does not say whether consume changes ModelRun state, how ModelGateway accepts the consumed dispatch, or how a retry gets a new dispatch while keeping the attempt state coherent. Specify and test that handoff before including Bridge; wrapping the whole `ModelGateway.execute` call is insufficient.
+
+### N4 — HIGH: normalizer-version bump can silently mint a fresh default claim
+
+R2 defines the effect key from a versioned semantic digest and makes the default occurrence sentinel derive from that identity ([DESIGN_OPTIONS.md](/home/nill/perso/work/AutoWork/docs/mission03-architecture/DESIGN_OPTIONS.md:377)). Since `normalizer_version` is part of the identity, changing it also changes the default key. The “explicit occurrence required” clause does not stop a caller using the new default key. Require a reviewed cross-version alias/migration or fail closed on an equivalent prior request until an explicit, workflow-authorized occurrence is supplied. Test unchanged semantics across a version bump.
+
+### N5 — MEDIUM: disabling the ModelGateway retry has no behavior-change oracle
+
+R2 allows either disabling `ModelGateway.execute`’s nested retry or routing each retry through a new `send_one` ([DESIGN_OPTIONS.md](/home/nill/perso/work/AutoWork/docs/mission03-architecture/DESIGN_OPTIONS.md:355)). Current code retries confirmed terminal Bridge failures ([model_gateway.py](/home/nill/perso/work/AutoWork/backend/src/cti_app/application/model_gateway.py:1257)); Bridge also has separately bounded pre-submission retry and correction behavior ([bridge_investigator.py](/home/nill/perso/work/AutoWork/backend/src/cti_app/application/bridge_investigator.py:1221)). Prefer a distinct consume for each existing retry so behavior is preserved. If disabling the nested retry is selected, add an explicit compatibility decision and oracle for the changed Bridge behavior.
+
+### N6 — MEDIUM: route catalog ownership and production exclusion need one assertion
+
+Treat the frozen table as an immutable transport/serializer catalog; authorization must still come from the locked owner, current envelope and reservation. R2 does not state whether this table is generated from the canonical tool/operation registration or is a second source for family/provider classification. Define that mapping once. Composition-only test substitution is appropriate and does not reopen the bypass by itself: current composition already injects optional ports and a turn transport at construction ([investigation_composition.py](/home/nill/perso/work/AutoWork/backend/src/cti_app/application/investigation_composition.py:1048)). Before the first slice, assert the test fake route exists only in the test composition, production has no enabled `vt.file_report` route, and all other production routes deny. R2 states this as intent (“production disabled; other families deny-all”) but not as an explicit oracle ([DESIGN_OPTIONS.md](/home/nill/perso/work/AutoWork/docs/mission03-architecture/DESIGN_OPTIONS.md:413)).
+
+## Owner, route, and test-transport decision
+
+`send_one(prepared)` need not expose a caller transport or accept a caller authorization object. It must reload the prepared owner by ID and prove the full owner/route/reservation binding described in N2. The route table should resolve only a server-selected route ID to a fixed normalizer, serializer, provider endpoint, and permit-aware transport. It should not make G2/TLP/stop decisions or accept arbitrary route/transport objects from callers. Test transports are substituted when composing the route table; the final fake send still checks the same opaque one-use permit and exact request digest. The test-only `vt.file_report` route is safe only while absent from production composition and all production egress remains deny-all.
+
+## S3 readiness gate
+
+**NOT MET.** F1 is closed at design level, but F2–F4 remain partial, and N1–N4 identify unresolved transaction/owner/Bridge/version contracts. The test-only route does not by itself authorize production transport. No production route, migration cutover, cross-invocation reuse, or real provider call is approved by this review.
+
+## Smallest safe first slice and first RED oracle
+
+The smallest safe first slice is one isolated test composition for `vt.file_report`: a versioned prepared request, additive dispatch row/claim, `send_one(prepared)`, a final fake transport that requires the one-use permit and verifies the exact digest, and deny-all behavior for every production route and other family. Do not include the live VirusTotal client in the test route.
+
+**First RED oracle:** with two independent PostgreSQL sessions, A persists the test invocation as `RUNNING`, its exact reservation, and `PREPARED` dispatch, then pauses immediately before consume. B commits `RUNNING → NEEDS_REVIEW`. A resumes; consume must reload/lock the owner and refuse with no `CONSUMED` state, no permit, and zero fake VT calls. Also directly call the raw fake adapter without a permit and assert zero calls. Run this against the production UOW/repositories and a disposable PostgreSQL database; an in-memory barrier is not sufficient. After the first red/green oracle, add the lock-order inversion case from N1 before expanding beyond the test route.
+
+Conditions that must remain true:
+
+- Production composition has no enabled test route; every other route remains deny-all.
+- The owner ID never substitutes for authorization; the durable owner and route binding are reloaded and checked in the consume transaction.
+- No database lock is held during the fake or any future transport call.
+- No ambiguous consumed dispatch is automatically resent or reused; no historical identity is backfilled from raw `normalized_parameters`.
+- `0001_baseline` and `0002_c2_experiments` remain unchanged; any schema is additive after the current head.
+
+## Tests and commands
+
+- Tests run: **none**. No pytest command was run.
+- Read-only commands: `git rev-parse HEAD`; `git status --short`; `codegraph explore` for the external-effect/Bridge/model gateway, acquisition/Retrohunt, stop state, and invocation/dispatch paths; targeted `rg -n` and `nl -ba` reads of the specified design artifacts and cited source.
+- No PostgreSQL, MinIO, Docker, provider, network, or CTI operation was performed.
+
+The output SHA-256 is reported with delivery.
