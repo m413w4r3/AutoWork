@@ -12,6 +12,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from cti_app.application.context_pagination import ContextOmissionManifestEntryV1
 from cti_app.application.investigation_contracts import (
     MAX_CONTEXT_BYTES,
     InvestigationContextV1,
@@ -116,7 +117,7 @@ class OperatorContextPointerV1(_OperatorContextContract):
 class OperatorContextPointerSetV1(_OperatorContextContract):
     section_uri_template: str = Field(min_length=1, max_length=2_048)
     section_limit: int = Field(default=20, ge=1, le=20)
-    section_cursors: dict[str, int]
+    section_cursors: dict[str, str]
     endpoints: dict[str, OperatorContextPointerV1]
 
 
@@ -179,6 +180,9 @@ class InvestigationOperatorContextSummaryV1(_OperatorContextContract):
     truncation: dict[str, bool]
     truncation_counts: dict[str, int]
     truncation_pointers: dict[str, tuple[str, ...]]
+    pagination_manifest: tuple[ContextOmissionManifestEntryV1, ...] = Field(
+        default=(), max_length=32
+    )
     current_opinion: OperatorOpinionPointerV1 | None
     policy: OperatorContextPolicyV1
 
@@ -201,6 +205,9 @@ class OperatorContextItemPageV1(_OperatorContextContract):
     total: int = Field(ge=0)
     next_offset: int | None = Field(default=None, ge=0)
     next_cursor: str | None = Field(default=None, max_length=1_024)
+    page_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_ref: str = Field(min_length=1, max_length=2_048)
+    omission_manifest: tuple[ContextOmissionManifestEntryV1, ...] = Field(default=(), max_length=8)
     items: tuple[Any, ...]
     section_truncated: bool = False
     untrusted_data: Literal[True] = True
@@ -319,6 +326,7 @@ def build_operator_context_summary(
         truncation=truncation,
         truncation_counts=truncation_counts,
         truncation_pointers=_truncation_pointers(truncation, truncation_counts),
+        pagination_manifest=context.investigation.pagination_manifest,
         current_opinion=(
             OperatorOpinionPointerV1(
                 opinion_id=context.current_opinion.opinion_id,
@@ -553,7 +561,7 @@ def _pointers(
             "&expected_version={version}&expected_sha256={sha256}"
         ),
         section_limit=20,
-        section_cursors=dict.fromkeys(OPERATOR_CONTEXT_SECTIONS, 0),
+        section_cursors=dict.fromkeys(OPERATOR_CONTEXT_SECTIONS, ""),
         endpoints={
             "pivot_frontier": OperatorContextPointerV1(
                 kind="endpoint",

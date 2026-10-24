@@ -20,6 +20,7 @@ from cti_app.application.advisor_checkpoint import (
     format_advisor_trace_purpose,
 )
 from cti_app.application.bridge_investigator import TurnSubmission, TurnSubmissionStatus
+from cti_app.application.context_pagination import decode_keyset_cursor, verify_page_sha256
 from cti_app.application.identity import Identity, IdentityScope
 from cti_app.application.investigation_advisor_tools import (
     ADVISOR_RESPONSE_SCHEMA,
@@ -1185,6 +1186,43 @@ async def test_external_llm_disclosure_is_required_for_operator_client() -> None
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "policy",
+    ("red_tlp", "snapshot_do_not_submit", "envelope_do_not_submit", "external_llm_denied"),
+)
+async def test_disclosure_controls_block_context_before_external_tool_dispatch(policy: str) -> None:
+    fixture, state, service = await _fixture()
+    article_port = fixture.context_builder.article_snapshots
+    if policy == "red_tlp":
+        article_port.snapshot = replace(article_port.snapshot, tlp="RED")
+    elif policy == "snapshot_do_not_submit":
+        article_port.snapshot = replace(article_port.snapshot, do_not_submit=True)
+    else:
+        envelope = fixture.envelopes._items[fixture.investigation_id]
+        if policy == "envelope_do_not_submit":
+            disclosure = replace(envelope.disclosure, do_not_submit=True)
+        else:
+            disclosure = replace(envelope.disclosure, external_llm_allowed=False)
+        fixture.envelopes._items[fixture.investigation_id] = replace(
+            envelope, disclosure=disclosure
+        )
+
+    with pytest.raises(OperatorToolInvocationError) as error:
+        await service.invoke(
+            tool_name="vt.file_report",
+            schema_version="1",
+            arguments={"query": "sample hash"},
+            purpose="deny dispatch when disclosure policy blocks external sharing",
+            expected_version=state.version,
+            idempotency_key=f"disclosure-{policy}",
+        )
+
+    assert error.value.code == "external_disclosure_denied"
+    assert fixture.tools["vt.file_report"].calls == []
+    assert await fixture.invocations.list_for_investigation(fixture.investigation_id) == ()
+
+
+@pytest.mark.asyncio
 async def test_secret_fields_and_signed_urls_are_rejected_before_persistence() -> None:
     fixture, state, service = await _fixture()
 
@@ -1524,7 +1562,7 @@ async def test_operator_http_routes_expose_bounded_context_and_idempotent_invoca
     assert summary_payload["working_state_sha256"] == state.sha256
     assert summary_payload["delta_since_version"]["from_version"] == state.version
     evidence_cursor = summary_payload["pointers"]["section_cursors"]["evidence_index"]
-    assert evidence_cursor == 0
+    assert evidence_cursor == ""
     assert (
         "/operator/context/section/{section}" in summary_payload["pointers"]["section_uri_template"]
     )
@@ -1557,6 +1595,80 @@ async def test_operator_http_routes_expose_bounded_context_and_idempotent_invoca
     assert saved_state.version == state.version + 1
     assert "sample hash" not in first.text
     assert fixture.tools["vt.file_report"].calls == [{"query": "sample hash"}]
+
+
+@pytest.mark.asyncio
+async def test_context_section_keyset_cursor_is_opaque_chained_and_offset_compatible() -> None:
+    fixture, state, service = await _fixture()
+    for index in range(25):
+        await fixture.observations.append_if_absent(
+            EvidenceObservation(
+                investigation_id=fixture.investigation_id,
+                kind=EvidenceKind.OTHER,
+                blob_id=uuid4(),
+                sha256=f"{index + 1:064x}",
+                source="test.source",
+                source_version="1",
+                observed_at=datetime(2026, 1, 1, tzinfo=UTC) + timedelta(seconds=index),
+                object_type="fixture",
+                object_id=str(index),
+            )
+        )
+
+    first = await service.get_context_section(
+        "evidence_index",
+        limit=20,
+        expected_version=state.version,
+        expected_sha256=state.sha256,
+    )
+    assert first.next_cursor is not None
+    assert not first.next_cursor.isdigit()
+    second = await service.get_context_section(
+        "evidence_index",
+        limit=20,
+        expected_version=state.version,
+        expected_sha256=state.sha256,
+        cursor=first.next_cursor,
+    )
+    offset_compatible = await service.get_context_section(
+        "evidence_index",
+        offset=20,
+        limit=20,
+        expected_version=state.version,
+        expected_sha256=state.sha256,
+    )
+    chained = decode_keyset_cursor(
+        first.next_cursor,
+        section="evidence_index",
+        investigation_id=fixture.investigation_id,
+        descending=True,
+    )
+
+    assert first.total == second.total == 25
+    assert len(first.items) == 20
+    assert len(second.items) == 5
+    assert tuple(item["evidence_id"] for item in second.items) == tuple(
+        item["evidence_id"] for item in offset_compatible.items
+    )
+    assert set(item["evidence_id"] for item in first.items).isdisjoint(
+        item["evidence_id"] for item in second.items
+    )
+    assert chained is not None
+    assert verify_page_sha256(
+        claimed_sha256=second.page_sha256,
+        section="evidence_index",
+        investigation_id=fixture.investigation_id,
+        items=second.items,
+        previous_page_sha256=chained["previous_page_sha256"],
+    )
+    with pytest.raises(OperatorToolInvocationError) as invalid:
+        await service.get_context_section(
+            "evidence_index",
+            expected_version=state.version,
+            expected_sha256=state.sha256,
+            cursor="not-a-keyset-cursor",
+        )
+    assert invalid.value.code == "operator_context_cursor_invalid"
 
 
 @pytest.mark.asyncio
