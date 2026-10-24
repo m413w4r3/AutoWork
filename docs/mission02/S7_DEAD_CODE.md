@@ -24,7 +24,7 @@ dynamic references. No migrations or archive formats are changed.
 - **Risk:** No internal runtime caller was found. An out-of-repository caller
   importing a private helper cannot be ruled out.
 
-### `OperatorToolInvocationService.get_context_summary` — accepted for removal
+### `OperatorToolInvocationService.get_context_summary` — removed
 
 - **Location:** `backend/src/cti_app/application/operator_tool_invocation.py:438`
 - **Caller evidence:** Repository-wide search found only the method definition.
