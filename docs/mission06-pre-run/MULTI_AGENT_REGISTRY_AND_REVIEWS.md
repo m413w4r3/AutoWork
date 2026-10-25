@@ -32,8 +32,8 @@ Légende : `PLANNED → RUNNING → REVIEW → APPROVED → INTEGRATED`, alterna
 | M06-POLICY-1 | `268c4abe-7f93-4d12-bcff-0d8b2175064b` | codex/gpt-6-luna · xhigh | `wks_a15c58fa94fe06bf` | `7059ebbd` | **INTEGRATED** | 51 unit + 6 PG PASS sur `main@efc38e8a` | `a656cd81-4250-4b5f-8033-01063f1d8aee` | **APPROVED** lot politique ; release externe conditionnée S3 | héritage épinglé, anti-faux HUMAN, bypass Bridge fermé ; B-4/cap/lignée S3 |
 | M06-S3-SPEC | `adb555b5-158a-450e-acff-c25293f85ea4` | codex/gpt-6-luna · xhigh | `wks_69c42fa0c7b7eab6` | `7059ebbd` | DONE | lecture seule | — | rapport reçu ; migration 0004 après 0003 | spécification S3 |
 | M06-REVIEW-POLICY-DESIGN | `66e365ad-83b0-43ad-8e7d-8b1d42a8e616` | codex/gpt-6-luna · xhigh | `wks_a221abc2a4219236` | `7059ebbd` | DONE | lecture seule | — | **REVISE** : 4 BLOCKER, 5 MAJOR ; corrections transmises | revue adversariale |
-| M06-S3-CORE-1 | `b052d44a-d753-44c5-8c5b-37e50bcb69a7` | codex/gpt-6-luna · xhigh | `wks_7dc76e2c336df65d` | `d53538b0` | DONE | 19 unit PASS parent ; PG NOT_RUN (0003 absent) | `a5773f45-7854-4165-9a1b-054ba12da200` | REVIEW | claim/permis, zéro fichier partagé ; acquisition refusée faute de lignée |
-| M06-REVIEW-S3-CORE | `a5773f45-7854-4165-9a1b-054ba12da200` | codex/gpt-6-luna · xhigh | `wks_bb93ccd029795f6a` | `642fae96` | DONE | lecture seule + 34 unit PASS | — | **REVISE final** : 1 BLOCKER (handoff tardif), 3 MAJOR ; 3e correction envoyée | revue adversariale |
+| M06-S3-CORE-1 | `b052d44a-d753-44c5-8c5b-37e50bcb69a7` | codex/gpt-6-luna · xhigh | `wks_7dc76e2c336df65d` | `d53538b0` | **REVISE — NON INTÉGRÉ** | 46 unit PASS ; PG combiné 3/5 RED ; lint+typecheck PASS | `a5773f45-7854-4165-9a1b-054ba12da200` | REVISE | 3 MAJOR : gate sans I/O, fragments token, preuve forgeable ; familles non migrées |
+| M06-REVIEW-S3-CORE | `a5773f45-7854-4165-9a1b-054ba12da200` | codex/gpt-6-luna · xhigh | `wks_bb93ccd029795f6a` | `0637bdea`/`de8b7451` | DONE | lecture seule + 46 unit PASS ; PG 3/5 | — | **REVISE final** : 0 BLOCKER, 3 MAJOR | revue adversariale |
 | M06-REVIEW-POLICY-IMPL | `a656cd81-4250-4b5f-8033-01063f1d8aee` | codex/gpt-6-luna · xhigh | `wks_7769192bb22b9bd6` | `33104968` | DONE | lecture seule + 51 unit PASS + 6 PG PASS | — | **APPROVED** lot politique ; S3-CORE doit fermer la course/cap/lignée avant release externe | revue adversariale |
 | M06-S3-VT-1 | à créer | codex/gpt-6-luna · xhigh | à créer | après core | PLANNED | fakes + PG | à créer | — | lecture VT |
 | M06-S3-DL-1 | à créer | codex/gpt-6-luna · xhigh | à créer | après core | PLANNED | fakes + PG | à créer | — | téléchargement |
@@ -69,7 +69,7 @@ Légende : `PLANNED → RUNNING → REVIEW → APPROVED → INTEGRATED`, alterna
 | `recon/RUN_STATE.md` | M06-R-RUN | `7a71689e65cf6198c16550d05a59ca03dfb97a877d00b268dbd4cb0ee28b01ed` |
 | `recon/POLICY_DESIGN_REVIEW.md` | M06-REVIEW-POLICY-DESIGN | `83773c57faedf56009edb2905c973214d38779b31c725a2d80473f3afb761338` |
 | `recon/S3_IMPLEMENTATION_SPEC.md` | M06-S3-SPEC | `ee82367b419a85ba1c6b90dd79a014907dc856647e4e016fffd22412fbe3a397` |
-| `recon/S3_CORE_REVIEW.md` | M06-REVIEW-S3-CORE | `05b0396f00523f9dd5a2cbe6d3eaaa164fc5860f8d3dcf73390ed24113de520e` |
+| `recon/S3_CORE_REVIEW.md` | M06-REVIEW-S3-CORE | `2c511d4f1dbc2d86d24424a3bbbc04a1cc8dc5b00b2d94485588a9badcffd9d2` |
 | `recon/POLICY_IMPL_REVIEW.md` | M06-REVIEW-POLICY-IMPL | `008153a396d5a4db1b3642ba4905bc2095417af569e5e3de6618a1eed1a3bc39` |
 
 ## Gate combiné temporaire (hors `main`)

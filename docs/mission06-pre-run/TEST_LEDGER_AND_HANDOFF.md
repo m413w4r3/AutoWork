@@ -124,7 +124,7 @@ n'est déclaré PASS sans commande et sortie réelles. Baseline de départ :
 | 2026-10-25 | combiné pré-fix fixture | `pytest tests/integration/test_external_effects_postgres.py -q` | **5 failed** — FK réservation budgétaire (fixture), corrigé |
 | 2026-10-26 | combiné `e2b05cfd` | `pytest tests/integration/test_external_effects_postgres.py -q` (base jetable) | **3 passed, 2 failed** — `effect_occurrence_required` et fixture budget `limits` ; correction finale en cours |
 | — | — | `make lint-backend` / `make typecheck-backend` | **NOT_RUN** côté agent (sync réseau) ; S3 core a rapporté lint+typecheck PASS dans son environnement |
-| — | — | S3 core PostgreSQL final | **EN ATTENTE** — rerun après correction fixture et intégration |
+| 2026-10-26 | combiné `e2b05cfd` | `pytest tests/integration/test_external_effects_postgres.py -q` (base jetable) | **3 passed, 2 failed** — replay `effect_occurrence_required` et fixture budget ; revue S3 `REVISE` (3 MAJOR) |
 
 Les 3 échecs PG de la politique à `980fef7e` sont : assertion `decisions == ()`
 vs liste vide, helper de réutilisation de sujet avec `edition=None`, et
@@ -168,17 +168,19 @@ Justification :
   revendiqués. La chaîne `0003→0004` s'applique sur base jetable après deux
   corrections d'intégration, mais les tests PG S3 finaux restent à rejouer.
 - **PARTIAL non-divulgation** : les filtres de credentials/signed URLs sont
-  testés unitairement, mais une revue a trouvé des fragments d'URL
-  credentials persistables, en cours de correction ; aucune preuve live.
+  testés unitairement, mais la revue S3 a trouvé des fragments `id_token` /
+  `refresh_token` persistables ; correction non intégrée (S3 `REVISE`) ;
+  aucune preuve live.
 - **PARTIAL concurrence/récupération** : la politique a 6 tests PG verts ;
-  les tests S3 de concurrence/crash ont échoué sur un fixture FK avant
-  correction et n'ont pas encore été rejoués.
+  le gate S3 combiné est à 3/5 après correction du fixture FK, avec deux
+  échecs restants (replay `effect_occurrence_required`, budget de crash).
 - **FAILED Luna xhigh multi-agent** : tous les enfants ont été créés en
   `codex/gpt-6-luna` `xhigh` avec vérification runtime, mais l'orchestrateur
   parent est `deepseek-flash[1m]`, pas Luna xhigh. La conformité complète de
   la mission n'est donc pas atteinte.
-- **REVISE revues** : deux revues indépendantes ont rendu `REVISE` sur les
-  deux lots ; aucune n'est `APPROVED` à la clôture.
+- **REVISE revues** : la revue politique est `APPROVED` (lot intégré) ; la
+  revue S3 reste `REVISE` (3 MAJOR : gate sans I/O physique, fragments de
+  token, preuve no-handoff forgeable). Le socle S3 n'est pas intégré.
 - **PARTIAL prévol run réel** : le plan et les inconnues sont documentés ;
   les lectures canoniques live (lignée de synthèse, état des jobs, MinIO)
   n'ont pas été effectuées et restent à autoriser.
@@ -187,16 +189,16 @@ Justification :
 
 ### État Git
 
-- `main` local : `58dee0dc` — **documentation uniquement**, aucun code Mission
-  06-P fusionné. Aucun push, merge distant, déploiement ou migration live.
-- Branche candidate politique : `m06/policy-impl` à `33104968`
-  (51 unitaires, 6 PostgreSQL verts ; revue indépendante en cours/`REVISE`).
-- Branche candidate S3 : `m06/s3-core-impl` à `642fae96` + correction finale
-  en cours (34 unitaires verts avant correction ; PG non rejoué).
+- `main` local : `0a5d3e29` — **politique OSINT_OPEN intégrée et approuvée**
+  (51 unitaires + 6 PostgreSQL verts sur `main@efc38e8a`). Aucun push, merge
+  distant, déploiement ou migration live.
+- Branche candidate S3 : `m06/s3-core-impl` à `de8b7451` — **NON INTÉGRÉE**.
+  46 unitaires verts, lint+typecheck PASS ; revue indépendante `REVISE`
+  (3 MAJOR) ; PG combiné 3/5.
 - Gate combiné temporaire : `/tmp/m06-combined-gate`, branche
-  `m06/combined-gate` à `1fdf64b6` (politique + S3 + correctifs d'intégration
+  `m06/combined-gate` à `e2b05cfd` (politique + S3 + correctifs d'intégration
   `env.py`). Chaîne `0001→0004` : `UPGRADE_OK` ; politique PG 6/6 ; S3 PG
-  RED sur fixture FK avant correction.
+  3/5.
 
 ### Prochaine action permissible
 
