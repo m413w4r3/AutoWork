@@ -50,6 +50,9 @@ async def test_record_json_is_bounded_sanitized_and_idempotent() -> None:
         "large_excerpt": large_excerpt,
         "signed_page": "https://vt.invalid/report?X-Amz-Signature=private-value",
         "signed_ipv6_page": ("https://[2001:db8::1]/report?X-Amz-Signature=ipv6-private-value"),
+        "signed_ipv6_zone_page": (
+            "https://[fe80::1%25eth0]/report?X-Amz-Signature=zone-private-value"
+        ),
         "api_key": attacker_token,
         "raw_bytes": raw_bytes,
         "payload_bytes": byte_array,
@@ -115,6 +118,7 @@ async def test_record_json_is_bounded_sanitized_and_idempotent() -> None:
     for forbidden in (
         b"private-value",
         b"ipv6-private-value",
+        b"zone-private-value",
         b"must-not-persist",
         b"X-Amz-Signature",
     ):

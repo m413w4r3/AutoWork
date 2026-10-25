@@ -31,7 +31,7 @@ _BINARY_FIELD = re.compile(
     re.I,
 )
 _SIGNED_URL = re.compile(
-    r"https?://(?:\[[0-9A-Fa-f:.]+\]|[^\s\]\[()<>\"]+)[^\s\]\[()<>\"]*",
+    r"https?://(?:\[[0-9A-Fa-f:.%A-Za-z0-9_~-]+\]|[^\s\]\[()<>\"]+)[^\s\]\[()<>\"]*",
     re.I,
 )
 _SECRET_VALUE = re.compile(
