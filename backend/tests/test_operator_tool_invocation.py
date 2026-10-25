@@ -1629,6 +1629,81 @@ async def test_operator_http_routes_expose_bounded_context_and_idempotent_invoca
 
 
 @pytest.mark.asyncio
+async def test_operator_http_reports_invalid_framework_proof_and_keeps_retry_blocked() -> None:
+    fixture, state, service = await _fixture()
+    envelope = await fixture.envelopes.get(fixture.investigation_id)
+    refused_budget = InvestigationBudget(
+        limits={**envelope.budget.limits, BudgetDimension.VT_UNITS: 0}
+    )
+    await fixture.envelopes.save_if_version(
+        replace(envelope, budget=refused_budget, version=envelope.version + 1),
+        expected_version=envelope.version,
+    )
+
+    refused = await service.invoke(
+        tool_name="vt.file_report",
+        schema_version="1",
+        arguments={"query": "proof integrity"},
+        purpose="verify the persisted refusal proof",
+        expected_version=state.version,
+        idempotency_key="invalid-proof-first-attempt",
+    )
+    assert refused.invocation.status is ToolInvocationStatus.NEEDS_REVIEW
+    assert fixture.tools["vt.file_report"].calls == []
+    observation = await fixture.observations.get(refused.invocation.response_refs[0])
+    assert observation is not None
+    stored = fixture.proof_artifacts.blobs[observation.blob_id]
+    fixture.proof_artifacts.blobs[observation.blob_id] = bytes((stored[0] ^ 1,)) + stored[1:]
+
+    latest_envelope = await fixture.envelopes.get(fixture.investigation_id)
+    extended_budget = InvestigationBudget(
+        limits={**latest_envelope.budget.limits, BudgetDimension.VT_UNITS: 1}
+    )
+    for reservation in latest_envelope.budget.reservations:
+        extended_budget.restore_reservation(reservation)
+    await fixture.envelopes.save_if_version(
+        replace(
+            latest_envelope,
+            budget=extended_budget,
+            version=latest_envelope.version + 1,
+        ),
+        expected_version=latest_envelope.version,
+    )
+
+    app = FastAPI()
+    app.include_router(router)
+    app.state.identity_provider = _IdentityProvider()
+    app.state.uow_factory = lambda: _Uow(fixture)
+    app.state.investigation_composition_factory = _CompositionFactory(service, fixture=fixture)
+    latest_state = await fixture.states.get(fixture.investigation_id)
+    async with httpx.AsyncClient(
+        transport=ASGITransport(app=app, raise_app_exceptions=False), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            f"/api/investigations/{fixture.investigation_id}/operator/tools/vt.file_report",
+            json={
+                "schema_version": "1",
+                "arguments": {"query": "proof integrity"},
+                "purpose": "verify the persisted refusal proof",
+                "expected_version": latest_state.version,
+            },
+            headers={"Idempotency-Key": "invalid-proof-retry"},
+        )
+
+    detail = response.json()["detail"]
+    assert response.status_code == 409
+    assert detail["code"] == "ambiguous_tool_invocation_requires_reconciliation"
+    assert detail["details"] == {
+        "existing_invocation_id": str(refused.invocation.id),
+        "framework_proof_rejection": "framework_proof_blob_hash_mismatch",
+    }
+    still_blocked = await fixture.invocations.get_by_operation_key(refused.invocation.operation_key)
+    assert still_blocked is not None
+    assert still_blocked.status is ToolInvocationStatus.NEEDS_REVIEW
+    assert fixture.tools["vt.file_report"].calls == []
+
+
+@pytest.mark.asyncio
 async def test_context_section_keyset_cursor_is_opaque_chained_and_offset_compatible() -> None:
     fixture, state, service = await _fixture()
     for index in range(25):

@@ -777,9 +777,8 @@ class OperatorToolInvocationService:
 
     async def _framework_pre_submission_proof(
         self, invocation: ToolInvocation
-    ) -> FrameworkPreSubmissionProof | None:
-        proof, _rejection = await self._execution._framework_pre_submission_proof(invocation)
-        return proof
+    ) -> tuple[FrameworkPreSubmissionProof | None, str | None]:
+        return await self._execution._framework_pre_submission_proof(invocation)
 
     async def _invoke_locked(
         self,
@@ -854,7 +853,7 @@ class OperatorToolInvocationService:
                 not in {ToolInvocationStatus.RUNNING, ToolInvocationStatus.NEEDS_REVIEW}
             ):
                 continue
-            proof = await self._framework_pre_submission_proof(existing)
+            proof, proof_rejection = await self._framework_pre_submission_proof(existing)
             if existing.status is ToolInvocationStatus.NEEDS_REVIEW and proof is not None:
                 resolved = existing.resolve_pre_submission_failure()
                 existing = await self._invocations.update_if_version(
@@ -878,10 +877,11 @@ class OperatorToolInvocationService:
                 )
                 await self._execution.commit_current_uow()
                 continue
+            details: dict[str, Any] = {"existing_invocation_id": str(existing.id)}
+            if proof_rejection is not None:
+                details["framework_proof_rejection"] = proof_rejection
             raise OperatorToolInvocationError(
-                "ambiguous_tool_invocation_requires_reconciliation",
-                409,
-                details={"existing_invocation_id": str(existing.id)},
+                "ambiguous_tool_invocation_requires_reconciliation", 409, details=details
             )
 
         if state.version != expected_version:

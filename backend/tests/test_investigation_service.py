@@ -11,6 +11,7 @@ import pytest
 
 from cti_app.api.investigation import InvestigationOperatorStatusResponse
 from cti_app.application.analyst_handoff import AnalystHandoffPolicy
+from cti_app.application.blob_storage import BlobReadLimitExceededError
 from cti_app.application.bridge_investigator import (
     BridgeInvestigator,
     ScriptedTurnTransport,
@@ -265,6 +266,7 @@ class _MemoryProofArtifactStore:
     def __init__(self):
         self.blobs = {}
         self.descriptors = {}
+        self.read_limit_errors = set()
 
     def store(self, blob_id, content):
         self.blobs[blob_id] = content
@@ -278,6 +280,8 @@ class _MemoryProofArtifactStore:
         return self.descriptors.get(blob_id)
 
     async def read_bytes(self, blob_id, *, max_bytes):
+        if blob_id in self.read_limit_errors:
+            raise BlobReadLimitExceededError(size_bytes=max_bytes + 1, max_bytes=max_bytes)
         content = self.blobs[blob_id]
         if len(content) > max_bytes:
             raise ValueError("blob exceeds max_bytes")
@@ -306,6 +310,16 @@ class _MemoryProofArtifactStore:
             result = payload.get("result")
             return result if isinstance(result, dict) else None
         return {"mime_type": descriptor["mime_type"], "byte_size": len(raw)}
+
+
+def _replace_framework_proof_blob(fixture, observation, raw):
+    fixture.proof_artifacts.blobs[observation.blob_id] = raw
+    digest = hashlib.sha256(raw).hexdigest()
+    fixture.proof_artifacts.descriptors[observation.blob_id].update(
+        sha256=digest,
+        byte_size=len(raw),
+    )
+    fixture.observations._items[observation.id] = replace(observation, sha256=digest)
 
 
 class _ObservationWriter:
@@ -2967,6 +2981,16 @@ async def test_framework_budget_refusal_resumes_after_budget_extension_without_d
         ("tampered_bytes", "framework_proof_blob_hash_mismatch"),
         ("missing_blob", "framework_proof_blob_unreadable"),
         ("descriptor_hash_mismatch", "framework_proof_descriptor_mismatch"),
+        ("descriptor_size_overflow", "framework_proof_blob_size_overflow"),
+        ("mime_mismatch", "framework_proof_descriptor_mismatch"),
+        ("read_limit_overflow", "framework_proof_blob_size_overflow"),
+        ("invalid_json", "framework_proof_payload_invalid_json"),
+        ("noncanonical_json", "framework_proof_payload_not_canonical"),
+        ("payload_tool_mismatch", "framework_proof_payload_mismatch"),
+        ("payload_schema_mismatch", "framework_proof_payload_mismatch"),
+        ("payload_version_mismatch", "framework_proof_payload_mismatch"),
+        ("payload_operation_mismatch", "framework_proof_payload_mismatch"),
+        ("proof_object_mismatch", "framework_proof_payload_mismatch"),
     ),
 )
 @pytest.mark.asyncio
@@ -3007,8 +3031,37 @@ async def test_framework_budget_refusal_stays_blocked_when_proof_blob_is_invalid
         )
     elif corruption == "missing_blob":
         fixture.proof_artifacts.blobs.pop(proof_observation.blob_id)
-    else:
+    elif corruption == "descriptor_hash_mismatch":
         fixture.proof_artifacts.descriptors[proof_observation.blob_id]["sha256"] = "0" * 64
+    elif corruption == "descriptor_size_overflow":
+        fixture.proof_artifacts.descriptors[proof_observation.blob_id]["byte_size"] = 64 * 1024 + 1
+    elif corruption == "mime_mismatch":
+        fixture.proof_artifacts.descriptors[proof_observation.blob_id]["mime_type"] = (
+            "application/octet-stream"
+        )
+    elif corruption == "read_limit_overflow":
+        fixture.proof_artifacts.read_limit_errors.add(proof_observation.blob_id)
+    elif corruption == "invalid_json":
+        _replace_framework_proof_blob(fixture, proof_observation, b"not-json")
+    elif corruption == "noncanonical_json":
+        stored = fixture.proof_artifacts.blobs[proof_observation.blob_id]
+        _replace_framework_proof_blob(fixture, proof_observation, b" " + stored)
+    else:
+        stored = fixture.proof_artifacts.blobs[proof_observation.blob_id]
+        payload = json.loads(stored)
+        if corruption == "payload_tool_mismatch":
+            payload["tool_name"] = "vt.other_tool"
+        elif corruption == "payload_schema_mismatch":
+            payload["schema"] = "wrong-schema"
+        elif corruption == "payload_version_mismatch":
+            payload["schema_version"] = "wrong-version"
+        elif corruption == "payload_operation_mismatch":
+            payload["operation_key"] = "wrong-operation"
+        else:
+            payload["result"]["framework_pre_submission_proof"]["object_type"] = (
+                "framework_pre_submission_invalid_arguments"
+            )
+        _replace_framework_proof_blob(fixture, proof_observation, canonical_json_bytes(payload))
 
     operator_invocations = OperatorToolInvocationService(
         investigation_id=state.investigation_id,
@@ -3024,7 +3077,11 @@ async def test_framework_budget_refusal_stays_blocked_when_proof_blob_is_invalid
         observations=fixture.observations,
         evidence_summaries=fixture.proof_artifacts,
     )
-    assert await operator_invocations._framework_pre_submission_proof(refusal) is None
+    operator_proof, operator_rejection = await operator_invocations._framework_pre_submission_proof(
+        refusal
+    )
+    assert operator_proof is None
+    assert operator_rejection == expected_error
 
     envelope = await fixture.envelopes.get(state.investigation_id)
     assert envelope is not None
