@@ -269,10 +269,12 @@ def async_get(value):
 
 class _SampleAssociations:
     def __init__(self, hashes):
-        self.hashes = tuple(hashes)
+        self.associations = tuple(
+            SimpleNamespace(id=uuid4(), sample_sha256=item) for item in hashes
+        )
 
     async def list_for_investigation(self, _investigation_id):
-        return tuple(SimpleNamespace(sample_sha256=item) for item in self.hashes)
+        return self.associations
 
 
 class _Samples:
@@ -2246,6 +2248,73 @@ async def test_sample_level_restriction_blocks_explicit_observation(restriction)
 
 
 @pytest.mark.asyncio
+async def test_restriction_trace_counts_sample_associations_not_observations() -> None:
+    investigation_id = uuid4()
+    sample_hash = "9" * 64
+    restriction_text = "Synthetic count semantics restriction marker"
+    first, first_raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": sample_hash,
+            "strings": [{"value": "RestrictedCountMarkerOne", "offset": 16}],
+        },
+    )
+    second, second_raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": sample_hash,
+            "strings": [{"value": "RestrictedCountMarkerTwo", "offset": 32}],
+        },
+    )
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    tool, sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=first,
+        raw=first_raw,
+    )
+    tool._observations = ObservationRepository((first, second))
+    tool._blobs.add(
+        second.blob_id,
+        sha256=second.sha256,
+        size=len(second_raw),
+        logical_bucket="evidence",
+    )
+    tool._artifact_store.values[second.blob_id] = second_raw
+    _attach_sample_policy(
+        tool,
+        sample_blob_id,
+        sample_hash,
+        license_restriction=restriction_text,
+    )
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Review both observations for one restricted sample.",
+            "evidence_refs": [str(first.id), str(second.id)],
+        },
+        make_context(investigation_id, key="operator:advisor:restricted-counts"),
+    )
+
+    association = tool._sample_associations.associations[0]
+    assert transport.calls == []
+    assert result.output["advisor_status"] == "disclosure_restricted"
+    assert result.output["disclosure_restricted_observation_count"] == 2
+    assert result.output["disclosure_restricted_sample_count"] == 1
+    assert result.output["disclosure_restricted_sample_association_count"] == 1
+    rows = result.output["disclosure_restricted_sample_associations"]
+    assert len(rows) == 1
+    assert rows[0]["association_id"] == str(association.id)
+    assert rows[0]["sample_sha256"] == sample_hash
+    assert tuple(rows[0]["restriction_sources"]) == ("license_restriction",)
+    assert set(rows[0]["linked_observation_refs"]) == {str(first.id), str(second.id)}
+    assert restriction_text not in repr(result.output)
+
+
+@pytest.mark.asyncio
 async def test_nested_sample_hash_with_license_restriction_refuses_before_bridge() -> None:
     investigation_id = uuid4()
     sample_hash = "e" * 64
@@ -4150,6 +4219,17 @@ async def test_draft_text_finding_ref_to_restricted_sample_is_vetoed_after_resol
     assert result.output["failure_stage"] == "sample_disclosure_restricted"
     assert result.output["confirmed_non_execution"] is True
     assert str(finding.id) in result.output["disclosure_restricted_finding_refs"]
+    association = tool._sample_associations.associations[0]
+    assert result.output["disclosure_restricted_sample_count"] == 1
+    assert result.output["disclosure_restricted_sample_association_count"] == 1
+    assert result.output["disclosure_restricted_observation_count"] == 1
+    rows = result.output["disclosure_restricted_sample_associations"]
+    assert len(rows) == 1
+    assert rows[0]["association_id"] == str(association.id)
+    assert rows[0]["sample_sha256"] == sample_hash
+    assert tuple(rows[0]["restriction_sources"]) == ("license_restriction",)
+    assert tuple(rows[0]["linked_observation_refs"]) == (str(observation.id),)
+    assert tuple(rows[0]["linked_finding_refs"]) == (str(finding.id),)
     safe_output = repr(result.output)
     assert restriction_text not in safe_output
     assert "RestrictedFindingSampleMarker" not in safe_output

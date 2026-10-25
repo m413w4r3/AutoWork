@@ -466,18 +466,27 @@ class InvestigationAdvisorTool:
                 context.investigation_id, investigation.subject_id
             )
             restricted_evidence_refs: tuple[UUID, ...] = ()
+            restricted_evidence: tuple[EvidenceObservation, ...] = ()
             if restricted_sample_hashes:
                 restricted_ids = []
+                restricted_items: list[EvidenceObservation] = []
                 for item in evidence:
                     for sample_hash in restricted_sample_hashes:
                         if await self._observation_references_sample(item, sample_hash):
                             restricted_ids.append(item.id)
+                            restricted_items.append(item)
                             break
                 restricted_evidence_refs = tuple(dict.fromkeys(restricted_ids))
+                restricted_evidence = tuple({item.id: item for item in restricted_items}.values())
                 if restricted_evidence_refs:
                     restricted_id_set = set(restricted_evidence_refs)
                     evidence = tuple(item for item in evidence if item.id not in restricted_id_set)
             if restricted_evidence_refs:
+                sample_trace = await self._restricted_sample_association_trace(
+                    context.investigation_id,
+                    restricted_sample_hashes,
+                    restricted_evidence,
+                )
                 return await self._persist_preflight_failure(
                     context,
                     consultation_type=consultation_type,
@@ -490,7 +499,14 @@ class InvestigationAdvisorTool:
                         "disclosure_restricted_refs": [
                             str(item) for item in restricted_evidence_refs
                         ],
-                        "disclosure_restricted_sample_count": len(restricted_evidence_refs),
+                        "disclosure_restricted_sample_count": len(
+                            {row["sample_sha256"] for row in sample_trace}
+                        ),
+                        "disclosure_restricted_sample_association_count": sum(
+                            1 for row in sample_trace if row["association_id"] is not None
+                        ),
+                        "disclosure_restricted_observation_count": len(restricted_evidence_refs),
+                        "disclosure_restricted_sample_associations": sample_trace,
                         "missing_refs": [str(item) for item in restricted_evidence_refs],
                         "confirmed_non_execution": True,
                         "bridge_turns_consumed": 0,
@@ -571,6 +587,7 @@ class InvestigationAdvisorTool:
                     context.investigation_id, resolved_evidence_refs
                 )
                 restricted_resolved_refs: list[UUID] = []
+                restricted_resolved_items: list[EvidenceObservation] = []
                 restricted_finding_ids: list[UUID] = []
                 for item in resolved_evidence:
                     references_restricted_sample = False
@@ -580,6 +597,7 @@ class InvestigationAdvisorTool:
                             break
                     if references_restricted_sample:
                         restricted_resolved_refs.append(item.id)
+                        restricted_resolved_items.append(item)
                         restricted_finding_ids.extend(
                             finding_id
                             for finding_id, observation_refs in finding_observation_refs.items()
@@ -587,6 +605,12 @@ class InvestigationAdvisorTool:
                         )
                 if restricted_resolved_refs or unresolved_finding_ids:
                     restricted_finding_ids.extend(unresolved_finding_ids)
+                    sample_trace = await self._restricted_sample_association_trace(
+                        context.investigation_id,
+                        restricted_sample_hashes,
+                        tuple(restricted_resolved_items),
+                        finding_observation_refs=finding_observation_refs,
+                    )
                     return await self._persist_preflight_failure(
                         context,
                         consultation_type=consultation_type,
@@ -601,7 +625,16 @@ class InvestigationAdvisorTool:
                             "disclosure_restricted_refs": [
                                 str(item) for item in restricted_resolved_refs
                             ],
-                            "disclosure_restricted_sample_count": len(restricted_resolved_refs),
+                            "disclosure_restricted_sample_count": len(
+                                {row["sample_sha256"] for row in sample_trace}
+                            ),
+                            "disclosure_restricted_sample_association_count": sum(
+                                1 for row in sample_trace if row["association_id"] is not None
+                            ),
+                            "disclosure_restricted_observation_count": len(
+                                restricted_resolved_refs
+                            ),
+                            "disclosure_restricted_sample_associations": sample_trace,
                             "missing_refs": [str(item) for item in restricted_resolved_refs],
                             **(
                                 {
@@ -3377,6 +3410,79 @@ class InvestigationAdvisorTool:
                 continue
             restricted.update(matched_hashes)
         return restricted
+
+    async def _restricted_sample_association_trace(
+        self,
+        investigation_id: UUID,
+        restricted_hashes: set[str],
+        observations: tuple[EvidenceObservation, ...],
+        *,
+        finding_observation_refs: Mapping[UUID, tuple[UUID, ...]] | None = None,
+    ) -> list[dict[str, object]]:
+        """Describe the linked sample associations behind a disclosure refusal.
+
+        The trace names association IDs and sample hashes, never the restriction
+        text. ``linked_finding_refs`` records the finding path that pulled a
+        restricted observation into the consultation; a row is emitted only for
+        a hash actually referenced by one of the refused observations.
+        """
+        if not restricted_hashes or not observations:
+            return []
+        investigation = await self._investigations.get(investigation_id)
+        if investigation is None:
+            return []
+        association_list = getattr(self._sample_associations, "list_for_investigation", None)
+        sample_list = getattr(self._samples, "list_for_subject", None)
+        if not callable(association_list) or not callable(sample_list):
+            return []
+        associations = tuple(await association_list(investigation_id))
+        samples = tuple(await sample_list(investigation.subject_id))
+        rows: list[dict[str, object]] = []
+        for sample_hash in sorted(restricted_hashes):
+            linked_items: list[UUID] = []
+            for item in observations:
+                if await self._observation_references_sample(item, sample_hash):
+                    linked_items.append(item.id)
+            linked_observations = tuple(linked_items)
+            if not linked_observations:
+                continue
+            linked_findings = tuple(
+                sorted(
+                    str(finding_id)
+                    for finding_id, observation_refs in (finding_observation_refs or {}).items()
+                    if set(observation_refs).intersection(linked_observations)
+                )
+            )
+            sample = next(
+                (
+                    item
+                    for item in samples
+                    if getattr(item, "expected_hash", None) == sample_hash
+                    or getattr(item, "source_object_id", None) == sample_hash
+                ),
+                None,
+            )
+            matching_associations = tuple(
+                association
+                for association in associations
+                if getattr(association, "sample_sha256", None) == sample_hash
+            )
+            association_ids: tuple[object, ...] = (
+                tuple(getattr(association, "id", None) for association in matching_associations)
+                if matching_associations
+                else (None,)
+            )
+            for association_id in association_ids:
+                row: dict[str, object] = {
+                    "association_id": (str(association_id) if association_id is not None else None),
+                    "sample_sha256": sample_hash,
+                    "restriction_sources": _sample_restriction_sources(sample),
+                    "linked_observation_refs": [str(item) for item in linked_observations],
+                }
+                if linked_findings:
+                    row["linked_finding_refs"] = list(linked_findings)
+                rows.append(row)
+        return rows
 
     async def _observation_references_sample(
         self, observation: EvidenceObservation, sample_hash: str
@@ -6717,6 +6823,25 @@ def _sample_policy_allows_external(sample: object) -> bool:
         or (isinstance(tlp_value, str) and tlp_value.casefold() == TLP.RED.value.casefold())
         or has_license_restriction
     )
+
+
+def _sample_restriction_sources(sample: object | None) -> list[str]:
+    """Return policy flag names, never the restriction text itself."""
+    if sample is None:
+        return []
+    sources: list[str] = []
+    if bool(getattr(sample, "do_not_submit", False)):
+        sources.append("do_not_submit")
+    if not bool(getattr(sample, "external_llm_allowed", True)):
+        sources.append("external_llm_allowed_false")
+    tlp = getattr(sample, "tlp", None)
+    tlp_value = getattr(tlp, "value", tlp)
+    if isinstance(tlp_value, str) and tlp_value.casefold() == TLP.RED.value.casefold():
+        sources.append("tlp_red")
+    license_restriction = getattr(sample, "license_restriction", None)
+    if license_restriction is not None and bool(str(license_restriction).strip()):
+        sources.append("license_restriction")
+    return sources
 
 
 def _safe_text(value: str, max_chars: int) -> str:
