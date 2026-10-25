@@ -368,9 +368,7 @@ async def test_experiment_postgres_cas_api_timeline_and_append_only(
                         "observation_ids": ["[redacted]"],
                         "superseded_by": expected_superseded_by.get(item.id, []),
                         "verdict_assertion_label": (
-                            refutes_label
-                            if item.verdict is ExperimentVerdict.REFUTES
-                            else None
+                            refutes_label if item.verdict is ExperimentVerdict.REFUTES else None
                         ),
                     }
                     for item in experiments
