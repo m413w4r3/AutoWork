@@ -7,7 +7,7 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4, uuid5
 
 from cti_app.application.identity import is_human_actor_id
@@ -70,7 +70,10 @@ class OsintOpenPolicyService:
         normalized_ref = _normalize_scope_ref(scope_kind, scope_ref)
         async with self.uow_factory() as uow:
             repository = uow.osint_open_policies
-            return await repository.latest_for_scope(scope_kind, normalized_ref)
+            return cast(
+                OsintPolicyVersion | None,
+                await repository.latest_for_scope(scope_kind, normalized_ref),
+            )
 
     async def activate(
         self,
@@ -304,9 +307,9 @@ class OsintOpenPolicyService:
                 )
             if envelope is None:
                 raise OsintPolicyConflictError("A durable policy pin exists without its envelope")
-            return envelope
+            return cast(object, envelope)
         if envelope is not None:
-            return envelope
+            return cast(object, envelope)
         if await uow.investigation_states.get(investigation_id) is not None:
             return None
         if await repository.invocation_count(investigation_id) != 0:
@@ -549,7 +552,7 @@ class OsintOpenPolicyService:
         policy, event = existing
         if event.payload_sha256 != payload_hash:
             raise OsintPolicyConflictError("Correlation was reused with different policy content")
-        return policy
+        return cast(OsintPolicyVersion, policy)
 
     @staticmethod
     def _payload_hash(

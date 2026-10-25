@@ -195,7 +195,7 @@ class InvestigationEnvelopeService:
             raise ValueError("Policy inheritance requires the identified activating actor")
         current = await uow.investigation_envelopes.get(investigation_id)
         if current is not None:
-            return current
+            return cast(InvestigationEnvelope, current)
         investigation = await uow.analyst_investigations.get(investigation_id)
         if investigation is None:
             raise EnvelopeNotFoundError("Investigation does not exist")
@@ -220,7 +220,7 @@ class InvestigationEnvelopeService:
         except VersionConflictError as exc:
             existing = await uow.investigation_envelopes.get(investigation_id)
             if existing is not None:
-                return existing
+                return cast(InvestigationEnvelope, existing)
             raise EnvelopeVersionConflictError(str(exc)) from exc
         if _synchronize_loop_budget_downloads(
             investigation, capabilities.budget_limits.get(BudgetDimension.DOWNLOADS, 0)

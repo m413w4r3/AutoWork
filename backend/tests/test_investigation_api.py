@@ -21,10 +21,10 @@ from cti_app.api.investigation import (
     router,
 )
 from cti_app.application.identity import Identity, IdentityScope, LocalIdentityProvider
-from cti_app.config import Settings
 from cti_app.application.investigation_persistence import VersionConflictError
 from cti_app.application.investigation_state import InvestigationStateVersionConflict
 from cti_app.application.jobs import DuplicateJobError
+from cti_app.config import Settings
 from cti_app.domain.classification import TLP
 from cti_app.domain.investigation import (
     AgendaItem,

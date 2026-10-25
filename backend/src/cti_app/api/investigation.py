@@ -3932,7 +3932,7 @@ async def _policy_activation_actor(uow: Any, effective_policy: Any) -> str | Non
         or event.correlation_id != inheritance.activation_correlation_id
     ):
         return None
-    return event.actor_id
+    return str(event.actor_id)
 
 
 def _policy_authority_status(effective_policy: Any) -> str:
@@ -3940,7 +3940,7 @@ def _policy_authority_status(effective_policy: Any) -> str:
         return "unavailable"
     if effective_policy.revoked:
         return "revoked"
-    return effective_policy.inheritance.status.value
+    return str(effective_policy.inheritance.status.value)
 
 
 def _uow_factory(request: Request) -> Any:

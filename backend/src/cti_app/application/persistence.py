@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Collection, Mapping, Sequence
 from datetime import date, datetime
 from types import TracebackType
-from typing import TYPE_CHECKING, Protocol, Self
+from typing import TYPE_CHECKING, Any, Protocol, Self
 from uuid import UUID
 
 from cti_app.application.investigation_persistence import (
@@ -894,6 +894,7 @@ class UnitOfWork(Protocol):
     detection_candidates: InvestigationDetectionCandidateRepository
     analyst_opinions: AnalystOpinionRepository
     investigation_envelopes: InvestigationEnvelopeRepository
+    osint_open_policies: Any
     investigation_budgets: InvestigationBudgetRepository
     investigation_states: InvestigationStateRepository
     # Defined further down in this module.

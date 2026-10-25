@@ -118,7 +118,9 @@ def _capabilities(
 ) -> OsintCapabilities:
     if request is None:
         return service.default_capabilities()
-    defaults = service.default_capabilities(request.allowed_providers)
+    defaults = service.default_capabilities(
+        tuple(request.allowed_providers) if request.allowed_providers is not None else None
+    )
     limits = dict(defaults.budget_limits)
     for name, value in request.budget_limits.items():
         try:
@@ -183,7 +185,11 @@ def _view(policy: OsintPolicyVersion) -> PolicyView:
             },
             "acquire_hits_allowed": capabilities.acquire_hits_allowed,
             "disclosure": {
-                "tlp": capabilities.disclosure.tlp.value,
+                "tlp": (
+                    capabilities.disclosure.tlp.value
+                    if capabilities.disclosure.tlp is not None
+                    else None
+                ),
                 "do_not_submit": capabilities.disclosure.do_not_submit,
                 "external_llm_allowed": capabilities.disclosure.external_llm_allowed,
             },

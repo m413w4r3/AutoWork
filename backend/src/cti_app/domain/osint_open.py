@@ -136,6 +136,8 @@ class OsintCapabilities:
             raise ValueError("A policy extension cannot clear do_not_submit")
         if current.disclosure.external_llm_allowed and not self.disclosure.external_llm_allowed:
             raise ValueError("A policy extension cannot revoke external model rights")
+        if self.disclosure.tlp is None or current.disclosure.tlp is None:
+            raise ValueError("Policy disclosure requires a concrete TLP")
         tlp_order = {
             TLPLevel.WHITE: 0,
             TLPLevel.CLEAR: 1,
