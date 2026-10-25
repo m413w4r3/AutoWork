@@ -135,7 +135,7 @@ async def test_authenticated_human_can_read_only_article_claims(
             cursor=None,
         )
     assert unverified_error.value.status_code == 403
-    assert unverified_error.value.detail["code"] == "operator_client_scope_required"
+    assert unverified_error.value.detail["code"] == "verified_human_operator_required"
 
     client_identity = provider.identity_for_authorization(f"Bearer {client_token}")
     assert client_identity is not None

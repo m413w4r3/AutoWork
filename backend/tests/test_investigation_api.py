@@ -21,6 +21,7 @@ from cti_app.api.investigation import (
     router,
 )
 from cti_app.application.identity import Identity, IdentityScope, LocalIdentityProvider
+from cti_app.config import Settings
 from cti_app.application.investigation_persistence import VersionConflictError
 from cti_app.application.investigation_state import InvestigationStateVersionConflict
 from cti_app.application.jobs import DuplicateJobError
@@ -577,6 +578,7 @@ def _client(*, store: _Store | None = None, factory: _CompositionFactory | None 
     app.state.job_service = _JobService(store)
     app.state.job_dispatcher = _Dispatcher()
     app.state.identity_provider = LocalIdentityProvider("analyst:test")
+    app.state.settings = Settings(_env_file=None)
     return _SyncASGIClient(app), store
 
 

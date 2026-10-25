@@ -1160,6 +1160,20 @@ async def test_g2_and_budget_guards_refuse_external_invocation(policy: str) -> N
             budget=InvestigationBudget(limits={BudgetDimension.VT_UNITS: 0}),
         )
 
+    if policy == "missing_g2":
+        with pytest.raises(OperatorToolInvocationError) as denied:
+            await service.invoke(
+                tool_name="vt.file_report",
+                schema_version="1",
+                arguments={"query": "hash"},
+                purpose="test the current authorization",
+                expected_version=state.version,
+                idempotency_key=f"policy-{policy}",
+            )
+        assert denied.value.code == "external_disclosure_denied"
+        assert fixture.tools["vt.file_report"].calls == []
+        return
+
     result = await service.invoke(
         tool_name="vt.file_report",
         schema_version="1",

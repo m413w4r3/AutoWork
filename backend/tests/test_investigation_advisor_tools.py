@@ -322,9 +322,22 @@ def make_context(
             BudgetDimension.TOOL_SECONDS: tool_seconds,
         },
     )
+    envelope = InvestigationEnvelope(
+        investigation_id=investigation_id,
+        allowed_providers=("bridge",),
+        budget=budget,
+        acquire_hits_allowed=False,
+        disclosure=DisclosureBounds(
+            tlp=TLPLevel.GREEN,
+            do_not_submit=False,
+            external_llm_allowed=True,
+        ),
+        approval_decision_id=uuid4(),
+        approval_actor_id="synthetic-test-approver",
+    )
     return ToolExecutionContext(
         investigation_id=investigation_id,
-        envelope=None,
+        envelope=envelope,
         budget=budget,
         idempotency_key=key,
         available_capabilities=frozenset(capabilities),

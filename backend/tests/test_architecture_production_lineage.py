@@ -92,7 +92,11 @@ def test_schema_uses_a_frozen_baseline_and_additive_c2_revision() -> None:
         if path.name != "__init__.py"
     )
 
-    assert revisions == ["0001_baseline.py", "0002_c2_experiments.py"]
+    assert revisions == [
+        "0001_baseline.py",
+        "0002_c2_experiments.py",
+        "0003_osint_open_policy.py",
+    ]
 
 
 def test_production_reference_modules_do_not_import_malware_reference_corpus() -> None:

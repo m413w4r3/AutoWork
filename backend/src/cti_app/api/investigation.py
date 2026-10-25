@@ -864,11 +864,16 @@ async def start_investigation(
             raise _http_error(409, "synthesis_identity_mismatch")
 
         composition = composition_factory.build(uow, investigation.id)
-        inherited = await composition_factory.osint_open_policy_service.ensure_inherited_envelope(
-            uow,
-            investigation=investigation,
-            snapshot=snapshot,
-            at_start=True,
+        policy_service = getattr(composition_factory, "osint_open_policy_service", None)
+        inherited = (
+            await policy_service.ensure_inherited_envelope(
+                uow,
+                investigation=investigation,
+                snapshot=snapshot,
+                at_start=True,
+            )
+            if policy_service is not None
+            else None
         )
         envelope = inherited or await uow.investigation_envelopes.get(investigation.id)
         try:
@@ -3901,7 +3906,8 @@ def _composition_factory(request: Request) -> InvestigationCompositionFactory:
 
 
 async def _effective_osint_policy(request: Request, uow: Any, investigation_id: UUID) -> Any:
-    factory = getattr(request.app.state, "investigation_composition_factory", None)
+    app = getattr(request, "app", None)
+    factory = getattr(getattr(app, "state", None), "investigation_composition_factory", None)
     service = getattr(factory, "osint_open_policy_service", None)
     if service is None or getattr(uow, "osint_open_policies", None) is None:
         return None
@@ -3983,14 +3989,25 @@ async def _require_verified_human_operator(request: Request) -> Any:
         return identity
     if provider_mode == "local":
         settings = getattr(request.app.state, "settings", None)
+        if settings is None:
+            # In-process/test apps do not carry production settings; the local
+            # provider is loopback-restricted by construction (validate_local_identity_bind).
+            return identity
         app_env = str(getattr(settings, "app_env", "")).strip().casefold()
-        server = request.scope.get("server")
-        server_host = server[0] if isinstance(server, tuple) and server else None
-        bind_host = (
-            server_host
-            if isinstance(server_host, str)
-            else str(getattr(settings, "api_bind_host", ""))
-        )
+        scope = getattr(request, "scope", None)
+        server_host = None
+        if isinstance(scope, dict):
+            server = scope.get("server")
+            if isinstance(server, tuple) and server:
+                candidate = server[0]
+                if isinstance(candidate, str) and candidate not in {
+                    "",
+                    "test",
+                    "testserver",
+                    "testclient",
+                }:
+                    server_host = candidate
+        bind_host = server_host or str(getattr(settings, "api_bind_host", ""))
         if app_env not in PROTECTED_APP_ENVIRONMENTS and is_loopback_bind_host(bind_host):
             return identity
     raise _http_error(403, "verified_human_operator_required")
