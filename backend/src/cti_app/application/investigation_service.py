@@ -111,6 +111,7 @@ from cti_app.domain.investigation import (
     InvestigationExecutionMode,
     InvestigationFinding,
     NoveltyClass,
+    TLPLevel,
     ToolInvocation,
     ToolInvocationStatus,
     canonical_json_bytes,
@@ -2804,18 +2805,36 @@ class InvestigationService:
     def _external_allowed(
         snapshot: ArticleSnapshot, envelope: InvestigationEnvelope | None
     ) -> bool:
-        tlp = (snapshot.tlp or "").strip().lower().replace("tlp:", "")
-        if envelope is None:
-            return bool(
-                snapshot.external_llm_allowed and not snapshot.do_not_submit and tlp != "red"
-            )
+        # External submission always needs a materialized G2 envelope. Policy
+        # inheritance is performed at investigation start, never at invocation.
+        if envelope is None or not isinstance(snapshot.tlp, str):
+            return False
+        raw_tlp = snapshot.tlp.strip().casefold()
+        if raw_tlp.startswith("tlp:"):
+            raw_tlp = raw_tlp[4:].strip()
+        try:
+            source_tlp = TLPLevel(raw_tlp)
+        except ValueError:
+            return False
+        envelope_tlp = envelope.disclosure.tlp
+        if envelope_tlp is not None and not isinstance(envelope_tlp, TLPLevel):
+            return False
+        tlp_rank = {
+            TLPLevel.WHITE: 0,
+            TLPLevel.CLEAR: 1,
+            TLPLevel.GREEN: 2,
+            TLPLevel.AMBER: 3,
+            TLPLevel.RED: 4,
+        }
+        if envelope_tlp is not None and tlp_rank[envelope_tlp] < tlp_rank[source_tlp]:
+            return False
         return bool(
             snapshot.external_llm_allowed
             and envelope.disclosure.external_llm_allowed
             and not snapshot.do_not_submit
             and not envelope.disclosure.do_not_submit
-            and tlp != "red"
-            and (envelope.disclosure.tlp is None or envelope.disclosure.tlp.value != "red")
+            and source_tlp is not TLPLevel.RED
+            and envelope_tlp is not TLPLevel.RED
         )
 
     @staticmethod

@@ -731,6 +731,11 @@ class DisclosureBounds:
             raise TypeError("Disclosure policy flags must be booleans")
 
 
+class EnvelopeAuthorityKind(StrEnum):
+    HUMAN_G2 = "human_g2"
+    OSINT_POLICY = "osint_policy"
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class InvestigationEnvelope:
     investigation_id: UUID
@@ -740,6 +745,10 @@ class InvestigationEnvelope:
     disclosure: DisclosureBounds
     approval_decision_id: UUID
     approval_actor_id: str
+    authority_kind: EnvelopeAuthorityKind = EnvelopeAuthorityKind.HUMAN_G2
+    inherited_policy_id: UUID | None = None
+    inherited_policy_version: int | None = None
+    inherited_policy_event_id: UUID | None = None
     approved_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     version: int = 1
 
@@ -752,6 +761,22 @@ class InvestigationEnvelope:
             raise TypeError("acquire_hits_allowed must be a boolean")
         if not self.approval_actor_id.strip():
             raise ValueError("An approved envelope requires an identified actor")
+        if not isinstance(self.authority_kind, EnvelopeAuthorityKind):
+            raise TypeError("Envelope authority must use EnvelopeAuthorityKind")
+        inherited_fields = (
+            self.inherited_policy_id,
+            self.inherited_policy_version,
+            self.inherited_policy_event_id,
+        )
+        if self.authority_kind is EnvelopeAuthorityKind.OSINT_POLICY:
+            if any(item is None for item in inherited_fields):
+                raise ValueError("An inherited envelope must identify its policy version and event")
+            if self.inherited_policy_version is None or self.inherited_policy_version < 1:
+                raise ValueError("Inherited policy version must be positive")
+            if self.approval_decision_id != self.inherited_policy_event_id:
+                raise ValueError("Inherited envelope authority must reference its policy event")
+        elif any(item is not None for item in inherited_fields):
+            raise ValueError("A HUMAN_G2 envelope cannot retain inherited policy references")
         if any(not provider.strip() for provider in self.allowed_providers):
             raise ValueError("Allowed provider names must not be empty")
         if self.version < 1:
@@ -813,6 +838,7 @@ __all__ = [
     "DetectionCandidateStatus",
     "DetectionCandidateVersion",
     "DisclosureBounds",
+    "EnvelopeAuthorityKind",
     "EvidenceKind",
     "EvidenceObservation",
     "FindingAssessment",

@@ -87,6 +87,9 @@ from cti_app.application.persistence import (
     VirusTotalObservationRepository,
 )
 from cti_app.application.production_read_model import BatchStatusReadRepository
+from cti_app.infrastructure.database.models import (
+    osint_open_policy as _osint_open_policy_models,  # noqa: F401
+)
 from cti_app.infrastructure.database.repositories.collection import (
     SqlAlchemyClaimRepository,
     SqlAlchemyCollectionAttemptRepository,
@@ -171,6 +174,9 @@ from cti_app.infrastructure.database.repositories.model_conversations import (
 from cti_app.infrastructure.database.repositories.model_runs import (
     SqlAlchemyModelOutputRejectionRepository,
     SqlAlchemyModelRunRepository,
+)
+from cti_app.infrastructure.database.repositories.osint_open_policy import (
+    SqlAlchemyOsintOpenPolicyRepository,
 )
 from cti_app.infrastructure.database.repositories.production import (
     SqlAlchemyAnalystDecisionRepository,
@@ -281,6 +287,7 @@ class SqlAlchemyUnitOfWork:
     analyst_investigations: AnalystInvestigationRepository
     analyst_decisions: AnalystDecisionRepository
     analyst_input_packs: AnalystInputPackRepository
+    osint_open_policies: Any
     edition_production_batches: EditionProductionBatchRepository
     edition_production_batch_items: EditionProductionBatchItemRepository
     edition_compositions: Any
@@ -384,6 +391,7 @@ class SqlAlchemyUnitOfWork:
         )
         self.analyst_investigations = SqlAlchemyAnalystInvestigationRepository(self._session)
         self.analyst_decisions = SqlAlchemyAnalystDecisionRepository(self._session)
+        self.osint_open_policies = SqlAlchemyOsintOpenPolicyRepository(self._session)
         self.analyst_input_packs = SqlAlchemyAnalystInputPackRepository(self._session)
         self.edition_production_batches = SqlAlchemyEditionProductionBatchRepository(self._session)
         self.edition_production_batch_items = SqlAlchemyEditionProductionBatchItemRepository(

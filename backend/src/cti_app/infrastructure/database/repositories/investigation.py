@@ -40,6 +40,7 @@ from cti_app.domain.investigation import (
     DetectionCandidateStatus,
     DetectionCandidateVersion,
     DisclosureBounds,
+    EnvelopeAuthorityKind,
     EvidenceKind,
     EvidenceObservation,
     FindingAssessment,
@@ -1500,6 +1501,10 @@ def _envelope_values(envelope: InvestigationEnvelope, *, updated_at: datetime) -
         "disclosure_external_llm_allowed": envelope.disclosure.external_llm_allowed,
         "approval_decision_id": envelope.approval_decision_id,
         "approval_actor_id": envelope.approval_actor_id,
+        "authority_kind": envelope.authority_kind.value,
+        "inherited_policy_id": envelope.inherited_policy_id,
+        "inherited_policy_version": envelope.inherited_policy_version,
+        "inherited_policy_event_id": envelope.inherited_policy_event_id,
         "approved_at": envelope.approved_at,
         "updated_at": updated_at,
         "version": envelope.version,
@@ -1519,6 +1524,12 @@ def _envelope_from_row(row: InvestigationEnvelopeRow) -> InvestigationEnvelope:
         ),
         approval_decision_id=row.approval_decision_id,
         approval_actor_id=row.approval_actor_id,
+        authority_kind=EnvelopeAuthorityKind(
+            row.authority_kind or EnvelopeAuthorityKind.HUMAN_G2.value
+        ),
+        inherited_policy_id=row.inherited_policy_id,
+        inherited_policy_version=row.inherited_policy_version,
+        inherited_policy_event_id=row.inherited_policy_event_id,
         approved_at=row.approved_at,
         version=row.version,
     )

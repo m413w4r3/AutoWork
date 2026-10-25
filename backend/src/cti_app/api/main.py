@@ -30,6 +30,7 @@ from cti_app.api.investigation_captures import (
 from cti_app.api.investigation_rule_corpus import router as investigation_rule_corpus_router
 from cti_app.api.jobs import router as jobs_router
 from cti_app.api.model_conversations import router as model_conversations_router
+from cti_app.api.osint_policy import router as osint_policy_router
 from cti_app.api.pdf_inspection import router as pdf_inspection_router
 from cti_app.api.production import router as production_router
 from cti_app.api.production_control import router as production_control_router
@@ -624,6 +625,7 @@ def create_app() -> FastAPI:
     if identity_provider.mode == "local":
         validate_local_identity_bind(app_env=settings.app_env, bind_host=settings.api_bind_host)
     application.state.identity_provider = identity_provider
+    application.state.settings = settings
     request_failures = DiagnosticsLog.from_env(settings.diagnostics_log_root)
 
     environment_is_protected = settings.app_env.strip().casefold() in PROTECTED_APP_ENVIRONMENTS
@@ -764,6 +766,7 @@ def create_app() -> FastAPI:
     application.include_router(collection_router)
     application.include_router(model_conversations_router)
     application.include_router(investigation_router)
+    application.include_router(osint_policy_router)
     application.include_router(investigation_captures_router)
     application.include_router(investigation_captures_legacy_router)
     application.include_router(investigation_rule_corpus_router)

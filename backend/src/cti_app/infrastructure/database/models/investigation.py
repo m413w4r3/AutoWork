@@ -561,6 +561,16 @@ class InvestigationEnvelopeRow(Base):
             "('white', 'clear', 'green', 'amber', 'red')",
             name="ck_investigation_envelopes_tlp",
         ),
+        CheckConstraint(
+            "(authority_kind IS NULL AND inherited_policy_id IS NULL "
+            "AND inherited_policy_version IS NULL AND inherited_policy_event_id IS NULL) OR "
+            "(authority_kind = 'human_g2' AND inherited_policy_id IS NULL "
+            "AND inherited_policy_version IS NULL AND inherited_policy_event_id IS NULL) OR "
+            "(authority_kind = 'osint_policy' AND inherited_policy_id IS NOT NULL "
+            "AND inherited_policy_version IS NOT NULL AND inherited_policy_event_id IS NOT NULL "
+            "AND approval_decision_id = inherited_policy_event_id)",
+            name="ck_investigation_envelopes_authority_lineage",
+        ),
         Index("ix_investigation_envelopes_updated", "updated_at"),
     )
 
@@ -577,6 +587,10 @@ class InvestigationEnvelopeRow(Base):
     disclosure_external_llm_allowed: Mapped[bool] = mapped_column(Boolean, nullable=False)
     approval_decision_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
     approval_actor_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    authority_kind: Mapped[str | None] = mapped_column(String(32))
+    inherited_policy_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
+    inherited_policy_version: Mapped[int | None] = mapped_column(BigInteger)
+    inherited_policy_event_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
     approved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     version: Mapped[int] = mapped_column(BigInteger, nullable=False)

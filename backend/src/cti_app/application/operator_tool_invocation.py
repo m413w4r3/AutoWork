@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from typing import Any, cast
 from urllib.parse import parse_qsl, urlsplit
@@ -423,6 +423,7 @@ class OperatorToolInvocationService:
         unavailable_tool_reasons: Mapping[str, str],
         observations: Any | None = None,
         evidence_summaries: CanonicalEvidenceSummaryPort | None = None,
+        effective_policy_for: Callable[[UUID], Awaitable[Any | None]] | None = None,
     ) -> None:
         self._investigation_id = investigation_id
         self._investigations = investigations
@@ -436,6 +437,7 @@ class OperatorToolInvocationService:
         self._unavailable_tool_reasons = unavailable_tool_reasons
         self._observations = observations
         self._evidence_summaries = evidence_summaries
+        self._effective_policy_for = effective_policy_for
 
     async def get_context(
         self,
@@ -924,6 +926,12 @@ class OperatorToolInvocationService:
             ToolEffect.EXTERNAL_ACTIVE,
             ToolEffect.EXTERNAL_SUBMIT,
         }
+        if requires_external_disclosure and not await self._policy_envelope_authorized(envelope):
+            self._require_external_disclosure(snapshot, None)
+        # Start-time policy inheritance is the only path to an OSINT_POLICY
+        # envelope. An old or unpinned investigation cannot acquire one here.
+        if requires_external_disclosure and envelope is None:
+            self._require_external_disclosure(snapshot, envelope)
         if (
             not advisor_disclosure_denied
             and requires_external_disclosure
@@ -1308,6 +1316,17 @@ class OperatorToolInvocationService:
     def _require_external_disclosure(snapshot: Any, envelope: Any) -> None:
         if not InvestigationService.external_llm_allowed(snapshot, envelope):
             raise OperatorToolInvocationError("external_disclosure_denied", 403)
+
+    async def _policy_envelope_authorized(self, envelope: Any) -> bool:
+        from cti_app.domain.investigation import EnvelopeAuthorityKind
+
+        if envelope is None or envelope.authority_kind is not EnvelopeAuthorityKind.OSINT_POLICY:
+            return True
+        resolver = self._effective_policy_for
+        if resolver is None:
+            return False
+        effective = await resolver(self._investigation_id)
+        return bool(effective is not None and effective.authorized)
 
     async def _result(
         self,

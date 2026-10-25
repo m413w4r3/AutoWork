@@ -140,6 +140,7 @@ from cti_app.application.network_workbench import (
     QuarantinedCaptureSource,
 )
 from cti_app.application.operator_tool_invocation import OperatorToolInvocationService
+from cti_app.application.osint_open_policy import OsintOpenPolicyService
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.research_context_builder import (
@@ -822,6 +823,7 @@ class _PermissionAwareInvestigationTransport:
 class InvestigationComposition:
     service: InvestigationService
     operator_tool_invocations: OperatorToolInvocationService
+    osint_open_policy_service: OsintOpenPolicyService | None
     registry: ToolRegistry
     tool_dependencies: InvestigationToolDependencies
     available_capabilities: frozenset[str]
@@ -1635,6 +1637,7 @@ def build_investigation_composition(
         no_progress_limit=settings.investigation_no_progress_limit,
         commit_uow=commit_uow if callable(commit_uow) else None,
     )
+    osint_open_policy_service = OsintOpenPolicyService(uow_factory, settings)
     return InvestigationComposition(
         service=service,
         operator_tool_invocations=OperatorToolInvocationService(
@@ -1650,7 +1653,9 @@ def build_investigation_composition(
             unavailable_tool_reasons=unavailable_tool_reasons,
             observations=uow.evidence_observations,
             evidence_summaries=evidence_summaries,
+            effective_policy_for=osint_open_policy_service.effective_for_investigation,
         ),
+        osint_open_policy_service=osint_open_policy_service,
         registry=registry,
         tool_dependencies=dependencies,
         available_capabilities=available_capabilities,
@@ -1771,6 +1776,10 @@ class InvestigationCompositionFactory:
     @property
     def article_snapshots(self) -> ProductionArticleSnapshotAdapter:
         return ProductionArticleSnapshotAdapter(self.uow_factory, self.artifact_store)
+
+    @property
+    def osint_open_policy_service(self) -> OsintOpenPolicyService:
+        return OsintOpenPolicyService(self.uow_factory, self.settings)
 
     def build(
         self,

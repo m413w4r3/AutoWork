@@ -32,7 +32,13 @@ from cti_app.application.content_pivot_candidates import (
 )
 from cti_app.application.diagram_compilation import DiagramCompilationError
 from cti_app.application.evidence_recorder import sanitize_evidence_text
-from cti_app.application.identity import IdentityProvider, IdentityScope
+from cti_app.application.identity import (
+    PROTECTED_APP_ENVIRONMENTS,
+    IdentityProvider,
+    IdentityScope,
+    is_human_actor_id,
+    is_loopback_bind_host,
+)
 from cti_app.application.investigation_composition import (
     InvestigationComposition,
     InvestigationCompositionFactory,
@@ -113,6 +119,7 @@ from cti_app.domain.analyst_opinion import AnalystOpinionV1
 from cti_app.domain.investigation import (
     BudgetDimension,
     DisclosureBounds,
+    EnvelopeAuthorityKind,
     FindingAssessment,
     InvestigationBudget,
     InvestigationExecutionMode,
@@ -218,6 +225,13 @@ class EnvelopeView(BaseModel):
     approval_decision_id: UUID | None = None
     approval_actor_id: str | None = None
     approved_at: datetime | None = None
+    authority_kind: str | None = None
+    inherited_policy_id: UUID | None = None
+    inherited_policy_version: int | None = None
+    inherited_policy_event_id: UUID | None = None
+    inherited_subject_id: UUID | None = None
+    policy_status: str | None = None
+    currently_authorized: bool = False
 
 
 class InvestigationRequestTarget(BaseModel):
@@ -848,7 +862,13 @@ async def start_investigation(
             raise _http_error(409, "synthesis_identity_mismatch")
 
         composition = composition_factory.build(uow, investigation.id)
-        envelope = await uow.investigation_envelopes.get(investigation.id)
+        inherited = await composition_factory.osint_open_policy_service.ensure_inherited_envelope(
+            uow,
+            investigation=investigation,
+            snapshot=snapshot,
+            at_start=True,
+        )
+        envelope = inherited or await uow.investigation_envelopes.get(investigation.id)
         try:
             state = await composition.service.start(
                 run=run,
@@ -1069,6 +1089,13 @@ async def get_investigation_experiments(
             else ()
         )
         authorization = g2_envelope_authorization_state(envelope, decisions)
+        effective_policy = await _effective_osint_policy(request, uow, investigation_id)
+        policy_authority = (
+            envelope is not None and envelope.authority_kind is EnvelopeAuthorityKind.OSINT_POLICY
+        )
+        g2_blocked = authorization.revoked or bool(
+            policy_authority and (effective_policy is None or not effective_policy.authorized)
+        )
         strategy = build_investigation_strategy_projection(
             investigation_id=investigation_id,
             subject_id=investigation.subject_id,
@@ -1085,7 +1112,7 @@ async def get_investigation_experiments(
             build_investigation_operator_strategy_checkpoint(
                 strategy,
                 state=state,
-                g2_blocked=authorization.revoked,
+                g2_blocked=g2_blocked,
             )
         )
         timeline_payload = project_safe_investigation_experiment_timeline(
@@ -1128,9 +1155,16 @@ async def get_investigation_pivot_frontier(
         envelope = await uow.investigation_envelopes.get(investigation_id)
         decisions = tuple(await uow.analyst_decisions.list_for_investigation(investigation_id))
         authorization = g2_envelope_authorization_state(envelope, decisions)
+        effective_policy = await _effective_osint_policy(request, uow, investigation_id)
+        policy_authority = (
+            envelope is not None and envelope.authority_kind is EnvelopeAuthorityKind.OSINT_POLICY
+        )
+        g2_revoked = authorization.revoked or bool(
+            policy_authority and effective_policy and effective_policy.revoked
+        )
         ceiling = authorization.authorization_ceiling
         g2_vt_authorized = bool(
-            not authorization.revoked
+            not g2_revoked
             and ceiling is not None
             and ceiling.acquire_hits_allowed
             and any(
@@ -1331,6 +1365,15 @@ async def _operator_context_invalidation_facts(
     envelope = await uow.investigation_envelopes.get(investigation_id)
     decisions = tuple(await uow.analyst_decisions.list_for_investigation(investigation_id))
     authorization = g2_envelope_authorization_state(envelope, decisions)
+    policy_service = getattr(composition, "osint_open_policy_service", None)
+    effective_policy = (
+        await policy_service.effective_for(uow, investigation_id)
+        if policy_service is not None and getattr(uow, "osint_open_policies", None) is not None
+        else None
+    )
+    policy_authority = (
+        getattr(envelope, "authority_kind", None) is EnvelopeAuthorityKind.OSINT_POLICY
+    )
     budget = getattr(envelope, "budget", None)
     g2_facts: dict[str, Any] = {
         "envelope_version": getattr(envelope, "version", None),
@@ -1339,11 +1382,31 @@ async def _operator_context_invalidation_facts(
             if isinstance((approved_at := getattr(envelope, "approved_at", None)), datetime)
             else None
         ),
-        "revoked": authorization.revoked,
+        "revoked": authorization.revoked
+        or bool(policy_authority and effective_policy and effective_policy.revoked),
+        "currently_authorized": (
+            not authorization.revoked
+            and (not policy_authority or bool(effective_policy and effective_policy.authorized))
+        ),
         "allowed_providers": list(getattr(envelope, "allowed_providers", ())),
         "acquire_hits_allowed": getattr(envelope, "acquire_hits_allowed", False),
         "approval_decision_id": str(getattr(envelope, "approval_decision_id", "")) or None,
         "approval_actor_id": getattr(envelope, "approval_actor_id", None),
+        "authority_kind": getattr(getattr(envelope, "authority_kind", None), "value", None),
+        "inherited_policy_id": str(getattr(envelope, "inherited_policy_id", "") or "") or None,
+        "inherited_policy_version": getattr(envelope, "inherited_policy_version", None),
+        "inherited_policy_event_id": str(getattr(envelope, "inherited_policy_event_id", "") or "")
+        or None,
+        "inherited_subject_id": (
+            str(effective_policy.inheritance.subject_id) if effective_policy is not None else None
+        ),
+        "policy_status": (
+            "revoked"
+            if effective_policy and effective_policy.revoked
+            else effective_policy.inheritance.status.value
+            if effective_policy
+            else None
+        ),
         "authorization_ceiling": (
             {
                 "allowed_providers": list(authorization.authorization_ceiling.allowed_providers),
@@ -1649,6 +1712,13 @@ async def get_investigation_operator_status(
         envelope = await uow.investigation_envelopes.get(investigation_id)
         decisions = tuple(await uow.analyst_decisions.list_for_investigation(investigation_id))
         authorization = g2_envelope_authorization_state(envelope, decisions)
+        effective_policy = await _effective_osint_policy(request, uow, investigation_id)
+        policy_authority = (
+            envelope is not None and envelope.authority_kind is EnvelopeAuthorityKind.OSINT_POLICY
+        )
+        g2_revoked = authorization.revoked or bool(
+            policy_authority and effective_policy and effective_policy.revoked
+        )
         invocations = tuple(await uow.tool_invocations.list_for_investigation(investigation_id))
         observations = tuple(
             await uow.evidence_observations.list_for_investigation(investigation_id)
@@ -1723,9 +1793,11 @@ async def get_investigation_operator_status(
             state=state,
             synthesis_sha256=snapshot.synthesis_sha256,
             envelope=envelope,
-            g2_revoked=authorization.revoked,
+            g2_revoked=g2_revoked,
             g2_reapproval_supported=(
-                authorization.revoked and authorization.authorization_ceiling is not None
+                not policy_authority
+                and authorization.revoked
+                and authorization.authorization_ceiling is not None
             ),
             invocations=invocations,
             observations=observations,
@@ -1759,47 +1831,7 @@ async def get_investigation_envelope(
     investigation_id: UUID,
     request: Request,
 ) -> EnvelopeView:
-    async with _uow_factory(request)() as uow:
-        investigation = await uow.analyst_investigations.get(investigation_id)
-        if investigation is None:
-            raise _http_error(404, "investigation_not_found")
-        composition = _composition_factory(request).build(uow, investigation_id, operator_mode=True)
-        snapshot = await composition.tool_dependencies.article_snapshots.resolve(
-            investigation.synthesis_artifact_id
-        )
-        current = await uow.investigation_envelopes.get(investigation_id)
-        settings = _composition_factory(request).settings
-        if current is None:
-            budget = _configured_budget(settings)
-            allowed_providers: tuple[str, ...] = ()
-            acquire_hits_allowed = False
-            disclosure = _source_disclosure(snapshot)
-            version = 0
-            decision_id = None
-            actor_id = None
-            approved_at = None
-        else:
-            budget = current.budget
-            allowed_providers = current.allowed_providers
-            acquire_hits_allowed = current.acquire_hits_allowed
-            disclosure = current.disclosure
-            version = current.version
-            decision_id = current.approval_decision_id
-            actor_id = current.approval_actor_id
-            approved_at = current.approved_at
-        return _envelope_view(
-            investigation_id=investigation_id,
-            budget=budget,
-            approved=current is not None,
-            version=version,
-            allowed_providers=allowed_providers,
-            available_providers=_available_providers(composition.available_tools),
-            acquire_hits_allowed=acquire_hits_allowed,
-            disclosure=disclosure,
-            approval_decision_id=decision_id,
-            approval_actor_id=actor_id,
-            approved_at=approved_at,
-        )
+    return await _current_envelope_view(request, investigation_id)
 
 
 @router.post("/investigations/{investigation_id}/envelope/approve", response_model=EnvelopeView)
@@ -1809,7 +1841,7 @@ async def approve_investigation_envelope(
     request: Request,
     idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=1, max_length=255)],
 ) -> EnvelopeView:
-    identity = await _identity(request)
+    identity = await _require_verified_human_operator(request)
     async with _uow_factory(request)() as uow:
         investigation = await uow.analyst_investigations.get(investigation_id)
         if investigation is None:
@@ -1856,7 +1888,7 @@ async def extend_investigation_envelope(
     request: Request,
     idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=1, max_length=255)],
 ) -> EnvelopeView:
-    identity = await _identity(request)
+    identity = await _require_verified_human_operator(request)
     service = InvestigationEnvelopeService(_uow_factory(request))
     async with _uow_factory(request)() as uow:
         current = await uow.investigation_envelopes.get(investigation_id)
@@ -1936,7 +1968,7 @@ async def revoke_investigation_envelope(
     request: Request,
     idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=1, max_length=255)],
 ) -> EnvelopeView:
-    identity = await _identity(request)
+    identity = await _require_verified_human_operator(request)
     try:
         await InvestigationEnvelopeService(_uow_factory(request)).revoke(
             investigation_id,
@@ -2235,7 +2267,16 @@ async def qualify_investigation_sample(
     request: Request,
     idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=1, max_length=255)],
 ) -> SampleQualificationResponse:
-    identity = await _identity(request)
+    if payload.qualification in {SampleQualification.CONFIRMED, SampleQualification.REJECTED}:
+        identity = await _require_verified_human_operator(request)
+        actor_kind = QualificationActorKind.HUMAN
+    else:
+        identity = await _identity(request)
+        actor_kind = (
+            QualificationActorKind.AGENT
+            if identity.has_scope(IdentityScope.OPERATOR_CLIENT)
+            else QualificationActorKind.HUMAN
+        )
     async with _uow_factory(request)() as uow:
         if await uow.analyst_investigations.get(investigation_id) is None:
             raise _http_error(404, "investigation_not_found")
@@ -2254,7 +2295,7 @@ async def qualify_investigation_sample(
             payload.qualification,
             InvestigationActor(
                 actor_id=identity.actor_id,
-                kind=QualificationActorKind.HUMAN,
+                kind=actor_kind,
             ),
             payload.reason,
             payload.evidence_refs,
@@ -2794,6 +2835,18 @@ async def _investigation_view(
     invocations = tuple(await uow.tool_invocations.list_for_investigation(investigation_id))
     decisions = tuple(await uow.analyst_decisions.list_for_investigation(investigation_id))
     authorization = g2_envelope_authorization_state(envelope, decisions)
+    policy_service = getattr(composition, "osint_open_policy_service", None)
+    effective_policy = (
+        await policy_service.effective_for(uow, investigation_id)
+        if policy_service is not None and getattr(uow, "osint_open_policies", None) is not None
+        else None
+    )
+    policy_authority = (
+        envelope is not None and envelope.authority_kind is EnvelopeAuthorityKind.OSINT_POLICY
+    )
+    currently_authorized = not authorization.revoked and (
+        not policy_authority or bool(effective_policy and effective_policy.authorized)
+    )
     opinion = await uow.analyst_opinions.get(uuid5(_OPINION_NAMESPACE, str(investigation_id)))
     effective_budget = (
         envelope.budget
@@ -2822,8 +2875,7 @@ async def _investigation_view(
         invocations=invocations,
         observations=observations,
         external_llm_allowed=(
-            not authorization.revoked
-            and InvestigationService.external_llm_allowed(snapshot, envelope)
+            currently_authorized and InvestigationService.external_llm_allowed(snapshot, envelope)
         ),
     )
     if tool_inventory is None:
@@ -2919,7 +2971,7 @@ async def _investigation_view(
         available_tools=list(available_tools),
         unavailable_tools=list(unavailable_tools),
         unavailable_tool_reasons=unavailable_tool_reasons,
-        envelope_approved=envelope is not None and not authorization.revoked,
+        envelope_approved=envelope is not None and currently_authorized,
         allowed_providers=list(envelope.allowed_providers) if envelope is not None else [],
         acquire_hits_allowed=envelope.acquire_hits_allowed if envelope is not None else False,
     )
@@ -3010,7 +3062,18 @@ async def _current_envelope_view(request: Request, investigation_id: UUID) -> En
                 approval_decision_id=None,
                 approval_actor_id=None,
                 approved_at=None,
+                authority_kind=None,
+                inherited_policy_id=None,
+                inherited_policy_version=None,
+                inherited_policy_event_id=None,
+                inherited_subject_id=None,
+                policy_status=None,
+                currently_authorized=False,
             )
+        effective_policy = await _effective_osint_policy(request, uow, investigation_id)
+        decisions = tuple(await uow.analyst_decisions.list_for_investigation(investigation_id))
+        authorization = g2_envelope_authorization_state(current, decisions)
+        policy_authority = current.authority_kind is EnvelopeAuthorityKind.OSINT_POLICY
         return _envelope_view(
             investigation_id=investigation_id,
             budget=current.budget,
@@ -3023,6 +3086,24 @@ async def _current_envelope_view(request: Request, investigation_id: UUID) -> En
             approval_decision_id=current.approval_decision_id,
             approval_actor_id=current.approval_actor_id,
             approved_at=current.approved_at,
+            authority_kind=current.authority_kind.value,
+            inherited_policy_id=current.inherited_policy_id,
+            inherited_policy_version=current.inherited_policy_version,
+            inherited_policy_event_id=current.inherited_policy_event_id,
+            inherited_subject_id=(
+                effective_policy.inheritance.subject_id if effective_policy is not None else None
+            ),
+            policy_status=(
+                "revoked"
+                if effective_policy and effective_policy.revoked
+                else effective_policy.inheritance.status.value
+                if effective_policy
+                else None
+            ),
+            currently_authorized=(
+                not authorization.revoked
+                and (not policy_authority or bool(effective_policy and effective_policy.authorized))
+            ),
         )
 
 
@@ -3170,6 +3251,13 @@ def _envelope_view(
     approval_decision_id: UUID | None,
     approval_actor_id: str | None,
     approved_at: datetime | None,
+    authority_kind: str | None,
+    inherited_policy_id: UUID | None,
+    inherited_policy_version: int | None,
+    inherited_policy_event_id: UUID | None,
+    inherited_subject_id: UUID | None,
+    policy_status: str | None,
+    currently_authorized: bool,
 ) -> EnvelopeView:
     return EnvelopeView(
         investigation_id=investigation_id,
@@ -3196,6 +3284,13 @@ def _envelope_view(
         approval_decision_id=approval_decision_id,
         approval_actor_id=approval_actor_id,
         approved_at=approved_at,
+        authority_kind=authority_kind,
+        inherited_policy_id=inherited_policy_id,
+        inherited_policy_version=inherited_policy_version,
+        inherited_policy_event_id=inherited_policy_event_id,
+        inherited_subject_id=inherited_subject_id,
+        policy_status=policy_status,
+        currently_authorized=currently_authorized,
     )
 
 
@@ -3776,6 +3871,14 @@ def _composition_factory(request: Request) -> InvestigationCompositionFactory:
     return cast(InvestigationCompositionFactory, factory)
 
 
+async def _effective_osint_policy(request: Request, uow: Any, investigation_id: UUID) -> Any:
+    factory = getattr(request.app.state, "investigation_composition_factory", None)
+    service = getattr(factory, "osint_open_policy_service", None)
+    if service is None or getattr(uow, "osint_open_policies", None) is None:
+        return None
+    return await service.effective_for(uow, investigation_id)
+
+
 def _uow_factory(request: Request) -> Any:
     factory = getattr(request.app.state, "uow_factory", None)
     if factory is None:
@@ -3802,13 +3905,31 @@ async def _require_article_claim_reader(request: Request, section: str) -> None:
     if identity.has_scope(IdentityScope.OPERATOR_CLIENT):
         return
     if section == "article_claims" and identity.has_scope(IdentityScope.HUMAN_OPERATOR):
-        provider = getattr(request.app.state, "identity_provider", None)
-        provider_mode = getattr(provider, "mode", None)
-        if provider_mode == "local" or (
-            provider_mode == "authenticated" and getattr(provider, "verified", False) is True
-        ):
-            return
+        await _require_verified_human_operator(request)
+        return
     raise _http_error(403, "operator_client_scope_required")
+
+
+async def _require_verified_human_operator(request: Request) -> Any:
+    """Return only a server-derived human identity with the verified-human gate."""
+    identity = await _identity(request)
+    if (
+        identity.has_scope(IdentityScope.OPERATOR_CLIENT)
+        or not identity.has_scope(IdentityScope.HUMAN_OPERATOR)
+        or not is_human_actor_id(identity.actor_id)
+    ):
+        raise _http_error(403, "verified_human_operator_required")
+    provider = getattr(request.app.state, "identity_provider", None)
+    provider_mode = getattr(provider, "mode", None)
+    if provider_mode == "authenticated" and getattr(provider, "verified", False) is True:
+        return identity
+    if provider_mode == "local":
+        settings = getattr(request.app.state, "settings", None)
+        app_env = str(getattr(settings, "app_env", "")).strip().casefold()
+        bind_host = str(getattr(settings, "api_bind_host", ""))
+        if app_env not in PROTECTED_APP_ENVIRONMENTS and is_loopback_bind_host(bind_host):
+            return identity
+    raise _http_error(403, "verified_human_operator_required")
 
 
 async def _dispatch(request: Request, job: Job) -> None:

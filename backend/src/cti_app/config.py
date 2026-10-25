@@ -177,6 +177,25 @@ class Settings(BaseSettings):
         default=None, gt=0, le=86400
     )
     code_version: str = "0.1.0"
+    # OSINT_OPEN is opt-in. These are generous policy defaults; independent hard
+    # maxima bound any activation or extension request.
+    osint_open_default_vt_units: int = Field(default=10_000, ge=1)
+    osint_open_default_downloads: int = Field(default=1_000, ge=1)
+    osint_open_default_bridge_turns: int = Field(default=100, ge=1)
+    osint_open_default_tool_seconds: int = Field(default=3_600, ge=1)
+    osint_open_default_context_bytes: int = Field(default=16 * 1024 * 1024, ge=1)
+    osint_open_default_context_tokens: int = Field(default=4_000_000, ge=1)
+    osint_open_default_shodan_credits: int | None = Field(default=None, ge=1)
+    osint_open_default_acquire_hits_allowed: bool = True
+    osint_open_default_max_effect_claims: int = Field(default=500, ge=1)
+    osint_open_max_vt_units: int = Field(default=100_000, ge=1)
+    osint_open_max_downloads: int = Field(default=10_000, ge=1)
+    osint_open_max_bridge_turns: int = Field(default=1_000, ge=1)
+    osint_open_max_tool_seconds: int = Field(default=86_400, ge=1)
+    osint_open_max_context_bytes: int = Field(default=128 * 1024 * 1024, ge=1)
+    osint_open_max_context_tokens: int = Field(default=32_000_000, ge=1)
+    osint_open_max_shodan_credits: int = Field(default=100_000, ge=1)
+    osint_open_max_effect_claims: int = Field(default=10_000, ge=1)
     worker_code_version: str | None = None
     model_conversation_retention_days: int = Field(default=90, ge=1, le=3650)
     discovery_chatgpt_structuring_fallback: bool = False
@@ -393,6 +412,16 @@ class Settings(BaseSettings):
     investigation_max_tool_seconds: int = Field(default=3600, ge=1)
     investigation_max_context_bytes: int = Field(default=4_000_000, ge=1)
     investigation_no_progress_limit: int = Field(default=3, ge=1, le=20)
+    osint_open_vt_units: int = Field(default=10_000, ge=0)
+    osint_open_downloads: int = Field(default=1_000, ge=0)
+    osint_open_bridge_turns: int = Field(default=100, ge=0)
+    osint_open_tool_seconds: int = Field(default=3_600, ge=1)
+    osint_open_context_bytes: int = Field(default=16_000_000, ge=1)
+    osint_open_context_tokens: int = Field(default=4_000_000, ge=1)
+    osint_open_shodan_credits: int | None = Field(default=None, ge=0)
+    osint_open_default_tlp: Literal["white", "clear", "green", "amber", "red"] = "clear"
+    osint_open_acquire_hits_allowed: bool = True
+    osint_open_max_effect_claims_per_investigation: int | None = Field(default=500, ge=1)
     rule_workbench_enabled: bool = False
     analysis_string_min_length: int = Field(default=4, ge=1, le=1024)
     analysis_max_strings: int = Field(default=10_000, ge=1, le=1_000_000)

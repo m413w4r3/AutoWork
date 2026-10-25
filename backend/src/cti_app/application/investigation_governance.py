@@ -22,6 +22,7 @@ from cti_app.domain.investigation import (
     BudgetDimension,
     BudgetReservationStatus,
     DisclosureBounds,
+    EnvelopeAuthorityKind,
     InvestigationBudget,
     InvestigationEnvelope,
     QualificationActorKind,
@@ -29,6 +30,7 @@ from cti_app.domain.investigation import (
     SampleQualification,
     TLPLevel,
 )
+from cti_app.domain.osint_open import OsintCapabilities
 from cti_app.domain.production import AnalystInvestigation
 
 _DECISION_NAMESPACE = UUID("4a4a20ac-2826-4c12-af6c-a72681034bc5")
@@ -103,6 +105,12 @@ def g2_envelope_authorization_state(
 ) -> G2EnvelopeAuthorizationState:
     if envelope is None:
         return G2EnvelopeAuthorizationState(revoked=False, authorization_ceiling=None)
+    if envelope.authority_kind is EnvelopeAuthorityKind.OSINT_POLICY:
+        # The approval UUID is a policy event UUID, never an AnalystDecision UUID.
+        return G2EnvelopeAuthorizationState(
+            revoked=False,
+            authorization_ceiling=_authorization_bounds_for_envelope(envelope),
+        )
     revocation = next(
         (
             item
@@ -171,6 +179,56 @@ class InvestigationEnvelopeService:
             ),
         )
 
+    async def create_policy_inherited_envelope(
+        self,
+        uow: Any,
+        *,
+        investigation_id: UUID,
+        policy_id: UUID,
+        policy_version: int,
+        policy_event_id: UUID,
+        actor_id: str,
+        capabilities: OsintCapabilities,
+        disclosure: DisclosureBounds,
+    ) -> InvestigationEnvelope:
+        """Persist policy authority without creating a human G2 decision."""
+        if not actor_id.strip():
+            raise ValueError("Policy inheritance requires the identified activating actor")
+        current = await uow.investigation_envelopes.get(investigation_id)
+        if current is not None:
+            return current
+        investigation = await uow.analyst_investigations.get(investigation_id)
+        if investigation is None:
+            raise EnvelopeNotFoundError("Investigation does not exist")
+        budget = InvestigationBudget(limits=capabilities.budget_limits)
+        envelope = InvestigationEnvelope(
+            investigation_id=investigation_id,
+            allowed_providers=capabilities.allowed_providers,
+            budget=budget,
+            acquire_hits_allowed=capabilities.acquire_hits_allowed,
+            disclosure=disclosure,
+            approval_decision_id=policy_event_id,
+            approval_actor_id=actor_id.strip(),
+            authority_kind=EnvelopeAuthorityKind.OSINT_POLICY,
+            inherited_policy_id=policy_id,
+            inherited_policy_version=policy_version,
+            inherited_policy_event_id=policy_event_id,
+            approved_at=datetime.now(UTC),
+            version=1,
+        )
+        try:
+            await uow.investigation_envelopes.save_if_version(envelope, expected_version=None)
+        except VersionConflictError as exc:
+            existing = await uow.investigation_envelopes.get(investigation_id)
+            if existing is not None:
+                return existing
+            raise EnvelopeVersionConflictError(str(exc)) from exc
+        if _synchronize_loop_budget_downloads(
+            investigation, capabilities.budget_limits.get(BudgetDimension.DOWNLOADS, 0)
+        ):
+            await uow.analyst_investigations.save(investigation)
+        return envelope
+
     async def approve(
         self,
         proposal: InvestigationEnvelopeProposal,
@@ -232,6 +290,7 @@ class InvestigationEnvelopeService:
                 disclosure=proposal.disclosure,
                 approval_decision_id=decision.id,
                 approval_actor_id=actor_id.strip(),
+                authority_kind=EnvelopeAuthorityKind.HUMAN_G2,
                 approved_at=datetime.now(UTC),
                 version=1,
             )
@@ -332,10 +391,19 @@ class InvestigationEnvelopeService:
                 disclosure=disclosure,
                 approval_decision_id=decision.id,
                 approval_actor_id=actor_id.strip(),
+                authority_kind=EnvelopeAuthorityKind.HUMAN_G2,
                 approved_at=datetime.now(UTC),
                 version=current.version + 1,
             )
             await uow.analyst_decisions.append(decision)
+            if current.authority_kind is EnvelopeAuthorityKind.OSINT_POLICY:
+                policy_repository = getattr(uow, "osint_open_policies", None)
+                if policy_repository is not None:
+                    from cti_app.domain.osint_open import OsintInheritanceStatus
+
+                    await policy_repository.set_inheritance_status_by_investigation(
+                        investigation_id, OsintInheritanceStatus.SUPERSEDED
+                    )
             try:
                 await uow.investigation_envelopes.save_if_version(
                     extended, expected_version=expected_version
@@ -469,6 +537,7 @@ class InvestigationEnvelopeService:
                 ),
                 approval_decision_id=decision.id,
                 approval_actor_id=actor_id.strip(),
+                authority_kind=EnvelopeAuthorityKind.HUMAN_G2,
                 approved_at=datetime.now(UTC),
                 version=current.version + 1,
             )
@@ -477,6 +546,14 @@ class InvestigationEnvelopeService:
                 details={"authorization_ceiling": _authorization_bounds_payload(current)},
             )
             await uow.analyst_decisions.append(decision)
+            if current.authority_kind is EnvelopeAuthorityKind.OSINT_POLICY:
+                policy_repository = getattr(uow, "osint_open_policies", None)
+                if policy_repository is not None:
+                    from cti_app.domain.osint_open import OsintInheritanceStatus
+
+                    await policy_repository.set_inheritance_status_by_investigation(
+                        investigation_id, OsintInheritanceStatus.SUPERSEDED
+                    )
             try:
                 await uow.investigation_envelopes.save_if_version(
                     revoked, expected_version=expected_version
