@@ -166,8 +166,9 @@ def _file_report(file_hash: str = _SEED_HASH) -> VirusTotalFileReport:
                 "id": file_hash,
                 "attributes": {
                     "last_analysis_date": 1_781_300_000,
-                    "api_key": "supersecret-response-value",
+                    "VT_API_KEY": "supersecret-response-value",
                     "signed_url": "https://example.test/download?token=signed-value",
+                    "api_key": "cti-response-value",
                 },
             }
         }
@@ -177,7 +178,7 @@ def _file_report(file_hash: str = _SEED_HASH) -> VirusTotalFileReport:
             id=file_hash,
             type="file",
             lookup_value=file_hash,
-            meaningful_name="api_key=supersecret-name",
+            meaningful_name="VT_API_KEY=supersecret-name api_key=cti-name",
             type_description="Win32 EXE",
             size=321,
             last_analysis_stats={"malicious": 4, "undetected": 59},
@@ -1262,6 +1263,7 @@ class _EvidenceAwareScriptedTransport(ScriptedTurnTransport):
         context_sha256: str,
         prompt: str,
         external_llm_allowed: bool,
+        timeout_seconds: float | None = None,
     ) -> Any:
         current = await self.evidence.list_for_investigation(investigation_id)
         if turn_index == 1:
@@ -1376,6 +1378,7 @@ class _EvidenceAwareScriptedTransport(ScriptedTurnTransport):
             context_sha256=context_sha256,
             prompt=prompt,
             external_llm_allowed=external_llm_allowed,
+            timeout_seconds=timeout_seconds,
         )
 
 

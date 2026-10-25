@@ -29,6 +29,7 @@ from cti_app.domain.retrohunt import (
     RetrohuntReservationState,
     RetrohuntSubmitRequest,
 )
+from cti_app.domain.rule_workbench import RuleTestCorpusRole
 
 MAX_SUBMISSIONS_PER_SUBJECT = RETROHUNT_MAX_SUBMISSIONS_PER_SUBJECT
 RETROHUNT_CAPABILITY = "vt.retrohunt"
@@ -563,32 +564,60 @@ def _quality_report_qualifies(
         or not isinstance(payload.get("roles"), list)
     ):
         return False
-    roles = {
-        entry.get("role"): entry
-        for entry in payload["roles"]
-        if isinstance(entry, Mapping) and isinstance(entry.get("role"), str)
+    required_roles = {
+        RuleTestCorpusRole.HUMAN_CONFIRMED.value,
+        RuleTestCorpusRole.NEW_CANDIDATE_UNCONFIRMED.value,
+        RuleTestCorpusRole.GOODWARE.value,
+        RuleTestCorpusRole.HOLDOUT_POSITIVE.value,
     }
-    if set(roles) != {
-        "confirmed_positive",
-        "out_of_cluster_candidate",
-        "goodware",
-        "holdout",
-    } or len(roles) != len(payload["roles"]):
+    known_roles = {role.value for role in RuleTestCorpusRole}
+    role_aliases = {
+        "confirmed_positive": RuleTestCorpusRole.HUMAN_CONFIRMED.value,
+        "out_of_cluster_candidate": RuleTestCorpusRole.NEW_CANDIDATE_UNCONFIRMED.value,
+        "holdout": RuleTestCorpusRole.HOLDOUT_POSITIVE.value,
+    }
+    roles: dict[str, Mapping[str, Any]] = {}
+    for entry in payload["roles"]:
+        if not isinstance(entry, Mapping) or not isinstance(entry.get("role"), str):
+            return False
+        raw_role = entry["role"]
+        role = role_aliases.get(raw_role, raw_role)
+        if role not in known_roles or role in roles:
+            return False
+        roles[role] = entry
+    # Current reports serialize every canonical enum role, including empty buckets.
+    # Only the four qualified buckets may contain corpus rows for this gate.
+    if not required_roles.issubset(roles) or any(
+        role not in required_roles and role_payload.get("corpus_sha256s")
+        for role, role_payload in roles.items()
+    ):
         return False
-    positives = roles.get("confirmed_positive")
+    if any(not _role_measured(role_payload) for role_payload in roles.values()):
+        return False
+    measured_roles = {
+        role for role, role_payload in roles.items() if role_payload.get("corpus_sha256s")
+    }
+    if measured_roles != required_roles:
+        return False
+    positive_role = RuleTestCorpusRole.HUMAN_CONFIRMED.value
+    positives = roles.get(positive_role)
     if not isinstance(positives, Mapping):
         return False
     if not _role_measured(positives) or not positives.get("matches"):
         return False
-    for role_name in ("goodware", "out_of_cluster_candidate", "holdout"):
-        role = roles.get(role_name)
-        if not isinstance(role, Mapping) or not role.get("corpus_sha256s"):
+    for role_name in (
+        RuleTestCorpusRole.GOODWARE.value,
+        RuleTestCorpusRole.NEW_CANDIDATE_UNCONFIRMED.value,
+        RuleTestCorpusRole.HOLDOUT_POSITIVE.value,
+    ):
+        role_payload = roles.get(role_name)
+        if not isinstance(role_payload, Mapping) or not role_payload.get("corpus_sha256s"):
             continue
-        if not _role_measured(role):
+        if not _role_measured(role_payload):
             return False
-        if role_name == "goodware":
+        if role_name == RuleTestCorpusRole.GOODWARE.value:
             acknowledged = set(decision_details.get("known_false_positives", ()))
-            if not set(role.get("matches", ())).issubset(acknowledged):
+            if not set(role_payload.get("matches", ())).issubset(acknowledged):
                 return False
     return True
 

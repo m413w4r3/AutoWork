@@ -9,7 +9,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import httpx
 import pytest
@@ -186,10 +186,14 @@ class _ControlledRuleCorpus:
         *,
         goodware: tuple[str, ...],
         holdout: tuple[str, ...],
+        new_candidates: tuple[str, ...] = (),
+        designated_holdouts: tuple[str, ...] = (),
     ) -> None:
         self._samples = dict(samples)
         self._goodware = goodware
         self._holdout = holdout
+        self._new_candidates = new_candidates
+        self._designated_holdouts = designated_holdouts
 
     async def get_bytes_for_sample(self, sample_sha256: str) -> bytes:
         payload = self._samples.get(sample_sha256)
@@ -199,9 +203,9 @@ class _ControlledRuleCorpus:
         return payload
 
     async def manual_rule_corpus_imports(
-        self, _investigation_id: UUID
+        self, investigation_id: UUID
     ) -> tuple[RuleCorpusInventoryItem, ...]:
-        return tuple(
+        goodware_items = tuple(
             RuleCorpusInventoryItem(
                 sample_sha256=sample_sha256,
                 role=RuleTestCorpusRole.GOODWARE,
@@ -211,6 +215,32 @@ class _ControlledRuleCorpus:
             )
             for sample_sha256 in self._goodware
         )
+        candidate_items = tuple(
+            RuleCorpusInventoryItem(
+                sample_sha256=sample_sha256,
+                role=RuleTestCorpusRole.NEW_CANDIDATE_UNCONFIRMED,
+                provenance=RuleSampleProvenance.SYNTHETIC,
+                size_bytes=len(self._samples[sample_sha256]),
+                source_description="Synthetic unconfirmed W14 candidate for local YARA testing.",
+            )
+            for sample_sha256 in self._new_candidates
+        )
+        holdout_items = tuple(
+            RuleCorpusInventoryItem(
+                sample_sha256=sample_sha256,
+                role=RuleTestCorpusRole.HOLDOUT_POSITIVE,
+                provenance=RuleSampleProvenance.SYNTHETIC,
+                size_bytes=len(self._samples[sample_sha256]),
+                source_description="Independent designated positive W14 holdout fixture.",
+                designated_at=datetime(2026, 1, 1, tzinfo=UTC),
+                observation_id=uuid5(
+                    NAMESPACE_URL, f"w14-holdout:{investigation_id}:{sample_sha256}"
+                ),
+                operator_id="w14-test-operator",
+            )
+            for sample_sha256 in self._designated_holdouts
+        )
+        return (*goodware_items, *candidate_items, *holdout_items)
 
     async def holdout_sample_sha256s(self, _investigation_id: UUID) -> tuple[str, ...]:
         return self._holdout
@@ -889,44 +919,57 @@ async def test_w14_a_similarity_rule_revision_and_new_article_sample(
             assert len(report_payloads) == 3
             assert all(item["execution_status"] == "ok" for item in report_payloads)
             assert all(item["validation_status"] == "real_partial" for item in report_payloads)
+            assert all(
+                any("holdout sans rôle" in limitation for limitation in item["limitations"])
+                for item in report_payloads
+            )
+            assert all(
+                any(
+                    "goodware_baseline" in limitation and "n'est liée" in limitation
+                    for limitation in item["limitations"]
+                )
+                for item in report_payloads
+            )
+            assert all(
+                holdout_sha not in item["corpus_sha256s_by_role"]["holdout_positive"]
+                for item in report_payloads
+            )
             first_v1 = next(
                 item
                 for item in report_payloads
                 if item["version_id"] == str(versions[0].id)
-                and sha_c not in item["corpus_sha256s_by_role"].get("out_of_cluster_candidate", [])
+                and sha_c not in item["corpus_sha256s_by_role"].get("new_candidate_unconfirmed", [])
             )
             assert first_v1["candidate_status"] == "tested"
+            # Serialized role keys use the canonical persisted RuleTestCorpusRole values.
             roles_first_v1 = {item["role"]: item for item in first_v1["roles"]}
-            assert {sha_a, sha_b} <= set(roles_first_v1["confirmed_positive"]["matches"])
-            assert sha_d in roles_first_v1["out_of_cluster_candidate"]["non_matches"]
+            assert {sha_a, sha_b} <= set(roles_first_v1["human_confirmed"]["matches"])
+            assert sha_d in roles_first_v1["new_candidate_unconfirmed"]["non_matches"]
             assert goodware_sha in roles_first_v1["goodware"]["non_matches"]
             first_goodware_case = roles_first_v1["goodware"]["test_cases"][0]
             assert first_goodware_case["provenance"] == RuleSampleProvenance.SYNTHETIC.value
-            assert holdout_sha in roles_first_v1["holdout"]["non_matches"]
             v1_after_c = next(
                 item
                 for item in report_payloads
                 if item["version_id"] == str(versions[0].id)
-                and sha_c in item["corpus_sha256s_by_role"].get("out_of_cluster_candidate", [])
+                and sha_c in item["corpus_sha256s_by_role"].get("new_candidate_unconfirmed", [])
             )
             roles_v1 = {item["role"]: item for item in v1_after_c["roles"]}
-            assert {sha_a, sha_b} <= set(roles_v1["confirmed_positive"]["matches"])
-            assert sha_d in roles_v1["confirmed_positive"]["non_matches"]
+            assert {sha_a, sha_b} <= set(roles_v1["human_confirmed"]["matches"])
+            assert sha_d in roles_v1["human_confirmed"]["non_matches"]
             assert sha_d in v1_after_c["false_negative_sha256s"]
             assert v1_after_c["revision_recommendation"] == "revise_false_negative"
-            assert sha_c in roles_v1["out_of_cluster_candidate"]["non_matches"]
+            assert sha_c in roles_v1["new_candidate_unconfirmed"]["non_matches"]
             assert goodware_sha in roles_v1["goodware"]["non_matches"]
-            assert holdout_sha in roles_v1["holdout"]["non_matches"]
             v2_report = next(
                 item
                 for item in report_payloads
                 if item["version_id"] == str(versions[1].id) and item["operation"] == "test"
             )
             roles_v2 = {item["role"]: item for item in v2_report["roles"]}
-            assert {sha_a, sha_b, sha_d} <= set(roles_v2["confirmed_positive"]["matches"])
-            assert sha_c in roles_v2["out_of_cluster_candidate"]["matches"]
+            assert {sha_a, sha_b, sha_d} <= set(roles_v2["human_confirmed"]["matches"])
+            assert sha_c in roles_v2["new_candidate_unconfirmed"]["matches"]
             assert goodware_sha in roles_v2["goodware"]["non_matches"]
-            assert holdout_sha in roles_v2["holdout"]["non_matches"]
             assert all(
                 item.tool_name != "rule.test" or item.status is ToolInvocationStatus.SUCCEEDED
                 for item in invocations
@@ -1621,17 +1664,37 @@ async def test_w14_e_retrohunt_subject_slots_replay_and_concurrent_investigation
 
         goodware_bytes = b"MZ\x00W14-retro-goodware-no-marker"
         holdout_bytes = b"MZ\x00W14-retro-holdout-no-marker"
+        new_candidate_bytes = b"MZ\x00W14-retro-new-candidate-no-marker"
+        designated_holdout_bytes = b"MZ\x00W14-retro-designated-holdout-no-marker"
         goodware_sha = hashlib.sha256(goodware_bytes).hexdigest()
         holdout_sha = hashlib.sha256(holdout_bytes).hexdigest()
+        new_candidate_sha = hashlib.sha256(new_candidate_bytes).hexdigest()
+        designated_holdout_sha = hashlib.sha256(designated_holdout_bytes).hexdigest()
         corpus_a = _ControlledRuleCorpus(
-            {sha_a: bytes_a, goodware_sha: goodware_bytes, holdout_sha: holdout_bytes},
+            {
+                sha_a: bytes_a,
+                goodware_sha: goodware_bytes,
+                holdout_sha: holdout_bytes,
+                new_candidate_sha: new_candidate_bytes,
+                designated_holdout_sha: designated_holdout_bytes,
+            },
             goodware=(goodware_sha,),
             holdout=(holdout_sha,),
+            new_candidates=(new_candidate_sha,),
+            designated_holdouts=(designated_holdout_sha,),
         )
         corpus_b = _ControlledRuleCorpus(
-            {sha_b: bytes_b, goodware_sha: goodware_bytes, holdout_sha: holdout_bytes},
+            {
+                sha_b: bytes_b,
+                goodware_sha: goodware_bytes,
+                holdout_sha: holdout_bytes,
+                new_candidate_sha: new_candidate_bytes,
+                designated_holdout_sha: designated_holdout_bytes,
+            },
             goodware=(goodware_sha,),
             holdout=(holdout_sha,),
+            new_candidates=(new_candidate_sha,),
+            designated_holdouts=(designated_holdout_sha,),
         )
         rule_route = VirusTotalOperationRoute(
             primary=VirusTotalRouteStep(
@@ -1991,12 +2054,26 @@ async def test_w14_e_retrohunt_subject_slots_replay_and_concurrent_investigation
             ]
             report = next(item for item in test_reports if item["operation"] == "test")
             assert report["execution_status"] == "ok"
+            # Serialized role keys use the canonical persisted RuleTestCorpusRole values.
             report_roles = {item["role"]: item for item in report["roles"]}
             assert seeded.investigation is not None
             expected_sha = material.sample_hash
-            assert expected_sha in report_roles["confirmed_positive"]["matches"]
+            required_retrohunt_roles = {
+                "human_confirmed",
+                "new_candidate_unconfirmed",
+                "goodware",
+                "holdout_positive",
+            }
+            assert required_retrohunt_roles <= set(report_roles)
+            assert {
+                role for role, report_role in report_roles.items() if report_role["corpus_sha256s"]
+            } == required_retrohunt_roles
+            assert expected_sha in report_roles["human_confirmed"]["matches"]
             assert goodware_sha in report_roles["goodware"]["non_matches"]
-            assert holdout_sha in report_roles["holdout"]["non_matches"]
+            assert new_candidate_sha in report_roles["new_candidate_unconfirmed"]["non_matches"]
+            assert designated_holdout_sha in report_roles["holdout_positive"]["non_matches"]
+            assert holdout_sha not in report["corpus_sha256s_by_role"]["holdout_positive"]
+            assert any("holdout sans rôle" in item for item in report["limitations"])
             assert {"rule.propose", "rule.test", "sample.analyze"} <= {
                 item.tool_name for item in invocations
             }
@@ -2164,6 +2241,9 @@ async def test_w14_e_retrohunt_subject_slots_replay_and_concurrent_investigation
                 replay_dispatcher,
                 UUID(resumed.json()["job_id"]),
             )
+            stopped = await client.get(f"/api/investigations/{first.investigation.id}")
+            assert stopped.status_code == 200, stopped.text
+            assert stopped.json()["stop_reason"] == "submission_needs_review"
         assert len(provider.requests) == 2, (
             "committed replay or refused third operation reached fake VT"
         )
@@ -2185,43 +2265,42 @@ async def test_w14_e_retrohunt_subject_slots_replay_and_concurrent_investigation
         assert len(retro_submits) == 3
         assert retro_submits[0].normalized_parameters == retro_submits[1].normalized_parameters
         assert retro_submits[1].status is ToolInvocationStatus.SUCCEEDED
-        assert retro_submits[2].status is ToolInvocationStatus.FAILED
-        submit_results = [
-            await driver.artifact_store.read_json(item.blob_id)
-            for item in final_observations
-            if item.source == "vt.retrohunt.submit"
+        # The adapter reports a local subject-slot refusal without framework proof
+        # that no external request was sent, so ambiguity hardening pauses for review.
+        assert retro_submits[2].status is ToolInvocationStatus.NEEDS_REVIEW
+        submit_observations = [
+            item for item in final_observations if item.source == "vt.retrohunt.submit"
         ]
-        by_invocation = {
-            item.invocation_ref: item
-            for item in final_observations
-            if item.source == "vt.retrohunt.submit"
-        }
+        submit_results = [
+            await driver.artifact_store.read_json(item.blob_id) for item in submit_observations
+        ]
+        successful_results = [
+            payload for payload in submit_results if "slots_consumed" in payload["result"]
+        ]
+        by_invocation = {item.invocation_ref: item for item in submit_observations}
         replay_payload = await driver.artifact_store.read_json(
             by_invocation[retro_submits[1].id].blob_id
         )
-        denied_payload = await driver.artifact_store.read_json(
-            by_invocation[retro_submits[2].id].blob_id
-        )
         assert replay_payload["result"]["slots_consumed"] == 2
         assert replay_payload["result"]["slots_remaining"] == 0
-        assert denied_payload["result"]["reason"] == "subject_slot_limit"
-        assert denied_payload["result"]["slots_consumed"] == 2
-        assert denied_payload["result"]["slots_remaining"] == 0
-        assert len(submit_results) == 3
+        assert len(successful_results) == 2
+        # The ambiguous third attempt records only a framework diagnostic; its
+        # adapter output is never archived as a submit result.
+        ambiguous = await driver.artifact_store.read_json(
+            by_invocation[retro_submits[2].id].blob_id
+        )
+        assert ambiguous["result"]["outcome"] == "external_effect_unconfirmed"
+        assert ambiguous["result"]["adapter_output_archived"] is False
         assert len([item for item in final_findings if item.kind is FindingKind.NEW_SAMPLE]) == 1
-        assert len(replay_transport.prompts) >= 3
-        for invocation in retro_submits[1:]:
+        assert len(replay_transport.prompts) == 2
+        for invocation in retro_submits[1:2]:
             observation = by_invocation[invocation.id]
             assert str(observation.id) in replay_transport.prompts[-1] or any(
                 str(observation.id) in prompt for prompt in replay_transport.prompts
             )
         _assert_observations_reach_following_bridge_turns(
             replay_transport,
-            tuple(
-                item
-                for item in final_invocations
-                if item.id in {retro_submits[1].id, retro_submits[2].id}
-            ),
+            tuple(item for item in final_invocations if item.id == retro_submits[1].id),
         )
 
         blocks = (
@@ -2230,8 +2309,8 @@ async def test_w14_e_retrohunt_subject_slots_replay_and_concurrent_investigation
                 "text": (
                     f"The exact reviewed rule returned {hit_observation.object_id} as a candidate "
                     "under the fake bounded Retrohunt corpus. The hit is not confirmed membership; "
-                    "the subject-wide budget consumed two slots and rejected a distinct third "
-                    "operation."
+                    "the subject-wide budget consumed two slots; a distinct third operation "
+                    "was recorded for reconciliation without another provider request."
                 ),
                 "finding_refs": [str(candidate_finding.id)],
                 "evidence_refs": [str(hit_observation.id)],

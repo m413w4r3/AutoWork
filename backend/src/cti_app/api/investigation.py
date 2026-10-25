@@ -1200,6 +1200,7 @@ async def get_investigation_operator_context(
                     working_state_version=operator_context.working_state_version,
                     working_state_sha256=operator_context.working_state_sha256,
                     state=state,
+                    context_sha256=operator_context.context_sha256,
                     since_version=since_version,
                     since_fingerprint=since_fingerprint,
                     invalidation_facts=invalidation_facts,
@@ -1485,7 +1486,7 @@ async def invoke_investigation_operator_tool(
                 idempotency_key=idempotency_key,
             )
         except OperatorToolInvocationError as exc:
-            raise _http_error(exc.status_code, exc.code) from exc
+            raise _http_error(exc.status_code, exc.code, details=exc.details) from exc
         except (VersionConflictError, InvestigationStateVersionConflict) as exc:
             raise _http_error(409, "stale_working_state") from exc
         advisor_output = None

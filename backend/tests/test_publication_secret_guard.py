@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -9,6 +10,8 @@ from pydantic import SecretStr
 
 from cti_app.application.publication_secret_guard import (
     PublicationSecretDetectedError,
+    configured_operational_secret_values,
+    contains_explicit_operational_secrets,
     guard_publication_render_data,
 )
 
@@ -63,6 +66,31 @@ def test_guard_still_refuses_service_dsns_and_signed_urls() -> None:
             guard_publication_render_data({"content_sections": [{"text": value}]})
         assert exc_info.value.code == "publication_secret_detected"
         assert value not in str(exc_info.value)
+
+
+def test_pure_secret_guard_uses_only_explicit_values_and_deterministic_patterns(
+    monkeypatch,
+) -> None:
+    secret = "explicit-credential-only-fixture"
+    settings = SimpleNamespace(
+        openai_bridge_api_key=SecretStr(secret),
+        workspace_path=Path("/synthetic/benign/workspace"),
+    )
+    monkeypatch.setenv("HOME", "/synthetic/ambient/home")
+    monkeypatch.setattr(Path, "cwd", lambda: Path("/synthetic/ambient/cwd"))
+    monkeypatch.setattr(Path, "home", lambda: Path("/synthetic/ambient/home"))
+
+    values = configured_operational_secret_values(settings)
+
+    assert values == (secret,)
+    assert contains_explicit_operational_secrets(
+        {"text": f"configured value: {secret}"}, operational_secret_values=values
+    )
+    assert contains_explicit_operational_secrets({"text": "OPENAI_BRIDGE_API_KEY=fixture"})
+    assert not contains_explicit_operational_secrets(
+        {"text": "/synthetic/ambient/cwd /synthetic/ambient/home"},
+        operational_secret_values=values,
+    )
 
 
 def test_guard_allows_typed_hash_ip_and_domain_iocs() -> None:

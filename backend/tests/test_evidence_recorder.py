@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import UUID, uuid4, uuid5
@@ -38,18 +40,39 @@ async def test_record_json_is_bounded_sanitized_and_idempotent() -> None:
     investigation_id = uuid4()
     invocation_id = uuid4()
     observed_at = datetime(2026, 10, 13, tzinfo=UTC)
+    attacker_token = "github_pat_" + "a" * 82
+    raw_bytes = b"harmless-binary-fixture"
+    byte_array = list(range(256))
+    byte_array_raw = bytes(byte_array)
+    large_excerpt = "Synthetic CTI excerpt " + "sample-marker " * 400
     payload = {
-        "summary": "Found the file; api_key=secret-value",
+        "summary": f"Found the file; attacker token={attacker_token}",
+        "large_excerpt": large_excerpt,
         "signed_page": "https://vt.invalid/report?X-Amz-Signature=private-value",
-        "api_key": "must-not-persist",
-        "raw_bytes": b"harmless-binary-fixture",
-        "nested": {"authorization": "Bearer top-secret", "count": 2},
+        "signed_ipv6_page": ("https://[2001:db8::1]/report?X-Amz-Signature=ipv6-private-value"),
+        "signed_ipv6_zone_page": (
+            "https://[fe80::1%25eth0]/report?X-Amz-Signature=zone-private-value"
+        ),
+        "signed_ipv6_encoded_zone_page": (
+            "https://[fe80::1%25eth%30]/report?X-Amz-Signature=encoded-zone-private-value"
+        ),
+        "signed_bracket_path": (
+            "https://example.test/path[segment]?X-Amz-Signature=bracket-path-private-value"
+        ),
+        "signed_paren_path": (
+            "https://example.test/path(foo)?X-Amz-Signature=paren-path-private-value"
+        ),
+        "api_key": attacker_token,
+        "raw_bytes": raw_bytes,
+        "payload_bytes": byte_array,
+        "wrapped_raw_bytes": {"value": byte_array},
+        "nested": {"operator_api_token": "must-not-persist", "count": 2},
         "provider_usage": {
             "status": "available",
             "input_tokens": 321,
             "output_tokens": 54,
             "total_tokens": 375,
-            "provider_private_token": "must-not-persist",
+            "vt_api_token": "must-not-persist",
         },
     }
 
@@ -84,20 +107,37 @@ async def test_record_json_is_bounded_sanitized_and_idempotent() -> None:
     assert first.observed_at == observed_at
     assert len(await repository.list_for_investigation(investigation_id)) == 1
     stored = store.blobs[first.blob_id]
+    decoded = json.loads(stored)
+    assert decoded["api_key"] == attacker_token
+    assert decoded["summary"].endswith(attacker_token)
+    assert decoded["large_excerpt"] == large_excerpt
+    assert decoded["raw_bytes"] == {
+        "encoding": "base64",
+        "byte_length": len(raw_bytes),
+        "sha256": hashlib.sha256(raw_bytes).hexdigest(),
+        "content_base64": base64.b64encode(raw_bytes).decode("ascii"),
+    }
+    assert decoded["payload_bytes"] == {
+        "encoding": "base64",
+        "byte_length": len(byte_array_raw),
+        "sha256": hashlib.sha256(byte_array_raw).hexdigest(),
+        "content_base64": base64.b64encode(byte_array_raw).decode("ascii"),
+    }
+    assert decoded["wrapped_raw_bytes"]["value"] == decoded["payload_bytes"]
     for forbidden in (
-        b"secret-value",
         b"private-value",
+        b"ipv6-private-value",
+        b"zone-private-value",
+        b"encoded-zone-private-value",
+        b"bracket-path-private-value",
+        b"paren-path-private-value",
         b"must-not-persist",
-        b"top-secret",
-        b"harmless-binary-fixture",
         b"X-Amz-Signature",
     ):
         assert forbidden not in stored
     assert b"[URL omitted]" in stored
-    assert b"[redacted]" in stored
     assert b'"input_tokens":321' in stored
     assert b'"total_tokens":375' in stored
-    assert b"provider_private_token" not in stored
 
     with pytest.raises(ValueError, match="different content"):
         await recorder.record_json(

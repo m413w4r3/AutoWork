@@ -319,6 +319,31 @@ def _restricted_identities(data: Mapping[str, Any]) -> set[tuple[str, str]]:
     return restricted
 
 
+def find_source_ref_conflicts(
+    prompt_data: Mapping[str, Any],
+    dossier: AdvisorDossier,
+    *,
+    raw_manifest: object,
+) -> tuple[SourceRefConflict, ...]:
+    """Return conflicts among the source identities available to a parser."""
+    return _identity_conflicts(prompt_data, dossier, raw_manifest=raw_manifest)
+
+
+def build_source_ref_catalog(
+    prompt_data: Mapping[str, Any],
+    dossier: AdvisorDossier,
+    *,
+    raw_manifest: object,
+) -> SourceRefCatalog:
+    """Build the public, immutable source catalog for a parser context."""
+    return _source_catalog(prompt_data, dossier, raw_manifest=raw_manifest)
+
+
+def restricted_source_identities(data: Mapping[str, Any]) -> frozenset[tuple[str, str]]:
+    """Return source identities excluded by disclosure restrictions."""
+    return frozenset(_restricted_identities(data))
+
+
 def _unprefixed_identifier(kind: str, identifier: str) -> str:
     prefix = f"{kind}:"
     return identifier.removeprefix(prefix)

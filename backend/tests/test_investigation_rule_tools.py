@@ -1794,6 +1794,12 @@ async def test_dispatcher_replay_returns_cached_rule_test_without_recompilation(
     data = b"synthetic sample with StableToolMarker"
     sha256 = _sha256(data)
     harness = _harness(samples={sha256: data}, goodware=(), holdout=())
+    unclassified_holdout_sha = "f" * 64
+
+    async def legacy_holdout_hashes(_investigation_id: UUID) -> Sequence[str]:
+        return (unclassified_holdout_sha,)
+
+    harness.bytes_port.holdout_sample_sha256s = legacy_holdout_hashes
     await _associate(harness, sha256)
     ref = await _source_observation(harness, "StableToolMarker")
     candidate = uuid4()
@@ -1811,13 +1817,246 @@ async def test_dispatcher_replay_returns_cached_rule_test_without_recompilation(
     before = harness.engine.compile_count
     first = await _call(harness, "rule.test", args, operation_key=operation_key)
     second = await _call(harness, "rule.test", args, operation_key=operation_key)
-    assert first.status is ToolInvocationStatus.PARTIAL
+    assert first.status is ToolInvocationStatus.SUCCEEDED
     assert second == first
     assert harness.engine.compile_count == before + 1
-    # With no operator-supplied benign bytes, the run records a partial
-    # evaluation instead of implying negative-corpus coverage.
+    # Informational corpus gaps remain visible and keep validation quality partial,
+    # while the completed measurement itself succeeds.
+    assert first.output["report"]["validation_status"] == "real_partial"
+    assert first.output["report"]["candidate_status"] == "candidate"
+    assert any(
+        "holdout sans rôle" in limitation for limitation in first.output["report"]["limitations"]
+    )
+    corpus = await harness.rule_tools._build_corpus(harness.investigation_id)
+    assert not corpus.blocking_limitations
+    assert any("holdout sans rôle" in item for item in corpus.measurement_limitations)
+    assert any("Aucun fichier binaire goodware" in item for item in corpus.measurement_limitations)
+    assert any("goodware_baseline" in item for item in corpus.measurement_limitations)
     assert proposed.status is ToolInvocationStatus.SUCCEEDED
     assert proposed.output["validation_status"] == "untested"
+
+
+@pytest.mark.asyncio
+async def test_blocking_corpus_limit_makes_measured_rule_partial_and_candidate() -> None:
+    samples = {
+        _sha256(b"first confirmed SharedBlockingMarker"): b"first confirmed SharedBlockingMarker",
+        _sha256(b"second confirmed SharedBlockingMarker"): b"second confirmed SharedBlockingMarker",
+    }
+    harness = _harness(samples=samples)
+    for sample_sha256 in samples:
+        association = await _associate(
+            harness,
+            sample_sha256,
+        )
+        confirmed_association = association.change_qualification(
+            SampleQualification.CONFIRMED,
+            actor_kind=QualificationActorKind.HUMAN,
+            actor_id="analyst-test",
+            reason="Confirm the synthetic positive fixture for the blocking-limit test.",
+        )
+        await harness.associations.append_version(
+            confirmed_association,
+            expected_version=association.version,
+        )
+    ref = await _source_observation(harness, "SharedBlockingMarker")
+    proposed = await _call(
+        harness,
+        "rule.propose",
+        {
+            "candidate_id": str(uuid4()),
+            "condition": "any",
+            "motifs": [_motif("SharedBlockingMarker", ref)],
+        },
+    )
+
+    async def unreadable_legacy_holdouts(_investigation_id: UUID) -> Sequence[str]:
+        raise RuntimeError("fixture reader failure")
+
+    harness.bytes_port.holdout_sample_sha256s = unreadable_legacy_holdouts
+    tested = await _call(
+        harness,
+        "rule.test",
+        {"candidate_id": proposed.output["candidate_id"]},
+    )
+
+    assert tested.status is ToolInvocationStatus.PARTIAL
+    assert tested.output["report"]["candidate_status"] == "candidate"
+    assert any(
+        "fournisseur de hash holdout n'a pas pu être lu" in item
+        for item in tested.output["report"]["limitations"]
+    )
+    corpus = await harness.rule_tools._build_corpus(harness.investigation_id)
+    assert any("fournisseur de hash holdout" in item for item in corpus.blocking_limitations)
+    assert any("goodware_baseline" in item for item in corpus.measurement_limitations)
+
+
+@pytest.mark.parametrize(
+    ("missing_role", "expected_role"),
+    [
+        ("holdout", RuleTestCorpusRole.HOLDOUT_POSITIVE),
+        ("candidate", RuleTestCorpusRole.NEW_CANDIDATE_UNCONFIRMED),
+    ],
+)
+@pytest.mark.asyncio
+async def test_missing_bytes_in_any_declared_role_blocks_tested_status(
+    missing_role: str, expected_role: RuleTestCorpusRole
+) -> None:
+    positive_bytes = (
+        b"first confirmed SharedMissingRoleMarker",
+        b"second confirmed SharedMissingRoleMarker",
+    )
+    goodware_bytes = b"ordinary synthetic goodware without the marker"
+    positive_hashes = tuple(_sha256(content) for content in positive_bytes)
+    goodware_hash = _sha256(goodware_bytes)
+    missing_hash = hashlib.sha256(f"missing {missing_role}".encode()).hexdigest()
+    harness = _harness(
+        samples={
+            **dict(zip(positive_hashes, positive_bytes, strict=True)),
+            goodware_hash: goodware_bytes,
+        },
+        goodware=(goodware_hash,),
+        holdout=(missing_hash,) if missing_role == "holdout" else (),
+    )
+    for sample_sha256 in positive_hashes:
+        association = await _associate(harness, sample_sha256)
+        confirmed_association = association.change_qualification(
+            SampleQualification.CONFIRMED,
+            actor_kind=QualificationActorKind.HUMAN,
+            actor_id="analyst-test",
+            reason="Confirm synthetic positives for the missing-role test.",
+        )
+        await harness.associations.append_version(
+            confirmed_association, expected_version=association.version
+        )
+    if missing_role == "candidate":
+        await _associate(harness, missing_hash, origin=SampleOrigin.MANUAL)
+
+    ref = await _source_observation(harness, "SharedMissingRoleMarker")
+    proposed = await _call(
+        harness,
+        "rule.propose",
+        {
+            "candidate_id": str(uuid4()),
+            "condition": "any",
+            "motifs": [_motif("SharedMissingRoleMarker", ref)],
+        },
+    )
+    tested = await _call(
+        harness,
+        "rule.test",
+        {"candidate_id": proposed.output["candidate_id"]},
+    )
+
+    assert tested.status is ToolInvocationStatus.PARTIAL
+    assert tested.output["report"]["candidate_status"] == "candidate"
+    missing_case = next(
+        case
+        for role in tested.output["report"]["roles"]
+        for case in role["test_cases"]
+        if case["sha256"] == missing_hash
+    )
+    assert missing_case["declared_role"] == expected_role.value
+    assert any(
+        missing_hash in limitation and expected_role.value in limitation
+        for limitation in tested.output["report"]["limitations"]
+    )
+    corpus = await harness.rule_tools._build_corpus(harness.investigation_id)
+    assert any(
+        missing_hash in limitation and expected_role.value in limitation
+        for limitation in corpus.blocking_limitations
+    )
+
+
+@pytest.mark.parametrize(
+    ("late_failure_role", "expected_role"),
+    [
+        ("candidate", RuleTestCorpusRole.NEW_CANDIDATE_UNCONFIRMED),
+        ("holdout", RuleTestCorpusRole.HOLDOUT_POSITIVE),
+    ],
+)
+@pytest.mark.asyncio
+async def test_late_corpus_read_failure_blocks_tested_status(
+    late_failure_role: str, expected_role: RuleTestCorpusRole
+) -> None:
+    from cti_app.application.rule_workbench import RuleCorpusBytesUnavailable
+
+    positive_bytes = (
+        b"first confirmed SharedLateReadMarker",
+        b"second confirmed SharedLateReadMarker",
+    )
+    goodware_bytes = b"ordinary goodware without the marker"
+    late_failure_bytes = f"unreadable {late_failure_role} without the marker".encode()
+    positive_hashes = tuple(_sha256(content) for content in positive_bytes)
+    goodware_hash = _sha256(goodware_bytes)
+    late_failure_hash = _sha256(late_failure_bytes)
+    harness = _harness(
+        samples={
+            **dict(zip(positive_hashes, positive_bytes, strict=True)),
+            goodware_hash: goodware_bytes,
+            late_failure_hash: late_failure_bytes,
+        },
+        goodware=(goodware_hash,),
+        holdout=(late_failure_hash,) if late_failure_role == "holdout" else (),
+    )
+    for sample_sha256 in positive_hashes:
+        association = await _associate(harness, sample_sha256)
+        confirmed_association = association.change_qualification(
+            SampleQualification.CONFIRMED,
+            actor_kind=QualificationActorKind.HUMAN,
+            actor_id="analyst-test",
+            reason="Confirm synthetic positives for the late-read failure test.",
+        )
+        await harness.associations.append_version(
+            confirmed_association, expected_version=association.version
+        )
+    if late_failure_role == "candidate":
+        await _associate(harness, late_failure_hash, origin=SampleOrigin.MANUAL)
+
+    artifact_lookups: list[str] = []
+    original_artifact_lookup = harness.bytes_port.get_artifact_id_for_sample
+
+    async def tracked_artifact_lookup(sample_sha256: str) -> UUID:
+        artifact_lookups.append(sample_sha256)
+        return await original_artifact_lookup(sample_sha256)
+
+    original_byte_reader = harness.bytes_port.get_bytes_for_sample
+
+    async def fail_late_read(sample_sha256: str) -> bytes:
+        if sample_sha256 == late_failure_hash:
+            raise RuleCorpusBytesUnavailable("fixture read failure after artifact lookup")
+        return await original_byte_reader(sample_sha256)
+
+    harness.bytes_port.get_artifact_id_for_sample = tracked_artifact_lookup
+    harness.bytes_port.get_bytes_for_sample = fail_late_read
+    ref = await _source_observation(harness, "SharedLateReadMarker")
+    proposed = await _call(
+        harness,
+        "rule.propose",
+        {
+            "candidate_id": str(uuid4()),
+            "condition": "any",
+            "motifs": [_motif("SharedLateReadMarker", ref)],
+        },
+    )
+    tested = await _call(
+        harness,
+        "rule.test",
+        {"candidate_id": proposed.output["candidate_id"]},
+    )
+
+    assert late_failure_hash in artifact_lookups
+    assert tested.status is ToolInvocationStatus.PARTIAL
+    assert tested.output["report"]["candidate_status"] == "candidate"
+    role_result = next(
+        role for role in tested.output["report"]["roles"] if role["role"] == expected_role.value
+    )
+    assert role_result["non_measurable"] == (late_failure_hash,)
+    assert any(
+        "bloque le statut testé" in limitation
+        and late_failure_hash in limitation
+        and expected_role.value in limitation
+        for limitation in tested.output["report"]["limitations"]
+    )
 
 
 @pytest.mark.asyncio
@@ -2182,6 +2421,40 @@ async def test_goodware_feature_baseline_is_not_reported_as_tested_goodware_byte
 
     assert not any(case.role is RuleTestCorpusRole.GOODWARE for case in corpus.cases)
     assert "aucun fichier binaire goodware" in " ".join(corpus.limitations).casefold()
+
+
+@pytest.mark.asyncio
+async def test_conflicting_corpus_roles_and_unreadable_goodware_baseline_are_blocking() -> None:
+    from cti_app.domain.rule_workbench import (
+        RuleCorpusInventoryItem,
+        RuleSampleProvenance,
+        RuleTestCorpusRole,
+    )
+
+    content = b"synthetic sample with conflicting corpus roles"
+    sample_sha256 = _sha256(content)
+    imports = tuple(
+        RuleCorpusInventoryItem(
+            sample_sha256=sample_sha256,
+            role=role,
+            provenance=RuleSampleProvenance.SYNTHETIC,
+            size_bytes=len(content),
+            source_description="Synthetic conflicting-role classification fixture.",
+        )
+        for role in (RuleTestCorpusRole.GOODWARE, RuleTestCorpusRole.HARD_NEGATIVE)
+    )
+    harness = _harness(samples={sample_sha256: content}, manual_imports=imports)
+
+    async def unreadable_baseline(_investigation_id: UUID) -> UUID | None:
+        raise RuntimeError("fixture baseline reader failure")
+
+    harness.bytes_port.goodware_baseline_id = unreadable_baseline
+    corpus = await harness.rule_tools._build_corpus(harness.investigation_id)
+
+    assert any("plusieurs rôles de corpus" in item for item in corpus.blocking_limitations)
+    assert any("baseline goodware liée" in item for item in corpus.blocking_limitations)
+    assert not any("n'est liée" in item for item in corpus.measurement_limitations)
+    assert any("plusieurs rôles de corpus" in item for item in corpus.limitations)
 
 
 @pytest.mark.asyncio

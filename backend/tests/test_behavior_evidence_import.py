@@ -50,7 +50,7 @@ def _context() -> SimpleNamespace:
     )
 
 
-def test_cape_report_normalizes_process_drop_network_and_behavior_without_secrets() -> None:
+def test_cape_report_normalizes_process_drop_network_and_behavior_with_cti_secrets() -> None:
     sample_sha256 = "a" * 64
     report = {
         "target": {"file": {"sha256": sample_sha256}},
@@ -68,7 +68,10 @@ def test_cape_report_normalizes_process_drop_network_and_behavior_without_secret
             "events": [
                 {
                     "category": "file",
-                    "description": "wrote /home/analyst/secret.bin api_key=hidden",
+                    "description": (
+                        "wrote /home/analyst/secret.bin api_key=hidden "
+                        "VT_API_KEY=operational-secret"
+                    ),
                     "pid": 100,
                     "timestamp": "2026-10-13T10:00:02Z",
                 }
@@ -111,9 +114,13 @@ def test_cape_report_normalizes_process_drop_network_and_behavior_without_secret
     assert evidence.network_sessions[1].host == "c2.example.com"
     assert evidence.network_sessions[2].host is None
     assert evidence.network_sessions[2].uri is None
-    assert "access_token=private" not in json.dumps(evidence, default=str)
-    assert "/home/analyst" not in json.dumps(evidence, default=str)
-    assert "api_key=hidden" not in json.dumps(evidence, default=str)
+    serialized = json.dumps(evidence, default=str)
+    # D7 keeps attacker/CTI tokens as canonical evidence in clear; only
+    # AutoWork operational credentials and local paths are removed.
+    assert "access_token=private" not in serialized
+    assert "api_key=hidden" in serialized
+    assert "operational-secret" not in serialized
+    assert "/home/analyst" not in serialized
     assert evidence.behaviors[0].evidence_path.startswith("/")
 
 

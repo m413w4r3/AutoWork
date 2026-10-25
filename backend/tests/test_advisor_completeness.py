@@ -552,7 +552,111 @@ def test_bytes_rows_with_raw_field_keep_offset_and_value() -> None:
 
     projected = extract_content_excerpts({"bytes": [{"offset": 4, "raw": "00ff"}]})
 
-    assert projected == [{"kind": "bytes", "title": "Octets observés — offset 4", "text": "00ff"}]
+    assert len(projected) == 1
+    assert projected[0]["kind"] == "bytes"
+    assert projected[0]["text"] == "00ff"
+    assert "encoding=hex" in projected[0]["title"]
+    assert "byte_length=2" in projected[0]["title"]
+    assert hashlib.sha256(bytes.fromhex("00ff")).hexdigest() in projected[0]["title"]
+    assert "offset 4" in projected[0]["title"]
+
+
+def test_byte_fragments_include_full_provenance_for_hex_base64_and_integer_arrays() -> None:
+    from cti_app.application.advisor_dossier import extract_content_excerpts
+
+    raw = b"\x00\xffA"
+    digest = hashlib.sha256(raw).hexdigest()
+    payload = {
+        "schema": "sample-byte-fragments.v1",
+        "evidence_id": "evidence-fixture-id",
+        "blob_id": "blob-fixture-id",
+        "association_id": "association-fixture-id",
+        "mime_type": "application/x-fixture; version=2",
+        "hex": [{"offset": 7, "length": len(raw), "value": raw.hex()}],
+        "base64": [
+            {
+                "encoding": "base64",
+                "offset": 17,
+                "length": len(raw),
+                "content_base64": base64.b64encode(raw).decode("ascii"),
+            }
+        ],
+        "raw_bytes": [{"offset": 27, "length": len(raw), "value": list(raw)}],
+    }
+
+    excerpts = extract_content_excerpts(payload)
+    byte_excerpts = [row for row in excerpts if row["title"].startswith("Octets observés")]
+
+    assert len(byte_excerpts) == 3
+    for row, offset, encoding in zip(
+        byte_excerpts, (7, 17, 27), ("hex", "base64", "base64"), strict=True
+    ):
+        for label in (
+            f"encoding={encoding}",
+            f"byte_length={len(raw)}",
+            f"sha256={digest}",
+            "evidence_id=evidence-fixture-id",
+            "blob_id=blob-fixture-id",
+            "association_id=association-fixture-id",
+            f"offset {offset}",
+            f"length={len(raw)}",
+            "mime_type=application/x-fixture; version=2",
+        ):
+            assert label in row["title"]
+
+
+@pytest.mark.parametrize(
+    ("kind", "encoding", "value", "rendered_encoding"),
+    [
+        ("hex", "hex", "00ff41", "hex"),
+        ("base64", "base64", "AP9B", "base64"),
+        ("bytes", "hex", [0, 255, 65], "base64"),
+    ],
+)
+def test_measurement_dossier_labels_fragment_digest_and_complete_provenance(
+    kind, encoding, value, rendered_encoding
+) -> None:
+    raw = b"\x00\xffA"
+    fragment_digest = hashlib.sha256(raw).hexdigest()
+    sample_digest = "a" * 64
+    evidence_digest = "b" * 64
+    measurement = {
+        "measurement_id": "M001",
+        "kind": kind,
+        "encoding": encoding,
+        "value": value,
+        "offset": 17,
+        "length": len(raw),
+        "byte_length": len(raw),
+        "sample_sha256": sample_digest,
+        "evidence_sha256": evidence_digest,
+        "fragment_sha256": "c" * 64,
+        "evidence_id": "evidence-fixture-id",
+        "blob_id": "blob-fixture-id",
+        "association_id": "association-fixture-id",
+        "mime_type": "application/x-fragment-fixture; version=4",
+    }
+    data = _planning_data(question="Review this hex byte measurement.", evidence=[], findings=[])
+    data["consultation_type"] = "yara_draft"
+    data["measurements"] = [measurement]
+
+    dossier = build_advisor_dossier(data)
+
+    for label in (
+        "encoding=" + rendered_encoding,
+        f"byte_length={len(raw)}",
+        f"length={len(raw)}",
+        "offset 17",
+        f"sha256={fragment_digest}",
+        f"fragment_sha256={fragment_digest}",
+        "evidence_id=evidence-fixture-id",
+        "blob_id=blob-fixture-id",
+        "association_id=association-fixture-id",
+        "mime_type=application/x-fragment-fixture; version=4",
+    ):
+        assert label in dossier.text
+    assert sample_digest not in dossier.text
+    assert evidence_digest not in dossier.text
 
 
 def test_equal_text_under_distinct_labels_is_not_deduplicated() -> None:

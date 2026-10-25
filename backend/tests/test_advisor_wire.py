@@ -6,6 +6,8 @@ import re
 from pathlib import Path
 from uuid import uuid4
 
+import pytest
+
 from cti_app.application.advisor_contracts import (
     extract_json_object,
     parse_typed_advisor_response,
@@ -23,8 +25,16 @@ from cti_app.application.investigation_advisor_tools import (
     _safe_text,
 )
 
+_ARCHIVED_RUN12_CORPUS = (
+    Path(__file__).parents[2]
+    / ".autowork-runs"
+    / "run12-editorial-2026-10-20"
+    / "bridge-comms"
+    / "corpus"
+)
 
-def test_wire_dossier_renders_relevant_measurement_as_text_without_metadata() -> None:
+
+def test_wire_dossier_renders_relevant_measurement_with_byte_provenance() -> None:
     prompt_data = {
         "question": "Vérifier les octets observés autour de l'offset 15232.",
         "consultation_type": "yara_draft",
@@ -55,10 +65,16 @@ def test_wire_dossier_renders_relevant_measurement_as_text_without_metadata() ->
     rendered = render_advisor_wire_input(prompt_data)
 
     assert "[E1]" in rendered
-    assert "hex, offset 15232: 1944" in rendered
+    fragment_sha256 = hashlib.sha256(bytes.fromhex("1944")).hexdigest()
+    assert (
+        "hex, offset 15232; encoding=hex; byte_length=2; length=2; sha256="
+        + fragment_sha256
+        + "; fragment_sha256="
+        + fragment_sha256
+        + ": 1944"
+    ) in rendered
     assert "offset 0" not in rendered
     assert "measurement_id" not in rendered
-    assert "sha256" not in rendered
     assert "a" * 64 not in rendered
     assert "1" * 64 not in rendered
 
@@ -269,14 +285,12 @@ def test_unreadable_cited_observations_produce_one_relevant_limit_not_empty_card
     assert dossier.manifest == ()
 
 
+@pytest.mark.skipif(
+    not _ARCHIVED_RUN12_CORPUS.is_dir(),
+    reason="archived Run12 corpus is not present in this checkout",
+)
 def test_archived_corpus_c01_to_c13_replays_as_compact_resolvable_text_dossiers() -> None:
-    corpus = (
-        Path(__file__).parents[2]
-        / ".autowork-runs"
-        / "run12-editorial-2026-10-20"
-        / "bridge-comms"
-        / "corpus"
-    )
+    corpus = _ARCHIVED_RUN12_CORPUS
     size_comparison: list[tuple[int, int]] = []
     for case_number in range(1, 14):
         case_id = f"C{case_number:02d}"
@@ -435,10 +449,15 @@ def test_archived_corpus_c01_to_c13_replays_as_compact_resolvable_text_dossiers(
             and value not in {"…", "..."}
             and not re.fullmatch(r"(?i)(?:R|M|F|A|E)[1-9][0-9]*", value)
             and value in prompt
+            # D7 permits authorized sample provenance, but only through the
+            # explicit provenance field, never as a bare incidental hash.
+            and not (key == "sample_sha256" and f"sample_sha256={value}" in prompt)
         ]
         assert not leaked_fields, (case_id, leaked_fields)
         for internal_key in (
-            "sha256",
+            # D7 transmits measurement/sample provenance hashes with the
+            # authorized evidence; the raw internal values above are still
+            # checked, and unrelated samples remain vetoed.
             "object_ref",
             "open_questions",
             "wire_ref_catalog",

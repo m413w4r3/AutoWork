@@ -324,8 +324,10 @@ async def test_experiment_postgres_cas_api_timeline_and_append_only(
         assert body["schema_version"] == "investigation-experiment-timeline.v1"
         assert body["stream_version"] == 4
         assert [item["version"] for item in body["experiments"]] == [1, 2, 3, 4]
+        # Free-text experiment fields are redacted by the read contract; the
+        # raw model methods must never be exposed by this API.
         assert [item["method"] for item in body["experiments"]] == [
-            item.method for item in experiments
+            "[redacted]" for _ in experiments
         ]
         assert [item["supersedes_experiment_ids"] for item in body["experiments"]] == [
             [],
@@ -343,31 +345,44 @@ async def test_experiment_postgres_cas_api_timeline_and_append_only(
             initial_support.id: [str(inconclusive_replacement.id)],
             inconclusive_replacement.id: [str(latest_support.id)],
         }
+        # Free-text scopes and non-canonical observation ids are redacted by the
+        # read contract; canonical experiment ids, structural verdicts,
+        # supersession and the derived claim status remain visible.
+        refutes_label = "Verdict enregistré : refutes (assertion, non conclusion)"
         assert body["claims"] == [
             {
                 "claim_id": CLAIM_ID,
-                "status": "qualified",
+                "status": "inconclusive",
                 "verdicts": ["refutes", "supports"],
                 "experiment_ids": [str(item.id) for item in experiments],
                 "superseded_by": [
                     str(inconclusive_replacement.id),
                     str(latest_support.id),
                 ],
+                "verdict_assertion_labels": [refutes_label],
                 "scopes": [
                     {
                         "experiment_id": str(item.id),
-                        "scope": item.scope,
+                        "scope": "[redacted]",
                         "verdict": item.verdict.value,
-                        "observation_ids": [
-                            str(ref.observation_id) for ref in item.observation_refs
-                        ],
+                        "observation_ids": ["[redacted]"],
                         "superseded_by": expected_superseded_by.get(item.id, []),
+                        "verdict_assertion_label": (
+                            refutes_label if item.verdict is ExperimentVerdict.REFUTES else None
+                        ),
                     }
                     for item in experiments
                 ],
                 "contradictory": True,
             }
         ]
+        serialized = json.dumps(body)
+        assert all(item.scope not in serialized for item in experiments)
+        assert all(
+            str(ref.observation_id) not in serialized
+            for item in experiments
+            for ref in item.observation_refs
+        )
 
         async with uow_factory() as uow:
             persisted = await uow.investigation_experiments.list_for_investigation(investigation.id)

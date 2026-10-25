@@ -406,7 +406,7 @@ def _safe_completeness_item(value: Any, *, dossier_entry: bool = False) -> dict[
                         "reason_sha256": _sha256_value(row.get("reason")) or "UNKNOWN",
                     }
                 )
-    item = {
+    item: dict[str, Any] = {
         "kind": raw_kind if raw_kind in _COMPLETENESS_KINDS else "UNKNOWN",
         "id": _opaque_id(value.get("id")) or "UNKNOWN",
         "sha256": _sha_value(value.get("sha256")),
@@ -638,7 +638,7 @@ def project_advisor_call_blob_metadata(
         "artifact_reader_unconfigured": "canonical artifact reader was not configured",
         "blob_read_failed": "canonical advisor-call blob could not be read",
         "blob_read_limit": "advisor-call blob exceeds the bounded metadata read size",
-    }.get(read_error, "canonical advisor-call blob was not read")
+    }.get(read_error or "", "canonical advisor-call blob was not read")
     payload: Mapping[str, Any] | None = None
     if raw is not None and actual_sha256 != expected_sha256:
         read_status = "hash_mismatch"
@@ -1647,7 +1647,7 @@ def _budget_event(investigation_id: str, budget_snapshot: Any) -> dict[str, Any]
                 },
             )
         )
-    rendered = [item for _, item in sorted(rendered, key=lambda pair: pair[0])]
+    ordered_reservations = [item for _, item in sorted(rendered, key=lambda pair: pair[0])]
     return _event(
         "budget.snapshot",
         investigation_id,
@@ -1656,7 +1656,7 @@ def _budget_event(investigation_id: str, budget_snapshot: Any) -> dict[str, Any]
         {
             "version": _get(budget_snapshot, "version"),
             "limits": _budget_amounts(_get(budget, "limits", {})),
-            "reservations": rendered,
+            "reservations": ordered_reservations,
             "transition_timestamps": _unknown(
                 "budget repository stores current versioned state, not transition timestamps"
             ),
@@ -1686,9 +1686,11 @@ def project_audit_events(snapshot: AuditSourceSnapshot) -> list[dict[str, Any]]:
         for block in _get(opinion, "blocks", ()) or ():
             for ref_name in ("bridge_draft_ref", "bridge_review_ref"):
                 ref = _get(block, ref_name)
-                invocation_id = _opaque_id(_get(ref, "invocation_id")) if ref is not None else None
-                if invocation_id and opinion_id != "UNKNOWN":
-                    attachments.setdefault(invocation_id, []).append(
+                attachment_invocation_id = (
+                    _opaque_id(_get(ref, "invocation_id")) if ref is not None else None
+                )
+                if attachment_invocation_id and opinion_id != "UNKNOWN":
+                    attachments.setdefault(attachment_invocation_id, []).append(
                         {"opinion_id": opinion_id, "version": str(_get(opinion, "version"))}
                     )
     for values in attachments.values():

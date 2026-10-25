@@ -2,15 +2,25 @@ from __future__ import annotations
 
 import hashlib
 import json
+import socket
+import subprocess
 from datetime import UTC, datetime
-from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 
-from cti_app.application.advisor_contracts import ADVISOR_SOURCE_PARSER_VERSION
-from cti_app.application.investigation_advisor_tools import ReparsePersistedAdvisorOutputTool
+from cti_app.application.advisor_semantic_parser import (
+    ADVISOR_RESPONSE_SCHEMA_V4,
+    ADVISOR_SOURCE_PARSER_VERSION_V4,
+)
+from cti_app.application.investigation_advisor_tools import (
+    ADVISOR_REPARSE_SCHEMA_VERSION,
+    ADVISOR_REPARSE_TOOL_NAME,
+    ReparsePersistedAdvisorOutputTool,
+    register_advisor_reparse_tool,
+)
+from cti_app.application.investigation_tools import InMemoryToolRegistry
 from cti_app.domain.investigation import EvidenceKind, EvidenceObservation, ToolInvocationStatus
 
 
@@ -64,87 +74,116 @@ class Recorder:
         return SimpleNamespace(id=self.observation_id)
 
 
-def _fixture_raw() -> str:
-    path = Path(__file__).parent / "fixtures" / "advisor_wire" / "bridge-yara-draft-347b29b2.txt"
-    return path.read_text(encoding="utf-8")
+def test_registered_reparse_interface_exposes_only_explicit_v4_selection() -> None:
+    registry = InMemoryToolRegistry()
+    adapter = ReparsePersistedAdvisorOutputTool(
+        observations=object(),
+        blobs=object(),
+        artifact_store=object(),
+        recorder=object(),
+    )
+
+    register_advisor_reparse_tool(registry, adapter=adapter)
+
+    registered = registry.get(ADVISOR_REPARSE_TOOL_NAME, ADVISOR_REPARSE_SCHEMA_VERSION)
+    assert registered is not None
+    schema = registered[0].input_schema
+    assert schema["properties"]["parser_version"]["enum"] == (ADVISOR_SOURCE_PARSER_VERSION_V4,)
+    assert "parser_version" not in schema["required"]
 
 
-def _suricata_raw() -> str:
-    return (
-        "advisor-wire.v1\nTYPE: suricata_draft\nSTATUS: succeeded\n"
-        "```suricata\n"
-        "alert tls any any -> any any (\n"
-        '    msg:"Observed SNI";\n'
-        '    tls.sni; content:"updates.example.test";\n'
-        "    sid:9900001; rev:1;\n"
-        ")\n"
-        "```\n"
-        "FACT: F1\n"
-        "INVARIANT: Le SNI observé est discriminant. | facts=F1\n"
-        "LIMITATION: none\n"
+def _prompt_data(input_refs: list[dict]) -> dict:
+    identifier = input_refs[0]["id"]
+    digest = input_refs[0]["sha256"]
+    return {
+        "consultation_type": "draft_text",
+        "question": "Review the observed JSON configuration.",
+        "transmitted_refs": input_refs,
+        "evidence": [
+            {
+                "evidence_id": identifier,
+                "sha256": digest,
+                "object_type": "observation",
+                "content_excerpts": [
+                    {
+                        "kind": "json",
+                        "title": "Observed JSON configuration",
+                        "text": '{"mode":"synthetic","label":"évidence 🧪"}',
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def _semantic_raw() -> str:
+    return json.dumps(
+        {
+            "schema": ADVISOR_RESPONSE_SCHEMA_V4,
+            "consultation_type": "draft_text",
+            "status": "succeeded",
+            "opinions": [
+                {
+                    "unit_id": "U1",
+                    "text": "Review the observed configuration.",
+                    "source_aliases": ["E1"],
+                }
+            ],
+            "incomplete_units": [],
+        },
+        ensure_ascii=False,
     )
 
 
 def _harness(
     raw_text: str,
     *,
-    consultation_type: str = "yara_draft",
-    input_refs: list[dict] | None = None,
-    previous_output: dict | None = None,
+    response_schema: str = "advisor-response.v3",
+    stored_parser_version: str = "advisor-source-parser.v3",
     reparse_context: dict | None = None,
-    review_units: list[dict] | None = None,
-    review_target: dict | None = None,
-    reviewed_text_sha256: str | None = None,
+    settings: object | None = None,
 ):
     investigation_id = uuid4()
     original_id = uuid4()
     invocation_id = str(uuid4())
-    measurement_ref = {"kind": "measurement", "id": "m001", "sha256": "a" * 64}
-    observation_ref = {"kind": "observation", "id": str(uuid4()), "sha256": "b" * 64}
-    selected_input_refs = (
-        input_refs if input_refs is not None else [measurement_ref, observation_ref]
-    )
+    input_refs = [{"kind": "observation", "id": "observation:synthetic-1", "sha256": "a" * 64}]
     output_sha256 = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
     raw_blob_id = uuid4()
     bridge_provenance = {
         "bridge_invocation_id": invocation_id,
         "bridge_invocation_id_kind": "conversation_turn",
         "input_sha256": "c" * 64,
-        "input_refs": selected_input_refs,
+        "input_refs": input_refs,
         "output_sha256": output_sha256,
         "provider_usage": {"status": "unknown"},
     }
-    output = previous_output or {
-        "schema": "advisor-response.v3",
-        "consultation_type": consultation_type,
-        "status": "partial",
-        "advisor_status": "partial",
-        "usable": False,
+    output = {
+        "schema": response_schema,
+        "consultation_type": "draft_text",
+        "parser_version": stored_parser_version,
+        "status": "succeeded",
+        "usable": True,
+        "output_sha256": output_sha256,
+        "bridge_provenance": bridge_provenance,
     }
-    output["output_sha256"] = output_sha256
-    output["bridge_provenance"] = bridge_provenance
     persisted = {
         "schema": "operator-advisor-call.v1",
-        "advisor_response_schema": "advisor-response.v3",
-        "consultation_type": consultation_type,
-        "advisor_status": "partial",
+        "advisor_response_schema": response_schema,
+        "consultation_type": "draft_text",
+        "advisor_status": "succeeded",
         "bridge_invocation_id": invocation_id,
         "bridge_invocation_id_kind": "conversation_turn",
         "idempotency_key": "original-call-key",
         "input_sha256": "c" * 64,
-        "input_refs": selected_input_refs,
+        "input_refs": input_refs,
+        "input_observation_refs": [],
+        "input_source_refs": [],
         "output_sha256": output_sha256,
         "provider_usage": {"status": "unknown"},
         "output": output,
     }
     if reparse_context is not None:
         persisted["reparse_context"] = reparse_context
-    if review_units is not None:
-        persisted["review_units"] = review_units
-    if review_target is not None:
-        persisted["review_target"] = review_target
-    if reviewed_text_sha256 is not None:
-        persisted["reviewed_text_sha256"] = reviewed_text_sha256
     persisted_bytes = json.dumps(
         persisted, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
@@ -158,61 +197,139 @@ def _harness(
         source_version="advisor-consult.v1",
         observed_at=datetime.now(UTC),
         object_type="advisor_call",
-        object_id=consultation_type,
+        object_id="draft_text",
     )
     recorder = Recorder()
     artifact_store = ArtifactStore(
-        {original.blob_id: persisted_bytes, raw_blob_id: raw_text.encode()}
+        {original.blob_id: persisted_bytes, raw_blob_id: raw_text.encode("utf-8")}
     )
     tool = ReparsePersistedAdvisorOutputTool(
         observations=ObservationRepository(original),
-        blobs=BlobRepository(raw_blob_id, output_sha256, len(raw_text.encode())),
+        blobs=BlobRepository(raw_blob_id, output_sha256, len(raw_text.encode("utf-8"))),
         artifact_store=artifact_store,
         recorder=recorder,
+        settings=settings,
     )
     context = SimpleNamespace(investigation_id=investigation_id)
-    return tool, recorder, original, context, invocation_id, output_sha256, selected_input_refs
+    return tool, recorder, original, context, output_sha256, artifact_store, raw_blob_id
 
 
 @pytest.mark.asyncio
-async def test_reparse_appends_verified_parse_without_a_bridge_transport() -> None:
-    raw = _fixture_raw()
-    tool, recorder, original, context, invocation_id, output_sha256, input_refs = _harness(raw)
+async def test_legacy_v3_reparse_is_auditable_without_blob_read_or_new_observation() -> None:
+    tool, recorder, original, context, output_sha256, store, raw_blob_id = _harness(
+        "advisor-wire.v1\nTYPE: draft_text\nSTATUS: succeeded\nOPINION: old output\n"
+    )
+    original_hash = original.sha256
 
     result = await tool.execute({"observation_id": str(original.id)}, context)
 
     assert result.status is ToolInvocationStatus.PARTIAL
-    assert result.output["advisor_status"] == "partial"
-    assert result.output["usable"] is True
-    assert result.output["bridge_invocation_id"] == invocation_id
+    assert result.error_code == "unsupported_legacy_format"
+    assert result.output["status"] == "unsupported_legacy_format"
     assert result.output["output_sha256"] == output_sha256
-    assert result.output["parser_version"] == ADVISOR_SOURCE_PARSER_VERSION
-    assert len(recorder.calls) == 1
-    recorded = recorder.calls[0]
-    assert recorded["source"] == "advisor.consult"
-    assert recorded["source_version"] == ADVISOR_SOURCE_PARSER_VERSION
-    assert recorded["idempotency_key"] == (
-        f"advisor-reparse:{original.id}:{ADVISOR_SOURCE_PARSER_VERSION}"
+    assert result.output["new_observation_written"] is False
+    assert store.calls == [original.blob_id]
+    assert recorder.calls == []
+    assert original.sha256 == original_hash
+    assert (
+        raw_blob_id not in store.values
+        or hashlib.sha256(store.values[raw_blob_id]).hexdigest() == output_sha256
     )
-    assert recorded["payload"]["reparsed_from_observation_id"] == str(original.id)
-    assert recorded["payload"]["input_refs"] == input_refs
-    assert recorded["payload"]["bridge_invocation_id"] == invocation_id
-    assert recorded["payload"]["bridge_turns_consumed"] == 0
-    parsed_output = recorded["payload"]["output"]
-    assert parsed_output["bridge_provenance"]["bridge_invocation_id"] == invocation_id
-    assert parsed_output["motifs"][0]["measurement_refs"] == [
-        {"measurement_id": "m001", "sha256": "a" * 64}
-    ]
 
 
 @pytest.mark.asyncio
-async def test_reparse_refuses_minio_bytes_that_do_not_match_observation_output_sha() -> None:
-    raw = _fixture_raw()
-    tool, recorder, original, context, _invocation_id, _output_sha, _refs = _harness(raw)
-    raw_blob_id = tool._blobs.blob_id
-    tool._artifact_store.values[raw_blob_id] = b"changed after the persisted observation"
+async def test_explicit_v4_reparse_appends_verified_parse_without_bridge_or_egress(
+    monkeypatch,
+) -> None:
+    raw = _semantic_raw()
+    input_refs = [{"kind": "observation", "id": "observation:synthetic-1", "sha256": "a" * 64}]
+    tool, recorder, original, context, output_sha256, store, raw_blob_id = _harness(
+        raw,
+        response_schema=ADVISOR_RESPONSE_SCHEMA_V4,
+        stored_parser_version=ADVISOR_SOURCE_PARSER_VERSION_V4,
+        reparse_context=_prompt_data(input_refs),
+    )
 
-    result = await tool.execute({"observation_id": str(original.id)}, context)
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("reparse attempted Bridge or network access")
+
+    monkeypatch.setattr(socket, "create_connection", forbidden)
+    monkeypatch.setattr(subprocess, "run", forbidden)
+
+    result = await tool.execute(
+        {
+            "observation_id": str(original.id),
+            "parser_version": ADVISOR_SOURCE_PARSER_VERSION_V4,
+        },
+        context,
+    )
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    assert result.output["parser_version"] == ADVISOR_SOURCE_PARSER_VERSION_V4
+    assert result.output["output_sha256"] == output_sha256
+    assert result.output["output"]["raw_output"] == raw
+    assert result.output["output"]["raw_output_bytes"] == len(raw.encode("utf-8"))
+    assert store.values[raw_blob_id] == raw.encode("utf-8")
+    assert hashlib.sha256(store.values[raw_blob_id]).hexdigest() == output_sha256
+    assert len(recorder.calls) == 1
+    recorded = recorder.calls[0]
+    assert recorded["source_version"] == ADVISOR_SOURCE_PARSER_VERSION_V4
+    assert recorded["payload"]["bridge_turns_consumed"] == 0
+    assert recorded["payload"]["output"]["parser_version"] == ADVISOR_SOURCE_PARSER_VERSION_V4
+    assert recorded["payload"]["output"]["candidates"][0]["validated"] is False
+
+
+@pytest.mark.asyncio
+async def test_reparse_passes_configured_credential_values_to_pure_v4_parser() -> None:
+    credential = "configured-only-reparse-token-508fb0e4"
+    raw_data = json.loads(_semantic_raw())
+    raw_data["opinions"][0]["text"] = f"Echoed value: {credential}"
+    raw = json.dumps(raw_data, ensure_ascii=False)
+    input_refs = [{"kind": "observation", "id": "observation:synthetic-1", "sha256": "a" * 64}]
+    tool, recorder, original, context, _, _, _ = _harness(
+        raw,
+        response_schema=ADVISOR_RESPONSE_SCHEMA_V4,
+        stored_parser_version=ADVISOR_SOURCE_PARSER_VERSION_V4,
+        reparse_context=_prompt_data(input_refs),
+        settings=SimpleNamespace(openai_bridge_api_key=credential),
+    )
+
+    result = await tool.execute(
+        {
+            "observation_id": str(original.id),
+            "parser_version": ADVISOR_SOURCE_PARSER_VERSION_V4,
+        },
+        context,
+    )
+
+    assert result.status is ToolInvocationStatus.PARTIAL
+    assert result.output["advisor_status"] == "refused"
+    assert result.output["output"]["raw_output"] is None
+    assert (
+        result.output["output"]["raw_output_sha256"]
+        == hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    )
+    assert len(recorder.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_v4_reparse_refuses_raw_bytes_that_do_not_match_the_persisted_sha() -> None:
+    input_refs = [{"kind": "observation", "id": "observation:synthetic-1", "sha256": "a" * 64}]
+    tool, recorder, original, context, _, store, raw_blob_id = _harness(
+        _semantic_raw(),
+        response_schema=ADVISOR_RESPONSE_SCHEMA_V4,
+        stored_parser_version=ADVISOR_SOURCE_PARSER_VERSION_V4,
+        reparse_context=_prompt_data(input_refs),
+    )
+    store.values[raw_blob_id] = b"changed after the persisted observation"
+
+    result = await tool.execute(
+        {
+            "observation_id": str(original.id),
+            "parser_version": ADVISOR_SOURCE_PARSER_VERSION_V4,
+        },
+        context,
+    )
 
     assert result.status is ToolInvocationStatus.FAILED
     assert result.error_code == "advisor_reparse_raw_output_sha256_mismatch"
@@ -220,224 +337,62 @@ async def test_reparse_refuses_minio_bytes_that_do_not_match_observation_output_
 
 
 @pytest.mark.asyncio
-async def test_reparse_accepts_verified_suricata_context_without_bridge() -> None:
-    raw = _suricata_raw()
-    input_refs = [{"kind": "observation", "id": str(uuid4()), "sha256": "d" * 64}]
-    network_facts = [
-        {
-            "fact_id": "nf001",
-            "evidence_id": input_refs[0]["id"],
-            "observation_sha256": input_refs[0]["sha256"],
-            "field": "tls.sni",
-            "value": "updates.example.test",
-        }
-    ]
-    tool, recorder, original, context, invocation_id, output_sha256, input_refs = _harness(
-        raw,
-        consultation_type="suricata_draft",
-        input_refs=input_refs,
-        reparse_context={
-            "transmitted_refs": input_refs,
-            "network_facts": network_facts,
-        },
+async def test_v4_requires_explicit_parser_selection_and_exact_reparse_context() -> None:
+    input_refs = [{"kind": "observation", "id": "observation:synthetic-1", "sha256": "a" * 64}]
+    tool, recorder, original, context, _, store, raw_blob_id = _harness(
+        _semantic_raw(),
+        response_schema=ADVISOR_RESPONSE_SCHEMA_V4,
+        stored_parser_version=ADVISOR_SOURCE_PARSER_VERSION_V4,
+        reparse_context=_prompt_data(input_refs),
     )
 
-    result = await tool.execute({"observation_id": str(original.id)}, context)
-
-    assert result.status is ToolInvocationStatus.SUCCEEDED
-    assert result.output["usable"] is True
-    assert result.output["rule_source"].startswith("alert tls")
-    assert result.output["output"]["fact_refs"] == ("nf001",)
-    assert result.output["output"]["invariants"][0]["fact_refs"] == ("nf001",)
-    stored_fact_ids = {item["fact_id"] for item in network_facts}
-    assert set(result.output["output"]["fact_refs"]) <= stored_fact_ids
-    assert result.output["output_sha256"] == hashlib.sha256(raw.encode()).hexdigest()
-    assert result.output["output_sha256"] == output_sha256
-    assert result.output["bridge_invocation_id"] == invocation_id
-    assert len(recorder.calls) == 1
-    recorded = recorder.calls[0]
-    assert recorded["kind"] is EvidenceKind.OTHER
-    assert recorded["object_type"] == "advisor_call"
-    assert recorded["object_id"] == "suricata_draft"
-    assert recorded["source_version"] == ADVISOR_SOURCE_PARSER_VERSION
-    assert recorded["idempotency_key"] == (
-        f"advisor-reparse:{original.id}:{ADVISOR_SOURCE_PARSER_VERSION}"
-    )
-    assert recorded["payload"]["input_refs"] == input_refs
-    assert recorded["payload"]["output"]["bridge_provenance"]["input_refs"] == input_refs
-    assert recorded["payload"]["bridge_turns_consumed"] == 0
-    assert recorded["payload"]["output"]["fact_refs"] == ["nf001"]
-    assert tool._observations.calls == [original.id]
-    assert tool._blobs.calls == [("model-outputs", output_sha256)]
-    assert tool._artifact_store.calls == [original.blob_id, tool._blobs.blob_id]
-
-
-@pytest.mark.asyncio
-async def test_reparse_refuses_suricata_without_persisted_context() -> None:
-    tool, recorder, original, context, *_ = _harness(
-        _suricata_raw(), consultation_type="suricata_draft"
-    )
-
-    result = await tool.execute({"observation_id": str(original.id)}, context)
-
-    assert result.status is ToolInvocationStatus.FAILED
-    assert result.error_code == "advisor_reparse_context_unavailable"
+    missing_selection = await tool.execute({"observation_id": str(original.id)}, context)
+    assert missing_selection.error_code == "advisor_reparse_parser_version_required"
     assert recorder.calls == []
+    assert raw_blob_id not in store.calls
 
-
-@pytest.mark.parametrize("network_facts", [[], [{"fact_id": "nf001"}]])
-@pytest.mark.asyncio
-async def test_reparse_refuses_suricata_with_incomplete_network_facts(network_facts) -> None:
-    input_refs = [{"kind": "observation", "id": str(uuid4()), "sha256": "e" * 64}]
-    tool, recorder, original, context, *_ = _harness(
-        _suricata_raw(),
-        consultation_type="suricata_draft",
-        input_refs=input_refs,
-        reparse_context={"transmitted_refs": input_refs, "network_facts": network_facts},
+    (
+        missing_context_tool,
+        missing_context_recorder,
+        missing_context_original,
+        missing_context,
+        *_,
+    ) = _harness(
+        _semantic_raw(),
+        response_schema=ADVISOR_RESPONSE_SCHEMA_V4,
+        stored_parser_version=ADVISOR_SOURCE_PARSER_VERSION_V4,
     )
-
-    result = await tool.execute({"observation_id": str(original.id)}, context)
-
-    assert result.status is ToolInvocationStatus.FAILED
-    assert result.error_code == "advisor_reparse_context_unavailable"
-    assert recorder.calls == []
-
-
-@pytest.mark.asyncio
-async def test_reparse_refuses_suricata_context_with_conflicting_references() -> None:
-    raw = _suricata_raw()
-    input_refs = [{"kind": "observation", "id": str(uuid4()), "sha256": "f" * 64}]
-    conflicting_refs = [{**input_refs[0], "sha256": "a" * 64}]
-    network_facts = [
+    no_context = await missing_context_tool.execute(
         {
-            "fact_id": "nf001",
-            "evidence_id": input_refs[0]["id"],
-            "observation_sha256": input_refs[0]["sha256"],
-            "field": "tls.sni",
-            "value": "updates.example.test",
-        }
-    ]
-    tool, recorder, original, context, *_ = _harness(
-        raw,
-        consultation_type="suricata_draft",
-        input_refs=input_refs,
-        reparse_context={
-            "transmitted_refs": conflicting_refs,
-            "network_facts": network_facts,
+            "observation_id": str(missing_context_original.id),
+            "parser_version": ADVISOR_SOURCE_PARSER_VERSION_V4,
         },
+        missing_context,
     )
-
-    result = await tool.execute({"observation_id": str(original.id)}, context)
-
-    assert result.status is ToolInvocationStatus.FAILED
-    assert result.error_code == "advisor_reparse_context_refs_invalid"
-    assert recorder.calls == []
+    assert no_context.error_code == "legacy_context_unavailable"
+    assert no_context.output["new_observation_written"] is False
+    assert missing_context_recorder.calls == []
 
 
 @pytest.mark.asyncio
-async def test_reparse_salvages_legacy_draft_text_and_flags_prose_aliases() -> None:
-    raw = """advisor-wire.v1
-TYPE: draft_text
-STATUS: succeeded
-UNIT: U9
-S: La synthèse cite les observations R2 et R3 dans sa prose. [A1]
-LIMITATION: La limite cite aussi R2 et R3 en prose.
-"""
-    ref = {"kind": "observation", "id": str(uuid4()), "sha256": "d" * 64}
-    previous_output = {
-        "schema": "advisor-response.v3",
-        "consultation_type": "draft_text",
-        "status": "partial",
-        "advisor_status": "partial",
-        "usable": False,
-        "blocks": [
-            {
-                "unit_id": "U9",
-                "block_type": "additional_samples",
-                "form": "analyst_note",
-                "anchor": "section:2:paragraph:0003",
-                "sentences": [
-                    {
-                        "text": "Une phrase antérieure conservée pour reconstruire U9.",
-                        "assertion_ids": ["assertion-u9"],
-                    }
-                ],
-            }
-        ],
-    }
-    tool, recorder, original, context, _invocation_id, _output_sha, _refs = _harness(
-        raw,
-        consultation_type="draft_text",
-        input_refs=[ref],
-        previous_output=previous_output,
+async def test_invalid_v4_reparse_does_not_append_a_conclusion() -> None:
+    input_refs = [{"kind": "observation", "id": "observation:synthetic-1", "sha256": "a" * 64}]
+    tool, recorder, original, context, _, _, _ = _harness(
+        '{"schema":"advisor-response.v3","status":"succeeded"}',
+        response_schema=ADVISOR_RESPONSE_SCHEMA_V4,
+        stored_parser_version=ADVISOR_SOURCE_PARSER_VERSION_V4,
+        reparse_context=_prompt_data(input_refs),
     )
 
-    result = await tool.execute({"observation_id": str(original.id)}, context)
-
-    assert result.status is ToolInvocationStatus.PARTIAL
-    assert result.output["usable"] is True
-    assert "source_alias_in_prose" in result.output["warnings"]
-    assert result.output["output"]["blocks"][0]["usable"] is True
-    assert "R2 et R3" in result.output["output"]["blocks"][0]["sentences"][0]["text"]
-    assert any("R2" in item and "R3" in item for item in result.output["output"]["limitations"])
-    assert (
-        "source_alias_in_prose" in result.output["output"]["warning_classification"]["informative"]
-    )
-    reparsed_payload = recorder.calls[0]["payload"]
-    assert reparsed_payload["bridge_turns_consumed"] == 0
-    assert "source_alias_in_prose" in reparsed_payload["output"]["warnings"]
-
-
-@pytest.mark.asyncio
-async def test_reparse_salvages_complete_review_units_from_partial_wire_without_bridge() -> None:
-    raw = """advisor-wire.v1
-TYPE: review_text
-STATUS: partial
-UNIT: U13
-REMARK: La remarque cite R2 en prose sans créer de référence.
-UNIT: U15
-REMARK: La réserve de portée reste associée à cette unité.
-LIMITATION: none
-"""
-    review_units = [
+    result = await tool.execute(
         {
-            "unit_id": unit_id,
-            "form": "body",
-            "block_type": "key_findings",
-            "anchor": None,
-            "reviewed_text_sha256": digest,
-        }
-        for unit_id, digest in (("U13", "a" * 64), ("U15", "b" * 64))
-    ]
-    input_refs = [{"kind": "observation", "id": str(uuid4()), "sha256": "e" * 64}]
-    tool, recorder, original, context, invocation_id, output_sha256, input_refs = _harness(
-        raw,
-        consultation_type="review_text",
-        input_refs=input_refs,
-        reparse_context={"transmitted_refs": input_refs, "units": review_units},
-        review_units=review_units,
-        previous_output={
-            "schema": "advisor-response.v3",
-            "consultation_type": "review_text",
-            "status": "partial",
-            "advisor_status": "partial",
-            "usable": False,
-            "reviews": [],
+            "observation_id": str(original.id),
+            "parser_version": ADVISOR_SOURCE_PARSER_VERSION_V4,
         },
+        context,
     )
-    result = await tool.execute({"observation_id": str(original.id)}, context)
 
-    assert result.status is ToolInvocationStatus.PARTIAL
-    assert result.output["advisor_status"] == "partial"
-    assert result.output["usable"] is True
-    assert result.output["bridge_invocation_id"] == invocation_id
-    assert result.output["output_sha256"] == output_sha256
-    assert [item["unit_id"] for item in result.output["output"]["reviews"]] == ["U13", "U15"]
-    assert all(item["usable"] for item in result.output["output"]["reviews"])
-    assert (
-        "source_alias_in_prose" in result.output["output"]["warning_classification"]["informative"]
-    )
-    recorded = recorder.calls[0]["payload"]
-    assert recorded["input_refs"] == input_refs
-    assert recorded["review_units"] == review_units
-    assert recorded["bridge_turns_consumed"] == 0
+    assert result.status is ToolInvocationStatus.NEEDS_REVIEW
+    assert result.output["status"] == "invalid"
+    assert result.output["new_observation_written"] is False
+    assert recorder.calls == []

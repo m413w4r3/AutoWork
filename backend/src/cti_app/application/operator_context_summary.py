@@ -232,6 +232,7 @@ def build_operator_context_summary(
     working_state_version: int,
     working_state_sha256: str,
     state: InvestigationWorkingState,
+    context_sha256: str | None = None,
     since_version: int | None = None,
     since_fingerprint: str | None = None,
     invalidation_facts: Mapping[str, Any] | None = None,
@@ -245,7 +246,7 @@ def build_operator_context_summary(
         raise ValueError("Operator context summary delta base is invalid")
 
     context_bytes = context.canonical_bytes()
-    context_sha256 = hashlib.sha256(context_bytes).hexdigest()
+    context_sha256 = context_sha256 or hashlib.sha256(context_bytes).hexdigest()
     pointers = _pointers(investigation_id=investigation_id)
     section_fingerprints = _section_fingerprints(
         context,

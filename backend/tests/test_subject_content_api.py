@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -203,10 +204,12 @@ class _PublicationRenderService:
         result: object | None = None,
         error: Exception | None = None,
         preview_attempt: object | None = None,
+        lineage: dict[str, object] | None = None,
     ) -> None:
         self.result = result
         self.error = error
         self.preview_attempt = preview_attempt
+        self.lineage = lineage
         self.artifact_ids: list[UUID] = []
         self.preview_compile_count = 0
         self._cached_preview_attempt: object | None = None
@@ -232,7 +235,7 @@ class _PublicationRenderService:
         return self.preview_attempt
 
     async def lineage_manifest_for_render(self, render: object) -> dict[str, object]:
-        return {
+        return self.lineage or {
             "schema_version": "pdf-lineage.v1",
             "render_identity": getattr(render, "input_hash", None),
         }
@@ -452,6 +455,13 @@ async def test_subject_publication_pdf_uses_current_verified_artifact(
         version=2,
     )
     output_blob_id = uuid4()
+    actors = {
+        "reviewer": {
+            "actor_id": "reviewer:canonical",
+            "role": "reviewer",
+            "decision_label": "opinion_approved",
+        }
+    }
     pdf_bytes = b"%PDF-1.7\npublication"
     render = SimpleNamespace(
         input_hash="e" * 64,
@@ -459,7 +469,10 @@ async def test_subject_publication_pdf_uses_current_verified_artifact(
         output_byte_size=len(pdf_bytes),
         output_sha256=hashlib.sha256(pdf_bytes).hexdigest(),
     )
-    renderer = _PublicationRenderService(result=render)
+    renderer = _PublicationRenderService(
+        result=render,
+        lineage={"schema_version": "pdf-lineage.v1", "actors": actors},
+    )
     payloads = _Payloads({output_blob_id: pdf_bytes})
     app = _app(
         _Uow(subject, [previous_run, current_run], [previous_artifact, current_artifact]),
@@ -478,6 +491,7 @@ async def test_subject_publication_pdf_uses_current_verified_artifact(
     assert response.content == pdf_bytes
     assert response.headers["x-publication-render-identity"] == render.input_hash
     assert renderer.artifact_ids == [current_artifact.id]
+    assert json.loads(response.headers["x-pdf-lineage"])["actors"] == actors
 
 
 @pytest.mark.anyio

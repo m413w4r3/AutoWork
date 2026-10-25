@@ -11,6 +11,7 @@ import pytest
 
 from cti_app.api.investigation import InvestigationOperatorStatusResponse
 from cti_app.application.analyst_handoff import AnalystHandoffPolicy
+from cti_app.application.blob_storage import BlobReadLimitExceededError
 from cti_app.application.bridge_investigator import (
     BridgeInvestigator,
     ScriptedTurnTransport,
@@ -59,6 +60,7 @@ from cti_app.application.investigation_tools import (
     ToolResult,
 )
 from cti_app.application.model_conversations import ModelConversationService
+from cti_app.application.operator_tool_invocation import OperatorToolInvocationService
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.research_context_builder import (
@@ -82,6 +84,7 @@ from cti_app.domain.investigation import (
     EvidenceObservation,
     FindingAssessment,
     FindingKind,
+    FrameworkPreSubmissionProof,
     InvestigationBudget,
     InvestigationEnvelope,
     InvestigationExecutionMode,
@@ -259,23 +262,102 @@ class _StateRepository(InMemoryInvestigationStateRepository):
         return await super().save_if_version(state, expected_version=expected_version)
 
 
+class _MemoryProofArtifactStore:
+    def __init__(self):
+        self.blobs = {}
+        self.descriptors = {}
+        self.read_limit_errors = set()
+
+    def store(self, blob_id, content):
+        self.blobs[blob_id] = content
+        self.descriptors[blob_id] = {
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "byte_size": len(content),
+            "mime_type": "application/json",
+        }
+
+    async def blob_metadata(self, blob_id):
+        return self.descriptors.get(blob_id)
+
+    async def read_bytes(self, blob_id, *, max_bytes):
+        if blob_id in self.read_limit_errors:
+            raise BlobReadLimitExceededError(size_bytes=max_bytes + 1, max_bytes=max_bytes)
+        content = self.blobs[blob_id]
+        if len(content) > max_bytes:
+            raise ValueError("blob exceeds max_bytes")
+        return content
+
+    async def summary(self, observation):
+        descriptor = await self.blob_metadata(observation.blob_id)
+        if descriptor is None or descriptor["sha256"] != observation.sha256:
+            return None
+        try:
+            raw = await self.read_bytes(observation.blob_id, max_bytes=512 * 1024 * 1024)
+        except Exception:
+            # Match CanonicalEvidenceSummaryPort's bounded binary fallback when
+            # a descriptor exists but the payload cannot be read.
+            return {"mime_type": descriptor["mime_type"], "byte_size": descriptor["byte_size"]}
+        if hashlib.sha256(raw).hexdigest() != observation.sha256:
+            return None
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            return {"mime_type": descriptor["mime_type"], "byte_size": len(raw)}
+        if (
+            isinstance(payload, dict)
+            and payload.get("schema") == "investigation-tool-observation.v1"
+        ):
+            result = payload.get("result")
+            return result if isinstance(result, dict) else None
+        return {"mime_type": descriptor["mime_type"], "byte_size": len(raw)}
+
+
+def _replace_framework_proof_blob(fixture, observation, raw):
+    fixture.proof_artifacts.blobs[observation.blob_id] = raw
+    digest = hashlib.sha256(raw).hexdigest()
+    fixture.proof_artifacts.descriptors[observation.blob_id].update(
+        sha256=digest,
+        byte_size=len(raw),
+    )
+    fixture.observations._items[observation.id] = replace(observation, sha256=digest)
+
+
 class _ObservationWriter:
-    def __init__(self, repository):
+    def __init__(self, repository, proof_artifacts=None):
         self.repository = repository
+        self.proof_artifacts = proof_artifacts
 
     async def archive(self, invocation, result):
         encoded = canonical_json_bytes(dict(result.output))
+        blob_id = uuid5(_OBSERVATION_NAMESPACE, "blob:" + invocation.operation_key)
+        if result.framework_pre_submission_proof is not None:
+            safe_result = dict(result.output)
+            safe_result["framework_pre_submission_proof"] = {
+                "object_type": result.framework_pre_submission_proof.value
+            }
+            payload = {
+                "schema": "investigation-tool-observation.v1",
+                "tool_name": invocation.tool_name,
+                "schema_version": invocation.schema_version,
+                "operation_key": invocation.operation_key,
+                "result": safe_result,
+            }
+            encoded = canonical_json_bytes(payload)
+            if self.proof_artifacts is not None:
+                self.proof_artifacts.store(blob_id, encoded)
         observation = EvidenceObservation(
             id=uuid5(_OBSERVATION_NAMESPACE, invocation.operation_key),
             investigation_id=invocation.investigation_id,
             kind=EvidenceKind.OTHER,
-            blob_id=uuid5(_OBSERVATION_NAMESPACE, "blob:" + invocation.operation_key),
+            blob_id=blob_id,
             sha256=hashlib.sha256(encoded).hexdigest(),
             source=invocation.tool_name,
             source_version=invocation.schema_version,
             observed_at=datetime.now(UTC),
             object_type=(
-                "provider_authorization_refusal"
+                result.framework_pre_submission_proof.value
+                if result.framework_pre_submission_proof is not None
+                else "provider_authorization_refusal"
                 if result.output.get("reason") == "provider_authorization_refused"
                 else {
                     "provider_download_route_not_found": "provider_download_route_refused",
@@ -473,6 +555,7 @@ class _Fixture:
         self.context_snapshots = InMemoryInvestigationContextSnapshotRepository()
         self.envelopes = InMemoryInvestigationEnvelopeRepository()
         self.observations = InMemoryEvidenceObservationRepository()
+        self.proof_artifacts = _MemoryProofArtifactStore()
         self.findings = InMemoryFindingRepository()
         self.invocations = InMemoryToolInvocationRepository()
         self.analyst_decisions = _DecisionRepository()
@@ -538,7 +621,9 @@ class _Fixture:
             observations=self.observations,
             findings=self.findings,
             opinions=self.opinions,
-            observation_writer=_ObservationWriter(self.observations),
+            observation_writer=_ObservationWriter(self.observations, self.proof_artifacts),
+            artifact_store=self.proof_artifacts,
+            evidence_summaries=self.proof_artifacts,
             available_capabilities=self.available_capabilities,
             no_progress_limit=no_progress_limit,
             commit_uow=self._commit,
@@ -1315,8 +1400,8 @@ async def test_untyped_download_refusal_requires_reconciliation_before_retry() -
     assert stopped.stop_reason is StopReason.SUBMISSION_NEEDS_REVIEW
     assert len(invocations) == 1
     assert invocations[0].status is ToolInvocationStatus.NEEDS_REVIEW
-    assert invocations[0].response_refs == ()
-    assert observations == ()
+    assert len(invocations[0].response_refs) == 1
+    assert observations[0].id == invocations[0].response_refs[0]
     assert envelope is not None
     assert envelope.budget.consumed[BudgetDimension.VT_UNITS] == 0
     assert envelope.budget.consumed[BudgetDimension.DOWNLOADS] == 0
@@ -1326,6 +1411,109 @@ async def test_untyped_download_refusal_requires_reconciliation_before_retry() -
         if item.operation_key == invocations[0].operation_key
     )
     assert reservation.status is BudgetReservationStatus.RESERVED
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_external_result_preserves_only_valid_refs_without_archiving_output() -> (
+    None
+):
+    call = _tool_call(
+        "vt.download_sample", "synthetic-partial-download", "reconcile the interrupted download"
+    )
+    fixture = _Fixture(
+        responses=[_decision(goal="reconcile download", next_action="finish", tools=(call,))],
+        tools=(("vt.download_sample", "vt", ToolEffect.ACQUIRE),),
+    )
+    fixture.envelope = replace(fixture.envelope, acquire_hits_allowed=True)
+    recorded = EvidenceObservation(
+        investigation_id=fixture.investigation_id,
+        kind=EvidenceKind.OTHER,
+        blob_id=uuid4(),
+        sha256=hashlib.sha256(b"synthetic recorded partial observation").hexdigest(),
+        source="synthetic-download-adapter",
+        source_version="1",
+        observed_at=datetime.now(UTC),
+        object_type="download_result",
+        object_id="synthetic-partial-download",
+        limitations=("Synthetic pre-recorded observation.",),
+    )
+    foreign = replace(recorded, investigation_id=uuid4(), id=uuid4())
+    await fixture.observations.append_if_absent(recorded)
+    await fixture.observations.append_if_absent(foreign)
+    fixture.tools["vt.download_sample"].result = ToolResult(
+        status=ToolInvocationStatus.NEEDS_REVIEW,
+        observation_refs=(recorded.id, foreign.id),
+        output={"raw_adapter_payload": "UNTRUSTED-SYNTHETIC-OUTPUT"},
+    )
+    state = await fixture.start()
+
+    stopped = await fixture.service.run(state.investigation_id)
+
+    invocations = await fixture.invocations.list_for_investigation(state.investigation_id)
+    observations = await fixture.observations.list_for_investigation(state.investigation_id)
+    assert stopped.stop_reason is StopReason.SUBMISSION_NEEDS_REVIEW
+    assert len(invocations) == 1
+    assert invocations[0].status is ToolInvocationStatus.NEEDS_REVIEW
+    assert invocations[0].response_refs == (recorded.id,)
+    assert observations == (recorded,)
+    with pytest.raises(ValueError, match="reconciled before resuming"):
+        await fixture.service.resume(state.investigation_id)
+    assert fixture.tools["vt.download_sample"].calls == [call["arguments"]]
+
+
+@pytest.mark.asyncio
+async def test_unreconciled_review_with_refs_blocks_next_external_tool_call() -> None:
+    first = _tool_call("vt.search", "synthetic:ambiguous", "reuse the reviewed lookup")
+    second = _tool_call("vt.search", "synthetic:later", "start another external lookup")
+    fixture = _Fixture(
+        responses=[
+            _decision(
+                goal="continue after reviewed lookup", next_action="continue", tools=(first, second)
+            ),
+            _decision(goal="finish after reconciliation gate", next_action="finish"),
+        ],
+        tools=(("vt.search", "vt"),),
+    )
+    state = await fixture.start()
+    observation = EvidenceObservation(
+        investigation_id=state.investigation_id,
+        kind=EvidenceKind.OTHER,
+        blob_id=uuid4(),
+        sha256=hashlib.sha256(b"synthetic ambiguous lookup evidence").hexdigest(),
+        source="synthetic-vt-search",
+        source_version="1",
+        observed_at=datetime.now(UTC),
+        object_type="search_result",
+        object_id="synthetic:ambiguous",
+    )
+    await fixture.observations.append_if_absent(observation)
+    operation_key, _ = _operation_and_observation_id(state.investigation_id, first)
+    invocation = ToolInvocation(
+        investigation_id=state.investigation_id,
+        operation_key=operation_key,
+        tool_name=first["tool_name"],
+        schema_version=first["schema_version"],
+        normalized_parameters=first["arguments"],
+        purpose=first["purpose"],
+    )
+    invocation = await fixture.invocations.add_if_absent(invocation)
+    invocation = await fixture.invocations.update_if_version(
+        invocation.transition(ToolInvocationStatus.RUNNING), expected_version=invocation.version
+    )
+    reviewed = replace(
+        invocation.transition(ToolInvocationStatus.NEEDS_REVIEW),
+        response_refs=(observation.id,),
+    )
+    await fixture.invocations.update_if_version(reviewed, expected_version=invocation.version)
+
+    result = await fixture.service.run(state.investigation_id)
+
+    invocations = await fixture.invocations.list_for_investigation(state.investigation_id)
+    assert result.stop_reason is StopReason.SUBMISSION_NEEDS_REVIEW
+    assert fixture.tools["vt.search"].calls == []
+    assert len(invocations) == 1
+    assert invocations[0].status is ToolInvocationStatus.NEEDS_REVIEW
+    assert invocations[0].response_refs == (observation.id,)
 
 
 @pytest.mark.asyncio
@@ -2646,6 +2834,276 @@ async def test_running_invocation_is_committed_before_dispatch_and_never_replaye
         len([item for item in envelope.budget.reservations if item.operation_key == operation_key])
         == 1
     )
+
+
+@pytest.mark.asyncio
+async def test_interrupted_running_invocation_requires_reconciliation_before_progress() -> None:
+    ambiguous_call = _tool_call("vt.search", "synthetic:stopped", "check the interrupted lookup")
+    later_call = _tool_call("network.lookup", "synthetic:later", "continue after reconciliation")
+    fixture = _Fixture(
+        responses=[
+            _decision(goal="start the lookup", next_action="continue", tools=(ambiguous_call,)),
+            _decision(
+                goal="continue after reconciliation", next_action="continue", tools=(later_call,)
+            ),
+            _decision(goal="finish", next_action="finish"),
+        ],
+        tools=(("vt.search", "vt"), ("network.lookup", "network")),
+    )
+    state = await fixture.start()
+    operation_key, _ = _operation_and_observation_id(state.investigation_id, ambiguous_call)
+    original_dispatcher = fixture.service._dispatcher
+
+    class _CrashBeforeDispatch:
+        async def dispatch(self, *_args, **_kwargs):
+            raise RuntimeError("simulated crash after durable RUNNING journal")
+
+    fixture.service._dispatcher = _CrashBeforeDispatch()
+    with pytest.raises(RuntimeError, match="durable RUNNING journal"):
+        await fixture.service.run(state.investigation_id)
+
+    invocation = await fixture.invocations.get_by_operation_key(operation_key)
+    assert invocation is not None
+    assert invocation.status is ToolInvocationStatus.RUNNING
+    assert fixture.tools["vt.search"].calls == []
+    stopped = await fixture.service.interrupt(state.investigation_id)
+    assert stopped.stop_reason is StopReason.USER_INTERRUPT
+    fixture.service._dispatcher = original_dispatcher
+
+    with pytest.raises(ValueError, match="reconciled before resuming"):
+        await fixture.service.resume(state.investigation_id)
+    invocation = await fixture.invocations.get_by_operation_key(operation_key)
+    assert invocation is not None
+    assert invocation.status is ToolInvocationStatus.NEEDS_REVIEW
+    assert fixture.tools["vt.search"].calls == []
+
+    await fixture.service.reconcile_invocation(
+        state.investigation_id,
+        invocation.id,
+        outcome=InvocationReconciliationOutcome.NOT_EXECUTED,
+        actor="analyst-1",
+        reason="The worker crashed before entering the adapter.",
+        expected_version=invocation.version,
+        idempotency_key="stopped-running-not-executed",
+    )
+    await fixture.service.resume(state.investigation_id)
+    completed = await fixture.service.run(state.investigation_id)
+
+    assert completed.stop_reason is StopReason.AGENT_FINISHED
+    assert fixture.tools["vt.search"].calls == []
+    assert fixture.tools["network.lookup"].calls == [later_call["arguments"]]
+    reconciled = await fixture.invocations.get_by_operation_key(operation_key)
+    assert reconciled is not None
+    assert reconciled.status is ToolInvocationStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_framework_budget_refusal_resumes_after_budget_extension_without_duplicate_call() -> (
+    None
+):
+    call = _tool_call("vt.search", "synthetic:budget", "query within the approved budget")
+    fixture = _Fixture(
+        responses=[
+            _decision(goal="query the sample", next_action="continue", tools=(call,)),
+            _decision(goal="retry after budget extension", next_action="continue", tools=(call,)),
+            _decision(goal="finish", next_action="finish"),
+            _decision(goal="replay the successful query", next_action="continue", tools=(call,)),
+            _decision(goal="finish after replay", next_action="finish"),
+        ],
+        tools=(("vt.search", "vt"),),
+    )
+    fixture.envelope = replace(
+        fixture.envelope,
+        budget=InvestigationBudget(
+            limits={
+                **fixture.envelope.budget.limits,
+                BudgetDimension.VT_UNITS: 0,
+            }
+        ),
+    )
+    state = await fixture.start()
+
+    refused = await fixture.service.run(state.investigation_id)
+
+    assert refused.stop_reason is StopReason.PERMISSION_REQUIRED
+    assert fixture.tools["vt.search"].calls == []
+    invocations = await fixture.invocations.list_for_investigation(state.investigation_id)
+    assert len(invocations) == 1
+    refusal = invocations[0]
+    assert refusal.status is ToolInvocationStatus.NEEDS_REVIEW
+    assert len(refusal.response_refs) == 1
+    proof_observation = await fixture.observations.get(refusal.response_refs[0])
+    assert proof_observation is not None
+    assert proof_observation.object_type == FrameworkPreSubmissionProof.BUDGET_REJECTED.value
+    envelope = await fixture.envelopes.get(state.investigation_id)
+    assert envelope is not None
+    refusal_reservation = next(
+        item for item in envelope.budget.reservations if item.operation_key == refusal.operation_key
+    )
+    assert refusal_reservation.status is BudgetReservationStatus.RELEASED
+
+    extended_budget = InvestigationBudget(
+        limits={**envelope.budget.limits, BudgetDimension.VT_UNITS: 1}
+    )
+    for reservation in envelope.budget.reservations:
+        extended_budget.restore_reservation(reservation)
+    await fixture.envelopes.save_if_version(
+        replace(envelope, budget=extended_budget, version=envelope.version + 1),
+        expected_version=envelope.version,
+    )
+    assert fixture.tools["vt.search"].calls == [], "no adapter call may precede the extension"
+
+    await fixture.service.resume(state.investigation_id)
+    refusal = await fixture.invocations.get_by_operation_key(refusal.operation_key)
+    assert refusal is not None
+    assert refusal.status is ToolInvocationStatus.FAILED
+    completed = await fixture.service.run(state.investigation_id)
+    assert completed.stop_reason is StopReason.AGENT_FINISHED
+    assert fixture.tools["vt.search"].calls == [call["arguments"]]
+
+    await fixture.service.resume(state.investigation_id)
+    replayed = await fixture.service.run(state.investigation_id)
+    assert replayed.stop_reason is StopReason.AGENT_FINISHED
+    assert fixture.tools["vt.search"].calls == [call["arguments"]]
+    invocations = await fixture.invocations.list_for_investigation(state.investigation_id)
+    assert len(invocations) == 2
+    assert [item.status for item in invocations] == [
+        ToolInvocationStatus.FAILED,
+        ToolInvocationStatus.SUCCEEDED,
+    ]
+    assert invocations[0].operation_key != invocations[1].operation_key
+    assert invocations[1].operation_key.startswith(f"{invocations[0].operation_key}:retry:1")
+
+
+@pytest.mark.parametrize(
+    ("corruption", "expected_error"),
+    (
+        ("tampered_bytes", "framework_proof_blob_hash_mismatch"),
+        ("missing_blob", "framework_proof_blob_unreadable"),
+        ("descriptor_hash_mismatch", "framework_proof_descriptor_mismatch"),
+        ("descriptor_size_overflow", "framework_proof_blob_size_overflow"),
+        ("mime_mismatch", "framework_proof_descriptor_mismatch"),
+        ("read_limit_overflow", "framework_proof_blob_size_overflow"),
+        ("invalid_json", "framework_proof_payload_invalid_json"),
+        ("noncanonical_json", "framework_proof_payload_not_canonical"),
+        ("payload_tool_mismatch", "framework_proof_payload_mismatch"),
+        ("payload_schema_mismatch", "framework_proof_payload_mismatch"),
+        ("payload_version_mismatch", "framework_proof_payload_mismatch"),
+        ("payload_operation_mismatch", "framework_proof_payload_mismatch"),
+        ("proof_object_mismatch", "framework_proof_payload_mismatch"),
+    ),
+)
+@pytest.mark.asyncio
+async def test_framework_budget_refusal_stays_blocked_when_proof_blob_is_invalid(
+    corruption, expected_error
+) -> None:
+    call = _tool_call("vt.search", "synthetic:invalid-proof", "query within the approved budget")
+    fixture = _Fixture(
+        responses=[
+            _decision(goal="query the sample", next_action="continue", tools=(call,)),
+            _decision(goal="retry after budget extension", next_action="continue", tools=(call,)),
+            _decision(goal="finish", next_action="finish"),
+        ],
+        tools=(("vt.search", "vt"),),
+    )
+    fixture.envelope = replace(
+        fixture.envelope,
+        budget=InvestigationBudget(
+            limits={
+                **fixture.envelope.budget.limits,
+                BudgetDimension.VT_UNITS: 0,
+            }
+        ),
+    )
+    state = await fixture.start()
+    stopped = await fixture.service.run(state.investigation_id)
+    assert stopped.stop_reason is StopReason.PERMISSION_REQUIRED
+    assert fixture.tools["vt.search"].calls == []
+
+    refusal = (await fixture.invocations.list_for_investigation(state.investigation_id))[0]
+    proof_observation = await fixture.observations.get(refusal.response_refs[0])
+    assert proof_observation is not None
+    assert proof_observation.object_type == FrameworkPreSubmissionProof.BUDGET_REJECTED.value
+    if corruption == "tampered_bytes":
+        stored = fixture.proof_artifacts.blobs[proof_observation.blob_id]
+        fixture.proof_artifacts.blobs[proof_observation.blob_id] = (
+            bytes((stored[0] ^ 1,)) + stored[1:]
+        )
+    elif corruption == "missing_blob":
+        fixture.proof_artifacts.blobs.pop(proof_observation.blob_id)
+    elif corruption == "descriptor_hash_mismatch":
+        fixture.proof_artifacts.descriptors[proof_observation.blob_id]["sha256"] = "0" * 64
+    elif corruption == "descriptor_size_overflow":
+        fixture.proof_artifacts.descriptors[proof_observation.blob_id]["byte_size"] = 64 * 1024 + 1
+    elif corruption == "mime_mismatch":
+        fixture.proof_artifacts.descriptors[proof_observation.blob_id]["mime_type"] = (
+            "application/octet-stream"
+        )
+    elif corruption == "read_limit_overflow":
+        fixture.proof_artifacts.read_limit_errors.add(proof_observation.blob_id)
+    elif corruption == "invalid_json":
+        _replace_framework_proof_blob(fixture, proof_observation, b"not-json")
+    elif corruption == "noncanonical_json":
+        stored = fixture.proof_artifacts.blobs[proof_observation.blob_id]
+        _replace_framework_proof_blob(fixture, proof_observation, b" " + stored)
+    else:
+        stored = fixture.proof_artifacts.blobs[proof_observation.blob_id]
+        payload = json.loads(stored)
+        if corruption == "payload_tool_mismatch":
+            payload["tool_name"] = "vt.other_tool"
+        elif corruption == "payload_schema_mismatch":
+            payload["schema"] = "wrong-schema"
+        elif corruption == "payload_version_mismatch":
+            payload["schema_version"] = "wrong-version"
+        elif corruption == "payload_operation_mismatch":
+            payload["operation_key"] = "wrong-operation"
+        else:
+            payload["result"]["framework_pre_submission_proof"]["object_type"] = (
+                "framework_pre_submission_invalid_arguments"
+            )
+        _replace_framework_proof_blob(fixture, proof_observation, canonical_json_bytes(payload))
+
+    operator_invocations = OperatorToolInvocationService(
+        investigation_id=state.investigation_id,
+        investigations=fixture.investigations,
+        states=fixture.states,
+        envelopes=fixture.envelopes,
+        invocations=fixture.invocations,
+        context_builder=fixture.context_builder,
+        execution=fixture.service,
+        registry=fixture.registry,
+        available_capabilities=fixture.available_capabilities,
+        unavailable_tool_reasons={},
+        observations=fixture.observations,
+        evidence_summaries=fixture.proof_artifacts,
+    )
+    operator_proof, operator_rejection = await operator_invocations._framework_pre_submission_proof(
+        refusal
+    )
+    assert operator_proof is None
+    assert operator_rejection == expected_error
+
+    envelope = await fixture.envelopes.get(state.investigation_id)
+    assert envelope is not None
+    extended_budget = InvestigationBudget(
+        limits={**envelope.budget.limits, BudgetDimension.VT_UNITS: 1}
+    )
+    for reservation in envelope.budget.reservations:
+        extended_budget.restore_reservation(reservation)
+    await fixture.envelopes.save_if_version(
+        replace(envelope, budget=extended_budget, version=envelope.version + 1),
+        expected_version=envelope.version,
+    )
+
+    with pytest.raises(ValueError, match=expected_error):
+        await fixture.service.resume(state.investigation_id)
+
+    still_blocked = await fixture.invocations.get_by_operation_key(refusal.operation_key)
+    assert still_blocked is not None
+    assert still_blocked.status is ToolInvocationStatus.NEEDS_REVIEW
+    blocked_run = await fixture.service.run(state.investigation_id)
+    assert blocked_run.stop_reason is StopReason.PERMISSION_REQUIRED
+    assert fixture.tools["vt.search"].calls == [], "invalid proof must not permit later dispatch"
 
 
 @pytest.mark.asyncio

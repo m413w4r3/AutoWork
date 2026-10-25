@@ -20,6 +20,7 @@ from cti_app.application.retrohunt import (
     RetrohuntService,
     RetrohuntSlotLimitError,
     _operation_key,
+    _quality_report_qualifies,
 )
 from cti_app.application.virustotal import (
     VirusTotalCapabilities,
@@ -54,6 +55,7 @@ from cti_app.domain.retrohunt import (
     RetrohuntReservationState,
     RetrohuntSubmitRequest,
 )
+from cti_app.domain.rule_workbench import RuleTestCorpusRole
 from cti_app.domain.virustotal import (
     VirusTotalCapability,
     VirusTotalEndpointVariant,
@@ -66,28 +68,28 @@ from cti_app.infrastructure.database.repositories.production import (
 from cti_app.infrastructure.virustotal import VirusTotalRetrohuntProxyAdapter
 
 SUBJECT_ID = uuid4()
-_EMPTY_REPORT_ROLES = (
+_MEASURED_REPORT_CONTROL_ROLES = (
     {
-        "role": "out_of_cluster_candidate",
-        "corpus_sha256s": [],
+        "role": "new_candidate_unconfirmed",
+        "corpus_sha256s": [hashlib.sha256(b"fixture-new-candidate").hexdigest()],
         "matches": [],
-        "non_matches": [],
+        "non_matches": [hashlib.sha256(b"fixture-new-candidate").hexdigest()],
         "non_measurable": [],
         "errors": [],
     },
     {
         "role": "goodware",
-        "corpus_sha256s": [],
+        "corpus_sha256s": [hashlib.sha256(b"fixture-goodware").hexdigest()],
         "matches": [],
-        "non_matches": [],
+        "non_matches": [hashlib.sha256(b"fixture-goodware").hexdigest()],
         "non_measurable": [],
         "errors": [],
     },
     {
-        "role": "holdout",
-        "corpus_sha256s": [],
+        "role": "holdout_positive",
+        "corpus_sha256s": [hashlib.sha256(b"fixture-holdout").hexdigest()],
         "matches": [],
-        "non_matches": [],
+        "non_matches": [hashlib.sha256(b"fixture-holdout").hexdigest()],
         "non_measurable": [],
         "errors": [],
     },
@@ -347,14 +349,14 @@ def _review(
         "coverage_statement": "One representative positive measured.",
         "roles": [
             {
-                "role": "confirmed_positive",
+                "role": "human_confirmed",
                 "corpus_sha256s": [positive],
                 "matches": [positive],
                 "non_matches": [],
                 "non_measurable": [],
                 "errors": [],
             },
-            *_EMPTY_REPORT_ROLES,
+            *(dict(role) for role in _MEASURED_REPORT_CONTROL_ROLES),
         ],
     }
     decision = AnalystDecision(
@@ -384,6 +386,66 @@ def _review(
         latest_decision=decision,
         test_reports=(SimpleNamespace(payload=payload),),
     )
+
+
+@pytest.mark.parametrize("legacy_roles", [False, True])
+def test_retrohunt_quality_gate_accepts_canonical_and_historical_role_values(
+    legacy_roles: bool,
+) -> None:
+    _source_sha256, review = _review(uuid4())
+    payload = review.test_reports[0].payload
+    if legacy_roles:
+        aliases = {
+            "human_confirmed": "confirmed_positive",
+            "new_candidate_unconfirmed": "out_of_cluster_candidate",
+            "holdout_positive": "holdout",
+        }
+        for role in payload["roles"]:
+            role["role"] = aliases.get(role["role"], role["role"])
+    else:
+        present = {role["role"] for role in payload["roles"]}
+        payload["roles"].extend(
+            {
+                "role": role.value,
+                "corpus_sha256s": [],
+                "matches": [],
+                "non_matches": [],
+                "non_measurable": [],
+                "errors": [],
+            }
+            for role in RuleTestCorpusRole
+            if role.value not in present
+        )
+
+    assert _quality_report_qualifies(payload, {"known_false_positives": []})
+
+
+def test_retrohunt_quality_gate_rejects_duplicate_canonical_and_legacy_role_mappings() -> None:
+    _source_sha256, review = _review(uuid4())
+    payload = review.test_reports[0].payload
+    positive = next(role for role in payload["roles"] if role["role"] == "human_confirmed")
+    payload["roles"].append({**positive, "role": "confirmed_positive"})
+
+    assert not _quality_report_qualifies(payload, {"known_false_positives": []})
+
+
+def test_retrohunt_quality_gate_rejects_incomplete_role_sets() -> None:
+    _source_sha256, review = _review(uuid4())
+    payload = review.test_reports[0].payload
+    payload["roles"] = [role for role in payload["roles"] if role["role"] != "holdout_positive"]
+
+    assert not _quality_report_qualifies(payload, {"known_false_positives": []})
+
+
+def test_retrohunt_quality_gate_still_requires_a_confirmed_positive_match() -> None:
+    _source_sha256, review = _review(uuid4())
+    payload = review.test_reports[0].payload
+    positive = next(role for role in payload["roles"] if role["role"] == "human_confirmed")
+    positive_sha = positive["corpus_sha256s"][0]
+    positive["matches"] = []
+    positive["non_matches"] = [positive_sha]
+
+    assert not _quality_report_qualifies(payload, {"known_false_positives": []})
 
 
 def _envelope(investigation_id: UUID) -> InvestigationEnvelope:

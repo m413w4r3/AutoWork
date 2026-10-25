@@ -520,7 +520,9 @@ describe("InvestigationLabViews", () => {
     ).toBeInTheDocument();
     expect(screen.getByText(/Expérience v1 · Réfute/)).toBeInTheDocument();
     expect(
-      screen.getByText("Verdict enregistré : refutes (assertion, non conclusion)"),
+      screen.getByText(
+        "Verdict enregistré : refutes (assertion, non conclusion)",
+      ),
     ).toHaveAttribute("role", "note");
     expect(screen.getByText(/Expérience v2 · Soutient/)).toBeInTheDocument();
   });

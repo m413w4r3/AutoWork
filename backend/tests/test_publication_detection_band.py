@@ -22,6 +22,8 @@ from cti_app.application.publication_augmentation import (
 )
 from cti_app.application.publication_builder import build_publication_document_v5
 from cti_app.application.publication_detection import (
+    PublicationDetectionDataError,
+    _provenance_counts,
     _validation_fields,
     build_publication_detection,
 )
@@ -67,7 +69,6 @@ def test_publication_detection_projects_only_calculable_yara_metrics() -> None:
     status, reason = _validation_fields(claimed)
     assert status is RuleValidationStatus.REAL_PARTIAL
     assert reason is PublicationDetectionReason.SAMPLE_BYTES_MISSING
-
     measured = {
         **claimed,
         "metrics": {
@@ -98,6 +99,67 @@ def test_publication_detection_projects_only_calculable_yara_metrics() -> None:
     status, reason = _validation_fields(incomplete_signature)
     assert status is RuleValidationStatus.REAL_PARTIAL
     assert reason is PublicationDetectionReason.SAMPLE_BYTES_MISSING
+
+
+@pytest.mark.parametrize("positive_role", ["human_confirmed", "confirmed_positive"])
+def test_publication_detection_reads_canonical_and_historical_positive_count_keys(
+    positive_role: str,
+) -> None:
+    counts = _provenance_counts(
+        {
+            "provenance_counts_by_role": {
+                positive_role: {"real": 2, "synthetic": 1},
+                "goodware": {"real": 3, "synthetic": 4},
+            }
+        }
+    )
+
+    assert counts["human_confirmed"] == (2, 1)
+    assert counts["goodware"] == (3, 4)
+
+
+def test_publication_detection_rejects_canonical_and_legacy_positive_count_duplicates() -> None:
+    with pytest.raises(PublicationDetectionDataError, match="both canonical and legacy"):
+        _provenance_counts(
+            {
+                "provenance_counts_by_role": {
+                    "human_confirmed": {"real": 1, "synthetic": 0},
+                    "confirmed_positive": {"real": 1, "synthetic": 0},
+                }
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("role", "count_name"),
+    [
+        ("human_confirmed", None),
+        ("goodware", None),
+        ("human_confirmed", "real"),
+        ("human_confirmed", "synthetic"),
+        ("goodware", "real"),
+        ("goodware", "synthetic"),
+    ],
+)
+def test_publication_detection_refuses_incomplete_provenance_counts(
+    role: str, count_name: str | None
+) -> None:
+    provenance = {
+        "human_confirmed": {"real": 2, "synthetic": 1},
+        "goodware": {"real": 3, "synthetic": 4},
+    }
+    if count_name is None:
+        provenance.pop(role)
+    else:
+        provenance[role].pop(count_name)
+
+    with pytest.raises(PublicationDetectionDataError, match="missing"):
+        _provenance_counts({"provenance_counts_by_role": provenance})
+
+
+def test_publication_detection_refuses_missing_provenance_count_map() -> None:
+    with pytest.raises(PublicationDetectionDataError, match="provenance counts are invalid"):
+        _provenance_counts({})
 
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -270,7 +332,7 @@ async def test_publication_detection_freezes_canonical_test_report_and_retrohunt
         "validation_status": "synthetic_only",
         "validation_reason": "positive_samples_are_synthetic",
         "provenance_counts_by_role": {
-            "confirmed_positive": {"real": 0, "synthetic": 2},
+            "human_confirmed": {"real": 0, "synthetic": 2},
             "goodware": {"real": 1, "synthetic": 2},
         },
         "false_positive_count": 0,

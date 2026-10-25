@@ -16,6 +16,7 @@ from sqlalchemy.orm import aliased
 from cti_app.application.context_pagination import (
     KeysetPageV1,
     decode_keyset_cursor,
+    decode_keyset_sort_key,
     make_keyset_page,
 )
 from cti_app.application.investigation_persistence import (
@@ -146,14 +147,16 @@ def _keyset_predicate(
     sort_column: Any,
     id_column: Any,
     *,
-    sort_key: datetime,
+    sort_key: datetime | None,
     item_id: UUID,
     descending: bool,
 ) -> Any:
-    """Build the stable (sort_key, id) seek predicate without database access."""
-    sort_after = sort_column < sort_key if descending else sort_column > sort_key
+    """Build the stable timestamp/UUID seek with NULL timestamps ordered last."""
     id_after = id_column < item_id if descending else id_column > item_id
-    return or_(sort_after, and_(sort_column == sort_key, id_after))
+    if sort_key is None:
+        return and_(sort_column.is_(None), id_after)
+    sort_after = sort_column < sort_key if descending else sort_column > sort_key
+    return or_(sort_after, and_(sort_column == sort_key, id_after), sort_column.is_(None))
 
 
 class SqlAlchemyToolInvocationRepository:
@@ -370,7 +373,12 @@ class SqlAlchemyEvidenceObservationRepository:
         rows = await self._session.scalars(
             select(EvidenceObservationRow)
             .where(EvidenceObservationRow.investigation_id == investigation_id)
-            .order_by(EvidenceObservationRow.observed_at, EvidenceObservationRow.id)
+            # observed_at is NOT NULL in the current schema; NULLS LAST keeps
+            # full-context ordering explicit for future or migrated nullable data.
+            .order_by(
+                EvidenceObservationRow.observed_at.asc().nulls_last(),
+                EvidenceObservationRow.id.asc(),
+            )
         )
         return tuple(_evidence_observation_from_row(row) for row in rows)
 
@@ -399,7 +407,7 @@ class SqlAlchemyEvidenceObservationRepository:
                 _keyset_predicate(
                     EvidenceObservationRow.observed_at,
                     EvidenceObservationRow.id,
-                    sort_key=datetime.fromisoformat(decoded["sort_key"]),
+                    sort_key=decode_keyset_sort_key(decoded["sort_key"]),
                     item_id=UUID(decoded["item_id"]),
                     descending=descending,
                 )
@@ -410,9 +418,15 @@ class SqlAlchemyEvidenceObservationRepository:
             .where(EvidenceObservationRow.investigation_id == investigation_id)
         )
         order = (
-            (EvidenceObservationRow.observed_at.desc(), EvidenceObservationRow.id.desc())
+            (
+                EvidenceObservationRow.observed_at.desc().nulls_last(),
+                EvidenceObservationRow.id.desc(),
+            )
             if descending
-            else (EvidenceObservationRow.observed_at, EvidenceObservationRow.id)
+            else (
+                EvidenceObservationRow.observed_at.asc().nulls_last(),
+                EvidenceObservationRow.id.asc(),
+            )
         )
         rows = await self._session.scalars(
             statement.order_by(*order).limit(limit + 1).execution_options(populate_existing=True)
@@ -542,6 +556,14 @@ class SqlAlchemyFindingRepository:
             .order_by(InvestigationFindingVersionRow.created_at, InvestigationFindingVersionRow.id)
         )
         return tuple([await self._finding_from_row(row) for row in rows])
+
+    async def version_count_for_investigation(self, investigation_id: UUID) -> int:
+        count = await self._session.scalar(
+            select(func.count())
+            .select_from(InvestigationFindingVersionRow)
+            .where(InvestigationFindingVersionRow.investigation_id == investigation_id)
+        )
+        return int(count or 0)
 
     async def page_for_investigation(
         self,

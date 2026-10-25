@@ -230,6 +230,9 @@ class ToolExecutionContext:
     available_capabilities: frozenset[str] = frozenset()
     blocked_capabilities: tuple[str, ...] = ()
     unavailable_tool_reasons: Mapping[str, str] = field(default_factory=dict)
+    pre_transport_check: (
+        Callable[[ToolExecutionContext], Awaitable[FrameworkPreSubmissionProof | None]] | None
+    ) = None
 
     def __post_init__(self) -> None:
         if not self.idempotency_key.strip():
@@ -763,9 +766,22 @@ class RegistryToolDispatcher:
                 framework_pre_submission_proof=FrameworkPreSubmissionProof.INVALID_ARGUMENTS,
             )
 
-        reserved_amounts = (
-            thaw_json(definition.cost_model) if reservation_amounts is None else reservation_amounts
-        )
+        if reservation_amounts is None:
+            reserved_amounts = thaw_json(definition.cost_model)
+            estimate_cost = getattr(adapter, "reservation_cost", None)
+            if callable(estimate_cost):
+                try:
+                    dynamic_cost = await estimate_cost(arguments, context)
+                    reserved_amounts.update(dynamic_cost)
+                except Exception as exc:
+                    return self._local_result(
+                        ToolInvocationStatus.NEEDS_REVIEW,
+                        f"Tool cost estimation failed: {type(exc).__name__}.",
+                        alternatives,
+                        pre_submission_proof=FrameworkPreSubmissionProof.BUDGET_REJECTED,
+                    )
+        else:
+            reserved_amounts = reservation_amounts
         try:
             context.budget.reserve(operation_key, reserved_amounts)
         except BudgetExceeded as exc:
@@ -781,7 +797,12 @@ class RegistryToolDispatcher:
             if proof is not None:
                 return self._pre_submission_result(proof, alternatives)
         try:
-            result = await adapter.execute(arguments, context)
+            adapter_context = (
+                replace(context, pre_transport_check=pre_dispatch_check)
+                if pre_dispatch_check is not None
+                else context
+            )
+            result = await adapter.execute(arguments, adapter_context)
         except Exception as exc:
             # A failed external call may have completed remotely; charge its reservation
             # and cache the result so replay cannot submit it a second time.

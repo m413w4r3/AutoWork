@@ -399,7 +399,7 @@ async def test_invalid_download_retry_is_bounded() -> None:
     "reported_status",
     (ToolInvocationStatus.NEEDS_REVIEW, ToolInvocationStatus.FAILED),
 )
-async def test_ambiguous_download_failure_stops_without_persisting_a_response(
+async def test_ambiguous_download_failure_stops_without_persisting_adapter_output(
     reported_status: ToolInvocationStatus,
 ) -> None:
     database = FakeDatabase()
@@ -480,9 +480,16 @@ async def test_ambiguous_download_failure_stops_without_persisting_a_response(
     assert state.stop_reason is StopReason.SUBMISSION_NEEDS_REVIEW
     assert len(invocations) == 1
     assert invocations[0].status is ToolInvocationStatus.NEEDS_REVIEW
-    assert invocations[0].response_refs == ()
+    # The framework records only a fixed diagnostic; the adapter's partial
+    # output is never promoted into evidence.
+    refs = invocations[0].response_refs
+    assert len(refs) == 1
+    diagnostics = await fixture.observations.list_for_investigation(fixture.investigation_id)
+    assert len(diagnostics) == 1
+    assert diagnostics[0].id == refs[0]
+    assert diagnostics[0].object_type in {"tool_call", "tool_result"}
+    assert diagnostics[0].source == "vt.download_sample"
     assert invocations[0].consumed_budget == {}
-    assert await fixture.observations.list_for_investigation(fixture.investigation_id) == ()
     assert envelope is not None
     reservation = next(
         item

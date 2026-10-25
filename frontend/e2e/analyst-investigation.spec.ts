@@ -28,8 +28,13 @@ test("enquête : lancer, suivre, réviser, approuver et proposer une publication
   await expect(
     page.getByText(/Une variante complémentaire est étayée/),
   ).toBeVisible();
+  await page.getByRole("button", { name: "Journal & revue" }).click();
   await expect(
-    page.getByText(/Capacités indisponibles, limites locales/),
+    page.getByRole("heading", { name: "Versions et dernières décisions" }),
+  ).toBeVisible();
+  await expect(page.getByText("Capacités indisponibles :")).toBeVisible();
+  await expect(
+    page.getByText("Les autres pistes restent consultables."),
   ).toBeVisible();
 
   await expect(
@@ -49,6 +54,8 @@ test("enquête : lancer, suivre, réviser, approuver et proposer une publication
   await page.getByRole("button", { name: "Confirmer l’approbation" }).click();
   await expect(page.getByText(/Enveloppe approuvée · version 1/)).toBeVisible();
 
+  await page.getByRole("button", { name: "Échantillons" }).click();
+  await expect(page.getByText(/Échantillons liés/)).toBeVisible();
   await page
     .getByLabel("Décision G3 pour dddddddddddd")
     .selectOption("confirmed");
@@ -66,6 +73,7 @@ test("enquête : lancer, suivre, réviser, approuver et proposer une publication
     page.getByText(/Qualification enregistrée avec l’acteur authentifié/),
   ).toBeVisible();
 
+  await page.getByRole("button", { name: "Journal & revue" }).click();
   await page
     .getByLabel("Demande (2 000 caractères maximum)")
     .fill(

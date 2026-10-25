@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import httpx
@@ -1559,6 +1559,7 @@ async def test_chatgpt_bridge_gateway_hard_timeout_cancels_one_transport_entry()
             del payload, idempotency_key
             self.calls.append(timeout_seconds)
             await asyncio.Event().wait()
+            return cast(dict[str, Any], None)
 
         async def retrieve(self, response_id: str) -> dict[str, Any]:
             del response_id

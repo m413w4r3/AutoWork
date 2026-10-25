@@ -21,7 +21,6 @@ from cti_app.application.investigation_tools import (
 from cti_app.application.operator_tool_invocation import (
     OperatorToolInvocationError,
 )
-from cti_app.application.research_context_builder import CanonicalEvidenceSummaryPort
 from cti_app.config import Settings
 from cti_app.domain.analyst_opinion import investigation_opinion_id
 from cti_app.domain.editorial import AnalystDecisionType
@@ -132,30 +131,28 @@ def _audited_envelope_service(fixture):
 
 
 def _enable_persisted_result_summaries(fixture, service):
-    blobs = {}
-
-    class _InMemoryArtifactStore:
-        async def read_bytes(self, blob_id, *, max_bytes):
-            payload = blobs[blob_id]
-            if len(payload) > max_bytes:
-                raise ValueError("test observation exceeds summary limit")
-            return payload
+    proof_artifacts = fixture.proof_artifacts
 
     class _CanonicalWriter:
         async def archive(self, invocation, result):
             if not result.output and result.framework_pre_submission_proof is None:
                 return ()
+            safe_result = dict(result.output)
+            if result.framework_pre_submission_proof is not None:
+                safe_result["framework_pre_submission_proof"] = {
+                    "object_type": result.framework_pre_submission_proof.value
+                }
             payload = canonical_json_bytes(
                 {
                     "schema": "investigation-tool-observation.v1",
                     "tool_name": invocation.tool_name,
                     "schema_version": invocation.schema_version,
                     "operation_key": invocation.operation_key,
-                    "result": dict(result.output),
+                    "result": safe_result,
                 }
             )
             blob_id = uuid4()
-            blobs[blob_id] = payload
+            proof_artifacts.store(blob_id, payload)
             observation = EvidenceObservation(
                 investigation_id=invocation.investigation_id,
                 kind=EvidenceKind.OTHER,
@@ -175,8 +172,9 @@ def _enable_persisted_result_summaries(fixture, service):
             return (await fixture.observations.append_if_absent(observation),)
 
     fixture.service._observation_writer = _CanonicalWriter()
+    fixture.service._artifact_store = proof_artifacts
+    fixture.service._evidence_summaries = proof_artifacts
     service._observations = fixture.observations
-    service._evidence_summaries = CanonicalEvidenceSummaryPort(_InMemoryArtifactStore())
 
 
 @pytest.mark.asyncio

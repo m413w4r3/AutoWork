@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import re
 import shutil
 import subprocess
 import unicodedata
 import xml.etree.ElementTree as ET
 from dataclasses import replace
+from datetime import date
 from io import BytesIO
 from pathlib import Path
 from typing import Any, NoReturn
@@ -16,6 +19,7 @@ import pytest
 from pypdf import PdfReader
 
 from cti_app.application.production_normalization import normalize_indicator_value
+from cti_app.application.publication_augmentation import augment_publication_with_opinion
 from cti_app.application.typst_compilation import (
     TYPST_COMPILER_VERSION,
     TypstCompileRequest,
@@ -32,6 +36,7 @@ from cti_app.domain.publication import (
     ArtifactType,
     PublicationIndicatorGroupV1,
     PublicationIndicatorV1,
+    PublicationTimelineEntryV1,
 )
 from cti_app.domain.publication_document import (
     PublicationDocumentV5,
@@ -49,6 +54,7 @@ from cti_app.domain.semantic_annotation import (
 )
 from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
 from tests.test_publication_builder_v4 import _cited_technical_context_case
+from tests.test_publication_document_v6 import _approved_opinion, _base_v5
 from tests.test_publication_v4 import _SOURCE_ID
 from tests.test_typst_rendering import _full_document, _table
 
@@ -380,6 +386,289 @@ async def test_real_typst_article_preserves_copyable_technical_literals(
     assert "Narrow hash column" in extracted
     assert "Registre Windows" in extracted
     assert len(reader.pages) >= 1
+
+
+@pytest.mark.asyncio
+async def test_real_typst_base_and_augmented_pdf_include_each_canonical_marker_once(
+    tmp_path: Path,
+    typst_binary: str,
+    font_bundle_root: Path,
+) -> None:
+    """Check every projected source, timeline, and opinion text field in compiled PDFs.
+
+    The fixture composes source title and publisher into the visible reference
+    text; the template does not print those metadata fields separately. The
+    reference row prints its publication date, ordinal identifier, reference text,
+    and URL. A timeline row prints its date, event text, and source ordinal. Opinion heading,
+    qualification, confidence, text, and visible citations are checked separately.
+
+    The test sees selectable text through ``pdftotext``. It cannot verify source or
+    opinion target IDs, source document UUIDs, or link destination bytes because
+    those are PDF metadata/annotations rather than printed text. It also does not
+    claim text coverage for any figure content rasterized as an image. The existing
+    references and opinion traceability sections are retained; no editorial
+    appendix is added.
+    """
+
+    pdftotext = shutil.which("pdftotext")
+    if pdftotext is None:
+        pytest.skip("pdftotext is required for the compiled PDF completeness oracle")
+
+    title_marker = "M04_BASE_TITLE_7F32A9"
+    lead_marker = "M04_BASE_LEAD_1C8E45"
+    timeline_marker = "M04_BASE_TIMELINE_TEXT_5D7C32"
+    timeline_date_marker = "M04_BASE_TIMELINE_DATE_6C8A14"
+    second_timeline_marker = "M04_BASE_TIMELINE_TEXT_4A920D"
+    second_timeline_date_marker = "M04_BASE_TIMELINE_DATE_2D7F6B"
+    opinion_marker = "M04_APPROVED_OPINION_93F4C8"
+    base = _base_v5()
+
+    # The template displays the publisher/title text assembled into each source
+    # reference, plus its source date and URL. Assign distinct markers per source
+    # so each rendered row and field has an independent exact-count assertion.
+    source_fields: dict[Any, dict[str, Any]] = {}
+    reference_texts: dict[Any, str] = {}
+    reference_expected_counts: dict[str, int] = {}
+    reference_display_dates: dict[Any, str] = {}
+    reference_urls: dict[Any, str] = {}
+    for index, reference in enumerate(base.references, start=1):
+        source = next(
+            item
+            for item in base.document.sources
+            if item.source_document_id == reference.source_document_id
+        )
+        source_title_marker = f"M04_SOURCE_TITLE_{index:02d}_6B0D21"
+        publisher_marker = f"M04_SOURCE_PUBLISHER_{index:02d}_71AC0E"
+        source_url = f"https://example.test/M04_SOURCE_URL_{index:02d}_91D30F"
+        published_at = date(2026, 10, 20 + index)
+        reference_text = f"{publisher_marker} publie « {source_title_marker} »"
+        source_fields[source.source_document_id] = {
+            "title": source_title_marker,
+            "publisher": publisher_marker,
+            "canonical_url": source_url,
+            "published_at": published_at,
+        }
+        reference_texts[reference.source_document_id] = reference_text
+        reference_display_dates[reference.source_document_id] = (
+            f"{published_at.day} octobre {published_at.year}"
+        )
+        reference_urls[reference.source_document_id] = source_url
+        reference_expected_counts.update(
+            {
+                source_title_marker: 1,
+                publisher_marker: 1,
+                reference_text: 1,
+                f"{published_at.day} octobre {published_at.year}": 1,
+                source_url: 1,
+            }
+        )
+    assert source_fields, "the real-PDF fixture must contain a canonical source reference"
+
+    sources = tuple(
+        replace(source, **source_fields[source.source_document_id])
+        if source.source_document_id in source_fields
+        else source
+        for source in base.document.sources
+    )
+    document = replace(
+        base.document,
+        title=title_marker,
+        sources=sources,
+        lead=(replace(base.document.lead[0], text=lead_marker), *base.document.lead[1:]),
+        timeline=(
+            PublicationTimelineEntryV1(
+                event_date=None,
+                date_text=timeline_date_marker,
+                text=timeline_marker,
+                evidence_refs=base.document.lead[0].evidence_refs,
+            ),
+            PublicationTimelineEntryV1(
+                event_date=None,
+                date_text=second_timeline_date_marker,
+                text=second_timeline_marker,
+                evidence_refs=base.document.lead[0].evidence_refs,
+            ),
+        ),
+    )
+    references = tuple(
+        replace(reference, text=reference_texts[reference.source_document_id])
+        for reference in base.references
+    )
+    anchors = publication_document_text_anchors(document, references=references)
+    assert set(anchors) == {
+        "title",
+        "lead:0001",
+        "timeline:0001",
+        "timeline:0002",
+        *(f"reference:{index:04d}" for index in range(1, len(references) + 1)),
+    }
+    semantic_text = SemanticTextV1(
+        schema_version=SEMANTIC_ANNOTATION_SCHEMA_VERSION,
+        policy_version=SEMANTIC_ANNOTATION_POLICY_VERSION,
+        paragraphs=tuple(
+            SemanticParagraphV1(
+                anchor,
+                (SemanticTextSpanV1(SemanticRole.TEXT, text),),
+            )
+            for anchor, text in anchors.items()
+        ),
+    )
+    base = replace(base, document=document, references=references, semantic_text=semantic_text)
+    opinion, context = _approved_opinion(base)
+    opinion = replace(
+        opinion,
+        blocks=(replace(opinion.blocks[0], text=opinion_marker),),
+        content_sha256="",
+    )
+    augmented = augment_publication_with_opinion(base, opinion, context)
+    template_bundle = load_template_bundle(_REPOSITORY_ROOT / "chpTypst")
+    font_snapshot = load_font_bundle_snapshot(font_bundle_root, _FONT_BUNDLE_LOCK)
+    compiler = TypstSubprocessCompiler(binary=typst_binary)
+
+    async def compile_and_extract(document, name: str) -> str:
+        source = TypstRenderer().render(
+            document,
+            template_bundle,
+            document_label=f"Publication de test — {name}",
+        )
+        workspace = tmp_path / f"{name}-workspace"
+        _build_runtime_workspace(
+            _REPOSITORY_ROOT,
+            workspace,
+            render_data=json.loads(source.render_data_bytes),
+        )
+        compiled = await compiler.compile(
+            TypstCompileRequest(
+                workspace_root=workspace,
+                entrypoint_relative_path="RENDERER/publication.typ",
+                font_paths=materialize_font_bundle(font_snapshot, tmp_path / f"{name}-fonts"),
+            )
+        )
+        pdf_path = tmp_path / f"{name}.pdf"
+        pdf_path.write_bytes(compiled.content)
+        extracted = await asyncio.to_thread(
+            subprocess.run,
+            (pdftotext, "-layout", str(pdf_path), "-"),
+            capture_output=True,
+            check=True,
+            timeout=30,
+        )
+        return extracted.stdout.decode("utf-8", errors="replace")
+
+    base_text = await compile_and_extract(base, "mission04-base")
+    augmented_text = await compile_and_extract(augmented, "mission04-augmented")
+
+    def normalize_pdf_text(value: str) -> str:
+        return value.replace("\u2018", "'").replace("\u2019", "'")
+
+    base_text = normalize_pdf_text(base_text)
+    augmented_text = normalize_pdf_text(augmented_text)
+
+    # Existing references and opinion traceability sections remain unchanged; this adds no new
+    # editorial section. Each reference ordinal is printed beside both its date and URL, and
+    # timeline citations repeat that ordinal once per source citation. Opinion citation labels
+    # repeat once inline and once in the existing traceability annex. ``pdftotext`` sees the
+    # printed URL but cannot verify the link destination bytes.
+    finding_id = str(context.findings[0].id)
+    evidence_id = str(context.observations[0].id)
+    timeline_expectations = (
+        (timeline_date_marker, timeline_marker, document.timeline[0]),
+        (second_timeline_date_marker, second_timeline_marker, document.timeline[1]),
+    )
+    reference_numbers = {
+        reference.source_document_id: index for index, reference in enumerate(references, start=1)
+    }
+    for timeline_date, timeline_text, entry in timeline_expectations:
+        assert entry.date_text == timeline_date
+        assert entry.text == timeline_text
+        assert any(ref.source_document_id in reference_numbers for ref in entry.evidence_refs)
+
+    def assert_reference_rows(text: str, label: str) -> None:
+        for reference in references:
+            number = reference_numbers[reference.source_document_id]
+            display_date = reference_display_dates[reference.source_document_id]
+            source_url = reference_urls[reference.source_document_id]
+            date_row = re.compile(rf"(?m)^\s*{number}\.\s*{re.escape(display_date)}\s*$")
+            url_row = re.compile(rf"(?m)^\s*{number}\s+{re.escape(source_url)}\s*$")
+            assert len(date_row.findall(text)) == 1, (
+                f"{label} PDF reference {number} date/identifier row: expected 1, "
+                f"found {len(date_row.findall(text))}"
+            )
+            assert len(url_row.findall(text)) == 1, (
+                f"{label} PDF reference {number} URL/identifier row: expected 1, "
+                f"found {len(url_row.findall(text))}"
+            )
+
+    def assert_timeline_citations(text: str, label: str) -> None:
+        for _, marker, entry in timeline_expectations:
+            expected_numbers = tuple(
+                dict.fromkeys(
+                    reference_numbers[ref.source_document_id]
+                    for ref in entry.evidence_refs
+                    if ref.source_document_id in reference_numbers
+                )
+            )
+            assert expected_numbers
+            for number in expected_numbers:
+                citation = re.compile(rf"{re.escape(marker)}\s*{number}(?!\d)")
+                assert len(citation.findall(text)) == 1, (
+                    f"{label} PDF timeline marker {marker!r} citation {number}: "
+                    f"expected 1, found {len(citation.findall(text))}"
+                )
+
+    base_expected_counts = reference_expected_counts | {
+        title_marker: 1,
+        lead_marker: 1,
+        timeline_marker: 1,
+        timeline_date_marker: 1,
+        second_timeline_marker: 1,
+        second_timeline_date_marker: 1,
+        "AVIS DE L'ANALYSTE": 0,
+        "Apports de l'enquête": 0,
+        "Fait étayé": 0,
+        "Confiance : 90%": 0,
+        opinion_marker: 0,
+        "[F1]": 0,
+        "[E1]": 0,
+        finding_id: 0,
+        evidence_id: 0,
+        "ANNEXE DE TRAÇABILITÉ": 0,
+    }
+    augmented_expected_counts = reference_expected_counts | {
+        title_marker: 1,
+        lead_marker: 1,
+        timeline_marker: 1,
+        timeline_date_marker: 1,
+        second_timeline_marker: 1,
+        second_timeline_date_marker: 1,
+        "AVIS DE L'ANALYSTE": 1,
+        "Apports de l'enquête": 1,
+        "Fait étayé": 1,
+        "Confiance : 90%": 1,
+        opinion_marker: 1,
+        # The inline citations repeat as identifiers in the existing traceability annex.
+        "[F1]": 2,
+        "[E1]": 2,
+        finding_id: 1,
+        evidence_id: 1,
+        "ANNEXE DE TRAÇABILITÉ": 1,
+    }
+    for marker, expected_count in base_expected_counts.items():
+        assert base_text.count(marker) == expected_count, (
+            f"base PDF marker {marker!r}: expected {expected_count}, "
+            f"found {base_text.count(marker)}"
+        )
+    for marker, expected_count in augmented_expected_counts.items():
+        assert augmented_text.count(marker) == expected_count, (
+            f"augmented PDF marker {marker!r}: expected {expected_count}, "
+            f"found {augmented_text.count(marker)}"
+        )
+    assert_reference_rows(base_text, "base")
+    assert_reference_rows(augmented_text, "augmented")
+    assert_timeline_citations(base_text, "base")
+    assert_timeline_citations(augmented_text, "augmented")
+    assert "reviewer-1" not in augmented_text
+    assert "approver-1" not in augmented_text
 
 
 @pytest.mark.asyncio

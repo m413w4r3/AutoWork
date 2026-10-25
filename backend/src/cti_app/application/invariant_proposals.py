@@ -65,7 +65,10 @@ from cti_app.domain.model_runs import ModelProvider
 from cti_app.domain.reference_corpus import ReferenceCorpusVerdict, assess_reference_feature
 
 P10_PROMPT_TEMPLATE_ID = "invariant-proposal-conversation"
-P10_PROMPT_VERSION = "4"
+# v5 bounds escaped-credential redaction at claim/line boundaries so adjacent CTI
+# evidence is preserved, and explicitly refuses an unbounded sensitive assignment.
+# v4 turns remain auditable history; they are never replayed under v5 rules.
+P10_PROMPT_VERSION = "5"
 P10_PARSER_STAGE = "p10_strict_proposal"
 _CONVERSATION_NAMESPACE = UUID("0f52a3a8-6cc8-5f4d-8ed5-1c2c3d4e5f60")
 _MISSING = object()
@@ -2393,7 +2396,7 @@ _URL_USERINFO = re.compile(r"(?i)(https?://|www\.)[^\s/@:]+(?::[^\s/@]*)?@")
 _URL_PARAM = re.compile(r"(?i)([?&#])([A-Za-z0-9_.%+-]+)=([^&#\s]*)")
 _TEXT_ASSIGNMENT = re.compile(
     r"(?i)(?<![A-Za-z0-9_])([\"']?)([A-Za-z][A-Za-z0-9_.-]*)"
-    r"([\"']?\s*[:=]\s*)([\"']?)([^\s,;}\"']+)"
+    r"((?:\\?[\"'])?\s*[:=]\s*)((?:\\?[\"'])?)([^\s,;}\"']+)"
 )
 _SENSITIVE_NAMES = frozenset(
     {
@@ -2440,6 +2443,190 @@ def _redact_url(value: str) -> str:
     return _URL_PARAM.sub(redact_param, value)
 
 
+def _escaped_assignment_header(value: str, start: int) -> tuple[tuple[str, int, str] | None, int]:
+    """Parse one header and return it with the next safe monotone scan position."""
+    if start and (
+        "a" <= value[start - 1].lower() <= "z"
+        or "0" <= value[start - 1] <= "9"
+        or value[start - 1] == "_"
+    ):
+        return None, start + 1
+
+    index = start
+    if index < len(value) and value[index] in "\"'":
+        index += 1
+    if index >= len(value) or not ("a" <= value[index].lower() <= "z"):
+        return None, index
+
+    name_start = index
+    index += 1
+    while index < len(value):
+        char = value[index]
+        if "a" <= char.lower() <= "z" or "0" <= char <= "9" or char in "_.-":
+            index += 1
+        else:
+            break
+    name = value[name_start:index]
+
+    if index < len(value) and value[index] in "\"'":
+        index += 1
+    elif index + 1 < len(value) and value[index] == "\\" and value[index + 1] in "\"'":
+        index += 2
+
+    while index < len(value) and value[index].isspace():
+        index += 1
+    if index >= len(value) or value[index] not in ":=":
+        return None, index
+    index += 1
+    while index < len(value) and value[index].isspace():
+        index += 1
+    if index + 1 >= len(value) or value[index] != "\\" or value[index + 1] not in "\"'":
+        return None, index
+    return (name, index + 2, value[index + 1]), index + 2
+
+
+def _escaped_assignment_boundary(value: str, after_quote: int) -> bool:
+    """Check whether an escaped quote closes a scalar at a JSON boundary."""
+    index = after_quote
+    while index < len(value) and value[index].isspace():
+        index += 1
+    if index == len(value) or value[index] in "}]":
+        return True
+    return value[index] == ","
+
+
+def _escaped_assignment_structural_quotes(value: str) -> list[int]:
+    """Index structural quotes of one escaped JSON layer in a monotone pass.
+
+    A quote is structural when it is preceded by a 1 mod 4 backslash run:
+    one layer of escaping. Quotes at 3 mod 4 are embedded in the scalar.
+    """
+    quotes: list[int] = []
+    index = 0
+    while index < len(value):
+        if value[index] != "\\":
+            index += 1
+            continue
+        slash_start = index
+        while index < len(value) and value[index] == "\\":
+            index += 1
+        if index < len(value) and value[index] in "\"'" and (index - slash_start) % 4 == 1:
+            quotes.append(index)
+            index += 1
+    return quotes
+
+
+def _escaped_assignment_line_breaks(value: str) -> list[int]:
+    """Index raw line breaks; only these bound an unclosed credential safely."""
+    return [index for index, char in enumerate(value) if char in "\r\n"]
+
+
+def _escaped_assignment_close(
+    value: str,
+    value_start: int,
+    quote: str,
+    structural_quotes: list[int],
+    quote_cursor: int,
+    line_breaks: list[int],
+    line_cursor: int,
+) -> tuple[tuple[int, int] | None, int]:
+    """Find the first structural quote closing the scalar.
+
+    The first structural quote of the same kind after the value start is the
+    JSON string's true close, even when the value contains raw ``}``, ``]`` or
+    ``,`` characters. It must be followed by a JSON boundary; otherwise the
+    quote belongs to a later key and the scalar is ambiguous. Only a raw
+    LF/CRLF can bound an unclosed scalar; anything else is an explicit refusal.
+    """
+    while quote_cursor < len(structural_quotes):
+        candidate = structural_quotes[quote_cursor]
+        if candidate < value_start or value[candidate] != quote:
+            quote_cursor += 1
+            continue
+        break
+    while line_cursor < len(line_breaks) and line_breaks[line_cursor] < value_start:
+        line_cursor += 1
+
+    if quote_cursor < len(structural_quotes):
+        close_index = structural_quotes[quote_cursor]
+        if line_cursor < len(line_breaks) and line_breaks[line_cursor] < close_index:
+            line = line_breaks[line_cursor]
+            return (line, line), line_cursor + 1
+        if not _escaped_assignment_boundary(value, close_index + 1):
+            return None, line_cursor
+        return (close_index - 1, close_index + 1), line_cursor
+
+    if line_cursor < len(line_breaks):
+        line = line_breaks[line_cursor]
+        return (line, line), line_cursor + 1
+    return None, line_cursor
+
+
+def _redact_escaped_text_assignments(value: str) -> str:
+    """Redact single-layer escaped assignments without regex suffix rescans."""
+    structural_quotes = _escaped_assignment_structural_quotes(value)
+    quote_cursor = 0
+    line_breaks = _escaped_assignment_line_breaks(value)
+    line_cursor = 0
+    parts: list[str] = []
+    copied_through = 0
+    index = 0
+    while index < len(value):
+        char = value[index]
+        if (char not in "\"'" and not ("a" <= char.lower() <= "z")) or (
+            index
+            and (
+                "a" <= value[index - 1].lower() <= "z"
+                or "0" <= value[index - 1] <= "9"
+                or value[index - 1] == "_"
+            )
+        ):
+            index += 1
+            continue
+
+        parsed_header, next_index = _escaped_assignment_header(value, index)
+        if parsed_header is None:
+            index = max(index + 1, next_index)
+            continue
+
+        name, value_start, quote = parsed_header
+        if not _sensitive_name(name):
+            index = value_start
+            continue
+
+        close, line_cursor = _escaped_assignment_close(
+            value,
+            value_start,
+            quote,
+            structural_quotes,
+            quote_cursor,
+            line_breaks,
+            line_cursor,
+        )
+        if close is None:
+            if value[value_start:] == "[REDACTED]":
+                return "".join(parts) + value[copied_through:]
+            raise ProposalContractError(
+                "ambiguous_operational_credential: an unclosed sensitive assignment "
+                "has no safe line boundary"
+            )
+
+        close_start, close_end = close
+        while (
+            quote_cursor < len(structural_quotes) and structural_quotes[quote_cursor] <= close_start
+        ):
+            quote_cursor += 1
+        if value[value_start:close_start] != "[REDACTED]":
+            parts.extend((value[copied_through:value_start], "[REDACTED]"))
+            copied_through = close_start
+        index = close_end
+
+    if not parts:
+        return value
+    parts.append(value[copied_through:])
+    return "".join(parts)
+
+
 def _redact_text(value: str) -> str:
     value = re.sub(r"\bsk-[A-Za-z0-9_-]{8,}\b", "[REDACTED]", value)
     value = re.sub(r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]{8,}", "[REDACTED]", value)
@@ -2448,6 +2635,8 @@ def _redact_text(value: str) -> str:
         r"\1=[REDACTED]",
         value,
     )
+
+    value = _redact_escaped_text_assignments(value)
 
     def redact_assignment(match: re.Match[str]) -> str:
         if not _sensitive_name(match.group(2)) or match.group(5).startswith("[REDACTED]"):

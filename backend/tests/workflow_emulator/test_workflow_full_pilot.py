@@ -32,16 +32,31 @@ from cti_app.application.investigation_contracts import FindingProposalV1
 from cti_app.application.investigation_service import _FINDING_NAMESPACE
 from cti_app.application.media_assets import MediaAssetStore
 from cti_app.application.network_capture_import import NetworkCaptureImportService
-from cti_app.application.network_protocol_model import NetworkProtocolWorkbench
+from cti_app.application.network_protocol_model import (
+    NETWORK_PROTOCOL_RENDERER_VERSION,
+    NetworkProtocolWorkbench,
+)
 from cti_app.application.network_workbench import (
     NetworkWorkbench,
     ProductionNetworkCaptureBlobStore,
 )
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.protocol_diagram_projection import (
+    PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION,
+    PROTOCOL_DIAGRAM_PROJECTION_VERSION,
+)
 from cti_app.application.publication_rendering import PublicationRenderService
 from cti_app.application.typst_paths import typst_bundle_paths
 from cti_app.application.typst_rendering import TypstRenderer
-from cti_app.application.virustotal import VirusTotalCapabilities
+from cti_app.application.virustotal import (
+    VirusTotalCapabilities,
+    VirusTotalCapability,
+    VirusTotalEndpointVariant,
+    VirusTotalOperationRoute,
+    VirusTotalRouteStep,
+    VirusTotalRoutingPolicy,
+    VirusTotalTransportKind,
+)
 from cti_app.application.virustotal_persistence import VirusTotalObservationService
 from cti_app.domain.analyst_opinion import (
     AnalystOpinionV1,
@@ -95,6 +110,7 @@ from cti_app.infrastructure.investigation_runtime_ports import (
 from cti_app.infrastructure.quarantined_capture_source import ProductionQuarantinedCaptureSource
 from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
 from tests.confined_worker_harness import build_confined_worker_harness
+from tests.fixtures.binary_factory import build_pe64
 from tests.integration.test_edition_multibatch_publication_postgres import _compose_three_runs
 from tests.shodan_support import FakeShodanPort
 from tests.workflow_emulator import invariants
@@ -160,6 +176,24 @@ def _json_default(value: object) -> object:
 
 async def _run_process(arguments: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess[Any]:
     return await asyncio.to_thread(subprocess.run, arguments, **kwargs)
+
+
+class _PilotFeaturePacks:
+    def __init__(
+        self,
+        packs: Mapping[str, Mapping[str, object]],
+        *,
+        unmeasured_hashes: Sequence[str],
+    ) -> None:
+        self._packs = dict(packs)
+        self._unmeasured_hashes = frozenset(unmeasured_hashes)
+
+    async def get_feature_pack(self, sample_sha256: str) -> Mapping[str, object] | None:
+        if sample_sha256 in self._unmeasured_hashes:
+            return None
+        if sample_sha256 not in self._packs:
+            raise AssertionError(f"pilot requested an unseeded feature pack: {sample_sha256}")
+        return self._packs[sample_sha256]
 
 
 def _with_article_claim(document: PublicationDocumentV5) -> PublicationDocumentV5:
@@ -279,10 +313,12 @@ class _PilotBridge(ScriptedInvestigationTransport):
         investigation_id: UUID,
         artifact_store: ProductionArtifactStore,
         material: SyntheticSampleMaterial,
+        comparison_sample_hashes: tuple[str, ...],
     ) -> None:
         self._uow_factory = uow_factory
         self._investigation_id = investigation_id
         self._artifact_store = artifact_store
+        self._comparison_sample_hashes = tuple(sorted(set(comparison_sample_hashes)))
         self.received_prompts: list[str] = []
         self.observations_before_turn: list[tuple[UUID, ...]] = []
         self.dynamic_choices: list[dict[str, object]] = []
@@ -423,7 +459,10 @@ class _PilotBridge(ScriptedInvestigationTransport):
                 ),
                 None,
             )
-            hashes = sorted({item.sample_sha256 for item in associations})
+            associated_hashes = {item.sample_sha256 for item in associations}
+            if not set(self._comparison_sample_hashes) <= associated_hashes:
+                raise AssertionError("the pilot comparison samples are not all associated")
+            hashes = list(self._comparison_sample_hashes)
             sample_observation = next(
                 (
                     item
@@ -949,9 +988,15 @@ async def test_workflow_full_supervised_first_run_dynamic_pilot(
         )
 
         marker = f"PilotSharedMarker{uuid4().hex[:12]}"
-        bytes_a = b"MZ\x00PILOT-SAMPLE-A:" + marker.encode() + b":inert-A"
-        bytes_b = b"MZ\x00PILOT-SAMPLE-B:" + marker.encode() + b":inert-B"
-        bytes_c = b"MZ\x00PILOT-SAMPLE-C:DistinctObservedFeature:" + marker.encode() + b":inert-C"
+        pe_fixture = build_pe64(rich_header=False)
+        bytes_a = pe_fixture + b"\x00PILOT-SAMPLE-A:" + marker.encode() + b":inert-A"
+        bytes_b = pe_fixture + b"\x00PILOT-SAMPLE-B:" + marker.encode() + b":inert-B"
+        bytes_c = (
+            pe_fixture
+            + b"\x00PILOT-SAMPLE-C:DistinctObservedFeature:"
+            + marker.encode()
+            + b":inert-C"
+        )
         sha_a, sha_b, sha_c = (
             hashlib.sha256(item).hexdigest() for item in (bytes_a, bytes_b, bytes_c)
         )
@@ -1178,6 +1223,16 @@ async def test_workflow_full_supervised_first_run_dynamic_pilot(
         network_limits = NetworkExtractionLimitsV1()
         tshark = ConfinedTsharkAdapter(worker.port, limits=network_limits)
         vt = HashCheckedVirusTotal(material=material, include_candidate=False)
+        vt._routing_policy = VirusTotalRoutingPolicy(
+            routes={
+                VirusTotalCapability.FILE_REPORT: VirusTotalOperationRoute(
+                    primary=VirusTotalRouteStep(
+                        transport=VirusTotalTransportKind.PROXY,
+                        variant=VirusTotalEndpointVariant.V3,
+                    )
+                )
+            }
+        )
         shodan = FakeShodanPort()
         runtime = build_investigation_runtime_composition_factory(
             settings,
@@ -1217,22 +1272,32 @@ async def test_workflow_full_supervised_first_run_dynamic_pilot(
             assert isinstance(item, Mapping) and item["status"] == "unavailable"
         floss_family = families["floss_extraction"]
         assert isinstance(floss_family, Mapping)
-        assert floss_family["status"] == "available"
-        assert floss_family["execution_mode"] == "analysis-worker"
+        expected_floss_status = "available" if shutil.which("floss") else "unavailable"
+        assert floss_family["status"] == expected_floss_status
+        if expected_floss_status == "available":
+            assert floss_family["execution_mode"] == "analysis-worker"
         assert isinstance(families["network_capture"], Mapping)
         assert families["network_capture"]["status"] == "available"
 
+        first_capture, second_capture = _unique_captures(uuid4().bytes)
+        capture_hashes = tuple(
+            hashlib.sha256(content).hexdigest() for content in (first_capture, second_capture)
+        )
         common = f"PilotSharedFeature{uuid4().hex[:10]}"
+        feature_packs = {
+            sha_a: _feature_pack(sha_a, strings=((common, 0x240),)),
+            sha_b: _feature_pack(sha_b, strings=((common, 0x318),)),
+            sha_c: _feature_pack(sha_c, strings=(("PilotDistinctFeature", 0x420),)),
+        }
         similarity = _family_similarity(
             uow_factory=uow_factory,
             artifact_store=artifact_store,
             investigation_id=seeded.investigation.id,
-            feature_packs={
-                sha_a: _feature_pack(sha_a, strings=((common, 0x240),)),
-                sha_b: _feature_pack(sha_b, strings=((common, 0x318),)),
-                sha_c: _feature_pack(sha_c, strings=(("PilotDistinctFeature", 0x420),)),
-            },
+            feature_packs=feature_packs,
             baseline_id=uuid4(),
+        )
+        similarity._feature_packs = _PilotFeaturePacks(
+            feature_packs, unmeasured_hashes=capture_hashes
         )
         optional_ports = runtime.composition_factory.optional_tool_ports
         assert optional_ports is not None
@@ -1242,6 +1307,7 @@ async def test_workflow_full_supervised_first_run_dynamic_pilot(
             investigation_id=seeded.investigation.id,
             artifact_store=artifact_store,
             material=material,
+            comparison_sample_hashes=(sha_a, sha_b, sha_c),
         )
         factory = replace(
             runtime.composition_factory,
@@ -1261,8 +1327,6 @@ async def test_workflow_full_supervised_first_run_dynamic_pilot(
             blob_catalog=blob_catalog,
             settings=settings,
         )
-        first_capture, second_capture = _unique_captures(uuid4().bytes)
-
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://workflow-full-pilot"
         ) as client:
@@ -1361,7 +1425,6 @@ async def test_workflow_full_supervised_first_run_dynamic_pilot(
             assert required_tools <= set(invocation_by_name)
             for unavailable_name in (
                 "native.inspect",
-                "sample.extract_obfuscated_strings",
                 "sample.extract_configuration",
             ):
                 assert all(
@@ -1370,10 +1433,13 @@ async def test_workflow_full_supervised_first_run_dynamic_pilot(
                 )
             unavailable_tools = {
                 "native.inspect",
-                "sample.extract_obfuscated_strings",
                 "sample.extract_configuration",
             }
-            partial_is_evidence = {"sample.analyze", "network.protocol.verify"}
+            partial_is_evidence = {
+                "sample.analyze",
+                "sample.extract_obfuscated_strings",
+                "network.protocol.verify",
+            }
             unexpected_statuses = {
                 name: [item.status.value for item in invocation_by_name[name]]
                 for name in required_tools - unavailable_tools - partial_is_evidence
@@ -1387,6 +1453,17 @@ async def test_workflow_full_supervised_first_run_dynamic_pilot(
                 item.status in {ToolInvocationStatus.SUCCEEDED, ToolInvocationStatus.PARTIAL}
                 for item in invocation_by_name["sample.analyze"]
             )
+            floss_statuses = {
+                item.status for item in invocation_by_name["sample.extract_obfuscated_strings"]
+            }
+            if expected_floss_status == "available":
+                assert floss_statuses <= {
+                    ToolInvocationStatus.SUCCEEDED,
+                    ToolInvocationStatus.PARTIAL,
+                    ToolInvocationStatus.EMPTY,
+                }
+            else:
+                assert floss_statuses == {ToolInvocationStatus.UNAVAILABLE}
             assert all(
                 item.status is ToolInvocationStatus.SUCCEEDED
                 for item in invocation_by_name["network.protocol.verify"]
@@ -1425,6 +1502,30 @@ async def test_workflow_full_supervised_first_run_dynamic_pilot(
             assert set(compared_hashes) == {sha_a, sha_b, sha_c}
             assert len(compared_hashes) == 3
             assert comparison_invocation.response_refs
+            comparison_observation = next(
+                item for item in observations if item.id == comparison_invocation.response_refs[0]
+            )
+            persisted_comparison = await artifact_store.read_json(comparison_observation.blob_id)
+            assert isinstance(persisted_comparison, Mapping)
+            assert set(persisted_comparison["comparison_sample_sha256s"]) == {
+                sha_a,
+                sha_b,
+                sha_c,
+            }
+            persisted_measurements: dict[str, set[bool]] = {
+                sample_hash: set() for sample_hash in (*compared_hashes, *capture_hashes)
+            }
+            for feature in persisted_comparison["features"]:
+                for presence in feature["sample_presence"]:
+                    sample_hash = presence["sample_sha256"]
+                    if sample_hash in persisted_measurements:
+                        persisted_measurements[sample_hash].add(presence["measured"])
+            assert all(
+                persisted_measurements[sample_hash] == {True} for sample_hash in compared_hashes
+            )
+            assert all(
+                persisted_measurements[sample_hash] == {False} for sample_hash in capture_hashes
+            )
             assert (
                 len([item for item in observations if item.source == "network.capture.inspect"])
                 == 2
@@ -1530,7 +1631,29 @@ async def test_workflow_full_supervised_first_run_dynamic_pilot(
                 item for item in observations if item.source == "network.protocol.render"
             )
             stored_semantic_render = await artifact_store.read_json(render_observation.blob_id)
-            assert stored_semantic_render == semantic_render.to_dict()
+            render_metadata = {
+                "render_identity",
+                "renderer_version",
+                "projection_version",
+                "figure_policy_version",
+            }
+            stored_render_semantics = {
+                key: value
+                for key, value in stored_semantic_render.items()
+                if key not in render_metadata
+            }
+            assert stored_render_semantics == semantic_render.to_dict()
+            assert {
+                "render_identity": stored_semantic_render["render_identity"],
+                "renderer_version": stored_semantic_render["renderer_version"],
+                "projection_version": stored_semantic_render["projection_version"],
+                "figure_policy_version": stored_semantic_render["figure_policy_version"],
+            } == {
+                "render_identity": render_observation.object_id,
+                "renderer_version": NETWORK_PROTOCOL_RENDERER_VERSION,
+                "projection_version": PROTOCOL_DIAGRAM_PROJECTION_VERSION,
+                "figure_policy_version": PROTOCOL_DIAGRAM_FIGURE_POLICY_VERSION,
+            }
             from cti_app.application.protocol_diagram_projection import (
                 compile_protocol_render_result,
                 opinion_protocol_figures,
@@ -1811,8 +1934,13 @@ async def test_workflow_full_supervised_first_run_dynamic_pilot(
             rendered_pages = tuple(sorted(output_root.glob("publication-v6-page-*.png")))
             assert len(rendered_pages) >= 1
             assert all(item.stat().st_size > 1_024 for item in rendered_pages)
-            figure_captions = tuple(item.caption.casefold() for item in figures)
-            assert all(caption in pdf_text for caption in figure_captions)
+            caption_search_from = 0
+            for figure in figures:
+                caption = " ".join(figure.caption.casefold().split())
+                assert caption, "PDF captions must not be empty"
+                caption_position = pdf_text.find(caption, caption_search_from)
+                assert caption_position >= 0, caption
+                caption_search_from = caption_position + len(caption)
 
             manifest_after = await read_manifest(uow_factory, edition.id)
             assert manifest_after is not None

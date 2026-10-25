@@ -7,6 +7,7 @@ module intentionally does not modify or depend on application/persistence.py.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
@@ -15,7 +16,10 @@ from uuid import UUID
 from cti_app.application.context_pagination import (
     KeysetPageV1,
     decode_keyset_cursor,
+    decode_keyset_sort_key,
+    keyset_position_after,
     make_keyset_page,
+    order_keyset_items,
 )
 from cti_app.domain.analyst_opinion import AnalystOpinionV1
 from cti_app.domain.investigation import (
@@ -87,6 +91,8 @@ class FindingRepository(Protocol):
     async def list_for_investigation(
         self, investigation_id: UUID
     ) -> tuple[InvestigationFinding, ...]: ...
+
+    async def version_count_for_investigation(self, investigation_id: UUID) -> int: ...
 
     async def page_for_investigation(
         self,
@@ -198,22 +204,21 @@ def _copy_budget(budget: InvestigationBudget) -> InvestigationBudget:
     return copied
 
 
-def _memory_keyset_page(
-    items: tuple[object, ...],
+def _memory_keyset_page[T](
+    items: tuple[T, ...],
     *,
     section: str,
     investigation_id: UUID,
     cursor: str | None,
     limit: int,
     descending: bool,
-    position: object,
+    position: Callable[[T], tuple[datetime | None, UUID]],
     latest_only: bool = False,
-) -> KeysetPageV1:
+) -> KeysetPageV1[T]:
     """Page a materialized in-memory snapshot; this does not bound source memory."""
     if not 1 <= limit <= 1_000:
         raise ValueError("Context page limit must be between 1 and 1000")
-    position_fn = position  # keep the generic callback local for type-checkers
-    ordered = sorted(items, key=position_fn, reverse=descending)  # type: ignore[arg-type]
+    ordered = list(order_keyset_items(items, position=position, descending=descending))
     if cursor is not None:
         decoded = decode_keyset_cursor(
             cursor,
@@ -221,8 +226,10 @@ def _memory_keyset_page(
             investigation_id=investigation_id,
             descending=descending,
         )
+        if decoded is None:
+            raise ValueError("Context keyset cursor is invalid")
         try:
-            sort_key = datetime.fromisoformat(decoded["sort_key"])
+            sort_key = decode_keyset_sort_key(decoded["sort_key"])
             item_id = UUID(decoded["item_id"])
         except (TypeError, ValueError):
             raise ValueError("Context keyset cursor is invalid") from None
@@ -230,7 +237,7 @@ def _memory_keyset_page(
         ordered = [
             item
             for item in ordered
-            if (position_fn(item) < pivot if descending else position_fn(item) > pivot)  # type: ignore[operator]
+            if keyset_position_after(position(item), pivot, descending=descending)
         ]
     return make_keyset_page(
         section=section,
@@ -239,7 +246,7 @@ def _memory_keyset_page(
         total=len(items),
         limit=limit,
         cursor=cursor,
-        position=position_fn,
+        position=position,
         descending=descending,
         source_bounded=False,
         unbounded_reason="In-memory repository materializes the full collection",
@@ -399,6 +406,9 @@ class InMemoryFindingRepository:
         return tuple(
             item for item in self._items.values() if item.investigation_id == investigation_id
         )
+
+    async def version_count_for_investigation(self, investigation_id: UUID) -> int:
+        return sum(item.investigation_id == investigation_id for item in self._items.values())
 
     async def page_for_investigation(
         self,

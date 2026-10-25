@@ -24,6 +24,7 @@ from cti_app.domain.investigation import (
     BudgetDimension,
     FindingAssessment,
     FindingKind,
+    FrameworkPreSubmissionProof,
     NoveltyClass,
     SampleQualification,
     ToolInvocationStatus,
@@ -559,7 +560,7 @@ async def test_postgres_bridge_pre_submission_exhaustion_resumes_with_new_attemp
 
 
 @pytest.mark.asyncio
-async def test_real_postgres_tool_path_classifies_vt_download_route_404_as_unavailable(
+async def test_real_postgres_tool_path_classifies_vt_download_route_404_as_needs_review(
     uow_factory, tmp_path: Path
 ) -> None:
     blob_catalog = BlobCatalogService(
@@ -654,6 +655,9 @@ async def test_real_postgres_tool_path_classifies_vt_download_route_404_as_unava
                 await uow.tool_invocations.list_for_investigation(seeded.investigation.id)
             )
             envelope = await uow.investigation_envelopes.get(seeded.investigation.id)
+            observations = await uow.evidence_observations.list_for_investigation(
+                seeded.investigation.id
+            )
             failed_attempt = await uow.sample_acquisition_attempts.find_latest_error(
                 seeded.investigation.id, material.sample_hash
             )
@@ -662,16 +666,26 @@ async def test_real_postgres_tool_path_classifies_vt_download_route_404_as_unava
             f"/api/v3/files/{material.sample_hash}/download",
             f"/api/v3/files/{material.sample_hash}/download_url",
         ]
-        assert invocation.status is ToolInvocationStatus.UNAVAILABLE
-        assert invocation.response_refs
-        assert invocation.consumed_budget
-        # This bare error object cannot be attributed to VT or its proxy. Its
-        # plain ledger code (rather than an opaque refusal-cache marker) keeps
-        # this 404 diagnostic and retryable after the route/config changes.
+        # The 404 body cannot be attributed to VT or its proxy, so the external
+        # outcome is ambiguous and must be reconciled before any retry. Only a
+        # framework diagnostic is persisted; the adapter output is not.
+        assert invocation.status is ToolInvocationStatus.NEEDS_REVIEW
+        assert len(invocation.response_refs) == 1
+        diagnostic_observation = next(
+            item for item in observations if item.id == invocation.response_refs[0]
+        )
+        diagnostic = await artifact_store.read_json(diagnostic_observation.blob_id)
+        assert diagnostic["result"]["outcome"] == "external_effect_unconfirmed"
+        assert diagnostic["result"]["adapter_output_archived"] is False
+        assert invocation.consumed_budget == {}
+        # Its plain ledger code (rather than an opaque refusal-cache marker)
+        # keeps this 404 diagnostic and retryable after the route/config changes.
         assert failed_attempt is not None
         assert failed_attempt.error_code == "virustotal_download_404_origin_unknown"
         assert envelope is not None
-        assert not any(item.status.value == "reserved" for item in envelope.budget.reservations)
+        # The ambiguous reservation is retained until reconciliation so a retry
+        # cannot consume the same budget a second time.
+        assert any(item.status.value == "reserved" for item in envelope.budget.reservations)
     finally:
         await vt_client.aclose()
 
@@ -806,6 +820,9 @@ async def test_real_postgres_exhausted_loop_acquisition_budget_is_not_ambiguous(
             invocations = tuple(
                 await uow.tool_invocations.list_for_investigation(seeded.investigation.id)
             )
+            observations = await uow.evidence_observations.list_for_investigation(
+                seeded.investigation.id
+            )
             envelope = await uow.investigation_envelopes.get(seeded.investigation.id)
             persisted = await uow.analyst_investigations.get(seeded.investigation.id)
         invocation = next(item for item in invocations if item.tool_name == "vt.download_sample")
@@ -814,11 +831,26 @@ async def test_real_postgres_exhausted_loop_acquisition_budget_is_not_ambiguous(
             f"{persisted.budget.max_vt_read_units if persisted is not None else None}/"
             f"{persisted.budget.consumed_vt_read_units if persisted is not None else None}"
         )
-        assert invocation.status is ToolInvocationStatus.UNAVAILABLE
-        assert invocation.response_refs
+        # The adapter's deterministic local refusal is not framework-attested:
+        # the dispatcher cannot prove adapter non-entry, so the invocation is
+        # conservatively reconciled as ambiguous and records only the framework
+        # diagnostic, never the adapter output.
+        assert invocation.status is ToolInvocationStatus.NEEDS_REVIEW
+        assert len(invocation.response_refs) == 1
+        diagnostic = next(item for item in observations if item.id == invocation.response_refs[0])
+        payload = await artifact_store.read_json(diagnostic.blob_id)
+        assert payload["result"]["outcome"] == "external_effect_unconfirmed"
+        assert payload["result"]["adapter_output_archived"] is False
+        assert not any(
+            item.object_type == FrameworkPreSubmissionProof.BUDGET_REJECTED.value
+            for item in observations
+        )
         assert all(amount == 0 for amount in invocation.consumed_budget.values())
         assert envelope is not None
-        assert not any(item.status.value == "reserved" for item in envelope.budget.reservations)
+        # The ambiguous reservation is held until reconciliation even though the
+        # adapter made no provider call; releasing it early would allow a double
+        # spend if the adapter's local refusal were later contradicted.
+        assert any(item.status.value == "reserved" for item in envelope.budget.reservations)
         assert persisted is not None
         assert persisted.budget.consumed_vt_read_units == consumed_vt_units
         assert persisted.budget.consumed_hits_acquired == consumed_hits

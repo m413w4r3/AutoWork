@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import math
@@ -9,23 +10,18 @@ import re
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any, Protocol
+from urllib.parse import parse_qsl, urlsplit
 from uuid import UUID, uuid5
 
 from cti_app.application.investigation_persistence import EvidenceObservationRepository
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.publication_secret_guard import is_operational_secret_field_name
 from cti_app.domain.investigation import EvidenceKind, EvidenceObservation
 
 MAX_EVIDENCE_JSON_BYTES = 512 * 1024 * 1024
-MAX_EVIDENCE_OBJECT_ITEMS = 256
-MAX_EVIDENCE_ARRAY_ITEMS = 128
 MAX_EVIDENCE_TEXT_CHARS = 4_000
 _EVIDENCE_NAMESPACE = UUID("47bfec4f-9070-42d0-aef5-0eb84c8b57cd")
 
-_SECRET_FIELD = re.compile(
-    r"(?:api[_-]?key|private[_-]?key|client[_-]?secret|access[_-]?token|"
-    r"bearer|token|secret|password|authorization|credential|cookie|signature)",
-    re.I,
-)
 _SAFE_USAGE_COUNT_FIELDS = frozenset(
     {"input_tokens", "output_tokens", "total_tokens", "cached_input_tokens", "reasoning_tokens"}
 )
@@ -34,12 +30,29 @@ _BINARY_FIELD = re.compile(
     r"bytes[_-]?(?:raw|file|sample|payload)|raw[_-]?(?:binary|octets))",
     re.I,
 )
-_SIGNED_URL = re.compile(r"https?://[^\s\]\[()<>\"]+", re.I)
+_SIGNED_URL = re.compile(r"https?://[^\s<>\"']+", re.I)
 _SECRET_VALUE = re.compile(
-    r"(?i)\b(api[_ -]?key|private[_ -]?key|access[_ -]?token|client[_ -]?secret|"
-    r"api[_ -]?token|authorization|credential|password|secret|signature|sig)\s*[:=]\s*[^\s,;]+"
+    r"(?i)\b((?:OPERATOR_[A-Z0-9_]*TOKEN)|"
+    r"(?:(?:VT|VIRUSTOTAL|SHODAN)_API_(?:KEY|TOKEN))|"
+    r"(?:(?:OPENAI_BRIDGE|QWEN|WEBAI)_API_KEY)|"
+    r"(?:(?:DATABASE|POSTGRES|REDIS|S3|MINIO|BRIDGE|SERVICE)_"
+    r"(?:DSN|URL|USER(?:NAME)?|PASSWORD|PASS|SECRET(?:_KEY)?|ACCESS_KEY))|"
+    r"(?:PRE)?SIGNED_URL)\s*[:=]\s*[^\s,;]+"
 )
-_BEARER_VALUE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
+_LOSSLESS_CONTENT_KEYS = frozenset(
+    {
+        "bytes",
+        "raw_bytes",
+        "octets",
+        "hex",
+        "hex_bytes",
+        "bytes_hex",
+        "hexdump",
+        "base64",
+        "base64_bytes",
+        "content_base64",
+    }
+)
 
 
 class EvidenceRecorder(Protocol):
@@ -334,21 +347,76 @@ class ProductionEvidenceRecorder:
 def sanitize_evidence_text(value: Any, *, max_chars: int = MAX_EVIDENCE_TEXT_CHARS) -> str:
     """Remove secret values, URLs, and NULs from a bounded untrusted string."""
     candidate = str(value).replace("\x00", "")
-    candidate = _SIGNED_URL.sub("[URL omitted]", candidate)
+    candidate = _SIGNED_URL.sub(_omit_signed_url, candidate)
     candidate = _SECRET_VALUE.sub(r"\1=[redacted]", candidate)
-    candidate = _BEARER_VALUE.sub("Bearer [redacted]", candidate)
     return candidate[: max(0, max_chars)]
 
 
-def _sanitize_json(value: Any, *, depth: int = 0) -> Any:
-    """Return JSON-safe, bounded data with secret and binary fields removed."""
+def _omit_signed_url(match: re.Match[str]) -> str:
+    url = match.group()
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        # A malformed authority cannot be proven free of signed query
+        # parameters; omit it rather than leaking the raw URL.
+        return "[URL omitted]"
+    sensitive = {
+        "sig",
+        "signature",
+        "token",
+        "access_token",
+        "api_token",
+        "api_key",
+        "key",
+        "auth",
+        "authorization",
+        "credential",
+        "expires",
+        "policy",
+        "x-amz-signature",
+        "x-amz-credential",
+        "x-amz-security-token",
+        "x-goog-signature",
+        "x-goog-credential",
+        "googleaccessid",
+    }
+    query_names = {name.casefold() for name, _ in parse_qsl(parsed.query, keep_blank_values=True)}
+    return "[URL omitted]" if parsed.username or parsed.password or query_names & sensitive else url
+
+
+def _binary_json_value(value: bytes | bytearray | memoryview) -> dict[str, Any]:
+    raw = bytes(value)
+    return {
+        "encoding": "base64",
+        "byte_length": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "content_base64": base64.b64encode(raw).decode("ascii"),
+    }
+
+
+def _byte_array(value: Any) -> bytes | None:
+    if not isinstance(value, list | tuple) or any(
+        type(item) is not int or item < 0 or item > 255 for item in value
+    ):
+        return None
+    return bytes(value)
+
+
+def _sanitize_json(
+    value: Any,
+    *,
+    depth: int = 0,
+    field_name: str = "",
+    binary_context: bool = False,
+) -> Any:
+    """Return JSON-safe data, preserving binary CTI as labeled Base64 evidence."""
     if depth > 16:
         return "[maximum depth omitted]"
+    if isinstance(value, bytes | bytearray | memoryview):
+        return _binary_json_value(value)
     if isinstance(value, Mapping):
         result: dict[str, Any] = {}
-        for index, (key, item) in enumerate(value.items()):
-            if index >= MAX_EVIDENCE_OBJECT_ITEMS:
-                break
+        for key, item in value.items():
             safe_key = str(key)[:256]
             safe_usage_count = (
                 safe_key in _SAFE_USAGE_COUNT_FIELDS
@@ -356,20 +424,44 @@ def _sanitize_json(value: Any, *, depth: int = 0) -> Any:
                 and not isinstance(item, bool)
                 and item >= 0
             )
-            if (_SECRET_FIELD.search(safe_key) and not safe_usage_count) or _BINARY_FIELD.search(
-                safe_key
-            ):
+            if is_operational_secret_field_name(safe_key) and not safe_usage_count:
                 continue
-            if safe_key.lower() in {"raw_bytes", "bytes", "octets"}:
-                continue
-            result[safe_key] = _sanitize_json(item, depth=depth + 1)
+            normalized_key = safe_key.casefold()
+            if normalized_key in _LOSSLESS_CONTENT_KEYS:
+                raw = _byte_array(item)
+                if raw is not None:
+                    result[safe_key] = _binary_json_value(raw)
+                    continue
+            nested_binary_context = binary_context or bool(
+                _BINARY_FIELD.search(safe_key) or normalized_key in _LOSSLESS_CONTENT_KEYS
+            )
+            result[safe_key] = _sanitize_json(
+                item,
+                depth=depth + 1,
+                field_name=safe_key,
+                binary_context=nested_binary_context,
+            )
         return result
     if isinstance(value, list | tuple):
-        return [_sanitize_json(item, depth=depth + 1) for item in value[:MAX_EVIDENCE_ARRAY_ITEMS]]
+        if (
+            binary_context
+            or _BINARY_FIELD.search(field_name)
+            or field_name.casefold()
+            in {
+                "bytes",
+                "octets",
+            }
+        ):
+            raw = _byte_array(value)
+            if raw is not None:
+                return _binary_json_value(raw)
+        return [
+            _sanitize_json(item, depth=depth + 1, binary_context=binary_context) for item in value
+        ]
     if isinstance(value, str):
-        return sanitize_evidence_text(value)
-    if isinstance(value, bytes | bytearray | memoryview):
-        return "[binary omitted]"
+        if field_name.casefold() in _LOSSLESS_CONTENT_KEYS:
+            return value.replace("\x00", "")
+        return sanitize_evidence_text(value, max_chars=MAX_EVIDENCE_JSON_BYTES)
     if value is None or isinstance(value, bool | int):
         return value
     if isinstance(value, float):
@@ -392,7 +484,7 @@ def _preserve_advisor_json(value: Any, *, depth: int = 0) -> Any:
     if isinstance(value, float):
         return value if math.isfinite(value) else None
     if isinstance(value, bytes | bytearray | memoryview):
-        raise ValueError("Binary data must be archived in a dedicated blob")
+        return _binary_json_value(value)
     return str(value)
 
 

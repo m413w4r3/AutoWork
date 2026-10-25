@@ -262,7 +262,7 @@ async def test_capa_reports_bounded_sanitized_subprocess_reason(
                 12,
                 b"",
                 b"ERROR capa: [Errno 30] Read-only file system: '/home/analysis' "
-                b"access_token=secret-value",
+                b"access_token=secret-value VT_API_KEY=operational-secret",
             ),
         )
 
@@ -292,7 +292,10 @@ async def test_capa_reports_bounded_sanitized_subprocess_reason(
     assert result["engine_status"] == "NON_ZERO_EXIT"
     assert "Read-only file system" in result["available_reason"]
     assert "/home/analysis" not in result["available_reason"]
-    assert "secret-value" not in result["available_reason"]
+    # D7 preserves attacker/CTI tokens in canonical evidence; operational
+    # AutoWork credentials remain redacted.
+    assert "access_token=secret-value" in result["available_reason"]
+    assert "operational-secret" not in result["available_reason"]
     assert persisted.persisted[0].errors
 
 
@@ -1033,6 +1036,24 @@ async def test_tool_registry_dispatch_runs_capa_and_strings_through_worker(
         and item.sha256 == hashlib.sha256(proof_bytes).hexdigest()
         for item in database.observations.values()
     )
+
+
+def test_mwcp_parser_probe_cache_is_keyed_by_parser_directory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture_directory = (Path(__file__).parent / "fixtures").resolve()
+    settings = Settings(
+        _env_file=None,
+        mwcp_parser_versions={"AutoworkSafeFixture": "fixture-v1"},
+    )
+
+    monkeypatch.delenv("ANALYSIS_MWCP_PARSER_DIR", raising=False)
+    without_fixture = build_analysis_worker_probe_payload(settings)
+    assert "mwcp_parser:AutoworkSafeFixture" not in without_fixture["versions"]
+
+    monkeypatch.setenv("ANALYSIS_MWCP_PARSER_DIR", str(fixture_directory))
+    with_fixture = build_analysis_worker_probe_payload(settings)
+    assert with_fixture["versions"]["mwcp_parser:AutoworkSafeFixture"] == "fixture-v1"
 
 
 @pytest.mark.asyncio
