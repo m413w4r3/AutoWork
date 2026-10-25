@@ -58,6 +58,9 @@ Any M05-A byte change would be visible here.
 | M05-A | 2e7733be | ruff check on changed source/tests; mypy on advisor modules | PASS | — |
 | M05-A | 2e7733be | anti-slop advisor prompt SHA | unchanged `54c9f454f0e80c95e518279c6a3205a776714db84964039a1fdaa0c7ebecafab` | byte parity |
 | M05-A | integrated `b8a10165` | golden + 6 advisor files + `test_investigation_advisor_tools.py` on main | PASS, 240 passed | 5.37 s |
+| M05-A + integration fix `7e51912a` | — | `make lint-backend` | PASS (849 files formatted); one import-order error found after integration and fixed mechanically without behaviour change | — |
+| M05-A | integrated `7e51912a` | `make typecheck-backend` | PASS, no issues in 822 source files | — |
+| M05-A | integrated `7e51912a` | `make test-ci-scripts` | PASS, 5 tests | 0.001 s |
 | M05-B | — | — | NOT_RUN | pending |
 | M05-C | — | — | NOT_RUN | pending |
 | M05-D | — | — | NOT_RUN | pending |
@@ -66,13 +69,13 @@ Any M05-A byte change would be visible here.
 
 | Gate | Result |
 |---|---|
-| `make lint-backend` | NOT_RUN |
-| `make typecheck-backend` | NOT_RUN |
-| `make test-backend` | NOT_RUN |
+| `make lint-backend` | PASS after M05-A integration (`7e51912a`) — must be rerun at final SHA |
+| `make typecheck-backend` | PASS after M05-A integration (`7e51912a`) — must be rerun at final SHA |
+| `make test-backend` | PASS at baseline 55fba67d (4904 passed, 2 skipped) — must be rerun at final SHA |
 | `make test-integration` (full) | NOT_RUN |
 | `make test-workflow` | NOT_RUN |
 | `make test-workflow-full` | NOT_RUN |
-| `make test-ci-scripts` | NOT_RUN |
+| `make test-ci-scripts` | PASS after M05-A integration (`7e51912a`, 5 tests) — rerun at final SHA |
 | frontend gates | NOT_RUN (backend-only change expected; confirm) |
 | full E2E-0 + E2E-1 in a recreated environment | NOT_RUN |
 
