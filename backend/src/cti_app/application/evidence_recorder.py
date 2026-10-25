@@ -360,7 +360,9 @@ def _omit_signed_url(match: re.Match[str]) -> str:
     try:
         parsed = urlsplit(url)
     except ValueError:
-        return url
+        # A malformed authority cannot be proven free of signed query
+        # parameters; omit it rather than leaking the raw URL.
+        return "[URL omitted]"
     sensitive = {
         "sig",
         "signature",
