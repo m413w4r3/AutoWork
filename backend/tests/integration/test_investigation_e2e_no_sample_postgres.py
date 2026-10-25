@@ -1,13 +1,13 @@
 """Continuous no-sample E2E-0 driver.
 
 NO_SAMPLE_INVARIANT: this driver creates no samples and asserts that sample
-associations are empty. The real ``ProposalConversationService.propose()`` path
-is NOT_DEMONSTRATED because it requires origin Samples; only the complementary
-terminal-gate check is present. Offline V4 parse+reparse is demonstrated using
-a separate synthetic persisted V4 fixture. Authoritative V4 reparse from the
-direct consultation writer remains NOT_DEMONSTRATED because it archives v2/v3;
-this driver must not relabel that archive. Everything else in this driver is
-executed by the PostgreSQL test.
+associations are empty. Its real ``ProposalConversationService.propose()`` path
+is proven absent by the typed first-precondition failure for a missing goodware
+baseline binding; the missing-Sample snapshot guard is later and is not reached.
+Synthetic offline V4 parse+reparse is demonstrated using a separate persisted
+fixture. Authoritative consultation-archive reparse is NOT_APPLICABLE while
+ADVISOR_CUTOVER_BLOCKED_BY_S3; production submission remains v3-authoritative.
+Everything else in this driver is executed by the PostgreSQL test.
 """
 
 from __future__ import annotations
@@ -42,6 +42,7 @@ from cti_app.application.bridge_investigator import (
 )
 from cti_app.application.identity import Identity, IdentityScope
 from cti_app.application.invariant_proposals import (
+    ProposalContractError,
     ProposalConversationService,
     _parse_proposal_response_details,
 )
@@ -54,6 +55,12 @@ from cti_app.application.investigation_audit_export import (
     write_audit_bundle,
 )
 from cti_app.application.media_assets import MediaAssetStore
+from cti_app.application.model_conversations import ModelConversationService
+from cti_app.application.model_gateway import (
+    ModelCapabilities,
+    ModelGateway,
+    ModelRouter,
+)
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.publication_rendering import PublicationRenderService
 from cti_app.application.research_context_builder import ResearchContextBuilder
@@ -73,7 +80,13 @@ from cti_app.domain.investigation import (
     InvestigationFinding,
     ToolInvocationStatus,
 )
-from cti_app.domain.model_runs import BridgeSubmissionState
+from cti_app.domain.model_conversations import ConversationPurpose
+from cti_app.domain.model_runs import (
+    BridgeSubmissionState,
+    ModelBackend,
+    ModelProvider,
+    ModelTransport,
+)
 from cti_app.domain.production import (
     AnalystInputPack,
     AnalystInvestigation,
@@ -100,6 +113,7 @@ from cti_app.infrastructure.database.investigation_audit_reader import (
 )
 from cti_app.infrastructure.database.session import create_session_factory
 from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
+from cti_app.integrations.models import BlobModelOutputStore
 from tests.integration.edition_codes import reserve_edition_code
 from tests.test_publication_document_v6 import _base_v5
 from tests.workflow_emulator.investigation_support import (
@@ -162,6 +176,50 @@ class _ReservationTransport:
             assert reservation.amounts[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
             assert reservation.amounts[BudgetDimension.CONTEXT_TOKENS] == prompt_tokens
         return self._responses.pop(0)
+
+
+class _P09RegistrySpy:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def propose(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        raise AssertionError("P09 must not be called by this proof")
+
+
+class _NoSendP10Adapter:
+    """Fake external route that fails the test if a P10 request is submitted."""
+
+    provider = ModelProvider.OPENAI
+    backend = ModelBackend.CHATGPT_BRIDGE
+    transport = ModelTransport.OPENAI_RESPONSES
+    requested_model = "m05b-no-send-p10-test-adapter"
+    is_external = True
+    capabilities = ModelCapabilities(conversation=True)
+
+    def __init__(self) -> None:
+        self.calls: list[Any] = []
+
+    async def invoke(
+        self,
+        request: Any,
+        *,
+        role: Any,
+        output_schema: type[Any] | None = None,
+    ) -> Any:
+        del role, output_schema
+        self.calls.append(request)
+        raise AssertionError("P10 must stop before its external adapter is invoked")
+
+    async def resume(
+        self,
+        response_id: str,
+        *,
+        role: Any,
+        output_schema: type[Any] | None = None,
+    ) -> Any:
+        del response_id, role, output_schema
+        raise AssertionError("P10 must not resume an external adapter")
 
 
 async def _seed_no_sample_article(
@@ -336,7 +394,8 @@ def _advisor_raw(status: str, opinion: str) -> str:
 async def test_investigation_no_sample_postgres_continuous_journey(
     uow_factory, migrated_postgres_url: str, tmp_path: Path
 ) -> None:
-    blob_catalog = BlobCatalogService(FilesystemBlobStore(tmp_path / "blob-storage"), uow_factory)
+    blob_store = FilesystemBlobStore(tmp_path / "blob-storage")
+    blob_catalog = BlobCatalogService(blob_store, uow_factory)
     artifact_store = ProductionArtifactStore(blob_catalog)
     seeded = await _seed_no_sample_article(uow_factory, artifact_store, uuid4().hex[:10])
     investigation_id = seeded["investigation"].id
@@ -421,7 +480,64 @@ async def test_investigation_no_sample_postgres_continuous_journey(
         assert started.status_code == 200, started.text
         async with uow_factory() as uow:
             state = await uow.investigation_states.get(investigation_id)
+            subject_samples = await uow.samples.list_for_subject(seeded["subject"].id)
+            baseline_binding = await uow.investigation_goodware_baselines.get(investigation_id)
         assert state is not None
+        assert subject_samples == []
+        assert baseline_binding is None
+
+        async def p10_turn_snapshot() -> tuple[tuple[UUID, tuple[UUID, ...]], ...]:
+            async with uow_factory() as uow:
+                conversations = await uow.model_conversations.list(
+                    edition_id=None,
+                    subject_id=seeded["subject"].id,
+                    purpose=ConversationPurpose.PIVOT_RESEARCH,
+                    status=None,
+                    provider=None,
+                )
+                p10_conversations = tuple(
+                    item
+                    for item in conversations
+                    if item.expected_profile == f"p10:{investigation_id}"
+                )
+                turns = []
+                for conversation in p10_conversations:
+                    saved = await uow.model_conversation_turns.list_for_conversation(
+                        conversation.id
+                    )
+                    turns.append((conversation.id, tuple(item.id for item in saved)))
+            return tuple(turns)
+
+        p10_turns_before = await p10_turn_snapshot()
+        assert p10_turns_before == ()
+        p09_absence = _P09RegistrySpy()
+        p10_adapter = _NoSendP10Adapter()
+        p10_gateway = ModelGateway(
+            ModelRouter(
+                openai_research=p10_adapter,
+                openai_structured=p10_adapter,
+                qwen=p10_adapter,
+                fake=p10_adapter,
+            ),
+            uow_factory,
+            BlobModelOutputStore(blob_catalog),
+        )
+        p10_model_conversations = ModelConversationService(uow_factory, p10_gateway, blob_store)
+        external_sends_before = len(transport.calls)
+        network_calls_before = transport.real_network_calls
+        p10_service = ProposalConversationService(
+            uow_factory,
+            p10_model_conversations,
+            p09_absence,
+        )
+        with pytest.raises(ProposalContractError) as proposal_error:
+            await p10_service.propose(investigation_id=investigation_id, cycle_number=1)
+        assert str(proposal_error.value) == "The investigation has no goodware baseline binding"
+        assert len(transport.calls) == external_sends_before
+        assert transport.real_network_calls == network_calls_before == 0
+        assert p10_adapter.calls == []
+        assert await p10_turn_snapshot() == p10_turns_before
+        assert p09_absence.calls == []
 
         approved = await approve_envelope_http(
             client,
@@ -674,9 +790,10 @@ async def test_investigation_no_sample_postgres_continuous_journey(
         )
         assert len(transport.calls) == 2
 
-        # Exercise the actual V4 parser and registered advisor.reparse adapter
-        # using an independently persisted synthetic fixture. The authoritative
-        # advisor.consult archive above remains v2/v3 and is never relabeled.
+        # Synthetic offline V4 verification exercises the V4 parser and registered
+        # advisor.reparse adapter without relabeling the v2/v3 consultation archive.
+        # Authoritative consultation-archive reparse is NOT_APPLICABLE while
+        # ADVISOR_CUTOVER_BLOCKED_BY_S3; production submission remains v3-authoritative.
         v4_original, v4_parse, v4_output_sha256 = await _persist_v4_reparse_fixture(
             uow_factory,
             artifact_store,
@@ -729,21 +846,13 @@ async def test_investigation_no_sample_postgres_continuous_journey(
             "CANDIDATE: literal_string | c2_indicator | exact | CreateMutexW | "
             "Synthetic unsupported candidate. | refs=unknown\n"
         )
-        # Complementary parser/P09 terminal-gate proof only. The real P10
-        # propose() path requires retained origin Samples, which this no-sample
-        # investigation intentionally does not create.
+        # Secondary refused-P10 terminal-gate proof: the real response processor
+        # must return before any P09 call. The primary P10 absence proof above
+        # exercises propose() and its typed first-precondition failure.
         parsed_refusal = _parse_proposal_response_details(refused_wire)
         assert parsed_refusal.outcome is ProposalOutcome.REFUSED
 
-        class _P09Registry:
-            def __init__(self) -> None:
-                self.calls: list[dict[str, Any]] = []
-
-            async def propose(self, **kwargs: Any) -> Any:
-                self.calls.append(kwargs)
-                raise AssertionError("refused P10 response must not reach P09")
-
-        p09 = _P09Registry()
+        p09 = _P09RegistrySpy()
         proposal_service = ProposalConversationService(None, None, p09)  # type: ignore[arg-type]
         terminal_results = await proposal_service._process_response_for_p09(
             outcome=parsed_refusal.outcome,
