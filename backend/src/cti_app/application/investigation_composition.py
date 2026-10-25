@@ -1610,6 +1610,7 @@ def build_investigation_composition(
         turn_transport or ModelConversationTurnTransport(model_conversations)
     )
     commit_uow = getattr(uow, "commit", None)
+    osint_open_policy_service = OsintOpenPolicyService(uow_factory, settings)
     service = InvestigationService(
         post_synthesis=AnalystPostSynthesisService(
             uow_factory,
@@ -1636,8 +1637,8 @@ def build_investigation_composition(
         available_capabilities=available_capabilities,
         no_progress_limit=settings.investigation_no_progress_limit,
         commit_uow=commit_uow if callable(commit_uow) else None,
+        effective_policy_for=osint_open_policy_service.effective_for_investigation,
     )
-    osint_open_policy_service = OsintOpenPolicyService(uow_factory, settings)
     return InvestigationComposition(
         service=service,
         operator_tool_invocations=OperatorToolInvocationService(

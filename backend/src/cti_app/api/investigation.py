@@ -224,6 +224,7 @@ class EnvelopeView(BaseModel):
     disclosure: dict[str, Any]
     approval_decision_id: UUID | None = None
     approval_actor_id: str | None = None
+    policy_activated_by: str | None = None
     approved_at: datetime | None = None
     authority_kind: str | None = None
     inherited_policy_id: UUID | None = None
@@ -1391,7 +1392,14 @@ async def _operator_context_invalidation_facts(
         "allowed_providers": list(getattr(envelope, "allowed_providers", ())),
         "acquire_hits_allowed": getattr(envelope, "acquire_hits_allowed", False),
         "approval_decision_id": str(getattr(envelope, "approval_decision_id", "")) or None,
-        "approval_actor_id": getattr(envelope, "approval_actor_id", None),
+        "approval_actor_id": (
+            None if policy_authority else getattr(envelope, "approval_actor_id", None)
+        ),
+        "policy_activated_by": (
+            effective_policy.policy.actor_id
+            if policy_authority and effective_policy is not None
+            else None
+        ),
         "authority_kind": getattr(getattr(envelope, "authority_kind", None), "value", None),
         "inherited_policy_id": str(getattr(envelope, "inherited_policy_id", "") or "") or None,
         "inherited_policy_version": getattr(envelope, "inherited_policy_version", None),
@@ -3043,7 +3051,7 @@ async def _current_envelope_view(request: Request, investigation_id: UUID) -> En
         investigation = await uow.analyst_investigations.get(investigation_id)
         if investigation is None:
             raise _http_error(404, "investigation_not_found")
-        composition = _composition_factory(request).build(uow, investigation_id)
+        composition = _composition_factory(request).build(uow, investigation_id, operator_mode=True)
         snapshot = await composition.tool_dependencies.article_snapshots.resolve(
             investigation.synthesis_artifact_id
         )
@@ -3061,6 +3069,7 @@ async def _current_envelope_view(request: Request, investigation_id: UUID) -> En
                 disclosure=_source_disclosure(snapshot),
                 approval_decision_id=None,
                 approval_actor_id=None,
+                policy_activated_by=None,
                 approved_at=None,
                 authority_kind=None,
                 inherited_policy_id=None,
@@ -3084,7 +3093,12 @@ async def _current_envelope_view(request: Request, investigation_id: UUID) -> En
             acquire_hits_allowed=current.acquire_hits_allowed,
             disclosure=current.disclosure,
             approval_decision_id=current.approval_decision_id,
-            approval_actor_id=current.approval_actor_id,
+            approval_actor_id=None if policy_authority else current.approval_actor_id,
+            policy_activated_by=(
+                effective_policy.policy.actor_id
+                if policy_authority and effective_policy is not None
+                else None
+            ),
             approved_at=current.approved_at,
             authority_kind=current.authority_kind.value,
             inherited_policy_id=current.inherited_policy_id,
@@ -3250,6 +3264,7 @@ def _envelope_view(
     disclosure: DisclosureBounds,
     approval_decision_id: UUID | None,
     approval_actor_id: str | None,
+    policy_activated_by: str | None,
     approved_at: datetime | None,
     authority_kind: str | None,
     inherited_policy_id: UUID | None,
@@ -3283,6 +3298,7 @@ def _envelope_view(
         },
         approval_decision_id=approval_decision_id,
         approval_actor_id=approval_actor_id,
+        policy_activated_by=policy_activated_by,
         approved_at=approved_at,
         authority_kind=authority_kind,
         inherited_policy_id=inherited_policy_id,

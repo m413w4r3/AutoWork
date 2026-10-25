@@ -27,13 +27,13 @@ from cti_app.domain.investigation import (
     EnvelopeAuthorityKind,
     InvestigationBudget,
     InvestigationEnvelope,
-    LoopBudget,
     TLPLevel,
     ToolInvocation,
 )
 from cti_app.domain.osint_open import OsintCapabilities, OsintInheritanceStatus, OsintScopeKind
 from cti_app.domain.production import (
     AnalystInvestigation,
+    LoopBudget,
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionRun,

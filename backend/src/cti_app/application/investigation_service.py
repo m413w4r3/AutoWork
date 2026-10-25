@@ -100,6 +100,7 @@ from cti_app.domain.investigation import (
     BudgetExceeded,
     BudgetReservation,
     BudgetReservationStatus,
+    EnvelopeAuthorityKind,
     EvidenceKind,
     EvidenceObservation,
     FindingAssessment,
@@ -314,6 +315,7 @@ class InvestigationService:
         max_turns_per_run: int = 64,
         commit_uow: Callable[[], Awaitable[None]] | None = None,
         audit_decisions: AnalystDecisionRepository | None = None,
+        effective_policy_for: Callable[[UUID], Awaitable[Any | None]] | None = None,
     ) -> None:
         if no_progress_limit < 1 or max_turns_per_run < 1:
             raise ValueError("Investigation loop limits must be positive")
@@ -338,6 +340,7 @@ class InvestigationService:
         self._no_progress_limit = no_progress_limit
         self._max_turns_per_run = max_turns_per_run
         self._commit_uow = commit_uow
+        self._effective_policy_for = effective_policy_for
         owner = getattr(commit_uow, "__self__", None)
         self._audit_decisions = audit_decisions or getattr(owner, "analyst_decisions", None)
 
@@ -2976,7 +2979,29 @@ class InvestigationService:
         if await self._requested_stop(investigation_id) is not None:
             return False
         current_envelope = await self._envelopes.get(investigation_id)
-        return not _envelope_reduced_since(approved_envelope, current_envelope)
+        if _envelope_reduced_since(approved_envelope, current_envelope):
+            return False
+        if (
+            approved_envelope is None
+            or approved_envelope.authority_kind is not EnvelopeAuthorityKind.OSINT_POLICY
+        ):
+            return True
+        resolver = self._effective_policy_for
+        if resolver is None:
+            return False
+        try:
+            effective_policy = await resolver(investigation_id)
+            if effective_policy is None or not effective_policy.authorized:
+                return False
+            investigation = await self._investigations.get(investigation_id)
+            return bool(
+                investigation is not None
+                and effective_policy.inheritance.subject_id == investigation.subject_id
+            )
+        except Exception:
+            # Missing policy state, lineage mismatch, or resolver failure must
+            # refuse before the Bridge transport emits a request.
+            return False
 
     async def _complete_bridge_reservation(
         self,

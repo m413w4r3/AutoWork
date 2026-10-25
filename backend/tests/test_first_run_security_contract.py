@@ -490,6 +490,27 @@ async def test_api_status_marks_local_identity_unverified_and_system_actor_canno
 
 
 @pytest.mark.asyncio
+async def test_api_status_disallows_local_approvals_in_protected_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        api_main,
+        "get_settings",
+        lambda: Settings(app_env="production", api_bind_host="127.0.0.1"),
+    )
+    application = api_main.create_app()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application),
+        base_url="http://127.0.0.1",
+    ) as client:
+        response = await client.get("/api/identity/status")
+
+    assert response.status_code == 200
+    assert response.json()["human_identity"] is True
+    assert response.json()["approvals_allowed"] is False
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("environment", ["production", "live"])
 async def test_api_refuses_requests_when_runtime_bind_is_exposed_in_production(
     monkeypatch: pytest.MonkeyPatch,

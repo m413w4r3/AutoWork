@@ -1,4 +1,4 @@
-"""Exhaustive coverage of the frozen baseline and additive C2 migration.
+"""Exhaustive coverage of the frozen baseline and additive migrations.
 
 This module validates, against a real (temporary) PostgreSQL database:
 
@@ -68,6 +68,7 @@ from cti_app.infrastructure.database.models import (  # noqa: F401
     investigation,
     jobs,
     model_execution,
+    osint_open_policy,
     production,
     publication_render,
     publication_review,
@@ -82,7 +83,8 @@ def _head_revision() -> str:
     """Read the chain head instead of pinning one migration by name.
 
     The rest of this module compares the full migrated schema against
-    ``Base.metadata``. The current head includes additive C2 migration 0002.
+    ``Base.metadata``. The current head includes additive migrations through
+    ``0003_osint_open_policy``.
     """
     from alembic.script import ScriptDirectory
 
@@ -126,6 +128,9 @@ INVESTIGATION_TABLES = frozenset(
         "investigation_working_states",
         "investigation_experiment_heads",
         "investigation_experiments",
+        "osint_open_policies",
+        "osint_open_policy_events",
+        "osint_open_inheritances",
     }
 )
 
@@ -149,6 +154,14 @@ IndexShape = tuple[str, tuple[str, ...], bool, bool]
 
 # (table, trigger_name) -> function_name, for every trigger installed at HEAD.
 EXPECTED_TRIGGERS: dict[tuple[str, str], str] = {
+    (
+        "osint_open_policy_events",
+        "trg_osint_open_policy_events_append_only",
+    ): "reject_osint_open_policy_event_mutation",
+    (
+        "osint_open_policies",
+        "trg_osint_open_policies_immutable",
+    ): "reject_osint_open_policy_version_mutation",
     (
         "edition_composition_events",
         "trg_edition_composition_events_append_only",
@@ -1029,7 +1042,7 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
     command.upgrade(config, "head")
     command.current(config)
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
-    assert _head_revision() == "0002_c2_experiments"
+    assert _head_revision() == "0003_osint_open_policy"
 
     tables = asyncio.run(_table_names(temporary_postgres_url))
     assert _REPAIR_TABLE in tables
@@ -1118,7 +1131,7 @@ def test_stamped_0001_without_c2_upgrades_additively_and_preserves_data(
 
     command.upgrade(config, "head")
 
-    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0002_c2_experiments"
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0003_osint_open_policy"
     after = asyncio.run(_database_snapshot(temporary_postgres_url))
     for table_name, table_schema in before.items():
         assert after[table_name] == table_schema
@@ -1142,7 +1155,7 @@ def test_stamped_0001_with_exact_manual_c2_schema_advances_without_ddl(
 
     command.upgrade(config, "head")
 
-    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0002_c2_experiments"
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0003_osint_open_policy"
     assert asyncio.run(_c2_catalog_snapshot(temporary_postgres_url)) == before_c2
     after_tables = asyncio.run(_database_snapshot(temporary_postgres_url))
     for table_name, table_schema in before_tables.items():
@@ -1233,7 +1246,7 @@ def test_c2_downgrade_refuses_to_discard_experiment_rows(
     with pytest.raises(RuntimeError, match="refusing to downgrade C2 experiment storage"):
         command.downgrade(config, "0001_baseline")
 
-    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0002_c2_experiments"
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0003_osint_open_policy"
 
     async def _experiment_count() -> int:
         engine = create_async_engine(temporary_postgres_url)
@@ -1247,3 +1260,146 @@ def test_c2_downgrade_refuses_to_discard_experiment_rows(
             await engine.dispose()
 
     assert asyncio.run(_experiment_count()) == 1
+
+
+def test_osint_policy_downgrade_refuses_policy_and_inherited_lineage_rows(
+    temporary_postgres_url: str,
+) -> None:
+    from cti_app.infrastructure.database.session import (
+        create_postgres_engine,
+        create_session_factory,
+    )
+    from tests.integration.test_osint_open_policy_postgres import (
+        _activate_for_subject,
+        _make_investigation,
+        _service,
+        _start_with_policy,
+        _uow_factory,
+    )
+
+    config = _alembic_config(temporary_postgres_url)
+    command.upgrade(config, "head")
+    engine = create_postgres_engine(temporary_postgres_url)
+    session_factory = create_session_factory(engine)
+    service = _service(session_factory)
+
+    async def _create_inherited_envelope() -> None:
+        try:
+            investigation_case = await _make_investigation(session_factory)
+            await _activate_for_subject(service, investigation_case.subject_id)
+            envelope = await _start_with_policy(
+                service, _uow_factory(session_factory), investigation_case
+            )
+            assert envelope is not None
+            assert envelope.inherited_policy_event_id is not None
+        finally:
+            await engine.dispose()
+
+    async def _state_counts() -> tuple[int, int, int, int, int, int]:
+        query_engine = create_postgres_engine(temporary_postgres_url)
+        try:
+            async with query_engine.connect() as connection:
+                counts = []
+                for table_name in (
+                    "osint_open_policies",
+                    "osint_open_policy_events",
+                    "osint_open_inheritances",
+                    "investigation_envelopes",
+                ):
+                    result = await connection.execute(text(f"SELECT count(*) FROM {table_name}"))
+                    counts.append(int(result.scalar_one()))
+                lineage = await connection.execute(
+                    text(
+                        "SELECT count(*) FROM investigation_envelopes "
+                        "WHERE authority_kind = 'osint_policy' "
+                        "AND inherited_policy_event_id IS NOT NULL"
+                    )
+                )
+                counts.append(int(lineage.scalar_one()))
+                policy_event = await connection.execute(
+                    text(
+                        "SELECT count(*) FROM investigation_envelopes e "
+                        "JOIN osint_open_policy_events p "
+                        "ON p.id = e.inherited_policy_event_id "
+                        "AND p.policy_id = e.inherited_policy_id "
+                        "AND p.policy_version = e.inherited_policy_version"
+                    )
+                )
+                counts.append(int(policy_event.scalar_one()))
+                return tuple(counts)  # type: ignore[return-value]
+        finally:
+            await query_engine.dispose()
+
+    asyncio.run(_create_inherited_envelope())
+    with pytest.raises(RuntimeError, match="Cannot downgrade populated OSINT_OPEN policy storage"):
+        command.downgrade(config, "0002_c2_experiments")
+
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0003_osint_open_policy"
+    assert asyncio.run(_state_counts()) == (1, 1, 1, 1, 1, 1)
+
+
+def test_0002_envelope_null_authority_is_read_as_human_without_backfill(
+    temporary_postgres_url: str,
+) -> None:
+    from cti_app.domain.investigation import EnvelopeAuthorityKind
+    from cti_app.infrastructure.database.session import (
+        create_postgres_engine,
+        create_session_factory,
+    )
+    from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
+    from tests.integration.test_osint_open_policy_postgres import _make_investigation
+
+    config = _alembic_config(temporary_postgres_url)
+    command.upgrade(config, "0002_c2_experiments")
+    engine = create_postgres_engine(temporary_postgres_url)
+    session_factory = create_session_factory(engine)
+
+    async def _prepare_legacy_envelope() -> Any:
+        try:
+            investigation_case = await _make_investigation(session_factory)
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "INSERT INTO investigation_envelopes "
+                        "(investigation_id, allowed_providers, budget_snapshot, "
+                        "acquire_hits_allowed, disclosure_tlp, disclosure_do_not_submit, "
+                        "disclosure_external_llm_allowed, approval_decision_id, approval_actor_id, "
+                        "approved_at, updated_at, version) "
+                        "VALUES (:investigation_id, CAST('[]' AS jsonb), "
+                        'CAST(\'{"limits": {}, "reservations": []}\' AS jsonb), '
+                        "false, 'GREEN', false, false, :decision_id, 'legacy-actor', "
+                        "now(), now(), 1)"
+                    ),
+                    {"investigation_id": investigation_case.id, "decision_id": uuid4()},
+                )
+            return investigation_case.id
+        finally:
+            await engine.dispose()
+
+    investigation_id = asyncio.run(_prepare_legacy_envelope())
+    command.upgrade(config, "head")
+
+    read_engine = create_postgres_engine(temporary_postgres_url)
+    read_session_factory = create_session_factory(read_engine)
+
+    async def _read_legacy_envelope() -> tuple[str | None, EnvelopeAuthorityKind | None]:
+        try:
+            async with read_engine.connect() as connection:
+                raw_authority = await connection.scalar(
+                    text(
+                        "SELECT authority_kind FROM investigation_envelopes "
+                        "WHERE investigation_id = :id"
+                    ),
+                    {"id": investigation_id},
+                )
+            async with SqlAlchemyUnitOfWork(read_session_factory) as uow:
+                envelope = await uow.investigation_envelopes.get(investigation_id)
+                assert envelope is not None
+                return raw_authority, envelope.authority_kind
+        finally:
+            await read_engine.dispose()
+
+    raw_authority, interpreted_authority = asyncio.run(_read_legacy_envelope())
+    assert raw_authority is None
+    assert interpreted_authority is EnvelopeAuthorityKind.HUMAN_G2
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0003_osint_open_policy"

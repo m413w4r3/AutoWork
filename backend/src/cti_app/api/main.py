@@ -699,14 +699,17 @@ def create_app() -> FastAPI:
             else "custom"
         )
         verified = bool(getattr(provider, "verified", False))
-        human_identity = not identity.has_scope(
-            IdentityScope.OPERATOR_CLIENT
-        ) and is_human_actor_id(identity.actor_id)
+        human_identity = (
+            not identity.has_scope(IdentityScope.OPERATOR_CLIENT)
+            and identity.has_scope(IdentityScope.HUMAN_OPERATOR)
+            and is_human_actor_id(identity.actor_id)
+        )
         server = request.scope.get("server")
         server_host = server[0] if isinstance(server, tuple) and server else None
         bind_host = server_host if isinstance(server_host, str) else settings.api_bind_host
         loopback = is_loopback_bind_host(bind_host)
         authenticated = mode == "authenticated" and verified
+        local_approvals_allowed = mode == "local" and not environment_is_protected and loopback
         if mode == "local":
             identity_scope = "local-isolated" if loopback else "local-unverified"
         else:
@@ -717,8 +720,7 @@ def create_app() -> FastAPI:
             "verified": verified,
             "identity_scope": identity_scope,
             "human_identity": human_identity,
-            "approvals_allowed": human_identity
-            and (authenticated or not environment_is_protected or loopback),
+            "approvals_allowed": human_identity and (authenticated or local_approvals_allowed),
             "bind_scope": "loopback" if loopback else "exposed",
             "warning": (
                 "Identité locale non vérifiée; accès local isolé uniquement sur loopback."

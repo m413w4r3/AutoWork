@@ -11,6 +11,7 @@ from httpx import ASGITransport
 
 from cti_app.api.investigation import router as investigation_router
 from cti_app.api.osint_policy import router as policy_router
+from cti_app.application.identity import Identity, IdentityScope
 from cti_app.application.investigation_governance import (
     InvestigationActor,
     SampleQualificationPermissionError,
@@ -33,8 +34,8 @@ from cti_app.domain.investigation import (
     DisclosureBounds,
     EnvelopeAuthorityKind,
     InvestigationBudget,
-    InvestigationExecutionMode,
     InvestigationEnvelope,
+    InvestigationExecutionMode,
     QualificationActorKind,
     SampleAssociation,
     SampleOrigin,
@@ -317,6 +318,64 @@ async def test_no_envelope_denies_bridge_submission_even_with_permissive_source(
     assert fixture.bridge_transport.submission_count == 0
 
 
+def _policy_authorized_envelope(envelope: InvestigationEnvelope) -> InvestigationEnvelope:
+    event_id = uuid4()
+    return replace(
+        envelope,
+        approval_decision_id=event_id,
+        authority_kind=EnvelopeAuthorityKind.OSINT_POLICY,
+        inherited_policy_id=uuid4(),
+        inherited_policy_version=1,
+        inherited_policy_event_id=event_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_bridge_refuses_policy_pin_when_investigation_subject_changes() -> None:
+    fixture = _Fixture(responses=[], tools=())
+    state = await fixture.start()
+    pinned_subject_id = fixture.subject_id
+    fixture.envelopes._items[fixture.investigation_id] = _policy_authorized_envelope(
+        fixture.envelope
+    )
+    investigation = fixture.investigations.items[fixture.investigation_id]
+    fixture.investigations.items[fixture.investigation_id] = replace(
+        investigation,
+        subject_id=uuid4(),
+    )
+
+    async def effective_policy(_investigation_id):
+        return SimpleNamespace(
+            inheritance=SimpleNamespace(subject_id=pinned_subject_id),
+            authorized=True,
+        )
+
+    fixture.service._effective_policy_for = effective_policy
+    await fixture.service.run(state.investigation_id)
+
+    assert fixture.bridge_transport.submission_count == 0
+
+
+@pytest.mark.asyncio
+async def test_bridge_refuses_revoked_policy_pin_before_submission() -> None:
+    fixture = _Fixture(responses=[], tools=())
+    state = await fixture.start()
+    fixture.envelopes._items[fixture.investigation_id] = _policy_authorized_envelope(
+        fixture.envelope
+    )
+
+    async def effective_policy(_investigation_id):
+        return SimpleNamespace(
+            inheritance=SimpleNamespace(subject_id=fixture.subject_id),
+            authorized=False,
+        )
+
+    fixture.service._effective_policy_for = effective_policy
+    await fixture.service.run(state.investigation_id)
+
+    assert fixture.bridge_transport.submission_count == 0
+
+
 @pytest.mark.asyncio
 async def test_external_operator_tool_denied_without_envelope_but_local_read_remains_allowed() -> (
     None
@@ -486,3 +545,182 @@ async def test_operator_client_can_read_context_but_cannot_mutate_g2_or_policy()
     assert context.status_code == 200, context.text
     assert envelope_mutation.status_code == 403
     assert policy_mutation.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_envelope_view_reconstructs_inherited_policy_event_lineage() -> None:
+    fixture, _state, service = await operator_fixture()
+    envelope = _policy_authorized_envelope(fixture.envelope)
+    fixture.envelopes._items[fixture.investigation_id] = envelope
+    policy_id = envelope.inherited_policy_id
+    policy_event_id = envelope.inherited_policy_event_id
+
+    class _PolicyService:
+        async def effective_for(self, uow, _investigation_id):
+            assert uow.osint_open_policies is not None
+            return SimpleNamespace(
+                inheritance=SimpleNamespace(
+                    subject_id=fixture.subject_id,
+                    status=SimpleNamespace(value="active"),
+                ),
+                policy=SimpleNamespace(actor_id="human:policy-activator"),
+                revoked=False,
+                authorized=True,
+            )
+
+    def uow_factory():
+        uow = _Uow(fixture)
+        uow.osint_open_policies = object()
+        return uow
+
+    app = FastAPI()
+    app.include_router(investigation_router)
+    app.state.identity_provider = _IdentityProvider()
+    app.state.uow_factory = uow_factory
+
+    class _EnvelopeCompositionFactory(_CompositionFactory):
+        def build(self, *args, **kwargs):
+            composition = super().build(*args, **kwargs)
+            composition.available_tools = ()
+            return composition
+
+    composition_factory = _EnvelopeCompositionFactory(service, fixture=fixture)
+    composition_factory.osint_open_policy_service = _PolicyService()
+    app.state.investigation_composition_factory = composition_factory
+
+    async with httpx.AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get(f"/api/investigations/{fixture.investigation_id}/envelope")
+
+    assert response.status_code == 200, response.text
+    view = response.json()
+    assert view["authority_kind"] == "osint_policy"
+    assert view["inherited_policy_id"] == str(policy_id)
+    assert view["inherited_policy_version"] == 1
+    assert view["inherited_policy_event_id"] == str(policy_event_id)
+    assert view["approval_decision_id"] == str(policy_event_id)
+    assert view["approval_actor_id"] is None
+    assert view["policy_activated_by"] == "human:policy-activator"
+    assert view["inherited_subject_id"] == str(fixture.subject_id)
+
+
+_MUTATION_REQUESTS = (
+    (
+        "/api/investigations/00000000-0000-0000-0000-000000000001/envelope/approve",
+        {"reason": "review", "correlation_id": "approve", "expected_version": 1},
+    ),
+    (
+        "/api/investigations/00000000-0000-0000-0000-000000000001/envelope/extend",
+        {"reason": "review", "correlation_id": "extend", "expected_version": 1},
+    ),
+    (
+        "/api/investigations/00000000-0000-0000-0000-000000000001/envelope/revoke",
+        {"reason": "review", "correlation_id": "revoke", "expected_version": 1},
+    ),
+    (
+        "/api/osint-open-policy/activate",
+        {
+            "scope": {"kind": "instance", "subject_ids": []},
+            "reason": "review",
+            "correlation_id": "activate",
+        },
+    ),
+    (
+        "/api/osint-open-policy/extend",
+        {
+            "policy_id": "00000000-0000-0000-0000-000000000002",
+            "expected_version": 1,
+            "reason": "review",
+            "correlation_id": "policy-extend",
+            "capabilities": {},
+        },
+    ),
+    (
+        "/api/osint-open-policy/revoke",
+        {
+            "policy_id": "00000000-0000-0000-0000-000000000002",
+            "expected_version": 1,
+            "reason": "review",
+            "correlation_id": "policy-revoke",
+        },
+    ),
+    (
+        "/api/investigations/00000000-0000-0000-0000-000000000001/samples/00000000-0000-0000-0000-000000000003/qualify",
+        {
+            "expected_version": 1,
+            "qualification": "confirmed",
+            "reason": "review",
+            "correlation_id": "confirm",
+        },
+    ),
+    (
+        "/api/investigations/00000000-0000-0000-0000-000000000001/samples/00000000-0000-0000-0000-000000000003/qualify",
+        {
+            "expected_version": 1,
+            "qualification": "rejected",
+            "reason": "review",
+            "correlation_id": "reject",
+        },
+    ),
+)
+
+
+class _AuthenticatedPrincipal:
+    mode = "authenticated"
+    verified = True
+
+    def __init__(self, actor_id: str) -> None:
+        self.actor_id = actor_id
+
+    async def current(self) -> Identity:
+        return Identity(
+            actor_id=self.actor_id,
+            scopes=frozenset({IdentityScope.HUMAN_OPERATOR}),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("actor_id", ("agent:bridge", "system:automation"))
+@pytest.mark.parametrize(("path", "payload"), _MUTATION_REQUESTS)
+async def test_agent_and_system_principals_cannot_use_any_human_mutation_route(
+    actor_id: str, path: str, payload: dict[str, object]
+) -> None:
+    app = FastAPI()
+    app.include_router(investigation_router)
+    app.include_router(policy_router)
+    app.state.identity_provider = _AuthenticatedPrincipal(actor_id)
+
+    async with httpx.AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            path,
+            json=payload,
+            headers={"Idempotency-Key": f"reject-{actor_id}"},
+        )
+
+    assert response.status_code == 403, response.text
+    assert response.json()["detail"]["code"] == "verified_human_operator_required"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("path", "payload"), _MUTATION_REQUESTS)
+async def test_human_mutation_routes_reject_client_supplied_actor_override(
+    path: str, payload: dict[str, object]
+) -> None:
+    app = FastAPI()
+    app.include_router(investigation_router)
+    app.include_router(policy_router)
+    app.state.identity_provider = _AuthenticatedPrincipal("human:verified-operator")
+
+    async with httpx.AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            path,
+            json={**payload, "actor_id": "human:spoofed-client"},
+            headers={"Idempotency-Key": "reject-client-actor-override"},
+        )
+
+    assert response.status_code == 422, response.text
