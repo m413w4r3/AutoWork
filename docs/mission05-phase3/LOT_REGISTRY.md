@@ -37,7 +37,7 @@ R1's map; D after B+C. A's application files are never touched by B/C/D.
 | M05-B | E2E-0 continuous no-sample scenario | B1 Luna Implementer xhigh (full-access, loopback only) | 2e7733be (A branch) | 337f983f → revised `80076e6a` → integrated `8da3300c` | INTEGRATED (partial) | parent 337f983f 1/1; revised 80076e6a 1/1; integrated main 1 passed in 4.55 s | R_B **APPROVED** on 80076e6a as an honest partial (not E2E_NO_SAMPLE_PASS) | `E2E_NO_SAMPLE_PARTIAL`: real P10 and authoritative v4 reparse NOT_DEMONSTRATED | **V3 contradiction**: real P10 service requires origin Samples, impossible in E2E-0 no-sample; v4 reparse needs a v4-parsed archive while the authoritative path archives v2/v3. Driver labels both NOT_DEMONSTRATED. |
 | M05-C | E2E-1 inert synthetic sample scenario | C1 Luna Implementer xhigh (full-access, loopback only) | 73ea620f (main with A) | 2748bdeb → revised `38d9312d` → integrated `222942e2` | INTEGRATED | 2748bdeb parent 1/1; revised 38d9312d parent 1/1 (4.25 s); integrated main 1/1 (5.17 s) | R_C **REVISE** on 2748bdeb; **APPROVED** on 38d9312d (4 findings resolved) | `E2E_SYNTHETIC_SAMPLE_PASS`; real VT transport and MinIO/S3 NOT_DEMONSTRATED |
 | M05-F | Fix Advisor missing-ref UnboundLocalError -> typed refusal | F1 Luna Implementer xhigh | 7c549ec3 | a1b356c6 → integrated `12671c6a` | INTEGRATED | integrated main: 241 advisor tests passed; anti-slop SHA unchanged | R_F Luna xhigh **APPROVED** (2 MINOR, no blocker) | Unblocked C | Unblocks M05-C; no byte change |
-| M05-D | Adversarial replay, regression gates, cross-review | D1 Luna Implementer high + reviewer xhigh | C-integrated | — | PLANNED | — | R_D xhigh, not B/C implementers | Depends B+C |
+| M05-D | Adversarial replay, regression gates, cross-review | D1 Luna Implementer xhigh (full-access, loopback only) | 37690820 | — | RUNNING | adversarial module + global gates | R_D xhigh RUNNING after candidate | Depends B+C; not a B/C implementer |
 
 Status vocabulary: `PLANNED / RUNNING / REVIEW / APPROVED / BLOCKED /
 INTEGRATED`. A lot is integrable only with relevant tests green and an
@@ -65,9 +65,9 @@ Required final set in `docs/mission05-phase3/`: `ARCHITECTURE_DECISIONS.md`,
 DEEP_ADVISOR_PREPARATION_PASS|REVISE : NOT_RUN
 E2E_NO_SAMPLE_PASS|PARTIAL|BLOCKED    : E2E_NO_SAMPLE_PARTIAL (driver integrated; real P10 + authoritative v4 reparse NOT_DEMONSTRATED)
 E2E_SYNTHETIC_SAMPLE_PASS|PARTIAL|BLOCKED : E2E_SYNTHETIC_SAMPLE_PASS (offline inert journey; real VT transport + MinIO/S3 NOT_DEMONSTRATED)
-PHASE3_OFFLINE_PASS|PARTIAL           : NOT_RUN
+PHASE3_OFFLINE_PASS|PARTIAL           : PHASE3_OFFLINE_PARTIAL (E2E-1 PASS; E2E-0 PARTIAL: real P10 + authoritative v4 reparse NOT_DEMONSTRATED; D pending)
 S3_BLOCKED_DESIGN                     : S3_BLOCKED_DESIGN (unchanged)
 ADVISOR_CUTOVER_BLOCKED_BY_S3         : ADVISOR_CUTOVER_BLOCKED_BY_S3 (unchanged)
-MAIN_LOCAL_REVIEWED|NOT_READY         : NOT_READY
+MAIN_LOCAL_REVIEWED|NOT_READY         : pending D integration and final gates
 READY_FOR_MAIN_PUSH_REVIEW|NO_GO      : NO_GO
 ```
