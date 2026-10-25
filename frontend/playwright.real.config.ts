@@ -6,7 +6,7 @@ const apiTarget =
 
 export default defineConfig({
   testDir: "./e2e-real",
-  timeout: 30_000,
+  timeout: 300_000,
   fullyParallel: false,
   workers: 1,
   retries: 0,

@@ -283,13 +283,12 @@ test("enquête A, publication augmentée, repin humain et PDF réel", async ({
       .getByLabel("Constats importants")
       .getByText("Shodan observed indexed services on the article IOC."),
   ).toBeVisible();
+  await page.getByRole("button", { name: "Échantillons" }).click();
   await expect(
     page
       .getByLabel("Nouvelles variantes et échantillons")
       .getByText(state.candidate_sha256, { exact: true }),
   ).toBeVisible();
-
-  await page.getByRole("button", { name: "Échantillons" }).click();
   const sampleCard = page
     .locator('section[aria-labelledby="investigation-samples-heading"] li')
     .filter({ hasText: state.candidate_sha256 });

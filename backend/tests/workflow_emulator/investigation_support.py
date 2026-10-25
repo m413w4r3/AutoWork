@@ -721,6 +721,11 @@ def investigation_settings(
         )
     return Settings.model_construct(
         investigation_max_cycles=12,
+        # Offline workflow tests drive the scripted transport directly; the
+        # production bridge pacing interval would make multi-turn scenarios
+        # exceed the browser test timeout without testing anything real.
+        openai_bridge_min_submission_interval_seconds=0,
+        openai_bridge_submission_jitter_fraction=0,
         investigation_max_vt_read_units=24,
         investigation_max_shodan_credits=4,
         investigation_max_hits_acquired=1,
