@@ -57,6 +57,7 @@ Any M05-A byte change would be visible here.
 | M05-A | 2e7733be | `tests/test_investigation_advisor_tools.py` | PASS, 125 passed | 3.18 s |
 | M05-A | 2e7733be | ruff check on changed source/tests; mypy on advisor modules | PASS | — |
 | M05-A | 2e7733be | anti-slop advisor prompt SHA | unchanged `54c9f454f0e80c95e518279c6a3205a776714db84964039a1fdaa0c7ebecafab` | byte parity |
+| M05-A | integrated `b8a10165` | golden + 6 advisor files + `test_investigation_advisor_tools.py` on main | PASS, 240 passed | 5.37 s |
 | M05-B | — | — | NOT_RUN | pending |
 | M05-C | — | — | NOT_RUN | pending |
 | M05-D | — | — | NOT_RUN | pending |

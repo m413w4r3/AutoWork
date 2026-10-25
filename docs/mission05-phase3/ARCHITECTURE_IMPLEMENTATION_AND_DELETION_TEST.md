@@ -1,6 +1,6 @@
 # Mission 05 — architecture implementation and deletion test
 
-Status: **M05-A candidate reviewed — see verdict at the end.** Only what the
+Status: **M05-A INTEGRATED on local main at `b8a10165`.** Only what the
 integrated commit and executed tests prove is recorded here.
 
 ## Modules before / after
@@ -78,8 +78,17 @@ integrated commit and executed tests prove is recorded here.
 
 - Reviewer: separate Paseo Luna xhigh session, read-only, candidate
   `2e7733be2c0a636b68cd82fb813d5e118f108380`.
-- Verdict: **PENDING** (written here when the reviewer returns; a `REVISE`
-  blocks integration).
+- Verdict: **APPROVED** — 2 MINOR findings, no blocker:
+  1. the baseline shim replay produced three architecture failures (the
+     reviewer's enumeration had two); the third is
+     `test_prompt_renderer_and_preparation_do_not_import_the_legacy_tool`,
+     which correctly detects the baseline dependency;
+  2. the AST check covers `ast.ImportFrom` but not `ast.Import`; the reviewer
+     manually verified both forms are absent in the candidate.
+- Reviewer's independent results: baseline shim replay 4 passed + 3 expected
+  architecture failures; candidate golden 7 passed; full advisor set 114
+  passed/1 skipped (worktree), 240 passed on integrated `main`; ruff and mypy
+  clean; scope limited to the renderer/preparation files and tests.
 
 ## Residual risks
 
