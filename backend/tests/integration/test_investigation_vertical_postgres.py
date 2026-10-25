@@ -655,6 +655,9 @@ async def test_real_postgres_tool_path_classifies_vt_download_route_404_as_needs
                 await uow.tool_invocations.list_for_investigation(seeded.investigation.id)
             )
             envelope = await uow.investigation_envelopes.get(seeded.investigation.id)
+            observations = await uow.evidence_observations.list_for_investigation(
+                seeded.investigation.id
+            )
             failed_attempt = await uow.sample_acquisition_attempts.find_latest_error(
                 seeded.investigation.id, material.sample_hash
             )
@@ -664,10 +667,16 @@ async def test_real_postgres_tool_path_classifies_vt_download_route_404_as_needs
             f"/api/v3/files/{material.sample_hash}/download_url",
         ]
         # The 404 body cannot be attributed to VT or its proxy, so the external
-        # outcome is ambiguous and must be reconciled before any retry. An
-        # ambiguous adapter outcome deliberately carries no evidence refs.
+        # outcome is ambiguous and must be reconciled before any retry. Only a
+        # framework diagnostic is persisted; the adapter output is not.
         assert invocation.status is ToolInvocationStatus.NEEDS_REVIEW
-        assert invocation.response_refs == ()
+        assert len(invocation.response_refs) == 1
+        diagnostic_observation = next(
+            item for item in observations if item.id == invocation.response_refs[0]
+        )
+        diagnostic = await artifact_store.read_json(diagnostic_observation.blob_id)
+        assert diagnostic["result"]["outcome"] == "external_effect_unconfirmed"
+        assert diagnostic["result"]["adapter_output_archived"] is False
         assert invocation.consumed_budget == {}
         # Its plain ledger code (rather than an opaque refusal-cache marker)
         # keeps this 404 diagnostic and retryable after the route/config changes.
@@ -824,9 +833,16 @@ async def test_real_postgres_exhausted_loop_acquisition_budget_is_not_ambiguous(
         )
         # The adapter's deterministic local refusal is not framework-attested:
         # the dispatcher cannot prove adapter non-entry, so the invocation is
-        # conservatively reconciled as ambiguous and carries no evidence refs.
+        # conservatively reconciled as ambiguous and records only the framework
+        # diagnostic, never the adapter output.
         assert invocation.status is ToolInvocationStatus.NEEDS_REVIEW
-        assert invocation.response_refs == ()
+        assert len(invocation.response_refs) == 1
+        diagnostic = next(
+            item for item in observations if item.id == invocation.response_refs[0]
+        )
+        payload = await artifact_store.read_json(diagnostic.blob_id)
+        assert payload["result"]["outcome"] == "external_effect_unconfirmed"
+        assert payload["result"]["adapter_output_archived"] is False
         assert not any(
             item.object_type == FrameworkPreSubmissionProof.BUDGET_REJECTED.value
             for item in observations
