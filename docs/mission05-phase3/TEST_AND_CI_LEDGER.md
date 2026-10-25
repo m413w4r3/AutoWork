@@ -65,7 +65,7 @@ Any M05-A byte change would be visible here.
 | M05-A + integration fix `7e51912a` | — | `make lint-backend` | PASS (849 files formatted); one import-order error found after integration and fixed mechanically without behaviour change | — |
 | M05-A | integrated `7e51912a` | `make typecheck-backend` | PASS, no issues in 822 source files | — |
 | M05-A | integrated `7e51912a` | `make test-ci-scripts` | PASS, 5 tests | 0.001 s |
-| M05-B | — | — | NOT_RUN | pending |
+| M05-B | 80076e6a → integrated `8da3300c` | `pytest -m integration tests/integration/test_investigation_e2e_no_sample_postgres.py` | PASS, 1 passed | 4.55 s integrated main; 4.00 s implementer; 4.03 s reviewer |
 | M05-C | — | — | NOT_RUN | pending |
 | M05-D | — | — | NOT_RUN | pending |
 
