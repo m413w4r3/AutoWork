@@ -511,6 +511,34 @@ async def test_api_status_disallows_local_approvals_in_protected_environment(
 
 
 @pytest.mark.asyncio
+async def test_local_approval_status_and_mutation_gate_use_request_bind_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        api_main,
+        "get_settings",
+        lambda: Settings(app_env="development", api_bind_host="127.0.0.1"),
+    )
+    application = api_main.create_app()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application),
+        base_url="http://0.0.0.0",
+    ) as client:
+        status_response = await client.get("/api/identity/status")
+        approval_response = await client.post(
+            "/api/investigations/00000000-0000-0000-0000-000000000001/envelope/approve",
+            json={"reason": "test", "correlation_id": "request-bind-test"},
+            headers={"Idempotency-Key": "request-bind-test"},
+        )
+
+    assert status_response.status_code == 200
+    assert status_response.json()["bind_scope"] == "exposed"
+    assert status_response.json()["approvals_allowed"] is False
+    assert approval_response.status_code == 403
+    assert approval_response.json()["detail"]["code"] == "verified_human_operator_required"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("environment", ["production", "live"])
 async def test_api_refuses_requests_when_runtime_bind_is_exposed_in_production(
     monkeypatch: pytest.MonkeyPatch,

@@ -568,26 +568,51 @@ async def test_operator_client_can_read_context_but_cannot_mutate_g2_or_policy()
 async def test_envelope_view_reconstructs_inherited_policy_event_lineage() -> None:
     fixture, _state, service = await operator_fixture()
     envelope = _policy_authorized_envelope(fixture.envelope)
+    activation_correlation_id = "policy-activation-correlation"
+    activation_event_id = uuid4()
+    policy_event_id = uuid4()
+    envelope = replace(
+        envelope,
+        approval_decision_id=policy_event_id,
+        inherited_policy_version=2,
+        inherited_policy_event_id=policy_event_id,
+    )
     fixture.envelopes._items[fixture.investigation_id] = envelope
     policy_id = envelope.inherited_policy_id
-    policy_event_id = envelope.inherited_policy_event_id
 
     class _PolicyService:
         async def effective_for(self, uow, _investigation_id):
             assert uow.osint_open_policies is not None
             return SimpleNamespace(
                 inheritance=SimpleNamespace(
+                    policy_id=policy_id,
+                    policy_version=2,
+                    policy_event_id=policy_event_id,
+                    activation_correlation_id=activation_correlation_id,
                     subject_id=fixture.subject_id,
                     status=SimpleNamespace(value="active"),
                 ),
-                policy=SimpleNamespace(actor_id="human:policy-activator"),
+                policy=SimpleNamespace(actor_id="human:policy-extender"),
                 revoked=False,
                 authorized=True,
             )
 
+    class _PolicyRepository:
+        async def event_for_version(self, requested_policy_id, version):
+            assert requested_policy_id == policy_id
+            assert version == 1
+            return SimpleNamespace(
+                id=activation_event_id,
+                policy_id=policy_id,
+                policy_version=1,
+                event_type="activated",
+                actor_id="human:policy-activator",
+                correlation_id=activation_correlation_id,
+            )
+
     def uow_factory():
         uow = _Uow(fixture)
-        uow.osint_open_policies = object()
+        uow.osint_open_policies = _PolicyRepository()
         return uow
 
     app = FastAPI()
@@ -614,12 +639,96 @@ async def test_envelope_view_reconstructs_inherited_policy_event_lineage() -> No
     view = response.json()
     assert view["authority_kind"] == "osint_policy"
     assert view["inherited_policy_id"] == str(policy_id)
-    assert view["inherited_policy_version"] == 1
+    assert view["inherited_policy_version"] == 2
     assert view["inherited_policy_event_id"] == str(policy_event_id)
     assert view["approval_decision_id"] == str(policy_event_id)
     assert view["approval_actor_id"] is None
     assert view["policy_activated_by"] == "human:policy-activator"
     assert view["inherited_subject_id"] == str(fixture.subject_id)
+
+
+@pytest.mark.asyncio
+async def test_operator_status_projects_policy_authority_without_individual_g2_approval() -> None:
+    fixture, _state, service = await operator_fixture()
+    envelope = _policy_authorized_envelope(fixture.envelope)
+    activation_correlation_id = "status-policy-activation-correlation"
+    activation_event_id = uuid4()
+    policy_event_id = envelope.inherited_policy_event_id
+    envelope = replace(
+        envelope,
+        inherited_policy_version=2,
+        inherited_policy_event_id=policy_event_id,
+    )
+    fixture.envelopes._items[fixture.investigation_id] = envelope
+    policy_id = envelope.inherited_policy_id
+
+    class _PolicyService:
+        async def effective_for(self, _uow, _investigation_id):
+            return SimpleNamespace(
+                inheritance=SimpleNamespace(
+                    policy_id=policy_id,
+                    policy_version=2,
+                    policy_event_id=policy_event_id,
+                    activation_correlation_id=activation_correlation_id,
+                    subject_id=fixture.subject_id,
+                    status=SimpleNamespace(value="active"),
+                ),
+                policy=SimpleNamespace(actor_id="human:policy-extender"),
+                revoked=False,
+                authorized=True,
+            )
+
+    class _PolicyRepository:
+        async def event_for_version(self, requested_policy_id, version):
+            assert requested_policy_id == policy_id
+            assert version == 1
+            return SimpleNamespace(
+                id=activation_event_id,
+                policy_id=policy_id,
+                policy_version=1,
+                event_type="activated",
+                actor_id="human:policy-activator",
+                correlation_id=activation_correlation_id,
+            )
+
+    def uow_factory():
+        uow = _Uow(fixture)
+        uow.osint_open_policies = _PolicyRepository()
+        return uow
+
+    app = FastAPI()
+    app.include_router(investigation_router)
+    app.state.identity_provider = _IdentityProvider()
+    app.state.uow_factory = uow_factory
+
+    class _StatusCompositionFactory(_CompositionFactory):
+        def build(self, *args, **kwargs):
+            composition = super().build(*args, **kwargs)
+            composition.available_tools = ()
+            return composition
+
+    composition_factory = _StatusCompositionFactory(service, fixture=fixture)
+    composition_factory.osint_open_policy_service = _PolicyService()
+    app.state.investigation_composition_factory = composition_factory
+
+    async with httpx.AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get(
+            f"/api/investigations/{fixture.investigation_id}/operator-status"
+        )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["g2"]["approval_decision_id"] is None
+    assert payload["g2"]["approval_actor_id"] is None
+    assert payload["policy_authority"] == {
+        "policy_id": str(policy_id),
+        "policy_version": 2,
+        "policy_event_id": str(policy_event_id),
+        "status": "active",
+        "activated_by": "human:policy-activator",
+    }
 
 
 _MUTATION_REQUESTS = (

@@ -15,6 +15,7 @@ from cti_app.application.bridge_investigator import (
 from cti_app.domain.analyst_opinion import AnalystOpinionV1
 from cti_app.domain.investigation import (
     BudgetDimension,
+    EnvelopeAuthorityKind,
     InvestigationEnvelope,
     InvestigationExecutionMode,
     ToolInvocation,
@@ -160,6 +161,7 @@ def build_investigation_operator_view(
     advisor_guidance: dict[str, Any] | None = None,
     g2_revoked: bool = False,
     g2_reapproval_supported: bool = False,
+    policy_authority: dict[str, Any] | None = None,
     pending_bridge_turn_id: UUID | None = None,
     pending_bridge_turn_status: str | None = None,
     pending_bridge_turn_error_code: str | None = None,
@@ -416,8 +418,22 @@ def build_investigation_operator_view(
                 "revoked": g2_revoked,
                 "reapproval_supported": g2_reapproval_supported,
                 "version": envelope.version if envelope else 0,
-                "approval_decision_id": envelope.approval_decision_id if envelope else None,
-                "approval_actor_id": envelope.approval_actor_id if envelope else None,
+                "approval_decision_id": (
+                    envelope.approval_decision_id
+                    if (
+                        envelope
+                        and envelope.authority_kind is not EnvelopeAuthorityKind.OSINT_POLICY
+                    )
+                    else None
+                ),
+                "approval_actor_id": (
+                    envelope.approval_actor_id
+                    if (
+                        envelope
+                        and envelope.authority_kind is not EnvelopeAuthorityKind.OSINT_POLICY
+                    )
+                    else None
+                ),
                 "allowed_providers": list(envelope.allowed_providers) if envelope else [],
                 "acquire_hits_allowed": envelope.acquire_hits_allowed if envelope else False,
                 "disclosure": (
@@ -430,6 +446,7 @@ def build_investigation_operator_view(
                     else None
                 ),
             },
+            "policy_authority": policy_authority,
             "budget": budget,
             "budget_reservations": reservations,
             "dependencies": {

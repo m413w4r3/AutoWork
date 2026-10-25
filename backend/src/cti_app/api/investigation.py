@@ -817,6 +817,7 @@ class InvestigationOperatorStatusResponse(BaseModel):
     evidence_checkpoint: dict[str, Any]
     opinion_checkpoint: dict[str, Any] | None
     g2: dict[str, Any]
+    policy_authority: dict[str, Any] | None = None
     budget: dict[str, Any]
     budget_reservations: list[dict[str, Any]]
     dependencies: dict[str, list[str]]
@@ -1391,12 +1392,14 @@ async def _operator_context_invalidation_facts(
         ),
         "allowed_providers": list(getattr(envelope, "allowed_providers", ())),
         "acquire_hits_allowed": getattr(envelope, "acquire_hits_allowed", False),
-        "approval_decision_id": str(getattr(envelope, "approval_decision_id", "")) or None,
+        "approval_decision_id": (
+            None if policy_authority else str(getattr(envelope, "approval_decision_id", "")) or None
+        ),
         "approval_actor_id": (
             None if policy_authority else getattr(envelope, "approval_actor_id", None)
         ),
         "policy_activated_by": (
-            effective_policy.policy.actor_id
+            await _policy_activation_actor(uow, effective_policy)
             if policy_authority and effective_policy is not None
             else None
         ),
@@ -1727,6 +1730,15 @@ async def get_investigation_operator_status(
         g2_revoked = authorization.revoked or bool(
             policy_authority and effective_policy and effective_policy.revoked
         )
+        policy_authority_view = None
+        if policy_authority:
+            policy_authority_view = {
+                "policy_id": str(envelope.inherited_policy_id),
+                "policy_version": envelope.inherited_policy_version,
+                "policy_event_id": str(envelope.inherited_policy_event_id),
+                "status": _policy_authority_status(effective_policy),
+                "activated_by": await _policy_activation_actor(uow, effective_policy),
+            }
         invocations = tuple(await uow.tool_invocations.list_for_investigation(investigation_id))
         observations = tuple(
             await uow.evidence_observations.list_for_investigation(investigation_id)
@@ -1802,6 +1814,7 @@ async def get_investigation_operator_status(
             synthesis_sha256=snapshot.synthesis_sha256,
             envelope=envelope,
             g2_revoked=g2_revoked,
+            policy_authority=policy_authority_view,
             g2_reapproval_supported=(
                 not policy_authority
                 and authorization.revoked
@@ -3095,7 +3108,7 @@ async def _current_envelope_view(request: Request, investigation_id: UUID) -> En
             approval_decision_id=current.approval_decision_id,
             approval_actor_id=None if policy_authority else current.approval_actor_id,
             policy_activated_by=(
-                effective_policy.policy.actor_id
+                await _policy_activation_actor(uow, effective_policy)
                 if policy_authority and effective_policy is not None
                 else None
             ),
@@ -3895,6 +3908,35 @@ async def _effective_osint_policy(request: Request, uow: Any, investigation_id: 
     return await service.effective_for(uow, investigation_id)
 
 
+async def _policy_activation_actor(uow: Any, effective_policy: Any) -> str | None:
+    """Resolve the original activator from the durable version-one activation event."""
+    inheritance = getattr(effective_policy, "inheritance", None)
+    repository = getattr(uow, "osint_open_policies", None)
+    event_reader = getattr(repository, "event_for_version", None)
+    if inheritance is None or not callable(event_reader):
+        return None
+    event = await event_reader(inheritance.policy_id, 1)
+    if event is None:
+        return None
+    event_type = getattr(getattr(event, "event_type", None), "value", event.event_type)
+    if (
+        event.policy_id != inheritance.policy_id
+        or event.policy_version != 1
+        or event_type != "activated"
+        or event.correlation_id != inheritance.activation_correlation_id
+    ):
+        return None
+    return event.actor_id
+
+
+def _policy_authority_status(effective_policy: Any) -> str:
+    if effective_policy is None:
+        return "unavailable"
+    if effective_policy.revoked:
+        return "revoked"
+    return effective_policy.inheritance.status.value
+
+
 def _uow_factory(request: Request) -> Any:
     factory = getattr(request.app.state, "uow_factory", None)
     if factory is None:
@@ -3942,7 +3984,13 @@ async def _require_verified_human_operator(request: Request) -> Any:
     if provider_mode == "local":
         settings = getattr(request.app.state, "settings", None)
         app_env = str(getattr(settings, "app_env", "")).strip().casefold()
-        bind_host = str(getattr(settings, "api_bind_host", ""))
+        server = request.scope.get("server")
+        server_host = server[0] if isinstance(server, tuple) and server else None
+        bind_host = (
+            server_host
+            if isinstance(server_host, str)
+            else str(getattr(settings, "api_bind_host", ""))
+        )
         if app_env not in PROTECTED_APP_ENVIRONMENTS and is_loopback_bind_host(bind_host):
             return identity
     raise _http_error(403, "verified_human_operator_required")
