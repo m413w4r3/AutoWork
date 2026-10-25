@@ -37,6 +37,8 @@ made; all transports are local fakes.
 | `pytest -m integration tests/integration/test_investigation_acquisition_postgres.py` | PASS, 6 passed | 5.58 s |
 | `pytest tests/test_advisor_consultation.py tests/test_advisor_wire.py tests/test_advisor_completeness.py tests/test_advisor_anti_slop_eval.py tests/test_operator_tool_invocation.py` | PASS, 108 passed | 2.76 s |
 | `pytest tests/test_investigation_advisor_tools.py` | PASS, 125 passed | 3.75 s |
+| `make test-backend` (full non-integration suite) | PASS, 4904 passed, 2 skipped, 31 deselected | 137.51 s |
+| golden replay at baseline `55fba67d` (copied `test_advisor_prompt_golden.py` into a detached worktree) | expected RED: 4 passed, 2 failed — failures are exactly the private-renderer inversion tests | 0.91 s |
 
 Baseline anti-slop prompt fingerprint (observed in the test output):
 advisor wire `advisor-wire.v1`, response `advisor-response.v3`, source parser
@@ -51,7 +53,10 @@ Any M05-A byte change would be visible here.
 | Lot | SHA | Command | Result | Notes |
 |---|---|---|---|---|
 | M05-DOCS | 0db6a90 | docs only | NOT_APPLICABLE | registry + briefs |
-| M05-A | — | — | NOT_RUN | pending implementer + independent reviewer |
+| M05-A | 2e7733be | advisor suite (golden + consultation + wire + completeness + anti-slop + operator invocation) | PASS, 114 passed, 1 skipped (archived Run12 corpus absent) | 2.12 s, independent parent rerun |
+| M05-A | 2e7733be | `tests/test_investigation_advisor_tools.py` | PASS, 125 passed | 3.18 s |
+| M05-A | 2e7733be | ruff check on changed source/tests; mypy on advisor modules | PASS | — |
+| M05-A | 2e7733be | anti-slop advisor prompt SHA | unchanged `54c9f454f0e80c95e518279c6a3205a776714db84964039a1fdaa0c7ebecafab` | byte parity |
 | M05-B | — | — | NOT_RUN | pending |
 | M05-C | — | — | NOT_RUN | pending |
 | M05-D | — | — | NOT_RUN | pending |

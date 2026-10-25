@@ -2,6 +2,11 @@
 
 Date opened: 2026-10-25. Owner prompt:
 `.prompts/PROMPT_PASEO_AUTOWORK_MISSION05_PHASE3_V3_EXECUTION_ARCHITECTURE_E2E.md`.
+`.prompts/` is gitignored, so it is absent from Paseo worktrees; recon agents
+therefore worked from the checked-in `ARCHITECTURE_DECISIONS.md` plus their
+briefs. The parent applied the V3 requirements when writing those briefs.
+`BLOCKED_V3_PROMPT_SOURCE` in an agent report is a worktree-visibility note,
+not a mission blocker.
 Baseline: `main@55fba67d5882c1ae6c4abff4e74c53a24e57649f`
 (clean worktree, `origin/main` identical at preflight).
 
@@ -26,9 +31,9 @@ R1's map; D after B+C. A's application files are never touched by B/C/D.
 | Lot | Objective | Agent (Paseo) | Base SHA | Result SHA | Status | Tests actually run | Review | Risks / deps |
 |---|---|---|---|---|---|---|---|---|
 | M05-DOCS | Open registry, DAG, briefs, decisions | parent | 55fba67d | (this commit) | INTEGRATED | docs only | n/a | none |
-| M05-A | TARGET_A deep Advisor preparation, one pure renderer, byte parity | A1 Luna Implementer xhigh | 55fba67d | — | RUNNING | — | R_A Luna Audit xhigh independent, pending | Golden capture required before source edits |
-| M05-R0 | Map E2E-0 seams/gaps, no edits | R0 Luna Audit xhigh | 55fba67d | — | RUNNING | — | n/a | Read-only |
-| M05-R1 | Map E2E-1 sample/storage/D7 gaps, no edits | R1 Luna Audit xhigh | 55fba67d | — | RUNNING | — | n/a | Read-only |
+| M05-A | TARGET_A deep Advisor preparation, one pure renderer, byte parity | A1 Luna Implementer xhigh | 55fba67d | 2e7733be (branch `m05a/advisor-deep`) | REVIEW | candidate: 114 passed/1 skipped; advisor tools 125 passed; ruff+mypy clean; parent independently reran the same | R_A Luna xhigh independent, RUNNING | Golden + 2 RED replayed at baseline; anti-slop SHA unchanged |
+| M05-R0 | Map E2E-0 seams/gaps, no edits | R0 Luna Audit xhigh | 55fba67d | 0db6a904 (read-only) | DONE — report in `_work/R0_E2E0_MAP.md` | no repo test run in agent sandbox (loopback denied); parent baseline run PASS | n/a | Found existing vertical test acquires a sample; context/advisor/audit/PDF/restart absent from one journey |
+| M05-R1 | Map E2E-1 sample/storage/D7 gaps, no edits | R1 Luna Audit xhigh | 55fba67d | 0db6a904 (read-only) | DONE — report in `_work/R1_E2E1_MAP.md` | no repo test run in agent sandbox (loopback denied); parent acquisition run PASS 6/6 | n/a | Filesystem blob store is the existing isolated test store; MinIO test-only isolatable but unproven; D7 matrix exists at unit level only |
 | M05-B | E2E-0 continuous no-sample scenario | B1 Luna Implementer xhigh | A-integrated | — | PLANNED | — | R_B Luna Audit xhigh | Depends R0, A |
 | M05-C | E2E-1 inert synthetic sample scenario | C1 Luna Implementer xhigh | B-integrated | — | PLANNED | — | R_C Luna Audit xhigh | Depends B, R1 |
 | M05-D | Adversarial replay, regression gates, cross-review | D1 Luna Implementer high + reviewer xhigh | C-integrated | — | PLANNED | — | R_D xhigh, not B/C implementers | Depends B+C |
