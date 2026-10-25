@@ -78,7 +78,7 @@ Any M05-A byte change would be visible here.
 | `make test-backend` | PASS at baseline 55fba67d (4904 passed, 2 skipped) — must be rerun at final SHA |
 | `make test-integration` (full) | NOT_RUN |
 | `make test-workflow` | PASS after M05-A integration (`68aefb2a`): 22 passed, 15 deselected, JUnit guard OK — rerun at final SHA |
-| `make test-workflow-full` | NOT_RUN |
+| `make test-workflow-full` | PASS after A+F+B integration (`58c29429`): 32 passed, 5 deselected, JUnit guard OK — rerun at final SHA |
 | `make test-ci-scripts` | PASS after M05-A integration (`7e51912a`, 5 tests) — rerun at final SHA |
 | frontend gates | NOT_RUN (backend-only change expected; confirm) |
 | full E2E-0 + E2E-1 in a recreated environment | NOT_RUN |
