@@ -88,6 +88,7 @@ async def _make_investigation(session_factory, *, subject_id=None) -> AnalystInv
     from tests.integration.edition_codes import reserve_edition_code
 
     suffix = uuid4().hex
+    edition: Edition | None = None
     if subject_id is None:
         edition = Edition(
             country=f"OSINT policy {suffix}",
@@ -103,12 +104,13 @@ async def _make_investigation(session_factory, *, subject_id=None) -> AnalystInv
             slug=f"osint-policy-{suffix}",
             tlp=TLP.AMBER,
         )
+        edition_id = edition.id
     else:
         async with SqlAlchemyUnitOfWork(session_factory) as uow:
             subject = await uow.subjects.get(subject_id)
         assert subject is not None
-        edition = None
-    run = ProductionRun(subject_id=subject.id, edition_id=edition.id)
+        edition_id = subject.edition_id
+    run = ProductionRun(subject_id=subject.id, edition_id=edition_id)
     artifact = ProductionArtifact(
         production_run_id=run.id,
         subject_id=subject.id,
@@ -141,6 +143,18 @@ async def _activate_for_subject(service: OsintOpenPolicyService, subject_id):
         actor_id="human:integration-operator",
         reason="authorized integration fixture",
         correlation_id=f"activate:{subject_id}",
+    )
+
+
+async def _activate_for_subjects(service: OsintOpenPolicyService, subject_ids):
+    scope_ref = ",".join(sorted(str(subject_id) for subject_id in subject_ids))
+    return await service.activate(
+        scope_kind=OsintScopeKind.SUBJECT_SET,
+        scope_ref=scope_ref,
+        capabilities=_capabilities(),
+        actor_id="human:integration-operator",
+        reason="authorized integration fixture",
+        correlation_id=f"activate:{scope_ref}",
     )
 
 
@@ -221,7 +235,7 @@ async def test_concurrent_start_pins_one_policy_envelope_without_human_decision(
             assert pin.subject_id == investigation.subject_id
             assert pin.policy_version == 1
             assert pin.correlation_id == f"osint-inherit:{policy.policy_id}:1:{investigation.id}"
-            assert decisions == ()
+            assert decisions == []
             await uow.commit()
     finally:
         await engine.dispose()
@@ -270,10 +284,12 @@ async def test_prior_invocation_unpinned_and_manual_g2_cases_do_not_auto_inherit
     factory = _uow_factory(session_factory)
     service = _service(session_factory)
     old = await _make_investigation(session_factory)
-    manual = await _make_investigation(session_factory, subject_id=old.subject_id)
-    latest_new_inv = await _make_investigation(session_factory, subject_id=old.subject_id)
+    manual = await _make_investigation(session_factory)
+    latest_new_inv = await _make_investigation(session_factory)
     try:
-        policy = await _activate_for_subject(service, old.subject_id)
+        policy = await _activate_for_subjects(
+            service, (old.subject_id, manual.subject_id, latest_new_inv.subject_id)
+        )
         async with factory() as uow:
             await uow.tool_invocations.add_if_absent(
                 ToolInvocation(
@@ -349,8 +365,13 @@ async def test_revocation_updates_api_view_effective_status_and_preserves_local_
     service = _service(session_factory)
     settings = _settings()
     investigation = await _make_investigation(session_factory)
+    no_new_policy = await _make_investigation(session_factory)
+    new_policy_case = await _make_investigation(session_factory)
     try:
-        policy = await _activate_for_subject(service, investigation.subject_id)
+        policy = await _activate_for_subjects(
+            service,
+            (investigation.subject_id, no_new_policy.subject_id, new_policy_case.subject_id),
+        )
         envelope = await _start_with_policy(service, factory, investigation)
         assert envelope is not None
         budget = envelope.budget
@@ -443,25 +464,24 @@ async def test_revocation_updates_api_view_effective_status_and_preserves_local_
         )
         assert manual.authority_kind is EnvelopeAuthorityKind.HUMAN_G2
         assert manual.inherited_policy_id is None
+        assert manual.allowed_providers == ()
+        assert manual.disclosure.external_llm_allowed is False
+        assert manual.budget.limits[BudgetDimension.VT_UNITS] == 0
+        assert manual.budget.reserved[BudgetDimension.VT_UNITS] == 3
+        assert manual.budget.reservations == current.budget.reservations
         async with factory() as uow:
             pin = await uow.osint_open_policies.get_inheritance(investigation.id)
             assert pin is not None and pin.status is OsintInheritanceStatus.SUPERSEDED
             await uow.commit()
 
-        no_new_policy = await _make_investigation(
-            session_factory, subject_id=investigation.subject_id
-        )
         assert await _start_with_policy(service, factory, no_new_policy) is None
         reactivated = await service.activate(
             scope_kind=OsintScopeKind.SUBJECT_SET,
-            scope_ref=str(investigation.subject_id),
+            scope_ref=policy.scope_ref,
             capabilities=_capabilities(),
             actor_id="human:integration-operator",
             reason="new policy authority after revocation",
-            correlation_id=f"reactivate:{investigation.subject_id}",
-        )
-        new_policy_case = await _make_investigation(
-            session_factory, subject_id=investigation.subject_id
+            correlation_id=f"reactivate:{policy.scope_ref}",
         )
         new_envelope = await _start_with_policy(service, factory, new_policy_case)
         assert reactivated.version == 3

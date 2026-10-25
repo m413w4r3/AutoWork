@@ -20,7 +20,6 @@ from cti_app.domain.editorial import (
 )
 from cti_app.domain.investigation import (
     BudgetDimension,
-    BudgetReservationStatus,
     DisclosureBounds,
     EnvelopeAuthorityKind,
     InvestigationBudget,
@@ -386,7 +385,10 @@ class InvestigationEnvelopeService:
             extended = InvestigationEnvelope(
                 investigation_id=investigation_id,
                 allowed_providers=normalized_providers,
-                budget=_copy_budget(current.budget, limits=requested_budget.limits),
+                budget=_copy_budget(
+                    current.budget,
+                    limits=requested_budget.limits,
+                ),
                 acquire_hits_allowed=acquire_hits_allowed,
                 disclosure=disclosure,
                 approval_decision_id=decision.id,
@@ -901,11 +903,10 @@ def _copy_budget(
 ) -> InvestigationBudget:
     copied = InvestigationBudget(limits=dict(budget.limits if limits is None else limits))
     for reservation in budget.reservations:
-        copied.reserve(reservation.operation_key, reservation.amounts)
-        if reservation.status is BudgetReservationStatus.COMMITTED:
-            copied.commit(reservation.operation_key, reservation.committed_amounts)
-        elif reservation.status is BudgetReservationStatus.RELEASED:
-            copied.release(reservation.operation_key)
+        # This copies recorded usage, not a new admission. Revocation can lower
+        # an external limit below an outstanding reservation; preserve the
+        # canonical reservation and its status without revalidating capacity.
+        copied.restore_reservation(reservation)
     return copied
 
 

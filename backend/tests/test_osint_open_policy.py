@@ -16,6 +16,7 @@ from cti_app.application.investigation_governance import (
     InvestigationActor,
     SampleQualificationPermissionError,
     SampleQualificationService,
+    _copy_budget,
 )
 from cti_app.application.investigation_service import InvestigationService
 from cti_app.application.investigation_tools import ToolEffect
@@ -31,6 +32,7 @@ from cti_app.application.osint_open_policy import (
 from cti_app.config import Settings
 from cti_app.domain.investigation import (
     BudgetDimension,
+    BudgetReservationStatus,
     DisclosureBounds,
     EnvelopeAuthorityKind,
     InvestigationBudget,
@@ -114,6 +116,21 @@ def _settings(**overrides: object) -> Settings:
     }
     fields.update(overrides)
     return Settings.model_construct(**fields)
+
+
+def test_budget_copy_preserves_reserved_external_usage_after_revocation() -> None:
+    budget = InvestigationBudget(limits={BudgetDimension.VT_UNITS: 3})
+    reservation = budget.reserve(
+        "reserved-before-revocation",
+        {BudgetDimension.VT_UNITS: 3},
+    )
+
+    copied = _copy_budget(budget, limits={BudgetDimension.VT_UNITS: 0})
+
+    assert copied.limits == {BudgetDimension.VT_UNITS: 0}
+    assert copied.reservations == (reservation,)
+    assert copied.reservations[0].status is BudgetReservationStatus.RESERVED
+    assert copied.reserved[BudgetDimension.VT_UNITS] == 3
 
 
 @pytest.mark.parametrize(
