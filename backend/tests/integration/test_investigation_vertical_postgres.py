@@ -24,6 +24,7 @@ from cti_app.domain.investigation import (
     BudgetDimension,
     FindingAssessment,
     FindingKind,
+    FrameworkPreSubmissionProof,
     NoveltyClass,
     SampleQualification,
     ToolInvocationStatus,
@@ -559,7 +560,7 @@ async def test_postgres_bridge_pre_submission_exhaustion_resumes_with_new_attemp
 
 
 @pytest.mark.asyncio
-async def test_real_postgres_tool_path_classifies_vt_download_route_404_as_unavailable(
+async def test_real_postgres_tool_path_classifies_vt_download_route_404_as_needs_review(
     uow_factory, tmp_path: Path
 ) -> None:
     blob_catalog = BlobCatalogService(
@@ -662,12 +663,13 @@ async def test_real_postgres_tool_path_classifies_vt_download_route_404_as_unava
             f"/api/v3/files/{material.sample_hash}/download",
             f"/api/v3/files/{material.sample_hash}/download_url",
         ]
-        assert invocation.status is ToolInvocationStatus.UNAVAILABLE
+        # The 404 body cannot be attributed to VT or its proxy, so the external
+        # outcome is ambiguous and must be reconciled before any retry.
+        assert invocation.status is ToolInvocationStatus.NEEDS_REVIEW
         assert invocation.response_refs
         assert invocation.consumed_budget
-        # This bare error object cannot be attributed to VT or its proxy. Its
-        # plain ledger code (rather than an opaque refusal-cache marker) keeps
-        # this 404 diagnostic and retryable after the route/config changes.
+        # Its plain ledger code (rather than an opaque refusal-cache marker)
+        # keeps this 404 diagnostic and retryable after the route/config changes.
         assert failed_attempt is not None
         assert failed_attempt.error_code == "virustotal_download_404_origin_unknown"
         assert envelope is not None
@@ -806,6 +808,9 @@ async def test_real_postgres_exhausted_loop_acquisition_budget_is_not_ambiguous(
             invocations = tuple(
                 await uow.tool_invocations.list_for_investigation(seeded.investigation.id)
             )
+            observations = await uow.evidence_observations.list_for_investigation(
+                seeded.investigation.id
+            )
             envelope = await uow.investigation_envelopes.get(seeded.investigation.id)
             persisted = await uow.analyst_investigations.get(seeded.investigation.id)
         invocation = next(item for item in invocations if item.tool_name == "vt.download_sample")
@@ -814,7 +819,11 @@ async def test_real_postgres_exhausted_loop_acquisition_budget_is_not_ambiguous(
             f"{persisted.budget.max_vt_read_units if persisted is not None else None}/"
             f"{persisted.budget.consumed_vt_read_units if persisted is not None else None}"
         )
-        assert invocation.status is ToolInvocationStatus.UNAVAILABLE
+        assert invocation.status is ToolInvocationStatus.NEEDS_REVIEW
+        assert any(
+            item.object_type == FrameworkPreSubmissionProof.BUDGET_REJECTED.value
+            for item in observations
+        )
         assert invocation.response_refs
         assert all(amount == 0 for amount in invocation.consumed_budget.values())
         assert envelope is not None

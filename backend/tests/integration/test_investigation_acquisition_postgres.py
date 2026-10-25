@@ -450,6 +450,9 @@ async def test_g1_registry_download_result_reaches_research_context_in_postgres(
         async def list_for_investigation(self, _investigation_id):
             return ()
 
+        async def version_count_for_investigation(self, _investigation_id):
+            return 0
+
     builder = ResearchContextBuilder(
         article_snapshots=_SnapshotPort(),
         observations=_RepositoryReader("evidence_observations"),
