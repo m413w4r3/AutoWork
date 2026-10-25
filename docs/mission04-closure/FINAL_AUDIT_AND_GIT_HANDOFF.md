@@ -30,8 +30,8 @@ branche à contourner. Le préflight a été répété sur le HEAD final avant p
 |---|---|
 | `origin/main` de départ | `d7cc6b590d3be41dae10299cc03364771fe6bda1` |
 | Branche de clôture | `mission04/closure-after-main` |
-| Merge final | **effectué localement après gates ; SHA dans le rapport final** |
-| Push | **non forcé après préflight répété** |
+| Merge final | `019ee0436ce9ed653b7353e67616700259639cfe` — `--no-ff` de `mission04/closure-after-main` |
+| Push | **non forcé après préflight répété ; run CI vérifié dans le rapport final** |
 | Force-push / réécriture | interdit et non utilisé |
 
 ## 3. Résultats des gates locaux
