@@ -4,9 +4,9 @@ import ast
 import inspect
 import re
 
+from cti_app.application.advisor_prompt import render_advisor_prompt
 from cti_app.application.bridge_investigator import render_investigation_prompt
 from cti_app.application.invariant_proposals import _render_prompt as render_p10_prompt
-from cti_app.application.advisor_prompt import render_advisor_prompt
 
 _FORBIDDEN_FORMAT_REQUEST = re.compile(r"\bjson\b|json\s+object|application/json", re.IGNORECASE)
 _CONSULTATION_TYPES = (
