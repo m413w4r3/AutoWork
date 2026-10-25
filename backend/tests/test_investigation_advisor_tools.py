@@ -2315,6 +2315,76 @@ async def test_restriction_trace_counts_sample_associations_not_observations() -
 
 
 @pytest.mark.asyncio
+async def test_restriction_trace_aggregates_conflicting_sample_records() -> None:
+    investigation_id = uuid4()
+    sample_hash = "8" * 64
+    restriction_text = "Synthetic conflicting-record restriction marker"
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": sample_hash,
+            "strings": [{"value": "RestrictedConflictingMarker", "offset": 16}],
+        },
+    )
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    tool, sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+    _attach_sample_policy(
+        tool,
+        sample_blob_id,
+        sample_hash,
+        license_restriction=restriction_text,
+    )
+    restricted_sample = tool._samples.samples[0]
+    allowed_sample = SimpleNamespace(
+        expected_hash=sample_hash,
+        source_object_id=None,
+        state="quarantined",
+        blob_id=sample_blob_id,
+        tlp=TLP.GREEN,
+        do_not_submit=False,
+        external_llm_allowed=True,
+    )
+    submit_blocked_sample = SimpleNamespace(
+        expected_hash=sample_hash,
+        source_object_id=None,
+        state="quarantined",
+        blob_id=sample_blob_id,
+        tlp=TLP.GREEN,
+        do_not_submit=True,
+        external_llm_allowed=True,
+    )
+    # Records sharing a hash may disagree; the trace must reflect every
+    # restriction that contributed to the veto, not the first matching record.
+    tool._samples = _Samples([allowed_sample, restricted_sample, submit_blocked_sample])
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Review the conflicting sample records.",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, key="operator:advisor:restricted-conflicting-records"),
+    )
+
+    assert transport.calls == []
+    assert result.output["advisor_status"] == "disclosure_restricted"
+    assert result.output["disclosure_restricted_sample_count"] == 1
+    rows = result.output["disclosure_restricted_sample_associations"]
+    assert len(rows) == 1
+    assert tuple(rows[0]["restriction_sources"]) == (
+        "do_not_submit",
+        "license_restriction",
+    )
+    assert restriction_text not in repr(result.output)
+
+
+@pytest.mark.asyncio
 async def test_nested_sample_hash_with_license_restriction_refuses_before_bridge() -> None:
     investigation_id = uuid4()
     sample_hash = "e" * 64

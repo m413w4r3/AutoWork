@@ -3453,14 +3453,18 @@ class InvestigationAdvisorTool:
                     if set(observation_refs).intersection(linked_observations)
                 )
             )
-            sample = next(
-                (
-                    item
-                    for item in samples
-                    if getattr(item, "expected_hash", None) == sample_hash
-                    or getattr(item, "source_object_id", None) == sample_hash
-                ),
-                None,
+            matching_samples = tuple(
+                item
+                for item in samples
+                if getattr(item, "expected_hash", None) == sample_hash
+                or getattr(item, "source_object_id", None) == sample_hash
+            )
+            restriction_sources = sorted(
+                {
+                    source
+                    for item in matching_samples
+                    for source in _sample_restriction_sources(item)
+                }
             )
             matching_associations = tuple(
                 association
@@ -3476,7 +3480,7 @@ class InvestigationAdvisorTool:
                 row: dict[str, object] = {
                     "association_id": (str(association_id) if association_id is not None else None),
                     "sample_sha256": sample_hash,
-                    "restriction_sources": _sample_restriction_sources(sample),
+                    "restriction_sources": restriction_sources,
                     "linked_observation_refs": [str(item) for item in linked_observations],
                 }
                 if linked_findings:
