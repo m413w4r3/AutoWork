@@ -117,6 +117,7 @@ class FakeStore:
         self.sealed: list[tuple[str, str]] = []
         self.reuse_id: UUID | None = uuid4()
         self.reuse_calls: list[ReuseDecision] = []
+        self.refused_reuse_reservations: list[str] = []
         self._first_consume = True
         self.claim_state = EffectClaimState.CONSUMED
         self.handoff_nonce: UUID | None = None
@@ -209,6 +210,17 @@ class FakeStore:
     ) -> UUID | None:
         self.reuse_calls.append(decision)
         return self.reuse_id
+
+    async def release_refused_reuse_reservation(
+        self,
+        claim: ExternalEffectClaim,
+        authority: ExternalEffectAuthority,
+        prepared: PreparedExternalRequest,
+    ) -> bool:
+        if authority.invocation_id is not None and authority.invocation_id != claim.invocation_id:
+            self.refused_reuse_reservations.append(authority.operation_key)
+            return True
+        return False
 
 
 class FakeTransport:
@@ -577,6 +589,7 @@ async def test_completed_effect_requires_family_reuse_policy_and_records_zero_bu
     assert isinstance(denied, Refused)
     assert denied.reason == "effect_occurrence_required"
     assert no_policy_transport.calls == []
+    assert store.refused_reuse_reservations == ["op-1"]
 
     transport = FakeTransport()
     policy = AllowReuse(claim.invocation_id, refs)

@@ -37,7 +37,9 @@ from cti_app.domain.external_effects import (
 )
 from cti_app.domain.investigation import (
     AgendaItem,
+    BudgetDimension,
     InvestigationAgenda,
+    InvestigationBudget,
     InvestigationExecutionMode,
 )
 from cti_app.domain.investigation_state import InvestigationWorkingState
@@ -58,6 +60,7 @@ from cti_app.infrastructure.database.repositories.external_effects import (
     ExternalEffectFamilyBinding,
     SqlAlchemyExternalEffectClaimStore,
 )
+from cti_app.infrastructure.database.repositories.investigation import _budget_to_payload
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
 from tests.workflow_emulator.investigation_support import seed_verified_article
@@ -159,16 +162,30 @@ class _ClaimBarrierStore:
         self._delegate = delegate
         self._barrier = barrier
         self._timeout_seconds = timeout_seconds
+        self._participants_remaining = barrier.parties
+        self._barrier_aborted = False
+        self._barrier_state_lock = asyncio.Lock()
 
     async def consume(self, *args: Any, **kwargs: Any):
+        async with self._barrier_state_lock:
+            should_wait = not self._barrier_aborted and self._participants_remaining > 0
+            if should_wait:
+                self._participants_remaining -= 1
+        if not should_wait:
+            return await self._delegate.consume(*args, **kwargs)
         try:
             await asyncio.wait_for(self._barrier.wait(), timeout=self._timeout_seconds)
         except TimeoutError as exc:
             # A caller may have refused during coordinator pre-validation and
-            # never reached this seam. Break the barrier so no peer waits on it.
+            # never reached this seam. Break the one-shot barrier so no peer
+            # waits on it; later replay calls bypass this already-used gate.
+            async with self._barrier_state_lock:
+                self._barrier_aborted = True
             await self._barrier.abort()
             raise RuntimeError("claim workers did not rendezvous before timeout") from exc
         except asyncio.BrokenBarrierError as exc:
+            async with self._barrier_state_lock:
+                self._barrier_aborted = True
             raise RuntimeError("claim worker barrier was aborted") from exc
         return await self._delegate.consume(*args, **kwargs)
 
@@ -224,6 +241,11 @@ async def _prepare_case(
     subject_id = seeded.subject.id
     approval_id = uuid4()
     now = datetime.now(UTC)
+    budget = InvestigationBudget(limits={BudgetDimension.VT_UNITS: max(1, invocations)})
+    operation_keys = [f"external-effect-op-{uuid4()}" for _ in range(invocations)]
+    for operation_key in operation_keys:
+        budget.reserve(operation_key, {BudgetDimension.VT_UNITS: 1})
+    budget_snapshot = _budget_to_payload(budget)
     authorities: list[tuple[ExternalEffectAuthority, PreparedExternalRequest]] = []
     async with session_factory() as session:
         async with session.begin():
@@ -240,7 +262,7 @@ async def _prepare_case(
                 .values(
                     investigation_id=seeded.investigation.id,
                     allowed_providers=[_PROVIDER],
-                    budget_snapshot={},
+                    budget_snapshot=budget_snapshot,
                     acquire_hits_allowed=True,
                     disclosure_tlp="clear",
                     disclosure_do_not_submit=False,
@@ -255,7 +277,7 @@ async def _prepare_case(
                     index_elements=[InvestigationEnvelopeRow.investigation_id],
                     set_={
                         "allowed_providers": [_PROVIDER],
-                        "budget_snapshot": {},
+                        "budget_snapshot": budget_snapshot,
                         "acquire_hits_allowed": True,
                         "disclosure_tlp": "clear",
                         "disclosure_do_not_submit": False,
@@ -269,7 +291,7 @@ async def _prepare_case(
                 )
             )
             for index in range(invocations):
-                operation_key = f"external-effect-op-{uuid4()}"
+                operation_key = operation_keys[index]
                 invocation_id = uuid4()
                 session.add(
                     ToolInvocationRow(
@@ -400,6 +422,7 @@ async def test_concurrent_same_effect_and_replay_make_one_send(
             )
         )
         assert transport.calls == 1
+        completed_result = next(result for result in results if isinstance(result, Completed))
         assert sum(isinstance(result, Completed) for result in results) == 1
         assert sum(isinstance(result, (Refused, Ambiguous)) for result in results) == 1
         first_authority, first_prepared = authorities[0]
@@ -408,6 +431,12 @@ async def test_concurrent_same_effect_and_replay_make_one_send(
         assert replay.reason == "effect_occurrence_required"
         assert transport.calls == 1
         async with session_factory() as session:
+            completed_claim = await session.get(ExternalEffectClaimRow, completed_result.claim_id)
+            first_reservation = await session.get(
+                InvestigationBudgetReservationRow,
+                (investigation_id, first_authority.operation_key),
+            )
+            envelope = await session.get(InvestigationEnvelopeRow, investigation_id)
             claim_count = await session.scalar(
                 select(func.count())
                 .select_from(ExternalEffectClaimRow)
@@ -426,6 +455,22 @@ async def test_concurrent_same_effect_and_replay_make_one_send(
                     ExternalEffectUseRow.use_kind == "SENT",
                 )
             )
+        assert completed_claim is not None
+        assert first_reservation is not None
+        assert envelope is not None
+        first_budget_reservation = next(
+            item
+            for item in envelope.budget_snapshot["reservations"]
+            if item["operation_key"] == first_authority.operation_key
+        )
+        if first_authority.invocation_id == completed_claim.invocation_id:
+            assert first_reservation.status == "reserved"
+            assert first_budget_reservation["status"] == "reserved"
+            assert envelope.version == 4
+        else:
+            assert first_reservation.status == "released"
+            assert first_budget_reservation["status"] == "released"
+            assert envelope.version == 5
         assert claim_count == 1
         assert sent_count == 1
     finally:

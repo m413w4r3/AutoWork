@@ -42,6 +42,7 @@ from cti_app.domain.external_effects import (
 from cti_app.domain.external_effects import (
     effect_key as compute_effect_key,
 )
+from cti_app.domain.investigation import BudgetReservationStatus
 from cti_app.infrastructure.database.models.core import SampleRow, SourceDocumentRow
 from cti_app.infrastructure.database.models.external_effects import (
     ExternalEffectClaimRow,
@@ -65,6 +66,10 @@ from cti_app.infrastructure.database.models.production import (
     SampleAcquisitionAttemptRow,
 )
 from cti_app.infrastructure.database.models.retrohunt import RetrohuntReservationRow
+from cti_app.infrastructure.database.repositories.investigation import (
+    _budget_from_payload,
+    _budget_to_payload,
+)
 
 
 class _ConsumeDenied(Exception):
@@ -247,10 +252,7 @@ class SqlAlchemyExternalEffectClaimStore:
                         envelope,
                         invocation,
                         family_binding,
-                        allow_nonrunning_invocation=(
-                            existing is not None
-                            and existing.state != EffectClaimState.COMPLETED.value
-                        ),
+                        allow_nonrunning_invocation=existing is not None,
                     )
                     self._validate_family_source_refs(family_binding, invocation, prepared)
                     if existing is not None:
@@ -707,6 +709,118 @@ class SqlAlchemyExternalEffectClaimStore:
                     return use_id
         except _ConsumeDenied:
             return None
+
+    async def release_refused_reuse_reservation(
+        self,
+        claim: ExternalEffectClaim,
+        authority: ExternalEffectAuthority,
+        prepared: PreparedExternalRequest,
+    ) -> bool:
+        """Release only a different invocation's still-reserved replay budget."""
+
+        if (
+            claim.state is not EffectClaimState.COMPLETED
+            or claim.investigation_id != authority.investigation_id
+            or authority.invocation_id is None
+            or authority.invocation_id == claim.invocation_id
+        ):
+            return False
+        if (
+            authority.authority_kind is ExternalEffectAuthorityKind.OSINT_POLICY
+            and self._policy_guard is None
+        ):
+            return False
+        family_binding = self._family_bindings.get(prepared.family)
+        if (
+            family_binding is None
+            or family_binding.provider != prepared.provider
+            or prepared.provider_scope not in family_binding.provider_scopes
+            or prepared.normalizer_version not in family_binding.normalizer_versions
+        ):
+            return False
+        try:
+            async with self._session_factory() as session:
+                async with session.begin():
+                    if authority.authority_kind is ExternalEffectAuthorityKind.OSINT_POLICY:
+                        assert self._policy_guard is not None
+                        try:
+                            policy_locked = await self._policy_guard.lock_for_consume(
+                                session, authority
+                            )
+                        except Exception as exc:
+                            raise _ConsumeDenied("osint_policy_lock_failed") from exc
+                        if not policy_locked:
+                            raise _ConsumeDenied("osint_policy_denied")
+                    (
+                        investigation,
+                        envelope,
+                        invocation,
+                        reservation,
+                        _amount_rows,
+                    ) = await self._lock_authority(
+                        session,
+                        authority,
+                        prepared,
+                        claim.effect_key,
+                        allow_any_reservation_state=True,
+                    )
+                    await self._check_authority(
+                        session,
+                        authority,
+                        prepared,
+                        claim.effect_key,
+                        investigation,
+                        envelope,
+                        invocation,
+                        family_binding,
+                        allow_nonrunning_invocation=True,
+                    )
+                    self._validate_family_source_refs(family_binding, invocation, prepared)
+                    existing = await session.scalar(
+                        select(ExternalEffectClaimRow)
+                        .where(
+                            ExternalEffectClaimRow.investigation_id == authority.investigation_id,
+                            ExternalEffectClaimRow.effect_key == claim.effect_key,
+                        )
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                    if (
+                        existing is None
+                        or existing.id != claim.id
+                        or existing.state != EffectClaimState.COMPLETED.value
+                        or existing.invocation_id != claim.invocation_id
+                        or existing.application_request_sha256
+                        != prepared.application_request_sha256
+                        or existing.canonical_request_sha256 != prepared.canonical_request_sha256
+                        or reservation.status != "reserved"
+                    ):
+                        return False
+                    try:
+                        budget = _budget_from_payload(envelope.budget_snapshot)
+                    except (KeyError, TypeError, ValueError):
+                        return False
+                    budget_reservation = next(
+                        (
+                            item
+                            for item in budget.reservations
+                            if item.operation_key == authority.operation_key
+                        ),
+                        None,
+                    )
+                    if (
+                        budget_reservation is None
+                        or budget_reservation.status is not BudgetReservationStatus.RESERVED
+                    ):
+                        return False
+                    budget.release(authority.operation_key)
+                    envelope.budget_snapshot = _budget_to_payload(budget)
+                    envelope.version += 1
+                    envelope.updated_at = datetime.now(UTC)
+                    reservation.status = "released"
+                    return True
+        except _ConsumeDenied:
+            return False
 
     async def _lock_authority(
         self,

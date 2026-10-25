@@ -161,6 +161,13 @@ class ExternalEffectClaimStore(Protocol):
         decision: ReuseDecision,
     ) -> UUID | None: ...
 
+    async def release_refused_reuse_reservation(
+        self,
+        claim: ExternalEffectClaim,
+        authority: ExternalEffectAuthority,
+        prepared: PreparedExternalRequest,
+    ) -> bool: ...
+
 
 @dataclass(frozen=True, slots=True)
 class TransportResponse:
@@ -619,6 +626,7 @@ class ExternalEffectCoordinator:
         if claim.state is EffectClaimState.COMPLETED:
             policy = self._reuse_policies.get(prepared.family)
             if policy is None:
+                await self._release_refused_reuse_reservation(claim, authority, prepared)
                 return Refused(
                     "effect_occurrence_required",
                     FrameworkNoSendProof("EXISTING_CLAIM", "effect_occurrence_required"),
@@ -628,6 +636,7 @@ class ExternalEffectCoordinator:
             except Exception:
                 decision = None
             if decision is None:
+                await self._release_refused_reuse_reservation(claim, authority, prepared)
                 return Refused(
                     "effect_occurrence_required",
                     FrameworkNoSendProof("REUSE_POLICY", "effect_occurrence_required"),
@@ -651,6 +660,19 @@ class ExternalEffectCoordinator:
         if claim.state is EffectClaimState.DEFINITIVELY_NOT_SUBMITTED:
             return DefinitelyNotSubmitted(claim.id)
         return Ambiguous(claim.id)
+
+    async def _release_refused_reuse_reservation(
+        self,
+        claim: ExternalEffectClaim,
+        authority: ExternalEffectAuthority,
+        prepared: PreparedExternalRequest,
+    ) -> None:
+        try:
+            await self._claim_store.release_refused_reuse_reservation(claim, authority, prepared)
+        except Exception:
+            # A release failure cannot authorize another send; the typed refusal
+            # remains the correct result and recovery can reconcile the reservation.
+            return
 
     async def _seal_needs_review(self, claim_id: UUID, reason_code: str) -> None:
         try:
