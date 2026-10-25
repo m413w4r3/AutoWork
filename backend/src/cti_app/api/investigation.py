@@ -1486,7 +1486,7 @@ async def invoke_investigation_operator_tool(
                 idempotency_key=idempotency_key,
             )
         except OperatorToolInvocationError as exc:
-            raise _http_error(exc.status_code, exc.code) from exc
+            raise _http_error(exc.status_code, exc.code, details=exc.details) from exc
         except (VersionConflictError, InvestigationStateVersionConflict) as exc:
             raise _http_error(409, "stale_working_state") from exc
         advisor_output = None

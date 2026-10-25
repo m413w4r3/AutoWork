@@ -79,7 +79,7 @@ from cti_app.domain.semantic_annotation import (
 
 # v28 adds compact editorial traceability and an explicit document label.
 # Canonical V5/V6 publication data remains unchanged.
-_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v29-secret-guard-editorial-traceability"
+_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v30-contiguous-protocol-figure-captions"
 _PUBLICATION_RENDERER_MANIFEST = "renderer-manifest.json"
 _FRENCH_MONTH_NAMES = (
     "janvier",
@@ -2405,8 +2405,7 @@ def project_publication_to_typst_model(
                     return title, "", None
 
                 if not has_legacy_proof_metadata:
-                    title = f"{title_prefix} — {source_title}" if source_title else title_prefix
-                    return title, "\n".join(caption_lines[1:]), None
+                    return title_prefix, "\n".join(caption_lines), None
 
                 proof_line = next(
                     line.removeprefix("Proof levels: ")

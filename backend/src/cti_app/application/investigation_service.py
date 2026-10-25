@@ -21,6 +21,7 @@ from cti_app.application.article_novelty import (
     NoveltyCandidate,
     NoveltyCandidateKind,
 )
+from cti_app.application.blob_storage import BlobReadLimitExceededError
 from cti_app.application.bridge_investigator import (
     BridgeInvestigator,
     BridgeTurnResult,
@@ -157,6 +158,13 @@ class ToolObservationWriter(Protocol):
     ) -> tuple[EvidenceObservation, ...]: ...
 
 
+class FrameworkProofDescriptorReader(Protocol):
+    async def blob_metadata(self, blob_id: UUID) -> Mapping[str, Any] | None: ...
+
+
+_MAX_FRAMEWORK_PRE_SUBMISSION_PROOF_BYTES = 64 * 1024
+
+
 class ProductionArtifactObservationWriter:
     """Archive bounded tool summaries as canonical evidence blobs."""
 
@@ -201,6 +209,14 @@ class ProductionArtifactObservationWriter:
             if result.framework_pre_submission_proof is None:
                 return ()
             safe_result = {}
+        if result.framework_pre_submission_proof is None:
+            # An adapter response is untrusted and cannot attest that the
+            # framework rejected an operation before submission.
+            safe_result.pop("framework_pre_submission_proof", None)
+        else:
+            safe_result["framework_pre_submission_proof"] = {
+                "object_type": result.framework_pre_submission_proof.value
+            }
         payload = {
             "schema": "investigation-tool-observation.v1",
             "tool_name": invocation.tool_name,
@@ -289,6 +305,8 @@ class InvestigationService:
         findings: FindingRepository,
         opinions: AnalystOpinionRepository,
         observation_writer: ToolObservationWriter | None = None,
+        artifact_store: ProductionArtifactStore | None = None,
+        evidence_summaries: FrameworkProofDescriptorReader | None = None,
         available_capabilities: frozenset[str] = frozenset(),
         author_id: str = "bridge-investigator",
         no_progress_limit: int = 2,
@@ -312,6 +330,8 @@ class InvestigationService:
         self._findings = findings
         self._opinions = opinions
         self._observation_writer = observation_writer
+        self._artifact_store = artifact_store
+        self._evidence_summaries = evidence_summaries
         self._available_capabilities = frozenset(available_capabilities)
         self._author_id = author_id
         self._no_progress_limit = no_progress_limit
@@ -454,16 +474,42 @@ class InvestigationService:
                 raise ValueError("The pending Bridge turn still has an active owner job")
             if disposition == "orphaned_running_turn":
                 state = await self._require_state(investigation_id)
-        unresolved = tuple(
+        running_invocations = tuple(
             item
             for item in await self._invocations.list_for_investigation(investigation_id)
-            if item.status in {ToolInvocationStatus.RUNNING, ToolInvocationStatus.NEEDS_REVIEW}
-            and not item.response_refs
+            if item.status is ToolInvocationStatus.RUNNING
         )
+        for invocation in running_invocations:
+            reviewed = invocation.transition(ToolInvocationStatus.NEEDS_REVIEW)
+            await self._invocations.update_if_version(reviewed, expected_version=invocation.version)
+        if running_invocations:
+            await self._commit_current_uow()
+        proof_resolved = False
+        proof_rejections: dict[UUID, str] = {}
+        for invocation in await self._unresolved_tool_invocations(investigation_id):
+            if invocation.status is not ToolInvocationStatus.NEEDS_REVIEW:
+                continue
+            proof, rejection = await self._framework_pre_submission_proof(invocation)
+            if proof is None:
+                if rejection is not None:
+                    proof_rejections[invocation.id] = rejection
+                continue
+            resolved = invocation.resolve_pre_submission_failure()
+            await self._invocations.update_if_version(resolved, expected_version=invocation.version)
+            proof_resolved = True
+        if proof_resolved:
+            await self._commit_current_uow()
+        unresolved = await self._unresolved_tool_invocations(investigation_id)
         if unresolved:
+            unresolved_details = []
+            for item in unresolved[:8]:
+                rejection = proof_rejections.get(item.id)
+                unresolved_details.append(
+                    f"{item.id} ({rejection})" if rejection is not None else str(item.id)
+                )
             raise ValueError(
                 "Ambiguous tool invocations must be reconciled before resuming: "
-                + ", ".join(str(item.id) for item in unresolved[:8])
+                + ", ".join(unresolved_details)
             )
         if (
             state.stop_reason is StopReason.SUBMISSION_NEEDS_REVIEW
@@ -486,6 +532,137 @@ class InvestigationService:
             investigation._bump()
             await self._investigations.save(investigation)
         return state
+
+    async def _unresolved_tool_invocations(
+        self, investigation_id: UUID
+    ) -> tuple[ToolInvocation, ...]:
+        return tuple(
+            item
+            for item in await self._invocations.list_for_investigation(investigation_id)
+            if item.status in {ToolInvocationStatus.RUNNING, ToolInvocationStatus.NEEDS_REVIEW}
+        )
+
+    async def _framework_pre_submission_proof(
+        self, invocation: ToolInvocation
+    ) -> tuple[FrameworkPreSubmissionProof | None, str | None]:
+        envelope = await self._envelopes.get(invocation.investigation_id)
+        if envelope is None:
+            return None, None
+        reservation = next(
+            (
+                item
+                for item in envelope.budget.reservations
+                if item.operation_key == invocation.operation_key
+            ),
+            None,
+        )
+        if (
+            reservation is None
+            or reservation.status is not BudgetReservationStatus.RELEASED
+            or dict(reservation.amounts) != dict(invocation.reserved_budget)
+        ):
+            return None, None
+        first_rejection: str | None = None
+        for observation_id in invocation.response_refs:
+            observation = await self._observations.get(observation_id)
+            if (
+                observation is None
+                or observation.investigation_id != invocation.investigation_id
+                or observation.invocation_ref != invocation.id
+                or observation.source != invocation.tool_name
+                or observation.source_version != invocation.schema_version
+                or observation.object_id != invocation.operation_key
+            ):
+                continue
+            try:
+                proof = FrameworkPreSubmissionProof(observation.object_type)
+            except ValueError:
+                continue
+            rejection = await self._verify_framework_pre_submission_proof(
+                invocation, observation, proof
+            )
+            if rejection is None:
+                return proof, None
+            if first_rejection is None:
+                first_rejection = rejection
+        if (
+            first_rejection is None
+            and invocation.response_refs
+            and (self._artifact_store is None or self._evidence_summaries is None)
+        ):
+            first_rejection = "framework_proof_verifier_unavailable"
+        return None, first_rejection
+
+    async def _verify_framework_pre_submission_proof(
+        self,
+        invocation: ToolInvocation,
+        observation: EvidenceObservation,
+        proof: FrameworkPreSubmissionProof,
+    ) -> str | None:
+        if self._artifact_store is None or self._evidence_summaries is None:
+            return "framework_proof_verifier_unavailable"
+        try:
+            descriptor = await self._evidence_summaries.blob_metadata(observation.blob_id)
+        except Exception:
+            return "framework_proof_descriptor_unreadable"
+        if descriptor is None:
+            return "framework_proof_descriptor_missing"
+        descriptor_sha256 = descriptor.get("sha256")
+        descriptor_size = descriptor.get("byte_size")
+        mime_type = descriptor.get("mime_type")
+        if (
+            descriptor_sha256 != observation.sha256
+            or isinstance(descriptor_size, bool)
+            or not isinstance(descriptor_size, int)
+            or descriptor_size < 0
+            or not isinstance(mime_type, str)
+            or mime_type.split(";", 1)[0].strip().casefold() != "application/json"
+        ):
+            return "framework_proof_descriptor_mismatch"
+        if descriptor_size > _MAX_FRAMEWORK_PRE_SUBMISSION_PROOF_BYTES:
+            return "framework_proof_blob_size_overflow"
+        try:
+            raw = await self._artifact_store.read_bytes(
+                observation.blob_id,
+                max_bytes=_MAX_FRAMEWORK_PRE_SUBMISSION_PROOF_BYTES,
+            )
+        except BlobReadLimitExceededError:
+            return "framework_proof_blob_size_overflow"
+        except Exception:
+            return "framework_proof_blob_unreadable"
+        if not isinstance(raw, bytes):
+            return "framework_proof_blob_unreadable"
+        if len(raw) != descriptor_size:
+            return "framework_proof_blob_size_mismatch"
+        if hashlib.sha256(raw).hexdigest() != observation.sha256:
+            return "framework_proof_blob_hash_mismatch"
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            return "framework_proof_payload_invalid_json"
+        if not isinstance(payload, dict):
+            return "framework_proof_payload_mismatch"
+        try:
+            canonical_payload = ProductionArtifactStore.canonical_json_bytes(payload)
+        except (TypeError, ValueError):
+            return "framework_proof_payload_invalid_json"
+        if canonical_payload != raw:
+            return "framework_proof_payload_not_canonical"
+        result = payload.get("result")
+        proof_payload = (
+            result.get("framework_pre_submission_proof") if isinstance(result, dict) else None
+        )
+        if (
+            payload.get("schema") != "investigation-tool-observation.v1"
+            or payload.get("tool_name") != invocation.tool_name
+            or payload.get("schema_version") != invocation.schema_version
+            or payload.get("operation_key") != invocation.operation_key
+            or not isinstance(proof_payload, dict)
+            or proof_payload != {"object_type": observation.object_type}
+            or observation.object_type != proof.value
+        ):
+            return "framework_proof_payload_mismatch"
+        return None
 
     async def interrupt(
         self, investigation_id: UUID, *, expected_version: int | None = None
@@ -1298,11 +1475,17 @@ class InvestigationService:
         }:
             budget.release(operation_key)
         try:
-            persisted_observations = (
-                ()
-                if ambiguous_adapter_response
-                else await self._persist_result_observations(invocation, result)
-            )
+            if ambiguous_adapter_response:
+                recorded_refs = await self._valid_observation_refs(
+                    investigation.id, result.observation_refs
+                )
+                persisted_observations = (
+                    ()
+                    if recorded_refs
+                    else await self._persist_ambiguous_result_observation(invocation)
+                )
+            else:
+                persisted_observations = await self._persist_result_observations(invocation, result)
         except Exception as exc:
             valid_refs = await self._valid_observation_refs(
                 investigation.id, result.observation_refs
@@ -1501,6 +1684,24 @@ class InvestigationService:
                 ToolEffect.EXTERNAL_ACTIVE,
                 ToolEffect.EXTERNAL_SUBMIT,
             }
+            if external_effect:
+                unresolved = tuple(
+                    item
+                    for item in await self._unresolved_tool_invocations(investigation.id)
+                    if item.status is ToolInvocationStatus.NEEDS_REVIEW
+                    or not _operation_key_matches(item.operation_key, operation_key)
+                )
+                if unresolved:
+                    unresolved_ids = ", ".join(str(item.id) for item in unresolved[:8])
+                    action_summaries.append(
+                        _action_summary(
+                            proposed.tool_name,
+                            ToolInvocationStatus.NEEDS_REVIEW,
+                            "An earlier ambiguous tool invocation must be reconciled before "
+                            f"another external operation: {unresolved_ids}",
+                        )
+                    )
+                    return state, StopReason.SUBMISSION_NEEDS_REVIEW
             definitive_failures = sum(
                 item.status is ToolInvocationStatus.FAILED and not item.response_refs
                 for item in all_matching_invocations
@@ -1687,10 +1888,12 @@ class InvestigationService:
             action_summaries.append(
                 _action_summary(invocation.tool_name, result.status, outcome_message)
             )
-            if result.status is ToolInvocationStatus.NEEDS_REVIEW and not result.output.get(
-                "request_permission", False
-            ):
-                return state, StopReason.SUBMISSION_NEEDS_REVIEW
+            if result.status is ToolInvocationStatus.NEEDS_REVIEW:
+                return state, (
+                    StopReason.PERMISSION_REQUIRED
+                    if _confirmed_external_non_execution(result)
+                    else StopReason.SUBMISSION_NEEDS_REVIEW
+                )
             # An ordinary policy denial is local to the operation; G2 reductions above
             # end this turn before any other proposed external operation is started.
 
@@ -2041,11 +2244,10 @@ class InvestigationService:
                 ToolResult(
                     status=status,
                     observation_refs=invocation.response_refs,
-                    output={"request_permission": True},
-                    message="Prior tool result is awaiting an explicit permission decision.",
+                    message="Prior tool result requires explicit reconciliation before reuse.",
                 ),
                 invocation.response_refs,
-                None,
+                StopReason.SUBMISSION_NEEDS_REVIEW,
             )
         if status in {ToolInvocationStatus.PENDING, ToolInvocationStatus.NEEDS_REVIEW}:
             return (
@@ -2098,6 +2300,21 @@ class InvestigationService:
         if self._observation_writer is None:
             raise RuntimeError("No observation archive is configured for tool output")
         return await self._observation_writer.archive(invocation, result)
+
+    async def _persist_ambiguous_result_observation(
+        self, invocation: ToolInvocation
+    ) -> tuple[EvidenceObservation, ...]:
+        """Record only framework status when an external result has no valid refs."""
+        safe_result = ToolResult(
+            status=ToolInvocationStatus.NEEDS_REVIEW,
+            output={
+                "status": ToolInvocationStatus.NEEDS_REVIEW.value,
+                "outcome": "external_effect_unconfirmed",
+                "adapter_output_archived": False,
+            },
+            message="The external result is ambiguous; adapter output was not archived.",
+        )
+        return await self._persist_result_observations(invocation, safe_result)
 
     async def _valid_observation_refs(
         self, investigation_id: UUID, refs: tuple[UUID, ...]

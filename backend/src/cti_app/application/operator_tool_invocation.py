@@ -62,7 +62,6 @@ from cti_app.application.research_context_builder import (
 )
 from cti_app.domain.analyst_opinion import investigation_opinion_id
 from cti_app.domain.investigation import (
-    BudgetReservationStatus,
     FrameworkPreSubmissionProof,
     InvestigationExecutionMode,
     ToolInvocation,
@@ -354,6 +353,8 @@ def _assert_keyset_page_consistency(page: Any, *, section: str, investigation_id
         if page.cursor is not None
         else None
     )
+    if page.cursor is not None and decoded_cursor is None:
+        raise ValueError("Operator keyset page cursor is missing its decoded payload")
     previous_page_sha256 = (
         decoded_cursor["previous_page_sha256"] if decoded_cursor is not None else "0" * 64
     )
@@ -887,48 +888,8 @@ class OperatorToolInvocationService:
 
     async def _framework_pre_submission_proof(
         self, invocation: ToolInvocation
-    ) -> FrameworkPreSubmissionProof | None:
-        if self._observations is None or self._evidence_summaries is None:
-            return None
-        envelope = await self._envelopes.get(self._investigation_id)
-        if envelope is None:
-            return None
-        reservation = next(
-            (
-                item
-                for item in envelope.budget.reservations
-                if item.operation_key == invocation.operation_key
-            ),
-            None,
-        )
-        if (
-            reservation is None
-            or reservation.status is not BudgetReservationStatus.RELEASED
-            or dict(reservation.amounts) != dict(invocation.reserved_budget)
-        ):
-            return None
-        for observation_id in invocation.response_refs:
-            observation = await self._observations.get(observation_id)
-            if (
-                observation is None
-                or observation.investigation_id != self._investigation_id
-                or observation.invocation_ref != invocation.id
-                or observation.source != invocation.tool_name
-                or observation.source_version != invocation.schema_version
-                or observation.object_id != invocation.operation_key
-            ):
-                continue
-            try:
-                proof = FrameworkPreSubmissionProof(observation.object_type)
-            except ValueError:
-                continue
-            try:
-                summary = await self._evidence_summaries.summary(observation)
-            except Exception:
-                continue
-            if isinstance(summary, Mapping):
-                return proof
-        return None
+    ) -> tuple[FrameworkPreSubmissionProof | None, str | None]:
+        return await self._execution._framework_pre_submission_proof(invocation)
 
     async def _invoke_locked(
         self,
@@ -1003,7 +964,7 @@ class OperatorToolInvocationService:
                 not in {ToolInvocationStatus.RUNNING, ToolInvocationStatus.NEEDS_REVIEW}
             ):
                 continue
-            proof = await self._framework_pre_submission_proof(existing)
+            proof, proof_rejection = await self._framework_pre_submission_proof(existing)
             if existing.status is ToolInvocationStatus.NEEDS_REVIEW and proof is not None:
                 resolved = existing.resolve_pre_submission_failure()
                 existing = await self._invocations.update_if_version(
@@ -1027,10 +988,11 @@ class OperatorToolInvocationService:
                 )
                 await self._execution.commit_current_uow()
                 continue
+            details: dict[str, Any] = {"existing_invocation_id": str(existing.id)}
+            if proof_rejection is not None:
+                details["framework_proof_rejection"] = proof_rejection
             raise OperatorToolInvocationError(
-                "ambiguous_tool_invocation_requires_reconciliation",
-                409,
-                details={"existing_invocation_id": str(existing.id)},
+                "ambiguous_tool_invocation_requires_reconciliation", 409, details=details
             )
 
         if state.version != expected_version:

@@ -478,7 +478,8 @@ async def _new_article_findings(
                 "kind": FindingKind.NETWORK_BEHAVIOUR.value,
                 "assessment": FindingAssessment.SUPPORTED.value,
                 "statement": (
-                    "The fake Shodan index returned two dated services for the article IOC."
+                    "The fake Shodan index returned two dated services for article IOC "
+                    f"{material.ip}."
                 ),
                 "observation_refs": [str(item) for item in shodan_refs],
                 "subject_ref": material.ip,
@@ -826,7 +827,7 @@ async def test_w18_supervised_first_run_recovers_without_replaying_confirmed_eff
                     "block_type": OpinionBlockType.KEY_FINDINGS.value,
                     "text": (
                         "The bounded VT search returned an article-relative candidate, and the "
-                        "passive Shodan query returned two indexed services."
+                        f"passive Shodan query returned two indexed services for {material.ip}."
                     ),
                     "finding_refs": [str(item.id) for item in supported],
                     "evidence_refs": [str(item) for item in evidence_refs],
@@ -1096,6 +1097,16 @@ async def test_w18_supervised_first_run_recovers_without_replaying_confirmed_eff
     assert ambiguous_invocation.status is ToolInvocationStatus.NEEDS_REVIEW
     assert len(ambiguous_invocation.response_refs) == 1
     assert set(ambiguous_invocation.response_refs) <= {item.id for item in observations_at_stop}
+    ambiguous_observation = next(
+        item for item in observations_at_stop if item.id == ambiguous_invocation.response_refs[0]
+    )
+    ambiguous_payload = await production.artifact_store.read_json(ambiguous_observation.blob_id)
+    assert ambiguous_payload["result"] == {
+        "status": ToolInvocationStatus.NEEDS_REVIEW.value,
+        "outcome": "external_effect_unconfirmed",
+        "adapter_output_archived": False,
+    }
+    assert "synthetic partial sample bytes" not in json.dumps(ambiguous_payload)
     assert not any(item.tool_name == "shodan.host" for item in invocations_at_stop)
     stopped_checkpoint = await _checkpoint(
         label="after-pivot-interrupt-second-tool-needs-review",
@@ -1136,6 +1147,22 @@ async def test_w18_supervised_first_run_recovers_without_replaying_confirmed_eff
         == status_after_crash["last_operation"]["id"]
     )
     assert status_after_worker_restart["stop_reason"] == StopReason.USER_INTERRUPT.value
+    resume_before_reconcile = await driver.client.post(
+        f"/api/investigations/{investigation_id}/resume",
+        json={"expected_version": status_after_worker_restart["working_state_version"]},
+        headers={"Idempotency-Key": f"w18-resume-before-reconcile-{investigation_id}"},
+    )
+    assert resume_before_reconcile.status_code == 409, resume_before_reconcile.text
+    assert resume_before_reconcile.json()["detail"]["code"] == "investigation_resume_conflict"
+    assert vt.download_calls == 1, "resume must not replay an ambiguous download"
+    assert shodan.calls == [], "no later external tool may run before reconciliation"
+    status_after_refused_resume = await _read_operator_status(
+        driver.client, uow_factory, investigation_id
+    )
+    assert (
+        status_after_refused_resume["working_state_version"]
+        == status_after_worker_restart["working_state_version"]
+    )
     reconcile = await driver.client.post(
         f"/api/investigations/{investigation_id}/invocations/{ambiguous_invocation.id}/reconcile",
         headers={"Idempotency-Key": f"w18-reconcile-{ambiguous_invocation.id}"},

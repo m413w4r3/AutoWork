@@ -1629,6 +1629,8 @@ def build_investigation_composition(
         observation_writer=ProductionArtifactObservationWriter(
             artifact_store, uow.evidence_observations
         ),
+        artifact_store=artifact_store,
+        evidence_summaries=evidence_summaries,
         available_capabilities=available_capabilities,
         no_progress_limit=settings.investigation_no_progress_limit,
         commit_uow=commit_uow if callable(commit_uow) else None,
