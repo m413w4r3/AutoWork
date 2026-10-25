@@ -2268,27 +2268,29 @@ async def test_w14_e_retrohunt_subject_slots_replay_and_concurrent_investigation
         # The adapter reports a local subject-slot refusal without framework proof
         # that no external request was sent, so ambiguity hardening pauses for review.
         assert retro_submits[2].status is ToolInvocationStatus.NEEDS_REVIEW
-        submit_results = [
-            await driver.artifact_store.read_json(item.blob_id)
-            for item in final_observations
-            if item.source == "vt.retrohunt.submit"
+        submit_observations = [
+            item for item in final_observations if item.source == "vt.retrohunt.submit"
         ]
-        by_invocation = {
-            item.invocation_ref: item
-            for item in final_observations
-            if item.source == "vt.retrohunt.submit"
-        }
+        submit_results = [
+            await driver.artifact_store.read_json(item.blob_id) for item in submit_observations
+        ]
+        successful_results = [
+            payload for payload in submit_results if "slots_consumed" in payload["result"]
+        ]
+        by_invocation = {item.invocation_ref: item for item in submit_observations}
         replay_payload = await driver.artifact_store.read_json(
             by_invocation[retro_submits[1].id].blob_id
         )
         assert replay_payload["result"]["slots_consumed"] == 2
         assert replay_payload["result"]["slots_remaining"] == 0
-        assert len(submit_results) == 2
-        assert not any(
-            item.invocation_ref == retro_submits[2].id
-            for item in final_observations
-            if item.source == "vt.retrohunt.submit"
+        assert len(successful_results) == 2
+        # The ambiguous third attempt records only a framework diagnostic; its
+        # adapter output is never archived as a submit result.
+        ambiguous = await driver.artifact_store.read_json(
+            by_invocation[retro_submits[2].id].blob_id
         )
+        assert ambiguous["result"]["outcome"] == "external_effect_unconfirmed"
+        assert ambiguous["result"]["adapter_output_archived"] is False
         assert len([item for item in final_findings if item.kind is FindingKind.NEW_SAMPLE]) == 1
         assert len(replay_transport.prompts) == 2
         for invocation in retro_submits[1:2]:
@@ -2298,11 +2300,7 @@ async def test_w14_e_retrohunt_subject_slots_replay_and_concurrent_investigation
             )
         _assert_observations_reach_following_bridge_turns(
             replay_transport,
-            tuple(
-                item
-                for item in final_invocations
-                if item.id in {retro_submits[1].id, retro_submits[2].id}
-            ),
+            tuple(item for item in final_invocations if item.id == retro_submits[1].id),
         )
 
         blocks = (

@@ -1300,16 +1300,17 @@ async def test_w13_d7_tool_replay_ambiguous_bridge_resume_and_local_denials(
                 assertions=(
                     "one-provider-download-for-one-operation-key",
                     "unbudgeted-second-download-is-operation-local",
-                    "independent-shodan-action-continues",
+                    "budget-denial-stops-before-independent-shodan",
                 ),
             )
             assert vt.download_calls == 1
-            assert shodan.calls and shodan.calls[0][0] == "host"
-            assert transport.submission_count == 4
+            assert shodan.calls == []
+            assert transport.submission_count == 3
             submissions_before_resume = transport.submission_count
             attempts_before_resume = transport.attempt_count
             state_response = await client.get(f"/api/investigations/{seeded.investigation.id}")
             assert state_response.status_code == 200, state_response.text
+            assert state_response.json()["stop_reason"] == "permission_required"
             current_version = state_response.json()["version"]
             resume = await client.post(
                 f"/api/investigations/{seeded.investigation.id}/resume",
@@ -1339,7 +1340,7 @@ async def test_w13_d7_tool_replay_ambiguous_bridge_resume_and_local_denials(
             first_downloads = [
                 item for item in invocations if item.tool_name == "vt.download_sample"
             ]
-            assert len(first_downloads) == 2
+            assert len(first_downloads) == 3
             succeeded = [
                 item for item in first_downloads if item.status is ToolInvocationStatus.SUCCEEDED
             ]
@@ -1348,17 +1349,19 @@ async def test_w13_d7_tool_replay_ambiguous_bridge_resume_and_local_denials(
                 for item in first_downloads
                 if item.status is not ToolInvocationStatus.SUCCEEDED
             ]
-            assert len(succeeded) == 1 and len(denied) == 1
-            assert denied[0].normalized_parameters.get("sha256") == second_sha
+            assert len(succeeded) == 1 and len(denied) == 2
+            assert all(item.normalized_parameters.get("sha256") == second_sha for item in denied)
             assert (
                 len([item for item in samples if item.sample_sha256 == material.sample_hash]) == 1
             )
             assert second_sha not in {item.sample_sha256 for item in samples}
-            assert denied[0].status is ToolInvocationStatus.NEEDS_REVIEW
-            assert any(
-                item.tool_name == "shodan.host" and item.status is ToolInvocationStatus.SUCCEEDED
-                for item in invocations
-            )
+            # Resume validates the first framework proof and retries the denied
+            # operation under a new audited key; the unchanged budget denies it
+            # again. The independent Shodan call was never dispatched.
+            assert denied[0].status is ToolInvocationStatus.FAILED
+            assert denied[1].status is ToolInvocationStatus.NEEDS_REVIEW
+            assert denied[1].operation_key.endswith(":retry:1")
+            assert not any(item.tool_name == "shodan.host" for item in invocations)
 
         # A separate investigation without acquisition rights. VT read and Shodan remain
         # independent, while only the attempted acquisition is denied locally.
