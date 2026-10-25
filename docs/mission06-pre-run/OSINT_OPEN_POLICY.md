@@ -1,11 +1,10 @@
 # Politique permanente `OSINT_OPEN` — conception et invariants
 
-Statut : **IMPLÉMENTÉ SUR BRANCHE CANDIDATE `33104968`** (`m06/policy-impl`).
-Vérifications parent : **51 tests unitaires** et **6 tests PostgreSQL** verts.
-Revue indépendante : conditions cross-lot S3 encore requises (course
-révocation → claim, plafond d'effets, lignée d'invocation) avant toute émission
-externe. Aucun lot n'est fusionné sur `main` et aucune capacité n'est déclarée
-PASS globalement.
+Statut : **INTÉGRÉ SUR `main@efc38e8a`**. Vérifications parent sur `main` :
+**51 tests unitaires** et **6 tests PostgreSQL** verts. Revue indépendante :
+**APPROVED pour le lot politique**. La release des effets externes reste
+conditionnée à S3-CORE (course révocation → claim, plafond d'effets, lignée
+d'invocation). Aucune capacité fournisseur live n'est déclarée PASS.
 
 ## 1. Objectif
 

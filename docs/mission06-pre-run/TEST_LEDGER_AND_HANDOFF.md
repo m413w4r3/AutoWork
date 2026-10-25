@@ -113,13 +113,16 @@ n'est déclaré PASS sans commande et sortie réelles. Baseline de départ :
 | 2026-10-25 | `f0787d52` | `pytest tests/test_osint_open_policy.py -q` (politique, parent) | **22 passed** |
 | 2026-10-25 | `980fef7e` | `pytest tests/test_osint_open_policy.py -q` (politique, parent) | **49 passed** |
 | 2026-10-25 | `33104968` | `pytest tests/test_osint_open_policy.py -q` (politique, parent) | **51 passed** |
+| 2026-10-26 | `main@efc38e8a` | politique intégrée : `pytest tests/test_osint_open_policy.py` | **51 passed** |
+| 2026-10-26 | `main@efc38e8a` | politique intégrée : `pytest tests/integration/test_osint_open_policy_postgres.py` (base jetable) | **6 passed** |
 | 2026-10-25 | `980fef7e` | `pytest tests/integration/test_osint_open_policy_postgres.py -q` (politique, base jetable 55432) | **3 passed, 3 failed — RED** |
 | 2026-10-25 | `980fef7e` | `ruff check` / `ruff format --check` (politique, implémenteur) | **PASS** (428 fichiers formatés) |
 | 2026-10-25 | `c5f27331` | `ruff check` / `ruff format --check` (S3 core, reviewer) | **PASS** |
 | 2026-10-25 | `642fae96` | `pytest tests/test_external_effects.py -q` (S3 core, parent) | **34 passed** |
 | 2026-10-25 | `7ef241f2` | `pytest tests/integration/test_osint_open_policy_postgres.py -q` (parent, base jetable) | **6 passed** |
 | 2026-10-25 | combiné `a1e6d994` + fixes env | `alembic upgrade head` sur base jetable neuve | **UPGRADE_OK** après exclusion `external_effect_*` du baseline et import `retrohunt` |
-| 2026-10-25 | combiné pré-fix fixture | `pytest tests/integration/test_external_effects_postgres.py -q` | **5 failed** — FK réservation budgétaire (fixture), correction en cours |
+| 2026-10-25 | combiné pré-fix fixture | `pytest tests/integration/test_external_effects_postgres.py -q` | **5 failed** — FK réservation budgétaire (fixture), corrigé |
+| 2026-10-26 | combiné `e2b05cfd` | `pytest tests/integration/test_external_effects_postgres.py -q` (base jetable) | **3 passed, 2 failed** — `effect_occurrence_required` et fixture budget `limits` ; correction finale en cours |
 | — | — | `make lint-backend` / `make typecheck-backend` | **NOT_RUN** côté agent (sync réseau) ; S3 core a rapporté lint+typecheck PASS dans son environnement |
 | — | — | S3 core PostgreSQL final | **EN ATTENTE** — rerun après correction fixture et intégration |
 
@@ -132,9 +135,9 @@ Aucun test fournisseur réel, MinIO live ou PostgreSQL live n'a été exécuté.
 ## 5. Verdicts finaux (état à la clôture de cette session)
 
 ```text
-OSINT_OPEN_POLICY_IMPLEMENTED|PARTIAL|BLOCKED       : PARTIAL
+OSINT_OPEN_POLICY_IMPLEMENTED|PARTIAL|BLOCKED       : PASS (couche politique)
 NO_REPEATED_OPERATOR_APPROVALS|PARTIAL|BLOCKED      : PARTIAL
-TLP_CLEAR_DEFAULT_FOR_SHAREABLE_SOURCES|PARTIAL|BLOCKED : PARTIAL
+TLP_CLEAR_DEFAULT_FOR_SHAREABLE_SOURCES|PARTIAL|BLOCKED : PASS (logique politique testée)
 G3_NONBLOCKING_FOR_ANALYSIS|PARTIAL|BLOCKED         : PARTIAL
 
 S3_VT_READ_READY|BLOCKED                            : BLOCKED
@@ -147,7 +150,7 @@ POSTGRES_CONCURRENCY_AND_RECOVERY_PASS|PARTIAL|BLOCKED : PARTIAL
 LOCAL_ANALYSIS_READY|PARTIAL|BLOCKED                : PARTIAL
 
 LUNA_XHIGH_MULTI_AGENT_VERIFIED|FAILED              : FAILED
-INDEPENDENT_REVIEWS_APPROVED|REVISE|BLOCKED         : REVISE
+INDEPENDENT_REVIEWS_APPROVED|REVISE|BLOCKED         : REVISE (politique APPROVED ; S3 en revue)
 
 REAL_RUN_PREFLIGHT_READY|PARTIAL|BLOCKED            : PARTIAL
 REAL_INVESTIGATION_NOT_STARTED                      : CONFIRMED
