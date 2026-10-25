@@ -112,6 +112,7 @@ n'est déclaré PASS sans commande et sortie réelles. Baseline de départ :
 | 2026-10-25 | `c5f27331` | `pytest tests/test_external_effects.py -q` (S3 core, parent) | **19 passed** |
 | 2026-10-25 | `f0787d52` | `pytest tests/test_osint_open_policy.py -q` (politique, parent) | **22 passed** |
 | 2026-10-25 | `980fef7e` | `pytest tests/test_osint_open_policy.py -q` (politique, parent) | **49 passed** |
+| 2026-10-25 | `33104968` | `pytest tests/test_osint_open_policy.py -q` (politique, parent) | **51 passed** |
 | 2026-10-25 | `980fef7e` | `pytest tests/integration/test_osint_open_policy_postgres.py -q` (politique, base jetable 55432) | **3 passed, 3 failed — RED** |
 | 2026-10-25 | `980fef7e` | `ruff check` / `ruff format --check` (politique, implémenteur) | **PASS** (428 fichiers formatés) |
 | 2026-10-25 | `c5f27331` | `ruff check` / `ruff format --check` (S3 core, reviewer) | **PASS** |

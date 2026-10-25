@@ -1,8 +1,11 @@
 # Politique permanente `OSINT_OPEN` — conception et invariants
 
-Statut : **BROUILLON DE CONCEPTION** (à confronter à la reconnaissance puis à
-l'implémentation et aux tests). Aucune capacité n'est déclarée PASS par ce
-document.
+Statut : **IMPLÉMENTÉ SUR BRANCHE CANDIDATE `33104968`** (`m06/policy-impl`).
+Vérifications parent : **51 tests unitaires** et **6 tests PostgreSQL** verts.
+Revue indépendante : conditions cross-lot S3 encore requises (course
+révocation → claim, plafond d'effets, lignée d'invocation) avant toute émission
+externe. Aucun lot n'est fusionné sur `main` et aucune capacité n'est déclarée
+PASS globalement.
 
 ## 1. Objectif
 

@@ -1,6 +1,9 @@
 # S3 — implémentation et gates des effets externes
 
-Statut : **CONCEPTION VALIDÉE, IMPLÉMENTATION NON TERMINÉE.** Ce document ne
+Statut : **SOCLE `S3-CORE` CANDIDAT (`642fae96` + correction finale), FAMILLES
+NON MIGRÉES.** 34 tests unitaires verts ; la chaîne `0003→0004` s'applique sur
+base jetable après les deux correctifs d'intégration ci-dessous ; les tests
+PostgreSQL S3 restent à rejouer après la correction du fixture. Ce document ne
 déclare aucun `S3_*_READY`. La conception D6 a été confrontée au code réel :
 [`recon/S3_SEAM.md`](recon/S3_SEAM.md) (SHA-256
 `9f17611abf3a05166f069b745cfd546041e6748ccce1f4f36b6135f3774dbaa4`). La
