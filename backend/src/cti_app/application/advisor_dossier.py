@@ -907,7 +907,18 @@ def build_advisor_dossier(prompt_data: Mapping[str, Any]) -> AdvisorDossier:
             continue
         measurement_id = _as_text(item.get("measurement_id"))
         evidence_id = _as_text(item.get("evidence_id"))
-        value = _as_text(item.get("value"))
+        raw_value = item.get("value")
+        value = _as_text(raw_value)
+        rendered_as_base64 = False
+        if not value and (
+            isinstance(raw_value, (bytes, bytearray, memoryview))
+            or (
+                isinstance(raw_value, (list, tuple))
+                and all(type(byte) is int and 0 <= byte <= 255 for byte in raw_value)
+            )
+        ):
+            value = base64.b64encode(bytes(raw_value)).decode("ascii")
+            rendered_as_base64 = True
         if not measurement_id or not value:
             continue
         kind = _as_text(item.get("kind")) or "mesure"
@@ -916,21 +927,40 @@ def build_advisor_dossier(prompt_data: Mapping[str, Any]) -> AdvisorDossier:
         source_evidence_sha256 = _as_text(item.get("evidence_sha256"))
         declared_encoding = _as_text(item.get("encoding")).casefold()
         byte_encoding = (
-            declared_encoding
+            "base64"
+            if rendered_as_base64
+            else declared_encoding
             if declared_encoding in {"hex", "hexdump", "base64", "bytes"}
             else kind.casefold()
             if kind.casefold() in {"hex", "base64", "bytes"}
             else ""
         )
-        byte_length = item.get("byte_length", item.get("length"))
+        fragment_bytes = _advisor_fragment_bytes(raw_value, byte_encoding)
+        if fragment_bytes is None:
+            fragment_bytes = _advisor_fragment_bytes(value, byte_encoding)
+        if fragment_bytes is not None and not byte_encoding:
+            byte_encoding = "base64"
+        byte_length = (
+            len(fragment_bytes)
+            if fragment_bytes is not None
+            else item.get("byte_length", item.get("length"))
+        )
         byte_metadata = []
         if byte_encoding:
             byte_metadata.append(f"encoding={byte_encoding}")
             if type(byte_length) is int and byte_length >= 0:
                 byte_metadata.append(f"byte_length={byte_length}; length={byte_length}")
-            full_digest = sample_sha256 or source_evidence_sha256
+            declared_fragment_sha256 = _as_text(item.get("fragment_sha256"))
+            full_digest = (
+                hashlib.sha256(fragment_bytes).hexdigest()
+                if fragment_bytes is not None
+                else declared_fragment_sha256
+                if re.fullmatch(r"(?i)[0-9a-f]{64}", declared_fragment_sha256)
+                else ""
+            )
             if full_digest:
                 byte_metadata.append(f"sha256={full_digest}")
+                byte_metadata.append(f"fragment_sha256={full_digest}")
             for key in ("evidence_id", "blob_id", "association_id"):
                 identifier = _as_text(item.get(key))
                 if identifier:
@@ -2166,6 +2196,32 @@ def _clean_label(value: str) -> str:
 
 def _as_text(value: object) -> str:
     return value.strip() if isinstance(value, str) else ""
+
+
+def _advisor_fragment_bytes(value: object, encoding: str) -> bytes | None:
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value)
+    if isinstance(value, (list, tuple)) and all(
+        type(byte) is int and 0 <= byte <= 255 for byte in value
+    ):
+        return bytes(value)
+    if not isinstance(value, str):
+        return None
+    compact = re.sub(r"\s+", "", value)
+    if encoding in {"hex", "hexdump", "bytes"}:
+        if compact and len(compact) % 2 == 0 and re.fullmatch(r"(?i)[0-9a-f]+", compact):
+            try:
+                return bytes.fromhex(compact)
+            except ValueError:
+                return None
+        if encoding != "bytes":
+            return None
+    if encoding in {"base64", "bytes"}:
+        try:
+            return base64.b64decode(compact, validate=True)
+        except (ValueError, binascii.Error):
+            return None
+    return None
 
 
 def _display_source_ref(value: object) -> str:

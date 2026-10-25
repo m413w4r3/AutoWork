@@ -2362,7 +2362,10 @@ async def test_lossless_sample_bytes_metadata_and_provenance_reach_fake_transpor
                 },
                 "offset": 38,
             },
-            "hex": [{"offset": 37, "value": raw_sample.hex()}],
+            "hex": [
+                {"offset": 37, "value": raw_sample.hex()},
+                {"offset": 91, "length": 4, "value": "00ff1020"},
+            ],
             "base64": base64_content,
             "mime_type": "application/x-synthetic-sample",
             "byte_length": len(raw_sample),
@@ -2449,6 +2452,8 @@ async def test_lossless_sample_bytes_metadata_and_provenance_reach_fake_transpor
         expected_bytes_label,
         "offset 37",
         "offset 38",
+        "offset 91",
+        f"sha256={hashlib.sha256(bytes.fromhex('00ff1020')).hexdigest()}",
         "status=clean",
         "analysis_status=malicious",
         "EngineAlpha",
@@ -2484,6 +2489,12 @@ async def test_lossless_sample_bytes_metadata_and_provenance_reach_fake_transpor
         for line in prompt.splitlines()
         if "Octets observés" in line
     )
+    fragment_line = next(
+        line for line in prompt.splitlines() if "Octets observés" in line and "offset 91" in line
+    )
+    assert f"mime_type={mime_type}" in fragment_line
+    assert f"sha256={hashlib.sha256(bytes.fromhex('00ff1020')).hexdigest()}" in fragment_line
+    assert f"; sha256={sample_sha256}" not in fragment_line
 
 
 @pytest.mark.asyncio
@@ -3253,8 +3264,10 @@ async def test_typed_floss_dotnet_and_verified_xxd_content_patterns_are_advisor_
         observation=observation,
         raw=raw,
     )
+    association_id = uuid4()
+    sample_mime_type = "application/x-measurement-fixture; version=5"
     tool._sample_associations.list_for_investigation = async_get(
-        (SimpleNamespace(sample_sha256=sample_sha256, id=uuid4()),)
+        (SimpleNamespace(sample_sha256=sample_sha256, id=association_id),)
     )
     tool._samples.list_for_subject = async_get(
         (
@@ -3267,6 +3280,7 @@ async def test_typed_floss_dotnet_and_verified_xxd_content_patterns_are_advisor_
         )
     )
     tool._blobs.add(sample_blob_id, sha256=sample_sha256, size=4096)
+    tool._blobs.descriptors[sample_blob_id].descriptor.mime_type = sample_mime_type
     if consultation_type == "figure_plan":
         finding = InvestigationFinding(
             investigation_id=investigation_id,
@@ -3329,6 +3343,12 @@ async def test_typed_floss_dotnet_and_verified_xxd_content_patterns_are_advisor_
         for item in typed_prompt_payload(prompt)["wire_ref_catalog"]
     )
     assert f"blob_id={sample_blob_id}" in prompt
+    if expected_kind == "hex":
+        fragment_sha256 = hashlib.sha256(bytes.fromhex(expected_value)).hexdigest()
+        assert f"association_id={association_id}" in prompt
+        assert f"mime_type={sample_mime_type}" in prompt
+        assert f"fragment_sha256={fragment_sha256}" in prompt
+        assert f"sample_sha256={sample_sha256}" in prompt
     if consultation_type == "yara_draft":
         assert result.output["schema"] == ADVISOR_RESPONSE_SCHEMA_V3
 
@@ -3998,6 +4018,70 @@ async def test_draft_text_resolves_facts_from_assertion_refs() -> None:
     assert "budget_remaining" not in prompt_data
 
 
+@pytest.mark.asyncio
+async def test_draft_text_assertion_ref_to_restricted_sample_is_vetoed_after_resolution() -> None:
+    investigation_id = uuid4()
+    sample_hash = "d" * 64
+    restriction_text = "Synthetic source restriction marker"
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": sample_hash,
+            "strings": [{"value": "RestrictedEditorialSampleMarker", "offset": 128}],
+        },
+    )
+    transport = Transport(
+        TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="must not be called")
+    )
+    tool, sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+    _attach_sample_policy(
+        tool,
+        sample_blob_id,
+        sample_hash,
+        license_restriction=restriction_text,
+    )
+
+    result = await tool.execute(
+        {
+            "consultation_type": "draft_text",
+            "units": [
+                {
+                    "id": "U1",
+                    "block_type": "uncertainties_and_next_leads",
+                    "form": "body",
+                    "anchor": None,
+                    "assertions": [
+                        {
+                            "id": "restricted-a1",
+                            "text": "Synthetic editorial assertion for offline testing.",
+                            "nature": "analyse",
+                            "refs": [{"kind": "observation", "id": str(observation.id)}],
+                            "block_type": "uncertainties_and_next_leads",
+                            "form": "body",
+                            "anchor": None,
+                        }
+                    ],
+                }
+            ],
+        },
+        make_context(investigation_id, key="operator:advisor:restricted-editorial-reference"),
+    )
+
+    assert transport.calls == []
+    assert result.output["advisor_status"] == "disclosure_restricted"
+    assert result.output["failure_stage"] == "sample_disclosure_restricted"
+    assert result.output["confirmed_non_execution"] is True
+    safe_output = repr(result.output)
+    assert restriction_text not in safe_output
+    assert "RestrictedEditorialSampleMarker" not in safe_output
+
+
 def test_context_truncation_stops_at_sentence_or_word_and_marks_ellipsis() -> None:
     sentence = _truncate_context_text(
         "Première phrase complète. Deuxième phrase qui continue sans fin.", 30
@@ -4401,6 +4485,59 @@ async def test_signed_url_in_payload_refuses_before_bridge_without_leaking_signa
     safe_output = repr(result.output)
     assert signed_url not in safe_output
     assert signature not in safe_output
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("representation", ["raw_bytes", "hex", "base64"])
+@pytest.mark.parametrize("material", ["configured_secret", "signed_url"])
+async def test_utf16le_encoded_sample_credentials_and_signed_urls_refuse_locally(
+    monkeypatch, representation, material
+) -> None:
+    secret = "autowork_fixture_utf16_" + "Q" * 48
+    signed_url = (
+        "https://storage.invalid/fixture?X-Amz-Credential=synthetic&"
+        "X-Amz-Signature=synthetic-signature"
+    )
+    value = secret if material == "configured_secret" else signed_url
+    encoded_bytes = value.encode("utf-16le")
+    content: dict[str, object]
+    if representation == "raw_bytes":
+        content = {"raw_bytes": list(encoded_bytes)}
+    elif representation == "hex":
+        content = {"encoding": "hex", "value": encoded_bytes.hex()}
+    else:
+        content = {
+            "encoding": "base64",
+            "content_base64": base64.b64encode(encoded_bytes).decode("ascii"),
+        }
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    investigation_id = uuid4()
+    tool, _sample_blob = make_tool(investigation_id=investigation_id, transport=transport)
+    tool._settings.operator_api_token = SecretStr(secret)
+
+    async def consultation_data(**_kwargs):
+        return {
+            "question": "Review the synthetic verified sample fragment.",
+            "evidence": [
+                {
+                    "evidence_id": str(uuid4()),
+                    "content_excerpts": [{"kind": representation, **content}],
+                }
+            ],
+        }
+
+    monkeypatch.setattr(tool, "_consultation_data", consultation_data)
+    result = await tool.execute(
+        {"consultation_type": "plan_investigation"}, make_context(investigation_id)
+    )
+
+    assert transport.calls == []
+    assert result.output["advisor_status"] == "refused"
+    assert result.output["refusal_code"] == "autowork_credential_or_signed_url_detected"
+    safe_output = repr(result.output)
+    assert secret not in safe_output
+    assert signed_url not in safe_output
+    assert "synthetic-signature" not in safe_output
 
 
 def test_advisor_secret_filter_preserves_sample_material_and_redacts_autowork_secrets() -> None:
@@ -4934,9 +5071,9 @@ async def test_large_prompt_reservation_is_persisted_before_fake_transport() -> 
     sample_bytes = bytes(index % 251 for index in range(3_200_000))
     sample_sha256 = hashlib.sha256(sample_bytes).hexdigest()
     sample_base64 = base64.b64encode(sample_bytes).decode("ascii")
-    sample_id = str(uuid4())
-    association_id = str(uuid4())
-    blob_id = str(uuid4())
+    sample_id = uuid4()
+    association_id = uuid4()
+    blob_id = uuid4()
     observation, observation_raw = make_observation(
         investigation_id,
         {
@@ -4986,75 +5123,51 @@ async def test_large_prompt_reservation_is_persisted_before_fake_transport() -> 
         size=len(observation_raw),
         logical_bucket="investigation-evidence",
     )
+    tool._artifact_store.values[blob_id] = sample_bytes
+    tool._blobs.add(
+        blob_id,
+        sha256=sample_sha256,
+        size=len(sample_bytes),
+        logical_bucket="samples-quarantine",
+    )
+    tool._blobs.descriptors[
+        blob_id
+    ].descriptor.mime_type = "application/x-synthetic-sample; fixture=large"
+    tool._settings.advisor_sample_blob_max_bytes = 8_000_000
+
+    class LargeSampleAssociations:
+        async def list_for_investigation(self, _investigation_id):
+            return (
+                SimpleNamespace(
+                    id=association_id,
+                    sample_sha256=sample_sha256,
+                    qualification="confirmed",
+                ),
+            )
+
+    class LargeSamples:
+        async def list_for_subject(self, _subject_id):
+            return (
+                SimpleNamespace(
+                    id=sample_id,
+                    expected_hash=sample_sha256,
+                    source_object_id=None,
+                    state="quarantined",
+                    blob_id=blob_id,
+                    tlp=TLP.GREEN,
+                    do_not_submit=False,
+                    external_llm_allowed=True,
+                    license_restriction=None,
+                    original_name="synthetic-large.bin",
+                    source_service="fixture",
+                    origin_kind="source_seed",
+                ),
+            )
+
+    tool._sample_associations = LargeSampleAssociations()
+    tool._samples = LargeSamples()
     fixture.service._available_capabilities = frozenset({"bridge.advisor"})
     register_investigation_advisor_tool(fixture.registry, adapter=tool)
-
-    async def large_sample_context(**_kwargs):
-        return {
-            "investigation_id": str(investigation_id),
-            "consultation_type": "plan_investigation",
-            "question": "Review the large authorized sample placeholder.",
-            "article_source_ref": "article:" + "a" * 64,
-            "article_sha256": "a" * 64,
-            "article_summary": "A verified article summary.",
-            "article_passages": [],
-            "open_questions": [],
-            "samples": [
-                {
-                    "verified": True,
-                    "sample_id": sample_id,
-                    "association_id": association_id,
-                    "blob_id": blob_id,
-                    "sha256": sample_sha256,
-                    "blob_sha256": sample_sha256,
-                    "byte_length": len(sample_bytes),
-                    "mime_type": "application/octet-stream",
-                    "association_status": "confirmed",
-                    "content_status": "verified",
-                    "state": "quarantined",
-                    "origin": "source_seed",
-                    "content_base64": sample_base64,
-                    "evidence_ids": [],
-                    "evidence_blob_ids": [],
-                    "evidence_sha256s": [],
-                    "analysis_engines": [],
-                    "analysis_status_by_engine": [],
-                    "related_sample_sha256": [],
-                }
-            ],
-            "evidence": [
-                {
-                    "evidence_id": str(observation.id),
-                    "kind": "binary_string",
-                    "object_type": "sample",
-                    "sha256": observation.sha256,
-                    "source": observation.source,
-                    "content_excerpts": [
-                        {
-                            "kind": "text",
-                            "title": "Verified sample observation",
-                            "text": "A verified large sample placeholder is present.",
-                        }
-                    ],
-                    "blob_read_verified": True,
-                }
-            ],
-            "findings": [],
-            "hypotheses": [
-                {
-                    "id": "large-sample",
-                    "statement": "The verified sample is relevant.",
-                    "status": "open",
-                    "evidence_refs": [str(observation.id)],
-                    "finding_refs": [],
-                }
-            ],
-            "working_state_version": 1,
-            "working_state_sha256": "f" * 64,
-            "truncation": {},
-        }
-
-    tool._consultation_data = large_sample_context
     investigation = await fixture.investigations.get(investigation_id)
     envelope = await fixture.envelopes.get(investigation_id)
     invocation, result, _refs, uncertain = await fixture.service.execute_tool_call(
@@ -5079,9 +5192,10 @@ async def test_large_prompt_reservation_is_persisted_before_fake_transport() -> 
     assert len(prompt.encode("utf-8")) > 4_000_000
     assert sample_base64 in prompt
     assert sample_sha256 in prompt
-    assert sample_id in prompt
-    assert association_id in prompt
-    assert blob_id in prompt
+    assert str(sample_id) in prompt
+    assert str(association_id) in prompt
+    assert str(blob_id) in prompt
+    assert "mime_type=application/x-synthetic-sample; fixture=large" in prompt
     assert f"length={len(sample_bytes)}" in prompt
     prompt_bytes = len(prompt.encode("utf-8"))
     prompt_tokens = (prompt_bytes + 3) // 4

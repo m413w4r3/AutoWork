@@ -523,6 +523,49 @@ class InvestigationAdvisorTool:
                 context=context,
                 question=question,
             )
+            if restricted_sample_hashes:
+                resolved_evidence_refs = tuple(
+                    dict.fromkeys(
+                        UUID(str(item["evidence_id"]))
+                        for item in prompt_data.get("evidence", ())
+                        if isinstance(item, Mapping) and isinstance(item.get("evidence_id"), str)
+                    )
+                )
+                resolved_evidence = await self._load_evidence(
+                    context.investigation_id, resolved_evidence_refs
+                )
+                restricted_resolved_refs: list[UUID] = []
+                for item in resolved_evidence:
+                    references_restricted_sample = False
+                    for sample_hash in restricted_sample_hashes:
+                        if await self._observation_references_sample(item, sample_hash):
+                            references_restricted_sample = True
+                            break
+                    if references_restricted_sample:
+                        restricted_resolved_refs.append(item.id)
+                if restricted_resolved_refs:
+                    return await self._persist_preflight_failure(
+                        context,
+                        consultation_type=consultation_type,
+                        evidence_refs=tuple(
+                            item.id for item in evidence if item.id not in restricted_resolved_refs
+                        ),
+                        output={
+                            "advisor_status": "disclosure_restricted",
+                            "preflight_status": "POLICY_BLOCKED",
+                            "failure_stage": "sample_disclosure_restricted",
+                            "failure_reason": "explicit_sample_restriction",
+                            "disclosure_restricted_refs": [
+                                str(item) for item in restricted_resolved_refs
+                            ],
+                            "disclosure_restricted_sample_count": len(restricted_resolved_refs),
+                            "missing_refs": [str(item) for item in restricted_resolved_refs],
+                            "confirmed_non_execution": True,
+                            "bridge_turns_consumed": 0,
+                            "usable": False,
+                        },
+                        error_code="advisor_disclosure_restricted",
+                    )
             restricted_finding_refs = _drop_findings_linked_to_restricted_evidence(
                 prompt_data, restricted_evidence_refs
             )
@@ -2099,6 +2142,9 @@ class InvestigationAdvisorTool:
                         self._advisor_measurement_row(
                             measurement,
                             blob_id=sample_blob[0],
+                            association_id=sample_blob[2],
+                            mime_type=sample_blob[3],
+                            fragment_bytes=_raw_value,
                             evidence_id=str(evidence_item.id),
                             evidence_sha256=evidence_item.sha256,
                             extractor_version=evidence_item.source_version,
@@ -2117,6 +2163,8 @@ class InvestigationAdvisorTool:
                             {
                                 **legacy,
                                 "blob_id": str(sample_blob[0]),
+                                "association_id": sample_blob[2],
+                                "mime_type": sample_blob[3],
                                 "evidence_id": str(evidence_item.id),
                                 "evidence_sha256": evidence_item.sha256,
                                 "extractor_version": _safe_text(evidence_item.source_version, 96),
@@ -2202,6 +2250,8 @@ class InvestigationAdvisorTool:
                         row = self._advisor_measurement_row(
                             measurement,
                             blob_id=sample_blob[0] if sample_blob is not None else None,
+                            association_id=sample_blob[2] if sample_blob is not None else None,
+                            mime_type=sample_blob[3] if sample_blob is not None else None,
                             evidence_id=measurement.observation_id,
                             evidence_sha256=observation.sha256,
                             extractor_version=observation.source_version,
@@ -2238,16 +2288,25 @@ class InvestigationAdvisorTool:
                 if sample_blob is not None:
                     row["sample_blob_id"] = str(sample_blob[0])
                     row["measurement_count"] = len(measured_rows)
-                    measured_facts.extend(
-                        {
-                            "evidence_id": str(item.id),
-                            "blob_id": str(sample_blob[0]),
-                            "sample_sha256": sample_blob[1],
-                            "extractor_version": _safe_text(item.source_version, 64),
-                            **measurement,
-                        }
-                        for measurement in measured_rows
-                    )
+                    for measurement in measured_rows:
+                        measurement_sample = await self._sample_blob_for_hash(
+                            investigation_id,
+                            item.object_id,
+                            measurement.get("sample_sha256"),
+                        )
+                        if measurement_sample is None:
+                            continue
+                        measured_facts.append(
+                            {
+                                "evidence_id": str(item.id),
+                                "blob_id": str(measurement_sample[0]),
+                                "sample_sha256": measurement_sample[1],
+                                "association_id": measurement_sample[2],
+                                "mime_type": measurement_sample[3],
+                                "extractor_version": _safe_text(item.source_version, 64),
+                                **measurement,
+                            }
+                        )
                 elif item.object_type in {"network_capture", "pcap", "pcapng"}:
                     row["representation"] = "quarantined_network_capture"
                 try:
@@ -2411,14 +2470,18 @@ class InvestigationAdvisorTool:
         sample_rows = await self._sample_inventory(investigation_id, evidence)
         base["samples"] = sample_rows
         association_ids_by_evidence: dict[str, list[str]] = {}
+        mime_types_by_evidence: dict[str, list[str]] = {}
         for sample in sample_rows:
             association_id = sample.get("association_id")
             evidence_ids = sample.get("evidence_ids")
+            mime_type = sample.get("mime_type")
             if not isinstance(association_id, str) or not isinstance(evidence_ids, list):
                 continue
             for evidence_id in evidence_ids:
                 if isinstance(evidence_id, str):
                     association_ids_by_evidence.setdefault(evidence_id, []).append(association_id)
+                    if isinstance(mime_type, str) and mime_type:
+                        mime_types_by_evidence.setdefault(evidence_id, []).append(mime_type)
         observations_by_id = {str(item.id): item for item in evidence}
         for evidence_row in base.get("evidence", ()):
             if not isinstance(evidence_row, dict):
@@ -2437,6 +2500,10 @@ class InvestigationAdvisorTool:
                     f"association_id={association_id}"
                     for association_id in association_ids_by_evidence.get(evidence_id, ())
                 ),
+                *(
+                    f"mime_type={mime_type}"
+                    for mime_type in mime_types_by_evidence.get(evidence_id, ())
+                ),
             ]
             for excerpt in excerpts:
                 if not isinstance(excerpt, dict) or excerpt.get("kind") not in {
@@ -2448,9 +2515,7 @@ class InvestigationAdvisorTool:
                 title = excerpt.get("title")
                 if not isinstance(title, str) or "encoding=" not in title:
                     continue
-                missing_provenance = [
-                    item for item in provenance if item.split("=", 1)[0] + "=" not in title
-                ]
+                missing_provenance = [item for item in provenance if item not in title]
                 if missing_provenance:
                     excerpt["title"] = title + "; " + "; ".join(missing_provenance)
         compacted = _compact_advisor_data(base, consultation_type)
@@ -2945,11 +3010,12 @@ class InvestigationAdvisorTool:
                 self._advisor_measurement_row(
                     measurement,
                     blob_id=None,
+                    fragment_bytes=raw_value,
                     evidence_id=str(observation.id),
                     evidence_sha256=observation.sha256,
                     extractor_version=observation.source_version,
                 )
-                for measurement, _raw_value in typed
+                for measurement, raw_value in typed
             ]
         return self._legacy_measurement_rows(payload)
 
@@ -3014,17 +3080,45 @@ class InvestigationAdvisorTool:
         measurement: ContentPatternMeasurement,
         *,
         blob_id: UUID | None,
+        association_id: str | None = None,
+        mime_type: str | None = None,
+        fragment_bytes: bytes | None = None,
         evidence_id: str,
         evidence_sha256: str,
         extractor_version: str,
     ) -> dict[str, Any]:
+        if fragment_bytes is None:
+            encoding = measurement.encoding.casefold().replace("-", "")
+            try:
+                if encoding in {"ascii", "utf8"}:
+                    fragment_bytes = measurement.bridge_value.encode(
+                        "ascii" if encoding == "ascii" else "utf-8"
+                    )
+                elif encoding == "utf16le":
+                    fragment_bytes = measurement.bridge_value.encode("utf-16le")
+                elif encoding == "raw":
+                    fragment_bytes = bytes.fromhex(measurement.bridge_value)
+                elif encoding == "base64":
+                    fragment_bytes = base64.b64decode(measurement.bridge_value, validate=True)
+            except (UnicodeEncodeError, ValueError, binascii.Error):
+                fragment_bytes = None
         return {
             **({"blob_id": str(blob_id)} if blob_id is not None else {}),
+            **({"association_id": association_id} if association_id else {}),
+            **({"mime_type": mime_type} if mime_type else {}),
             "kind": measurement.bridge_kind,
             "value": measurement.bridge_value,
             "offset": measurement.offset,
             "length": measurement.length,
+            "byte_length": len(fragment_bytes)
+            if fragment_bytes is not None
+            else measurement.length,
             "encoding": measurement.encoding,
+            **(
+                {"fragment_sha256": hashlib.sha256(fragment_bytes).hexdigest()}
+                if fragment_bytes is not None
+                else {}
+            ),
             "source_file": measurement.source_file,
             "sample_sha256": measurement.sample_sha256,
             "evidence_id": evidence_id,
@@ -3070,6 +3164,14 @@ class InvestigationAdvisorTool:
                     continue
                 if target_key == "hex" and not _valid_hex_measurement(label):
                     continue
+                fragment_bytes: bytes | None = None
+                try:
+                    if target_key == "hex":
+                        fragment_bytes = bytes.fromhex(re.sub(r"\s+", "", label))
+                    elif target_key == "base64":
+                        fragment_bytes = base64.b64decode(re.sub(r"\s+", "", label), validate=True)
+                except (ValueError, binascii.Error):
+                    fragment_bytes = None
                 rows.append(
                     {
                         "kind": target_key,
@@ -3078,6 +3180,14 @@ class InvestigationAdvisorTool:
                         "sample_sha256": sample_sha256,
                         "length": None,
                         "encoding": "legacy_typed",
+                        **(
+                            {
+                                "byte_length": len(fragment_bytes),
+                                "fragment_sha256": hashlib.sha256(fragment_bytes).hexdigest(),
+                            }
+                            if fragment_bytes is not None
+                            else {}
+                        ),
                         "source_file": "sample_observation",
                     }
                 )
@@ -3162,7 +3272,7 @@ class InvestigationAdvisorTool:
         investigation_id: UUID,
         object_id: str,
         measured_hash: object,
-    ) -> tuple[UUID, str] | None:
+    ) -> tuple[UUID, str, str, str] | None:
         investigation = await self._investigations.get(investigation_id)
         if investigation is None or not isinstance(measured_hash, str):
             return None
@@ -3177,6 +3287,11 @@ class InvestigationAdvisorTool:
             if item.sample_sha256 == measured_hash or item.sample_sha256 == object_id
         }
         if measured_hash not in allowed_hashes:
+            return None
+        association = next(
+            (item for item in associations if item.sample_sha256 == measured_hash), None
+        )
+        if association is None:
             return None
         samples = await sample_list(investigation.subject_id)
         for sample in samples:
@@ -3198,7 +3313,19 @@ class InvestigationAdvisorTool:
                 or blob.descriptor.logical_bucket != "samples-quarantine"
             ):
                 continue
-            return sample.blob_id, measured_hash
+            mime_type = getattr(blob.descriptor, "mime_type", "application/octet-stream")
+            mime_type = (
+                mime_type.strip()
+                if isinstance(mime_type, str) and mime_type.strip()
+                else "application/octet-stream"
+            )
+            association_id = getattr(association, "id", None)
+            return (
+                sample.blob_id,
+                measured_hash,
+                str(association_id) if association_id is not None else "",
+                mime_type[:512],
+            )
         return None
 
     @staticmethod
@@ -4372,10 +4499,13 @@ def _contains_encoded_operational_secrets(value: Any, *, settings: Settings | No
                 return ()
         return ()
 
-    return any(
-        contains_operational_secrets(fragment.decode("latin-1"), settings=settings)
-        for fragment in decoded_fragments(value)
-    )
+    text_encodings = ("utf-8", "utf-16le", "utf-16be", "latin-1")
+    for fragment in decoded_fragments(value):
+        for encoding in text_encodings:
+            decoded_text = fragment.decode(encoding, errors="ignore")
+            if contains_operational_secrets(decoded_text, settings=settings):
+                return True
+    return False
 
 
 def _advisor_unit_provenance(
