@@ -14,6 +14,7 @@ from cti_app.infrastructure.database.models import (  # noqa: F401
     edition_render,
     editions,
     editorial,
+    external_effects,
     invariants,
     investigation,
     jobs,
