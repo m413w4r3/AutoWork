@@ -56,6 +56,12 @@ async def test_record_json_is_bounded_sanitized_and_idempotent() -> None:
         "signed_ipv6_encoded_zone_page": (
             "https://[fe80::1%25eth%30]/report?X-Amz-Signature=encoded-zone-private-value"
         ),
+        "signed_bracket_path": (
+            "https://example.test/path[segment]?X-Amz-Signature=bracket-path-private-value"
+        ),
+        "signed_paren_path": (
+            "https://example.test/path(foo)?X-Amz-Signature=paren-path-private-value"
+        ),
         "api_key": attacker_token,
         "raw_bytes": raw_bytes,
         "payload_bytes": byte_array,
@@ -123,6 +129,8 @@ async def test_record_json_is_bounded_sanitized_and_idempotent() -> None:
         b"ipv6-private-value",
         b"zone-private-value",
         b"encoded-zone-private-value",
+        b"bracket-path-private-value",
+        b"paren-path-private-value",
         b"must-not-persist",
         b"X-Amz-Signature",
     ):
