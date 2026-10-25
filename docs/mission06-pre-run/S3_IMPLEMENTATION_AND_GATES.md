@@ -3,7 +3,10 @@
 Statut : **CONCEPTION VALIDÉE, IMPLÉMENTATION NON TERMINÉE.** Ce document ne
 déclare aucun `S3_*_READY`. La conception D6 a été confrontée au code réel :
 [`recon/S3_SEAM.md`](recon/S3_SEAM.md) (SHA-256
-`9f17611abf3a05166f069b745cfd546041e6748ccce1f4f36b6135f3774dbaa4`). Le code
+`9f17611abf3a05166f069b745cfd546041e6748ccce1f4f36b6135f3774dbaa4`). La
+spécification d'implémentation détaillée est
+[`recon/S3_IMPLEMENTATION_SPEC.md`](recon/S3_IMPLEMENTATION_SPEC.md) (SHA-256
+`ee82367b419a85ba1c6b90dd79a014907dc856647e4e016fffd22412fbe3a397`). Le code
 actuel n'a **pas** de transaction de consume partagée, et les adaptateurs/
 transports restent appelables sans permis.
 
