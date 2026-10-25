@@ -34,7 +34,7 @@ the final gate replay. Any row not backed by an executed test is
 
 | Invariant | Expected | Status |
 |---|---|---|
-| Restart with `RUNNING` or uncertain external outcome | reservation and diagnostics preserved; no second call on the same operation key; `NEEDS_REVIEW` unless canonical bounded non-submission proof | **PARTIAL — M05-D PG terminal redelivery PASS** (one committed/consumed turn, stable `NEEDS_REVIEW`, state/audit/model/hash/chronology unchanged, fake sends stay 1); **in-flight crash recovery NOT_DEMONSTRATED** |
+| Restart with `RUNNING` or uncertain external outcome | reservation and diagnostics preserved; no second call on the same operation key; `NEEDS_REVIEW` unless canonical bounded non-submission proof | **PASS for the two proven in-flight classes (closure, `4111acf3`)** — (a) *ambiguous submission*: durable job `RUNNING`, turn `RUNNING`, ModelRun `RUNNING`/`EXTERNAL_STATE_UNKNOWN` with a stable bridge request id and a `RESERVED` bridge reservation; a fresh runtime on the same PG recovers the abandoned job, requeues the same attempt, resumes, seals the turn as `orphaned_running_turn`, keeps `NEEDS_REVIEW`, commits the reservation once and keeps provider sends at 1; input/authorized/evidence hashes, prompt template id/version and requested model are exactly preserved; (b) *proven no-send*: the worker dies after the `RUNNING` turn + pre-submission ModelRun commit but before the submission claim; durable `NOT_SUBMITTED`, attempt 0, no bridge request id, provider sends 0; recovery preserves that proof, seals to `NEEDS_REVIEW`, sends 0 and invents no retry. **The framework pre-submission-proof tool-invocation branch remains NOT_EXERCISED.** M05-D terminal redelivery remains PASS (one committed/consumed turn, stable `NEEDS_REVIEW`, state/audit/model/hash/chronology unchanged, fake sends stay 1). |
 | Canonical status/model/hash survive a new service instance on the same disposable PG | identical SQL/version/SHA | **PASS (M05-B PG)** — rebuilt app/service and transport replay the uncertain invocation; snapshot hashes and audit unchanged, replay transport sends 0 |
 | Stale context cursor | HTTP 409, no silent reread | **PASS (M05-D PG)** — `stale_cursor.status_code == 409` |
 | Invalid legacy offset | HTTP 422 | **PASS (M05-D PG)** — mixed cursor/offset request returns 422 |
@@ -53,6 +53,18 @@ the final gate replay. Any row not backed by an executed test is
 | Runtime: no `httpx`/socket external call during E2E | **PASS (M05-D)** — the guard actively rejects a UDP probe to `203.0.113.9:9`, HTTP/DNS non-loopback names, and allows only loopback PostgreSQL/local tools |
 | No dotenv/secret read by pure preparation | **PASS (M05-A)**: `test_prepare_accepts_pure_mapping_and_does_not_open_files_start_processes_or_connect` monkeypatches file/socket/subprocess/`get_settings` I/O to raise and still succeeds; the renderer module imports only `advisor_wire`. |
 | No external client constructed by the renderer | **PASS (M05-A source audit)**: `advisor_prompt.py` imports only `collections.abc`/`typing`/`advisor_wire`; no httpx/socket/settings. |
+
+## Closure-pass proofs (2026-10-25, code SHA `4111acf3`)
+
+| Proof | Status |
+|---|---|
+| P10 absence in a no-sample investigation | **PASS** — the real `ProposalConversationService.propose()` raises the typed first-precondition failure `The investigation has no goodware baseline binding`; durable state has no subject Samples and no baseline binding; zero adapter calls, no P10 turn, no P09 call. |
+| Real P10 with satisfied preconditions | **PASS** — persisted inert Sample + real imported/bound goodware index; real P10 snapshot; one local fake model send; a real P09 invariant; replay reuses the same turn with one send. |
+| In-flight ambiguous recovery | **PASS** — see the replay row above. |
+| In-flight proven no-send | **PASS** — see the replay row above. |
+| No application code changed | **PASS** — `git diff --name-status a30a7c22..4111acf3` lists only three integration test files. |
+| No live egress in the new tests | **PASS** — only local adapter fakes; no network client is constructed, and the provider fake asserts its send count. |
+| Framework pre-submission-proof tool-invocation branch | **NOT_EXERCISED** — the in-flight oracle proves the model-run submission boundary; the tool-invocation proof verifier is not triggered. This is recorded, not claimed. |
 
 ## S3 / Advisor cutover
 

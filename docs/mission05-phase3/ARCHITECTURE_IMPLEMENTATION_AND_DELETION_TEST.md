@@ -3,6 +3,11 @@
 Status: **M05-A INTEGRATED on local main at `b8a10165`.** Only what the
 integrated commit and executed tests prove is recorded here.
 
+**Closure pass (2026-10-25, `4111acf3`):** no architecture change. The closure
+diff `a30a7c22..4111acf3` touches only three integration test files; the
+renderer, preparation interface, byte corpus and deletion test below are
+unchanged.
+
 ## Modules before / after
 
 | Aspect | Before (`55fba67d`) | After (M05-A `2e7733be`) |

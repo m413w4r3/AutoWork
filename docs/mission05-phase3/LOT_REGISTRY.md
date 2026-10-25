@@ -13,7 +13,9 @@ Baseline: `main@55fba67d5882c1ae6c4abff4e74c53a24e57649f`
 Hard rules: local `main` only; no push/PR/release; no live provider, Bridge,
 VT, Shodan, CTI source, live PostgreSQL/MinIO, migration or deployment. S3
 stays `S3_BLOCKED_DESIGN`; Advisor cutover stays
-`ADVISOR_CUTOVER_BLOCKED_BY_S3`.
+`ADVISOR_CUTOVER_BLOCKED_BY_S3`. These rules governed the original mission and
+the closure. The owner published `a30a7c22` to `origin/main` after the original
+close; the closure pass performed no new push.
 
 ## DAG
 
@@ -44,6 +46,24 @@ Status vocabulary: `PLANNED / RUNNING / REVIEW / APPROVED / BLOCKED /
 INTEGRATED`. A lot is integrable only with relevant tests green and an
 independent `APPROVED` review; `REVISE` means correction plus a new review.
 
+## Closure corrective pass (C1–C4, M05-REV)
+
+Base `a30a7c22` (published). Worktrees were used only for the independent Luna
+agents; integration is on local `main`. No new push was performed.
+
+| Lot | Objective | Agent | Base | Result SHA | Status | Tests actually run | Review |
+|---|---|---|---|---|---|---|---|
+| M05-C1 | Correct the E2E-0 contract; real P10 absence + real P10 with satisfied preconditions | Luna Implementer xhigh, wks_660f81c51758d0fa | a30a7c22 | `9d54d6a1` → integrated `dd5636e1` | INTEGRATED | targeted 2 passed (4.58 s parent); integrated four oracles 4 passed (8.43 s) | M05-REV xhigh |
+| M05-C2 | In-flight crash recovery oracle | Luna Implementer xhigh, wks_5f9ddda089ed2fd6 | a30a7c22 | `b5421ff6` + `f7c58900` → integrated `5f62805a` + `ca78f1e4`; parent `7b896f20` adds the proven-no-send class | INTEGRATED | 1 passed 1.92 s (ambiguous); 2 passed 2.79–3.07 s (both classes); exact hash/version assertions in `4111acf3` | M05-REV xhigh |
+| M05-C3 | Parent integration and full gates | parent | a30a7c22 | `4111acf3` | GATES GREEN | lint, typecheck, backend, full integration (351), workflow FAST/FULL, CI scripts | — |
+| M05-C4 | Documentation closure | parent | `4111acf3` | (this docs commit) | DONE | docs only | — |
+| M05-REV | Independent closure review | Luna xhigh, wks_569a4cf025c30962 | a30a7c22 | candidate `ca78f1e4` **REVISE** (2 MAJOR, 1 MINOR) → corrections `4424fb4d`/`4111acf3` → **APPROVED** on `4111acf3` | APPROVED | independent source review; reviewer did not run PostgreSQL (parent-reported 351 passed) | — |
+
+The closure diff `a30a7c22..4111acf3` changes only three integration test files:
+`test_investigation_e2e_no_sample_postgres.py` (modified),
+`test_invariant_proposals_postgres.py` (new),
+`test_inflight_job_recovery_postgres.py` (new). No application code changed.
+
 ## File ownership (conflict prevention)
 
 | Lot | Owned paths |
@@ -60,15 +80,19 @@ Required final set in `docs/mission05-phase3/`: `ARCHITECTURE_DECISIONS.md`,
 `E2E_1_SYNTHETIC_SAMPLE.md`, `TEST_AND_CI_LEDGER.md`,
 `SECURITY_REPLAY_AND_S3_GATES.md`, `FINAL_AUDIT_AND_HANDOFF.md`, `_work/`.
 
-## Verdicts (updated at close)
+## Verdicts (closure pass, code SHA `4111acf3`)
+
+Previous verdicts at `a30a7c22` are retained before the arrow; the arrow shows
+the closure evolution. No earlier verdict is deleted.
 
 ```text
-DEEP_ADVISOR_PREPARATION_PASS|REVISE : DEEP_ADVISOR_PREPARATION_PASS (A/F integrated, byte parity and typed refusals)
-E2E_NO_SAMPLE_PASS|PARTIAL|BLOCKED    : E2E_NO_SAMPLE_PARTIAL (continuous driver integrated; real P10 + authoritative v4 reparse NOT_DEMONSTRATED)
-E2E_SYNTHETIC_SAMPLE_PASS|PARTIAL|BLOCKED : E2E_SYNTHETIC_SAMPLE_PASS (offline inert journey; real VT transport + MinIO/S3 NOT_DEMONSTRATED)
-PHASE3_OFFLINE_PASS|PARTIAL           : PHASE3_OFFLINE_PARTIAL (E2E-1 PASS; E2E-0 PARTIAL; D adversarial integrated; in-flight crash recovery NOT_DEMONSTRATED)
+DEEP_ADVISOR_PREPARATION_PASS|REVISE : DEEP_ADVISOR_PREPARATION_PASS (unchanged; no advisor code changed in the closure)
+E2E_NO_SAMPLE_PASS|PARTIAL|BLOCKED    : E2E_NO_SAMPLE_PARTIAL → E2E_NO_SAMPLE_PASS (typed P10 absence with the real service; real P10 proven where preconditions hold; authoritative archive reparse excluded while the cutover is blocked, offline V4 retained)
+E2E_SYNTHETIC_SAMPLE_PASS|PARTIAL|BLOCKED : E2E_SYNTHETIC_SAMPLE_PASS (unchanged and replayed at 4111acf3; real VT transport + MinIO/S3 still NOT_DEMONSTRATED)
+IN_FLIGHT_RECOVERY_PASS|PARTIAL       : NOT_DEMONSTRATED → IN_FLIGHT_RECOVERY_PASS (ambiguous submission: no second send, NEEDS_REVIEW, exact hash/version preservation; proven no-send: zero sends, proof preserved, no retry authorization; framework tool-invocation proof branch NOT_EXERCISED)
+PHASE3_OFFLINE_PASS|PARTIAL           : PHASE3_OFFLINE_PARTIAL → PHASE3_OFFLINE_PASS (both E2E PASS, deep advisor PASS, all applicable closure gates green)
 S3_BLOCKED_DESIGN                     : S3_BLOCKED_DESIGN (unchanged)
 ADVISOR_CUTOVER_BLOCKED_BY_S3         : ADVISOR_CUTOVER_BLOCKED_BY_S3 (unchanged)
-MAIN_LOCAL_REVIEWED|NOT_READY         : MAIN_LOCAL_REVIEWED (final executable gates rerun on local main; see TEST_AND_CI_LEDGER.md)
-READY_FOR_MAIN_PUSH_REVIEW|NO_GO      : READY_FOR_MAIN_PUSH_REVIEW (no push performed; owner authorization required)
+MAIN_LOCAL_REVIEWED|NOT_READY         : MAIN_LOCAL_REVIEWED (closure gates rerun on local main at 4111acf3; see TEST_AND_CI_LEDGER.md)
+READY_FOR_MAIN_PUSH_REVIEW|NO_GO      : READY_FOR_MAIN_PUSH_REVIEW (no new push performed; owner authorization required)
 ```

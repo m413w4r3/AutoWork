@@ -90,6 +90,36 @@ Any M05-A byte change would be visible here.
 | live providers / MinIO / S3 | NOT_DEMONSTRATED — explicitly out of scope and still blocked |
 | full E2E-0 + E2E-1 in a recreated environment | NOT_RUN |
 
+## Corrective closure pass (C1–C4)
+
+Code SHA under the final closure gates: `4111acf3` (published baseline
+`a30a7c22` + four test-only commits). Environment: Python 3.12.3, disposable
+`postgres-test` on `127.0.0.1:55432`, pinned Typst 0.15.1, Poppler 24.02.0,
+font bundle `chpTypst`, `TMPDIR=$HOME/.cache/awtmp`. No live provider/Bridge/
+VT/Shodan/S3/MinIO call.
+
+| Check | Result | Notes |
+|---|---|---|
+| Four targeted oracles (E2E-0, E2E-1, P10, in-flight) at `ca78f1e4` | **PASS**, 4 passed | 8.43 s |
+| Revised P10 + both recovery scenarios at `4111acf3` | **PASS**, 3 passed | 3.37 s |
+| `make lint-backend` at `4111acf3` | **PASS** | 854 files already formatted |
+| `make typecheck-backend` at `4111acf3` | **PASS** | no issues in 827 source files |
+| `make test-backend` at `ca78f1e4` | **PASS**, 4912 passed, 2 skipped, 31 deselected | 133.04 s; the later commits are integration-test-only and ignored by this target |
+| `make test-integration` at `ca78f1e4` | **RED → GREEN** | First full run: 1 failed / 349 passed (`test_agentic_correction_loop_postgres` resolved the snap `typst` wrapper). Isolated rerun with the pinned binary on `PATH`: PASS 3.74 s. Full rerun: 350 passed in 145.68 s. |
+| `make test-integration` at `7b896f20` | **PASS**, 351 passed | 149.59 s; adds the proven-no-send recovery scenario |
+| `make test-integration` at `4111acf3` | **PASS**, 351 passed | 151.44 s; includes both E2E drivers, the P10 test and both recovery scenarios |
+| `make test-workflow` at `ca78f1e4` | **PASS**, 22 passed, 15 deselected | 62.31 s, JUnit guard OK; later commits are integration-test-only and not collected by this target |
+| `make test-workflow-full` at `ca78f1e4` | **PASS**, 32 passed, 5 deselected | 115.37 s, JUnit guard OK |
+| `make test-ci-scripts` at `ca78f1e4` | **PASS**, 5 tests | no CI script changed afterwards |
+| Frontend gates | **NOT_RUN** | no frontend path touched |
+| GitHub CI run #40210449466 on published `a30a7c22` | **SUCCESS** | 5/5 jobs: backend, typst-renderer-smoke, W10+J2 browser, frontend, compose. The backend job ran ruff/format/mypy, the non-workflow pytest with the PostgreSQL service (integration included) and workflow FAST/FULL. |
+| GitHub CI on the new local commits | **NOT_RUN** | The commits are unpushed; no push was performed in this closure. |
+
+The RED → GREEN integration entry is environmental: the test resolves `typst`
+from `PATH`, not `TYPST_BINARY`. With the pinned binary prepended to `PATH` the
+same test and the full suite pass. No application or test assertion was
+weakened.
+
 ## Cost / duration
 
 Token and cost figures: UNKNOWN (not measured). Durations only where the test

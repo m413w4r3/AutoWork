@@ -5,6 +5,13 @@ Real VirusTotal transport and MinIO/S3 are **NOT_DEMONSTRATED** and are not
 claimed; the isolated filesystem object store is the storage backend exercised.
 This is not malware analysis and not S3 validation.
 
+**Closure pass (2026-10-25, code SHA `4111acf3`):** this driver is unchanged
+and was replayed on the integrated code. The real P10 proof deliberately lives
+in a separate focused PostgreSQL test (`test_invariant_proposals_postgres.py`)
+so this journey's audit counts, evidence chain and replay assertions are not
+rewritten to accommodate a P10 turn. See `E2E_0_NO_SAMPLE.md` for the corrected
+E2E-0 contract.
+
 ## Driver
 
 - Test node:
@@ -68,6 +75,11 @@ Observed: **1 passed in 5.17 s** on integrated main (parent run);
 implementer 4.68 s; independent reviewer 4.86 s. No external service or sample
 execution.
 
+Closure replay at `4111acf3`: the four targeted oracles (`E2E-0`, `E2E-1`,
+P10, in-flight recovery) passed together in **8.43 s** at `ca78f1e4`; the final
+full integration suite passed **351 tests in 151.44 s** on `4111acf3`, this
+driver included.
+
 ## Independent adversarial replay (M05-D)
 
 The M05-D module was integrated at `70ffb9df` and replayed on the D tree by
@@ -88,5 +100,8 @@ stand.
   the deliberate acquisition seam.
 - **Malware analysis:** the sample is strictly inert; no execution, scanning
   or behavior is claimed.
-- **P10/P09:** not part of this journey; see `E2E_0_NO_SAMPLE.md` for the
-  V3 contradiction.
+- **P10/P09:** not part of this journey. A real P10 with satisfied
+  preconditions (persisted Sample, imported/bound goodware index, real P09
+  invariant, replay without a second send) is proven in
+  `backend/tests/integration/test_invariant_proposals_postgres.py`; see
+  `E2E_0_NO_SAMPLE.md` for the corrected no-sample contract.
