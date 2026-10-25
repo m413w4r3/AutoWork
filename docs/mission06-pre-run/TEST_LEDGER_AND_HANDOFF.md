@@ -180,10 +180,43 @@ Justification :
   les lectures canoniques live (lignée de synthèse, état des jobs, MinIO)
   n'ont pas été effectuées et restent à autoriser.
 
-## 6. Handoff futur
+## 6. Handoff concret
 
-Le handoff final doit contenir : SHA intégré, liste des lots approuvés,
-commandes et résultats réellement exécutés, tests `NOT_RUN`, risques résiduels,
-verdicts finaux et prochaine action permissible. Aucun push, merge distant,
-déploiement, migration live ou appel fournisseur n'est autorisé par ce
-registre.
+### État Git
+
+- `main` local : `58dee0dc` — **documentation uniquement**, aucun code Mission
+  06-P fusionné. Aucun push, merge distant, déploiement ou migration live.
+- Branche candidate politique : `m06/policy-impl` à `33104968`
+  (51 unitaires, 6 PostgreSQL verts ; revue indépendante en cours/`REVISE`).
+- Branche candidate S3 : `m06/s3-core-impl` à `642fae96` + correction finale
+  en cours (34 unitaires verts avant correction ; PG non rejoué).
+- Gate combiné temporaire : `/tmp/m06-combined-gate`, branche
+  `m06/combined-gate` à `1fdf64b6` (politique + S3 + correctifs d'intégration
+  `env.py`). Chaîne `0001→0004` : `UPGRADE_OK` ; politique PG 6/6 ; S3 PG
+  RED sur fixture FK avant correction.
+
+### Prochaine action permissible
+
+1. Attendre/valider les derniers commits correctifs S3 et la re-revue
+   indépendante.
+2. Si et seulement si les revues passent `APPROVED` : fusionner la politique
+   puis S3 sur `main`, appliquer les deux correctifs `env.py` (exclusion
+   `external_effect_*` du baseline, import `retrohunt`), rejouer
+   `alembic upgrade head` et les tests PG combinés.
+3. Si une revue reste `REVISE` : conserver les branches candidates, ne pas
+   fusionner, et traiter les constats avant toute release.
+4. Toute prévol live (lecture canonique Run 12, G2/TLP, MinIO) exige une
+   autorisation séparée ; aucun appel fournisseur, téléchargement ou
+   exécution d'échantillon n'est autorisé par ce handoff.
+
+### Risques résiduels
+
+- Course révocation → émission : propriété du consume atomique S3-CORE, pas
+  encore prouvée en PostgreSQL combiné.
+- Plafond `max_effect_claims_per_investigation` et lignée d'invocation :
+  validation politique présente, application runtime à câbler dans S3.
+- Identité de production : les providers locaux/statiques collapsent les
+  utilisateurs en IDs génériques ; attribution humaine non vérifiée.
+- Toutes les capacités VT/Bridge/analyse locale restent `UNKNOWN` ou
+  `BLOCKED` en live ; aucun test ne prouve une réception fournisseur.
+- Le parent n'est pas Luna xhigh ; les enfants le sont.
