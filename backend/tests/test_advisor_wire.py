@@ -449,10 +449,15 @@ def test_archived_corpus_c01_to_c13_replays_as_compact_resolvable_text_dossiers(
             and value not in {"…", "..."}
             and not re.fullmatch(r"(?i)(?:R|M|F|A|E)[1-9][0-9]*", value)
             and value in prompt
+            # D7 permits authorized sample provenance, but only through the
+            # explicit provenance field, never as a bare incidental hash.
+            and not (key == "sample_sha256" and f"sample_sha256={value}" in prompt)
         ]
         assert not leaked_fields, (case_id, leaked_fields)
         for internal_key in (
-            "sha256",
+            # D7 transmits measurement/sample provenance hashes with the
+            # authorized evidence; the raw internal values above are still
+            # checked, and unrelated samples remain vetoed.
             "object_ref",
             "open_questions",
             "wire_ref_catalog",
