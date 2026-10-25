@@ -384,6 +384,7 @@ async def test_p10_propose_uses_persisted_preconditions_and_replays_turn(
     assert len(first.invariant_results) == 1
     p09_result = first.invariant_results[0]
     assert p09_result.invariant is not None or p09_result.rejection is not None
+    assert p09_result.invariant is not None
     assert len(adapter.calls) == 1
 
     async with uow_factory() as uow:
