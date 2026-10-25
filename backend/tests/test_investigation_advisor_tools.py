@@ -6376,3 +6376,34 @@ async def test_suricata_draft_refuses_before_bridge_without_measured_network_fac
     assert result.output["bridge_turns_consumed"] == 0
     assert result.output["usable"] is False
     assert transport.calls == []
+
+
+@pytest.mark.asyncio
+async def test_missing_evidence_reference_returns_typed_pre_transport_refusal() -> None:
+    investigation_id = uuid4()
+    observation, raw = make_observation(investigation_id, {"schema": "offline-test.v1"})
+    missing_observation_id = uuid4()
+    transport = Transport(None)
+    tool, _sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "evidence_refs": [str(observation.id), str(missing_observation_id)],
+        },
+        make_context(investigation_id),
+    )
+
+    assert result.status is ToolInvocationStatus.FAILED
+    assert result.error_code == "advisor_input_invalid"
+    assert result.output["advisor_status"] == "invalid_input"
+    assert result.output["input_error_code"] == "advisor_input_rejected"
+    assert result.output["failure_stage"] == "pre_transport_validation"
+    assert result.output["confirmed_non_execution"] is True
+    assert result.output["provider_usage"] == {"status": "not_submitted"}
+    assert transport.calls == []

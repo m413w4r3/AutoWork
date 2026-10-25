@@ -351,7 +351,7 @@ class InvestigationAdvisorTool:
             return await self._input_failure(context, exc.reason_code)
         except (KeyError, TypeError, ValueError):
             return await self._input_failure(context, "advisor_arguments_invalid")
-        evidence: tuple[EvidenceObservation, ...]
+        evidence: tuple[EvidenceObservation, ...] = ()
         try:
             execution_clock = time.monotonic
             started_at = execution_clock()
