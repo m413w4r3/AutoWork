@@ -30,7 +30,10 @@ _BINARY_FIELD = re.compile(
     r"bytes[_-]?(?:raw|file|sample|payload)|raw[_-]?(?:binary|octets))",
     re.I,
 )
-_SIGNED_URL = re.compile(r"https?://[^\s\]\[()<>\"]+", re.I)
+_SIGNED_URL = re.compile(
+    r"https?://(?:\[[0-9A-Fa-f:.]+\]|[^\s\]\[()<>\"]+)[^\s\]\[()<>\"]*",
+    re.I,
+)
 _SECRET_VALUE = re.compile(
     r"(?i)\b((?:OPERATOR_[A-Z0-9_]*TOKEN)|"
     r"(?:(?:VT|VIRUSTOTAL|SHODAN)_API_(?:KEY|TOKEN))|"

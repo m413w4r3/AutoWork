@@ -49,6 +49,7 @@ async def test_record_json_is_bounded_sanitized_and_idempotent() -> None:
         "summary": f"Found the file; attacker token={attacker_token}",
         "large_excerpt": large_excerpt,
         "signed_page": "https://vt.invalid/report?X-Amz-Signature=private-value",
+        "signed_ipv6_page": ("https://[2001:db8::1]/report?X-Amz-Signature=ipv6-private-value"),
         "api_key": attacker_token,
         "raw_bytes": raw_bytes,
         "payload_bytes": byte_array,
@@ -111,7 +112,12 @@ async def test_record_json_is_bounded_sanitized_and_idempotent() -> None:
         "content_base64": base64.b64encode(byte_array_raw).decode("ascii"),
     }
     assert decoded["wrapped_raw_bytes"]["value"] == decoded["payload_bytes"]
-    for forbidden in (b"private-value", b"must-not-persist", b"X-Amz-Signature"):
+    for forbidden in (
+        b"private-value",
+        b"ipv6-private-value",
+        b"must-not-persist",
+        b"X-Amz-Signature",
+    ):
         assert forbidden not in stored
     assert b"[URL omitted]" in stored
     assert b'"input_tokens":321' in stored
