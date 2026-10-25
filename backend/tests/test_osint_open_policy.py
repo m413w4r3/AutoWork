@@ -33,6 +33,7 @@ from cti_app.domain.investigation import (
     DisclosureBounds,
     EnvelopeAuthorityKind,
     InvestigationBudget,
+    InvestigationExecutionMode,
     InvestigationEnvelope,
     QualificationActorKind,
     SampleAssociation,
@@ -80,6 +81,21 @@ def _capabilities(**overrides: object) -> OsintCapabilities:
         ),
         "max_effect_claims_per_investigation": 25,
     }
+    overrides = dict(overrides)
+    budget_dimension_aliases = {
+        "vt_units": BudgetDimension.VT_UNITS,
+        "shodan_credits": BudgetDimension.SHODAN_CREDITS,
+        "downloads": BudgetDimension.DOWNLOADS,
+        "bridge_turns": BudgetDimension.BRIDGE_TURNS,
+        "tool_seconds": BudgetDimension.TOOL_SECONDS,
+        "context_bytes": BudgetDimension.CONTEXT_BYTES,
+        "context_tokens": BudgetDimension.CONTEXT_TOKENS,
+    }
+    budget_limits = dict(values["budget_limits"])
+    for name, dimension in budget_dimension_aliases.items():
+        if name in overrides:
+            budget_limits[dimension] = overrides.pop(name)
+    values["budget_limits"] = budget_limits
     values.update(overrides)
     return OsintCapabilities(**values)  # type: ignore[arg-type]
 
@@ -307,9 +323,12 @@ async def test_external_operator_tool_denied_without_envelope_but_local_read_rem
 ):
     fixture = _Fixture(
         responses=[],
-        tools=[("vt.file_report", "vt"), ("local.read", "local", ToolEffect.LOCAL_READ)],
+        tools=[
+            ("vt.file_report", "vt"),
+            ("local.read", "local", ToolEffect.LOCAL_READ, "local.read", {}),
+        ],
     )
-    state = await fixture.start()
+    state = await fixture.start(execution_mode=InvestigationExecutionMode.OPERATOR_LED)
     fixture.envelopes._items.pop(fixture.investigation_id)
     service = operator_service(fixture)
 
