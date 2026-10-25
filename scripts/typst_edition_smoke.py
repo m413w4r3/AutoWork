@@ -105,7 +105,11 @@ async def _compile_edition() -> None:
         _CHP_TYPST_ROOT,
         manifest_name="edition-renderer-manifest.json",
     )
-    rendered = EditionTypstRenderer().render(_edition_document(), bundle)
+    rendered = EditionTypstRenderer().render(
+        _edition_document(),
+        bundle,
+        document_label="AutoWork edition smoke",
+    )
     render_data = json.loads(rendered.render_data_bytes)
     if len(render_data["publications"]) < 2:
         raise RuntimeError("edition smoke must contain at least two publications")
