@@ -58,6 +58,9 @@ Any M05-A byte change would be visible here.
 | M05-A | 2e7733be | ruff check on changed source/tests; mypy on advisor modules | PASS | — |
 | M05-A | 2e7733be | anti-slop advisor prompt SHA | unchanged `54c9f454f0e80c95e518279c6a3205a776714db84964039a1fdaa0c7ebecafab` | byte parity |
 | M05-A | integrated `b8a10165` | golden + 6 advisor files + `test_investigation_advisor_tools.py` on main | PASS, 240 passed | 5.37 s |
+| M05-F | base `7c549ec3` | RED regression test replay | FAIL as expected: `UnboundLocalError` at `investigation_advisor_tools.py:1006` | 1.14 s |
+| M05-F | candidate `a1b356c6` | same regression test | PASS, 1 passed | 0.53 s |
+| M05-F | integrated `12671c6a` | advisor tools + golden + 6 advisor files on main | PASS, 241 passed | 5.39 s |
 | M05-A + integration fix `7e51912a` | — | `make lint-backend` | PASS (849 files formatted); one import-order error found after integration and fixed mechanically without behaviour change | — |
 | M05-A | integrated `7e51912a` | `make typecheck-backend` | PASS, no issues in 822 source files | — |
 | M05-A | integrated `7e51912a` | `make test-ci-scripts` | PASS, 5 tests | 0.001 s |
