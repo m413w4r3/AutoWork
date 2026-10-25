@@ -21,6 +21,9 @@ from string import ascii_uppercase
 RESERVED_CODES: frozenset[str] = frozenset(
     {
         "CI",
+        "CL",
+        "CR",
+        "CT",
         "DB",
         "DE",
         "FR",
@@ -29,11 +32,17 @@ RESERVED_CODES: frozenset[str] = frozenset(
         "IR",
         "IT",
         "IV",
+        "NO",
+        "PY",
         "RA",
         "RB",
         "RC",
         "RD",
+        "RH",
+        "RK",
         "RX",
+        "SL",
+        "ZY",
         "ZZ",
     }
 )
