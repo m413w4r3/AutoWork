@@ -59,9 +59,9 @@ def _context(investigation_id, *, key: str, tool_seconds: int) -> ToolExecutionC
     budget.reserve(
         key,
         {
+            # Direct tool execution bypasses the dispatcher's measured prompt
+            # reservation; reserve only the dimensions under test here.
             BudgetDimension.BRIDGE_TURNS: 1,
-            BudgetDimension.CONTEXT_BYTES: 4_000_000,
-            BudgetDimension.CONTEXT_TOKENS: 1_000_000,
             BudgetDimension.TOOL_SECONDS: tool_seconds,
         },
     )
@@ -125,7 +125,21 @@ async def test_3600_second_reservation_bounds_7200_role_and_late_response_is_amb
     assert result.output["advisor_status"] == "needs_review"
     assert result.budget_consumed[BudgetDimension.TOOL_SECONDS] <= 3_600
     assert "blocks" not in result.output
-    reservation = context.budget.commit(context.idempotency_key, result.budget_consumed)
+    # Direct execution bypasses the dispatcher's measured context reservation;
+    # commit only the dimensions this test actually reserved.
+    reserved_dimensions = next(
+        item.amounts
+        for item in context.budget.reservations
+        if item.operation_key == context.idempotency_key
+    )
+    reservation = context.budget.commit(
+        context.idempotency_key,
+        {
+            dimension: amount
+            for dimension, amount in result.budget_consumed.items()
+            if dimension in reserved_dimensions
+        },
+    )
     assert (
         reservation.committed_amounts[BudgetDimension.TOOL_SECONDS]
         <= reservation.amounts[BudgetDimension.TOOL_SECONDS]
