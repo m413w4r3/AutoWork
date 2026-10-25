@@ -33,8 +33,8 @@ Légende : `PLANNED → RUNNING → REVIEW → APPROVED → INTEGRATED`, alterna
 | M06-S3-SPEC | `adb555b5-158a-450e-acff-c25293f85ea4` | codex/gpt-6-luna · xhigh | `wks_69c42fa0c7b7eab6` | `7059ebbd` | DONE | lecture seule | — | rapport reçu ; migration 0004 après 0003 | spécification S3 |
 | M06-REVIEW-POLICY-DESIGN | `66e365ad-83b0-43ad-8e7d-8b1d42a8e616` | codex/gpt-6-luna · xhigh | `wks_a221abc2a4219236` | `7059ebbd` | DONE | lecture seule | — | **REVISE** : 4 BLOCKER, 5 MAJOR ; corrections transmises | revue adversariale |
 | M06-S3-CORE-1 | `b052d44a-d753-44c5-8c5b-37e50bcb69a7` | codex/gpt-6-luna · xhigh | `wks_7dc76e2c336df65d` | `d53538b0` | DONE | 19 unit PASS parent ; PG NOT_RUN (0003 absent) | `a5773f45-7854-4165-9a1b-054ba12da200` | REVIEW | claim/permis, zéro fichier partagé ; acquisition refusée faute de lignée |
-| M06-REVIEW-S3-CORE | `a5773f45-7854-4165-9a1b-054ba12da200` | codex/gpt-6-luna · xhigh | `wks_bb93ccd029795f6a` | `c5f27331` | DONE | lecture seule + 19 unit PASS | — | **REVISE** : 1 BLOCKER, 8 MAJOR, 3 MINOR ; corrections envoyées | revue adversariale |
-| M06-REVIEW-POLICY-IMPL | `a656cd81-4250-4b5f-8033-01063f1d8aee` | codex/gpt-6-luna · xhigh | `wks_7769192bb22b9bd6` | `f0787d52` | DONE | lecture seule + 22 unit PASS | — | **REVISE** : 1 BLOCKER, 3 MAJOR, 4 MINOR ; corrections envoyées | revue adversariale |
+| M06-REVIEW-S3-CORE | `a5773f45-7854-4165-9a1b-054ba12da200` | codex/gpt-6-luna · xhigh | `wks_bb93ccd029795f6a` | `642fae96` | DONE | lecture seule + 34 unit PASS | — | **REVISE final** : 1 BLOCKER (handoff tardif), 3 MAJOR ; 3e correction envoyée | revue adversariale |
+| M06-REVIEW-POLICY-IMPL | `a656cd81-4250-4b5f-8033-01063f1d8aee` | codex/gpt-6-luna · xhigh | `wks_7769192bb22b9bd6` | `7ef241f2` | DONE | lecture seule + 50 unit PASS + 6 PG PASS | — | **REVISE final** : 1 BLOCKER (course S3), 3 MAJOR, 2 MINOR ; projection `/operator-status` en correction | revue adversariale |
 | M06-S3-VT-1 | à créer | codex/gpt-6-luna · xhigh | à créer | après core | PLANNED | fakes + PG | à créer | — | lecture VT |
 | M06-S3-DL-1 | à créer | codex/gpt-6-luna · xhigh | à créer | après core | PLANNED | fakes + PG | à créer | — | téléchargement |
 | M06-S3-BRIDGE-1 | à créer | codex/gpt-6-luna · xhigh | à créer | après core | PLANNED | fakes + PG | à créer | — | tours Bridge |
@@ -71,3 +71,19 @@ Légende : `PLANNED → RUNNING → REVIEW → APPROVED → INTEGRATED`, alterna
 | `recon/S3_IMPLEMENTATION_SPEC.md` | M06-S3-SPEC | `ee82367b419a85ba1c6b90dd79a014907dc856647e4e016fffd22412fbe3a397` |
 | `recon/S3_CORE_REVIEW.md` | M06-REVIEW-S3-CORE | `05b0396f00523f9dd5a2cbe6d3eaaa164fc5860f8d3dcf73390ed24113de520e` |
 | `recon/POLICY_IMPL_REVIEW.md` | M06-REVIEW-POLICY-IMPL | `9ca5e802c76c5ec3ce71b8f55f1e1539355628f0ceb7f299fbedc1845b8ce33d` |
+
+## Gate combiné temporaire (hors `main`)
+
+- Worktree `/tmp/m06-combined-gate`, branche `m06/combined-gate`, base
+  `4923bbf8`, cherry-picks politique `7ef241f2` + S3 `642fae96`.
+- Chaîne `0001 → 0002 → 0003 → 0004` appliquée réellement sur une base
+  jetable après deux corrections d'intégration : exclusion des tables
+  `external_effect_*` du métadata baseline gelé, et import du modèle
+  `retrohunt` dans `migrations/env.py`. Résultat : `UPGRADE_OK`.
+- Tests PostgreSQL politique : **6/6 PASS** à `7ef241f2`.
+- Tests PostgreSQL S3 : **5 FAILED** sur une violation FK du fixture
+  (ligne de montant budgétaire insérée avant la réservation parente), corrigée
+  dans la dernière passe ; rerun parent à faire après intégration.
+- Aucun de ces résultats ne constitue une preuve de transport fournisseur.
+  Le worktree combiné n'est **pas** fusionné sur `main` tant que les revues
+  restent `REVISE`.

@@ -62,6 +62,24 @@ Aucune réécriture de `0001_baseline` ou `0002_c2_experiments`. Aucun backfill.
 Les identités d'effet ne contiennent jamais de credentials, tokens, mots de
 passe, signed URLs ou en-têtes secrets.
 
+### Constats du gate combiné `0003→0004` (2026-10-25)
+
+Le gate temporaire a montré que la chaîne ne s'applique pas sans deux
+corrections d'intégration :
+
+1. la baseline `0001` dérive ses tables de `Base.metadata` ; les tables
+   `external_effect_claim` et `external_effect_use` doivent être exclues du
+   métadata « baseline gelée », sinon `0004` voit ses tables déjà créées et
+   échoue à son preflight ;
+2. `migrations/env.py` doit importer le modèle `retrohunt` pour que la FK de
+   `0004` vers `retrohunt_reservations` se résolve.
+
+Après ces deux corrections, `alembic upgrade head` applique réellement
+`0001 → 0002 → 0003 → 0004` sur une base jetable (`UPGRADE_OK`). Le fixture
+PostgreSQL S3 doit aussi insérer la réservation budgétaire parente avant la
+ligne de montant (contrainte FK). Ces points sont des gates d'intégration,
+pas des preuves de transport fournisseur.
+
 ## 3. Familles
 
 | Famille | État | Fallback silencieux interdit |

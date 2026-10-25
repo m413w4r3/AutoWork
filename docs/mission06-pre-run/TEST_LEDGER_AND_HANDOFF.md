@@ -105,12 +105,81 @@ n'est déclaré PASS sans commande et sortie réelles. Baseline de départ :
 | Absence de secrets | revue ciblée des diffs | NOT_RUN |
 | Migration sur base jetable | `alembic upgrade head` + tests migration | NOT_RUN |
 
-## 4. Tests déjà exécutés
+## 4. Tests réellement exécutés
 
-Aucun test de code Mission 06-P n'a encore été exécuté. Les reconnaissances
-POLICY, S3, RUNTIME et RUN étaient en lecture seule et n'ont lancé aucun test.
+| Date | SHA | Commande | Résultat |
+|---|---|---|---|
+| 2026-10-25 | `c5f27331` | `pytest tests/test_external_effects.py -q` (S3 core, parent) | **19 passed** |
+| 2026-10-25 | `f0787d52` | `pytest tests/test_osint_open_policy.py -q` (politique, parent) | **22 passed** |
+| 2026-10-25 | `980fef7e` | `pytest tests/test_osint_open_policy.py -q` (politique, parent) | **49 passed** |
+| 2026-10-25 | `980fef7e` | `pytest tests/integration/test_osint_open_policy_postgres.py -q` (politique, base jetable 55432) | **3 passed, 3 failed — RED** |
+| 2026-10-25 | `980fef7e` | `ruff check` / `ruff format --check` (politique, implémenteur) | **PASS** (428 fichiers formatés) |
+| 2026-10-25 | `c5f27331` | `ruff check` / `ruff format --check` (S3 core, reviewer) | **PASS** |
+| 2026-10-25 | `642fae96` | `pytest tests/test_external_effects.py -q` (S3 core, parent) | **34 passed** |
+| 2026-10-25 | `7ef241f2` | `pytest tests/integration/test_osint_open_policy_postgres.py -q` (parent, base jetable) | **6 passed** |
+| 2026-10-25 | combiné `a1e6d994` + fixes env | `alembic upgrade head` sur base jetable neuve | **UPGRADE_OK** après exclusion `external_effect_*` du baseline et import `retrohunt` |
+| 2026-10-25 | combiné pré-fix fixture | `pytest tests/integration/test_external_effects_postgres.py -q` | **5 failed** — FK réservation budgétaire (fixture), correction en cours |
+| — | — | `make lint-backend` / `make typecheck-backend` | **NOT_RUN** côté agent (sync réseau) ; S3 core a rapporté lint+typecheck PASS dans son environnement |
+| — | — | S3 core PostgreSQL final | **EN ATTENTE** — rerun après correction fixture et intégration |
 
-## 5. Handoff futur
+Les 3 échecs PG de la politique à `980fef7e` sont : assertion `decisions == ()`
+vs liste vide, helper de réutilisation de sujet avec `edition=None`, et
+`BudgetExceeded(vt_units)` lors d'une extension manuelle après révocation.
+Une correction est en cours ; aucun PASS n'est déclaré avant un rerun vert.
+Aucun test fournisseur réel, MinIO live ou PostgreSQL live n'a été exécuté.
+
+## 5. Verdicts finaux (état à la clôture de cette session)
+
+```text
+OSINT_OPEN_POLICY_IMPLEMENTED|PARTIAL|BLOCKED       : PARTIAL
+NO_REPEATED_OPERATOR_APPROVALS|PARTIAL|BLOCKED      : PARTIAL
+TLP_CLEAR_DEFAULT_FOR_SHAREABLE_SOURCES|PARTIAL|BLOCKED : PARTIAL
+G3_NONBLOCKING_FOR_ANALYSIS|PARTIAL|BLOCKED         : PARTIAL
+
+S3_VT_READ_READY|BLOCKED                            : BLOCKED
+S3_VT_DOWNLOAD_READY|BLOCKED                        : BLOCKED
+S3_BRIDGE_READY|BLOCKED                             : BLOCKED
+S3_OTHER_ROUTES_NOT_CLAIMED                         : CONFIRMED
+
+CREDENTIAL_NON_DISCLOSURE_PASS|PARTIAL|BLOCKED      : PARTIAL
+POSTGRES_CONCURRENCY_AND_RECOVERY_PASS|PARTIAL|BLOCKED : PARTIAL
+LOCAL_ANALYSIS_READY|PARTIAL|BLOCKED                : PARTIAL
+
+LUNA_XHIGH_MULTI_AGENT_VERIFIED|FAILED              : FAILED
+INDEPENDENT_REVIEWS_APPROVED|REVISE|BLOCKED         : REVISE
+
+REAL_RUN_PREFLIGHT_READY|PARTIAL|BLOCKED            : PARTIAL
+REAL_INVESTIGATION_NOT_STARTED                      : CONFIRMED
+```
+
+Justification :
+
+- **PARTIAL politique** : le code, les 50 tests unitaires et les 6 tests
+  PostgreSQL de politique sont verts, mais la revue indépendante reste
+  `REVISE` sur la course révocation → émission (propriété S3-CORE), la
+  projection `/operator-status` et la lignée d'invocation. Aucun lot n'est
+  fusionné sur `main` tant que la revue n'est pas `APPROVED`.
+- **BLOCKED S3 familles** : seul le socle `ExternalEffectCoordinator` existe ;
+  aucune famille VT/Bridge n'est migrée. Les verdicts READY ne sont donc pas
+  revendiqués. La chaîne `0003→0004` s'applique sur base jetable après deux
+  corrections d'intégration, mais les tests PG S3 finaux restent à rejouer.
+- **PARTIAL non-divulgation** : les filtres de credentials/signed URLs sont
+  testés unitairement, mais une revue a trouvé des fragments d'URL
+  credentials persistables, en cours de correction ; aucune preuve live.
+- **PARTIAL concurrence/récupération** : la politique a 6 tests PG verts ;
+  les tests S3 de concurrence/crash ont échoué sur un fixture FK avant
+  correction et n'ont pas encore été rejoués.
+- **FAILED Luna xhigh multi-agent** : tous les enfants ont été créés en
+  `codex/gpt-6-luna` `xhigh` avec vérification runtime, mais l'orchestrateur
+  parent est `deepseek-flash[1m]`, pas Luna xhigh. La conformité complète de
+  la mission n'est donc pas atteinte.
+- **REVISE revues** : deux revues indépendantes ont rendu `REVISE` sur les
+  deux lots ; aucune n'est `APPROVED` à la clôture.
+- **PARTIAL prévol run réel** : le plan et les inconnues sont documentés ;
+  les lectures canoniques live (lignée de synthèse, état des jobs, MinIO)
+  n'ont pas été effectuées et restent à autoriser.
+
+## 6. Handoff futur
 
 Le handoff final doit contenir : SHA intégré, liste des lots approuvés,
 commandes et résultats réellement exécutés, tests `NOT_RUN`, risques résiduels,
