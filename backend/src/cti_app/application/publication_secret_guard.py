@@ -67,10 +67,21 @@ _SENSITIVE_QUERY_NAMES = frozenset(
     {
         "sig",
         "signature",
+        "token",
+        "access_token",
+        "api_token",
+        "api_key",
+        "key",
+        "auth",
+        "authorization",
+        "credential",
+        "expires",
+        "policy",
         "x-amz-signature",
         "x-amz-credential",
         "x-amz-security-token",
         "x-goog-signature",
+        "x-goog-credential",
         "googleaccessid",
     }
 )

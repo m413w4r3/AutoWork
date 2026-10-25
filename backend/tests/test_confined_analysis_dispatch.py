@@ -262,7 +262,7 @@ async def test_capa_reports_bounded_sanitized_subprocess_reason(
                 12,
                 b"",
                 b"ERROR capa: [Errno 30] Read-only file system: '/home/analysis' "
-                b"access_token=secret-value",
+                b"access_token=secret-value VT_API_KEY=operational-secret",
             ),
         )
 
@@ -292,7 +292,10 @@ async def test_capa_reports_bounded_sanitized_subprocess_reason(
     assert result["engine_status"] == "NON_ZERO_EXIT"
     assert "Read-only file system" in result["available_reason"]
     assert "/home/analysis" not in result["available_reason"]
-    assert "secret-value" not in result["available_reason"]
+    # D7 preserves attacker/CTI tokens in canonical evidence; operational
+    # AutoWork credentials remain redacted.
+    assert "access_token=secret-value" in result["available_reason"]
+    assert "operational-secret" not in result["available_reason"]
     assert persisted.persisted[0].errors
 
 

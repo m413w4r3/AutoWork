@@ -312,7 +312,7 @@ async def test_invalid_shodan_count_arguments_are_definitive_local_failures() ->
     invalid_arguments = (
         {
             "query": "port:443",
-            "justification": ["api_key=synthetic-secret", "second"],
+            "justification": ["SHODAN_API_KEY=synthetic-secret", "second"],
             "evidence_refs": [],
         },
         {"query": "port:443", "evidence_refs": []},
@@ -771,13 +771,17 @@ async def test_raw_response_over_configured_limit_is_not_archived_and_returns_pa
 
 
 @pytest.mark.asyncio
-async def test_host_output_and_evidence_never_expose_provider_secrets_or_signed_urls() -> None:
+async def test_host_output_and_evidence_redact_operational_secrets_and_signed_urls() -> None:
     class SecretPort(FakeShodanPort):
         async def host(self, ip):
             view = await super().host(ip)
             unsafe = replace(
                 view.services[0],
-                banner="Authorization: Bearer test-token api_key=provider-secret https://x.test/?signature=signed",
+                banner=(
+                    "Authorization: Bearer OPERATOR_RESEARCH_TOKEN=test-token "
+                    "SHODAN_API_KEY=provider-secret api_key=cti-token "
+                    "https://x.test/?signature=signed"
+                ),
             )
             return replace(view, services=(unsafe, *view.services[1:]))
 
@@ -790,10 +794,13 @@ async def test_host_output_and_evidence_never_expose_provider_secrets_or_signed_
     assert "provider-secret" not in str(result.output)
     assert "test-token" not in str(result.output)
     assert "https://x.test" not in str(result.output)
+    # D7 keeps authorized CTI material such as a scanned api_key value.
+    assert "api_key=cti-token" in str(result.output)
     stored = b" ".join(rig.store.blobs.values())
     assert b"provider-secret" not in stored
     assert b"test-token" not in stored
     assert b"https://x.test" not in stored
+    assert b"api_key=cti-token" in stored
     service = result.output["summary"]["services"][0]
     assert service["banner_truncated"] is False
 

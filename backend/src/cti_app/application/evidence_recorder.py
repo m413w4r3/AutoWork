@@ -361,10 +361,21 @@ def _omit_signed_url(match: re.Match[str]) -> str:
     sensitive = {
         "sig",
         "signature",
+        "token",
+        "access_token",
+        "api_token",
+        "api_key",
+        "key",
+        "auth",
+        "authorization",
+        "credential",
+        "expires",
+        "policy",
         "x-amz-signature",
         "x-amz-credential",
         "x-amz-security-token",
         "x-goog-signature",
+        "x-goog-credential",
         "googleaccessid",
     }
     query_names = {name.casefold() for name, _ in parse_qsl(parsed.query, keep_blank_values=True)}
