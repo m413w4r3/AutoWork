@@ -37,7 +37,8 @@ made; all transports are local fakes.
 | `pytest -m integration tests/integration/test_investigation_acquisition_postgres.py` | PASS, 6 passed | 5.58 s |
 | `pytest tests/test_advisor_consultation.py tests/test_advisor_wire.py tests/test_advisor_completeness.py tests/test_advisor_anti_slop_eval.py tests/test_operator_tool_invocation.py` | PASS, 108 passed | 2.76 s |
 | `pytest tests/test_investigation_advisor_tools.py` | PASS, 125 passed | 3.75 s |
-| `make test-backend` (full non-integration suite) | PASS, 4904 passed, 2 skipped, 31 deselected | 137.51 s |
+| `make test-backend` (full non-integration suite) at baseline 55fba67d | PASS, 4904 passed, 2 skipped, 31 deselected | 137.51 s |
+| `make test-backend` after A+F integration (`57960058`) | PASS, 4912 passed, 2 skipped, 31 deselected | 137.29 s |
 | golden replay at baseline `55fba67d` (copied `test_advisor_prompt_golden.py` into a detached worktree) | expected RED: 4 passed, 2 failed — failures are exactly the private-renderer inversion tests | 0.91 s |
 
 Baseline anti-slop prompt fingerprint (observed in the test output):
