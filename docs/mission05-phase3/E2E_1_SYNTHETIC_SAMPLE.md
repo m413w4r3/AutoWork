@@ -68,6 +68,17 @@ Observed: **1 passed in 5.17 s** on integrated main (parent run);
 implementer 4.68 s; independent reviewer 4.86 s. No external service or sample
 execution.
 
+## Independent adversarial replay (M05-D)
+
+The M05-D module was integrated at `70ffb9df` and replayed on the D tree by
+the parent (**2 passed**, 7.06 s, both E2E drivers). The final full integration
+run at `25de7308` passed all **348** tests, including this driver and the three
+adversarial tests. D adds a persisted, confirmed sample veto matrix (TLP RED,
+`do_not_submit`, external disclosure disabled, `license_restriction`), a
+terminal-redelivery audit/chronology replay and real V5/V6 PDF checks. It does
+not exercise MinIO/S3 or the real VirusTotal transport, so those non-claims
+stand.
+
 ## Missing proofs / non-claims
 
 - **MinIO/S3:** not exercised. The isolated filesystem store is a valid

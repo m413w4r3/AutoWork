@@ -1,19 +1,20 @@
 # Mission 05 — final audit and handoff
 
-Status: **D IN PROGRESS**. Verdicts below are those already proven; `PHASE3`
-and readiness are finalized after M05-D and the final gate replay.
+Status: **PHASE 3 OFFLINE CLOSED — LOCAL MAIN REVIEWED, NOT PUSHED**.
+Every verdict below is backed by an executed command on this host; the two
+V3-incompatible seams and all live/S3 non-claims remain explicit.
 
 ## Git
 
 | Item | Value |
 |---|---|
 | Baseline `origin/main` | `55fba67d5882c1ae6c4abff4e74c53a24e57649f` |
-| Local `main` at writing | `dc1dadd8` (D brief commit `37690820` is D's base) |
-| Mission code commits | M05-A `b8a10165`; lint fix `7e51912a`; M05-F `12671c6a`; M05-B `8da3300c`; M05-C `222942e2` |
-| Mission docs commits | `0db6a904`, `6ed8b423`, `ac13d9a6`, `e6e0ad22`, `73ea620f`, `078d4876`, `68aefb2a`, `95c5a20c`, `924e3106`, `7c549ec3`, `b937d56e`, `f618a56e`, `57960058`, `58c29429`, `4dbfca96`, `e74e37ff`, `c770e9df`, `cd5e69ff`, `36c83da2`, `37690820`, `dc1dadd8` |
-| Remote push | **NOT PERFORMED** (explicitly out of scope) |
-| Worktree state | local main clean at each recorded step; temporary agent worktrees isolated |
-| Temporary worktrees | Paseo worktrees under `~/.paseo/worktrees/`; no destructive cleanup performed |
+| Final code SHA under gates | `25de7308` (M05-D integration `70ffb9df` + test-only isolation fix) |
+| Mission code commits | M05-A `b8a10165`; lint fix `7e51912a`; M05-F `12671c6a`; M05-B `8da3300c`; M05-C `222942e2`; M05-D `70ffb9df`; isolation fix `25de7308` |
+| Mission docs commits | `0db6a904` … `507ed250`, plus this close commit |
+| Remote push | **NOT PERFORMED** — no push/PR/merge to `origin` |
+| Force-push / history rewrite | none |
+| Worktree at close | local `main` clean; agent worktrees isolated and left in place |
 
 ## Lot decisions
 
@@ -23,25 +24,40 @@ and readiness are finalized after M05-D and the final gate replay.
 | M05-F | `a1b356c6` | Luna Implementer xhigh | Luna xhigh, separate session | **APPROVED** | `12671c6a` |
 | M05-B | `337f983f` → `80076e6a` | Luna Implementer xhigh | Luna xhigh, separate session | **REVISE** → **APPROVED as honest partial** | `8da3300c` |
 | M05-C | `2748bdeb` → `38d9312d` | Luna Implementer xhigh | Luna xhigh, separate session | **REVISE** → **APPROVED** | `222942e2` |
-| M05-D | — | Luna Implementer xhigh | Luna xhigh, independent of B/C | RUNNING | — |
+| M05-D | `59f8c85c` → `85af3430` → `1667418c` | Luna Implementer xhigh | Luna xhigh, independent of B/C | **REVISE** → **REVISE** → **APPROVED** | `70ffb9df` |
+| M05-IDFIX | parent change | parent | test-only isolation fix, no review lot | **APPLIED** | `25de7308` |
 
-## Executed gates (actual results)
+## Final gates (actual results)
 
 | Gate | Result |
 |---|---|
-| `make lint-backend` after A+F | PASS (849 files formatted) — one import-order error found and fixed |
-| `make typecheck-backend` after A+F | PASS, 822 source files |
-| `make test-backend` after A+F | PASS, 4912 passed, 2 skipped, 31 deselected in 137.29 s |
-| `make test-workflow` after A | PASS, 22 passed, 15 deselected in 72.36 s, JUnit guard OK |
-| `make test-workflow-full` after A+F+B | PASS, 32 passed, 5 deselected in 122.67 s, JUnit guard OK |
-| `make test-ci-scripts` after A | PASS, 5 tests |
-| M05-B driver (integrated main) | PASS, 1 passed in 4.55 s |
-| M05-C driver (integrated main) | PASS, 1 passed in 5.17 s |
-| Full `make test-integration` | NOT_RUN at final SHA (D gate) |
-| Frontend gates | NOT_RUN (backend-only change expected; confirm) |
-| Final full backend at final SHA | NOT_RUN (D gate / parent replay) |
+| `make lint-backend` at `25de7308` | **PASS** — checks passed, 852 files formatted |
+| `make typecheck-backend` at `25de7308` | **PASS** — no issues in 825 source files |
+| `make test-backend` at `70ffb9df` | **PASS** — 4912 passed, 2 skipped, 31 deselected in 131.68 s. The only later commit is an integration-test file ignored by this target. |
+| `make test-integration` at `25de7308` | **PASS** — 348 passed in 115.78 s (B, C and the 3 D tests included) |
+| `make test-workflow` at `25de7308` | **PASS** — 22 passed, 15 deselected in 60.61 s, JUnit guard OK |
+| `make test-workflow-full` at `25de7308` | **PASS** — 32 passed, 5 deselected in 103.46 s, JUnit guard OK |
+| `make test-ci-scripts` at `70ffb9df` | **PASS** — 5 tests; no CI script or tested file changed afterwards |
+| `test_agentic_correction_loop_postgres.py` isolated | PASS — 1 passed in 3.86 s with pinned Typst on PATH; environmental only |
+| D focused module | PASS — 3 passed at `85af3430` (5.06 s parent / 5.32 s reviewer) and `1667418c` (5.35 s parent / 5.14 s D) |
+| B + C drivers on the D tree | PASS — 2 passed in 7.06 s |
+| Frontend gates | NOT_RUN — backend/test-only changes; no frontend path touched |
+| Live providers / MinIO / S3 / CTI | NOT_DEMONSTRATED — explicitly out of scope |
 
-## Gate summary (current, not final)
+## Incident found by the final gate replay
+
+The first full integration run after D integration was **RED**: 1 failed /
+347 passed. `test_production_control_view_postgres` found its fixed edition
+`CT` already present. Root cause was test infrastructure, not application
+behavior: the integration database is session-scoped, editions are unique on
+`(country_code, period)`, and the process-wide code allocator reached `CT`,
+which the control-view test writes literally and which was missing from
+`RESERVED_CODES`. M05-D's added allocation pressure exposed the latent defect.
+`25de7308` reserves the nine literal codes currently used by integration tests,
+per the allocator's own contract. The rerun passed 348/348. No application code
+changed. This is recorded as RED → GREEN, not silently repaired.
+
+## Final verdicts
 
 ```text
 DEEP_ADVISOR_PREPARATION_PASS|REVISE       : DEEP_ADVISOR_PREPARATION_PASS
@@ -50,8 +66,8 @@ E2E_SYNTHETIC_SAMPLE_PASS|PARTIAL|BLOCKED  : E2E_SYNTHETIC_SAMPLE_PASS
 PHASE3_OFFLINE_PASS|PARTIAL                : PHASE3_OFFLINE_PARTIAL
 S3_BLOCKED_DESIGN                          : S3_BLOCKED_DESIGN (unchanged)
 ADVISOR_CUTOVER_BLOCKED_BY_S3              : ADVISOR_CUTOVER_BLOCKED_BY_S3 (unchanged)
-MAIN_LOCAL_REVIEWED|NOT_READY              : pending D
-READY_FOR_MAIN_PUSH_REVIEW|NO_GO           : pending D
+MAIN_LOCAL_REVIEWED|NOT_READY              : MAIN_LOCAL_REVIEWED
+READY_FOR_MAIN_PUSH_REVIEW|NO_GO           : READY_FOR_MAIN_PUSH_REVIEW
 ```
 
 ## Why E2E-0 is PARTIAL
@@ -66,8 +82,12 @@ constraint as written:
    adapter correctly refuses to relabel it. The driver adds a test-only V4
    fixture, explicitly not the authoritative archive.
 
+M05-D does not remove either contradiction, so the verdict remains `PARTIAL`.
+
 ## Missing proofs / non-claims
 
+- In-flight crash recovery is **NOT_DEMONSTRATED**; M05-D proves terminal
+  completed-job redelivery is a no-op only.
 - MinIO/S3 not exercised; `S3_BLOCKED_DESIGN` unchanged.
 - Real VT transport, Bridge, LLM providers and CTI sources never called.
 - No malware download, execution, scanning, upload, publication, deployment
@@ -77,6 +97,5 @@ constraint as written:
 
 ## Next permissible action
 
-After M05-D is reviewed and integrated: rerun the final gates on the final
-local `main` SHA, then produce `READY_FOR_MAIN_PUSH_REVIEW`/`NO_GO`. No push
-without explicit owner authorization.
+Owner review of `main` for a push decision. No push, merge, release or
+deployment was performed by this mission.

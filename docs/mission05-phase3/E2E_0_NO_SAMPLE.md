@@ -61,6 +61,15 @@ uv run --no-sync --python 3.12 pytest -m integration \
 Observed: **1 passed in 4.55 s** on integrated main (parent run);
 implementer 4.00 s; independent reviewer 4.03 s. No external service contacted.
 
+## Independent adversarial replay (M05-D)
+
+The M05-D module was integrated at `70ffb9df` and replayed on the D tree by
+the parent (**2 passed**, 7.06 s, both E2E drivers). The final full integration
+run at `25de7308` passed all **348** tests, including this driver and the three
+adversarial tests. D adds context CAS/egress-guard, sample-policy veto,
+terminal-redelivery and real-PDF provenance checks; it does not remove the two
+missing proofs below, so the verdict remains `PARTIAL`.
+
 ## Missing proofs / blockers
 
 1. **Real P10 `propose()`** requires retained origin Samples

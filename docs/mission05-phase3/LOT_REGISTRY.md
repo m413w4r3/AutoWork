@@ -37,7 +37,8 @@ R1's map; D after B+C. A's application files are never touched by B/C/D.
 | M05-B | E2E-0 continuous no-sample scenario | B1 Luna Implementer xhigh (full-access, loopback only) | 2e7733be (A branch) | 337f983f → revised `80076e6a` → integrated `8da3300c` | INTEGRATED (partial) | parent 337f983f 1/1; revised 80076e6a 1/1; integrated main 1 passed in 4.55 s | R_B **APPROVED** on 80076e6a as an honest partial (not E2E_NO_SAMPLE_PASS) | `E2E_NO_SAMPLE_PARTIAL`: real P10 and authoritative v4 reparse NOT_DEMONSTRATED | **V3 contradiction**: real P10 service requires origin Samples, impossible in E2E-0 no-sample; v4 reparse needs a v4-parsed archive while the authoritative path archives v2/v3. Driver labels both NOT_DEMONSTRATED. |
 | M05-C | E2E-1 inert synthetic sample scenario | C1 Luna Implementer xhigh (full-access, loopback only) | 73ea620f (main with A) | 2748bdeb → revised `38d9312d` → integrated `222942e2` | INTEGRATED | 2748bdeb parent 1/1; revised 38d9312d parent 1/1 (4.25 s); integrated main 1/1 (5.17 s) | R_C **REVISE** on 2748bdeb; **APPROVED** on 38d9312d (4 findings resolved) | `E2E_SYNTHETIC_SAMPLE_PASS`; real VT transport and MinIO/S3 NOT_DEMONSTRATED |
 | M05-F | Fix Advisor missing-ref UnboundLocalError -> typed refusal | F1 Luna Implementer xhigh | 7c549ec3 | a1b356c6 → integrated `12671c6a` | INTEGRATED | integrated main: 241 advisor tests passed; anti-slop SHA unchanged | R_F Luna xhigh **APPROVED** (2 MINOR, no blocker) | Unblocked C | Unblocks M05-C; no byte change |
-| M05-D | Adversarial replay, regression gates, cross-review | D1 Luna Implementer xhigh (full-access, loopback only) | 37690820 | — | RUNNING | adversarial module + global gates | R_D xhigh RUNNING after candidate | Depends B+C; not a B/C implementer |
+| M05-D | Adversarial replay, regression gates, cross-review | D1 Luna Implementer xhigh (full-access, loopback only) | 37690820 | 59f8c85c → 85af3430 → 1667418c → integrated `70ffb9df` | INTEGRATED | focused module 3 passed (parent 5.06/5.35 s; reviewer 5.32 s); B/C drivers on D tree 2 passed (7.06 s); integrated main: integration 348 passed, backend 4912 passed | R_D xhigh independent: REVISE → REVISE → **APPROVED** on 1667418c (all findings resolved, one new ordering assertion added) | Terminal completed-job redelivery proven; in-flight crash recovery NOT_DEMONSTRATED; depends B+C |
+| M05-IDFIX | Reserve hardcoded edition codes in the integration allocator | parent (root-cause fix after D integration) | 70ffb9df | `25de7308` | INTEGRATED | first full integration run 1 failed/347 passed (`CT` collision); after fix 348 passed in 115.78 s | n/a — test-only isolation fix, no review lot | Exposed by D's added allocation pressure; nine hardcoded codes now reserved per the allocator contract |
 
 Status vocabulary: `PLANNED / RUNNING / REVIEW / APPROVED / BLOCKED /
 INTEGRATED`. A lot is integrable only with relevant tests green and an
@@ -62,12 +63,12 @@ Required final set in `docs/mission05-phase3/`: `ARCHITECTURE_DECISIONS.md`,
 ## Verdicts (updated at close)
 
 ```text
-DEEP_ADVISOR_PREPARATION_PASS|REVISE : NOT_RUN
-E2E_NO_SAMPLE_PASS|PARTIAL|BLOCKED    : E2E_NO_SAMPLE_PARTIAL (driver integrated; real P10 + authoritative v4 reparse NOT_DEMONSTRATED)
+DEEP_ADVISOR_PREPARATION_PASS|REVISE : DEEP_ADVISOR_PREPARATION_PASS (A/F integrated, byte parity and typed refusals)
+E2E_NO_SAMPLE_PASS|PARTIAL|BLOCKED    : E2E_NO_SAMPLE_PARTIAL (continuous driver integrated; real P10 + authoritative v4 reparse NOT_DEMONSTRATED)
 E2E_SYNTHETIC_SAMPLE_PASS|PARTIAL|BLOCKED : E2E_SYNTHETIC_SAMPLE_PASS (offline inert journey; real VT transport + MinIO/S3 NOT_DEMONSTRATED)
-PHASE3_OFFLINE_PASS|PARTIAL           : PHASE3_OFFLINE_PARTIAL (E2E-1 PASS; E2E-0 PARTIAL: real P10 + authoritative v4 reparse NOT_DEMONSTRATED; D pending)
+PHASE3_OFFLINE_PASS|PARTIAL           : PHASE3_OFFLINE_PARTIAL (E2E-1 PASS; E2E-0 PARTIAL; D adversarial integrated; in-flight crash recovery NOT_DEMONSTRATED)
 S3_BLOCKED_DESIGN                     : S3_BLOCKED_DESIGN (unchanged)
 ADVISOR_CUTOVER_BLOCKED_BY_S3         : ADVISOR_CUTOVER_BLOCKED_BY_S3 (unchanged)
-MAIN_LOCAL_REVIEWED|NOT_READY         : pending D integration and final gates
-READY_FOR_MAIN_PUSH_REVIEW|NO_GO      : NO_GO
+MAIN_LOCAL_REVIEWED|NOT_READY         : MAIN_LOCAL_REVIEWED (final executable gates rerun on local main; see TEST_AND_CI_LEDGER.md)
+READY_FOR_MAIN_PUSH_REVIEW|NO_GO      : READY_FOR_MAIN_PUSH_REVIEW (no push performed; owner authorization required)
 ```

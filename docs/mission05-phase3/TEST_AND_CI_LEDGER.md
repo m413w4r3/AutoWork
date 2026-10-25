@@ -69,20 +69,25 @@ Any M05-A byte change would be visible here.
 | M05-C | 38d9312d → integrated `222942e2` | `pytest -m integration tests/integration/test_investigation_e2e_synthetic_sample_postgres.py` | PASS, 1 passed | 5.17 s integrated main; 4.68 s implementer; 4.86 s reviewer |
 | M05-D | 59f8c85c (candidate) | `pytest -m integration tests/integration/test_e2e_phase3_adversarial_postgres.py` | PASS, 2 passed | 4.56 s implementer; 2.98 s on f9c779a3 parent |
 | M05-D | 59f8c85c | full gate set reported by D (lint, typecheck, test-backend, test-integration, workflow fast/full, CI scripts) | lint/typecheck PASS; test-backend 2 `filesystem_confinement_unavailable` failures in the agent sandbox (parent passes `test_local_analysis_commands.py` 23/23); integration 347 passed/142.36 s; workflow 22/32 passed; CI scripts 5 passed | reviewer independently confirmed integration 347 passed and no confinement failures in parent-class environment |
+| M05-D | 85af3430 (correction after REVISE) | focused adversarial module | PASS, 3 passed | 5.06 s parent; 5.32 s reviewer |
+| M05-D | 85af3430 | B and C drivers replayed on the D tree | PASS, 2 passed | 7.06 s parent |
+| M05-D | 1667418c (final correction) | focused adversarial module | PASS, 3 passed | 5.35 s parent; 5.14 s implementer |
+| M05-IDFIX | 70ffb9df → `25de7308` | `make test-integration` before/after reserving literal edition codes | **RED** 1 failed / 347 passed (`CT` collided, `add_if_absent` False) → **GREEN** 348 passed | 120.16 s → 115.78 s; root cause was the shared session DB plus allocator reaching a literal code |
 
 ## Global gates (after integration on local main)
 
 | Gate | Result |
 |---|---|
-| `make lint-backend` | PASS after M05-A integration (`7e51912a`) — must be rerun at final SHA |
-| `make typecheck-backend` | PASS after M05-A integration (`7e51912a`) — must be rerun at final SHA |
-| `make test-backend` | PASS at baseline 55fba67d (4904 passed, 2 skipped) — must be rerun at final SHA |
-| `make test-integration` (full) on integrated main `f691ac19` | PASS, 345 passed in 139.09 s with the pinned Typst binary on PATH. (D worktree with its 2 extra tests: 347 passed in 142.36 s, reviewer.) |
+| `make lint-backend` at final code `25de7308` | **PASS** — Ruff checks passed, 852 files already formatted |
+| `make typecheck-backend` at final code `25de7308` | **PASS** — no issues in 825 source files |
+| `make test-backend` at `70ffb9df` | **PASS**, 4912 passed, 2 skipped, 31 deselected in 131.68 s. The only later commit (`25de7308`) is an integration-test file ignored by this target. |
+| `make test-integration` at `25de7308` (full) | **PASS**, 348 passed in 115.78 s with the pinned Typst binary, font bundle and loopback PostgreSQL. Includes both E2E drivers and the 3 adversarial tests. |
 | `test_agentic_correction_loop_postgres.py` isolated | PASS, 1 passed in 3.86 s with pinned Typst on PATH; without it, it resolves the broken snap wrapper. Environmental only. |
-| `make test-workflow` | PASS after M05-A integration (`68aefb2a`): 22 passed, 15 deselected, JUnit guard OK — rerun at final SHA |
-| `make test-workflow-full` | PASS after A+F+B integration (`58c29429`): 32 passed, 5 deselected, JUnit guard OK — rerun at final SHA |
-| `make test-ci-scripts` | PASS after M05-A integration (`7e51912a`, 5 tests) — rerun at final SHA |
-| frontend gates | NOT_RUN (backend-only change expected; confirm) |
+| `make test-workflow` at `25de7308` | **PASS**, 22 passed, 15 deselected in 60.61 s, JUnit guard OK |
+| `make test-workflow-full` at `25de7308` | **PASS**, 32 passed, 5 deselected in 103.46 s, JUnit guard OK |
+| `make test-ci-scripts` at `70ffb9df` | **PASS**, 5 tests. No CI script or tested file changed afterwards. |
+| frontend gates | NOT_RUN — backend/test-only change; no frontend path touched |
+| live providers / MinIO / S3 | NOT_DEMONSTRATED — explicitly out of scope and still blocked |
 | full E2E-0 + E2E-1 in a recreated environment | NOT_RUN |
 
 ## Cost / duration
