@@ -34,7 +34,7 @@ _ARCHIVED_RUN12_CORPUS = (
 )
 
 
-def test_wire_dossier_renders_relevant_measurement_as_text_without_metadata() -> None:
+def test_wire_dossier_renders_relevant_measurement_with_byte_provenance() -> None:
     prompt_data = {
         "question": "Vérifier les octets observés autour de l'offset 15232.",
         "consultation_type": "yara_draft",
@@ -65,10 +65,16 @@ def test_wire_dossier_renders_relevant_measurement_as_text_without_metadata() ->
     rendered = render_advisor_wire_input(prompt_data)
 
     assert "[E1]" in rendered
-    assert "hex, offset 15232: 1944" in rendered
+    fragment_sha256 = hashlib.sha256(bytes.fromhex("1944")).hexdigest()
+    assert (
+        "hex, offset 15232; encoding=hex; byte_length=2; length=2; sha256="
+        + fragment_sha256
+        + "; fragment_sha256="
+        + fragment_sha256
+        + ": 1944"
+    ) in rendered
     assert "offset 0" not in rendered
     assert "measurement_id" not in rendered
-    assert "sha256" not in rendered
     assert "a" * 64 not in rendered
     assert "1" * 64 not in rendered
 

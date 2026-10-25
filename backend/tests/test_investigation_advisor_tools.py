@@ -27,7 +27,6 @@ from cti_app.application.bridge_investigator import (
 from cti_app.application.content_pivot_candidates import verify_content_pattern_candidates
 from cti_app.application.investigation_advisor_tools import (
     ADVISOR_RESPONSE_SCHEMA,
-    MAX_ADVISOR_INPUT_BYTES,
     MAX_ADVISOR_TOOL_SECONDS,
     InvestigationAdvisorTool,
     _advisor_dossier_opinion_source_refs,
@@ -38,17 +37,27 @@ from cti_app.application.investigation_advisor_tools import (
     _truncate_context_text,
     register_investigation_advisor_tool,
 )
-from cti_app.application.investigation_tools import ToolExecutionContext, ToolResult
+from cti_app.application.investigation_tools import (
+    InMemoryToolRegistry,
+    RegistryToolDispatcher,
+    ToolExecutionContext,
+    ToolResult,
+)
 from cti_app.domain.analyst_opinion import OpinionBlockType
 from cti_app.domain.classification import TLP
 from cti_app.domain.investigation import (
     BudgetDimension,
+    DisclosureBounds,
     EvidenceKind,
     EvidenceObservation,
     FindingAssessment,
     FindingKind,
+    FrameworkPreSubmissionProof,
     InvestigationBudget,
+    InvestigationEnvelope,
+    InvestigationExecutionMode,
     InvestigationFinding,
+    TLPLevel,
     ToolInvocationStatus,
 )
 
@@ -260,10 +269,12 @@ def async_get(value):
 
 class _SampleAssociations:
     def __init__(self, hashes):
-        self.hashes = tuple(hashes)
+        self.associations = tuple(
+            SimpleNamespace(id=uuid4(), sample_sha256=item) for item in hashes
+        )
 
     async def list_for_investigation(self, _investigation_id):
-        return tuple(SimpleNamespace(sample_sha256=item) for item in self.hashes)
+        return self.associations
 
 
 class _Samples:
@@ -317,6 +328,35 @@ def make_context(
         budget=budget,
         idempotency_key=key,
         available_capabilities=frozenset(capabilities),
+    )
+
+
+def make_dispatch_context(investigation_id, *, context_byte_limit=None):
+    limits = (
+        {BudgetDimension.CONTEXT_BYTES: context_byte_limit}
+        if context_byte_limit is not None
+        else {}
+    )
+    budget = InvestigationBudget(limits=limits)
+    envelope = InvestigationEnvelope(
+        investigation_id=investigation_id,
+        allowed_providers=("bridge",),
+        budget=budget,
+        acquire_hits_allowed=False,
+        disclosure=DisclosureBounds(
+            tlp=TLPLevel.GREEN,
+            do_not_submit=False,
+            external_llm_allowed=True,
+        ),
+        approval_decision_id=uuid4(),
+        approval_actor_id="synthetic-test-approver",
+    )
+    return ToolExecutionContext(
+        investigation_id=investigation_id,
+        envelope=envelope,
+        budget=budget,
+        idempotency_key=f"operator:advisor:dispatch:{uuid4()}",
+        available_capabilities=frozenset({"bridge.advisor"}),
     )
 
 
@@ -755,7 +795,7 @@ async def test_args_hint_contract_is_bounded_and_normalization_is_recorded(
 
     assert result.status is ToolInvocationStatus.PARTIAL
     assert result.output["advisor_status"] == "partial"
-    assert len(transport.calls) == 1
+    assert len(transport.calls) == 1, result
     prompt = transport.calls[0]["prompt"]
     assert "advisor-wire.v1" in prompt
     assert "FAITS TRANSMIS" in prompt
@@ -1030,10 +1070,13 @@ async def test_yara_draft_sends_only_verified_offsets_and_returns_untrusted_text
 
     prompt = transport.calls[0]["prompt"]
     assert result.status is ToolInvocationStatus.SUCCEEDED, dict(result.output)
-    assert str(sample_blob_id) not in prompt
+    assert f"blob_id={sample_blob_id}" in prompt
+    assert f"sha256={sample_sha256}" in prompt
     prompt_payload = typed_prompt_payload(prompt)
     assert "blob_id" not in prompt_payload["measurements"][0]
-    assert prompt_payload["measurements"][0]["measurement_id"] == "E1"
+    evidence_alias = prompt_payload["measurements"][0]["evidence_id"]
+    assert re.fullmatch(r"E[1-9][0-9]*", evidence_alias)
+    assert prompt_payload["measurements"][0]["measurement_id"] == evidence_alias
     assert "offset 128:" in prompt
     assert {item["kind"] for item in typed_prompt_payload(prompt)["measurements"]} == {
         "string",
@@ -1169,9 +1212,9 @@ async def test_plan_investigation_selects_relevant_content_from_six_refs() -> No
         make_context(investigation_id, key="operator:advisor:six-refs"),
     )
 
-    assert result.status is ToolInvocationStatus.SUCCEEDED
+    assert result.status is ToolInvocationStatus.SUCCEEDED, result.output
     prompt = transport.calls[0]["prompt"]
-    assert all(str(item.id) not in prompt for item in observations)
+    assert all(f"evidence_ids={item.id}" in prompt for item in observations)
     reference_catalog = typed_prompt_payload(prompt)["wire_ref_catalog"]
     assert all(
         {"ref": f"E{index}", "kind": "observation"} in reference_catalog
@@ -1281,12 +1324,13 @@ async def test_minimal_plan_assembles_evidence_and_parses_structured_output() ->
     )
 
     prompt = transport.calls[0]["prompt"]
-    assert result.status is ToolInvocationStatus.SUCCEEDED
-    assert str(observation.id) not in prompt
-    assert str(sample_blob_id) not in prompt
+    assert result.status is ToolInvocationStatus.SUCCEEDED, result.output
+    assert f"evidence_ids={observation.id}" in prompt
+    assert f"blob_id={sample_blob_id}" in prompt
     assert {"ref": "E1", "kind": "observation"} in typed_prompt_payload(prompt)["wire_ref_catalog"]
     assert "UnrelatedTelemetryMarker" not in prompt
-    assert "evidence_recorded" not in prompt
+    assert "analysis_status_by_engine" in prompt
+    assert "evidence_recorded" in prompt
     assert "Plan autour de CreateMutexW." in prompt
     assert str(unrelated.id) not in prompt
     assert result.output["summary"].startswith("Comparer")
@@ -1845,7 +1889,13 @@ async def test_short_verified_xxd_signature_remains_a_selectable_measurement() -
         and item["length"] == 12
         for item in measurements
     )
-    assert excerpts == []
+    assert excerpts == [
+        {
+            "kind": "metadata",
+            "title": "Métadonnée CTI — contenu observé",
+            "text": f"sample_sha256={sample_sha256}",
+        }
+    ]
 
 
 async def _submit_preservation_observation(payload, *, question: str, key: str):
@@ -2022,9 +2072,18 @@ async def test_large_text_and_hex_reach_fake_transport_with_matching_manifest() 
         key="operator:advisor:large-text-and-hex",
     )
 
+    byte_title = next(
+        line[2:]
+        for line in prompt.splitlines()
+        if line.startswith("| Octets observés; encoding=hex;")
+    )
+    assert f"byte_length={len(bytes.fromhex(hex_value))}" in byte_title
+    assert f"sha256={hashlib.sha256(bytes.fromhex(hex_value)).hexdigest()}" in byte_title
+    assert "offset 128" in byte_title
+    assert "evidence_id=" in byte_title
+    assert "blob_id=" in byte_title
     expected_body = (
-        f"Texte observé — Long text evidence:\n| {text_value}\n\n"
-        f"Octets observés — offset 128:\n| {hex_value}"
+        f"Texte observé — Long text evidence:\n| {text_value}\n\n{byte_title}\n| {hex_value}"
     )
     assert text_value in prompt
     assert hex_value in prompt
@@ -2147,6 +2206,7 @@ async def test_generic_api_key_in_cti_evidence_is_not_an_autowork_secret() -> No
         {"do_not_submit": True},
         {"external_llm_allowed": False},
         {"tlp": TLP.RED},
+        {"license_restriction": "Owner prohibits external disclosure"},
     ],
 )
 async def test_sample_level_restriction_blocks_explicit_observation(restriction) -> None:
@@ -2183,6 +2243,196 @@ async def test_sample_level_restriction_blocks_explicit_observation(restriction)
     assert result.output["preflight_status"] == "POLICY_BLOCKED"
     assert tuple(result.output["disclosure_restricted_refs"]) == (str(observation.id),)
     assert result.output["confirmed_non_execution"] is True
+    if restriction.get("license_restriction"):
+        assert restriction["license_restriction"] not in repr(result.output)
+
+
+@pytest.mark.asyncio
+async def test_restriction_trace_counts_sample_associations_not_observations() -> None:
+    investigation_id = uuid4()
+    sample_hash = "9" * 64
+    restriction_text = "Synthetic count semantics restriction marker"
+    first, first_raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": sample_hash,
+            "strings": [{"value": "RestrictedCountMarkerOne", "offset": 16}],
+        },
+    )
+    second, second_raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": sample_hash,
+            "strings": [{"value": "RestrictedCountMarkerTwo", "offset": 32}],
+        },
+    )
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    tool, sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=first,
+        raw=first_raw,
+    )
+    tool._observations = ObservationRepository((first, second))
+    tool._blobs.add(
+        second.blob_id,
+        sha256=second.sha256,
+        size=len(second_raw),
+        logical_bucket="evidence",
+    )
+    tool._artifact_store.values[second.blob_id] = second_raw
+    _attach_sample_policy(
+        tool,
+        sample_blob_id,
+        sample_hash,
+        license_restriction=restriction_text,
+    )
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Review both observations for one restricted sample.",
+            "evidence_refs": [str(first.id), str(second.id)],
+        },
+        make_context(investigation_id, key="operator:advisor:restricted-counts"),
+    )
+
+    association = tool._sample_associations.associations[0]
+    assert transport.calls == []
+    assert result.output["advisor_status"] == "disclosure_restricted"
+    assert result.output["disclosure_restricted_observation_count"] == 2
+    assert result.output["disclosure_restricted_sample_count"] == 1
+    assert result.output["disclosure_restricted_sample_association_count"] == 1
+    rows = result.output["disclosure_restricted_sample_associations"]
+    assert len(rows) == 1
+    assert rows[0]["association_id"] == str(association.id)
+    assert rows[0]["sample_sha256"] == sample_hash
+    assert tuple(rows[0]["restriction_sources"]) == ("license_restriction",)
+    assert set(rows[0]["linked_observation_refs"]) == {str(first.id), str(second.id)}
+    assert restriction_text not in repr(result.output)
+
+
+@pytest.mark.asyncio
+async def test_restriction_trace_aggregates_conflicting_sample_records() -> None:
+    investigation_id = uuid4()
+    sample_hash = "8" * 64
+    restriction_text = "Synthetic conflicting-record restriction marker"
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": sample_hash,
+            "strings": [{"value": "RestrictedConflictingMarker", "offset": 16}],
+        },
+    )
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    tool, sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+    _attach_sample_policy(
+        tool,
+        sample_blob_id,
+        sample_hash,
+        license_restriction=restriction_text,
+    )
+    restricted_sample = tool._samples.samples[0]
+    allowed_sample = SimpleNamespace(
+        expected_hash=sample_hash,
+        source_object_id=None,
+        state="quarantined",
+        blob_id=sample_blob_id,
+        tlp=TLP.GREEN,
+        do_not_submit=False,
+        external_llm_allowed=True,
+    )
+    submit_blocked_sample = SimpleNamespace(
+        expected_hash=sample_hash,
+        source_object_id=None,
+        state="quarantined",
+        blob_id=sample_blob_id,
+        tlp=TLP.GREEN,
+        do_not_submit=True,
+        external_llm_allowed=True,
+    )
+    # Records sharing a hash may disagree; the trace must reflect every
+    # restriction that contributed to the veto, not the first matching record.
+    tool._samples = _Samples([allowed_sample, restricted_sample, submit_blocked_sample])
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Review the conflicting sample records.",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, key="operator:advisor:restricted-conflicting-records"),
+    )
+
+    assert transport.calls == []
+    assert result.output["advisor_status"] == "disclosure_restricted"
+    assert result.output["disclosure_restricted_sample_count"] == 1
+    rows = result.output["disclosure_restricted_sample_associations"]
+    assert len(rows) == 1
+    assert tuple(rows[0]["restriction_sources"]) == (
+        "do_not_submit",
+        "license_restriction",
+    )
+    assert restriction_text not in repr(result.output)
+
+
+@pytest.mark.asyncio
+async def test_nested_sample_hash_with_license_restriction_refuses_before_bridge() -> None:
+    investigation_id = uuid4()
+    sample_hash = "e" * 64
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "investigation-tool-observation.v1",
+            "result": {
+                "schema": "sample-obfuscated-strings.v1",
+                "sample_sha256": sample_hash,
+                "strings": [{"value": "RESTRICTED_NESTED_SAMPLE_MARKER", "offset": 32}],
+            },
+        },
+    )
+    observation = replace(observation, object_id="sample")
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    tool, sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+    tool._blobs.descriptors[
+        observation.blob_id
+    ].descriptor.logical_bucket = "investigation-evidence"
+    tool._observations.observations[observation.id] = observation
+    _attach_sample_policy(
+        tool,
+        sample_blob_id,
+        sample_hash,
+        license_restriction="Owner prohibits external disclosure",
+    )
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Review the nested sample observation.",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, key="operator:advisor:nested-restricted-sample"),
+    )
+
+    assert transport.calls == []
+    assert result.output["advisor_status"] == "disclosure_restricted"
+    assert tuple(result.output["disclosure_restricted_refs"]) == (str(observation.id),)
+    safe_output = repr(result.output)
+    assert "Owner prohibits external disclosure" not in safe_output
+    assert "RESTRICTED_NESTED_SAMPLE_MARKER" not in safe_output
 
 
 @pytest.mark.asyncio
@@ -2226,6 +2476,407 @@ async def test_unrestricted_sample_measurement_reaches_fake_transport() -> None:
     assert len(transport.calls) == 1
     assert value in transport.calls[0]["prompt"]
     assert result.output["bridge_provenance"]["preflight_status"] == "READY"
+
+
+@pytest.mark.asyncio
+async def test_lossless_sample_bytes_metadata_and_provenance_reach_fake_transport() -> None:
+    investigation_id = uuid4()
+    attacker_token = "ghp_" + "a" * 36
+    raw_sample = bytes((0x90, 0x90, 0xC3, 0x41, 0x42)) + b" " + attacker_token.encode()
+    sample_sha256 = hashlib.sha256(raw_sample).hexdigest()
+    base64_content = base64.b64encode(raw_sample).decode("ascii")
+    contradictory_source_hash = "d" * 64
+    observation, raw_observation = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-byte-metadata.v1",
+            "sample_sha256": sample_sha256,
+            "raw_bytes": {"value": list(raw_sample), "offset": 37},
+            "bytes": {
+                "value": {
+                    "encoding": "base64",
+                    "byte_length": len(raw_sample),
+                    "sha256": sample_sha256,
+                    "content_base64": base64_content,
+                },
+                "offset": 38,
+            },
+            "hex": [
+                {"offset": 37, "value": raw_sample.hex()},
+                {"offset": 91, "length": 4, "value": "00ff1020"},
+            ],
+            "base64": base64_content,
+            "mime_type": "application/x-synthetic-sample",
+            "byte_length": len(raw_sample),
+            "status": "clean",
+            "analysis_status": "malicious",
+            "engines": ["EngineAlpha", "EngineBeta"],
+            "traces": ["trace-fragment-1"],
+            "fragments": [{"offset": 37, "length": len(raw_sample)}],
+        },
+    )
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=advisor_response(
+                "The verified sample context supports the review.", [str(observation.id)]
+            ),
+        )
+    )
+    tool, sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw_observation,
+    )
+    association_id = uuid4()
+    sample_id = uuid4()
+    tool._blobs.add(
+        sample_blob_id,
+        sha256=sample_sha256,
+        size=len(raw_sample),
+        logical_bucket="samples-quarantine",
+    )
+    mime_type = "application/x-synthetic-sample; version=2; charset=binary"
+    tool._blobs.descriptors[sample_blob_id].descriptor.mime_type = mime_type
+    tool._artifact_store.values[sample_blob_id] = raw_sample
+
+    async def sample_associations(_investigation_id):
+        return (
+            SimpleNamespace(
+                id=association_id,
+                sample_sha256=sample_sha256,
+                qualification="confirmed",
+                related_sample_sha256=(contradictory_source_hash,),
+            ),
+        )
+
+    async def samples_for_subject(_subject_id):
+        return (
+            SimpleNamespace(
+                id=sample_id,
+                expected_hash=sample_sha256,
+                source_object_id=contradictory_source_hash,
+                blob_id=sample_blob_id,
+                state="quarantined",
+                origin_kind="source_seed",
+                original_name="fixture.exe",
+                source_service="synthetic-source",
+                tlp=TLP.GREEN,
+                do_not_submit=False,
+                external_llm_allowed=True,
+                license_restriction=None,
+            ),
+        )
+
+    tool._sample_associations = SimpleNamespace(list_for_investigation=sample_associations)
+    tool._samples = SimpleNamespace(list_for_subject=samples_for_subject)
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Review the observed sample bytes and contradictory status metadata.",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, key="operator:advisor:lossless-sample-bytes"),
+    )
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED, result.output
+    assert len(transport.calls) == 1
+    prompt = transport.calls[0]["prompt"]
+    expected_bytes_label = f"encoding=base64; byte_length={len(raw_sample)}; sha256={sample_sha256}"
+    for required in (
+        base64_content,
+        raw_sample.hex(),
+        expected_bytes_label,
+        "offset 37",
+        "offset 38",
+        "offset 91",
+        f"sha256={hashlib.sha256(bytes.fromhex('00ff1020')).hexdigest()}",
+        "status=clean",
+        "analysis_status=malicious",
+        "EngineAlpha",
+        "EngineBeta",
+        "trace-fragment-1",
+        mime_type,
+        f"sample_id={sample_id}",
+        f"association_id={association_id}",
+        f"blob_id={sample_blob_id}",
+        f"sha256={sample_sha256}",
+        f"blob_sha256={sample_sha256}",
+        f"evidence_ids={observation.id}",
+        f"evidence_blob_ids={observation.blob_id}",
+        f"evidence_sha256s={observation.sha256}",
+        f"related_sample_sha256={contradictory_source_hash}",
+        f"source_object_id={contradictory_source_hash}",
+        f"length={len(raw_sample)}",
+        "do_not_submit=false",
+        "external_llm_allowed=true",
+    ):
+        assert required in prompt
+    assert attacker_token in base64.b64decode(base64_content).decode("latin-1")
+    assert result.output["bridge_provenance"]["redacted_secret_count"] == 0
+    assert any(
+        all(
+            value in line
+            for value in (
+                f"evidence_id={observation.id}",
+                f"blob_id={observation.blob_id}",
+                f"association_id={association_id}",
+            )
+        )
+        for line in prompt.splitlines()
+        if "Octets observés" in line
+    )
+    fragment_line = next(
+        line for line in prompt.splitlines() if "Octets observés" in line and "offset 91" in line
+    )
+    assert f"mime_type={mime_type}" in fragment_line
+    assert f"sha256={hashlib.sha256(bytes.fromhex('00ff1020')).hexdigest()}" in fragment_line
+    assert f"; sha256={sample_sha256}" not in fragment_line
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("representation", "material_kind"),
+    [
+        ("sample_blob", "operational_secret"),
+        ("sample_blob", "signed_url"),
+        ("byte_array", "operational_secret"),
+        ("byte_array", "signed_url"),
+        ("hex", "operational_secret"),
+        ("hex", "signed_url"),
+        ("base64", "operational_secret"),
+        ("base64", "signed_url"),
+    ],
+)
+async def test_encoded_sample_material_with_operational_secret_or_signed_url_is_refused(
+    representation, material_kind
+) -> None:
+    investigation_id = uuid4()
+    operator_secret = "autowork_fixture_" + "S" * 48
+    material = (
+        operator_secret
+        if material_kind == "operational_secret"
+        else "https://storage.invalid/sample?X-Amz-Signature=synthetic-signed-sample-url"
+    )
+    raw_material = material.encode("ascii")
+    sample_hash = hashlib.sha256(raw_material).hexdigest()
+    measured_payload: dict[str, Any]
+    if representation == "hex":
+        measured_payload = {"hex": [{"offset": 3, "value": raw_material.hex()}]}
+    elif representation == "byte_array":
+        measured_payload = {"raw_bytes": [{"offset": 3, "value": list(raw_material)}]}
+    elif representation == "base64":
+        measured_payload = {
+            "base64": [{"offset": 3, "value": base64.b64encode(raw_material).decode("ascii")}]
+        }
+    else:
+        measured_payload = {"content": "A sample blob is associated with this evidence."}
+    observation, observation_raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-encoded-secret-fixture.v1",
+            "sample_sha256": sample_hash,
+            **measured_payload,
+        },
+    )
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    tool, sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=observation_raw,
+    )
+    tool._settings.operator_api_token = SecretStr(operator_secret)
+    if representation == "sample_blob":
+        association_id = uuid4()
+        sample_id = uuid4()
+        tool._blobs.add(
+            sample_blob_id,
+            sha256=sample_hash,
+            size=len(raw_material),
+            logical_bucket="samples-quarantine",
+        )
+        tool._artifact_store.values[sample_blob_id] = raw_material
+
+        async def list_sample_associations(_id):
+            return (SimpleNamespace(id=association_id, sample_sha256=sample_hash),)
+
+        async def list_samples(_id):
+            return (
+                SimpleNamespace(
+                    id=sample_id,
+                    expected_hash=sample_hash,
+                    source_object_id=None,
+                    blob_id=sample_blob_id,
+                    state="quarantined",
+                    origin_kind="source_seed",
+                    original_name="synthetic-sample.bin",
+                    source_service="fixture",
+                    tlp=TLP.GREEN,
+                    do_not_submit=False,
+                    external_llm_allowed=True,
+                    license_restriction=None,
+                ),
+            )
+
+        tool._sample_associations = SimpleNamespace(list_for_investigation=list_sample_associations)
+        tool._samples = SimpleNamespace(list_for_subject=list_samples)
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Review the encoded sample bytes.",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, key=f"operator:advisor:encoded-veto:{representation}"),
+    )
+
+    assert transport.calls == []
+    assert result.output["advisor_status"] == "refused"
+    assert result.output["refusal_code"] == "autowork_credential_or_signed_url_detected"
+    safe_output = repr(result.output)
+    assert operator_secret not in safe_output
+    assert "synthetic-signed-sample-url" not in safe_output
+
+
+@pytest.mark.asyncio
+async def test_sample_blob_over_configured_technical_bound_is_omitted_with_provenance() -> None:
+    investigation_id = uuid4()
+    sample_content = b"synthetic sample content above the configured test bound"
+    sample_hash = hashlib.sha256(sample_content).hexdigest()
+    observation, observation_raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-technical-bound-fixture.v1",
+            "sample_sha256": sample_hash,
+            "content": "Verified observation remains available while blob content is omitted.",
+        },
+    )
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=advisor_response(
+                "The verified metadata is available.", [str(observation.id)]
+            ),
+        )
+    )
+    tool, sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=observation_raw,
+    )
+    tool._settings.advisor_sample_blob_max_bytes = 8
+    sample_id = uuid4()
+    association_id = uuid4()
+    tool._blobs.add(
+        sample_blob_id,
+        sha256=sample_hash,
+        size=len(sample_content),
+        logical_bucket="samples-quarantine",
+    )
+    tool._blobs.descriptors[sample_blob_id].descriptor.mime_type = "application/x-bound; v=1"
+    tool._artifact_store.values[sample_blob_id] = sample_content
+    sample_reads = []
+    original_read_bytes = tool._artifact_store.read_bytes
+
+    async def track_sample_read(blob_id, *, max_bytes):
+        if blob_id == sample_blob_id:
+            sample_reads.append(blob_id)
+        return await original_read_bytes(blob_id, max_bytes=max_bytes)
+
+    tool._artifact_store.read_bytes = track_sample_read
+
+    async def list_sample_associations(_id):
+        return (SimpleNamespace(id=association_id, sample_sha256=sample_hash),)
+
+    async def list_samples(_id):
+        return (
+            SimpleNamespace(
+                id=sample_id,
+                expected_hash=sample_hash,
+                source_object_id=None,
+                blob_id=sample_blob_id,
+                state="quarantined",
+                origin_kind="source_seed",
+                original_name="synthetic-large-sample.bin",
+                source_service="fixture",
+                tlp=TLP.GREEN,
+                do_not_submit=False,
+                external_llm_allowed=True,
+                license_restriction=None,
+            ),
+        )
+
+    tool._sample_associations = SimpleNamespace(list_for_investigation=list_sample_associations)
+    tool._samples = SimpleNamespace(list_for_subject=list_samples)
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Review the sample metadata.",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, key="operator:advisor:sample-technical-bound"),
+    )
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED, result.output
+    assert len(transport.calls) == 1
+    assert sample_reads == []
+    prompt = transport.calls[0]["prompt"]
+    assert f"sample_id={sample_id}" in prompt
+    assert f"association_id={association_id}" in prompt
+    assert "content_status=omitted_technical_size_limit" in prompt
+    assert "content_omission_reason=sample_blob_exceeds_configured_technical_limit" in prompt
+    assert "maximum_content_bytes=8" in prompt
+    assert base64.b64encode(sample_content).decode("ascii") not in prompt
+
+
+@pytest.mark.asyncio
+async def test_unreferenced_restricted_sample_does_not_block_unrelated_consultation() -> None:
+    investigation_id = uuid4()
+    observation, raw = make_observation(
+        investigation_id,
+        {"schema": "generic-observation.v1", "content": "Permitted unrelated evidence."},
+    )
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=advisor_response(
+                "The unrelated evidence is usable.", [str(observation.id)]
+            ),
+        )
+    )
+    tool, sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+    _attach_sample_policy(
+        tool,
+        sample_blob_id,
+        "c" * 64,
+        license_restriction="Owner prohibits unrelated external disclosure",
+    )
+
+    arguments = {
+        "consultation_type": "plan_investigation",
+        "question": "Review the unrelated permitted observation.",
+        "evidence_refs": [str(observation.id)],
+    }
+    measured_cost = await tool.reservation_cost(arguments, make_dispatch_context(investigation_id))
+    result = await tool.execute(
+        arguments,
+        make_context(investigation_id, key="operator:advisor:unrelated-restricted-sample"),
+    )
+
+    assert measured_cost[BudgetDimension.CONTEXT_BYTES] > 0
+    assert result.status is ToolInvocationStatus.SUCCEEDED, result.output
+    assert len(transport.calls) == 1
+    assert "Owner prohibits unrelated external disclosure" not in transport.calls[0]["prompt"]
 
 
 @pytest.mark.asyncio
@@ -2288,7 +2939,7 @@ async def test_dotnet_analysis_of_restricted_sample_is_blocked() -> None:
 
 
 @pytest.mark.asyncio
-async def test_finding_linked_to_restricted_observation_is_dropped() -> None:
+async def test_restricted_sample_inventory_refuses_before_sending_linked_finding() -> None:
     investigation_id = uuid4()
     sample_hash = "c" * 64
     restricted, restricted_raw = make_observation(
@@ -2357,13 +3008,10 @@ async def test_finding_linked_to_restricted_observation_is_dropped() -> None:
         make_context(investigation_id, key="operator:advisor:restricted-finding"),
     )
 
-    assert len(transport.calls) == 1
-    prompt = transport.calls[0]["prompt"]
-    assert "RESTRICTED_FINDING_MARKER" not in prompt
-    assert "Permitted observation content." in prompt
-    assert tuple(result.output["bridge_provenance"]["disclosure_restricted_finding_refs"]) == (
-        str(finding.id),
-    )
+    assert transport.calls == []
+    assert result.output["advisor_status"] == "disclosure_restricted"
+    assert result.output["confirmed_non_execution"] is True
+    assert "RESTRICTED_FINDING_MARKER" not in repr(result.output)
 
 
 @pytest.mark.asyncio
@@ -2482,7 +3130,8 @@ async def test_minimal_yara_draft_selects_measured_blob_offsets_server_side() ->
 
     prompt = transport.calls[0]["prompt"]
     assert result.status is ToolInvocationStatus.SUCCEEDED
-    assert str(sample_blob_id) not in prompt
+    assert f"blob_id={sample_blob_id}" in prompt
+    assert f"sha256={sample_sha256}" in prompt
     assert "blob_id" not in typed_prompt_payload(prompt)["measurements"][0]
     assert "offset 128:" in prompt
     assert "offset 384:" in prompt
@@ -2540,6 +3189,10 @@ async def test_verified_measurement_candidates_reach_pivot_and_v3_prompts(
     tool._sample_associations.list_for_investigation = async_get(
         (SimpleNamespace(sample_sha256=sample_sha256, id=uuid4()),)
     )
+    if consultation_type == "suricata_draft":
+        tool._blobs.descriptors[
+            observation.blob_id
+        ].descriptor.logical_bucket = "investigation-evidence"
     tool._samples.list_for_subject = async_get(
         (
             SimpleNamespace(
@@ -2603,8 +3256,8 @@ async def test_verified_measurement_candidates_reach_pivot_and_v3_prompts(
     )
     assert prompt_data["measurements"][0]["measurement_id"] == evidence_alias
     assert "blob_id" not in prompt_data["measurements"][0]
-    assert str(observation.id) not in transport.calls[0]["prompt"]
-    assert str(sample_blob_id) not in transport.calls[0]["prompt"]
+    assert f"evidence_ids={observation.id}" in transport.calls[0]["prompt"]
+    assert f"blob_id={sample_blob_id}" in transport.calls[0]["prompt"]
 
 
 @pytest.mark.parametrize(
@@ -2750,8 +3403,10 @@ async def test_typed_floss_dotnet_and_verified_xxd_content_patterns_are_advisor_
         observation=observation,
         raw=raw,
     )
+    association_id = uuid4()
+    sample_mime_type = "application/x-measurement-fixture; version=5"
     tool._sample_associations.list_for_investigation = async_get(
-        (SimpleNamespace(sample_sha256=sample_sha256, id=uuid4()),)
+        (SimpleNamespace(sample_sha256=sample_sha256, id=association_id),)
     )
     tool._samples.list_for_subject = async_get(
         (
@@ -2764,6 +3419,7 @@ async def test_typed_floss_dotnet_and_verified_xxd_content_patterns_are_advisor_
         )
     )
     tool._blobs.add(sample_blob_id, sha256=sample_sha256, size=4096)
+    tool._blobs.descriptors[sample_blob_id].descriptor.mime_type = sample_mime_type
     if consultation_type == "figure_plan":
         finding = InvestigationFinding(
             investigation_id=investigation_id,
@@ -2825,7 +3481,13 @@ async def test_typed_floss_dotnet_and_verified_xxd_content_patterns_are_advisor_
         item == {"ref": evidence_alias, "kind": "measurement"}
         for item in typed_prompt_payload(prompt)["wire_ref_catalog"]
     )
-    assert str(sample_blob_id) not in prompt
+    assert f"blob_id={sample_blob_id}" in prompt
+    if expected_kind == "hex":
+        fragment_sha256 = hashlib.sha256(bytes.fromhex(expected_value)).hexdigest()
+        assert f"association_id={association_id}" in prompt
+        assert f"mime_type={sample_mime_type}" in prompt
+        assert f"fragment_sha256={fragment_sha256}" in prompt
+        assert f"sample_sha256={sample_sha256}" in prompt
     if consultation_type == "yara_draft":
         assert result.output["schema"] == ADVISOR_RESPONSE_SCHEMA_V3
 
@@ -3403,7 +4065,7 @@ async def test_review_text_includes_unit_fact_dossier_and_omits_advisor_state(
     assert "tools" not in prompt_data
     assert "gaps" not in prompt_data
     assert "budget_remaining" not in prompt_data
-    assert len(prompt.encode("utf-8")) <= MAX_ADVISOR_INPUT_BYTES
+    assert len(prompt.encode("utf-8")) == result.output["bridge_provenance"]["prompt_bytes"]
     assert "RC4_KEY_EXAMPLE" in prompt
     assert "RC4_KEY_EXAMPLE=0x1234" in prompt
     assert "ghp_" + "a" * 36 in prompt
@@ -3495,6 +4157,341 @@ async def test_draft_text_resolves_facts_from_assertion_refs() -> None:
     assert "budget_remaining" not in prompt_data
 
 
+@pytest.mark.asyncio
+async def test_draft_text_assertion_ref_to_restricted_sample_is_vetoed_after_resolution() -> None:
+    investigation_id = uuid4()
+    sample_hash = "d" * 64
+    restriction_text = "Synthetic source restriction marker"
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": sample_hash,
+            "strings": [{"value": "RestrictedEditorialSampleMarker", "offset": 128}],
+        },
+    )
+    transport = Transport(
+        TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="must not be called")
+    )
+    tool, sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+    _attach_sample_policy(
+        tool,
+        sample_blob_id,
+        sample_hash,
+        license_restriction=restriction_text,
+    )
+
+    result = await tool.execute(
+        {
+            "consultation_type": "draft_text",
+            "units": [
+                {
+                    "id": "U1",
+                    "block_type": "uncertainties_and_next_leads",
+                    "form": "body",
+                    "anchor": None,
+                    "assertions": [
+                        {
+                            "id": "restricted-a1",
+                            "text": "Synthetic editorial assertion for offline testing.",
+                            "nature": "analyse",
+                            "refs": [{"kind": "observation", "id": str(observation.id)}],
+                            "block_type": "uncertainties_and_next_leads",
+                            "form": "body",
+                            "anchor": None,
+                        }
+                    ],
+                }
+            ],
+        },
+        make_context(investigation_id, key="operator:advisor:restricted-editorial-reference"),
+    )
+
+    assert transport.calls == []
+    assert result.output["advisor_status"] == "disclosure_restricted"
+    assert result.output["failure_stage"] == "sample_disclosure_restricted"
+    assert result.output["confirmed_non_execution"] is True
+    safe_output = repr(result.output)
+    assert restriction_text not in safe_output
+    assert "RestrictedEditorialSampleMarker" not in safe_output
+
+
+@pytest.mark.asyncio
+async def test_draft_text_finding_ref_to_restricted_sample_is_vetoed_after_resolution() -> None:
+    investigation_id = uuid4()
+    sample_hash = "d" * 64
+    restriction_text = "Synthetic finding source restriction marker"
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": sample_hash,
+            "strings": [{"value": "RestrictedFindingSampleMarker", "offset": 128}],
+        },
+    )
+    finding = InvestigationFinding(
+        investigation_id=investigation_id,
+        kind=FindingKind.CAPABILITY,
+        assessment=FindingAssessment.SUPPORTED,
+        statement="Restricted finding statement marker.",
+        observation_refs=(observation.id,),
+    )
+    transport = Transport(
+        TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="must not be called")
+    )
+    tool, sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+    _attach_sample_policy(
+        tool,
+        sample_blob_id,
+        sample_hash,
+        license_restriction=restriction_text,
+    )
+    tool._findings = FindingRepository((finding,))
+
+    result = await tool.execute(
+        {
+            "consultation_type": "draft_text",
+            "units": [
+                {
+                    "id": "U1",
+                    "block_type": "uncertainties_and_next_leads",
+                    "form": "body",
+                    "anchor": None,
+                    "assertions": [
+                        {
+                            "id": "finding-a1",
+                            "text": "Synthetic assertion citing a finding.",
+                            "nature": "analyse",
+                            "refs": [{"kind": "finding", "id": str(finding.id)}],
+                            "block_type": "uncertainties_and_next_leads",
+                            "form": "body",
+                            "anchor": None,
+                        }
+                    ],
+                }
+            ],
+        },
+        make_context(investigation_id, key="operator:advisor:restricted-finding-reference"),
+    )
+
+    assert transport.calls == []
+    assert result.output["advisor_status"] == "disclosure_restricted"
+    assert result.output["failure_stage"] == "sample_disclosure_restricted"
+    assert result.output["confirmed_non_execution"] is True
+    assert str(finding.id) in result.output["disclosure_restricted_finding_refs"]
+    association = tool._sample_associations.associations[0]
+    assert result.output["disclosure_restricted_sample_count"] == 1
+    assert result.output["disclosure_restricted_sample_association_count"] == 1
+    assert result.output["disclosure_restricted_observation_count"] == 1
+    rows = result.output["disclosure_restricted_sample_associations"]
+    assert len(rows) == 1
+    assert rows[0]["association_id"] == str(association.id)
+    assert rows[0]["sample_sha256"] == sample_hash
+    assert tuple(rows[0]["restriction_sources"]) == ("license_restriction",)
+    assert tuple(rows[0]["linked_observation_refs"]) == (str(observation.id),)
+    assert tuple(rows[0]["linked_finding_refs"]) == (str(finding.id),)
+    safe_output = repr(result.output)
+    assert restriction_text not in safe_output
+    assert "RestrictedFindingSampleMarker" not in safe_output
+    assert "Restricted finding statement marker" not in safe_output
+
+
+@pytest.mark.asyncio
+async def test_draft_text_unrelated_finding_remains_eligible() -> None:
+    investigation_id = uuid4()
+    restricted_hash = "d" * 64
+    unrelated_hash = "e" * 64
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": unrelated_hash,
+            "strings": [{"value": "PermittedFindingSampleMarker", "offset": 128}],
+        },
+    )
+    finding = InvestigationFinding(
+        investigation_id=investigation_id,
+        kind=FindingKind.CAPABILITY,
+        assessment=FindingAssessment.SUPPORTED,
+        statement="Unrelated finding remains eligible for consultation.",
+        observation_refs=(observation.id,),
+    )
+    transport = Transport(
+        TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="synthetic response")
+    )
+    tool, sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+    _attach_sample_policy(
+        tool,
+        sample_blob_id,
+        restricted_hash,
+        license_restriction="Synthetic restriction for an unreferenced sample",
+    )
+    tool._findings = FindingRepository((finding,))
+
+    await tool.execute(
+        {
+            "consultation_type": "draft_text",
+            "units": [
+                {
+                    "id": "U1",
+                    "block_type": "uncertainties_and_next_leads",
+                    "form": "body",
+                    "anchor": None,
+                    "assertions": [
+                        {
+                            "id": "unrelated-finding-a1",
+                            "text": "Synthetic assertion citing an unrelated finding.",
+                            "nature": "analyse",
+                            "refs": [{"kind": "finding", "id": str(finding.id)}],
+                            "block_type": "uncertainties_and_next_leads",
+                            "form": "body",
+                            "anchor": None,
+                        }
+                    ],
+                }
+            ],
+        },
+        make_context(investigation_id, key="operator:advisor:unrelated-finding-reference"),
+    )
+
+    assert len(transport.calls) == 1
+    assert "Unrelated finding remains eligible" in transport.calls[0]["prompt"]
+    assert "Synthetic restriction for an unreferenced sample" not in transport.calls[0]["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_editorial_measurements_keep_fragment_provenance_for_byte_representations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cti_app.application.advisor_dossier import build_advisor_dossier
+
+    investigation_id = uuid4()
+    sample_hash = "f" * 64
+    observation, raw = make_observation(
+        investigation_id,
+        {"schema": "generic-observation.v1", "content": "Editorial byte measurement fixture."},
+    )
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    tool, sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+    _attach_sample_policy(tool, sample_blob_id, sample_hash)
+    association_id = uuid4()
+    tool._sample_associations = SimpleNamespace(
+        list_for_investigation=async_get(
+            (SimpleNamespace(id=association_id, sample_sha256=sample_hash),)
+        )
+    )
+    tool._blobs.descriptors[
+        sample_blob_id
+    ].descriptor.mime_type = "application/x-editorial-fragment; version=2"
+    expected_bytes = bytes((0, 255))
+    expected_digest = hashlib.sha256(expected_bytes).hexdigest()
+    measurement_rows = (
+        {
+            "kind": "hex",
+            "value": "00ff",
+            "encoding": "raw",
+            "offset": 11,
+            "length": 2,
+            "sample_sha256": sample_hash,
+        },
+        {
+            "kind": "base64",
+            "value": "AP8=",
+            "encoding": "base64",
+            "offset": 22,
+            "length": 2,
+            "sample_sha256": sample_hash,
+        },
+        {
+            "kind": "bytes",
+            "value": expected_bytes,
+            "encoding": "bytes",
+            "offset": 33,
+            "length": 2,
+            "sample_sha256": sample_hash,
+        },
+        {
+            "kind": "bytes",
+            "value": [0, 255],
+            "encoding": "bytes",
+            "offset": 44,
+            "length": 2,
+            "sample_sha256": sample_hash,
+        },
+    )
+
+    async def editorial_measurement_rows(_observation):
+        return [dict(row) for row in measurement_rows]
+
+    monkeypatch.setattr(tool, "_measurement_rows", editorial_measurement_rows)
+    (
+        _observation_items,
+        evidence_rows,
+        measured_rows,
+        _finding_rows,
+    ) = await tool._editorial_reference_facts(
+        investigation_id=investigation_id,
+        evidence=(),
+        prompt_data={
+            "assertions": [{"refs": [{"kind": "observation", "id": str(observation.id)}]}]
+        },
+    )
+
+    assert len(measured_rows) == 4
+    for row, offset, encoding in zip(
+        measured_rows, (11, 22, 33, 44), ("hex", "base64", "base64", "base64"), strict=True
+    ):
+        assert row["offset"] == offset
+        assert row["encoding"] == encoding
+        assert row["byte_length"] == 2
+        assert row["length"] == 2
+        assert row["fragment_sha256"] == expected_digest
+        assert row["evidence_id"] == str(observation.id)
+        assert row["blob_id"] == str(sample_blob_id)
+        assert row["association_id"] == str(association_id)
+        assert row["mime_type"] == "application/x-editorial-fragment; version=2"
+
+    dossier = build_advisor_dossier(
+        {
+            "evidence": evidence_rows,
+            "measured_facts": measured_rows,
+            "assertions": [{"refs": [{"kind": "observation", "id": str(observation.id)}]}],
+        }
+    )
+    for offset, encoding in zip(
+        (11, 22, 33, 44), ("hex", "base64", "base64", "base64"), strict=True
+    ):
+        assert f"offset {offset}" in dossier.text
+        assert f"encoding={encoding}" in dossier.text
+    assert f"fragment_sha256={expected_digest}" in dossier.text
+    assert f"association_id={association_id}" in dossier.text
+    assert f"evidence_id={observation.id}" in dossier.text
+    assert f"blob_id={sample_blob_id}" in dossier.text
+    assert "byte_length=2" in dossier.text
+    assert "length=2" in dossier.text
+    assert "mime_type=application/x-editorial-fragment; version=2" in dossier.text
+
+
 def test_context_truncation_stops_at_sentence_or_word_and_marks_ellipsis() -> None:
     sentence = _truncate_context_text(
         "Première phrase complète. Deuxième phrase qui continue sans fin.", 30
@@ -3507,7 +4504,8 @@ def test_context_truncation_stops_at_sentence_or_word_and_marks_ellipsis() -> No
 
 
 @pytest.mark.asyncio
-async def test_external_disclosure_denial_never_calls_bridge() -> None:
+@pytest.mark.parametrize("policy", ["external_llm_allowed", "do_not_submit", "tlp_red"])
+async def test_external_disclosure_denial_never_calls_bridge(policy) -> None:
     investigation_id = uuid4()
     observation, raw = make_observation(
         investigation_id,
@@ -3521,8 +4519,15 @@ async def test_external_disclosure_denial_never_calls_bridge() -> None:
         transport=transport,
         observation=observation,
         raw=raw,
-        allowed=False,
+        allowed=True,
     )
+    snapshot = await tool._article_snapshots.resolve(uuid4())
+    if policy == "external_llm_allowed":
+        snapshot.external_llm_allowed = False
+    elif policy == "do_not_submit":
+        snapshot.do_not_submit = True
+    else:
+        snapshot.tlp = "RED"
     result = await tool.execute(
         {
             "consultation_type": "plan_investigation",
@@ -3539,12 +4544,410 @@ async def test_external_disclosure_denial_never_calls_bridge() -> None:
     assert transport.calls == []
 
 
+@pytest.mark.asyncio
+async def test_dispatcher_reserves_measured_prompt_bytes_before_transport_and_commits_them() -> (
+    None
+):
+    investigation_id = uuid4()
+    context = make_dispatch_context(investigation_id)
+    observation, raw = make_observation(
+        investigation_id,
+        {"schema": "generic-observation.v1", "content": "Synthetic G2 reservation evidence."},
+    )
+
+    def verify_reservation_before_transport(call):
+        prompt_bytes = len(call["prompt"].encode("utf-8"))
+        reservation = next(
+            item
+            for item in context.budget.reservations
+            if item.operation_key == context.idempotency_key
+        )
+        assert reservation.status.value == "reserved"
+        assert reservation.amounts[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
+        assert reservation.amounts[BudgetDimension.CONTEXT_TOKENS] == (prompt_bytes + 3) // 4
+        return TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=advisor_response(
+                "The measured reservation passed G2.", [str(observation.id)]
+            ),
+        )
+
+    transport = Transport(verify_reservation_before_transport)
+    tool, _sample_blob = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+    registry = InMemoryToolRegistry()
+    register_investigation_advisor_tool(registry, adapter=tool)
+    result = await RegistryToolDispatcher(registry).dispatch(
+        context,
+        tool_name="advisor.consult",
+        schema_version="advisor-consult.v1",
+        arguments={
+            "consultation_type": "plan_investigation",
+            "evidence_refs": [str(observation.id)],
+        },
+        purpose="Measure and reserve the advisor prompt before transport.",
+        operation_key=context.idempotency_key,
+    )
+
+    assert len(transport.calls) == 1, result
+    prompt_bytes = len(transport.calls[0]["prompt"].encode("utf-8"))
+    reservation = next(
+        item
+        for item in context.budget.reservations
+        if item.operation_key == context.idempotency_key
+    )
+    assert reservation.status.value == "committed"
+    assert reservation.amounts[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
+    assert reservation.amounts[BudgetDimension.CONTEXT_TOKENS] == (prompt_bytes + 3) // 4
+    assert reservation.committed_amounts[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
+    assert reservation.committed_amounts[BudgetDimension.CONTEXT_TOKENS] == (prompt_bytes + 3) // 4
+    assert result.budget_consumed[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
+    assert result.budget_consumed[BudgetDimension.CONTEXT_TOKENS] == (prompt_bytes + 3) // 4
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_denies_over_budget_measured_prompt_before_transport() -> None:
+    investigation_id = uuid4()
+    context = make_dispatch_context(investigation_id, context_byte_limit=1)
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    tool, _sample_blob = make_tool(investigation_id=investigation_id, transport=transport)
+    registry = InMemoryToolRegistry()
+    register_investigation_advisor_tool(registry, adapter=tool)
+
+    result = await RegistryToolDispatcher(registry).dispatch(
+        context,
+        tool_name="advisor.consult",
+        schema_version="advisor-consult.v1",
+        arguments={"consultation_type": "plan_investigation", "evidence_refs": []},
+        purpose="Check G2 admission against the measured advisor prompt.",
+        operation_key=context.idempotency_key,
+    )
+
+    assert result.status is ToolInvocationStatus.NEEDS_REVIEW
+    assert result.framework_pre_submission_proof is FrameworkPreSubmissionProof.BUDGET_REJECTED
+    assert transport.calls == []
+    assert not context.budget.reservations
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_revocation_proof_stops_before_fake_advisor_transport() -> None:
+    investigation_id = uuid4()
+    context = make_dispatch_context(investigation_id)
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    tool, _sample_blob = make_tool(investigation_id=investigation_id, transport=transport)
+    registry = InMemoryToolRegistry()
+    register_investigation_advisor_tool(registry, adapter=tool)
+
+    async def revoked_before_dispatch(_context):
+        return FrameworkPreSubmissionProof.ENVELOPE_REVOKED
+
+    result = await RegistryToolDispatcher(registry).dispatch(
+        context,
+        tool_name="advisor.consult",
+        schema_version="advisor-consult.v1",
+        arguments={"consultation_type": "plan_investigation", "evidence_refs": []},
+        purpose="Exercise the final revocation gate before adapter dispatch.",
+        operation_key=context.idempotency_key,
+        pre_dispatch_check=revoked_before_dispatch,
+    )
+
+    assert result.status is ToolInvocationStatus.POLICY_DENIED
+    assert result.framework_pre_submission_proof is FrameworkPreSubmissionProof.ENVELOPE_REVOKED
+    assert transport.calls == []
+
+
+@pytest.mark.asyncio
+async def test_revocation_during_prompt_preparation_stops_before_fake_transport() -> None:
+    investigation_id = uuid4()
+    context = make_dispatch_context(investigation_id)
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    tool, _sample_blob = make_tool(investigation_id=investigation_id, transport=transport)
+    registry = InMemoryToolRegistry()
+    register_investigation_advisor_tool(registry, adapter=tool)
+    original_put_text = tool._artifact_store.put_text
+    admission_checks = 0
+    revoked = False
+
+    async def archive_and_revoke(value, *, bucket):
+        nonlocal revoked
+        blob_id = await original_put_text(value, bucket=bucket)
+        revoked = True
+        return blob_id
+
+    async def check_current_admission(_context):
+        nonlocal admission_checks
+        admission_checks += 1
+        return FrameworkPreSubmissionProof.ENVELOPE_REVOKED if revoked else None
+
+    tool._artifact_store.put_text = archive_and_revoke
+    result = await RegistryToolDispatcher(registry).dispatch(
+        context,
+        tool_name="advisor.consult",
+        schema_version="advisor-consult.v1",
+        arguments={
+            "consultation_type": "plan_investigation",
+            "question": "Prepare and then recheck admission before transport.",
+            "evidence_refs": [],
+        },
+        purpose="Exercise the post-preparation current-envelope check.",
+        operation_key=context.idempotency_key,
+        pre_dispatch_check=check_current_admission,
+    )
+
+    assert admission_checks == 2
+    assert revoked is True
+    assert transport.calls == []
+    assert result.output["failure_stage"] == "post_preparation_admission"
+    assert result.output["failure_reason"] == "current_admission_revoked"
+    assert "secret" not in repr(result.output).casefold()
+
+
+@pytest.mark.asyncio
+async def test_service_current_envelope_recheck_preserves_needs_review_recovery() -> None:
+    try:
+        from tests.test_investigation_service import _Fixture
+    except ImportError as exc:
+        pytest.skip(f"service fixture dependencies are unavailable: {exc.name}")
+
+    from cti_app.domain.investigation_state import Hypothesis
+
+    fixture = _Fixture(responses=[], tools=())
+    fixture.envelope = replace(fixture.envelope, allowed_providers=("bridge",))
+    state = await fixture.start(
+        hypotheses=(Hypothesis(id="revocation", statement="A synthetic review hypothesis."),),
+        execution_mode=InvestigationExecutionMode.OPERATOR_LED,
+    )
+    investigation_id = fixture.investigation_id
+    operation_key = "operator:advisor:late-revocation"
+    observation, observation_raw = make_observation(
+        investigation_id,
+        {"schema": "revocation-fixture.v1", "content": "A verified local evidence marker."},
+    )
+    await fixture.observations.append_if_absent(observation)
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    tool, _sample_blob = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=observation_raw,
+    )
+    tool._investigations = fixture.investigations
+    tool._observations = fixture.observations
+    tool._findings = fixture.findings
+    tool._investigation_states = fixture.states
+    tool._opinions = fixture.opinions
+    tool._article_snapshots = fixture.context_builder.article_snapshots
+    tool._registry = fixture.registry
+    tool._artifact_store.values[observation.blob_id] = observation_raw
+    tool._blobs.add(
+        observation.blob_id,
+        sha256=observation.sha256,
+        size=len(observation_raw),
+        logical_bucket="investigation-evidence",
+    )
+
+    async def prepared_context(**_kwargs):
+        return {
+            "investigation_id": str(investigation_id),
+            "consultation_type": "plan_investigation",
+            "question": "Review the verified synthetic marker.",
+            "article_source_ref": "article:" + "a" * 64,
+            "article_sha256": "a" * 64,
+            "article_summary": "A synthetic verified summary.",
+            "article_passages": [],
+            "open_questions": [],
+            "samples": [],
+            "evidence": [
+                {
+                    "evidence_id": str(observation.id),
+                    "kind": "other",
+                    "object_type": "generic",
+                    "sha256": observation.sha256,
+                    "source": observation.source,
+                    "content_excerpts": [
+                        {
+                            "kind": "text",
+                            "title": "Verified local evidence",
+                            "text": "A verified local evidence marker.",
+                        }
+                    ],
+                    "blob_read_verified": True,
+                }
+            ],
+            "evidence_refs": [str(observation.id)],
+            "findings": [],
+            "hypotheses": [
+                {
+                    "id": "revocation",
+                    "statement": "A synthetic review hypothesis.",
+                    "status": "open",
+                    "evidence_refs": [str(observation.id)],
+                    "finding_refs": [],
+                }
+            ],
+            "working_state_version": 1,
+            "working_state_sha256": "f" * 64,
+            "truncation": {},
+        }
+
+    tool._consultation_data = prepared_context
+    fixture.service._available_capabilities = frozenset({"bridge.advisor"})
+    register_investigation_advisor_tool(fixture.registry, adapter=tool)
+    original_put_text = tool._artifact_store.put_text
+    revocations = []
+
+    async def archive_then_revoke(value, *, bucket):
+        blob_id = await original_put_text(value, bucket=bucket)
+        current = await fixture.envelopes.get(investigation_id)
+        assert current is not None
+        revoked = replace(
+            current,
+            version=current.version + 1,
+            disclosure=replace(
+                current.disclosure,
+                do_not_submit=True,
+                external_llm_allowed=False,
+            ),
+        )
+        await fixture.envelopes.save_if_version(revoked, expected_version=current.version)
+        revocations.append(revoked.version)
+        return blob_id
+
+    tool._artifact_store.put_text = archive_then_revoke
+    investigation = await fixture.investigations.get(investigation_id)
+    envelope = await fixture.envelopes.get(investigation_id)
+    invocation, result, _refs, uncertain = await fixture.service.execute_tool_call(
+        investigation=investigation,
+        envelope=envelope,
+        budget=envelope.budget,
+        state=state,
+        tool_name="advisor.consult",
+        schema_version="advisor-consult.v1",
+        arguments={
+            "consultation_type": "plan_investigation",
+            "evidence_refs": [str(observation.id)],
+        },
+        purpose="Recheck current admission after local prompt preparation.",
+        operation_key=operation_key,
+    )
+
+    assert revocations
+    assert transport.calls == []
+    assert invocation.status is ToolInvocationStatus.NEEDS_REVIEW
+    assert uncertain is True
+    assert result.output["failure_stage"] == "post_preparation_admission"
+    assert result.output["failure_reason"] == "current_admission_revoked"
+    assert "secret" not in repr(result.output).casefold()
+    latest_envelope = await fixture.envelopes.get(investigation_id)
+    reservation = next(
+        item for item in latest_envelope.budget.reservations if item.operation_key == operation_key
+    )
+    assert reservation.status.value == "reserved"
+
+
 def test_advisor_payload_redacts_credentials_embedded_in_urls() -> None:
     cleaned, count = _redact_advisor_payload(
         {"request": "fetch https://analyst:secret@example.test/path"}
     )
     assert cleaned["request"] == "fetch [clé masquée]"
     assert count == 1
+
+
+@pytest.mark.asyncio
+async def test_signed_url_in_payload_refuses_before_bridge_without_leaking_signature(
+    monkeypatch,
+) -> None:
+    investigation_id = uuid4()
+    signature = "synthetic-signature-value"
+    signed_url = (
+        "https://storage.invalid/sample?X-Amz-Credential=synthetic-credential&"
+        f"X-Amz-Signature={signature}"
+    )
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    tool, _sample_blob = make_tool(investigation_id=investigation_id, transport=transport)
+
+    async def consultation_data(**_kwargs):
+        return {
+            "question": "Review the sample reference.",
+            "evidence": [
+                {
+                    "evidence_id": str(uuid4()),
+                    "source": "sample.store",
+                    "object_type": "sample",
+                    "sha256": "f" * 64,
+                    "content_excerpts": [{"title": "Sample URL", "text": signed_url}],
+                }
+            ],
+        }
+
+    monkeypatch.setattr(tool, "_consultation_data", consultation_data)
+    result = await tool.execute(
+        {"consultation_type": "plan_investigation"}, make_context(investigation_id)
+    )
+
+    assert transport.calls == []
+    assert result.output["advisor_status"] == "refused"
+    assert result.output["refusal_code"] == "autowork_credential_or_signed_url_detected"
+    safe_output = repr(result.output)
+    assert signed_url not in safe_output
+    assert signature not in safe_output
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("representation", ["raw_bytes", "hex", "base64"])
+@pytest.mark.parametrize("material", ["configured_secret", "signed_url"])
+async def test_utf16le_encoded_sample_credentials_and_signed_urls_refuse_locally(
+    monkeypatch, representation, material
+) -> None:
+    secret = "autowork_fixture_utf16_" + "Q" * 48
+    signed_url = (
+        "https://storage.invalid/fixture?X-Amz-Credential=synthetic&"
+        "X-Amz-Signature=synthetic-signature"
+    )
+    value = secret if material == "configured_secret" else signed_url
+    encoded_bytes = value.encode("utf-16le")
+    content: dict[str, object]
+    if representation == "raw_bytes":
+        content = {"raw_bytes": list(encoded_bytes)}
+    elif representation == "hex":
+        content = {"encoding": "hex", "value": encoded_bytes.hex()}
+    else:
+        content = {
+            "encoding": "base64",
+            "content_base64": base64.b64encode(encoded_bytes).decode("ascii"),
+        }
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    investigation_id = uuid4()
+    tool, _sample_blob = make_tool(investigation_id=investigation_id, transport=transport)
+    tool._settings.operator_api_token = SecretStr(secret)
+
+    async def consultation_data(**_kwargs):
+        return {
+            "question": "Review the synthetic verified sample fragment.",
+            "evidence": [
+                {
+                    "evidence_id": str(uuid4()),
+                    "content_excerpts": [{"kind": representation, **content}],
+                }
+            ],
+        }
+
+    monkeypatch.setattr(tool, "_consultation_data", consultation_data)
+    result = await tool.execute(
+        {"consultation_type": "plan_investigation"}, make_context(investigation_id)
+    )
+
+    assert transport.calls == []
+    assert result.output["advisor_status"] == "refused"
+    assert result.output["refusal_code"] == "autowork_credential_or_signed_url_detected"
+    safe_output = repr(result.output)
+    assert secret not in safe_output
+    assert signed_url not in safe_output
+    assert "synthetic-signature" not in safe_output
 
 
 def test_advisor_secret_filter_preserves_sample_material_and_redacts_autowork_secrets() -> None:
@@ -3601,7 +5004,7 @@ def test_advisor_secret_filter_preserves_sample_material_and_redacts_autowork_se
 
 
 @pytest.mark.asyncio
-async def test_bridge_receives_cti_material_in_clear_and_autowork_tokens_masked(
+async def test_autowork_credentials_in_payload_refuse_before_bridge_without_leaking_values(
     monkeypatch,
 ) -> None:
     investigation_id = uuid4()
@@ -3645,13 +5048,14 @@ async def test_bridge_receives_cti_material_in_clear_and_autowork_tokens_masked(
         {"consultation_type": "plan_investigation"}, make_context(investigation_id)
     )
 
-    assert transport.calls
-    prompt = str(transport.calls[0]["prompt"])
-    assert rc4_key in prompt
-    assert attacker_token in prompt
-    assert "[clé masquée]" not in prompt
-    assert operator_secret not in prompt
-    assert result.status in {ToolInvocationStatus.SUCCEEDED, ToolInvocationStatus.PARTIAL}
+    assert transport.calls == []
+    assert result.status is ToolInvocationStatus.FAILED
+    assert result.output["advisor_status"] == "refused"
+    assert result.output["confirmed_non_execution"] is True
+    safe_output = repr(result.output)
+    assert operator_secret not in safe_output
+    assert rc4_key not in safe_output
+    assert attacker_token not in safe_output
 
 
 @pytest.mark.asyncio
@@ -3673,7 +5077,7 @@ async def test_advisor_refuses_and_persists_when_marked_secret_survives(monkeypa
 
     assert result.status is ToolInvocationStatus.FAILED
     assert result.error_code == "advisor_secret_field_remaining"
-    assert result.output["refusal_code"] == "secret_field_remaining"
+    assert result.output["refusal_code"] == "autowork_credential_or_signed_url_detected"
     assert "test sentinel" not in repr(result.output)
     assert transport.calls == []
     call = next(
@@ -3816,8 +5220,9 @@ async def test_draft_text_batches_units_and_keeps_provenance_per_unit() -> None:
 
     assert result.status is ToolInvocationStatus.SUCCEEDED
     assert len(transport.calls) == 1
-    assert all(
-        len(call["prompt"].encode("utf-8")) <= MAX_ADVISOR_INPUT_BYTES for call in transport.calls
+    assert (
+        len(transport.calls[0]["prompt"].encode("utf-8"))
+        == result.output["bridge_provenance"]["batches"][0]["prompt_bytes"]
     )
     assert [len(typed_prompt_payload(call["prompt"])["units"]) for call in transport.calls] == [19]
     assert result.budget_consumed[BudgetDimension.BRIDGE_TURNS] == 1
@@ -3848,6 +5253,7 @@ async def test_editorial_batch_retains_cursor_and_stops_after_ambiguous_result()
         context,
         *,
         _editorial_batch_child=False,
+        _reservation_operation_key=None,
         _execution_timeout_seconds=None,
         _execution_deadline_monotonic=None,
         _bridge_turns_remaining=None,
@@ -3896,6 +5302,7 @@ async def test_editorial_batch_keeps_prior_consumption_when_remaining_budget_is_
         context,
         *,
         _editorial_batch_child=False,
+        _reservation_operation_key=None,
         _execution_timeout_seconds=None,
         _execution_deadline_monotonic=None,
         _bridge_turns_remaining=None,
@@ -4055,82 +5462,165 @@ async def test_six_unit_editorial_batch_includes_clear_implant_materials() -> No
 
 
 @pytest.mark.asyncio
-async def test_editorial_batch_stops_on_oversized_shared_context_with_observation(
-    monkeypatch,
-) -> None:
-    import cti_app.application.investigation_advisor_tools as advisor_tools_module
+async def test_large_prompt_reservation_is_persisted_before_fake_transport() -> None:
+    try:
+        from tests.test_investigation_service import _Fixture
+    except ImportError as exc:
+        pytest.skip(f"service fixture dependencies are unavailable: {exc.name}")
 
-    investigation_id = uuid4()
-    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    fixture = _Fixture(responses=[], tools=())
+    fixture.envelope = replace(fixture.envelope, allowed_providers=("bridge",))
+    from cti_app.domain.investigation_state import Hypothesis
+
+    state = await fixture.start(
+        hypotheses=(Hypothesis(id="large-sample", statement="The verified sample is relevant."),),
+        execution_mode=InvestigationExecutionMode.OPERATOR_LED,
+    )
+    investigation_id = fixture.investigation_id
+    operation_key = "operator:advisor:d7-large-sample-context"
+    sample_bytes = bytes(index % 251 for index in range(3_200_000))
+    sample_sha256 = hashlib.sha256(sample_bytes).hexdigest()
+    sample_base64 = base64.b64encode(sample_bytes).decode("ascii")
+    sample_id = uuid4()
+    association_id = uuid4()
+    blob_id = uuid4()
+    observation, observation_raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-large-placeholder.v1",
+            "sample_sha256": sample_sha256,
+            "content": "A verified large sample placeholder is present.",
+        },
+    )
+    await fixture.observations.append_if_absent(observation)
+    response = TurnSubmission(
+        TurnSubmissionStatus.SUCCEEDED,
+        output_text=advisor_response("The sample placeholder was received.", [str(observation.id)]),
+    )
+
+    class DurableReservationTransport(Transport):
+        async def submit(self, **kwargs):
+            self.calls.append(kwargs)
+            prompt_bytes = len(kwargs["prompt"].encode("utf-8"))
+            current_invocation = await fixture.invocations.get_by_operation_key(operation_key)
+            current_envelope = await fixture.envelopes.get(investigation_id)
+            assert current_invocation is not None
+            assert current_invocation.status is ToolInvocationStatus.RUNNING
+            assert current_invocation.reserved_budget[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
+            reservation = next(
+                item
+                for item in current_envelope.budget.reservations
+                if item.operation_key == operation_key
+            )
+            assert reservation.status.value == "reserved"
+            assert reservation.amounts[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
+            assert reservation.amounts[BudgetDimension.CONTEXT_TOKENS] == (prompt_bytes + 3) // 4
+            return response
+
+    transport = DurableReservationTransport(response)
     tool, _sample_blob = make_tool(investigation_id=investigation_id, transport=transport)
-    monkeypatch.setattr(advisor_tools_module, "MAX_ADVISOR_INPUT_BYTES", 500)
+    tool._investigations = fixture.investigations
+    tool._observations = fixture.observations
+    tool._findings = fixture.findings
+    tool._investigation_states = fixture.states
+    tool._opinions = fixture.opinions
+    tool._article_snapshots = fixture.context_builder.article_snapshots
+    tool._registry = fixture.registry
+    tool._artifact_store.values[observation.blob_id] = observation_raw
+    tool._blobs.add(
+        observation.blob_id,
+        sha256=observation.sha256,
+        size=len(observation_raw),
+        logical_bucket="investigation-evidence",
+    )
+    tool._artifact_store.values[blob_id] = sample_bytes
+    tool._blobs.add(
+        blob_id,
+        sha256=sample_sha256,
+        size=len(sample_bytes),
+        logical_bucket="samples-quarantine",
+    )
+    tool._blobs.descriptors[
+        blob_id
+    ].descriptor.mime_type = "application/x-synthetic-sample; fixture=large"
+    tool._settings.advisor_sample_blob_max_bytes = 8_000_000
 
-    async def oversized_context(**_kwargs):
-        return {
-            "consultation_type": "draft_text",
-            "question": "Rédiger les sections demandées.",
-            "units": [
-                {"id": "U1", "block_type": "key_findings", "form": "body", "anchor": None},
-                {
-                    "id": "U2",
-                    "block_type": "implant_materials",
-                    "form": "body",
-                    "anchor": None,
-                },
-            ],
-            "assertions": [
-                {"id": "a1", "unit_id": "U1", "text": "Assertion one."},
-                {"id": "a2", "unit_id": "U2", "text": "Implant value ghp_clear_fixture."},
-            ],
-            "evidence": [{"summary": "x" * 1800}],
-            "truncation": {},
-        }
+    class LargeSampleAssociations:
+        async def list_for_investigation(self, _investigation_id):
+            return (
+                SimpleNamespace(
+                    id=association_id,
+                    sample_sha256=sample_sha256,
+                    qualification="confirmed",
+                ),
+            )
 
-    monkeypatch.setattr(tool, "_consultation_data", oversized_context)
-    units = [
-        {
-            "id": "U1",
-            "block_type": OpinionBlockType.KEY_FINDINGS.value,
-            "form": "body",
-            "anchor": None,
-            "assertions": [],
+    class LargeSamples:
+        async def list_for_subject(self, _subject_id):
+            return (
+                SimpleNamespace(
+                    id=sample_id,
+                    expected_hash=sample_sha256,
+                    source_object_id=None,
+                    state="quarantined",
+                    blob_id=blob_id,
+                    tlp=TLP.GREEN,
+                    do_not_submit=False,
+                    external_llm_allowed=True,
+                    license_restriction=None,
+                    original_name="synthetic-large.bin",
+                    source_service="fixture",
+                    origin_kind="source_seed",
+                ),
+            )
+
+    tool._sample_associations = LargeSampleAssociations()
+    tool._samples = LargeSamples()
+    fixture.service._available_capabilities = frozenset({"bridge.advisor"})
+    register_investigation_advisor_tool(fixture.registry, adapter=tool)
+    investigation = await fixture.investigations.get(investigation_id)
+    envelope = await fixture.envelopes.get(investigation_id)
+    invocation, result, _refs, uncertain = await fixture.service.execute_tool_call(
+        investigation=investigation,
+        envelope=envelope,
+        budget=envelope.budget,
+        state=state,
+        tool_name="advisor.consult",
+        schema_version="advisor-consult.v1",
+        arguments={
+            "consultation_type": "plan_investigation",
+            "evidence_refs": [str(observation.id)],
         },
-        {
-            "id": "U2",
-            "block_type": OpinionBlockType.IMPLANT_MATERIALS.value,
-            "form": "body",
-            "anchor": None,
-            "assertions": [],
-        },
-    ]
-
-    result = await tool.execute(
-        {"consultation_type": "draft_text", "evidence_refs": [], "units": units},
-        make_context(investigation_id, key="operator:advisor:draft-text-oversized-shared"),
+        purpose="Review an authorized large sample placeholder with exact G2 accounting.",
+        operation_key=operation_key,
     )
 
-    assert result.status is ToolInvocationStatus.UNAVAILABLE
-    assert transport.calls == []
-    assert result.output["failure_stage"] == "budget_admission"
-    assert (
-        result.output["failure_reason"]
-        == "bridge_turn_reservation_insufficient_for_editorial_batches"
+    assert result.status is ToolInvocationStatus.SUCCEEDED, result.output.get("missing_refs")
+    assert uncertain is False
+    assert len(transport.calls) == 1
+    prompt = transport.calls[0]["prompt"]
+    assert len(prompt.encode("utf-8")) > 4_000_000
+    assert sample_base64 in prompt
+    assert sample_sha256 in prompt
+    assert str(sample_id) in prompt
+    assert str(association_id) in prompt
+    assert str(blob_id) in prompt
+    assert "mime_type=application/x-synthetic-sample; fixture=large" in prompt
+    assert f"length={len(sample_bytes)}" in prompt
+    prompt_bytes = len(prompt.encode("utf-8"))
+    prompt_tokens = (prompt_bytes + 3) // 4
+    assert invocation.reserved_budget[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
+    assert invocation.reserved_budget[BudgetDimension.CONTEXT_TOKENS] == prompt_tokens
+    assert invocation.consumed_budget[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
+    assert invocation.consumed_budget[BudgetDimension.CONTEXT_TOKENS] == prompt_tokens
+    latest_envelope = await fixture.envelopes.get(investigation_id)
+    reservation = next(
+        item for item in latest_envelope.budget.reservations if item.operation_key == operation_key
     )
-    assert result.output["confirmed_non_execution"] is True
-    assert result.output["unprocessed_unit_ids"] == ("U1", "U2")
-    assert result.output["batch_cursor"]["next_batch_index"] == 1
-    advisor_call = next(
-        item
-        for item in tool._observations.observations.values()
-        if item.source == "advisor.consult" and item.object_type == "advisor_call"
-    )
-    persisted = json.loads(
-        await tool._artifact_store.read_bytes(advisor_call.blob_id, max_bytes=16 * 1024)
-    )
-    assert persisted["failure_stage"] == "budget_admission"
-    assert (
-        persisted["failure_reason"] == "bridge_turn_reservation_insufficient_for_editorial_batches"
-    )
+    assert reservation.amounts[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
+    assert reservation.amounts[BudgetDimension.CONTEXT_TOKENS] == prompt_tokens
+    assert reservation.committed_amounts[BudgetDimension.CONTEXT_BYTES] == prompt_bytes
+    assert reservation.committed_amounts[BudgetDimension.CONTEXT_TOKENS] == prompt_tokens
 
 
 @pytest.mark.asyncio
@@ -4174,7 +5664,6 @@ async def test_draft_text_uses_compact_context_for_multiple_units() -> None:
         observation=observation,
         raw=raw,
     )
-    tool._settings.operator_advisor_max_input_bytes = 15_000
     units = []
     for unit_index, block_type in enumerate(block_types, start=1):
         assertions = [
