@@ -404,9 +404,17 @@ async def test_ambiguous_inflight_emission_recovers_without_second_provider_send
             fresh.session_factory, investigation_id, fresh.artifact_store
         )
         assert final_audit.hypotheses_state == state
-        assert final_audit.conversation == final_conversation
-        assert tuple(final_audit.conversation_turns) == final_turns
-        assert tuple(final_audit.model_runs) == final_runs
+        # The audit projection resolves a model conversation only through the
+        # P10 pivot binding (`analyst_investigations.pivot_conversation_id`).
+        # A Bridge-led investigation turn has no such binding, so the projection
+        # exposes no conversation here (identical to the E2E-0 and M05-D
+        # snapshots). The turn/run audit is asserted directly through the model
+        # repositories above; the projection itself is checked through state,
+        # source versions and the G2 envelope below.
+        assert final_audit.pivot_conversation_id is None
+        assert final_audit.conversation is None
+        assert final_audit.conversation_turns == ()
+        assert final_audit.model_runs == ()
         assert final_audit.source_versions["investigation_state"] == state.SCHEMA
         assert (
             final_audit.source_versions["model_conversation"] == "model-conversation.repository.v1"
