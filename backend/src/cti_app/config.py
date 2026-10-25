@@ -108,6 +108,10 @@ class Settings(BaseSettings):
     openai_bridge_submission_jitter_fraction: float = Field(default=0.3, ge=0, le=0.3)
     operator_advisor_checkpoint_tool_threshold: int = Field(default=12, ge=1, le=1000)
     model_output_max_bytes: int = Field(default=512 * 1024 * 1024, gt=0, le=5 * 1024 * 1024 * 1024)
+    # Bound in-memory verified sample reads before Base64 prompt encoding.
+    advisor_sample_blob_max_bytes: int = Field(
+        default=64 * 1024 * 1024, gt=0, le=1024 * 1024 * 1024
+    )
     openai_bridge_pre_submission_retry_base_seconds: float = Field(default=1.0, ge=0, le=300)
     openai_bridge_pre_submission_retry_max_seconds: float = Field(default=8.0, ge=0, le=3600)
     openai_bridge_connect_timeout_seconds: float = Field(default=3.0, gt=0, le=30)

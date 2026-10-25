@@ -2070,9 +2070,18 @@ async def test_large_text_and_hex_reach_fake_transport_with_matching_manifest() 
         key="operator:advisor:large-text-and-hex",
     )
 
+    byte_title = next(
+        line[2:]
+        for line in prompt.splitlines()
+        if line.startswith("| Octets observés; encoding=hex;")
+    )
+    assert f"byte_length={len(bytes.fromhex(hex_value))}" in byte_title
+    assert f"sha256={hashlib.sha256(bytes.fromhex(hex_value)).hexdigest()}" in byte_title
+    assert "offset 128" in byte_title
+    assert "evidence_id=" in byte_title
+    assert "blob_id=" in byte_title
     expected_body = (
-        f"Texte observé — Long text evidence:\n| {text_value}\n\n"
-        f"Octets observés — offset 128:\n| {hex_value}"
+        f"Texte observé — Long text evidence:\n| {text_value}\n\n{byte_title}\n| {hex_value}"
     )
     assert text_value in prompt
     assert hex_value in prompt
@@ -2333,7 +2342,8 @@ async def test_unrestricted_sample_measurement_reaches_fake_transport() -> None:
 @pytest.mark.asyncio
 async def test_lossless_sample_bytes_metadata_and_provenance_reach_fake_transport() -> None:
     investigation_id = uuid4()
-    raw_sample = bytes((0x90, 0x90, 0xC3, 0x41, 0x42))
+    attacker_token = "ghp_" + "a" * 36
+    raw_sample = bytes((0x90, 0x90, 0xC3, 0x41, 0x42)) + b" " + attacker_token.encode()
     sample_sha256 = hashlib.sha256(raw_sample).hexdigest()
     base64_content = base64.b64encode(raw_sample).decode("ascii")
     contradictory_source_hash = "d" * 64
@@ -2385,7 +2395,8 @@ async def test_lossless_sample_bytes_metadata_and_provenance_reach_fake_transpor
         size=len(raw_sample),
         logical_bucket="samples-quarantine",
     )
-    tool._blobs.descriptors[sample_blob_id].descriptor.mime_type = "application/x-synthetic-sample"
+    mime_type = "application/x-synthetic-sample; version=2; charset=binary"
+    tool._blobs.descriptors[sample_blob_id].descriptor.mime_type = mime_type
     tool._artifact_store.values[sample_blob_id] = raw_sample
 
     async def sample_associations(_investigation_id):
@@ -2443,7 +2454,7 @@ async def test_lossless_sample_bytes_metadata_and_provenance_reach_fake_transpor
         "EngineAlpha",
         "EngineBeta",
         "trace-fragment-1",
-        "application/x-synthetic-sample",
+        mime_type,
         f"sample_id={sample_id}",
         f"association_id={association_id}",
         f"blob_id={sample_blob_id}",
@@ -2459,6 +2470,263 @@ async def test_lossless_sample_bytes_metadata_and_provenance_reach_fake_transpor
         "external_llm_allowed=true",
     ):
         assert required in prompt
+    assert attacker_token in base64.b64decode(base64_content).decode("latin-1")
+    assert result.output["bridge_provenance"]["redacted_secret_count"] == 0
+    assert any(
+        all(
+            value in line
+            for value in (
+                f"evidence_id={observation.id}",
+                f"blob_id={observation.blob_id}",
+                f"association_id={association_id}",
+            )
+        )
+        for line in prompt.splitlines()
+        if "Octets observés" in line
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("representation", "material_kind"),
+    [
+        ("sample_blob", "operational_secret"),
+        ("sample_blob", "signed_url"),
+        ("byte_array", "operational_secret"),
+        ("byte_array", "signed_url"),
+        ("hex", "operational_secret"),
+        ("hex", "signed_url"),
+        ("base64", "operational_secret"),
+        ("base64", "signed_url"),
+    ],
+)
+async def test_encoded_sample_material_with_operational_secret_or_signed_url_is_refused(
+    representation, material_kind
+) -> None:
+    investigation_id = uuid4()
+    operator_secret = "autowork_fixture_" + "S" * 48
+    material = (
+        operator_secret
+        if material_kind == "operational_secret"
+        else "https://storage.invalid/sample?X-Amz-Signature=synthetic-signed-sample-url"
+    )
+    raw_material = material.encode("ascii")
+    sample_hash = hashlib.sha256(raw_material).hexdigest()
+    measured_payload: dict[str, Any]
+    if representation == "hex":
+        measured_payload = {"hex": [{"offset": 3, "value": raw_material.hex()}]}
+    elif representation == "byte_array":
+        measured_payload = {"raw_bytes": [{"offset": 3, "value": list(raw_material)}]}
+    elif representation == "base64":
+        measured_payload = {
+            "base64": [{"offset": 3, "value": base64.b64encode(raw_material).decode("ascii")}]
+        }
+    else:
+        measured_payload = {"content": "A sample blob is associated with this evidence."}
+    observation, observation_raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-encoded-secret-fixture.v1",
+            "sample_sha256": sample_hash,
+            **measured_payload,
+        },
+    )
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    tool, sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=observation_raw,
+    )
+    tool._settings.operator_api_token = SecretStr(operator_secret)
+    if representation == "sample_blob":
+        association_id = uuid4()
+        sample_id = uuid4()
+        tool._blobs.add(
+            sample_blob_id,
+            sha256=sample_hash,
+            size=len(raw_material),
+            logical_bucket="samples-quarantine",
+        )
+        tool._artifact_store.values[sample_blob_id] = raw_material
+
+        async def list_sample_associations(_id):
+            return (SimpleNamespace(id=association_id, sample_sha256=sample_hash),)
+
+        async def list_samples(_id):
+            return (
+                SimpleNamespace(
+                    id=sample_id,
+                    expected_hash=sample_hash,
+                    source_object_id=None,
+                    blob_id=sample_blob_id,
+                    state="quarantined",
+                    origin_kind="source_seed",
+                    original_name="synthetic-sample.bin",
+                    source_service="fixture",
+                    tlp=TLP.GREEN,
+                    do_not_submit=False,
+                    external_llm_allowed=True,
+                    license_restriction=None,
+                ),
+            )
+
+        tool._sample_associations = SimpleNamespace(list_for_investigation=list_sample_associations)
+        tool._samples = SimpleNamespace(list_for_subject=list_samples)
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Review the encoded sample bytes.",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, key=f"operator:advisor:encoded-veto:{representation}"),
+    )
+
+    assert transport.calls == []
+    assert result.output["advisor_status"] == "refused"
+    assert result.output["refusal_code"] == "autowork_credential_or_signed_url_detected"
+    safe_output = repr(result.output)
+    assert operator_secret not in safe_output
+    assert "synthetic-signed-sample-url" not in safe_output
+
+
+@pytest.mark.asyncio
+async def test_sample_blob_over_configured_technical_bound_is_omitted_with_provenance() -> None:
+    investigation_id = uuid4()
+    sample_content = b"synthetic sample content above the configured test bound"
+    sample_hash = hashlib.sha256(sample_content).hexdigest()
+    observation, observation_raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-technical-bound-fixture.v1",
+            "sample_sha256": sample_hash,
+            "content": "Verified observation remains available while blob content is omitted.",
+        },
+    )
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=advisor_response(
+                "The verified metadata is available.", [str(observation.id)]
+            ),
+        )
+    )
+    tool, sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=observation_raw,
+    )
+    tool._settings.advisor_sample_blob_max_bytes = 8
+    sample_id = uuid4()
+    association_id = uuid4()
+    tool._blobs.add(
+        sample_blob_id,
+        sha256=sample_hash,
+        size=len(sample_content),
+        logical_bucket="samples-quarantine",
+    )
+    tool._blobs.descriptors[sample_blob_id].descriptor.mime_type = "application/x-bound; v=1"
+    tool._artifact_store.values[sample_blob_id] = sample_content
+    sample_reads = []
+    original_read_bytes = tool._artifact_store.read_bytes
+
+    async def track_sample_read(blob_id, *, max_bytes):
+        if blob_id == sample_blob_id:
+            sample_reads.append(blob_id)
+        return await original_read_bytes(blob_id, max_bytes=max_bytes)
+
+    tool._artifact_store.read_bytes = track_sample_read
+
+    async def list_sample_associations(_id):
+        return (SimpleNamespace(id=association_id, sample_sha256=sample_hash),)
+
+    async def list_samples(_id):
+        return (
+            SimpleNamespace(
+                id=sample_id,
+                expected_hash=sample_hash,
+                source_object_id=None,
+                blob_id=sample_blob_id,
+                state="quarantined",
+                origin_kind="source_seed",
+                original_name="synthetic-large-sample.bin",
+                source_service="fixture",
+                tlp=TLP.GREEN,
+                do_not_submit=False,
+                external_llm_allowed=True,
+                license_restriction=None,
+            ),
+        )
+
+    tool._sample_associations = SimpleNamespace(list_for_investigation=list_sample_associations)
+    tool._samples = SimpleNamespace(list_for_subject=list_samples)
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Review the sample metadata.",
+            "evidence_refs": [str(observation.id)],
+        },
+        make_context(investigation_id, key="operator:advisor:sample-technical-bound"),
+    )
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED, result.output
+    assert len(transport.calls) == 1
+    assert sample_reads == []
+    prompt = transport.calls[0]["prompt"]
+    assert f"sample_id={sample_id}" in prompt
+    assert f"association_id={association_id}" in prompt
+    assert "content_status=omitted_technical_size_limit" in prompt
+    assert "content_omission_reason=sample_blob_exceeds_configured_technical_limit" in prompt
+    assert "maximum_content_bytes=8" in prompt
+    assert base64.b64encode(sample_content).decode("ascii") not in prompt
+
+
+@pytest.mark.asyncio
+async def test_unreferenced_restricted_sample_does_not_block_unrelated_consultation() -> None:
+    investigation_id = uuid4()
+    observation, raw = make_observation(
+        investigation_id,
+        {"schema": "generic-observation.v1", "content": "Permitted unrelated evidence."},
+    )
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=advisor_response(
+                "The unrelated evidence is usable.", [str(observation.id)]
+            ),
+        )
+    )
+    tool, sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+    _attach_sample_policy(
+        tool,
+        sample_blob_id,
+        "c" * 64,
+        license_restriction="Owner prohibits unrelated external disclosure",
+    )
+
+    arguments = {
+        "consultation_type": "plan_investigation",
+        "question": "Review the unrelated permitted observation.",
+        "evidence_refs": [str(observation.id)],
+    }
+    measured_cost = await tool.reservation_cost(arguments, make_dispatch_context(investigation_id))
+    result = await tool.execute(
+        arguments,
+        make_context(investigation_id, key="operator:advisor:unrelated-restricted-sample"),
+    )
+
+    assert measured_cost[BudgetDimension.CONTEXT_BYTES] > 0
+    assert result.status is ToolInvocationStatus.SUCCEEDED, result.output
+    assert len(transport.calls) == 1
+    assert "Owner prohibits unrelated external disclosure" not in transport.calls[0]["prompt"]
 
 
 @pytest.mark.asyncio
@@ -3896,6 +4164,195 @@ async def test_dispatcher_revocation_proof_stops_before_fake_advisor_transport()
     assert result.status is ToolInvocationStatus.POLICY_DENIED
     assert result.framework_pre_submission_proof is FrameworkPreSubmissionProof.ENVELOPE_REVOKED
     assert transport.calls == []
+
+
+@pytest.mark.asyncio
+async def test_revocation_during_prompt_preparation_stops_before_fake_transport() -> None:
+    investigation_id = uuid4()
+    context = make_dispatch_context(investigation_id)
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    tool, _sample_blob = make_tool(investigation_id=investigation_id, transport=transport)
+    registry = InMemoryToolRegistry()
+    register_investigation_advisor_tool(registry, adapter=tool)
+    original_put_text = tool._artifact_store.put_text
+    admission_checks = 0
+    revoked = False
+
+    async def archive_and_revoke(value, *, bucket):
+        nonlocal revoked
+        blob_id = await original_put_text(value, bucket=bucket)
+        revoked = True
+        return blob_id
+
+    async def check_current_admission(_context):
+        nonlocal admission_checks
+        admission_checks += 1
+        return FrameworkPreSubmissionProof.ENVELOPE_REVOKED if revoked else None
+
+    tool._artifact_store.put_text = archive_and_revoke
+    result = await RegistryToolDispatcher(registry).dispatch(
+        context,
+        tool_name="advisor.consult",
+        schema_version="advisor-consult.v1",
+        arguments={
+            "consultation_type": "plan_investigation",
+            "question": "Prepare and then recheck admission before transport.",
+            "evidence_refs": [],
+        },
+        purpose="Exercise the post-preparation current-envelope check.",
+        operation_key=context.idempotency_key,
+        pre_dispatch_check=check_current_admission,
+    )
+
+    assert admission_checks == 2
+    assert revoked is True
+    assert transport.calls == []
+    assert result.output["failure_stage"] == "post_preparation_admission"
+    assert result.output["failure_reason"] == "current_admission_revoked"
+    assert "secret" not in repr(result.output).casefold()
+
+
+@pytest.mark.asyncio
+async def test_service_current_envelope_recheck_preserves_needs_review_recovery() -> None:
+    try:
+        from tests.test_investigation_service import _Fixture
+    except ImportError as exc:
+        pytest.skip(f"service fixture dependencies are unavailable: {exc.name}")
+
+    from cti_app.domain.investigation_state import Hypothesis
+
+    fixture = _Fixture(responses=[], tools=())
+    fixture.envelope = replace(fixture.envelope, allowed_providers=("bridge",))
+    state = await fixture.start(
+        hypotheses=(Hypothesis(id="revocation", statement="A synthetic review hypothesis."),),
+        execution_mode=InvestigationExecutionMode.OPERATOR_LED,
+    )
+    investigation_id = fixture.investigation_id
+    operation_key = "operator:advisor:late-revocation"
+    observation, observation_raw = make_observation(
+        investigation_id,
+        {"schema": "revocation-fixture.v1", "content": "A verified local evidence marker."},
+    )
+    await fixture.observations.append_if_absent(observation)
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    tool, _sample_blob = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=observation_raw,
+    )
+    tool._investigations = fixture.investigations
+    tool._observations = fixture.observations
+    tool._findings = fixture.findings
+    tool._investigation_states = fixture.states
+    tool._opinions = fixture.opinions
+    tool._article_snapshots = fixture.context_builder.article_snapshots
+    tool._registry = fixture.registry
+    tool._artifact_store.values[observation.blob_id] = observation_raw
+    tool._blobs.add(
+        observation.blob_id,
+        sha256=observation.sha256,
+        size=len(observation_raw),
+        logical_bucket="investigation-evidence",
+    )
+
+    async def prepared_context(**_kwargs):
+        return {
+            "investigation_id": str(investigation_id),
+            "consultation_type": "plan_investigation",
+            "question": "Review the verified synthetic marker.",
+            "article_source_ref": "article:" + "a" * 64,
+            "article_sha256": "a" * 64,
+            "article_summary": "A synthetic verified summary.",
+            "article_passages": [],
+            "open_questions": [],
+            "samples": [],
+            "evidence": [
+                {
+                    "evidence_id": str(observation.id),
+                    "kind": "other",
+                    "object_type": "generic",
+                    "sha256": observation.sha256,
+                    "source": observation.source,
+                    "content_excerpts": [
+                        {
+                            "kind": "text",
+                            "title": "Verified local evidence",
+                            "text": "A verified local evidence marker.",
+                        }
+                    ],
+                    "blob_read_verified": True,
+                }
+            ],
+            "evidence_refs": [str(observation.id)],
+            "findings": [],
+            "hypotheses": [
+                {
+                    "id": "revocation",
+                    "statement": "A synthetic review hypothesis.",
+                    "status": "open",
+                    "evidence_refs": [str(observation.id)],
+                    "finding_refs": [],
+                }
+            ],
+            "working_state_version": 1,
+            "working_state_sha256": "f" * 64,
+            "truncation": {},
+        }
+
+    tool._consultation_data = prepared_context
+    fixture.service._available_capabilities = frozenset({"bridge.advisor"})
+    register_investigation_advisor_tool(fixture.registry, adapter=tool)
+    original_put_text = tool._artifact_store.put_text
+    revocations = []
+
+    async def archive_then_revoke(value, *, bucket):
+        blob_id = await original_put_text(value, bucket=bucket)
+        current = await fixture.envelopes.get(investigation_id)
+        assert current is not None
+        revoked = replace(
+            current,
+            version=current.version + 1,
+            disclosure=replace(
+                current.disclosure,
+                do_not_submit=True,
+                external_llm_allowed=False,
+            ),
+        )
+        await fixture.envelopes.save_if_version(revoked, expected_version=current.version)
+        revocations.append(revoked.version)
+        return blob_id
+
+    tool._artifact_store.put_text = archive_then_revoke
+    investigation = await fixture.investigations.get(investigation_id)
+    envelope = await fixture.envelopes.get(investigation_id)
+    invocation, result, _refs, uncertain = await fixture.service.execute_tool_call(
+        investigation=investigation,
+        envelope=envelope,
+        budget=envelope.budget,
+        state=state,
+        tool_name="advisor.consult",
+        schema_version="advisor-consult.v1",
+        arguments={
+            "consultation_type": "plan_investigation",
+            "evidence_refs": [str(observation.id)],
+        },
+        purpose="Recheck current admission after local prompt preparation.",
+        operation_key=operation_key,
+    )
+
+    assert revocations
+    assert transport.calls == []
+    assert invocation.status is ToolInvocationStatus.NEEDS_REVIEW
+    assert uncertain is True
+    assert result.output["failure_stage"] == "post_preparation_admission"
+    assert result.output["failure_reason"] == "current_admission_revoked"
+    assert "secret" not in repr(result.output).casefold()
+    latest_envelope = await fixture.envelopes.get(investigation_id)
+    reservation = next(
+        item for item in latest_envelope.budget.reservations if item.operation_key == operation_key
+    )
+    assert reservation.status.value == "reserved"
 
 
 def test_advisor_payload_redacts_credentials_embedded_in_urls() -> None:
