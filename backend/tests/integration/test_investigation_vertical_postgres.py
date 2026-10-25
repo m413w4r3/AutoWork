@@ -837,9 +837,7 @@ async def test_real_postgres_exhausted_loop_acquisition_budget_is_not_ambiguous(
         # diagnostic, never the adapter output.
         assert invocation.status is ToolInvocationStatus.NEEDS_REVIEW
         assert len(invocation.response_refs) == 1
-        diagnostic = next(
-            item for item in observations if item.id == invocation.response_refs[0]
-        )
+        diagnostic = next(item for item in observations if item.id == invocation.response_refs[0])
         payload = await artifact_store.read_json(diagnostic.blob_id)
         assert payload["result"]["outcome"] == "external_effect_unconfirmed"
         assert payload["result"]["adapter_output_archived"] is False
