@@ -25,11 +25,13 @@ Légende : `PLANNED → RUNNING → REVIEW → APPROVED → INTEGRATED`, alterna
 
 | Lot | Agent | Modèle/effort | Workspace | SHA base | Statut | Tests | Reviewer | Décision | Risques |
 |---|---|---|---|---|---|---|---|---|---|
-| M06-R-POLICY | `fc7927f4-28cb-4d99-ab50-1566a4bf153b` | codex/gpt-6-luna · xhigh | `wks_0a6cdd38441320d6` | `505c1cd2` | RUNNING | lecture seule | — | — | carte des gates |
-| M06-R-S3 | `f263c604-dbc2-4c5c-8e74-73bca04b5dfb` | codex/gpt-6-luna · xhigh | `wks_c951e8eddf4fe80e` | `505c1cd2` | RUNNING | lecture seule | — | — | validation D6 |
-| M06-R-RUNTIME | `eab41336-0371-4bf2-be21-45b190adb0cf` | codex/gpt-6-luna · xhigh | `wks_a861774a39607ad9` | `505c1cd2` | RUNNING | lecture seule | — | — | prévol P3 |
-| M06-R-RUN | `af077b38-cb5f-48b9-8a9b-800bda3f0c3e` | codex/gpt-6-luna · xhigh | `wks_f8c47eda0b091a30` | `505c1cd2` | RUNNING | lecture seule | — | — | état P4 |
-| M06-POLICY-1 | à créer | codex/gpt-6-luna · xhigh | à créer | après recon | PLANNED | RED/GREEN politique | à créer | — | héritage G2/G3 |
+| M06-R-POLICY | `fc7927f4-28cb-4d99-ab50-1566a4bf153b` | codex/gpt-6-luna · xhigh | `wks_0a6cdd38441320d6` | `505c1cd2` | DONE | lecture seule | — | rapport reçu | carte des gates |
+| M06-R-S3 | `f263c604-dbc2-4c5c-8e74-73bca04b5dfb` | codex/gpt-6-luna · xhigh | `wks_c951e8eddf4fe80e` | `505c1cd2` | DONE | lecture seule | — | rapport reçu ; D6 toujours valide | validation D6 |
+| M06-R-RUNTIME | `eab41336-0371-4bf2-be21-45b190adb0cf` | codex/gpt-6-luna · xhigh | `wks_a861774a39607ad9` | `505c1cd2` | DONE | lecture seule | — | rapport reçu ; 0 READY live | prévol P3 |
+| M06-R-RUN | `af077b38-cb5f-48b9-8a9b-800bda3f0c3e` | codex/gpt-6-luna · xhigh | `wks_f8c47eda0b091a30` | `505c1cd2` | DONE | lecture seule | — | rapport reçu ; lignée synthèse UNKNOWN | état P4 |
+| M06-POLICY-1 | `268c4abe-7f93-4d12-bcff-0d8b2175064b` | codex/gpt-6-luna · xhigh | `wks_a15c58fa94fe06bf` | `7059ebbd` | RUNNING | unit + lint + typecheck + PG (si Docker) | à créer | correction `EnvelopeAuthorityKind` envoyée | héritage G2/G3, TLP, bypass Bridge |
+| M06-S3-SPEC | `adb555b5-158a-450e-acff-c25293f85ea4` | codex/gpt-6-luna · xhigh | `wks_69c42fa0c7b7eab6` | `7059ebbd` | RUNNING | lecture seule | — | — | spécification S3 |
+| M06-REVIEW-POLICY-DESIGN | `66e365ad-83b0-43ad-8e7d-8b1d42a8e616` | codex/gpt-6-luna · xhigh | `wks_a221abc2a4219236` | `7059ebbd` | RUNNING | lecture seule | — | — | revue adversariale |
 | M06-S3-CORE-1 | à créer | codex/gpt-6-luna · xhigh | à créer | après recon | PLANNED | PG jetable + concurrence | à créer | — | claim/permis |
 | M06-S3-VT-1 | à créer | codex/gpt-6-luna · xhigh | à créer | après core | PLANNED | fakes + PG | à créer | — | lecture VT |
 | M06-S3-DL-1 | à créer | codex/gpt-6-luna · xhigh | à créer | après core | PLANNED | fakes + PG | à créer | — | téléchargement |
@@ -54,3 +56,12 @@ Légende : `PLANNED → RUNNING → REVIEW → APPROVED → INTEGRATED`, alterna
    `autowork-cti-evidence-gate` sont disponibles.
 3. Aucun appel fournisseur, téléchargement, accès live PostgreSQL/MinIO ou
    migration live n'est autorisé par cette mission.
+
+## Preuves de reconnaissance conservées
+
+| Rapport | Agent | SHA-256 |
+|---|---|---|
+| `recon/POLICY_SEAM.md` | M06-R-POLICY | `45e6c18d1563d22a09dd468fca3055111e719cf43ab8a5a6b89e55c93cb9cc44` |
+| `recon/S3_SEAM.md` | M06-R-S3 | `9f17611abf3a05166f069b745cfd546041e6748ccce1f4f36b6135f3774dbaa4` |
+| `recon/RUNTIME_READINESS.md` | M06-R-RUNTIME | `8d45480896e27945087c99786cd995dce6670831f5ee05edae6833fee4220f47` |
+| `recon/RUN_STATE.md` | M06-R-RUN | `7a71689e65cf6198c16550d05a59ca03dfb97a877d00b268dbd4cb0ee28b01ed` |

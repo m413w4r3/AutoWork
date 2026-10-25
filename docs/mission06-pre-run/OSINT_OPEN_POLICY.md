@@ -67,23 +67,29 @@ journalisé.
    révoquée ;
 2. vérifie l'appartenance du `subject_id` à la portée ;
 3. si une enveloppe existe déjà, la retourne sans la modifier ;
-4. sinon, crée une décision d'audit `PIVOT_APPROVE` ciblant l'investigation.
-   `actor_id` est **l'acteur humain qui a activé la politique**, et
-   `details` contient `osint_policy_id`, `osint_policy_version`,
-   `inherited: true`, `activation_correlation_id`. La raison cite la politique
-   et sa version. Ce n'est pas une approbation individuelle déguisée : c'est
-   une décision dérivée, tracée jusqu'à l'activation ;
+4. sinon, crée une enveloppe avec une autorité explicite :
+   `authority_kind = OSINT_POLICY`, `inherited_policy_id` et
+   `inherited_policy_version`. `approval_decision_id` référence l'événement
+   durable d'activation/version de la politique, **pas** un `AnalystDecision`.
+   `approval_actor_id` conserve l'acteur humain qui a activé la politique,
+   mais l'autorité reste `OSINT_POLICY`, jamais `HUMAN_G2`. Aucune décision
+   `PIVOT_APPROVE` n'est fabriquée ;
 5. crée l'enveloppe version 1 avec les providers, budgets, droits d'acquisition
    et bornes de divulgation de la politique ;
-6. enregistre la lignée `osint_open_inheritances` (investigation, politique,
-   version, décision d'héritage, statut `ACTIVE`).
+6. enregistre l'épinglage `osint_open_inheritances` (investigation, politique,
+   version, événement d'activation, statut `ACTIVE`).
 
-La corrélation d'héritage est déterministe
+L'épinglage est déterministe
 (`osint-inherit:<policy_id>:<policy_version>:<investigation_id>`), ce qui rend
 le rejeu idempotent. Deux créations concurrentes ne produisent qu'une enveloppe.
 
-L'héritage est déclenché au démarrage de l'investigation et, en défense en
-profondeur, à la première invocation opérateur si aucune enveloppe n'existe.
+**Pas d'héritage rétroactif.** L'héritage n'est créé qu'au démarrage d'une
+investigation nouvelle, sans enveloppe approuvée antérieure et sans invocation
+outil antérieure. Une investigation déjà commencée, déjà approuvée ou non
+épinglée reste `RESTRICTED` ; une invocation externe sans enveloppe est
+refusée. Une extension ou un élargissement ultérieur de la politique ne met
+pas à niveau une investigation déjà épinglée. Seule une révocation, qui est
+restrictive, s'applique immédiatement au travail épinglé.
 
 ### 2.5 Révocation et courses
 
@@ -151,7 +157,10 @@ persistance, les verrous et la propagation sont dans l'adaptateur PostgreSQL.
 - `osint_open_policy_events` : journal append-only des activations, extensions
   et révocations, avec hash de payload et version précédente.
 - `osint_open_inheritances` : `investigation_id` PK/FK restrictive, politique,
-  version, décision d'héritage, statut, horodatages.
+  version, événement d'activation, statut, horodatages.
+- colonnes additives sur `investigation_envelopes` : `authority_kind`
+  (nullable ; `NULL` = `HUMAN_G2` historique), `inherited_policy_id`,
+  `inherited_policy_version`. Aucune réécriture des lignes existantes.
 
 Aucune modification de `0001` ou `0002`. Aucun backfill. Les enveloppes
 historiques restent inchangées.
