@@ -28,7 +28,12 @@ _TABLES = ("external_effect_claim", "external_effect_use")
 
 
 def _tokens(value: str) -> tuple[str, ...]:
-    normalized = re.sub(r"::(?:text|character varying)\b", "", value, flags=re.IGNORECASE)
+    normalized = re.sub(
+        r"::(?:text|character varying|jsonb|uuid|bigint|integer)\b",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    )
     return tuple(
         token.casefold()
         for token in re.findall(
@@ -85,6 +90,17 @@ def _assert_table_shape(bind: Any, table: Any) -> None:
             raise RuntimeError(
                 f"external effect migration preflight rejected type/nullability drift "
                 f"in {name}.{column_name}"
+            )
+        expected_default = (
+            _tokens(str(column.server_default.arg)) if column.server_default is not None else None
+        )
+        actual_default = (
+            _tokens(str(actual["default"])) if actual.get("default") is not None else None
+        )
+        if actual_default != expected_default:
+            raise RuntimeError(
+                f"external effect migration preflight rejected default drift in "
+                f"{name}.{column_name}"
             )
 
     expected_constraints: dict[str, tuple[str, tuple[str, ...], Any]] = {}
@@ -160,11 +176,15 @@ def _assert_table_shape(bind: Any, table: Any) -> None:
         index.name: (tuple(column.name for column in index.columns), bool(index.unique))
         for index in table.indexes
     }
-    actual_indexes = {
-        item["name"]: (tuple(item.get("column_names") or ()), bool(item.get("unique")))
-        for item in inspector.get_indexes(name)
-        if item.get("name") in expected_indexes
-    }
+    actual_indexes = {}
+    for item in inspector.get_indexes(name):
+        # PostgreSQL also reports indexes backing PK/UNIQUE constraints.
+        if item.get("duplicates_constraint") is not None:
+            continue
+        actual_indexes[item["name"]] = (
+            tuple(item.get("column_names") or ()),
+            bool(item.get("unique")),
+        )
     if actual_indexes != expected_indexes:
         raise RuntimeError(f"external effect migration preflight rejected index drift in {name}")
 

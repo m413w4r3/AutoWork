@@ -1,21 +1,24 @@
 from __future__ import annotations
 
 import copy
+import importlib
 from collections.abc import Mapping
 from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy.dialects import postgresql
 
 from cti_app.application.external_effects import (
     Ambiguous,
     Completed,
     ConsumeCommitted,
     ConsumeRefused,
+    DefinitelyNotSubmitted,
     ExistingClaim,
     ExternalEffectClaim,
     ExternalEffectCoordinator,
-    FrameworkProvenPreHandoffFailure,
     Refused,
+    RequestHandoff,
     ReuseDecision,
     TransportResponse,
     _PermitRegistry,
@@ -36,7 +39,9 @@ from cti_app.domain.external_effects import (
     occurrence_sha256,
 )
 from cti_app.infrastructure.database.repositories.external_effects import (
+    ExternalEffectFamilyBinding,
     SqlAlchemyExternalEffectClaimStore,
+    _ConsumeDenied,
 )
 
 _INVESTIGATION_ID = UUID("b4079022-263e-48cb-86f7-460be4457fcb")
@@ -139,7 +144,11 @@ class FakeStore:
         self.events.append("complete")
         return self.complete_result
 
-    async def definitely_not_submitted(self, claim_id: UUID, *, reason_code: str) -> bool:
+    async def definitely_not_submitted(
+        self, claim_id: UUID, *, proof: object, reason_code: str
+    ) -> bool:
+        assert getattr(proof, "claim_id", None) == claim_id
+        assert getattr(proof, "handoff_count", None) == 0
         self.sealed.append(("not_submitted", reason_code))
         return True
 
@@ -160,22 +169,39 @@ class FakeStore:
 
 class FakeTransport:
     def __init__(
-        self, events: list[str] | None = None, response: object | Exception | None = None
+        self,
+        events: list[str] | None = None,
+        response: object | Exception | None = None,
+        *,
+        fail_before_handoff: bool = False,
     ) -> None:
         self.calls: list[tuple[FrozenWireRequest, ConsumedEffectPermit]] = []
+        self.send_entries = 0
         self.events = events
         self.response = response or TransportResponse(result_ref="artifact:result-1")
+        self.fail_before_handoff = fail_before_handoff
 
     async def send(
-        self, request: FrozenWireRequest, *, permit: ConsumedEffectPermit
+        self,
+        request: FrozenWireRequest,
+        *,
+        permit: ConsumedEffectPermit,
+        handoff: RequestHandoff,
     ) -> TransportResponse:
+        self.send_entries += 1
         if self.events is not None:
             assert self.events[-1] == "commit"
             self.events.append("send")
-        self.calls.append((request, permit))
-        if isinstance(self.response, Exception):
-            raise self.response
-        return self.response  # type: ignore[return-value]
+        if self.fail_before_handoff:
+            raise RuntimeError("local transport setup failed")
+
+        async def physical_send() -> TransportResponse:
+            self.calls.append((request, permit))
+            if isinstance(self.response, Exception):
+                raise self.response
+            return self.response  # type: ignore[return-value]
+
+        return await handoff(physical_send)
 
 
 class AllowReuse:
@@ -315,13 +341,40 @@ async def test_prepared_byte_mutation_is_refused_before_consume_or_send() -> Non
 
 
 @pytest.mark.asyncio
-async def test_framework_proven_pre_handoff_is_definitive_not_submitted() -> None:
+async def test_handoff_then_transport_exception_is_ambiguous_and_never_retried() -> None:
     store = FakeStore()
-    transport = FakeTransport(response=FrameworkProvenPreHandoffFailure("connect_not_started"))
-    outcome = await ExternalEffectCoordinator(store).send_one(_authority(), _prepared(), transport)
-    assert outcome.__class__.__name__ == "DefinitelyNotSubmitted"
-    assert store.sealed == [("not_submitted", "connect_not_started")]
+    transport = FakeTransport(response=RuntimeError("remote accepted then client failed"))
+    coordinator = ExternalEffectCoordinator(store)
+    outcome = await coordinator.send_one(_authority(), _prepared(), transport)
+    assert isinstance(outcome, Ambiguous)
+    assert store.sealed == [("needs_review", "transport_outcome_unknown")]
     assert len(transport.calls) == 1
+    replay = await coordinator.send_one(_authority(), _prepared(), transport)
+    assert isinstance(replay, Ambiguous)
+    assert len(transport.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_zero_handoff_counter_allows_definitive_not_submitted() -> None:
+    store = FakeStore()
+    transport = FakeTransport(fail_before_handoff=True)
+    outcome = await ExternalEffectCoordinator(store).send_one(_authority(), _prepared(), transport)
+    assert isinstance(outcome, DefinitelyNotSubmitted)
+    assert store.sealed == [("not_submitted", "transport_failed_before_handoff")]
+    assert transport.send_entries == 1
+    assert transport.calls == []
+
+
+@pytest.mark.asyncio
+async def test_expired_permit_is_refused_before_transport_entry() -> None:
+    store = FakeStore()
+    transport = FakeTransport()
+    coordinator = ExternalEffectCoordinator(store)
+    coordinator._permits._ttl_seconds = -1
+    outcome = await coordinator.send_one(_authority(), _prepared(), transport)
+    assert isinstance(outcome, DefinitelyNotSubmitted)
+    assert transport.send_entries == 0
+    assert transport.calls == []
 
 
 @pytest.mark.asyncio
@@ -435,6 +488,33 @@ def test_no_secret_fields_or_signed_urls_are_persistable_or_repr_visible() -> No
     assert "sig=ephemeral" not in repr(secret_wire)
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://host/path?X-Api-Key=secret",
+        "https://host/path?x_api_key=secret",
+        "https://host/path?client_secret=secret",
+        "https://host/path?access_token=secret",
+        "https://host/path?signature=secret",
+        "https://host/path?token=secret",
+        "https://host/path?%78_api_key=secret",
+    ],
+)
+def test_credential_query_aliases_are_rejected_from_persisted_urls(url: str) -> None:
+    with pytest.raises(ExternalEffectValidationError):
+        _prepared(request={"url": url})
+    with pytest.raises(ExternalEffectValidationError):
+        PreparedExternalRequest.build(
+            family="vt.file_report",
+            provider="virustotal",
+            provider_scope="tenant-prod",
+            normalizer_version="vt.file-report.v1",
+            canonical_request={"hash": "abc"},
+            request_ref=url,
+            application_request=_wire(),
+        )
+
+
 @pytest.mark.asyncio
 async def test_osint_policy_authority_defaults_to_deny_without_guard() -> None:
     async def forbidden_session_factory() -> object:
@@ -442,7 +522,6 @@ async def test_osint_policy_authority_defaults_to_deny_without_guard() -> None:
 
     store = SqlAlchemyExternalEffectClaimStore(
         forbidden_session_factory,  # type: ignore[arg-type]
-        normalizer_versions={"vt.file_report": frozenset({"vt.file-report.v1"})},
     )
     outcome = await store.consume(
         _authority(invocation_id=None, policy=True),
@@ -451,6 +530,67 @@ async def test_osint_policy_authority_defaults_to_deny_without_guard() -> None:
         occurrence_digest=occurrence_sha256(None),
     )
     assert outcome == ConsumeRefused("osint_policy_guard_unavailable")
+
+
+@pytest.mark.asyncio
+async def test_osint_policy_guard_locks_before_envelope() -> None:
+    events: list[str] = []
+
+    class _NoopContext:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args: object):
+            return None
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args: object):
+            return None
+
+        def begin(self):
+            return _NoopContext()
+
+        async def scalar(self, *args: object, **kwargs: object):
+            return None
+
+    class _Guard:
+        async def lock_for_consume(self, session, authority):
+            events.append("policy")
+            return True
+
+        async def authorize(self, context):
+            return True
+
+    class _OrderingStore(SqlAlchemyExternalEffectClaimStore):
+        async def _lock_authority(self, *args, **kwargs):
+            events.append("envelope")
+            raise _ConsumeDenied("stop after order probe")
+
+    prepared = _prepared()
+    store = _OrderingStore(
+        lambda: _Session(),  # type: ignore[arg-type]
+        policy_guard=_Guard(),
+        family_bindings={
+            prepared.family: ExternalEffectFamilyBinding(
+                provider=prepared.provider,
+                provider_scopes=frozenset({prepared.provider_scope}),
+                normalizer_versions=frozenset({prepared.normalizer_version}),
+                invocation_tool_binding=(prepared.family, "v1"),
+            )
+        },
+    )
+    authority = _authority(invocation_id=None, policy=True)
+    result = await store.consume(
+        authority,
+        prepared,
+        effect_key=effect_key(authority.investigation_id, prepared),
+        occurrence_digest=occurrence_sha256(prepared.occurrence_id),
+    )
+    assert result == ConsumeRefused("stop after order probe")
+    assert events == ["policy", "envelope"]
 
 
 def test_authority_requires_explicit_osint_policy_bindings() -> None:
@@ -465,3 +605,193 @@ def test_authority_requires_explicit_osint_policy_bindings() -> None:
             invocation_arguments_sha256=None,
             authority_kind=ExternalEffectAuthorityKind.OSINT_POLICY,
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["omitted", "malformed", "mismatched"])
+async def test_source_dependent_family_rejects_untrusted_source_refs(case: str) -> None:
+    expected_id = UUID("89c70553-4511-40a1-8f30-14f9e3fc4ea8")
+    other_id = UUID("5a98ad22-ec4f-4cb4-a6b2-f75b49d4c0bd")
+    actual_refs = {
+        "omitted": (),
+        "malformed": (EvidenceReference("sample", "not-a-uuid", "v1", "c" * 64),),
+        "mismatched": (EvidenceReference("sample", str(other_id), "v1", "c" * 64),),
+    }[case]
+    prepared = _prepared(evidence_refs=actual_refs)
+    authority = _authority()
+
+    class _NoopContext:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args: object):
+            return None
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args: object):
+            return None
+
+        def begin(self):
+            return _NoopContext()
+
+        async def scalar(self, *args: object, **kwargs: object):
+            return None
+
+    class _SourceCheckStore(SqlAlchemyExternalEffectClaimStore):
+        async def _lock_authority(self, *args, **kwargs):
+            invocation = type(
+                "Invocation",
+                (),
+                {"normalized_parameters": {"sample_id": str(expected_id)}},
+            )()
+            return (object(), object(), invocation, object(), [])
+
+        async def _check_authority(self, *args, **kwargs):
+            return None
+
+    store = _SourceCheckStore(
+        lambda: _Session(),  # type: ignore[arg-type]
+        family_bindings={
+            prepared.family: ExternalEffectFamilyBinding(
+                provider=prepared.provider,
+                provider_scopes=frozenset({prepared.provider_scope}),
+                normalizer_versions=frozenset({prepared.normalizer_version}),
+                invocation_tool_binding=(prepared.family, "v1"),
+                requires_source_refs=True,
+                source_reference_resolver=lambda parameters: (
+                    EvidenceReference("sample", parameters["sample_id"], "v1", "c" * 64),
+                ),
+            )
+        },
+    )
+    transport = FakeTransport()
+    direct_result = await store.consume(
+        authority,
+        prepared,
+        effect_key=effect_key(authority.investigation_id, prepared),
+        occurrence_digest=occurrence_sha256(prepared.occurrence_id),
+    )
+    assert isinstance(direct_result, ConsumeRefused)
+    result = await ExternalEffectCoordinator(store).send_one(authority, prepared, transport)
+    assert isinstance(result, Refused)
+    assert result.reason in {"malformed_source_reference", "source_references_mismatch"}
+    assert transport.send_entries == 0
+    assert transport.calls == []
+
+
+@pytest.mark.parametrize("drift", ["missing_default", "extra_index"])
+def test_migration_preflight_rejects_default_and_complete_index_drift(
+    monkeypatch: pytest.MonkeyPatch, drift: str
+) -> None:
+    migration = importlib.import_module("migrations.versions.0004_external_effect_claims")
+    expected_tables = migration._expected_tables()
+
+    class _Result:
+        def scalars(self):
+            return ["external_effect_claim", "external_effect_use"]
+
+    class _Bind:
+        ddl_calls = 0
+
+        def execute(self, statement, parameters=None):
+            return _Result()
+
+    class _Inspector:
+        def get_table_names(self):
+            return ["external_effect_claim", "external_effect_use"]
+
+        def _table(self, name: str):
+            return next(table for table in expected_tables if table.name == name)
+
+        def get_columns(self, name: str):
+            rows = []
+            for column in self._table(name).columns:
+                default = (
+                    str(column.server_default.arg) if column.server_default is not None else None
+                )
+                if (
+                    drift == "missing_default"
+                    and name == "external_effect_claim"
+                    and column.name == "evidence_refs"
+                ):
+                    default = None
+                rows.append(
+                    {
+                        "name": column.name,
+                        "type": column.type.compile(dialect=postgresql.dialect()),
+                        "nullable": column.nullable,
+                        "default": default,
+                    }
+                )
+            return rows
+
+        def get_pk_constraint(self, name: str):
+            constraint = next(
+                item
+                for item in self._table(name).constraints
+                if item.__class__.__name__ == "PrimaryKeyConstraint"
+            )
+            return {
+                "name": constraint.name,
+                "constrained_columns": [column.name for column in constraint.columns],
+            }
+
+        def get_unique_constraints(self, name: str):
+            return [
+                {"name": item.name, "column_names": [column.name for column in item.columns]}
+                for item in self._table(name).constraints
+                if item.__class__.__name__ == "UniqueConstraint"
+            ]
+
+        def get_check_constraints(self, name: str):
+            return [
+                {"name": item.name, "sqltext": str(item.sqltext)}
+                for item in self._table(name).constraints
+                if item.__class__.__name__ == "CheckConstraint"
+            ]
+
+        def get_foreign_keys(self, name: str):
+            rows = []
+            for item in self._table(name).constraints:
+                if item.__class__.__name__ != "ForeignKeyConstraint":
+                    continue
+                elements = tuple(item.elements)
+                rows.append(
+                    {
+                        "name": item.name,
+                        "constrained_columns": [column.name for column in item.columns],
+                        "referred_table": elements[0].column.table.name,
+                        "referred_columns": [element.column.name for element in elements],
+                        "options": {"ondelete": item.ondelete},
+                    }
+                )
+            return rows
+
+        def get_indexes(self, name: str):
+            rows = [
+                {
+                    "name": item.name,
+                    "column_names": [column.name for column in item.columns],
+                    "unique": item.unique,
+                }
+                for item in self._table(name).indexes
+            ]
+            if drift == "extra_index" and name == "external_effect_claim":
+                rows.append(
+                    {
+                        "name": "ix_external_effect_claim_unexpected",
+                        "column_names": ["id"],
+                        "unique": False,
+                    }
+                )
+            return rows
+
+    inspector = _Inspector()
+    monkeypatch.setattr(migration, "inspect", lambda _bind: inspector)
+    bind = _Bind()
+    with pytest.raises(RuntimeError, match="drift"):
+        migration._preflight(bind)
+    assert bind.ddl_calls == 0

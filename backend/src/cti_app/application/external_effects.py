@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from collections.abc import Mapping
+import time
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 from uuid import UUID, uuid4
@@ -87,7 +88,15 @@ class ConsumePolicyContext:
 
 
 class ExternalEffectPolicyGuard(Protocol):
-    """An injected guard for OSINT_POLICY authority, called under DB locks."""
+    """OSINT guard; policy/revocation writers lock policy before envelope."""
+
+    async def lock_for_consume(
+        self, database_session: Any, authority: ExternalEffectAuthority
+    ) -> bool:
+        """Lock/reload the persisted event and verify active status, version, and subject
+        pin before the caller acquires envelope FOR UPDATE. Missing events deny.
+        Revocation writers take this policy-event lock before the same envelope lock.
+        """
 
     async def authorize(self, context: ConsumePolicyContext) -> bool: ...
 
@@ -129,7 +138,9 @@ class ExternalEffectClaimStore(Protocol):
         evidence_refs: tuple[EvidenceReference, ...],
     ) -> bool: ...
 
-    async def definitely_not_submitted(self, claim_id: UUID, *, reason_code: str) -> bool: ...
+    async def definitely_not_submitted(
+        self, claim_id: UUID, *, proof: _CoordinatorNoHandoffProof, reason_code: str
+    ) -> bool: ...
 
     async def needs_review(self, claim_id: UUID, *, reason_code: str) -> bool: ...
 
@@ -154,12 +165,37 @@ class TransportResponse:
             raise ExternalEffectValidationError("transport evidence refs must be typed references")
 
 
-class FrameworkProvenPreHandoffFailure(Exception):
-    """Transport framework proof: no request bytes reached the client handoff."""
+@dataclass(frozen=True, slots=True, init=False, repr=False)
+class _CoordinatorNoHandoffProof:
+    """Opaque proof minted only while the coordinator's handoff count is zero."""
 
-    def __init__(self, reason_code: str) -> None:
-        super().__init__(reason_code)
-        self.reason_code = _safe_reason_code(reason_code)
+    claim_id: UUID
+    handoff_count: int
+    nonce: UUID
+    _issuer: object
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        raise TypeError("no-handoff proofs are issued by ExternalEffectCoordinator")
+
+    @classmethod
+    def _issue(cls, *, claim_id: UUID, issuer: object) -> _CoordinatorNoHandoffProof:
+        proof = object.__new__(cls)
+        for name, value in {
+            "claim_id": claim_id,
+            "handoff_count": 0,
+            "nonce": uuid4(),
+            "_issuer": issuer,
+        }.items():
+            object.__setattr__(proof, name, value)
+        return proof
+
+
+class RequestHandoff(Protocol):
+    """The only callback a transport may use to invoke its physical sender."""
+
+    async def __call__(
+        self, operation: Callable[[], Awaitable[TransportResponse]]
+    ) -> TransportResponse: ...
 
 
 class PermitAwareTransport(Protocol):
@@ -168,6 +204,7 @@ class PermitAwareTransport(Protocol):
         request: FrozenWireRequest,
         *,
         permit: ConsumedEffectPermit,
+        handoff: RequestHandoff,
     ) -> TransportResponse: ...
 
 
@@ -196,6 +233,7 @@ class Refused:
 @dataclass(frozen=True, slots=True)
 class DefinitelyNotSubmitted:
     claim_id: UUID
+    framework_proof: _CoordinatorNoHandoffProof | None = None
     state: EffectClaimState = EffectClaimState.DEFINITIVELY_NOT_SUBMITTED
 
 
@@ -211,8 +249,11 @@ ExternalEffectOutcome = Completed | Reused | Refused | DefinitelyNotSubmitted | 
 class _PermitRegistry:
     """Process-local, identity-based one-use permit registry."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, ttl_seconds: float = 5.0) -> None:
+        if ttl_seconds <= 0:
+            raise ValueError("permit lifetime must be positive")
         self._issuer = object()
+        self._ttl_seconds = ttl_seconds
         self._issued: dict[UUID, ConsumedEffectPermit] = {}
         self._lock = threading.Lock()
 
@@ -231,6 +272,7 @@ class _PermitRegistry:
             prepared=prepared,
             effect_key=key,
             nonce=nonce,
+            expires_at_monotonic=time.monotonic() + self._ttl_seconds,
         )
         with self._lock:
             self._issued[nonce] = permit
@@ -246,8 +288,11 @@ class _PermitRegistry:
         """Burn before handoff; locks are released before the transport call."""
 
         nonce = getattr(permit, "nonce", None)
+        if not isinstance(nonce, UUID):
+            return False
         if getattr(permit, "_issuer", None) is not self._issuer:
             return False
+        expired = time.monotonic() >= permit.expires_at_monotonic
         matches = (
             permit.investigation_id == authority.investigation_id
             and permit.invocation_id == authority.invocation_id
@@ -258,9 +303,14 @@ class _PermitRegistry:
             and permit.request_digest == prepared.application_request_sha256
             and permit.envelope_version == authority.expected_envelope_version
             and permit.approval_decision_id == authority.approval_decision_id
+            and not expired
             and application_request_sha256(prepared.application_request) == permit.request_digest
         )
         if not matches:
+            if expired:
+                with self._lock:
+                    if self._issued.get(nonce) is permit:
+                        del self._issued[nonce]
             return False
         with self._lock:
             issued = self._issued.get(nonce)
@@ -280,6 +330,7 @@ class ExternalEffectCoordinator:
         self._claim_store = claim_store
         self._reuse_policies = dict(reuse_policies or {})
         self._permits = _PermitRegistry()
+        self._proof_issuer = object()
 
     async def send_one(
         self,
@@ -342,29 +393,47 @@ class ExternalEffectCoordinator:
         # Permit creation occurs only after the store reports a committed claim.
         permit = self._permits.issue(consume.claim_id, authority, prepared, key)
         if not self._permits.burn_and_validate(permit, authority, prepared, key):
-            await self._seal_needs_review(consume.claim_id, "permit_validation_failed")
-            return Ambiguous(consume.claim_id)
+            return await self._seal_zero_handoff(
+                consume.claim_id, handoff_count=0, reason_code="permit_validation_failed"
+            )
 
+        handoff_counter = _CoordinatorHandoffCounter(
+            claim_id=consume.claim_id,
+            issuer=self._proof_issuer,
+            expected_request_digest=prepared.application_request_sha256,
+            request=prepared.application_request,
+        )
         try:
-            response = await transport.send(prepared.application_request, permit=permit)
-        except FrameworkProvenPreHandoffFailure as exc:
-            try:
-                changed = await self._claim_store.definitely_not_submitted(
-                    consume.claim_id, reason_code=exc.reason_code
-                )
-            except Exception:
-                changed = False
-            if changed:
-                return DefinitelyNotSubmitted(consume.claim_id)
-            await self._seal_needs_review(consume.claim_id, "pre_handoff_seal_failed")
-            return Ambiguous(consume.claim_id)
+            response = await transport.send(
+                prepared.application_request,
+                permit=permit,
+                handoff=handoff_counter.invoke,
+            )
         except asyncio.CancelledError:
-            await self._seal_needs_review(consume.claim_id, "cancelled_after_permit_burn")
+            if handoff_counter.count == 0:
+                return await self._seal_zero_handoff(
+                    consume.claim_id,
+                    handoff_count=handoff_counter.count,
+                    reason_code="cancelled_before_handoff",
+                )
+            await self._seal_needs_review(consume.claim_id, "cancelled_after_handoff")
             return Ambiguous(consume.claim_id)
         except Exception:
+            if handoff_counter.count == 0:
+                return await self._seal_zero_handoff(
+                    consume.claim_id,
+                    handoff_count=handoff_counter.count,
+                    reason_code="transport_failed_before_handoff",
+                )
             await self._seal_needs_review(consume.claim_id, "transport_outcome_unknown")
             return Ambiguous(consume.claim_id)
 
+        if handoff_counter.count == 0:
+            return await self._seal_zero_handoff(
+                consume.claim_id,
+                handoff_count=handoff_counter.count,
+                reason_code="transport_returned_without_handoff",
+            )
         if not isinstance(response, TransportResponse):
             await self._seal_needs_review(consume.claim_id, "invalid_transport_response")
             return Ambiguous(consume.claim_id)
@@ -444,6 +513,54 @@ class ExternalEffectCoordinator:
             # itself is unavailable.
             return
 
+    async def _seal_zero_handoff(
+        self, claim_id: UUID, *, handoff_count: int, reason_code: str
+    ) -> DefinitelyNotSubmitted | Ambiguous:
+        if handoff_count != 0:
+            await self._seal_needs_review(claim_id, "invalid_zero_handoff_proof")
+            return Ambiguous(claim_id)
+        proof = _CoordinatorNoHandoffProof._issue(claim_id=claim_id, issuer=self._proof_issuer)
+        try:
+            changed = await self._claim_store.definitely_not_submitted(
+                claim_id, proof=proof, reason_code=reason_code
+            )
+        except Exception:
+            changed = False
+        if changed:
+            return DefinitelyNotSubmitted(claim_id, framework_proof=proof)
+        await self._seal_needs_review(claim_id, "zero_handoff_seal_failed")
+        return Ambiguous(claim_id)
+
+
+class _CoordinatorHandoffCounter:
+    """Coordinator-owned one-request gate passed to the injected transport."""
+
+    def __init__(
+        self,
+        *,
+        claim_id: UUID,
+        issuer: object,
+        expected_request_digest: str,
+        request: FrozenWireRequest,
+    ) -> None:
+        self.claim_id = claim_id
+        self.issuer = issuer
+        self.expected_request_digest = expected_request_digest
+        self.request = request
+        self.count = 0
+        self._lock = threading.Lock()
+
+    async def invoke(
+        self, operation: Callable[[], Awaitable[TransportResponse]]
+    ) -> TransportResponse:
+        with self._lock:
+            if self.count != 0:
+                raise RuntimeError("one physical handoff is permitted")
+            if application_request_sha256(self.request) != self.expected_request_digest:
+                raise ExternalEffectValidationError("wire request changed before handoff")
+            self.count = 1
+        return await operation()
+
 
 def _safe_reason_code(value: str) -> str:
     if not isinstance(value, str) or not value or len(value) > 64:
@@ -469,9 +586,9 @@ __all__ = [
     "ExternalEffectPolicyGuard",
     "ExternalEffectReusePolicy",
     "FrameworkNoSendProof",
-    "FrameworkProvenPreHandoffFailure",
     "PermitAwareTransport",
     "Refused",
+    "RequestHandoff",
     "ReuseDecision",
     "TransportResponse",
 ]

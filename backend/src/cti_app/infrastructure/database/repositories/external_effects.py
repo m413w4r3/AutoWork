@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import re
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 from sqlalchemy import or_, select, update
@@ -20,6 +22,7 @@ from cti_app.application.external_effects import (
     ExternalEffectClaim,
     ExternalEffectPolicyGuard,
     ReuseDecision,
+    _CoordinatorNoHandoffProof,
 )
 from cti_app.domain.external_effects import (
     EffectClaimState,
@@ -50,6 +53,7 @@ from cti_app.infrastructure.database.models.investigation import (
     ToolInvocationRow,
 )
 from cti_app.infrastructure.database.models.model_execution import (
+    ModelConversationRow,
     ModelConversationTurnRow,
     ModelRunRow,
 )
@@ -66,6 +70,88 @@ class _ConsumeDenied(Exception):
         self.reason = reason
 
 
+SourceReferenceResolver = Callable[[Mapping[str, Any]], tuple[EvidenceReference, ...]]
+
+
+@dataclass(frozen=True, slots=True)
+class ExternalEffectFamilyBinding:
+    """Server-owned provider, model, and source contract for one external family.
+
+    A source resolver derives the expected evidence references from persisted,
+    normalized invocation inputs; callers cannot use empty references to bypass
+    a source restriction.
+    """
+
+    provider: str
+    provider_scopes: frozenset[str]
+    normalizer_versions: frozenset[str]
+    invocation_tool_binding: tuple[str, str] | None
+    model_submission: bool = False
+    requires_model_lineage: bool = False
+    model_run_provider: str | None = None
+    requires_source_refs: bool = False
+    source_reference_resolver: SourceReferenceResolver | None = None
+
+    def __post_init__(self) -> None:
+        if self.requires_source_refs and self.source_reference_resolver is None:
+            raise ValueError("source-dependent families require a trusted source resolver")
+        if self.requires_model_lineage and self.model_run_provider is None:
+            raise ValueError("model-lineage families require a persisted model provider binding")
+
+
+def _is_model_submission(
+    prepared: PreparedExternalRequest, family_binding: ExternalEffectFamilyBinding
+) -> bool:
+    return (
+        prepared.provider.casefold() in _MODEL_SUBMISSION_PROVIDERS
+        or family_binding.model_submission
+        or prepared.family.startswith(_MODEL_LINEAGE_PREFIXES)
+    )
+
+
+def _requires_model_lineage(family: str, family_binding: ExternalEffectFamilyBinding) -> bool:
+    return family_binding.requires_model_lineage or family.startswith(_MODEL_LINEAGE_PREFIXES)
+
+
+def _retrohunt_request_matches(
+    attempt: RetrohuntReservationRow,
+    prepared: PreparedExternalRequest,
+    authority: ExternalEffectAuthority,
+) -> bool:
+    if authority.operation_key.strip() == "":
+        return False
+    expected_request = {
+        "schema": "vt-retrohunt-operation.v1",
+        "rule_source_sha256": attempt.rule_source_sha256,
+        "corpus_id": attempt.corpus_id,
+        "corpus_sha256": attempt.corpus_sha256,
+        "parameters": attempt.parameters,
+    }
+    request = dict(prepared.canonical_request)
+    if request.get("version_id") != str(attempt.rule_version_id):
+        return False
+    request.pop("version_id", None)
+    if request != expected_request:
+        return False
+    expected_operation_key = _sha256(canonical_json_bytes(expected_request))
+    return attempt.operation_key == authority.operation_key == expected_operation_key
+
+
+_MODEL_SUBMISSION_PROVIDERS = frozenset(
+    {
+        "openai",
+        "gemini",
+        "qwen",
+        "bridge",
+        "chatgpt_bridge",
+        "openai_chatgpt_bridge",
+    }
+)
+_MODEL_LINEAGE_PREFIXES = ("bridge.", "advisor.")
+_RETROHUNT_PREFIXES = ("retrohunt.",)
+_ACQUISITION_PREFIXES = ("acquisition.", "vt.download")
+
+
 class SqlAlchemyExternalEffectClaimStore:
     """Owns each consume/CAS transaction and returns only after commit.
 
@@ -80,15 +166,11 @@ class SqlAlchemyExternalEffectClaimStore:
         session_factory: async_sessionmaker[AsyncSession],
         *,
         policy_guard: ExternalEffectPolicyGuard | None = None,
-        provider_bindings: Mapping[str, tuple[str, frozenset[str]]] | None = None,
-        normalizer_versions: Mapping[str, frozenset[str]] | None = None,
-        invocation_bindings: Mapping[str, tuple[str, str]] | None = None,
+        family_bindings: Mapping[str, ExternalEffectFamilyBinding] | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._policy_guard = policy_guard
-        self._provider_bindings = dict(provider_bindings or {})
-        self._normalizer_versions = dict(normalizer_versions or {})
-        self._invocation_bindings = dict(invocation_bindings or {})
+        self._family_bindings = dict(family_bindings or {})
 
     async def consume(
         self,
@@ -113,20 +195,29 @@ class SqlAlchemyExternalEffectClaimStore:
                 return ConsumeRefused("occurrence_digest_mismatch")
         except (TypeError, ValueError):
             return ConsumeRefused("invalid_prepared_effect")
-        if prepared.normalizer_version not in self._normalizer_versions.get(
-            prepared.family, frozenset()
-        ):
-            return ConsumeRefused("unsupported_normalizer_version")
-        provider_binding = self._provider_bindings.get(prepared.family)
+        family_binding = self._family_bindings.get(prepared.family)
+        if family_binding is None:
+            return ConsumeRefused("family_not_registered")
         if (
-            provider_binding is None
-            or provider_binding[0] != prepared.provider
-            or prepared.provider_scope not in provider_binding[1]
+            family_binding.provider != prepared.provider
+            or prepared.provider_scope not in family_binding.provider_scopes
         ):
             return ConsumeRefused("provider_scope_not_registered")
+        if prepared.normalizer_version not in family_binding.normalizer_versions:
+            return ConsumeRefused("unsupported_normalizer_version")
         try:
             async with self._session_factory() as session:
                 async with session.begin():
+                    if authority.authority_kind is ExternalEffectAuthorityKind.OSINT_POLICY:
+                        assert self._policy_guard is not None
+                        try:
+                            policy_locked = await self._policy_guard.lock_for_consume(
+                                session, authority
+                            )
+                        except Exception as exc:
+                            raise _ConsumeDenied("osint_policy_lock_failed") from exc
+                        if not policy_locked:
+                            raise _ConsumeDenied("osint_policy_denied")
                     (
                         investigation,
                         envelope,
@@ -152,11 +243,13 @@ class SqlAlchemyExternalEffectClaimStore:
                         investigation,
                         envelope,
                         invocation,
+                        family_binding,
                         allow_nonrunning_invocation=(
                             existing is not None
                             and existing.state != EffectClaimState.COMPLETED.value
                         ),
                     )
+                    self._validate_family_source_refs(family_binding, invocation, prepared)
                     if existing is not None:
                         if (
                             reservation.status == "released"
@@ -229,12 +322,22 @@ class SqlAlchemyExternalEffectClaimStore:
                             result = ExistingClaim(_claim_to_domain(existing))
                         else:
                             await self._lock_and_consume_family_attempt(
-                                session, authority, prepared
+                                session, authority, prepared, investigation, family_binding
                             )
                             await self._check_source_restrictions(
-                                session, authority, prepared, investigation.subject_id
+                                session,
+                                authority,
+                                prepared,
+                                investigation.subject_id,
+                                family_binding,
                             )
-                            await self._lock_and_start_model_attempt(session, authority)
+                            await self._lock_and_start_model_attempt(
+                                session,
+                                authority,
+                                prepared,
+                                investigation.subject_id,
+                                family_binding,
+                            )
                             result = ConsumeCommitted(row_id)
             return result
         except _ConsumeDenied as denied:
@@ -311,7 +414,20 @@ class SqlAlchemyExternalEffectClaimStore:
                     )
                 return True
 
-    async def definitely_not_submitted(self, claim_id: UUID, *, reason_code: str) -> bool:
+    async def definitely_not_submitted(
+        self,
+        claim_id: UUID,
+        *,
+        proof: _CoordinatorNoHandoffProof,
+        reason_code: str,
+    ) -> bool:
+        if (
+            not isinstance(proof, _CoordinatorNoHandoffProof)
+            or proof.claim_id != claim_id
+            or proof.handoff_count != 0
+            or proof._issuer is None
+        ):
+            return False
         reason = _safe_code(reason_code)
         async with self._session_factory() as session:
             async with session.begin():
@@ -437,6 +553,15 @@ class SqlAlchemyExternalEffectClaimStore:
             return None
         if authority.invocation_id is None:
             return None
+        family_binding = self._family_bindings.get(prepared.family)
+        if (
+            family_binding is None
+            or family_binding.provider != prepared.provider
+            or prepared.provider_scope not in family_binding.provider_scopes
+            or prepared.normalizer_version not in family_binding.normalizer_versions
+            or _requires_model_lineage(prepared.family, family_binding)
+        ):
+            return None
         if (
             authority.acquisition_attempt_id is not None
             or authority.retrohunt_reservation_id is not None
@@ -449,6 +574,10 @@ class SqlAlchemyExternalEffectClaimStore:
         try:
             async with self._session_factory() as session:
                 async with session.begin():
+                    if authority.authority_kind is ExternalEffectAuthorityKind.OSINT_POLICY:
+                        assert self._policy_guard is not None
+                        if not await self._policy_guard.lock_for_consume(session, authority):
+                            return None
                     (
                         investigation,
                         envelope,
@@ -470,7 +599,9 @@ class SqlAlchemyExternalEffectClaimStore:
                         investigation,
                         envelope,
                         invocation,
+                        family_binding,
                     )
+                    self._validate_family_source_refs(family_binding, invocation, prepared)
                     current = await session.scalar(
                         select(ExternalEffectClaimRow)
                         .where(ExternalEffectClaimRow.id == claim.id)
@@ -485,7 +616,11 @@ class SqlAlchemyExternalEffectClaimStore:
                     ):
                         return None
                     await self._check_source_restrictions(
-                        session, authority, prepared, investigation.subject_id
+                        session,
+                        authority,
+                        prepared,
+                        investigation.subject_id,
+                        family_binding,
                     )
                     if reservation.status == "released":
                         existing_use = await session.scalar(
@@ -553,7 +688,9 @@ class SqlAlchemyExternalEffectClaimStore:
         InvestigationBudgetReservationRow,
         list[Any],
     ]:
-        # Universal order begins with envelope, then persisted stop state.
+        # OSINT callers already hold the pinned-policy lock. Revocation writers
+        # must take that same policy lock before this envelope lock, then follow
+        # the persisted-stop, invocation, reservation, claim, and family order.
         envelope = await session.scalar(
             select(InvestigationEnvelopeRow)
             .where(InvestigationEnvelopeRow.investigation_id == authority.investigation_id)
@@ -639,6 +776,7 @@ class SqlAlchemyExternalEffectClaimStore:
         investigation: AnalystInvestigationRow,
         envelope: InvestigationEnvelopeRow,
         invocation: ToolInvocationRow | None,
+        family_binding: ExternalEffectFamilyBinding,
         *,
         allow_nonrunning_invocation: bool = False,
     ) -> None:
@@ -652,10 +790,7 @@ class SqlAlchemyExternalEffectClaimStore:
             raise _ConsumeDenied("tlp_red")
         if envelope.disclosure_do_not_submit:
             raise _ConsumeDenied("do_not_submit")
-        is_model_submission = (
-            authority.bridge_turn_id is not None
-            or prepared.provider.casefold() in {"openai", "gemini", "qwen", "chatgpt_bridge"}
-        )
+        is_model_submission = _is_model_submission(prepared, family_binding)
         if is_model_submission and not envelope.disclosure_external_llm_allowed:
             raise _ConsumeDenied("external_llm_not_allowed")
         if (
@@ -711,23 +846,93 @@ class SqlAlchemyExternalEffectClaimStore:
                 raise _ConsumeDenied("invocation_arguments_not_canonical") from None
             if actual_digest != authority.invocation_arguments_sha256:
                 raise _ConsumeDenied("invocation_arguments_digest_mismatch")
-            binding = self._invocation_bindings.get(prepared.family)
+            binding = family_binding.invocation_tool_binding
             if binding is None:
                 raise _ConsumeDenied("invocation_family_binding_missing")
             if (invocation.tool_name, invocation.schema_version) != binding:
                 raise _ConsumeDenied("invocation_operation_schema_mismatch")
+
+    def _validate_family_source_refs(
+        self,
+        family_binding: ExternalEffectFamilyBinding,
+        invocation: ToolInvocationRow | None,
+        prepared: PreparedExternalRequest,
+    ) -> None:
+        if not family_binding.requires_source_refs:
+            return
+        if invocation is None or family_binding.source_reference_resolver is None:
+            raise _ConsumeDenied("trusted_source_inputs_required")
+        try:
+            expected = family_binding.source_reference_resolver(invocation.normalized_parameters)
+        except Exception as exc:
+            raise _ConsumeDenied("trusted_source_reference_resolution_failed") from exc
+        if not expected:
+            raise _ConsumeDenied("source_references_required")
+        try:
+            normalized_expected = tuple(
+                EvidenceReference(item.kind, item.id, item.version, item.sha256)
+                for item in expected
+            )
+            normalized_actual = tuple(
+                EvidenceReference(item.kind, item.id, item.version, item.sha256)
+                for item in prepared.evidence_refs
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise _ConsumeDenied("malformed_source_references") from exc
+        for reference in (*normalized_expected, *normalized_actual):
+            if reference.kind == "sample_hash":
+                if not re.fullmatch(r"[0-9a-f]{64}", reference.id):
+                    raise _ConsumeDenied("malformed_source_reference")
+            elif reference.kind in {
+                "sample",
+                "sample_association_sample",
+                "sample_association",
+                "source_document",
+                "document",
+            }:
+                try:
+                    UUID(reference.id)
+                except ValueError as exc:
+                    raise _ConsumeDenied("malformed_source_reference") from exc
+            else:
+                raise _ConsumeDenied("unrecognized_source_reference_kind")
+
+        def sort_key(item: EvidenceReference) -> tuple[str, str, str, str]:
+            return item.kind, item.id, item.version, item.sha256
+
+        if not normalized_actual or sorted(normalized_actual, key=sort_key) != sorted(
+            normalized_expected, key=sort_key
+        ):
+            raise _ConsumeDenied("source_references_mismatch")
 
     async def _lock_and_consume_family_attempt(
         self,
         session: AsyncSession,
         authority: ExternalEffectAuthority,
         prepared: PreparedExternalRequest,
+        investigation: AnalystInvestigationRow,
+        family_binding: ExternalEffectFamilyBinding,
     ) -> None:
+        is_retrohunt = prepared.family.startswith(_RETROHUNT_PREFIXES)
+        is_acquisition = prepared.family.startswith(_ACQUISITION_PREFIXES)
+        requires_model_lineage = _requires_model_lineage(prepared.family, family_binding)
         if (
             authority.acquisition_attempt_id is not None
             and authority.retrohunt_reservation_id is not None
         ):
             raise _ConsumeDenied("multiple_family_attempts")
+        if authority.acquisition_attempt_id is not None and not is_acquisition:
+            raise _ConsumeDenied("acquisition_attempt_on_unrelated_family")
+        if authority.retrohunt_reservation_id is not None and not is_retrohunt:
+            raise _ConsumeDenied("retrohunt_attempt_on_unrelated_family")
+        if (authority.bridge_turn_id is not None or authority.model_run_id is not None) and not (
+            requires_model_lineage
+        ):
+            raise _ConsumeDenied("model_attempt_on_unrelated_family")
+        if requires_model_lineage and (
+            authority.bridge_turn_id is None or authority.model_run_id is None
+        ):
+            raise _ConsumeDenied("bridge_turn_run_pair_required")
         if authority.acquisition_attempt_id is not None:
             attempt = await session.scalar(
                 select(SampleAcquisitionAttemptRow)
@@ -740,9 +945,13 @@ class SqlAlchemyExternalEffectClaimStore:
             # Existing ledger rows are terminal outcomes written after a pull;
             # they cannot authorize a new pre-send request.
             raise _ConsumeDenied("acquisition_dispatch_attempt_required")
-        if prepared.family.startswith(("acquisition.", "vt.download")):
+        if is_acquisition:
+            raise _ConsumeDenied("acquisition_dispatch_attempt_required")
+        if authority.acquisition_attempt_id is not None:
             raise _ConsumeDenied("acquisition_dispatch_attempt_required")
 
+        if is_retrohunt and authority.retrohunt_reservation_id is None:
+            raise _ConsumeDenied("retrohunt_attempt_required")
         if authority.retrohunt_reservation_id is not None:
             attempt = await session.scalar(
                 select(RetrohuntReservationRow)
@@ -754,14 +963,18 @@ class SqlAlchemyExternalEffectClaimStore:
                 attempt is None
                 or attempt.investigation_id != authority.investigation_id
                 or attempt.state != "reserved"
+                or attempt.subject_id != investigation.subject_id
+                or (
+                    authority.pinned_subject_id is not None
+                    and attempt.subject_id != authority.pinned_subject_id
+                )
+                or not _retrohunt_request_matches(attempt, prepared, authority)
             ):
                 raise _ConsumeDenied("retrohunt_attempt_not_reserved")
             now = datetime.now(UTC)
             attempt.state = "submitting"
             attempt.version += 1
             attempt.updated_at = now
-        elif prepared.family.startswith("retrohunt."):
-            raise _ConsumeDenied("retrohunt_attempt_required")
 
     async def _check_source_restrictions(
         self,
@@ -769,16 +982,33 @@ class SqlAlchemyExternalEffectClaimStore:
         authority: ExternalEffectAuthority,
         prepared: PreparedExternalRequest,
         subject_id: UUID,
+        family_binding: ExternalEffectFamilyBinding,
     ) -> None:
         sample_ids: set[UUID] = set()
         referenced_sample_ids: set[UUID] = set()
         association_ids: set[UUID] = set()
         document_ids: set[UUID] = set()
+        sample_hashes: set[str] = set()
+        recognized_kinds = {
+            "sample",
+            "sample_association_sample",
+            "sample_association",
+            "sample_hash",
+            "source_document",
+            "document",
+        }
         for reference in prepared.evidence_refs:
+            if reference.kind not in recognized_kinds:
+                continue
+            if reference.kind == "sample_hash":
+                if not re.fullmatch(r"[0-9a-f]{64}", reference.id):
+                    raise _ConsumeDenied("malformed_sample_hash_reference")
+                sample_hashes.add(reference.id)
+                continue
             try:
                 ref_id = UUID(reference.id)
-            except ValueError:
-                continue
+            except ValueError as exc:
+                raise _ConsumeDenied("malformed_source_reference") from exc
             if reference.kind in {"sample", "sample_association_sample"}:
                 sample_ids.add(ref_id)
                 referenced_sample_ids.add(ref_id)
@@ -801,6 +1031,9 @@ class SqlAlchemyExternalEffectClaimStore:
                         )
                         if sample_ids
                         else SampleAssociationRow.sample_id.is_(None),
+                        SampleAssociationRow.sample_sha256.in_(sorted(sample_hashes))
+                        if sample_hashes
+                        else SampleAssociationRow.sample_sha256.is_(None),
                     )
                 )
                 .order_by(SampleAssociationRow.id)
@@ -818,6 +1051,9 @@ class SqlAlchemyExternalEffectClaimStore:
             and {item.id for item in associations}.intersection(association_ids) != association_ids
         ):
             raise _ConsumeDenied("sample_association_missing")
+        found_hashes = {item.sample_sha256 for item in associations}
+        if sample_hashes and not sample_hashes.issubset(found_hashes):
+            raise _ConsumeDenied("sample_hash_not_associated_with_investigation")
         if referenced_sample_ids and not referenced_sample_ids.issubset(
             {item.sample_id for item in associations if item.sample_id is not None}
         ):
@@ -839,7 +1075,7 @@ class SqlAlchemyExternalEffectClaimStore:
         for sample in samples:
             if sample.subject_id != subject_id or sample.tlp == "red" or sample.do_not_submit:
                 raise _ConsumeDenied("sample_source_restricted")
-            if authority.bridge_turn_id is not None and not sample.external_llm_allowed:
+            if _is_model_submission(prepared, family_binding) and not sample.external_llm_allowed:
                 raise _ConsumeDenied("sample_external_llm_not_allowed")
         if sample_ids and {sample.id for sample in samples} != sample_ids:
             raise _ConsumeDenied("sample_source_missing")
@@ -865,16 +1101,26 @@ class SqlAlchemyExternalEffectClaimStore:
                 or bool(document.license_restriction)
             ):
                 raise _ConsumeDenied("source_document_restricted")
-            if authority.bridge_turn_id is not None and not document.external_llm_allowed:
+            if _is_model_submission(prepared, family_binding) and not document.external_llm_allowed:
                 raise _ConsumeDenied("source_document_external_llm_not_allowed")
         if document_ids and {document.id for document in documents} != document_ids:
             raise _ConsumeDenied("source_document_missing")
 
     async def _lock_and_start_model_attempt(
-        self, session: AsyncSession, authority: ExternalEffectAuthority
+        self,
+        session: AsyncSession,
+        authority: ExternalEffectAuthority,
+        prepared: PreparedExternalRequest,
+        investigation_subject_id: UUID,
+        family_binding: ExternalEffectFamilyBinding,
     ) -> None:
-        if authority.bridge_turn_id is None and authority.model_run_id is None:
+        requires_model_lineage = _requires_model_lineage(prepared.family, family_binding)
+        if not requires_model_lineage:
+            if authority.bridge_turn_id is not None or authority.model_run_id is not None:
+                raise _ConsumeDenied("model_attempt_on_unrelated_family")
             return
+        if authority.bridge_turn_id is None and authority.model_run_id is None:
+            raise _ConsumeDenied("bridge_turn_run_pair_required")
         if authority.bridge_turn_id is None or authority.model_run_id is None:
             raise _ConsumeDenied("bridge_turn_run_pair_required")
         turn = await session.scalar(
@@ -885,13 +1131,40 @@ class SqlAlchemyExternalEffectClaimStore:
         )
         if turn is None or turn.model_run_id != authority.model_run_id or turn.status != "running":
             raise _ConsumeDenied("bridge_turn_not_eligible")
+        conversation = await session.scalar(
+            select(ModelConversationRow)
+            .where(ModelConversationRow.id == turn.conversation_id)
+            .execution_options(populate_existing=True)
+        )
+        if (
+            conversation is None
+            or conversation.subject_id != investigation_subject_id
+            or (
+                authority.pinned_subject_id is not None
+                and conversation.subject_id != authority.pinned_subject_id
+            )
+            or conversation.provider != (family_binding.model_run_provider or prepared.provider)
+        ):
+            raise _ConsumeDenied("model_conversation_binding_mismatch")
         run = await session.scalar(
             select(ModelRunRow)
             .where(ModelRunRow.id == authority.model_run_id)
             .with_for_update()
             .execution_options(populate_existing=True)
         )
-        if run is None or run.status != "running" or run.submission_state != "not_submitted":
+        expected_provider = family_binding.model_run_provider or prepared.provider
+        model_input_sha256 = prepared.canonical_request.get("model_input_sha256")
+        authorized_input_sha256 = prepared.canonical_request.get("authorized_input_hash")
+        if (
+            run is None
+            or run.status != "running"
+            or run.submission_state != "not_submitted"
+            or run.provider != expected_provider
+            or not isinstance(model_input_sha256, str)
+            or not isinstance(authorized_input_sha256, str)
+            or turn.input_sha256 != model_input_sha256
+            or run.authorized_input_hash != authorized_input_sha256
+        ):
             raise _ConsumeDenied("model_run_not_eligible")
         run.submission_state = "submission_in_progress"
         run.submission_attempt += 1
@@ -900,10 +1173,13 @@ class SqlAlchemyExternalEffectClaimStore:
     async def _claim_for_transition(
         self, session: AsyncSession, claim_id: UUID
     ) -> ExternalEffectClaimRow | None:
-        return await session.scalar(
-            select(ExternalEffectClaimRow)
-            .where(ExternalEffectClaimRow.id == claim_id)
-            .execution_options(populate_existing=True)
+        return cast(
+            ExternalEffectClaimRow | None,
+            await session.scalar(
+                select(ExternalEffectClaimRow)
+                .where(ExternalEffectClaimRow.id == claim_id)
+                .execution_options(populate_existing=True)
+            ),
         )
 
     async def _lock_transition_parents(

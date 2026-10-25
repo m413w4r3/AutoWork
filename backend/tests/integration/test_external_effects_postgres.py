@@ -4,10 +4,11 @@ import asyncio
 import hashlib
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
@@ -19,8 +20,10 @@ from cti_app.application.external_effects import (
     ConsumePolicyContext,
     ExternalEffectCoordinator,
     Refused,
+    RequestHandoff,
     TransportResponse,
 )
+from cti_app.application.investigation_service import InvestigationService
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.domain.external_effects import (
     ConsumedEffectPermit,
@@ -32,6 +35,12 @@ from cti_app.domain.external_effects import (
     effect_key,
     occurrence_sha256,
 )
+from cti_app.domain.investigation import (
+    AgendaItem,
+    InvestigationAgenda,
+    InvestigationExecutionMode,
+)
+from cti_app.domain.investigation_state import InvestigationWorkingState
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 from cti_app.infrastructure.database.models.external_effects import (
     ExternalEffectClaimRow,
@@ -46,6 +55,7 @@ from cti_app.infrastructure.database.models.investigation import (
 )
 from cti_app.infrastructure.database.models.production import AnalystInvestigationRow
 from cti_app.infrastructure.database.repositories.external_effects import (
+    ExternalEffectFamilyBinding,
     SqlAlchemyExternalEffectClaimStore,
 )
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
@@ -64,23 +74,108 @@ _REQUEST = {"hash": "abc", "include": ["relations", "history"]}
 class _CountingTransport:
     def __init__(self) -> None:
         self.calls = 0
+        self.send_entries = 0
         self._lock = asyncio.Lock()
 
     async def send(
-        self, request: FrozenWireRequest, *, permit: ConsumedEffectPermit
+        self,
+        request: FrozenWireRequest,
+        *,
+        permit: ConsumedEffectPermit,
+        handoff: RequestHandoff,
     ) -> TransportResponse:
-        async with self._lock:
-            self.calls += 1
-        return TransportResponse(result_ref="artifact:pg-fake-result")
+        self.send_entries += 1
+
+        async def physical_send() -> TransportResponse:
+            async with self._lock:
+                self.calls += 1
+            return TransportResponse(result_ref="artifact:pg-fake-result")
+
+        return await handoff(physical_send)
 
 
-class _DenyPolicyGuard:
-    def __init__(self) -> None:
-        self.called_under_transaction = False
+class _BarrierPolicyGuard:
+    """Barrier guard with policy-event lock before envelope lock in both paths."""
+
+    def __init__(self, policy_event_id: UUID, *, block_consume: bool = False) -> None:
+        self.policy_event_id = policy_event_id
+        self.lock_key = policy_event_id.int & ((1 << 63) - 1)
+        self.policy_version = "osint-open.v1"
+        self.revoked = False
+        self.block_consume = block_consume
+        self.consume_locked = asyncio.Event()
+        self.release_consume = asyncio.Event()
+        self.revoke_started = asyncio.Event()
+        self.events: list[str] = []
+
+    async def lock_for_consume(self, database_session: AsyncSession, authority: Any) -> bool:
+        self.events.append("policy_lock")
+        if authority.policy_event_id != self.policy_event_id:
+            return False
+        if authority.policy_version != self.policy_version:
+            return False
+        await database_session.execute(
+            text("SELECT pg_advisory_xact_lock(:policy_lock_key)"),
+            {"policy_lock_key": self.lock_key},
+        )
+        self.consume_locked.set()
+        if self.block_consume:
+            await self.release_consume.wait()
+        return not self.revoked
 
     async def authorize(self, context: ConsumePolicyContext) -> bool:
-        self.called_under_transaction = bool(context.database_session.in_transaction())
-        return False
+        self.events.append("policy_authorize")
+        return (
+            bool(context.database_session.in_transaction())
+            and not self.revoked
+            and context.investigation_subject_id == context.authority.pinned_subject_id
+        )
+
+    async def revoke(self, session_factory, investigation_id: UUID) -> None:
+        self.revoke_started.set()
+        async with session_factory() as session:
+            async with session.begin():
+                # Policy-event then envelope is the shared consume/revoke order.
+                await session.execute(
+                    text("SELECT pg_advisory_xact_lock(:policy_lock_key)"),
+                    {"policy_lock_key": self.lock_key},
+                )
+                await session.scalar(
+                    select(InvestigationEnvelopeRow)
+                    .where(InvestigationEnvelopeRow.investigation_id == investigation_id)
+                    .with_for_update()
+                )
+                self.revoked = True
+
+
+class _ClaimBarrierStore:
+    """Hold both workers immediately before the durable claim transaction."""
+
+    def __init__(self, delegate: SqlAlchemyExternalEffectClaimStore, barrier: asyncio.Barrier):
+        self._delegate = delegate
+        self._barrier = barrier
+
+    async def consume(self, *args: Any, **kwargs: Any):
+        await self._barrier.wait()
+        return await self._delegate.consume(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._delegate, name)
+
+
+class _PreConsumeFailureStore:
+    """Inject a crash before the real store opens a transaction."""
+
+    def __init__(self, delegate: SqlAlchemyExternalEffectClaimStore) -> None:
+        self._delegate = delegate
+        self.consume_calls = 0
+
+    async def consume(self, *args: Any, **kwargs: Any):
+        self.consume_calls += 1
+        raise RuntimeError("injected crash before consume")
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._delegate, name)
 
 
 async def _prepare_case(
@@ -98,9 +193,14 @@ async def _prepare_case(
 ]:
     engine = create_postgres_engine(database_url)
     session_factory = create_session_factory(engine)
-    uow_factory = SqlAlchemyUnitOfWork(session_factory)
+
+    def uow_factory() -> SqlAlchemyUnitOfWork:
+        return SqlAlchemyUnitOfWork(session_factory)
+
     artifact_store = ProductionArtifactStore(
-        BlobCatalogService(FilesystemBlobStore(tmp_path / f"external-effects-{suffix}"))
+        BlobCatalogService(
+            FilesystemBlobStore(tmp_path / f"external-effects-{suffix}"), uow_factory
+        )
     )
     seeded = await seed_verified_article(
         uow_factory,
@@ -218,6 +318,21 @@ async def _prepare_case(
                     ),
                 )
                 authorities.append((authority, prepared))
+    async with uow_factory() as uow:
+        await uow.investigation_states.save_if_version(
+            InvestigationWorkingState(
+                investigation_id=seeded.investigation.id,
+                agenda=InvestigationAgenda(
+                    items=(
+                        AgendaItem(question="Verify the source claim.", potential=0.9, rank=1),
+                        AgendaItem(question="Check for contradictions.", potential=0.7, rank=2),
+                    )
+                ),
+                execution_mode=InvestigationExecutionMode.BRIDGE_LED,
+            ),
+            expected_version=None,
+        )
+        await uow.commit()
     return session_factory, engine, seeded.investigation.id, subject_id, authorities
 
 
@@ -232,14 +347,19 @@ def update_investigation_status(investigation_id: UUID):
 
 
 def _store(
-    session_factory: async_sessionmaker[AsyncSession], *, policy_guard=None
+    session_factory: async_sessionmaker[AsyncSession], *, policy_guard: Any = None
 ) -> SqlAlchemyExternalEffectClaimStore:
     return SqlAlchemyExternalEffectClaimStore(
         session_factory,
         policy_guard=policy_guard,
-        provider_bindings={_FAMILY: (_PROVIDER, frozenset({"tenant-test"}))},
-        normalizer_versions={_FAMILY: frozenset({_NORMALIZER})},
-        invocation_bindings={_FAMILY: (_FAMILY, "v1")},
+        family_bindings={
+            _FAMILY: ExternalEffectFamilyBinding(
+                provider=_PROVIDER,
+                provider_scopes=frozenset({"tenant-test"}),
+                normalizer_versions=frozenset({_NORMALIZER}),
+                invocation_tool_binding=(_FAMILY, "v1"),
+            )
+        },
     )
 
 
@@ -254,7 +374,9 @@ async def test_concurrent_same_effect_and_replay_make_one_send(
         invocations=2,
     )
     store = _store(session_factory)
-    coordinator = ExternalEffectCoordinator(store)
+    coordinator = ExternalEffectCoordinator(
+        _ClaimBarrierStore(store, asyncio.Barrier(len(authorities)))
+    )
     transport = _CountingTransport()
     try:
         results = await asyncio.gather(
@@ -296,15 +418,10 @@ async def test_concurrent_same_effect_and_replay_make_one_send(
         await engine.dispose()
 
 
-@pytest.mark.asyncio
-async def test_revocation_first_guard_denies_with_zero_send(
-    migrated_postgres_url: str, tmp_path: Path
-) -> None:
-    session_factory, engine, investigation_id, subject_id, authorities = await _prepare_case(
-        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
-    )
-    base, prepared = authorities[0]
-    authority = ExternalEffectAuthority(
+def _policy_authority(
+    base: ExternalEffectAuthority, *, subject_id: UUID, policy_event_id: UUID
+) -> ExternalEffectAuthority:
+    return ExternalEffectAuthority(
         investigation_id=base.investigation_id,
         invocation_id=base.invocation_id,
         operation_key=base.operation_key,
@@ -313,18 +430,32 @@ async def test_revocation_first_guard_denies_with_zero_send(
         approval_decision_id=base.approval_decision_id,
         invocation_arguments_sha256=base.invocation_arguments_sha256,
         authority_kind=ExternalEffectAuthorityKind.OSINT_POLICY,
-        policy_event_id=uuid4(),
+        policy_event_id=policy_event_id,
         policy_version="osint-open.v1",
         pinned_subject_id=subject_id,
     )
-    guard = _DenyPolicyGuard()
+
+
+@pytest.mark.asyncio
+async def test_revocation_first_guard_denies_with_zero_send(
+    migrated_postgres_url: str, tmp_path: Path
+) -> None:
+    session_factory, engine, investigation_id, subject_id, authorities = await _prepare_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    base, prepared = authorities[0]
+    guard = _BarrierPolicyGuard(uuid4())
+    authority = _policy_authority(
+        base, subject_id=subject_id, policy_event_id=guard.policy_event_id
+    )
     store = _store(session_factory, policy_guard=guard)
     transport = _CountingTransport()
     try:
+        await guard.revoke(session_factory, investigation_id)
         outcome = await ExternalEffectCoordinator(store).send_one(authority, prepared, transport)
         assert isinstance(outcome, Refused)
         assert outcome.reason == "osint_policy_denied"
-        assert guard.called_under_transaction
+        assert guard.events == ["policy_lock"]
         assert transport.calls == 0
         async with session_factory() as session:
             count = await session.scalar(
@@ -338,13 +469,60 @@ async def test_revocation_first_guard_denies_with_zero_send(
 
 
 @pytest.mark.asyncio
+async def test_consume_first_policy_lock_wins_before_revocation(
+    migrated_postgres_url: str, tmp_path: Path
+) -> None:
+    session_factory, engine, investigation_id, subject_id, authorities = await _prepare_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    base, prepared = authorities[0]
+    guard = _BarrierPolicyGuard(uuid4(), block_consume=True)
+    authority = _policy_authority(
+        base, subject_id=subject_id, policy_event_id=guard.policy_event_id
+    )
+    store = _store(session_factory, policy_guard=guard)
+    transport = _CountingTransport()
+    try:
+        send_task = asyncio.create_task(
+            ExternalEffectCoordinator(store).send_one(authority, prepared, transport)
+        )
+        await asyncio.wait_for(guard.consume_locked.wait(), timeout=10)
+        revoke_task = asyncio.create_task(guard.revoke(session_factory, investigation_id))
+        await asyncio.wait_for(guard.revoke_started.wait(), timeout=10)
+        guard.release_consume.set()
+        outcome = await send_task
+        await revoke_task
+        assert isinstance(outcome, Completed)
+        assert transport.calls == 1
+        assert guard.events == ["policy_lock", "policy_authorize"]
+        async with session_factory() as session:
+            claim = await session.get(ExternalEffectClaimRow, outcome.claim_id)
+        assert claim is not None and claim.state == "COMPLETED"
+    finally:
+        guard.release_consume.set()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_crash_before_consume_leaves_no_claim(
     migrated_postgres_url: str, tmp_path: Path
 ) -> None:
-    session_factory, engine, investigation_id, _subject_id, _authorities = await _prepare_case(
+    session_factory, engine, investigation_id, _subject_id, authorities = await _prepare_case(
         migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
     )
+    authority, prepared = authorities[0]
+    store = _store(session_factory)
+    failing_store = _PreConsumeFailureStore(store)
+    transport = _CountingTransport()
+    coordinator = ExternalEffectCoordinator(failing_store)
     try:
+        outcome = await coordinator.send_one(authority, prepared, transport)
+        assert isinstance(outcome, Refused)
+        assert outcome.reason == "consume_unavailable"
+        assert failing_store.consume_calls == 1
+        assert transport.calls == 0
+        assert transport.send_entries == 0
+        assert coordinator._permits._issued == {}
         async with session_factory() as session:
             count = await session.scalar(
                 select(func.count())
@@ -352,6 +530,41 @@ async def test_crash_before_consume_leaves_no_claim(
                 .where(ExternalEffectClaimRow.investigation_id == investigation_id)
             )
         assert count == 0
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            service = InvestigationService(
+                post_synthesis=None,
+                investigations=uow.analyst_investigations,
+                states=uow.investigation_states,
+                context_snapshots=None,
+                envelopes=uow.investigation_envelopes,
+                context_builder=None,
+                bridge=None,
+                registry=None,
+                dispatcher=None,
+                invocations=uow.tool_invocations,
+                observations=uow.evidence_observations,
+                findings=uow.investigation_findings,
+                opinions=uow.analyst_opinions,
+                commit_uow=uow.commit,
+            )
+            with pytest.raises(ValueError, match="Ambiguous tool invocations"):
+                await service.resume(investigation_id)
+        async with session_factory() as session:
+            invocation = await session.get(ToolInvocationRow, authority.invocation_id)
+            reservation = await session.get(
+                InvestigationBudgetReservationRow,
+                (investigation_id, authority.operation_key),
+            )
+            amount = await session.get(
+                InvestigationBudgetReservationAmountRow,
+                (investigation_id, authority.operation_key, "vt_units"),
+            )
+        assert invocation is not None and invocation.status == "needs_review"
+        assert reservation is not None and reservation.status == "reserved"
+        assert amount is not None and amount.reserved_amount == 1
+        assert amount.committed_amount is None
+        assert transport.calls == 0
+        assert transport.send_entries == 0
     finally:
         await engine.dispose()
 

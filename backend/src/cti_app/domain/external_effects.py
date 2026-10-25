@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Any
+from urllib.parse import parse_qsl, unquote_plus, urlsplit
 from uuid import UUID
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -257,6 +258,7 @@ class ConsumedEffectPermit:
     envelope_version: int
     approval_decision_id: UUID
     nonce: UUID
+    expires_at_monotonic: float
     _issuer: object
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -272,6 +274,7 @@ class ConsumedEffectPermit:
         prepared: PreparedExternalRequest,
         effect_key: str,
         nonce: UUID,
+        expires_at_monotonic: float,
     ) -> ConsumedEffectPermit:
         permit = object.__new__(cls)
         for name, value in {
@@ -286,6 +289,7 @@ class ConsumedEffectPermit:
             "envelope_version": authority.expected_envelope_version,
             "approval_decision_id": authority.approval_decision_id,
             "nonce": nonce,
+            "expires_at_monotonic": expires_at_monotonic,
             "_issuer": issuer,
         }.items():
             object.__setattr__(permit, name, value)
@@ -445,6 +449,7 @@ def _assert_safe_persisted_json(value: Any, path: str = "canonical_request") -> 
         "credential",
         "private_key",
         "signed_url",
+        "signature",
     )
     if isinstance(value, Mapping):
         for key, child in value.items():
@@ -473,23 +478,33 @@ def _validate_safe_reference(value: str, label: str, *, allow_non_reference: boo
             raise ExternalEffectValidationError(
                 f"credential-bearing URL is not persistable: {label}"
             )
-    if "?" in value:
-        query = value.split("?", 1)[1]
+    if "://" in value or "?" in value:
+        try:
+            query = urlsplit(value).query
+        except ValueError as exc:
+            raise ExternalEffectValidationError(f"invalid URL is not persistable: {label}") from exc
         sensitive_query_names = {
             "access_token",
-            "api_key",
             "apikey",
             "auth",
             "authorization",
+            "client_secret",
+            "credential",
+            "key",
             "password",
+            "passwd",
             "secret",
+            "sig",
+            "signature",
             "token",
-            "x-amz-credential",
-            "x-amz-security-token",
+            "x_amz_credential",
+            "x_amz_security_token",
+            "x_api_key",
         }
-        for item in query.split("&"):
-            name = item.split("=", 1)[0].casefold().replace("-", "_")
-            if name in sensitive_query_names:
+        normalized_sensitive = {re.sub(r"[^a-z0-9]", "", name) for name in sensitive_query_names}
+        for name, _ in parse_qsl(query, keep_blank_values=True):
+            normalized_name = re.sub(r"[^a-z0-9]", "", unquote_plus(name).casefold())
+            if normalized_name in normalized_sensitive:
                 raise ExternalEffectValidationError(
                     f"credential-bearing URL is not persistable: {label}"
                 )
