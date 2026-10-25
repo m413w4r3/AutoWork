@@ -1,4 +1,4 @@
-# Seven curated engineering skills (AutoWork)
+# Eight curated engineering skills (AutoWork)
 
 These are local **adapted copies** of selected skills from
 [mattpocock/skills](https://github.com/mattpocock/skills), pinned at
@@ -16,6 +16,7 @@ duplicate skill names.
 | `implement-spec` | Per-ticket fresh Luna worktrees and parent-controlled integration |
 | `retro` | Improve CI, instructions and agent workflow from real evidence |
 | `domain-modeling` | CTI terminology/glossary and proposed ADRs |
+| `improve-codebase-architecture` | Read-only deep-module preflight, before/after candidates, no automatic refactor |
 | `writing-for-agents` | Precise skills and lean AGENTS/CLAUDE references |
 
 Already installed AutoWork skills such as `autowork-ralph-gate` and
