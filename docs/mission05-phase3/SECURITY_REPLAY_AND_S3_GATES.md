@@ -49,7 +49,8 @@ executed test is `NOT_DEMONSTRATED`, never PASS.
 | Source audit: no external client constructed in fake E2E paths | NOT_DEMONSTRATED |
 | Runtime: fake transport is the only submit port; counters asserted | NOT_DEMONSTRATED |
 | Runtime: no `httpx`/socket external call during E2E | NOT_DEMONSTRATED |
-| No dotenv/secret read by pure preparation | NOT_DEMONSTRATED |
+| No dotenv/secret read by pure preparation | **PASS (M05-A)**: `test_prepare_accepts_pure_mapping_and_does_not_open_files_start_processes_or_connect` monkeypatches file/socket/subprocess/`get_settings` I/O to raise and still succeeds; the renderer module imports only `advisor_wire`. |
+| No external client constructed by the renderer | **PASS (M05-A source audit)**: `advisor_prompt.py` imports only `collections.abc`/`typing`/`advisor_wire`; no httpx/socket/settings. |
 
 ## S3 / Advisor cutover
 
