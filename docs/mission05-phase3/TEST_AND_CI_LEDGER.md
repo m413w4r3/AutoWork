@@ -67,7 +67,8 @@ Any M05-A byte change would be visible here.
 | M05-A | integrated `7e51912a` | `make test-ci-scripts` | PASS, 5 tests | 0.001 s |
 | M05-B | 80076e6a → integrated `8da3300c` | `pytest -m integration tests/integration/test_investigation_e2e_no_sample_postgres.py` | PASS, 1 passed | 4.55 s integrated main; 4.00 s implementer; 4.03 s reviewer |
 | M05-C | 38d9312d → integrated `222942e2` | `pytest -m integration tests/integration/test_investigation_e2e_synthetic_sample_postgres.py` | PASS, 1 passed | 5.17 s integrated main; 4.68 s implementer; 4.86 s reviewer |
-| M05-D | f9c779a3 (candidate) | `pytest -m integration tests/integration/test_e2e_phase3_adversarial_postgres.py` | PASS, 2 passed | 2.98 s, parent independent run |
+| M05-D | 59f8c85c (candidate) | `pytest -m integration tests/integration/test_e2e_phase3_adversarial_postgres.py` | PASS, 2 passed | 4.56 s implementer; 2.98 s on f9c779a3 parent |
+| M05-D | 59f8c85c | full gate set reported by D (lint, typecheck, test-backend, test-integration, workflow fast/full, CI scripts) | lint/typecheck PASS; test-backend 2 `filesystem_confinement_unavailable` failures in the agent sandbox (parent passes `test_local_analysis_commands.py` 23/23); integration 347 passed/142.36 s; workflow 22/32 passed; CI scripts 5 passed | reviewer independently confirmed integration 347 passed and no confinement failures in parent-class environment |
 
 ## Global gates (after integration on local main)
 
@@ -76,7 +77,8 @@ Any M05-A byte change would be visible here.
 | `make lint-backend` | PASS after M05-A integration (`7e51912a`) — must be rerun at final SHA |
 | `make typecheck-backend` | PASS after M05-A integration (`7e51912a`) — must be rerun at final SHA |
 | `make test-backend` | PASS at baseline 55fba67d (4904 passed, 2 skipped) — must be rerun at final SHA |
-| `make test-integration` (full) | NOT_RUN at final SHA. Isolated diagnosis: `test_agentic_correction_loop_postgres.py` fails only because it resolves the broken `/snap/bin/typst`; with `PATH=/home/nill/.local/share/autowork-tools/bin:$PATH` it passes (1 passed in 3.86 s). Not a code regression. |
+| `make test-integration` (full) on integrated main `f691ac19` | PASS, 345 passed in 139.09 s with the pinned Typst binary on PATH. (D worktree with its 2 extra tests: 347 passed in 142.36 s, reviewer.) |
+| `test_agentic_correction_loop_postgres.py` isolated | PASS, 1 passed in 3.86 s with pinned Typst on PATH; without it, it resolves the broken snap wrapper. Environmental only. |
 | `make test-workflow` | PASS after M05-A integration (`68aefb2a`): 22 passed, 15 deselected, JUnit guard OK — rerun at final SHA |
 | `make test-workflow-full` | PASS after A+F+B integration (`58c29429`): 32 passed, 5 deselected, JUnit guard OK — rerun at final SHA |
 | `make test-ci-scripts` | PASS after M05-A integration (`7e51912a`, 5 tests) — rerun at final SHA |
