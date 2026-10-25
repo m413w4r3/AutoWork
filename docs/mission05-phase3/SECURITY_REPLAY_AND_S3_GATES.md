@@ -27,6 +27,7 @@ executed test is `NOT_DEMONSTRATED`, never PASS.
 | signed URL / revoked authorization | credential/signed-URL refusal | fake counter 0 | NOT_DEMONSTRATED |
 | canonical evidence absent / completeness not READY | `evidence_preflight_*` refusal | fake counter 0 | NOT_DEMONSTRATED |
 | ref identity conflict (same kind/id, two SHAs) | `ref_reference_conflict` | fake counter 0 | NOT_DEMONSTRATED |
+| evidence reference absent or from another investigation | `advisor_input_invalid` / `advisor_input_rejected`, `confirmed_non_execution=true`, `provider_usage.not_submitted` | fake counter 0 | **PASS (M05-F, unit + PG)** — RED `UnboundLocalError` at base line 1006, GREEN typed refusal at candidate `a1b356c6` / integrated `12671c6a` |
 
 ## Replay / restart invariants
 
