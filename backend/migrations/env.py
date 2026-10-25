@@ -36,6 +36,7 @@ if config.config_file_name is not None:
 
 target_metadata = Base.metadata
 
+_EXTERNAL_EFFECT_TABLES = frozenset({"external_effect_claim", "external_effect_use"})
 _OSINT_POLICY_TABLES = frozenset(
     {
         "osint_open_policies",
@@ -63,7 +64,7 @@ def _metadata_for_frozen_baseline() -> MetaData:
     """
     metadata = MetaData()
     for source_table in target_metadata.tables.values():
-        if source_table.name in _OSINT_POLICY_TABLES:
+        if source_table.name in _OSINT_POLICY_TABLES or source_table.name in _EXTERNAL_EFFECT_TABLES:
             continue
         table = source_table.to_metadata(metadata)
         if table.name != "investigation_envelopes":
