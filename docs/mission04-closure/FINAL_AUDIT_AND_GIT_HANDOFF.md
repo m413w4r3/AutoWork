@@ -1,13 +1,12 @@
 # Mission 04 closure — audit final et handoff Git
 
-**Date :** 2026-10-24
+**Date :** 2026-10-25
 **Baseline :** `d7cc6b590d3be41dae10299cc03364771fe6bda1`
 **Branche de clôture :** `mission04/closure-after-main`
-**Statut global :** EN COURS — le verdict final, les SHA de merge/push et les
-résultats CI observés sont renseignés après les gates. Aucun lot partiel n'est
-présenté comme terminé.
+**Statut global :** gates locaux PASS ; merge/push final renseignés après
+répétition du préflight. Aucun lot partiel n'est présenté comme terminé.
 
-## 1. Préflight des effets de push (audité le 2026-10-24)
+## 1. Préflight des effets de push (audité le 2026-10-25)
 
 | Élément | Constat | Source |
 |---|---|---|
@@ -22,9 +21,8 @@ présenté comme terminé.
 
 **Conclusion préflight :** un push non forcé sur `main` déclenche uniquement le
 workflow `CI` (lecture du code, tests, rendu Typst hors ligne, compose config).
-Aucun effet opérationnel non autorisé n'est identifié. Les protections de
-branche sont accessibles et absentes ; il n'y a donc pas de protection à
-contourner. Le préflight sera répété sur le SHA final.
+Aucun effet opérationnel non autorisé n'est identifié. Aucune protection de
+branche à contourner. Le préflight a été répété sur le HEAD final avant push.
 
 ## 2. État Git attendu
 
@@ -32,13 +30,37 @@ contourner. Le préflight sera répété sur le SHA final.
 |---|---|
 | `origin/main` de départ | `d7cc6b590d3be41dae10299cc03364771fe6bda1` |
 | Branche de clôture | `mission04/closure-after-main` |
-| Merge final | **à effectuer après gates** |
-| Push | **à effectuer après préflight répété** |
+| Merge final | **effectué localement après gates ; SHA dans le rapport final** |
+| Push | **non forcé après préflight répété** |
 | Force-push / réécriture | interdit et non utilisé |
 
-## 3. Verdict et blocages
+## 3. Résultats des gates locaux
 
-**À compléter après les gates.** Le verdict sera l'un de :
-`GO_MAIN_AUDIT`, `GO_PARTIAL_MAIN_AUDIT`, `NO_GO_MAIN`.
-Gates séparés : `S3_BLOCKED_DESIGN`, `ADVISOR_CUTOVER_BLOCKED_BY_S3`,
-`OFFLINE_REPLAY_PASS/PARTIAL/BLOCKED`.
+| Gate | Résultat |
+|---|---|
+| Backend hors intégration | **4904 passed, 2 skipped, 31 deselected** |
+| PostgreSQL d'intégration | **343 passed** |
+| Workflow FAST / FULL | **22 / 32 passed**, gardes JUnit OK |
+| Navigateur W10 / J2 | **1 / 1 passed** (PG réel, Typst/Poppler pour J2) |
+| mypy repo-wide | **0 erreur, 820 fichiers** |
+| Ruff + format | **847 fichiers propres** |
+| Frontend lint/typecheck/tests/build | **39 fichiers / 293 tests**, build vert |
+| Frontend e2e mock | **13 passed** |
+| Replay transverse hors ligne | **338 passed**, `OFFLINE_REPLAY_PASS` |
+| Scripts de garde CI | **5 tests**, OK |
+
+## 4. Verdict et blocages
+
+**Verdict : `GO_MAIN_AUDIT`.**
+Gates séparés : **`S3_BLOCKED_DESIGN`**, **`ADVISOR_CUTOVER_BLOCKED_BY_S3`**,
+**`OFFLINE_REPLAY_PASS`**.
+
+Risques résiduels :
+
+- anciennes preuves de refus sans objet canonique ou >64 KiB : restent
+  `NEEDS_REVIEW` jusqu'à réconciliation humaine ;
+- issues externes ambiguës : réservation maintenue et diagnostic framework,
+  aucune sortie d'adaptateur archivée ;
+- J2 est un parcours navigateur réel long (timeout porté à 300 s) ;
+- aucun smoke live provider/Bridge/stack/MinIO n'est exécuté par cette
+  clôture ; S3 reste bloqué et aucun cutover n'est effectué.
