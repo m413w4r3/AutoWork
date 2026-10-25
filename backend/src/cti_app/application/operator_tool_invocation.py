@@ -60,7 +60,6 @@ from cti_app.application.research_context_builder import (
 )
 from cti_app.domain.analyst_opinion import investigation_opinion_id
 from cti_app.domain.investigation import (
-    BudgetReservationStatus,
     FrameworkPreSubmissionProof,
     InvestigationExecutionMode,
     ToolInvocation,
@@ -232,7 +231,7 @@ def _materialized_page_proof(
         total=total,
         has_more=has_more,
         source_bounded=False,
-        omission_reasons=omission_reasons,
+        omission_reasons=cast(Mapping[ContextOmissionReason | str, int], omission_reasons),
         unbounded_reason=unbounded_reason,
         selected=len(items),
         omitted=omitted,
@@ -257,17 +256,18 @@ def _assert_keyset_page_consistency(page: Any, *, section: str, investigation_id
     if len(entries) != 1:
         raise ValueError("Operator keyset page must have exactly one omission manifest")
     entry = entries[0]
-    previous_page_sha256 = (
-        decode_keyset_cursor(
+    previous_page_sha256 = "0" * 64
+    if page.cursor is not None:
+        decoded_cursor = decode_keyset_cursor(
             page.cursor,
             section=section,
             investigation_id=investigation_id,
             descending=page.descending,
             context_sha256=page.context_sha256,
-        )["previous_page_sha256"]
-        if page.cursor is not None
-        else "0" * 64
-    )
+        )
+        if decoded_cursor is None:
+            raise ValueError("Operator keyset page cursor is missing its decoded payload")
+        previous_page_sha256 = decoded_cursor["previous_page_sha256"]
     assert_manifest_consistency(
         section=section,
         investigation_id=investigation_id,
@@ -778,47 +778,8 @@ class OperatorToolInvocationService:
     async def _framework_pre_submission_proof(
         self, invocation: ToolInvocation
     ) -> FrameworkPreSubmissionProof | None:
-        if self._observations is None or self._evidence_summaries is None:
-            return None
-        envelope = await self._envelopes.get(self._investigation_id)
-        if envelope is None:
-            return None
-        reservation = next(
-            (
-                item
-                for item in envelope.budget.reservations
-                if item.operation_key == invocation.operation_key
-            ),
-            None,
-        )
-        if (
-            reservation is None
-            or reservation.status is not BudgetReservationStatus.RELEASED
-            or dict(reservation.amounts) != dict(invocation.reserved_budget)
-        ):
-            return None
-        for observation_id in invocation.response_refs:
-            observation = await self._observations.get(observation_id)
-            if (
-                observation is None
-                or observation.investigation_id != self._investigation_id
-                or observation.invocation_ref != invocation.id
-                or observation.source != invocation.tool_name
-                or observation.source_version != invocation.schema_version
-                or observation.object_id != invocation.operation_key
-            ):
-                continue
-            try:
-                proof = FrameworkPreSubmissionProof(observation.object_type)
-            except ValueError:
-                continue
-            try:
-                summary = await self._evidence_summaries.summary(observation)
-            except Exception:
-                continue
-            if isinstance(summary, Mapping):
-                return proof
-        return None
+        proof, _rejection = await self._execution._framework_pre_submission_proof(invocation)
+        return proof
 
     async def _invoke_locked(
         self,

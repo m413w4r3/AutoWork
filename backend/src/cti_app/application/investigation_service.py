@@ -21,6 +21,7 @@ from cti_app.application.article_novelty import (
     NoveltyCandidate,
     NoveltyCandidateKind,
 )
+from cti_app.application.blob_storage import BlobReadLimitExceededError
 from cti_app.application.bridge_investigator import (
     BridgeInvestigator,
     BridgeTurnResult,
@@ -157,6 +158,13 @@ class ToolObservationWriter(Protocol):
     ) -> tuple[EvidenceObservation, ...]: ...
 
 
+class FrameworkProofDescriptorReader(Protocol):
+    async def blob_metadata(self, blob_id: UUID) -> Mapping[str, Any] | None: ...
+
+
+_MAX_FRAMEWORK_PRE_SUBMISSION_PROOF_BYTES = 64 * 1024
+
+
 class ProductionArtifactObservationWriter:
     """Archive bounded tool summaries as canonical evidence blobs."""
 
@@ -201,6 +209,14 @@ class ProductionArtifactObservationWriter:
             if result.framework_pre_submission_proof is None:
                 return ()
             safe_result = {}
+        if result.framework_pre_submission_proof is None:
+            # An adapter response is untrusted and cannot attest that the
+            # framework rejected an operation before submission.
+            safe_result.pop("framework_pre_submission_proof", None)
+        else:
+            safe_result["framework_pre_submission_proof"] = {
+                "object_type": result.framework_pre_submission_proof.value
+            }
         payload = {
             "schema": "investigation-tool-observation.v1",
             "tool_name": invocation.tool_name,
@@ -289,6 +305,8 @@ class InvestigationService:
         findings: FindingRepository,
         opinions: AnalystOpinionRepository,
         observation_writer: ToolObservationWriter | None = None,
+        artifact_store: ProductionArtifactStore | None = None,
+        evidence_summaries: FrameworkProofDescriptorReader | None = None,
         available_capabilities: frozenset[str] = frozenset(),
         author_id: str = "bridge-investigator",
         no_progress_limit: int = 2,
@@ -312,6 +330,8 @@ class InvestigationService:
         self._findings = findings
         self._opinions = opinions
         self._observation_writer = observation_writer
+        self._artifact_store = artifact_store
+        self._evidence_summaries = evidence_summaries
         self._available_capabilities = frozenset(available_capabilities)
         self._author_id = author_id
         self._no_progress_limit = no_progress_limit
@@ -465,11 +485,14 @@ class InvestigationService:
         if running_invocations:
             await self._commit_current_uow()
         proof_resolved = False
+        proof_rejections: dict[UUID, str] = {}
         for invocation in await self._unresolved_tool_invocations(investigation_id):
             if invocation.status is not ToolInvocationStatus.NEEDS_REVIEW:
                 continue
-            proof = await self._framework_pre_submission_proof(invocation)
+            proof, rejection = await self._framework_pre_submission_proof(invocation)
             if proof is None:
+                if rejection is not None:
+                    proof_rejections[invocation.id] = rejection
                 continue
             resolved = invocation.resolve_pre_submission_failure()
             await self._invocations.update_if_version(resolved, expected_version=invocation.version)
@@ -478,9 +501,15 @@ class InvestigationService:
             await self._commit_current_uow()
         unresolved = await self._unresolved_tool_invocations(investigation_id)
         if unresolved:
+            unresolved_details = []
+            for item in unresolved[:8]:
+                rejection = proof_rejections.get(item.id)
+                unresolved_details.append(
+                    f"{item.id} ({rejection})" if rejection is not None else str(item.id)
+                )
             raise ValueError(
                 "Ambiguous tool invocations must be reconciled before resuming: "
-                + ", ".join(str(item.id) for item in unresolved[:8])
+                + ", ".join(unresolved_details)
             )
         if (
             state.stop_reason is StopReason.SUBMISSION_NEEDS_REVIEW
@@ -515,10 +544,10 @@ class InvestigationService:
 
     async def _framework_pre_submission_proof(
         self, invocation: ToolInvocation
-    ) -> FrameworkPreSubmissionProof | None:
+    ) -> tuple[FrameworkPreSubmissionProof | None, str | None]:
         envelope = await self._envelopes.get(invocation.investigation_id)
         if envelope is None:
-            return None
+            return None, None
         reservation = next(
             (
                 item
@@ -532,7 +561,8 @@ class InvestigationService:
             or reservation.status is not BudgetReservationStatus.RELEASED
             or dict(reservation.amounts) != dict(invocation.reserved_budget)
         ):
-            return None
+            return None, None
+        first_rejection: str | None = None
         for observation_id in invocation.response_refs:
             observation = await self._observations.get(observation_id)
             if (
@@ -545,9 +575,93 @@ class InvestigationService:
             ):
                 continue
             try:
-                return FrameworkPreSubmissionProof(observation.object_type)
+                proof = FrameworkPreSubmissionProof(observation.object_type)
             except ValueError:
                 continue
+            rejection = await self._verify_framework_pre_submission_proof(
+                invocation, observation, proof
+            )
+            if rejection is None:
+                return proof, None
+            if first_rejection is None:
+                first_rejection = rejection
+        if (
+            first_rejection is None
+            and invocation.response_refs
+            and (self._artifact_store is None or self._evidence_summaries is None)
+        ):
+            first_rejection = "framework_proof_verifier_unavailable"
+        return None, first_rejection
+
+    async def _verify_framework_pre_submission_proof(
+        self,
+        invocation: ToolInvocation,
+        observation: EvidenceObservation,
+        proof: FrameworkPreSubmissionProof,
+    ) -> str | None:
+        if self._artifact_store is None or self._evidence_summaries is None:
+            return "framework_proof_verifier_unavailable"
+        try:
+            descriptor = await self._evidence_summaries.blob_metadata(observation.blob_id)
+        except Exception:
+            return "framework_proof_descriptor_unreadable"
+        if descriptor is None:
+            return "framework_proof_descriptor_missing"
+        descriptor_sha256 = descriptor.get("sha256")
+        descriptor_size = descriptor.get("byte_size")
+        mime_type = descriptor.get("mime_type")
+        if (
+            descriptor_sha256 != observation.sha256
+            or isinstance(descriptor_size, bool)
+            or not isinstance(descriptor_size, int)
+            or descriptor_size < 0
+            or not isinstance(mime_type, str)
+            or mime_type.split(";", 1)[0].strip().casefold() != "application/json"
+        ):
+            return "framework_proof_descriptor_mismatch"
+        if descriptor_size > _MAX_FRAMEWORK_PRE_SUBMISSION_PROOF_BYTES:
+            return "framework_proof_blob_size_overflow"
+        try:
+            raw = await self._artifact_store.read_bytes(
+                observation.blob_id,
+                max_bytes=_MAX_FRAMEWORK_PRE_SUBMISSION_PROOF_BYTES,
+            )
+        except BlobReadLimitExceededError:
+            return "framework_proof_blob_size_overflow"
+        except Exception:
+            return "framework_proof_blob_unreadable"
+        if not isinstance(raw, bytes):
+            return "framework_proof_blob_unreadable"
+        if len(raw) != descriptor_size:
+            return "framework_proof_blob_size_mismatch"
+        if hashlib.sha256(raw).hexdigest() != observation.sha256:
+            return "framework_proof_blob_hash_mismatch"
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            return "framework_proof_payload_invalid_json"
+        if not isinstance(payload, dict):
+            return "framework_proof_payload_mismatch"
+        try:
+            canonical_payload = ProductionArtifactStore.canonical_json_bytes(payload)
+        except (TypeError, ValueError):
+            return "framework_proof_payload_invalid_json"
+        if canonical_payload != raw:
+            return "framework_proof_payload_not_canonical"
+        result = payload.get("result")
+        proof_payload = (
+            result.get("framework_pre_submission_proof") if isinstance(result, dict) else None
+        )
+        if (
+            payload.get("schema") != "investigation-tool-observation.v1"
+            or payload.get("tool_name") != invocation.tool_name
+            or payload.get("schema_version") != invocation.schema_version
+            or payload.get("operation_key") != invocation.operation_key
+            or not isinstance(proof_payload, dict)
+            or proof_payload != {"object_type": observation.object_type}
+            or observation.object_type != proof.value
+        ):
+            return "framework_proof_payload_mismatch"
         return None
 
     async def interrupt(
