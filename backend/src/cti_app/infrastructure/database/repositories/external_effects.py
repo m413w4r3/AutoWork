@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import math
 import re
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -22,6 +24,7 @@ from cti_app.application.external_effects import (
     ExternalEffectClaim,
     ExternalEffectPolicyGuard,
     ReuseDecision,
+    _consume_no_handoff_proof,
     _CoordinatorNoHandoffProof,
 )
 from cti_app.domain.external_effects import (
@@ -343,6 +346,41 @@ class SqlAlchemyExternalEffectClaimStore:
         except _ConsumeDenied as denied:
             return ConsumeRefused(denied.reason)
 
+    async def enter_handoff(
+        self,
+        claim_id: UUID,
+        *,
+        permit_nonce: UUID,
+        request_digest: str,
+        expires_at_monotonic: float,
+    ) -> bool:
+        if (
+            not isinstance(permit_nonce, UUID)
+            or not re.fullmatch(r"[0-9a-f]{64}", request_digest)
+            or not math.isfinite(expires_at_monotonic)
+        ):
+            return False
+        async with self._session_factory() as session:
+            async with session.begin():
+                row = await session.scalar(
+                    select(ExternalEffectClaimRow)
+                    .where(ExternalEffectClaimRow.id == claim_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+                if (
+                    row is None
+                    or row.state != EffectClaimState.CONSUMED.value
+                    or row.handoff_permit_nonce is not None
+                    or row.application_request_sha256 != request_digest
+                    or time.monotonic() >= expires_at_monotonic
+                ):
+                    return False
+                row.handoff_permit_nonce = permit_nonce
+                row.version += 1
+                row.updated_at = datetime.now(UTC)
+                return True
+
     async def complete(
         self,
         claim_id: UUID,
@@ -367,6 +405,7 @@ class SqlAlchemyExternalEffectClaimStore:
                     .where(
                         ExternalEffectClaimRow.id == claim_id,
                         ExternalEffectClaimRow.state == EffectClaimState.CONSUMED.value,
+                        ExternalEffectClaimRow.handoff_permit_nonce.is_not(None),
                         ExternalEffectClaimRow.version == row.version,
                     )
                     .values(
@@ -421,12 +460,7 @@ class SqlAlchemyExternalEffectClaimStore:
         proof: _CoordinatorNoHandoffProof,
         reason_code: str,
     ) -> bool:
-        if (
-            not isinstance(proof, _CoordinatorNoHandoffProof)
-            or proof.claim_id != claim_id
-            or proof.handoff_count != 0
-            or proof._issuer is None
-        ):
+        if not _consume_no_handoff_proof(proof, claim_id):
             return False
         reason = _safe_code(reason_code)
         async with self._session_factory() as session:
@@ -441,6 +475,7 @@ class SqlAlchemyExternalEffectClaimStore:
                     .where(
                         ExternalEffectClaimRow.id == claim_id,
                         ExternalEffectClaimRow.state == EffectClaimState.CONSUMED.value,
+                        ExternalEffectClaimRow.handoff_permit_nonce.is_(None),
                         ExternalEffectClaimRow.version == row.version,
                     )
                     .values(

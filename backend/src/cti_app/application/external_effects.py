@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 from uuid import UUID, uuid4
@@ -138,6 +138,15 @@ class ExternalEffectClaimStore(Protocol):
         evidence_refs: tuple[EvidenceReference, ...],
     ) -> bool: ...
 
+    async def enter_handoff(
+        self,
+        claim_id: UUID,
+        *,
+        permit_nonce: UUID,
+        request_digest: str,
+        expires_at_monotonic: float,
+    ) -> bool: ...
+
     async def definitely_not_submitted(
         self, claim_id: UUID, *, proof: _CoordinatorNoHandoffProof, reason_code: str
     ) -> bool: ...
@@ -167,10 +176,9 @@ class TransportResponse:
 
 @dataclass(frozen=True, slots=True, init=False, repr=False)
 class _CoordinatorNoHandoffProof:
-    """Opaque proof minted only while the coordinator's handoff count is zero."""
+    """Opaque proof minted only by the coordinator before transport entry."""
 
     claim_id: UUID
-    handoff_count: int
     nonce: UUID
     _issuer: object
 
@@ -182,7 +190,6 @@ class _CoordinatorNoHandoffProof:
         proof = object.__new__(cls)
         for name, value in {
             "claim_id": claim_id,
-            "handoff_count": 0,
             "nonce": uuid4(),
             "_issuer": issuer,
         }.items():
@@ -190,12 +197,56 @@ class _CoordinatorNoHandoffProof:
         return proof
 
 
-class RequestHandoff(Protocol):
-    """The only callback a transport may use to invoke its physical sender."""
+class _NoHandoffProofRegistry:
+    """Process-local authority for registered, one-use coordinator proofs."""
 
-    async def __call__(
-        self, operation: Callable[[], Awaitable[TransportResponse]]
-    ) -> TransportResponse: ...
+    def __init__(self) -> None:
+        self._issued: dict[UUID, tuple[object, UUID, _CoordinatorNoHandoffProof]] = {}
+        self._lock = threading.Lock()
+
+    def issue(self, claim_id: UUID, issuer: object) -> _CoordinatorNoHandoffProof:
+        proof = _CoordinatorNoHandoffProof._issue(claim_id=claim_id, issuer=issuer)
+        with self._lock:
+            self._issued[proof.nonce] = (issuer, claim_id, proof)
+        return proof
+
+    def consume(self, proof: _CoordinatorNoHandoffProof, claim_id: UUID) -> bool:
+        if not isinstance(proof, _CoordinatorNoHandoffProof):
+            return False
+        nonce = getattr(proof, "nonce", None)
+        issuer = getattr(proof, "_issuer", None)
+        bound_claim_id = getattr(proof, "claim_id", None)
+        if not isinstance(nonce, UUID) or not isinstance(bound_claim_id, UUID):
+            return False
+        with self._lock:
+            registered = self._issued.get(nonce)
+            if (
+                registered is None
+                or registered[0] is not issuer
+                or registered[1] != claim_id
+                or bound_claim_id != claim_id
+                or registered[2] is not proof
+            ):
+                return False
+            del self._issued[nonce]
+            return True
+
+
+_NO_HANDOFF_PROOFS = _NoHandoffProofRegistry()
+
+
+def _consume_no_handoff_proof(proof: _CoordinatorNoHandoffProof, claim_id: UUID) -> bool:
+    """Validate and burn a coordinator-issued proof before a terminal CAS."""
+
+    return _NO_HANDOFF_PROOFS.consume(proof, claim_id)
+
+
+class PermitHandoffGate(Protocol):
+    """One-use gate transports enter immediately before physical submission."""
+
+    async def enter(
+        self, permit: ConsumedEffectPermit, prepared: PreparedExternalRequest
+    ) -> None: ...
 
 
 class PermitAwareTransport(Protocol):
@@ -204,7 +255,8 @@ class PermitAwareTransport(Protocol):
         request: FrozenWireRequest,
         *,
         permit: ConsumedEffectPermit,
-        handoff: RequestHandoff,
+        prepared: PreparedExternalRequest,
+        gate: PermitHandoffGate,
     ) -> TransportResponse: ...
 
 
@@ -235,6 +287,10 @@ class DefinitelyNotSubmitted:
     claim_id: UUID
     framework_proof: _CoordinatorNoHandoffProof | None = None
     state: EffectClaimState = EffectClaimState.DEFINITIVELY_NOT_SUBMITTED
+
+
+class HandoffGateRefused(RuntimeError):
+    """The one-use gate could not authorize physical handoff."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -285,16 +341,48 @@ class _PermitRegistry:
         prepared: PreparedExternalRequest,
         key: str,
     ) -> bool:
-        """Burn before handoff; locks are released before the transport call."""
+        """Atomically validate and burn immediately before durable gate entry."""
 
         nonce = getattr(permit, "nonce", None)
         if not isinstance(nonce, UUID):
             return False
-        if getattr(permit, "_issuer", None) is not self._issuer:
+        with self._lock:
+            issued = self._issued.get(nonce)
+            if issued is not permit:
+                return False
+            if not self._matches(permit, authority, prepared, key):
+                if time.monotonic() >= permit.expires_at_monotonic:
+                    del self._issued[nonce]
+                return False
+            del self._issued[nonce]
+        return True
+
+    def is_valid(
+        self,
+        permit: ConsumedEffectPermit,
+        authority: ExternalEffectAuthority,
+        prepared: PreparedExternalRequest,
+        key: str,
+    ) -> bool:
+        nonce = getattr(permit, "nonce", None)
+        if not isinstance(nonce, UUID):
             return False
-        expired = time.monotonic() >= permit.expires_at_monotonic
-        matches = (
-            permit.investigation_id == authority.investigation_id
+        with self._lock:
+            return self._issued.get(nonce) is permit and self._matches(
+                permit, authority, prepared, key
+            )
+
+    def _matches(
+        self,
+        permit: ConsumedEffectPermit,
+        authority: ExternalEffectAuthority,
+        prepared: PreparedExternalRequest,
+        key: str,
+    ) -> bool:
+        return (
+            getattr(permit, "_issuer", None) is self._issuer
+            and time.monotonic() < permit.expires_at_monotonic
+            and permit.investigation_id == authority.investigation_id
             and permit.invocation_id == authority.invocation_id
             and permit.effect_key == key
             and permit.family == prepared.family
@@ -303,21 +391,84 @@ class _PermitRegistry:
             and permit.request_digest == prepared.application_request_sha256
             and permit.envelope_version == authority.expected_envelope_version
             and permit.approval_decision_id == authority.approval_decision_id
-            and not expired
             and application_request_sha256(prepared.application_request) == permit.request_digest
         )
-        if not matches:
-            if expired:
-                with self._lock:
-                    if self._issued.get(nonce) is permit:
-                        del self._issued[nonce]
-            return False
-        with self._lock:
-            issued = self._issued.get(nonce)
-            if issued is not permit:
-                return False
-            del self._issued[nonce]
-        return True
+
+
+class _HandoffGate:
+    """Serialize local closure with the durable one-use claim handoff marker."""
+
+    def __init__(
+        self,
+        *,
+        claim_store: ExternalEffectClaimStore,
+        permit_registry: _PermitRegistry,
+        permit: ConsumedEffectPermit,
+        authority: ExternalEffectAuthority,
+        prepared: PreparedExternalRequest,
+        key: str,
+    ) -> None:
+        self._claim_store = claim_store
+        self._permit_registry = permit_registry
+        self._permit = permit
+        self._authority = authority
+        self._prepared = prepared
+        self._key = key
+        self._lock = asyncio.Lock()
+        self._state = "OPEN"
+
+    @property
+    def entered(self) -> bool:
+        return self._state == "ENTERED"
+
+    async def enter(self, permit: ConsumedEffectPermit, prepared: PreparedExternalRequest) -> None:
+        expired_after_commit = False
+        async with self._lock:
+            if self._state != "OPEN":
+                raise HandoffGateRefused("handoff gate is closed or already used")
+            self._state = "ENTERING"
+            if permit is not self._permit or prepared is not self._prepared:
+                self._state = "CLOSED"
+                raise HandoffGateRefused("handoff token binding mismatch")
+            try:
+                validate_prepared_request(prepared)
+            except ExternalEffectValidationError as exc:
+                self._state = "CLOSED"
+                raise HandoffGateRefused("prepared request changed before handoff") from exc
+            if not self._permit_registry.burn_and_validate(
+                permit, self._authority, prepared, self._key
+            ):
+                self._state = "CLOSED"
+                raise HandoffGateRefused("permit expired, invalid, or already used")
+            try:
+                admitted = await self._claim_store.enter_handoff(
+                    permit.claim_id,
+                    permit_nonce=permit.nonce,
+                    request_digest=prepared.application_request_sha256,
+                    expires_at_monotonic=permit.expires_at_monotonic,
+                )
+            except Exception as exc:
+                self._state = "CLOSED"
+                raise HandoffGateRefused("durable handoff gate unavailable") from exc
+            if not admitted:
+                self._state = "CLOSED"
+                raise HandoffGateRefused("claim is sealed or handoff already entered")
+            if time.monotonic() >= permit.expires_at_monotonic:
+                self._state = "CLOSED"
+                expired_after_commit = True
+            else:
+                self._state = "ENTERED"
+        if expired_after_commit:
+            try:
+                await self._claim_store.needs_review(
+                    permit.claim_id, reason_code="permit_expired_after_gate_commit"
+                )
+            finally:
+                raise HandoffGateRefused("permit expired at handoff gate")
+
+    async def close(self) -> None:
+        async with self._lock:
+            self._state = "CLOSED"
 
 
 class ExternalEffectCoordinator:
@@ -326,10 +477,11 @@ class ExternalEffectCoordinator:
         claim_store: ExternalEffectClaimStore,
         *,
         reuse_policies: Mapping[str, ExternalEffectReusePolicy] | None = None,
+        permit_ttl_seconds: float = 5.0,
     ) -> None:
         self._claim_store = claim_store
         self._reuse_policies = dict(reuse_policies or {})
-        self._permits = _PermitRegistry()
+        self._permits = _PermitRegistry(ttl_seconds=permit_ttl_seconds)
         self._proof_issuer = object()
 
     async def send_one(
@@ -392,49 +544,43 @@ class ExternalEffectCoordinator:
 
         # Permit creation occurs only after the store reports a committed claim.
         permit = self._permits.issue(consume.claim_id, authority, prepared, key)
-        if not self._permits.burn_and_validate(permit, authority, prepared, key):
+        if not self._permits.is_valid(permit, authority, prepared, key):
             return await self._seal_zero_handoff(
-                consume.claim_id, handoff_count=0, reason_code="permit_validation_failed"
+                consume.claim_id, reason_code="permit_validation_failed"
             )
 
-        handoff_counter = _CoordinatorHandoffCounter(
-            claim_id=consume.claim_id,
-            issuer=self._proof_issuer,
-            expected_request_digest=prepared.application_request_sha256,
-            request=prepared.application_request,
+        gate = _HandoffGate(
+            claim_store=self._claim_store,
+            permit_registry=self._permits,
+            permit=permit,
+            authority=authority,
+            prepared=prepared,
+            key=key,
         )
         try:
             response = await transport.send(
                 prepared.application_request,
                 permit=permit,
-                handoff=handoff_counter.invoke,
+                prepared=prepared,
+                gate=gate,
             )
         except asyncio.CancelledError:
-            if handoff_counter.count == 0:
-                return await self._seal_zero_handoff(
-                    consume.claim_id,
-                    handoff_count=handoff_counter.count,
-                    reason_code="cancelled_before_handoff",
-                )
-            await self._seal_needs_review(consume.claim_id, "cancelled_after_handoff")
+            await gate.close()
+            await self._seal_needs_review(consume.claim_id, "cancelled_during_transport")
             return Ambiguous(consume.claim_id)
         except Exception:
-            if handoff_counter.count == 0:
-                return await self._seal_zero_handoff(
-                    consume.claim_id,
-                    handoff_count=handoff_counter.count,
-                    reason_code="transport_failed_before_handoff",
-                )
+            # Once transport.send has started, the coordinator cannot establish
+            # that the adapter did not bypass or detach the gate.
+            await gate.close()
             await self._seal_needs_review(consume.claim_id, "transport_outcome_unknown")
             return Ambiguous(consume.claim_id)
 
-        if handoff_counter.count == 0:
-            return await self._seal_zero_handoff(
-                consume.claim_id,
-                handoff_count=handoff_counter.count,
-                reason_code="transport_returned_without_handoff",
-            )
+        if not gate.entered:
+            await gate.close()
+            await self._seal_needs_review(consume.claim_id, "transport_returned_without_handoff")
+            return Ambiguous(consume.claim_id)
         if not isinstance(response, TransportResponse):
+            await gate.close()
             await self._seal_needs_review(consume.claim_id, "invalid_transport_response")
             return Ambiguous(consume.claim_id)
         try:
@@ -445,6 +591,7 @@ class ExternalEffectCoordinator:
             )
         except Exception:
             completed = False
+        await gate.close()
         if not completed:
             await self._seal_needs_review(consume.claim_id, "outcome_persist_failed")
             return Ambiguous(consume.claim_id)
@@ -514,12 +661,9 @@ class ExternalEffectCoordinator:
             return
 
     async def _seal_zero_handoff(
-        self, claim_id: UUID, *, handoff_count: int, reason_code: str
+        self, claim_id: UUID, *, reason_code: str
     ) -> DefinitelyNotSubmitted | Ambiguous:
-        if handoff_count != 0:
-            await self._seal_needs_review(claim_id, "invalid_zero_handoff_proof")
-            return Ambiguous(claim_id)
-        proof = _CoordinatorNoHandoffProof._issue(claim_id=claim_id, issuer=self._proof_issuer)
+        proof = _NO_HANDOFF_PROOFS.issue(claim_id, self._proof_issuer)
         try:
             changed = await self._claim_store.definitely_not_submitted(
                 claim_id, proof=proof, reason_code=reason_code
@@ -530,44 +674,6 @@ class ExternalEffectCoordinator:
             return DefinitelyNotSubmitted(claim_id, framework_proof=proof)
         await self._seal_needs_review(claim_id, "zero_handoff_seal_failed")
         return Ambiguous(claim_id)
-
-
-class _CoordinatorHandoffCounter:
-    """Coordinator-owned one-request gate passed to the injected transport."""
-
-    def __init__(
-        self,
-        *,
-        claim_id: UUID,
-        issuer: object,
-        expected_request_digest: str,
-        request: FrozenWireRequest,
-    ) -> None:
-        self.claim_id = claim_id
-        self.issuer = issuer
-        self.expected_request_digest = expected_request_digest
-        self.request = request
-        self.count = 0
-        self._lock = threading.Lock()
-
-    async def invoke(
-        self, operation: Callable[[], Awaitable[TransportResponse]]
-    ) -> TransportResponse:
-        with self._lock:
-            if self.count != 0:
-                raise RuntimeError("one physical handoff is permitted")
-            if application_request_sha256(self.request) != self.expected_request_digest:
-                raise ExternalEffectValidationError("wire request changed before handoff")
-            self.count = 1
-        return await operation()
-
-
-def _safe_reason_code(value: str) -> str:
-    if not isinstance(value, str) or not value or len(value) > 64:
-        return "framework_pre_handoff_failure"
-    if not all(char.isalnum() or char in "_-" for char in value):
-        return "framework_pre_handoff_failure"
-    return value
 
 
 __all__ = [
@@ -586,9 +692,10 @@ __all__ = [
     "ExternalEffectPolicyGuard",
     "ExternalEffectReusePolicy",
     "FrameworkNoSendProof",
+    "HandoffGateRefused",
     "PermitAwareTransport",
+    "PermitHandoffGate",
     "Refused",
-    "RequestHandoff",
     "ReuseDecision",
     "TransportResponse",
 ]

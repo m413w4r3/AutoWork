@@ -19,8 +19,8 @@ from cti_app.application.external_effects import (
     ConsumeCommitted,
     ConsumePolicyContext,
     ExternalEffectCoordinator,
+    PermitHandoffGate,
     Refused,
-    RequestHandoff,
     TransportResponse,
 )
 from cti_app.application.investigation_service import InvestigationService
@@ -82,16 +82,14 @@ class _CountingTransport:
         request: FrozenWireRequest,
         *,
         permit: ConsumedEffectPermit,
-        handoff: RequestHandoff,
+        prepared: PreparedExternalRequest,
+        gate: PermitHandoffGate,
     ) -> TransportResponse:
         self.send_entries += 1
-
-        async def physical_send() -> TransportResponse:
-            async with self._lock:
-                self.calls += 1
-            return TransportResponse(result_ref="artifact:pg-fake-result")
-
-        return await handoff(physical_send)
+        await gate.enter(permit, prepared)
+        async with self._lock:
+            self.calls += 1
+        return TransportResponse(result_ref="artifact:pg-fake-result")
 
 
 class _BarrierPolicyGuard:
@@ -284,6 +282,7 @@ async def _prepare_case(
                         sequence=1000 + index,
                     )
                 )
+                await session.flush()
                 session.add(
                     InvestigationBudgetReservationAmountRow(
                         investigation_id=seeded.investigation.id,

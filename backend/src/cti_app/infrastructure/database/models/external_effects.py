@@ -140,6 +140,7 @@ class ExternalEffectClaimRow(Base):
     approval_decision_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
     invocation_arguments_sha256: Mapped[str | None] = mapped_column(CHAR(64))
     state: Mapped[str] = mapped_column(String(32), nullable=False)
+    handoff_permit_nonce: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
     version: Mapped[int] = mapped_column(BigInteger, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     consumed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

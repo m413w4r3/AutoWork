@@ -478,13 +478,14 @@ def _validate_safe_reference(value: str, label: str, *, allow_non_reference: boo
             raise ExternalEffectValidationError(
                 f"credential-bearing URL is not persistable: {label}"
             )
-    if "://" in value or "?" in value:
+    if "://" in value or "?" in value or "#" in value:
         try:
-            query = urlsplit(value).query
+            parsed = urlsplit(value)
         except ValueError as exc:
             raise ExternalEffectValidationError(f"invalid URL is not persistable: {label}") from exc
-        sensitive_query_names = {
+        sensitive_parameter_names = {
             "access_token",
+            "access_key",
             "apikey",
             "auth",
             "authorization",
@@ -501,13 +502,16 @@ def _validate_safe_reference(value: str, label: str, *, allow_non_reference: boo
             "x_amz_security_token",
             "x_api_key",
         }
-        normalized_sensitive = {re.sub(r"[^a-z0-9]", "", name) for name in sensitive_query_names}
-        for name, _ in parse_qsl(query, keep_blank_values=True):
-            normalized_name = re.sub(r"[^a-z0-9]", "", unquote_plus(name).casefold())
-            if normalized_name in normalized_sensitive:
-                raise ExternalEffectValidationError(
-                    f"credential-bearing URL is not persistable: {label}"
-                )
+        normalized_sensitive = {
+            re.sub(r"[^a-z0-9]", "", name) for name in sensitive_parameter_names
+        }
+        for component in (parsed.query, parsed.fragment):
+            for name, _ in parse_qsl(component, keep_blank_values=True):
+                normalized_name = re.sub(r"[^a-z0-9]", "", unquote_plus(name).casefold())
+                if normalized_name in normalized_sensitive or normalized_name.startswith("xamz"):
+                    raise ExternalEffectValidationError(
+                        f"credential-bearing URL is not persistable: {label}"
+                    )
     if not allow_non_reference and not value.strip():
         raise ExternalEffectValidationError(f"{label} must not be empty")
 
