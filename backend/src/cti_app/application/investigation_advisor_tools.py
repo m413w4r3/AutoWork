@@ -524,17 +524,54 @@ class InvestigationAdvisorTool:
                 question=question,
             )
             if restricted_sample_hashes:
-                resolved_evidence_refs = tuple(
-                    dict.fromkeys(
-                        UUID(str(item["evidence_id"]))
-                        for item in prompt_data.get("evidence", ())
-                        if isinstance(item, Mapping) and isinstance(item.get("evidence_id"), str)
+                resolved_evidence_ref_values: list[UUID] = []
+                for item in prompt_data.get("evidence", ()):
+                    if not isinstance(item, Mapping) or not isinstance(
+                        item.get("evidence_id"), str
+                    ):
+                        continue
+                    try:
+                        resolved_evidence_ref_values.append(UUID(item["evidence_id"]))
+                    except ValueError:
+                        continue
+
+                prompt_finding_ids: set[UUID] = set()
+                for item in prompt_data.get("findings", ()):
+                    if not isinstance(item, Mapping) or not isinstance(item.get("finding_id"), str):
+                        continue
+                    try:
+                        prompt_finding_ids.add(UUID(item["finding_id"]))
+                    except ValueError:
+                        continue
+
+                finding_observation_refs: dict[UUID, tuple[UUID, ...]] = {}
+                if prompt_finding_ids:
+                    current_findings = await self._findings.list_for_investigation(
+                        context.investigation_id
                     )
-                )
+                    for finding in current_findings:
+                        finding_id = getattr(finding, "id", None)
+                        if (
+                            finding_id not in prompt_finding_ids
+                            or getattr(finding, "investigation_id", None)
+                            != context.investigation_id
+                        ):
+                            continue
+                        linked_refs = tuple(
+                            ref
+                            for ref in getattr(finding, "observation_refs", ())
+                            if isinstance(ref, UUID)
+                        )
+                        finding_observation_refs[finding_id] = linked_refs
+                        resolved_evidence_ref_values.extend(linked_refs)
+
+                unresolved_finding_ids = prompt_finding_ids.difference(finding_observation_refs)
+                resolved_evidence_refs = tuple(dict.fromkeys(resolved_evidence_ref_values))
                 resolved_evidence = await self._load_evidence(
                     context.investigation_id, resolved_evidence_refs
                 )
                 restricted_resolved_refs: list[UUID] = []
+                restricted_finding_ids: list[UUID] = []
                 for item in resolved_evidence:
                     references_restricted_sample = False
                     for sample_hash in restricted_sample_hashes:
@@ -543,7 +580,13 @@ class InvestigationAdvisorTool:
                             break
                     if references_restricted_sample:
                         restricted_resolved_refs.append(item.id)
-                if restricted_resolved_refs:
+                        restricted_finding_ids.extend(
+                            finding_id
+                            for finding_id, observation_refs in finding_observation_refs.items()
+                            if item.id in observation_refs
+                        )
+                if restricted_resolved_refs or unresolved_finding_ids:
+                    restricted_finding_ids.extend(unresolved_finding_ids)
                     return await self._persist_preflight_failure(
                         context,
                         consultation_type=consultation_type,
@@ -560,6 +603,15 @@ class InvestigationAdvisorTool:
                             ],
                             "disclosure_restricted_sample_count": len(restricted_resolved_refs),
                             "missing_refs": [str(item) for item in restricted_resolved_refs],
+                            **(
+                                {
+                                    "disclosure_restricted_finding_refs": [
+                                        str(item) for item in dict.fromkeys(restricted_finding_ids)
+                                    ]
+                                }
+                                if restricted_finding_ids
+                                else {}
+                            ),
                             "confirmed_non_execution": True,
                             "bridge_turns_consumed": 0,
                             "usable": False,
@@ -2635,14 +2687,102 @@ class InvestigationAdvisorTool:
                 measurements = []
             for measurement in measurements:
                 raw_value = measurement.get("value")
+                kind = str(measurement.get("kind", "measurement"))
+                declared_encoding = measurement.get("encoding")
+                encoding = (
+                    declared_encoding.casefold().replace("-", "")
+                    if isinstance(declared_encoding, str)
+                    else ""
+                )
+                fragment_bytes: bytes | None = None
+                if isinstance(raw_value, (bytes, bytearray, memoryview)):
+                    fragment_bytes = bytes(raw_value)
+                    sample_material = base64.b64encode(fragment_bytes).decode("ascii")
+                    encoding = "base64"
+                elif isinstance(raw_value, (list, tuple)) and all(
+                    type(value) is int and 0 <= value <= 255 for value in raw_value
+                ):
+                    fragment_bytes = bytes(raw_value)
+                    sample_material = base64.b64encode(fragment_bytes).decode("ascii")
+                    encoding = "base64"
+                else:
+                    sample_material = str(raw_value or "")
+                    if encoding in {"raw", "legacytyped"} and kind.casefold() == "hex":
+                        encoding = "hex"
+                    elif encoding == "legacytyped" and kind.casefold() in {"hex", "base64"}:
+                        encoding = kind.casefold()
+                    if isinstance(raw_value, str):
+                        compact_value = re.sub(r"\s+", "", raw_value)
+                        if encoding in {"hex", "hexdump"} or (
+                            kind.casefold() == "hex" and not encoding
+                        ):
+                            try:
+                                fragment_bytes = bytes.fromhex(compact_value)
+                                encoding = "hex"
+                            except ValueError:
+                                fragment_bytes = None
+                        elif encoding == "base64" or kind.casefold() == "base64":
+                            try:
+                                fragment_bytes = base64.b64decode(compact_value, validate=True)
+                                encoding = "base64"
+                            except (ValueError, binascii.Error):
+                                fragment_bytes = None
+                        elif kind.casefold() == "bytes":
+                            try:
+                                if compact_value and re.fullmatch(
+                                    r"(?i)(?:[0-9a-f]{2})+", compact_value
+                                ):
+                                    fragment_bytes = bytes.fromhex(compact_value)
+                                    encoding = "hex"
+                                else:
+                                    fragment_bytes = base64.b64decode(compact_value, validate=True)
+                                    encoding = "base64"
+                            except (ValueError, binascii.Error):
+                                fragment_bytes = None
+
+                sample_hash = measurement.get("sample_sha256")
+                sample_blob = await self._sample_blob_for_hash(
+                    investigation_id,
+                    item.object_id,
+                    sample_hash,
+                )
                 fact: dict[str, Any] = {
                     "evidence_id": str(item.id),
-                    "kind": str(measurement.get("kind", "measurement")),
-                    "sample_material": str(raw_value or ""),
+                    "kind": kind,
+                    "sample_material": sample_material,
                 }
                 offset = measurement.get("offset")
                 if type(offset) is int and offset >= 0:
                     fact["offset"] = offset
+                for key in ("length", "byte_length"):
+                    value = measurement.get(key)
+                    if type(value) is int and value >= 0:
+                        fact[key] = value
+                byte_length = len(fragment_bytes) if fragment_bytes is not None else None
+                if byte_length is not None:
+                    fact["byte_length"] = byte_length
+                if encoding and encoding != "legacytyped":
+                    fact["encoding"] = encoding
+                fragment_sha256 = (
+                    hashlib.sha256(fragment_bytes).hexdigest()
+                    if fragment_bytes is not None
+                    else measurement.get("fragment_sha256")
+                )
+                if isinstance(fragment_sha256, str) and re.fullmatch(
+                    r"(?i)[0-9a-f]{64}", fragment_sha256
+                ):
+                    fact["fragment_sha256"] = fragment_sha256
+                for key in ("sample_sha256", "evidence_sha256", "source_file"):
+                    value = measurement.get(key)
+                    if isinstance(value, str) and value:
+                        fact[key] = value
+                if sample_blob is not None:
+                    blob_id, _sample_sha256, association_id, mime_type = sample_blob
+                    fact["blob_id"] = str(blob_id)
+                    if association_id:
+                        fact["association_id"] = association_id
+                    if mime_type:
+                        fact["mime_type"] = mime_type
                 measured_payload.append(fact)
 
         finding_payload = [

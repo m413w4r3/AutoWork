@@ -4082,6 +4082,266 @@ async def test_draft_text_assertion_ref_to_restricted_sample_is_vetoed_after_res
     assert "RestrictedEditorialSampleMarker" not in safe_output
 
 
+@pytest.mark.asyncio
+async def test_draft_text_finding_ref_to_restricted_sample_is_vetoed_after_resolution() -> None:
+    investigation_id = uuid4()
+    sample_hash = "d" * 64
+    restriction_text = "Synthetic finding source restriction marker"
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": sample_hash,
+            "strings": [{"value": "RestrictedFindingSampleMarker", "offset": 128}],
+        },
+    )
+    finding = InvestigationFinding(
+        investigation_id=investigation_id,
+        kind=FindingKind.CAPABILITY,
+        assessment=FindingAssessment.SUPPORTED,
+        statement="Restricted finding statement marker.",
+        observation_refs=(observation.id,),
+    )
+    transport = Transport(
+        TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="must not be called")
+    )
+    tool, sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+    _attach_sample_policy(
+        tool,
+        sample_blob_id,
+        sample_hash,
+        license_restriction=restriction_text,
+    )
+    tool._findings = FindingRepository((finding,))
+
+    result = await tool.execute(
+        {
+            "consultation_type": "draft_text",
+            "units": [
+                {
+                    "id": "U1",
+                    "block_type": "uncertainties_and_next_leads",
+                    "form": "body",
+                    "anchor": None,
+                    "assertions": [
+                        {
+                            "id": "finding-a1",
+                            "text": "Synthetic assertion citing a finding.",
+                            "nature": "analyse",
+                            "refs": [{"kind": "finding", "id": str(finding.id)}],
+                            "block_type": "uncertainties_and_next_leads",
+                            "form": "body",
+                            "anchor": None,
+                        }
+                    ],
+                }
+            ],
+        },
+        make_context(investigation_id, key="operator:advisor:restricted-finding-reference"),
+    )
+
+    assert transport.calls == []
+    assert result.output["advisor_status"] == "disclosure_restricted"
+    assert result.output["failure_stage"] == "sample_disclosure_restricted"
+    assert result.output["confirmed_non_execution"] is True
+    assert str(finding.id) in result.output["disclosure_restricted_finding_refs"]
+    safe_output = repr(result.output)
+    assert restriction_text not in safe_output
+    assert "RestrictedFindingSampleMarker" not in safe_output
+    assert "Restricted finding statement marker" not in safe_output
+
+
+@pytest.mark.asyncio
+async def test_draft_text_unrelated_finding_remains_eligible() -> None:
+    investigation_id = uuid4()
+    restricted_hash = "d" * 64
+    unrelated_hash = "e" * 64
+    observation, raw = make_observation(
+        investigation_id,
+        {
+            "schema": "sample-obfuscated-strings.v1",
+            "sample_sha256": unrelated_hash,
+            "strings": [{"value": "PermittedFindingSampleMarker", "offset": 128}],
+        },
+    )
+    finding = InvestigationFinding(
+        investigation_id=investigation_id,
+        kind=FindingKind.CAPABILITY,
+        assessment=FindingAssessment.SUPPORTED,
+        statement="Unrelated finding remains eligible for consultation.",
+        observation_refs=(observation.id,),
+    )
+    transport = Transport(
+        TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="synthetic response")
+    )
+    tool, sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+    _attach_sample_policy(
+        tool,
+        sample_blob_id,
+        restricted_hash,
+        license_restriction="Synthetic restriction for an unreferenced sample",
+    )
+    tool._findings = FindingRepository((finding,))
+
+    await tool.execute(
+        {
+            "consultation_type": "draft_text",
+            "units": [
+                {
+                    "id": "U1",
+                    "block_type": "uncertainties_and_next_leads",
+                    "form": "body",
+                    "anchor": None,
+                    "assertions": [
+                        {
+                            "id": "unrelated-finding-a1",
+                            "text": "Synthetic assertion citing an unrelated finding.",
+                            "nature": "analyse",
+                            "refs": [{"kind": "finding", "id": str(finding.id)}],
+                            "block_type": "uncertainties_and_next_leads",
+                            "form": "body",
+                            "anchor": None,
+                        }
+                    ],
+                }
+            ],
+        },
+        make_context(investigation_id, key="operator:advisor:unrelated-finding-reference"),
+    )
+
+    assert len(transport.calls) == 1
+    assert "Unrelated finding remains eligible" in transport.calls[0]["prompt"]
+    assert "Synthetic restriction for an unreferenced sample" not in transport.calls[0]["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_editorial_measurements_keep_fragment_provenance_for_byte_representations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cti_app.application.advisor_dossier import build_advisor_dossier
+
+    investigation_id = uuid4()
+    sample_hash = "f" * 64
+    observation, raw = make_observation(
+        investigation_id,
+        {"schema": "generic-observation.v1", "content": "Editorial byte measurement fixture."},
+    )
+    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
+    tool, sample_blob_id = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
+    _attach_sample_policy(tool, sample_blob_id, sample_hash)
+    association_id = uuid4()
+    tool._sample_associations = SimpleNamespace(
+        list_for_investigation=async_get(
+            (SimpleNamespace(id=association_id, sample_sha256=sample_hash),)
+        )
+    )
+    tool._blobs.descriptors[
+        sample_blob_id
+    ].descriptor.mime_type = "application/x-editorial-fragment; version=2"
+    expected_bytes = bytes((0, 255))
+    expected_digest = hashlib.sha256(expected_bytes).hexdigest()
+    measurement_rows = (
+        {
+            "kind": "hex",
+            "value": "00ff",
+            "encoding": "raw",
+            "offset": 11,
+            "length": 2,
+            "sample_sha256": sample_hash,
+        },
+        {
+            "kind": "base64",
+            "value": "AP8=",
+            "encoding": "base64",
+            "offset": 22,
+            "length": 2,
+            "sample_sha256": sample_hash,
+        },
+        {
+            "kind": "bytes",
+            "value": expected_bytes,
+            "encoding": "bytes",
+            "offset": 33,
+            "length": 2,
+            "sample_sha256": sample_hash,
+        },
+        {
+            "kind": "bytes",
+            "value": [0, 255],
+            "encoding": "bytes",
+            "offset": 44,
+            "length": 2,
+            "sample_sha256": sample_hash,
+        },
+    )
+
+    async def editorial_measurement_rows(_observation):
+        return [dict(row) for row in measurement_rows]
+
+    monkeypatch.setattr(tool, "_measurement_rows", editorial_measurement_rows)
+    (
+        _observation_items,
+        evidence_rows,
+        measured_rows,
+        _finding_rows,
+    ) = await tool._editorial_reference_facts(
+        investigation_id=investigation_id,
+        evidence=(),
+        prompt_data={
+            "assertions": [{"refs": [{"kind": "observation", "id": str(observation.id)}]}]
+        },
+    )
+
+    assert len(measured_rows) == 4
+    for row, offset, encoding in zip(
+        measured_rows, (11, 22, 33, 44), ("hex", "base64", "base64", "base64"), strict=True
+    ):
+        assert row["offset"] == offset
+        assert row["encoding"] == encoding
+        assert row["byte_length"] == 2
+        assert row["length"] == 2
+        assert row["fragment_sha256"] == expected_digest
+        assert row["evidence_id"] == str(observation.id)
+        assert row["blob_id"] == str(sample_blob_id)
+        assert row["association_id"] == str(association_id)
+        assert row["mime_type"] == "application/x-editorial-fragment; version=2"
+
+    dossier = build_advisor_dossier(
+        {
+            "evidence": evidence_rows,
+            "measured_facts": measured_rows,
+            "assertions": [{"refs": [{"kind": "observation", "id": str(observation.id)}]}],
+        }
+    )
+    for offset, encoding in zip(
+        (11, 22, 33, 44), ("hex", "base64", "base64", "base64"), strict=True
+    ):
+        assert f"offset {offset}" in dossier.text
+        assert f"encoding={encoding}" in dossier.text
+    assert f"fragment_sha256={expected_digest}" in dossier.text
+    assert f"association_id={association_id}" in dossier.text
+    assert f"evidence_id={observation.id}" in dossier.text
+    assert f"blob_id={sample_blob_id}" in dossier.text
+    assert "byte_length=2" in dossier.text
+    assert "length=2" in dossier.text
+    assert "mime_type=application/x-editorial-fragment; version=2" in dossier.text
+
+
 def test_context_truncation_stops_at_sentence_or_word_and_marks_ellipsis() -> None:
     sentence = _truncate_context_text(
         "Première phrase complète. Deuxième phrase qui continue sans fin.", 30

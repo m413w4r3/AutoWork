@@ -791,15 +791,74 @@ def build_advisor_dossier(prompt_data: Mapping[str, Any]) -> AdvisorDossier:
                 pieces.append(f"{title}:\n{_quote(body)}")
                 row_score = max(row_score, score, 1 if explicitly_referenced_observation else 0)
         for fact in (*measurement_rows, *typed_measurements):
-            value = _as_text(fact.get("sample_material", fact.get("value")))
+            raw_value = fact.get("sample_material", fact.get("value"))
+            value = _as_text(raw_value)
             if not value or value in {"…", "..."}:
                 continue
             kind = _as_text(fact.get("kind")) or "mesure"
             offset = fact.get("offset")
-            if type(offset) is int and offset >= 0:
-                fact_text = f"{kind}, offset {offset}: {value}"
-            else:
-                fact_text = f"{kind}: {value}"
+            declared_encoding = _as_text(fact.get("encoding")).casefold().replace("-", "")
+            if declared_encoding in {"raw", "legacytyped"} and kind.casefold() == "hex":
+                declared_encoding = "hex"
+            elif declared_encoding == "legacytyped" and kind.casefold() in {"hex", "base64"}:
+                declared_encoding = kind.casefold()
+            byte_encoding = (
+                declared_encoding
+                if declared_encoding in {"hex", "hexdump", "base64", "bytes"}
+                else kind.casefold()
+                if kind.casefold() in {"hex", "hexdump", "base64", "bytes"}
+                else ""
+            )
+            fragment_bytes = _advisor_fragment_bytes(raw_value, byte_encoding)
+            if isinstance(raw_value, (bytes, bytearray, memoryview)) or (
+                isinstance(raw_value, (list, tuple))
+                and all(type(byte) is int and 0 <= byte <= 255 for byte in raw_value)
+            ):
+                fragment_bytes = _advisor_fragment_bytes(raw_value, "bytes")
+                byte_encoding = "base64"
+                if fragment_bytes is not None:
+                    value = base64.b64encode(fragment_bytes).decode("ascii")
+            byte_length = (
+                len(fragment_bytes)
+                if fragment_bytes is not None
+                else fact.get("byte_length", fact.get("length"))
+            )
+            declared_fragment_sha256 = _as_text(fact.get("fragment_sha256"))
+            full_digest = (
+                hashlib.sha256(fragment_bytes).hexdigest()
+                if fragment_bytes is not None
+                else declared_fragment_sha256
+                if re.fullmatch(r"(?i)[0-9a-f]{64}", declared_fragment_sha256)
+                else ""
+            )
+            is_byte_fragment = byte_encoding in {"hex", "hexdump", "base64", "bytes"} or (
+                kind.casefold() in {"hex", "hexdump", "base64", "bytes"}
+            )
+            provenance = []
+            if is_byte_fragment and byte_encoding:
+                provenance.append(f"encoding={byte_encoding}")
+            if is_byte_fragment and type(byte_length) is int and byte_length >= 0:
+                provenance.append(f"byte_length={byte_length}")
+            declared_length = fact.get("length")
+            if is_byte_fragment and type(declared_length) is int and declared_length >= 0:
+                provenance.append(f"length={declared_length}")
+            if is_byte_fragment and full_digest:
+                provenance.extend((f"sha256={full_digest}", f"fragment_sha256={full_digest}"))
+            if is_byte_fragment:
+                for key in ("evidence_id", "blob_id", "association_id"):
+                    identifier_value = _as_text(fact.get(key))
+                    if identifier_value:
+                        provenance.append(f"{key}={identifier_value}")
+                sample_sha256 = _as_text(fact.get("sample_sha256"))
+                if sample_sha256:
+                    provenance.append(f"sample_sha256={sample_sha256}")
+                mime_type = _as_text(fact.get("mime_type", fact.get("mime")))
+                if mime_type:
+                    provenance.append(f"mime_type={mime_type[:512]}")
+            location = f"offset {offset}" if type(offset) is int and offset >= 0 else ""
+            fact_text = f"{kind}, {location}: {value}" if location else f"{kind}: {value}"
+            if provenance:
+                fact_text += " [" + "; ".join(provenance) + "]"
             score = _relevance_score(task_terms, fact_text)
             if _numeric_targets_conflict(relevance_text, fact_text):
                 score = 0
