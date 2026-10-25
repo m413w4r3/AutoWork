@@ -454,6 +454,28 @@ class InvestigationService:
                 raise ValueError("The pending Bridge turn still has an active owner job")
             if disposition == "orphaned_running_turn":
                 state = await self._require_state(investigation_id)
+        running_invocations = tuple(
+            item
+            for item in await self._invocations.list_for_investigation(investigation_id)
+            if item.status is ToolInvocationStatus.RUNNING
+        )
+        for invocation in running_invocations:
+            reviewed = invocation.transition(ToolInvocationStatus.NEEDS_REVIEW)
+            await self._invocations.update_if_version(reviewed, expected_version=invocation.version)
+        if running_invocations:
+            await self._commit_current_uow()
+        proof_resolved = False
+        for invocation in await self._unresolved_tool_invocations(investigation_id):
+            if invocation.status is not ToolInvocationStatus.NEEDS_REVIEW:
+                continue
+            proof = await self._framework_pre_submission_proof(invocation)
+            if proof is None:
+                continue
+            resolved = invocation.resolve_pre_submission_failure()
+            await self._invocations.update_if_version(resolved, expected_version=invocation.version)
+            proof_resolved = True
+        if proof_resolved:
+            await self._commit_current_uow()
         unresolved = await self._unresolved_tool_invocations(investigation_id)
         if unresolved:
             raise ValueError(
@@ -490,6 +512,43 @@ class InvestigationService:
             for item in await self._invocations.list_for_investigation(investigation_id)
             if item.status in {ToolInvocationStatus.RUNNING, ToolInvocationStatus.NEEDS_REVIEW}
         )
+
+    async def _framework_pre_submission_proof(
+        self, invocation: ToolInvocation
+    ) -> FrameworkPreSubmissionProof | None:
+        envelope = await self._envelopes.get(invocation.investigation_id)
+        if envelope is None:
+            return None
+        reservation = next(
+            (
+                item
+                for item in envelope.budget.reservations
+                if item.operation_key == invocation.operation_key
+            ),
+            None,
+        )
+        if (
+            reservation is None
+            or reservation.status is not BudgetReservationStatus.RELEASED
+            or dict(reservation.amounts) != dict(invocation.reserved_budget)
+        ):
+            return None
+        for observation_id in invocation.response_refs:
+            observation = await self._observations.get(observation_id)
+            if (
+                observation is None
+                or observation.investigation_id != invocation.investigation_id
+                or observation.invocation_ref != invocation.id
+                or observation.source != invocation.tool_name
+                or observation.source_version != invocation.schema_version
+                or observation.object_id != invocation.operation_key
+            ):
+                continue
+            try:
+                return FrameworkPreSubmissionProof(observation.object_type)
+            except ValueError:
+                continue
+        return None
 
     async def interrupt(
         self, investigation_id: UUID, *, expected_version: int | None = None
@@ -1684,7 +1743,11 @@ class InvestigationService:
                 _action_summary(invocation.tool_name, result.status, outcome_message)
             )
             if result.status is ToolInvocationStatus.NEEDS_REVIEW:
-                return state, StopReason.SUBMISSION_NEEDS_REVIEW
+                return state, (
+                    StopReason.PERMISSION_REQUIRED
+                    if _confirmed_external_non_execution(result)
+                    else StopReason.SUBMISSION_NEEDS_REVIEW
+                )
             # An ordinary policy denial is local to the operation; G2 reductions above
             # end this turn before any other proposed external operation is started.
 

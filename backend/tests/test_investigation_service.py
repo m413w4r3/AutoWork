@@ -82,6 +82,7 @@ from cti_app.domain.investigation import (
     EvidenceObservation,
     FindingAssessment,
     FindingKind,
+    FrameworkPreSubmissionProof,
     InvestigationBudget,
     InvestigationEnvelope,
     InvestigationExecutionMode,
@@ -275,7 +276,9 @@ class _ObservationWriter:
             source_version=invocation.schema_version,
             observed_at=datetime.now(UTC),
             object_type=(
-                "provider_authorization_refusal"
+                result.framework_pre_submission_proof.value
+                if result.framework_pre_submission_proof is not None
+                else "provider_authorization_refusal"
                 if result.output.get("reason") == "provider_authorization_refused"
                 else {
                     "provider_download_route_not_found": "provider_download_route_refused",
@@ -2749,6 +2752,145 @@ async def test_running_invocation_is_committed_before_dispatch_and_never_replaye
         len([item for item in envelope.budget.reservations if item.operation_key == operation_key])
         == 1
     )
+
+
+@pytest.mark.asyncio
+async def test_interrupted_running_invocation_requires_reconciliation_before_progress() -> None:
+    ambiguous_call = _tool_call("vt.search", "synthetic:stopped", "check the interrupted lookup")
+    later_call = _tool_call("network.lookup", "synthetic:later", "continue after reconciliation")
+    fixture = _Fixture(
+        responses=[
+            _decision(goal="start the lookup", next_action="continue", tools=(ambiguous_call,)),
+            _decision(
+                goal="continue after reconciliation", next_action="continue", tools=(later_call,)
+            ),
+            _decision(goal="finish", next_action="finish"),
+        ],
+        tools=(("vt.search", "vt"), ("network.lookup", "network")),
+    )
+    state = await fixture.start()
+    operation_key, _ = _operation_and_observation_id(state.investigation_id, ambiguous_call)
+    original_dispatcher = fixture.service._dispatcher
+
+    class _CrashBeforeDispatch:
+        async def dispatch(self, *_args, **_kwargs):
+            raise RuntimeError("simulated crash after durable RUNNING journal")
+
+    fixture.service._dispatcher = _CrashBeforeDispatch()
+    with pytest.raises(RuntimeError, match="durable RUNNING journal"):
+        await fixture.service.run(state.investigation_id)
+
+    invocation = await fixture.invocations.get_by_operation_key(operation_key)
+    assert invocation is not None
+    assert invocation.status is ToolInvocationStatus.RUNNING
+    assert fixture.tools["vt.search"].calls == []
+    stopped = await fixture.service.interrupt(state.investigation_id)
+    assert stopped.stop_reason is StopReason.USER_INTERRUPT
+    fixture.service._dispatcher = original_dispatcher
+
+    with pytest.raises(ValueError, match="reconciled before resuming"):
+        await fixture.service.resume(state.investigation_id)
+    invocation = await fixture.invocations.get_by_operation_key(operation_key)
+    assert invocation is not None
+    assert invocation.status is ToolInvocationStatus.NEEDS_REVIEW
+    assert fixture.tools["vt.search"].calls == []
+
+    await fixture.service.reconcile_invocation(
+        state.investigation_id,
+        invocation.id,
+        outcome=InvocationReconciliationOutcome.NOT_EXECUTED,
+        actor="analyst-1",
+        reason="The worker crashed before entering the adapter.",
+        expected_version=invocation.version,
+        idempotency_key="stopped-running-not-executed",
+    )
+    await fixture.service.resume(state.investigation_id)
+    completed = await fixture.service.run(state.investigation_id)
+
+    assert completed.stop_reason is StopReason.AGENT_FINISHED
+    assert fixture.tools["vt.search"].calls == []
+    assert fixture.tools["network.lookup"].calls == [later_call["arguments"]]
+    reconciled = await fixture.invocations.get_by_operation_key(operation_key)
+    assert reconciled is not None
+    assert reconciled.status is ToolInvocationStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_framework_budget_refusal_resumes_after_budget_extension_without_duplicate_call() -> (
+    None
+):
+    call = _tool_call("vt.search", "synthetic:budget", "query within the approved budget")
+    fixture = _Fixture(
+        responses=[
+            _decision(goal="query the sample", next_action="continue", tools=(call,)),
+            _decision(goal="retry after budget extension", next_action="continue", tools=(call,)),
+            _decision(goal="finish", next_action="finish"),
+            _decision(goal="replay the successful query", next_action="continue", tools=(call,)),
+            _decision(goal="finish after replay", next_action="finish"),
+        ],
+        tools=(("vt.search", "vt"),),
+    )
+    fixture.envelope = replace(
+        fixture.envelope,
+        budget=InvestigationBudget(
+            limits={
+                **fixture.envelope.budget.limits,
+                BudgetDimension.VT_UNITS: 0,
+            }
+        ),
+    )
+    state = await fixture.start()
+
+    refused = await fixture.service.run(state.investigation_id)
+
+    assert refused.stop_reason is StopReason.PERMISSION_REQUIRED
+    assert fixture.tools["vt.search"].calls == []
+    invocations = await fixture.invocations.list_for_investigation(state.investigation_id)
+    assert len(invocations) == 1
+    refusal = invocations[0]
+    assert refusal.status is ToolInvocationStatus.NEEDS_REVIEW
+    assert len(refusal.response_refs) == 1
+    proof_observation = await fixture.observations.get(refusal.response_refs[0])
+    assert proof_observation is not None
+    assert proof_observation.object_type == FrameworkPreSubmissionProof.BUDGET_REJECTED.value
+    envelope = await fixture.envelopes.get(state.investigation_id)
+    assert envelope is not None
+    refusal_reservation = next(
+        item for item in envelope.budget.reservations if item.operation_key == refusal.operation_key
+    )
+    assert refusal_reservation.status is BudgetReservationStatus.RELEASED
+
+    extended_budget = InvestigationBudget(
+        limits={**envelope.budget.limits, BudgetDimension.VT_UNITS: 1}
+    )
+    for reservation in envelope.budget.reservations:
+        extended_budget.restore_reservation(reservation)
+    await fixture.envelopes.save_if_version(
+        replace(envelope, budget=extended_budget, version=envelope.version + 1),
+        expected_version=envelope.version,
+    )
+    assert fixture.tools["vt.search"].calls == [], "no adapter call may precede the extension"
+
+    await fixture.service.resume(state.investigation_id)
+    refusal = await fixture.invocations.get_by_operation_key(refusal.operation_key)
+    assert refusal is not None
+    assert refusal.status is ToolInvocationStatus.FAILED
+    completed = await fixture.service.run(state.investigation_id)
+    assert completed.stop_reason is StopReason.AGENT_FINISHED
+    assert fixture.tools["vt.search"].calls == [call["arguments"]]
+
+    await fixture.service.resume(state.investigation_id)
+    replayed = await fixture.service.run(state.investigation_id)
+    assert replayed.stop_reason is StopReason.AGENT_FINISHED
+    assert fixture.tools["vt.search"].calls == [call["arguments"]]
+    invocations = await fixture.invocations.list_for_investigation(state.investigation_id)
+    assert len(invocations) == 2
+    assert [item.status for item in invocations] == [
+        ToolInvocationStatus.FAILED,
+        ToolInvocationStatus.SUCCEEDED,
+    ]
+    assert invocations[0].operation_key != invocations[1].operation_key
+    assert invocations[1].operation_key.startswith(f"{invocations[0].operation_key}:retry:1")
 
 
 @pytest.mark.asyncio
