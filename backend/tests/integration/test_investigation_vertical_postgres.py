@@ -664,16 +664,19 @@ async def test_real_postgres_tool_path_classifies_vt_download_route_404_as_needs
             f"/api/v3/files/{material.sample_hash}/download_url",
         ]
         # The 404 body cannot be attributed to VT or its proxy, so the external
-        # outcome is ambiguous and must be reconciled before any retry.
+        # outcome is ambiguous and must be reconciled before any retry. An
+        # ambiguous adapter outcome deliberately carries no evidence refs.
         assert invocation.status is ToolInvocationStatus.NEEDS_REVIEW
-        assert invocation.response_refs
-        assert invocation.consumed_budget
+        assert invocation.response_refs == ()
+        assert invocation.consumed_budget == {}
         # Its plain ledger code (rather than an opaque refusal-cache marker)
         # keeps this 404 diagnostic and retryable after the route/config changes.
         assert failed_attempt is not None
         assert failed_attempt.error_code == "virustotal_download_404_origin_unknown"
         assert envelope is not None
-        assert not any(item.status.value == "reserved" for item in envelope.budget.reservations)
+        # The ambiguous reservation is retained until reconciliation so a retry
+        # cannot consume the same budget a second time.
+        assert any(item.status.value == "reserved" for item in envelope.budget.reservations)
     finally:
         await vt_client.aclose()
 
@@ -819,15 +822,21 @@ async def test_real_postgres_exhausted_loop_acquisition_budget_is_not_ambiguous(
             f"{persisted.budget.max_vt_read_units if persisted is not None else None}/"
             f"{persisted.budget.consumed_vt_read_units if persisted is not None else None}"
         )
+        # The adapter's deterministic local refusal is not framework-attested:
+        # the dispatcher cannot prove adapter non-entry, so the invocation is
+        # conservatively reconciled as ambiguous and carries no evidence refs.
         assert invocation.status is ToolInvocationStatus.NEEDS_REVIEW
-        assert any(
+        assert invocation.response_refs == ()
+        assert not any(
             item.object_type == FrameworkPreSubmissionProof.BUDGET_REJECTED.value
             for item in observations
         )
-        assert invocation.response_refs
         assert all(amount == 0 for amount in invocation.consumed_budget.values())
         assert envelope is not None
-        assert not any(item.status.value == "reserved" for item in envelope.budget.reservations)
+        # The ambiguous reservation is held until reconciliation even though the
+        # adapter made no provider call; releasing it early would allow a double
+        # spend if the adapter's local refusal were later contradicted.
+        assert any(item.status.value == "reserved" for item in envelope.budget.reservations)
         assert persisted is not None
         assert persisted.budget.consumed_vt_read_units == consumed_vt_units
         assert persisted.budget.consumed_hits_acquired == consumed_hits
