@@ -13,6 +13,7 @@ from cti_app.application.advisor_contracts import (
     parse_typed_advisor_response,
 )
 from cti_app.application.advisor_dossier import build_advisor_dossier, extract_content_excerpts
+from cti_app.application.advisor_prompt import render_advisor_prompt
 from cti_app.application.advisor_wire import (
     advisor_wire_aliases,
     parse_advisor_wire,
@@ -20,7 +21,6 @@ from cti_app.application.advisor_wire import (
 )
 from cti_app.application.investigation_advisor_tools import (
     ADVISOR_RESPONSE_SCHEMA,
-    InvestigationAdvisorTool,
     _parse_advisor_output,
     _safe_text,
 )
@@ -395,7 +395,7 @@ def test_archived_corpus_c01_to_c13_replays_as_compact_resolvable_text_dossiers(
             if item.get("kind") == "finding" and str(item.get("id")) in finding_lines
         )
         replay["dossier_manifest"] = [dict(item) for item in dossier.manifest]
-        prompt = InvestigationAdvisorTool._prompt(str(replay["consultation_type"]), replay)
+        prompt = render_advisor_prompt(str(replay["consultation_type"]), replay)
         new_prompt_bytes = len(prompt.encode("utf-8"))
         size_comparison.append((old_prompt_bytes, new_prompt_bytes))
         dossier_region = prompt.split("DOSSIER DE FAITS\n", 1)[1].split("\nQUALITÉ:", 1)[0]

@@ -21,6 +21,7 @@ from cti_app.application.advisor_dossier import (
     build_advisor_dossier,
     evaluate_advisor_evidence_preflight,
 )
+from cti_app.application.advisor_prompt import render_advisor_prompt
 from cti_app.application.advisor_wire import ADVISOR_WIRE_VERSION, advisor_wire_aliases
 from cti_app.application.bridge_investigator import (
     INVESTIGATION_PROMPT_VERSION,
@@ -28,7 +29,6 @@ from cti_app.application.bridge_investigator import (
 )
 from cti_app.application.investigation_advisor_tools import (
     ADVISOR_SCHEMA_VERSION,
-    InvestigationAdvisorTool,
     _safe_text,
 )
 from cti_app.application.investigation_contracts import (
@@ -278,7 +278,7 @@ def _prompt_hashes() -> dict[str, Any]:
             }
         ],
     }
-    advisor_prompt = InvestigationAdvisorTool._prompt("draft_text", advisor_data)
+    advisor_prompt = render_advisor_prompt("draft_text", advisor_data)
     return {
         "investigation": {
             "version": INVESTIGATION_PROMPT_VERSION,
@@ -370,7 +370,7 @@ def _evaluate_case(case: dict[str, Any]) -> dict[str, Any]:
         aliases = advisor_wire_aliases(data)["assertions"]
         assert case["allowed_aliases"] == list(aliases)
         dossier = build_advisor_dossier(data)
-        prompt = InvestigationAdvisorTool._prompt(data["consultation_type"], data)
+        prompt = render_advisor_prompt(data["consultation_type"], data)
         preflight = evaluate_advisor_evidence_preflight(data, dossier, prompt)
         preflight_status = preflight["status"]
         preflight_allows_submission = preflight_status == "READY"

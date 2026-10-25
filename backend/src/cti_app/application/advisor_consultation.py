@@ -15,6 +15,7 @@ from cti_app.application.advisor_dossier import (
     build_advisor_dossier,
     evaluate_advisor_evidence_preflight,
 )
+from cti_app.application.advisor_prompt import render_advisor_prompt
 from cti_app.application.publication_secret_guard import (
     contains_operational_secrets,
     redact_operational_secrets,
@@ -193,11 +194,7 @@ def _prepare_projection(projection: Mapping[str, Any]) -> PreparedConsultation |
     if not isinstance(prompt_data.get("transmitted_refs"), (list, tuple)):
         prompt_data["transmitted_refs"] = []
 
-    # Reuse the existing pure renderer so the dormant prepared path has the
-    # same wire shape as the current advisor prompt.
-    from cti_app.application.investigation_advisor_tools import InvestigationAdvisorTool
-
-    prompt = InvestigationAdvisorTool._prompt(consultation_type, prompt_data)
+    prompt = render_advisor_prompt(consultation_type, prompt_data)
     prompt_utf8 = prompt.encode("utf-8")
     completeness = evaluate_advisor_evidence_preflight(prompt_data, dossier, prompt)
     conflicts = _identity_conflicts(prompt_data, dossier, raw_manifest=raw_manifest)

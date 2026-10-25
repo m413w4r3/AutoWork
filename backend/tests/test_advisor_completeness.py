@@ -13,15 +13,13 @@ from cti_app.application.advisor_dossier import (
     evaluate_advisor_evidence_preflight,
     extract_content_excerpts,
 )
+from cti_app.application.advisor_prompt import render_advisor_prompt
 from cti_app.application.bridge_investigator import (
     ScriptedTurnTransport,
     TurnSubmission,
     TurnSubmissionStatus,
 )
-from cti_app.application.investigation_advisor_tools import (
-    InvestigationAdvisorTool,
-    _advisor_payload_was_submitted,
-)
+from cti_app.application.investigation_advisor_tools import _advisor_payload_was_submitted
 
 
 def _planning_data(*, question: str, evidence: list[dict], findings: list[dict]) -> dict:
@@ -749,7 +747,7 @@ async def test_large_dossier_crosses_bridge_file_threshold_without_omission() ->
         dossier_bytes=dossier.byte_size,
         dossier_manifest=[dict(row) for row in dossier.manifest],
     )
-    prompt = InvestigationAdvisorTool._prompt("draft_text", data)
+    prompt = render_advisor_prompt("draft_text", data)
     payload = prompt.encode("utf-8")
     simulated_bridge_mode = "text_file" if len(payload) > 200_000 else "inline"
     assert simulated_bridge_mode == "text_file"

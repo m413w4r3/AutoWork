@@ -6,7 +6,7 @@ import re
 
 from cti_app.application.bridge_investigator import render_investigation_prompt
 from cti_app.application.invariant_proposals import _render_prompt as render_p10_prompt
-from cti_app.application.investigation_advisor_tools import InvestigationAdvisorTool
+from cti_app.application.advisor_prompt import render_advisor_prompt
 
 _FORBIDDEN_FORMAT_REQUEST = re.compile(r"\bjson\b|json\s+object|application/json", re.IGNORECASE)
 _CONSULTATION_TYPES = (
@@ -31,7 +31,7 @@ def _string_literals(function: object) -> str:
 
 def test_investigation_bridge_prompts_request_only_text_wire_formats() -> None:
     for consultation_type in _CONSULTATION_TYPES:
-        prompt = InvestigationAdvisorTool._prompt(consultation_type, {})
+        prompt = render_advisor_prompt(consultation_type, {})
         format_instructions = prompt.split("<UNTRUSTED_ADVISORY_INPUT>", 1)[0]
         assert "advisor-wire.v1" in format_instructions
         assert _FORBIDDEN_FORMAT_REQUEST.search(format_instructions) is None
