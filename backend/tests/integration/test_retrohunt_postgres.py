@@ -155,13 +155,20 @@ def _approved_review(investigation_id: UUID, suffix: str):
     roles.extend(
         {
             "role": role,
-            "corpus_sha256s": [],
+            "corpus_sha256s": [sample],
             "matches": [],
-            "non_matches": [],
+            "non_matches": [sample],
             "non_measurable": [],
             "errors": [],
         }
-        for role in ("goodware", "out_of_cluster_candidate", "holdout")
+        for role, sample in (
+            ("goodware", hashlib.sha256(f"goodware:{suffix}".encode()).hexdigest()),
+            (
+                "out_of_cluster_candidate",
+                hashlib.sha256(f"candidate:{suffix}".encode()).hexdigest(),
+            ),
+            ("holdout", hashlib.sha256(f"holdout:{suffix}".encode()).hexdigest()),
+        )
     )
     decision = AnalystDecision(
         investigation_id=investigation_id,
