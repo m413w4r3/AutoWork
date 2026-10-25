@@ -134,6 +134,26 @@ class _SimulatedModelAdapter:
         raise AssertionError("The recovery path must not resume or resubmit a provider request.")
 
 
+class _CrashingGateway:
+    """Delegate to the real gateway but kill the worker before submission.
+
+    ``ModelConversationService.add_turn`` commits the RUNNING turn and the
+    pre-submission ModelRun before it calls ``gateway.execute``. Raising a
+    BaseException here therefore leaves a durable, provable
+    ``NOT_SUBMITTED`` state with no bridge request id and no provider call.
+    """
+
+    def __init__(self, inner: ModelGateway) -> None:
+        self._inner = inner
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    async def execute(self, request: Any, role: ModelRole) -> Any:
+        del request, role
+        raise _SimulatedWorkerDeath("worker died before the durable submission claim")
+
+
 @dataclass(slots=True)
 class _Runtime:
     engine: Any
@@ -155,6 +175,8 @@ def _build_runtime(
     database_url: str,
     blob_root: Path,
     provider_fake: _ProviderSideFake,
+    *,
+    crash_before_submission: bool = False,
 ) -> _Runtime:
     engine = create_postgres_engine(database_url)
     session_factory = create_session_factory(engine)
@@ -178,7 +200,8 @@ def _build_runtime(
         uow_factory,
         BlobModelOutputStore(BlobCatalogService(blob_store, uow_factory)),
     )
-    model_conversations = ModelConversationService(uow_factory, gateway, blob_store)
+    conversation_gateway: Any = _CrashingGateway(gateway) if crash_before_submission else gateway
+    model_conversations = ModelConversationService(uow_factory, conversation_gateway, blob_store)
     composition_factory = InvestigationCompositionFactory(
         uow_factory=uow_factory,
         artifact_store=artifact_store,
@@ -436,6 +459,176 @@ async def test_ambiguous_inflight_emission_recovers_without_second_provider_send
         # The recovery seals the uncertain durable operation. It does not grant
         # permission to allocate another submission attempt or conversation turn.
         assert provider_fake.send_count == 1
+    finally:
+        if fresh is not None:
+            await fresh.engine.dispose()
+        await first.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_pre_submission_interruption_proves_no_send_without_retry_authorization(
+    migrated_postgres_url: str,
+    tmp_path: Path,
+) -> None:
+    """A crash before the submission claim is provably non-submission.
+
+    The durable ModelRun is still NOT_SUBMITTED with no bridge request id and
+    the provider fake observed zero sends. Recovery preserves that proof, seals
+    the ownerless turn for review and does not infer a retry authorization from
+    it. This distinguishes the proven-no-send class from the ambiguous class in
+    the first scenario, whose submission claim and single send survive.
+    """
+    provider_fake = _ProviderSideFake()
+    first = _build_runtime(
+        migrated_postgres_url,
+        tmp_path / "shared-blobs",
+        provider_fake,
+        crash_before_submission=True,
+    )
+    fresh: _Runtime | None = None
+    try:
+        seeded = await seed_verified_article(
+            first.uow_factory,
+            first.artifact_store,
+            suffix=uuid4().hex[:10],
+        )
+        investigation_id = seeded.investigation.id
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=first.app), base_url="http://test"
+        ) as client:
+            started = await start_investigation_http(client, seeded)
+            job_id = UUID(started["job_id"])
+            approved = await approve_envelope_http(
+                client,
+                investigation_id,
+                providers=(),
+                budget_limits={
+                    "bridge_turns": 4,
+                    "vt_units": 0,
+                    "shodan_credits": 0,
+                    "downloads": 0,
+                    "tool_seconds": 20_000,
+                },
+                allow_acquisition=False,
+            )
+            assert approved.status_code == 200, approved.text
+
+        with pytest.raises(_SimulatedWorkerDeath):
+            await first.dispatcher.dispatch(job_id)
+        assert provider_fake.send_count == 0
+        assert provider_fake.request_ids == []
+
+        async with first.uow_factory() as uow:
+            interrupted_job = await uow.jobs.get(job_id)
+            assert interrupted_job is not None
+            assert interrupted_job.status is JobStatus.RUNNING
+            assert interrupted_job.attempt == 1
+            assert interrupted_job.heartbeat_at is not None
+            interrupted_job.heartbeat_at = datetime.now(UTC) - timedelta(minutes=5)
+            await uow.jobs.save(interrupted_job)
+            await uow.commit()
+
+        interrupted_conversation, interrupted_turns, interrupted_runs = await _read_model_records(
+            first.uow_factory, investigation_id
+        )
+        assert interrupted_conversation.status is ConversationStatus.BUSY
+        assert len(interrupted_turns) == 1
+        interrupted_turn = interrupted_turns[0]
+        assert interrupted_turn.status is ConversationTurnStatus.RUNNING
+        assert len(interrupted_runs) == 1
+        interrupted_run = interrupted_runs[0]
+        assert interrupted_run.status is ModelRunStatus.RUNNING
+        # The proof of non-submission: the run never claimed a provider attempt.
+        assert interrupted_run.submission_state is ModelSubmissionState.NOT_SUBMITTED
+        assert interrupted_run.submission_attempt == 0
+        assert interrupted_run.bridge_request_id is None
+
+        audit_at_interruption = await read_investigation_audit_snapshot(
+            first.session_factory, investigation_id, first.artifact_store
+        )
+        assert audit_at_interruption.envelope is not None
+        interrupted_reservations = tuple(
+            reservation
+            for reservation in audit_at_interruption.envelope.budget.reservations
+            if reservation.amounts.get(BudgetDimension.BRIDGE_TURNS, 0) > 0
+        )
+        assert len(interrupted_reservations) == 1
+        interrupted_reservation = interrupted_reservations[0]
+        assert interrupted_reservation.status is BudgetReservationStatus.RESERVED
+        assert interrupted_reservation.amounts[BudgetDimension.BRIDGE_TURNS] == 1
+        assert interrupted_reservation.committed_amounts.get(BudgetDimension.BRIDGE_TURNS, 0) == 0
+        assert audit_at_interruption.envelope.budget.consumed[BudgetDimension.BRIDGE_TURNS] == 0
+
+        # The fresh runtime uses the real gateway: recovery must not resubmit.
+        fresh = _build_runtime(migrated_postgres_url, tmp_path / "shared-blobs", provider_fake)
+        assert fresh.engine is not first.engine
+        assert fresh.model_conversations is not first.model_conversations
+        assert fresh.executor is not first.executor
+        fresh.app.state.job_dispatcher = fresh.dispatcher
+
+        timeout = timedelta(seconds=30)
+        recovered_jobs = await fresh.job_service.recover_abandoned(timeout)
+        assert [item.id for item in recovered_jobs] == [job_id]
+        async with fresh.uow_factory() as uow:
+            queued_job = await uow.jobs.get(job_id)
+        assert queued_job is not None
+        assert queued_job.status is JobStatus.QUEUED
+        assert queued_job.attempt == 0
+        assert queued_job.error_code == "worker_interrupted"
+
+        await fresh.dispatcher.dispatch(job_id)
+        assert provider_fake.send_count == 0
+        assert provider_fake.request_ids == []
+
+        async with fresh.uow_factory() as uow:
+            final_job = await uow.jobs.get(job_id)
+            state = await uow.investigation_states.get(investigation_id)
+        assert final_job is not None and state is not None
+        assert final_job.status is JobStatus.SUCCEEDED
+        assert final_job.attempt == 1
+        assert state.stop_reason is StopReason.SUBMISSION_NEEDS_REVIEW
+
+        final_conversation, final_turns, final_runs = await _read_model_records(
+            fresh.uow_factory, investigation_id
+        )
+        assert final_conversation.status is ConversationStatus.NEEDS_REVIEW
+        assert len(final_turns) == 1
+        final_turn = final_turns[0]
+        assert final_turn.id == interrupted_turn.id
+        assert final_turn.status is ConversationTurnStatus.NEEDS_REVIEW
+        assert final_turn.error_code == "orphaned_running_turn"
+        assert len(final_runs) == 1
+        final_run = final_runs[0]
+        assert final_run.id == interrupted_run.id
+        assert final_run.status is ModelRunStatus.NEEDS_REVIEW
+        # The durable no-send proof survives the seal: no submission was ever
+        # claimed and no provider request identity was allocated.
+        assert final_run.submission_state is ModelSubmissionState.NOT_SUBMITTED
+        assert final_run.submission_attempt == 0
+        assert final_run.bridge_request_id is None
+
+        final_audit = await read_investigation_audit_snapshot(
+            fresh.session_factory, investigation_id, fresh.artifact_store
+        )
+        assert final_audit.hypotheses_state == state
+        assert final_audit.envelope is not None
+        final_reservations = tuple(
+            reservation
+            for reservation in final_audit.envelope.budget.reservations
+            if reservation.operation_key == interrupted_reservation.operation_key
+        )
+        assert len(final_reservations) == 1
+        final_reservation = final_reservations[0]
+        assert final_reservation.amounts == interrupted_reservation.amounts
+        assert final_reservation.status is BudgetReservationStatus.COMMITTED
+        assert final_reservation.committed_amounts[BudgetDimension.BRIDGE_TURNS] == 1
+        assert final_audit.envelope.budget.consumed[BudgetDimension.BRIDGE_TURNS] == 1
+        assert final_audit.envelope.budget.reserved[BudgetDimension.BRIDGE_TURNS] == 0
+
+        # No retry authorization was invented: one durable turn, no second
+        # attempt, and the provider fake never saw a request.
+        assert provider_fake.send_count == 0
+        assert provider_fake.request_ids == []
     finally:
         if fresh is not None:
             await fresh.engine.dispose()
