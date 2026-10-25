@@ -147,14 +147,29 @@ class _BarrierPolicyGuard:
 
 
 class _ClaimBarrierStore:
-    """Hold both workers immediately before the durable claim transaction."""
+    """Boundedly rendezvous workers immediately before the claim transaction."""
 
-    def __init__(self, delegate: SqlAlchemyExternalEffectClaimStore, barrier: asyncio.Barrier):
+    def __init__(
+        self,
+        delegate: SqlAlchemyExternalEffectClaimStore,
+        barrier: asyncio.Barrier,
+        *,
+        timeout_seconds: float = 5.0,
+    ):
         self._delegate = delegate
         self._barrier = barrier
+        self._timeout_seconds = timeout_seconds
 
     async def consume(self, *args: Any, **kwargs: Any):
-        await self._barrier.wait()
+        try:
+            await asyncio.wait_for(self._barrier.wait(), timeout=self._timeout_seconds)
+        except TimeoutError as exc:
+            # A caller may have refused during coordinator pre-validation and
+            # never reached this seam. Break the barrier so no peer waits on it.
+            await self._barrier.abort()
+            raise RuntimeError("claim workers did not rendezvous before timeout") from exc
+        except asyncio.BrokenBarrierError as exc:
+            raise RuntimeError("claim worker barrier was aborted") from exc
         return await self._delegate.consume(*args, **kwargs)
 
     def __getattr__(self, name: str) -> Any:
