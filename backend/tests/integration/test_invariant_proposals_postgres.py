@@ -43,6 +43,7 @@ from cti_app.application.model_gateway import (
 )
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.sample_acquisition import SAMPLES_QUARANTINE_BUCKET
+from cti_app.config import Settings
 from cti_app.domain.analysis import SampleFeatureSetV1, SampleFormat
 from cti_app.domain.classification import TLP
 from cti_app.domain.editions import Edition
@@ -367,7 +368,13 @@ async def test_p10_propose_uses_persisted_preconditions_and_replays_turn(
         BlobModelOutputStore(blob_catalog),
     )
     model_conversations = ModelConversationService(uow_factory, gateway, blob_store)
-    invariant_registry = InvariantRegistryService(uow_factory, goodware_measurement)
+    invariant_registry = InvariantRegistryService(
+        uow_factory,
+        goodware_measurement,
+        # Never let the test read a developer's backend/.env: this oracle must
+        # be reproducible from explicit inputs only.
+        settings=Settings(_env_file=None),
+    )
     service = ProposalConversationService(
         uow_factory,
         model_conversations,

@@ -321,8 +321,23 @@ async def test_ambiguous_inflight_emission_recovers_without_second_provider_send
         assert interrupted_run.bridge_request_id == provider_fake.request_ids[0]
         assert interrupted_turn.model_run_id == interrupted_run.id
         assert interrupted_turn.input_sha256 and len(interrupted_turn.input_sha256) == 64
-        assert len(interrupted_run.authorized_input_hash) == 64
-        assert len(interrupted_run.evidence_pack_hash) == 64
+        interrupted_identity = {
+            "turn_id": interrupted_turn.id,
+            "turn_input_sha256": interrupted_turn.input_sha256,
+            "turn_idempotency_key": interrupted_turn.idempotency_key,
+            "run_id": interrupted_run.id,
+            "authorized_input_hash": interrupted_run.authorized_input_hash,
+            "evidence_pack_hash": interrupted_run.evidence_pack_hash,
+            "prompt_template_id": interrupted_run.prompt_template_id,
+            "prompt_template_version": interrupted_run.prompt_template_version,
+            "requested_model": interrupted_run.requested_model,
+            "bridge_request_id": interrupted_run.bridge_request_id,
+            "submission_attempt": interrupted_run.submission_attempt,
+        }
+        assert len(interrupted_identity["authorized_input_hash"]) == 64
+        assert len(interrupted_identity["evidence_pack_hash"]) == 64
+        assert interrupted_identity["prompt_template_id"]
+        assert interrupted_identity["prompt_template_version"]
 
         audit_at_interruption = await read_investigation_audit_snapshot(
             first.session_factory, investigation_id, first.artifact_store
@@ -418,10 +433,20 @@ async def test_ambiguous_inflight_emission_recovers_without_second_provider_send
         assert final_run.error_code == "orphaned_running_turn"
         assert final_run.error_details is not None
         assert final_run.error_details["recovery"] == "distinct_attempt_after_terminal_owner"
-        assert final_run.prompt_template_id and final_run.prompt_template_version
-        assert final_run.requested_model == _SimulatedModelAdapter.requested_model
-        assert len(final_run.authorized_input_hash) == 64
-        assert len(final_run.evidence_pack_hash) == 64
+        # Exact preservation across the fresh service instance: the hashes,
+        # prompt template identity, requested model and provider request
+        # identity must be byte-identical to the interrupted record.
+        assert final_turn.id == interrupted_identity["turn_id"]
+        assert final_turn.input_sha256 == interrupted_identity["turn_input_sha256"]
+        assert final_turn.idempotency_key == interrupted_identity["turn_idempotency_key"]
+        assert final_run.id == interrupted_identity["run_id"]
+        assert final_run.authorized_input_hash == interrupted_identity["authorized_input_hash"]
+        assert final_run.evidence_pack_hash == interrupted_identity["evidence_pack_hash"]
+        assert final_run.prompt_template_id == interrupted_identity["prompt_template_id"]
+        assert final_run.prompt_template_version == interrupted_identity["prompt_template_version"]
+        assert final_run.requested_model == interrupted_identity["requested_model"]
+        assert final_run.bridge_request_id == interrupted_identity["bridge_request_id"]
+        assert final_run.submission_attempt == interrupted_identity["submission_attempt"]
 
         final_audit = await read_investigation_audit_snapshot(
             fresh.session_factory, investigation_id, fresh.artifact_store
@@ -542,6 +567,24 @@ async def test_pre_submission_interruption_proves_no_send_without_retry_authoriz
         assert interrupted_run.submission_state is ModelSubmissionState.NOT_SUBMITTED
         assert interrupted_run.submission_attempt == 0
         assert interrupted_run.bridge_request_id is None
+        interrupted_identity = {
+            "turn_id": interrupted_turn.id,
+            "turn_input_sha256": interrupted_turn.input_sha256,
+            "turn_idempotency_key": interrupted_turn.idempotency_key,
+            "run_id": interrupted_run.id,
+            "authorized_input_hash": interrupted_run.authorized_input_hash,
+            "evidence_pack_hash": interrupted_run.evidence_pack_hash,
+            "prompt_template_id": interrupted_run.prompt_template_id,
+            "prompt_template_version": interrupted_run.prompt_template_version,
+            "requested_model": interrupted_run.requested_model,
+            "bridge_request_id": interrupted_run.bridge_request_id,
+            "submission_attempt": interrupted_run.submission_attempt,
+        }
+        assert len(interrupted_identity["turn_input_sha256"]) == 64
+        assert len(interrupted_identity["authorized_input_hash"]) == 64
+        assert len(interrupted_identity["evidence_pack_hash"]) == 64
+        assert interrupted_identity["prompt_template_id"]
+        assert interrupted_identity["prompt_template_version"]
 
         audit_at_interruption = await read_investigation_audit_snapshot(
             first.session_factory, investigation_id, first.artifact_store
@@ -606,6 +649,19 @@ async def test_pre_submission_interruption_proves_no_send_without_retry_authoriz
         assert final_run.submission_state is ModelSubmissionState.NOT_SUBMITTED
         assert final_run.submission_attempt == 0
         assert final_run.bridge_request_id is None
+        # Exact preservation across the fresh service instance, including the
+        # absence of any provider request identity.
+        assert final_turn.id == interrupted_identity["turn_id"]
+        assert final_turn.input_sha256 == interrupted_identity["turn_input_sha256"]
+        assert final_turn.idempotency_key == interrupted_identity["turn_idempotency_key"]
+        assert final_run.id == interrupted_identity["run_id"]
+        assert final_run.authorized_input_hash == interrupted_identity["authorized_input_hash"]
+        assert final_run.evidence_pack_hash == interrupted_identity["evidence_pack_hash"]
+        assert final_run.prompt_template_id == interrupted_identity["prompt_template_id"]
+        assert final_run.prompt_template_version == interrupted_identity["prompt_template_version"]
+        assert final_run.requested_model == interrupted_identity["requested_model"]
+        assert final_run.bridge_request_id == interrupted_identity["bridge_request_id"]
+        assert final_run.submission_attempt == interrupted_identity["submission_attempt"]
 
         final_audit = await read_investigation_audit_snapshot(
             fresh.session_factory, investigation_id, fresh.artifact_store
