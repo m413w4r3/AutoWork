@@ -27,6 +27,22 @@ Un appel direct à un adaptateur ou à un transport sans permis est un refus
 typé, zéro émission. Chaque page, fallback, redirection, retry ou correction
 consomme un permis distinct.
 
+### Couplage avec la politique OSINT_OPEN
+
+Pour une enveloppe `authority_kind=OSINT_POLICY`, la transaction de consume
+vérifie, sous verrou, que :
+
+- l'investigation porte toujours le même `subject_id` que le pin d'héritage ;
+- l'événement/version de politique épinglé existe et n'est pas révoqué ;
+- l'enveloppe, l'invocation et la réservation sont toujours dans l'état attendu.
+
+Ordre de verrouillage : politique épinglée → enveloppe → invocation →
+réservation → claim → tentative de famille → `ModelConversationTurn`/`ModelRun`.
+La révocation de politique verrouille la politique puis les enveloppes
+héritées. Un claim commité avant la révocation autorise un seul envoi ; un
+claim qui observe la révocation est refusé avec zéro émission. Une
+investigation annulée/reprise ne regagne aucun droit après révocation.
+
 ## 2. Modèle durable
 
 La migration additive `0004_external_effect_claims` (après

@@ -27,6 +27,12 @@ Une politique est identifiée par `(scope_kind, scope_ref)`. Les versions sont
 append-only ; la version active est la dernière version non révoquée. Une
 révocation crée une nouvelle version `REVOKED` avec droits externes à zéro.
 
+Chaque héritage épingle le `subject_id` exact de l'investigation. L'application
+n'a pas de dimension workspace/tenant distincte : la portée `INSTANCE` est
+global par conception. Une investigation dont le `subject_id` changerait ne
+peut plus utiliser l'autorité héritée ; le contrôle est refait à chaque
+admission d'effet sous le même verrou que l'héritage/révocation.
+
 ### 2.2 Contenu autorisé
 
 Une version contient uniquement des faits non secrets :
@@ -37,12 +43,29 @@ Une version contient uniquement des faits non secrets :
 - `acquire_hits_allowed` ;
 - `disclosure` : TLP par défaut des nouvelles enveloppes, `do_not_submit`,
   `external_llm_allowed` ;
-- `max_effect_claims_per_investigation` (coupe-circuit optionnel).
+- `max_effect_claims_per_investigation` : **obligatoire et positif** pour
+  chaque investigation héritée.
+
+Toutes les dimensions nécessaires aux capacités activées sont finies et
+positives. Des maxima absolus configurés (`osint_open_max_*`) bornent chaque
+valeur ; une activation ou extension au-dessus du maximum est refusée. Une
+dimension absente ou non finie n'est jamais interprétée comme illimitée.
+L'épuisement refuse localement avant émission.
 
 Aucun credential, token, mot de passe, signed URL ou en-tête secret n'entre
-dans la politique, ses événements ou ses prompts.
+dans la politique, ses événements ou ses prompts. Les champs libres
+(raison, corrélation, acteur) sont bornés et rejettent ou masquent les
+sentences de type credential/signed URL avant persistance.
 
 ### 2.3 Activation, extension, révocation
+
+Les mutations `activate`/`extend`/`revoke` exigent une identité **dérivée du
+serveur**, avec le scope `HUMAN_OPERATOR` et la même vérification humaine que
+les routes réservées aux humains (provider local uniquement sur bind loopback
+isolé, ou provider authentifié `verified=True`). Un principal
+`OPERATOR_CLIENT`, agent ou système est refusé. L'acteur n'est jamais accepté
+depuis le body de la requête. La même exigence s'applique à la supersession
+manuelle d'une enveloppe héritée.
 
 - `activate(actor_id, reason, correlation_id, …)` exige un acteur authentifié
   non vide, une raison et une corrélation. Le rejeu de la même corrélation et
@@ -108,6 +131,14 @@ sérialise « révocation » et « héritage » : si la révocation commite d'ab
 l'héritage est refusé ; si l'héritage commite d'abord, il est ensuite révoqué
 par la propagation.
 
+Pour les effets externes S3, la transaction de consume verrouille, dans
+l'ordre : la politique épinglée (version/statut), l'enveloppe, l'invocation,
+la réservation, puis le claim et l'éventuelle tentative de famille. Le commit
+du claim est le point de linéarisation : un claim commité avant la révocation
+autorise **un seul** envoi physique ; un claim qui observe la révocation est
+refusé avec zéro émission. Une investigation arrêtée/annulée puis reprise ne
+regagne aucun droit après révocation.
+
 ### 2.6 TLP
 
 - Les nouvelles enveloppes héritées utilisent `TLP:CLEAR` par défaut lorsque
@@ -118,6 +149,10 @@ par la propagation.
   consultation.
 - `ensure_tlp_not_downgraded` reste en vigueur. Aucune baisse de TLP n'est
   déduite de l'activation.
+- Une TLP absente, vide ou inconnue est traitée comme **non partageable** et
+  refuse toute émission externe jusqu'à classification explicite. L'intersection
+  `policy AND source` est monotone : aucun `do_not_submit` ni
+  `external_llm_allowed=false` n'est effacé par la politique.
 
 ### 2.7 G2 et G3
 
@@ -183,20 +218,33 @@ historiques restent inchangées.
    conflit.
 3. Héritage : une enveloppe, une décision dérivée, lignée `ACTIVE` ; rejeu →
    aucune duplication ; deux appels concurrents → une seule enveloppe.
-4. Aucune identité `HUMAN` fabriquée : la décision dérivée porte l'acteur réel
-   de l'activation et `inherited=true` ; aucun `QualificationActorKind.HUMAN`
-   synthétique n'est créé pour un agent.
+4. Aucune identité `HUMAN` fabriquée : l'enveloppe héritée porte
+   `authority_kind=OSINT_POLICY`, `inherited_policy_event_id`, et aucune
+   `AnalystDecision(PIVOT_APPROVE)` n'est créée. L'acteur réel de l'activation
+   reste sur l'événement policy.
+4bis. Activation/extension/révocation par `OPERATOR_CLIENT`, agent ou système →
+   refus ; acteur fourni dans le body ignoré ; provider local non vérifié sur
+   bind exposé → refus.
 5. TLP : nouvelle source partageable → CLEAR ; source GREEN/RED existante →
-   inchangée ; `do_not_submit`/`external_llm_allowed=false` → refus conservé.
-6. G2 : budgets hérités positifs ; consommation comptabilisée ; budget épuisé →
-   refus local sans émission.
+   inchangée ; `do_not_submit`/`external_llm_allowed=false` → refus conservé ;
+   TLP absente/vide/inconnue → refus externe.
+6. G2 : budgets hérités positifs et finis ; dimension absente ou au-dessus du
+   maximum configuré → activation refusée ; consommation comptabilisée ; budget
+   épuisé → refus local sans émission.
 7. Révocation avant émission → refus et zéro appel ; révocation après
    consommation S3 → l'émission déjà autorisée reste unique, toute suivante est
    refusée.
+7bis. `subject_id` modifié après héritage, ou investigation hors scope → refus
+   au consume, zéro émission.
 8. G3 : `candidate`/`related`/`uncertain` par l'agent → accepté ;
-   `confirmed`/`rejected` par l'agent → refus ; humain identifié → accepté.
+   `confirmed`/`rejected` par l'agent → refus ; humain identifié et vérifié →
+   accepté.
 9. Migration : upgrade `0002 → 0003` sur base jetable, contraintes et index
-   présents ; downgrade refusé si des lignées/événements existent.
+   présents ; downgrade refusé si des lignées/événements/enveloppes
+   policy-existent ; `authority_kind NULL` relu comme `HUMAN_G2` ; aucune ligne
+   historique backfillée.
+9bis. Sentinelles de credentials/signed URL dans raison, corrélation ou acteur →
+   absentes des événements, logs et réponses.
 10. Aucun test ne contacte un provider, PostgreSQL live, MinIO live ou un
     secret.
 

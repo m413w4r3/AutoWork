@@ -31,7 +31,7 @@ Légende : `PLANNED → RUNNING → REVIEW → APPROVED → INTEGRATED`, alterna
 | M06-R-RUN | `af077b38-cb5f-48b9-8a9b-800bda3f0c3e` | codex/gpt-6-luna · xhigh | `wks_f8c47eda0b091a30` | `505c1cd2` | DONE | lecture seule | — | rapport reçu ; lignée synthèse UNKNOWN | état P4 |
 | M06-POLICY-1 | `268c4abe-7f93-4d12-bcff-0d8b2175064b` | codex/gpt-6-luna · xhigh | `wks_a15c58fa94fe06bf` | `7059ebbd` | RUNNING | unit + lint + typecheck + PG (si Docker) | à créer | correction `EnvelopeAuthorityKind` envoyée | héritage G2/G3, TLP, bypass Bridge |
 | M06-S3-SPEC | `adb555b5-158a-450e-acff-c25293f85ea4` | codex/gpt-6-luna · xhigh | `wks_69c42fa0c7b7eab6` | `7059ebbd` | RUNNING | lecture seule | — | — | spécification S3 |
-| M06-REVIEW-POLICY-DESIGN | `66e365ad-83b0-43ad-8e7d-8b1d42a8e616` | codex/gpt-6-luna · xhigh | `wks_a221abc2a4219236` | `7059ebbd` | RUNNING | lecture seule | — | — | revue adversariale |
+| M06-REVIEW-POLICY-DESIGN | `66e365ad-83b0-43ad-8e7d-8b1d42a8e616` | codex/gpt-6-luna · xhigh | `wks_a221abc2a4219236` | `7059ebbd` | DONE | lecture seule | — | **REVISE** : 4 BLOCKER, 5 MAJOR ; corrections transmises | revue adversariale |
 | M06-S3-CORE-1 | à créer | codex/gpt-6-luna · xhigh | à créer | après recon | PLANNED | PG jetable + concurrence | à créer | — | claim/permis |
 | M06-S3-VT-1 | à créer | codex/gpt-6-luna · xhigh | à créer | après core | PLANNED | fakes + PG | à créer | — | lecture VT |
 | M06-S3-DL-1 | à créer | codex/gpt-6-luna · xhigh | à créer | après core | PLANNED | fakes + PG | à créer | — | téléchargement |
@@ -65,3 +65,4 @@ Légende : `PLANNED → RUNNING → REVIEW → APPROVED → INTEGRATED`, alterna
 | `recon/S3_SEAM.md` | M06-R-S3 | `9f17611abf3a05166f069b745cfd546041e6748ccce1f4f36b6135f3774dbaa4` |
 | `recon/RUNTIME_READINESS.md` | M06-R-RUNTIME | `8d45480896e27945087c99786cd995dce6670831f5ee05edae6833fee4220f47` |
 | `recon/RUN_STATE.md` | M06-R-RUN | `7a71689e65cf6198c16550d05a59ca03dfb97a877d00b268dbd4cb0ee28b01ed` |
+| `recon/POLICY_DESIGN_REVIEW.md` | M06-REVIEW-POLICY-DESIGN | `83773c57faedf56009edb2905c973214d38779b31c725a2d80473f3afb761338` |
