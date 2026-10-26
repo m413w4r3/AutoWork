@@ -16,6 +16,7 @@ from cti_app.application.bridge_investigator import (
     TurnSubmission,
     TurnSubmissionStatus,
 )
+from cti_app.application.investigation_composition import OptionalInvestigationToolPorts
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.virustotal import (
     VirusTotalCapabilities,
@@ -162,11 +163,10 @@ def _real_vt_runtime_ports(
 
 @pytest.mark.asyncio
 async def test_real_postgres_http_bridge_vertical_investigation_and_v6_publication(
-    uow_factory, tmp_path: Path
+    uow_factory, migrated_postgres_url: str, tmp_path: Path
 ) -> None:
-    blob_catalog = BlobCatalogService(
-        FilesystemBlobStore(tmp_path / "vertical-blob-storage"), uow_factory
-    )
+    blob_store = FilesystemBlobStore(tmp_path / "vertical-blob-storage")
+    blob_catalog = BlobCatalogService(blob_store, uow_factory)
     artifact_store = ProductionArtifactStore(blob_catalog)
     seeded = await _seed_verified_article(uow_factory, artifact_store, suffix=uuid4().hex[:10])
     assert seeded.seed_observation is not None
@@ -174,6 +174,36 @@ async def test_real_postgres_http_bridge_vertical_investigation_and_v6_publicati
     candidate_hash = material.sample_hash
     vt = _HashCheckedVirusTotal(material=material, include_candidate=True)
     shodan = FakeShodanPort()
+    download_requests: list[str] = []
+    signed_url = (
+        "https://vtsamples.commondatastorage.googleapis.com/synthetic-sample?signature=synthetic"
+    )
+
+    def mock_download(request: httpx.Request) -> httpx.Response:
+        download_requests.append(f"{request.url.host}{request.url.path}")
+        if request.url.path.endswith("/download_url"):
+            return httpx.Response(200, json={"data": signed_url}, request=request)
+        if request.url.host == "vtsamples.commondatastorage.googleapis.com":
+            return httpx.Response(
+                200,
+                content=material.sample_bytes,
+                headers={"content-type": "application/octet-stream"},
+                request=request,
+            )
+        return httpx.Response(404, json={"error": "NotFoundError"}, request=request)
+
+    vt_client = httpx.AsyncClient(transport=httpx.MockTransport(mock_download), trust_env=False)
+    vt_adapter = VirusTotalHttpAdapter(
+        client=vt_client,
+        base_url="https://www.virustotal.com/api/v3",
+        capabilities=VirusTotalCapabilities(file_download=True),
+        file_download_enabled=True,
+        download_allowed_hosts=frozenset({"vtsamples.commondatastorage.googleapis.com"}),
+        download_allowed_ports=frozenset({443}),
+        download_client_factory=lambda: httpx.AsyncClient(
+            transport=httpx.MockTransport(mock_download), trust_env=False
+        ),
+    )
 
     async def final_response_builder(observations):
         async with uow_factory() as uow:
@@ -272,6 +302,16 @@ async def test_real_postgres_http_bridge_vertical_investigation_and_v6_publicati
         final_response_builder=final_response_builder,
     )
     settings = _settings(providers=True, local_analysis=True)
+    runtime_engine, runtime_ports = _real_vt_runtime_ports(
+        database_url=migrated_postgres_url,
+        uow_factory=uow_factory,
+        blob_store=blob_store,
+        blob_catalog=blob_catalog,
+        settings=settings,
+        virustotal=vt_adapter,
+        capabilities=VirusTotalCapabilities(file_download=True),
+    )
+    assert runtime_ports.acquisition is not None
     composition_factory = _composition_factory(
         uow_factory=uow_factory,
         artifact_store=artifact_store,
@@ -280,6 +320,7 @@ async def test_real_postgres_http_bridge_vertical_investigation_and_v6_publicati
         virustotal=vt,
         shodan=shodan,
         include_local_analysis=True,
+        additional_ports=OptionalInvestigationToolPorts(acquisition=runtime_ports.acquisition),
     )
     app, registry, dispatcher = _build_app(
         uow_factory=uow_factory,
@@ -408,7 +449,11 @@ async def test_real_postgres_http_bridge_vertical_investigation_and_v6_publicati
         assert vt.calls["file_report"] == 1
 
         assert vt.calls["intelligence_search"] == 1
-        assert vt.download_calls == 1
+        assert download_requests == [
+            f"www.virustotal.com/api/v3/files/{candidate_hash}/download",
+            f"www.virustotal.com/api/v3/files/{candidate_hash}/download_url",
+            "vtsamples.commondatastorage.googleapis.com/synthetic-sample",
+        ]
         assert shodan.calls == [("host", (_IOC,))]
         submissions_before_replay = transport.submission_count
         assert submissions_before_replay == 7
@@ -416,7 +461,7 @@ async def test_real_postgres_http_bridge_vertical_investigation_and_v6_publicati
         # Re-dispatching the succeeded durable job does not download again or submit
         # another Bridge turn.
         await _run_http_job(app, uow_factory, registry, dispatcher, UUID(started["job_id"]))
-        assert vt.download_calls == 1
+        assert len(download_requests) == 3
         assert transport.submission_count == submissions_before_replay
 
         qualification = await client.post(
@@ -506,6 +551,8 @@ async def test_real_postgres_http_bridge_vertical_investigation_and_v6_publicati
     assert parsed.base_publication == base_document
     assert await _read_composition(uow_factory, seeded.edition.id) == before_composition
     assert await _read_manifest(uow_factory, seeded.edition.id) == before_manifest
+    await vt_client.aclose()
+    await runtime_engine.dispose()
 
 
 @pytest.mark.asyncio
