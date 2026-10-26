@@ -100,8 +100,17 @@ class ExternalEffectFamilyBinding:
     model_run_provider: str | None = None
     requires_source_refs: bool = False
     source_reference_resolver: SourceReferenceResolver | None = None
+    credential_parameter_names: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
+        if any(not isinstance(name, str) for name in self.credential_parameter_names):
+            raise ValueError("family credential parameter declarations must be strings")
+        credential_parameter_names = frozenset(
+            re.sub(r"[-_]", "", name.casefold()) for name in self.credential_parameter_names
+        )
+        if credential_parameter_names - {"key"}:
+            raise ValueError("unsupported family credential parameter")
+        object.__setattr__(self, "credential_parameter_names", credential_parameter_names)
         if self.requires_source_refs and self.source_reference_resolver is None:
             raise ValueError("source-dependent families require a trusted source resolver")
         if self.requires_model_lineage and self.model_run_provider is None:
@@ -120,6 +129,14 @@ def _is_model_submission(
 
 def _requires_model_lineage(family: str, family_binding: ExternalEffectFamilyBinding) -> bool:
     return family_binding.requires_model_lineage or family.startswith(_MODEL_LINEAGE_PREFIXES)
+
+
+def _family_credentials_match(
+    prepared: PreparedExternalRequest, family_binding: ExternalEffectFamilyBinding
+) -> bool:
+    return (
+        frozenset(prepared.credential_parameter_names) == family_binding.credential_parameter_names
+    )
 
 
 def _retrohunt_request_matches(
@@ -227,6 +244,8 @@ class SqlAlchemyExternalEffectClaimStore:
             or prepared.provider_scope not in family_binding.provider_scopes
         ):
             return ConsumeRefused("provider_scope_not_registered")
+        if not _family_credentials_match(prepared, family_binding):
+            return ConsumeRefused("family_credential_declaration_mismatch")
         if prepared.normalizer_version not in family_binding.normalizer_versions:
             return ConsumeRefused("unsupported_normalizer_version")
         try:
@@ -485,9 +504,8 @@ class SqlAlchemyExternalEffectClaimStore:
         reason_code: str,
     ) -> bool:
         proof_kind = self._consume_no_handoff_proof(proof, claim_id)
-        if proof_kind is None:
+        if proof_kind is not NoSubmissionProofKind.BEFORE_HANDOFF:
             return False
-        expected_handoff_nonce_is_null = proof_kind is NoSubmissionProofKind.BEFORE_HANDOFF
         reason = _safe_code(reason_code)
         async with self._session_factory() as session:
             async with session.begin():
@@ -501,11 +519,7 @@ class SqlAlchemyExternalEffectClaimStore:
                     .where(
                         ExternalEffectClaimRow.id == claim_id,
                         ExternalEffectClaimRow.state == EffectClaimState.CONSUMED.value,
-                        (
-                            ExternalEffectClaimRow.handoff_permit_nonce.is_(None)
-                            if expected_handoff_nonce_is_null
-                            else ExternalEffectClaimRow.handoff_permit_nonce.is_not(None)
-                        ),
+                        ExternalEffectClaimRow.handoff_permit_nonce.is_(None),
                         ExternalEffectClaimRow.version == row.version,
                     )
                     .values(
@@ -528,18 +542,6 @@ class SqlAlchemyExternalEffectClaimStore:
                         .values(
                             status="failed", version=ToolInvocationRow.version + 1, updated_at=now
                         )
-                    )
-                if (
-                    row.model_run_id is not None
-                    and proof_kind is NoSubmissionProofKind.TRANSPORT_NO_BYTES_LEFT
-                ):
-                    await session.execute(
-                        update(ModelRunRow)
-                        .where(
-                            ModelRunRow.id == row.model_run_id,
-                            ModelRunRow.submission_state == "submission_in_progress",
-                        )
-                        .values(submission_state="not_submitted", updated_at=now)
                     )
                 return True
 
@@ -636,6 +638,7 @@ class SqlAlchemyExternalEffectClaimStore:
             or family_binding.provider != prepared.provider
             or prepared.provider_scope not in family_binding.provider_scopes
             or prepared.normalizer_version not in family_binding.normalizer_versions
+            or not _family_credentials_match(prepared, family_binding)
             or _requires_model_lineage(prepared.family, family_binding)
         ):
             return None
@@ -776,6 +779,7 @@ class SqlAlchemyExternalEffectClaimStore:
             or family_binding.provider != prepared.provider
             or prepared.provider_scope not in family_binding.provider_scopes
             or prepared.normalizer_version not in family_binding.normalizer_versions
+            or not _family_credentials_match(prepared, family_binding)
         ):
             return False
         try:

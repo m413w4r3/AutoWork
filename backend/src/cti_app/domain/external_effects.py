@@ -109,6 +109,7 @@ class PreparedExternalRequest:
     occurrence_id: UUID | None
     evidence_refs: tuple[EvidenceReference, ...]
     application_request: FrozenWireRequest = field(repr=False, compare=False)
+    credential_parameter_names: tuple[str, ...] = field(default=(), repr=False)
     identity_version: str = "effect-key.v1"
 
     def __post_init__(self) -> None:
@@ -127,6 +128,21 @@ class PreparedExternalRequest:
             not isinstance(item, EvidenceReference) for item in self.evidence_refs
         ):
             raise ExternalEffectValidationError("evidence_refs must be EvidenceReference values")
+        if not isinstance(self.credential_parameter_names, tuple) or any(
+            not isinstance(item, str) for item in self.credential_parameter_names
+        ):
+            raise ExternalEffectValidationError("credential parameter declarations must be strings")
+        credential_parameter_names = tuple(
+            sorted(
+                {
+                    _normalize_declared_credential_parameter_name(item)
+                    for item in self.credential_parameter_names
+                }
+            )
+        )
+        if set(credential_parameter_names) - _OPTIONAL_CREDENTIAL_PARAMETER_NAMES:
+            raise ExternalEffectValidationError("unsupported family credential parameter")
+        object.__setattr__(self, "credential_parameter_names", credential_parameter_names)
         frozen = _freeze_json(self.canonical_request)
         if not isinstance(frozen, Mapping):
             raise ExternalEffectValidationError("canonical_request must be a JSON object")
@@ -136,7 +152,13 @@ class PreparedExternalRequest:
         _require_sha256(self.application_request_sha256, "application_request_sha256")
         if canonical_request_sha256(frozen) != self.canonical_request_sha256:
             raise ExternalEffectValidationError("canonical_request_sha256 does not match request")
-        if application_request_sha256(self.application_request) != self.application_request_sha256:
+        if (
+            application_request_sha256(
+                self.application_request,
+                credential_parameter_names=self.credential_parameter_names,
+            )
+            != self.application_request_sha256
+        ):
             raise ExternalEffectValidationError(
                 "application_request_sha256 does not match redacted wire image"
             )
@@ -157,6 +179,7 @@ class PreparedExternalRequest:
         request_ref: str | None = None,
         occurrence_id: UUID | None = None,
         evidence_refs: tuple[EvidenceReference, ...] = (),
+        credential_parameter_names: tuple[str, ...] = (),
         identity_version: str = "effect-key.v1",
     ) -> PreparedExternalRequest:
         return cls(
@@ -167,11 +190,15 @@ class PreparedExternalRequest:
             canonical_request=canonical_request,
             request_ref=request_ref,
             canonical_request_sha256=canonical_request_sha256(canonical_request),
-            application_request_sha256=application_request_sha256(application_request),
+            application_request_sha256=application_request_sha256(
+                application_request,
+                credential_parameter_names=credential_parameter_names,
+            ),
             physical_request_sha256=_wire_request_sha256(application_request),
             occurrence_id=occurrence_id,
             evidence_refs=evidence_refs,
             application_request=application_request,
+            credential_parameter_names=credential_parameter_names,
             identity_version=identity_version,
         )
 
@@ -312,8 +339,18 @@ def canonical_request_sha256(canonical_request: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical_json_bytes(canonical_request)).hexdigest()
 
 
-def application_request_sha256(request: FrozenWireRequest) -> str:
+def application_request_sha256(
+    request: FrozenWireRequest,
+    *,
+    credential_parameter_names: tuple[str, ...] = (),
+) -> str:
     """Hash a credential-redacted wire image for durable claim identity."""
+
+    declared_names = frozenset(
+        _normalize_declared_credential_parameter_name(name) for name in credential_parameter_names
+    )
+    if declared_names - _OPTIONAL_CREDENTIAL_PARAMETER_NAMES:
+        raise ExternalEffectValidationError("unsupported family credential parameter")
 
     headers_value = [
         [
@@ -327,7 +364,7 @@ def application_request_sha256(request: FrozenWireRequest) -> str:
         "format": "autowork.application-request.v1",
         "headers_b64": _b64url(canonical_json_bytes(headers_value)),
         "method_b64": _b64url(request.method),
-        "target_b64": _b64url(_redact_target_credentials(request.target)),
+        "target_b64": _b64url(_redact_target_credentials(request.target, declared_names)),
     }
     return hashlib.sha256(canonical_json_bytes(image)).hexdigest()
 
@@ -346,92 +383,64 @@ def _wire_request_sha256(request: FrozenWireRequest) -> str:
     return hashlib.sha256(canonical_json_bytes(image)).hexdigest()
 
 
+_CREDENTIAL_HEADER_NAMES = frozenset({"authorization", "proxyauthorization", "cookie", "xapikey"})
 _CREDENTIAL_PARAMETER_NAMES = frozenset(
-    re.sub(r"[^a-z0-9]", "", name)
+    re.sub(r"[-_]", "", name)
     for name in (
-        "access_token",
-        "access_key",
-        "access_key_id",
         "apikey",
         "api_key",
-        "auth",
-        "authorization",
-        "bearer",
-        "bearer_token",
-        "client_secret",
-        "client_assertion",
-        "credential",
-        "credentials",
+        "access_token",
         "id_token",
-        "jwt",
-        "jwt_token",
-        "key",
-        "password",
-        "passwd",
         "refresh_token",
-        "secret",
-        "session",
-        "session_id",
-        "session_token",
-        "sig",
-        "signature",
         "token",
-        "oauth_token",
-        "oauth_signature",
-        "private_key",
-        "private_key_id",
-        "client_key",
-        "client_secret_key",
-        "secret_key",
-        "api_secret",
-        "consumer_key",
-        "consumer_secret",
-        "code_verifier",
-        "passphrase",
-        "x_amz_credential",
-        "x_amz_security_token",
-        "x_api_key",
-        "cookie",
-        "proxy_authorization",
+        "client_secret",
+        "secret",
+        "password",
+        "signature",
+        "sig",
+        "x-amz-signature",
+        "x-goog-signature",
     )
 )
+_OPTIONAL_CREDENTIAL_PARAMETER_NAMES = frozenset({"key"})
 
 
 def _normalized_credential_name(raw_name: bytes) -> str:
     decoded = unquote_plus(raw_name.decode("ascii", errors="ignore")).casefold()
-    return re.sub(r"[^a-z0-9]", "", decoded)
+    return re.sub(r"[-_]", "", decoded)
 
 
-def _is_credential_name(normalized: str) -> bool:
-    return (
-        normalized in _CREDENTIAL_PARAMETER_NAMES
-        or "token" in normalized
-        or "secret" in normalized
-        or normalized.startswith("xamz")
-    )
+def _normalize_declared_credential_parameter_name(name: str) -> str:
+    decoded = unquote_plus(name).casefold()
+    return re.sub(r"[-_]", "", decoded)
 
 
 def _credential_header_name(name: bytes) -> bool:
-    return _is_credential_name(_normalized_credential_name(name))
+    normalized = re.sub(r"[-_]", "", name.decode("ascii", errors="ignore").casefold())
+    return normalized in _CREDENTIAL_HEADER_NAMES
 
 
-def _redact_parameter_component(component: bytes) -> bytes:
+def _is_credential_parameter_name(normalized: str, declared_names: frozenset[str]) -> bool:
+    return normalized in _CREDENTIAL_PARAMETER_NAMES or normalized in declared_names
+
+
+def _redact_parameter_component(component: bytes, declared_names: frozenset[str]) -> bytes:
     pieces = re.split(rb"([&;])", component)
     for index in range(0, len(pieces), 2):
         name, separator, _value = pieces[index].partition(b"=")
-        if _is_credential_name(_normalized_credential_name(name)):
+        if _is_credential_parameter_name(_normalized_credential_name(name), declared_names):
             pieces[index] = name + separator + b"<redacted>"
     return b"".join(pieces)
 
 
-def _redact_target_credentials(target: bytes) -> bytes:
+def _redact_target_credentials(target: bytes, declared_names: frozenset[str]) -> bytes:
     before_fragment, fragment_separator, fragment = target.partition(b"#")
     path, query_separator, query = before_fragment.partition(b"?")
     redacted = path
     if query_separator:
-        redacted += query_separator + _redact_parameter_component(query)
+        redacted += query_separator + _redact_parameter_component(query, declared_names)
     if fragment_separator:
-        redacted += fragment_separator + _redact_parameter_component(fragment)
+        redacted += fragment_separator + _redact_parameter_component(fragment, declared_names)
     return redacted
 
 
@@ -471,7 +480,10 @@ def validate_prepared_request(prepared: PreparedExternalRequest) -> None:
     if canonical_request_sha256(prepared.canonical_request) != prepared.canonical_request_sha256:
         raise ExternalEffectValidationError("canonical request changed after preparation")
     if (
-        application_request_sha256(prepared.application_request)
+        application_request_sha256(
+            prepared.application_request,
+            credential_parameter_names=prepared.credential_parameter_names,
+        )
         != prepared.application_request_sha256
         or _wire_request_sha256(prepared.application_request) != prepared.physical_request_sha256
     ):
@@ -548,28 +560,63 @@ def _freeze_normalized(value: Any) -> Any:
 
 
 def _assert_safe_persisted_json(value: Any, path: str = "canonical_request") -> None:
-    sensitive_key_parts = (
-        "authorization",
-        "api_key",
-        "apikey",
-        "access_key",
-        "access_token",
-        "refresh_token",
-        "token",
-        "password",
-        "passwd",
-        "secret",
-        "cookie",
-        "set-cookie",
-        "credential",
-        "private_key",
-        "signed_url",
-        "signature",
+    sensitive_key_names = frozenset(
+        re.sub(r"[-_]", "", name)
+        for name in (
+            "authorization",
+            "proxy_authorization",
+            "apikey",
+            "api_key",
+            "x_api_key",
+            "access_key",
+            "access_key_id",
+            "access_token",
+            "id_token",
+            "refresh_token",
+            "client_secret",
+            "client_assertion",
+            "auth",
+            "bearer",
+            "bearer_token",
+            "jwt",
+            "jwt_token",
+            "token",
+            "password",
+            "passwd",
+            "secret",
+            "session",
+            "session_id",
+            "session_token",
+            "cookie",
+            "set-cookie",
+            "credential",
+            "credentials",
+            "private_key",
+            "private_key_id",
+            "client_key",
+            "client_secret_key",
+            "secret_key",
+            "api_secret",
+            "consumer_key",
+            "consumer_secret",
+            "signed_url",
+            "signature",
+            "sig",
+            "oauth_token",
+            "oauth_signature",
+            "code_verifier",
+            "passphrase",
+            "x_amz_credential",
+            "x_amz_security_token",
+            "x_api_key",
+            "x-amz-signature",
+            "x-goog-signature",
+        )
     )
     if isinstance(value, Mapping):
         for key, child in value.items():
-            lowered = key.casefold().replace("-", "_")
-            if any(part.replace("-", "_") in lowered for part in sensitive_key_parts):
+            normalized = re.sub(r"[-_]", "", key.casefold())
+            if normalized in sensitive_key_names:
                 raise ExternalEffectValidationError(
                     f"secret-bearing field is not persistable: {path}.{key}"
                 )

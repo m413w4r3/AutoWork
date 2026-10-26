@@ -91,12 +91,8 @@ class _CountingTransport:
         self,
         *,
         response: TransportResponse | Exception | None = None,
-        pre_submission_failure: (
-            httpx.ConnectError | httpx.ConnectTimeout | httpx.PoolTimeout | None
-        ) = None,
     ) -> None:
         self.__raw_client = _CountingRawClient(response)
-        self.pre_submission_failure = pre_submission_failure
         self.submit_entries = 0
 
     @property
@@ -117,9 +113,6 @@ class _CountingTransport:
         if self.__raw_client.retries_enabled:
             raise HandoffGateRefused("raw client retries must be disabled")
         capability(request)
-        if self.pre_submission_failure is not None:
-            capability.report_pre_submission_failure(self.pre_submission_failure)
-            raise self.pre_submission_failure
         return await self.__raw_client.send(request, follow_redirects=False)
 
 
@@ -535,7 +528,7 @@ async def test_second_coordinator_cannot_seal_claim_with_foreign_proof(
 
 
 @pytest.mark.asyncio
-async def test_postgate_connect_failure_is_definitively_not_submitted(
+async def test_connect_error_after_handoff_is_needs_review_and_never_retried(
     migrated_postgres_url: str, tmp_path: Path
 ) -> None:
     session_factory, engine, _investigation_id, _subject_id, authorities = await _prepare_case(
@@ -544,24 +537,36 @@ async def test_postgate_connect_failure_is_definitively_not_submitted(
     authority, prepared = authorities[0]
     store = _store(session_factory)
     failure = httpx.ConnectError("connection could not be established")
-    transport = _CountingTransport(pre_submission_failure=failure)
+    transport = _CountingTransport(response=failure)
     coordinator = ExternalEffectCoordinator(store)
     try:
         first = await coordinator.send_one(authority, prepared, transport)
-        assert isinstance(first, DefinitelyNotSubmitted)
+        assert isinstance(first, Ambiguous)
         assert transport.submit_entries == 1
-        assert transport.calls == 0
+        assert transport.calls == 1
         async with session_factory() as session:
             row = await session.get(ExternalEffectClaimRow, first.claim_id)
         assert row is not None
-        assert row.state == "DEFINITIVELY_NOT_SUBMITTED"
+        assert row.state == "NEEDS_REVIEW"
         assert row.handoff_permit_nonce is not None
-        assert row.last_error_code == "transport_no_request_bytes"
+        assert row.last_error_code == "transport_outcome_unknown"
 
         replay = await coordinator.send_one(authority, prepared, transport)
-        assert isinstance(replay, DefinitelyNotSubmitted)
+        assert isinstance(replay, Ambiguous)
         assert transport.submit_entries == 1
-        assert transport.calls == 0
+        assert transport.calls == 1
+        assert replay.claim_id == first.claim_id
+        async with session_factory() as session:
+            claims = await session.scalar(
+                select(func.count())
+                .select_from(ExternalEffectClaimRow)
+                .where(
+                    ExternalEffectClaimRow.investigation_id == authority.investigation_id,
+                    ExternalEffectClaimRow.effect_key
+                    == effect_key(authority.investigation_id, prepared),
+                )
+            )
+        assert claims == 1
     finally:
         await engine.dispose()
 
@@ -732,7 +737,10 @@ async def test_downgrade_refuses_committed_external_effect_rows(
 
 
 def _store(
-    session_factory: async_sessionmaker[AsyncSession], *, policy_guard: Any = None
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    policy_guard: Any = None,
+    credential_parameter_names: frozenset[str] = frozenset(),
 ) -> SqlAlchemyExternalEffectClaimStore:
     return SqlAlchemyExternalEffectClaimStore(
         session_factory,
@@ -743,9 +751,52 @@ def _store(
                 provider_scopes=frozenset({"tenant-test"}),
                 normalizer_versions=frozenset({_NORMALIZER}),
                 invocation_tool_binding=(_FAMILY, "v1"),
+                credential_parameter_names=credential_parameter_names,
             )
         },
     )
+
+
+@pytest.mark.asyncio
+async def test_family_declared_key_parameter_is_required_before_submission(
+    migrated_postgres_url: str, tmp_path: Path
+) -> None:
+    session_factory, engine, _investigation_id, _subject_id, authorities = await _prepare_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    authority, base = authorities[0]
+    wire = FrozenWireRequest(
+        method=b"GET",
+        target=b"/v1/report?hash=abc&key=credential-probe",
+        headers=((b"accept", b"application/json"),),
+        body=b"",
+    )
+    prepared = PreparedExternalRequest.build(
+        family=base.family,
+        provider=base.provider,
+        provider_scope=base.provider_scope,
+        normalizer_version=base.normalizer_version,
+        canonical_request=base.canonical_request,
+        application_request=wire,
+        credential_parameter_names=("key",),
+    )
+    unconfigured_transport = _CountingTransport()
+    try:
+        refused = await ExternalEffectCoordinator(_store(session_factory)).send_one(
+            authority, prepared, unconfigured_transport
+        )
+        assert isinstance(refused, Refused)
+        assert refused.reason == "family_credential_declaration_mismatch"
+        assert unconfigured_transport.calls == 0
+
+        configured_transport = _CountingTransport()
+        accepted = await ExternalEffectCoordinator(
+            _store(session_factory, credential_parameter_names=frozenset({"key"}))
+        ).send_one(authority, prepared, configured_transport)
+        assert isinstance(accepted, Completed)
+        assert configured_transport.calls == 1
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio

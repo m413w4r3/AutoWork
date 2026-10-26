@@ -21,8 +21,6 @@ from enum import StrEnum
 from typing import Any, Protocol, SupportsIndex, cast
 from uuid import UUID, uuid4
 
-import httpx
-
 from cti_app.domain.external_effects import (
     ConsumedEffectPermit,
     EffectClaimState,
@@ -205,7 +203,6 @@ class NoSubmissionProofKind(StrEnum):
     """Coordinator-verified proof phase delivered only to the claim store."""
 
     BEFORE_HANDOFF = "before_handoff"
-    TRANSPORT_NO_BYTES_LEFT = "transport_no_bytes_left"
 
 
 @dataclass(frozen=True, slots=True, init=False, repr=False)
@@ -288,10 +285,6 @@ class PhysicalSendCapability:
     def __call__(self, request: FrozenWireRequest) -> None:
         raise HandoffGateRefused("physical send capability is not registered")
 
-    def report_pre_submission_failure(self, failure: BaseException) -> None:
-        """Report a transport exception that proves no request bytes left."""
-        raise HandoffGateRefused("pre-submission evidence is not registered")
-
     def __copy__(self) -> PhysicalSendCapability:
         return object.__new__(type(self))
 
@@ -303,41 +296,23 @@ class PhysicalSendCapability:
 
 
 def _install_physical_send_capability_dispatch() -> tuple[
-    Callable[
-        [Callable[[FrozenWireRequest], None], Callable[[BaseException], None]],
-        PhysicalSendCapability,
-    ],
+    Callable[[Callable[[FrozenWireRequest], None]], PhysicalSendCapability],
     Callable[[PhysicalSendCapability], None],
 ]:
     registry_lock = threading.Lock()
-    authorizers: dict[
-        PhysicalSendCapability,
-        tuple[Callable[[FrozenWireRequest], None], Callable[[BaseException], None]],
-    ] = {}
+    authorizers: dict[PhysicalSendCapability, Callable[[FrozenWireRequest], None]] = {}
 
     def dispatch(capability: PhysicalSendCapability, request: FrozenWireRequest) -> None:
         with registry_lock:
             registered = authorizers.get(capability)
         if registered is None:
             raise HandoffGateRefused("physical send capability is not registered")
-        registered[0](request)
+        registered(request)
 
-    def report_pre_submission_failure(
-        capability: PhysicalSendCapability, failure: BaseException
-    ) -> None:
-        with registry_lock:
-            registered = authorizers.get(capability)
-        if registered is None:
-            raise HandoffGateRefused("physical send capability is not registered")
-        registered[1](failure)
-
-    def issue(
-        authorize: Callable[[FrozenWireRequest], None],
-        report_no_bytes_left: Callable[[BaseException], None],
-    ) -> PhysicalSendCapability:
+    def issue(authorize: Callable[[FrozenWireRequest], None]) -> PhysicalSendCapability:
         capability = object.__new__(PhysicalSendCapability)
         with registry_lock:
-            authorizers[capability] = (authorize, report_no_bytes_left)
+            authorizers[capability] = authorize
         return capability
 
     def revoke(capability: PhysicalSendCapability) -> None:
@@ -345,11 +320,6 @@ def _install_physical_send_capability_dispatch() -> tuple[
             authorizers.pop(capability, None)
 
     type.__setattr__(PhysicalSendCapability, "__call__", dispatch)
-    type.__setattr__(
-        PhysicalSendCapability,
-        "report_pre_submission_failure",
-        report_pre_submission_failure,
-    )
     return issue, revoke
 
 
@@ -360,10 +330,7 @@ del _install_physical_send_capability_dispatch
 
 
 def _make_capability_init_binder(
-    issue: Callable[
-        [Callable[[FrozenWireRequest], None], Callable[[BaseException], None]],
-        PhysicalSendCapability,
-    ],
+    issue: Callable[[Callable[[FrozenWireRequest], None]], PhysicalSendCapability],
     revoke: Callable[[PhysicalSendCapability], None],
 ) -> Callable[[Callable[..., None]], Callable[..., None]]:
     def bind(initializer: Callable[..., None]) -> Callable[..., None]:
@@ -541,7 +508,7 @@ class ExternalEffectCoordinator:
         reuse_policies: Mapping[str, ExternalEffectReusePolicy] | None = None,
         permit_ttl_seconds: float = 5.0,
         capability_issuer: Callable[
-            [Callable[[FrozenWireRequest], None], Callable[[BaseException], None]],
+            [Callable[[FrozenWireRequest], None]],
             PhysicalSendCapability,
         ],
         capability_revoker: Callable[[PhysicalSendCapability], None],
@@ -654,24 +621,7 @@ class ExternalEffectCoordinator:
                         raise HandoffGateRefused("physical send capability expired or invalid")
                     capability_used = True
 
-            def report_no_bytes_left(failure: BaseException) -> None:
-                proven_no_write_errors = (
-                    httpx.ConnectError,
-                    httpx.ConnectTimeout,
-                    httpx.PoolTimeout,
-                )
-                if type(failure) not in proven_no_write_errors:
-                    raise HandoffGateRefused("transport failure does not prove zero request bytes")
-                with capability_lock:
-                    if not capability_active or not capability_used:
-                        raise HandoffGateRefused(
-                            "no-bytes evidence lacks an active send capability"
-                        )
-                    if handoff_state.get("pre_submission_failure") is not None:
-                        raise HandoffGateRefused("pre-submission evidence was already reported")
-                    handoff_state["pre_submission_failure"] = failure
-
-            capability = capability_issuer(physical_send_capability, report_no_bytes_left)
+            capability = capability_issuer(physical_send_capability)
             capability_was_used = False
             try:
                 response = await transport.submit_once(request, capability)
@@ -684,8 +634,6 @@ class ExternalEffectCoordinator:
                 # The durable handoff marker is already present and the transport
                 # ran, so reject its response without claiming zero egress.
                 raise HandoffGateRefused("transport returned without using its send capability")
-            if handoff_state.get("pre_submission_failure") is not None:
-                raise HandoffGateRefused("transport reported no-bytes evidence without raising it")
             return response
 
         async def seal_zero_handoff(
@@ -788,17 +736,7 @@ class ExternalEffectCoordinator:
                     reason_code="pre_handoff_gate_refused",
                     kind=NoSubmissionProofKind.BEFORE_HANDOFF,
                 )
-            except Exception as exc:
-                if handoff_state.get("pre_submission_failure") is exc and type(exc) in (
-                    httpx.ConnectError,
-                    httpx.ConnectTimeout,
-                    httpx.PoolTimeout,
-                ):
-                    return await seal_zero_handoff(
-                        consume.claim_id,
-                        reason_code="transport_no_request_bytes",
-                        kind=NoSubmissionProofKind.TRANSPORT_NO_BYTES_LEFT,
-                    )
+            except Exception:
                 await self._seal_needs_review(consume.claim_id, "transport_outcome_unknown")
                 return Ambiguous(consume.claim_id)
 
