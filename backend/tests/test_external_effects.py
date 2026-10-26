@@ -1551,6 +1551,9 @@ async def test_osint_policy_guard_locks_before_envelope() -> None:
         async def authorize(self, context):
             return True
 
+        async def authorize_source_disclosure(self, context):
+            return True
+
     class _OrderingStore(SqlAlchemyExternalEffectClaimStore):
         async def _lock_authority(self, *args, **kwargs):
             events.append("envelope")
@@ -1670,6 +1673,47 @@ async def test_source_dependent_family_rejects_untrusted_source_refs(case: str) 
     assert result.reason in {"malformed_source_reference", "source_references_mismatch"}
     assert transport.submit_entries == 0
     assert transport.calls == []
+
+
+@pytest.mark.parametrize(
+    ("request_sandbox", "expected_sandbox", "denied"),
+    [
+        ("sandbox-1", "sandbox-1", False),
+        ("sandbox-2", "sandbox-1", True),
+        ("sandbox%3A1", "sandbox:1", False),
+    ],
+)
+def test_vt_pcap_source_hash_is_bound_to_persisted_request_target(
+    request_sandbox: str, expected_sandbox: str, denied: bool
+) -> None:
+    file_hash = "a" * 64
+    source_reference = EvidenceReference("sample_hash", file_hash, "sample-hash.v1", file_hash)
+    prepared = _prepared(
+        family="vt.behaviour_pcap",
+        request={"path": f"/api/v3/file_behaviours/{request_sandbox}/pcap"},
+        evidence_refs=(source_reference,),
+    )
+    invocation = SimpleNamespace(
+        normalized_parameters={"file_hash": file_hash, "sandbox_id": expected_sandbox}
+    )
+    binding = ExternalEffectFamilyBinding(
+        provider=prepared.provider,
+        provider_scopes=frozenset({prepared.provider_scope}),
+        normalizer_versions=frozenset({prepared.normalizer_version}),
+        invocation_tool_binding=("vt.behaviour_pcap", "1"),
+        requires_source_refs=True,
+        source_reference_resolver=lambda _parameters: (source_reference,),
+    )
+    store = SqlAlchemyExternalEffectClaimStore(
+        lambda: None,  # type: ignore[arg-type]
+        family_bindings={prepared.family: binding},
+    )
+
+    if denied:
+        with pytest.raises(_ConsumeDenied, match="vt_source_hash_request_mismatch"):
+            store._validate_family_source_refs(binding, invocation, prepared)
+    else:
+        store._validate_family_source_refs(binding, invocation, prepared)
 
 
 @pytest.mark.parametrize("drift", ["missing_default", "extra_index"])

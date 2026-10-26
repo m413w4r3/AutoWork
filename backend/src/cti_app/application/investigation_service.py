@@ -1312,6 +1312,9 @@ class InvestigationService:
             reserved_budget=requested_cost,
         )
         invocation = await self._invocations.add_if_absent(invocation)
+        if tool_name in _VT_COORDINATED_READ_TOOLS:
+            invocation_parameters = invocation.normalized_parameters
+            external_effect_evidence_refs = _vt_source_refs_from_parameters(invocation_parameters)
         admission_reservation: BudgetReservation | None = None
         if invocation.status is ToolInvocationStatus.PENDING:
             # A durable invocation is the source of truth for an operation's cost.
@@ -1665,7 +1668,11 @@ class InvestigationService:
         investigation: AnalystInvestigation,
         references: tuple[EvidenceReference, ...],
     ) -> bool:
-        hashes = {reference.id for reference in references if reference.kind == "sample_hash"}
+        sample_hashes = {
+            reference.id for reference in references if reference.kind == "sample_hash"
+        }
+        observation_hashes: set[str] = set()
+        hashes = set(sample_hashes)
         document_ids = {
             reference.id for reference in references if reference.kind == "source_document"
         }
@@ -1685,8 +1692,17 @@ class InvestigationService:
             ):
                 return True
             object_type = observation.object_type.casefold()
-            if object_type in {"sample", "file", "sample_observation"}:
-                hashes.add(observation.object_id)
+            if object_type in {"sample", "file", "sample_observation"} or (
+                sample_hashes and object_type == "sha256"
+            ):
+                try:
+                    sample_hash = normalize_file_hash(observation.object_id)
+                except (TypeError, ValueError):
+                    return True
+                if len(sample_hash) != 64:
+                    return True
+                observation_hashes.add(sample_hash)
+                hashes.add(sample_hash)
             elif object_type in {"source_document", "document"}:
                 document_ids.add(observation.object_id)
         sample_associations = self._sample_associations
@@ -1695,7 +1711,14 @@ class InvestigationService:
             if sample_associations is None or sample_repository is None:
                 return True
             associations = await sample_associations.list_for_investigation(investigation.id)
-            if not hashes.issubset({association.sample_sha256 for association in associations}):
+            associated_hashes = {association.sample_sha256 for association in associations}
+            if any(
+                reference.kind == "sample_hash" for reference in references
+            ) and not observation_hashes.issubset(sample_hashes):
+                return True
+            if sample_hashes - (associated_hashes | observation_hashes):
+                return True
+            if observation_hashes - (associated_hashes | sample_hashes):
                 return True
         for sample_hash in hashes:
             if sample_repository is None:
@@ -1752,12 +1775,38 @@ class InvestigationService:
                 return ()
             if len(normalized_hash) != 64:
                 return ()
+            hash_reference = EvidenceReference(
+                kind="sample_hash",
+                id=normalized_hash,
+                version="sample-hash.v1",
+                sha256=normalized_hash,
+            )
+            associations = (
+                await self._sample_associations.list_for_investigation(investigation.id)
+                if self._sample_associations is not None
+                else ()
+            )
+            if any(item.sample_sha256 == normalized_hash for item in associations):
+                return (hash_reference,)
+            observations = await self._observations.list_for_investigation(investigation.id)
+            matching_observations = tuple(
+                item
+                for item in observations
+                if item.object_type.casefold() in {"sample", "file", "sample_observation", "sha256"}
+                and item.object_id == normalized_hash
+            )
+            if not matching_observations:
+                return ()
             return (
-                EvidenceReference(
-                    kind="sample_hash",
-                    id=normalized_hash,
-                    version="sample-hash.v1",
-                    sha256=normalized_hash,
+                hash_reference,
+                *(
+                    EvidenceReference(
+                        kind="evidence_observation",
+                        id=str(item.id),
+                        version=item.source_version,
+                        sha256=item.sha256,
+                    )
+                    for item in sorted(matching_observations, key=lambda value: str(value.id))
                 ),
             )
 

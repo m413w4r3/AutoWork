@@ -82,6 +82,9 @@ from cti_app.infrastructure.database.repositories.external_effects import (
     SqlAlchemyExternalEffectClaimStore,
 )
 from cti_app.infrastructure.database.repositories.investigation import _budget_to_payload
+from cti_app.infrastructure.database.repositories.virustotal_external_effects import (
+    SqlAlchemyVirusTotalPolicyGuard,
+)
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
 from tests.integration.conftest import _alembic_config
@@ -1278,6 +1281,75 @@ async def test_unresolvable_evidence_observation_refuses_model_submission(
 
 
 @pytest.mark.asyncio
+async def test_observation_hash_with_null_sample_association_refuses_model_submission(
+    migrated_postgres_url: str, tmp_path: Path
+) -> None:
+    session_factory, engine, investigation_id, _subject_id, authorities = await _prepare_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    authority, base = authorities[0]
+    sample_sha256 = "c" * 64
+    observation_id = uuid4()
+    observation_sha256 = "d" * 64
+    observation_version = "source-v1"
+    async with session_factory() as session:
+        async with session.begin():
+            blob = await session.scalar(select(BlobRow).order_by(BlobRow.id).limit(1))
+            assert blob is not None
+            session.add(
+                SampleAssociationRow(
+                    id=uuid4(),
+                    investigation_id=investigation_id,
+                    sample_id=None,
+                    sample_sha256=sample_sha256,
+                    origin="manual",
+                )
+            )
+            session.add(
+                EvidenceObservationRow(
+                    id=observation_id,
+                    investigation_id=investigation_id,
+                    kind="other",
+                    blob_id=blob.id,
+                    sha256=observation_sha256,
+                    source="test.source",
+                    source_version=observation_version,
+                    observed_at=datetime.now(UTC),
+                    object_type="file",
+                    object_id=sample_sha256,
+                    limitations=[],
+                    invocation_ref=None,
+                )
+            )
+    prepared = PreparedExternalRequest.build(
+        family=base.family,
+        provider=base.provider,
+        provider_scope=base.provider_scope,
+        normalizer_version=base.normalizer_version,
+        canonical_request=base.canonical_request,
+        application_request=base.application_request,
+        evidence_refs=(
+            EvidenceReference(
+                kind="evidence_observation",
+                id=str(observation_id),
+                version=observation_version,
+                sha256=observation_sha256,
+            ),
+        ),
+    )
+    transport = _CountingTransport()
+    try:
+        outcome = await ExternalEffectCoordinator(
+            _store(session_factory, model_submission=True)
+        ).send_one(authority, prepared, transport)
+        assert isinstance(outcome, Refused)
+        assert outcome.reason == "sample_hash_unresolvable"
+        assert transport.calls == 0
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_evidence_observation_resolves_restricted_sample_hash_at_consume(
     migrated_postgres_url: str, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -1397,6 +1469,130 @@ async def test_evidence_observation_resolves_restricted_sample_hash_at_consume(
             for claim in claims
         ]
         assert restriction_text not in repr(persisted_claims)
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_human_g2_vt_read_checks_external_llm_source_restriction_at_consume(
+    migrated_postgres_url: str, tmp_path: Path
+) -> None:
+    session_factory, engine, investigation_id, subject_id, authorities = await _prepare_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    authority, base = authorities[0]
+    sample_id = uuid4()
+    sample_sha256 = "b" * 64
+    observation_id = uuid4()
+    observation_sha256 = "e" * 64
+    observation_version = "source-v1"
+    async with session_factory() as session:
+        async with session.begin():
+            blob = await session.scalar(select(BlobRow).order_by(BlobRow.id).limit(1))
+            assert blob is not None
+            session.add(
+                SampleRow(
+                    id=sample_id,
+                    subject_id=subject_id,
+                    blob_id=blob.id,
+                    original_name="human-g2-restricted-sample.bin",
+                    origin="test",
+                    acquired_at=datetime.now(UTC),
+                    license_restriction=None,
+                    tlp="CLEAR",
+                    do_not_submit=False,
+                    external_llm_allowed=False,
+                    origin_kind="manual",
+                    state="validated",
+                    source_service=None,
+                    source_object_id=sample_sha256,
+                    expected_hash=sample_sha256,
+                    validation_actor=None,
+                    validation_date=None,
+                    validation_reason=None,
+                    imphash=None,
+                    ssdeep=None,
+                    tlsh=None,
+                    rich_header_hash=None,
+                    vhash=None,
+                    main_icon_dhash=None,
+                    imphash_source=None,
+                    ssdeep_source=None,
+                    tlsh_source=None,
+                    rich_header_hash_source=None,
+                    vhash_source=None,
+                    main_icon_dhash_source=None,
+                    created_at=datetime.now(UTC),
+                )
+            )
+            session.add(
+                SampleAssociationRow(
+                    id=uuid4(),
+                    investigation_id=investigation_id,
+                    sample_id=sample_id,
+                    sample_sha256=sample_sha256,
+                    origin="manual",
+                )
+            )
+            session.add(
+                EvidenceObservationRow(
+                    id=observation_id,
+                    investigation_id=investigation_id,
+                    kind="other",
+                    blob_id=blob.id,
+                    sha256=observation_sha256,
+                    source="test.source",
+                    source_version=observation_version,
+                    observed_at=datetime.now(UTC),
+                    object_type="file",
+                    object_id=sample_sha256,
+                    limitations=[],
+                    invocation_ref=None,
+                )
+            )
+    source_refs = (
+        EvidenceReference("sample_hash", sample_sha256, "sample-hash.v1", sample_sha256),
+        EvidenceReference(
+            "evidence_observation",
+            str(observation_id),
+            observation_version,
+            observation_sha256,
+        ),
+    )
+    request_path = f"/api/v3/files/{sample_sha256}"
+    prepared = PreparedExternalRequest.build(
+        family=base.family,
+        provider=base.provider,
+        provider_scope=base.provider_scope,
+        normalizer_version=base.normalizer_version,
+        canonical_request={"path": request_path},
+        application_request=FrozenWireRequest(
+            method=b"GET",
+            target=request_path.encode(),
+            headers=((b"accept", b"application/json"),),
+            body=b"",
+        ),
+        evidence_refs=source_refs,
+    )
+    family_binding = ExternalEffectFamilyBinding(
+        provider=base.provider,
+        provider_scopes=frozenset({base.provider_scope}),
+        normalizer_versions=frozenset({base.normalizer_version}),
+        invocation_tool_binding=(base.family, "v1"),
+        requires_source_refs=True,
+        source_reference_resolver=lambda _parameters: source_refs,
+    )
+    store = SqlAlchemyExternalEffectClaimStore(
+        session_factory,
+        policy_guard=SqlAlchemyVirusTotalPolicyGuard(),
+        family_bindings={base.family: family_binding},
+    )
+    transport = _CountingTransport()
+    try:
+        outcome = await ExternalEffectCoordinator(store).send_one(authority, prepared, transport)
+        assert isinstance(outcome, Refused)
+        assert outcome.reason == "vt_source_disclosure_denied"
+        assert transport.calls == 0
     finally:
         await engine.dispose()
 

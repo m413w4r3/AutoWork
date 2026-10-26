@@ -9,6 +9,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, cast
+from urllib.parse import unquote
 from uuid import UUID, uuid4
 
 from sqlalchemy import or_, select, update
@@ -46,7 +47,7 @@ from cti_app.domain.external_effects import (
     effect_key as compute_effect_key,
 )
 from cti_app.domain.investigation import BudgetReservationStatus
-from cti_app.infrastructure.database.models.core import SampleRow, SourceDocumentRow
+from cti_app.infrastructure.database.models.core import BlobRow, SampleRow, SourceDocumentRow
 from cti_app.infrastructure.database.models.external_effects import (
     ExternalEffectClaimRow,
     ExternalEffectUseRow,
@@ -83,6 +84,60 @@ class _ConsumeDenied(Exception):
 
 
 SourceReferenceResolver = Callable[[Mapping[str, Any]], tuple[EvidenceReference, ...]]
+
+
+def _vt_file_hash_from_request(prepared: PreparedExternalRequest) -> str | None:
+    path = prepared.canonical_request.get("path")
+    if not isinstance(path, str):
+        return None
+    path_parts = path.split("/")
+    try:
+        files_index = path_parts.index("files")
+    except ValueError:
+        files_index = -1
+    if files_index >= 0 and files_index + 1 < len(path_parts):
+        candidate = path_parts[files_index + 1]
+        return candidate if re.fullmatch(r"[0-9a-f]{64}", candidate) else None
+    if not path.rstrip("/").endswith("/file/report"):
+        return None
+    query = prepared.canonical_request.get("query")
+    if not isinstance(query, (list, tuple)):
+        return None
+    resources = [
+        item[1]
+        for item in query
+        if isinstance(item, (list, tuple))
+        and len(item) == 2
+        and item[0] == "resource"
+        and isinstance(item[1], str)
+    ]
+    if len(resources) != 1 or not re.fullmatch(r"[0-9a-f]{64}", resources[0]):
+        return None
+    return resources[0]
+
+
+def _vt_pcap_sandbox_from_request(prepared: PreparedExternalRequest) -> str | None:
+    path = prepared.canonical_request.get("path")
+    if not isinstance(path, str):
+        return None
+    path_parts = path.strip("/").split("/")
+    for index, part in enumerate(path_parts):
+        if (
+            part == "file_behaviours"
+            and index + 2 == len(path_parts) - 1
+            and path_parts[index + 2] == "pcap"
+        ):
+            candidate = path_parts[index + 1]
+            try:
+                decoded_candidate = unquote(candidate, errors="strict")
+            except UnicodeDecodeError:
+                return None
+            return (
+                decoded_candidate
+                if re.fullmatch(r"[A-Za-z0-9._:-]{1,256}", decoded_candidate)
+                else None
+            )
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1002,23 +1057,35 @@ class SqlAlchemyExternalEffectClaimStore:
         ):
             raise _ConsumeDenied("pinned_subject_mismatch")
 
+        policy_context = ConsumePolicyContext(
+            authority=authority,
+            prepared=prepared,
+            effect_key=key,
+            database_session=session,
+            investigation_subject_id=investigation.subject_id,
+        )
         if authority.authority_kind is ExternalEffectAuthorityKind.OSINT_POLICY:
             if self._policy_guard is None:
                 raise _ConsumeDenied("osint_policy_guard_unavailable")
             try:
-                allowed = await self._policy_guard.authorize(
-                    ConsumePolicyContext(
-                        authority=authority,
-                        prepared=prepared,
-                        effect_key=key,
-                        database_session=session,
-                        investigation_subject_id=investigation.subject_id,
-                    )
-                )
+                allowed = await self._policy_guard.authorize(policy_context)
             except Exception as exc:
                 raise _ConsumeDenied("osint_policy_guard_error") from exc
             if not allowed:
                 raise _ConsumeDenied("osint_policy_denied")
+        elif (
+            authority.authority_kind is ExternalEffectAuthorityKind.HUMAN_G2
+            and prepared.family.startswith("vt.")
+            and family_binding.requires_source_refs
+        ):
+            if self._policy_guard is None:
+                raise _ConsumeDenied("vt_source_guard_unavailable")
+            try:
+                allowed = await self._policy_guard.authorize_source_disclosure(policy_context)
+            except Exception as exc:
+                raise _ConsumeDenied("vt_source_guard_error") from exc
+            if not allowed:
+                raise _ConsumeDenied("vt_source_disclosure_denied")
 
         if invocation is None:
             if not any(
@@ -1103,6 +1170,26 @@ class SqlAlchemyExternalEffectClaimStore:
             normalized_expected, key=sort_key
         ):
             raise _ConsumeDenied("source_references_mismatch")
+        if prepared.family in {"vt.file_report", "vt.behaviour", "vt.relationships"}:
+            hash_references = [item for item in normalized_actual if item.kind == "sample_hash"]
+            if hash_references and (
+                len(hash_references) != 1
+                or _vt_file_hash_from_request(prepared) != hash_references[0].id
+            ):
+                raise _ConsumeDenied("vt_source_hash_request_mismatch")
+        elif prepared.family == "vt.behaviour_pcap":
+            hash_references = [item for item in normalized_actual if item.kind == "sample_hash"]
+            parameters = invocation.normalized_parameters
+            expected_hash = parameters.get("file_hash")
+            expected_sandbox = parameters.get("sandbox_id")
+            if (
+                len(hash_references) != 1
+                or not isinstance(expected_hash, str)
+                or hash_references[0].id != expected_hash
+                or not isinstance(expected_sandbox, str)
+                or _vt_pcap_sandbox_from_request(prepared) != expected_sandbox
+            ):
+                raise _ConsumeDenied("vt_source_hash_request_mismatch")
 
     async def _lock_and_consume_family_attempt(
         self,
@@ -1188,8 +1275,15 @@ class SqlAlchemyExternalEffectClaimStore:
         association_ids: set[UUID] = set()
         document_ids: set[UUID] = set()
         sample_hashes: set[str] = set()
+        observation_hashes: set[str] = set()
         observation_ids: dict[UUID, EvidenceReference] = {}
         is_model_submission = _is_model_submission(prepared, family_binding)
+        vt_file_hash_read = prepared.family in {
+            "vt.file_report",
+            "vt.behaviour",
+            "vt.behaviour_pcap",
+            "vt.relationships",
+        }
         recognized_kinds = {
             "sample",
             "sample_association_sample",
@@ -1254,10 +1348,13 @@ class SqlAlchemyExternalEffectClaimStore:
                 ):
                     raise _ConsumeDenied("evidence_observation_version_mismatch")
                 object_type = observation.object_type.casefold()
-                if object_type in {"sample", "file", "sample_observation"}:
+                file_object_types = {"sample", "file", "sample_observation"}
+                if vt_file_hash_read:
+                    file_object_types.add("sha256")
+                if object_type in file_object_types:
                     if not re.fullmatch(r"[0-9a-f]{64}", observation.object_id):
                         raise _ConsumeDenied("unresolvable_evidence_observation_source")
-                    sample_hashes.add(observation.object_id)
+                    observation_hashes.add(observation.object_id)
                 elif object_type in {"source_document", "document"}:
                     try:
                         document_ids.add(UUID(observation.object_id))
@@ -1266,7 +1363,11 @@ class SqlAlchemyExternalEffectClaimStore:
                 elif is_model_submission:
                     raise _ConsumeDenied("unresolvable_evidence_observation_source")
 
+        if vt_file_hash_read and sample_hashes and not observation_hashes.issubset(sample_hashes):
+            raise _ConsumeDenied("vt_source_observation_hash_mismatch")
+
         association_terms: list[ColumnElement[bool]] = []
+        source_hashes = sample_hashes | observation_hashes
         if association_ids:
             association_terms.append(SampleAssociationRow.id.in_(sorted(association_ids, key=str)))
         if sample_ids:
@@ -1274,10 +1375,10 @@ class SqlAlchemyExternalEffectClaimStore:
                 (SampleAssociationRow.investigation_id == authority.investigation_id)
                 & SampleAssociationRow.sample_id.in_(sorted(sample_ids, key=str))
             )
-        if sample_hashes:
+        if source_hashes:
             association_terms.append(
                 (SampleAssociationRow.investigation_id == authority.investigation_id)
-                & SampleAssociationRow.sample_sha256.in_(sorted(sample_hashes))
+                & SampleAssociationRow.sample_sha256.in_(sorted(source_hashes))
             )
         associations = (
             list(
@@ -1305,18 +1406,48 @@ class SqlAlchemyExternalEffectClaimStore:
         ):
             raise _ConsumeDenied("sample_association_missing")
         found_hashes = {item.sample_sha256 for item in associations}
-        if sample_hashes and not sample_hashes.issubset(found_hashes):
+        observation_grounding_hashes = observation_hashes if vt_file_hash_read else set()
+        if sample_hashes - (found_hashes | observation_grounding_hashes):
             raise _ConsumeDenied("sample_hash_not_associated_with_investigation")
-        if is_model_submission and sample_hashes:
+        sample_hash_grounding = sample_hashes if vt_file_hash_read else set()
+        if observation_hashes - (found_hashes | sample_hash_grounding):
+            raise _ConsumeDenied("evidence_observation_not_associated_with_investigation")
+        model_source_hashes = sample_hashes | observation_hashes
+        if is_model_submission and model_source_hashes:
+            source_associations = [
+                item for item in associations if item.sample_sha256 in model_source_hashes
+            ]
+            if any(item.sample_id is None for item in source_associations):
+                raise _ConsumeDenied("sample_hash_unresolvable")
             resolved_hashes = {
-                item.sample_sha256 for item in associations if item.sample_id is not None
+                item.sample_sha256 for item in source_associations if item.sample_id is not None
             }
-            if not sample_hashes.issubset(resolved_hashes):
+            if not model_source_hashes.issubset(resolved_hashes):
                 raise _ConsumeDenied("sample_hash_unresolvable")
         if referenced_sample_ids and not referenced_sample_ids.issubset(
             {item.sample_id for item in associations if item.sample_id is not None}
         ):
             raise _ConsumeDenied("sample_not_associated_with_investigation")
+
+        if vt_file_hash_read and source_hashes:
+            hash_samples = list(
+                await session.scalars(
+                    select(SampleRow)
+                    .join(BlobRow, BlobRow.id == SampleRow.blob_id)
+                    .where(
+                        SampleRow.subject_id == subject_id,
+                        or_(
+                            BlobRow.sha256.in_(sorted(source_hashes)),
+                            SampleRow.expected_hash.in_(sorted(source_hashes)),
+                            SampleRow.source_object_id.in_(sorted(source_hashes)),
+                        ),
+                    )
+                    .order_by(SampleRow.id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            )
+            sample_ids.update(item.id for item in hash_samples)
 
         samples = list(
             await session.scalars(

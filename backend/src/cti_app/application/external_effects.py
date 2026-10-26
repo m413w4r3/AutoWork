@@ -97,7 +97,7 @@ class ConsumePolicyContext:
 
 
 class ExternalEffectPolicyGuard(Protocol):
-    """OSINT guard; policy/revocation writers lock policy before envelope."""
+    """Source and OSINT guard; policy/revocation writers lock before the envelope."""
 
     async def lock_for_consume(
         self, database_session: Any, authority: ExternalEffectAuthority
@@ -108,6 +108,10 @@ class ExternalEffectPolicyGuard(Protocol):
         """
 
     async def authorize(self, context: ConsumePolicyContext) -> bool: ...
+
+    async def authorize_source_disclosure(self, context: ConsumePolicyContext) -> bool:
+        """Check source disclosure restrictions without requiring an OSINT policy pin."""
+        ...
 
 
 @dataclass(frozen=True, slots=True)
