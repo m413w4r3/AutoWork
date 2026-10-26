@@ -217,6 +217,8 @@ async def _run_inherited_case(
     source_tlp: TLP = TLP.CLEAR,
     source_do_not_submit: bool = False,
     source_license_restriction: str | None = None,
+    associate_hashes: bool = True,
+    sample_observation_hashes: tuple[str, ...] = (),
 ):
     engine = create_postgres_engine(database_url)
     session_factory = create_session_factory(engine)
@@ -297,17 +299,42 @@ async def _run_inherited_case(
             await uow.source_documents.add(source_document)
             await uow.evidence_observations.append_if_absent(source_observation)
             await uow.commit()
-    async with uow_factory() as uow:
-        for file_hash in sorted(set(hashes)):
-            await uow.sample_associations.append_version(
-                SampleAssociation(
-                    investigation_id=seeded.investigation.id,
-                    sample_sha256=file_hash,
-                    origin=SampleOrigin.MANUAL,
-                ),
-                expected_version=0,
-            )
-        await uow.commit()
+    if sample_observation_hashes:
+        async with uow_factory() as uow:
+            for file_hash in sorted(set(sample_observation_hashes)):
+                observation_bytes = f"synthetic hash observation {uuid4()}".encode()
+                observation_blob_id = await artifact_store.put_bytes(
+                    observation_bytes,
+                    bucket="vt-read-hash-observations",
+                    mime_type="application/octet-stream",
+                )
+                await uow.evidence_observations.append_if_absent(
+                    EvidenceObservation(
+                        investigation_id=seeded.investigation.id,
+                        kind=EvidenceKind.OTHER,
+                        blob_id=observation_blob_id,
+                        sha256=hashlib.sha256(observation_bytes).hexdigest(),
+                        source="synthetic-vt-hash-observation",
+                        source_version="synthetic-v1",
+                        observed_at=datetime.now(UTC),
+                        object_type="sha256",
+                        object_id=file_hash,
+                        limitations=("Synthetic source observation only.",),
+                    )
+                )
+            await uow.commit()
+    if associate_hashes:
+        async with uow_factory() as uow:
+            for file_hash in sorted(set(hashes)):
+                await uow.sample_associations.append_version(
+                    SampleAssociation(
+                        investigation_id=seeded.investigation.id,
+                        sample_sha256=file_hash,
+                        origin=SampleOrigin.MANUAL,
+                    ),
+                    expected_version=0,
+                )
+            await uow.commit()
     await _seed_unrelated_unassociated_sample(uow_factory, artifact_store)
     policy_service, policy = await _activate_policy(
         uow_factory, seeded.subject.id, max_claims=max_claims
@@ -580,6 +607,52 @@ async def test_osint_open_inherited_investigation_uses_vt_coordinator_and_hides_
 
 
 @pytest.mark.asyncio
+async def test_osint_open_vt_read_accepts_investigation_observation_without_association(
+    migrated_postgres_url: str, tmp_path: Path
+) -> None:
+    file_hash = _synthetic_hash()
+    physical_requests: list[httpx.Request] = []
+
+    def proxy_handler(request: httpx.Request) -> httpx.Response:
+        physical_requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "id": file_hash,
+                    "type": "file",
+                    "attributes": {"reputation": 1, "last_analysis_stats": {}},
+                }
+            },
+            request=request,
+        )
+
+    result = await _run_inherited_case(
+        database_url=migrated_postgres_url,
+        tmp_path=tmp_path,
+        max_claims=10,
+        hashes=(file_hash,),
+        proxy_handler=proxy_handler,
+        associate_hashes=False,
+        sample_observation_hashes=(file_hash,),
+    )
+    try:
+        assert len(physical_requests) == 1
+        assert result["invocations"]
+        assert result["invocations"][0].status is ToolInvocationStatus.SUCCEEDED
+        assert len(result["claims"]) == 1
+        assert result["claims"][0].family == "vt.file_report"
+        source_refs = result["claims"][0].evidence_refs
+        assert any(reference["kind"] == "sample_hash" for reference in source_refs)
+        assert any(reference["kind"] == "evidence_observation" for reference in source_refs)
+    finally:
+        if result["direct_client"] is not None:
+            await result["direct_client"].aclose()
+        await result["proxy_client"].aclose()
+        await result["engine"].dispose()
+
+
+@pytest.mark.asyncio
 async def test_osint_open_inherited_investigation_gates_behaviour_pcap(
     migrated_postgres_url: str, tmp_path: Path, caplog
 ) -> None:
@@ -770,6 +843,81 @@ async def test_restricted_sample_vt_read_is_refused_before_transport(
         }
         if not bypass_legacy_guard:
             assert result["claims"] == []
+    finally:
+        if result["direct_client"] is not None:
+            await result["direct_client"].aclose()
+        await result["proxy_client"].aclose()
+        await result["engine"].dispose()
+
+
+@pytest.mark.asyncio
+async def test_restricted_observation_grounded_vt_read_is_refused_before_transport(
+    migrated_postgres_url: str, tmp_path: Path
+) -> None:
+    sample_bytes = f"synthetic restricted observation-grounded source {uuid4()}".encode()
+    file_hash = hashlib.sha256(sample_bytes).hexdigest()
+    physical_requests: list[httpx.Request] = []
+
+    def proxy_handler(request: httpx.Request) -> httpx.Response:
+        physical_requests.append(request)
+        return httpx.Response(
+            200, json={"data": {"id": file_hash, "type": "file"}}, request=request
+        )
+
+    result = await _run_inherited_case(
+        database_url=migrated_postgres_url,
+        tmp_path=tmp_path,
+        max_claims=10,
+        hashes=(file_hash,),
+        proxy_handler=proxy_handler,
+        sample_bytes=sample_bytes,
+        sample_do_not_submit=True,
+        associate_hashes=False,
+        sample_observation_hashes=(file_hash,),
+        bypass_legacy_guard=True,
+    )
+    try:
+        assert physical_requests == []
+        assert result["invocations"]
+        assert result["invocations"][0].status in {
+            ToolInvocationStatus.POLICY_DENIED,
+            ToolInvocationStatus.NEEDS_REVIEW,
+        }
+    finally:
+        if result["direct_client"] is not None:
+            await result["direct_client"].aclose()
+        await result["proxy_client"].aclose()
+        await result["engine"].dispose()
+
+
+@pytest.mark.asyncio
+async def test_ungrounded_vt_hash_read_is_refused_before_transport(
+    migrated_postgres_url: str, tmp_path: Path
+) -> None:
+    file_hash = _synthetic_hash()
+    physical_requests: list[httpx.Request] = []
+
+    def proxy_handler(request: httpx.Request) -> httpx.Response:
+        physical_requests.append(request)
+        return httpx.Response(
+            200, json={"data": {"id": file_hash, "type": "file"}}, request=request
+        )
+
+    result = await _run_inherited_case(
+        database_url=migrated_postgres_url,
+        tmp_path=tmp_path,
+        max_claims=10,
+        hashes=(file_hash,),
+        proxy_handler=proxy_handler,
+        associate_hashes=False,
+    )
+    try:
+        assert physical_requests == []
+        assert result["invocations"]
+        assert result["invocations"][0].status in {
+            ToolInvocationStatus.POLICY_DENIED,
+            ToolInvocationStatus.NEEDS_REVIEW,
+        }
     finally:
         if result["direct_client"] is not None:
             await result["direct_client"].aclose()

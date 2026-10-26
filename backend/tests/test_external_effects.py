@@ -1672,6 +1672,47 @@ async def test_source_dependent_family_rejects_untrusted_source_refs(case: str) 
     assert transport.calls == []
 
 
+@pytest.mark.parametrize(
+    ("request_sandbox", "expected_sandbox", "denied"),
+    [
+        ("sandbox-1", "sandbox-1", False),
+        ("sandbox-2", "sandbox-1", True),
+        ("sandbox%3A1", "sandbox:1", False),
+    ],
+)
+def test_vt_pcap_source_hash_is_bound_to_persisted_request_target(
+    request_sandbox: str, expected_sandbox: str, denied: bool
+) -> None:
+    file_hash = "a" * 64
+    source_reference = EvidenceReference("sample_hash", file_hash, "sample-hash.v1", file_hash)
+    prepared = _prepared(
+        family="vt.behaviour_pcap",
+        request={"path": f"/api/v3/file_behaviours/{request_sandbox}/pcap"},
+        evidence_refs=(source_reference,),
+    )
+    invocation = SimpleNamespace(
+        normalized_parameters={"file_hash": file_hash, "sandbox_id": expected_sandbox}
+    )
+    binding = ExternalEffectFamilyBinding(
+        provider=prepared.provider,
+        provider_scopes=frozenset({prepared.provider_scope}),
+        normalizer_versions=frozenset({prepared.normalizer_version}),
+        invocation_tool_binding=("vt.behaviour_pcap", "1"),
+        requires_source_refs=True,
+        source_reference_resolver=lambda _parameters: (source_reference,),
+    )
+    store = SqlAlchemyExternalEffectClaimStore(
+        lambda: None,  # type: ignore[arg-type]
+        family_bindings={prepared.family: binding},
+    )
+
+    if denied:
+        with pytest.raises(_ConsumeDenied, match="vt_source_hash_request_mismatch"):
+            store._validate_family_source_refs(binding, invocation, prepared)
+    else:
+        store._validate_family_source_refs(binding, invocation, prepared)
+
+
 @pytest.mark.parametrize("drift", ["missing_default", "extra_index"])
 def test_migration_preflight_rejects_default_and_complete_index_drift(
     monkeypatch: pytest.MonkeyPatch, drift: str

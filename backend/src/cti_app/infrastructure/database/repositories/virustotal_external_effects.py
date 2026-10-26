@@ -6,7 +6,7 @@ import re
 from collections.abc import Callable, Mapping
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cti_app.application.external_effects import (
@@ -52,6 +52,13 @@ VT_EXTERNAL_EFFECT_FAMILIES = {
 }
 _VT_RAW_RESPONSE_KIND = "vt.raw_response"
 _VT_SOURCE_REFS_KEY = "_vt_external_effect_source_refs"
+_VT_FILE_OBJECT_TYPES = {"sample", "file", "sample_observation"}
+_VT_HASH_READ_FAMILIES = {
+    "vt.file_report",
+    "vt.behaviour",
+    "vt.behaviour_pcap",
+    "vt.relationships",
+}
 
 
 def _metadata_source_refs(parameters: Mapping[str, object]) -> tuple[EvidenceReference, ...]:
@@ -96,7 +103,17 @@ def _source_refs_for_family(
                 sha256=hash_value,
             ),
         )
-        return expected if not metadata or metadata == expected else ()
+        if not metadata or metadata == expected:
+            return expected
+        if (
+            sum(reference.kind == "sample_hash" for reference in metadata) == 1
+            and expected[0] in metadata
+            and all(
+                reference.kind in {"sample_hash", "evidence_observation"} for reference in metadata
+            )
+        ):
+            return metadata
+        return ()
     return metadata
 
 
@@ -324,6 +341,7 @@ class SqlAlchemyVirusTotalPolicyGuard:
             for reference in context.prepared.evidence_refs
             if reference.kind == "sample_hash"
         }
+        observation_hashes: set[str] = set()
         sample_ids: set[UUID] = set()
         document_ids: set[UUID] = set()
         observation_refs = {
@@ -367,26 +385,41 @@ class SqlAlchemyVirusTotalPolicyGuard:
                     or reference.sha256 != observation.sha256
                 ):
                     return False
-                if observation.object_type.casefold() in {"sample", "file", "sample_observation"}:
-                    sample_hashes.add(observation.object_id)
+                object_type = observation.object_type.casefold()
+                if object_type in _VT_FILE_OBJECT_TYPES or (
+                    context.prepared.family in _VT_HASH_READ_FAMILIES and object_type == "sha256"
+                ):
+                    if not re.fullmatch(r"[0-9a-f]{64}", observation.object_id):
+                        return False
+                    observation_hashes.add(observation.object_id)
                 elif observation.object_type.casefold() in {"source_document", "document"}:
                     try:
                         document_ids.add(UUID(observation.object_id))
                     except ValueError:
                         return False
 
-        if sample_hashes:
+        source_hashes = sample_hashes | observation_hashes
+        if (
+            context.prepared.family in _VT_HASH_READ_FAMILIES
+            and sample_hashes
+            and not observation_hashes.issubset(sample_hashes)
+        ):
+            return False
+        if source_hashes:
             associations = list(
                 await session.scalars(
                     select(SampleAssociationRow)
                     .where(
                         SampleAssociationRow.investigation_id == context.authority.investigation_id,
-                        SampleAssociationRow.sample_sha256.in_(sorted(sample_hashes)),
+                        SampleAssociationRow.sample_sha256.in_(sorted(source_hashes)),
                     )
                     .with_for_update()
                 )
             )
-            if not sample_hashes.issubset({item.sample_sha256 for item in associations}):
+            associated_hashes = {item.sample_sha256 for item in associations}
+            if sample_hashes - (associated_hashes | observation_hashes):
+                return False
+            if observation_hashes - (associated_hashes | sample_hashes):
                 return False
             sample_ids.update(item.sample_id for item in associations if item.sample_id is not None)
         if sample_ids:
@@ -408,14 +441,22 @@ class SqlAlchemyVirusTotalPolicyGuard:
                 for item in samples
             ):
                 return False
-        if sample_hashes:
+        if source_hashes:
+            sample_hash_terms = [BlobRow.sha256.in_(sorted(source_hashes))]
+            if context.prepared.family in _VT_HASH_READ_FAMILIES:
+                sample_hash_terms.extend(
+                    (
+                        SampleRow.expected_hash.in_(sorted(source_hashes)),
+                        SampleRow.source_object_id.in_(sorted(source_hashes)),
+                    )
+                )
             hash_samples = list(
                 await session.scalars(
                     select(SampleRow)
                     .join(BlobRow, BlobRow.id == SampleRow.blob_id)
                     .where(
                         SampleRow.subject_id == context.investigation_subject_id,
-                        BlobRow.sha256.in_(sorted(sample_hashes)),
+                        or_(*sample_hash_terms),
                     )
                     .with_for_update()
                 )

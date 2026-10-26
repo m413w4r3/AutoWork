@@ -140,9 +140,6 @@ async def test_real_postgres_http_bridge_vertical_investigation_and_v6_publicati
     seeded = await _seed_verified_article(uow_factory, artifact_store, suffix=uuid4().hex[:10])
     assert seeded.seed_observation is not None
     material = _unique_sample_material()
-    source_association_id = await _associate_vt_file_source(
-        uow_factory, seeded.investigation.id, seeded.seed_observation.object_id
-    )
     candidate_hash = material.sample_hash
     vt = _HashCheckedVirusTotal(material=material, include_candidate=True)
     shodan = FakeShodanPort()
@@ -307,10 +304,7 @@ async def test_real_postgres_http_bridge_vertical_investigation_and_v6_publicati
         sample_list = await client.get(f"/api/investigations/{investigation_id}/samples")
         assert sample_list.status_code == 200, sample_list.text
         sample_views = sample_list.json()
-        assert {item["sample_sha256"] for item in sample_views} == {
-            seeded.seed_observation.object_id,
-            candidate_hash,
-        }
+        assert {item["sample_sha256"] for item in sample_views} == {candidate_hash}
         sample_view = next(item for item in sample_views if item["sample_sha256"] == candidate_hash)
         assert sample_view["sample_sha256"] == candidate_hash
         assert sample_view["qualification"] == "candidate"
@@ -354,9 +348,9 @@ async def test_real_postgres_http_bridge_vertical_investigation_and_v6_publicati
                 "sample.analyze",
                 "shodan.host",
             }
-            # The article seed is linked for VT source-policy checks but has no quarantined
-            # bytes. If it is selected for eager local analysis, that request must fail closed;
-            # acquired candidates may be partial when optional extractors are not provisioned.
+            # The article seed is canonical hash evidence without a sample association or
+            # quarantined bytes; acquired candidates may be partial when optional extractors
+            # are not provisioned.
             failed_analysis = tuple(
                 item
                 for item in invocations
@@ -372,7 +366,7 @@ async def test_real_postgres_http_bridge_vertical_investigation_and_v6_publicati
                 or (
                     item.tool_name == "sample.analyze"
                     and item.status is ToolInvocationStatus.FAILED
-                    and item.normalized_parameters["association_id"] == str(source_association_id)
+                    and item.normalized_parameters["association_id"] == str(association.id)
                 )
                 for item in invocations
             )
