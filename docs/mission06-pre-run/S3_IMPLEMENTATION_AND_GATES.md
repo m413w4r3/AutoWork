@@ -1,5 +1,12 @@
 # S3 — implémentation et gates des effets externes
 
+> **Mise à jour M06-P/R (2026-10-26) :** `S3-CORE` **APPROVED** sur `796292a7`
+> (5ᵉ revue indépendante xhigh) et **intégré** sur `main` local ; chaîne
+> `0001→0004` validée sur base jetable ; 5 tests PG S3 d'origine + nouveaux
+> verts. Familles VT-READ et BRIDGE en cours, VT-DOWNLOAD planifiée après
+> VT-READ (migration additive `0005` attendue pour la tentative de dispatch
+> pré-envoi). Le statut historique ci-dessous est conservé.
+
 Statut : **SOCLE `S3-CORE` CANDIDAT NON INTÉGRÉ (`2c6c6074`), REVUE `REVISE`,
 FAMILLES NON MIGRÉES.** 46 tests unitaires verts ; la chaîne `0003→0004`
 s'applique sur base jetable après les deux correctifs d'intégration ci-dessous ;

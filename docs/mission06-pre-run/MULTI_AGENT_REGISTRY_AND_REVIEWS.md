@@ -90,3 +90,41 @@ Légende : `PLANNED → RUNNING → REVIEW → APPROVED → INTEGRATED`, alterna
 - Aucun de ces résultats ne constitue une preuve de transport fournisseur.
   Le socle S3 n'est **pas** fusionné sur `main` tant que sa revue n'est pas
   `APPROVED` et que les 5 tests PG ne sont pas verts.
+
+## Reprise M06-P/R (2026-10-26) — registre
+
+Parent : session Claude Code `b078131f`, **`claude/claude-opus-5-5`** (effort
+medium), **non Luna** → `LUNA_XHIGH_MULTI_AGENT_VERIFIED` reste **FAILED** pour
+la couche parente. Une session sœur `d4eea4eb` (même prompt) avait tenté de
+créer un parent Luna ; l'appel `create_agent` n'a jamais abouti (aucun agent
+créé, vérifié via `list_agents`) : un seul parent actif. Tous les enfants
+ci-dessous sont `codex/gpt-6-luna`, effort vérifié par `get_agent_status`.
+Aucun reviewer n'a revu son propre lot.
+
+| Lot | Agent | Effort | Base → SHA final | Statut | Reviewer | Verdict |
+|---|---|---|---|---|---|---|
+| WORKFLOW-GATE-FIX (régression CI `af819b2e`) | `aff458bc` | high | `af819b2e` → `a832902b` | **INTEGRATED** (ff `main`) | `b50f23f4` (xhigh) | REVISE (1 Low) → **APPROVED** `a832902b` |
+| RUNTIME-PREFLIGHT (lecture seule, code/docs) | `3b650779` | high | `af819b2e` | DONE → [`recon/RUNTIME_PREFLIGHT_R.md`](recon/RUNTIME_PREFLIGHT_R.md) | — | — |
+| S3-CORE-FIX (reprise `2c6c6074`, cherry-pick + 3 MAJOR) | `27d8fb19` | xhigh | `a832902b` → `2d39fe34` | relayé (contexte ~60 %) | — | — |
+| S3-CORE-FIX-2 (session fraîche, oracle PG) | `b0483a4b` | xhigh | `2d39fe34` → `796292a7` | **INTEGRATED** (ff `main`) | `27e3f730` (xhigh) | voir historique |
+| S3-CORE-REVIEW | `27e3f730` | xhigh | — | DONE | — | `a1f0d0c2` REVISE (3 MAJOR) → `8a8bc7da` REVISE (1 MAJOR) → `de4f6603` REVISE (1 MAJOR) → **`796292a7` APPROVED** |
+| S3-FAMILY-MAP (lecture seule) | `20a08f26` | high | `a832902b` | DONE → [`recon/S3_FAMILY_MAP.md`](recon/S3_FAMILY_MAP.md) | — | — |
+| S3-VT-READ (+ câblage partagé) | `f2bdce99` | xhigh | `044178b2` | RUNNING | à créer | — |
+| S3-BRIDGE | `f070c5a6` | xhigh | `044178b2` | RUNNING | à créer | — |
+| S3-VT-DOWNLOAD | à créer après VT-READ | xhigh | — | PLANNED | à créer | — |
+
+Historique des verdicts S3-CORE (aucun effacé) :
+
+1. `0637bdea` (M06-P) : REVISE — gate sans I/O, alias `id_token`/`refresh_token`, preuve forgeable par registre global.
+2. `a1f0d0c2` : REVISE — `submit_once` sans permis ; émission de preuve via `coordinator._proof_authority` ; downgrade `0004` en course avec les écritures. Alias OAuth : fermé.
+3. `8a8bc7da` : REVISE — capacité d'envoi survivant à l'appel du gate. Preuves/0004 : fermés ; décalage d'horloge = artefact de test (prod : même horloge monotone).
+4. `de4f6603` : REVISE — capacité forgeable (`object.__new__` + slot mangled inscriptible).
+5. **`796292a7` : APPROVED** — jeton opaque validé via registre d'identité tenu en fermeture, révoqué en `finally`.
+
+Arbitrage parent (modèle de menace, docstring de `application/external_effects.py`) :
+protection contre le code famille/adaptateur utilisant des API publiques ou
+`_privées`, et contre les valeurs forgées/copiées/rejouées ; l'introspection
+arbitraire en processus (gc, inspection de fermetures/frames, ctypes,
+monkey-patch de classe) est hors périmètre. Conséquence : chaque revue de
+famille doit vérifier client brut privé, un seul appel juste après usage de la
+capacité, ni retry, ni redirection suivie, ni chemin d'envoi alternatif.

@@ -237,3 +237,48 @@ Justification :
 - Toutes les capacités VT/Bridge/analyse locale restent `UNKNOWN` ou
   `BLOCKED` en live ; aucun test ne prouve une réception fournisseur.
 - Le parent n'est pas Luna xhigh ; les enfants le sont.
+
+## 6. Reprise M06-P/R (2026-10-26) — tests réellement exécutés par le parent
+
+Environnement local corrigé (aucune modification de code) : Typst épinglé
+`0.15.1` = `~/.local/share/autowork-tools/typst` via `TYPST_BINARY` et `PATH`
+(`/snap/bin/typst --version` échoue : snap-confine `cap_dac_override`),
+`FONT_BUNDLE_ROOT=<checkout principal>/chpTypst` pour les worktrees,
+`TMPDIR` sous `$HOME`, PostgreSQL jetable `postgres-test` (127.0.0.1:55432,
+profil `integration-test`, distinct de la stack live).
+
+**Correction du handoff précédent.** La CI GitHub de `af819b2e` (run
+`40284320309`) est **rouge** : 11 tests workflow (FAST 9, FULL 2) en 403
+`verified_human_operator_required` et mypy en échec
+(`tests/test_osint_open_policy.py:97`). Ces gates n'étaient pas couverts par
+le handoff (« 355 passed » = intégration seule ; « mypy 420 PASS » inexact).
+Localement, l'intégration de `af819b2e` avait aussi 1 régression de même
+nature (`test_operator_context_cas_and_advisor_egress_guard_postgres`, revoke
+d'enveloppe exigeant désormais un humain vérifié). Les 5 + 7 échecs
+« Typst » du handoff étaient bien environnementaux.
+
+| SHA | Commande | Résultat |
+|---|---|---|
+| `af819b2e` | `make test-backend` (Typst épinglé) | **4965 passed, 2 skipped, 0 failed** |
+| `af819b2e` | `make test-integration` | 361 passed, **1 failed** (revoke 403) |
+| `af819b2e` | workflow FAST+FULL (local) | 403 reproduits (W15) |
+| `db9b19f9` | workflow FAST+FULL + `FONT_BUNDLE_ROOT` | **31 passed** |
+| `e775b30a` | `make test-integration` | **362 passed** |
+| `ff5f3d5e` | `mypy src tests` | **Success, 834 fichiers** ; `ruff` PASS |
+| `a832902b` | test de refus non-loopback, mutation (clause loopback retirée → échec ; rétablie → succès, y compris `APP_ENV=production`) | PASS |
+| `a1f0d0c2` | S3 unit / PG S3+politique | 60 / 13 passed ; suites complètes : backend 3 failed (1 réel : liste des révisions), intégration 6 failed (têtes `0003` attendues) |
+| `2d39fe34` | `alembic upgrade head → downgrade 0003 → head → downgrade 0002 → head` (base jetable, supprimée ensuite) | **OK**, tête `0004`, 2 tables `external_effect_*` |
+| `2d39fe34` | PG S3 + migrations | 134 passed, **3 failed** (nouveaux tests non exécutés par l'auteur) |
+| `8a8bc7da` | ruff/mypy ; backend ; intégration ; workflow | PASS ; 5025 passed + 2 env ; **373 passed** ; **31 passed** |
+| `de4f6603` | idem | PASS ; 5029 + 2 env ; **373** ; **31** |
+| **`796292a7`** | ruff/format ; mypy ; backend ; intégration ; workflow FAST+FULL | **PASS ; 840 fichiers ; 5031 passed + 2 env ; 373 passed ; 31 passed** |
+
+Les 2 échecs « env » sont `tests/test_local_analysis_commands.py`
+(`test_catalogued_commands_read_synthetic_elf_with_bounded_output`,
+`test_metacharacters_in_sample_strings_are_inert_and_filenames_are_fixed`) :
+ils échouent à l'identique sur une archive `git archive` de `main@a832902b`
+hors checkout principal et passent dans le checkout principal ; non liés à S3.
+`backend/migrations` est inchangé entre `2d39fe34` et `796292a7`.
+
+État `main` local : `af819b2e` (= `origin/main`) → `a832902b`
+(workflow-gate-fix) → `796292a7` (S3-CORE) → `044178b2` (docs). **Aucun push.**
