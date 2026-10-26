@@ -1551,6 +1551,9 @@ async def test_osint_policy_guard_locks_before_envelope() -> None:
         async def authorize(self, context):
             return True
 
+        async def authorize_source_disclosure(self, context):
+            return True
+
     class _OrderingStore(SqlAlchemyExternalEffectClaimStore):
         async def _lock_authority(self, *args, **kwargs):
             events.append("envelope")

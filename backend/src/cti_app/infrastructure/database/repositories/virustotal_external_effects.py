@@ -170,7 +170,7 @@ class VirusTotalReadReusePolicy:
 
 
 class SqlAlchemyVirusTotalPolicyGuard:
-    """Lock a pinned OSINT policy before the coordinator locks its envelope."""
+    """Check VT source disclosure and lock pinned OSINT policy before the envelope."""
 
     async def lock_for_consume(
         self, database_session: AsyncSession, authority: ExternalEffectAuthority
@@ -298,7 +298,7 @@ class SqlAlchemyVirusTotalPolicyGuard:
             pinned.disclosure_tlp.casefold() == "red"
             or pinned.disclosure_do_not_submit
             or not pinned.disclosure_external_llm_allowed
-            or not await self._source_external_disclosure_allowed(context)
+            or not await self.authorize_source_disclosure(context)
         ):
             return False
         try:
@@ -331,6 +331,9 @@ class SqlAlchemyVirusTotalPolicyGuard:
         vt_budget = int(pinned.budget_limits.get("vt_units", 0))
         reserved_vt = int(context.authority.reservation_amounts.get("vt_units", 0))
         return reserved_vt <= vt_budget
+
+    async def authorize_source_disclosure(self, context: ConsumePolicyContext) -> bool:
+        return await self._source_external_disclosure_allowed(context)
 
     async def _source_external_disclosure_allowed(self, context: ConsumePolicyContext) -> bool:
         session = context.database_session

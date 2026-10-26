@@ -1057,23 +1057,35 @@ class SqlAlchemyExternalEffectClaimStore:
         ):
             raise _ConsumeDenied("pinned_subject_mismatch")
 
+        policy_context = ConsumePolicyContext(
+            authority=authority,
+            prepared=prepared,
+            effect_key=key,
+            database_session=session,
+            investigation_subject_id=investigation.subject_id,
+        )
         if authority.authority_kind is ExternalEffectAuthorityKind.OSINT_POLICY:
             if self._policy_guard is None:
                 raise _ConsumeDenied("osint_policy_guard_unavailable")
             try:
-                allowed = await self._policy_guard.authorize(
-                    ConsumePolicyContext(
-                        authority=authority,
-                        prepared=prepared,
-                        effect_key=key,
-                        database_session=session,
-                        investigation_subject_id=investigation.subject_id,
-                    )
-                )
+                allowed = await self._policy_guard.authorize(policy_context)
             except Exception as exc:
                 raise _ConsumeDenied("osint_policy_guard_error") from exc
             if not allowed:
                 raise _ConsumeDenied("osint_policy_denied")
+        elif (
+            authority.authority_kind is ExternalEffectAuthorityKind.HUMAN_G2
+            and prepared.family.startswith("vt.")
+            and family_binding.requires_source_refs
+        ):
+            if self._policy_guard is None:
+                raise _ConsumeDenied("vt_source_guard_unavailable")
+            try:
+                allowed = await self._policy_guard.authorize_source_disclosure(policy_context)
+            except Exception as exc:
+                raise _ConsumeDenied("vt_source_guard_error") from exc
+            if not allowed:
+                raise _ConsumeDenied("vt_source_disclosure_denied")
 
         if invocation is None:
             if not any(
@@ -1400,11 +1412,17 @@ class SqlAlchemyExternalEffectClaimStore:
         sample_hash_grounding = sample_hashes if vt_file_hash_read else set()
         if observation_hashes - (found_hashes | sample_hash_grounding):
             raise _ConsumeDenied("evidence_observation_not_associated_with_investigation")
-        if is_model_submission and sample_hashes:
+        model_source_hashes = sample_hashes | observation_hashes
+        if is_model_submission and model_source_hashes:
+            source_associations = [
+                item for item in associations if item.sample_sha256 in model_source_hashes
+            ]
+            if any(item.sample_id is None for item in source_associations):
+                raise _ConsumeDenied("sample_hash_unresolvable")
             resolved_hashes = {
-                item.sample_sha256 for item in associations if item.sample_id is not None
+                item.sample_sha256 for item in source_associations if item.sample_id is not None
             }
-            if not sample_hashes.issubset(resolved_hashes):
+            if not model_source_hashes.issubset(resolved_hashes):
                 raise _ConsumeDenied("sample_hash_unresolvable")
         if referenced_sample_ids and not referenced_sample_ids.issubset(
             {item.sample_id for item in associations if item.sample_id is not None}
