@@ -40,7 +40,6 @@ from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.model_gateway import (
     AdapterResult,
     AdapterResultStatus,
-    BlobModelOutputStore,
     BridgeExternalEffectBinding,
     ModelCapabilities,
     ModelGateway,
@@ -113,6 +112,7 @@ from cti_app.infrastructure.database.session import create_postgres_engine, crea
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
 from cti_app.infrastructure.investigation_runtime_ports import create_external_effect_coordinator
 from cti_app.integrations.models import (
+    BlobModelOutputStore,
     BridgeTransportError,
     FakeModelAdapter,
     create_coordinated_http_responses_transport,

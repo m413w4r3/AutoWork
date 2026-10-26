@@ -1208,8 +1208,8 @@ async def test_investigation_e2e_synthetic_sample_postgres(
             assert "advisor_call.metadata" in event_types
             source_events = audit_events[:-1]
             event_counts = Counter(item["type"] for item in source_events)
-            # Success, two sensitive-input vetoes, four policy vetoes, and missing-ref refusal.
-            expected_advisor_metadata_events = 1 + 2 + 4 + 1
+            # Success, two sensitive-input vetoes, three policy vetoes, and missing-ref refusal.
+            expected_advisor_metadata_events = 1 + 2 + 3 + 1
             assert event_counts["evidence_observation.recorded"] == len(audit_snapshot.observations)
             assert event_counts["finding.version_recorded"] == len(audit_snapshot.findings)
             assert event_counts["opinion.version_recorded"] == len(audit_snapshot.opinions)
