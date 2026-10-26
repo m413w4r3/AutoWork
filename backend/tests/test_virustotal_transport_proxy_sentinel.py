@@ -334,7 +334,7 @@ async def test_direct_v2_download_keeps_only_documented_params_without_sentinel(
 
 
 @pytest.mark.asyncio
-async def test_behaviour_pcap_queryless_proxy_stream_uses_sentinel() -> None:
+async def test_behaviour_pcap_queryless_proxy_uses_sentinel() -> None:
     def pcap_route(request: httpx.Request, rewritten_query: str) -> httpx.Response:
         assert rewritten_query == "x=1&apikey=" + PROXY_SECRET
         return httpx.Response(200, content=PCAP_BYTES, request=request)
@@ -348,8 +348,10 @@ async def test_behaviour_pcap_queryless_proxy_stream_uses_sentinel() -> None:
         behaviour_pcap_enabled=True,
         proxy_query_sentinel_enabled=True,
     )
+    configure_test_vt_adapter(adapter)
     try:
-        result = await adapter.behaviour_pcap("sandbox-1", sink=io.BytesIO())
+        with authorized_vt_read():
+            result = await adapter.behaviour_pcap("sandbox-1", sink=io.BytesIO())
     finally:
         await client.aclose()
 

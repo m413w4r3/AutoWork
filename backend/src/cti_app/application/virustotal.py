@@ -330,13 +330,14 @@ class VirusTotalRawResponse:
     """The safe, httpx-independent shape of one successful upstream response.
 
     Carries only what the domain and persistence layers need to reproduce
-    the transport's outcome: the exact body bytes and the HTTP status the
-    server actually returned. Never carries headers, cookies, or anything
-    that could leak credentials.
+    the transport's outcome: the exact body bytes, HTTP status, and a
+    normalized content-type class. Never carries headers, cookies, or
+    anything that could leak credentials.
     """
 
     body: bytes
     status_code: int
+    content_type_class: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -438,7 +439,7 @@ class VirusTotalPort(Protocol):
     ) -> VirusTotalDownloadResult: ...
 
     async def behaviour_pcap(
-        self, sandbox_id: str, *, sink: BinaryIO
+        self, sandbox_id: str, *, sink: BinaryIO, max_bytes: int | None = None
     ) -> VirusTotalDownloadResult: ...
 
     async def file_relationship(

@@ -159,6 +159,7 @@ _VT_COORDINATED_READ_TOOLS = frozenset(
         "vt.relationships",
         "vt.intelligence_search",
         "vt.behaviour",
+        "vt.behaviour_pcap",
     }
 )
 

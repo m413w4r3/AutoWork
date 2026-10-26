@@ -22,12 +22,15 @@ from cti_app.application.virustotal import (
     VirusTotalDownloadHostNotAllowedError,
     VirusTotalDownloadTooLargeError,
     VirusTotalError,
+    VirusTotalExternalEffectRefusedError,
     VirusTotalHttpError,
     VirusTotalOperationRoute,
     VirusTotalPayloadError,
     VirusTotalRouteStep,
     VirusTotalRoutingPolicy,
     VirusTotalSignedUrlExpiredError,
+    VirusTotalUnexpectedRedirectError,
+    virustotal_external_effect_scope,
 )
 from cti_app.domain.virustotal import (
     VirusTotalCapability,
@@ -423,11 +426,12 @@ async def test_signed_cdn_403_is_an_expired_ticket() -> None:
 
 
 @pytest.mark.asyncio
-async def test_pcap_signed_redirect_uses_allowlisted_credential_free_transport() -> None:
-    valid_pcap = b"\xd4\xc3\xb2\xa1" + b"signed-pcap"
+async def test_pcap_redirect_is_archived_and_not_followed_outside_coordinator() -> None:
+    upstream_requests: list[httpx.Request] = []
     signed_url = "https://cdn.example.test/pcap?signature=hidden"
 
     def upstream(request: httpx.Request) -> httpx.Response:
+        upstream_requests.append(request)
         assert str(request.url) == f"{BASE}/file_behaviours/sandbox-1/pcap"
         return httpx.Response(
             302,
@@ -436,21 +440,20 @@ async def test_pcap_signed_redirect_uses_allowlisted_credential_free_transport()
         )
 
     def cdn(request: httpx.Request) -> httpx.Response:
-        assert str(request.url) == signed_url
-        assert "x-apikey" not in request.headers
-        assert "cookie" not in request.headers
-        return httpx.Response(200, content=valid_pcap, request=request)
+        pytest.fail(f"uncoordinated signed redirect was followed: {request.url!s}")
 
     adapter, clients = _make_adapter(upstream, cdn_handler=cdn)
     try:
-        sink = BytesIO()
-        result = await adapter.behaviour_pcap("sandbox-1", sink=sink)
+        with pytest.raises(VirusTotalUnexpectedRedirectError):
+            await adapter.behaviour_pcap("sandbox-1", sink=BytesIO())
     finally:
         await _close(clients)
-    assert sink.getvalue() == valid_pcap
-    assert result.sha256 == hashlib.sha256(valid_pcap).hexdigest()
-    assert result.size == len(valid_pcap)
-    assert signed_url not in repr(result)
+    assert len(upstream_requests) == 1
+    assert len(adapter._test_external_effect_store.claims) == 1
+    assert all(
+        signed_url not in repr(claim)
+        for claim in adapter._test_external_effect_store.claims.values()
+    )
 
 
 @pytest.mark.asyncio
@@ -728,8 +731,10 @@ async def test_v2_secret_is_removed_from_exception_context_repr_and_logs(
 @pytest.mark.asyncio
 async def test_behaviour_pcap_is_bounded_hashed_and_magic_checked() -> None:
     valid_pcap = b"\xd4\xc3\xb2\xa1" + b"pcap-payload"
+    requests: list[httpx.Request] = []
 
     def pcap(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
         assert str(request.url) == f"{BASE}/file_behaviours/sandbox-1/pcap"
         return httpx.Response(200, content=valid_pcap, request=request)
 
@@ -737,11 +742,33 @@ async def test_behaviour_pcap_is_bounded_hashed_and_magic_checked() -> None:
     try:
         sink = BytesIO()
         result = await adapter.behaviour_pcap("sandbox-1", sink=sink)
+        replay_sink = BytesIO()
+        replay = await adapter.behaviour_pcap("sandbox-1", sink=replay_sink)
     finally:
         await _close(clients)
     assert sink.getvalue() == valid_pcap
+    assert replay_sink.getvalue() == valid_pcap
     assert result.sha256 == hashlib.sha256(valid_pcap).hexdigest()
     assert result.size == len(valid_pcap)
+    assert replay == result
+    assert len(requests) == 1
+    assert len(adapter._test_external_effect_store.claims) == 1
+    assert adapter._test_external_effect_store.reuse_count == 1
+    claim = next(iter(adapter._test_external_effect_store.claims.values()))
+    archived = adapter._test_vt_response_archive.items[claim.result_ref]
+    assert archived.reference.sha256 == hashlib.sha256(valid_pcap).hexdigest()
+
+    oversized, oversized_clients = _make_adapter(
+        lambda request: httpx.Response(200, content=valid_pcap, request=request)
+    )
+    try:
+        oversized_sink = BytesIO()
+        with pytest.raises(VirusTotalDownloadTooLargeError):
+            await oversized.behaviour_pcap("sandbox-1", sink=oversized_sink, max_bytes=4)
+        assert oversized_sink.getvalue() == b""
+        assert len(oversized._test_external_effect_store.claims) == 1
+    finally:
+        await _close(oversized_clients)
 
     adapter, clients = _make_adapter(
         lambda request: (
@@ -756,6 +783,24 @@ async def test_behaviour_pcap_is_bounded_hashed_and_magic_checked() -> None:
     finally:
         await _close(clients)
     assert caught.value.code == "virustotal_pcap_magic_invalid"
+
+
+@pytest.mark.asyncio
+async def test_behaviour_pcap_without_committed_authority_sends_nothing() -> None:
+    requests: list[httpx.Request] = []
+
+    def pcap(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, content=b"\xd4\xc3\xb2\xa1", request=request)
+
+    adapter, clients = _make_adapter(pcap)
+    try:
+        with virustotal_external_effect_scope(None):
+            with pytest.raises(VirusTotalExternalEffectRefusedError):
+                await adapter.behaviour_pcap("sandbox-1", sink=BytesIO())
+    finally:
+        await _close(clients)
+    assert requests == []
 
 
 @pytest.mark.asyncio

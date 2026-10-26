@@ -53,6 +53,7 @@ from cti_app.application.research_context_builder import ArticleSnapshot, Resear
 from cti_app.application.virustotal import (
     VirusTotalCapabilities,
     VirusTotalDownloadResult,
+    VirusTotalExternalEffectNeedsReviewError,
     VirusTotalFile,
     VirusTotalFileReport,
     VirusTotalHttpError,
@@ -275,7 +276,10 @@ class FakeVirusTotalPort:
         self._raise("behaviours")
         return self.behaviour_pages.pop(0) if self.behaviour_pages else _page()
 
-    async def behaviour_pcap(self, sandbox_id: str, *, sink: Any) -> VirusTotalDownloadResult:
+    async def behaviour_pcap(
+        self, sandbox_id: str, *, sink: Any, max_bytes: int | None = None
+    ) -> VirusTotalDownloadResult:
+        del max_bytes
         self.calls["behaviour_pcap"] += 1
         self._raise("behaviour_pcap")
         sink.write(self.pcap_bytes)
@@ -951,6 +955,27 @@ async def test_behaviour_pcap_transport_error_is_specific_and_confirmed_non_exec
     assert result.status is ToolInvocationStatus.UNAVAILABLE
     assert result.output["reason"] == "pcap_transport_timeout"
     assert result.output["confirmed_non_execution"] is True
+
+
+@pytest.mark.asyncio
+async def test_behaviour_pcap_preserves_ambiguous_effect_as_needs_review() -> None:
+    tools = _tool_set()
+    tools.vt.errors["behaviour_pcap"] = VirusTotalExternalEffectNeedsReviewError(
+        "The completed request could not be verified."
+    )
+    registered = tools.registry.get("vt.behaviour_pcap", "1")
+    assert registered is not None
+    _definition, adapter = registered
+
+    async def saved_report_contains_capture(_investigation_id, _file_hash, _sandbox_id):
+        return True
+
+    adapter._saved_report_contains_capture = saved_report_contains_capture
+    result = await adapter.execute({"file_hash": _SEED_HASH, "sandbox_id": "Zenbox"}, tools.context)
+
+    assert result.status is ToolInvocationStatus.NEEDS_REVIEW
+    assert result.output["reason"] == "external_effect_needs_review"
+    assert result.output.get("confirmed_non_execution") is not True
 
 
 def _minimal_pcap() -> bytes:

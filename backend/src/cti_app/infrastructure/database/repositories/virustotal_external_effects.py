@@ -38,6 +38,7 @@ VT_EXTERNAL_EFFECT_FAMILIES = {
     "vt.relationships": ("vt.relationships", "1"),
     "vt.intelligence_search": ("vt.intelligence_search", "1"),
     "vt.behaviour": ("vt.behaviour", "1"),
+    "vt.behaviour_pcap": ("vt.behaviour_pcap", "1"),
 }
 _VT_RAW_RESPONSE_KIND = "vt.raw_response"
 

@@ -1471,7 +1471,11 @@ class _BehaviourPcapAdapter(_VirusTotalAdapter):
             sink = _BoundedCaptureSink(self.max_capture_bytes)
             state.api_requests = 1
             try:
-                result = await self.virustotal.behaviour_pcap(sandbox_id, sink=sink)
+                result = await self.virustotal.behaviour_pcap(
+                    sandbox_id,
+                    sink=sink,
+                    max_bytes=self.max_capture_bytes,
+                )
                 content = sink.getvalue()
                 if (
                     not content
@@ -1489,6 +1493,8 @@ class _BehaviourPcapAdapter(_VirusTotalAdapter):
                     raise VirusTotalInvalidInputError(
                         "VirusTotal sandbox PCAP hashes do not match the received bytes."
                     )
+            except VirusTotalExternalEffectNeedsReviewError:
+                raise
             except (VirusTotalError, TypeError, ValueError) as exc:
                 extra: dict[str, Any] = {"confirmed_non_execution": True}
                 status_code = getattr(exc, "status_code", None)
