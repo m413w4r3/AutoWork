@@ -144,7 +144,15 @@ class PreparedExternalRequest:
         frozen = _freeze_json(self.canonical_request)
         if not isinstance(frozen, Mapping):
             raise ExternalEffectValidationError("canonical_request must be a JSON object")
-        _assert_safe_persisted_json(frozen)
+        _assert_safe_persisted_json(
+            frozen,
+            credential_parameter_names=frozenset(
+                {
+                    *_CREDENTIAL_PARAMETER_NAMES,
+                    *credential_parameter_names,
+                }
+            ),
+        )
         object.__setattr__(self, "canonical_request", frozen)
         _require_sha256(self.canonical_request_sha256, "canonical_request_sha256")
         _require_sha256(self.application_request_sha256, "application_request_sha256")
@@ -507,7 +515,15 @@ def validate_prepared_request(prepared: PreparedExternalRequest) -> None:
         or _wire_request_sha256(prepared.application_request) != prepared.physical_request_sha256
     ):
         raise ExternalEffectValidationError("application request changed after preparation")
-    _assert_safe_persisted_json(prepared.canonical_request)
+    _assert_safe_persisted_json(
+        prepared.canonical_request,
+        credential_parameter_names=frozenset(
+            {
+                *_CREDENTIAL_PARAMETER_NAMES,
+                *prepared.credential_parameter_names,
+            }
+        ),
+    )
     if prepared.request_ref is not None:
         _validate_safe_reference(prepared.request_ref, "request_ref")
     for reference in prepared.evidence_refs:
@@ -578,7 +594,12 @@ def _freeze_normalized(value: Any) -> Any:
     return value
 
 
-def _assert_safe_persisted_json(value: Any, path: str = "canonical_request") -> None:
+def _assert_safe_persisted_json(
+    value: Any,
+    path: str = "canonical_request",
+    *,
+    credential_parameter_names: frozenset[str] = frozenset(),
+) -> None:
     sensitive_key_names = frozenset(
         re.sub(r"[-_]", "", name)
         for name in (
@@ -635,19 +656,38 @@ def _assert_safe_persisted_json(value: Any, path: str = "canonical_request") -> 
     if isinstance(value, Mapping):
         for key, child in value.items():
             normalized = re.sub(r"[-_]", "", key.casefold())
-            if normalized in sensitive_key_names:
+            if normalized in sensitive_key_names or normalized in credential_parameter_names:
                 raise ExternalEffectValidationError(
                     f"secret-bearing field is not persistable: {path}.{key}"
                 )
-            _assert_safe_persisted_json(child, f"{path}.{key}")
+            _assert_safe_persisted_json(
+                child,
+                f"{path}.{key}",
+                credential_parameter_names=credential_parameter_names,
+            )
     elif isinstance(value, (list, tuple)):
         for index, child in enumerate(value):
-            _assert_safe_persisted_json(child, f"{path}[{index}]")
+            _assert_safe_persisted_json(
+                child,
+                f"{path}[{index}]",
+                credential_parameter_names=credential_parameter_names,
+            )
     elif isinstance(value, str):
-        _validate_safe_reference(value, path, allow_non_reference=True)
+        _validate_safe_reference(
+            value,
+            path,
+            allow_non_reference=True,
+            credential_parameter_names=credential_parameter_names,
+        )
 
 
-def _validate_safe_reference(value: str, label: str, *, allow_non_reference: bool = False) -> None:
+def _validate_safe_reference(
+    value: str,
+    label: str,
+    *,
+    allow_non_reference: bool = False,
+    credential_parameter_names: frozenset[str] = frozenset(),
+) -> None:
     lowered = value.casefold()
     if any(
         marker in lowered
@@ -710,6 +750,7 @@ def _validate_safe_reference(value: str, label: str, *, allow_non_reference: boo
         normalized_sensitive = {
             re.sub(r"[^a-z0-9]", "", name) for name in sensitive_parameter_names
         }
+        normalized_sensitive.update(credential_parameter_names)
         for component in (parsed.query, parsed.fragment):
             for name, _ in parse_qsl(component, keep_blank_values=True):
                 normalized_name = re.sub(r"[^a-z0-9]", "", unquote_plus(name).casefold())

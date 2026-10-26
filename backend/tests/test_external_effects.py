@@ -399,6 +399,19 @@ def test_credential_redacted_digest_hides_credentials_but_exact_digest_does_not(
     assert application_request_sha256(changed_target) != application_request_sha256(first)
 
 
+def test_declared_credential_cannot_be_persisted_in_canonical_request() -> None:
+    with pytest.raises(ExternalEffectValidationError, match=r"canonical_request\.key"):
+        PreparedExternalRequest.build(
+            family="vt.file_report",
+            provider="virustotal",
+            provider_scope="tenant-prod",
+            normalizer_version="vt.file-report.v1",
+            canonical_request={"hash": "abc", "key": "SECRET"},
+            application_request=_wire(target=b"/v1/report?hash=abc&key=SECRET"),
+            credential_parameter_names=("key",),
+        )
+
+
 def test_persisted_header_digest_allowlists_only_documented_safe_values() -> None:
     safe_first = _wire(
         headers=((b"Content-Type", b"application/json"), (b"Accept", b"application/json"))

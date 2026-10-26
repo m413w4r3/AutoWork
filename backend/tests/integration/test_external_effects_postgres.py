@@ -36,8 +36,10 @@ from cti_app.application.external_effects import (
 from cti_app.application.investigation_service import InvestigationService
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.domain.external_effects import (
+    EvidenceReference,
     ExternalEffectAuthority,
     ExternalEffectAuthorityKind,
+    ExternalEffectValidationError,
     FrozenWireRequest,
     PreparedExternalRequest,
     _wire_request_sha256,
@@ -55,16 +57,24 @@ from cti_app.domain.investigation import (
 )
 from cti_app.domain.investigation_state import InvestigationWorkingState
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
+from cti_app.infrastructure.database.models.core import BlobRow, SampleRow, SourceDocumentRow
 from cti_app.infrastructure.database.models.external_effects import (
     ExternalEffectClaimRow,
     ExternalEffectUseRow,
 )
 from cti_app.infrastructure.database.models.investigation import (
+    EvidenceObservationRow,
     InvestigationBudgetRecordRow,
     InvestigationBudgetReservationAmountRow,
     InvestigationBudgetReservationRow,
     InvestigationEnvelopeRow,
+    SampleAssociationRow,
     ToolInvocationRow,
+)
+from cti_app.infrastructure.database.models.model_execution import (
+    ModelConversationRow,
+    ModelConversationTurnRow,
+    ModelRunRow,
 )
 from cti_app.infrastructure.database.models.production import AnalystInvestigationRow
 from cti_app.infrastructure.database.repositories.external_effects import (
@@ -407,6 +417,273 @@ async def _prepare_case(
         )
         await uow.commit()
     return session_factory, engine, seeded.investigation.id, subject_id, authorities
+
+
+async def _prepare_model_submission_case(
+    database_url: str,
+    tmp_path: Path,
+    *,
+    suffix: str,
+    persisted_request_id: str = "bridge-request-1",
+    claimed_request_id: str | None = None,
+) -> tuple[
+    async_sessionmaker[AsyncSession],
+    AsyncEngine,
+    UUID,
+    ExternalEffectAuthority,
+    PreparedExternalRequest,
+    SqlAlchemyExternalEffectClaimStore,
+    UUID,
+]:
+    session_factory, engine, investigation_id, _subject_id, authorities = await _prepare_case(
+        database_url, tmp_path, suffix=suffix
+    )
+    authority, _base = authorities[0]
+    conversation_id = uuid4()
+    turn_id = uuid4()
+    run_id = uuid4()
+    input_sha256 = "a" * 64
+    effective_claimed_request_id = claimed_request_id or persisted_request_id
+    now = datetime.now(UTC)
+    async with session_factory() as session:
+        async with session.begin():
+            envelope = await session.get(InvestigationEnvelopeRow, investigation_id)
+            assert envelope is not None
+            envelope.allowed_providers = ["openai"]
+            session.add(
+                ModelConversationRow(
+                    id=conversation_id,
+                    provider="openai",
+                    transport="chatgpt_bridge",
+                    purpose="analyst_assistance",
+                    edition_id=None,
+                    subject_id=_subject_id,
+                    title="S3 test conversation",
+                    status="busy",
+                    external_id=None,
+                    external_locator=None,
+                    expected_profile=None,
+                    requested_model=None,
+                    head_turn_id=None,
+                    turn_count=1,
+                    created_at=now,
+                    updated_at=now,
+                    last_used_at=None,
+                    version=1,
+                )
+            )
+            session.add(
+                ModelRunRow(
+                    id=run_id,
+                    provider="openai",
+                    backend="chatgpt_bridge",
+                    transport="openai_responses",
+                    model_role="research",
+                    requested_model="test-model",
+                    actual_model_version=None,
+                    prompt_template_id="test.prompt",
+                    prompt_template_version="1",
+                    authorized_input_hash=input_sha256,
+                    evidence_pack_hash="b" * 64,
+                    parameters={},
+                    duration_ms=None,
+                    usage=None,
+                    status="running",
+                    submission_state="external_state_unknown",
+                    submission_attempt=1,
+                    bridge_request_id=persisted_request_id,
+                    response_id=None,
+                    output_references=[],
+                    error_code=None,
+                    error_message=None,
+                    error_details=None,
+                    raw_output_reference=None,
+                    raw_output_sha256=None,
+                    raw_output_chars=None,
+                    normalized_output_reference=None,
+                    normalized_output_sha256=None,
+                    parser_stage=None,
+                    serializer_version=None,
+                    normalization_version=None,
+                    json_error_line=None,
+                    json_error_column=None,
+                    validation_errors=[],
+                    transformations=[],
+                    citation_count=0,
+                    extracted_url_count=0,
+                    visible_citations=[],
+                    started_at=now,
+                    finished_at=None,
+                    updated_at=now,
+                )
+            )
+            await session.flush()
+            session.add(
+                ModelConversationTurnRow(
+                    id=turn_id,
+                    conversation_id=conversation_id,
+                    sequence=1,
+                    parent_turn_id=None,
+                    model_run_id=run_id,
+                    input_blob_reference="sha256:" + input_sha256,
+                    input_sha256=input_sha256,
+                    output_blob_reference=None,
+                    output_sha256=None,
+                    status="running",
+                    external_turn_id=None,
+                    idempotency_key=f"test:{run_id}",
+                    correlation_id=f"test:{run_id}",
+                    error_code=None,
+                    error_message=None,
+                    error_details=None,
+                    created_at=now,
+                    started_at=now,
+                    finished_at=None,
+                )
+            )
+    authority = replace(authority, bridge_turn_id=turn_id, model_run_id=run_id)
+    prepared = PreparedExternalRequest.build(
+        family="bridge.investigation_turn.v1",
+        provider="openai",
+        provider_scope="bridge-test",
+        normalizer_version="bridge.turn.v1",
+        canonical_request={
+            "model_input_sha256": input_sha256,
+            "authorized_input_hash": input_sha256,
+            "bridge_request_id": effective_claimed_request_id,
+        },
+        application_request=FrozenWireRequest(
+            method=b"POST",
+            target=b"/responses",
+            headers=((b"content-type", b"application/json"),),
+            body=b'{"input":"safe"}',
+        ),
+    )
+    store = SqlAlchemyExternalEffectClaimStore(
+        session_factory,
+        family_bindings={
+            prepared.family: ExternalEffectFamilyBinding(
+                provider="openai",
+                provider_scopes=frozenset({"bridge-test"}),
+                normalizer_versions=frozenset({"bridge.turn.v1"}),
+                invocation_tool_binding=(_FAMILY, "v1"),
+                model_submission=True,
+                requires_model_lineage=True,
+                model_run_provider="openai",
+            )
+        },
+    )
+    return session_factory, engine, investigation_id, authority, prepared, store, run_id
+
+
+@pytest.mark.asyncio
+async def test_prestarted_bridge_attempt_matches_request_and_does_not_increment_twice(
+    migrated_postgres_url: str, tmp_path: Path
+) -> None:
+    (
+        session_factory,
+        engine,
+        _investigation_id,
+        authority,
+        prepared,
+        store,
+        run_id,
+    ) = await _prepare_model_submission_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    transport = _CountingTransport()
+    try:
+        async with session_factory() as session:
+            before = await session.get(ModelRunRow, run_id)
+        assert before is not None
+        assert before.submission_state == "external_state_unknown"
+        assert before.submission_attempt == 1
+        outcome = await ExternalEffectCoordinator(store).send_one(authority, prepared, transport)
+        assert isinstance(outcome, Completed)
+        assert transport.calls == 1
+        async with session_factory() as session:
+            run = await session.get(ModelRunRow, run_id)
+            claim = await session.get(ExternalEffectClaimRow, outcome.claim_id)
+        assert run is not None
+        assert run.submission_state == "result_obtained"
+        assert run.submission_attempt == 1
+        assert run.bridge_request_id == prepared.canonical_request["bridge_request_id"]
+        assert claim is not None and claim.model_run_id == run_id
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_bridge_attempt_request_id_mismatch_refuses_without_send_or_increment(
+    migrated_postgres_url: str, tmp_path: Path
+) -> None:
+    (
+        session_factory,
+        engine,
+        _investigation_id,
+        authority,
+        prepared,
+        store,
+        run_id,
+    ) = await _prepare_model_submission_case(
+        migrated_postgres_url,
+        tmp_path,
+        suffix=uuid4().hex[:12],
+        persisted_request_id="persisted-bridge-request",
+        claimed_request_id="different-claim-request",
+    )
+    transport = _CountingTransport()
+    try:
+        outcome = await ExternalEffectCoordinator(store).send_one(authority, prepared, transport)
+        assert isinstance(outcome, Refused)
+        assert outcome.reason == "model_run_not_eligible"
+        assert transport.calls == 0
+        async with session_factory() as session:
+            run = await session.get(ModelRunRow, run_id)
+            claim_count = await session.scalar(
+                select(func.count())
+                .select_from(ExternalEffectClaimRow)
+                .where(ExternalEffectClaimRow.investigation_id == authority.investigation_id)
+            )
+        assert run is not None
+        assert run.submission_state == "external_state_unknown"
+        assert run.submission_attempt == 1
+        assert claim_count == 0
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_crash_before_bridge_consume_keeps_unknown_attempt_for_reconciliation(
+    migrated_postgres_url: str, tmp_path: Path
+) -> None:
+    (
+        session_factory,
+        engine,
+        _investigation_id,
+        _authority,
+        _prepared,
+        _store,
+        run_id,
+    ) = await _prepare_model_submission_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    try:
+        # ModelGateway has durably allocated the attempt; simulate a process
+        # crash before the coordinator creates/consumes its claim.
+        async with session_factory() as session:
+            run = await session.get(ModelRunRow, run_id)
+            claim_count = await session.scalar(
+                select(func.count())
+                .select_from(ExternalEffectClaimRow)
+                .where(ExternalEffectClaimRow.model_run_id == run_id)
+            )
+        assert run is not None
+        assert run.submission_state == "external_state_unknown"
+        assert run.submission_attempt == 1
+        assert claim_count == 0
+    finally:
+        await engine.dispose()
 
 
 def update_investigation_status(investigation_id: UUID):
@@ -757,6 +1034,7 @@ def _store(
     *,
     policy_guard: Any = None,
     credential_parameter_names: frozenset[str] = frozenset(),
+    model_submission: bool = False,
 ) -> SqlAlchemyExternalEffectClaimStore:
     return SqlAlchemyExternalEffectClaimStore(
         session_factory,
@@ -767,6 +1045,7 @@ def _store(
                 provider_scopes=frozenset({"tenant-test"}),
                 normalizer_versions=frozenset({_NORMALIZER}),
                 invocation_tool_binding=(_FAMILY, "v1"),
+                model_submission=model_submission,
                 credential_parameter_names=credential_parameter_names,
             )
         },
@@ -817,6 +1096,324 @@ async def test_family_declared_key_parameter_is_required_before_submission(
         assert configured_transport.calls == 1
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_declared_query_credential_in_canonical_request_is_rejected_before_persist(
+    migrated_postgres_url: str, tmp_path: Path
+) -> None:
+    session_factory, engine, investigation_id, _subject_id, _authorities = await _prepare_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    try:
+        with pytest.raises(ExternalEffectValidationError, match=r"canonical_request\.key"):
+            PreparedExternalRequest.build(
+                family=_FAMILY,
+                provider=_PROVIDER,
+                provider_scope="tenant-test",
+                normalizer_version=_NORMALIZER,
+                canonical_request={"hash": "abc", "key": "SECRET"},
+                application_request=FrozenWireRequest(
+                    method=b"GET",
+                    target=b"/v1/report?hash=abc&key=SECRET",
+                    headers=((b"accept", b"application/json"),),
+                    body=b"",
+                ),
+                credential_parameter_names=("key",),
+            )
+        async with session_factory() as session:
+            claim_count = await session.scalar(
+                select(func.count())
+                .select_from(ExternalEffectClaimRow)
+                .where(ExternalEffectClaimRow.investigation_id == investigation_id)
+            )
+        assert claim_count == 0
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("restriction", "expected_reason"),
+    [
+        ("tlp", "source_document_restricted"),
+        ("external_llm_allowed", "source_document_external_llm_not_allowed"),
+        ("do_not_submit", "source_document_restricted"),
+        ("clear", None),
+    ],
+)
+async def test_evidence_observation_source_document_restrictions_are_checked_at_consume(
+    migrated_postgres_url: str,
+    tmp_path: Path,
+    restriction: str,
+    expected_reason: str | None,
+) -> None:
+    session_factory, engine, investigation_id, subject_id, authorities = await _prepare_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    authority, base = authorities[0]
+    observation_id = uuid4()
+    observation_sha256 = "c" * 64
+    observation_version = "source-v1"
+    async with session_factory() as session:
+        async with session.begin():
+            blob = await session.scalar(select(BlobRow).order_by(BlobRow.id).limit(1))
+            assert blob is not None
+            document = SourceDocumentRow(
+                id=uuid4(),
+                subject_id=subject_id,
+                blob_id=blob.id,
+                original_name="external-effects-source.txt",
+                origin="test",
+                acquired_at=datetime.now(UTC),
+                license_restriction=None,
+                tlp="CLEAR",
+                do_not_submit=False,
+                external_llm_allowed=True,
+                logical_filename=None,
+                source_collection_id=None,
+                source_candidate_id=None,
+                decoded_blob_id=None,
+                title="Test source",
+                publisher=None,
+                published_at=None,
+                final_url=None,
+                declared_mime_type=None,
+                detected_mime_type=None,
+                encoded_sha256=None,
+                decoded_sha256=None,
+                encoded_size=None,
+                decoded_size=None,
+                created_at=datetime.now(UTC),
+            )
+            session.add(document)
+            await session.flush()
+            if restriction == "tlp":
+                document.tlp = "RED"
+            elif restriction == "external_llm_allowed":
+                document.external_llm_allowed = False
+            elif restriction == "do_not_submit":
+                document.do_not_submit = True
+            session.add(
+                EvidenceObservationRow(
+                    id=observation_id,
+                    investigation_id=investigation_id,
+                    kind="other",
+                    blob_id=document.blob_id,
+                    sha256=observation_sha256,
+                    source="test.source",
+                    source_version=observation_version,
+                    observed_at=datetime.now(UTC),
+                    object_type="source_document",
+                    object_id=str(document.id),
+                    limitations=[],
+                    invocation_ref=None,
+                )
+            )
+    reference = EvidenceReference(
+        kind="evidence_observation",
+        id=str(observation_id),
+        version=observation_version,
+        sha256=observation_sha256,
+    )
+    prepared = PreparedExternalRequest.build(
+        family=base.family,
+        provider=base.provider,
+        provider_scope=base.provider_scope,
+        normalizer_version=base.normalizer_version,
+        canonical_request=base.canonical_request,
+        application_request=base.application_request,
+        evidence_refs=(reference,),
+    )
+    transport = _CountingTransport()
+    try:
+        outcome = await ExternalEffectCoordinator(
+            _store(session_factory, model_submission=True)
+        ).send_one(authority, prepared, transport)
+        if expected_reason is None:
+            assert isinstance(outcome, Completed)
+            assert transport.calls == 1
+        else:
+            assert isinstance(outcome, Refused)
+            assert outcome.reason == expected_reason
+            assert transport.calls == 0
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_unresolvable_evidence_observation_refuses_model_submission(
+    migrated_postgres_url: str, tmp_path: Path
+) -> None:
+    session_factory, engine, _investigation_id, _subject_id, authorities = await _prepare_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    authority, base = authorities[0]
+    prepared = PreparedExternalRequest.build(
+        family=base.family,
+        provider=base.provider,
+        provider_scope=base.provider_scope,
+        normalizer_version=base.normalizer_version,
+        canonical_request=base.canonical_request,
+        application_request=base.application_request,
+        evidence_refs=(
+            EvidenceReference(
+                kind="evidence_observation",
+                id=str(uuid4()),
+                version="source-v1",
+                sha256="d" * 64,
+            ),
+        ),
+    )
+    transport = _CountingTransport()
+    try:
+        outcome = await ExternalEffectCoordinator(
+            _store(session_factory, model_submission=True)
+        ).send_one(authority, prepared, transport)
+        assert isinstance(outcome, Refused)
+        assert outcome.reason == "evidence_observation_missing"
+        assert transport.calls == 0
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_evidence_observation_resolves_restricted_sample_hash_at_consume(
+    migrated_postgres_url: str, tmp_path: Path
+) -> None:
+    session_factory, engine, investigation_id, subject_id, authorities = await _prepare_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    authority, base = authorities[0]
+    sample_id = uuid4()
+    sample_sha256 = "f" * 64
+    observation_id = uuid4()
+    observation_sha256 = "e" * 64
+    observation_version = "source-v1"
+    async with session_factory() as session:
+        async with session.begin():
+            blob = await session.scalar(select(BlobRow).order_by(BlobRow.id).limit(1))
+            assert blob is not None
+            session.add(
+                SampleRow(
+                    id=sample_id,
+                    subject_id=subject_id,
+                    blob_id=blob.id,
+                    original_name="restricted-sample.bin",
+                    origin="test",
+                    acquired_at=datetime.now(UTC),
+                    license_restriction=None,
+                    tlp="RED",
+                    do_not_submit=False,
+                    external_llm_allowed=True,
+                    origin_kind="manual",
+                    state="validated",
+                    source_service=None,
+                    source_object_id=None,
+                    expected_hash=sample_sha256,
+                    validation_actor=None,
+                    validation_date=None,
+                    validation_reason=None,
+                    imphash=None,
+                    ssdeep=None,
+                    tlsh=None,
+                    rich_header_hash=None,
+                    vhash=None,
+                    main_icon_dhash=None,
+                    imphash_source=None,
+                    ssdeep_source=None,
+                    tlsh_source=None,
+                    rich_header_hash_source=None,
+                    vhash_source=None,
+                    main_icon_dhash_source=None,
+                    created_at=datetime.now(UTC),
+                )
+            )
+            session.add(
+                SampleAssociationRow(
+                    id=uuid4(),
+                    investigation_id=investigation_id,
+                    sample_id=sample_id,
+                    sample_sha256=sample_sha256,
+                    origin="manual",
+                )
+            )
+            session.add(
+                EvidenceObservationRow(
+                    id=observation_id,
+                    investigation_id=investigation_id,
+                    kind="other",
+                    blob_id=blob.id,
+                    sha256=observation_sha256,
+                    source="test.source",
+                    source_version=observation_version,
+                    observed_at=datetime.now(UTC),
+                    object_type="file",
+                    object_id=sample_sha256,
+                    limitations=[],
+                    invocation_ref=None,
+                )
+            )
+    prepared = PreparedExternalRequest.build(
+        family=base.family,
+        provider=base.provider,
+        provider_scope=base.provider_scope,
+        normalizer_version=base.normalizer_version,
+        canonical_request=base.canonical_request,
+        application_request=base.application_request,
+        evidence_refs=(
+            EvidenceReference(
+                kind="evidence_observation",
+                id=str(observation_id),
+                version=observation_version,
+                sha256=observation_sha256,
+            ),
+        ),
+    )
+    transport = _CountingTransport()
+    try:
+        outcome = await ExternalEffectCoordinator(
+            _store(session_factory, model_submission=True)
+        ).send_one(authority, prepared, transport)
+        assert isinstance(outcome, Refused)
+        assert outcome.reason == "sample_source_restricted"
+        assert transport.calls == 0
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_empty_source_refs_do_not_match_unrelated_null_sample_associations(
+    migrated_postgres_url: str, tmp_path: Path
+) -> None:
+    first_factory, first_engine, _first_investigation, _subject, authorities = await _prepare_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    second_factory, second_engine, second_investigation, _subject2, _other = await _prepare_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    authority, prepared = authorities[0]
+    async with second_factory() as session:
+        async with session.begin():
+            session.add(
+                SampleAssociationRow(
+                    id=uuid4(),
+                    investigation_id=second_investigation,
+                    sample_id=None,
+                    sample_sha256="e" * 64,
+                    origin="manual",
+                )
+            )
+    transport = _CountingTransport()
+    try:
+        outcome = await ExternalEffectCoordinator(_store(first_factory)).send_one(
+            authority, prepared, transport
+        )
+        assert isinstance(outcome, Completed)
+        assert transport.calls == 1
+    finally:
+        await first_engine.dispose()
+        await second_engine.dispose()
 
 
 @pytest.mark.asyncio
