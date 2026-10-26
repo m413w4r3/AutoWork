@@ -1279,7 +1279,7 @@ async def test_unresolvable_evidence_observation_refuses_model_submission(
 
 @pytest.mark.asyncio
 async def test_evidence_observation_resolves_restricted_sample_hash_at_consume(
-    migrated_postgres_url: str, tmp_path: Path
+    migrated_postgres_url: str, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     session_factory, engine, investigation_id, subject_id, authorities = await _prepare_case(
         migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
@@ -1287,6 +1287,7 @@ async def test_evidence_observation_resolves_restricted_sample_hash_at_consume(
     authority, base = authorities[0]
     sample_id = uuid4()
     sample_sha256 = "f" * 64
+    restriction_text = "license restriction canary must not persist"
     observation_id = uuid4()
     observation_sha256 = "e" * 64
     observation_version = "source-v1"
@@ -1302,8 +1303,8 @@ async def test_evidence_observation_resolves_restricted_sample_hash_at_consume(
                     original_name="restricted-sample.bin",
                     origin="test",
                     acquired_at=datetime.now(UTC),
-                    license_restriction=None,
-                    tlp="RED",
+                    license_restriction=restriction_text,
+                    tlp="CLEAR",
                     do_not_submit=False,
                     external_llm_allowed=True,
                     origin_kind="manual",
@@ -1378,8 +1379,144 @@ async def test_evidence_observation_resolves_restricted_sample_hash_at_consume(
         assert isinstance(outcome, Refused)
         assert outcome.reason == "sample_source_restricted"
         assert transport.calls == 0
+        assert restriction_text not in repr(outcome)
+        assert restriction_text not in caplog.text
+        async with session_factory() as session:
+            claims = list(
+                await session.scalars(
+                    select(ExternalEffectClaimRow).where(
+                        ExternalEffectClaimRow.investigation_id == investigation_id
+                    )
+                )
+            )
+        assert restriction_text not in repr(claims)
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reference_kind", "expected_reason"),
+    [
+        ("sample_association", "sample_association_unresolvable"),
+        ("sample_hash", "sample_hash_unresolvable"),
+    ],
+)
+async def test_model_submission_rejects_unresolved_null_sample_association_refs(
+    migrated_postgres_url: str,
+    tmp_path: Path,
+    reference_kind: str,
+    expected_reason: str,
+) -> None:
+    session_factory, engine, investigation_id, _subject_id, authorities = await _prepare_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    authority, base = authorities[0]
+    association_id = uuid4()
+    sample_sha256 = "a" * 64
+    async with session_factory() as session:
+        async with session.begin():
+            session.add(
+                SampleAssociationRow(
+                    id=association_id,
+                    investigation_id=investigation_id,
+                    sample_id=None,
+                    sample_sha256=sample_sha256,
+                    origin="manual",
+                )
+            )
+    reference = EvidenceReference(
+        kind=reference_kind,
+        id=str(association_id) if reference_kind == "sample_association" else sample_sha256,
+        version="association-v1" if reference_kind == "sample_association" else "sample-hash-v1",
+        sha256=sample_sha256,
+    )
+    prepared = PreparedExternalRequest.build(
+        family=base.family,
+        provider=base.provider,
+        provider_scope=base.provider_scope,
+        normalizer_version=base.normalizer_version,
+        canonical_request=base.canonical_request,
+        application_request=base.application_request,
+        evidence_refs=(reference,),
+    )
+    transport = _CountingTransport()
+    try:
+        outcome = await ExternalEffectCoordinator(
+            _store(session_factory, model_submission=True)
+        ).send_one(authority, prepared, transport)
+        assert isinstance(outcome, Refused)
+        assert outcome.reason == expected_reason
+        assert transport.calls == 0
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_local_association", [True, False])
+async def test_sample_hash_association_lookup_is_scoped_to_claim_investigation(
+    migrated_postgres_url: str, tmp_path: Path, include_local_association: bool
+) -> None:
+    first_factory, first_engine, first_investigation, _subject, authorities = await _prepare_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    second_factory, second_engine, second_investigation, _subject2, _other = await _prepare_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    authority, base = authorities[0]
+    sample_sha256 = "b" * 64
+    async with second_factory() as session:
+        async with session.begin():
+            if include_local_association:
+                session.add(
+                    SampleAssociationRow(
+                        id=uuid4(),
+                        investigation_id=first_investigation,
+                        sample_id=None,
+                        sample_sha256=sample_sha256,
+                        origin="manual",
+                    )
+                )
+            session.add(
+                SampleAssociationRow(
+                    id=uuid4(),
+                    investigation_id=second_investigation,
+                    sample_id=None,
+                    sample_sha256=sample_sha256,
+                    origin="manual",
+                )
+            )
+    prepared = PreparedExternalRequest.build(
+        family=base.family,
+        provider=base.provider,
+        provider_scope=base.provider_scope,
+        normalizer_version=base.normalizer_version,
+        canonical_request=base.canonical_request,
+        application_request=base.application_request,
+        evidence_refs=(
+            EvidenceReference(
+                kind="sample_hash",
+                id=sample_sha256,
+                version="sample-hash-v1",
+                sha256=sample_sha256,
+            ),
+        ),
+    )
+    transport = _CountingTransport()
+    try:
+        outcome = await ExternalEffectCoordinator(_store(first_factory)).send_one(
+            authority, prepared, transport
+        )
+        if include_local_association:
+            assert isinstance(outcome, Completed)
+            assert transport.calls == 1
+        else:
+            assert isinstance(outcome, Refused)
+            assert outcome.reason == "sample_hash_not_associated_with_investigation"
+            assert transport.calls == 0
+    finally:
+        await first_engine.dispose()
+        await second_engine.dispose()
 
 
 @pytest.mark.asyncio

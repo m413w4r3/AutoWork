@@ -1188,7 +1188,6 @@ class SqlAlchemyExternalEffectClaimStore:
         association_ids: set[UUID] = set()
         document_ids: set[UUID] = set()
         sample_hashes: set[str] = set()
-        observation_sample_hashes: set[str] = set()
         observation_ids: dict[UUID, EvidenceReference] = {}
         is_model_submission = _is_model_submission(prepared, family_binding)
         recognized_kinds = {
@@ -1259,7 +1258,6 @@ class SqlAlchemyExternalEffectClaimStore:
                     if not re.fullmatch(r"[0-9a-f]{64}", observation.object_id):
                         raise _ConsumeDenied("unresolvable_evidence_observation_source")
                     sample_hashes.add(observation.object_id)
-                    observation_sample_hashes.add(observation.object_id)
                 elif object_type in {"source_document", "document"}:
                     try:
                         document_ids.add(UUID(observation.object_id))
@@ -1277,7 +1275,10 @@ class SqlAlchemyExternalEffectClaimStore:
                 & SampleAssociationRow.sample_id.in_(sorted(sample_ids, key=str))
             )
         if sample_hashes:
-            association_terms.append(SampleAssociationRow.sample_sha256.in_(sorted(sample_hashes)))
+            association_terms.append(
+                (SampleAssociationRow.investigation_id == authority.investigation_id)
+                & SampleAssociationRow.sample_sha256.in_(sorted(sample_hashes))
+            )
         associations = (
             list(
                 await session.scalars(
@@ -1296,6 +1297,8 @@ class SqlAlchemyExternalEffectClaimStore:
                 raise _ConsumeDenied("sample_association_investigation_mismatch")
             if association.sample_id is not None:
                 sample_ids.add(association.sample_id)
+            elif is_model_submission and association.id in association_ids:
+                raise _ConsumeDenied("sample_association_unresolvable")
         if (
             association_ids
             and {item.id for item in associations}.intersection(association_ids) != association_ids
@@ -1304,12 +1307,12 @@ class SqlAlchemyExternalEffectClaimStore:
         found_hashes = {item.sample_sha256 for item in associations}
         if sample_hashes and not sample_hashes.issubset(found_hashes):
             raise _ConsumeDenied("sample_hash_not_associated_with_investigation")
-        if is_model_submission and observation_sample_hashes:
+        if is_model_submission and sample_hashes:
             resolved_hashes = {
                 item.sample_sha256 for item in associations if item.sample_id is not None
             }
-            if not observation_sample_hashes.issubset(resolved_hashes):
-                raise _ConsumeDenied("evidence_observation_sample_unresolvable")
+            if not sample_hashes.issubset(resolved_hashes):
+                raise _ConsumeDenied("sample_hash_unresolvable")
         if referenced_sample_ids and not referenced_sample_ids.issubset(
             {item.sample_id for item in associations if item.sample_id is not None}
         ):
@@ -1333,6 +1336,7 @@ class SqlAlchemyExternalEffectClaimStore:
                 sample.subject_id != subject_id
                 or sample.tlp.casefold() == "red"
                 or sample.do_not_submit
+                or bool((sample.license_restriction or "").strip())
             ):
                 raise _ConsumeDenied("sample_source_restricted")
             if _is_model_submission(prepared, family_binding) and not sample.external_llm_allowed:
