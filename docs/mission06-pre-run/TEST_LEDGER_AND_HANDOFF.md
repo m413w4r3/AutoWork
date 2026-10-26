@@ -150,7 +150,7 @@ POSTGRES_CONCURRENCY_AND_RECOVERY_PASS|PARTIAL|BLOCKED : PARTIAL
 LOCAL_ANALYSIS_READY|PARTIAL|BLOCKED                : PARTIAL
 
 LUNA_XHIGH_MULTI_AGENT_VERIFIED|FAILED              : FAILED
-INDEPENDENT_REVIEWS_APPROVED|REVISE|BLOCKED         : REVISE (politique APPROVED ; S3 en revue)
+INDEPENDENT_REVIEWS_APPROVED|REVISE|BLOCKED         : REVISE (politique APPROVED ; S3 REVISE)
 
 REAL_RUN_PREFLIGHT_READY|PARTIAL|BLOCKED            : PARTIAL
 REAL_INVESTIGATION_NOT_STARTED                      : CONFIRMED
@@ -158,22 +158,24 @@ REAL_INVESTIGATION_NOT_STARTED                      : CONFIRMED
 
 Justification :
 
-- **PARTIAL politique** : le code, les 50 tests unitaires et les 6 tests
-  PostgreSQL de politique sont verts, mais la revue indépendante reste
-  `REVISE` sur la course révocation → émission (propriété S3-CORE), la
-  projection `/operator-status` et la lignée d'invocation. Aucun lot n'est
-  fusionné sur `main` tant que la revue n'est pas `APPROVED`.
-- **BLOCKED S3 familles** : seul le socle `ExternalEffectCoordinator` existe ;
-  aucune famille VT/Bridge n'est migrée. Les verdicts READY ne sont donc pas
-  revendiqués. La chaîne `0003→0004` s'applique sur base jetable après deux
-  corrections d'intégration, mais les tests PG S3 finaux restent à rejouer.
+- **PASS politique** : la politique est intégrée sur `main` (`4a97fa58`),
+  avec **51 tests unitaires** et **6 tests PostgreSQL** verts, et une revue
+  indépendante **APPROVED** pour le lot politique. La course révocation →
+  émission, le plafond d'effets et la lignée d'invocation restent des gates
+  S3-CORE avant toute release externe.
+- **BLOCKED S3 familles** : seul le socle `ExternalEffectCoordinator` existe
+  (candidat `2c6c6074`, non intégré) ; aucune famille VT/Bridge n'est migrée.
+  Les verdicts READY ne sont donc pas revendiqués. La chaîne `0003→0004`
+  s'applique sur base jetable après deux corrections d'intégration, mais le
+  gate PG S3 est à 3/5 et la revue S3 reste `REVISE` (3 MAJOR).
 - **PARTIAL non-divulgation** : les filtres de credentials/signed URLs sont
   testés unitairement, mais la revue S3 a trouvé des fragments `id_token` /
   `refresh_token` persistables ; correction non intégrée (S3 `REVISE`) ;
   aucune preuve live.
-- **PARTIAL concurrence/récupération** : la politique a 6 tests PG verts ;
-  le gate S3 combiné est à 3/5 après correction du fixture FK, avec deux
-  échecs restants (replay `effect_occurrence_required`, budget de crash).
+- **PARTIAL concurrence/récupération** : la politique a 6 tests PG verts et
+  la suite de migrations **120/120** ; le gate S3 combiné est à 3/5, avec
+  deux échecs corrigés dans le candidat `2c6c6074` mais non rejoués/reviewés
+  sur `main`. Aucun verdict de concurrence S3 n'est revendiqué.
 - **FAILED Luna xhigh multi-agent** : tous les enfants ont été créés en
   `codex/gpt-6-luna` `xhigh` avec vérification runtime, mais l'orchestrateur
   parent est `deepseek-flash[1m]`, pas Luna xhigh. La conformité complète de
@@ -181,6 +183,13 @@ Justification :
 - **REVISE revues** : la revue politique est `APPROVED` (lot intégré) ; la
   revue S3 reste `REVISE` (3 MAJOR : gate sans I/O physique, fragments de
   token, preuve no-handoff forgeable). Le socle S3 n'est pas intégré.
+- **Gates finaux réellement exécutés sur `main`** : suite backend
+  **4931 passed, 5 failed** (tous Typst : `/snap/bin/typst --version` échoue
+  avec `snap-confine ... cap_dac_override`), 31 skipped ; suite d'intégration
+  **355 passed, 7 failed** (tous Typst/environnementaux) ; migrations
+  **120 passed** ; `ruff check`/`format` PASS ; `mypy` **success on 420
+  source files**. Les échecs Typst ne sont pas des régressions politiques ;
+  ils ne sont pas déclarés PASS.
 - **PARTIAL prévol run réel** : le plan et les inconnues sont documentés ;
   les lectures canoniques live (lignée de synthèse, état des jobs, MinIO)
   n'ont pas été effectuées et restent à autoriser.
@@ -189,27 +198,30 @@ Justification :
 
 ### État Git
 
-- `main` local : `0a5d3e29` — **politique OSINT_OPEN intégrée et approuvée**
-  (51 unitaires + 6 PostgreSQL verts sur `main@efc38e8a`). Aucun push, merge
-  distant, déploiement ou migration live.
-- Branche candidate S3 : `m06/s3-core-impl` à `de8b7451` — **NON INTÉGRÉE**.
+- `main` local : `4a97fa58` — **politique OSINT_OPEN intégrée, approuvée et
+  vérifiée** (51 unitaires + 6 PostgreSQL verts, revue `APPROVED`, suites
+  backend/intégration vertes hors Typst). Aucun push, merge distant,
+  déploiement ou migration live.
+- Branche candidate S3 : `m06/s3-core-impl` à `2c6c6074` — **NON INTÉGRÉE**.
   46 unitaires verts, lint+typecheck PASS ; revue indépendante `REVISE`
-  (3 MAJOR) ; PG combiné 3/5.
+  (3 MAJOR) ; gate PG combiné 3/5 avant la correction `2c6c6074`, non
+  rejoué/reviewé sur `main`.
 - Gate combiné temporaire : `/tmp/m06-combined-gate`, branche
-  `m06/combined-gate` à `e2b05cfd` (politique + S3 + correctifs d'intégration
-  `env.py`). Chaîne `0001→0004` : `UPGRADE_OK` ; politique PG 6/6 ; S3 PG
-  3/5.
+  `m06/combined-gate` à `e2b05cfd` (politique + S3 jusqu'à `de8b7451` +
+  correctifs d'intégration `env.py`). Chaîne `0001→0004` : `UPGRADE_OK` ;
+  politique PG 6/6 ; S3 PG 3/5.
 
 ### Prochaine action permissible
 
-1. Attendre/valider les derniers commits correctifs S3 et la re-revue
-   indépendante.
-2. Si et seulement si les revues passent `APPROVED` : fusionner la politique
-   puis S3 sur `main`, appliquer les deux correctifs `env.py` (exclusion
-   `external_effect_*` du baseline, import `retrohunt`), rejouer
-   `alembic upgrade head` et les tests PG combinés.
-3. Si une revue reste `REVISE` : conserver les branches candidates, ne pas
-   fusionner, et traiter les constats avant toute release.
+1. Corriger les 3 MAJOR S3 (gate sans I/O physique, fragments `id_token` /
+   `refresh_token`, preuve no-handoff forgeable), puis faire une revue
+   indépendante du candidat corrigé.
+2. Si et seulement si la revue S3 passe `APPROVED` : intégrer le socle S3,
+   appliquer les deux correctifs `env.py` (exclusion `external_effect_*` du
+   baseline, import `retrohunt`), rejouer `alembic upgrade head` et les cinq
+   tests PG S3.
+3. Si la revue S3 reste `REVISE` : conserver la branche candidate, ne pas
+   fusionner, et traiter les constats avant toute release externe.
 4. Toute prévol live (lecture canonique Run 12, G2/TLP, MinIO) exige une
    autorisation séparée ; aucun appel fournisseur, téléchargement ou
    exécution d'échantillon n'est autorisé par ce handoff.

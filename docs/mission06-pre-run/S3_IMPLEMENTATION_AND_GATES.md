@@ -1,13 +1,14 @@
 # S3 — implémentation et gates des effets externes
 
-Statut : **SOCLE `S3-CORE` CANDIDAT NON INTÉGRÉ (`de8b7451`), REVUE `REVISE`,
+Statut : **SOCLE `S3-CORE` CANDIDAT NON INTÉGRÉ (`2c6c6074`), REVUE `REVISE`,
 FAMILLES NON MIGRÉES.** 46 tests unitaires verts ; la chaîne `0003→0004`
 s'applique sur base jetable après les deux correctifs d'intégration ci-dessous ;
-les tests PostgreSQL S3 sont **3/5** (deux échecs : replay
-`effect_occurrence_required`, fixture budget). La revue finale retient 3 MAJOR :
-le gate n'possède pas l'I/O physique, des fragments `id_token`/`refresh_token`
-persistent, et une preuve no-handoff peut être forgée via un registre global.
-Ce document ne déclare aucun `S3_*_READY`. La conception D6 a été confrontée au code réel :
+le gate PG S3 était **3/5** avant `2c6c6074` (replay
+`effect_occurrence_required` et fixture budget corrigés ensuite, non rejoués
+sur `main`). La revue finale retient 3 MAJOR : le gate n'possède pas l'I/O
+physique, des fragments `id_token`/`refresh_token` persistent, et une preuve
+no-handoff peut être forgée via un registre global. Ce document ne déclare
+aucun `S3_*_READY`. La conception D6 a été confrontée au code réel :
 [`recon/S3_SEAM.md`](recon/S3_SEAM.md) (SHA-256
 `9f17611abf3a05166f069b745cfd546041e6748ccce1f4f36b6135f3774dbaa4`). La
 spécification d'implémentation détaillée est

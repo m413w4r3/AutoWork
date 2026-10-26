@@ -1,10 +1,12 @@
 # Politique permanente `OSINT_OPEN` — conception et invariants
 
-Statut : **INTÉGRÉ SUR `main@efc38e8a`**. Vérifications parent sur `main` :
-**51 tests unitaires** et **6 tests PostgreSQL** verts. Revue indépendante :
-**APPROVED pour le lot politique**. La release des effets externes reste
-conditionnée à S3-CORE (course révocation → claim, plafond d'effets, lignée
-d'invocation). Aucune capacité fournisseur live n'est déclarée PASS.
+Statut : **INTÉGRÉ SUR `main@4a97fa58`**. Vérifications parent sur `main` :
+**51 tests unitaires**, **6 tests PostgreSQL**, **120 tests de migration**,
+suite backend **4931 passed** et intégration **355 passed** hors échecs Typst
+environnementaux. Revue indépendante : **APPROVED pour le lot politique**.
+La release des effets externes reste conditionnée à S3-CORE (course
+révocation → claim, plafond d'effets, lignée d'invocation). Aucune capacité
+fournisseur live n'est déclarée PASS.
 
 ## 1. Objectif
 
