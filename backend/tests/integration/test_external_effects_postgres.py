@@ -828,6 +828,7 @@ async def test_bridge_submission_cannot_omit_restricted_prompt_source_reference(
 
     transport = create_coordinated_http_responses_transport(
         "https://bridge.synthetic/v1",
+        api_key=None,
         coordinator=create_external_effect_coordinator(session_factory),
         http_transport=httpx.MockTransport(handler),
     )
