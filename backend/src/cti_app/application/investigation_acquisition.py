@@ -711,6 +711,11 @@ class HitAcquisitionService:
                 raise HitAcquisitionError(
                     "Quarantined blob hash does not match the requested SHA-256"
                 )
+            await uow.sample_associations.link_sample(
+                association.id,
+                sample.id,
+                expected_sha256=association.sample_sha256,
+            )
             if reused_from_subject_sample:
                 events = await uow.provenance.list_for_aggregate("sample", sample.id)
                 already_recorded = any(
@@ -741,7 +746,7 @@ class HitAcquisitionService:
                             tlp=sample.tlp,
                         )
                     )
-                    await uow.commit()
+            await uow.commit()
         is_subject_reuse = reused_from_subject_sample
         observation = await self._recorder.record_existing_blob(
             investigation_id=association.investigation_id,

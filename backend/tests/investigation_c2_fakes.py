@@ -50,6 +50,7 @@ class FakeDatabase:
         self.investigations: dict[UUID, AnalystInvestigation] = {}
         self.envelopes: dict[UUID, InvestigationEnvelope] = {}
         self.associations: dict[UUID, SampleAssociation] = {}
+        self.association_sample_ids: dict[UUID, UUID] = {}
         self.decisions: list[Any] = []
         self.observations: dict[UUID, EvidenceObservation] = {}
         self.attempts: list[SampleAcquisitionAttempt] = []
@@ -170,6 +171,27 @@ class _Associations:
             raise RuntimeError("association version conflict")
         self.db.associations[association.id] = association
         return association
+
+    async def link_sample(
+        self, association_id: UUID, sample_id: UUID, *, expected_sha256: str
+    ) -> None:
+        association = self.db.associations.get(association_id)
+        sample = self.db.samples.get(sample_id)
+        if association is None or association.sample_sha256 != expected_sha256 or sample is None:
+            raise ValueError("sample association link does not match")
+        blob = self.db.blobs.get(sample.blob_id)
+        investigation = self.db.investigations.get(association.investigation_id)
+        if (
+            blob is None
+            or blob.descriptor.sha256 != expected_sha256
+            or investigation is None
+            or sample.subject_id != investigation.subject_id
+        ):
+            raise ValueError("sample association link does not match its investigation")
+        existing_sample_id = self.db.association_sample_ids.get(association_id)
+        if existing_sample_id not in {None, sample_id}:
+            raise ValueError("sample association is already linked to another sample")
+        self.db.association_sample_ids[association_id] = sample_id
 
 
 class _Decisions:

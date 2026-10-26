@@ -179,6 +179,7 @@ class _SampleRepository:
 class _SampleAssociationRepository:
     def __init__(self) -> None:
         self.associations: dict[UUID, SampleAssociation] = {}
+        self.sample_ids: dict[UUID, UUID] = {}
 
     async def list_for_investigation(self, investigation_id: UUID):
         return tuple(
@@ -192,6 +193,17 @@ class _SampleAssociationRepository:
 
     async def get(self, association_id: UUID) -> SampleAssociation | None:
         return self.associations.get(association_id)
+
+    async def link_sample(
+        self, association_id: UUID, sample_id: UUID, *, expected_sha256: str
+    ) -> None:
+        association = self.associations.get(association_id)
+        if association is None or association.sample_sha256 != expected_sha256:
+            raise ValueError("sample association link does not match")
+        current = self.sample_ids.get(association_id)
+        if current not in {None, sample_id}:
+            raise ValueError("sample association is already linked to another sample")
+        self.sample_ids[association_id] = sample_id
 
 
 class _ProvenanceRepository:

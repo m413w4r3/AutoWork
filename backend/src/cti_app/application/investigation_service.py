@@ -85,7 +85,7 @@ from cti_app.application.research_context_builder import (
     provider_authorization_blocked_capabilities,
     provider_download_blocked_capabilities,
 )
-from cti_app.application.virustotal import normalize_file_hash
+from cti_app.application.virustotal import VirusTotalInvalidInputError, normalize_file_hash
 from cti_app.domain.analyst_opinion import (
     AnalystObservationV1,
     AnalystOpinionStatus,
@@ -1295,7 +1295,7 @@ class InvestigationService:
                 if tool_name == "vt.download_sample":
                     try:
                         download_hash = normalize_file_hash(str(arguments.get("sha256", "")))
-                    except (TypeError, ValueError):
+                    except (TypeError, ValueError, VirusTotalInvalidInputError):
                         external_effect_evidence_refs = ()
                     else:
                         external_effect_evidence_refs = (
@@ -1562,13 +1562,11 @@ class InvestigationService:
                 snapshot = await self._context_builder.article_snapshots.resolve(
                     current_investigation.synthesis_artifact_id
                 )
-                if (
-                    tool_name != "vt.download_sample"
-                    and not self.external_llm_allowed(snapshot, current_envelope)
+                if not self.external_llm_allowed(
+                    snapshot, current_envelope
                 ) or await self._vt_source_disclosure_restricted(
                     current_investigation,
                     external_effect_evidence_refs,
-                    require_external_llm_allowed=tool_name != "vt.download_sample",
                 ):
                     return FrameworkPreSubmissionProof.DISCLOSURE_REVOKED
             elif tool_name == "advisor.consult":

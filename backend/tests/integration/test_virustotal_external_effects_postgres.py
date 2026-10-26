@@ -143,6 +143,29 @@ class _RevokingScriptedTurnTransport(ScriptedTurnTransport):
         self._policy = policy
         self._revoked = False
 
+    async def submit(
+        self,
+        *,
+        investigation_id: UUID,
+        subject_id: UUID,
+        turn_index: int,
+        context_sha256: str,
+        prompt: str,
+        external_llm_allowed: bool,
+        timeout_seconds: float | None = None,
+    ) -> TurnSubmission:
+        result = await super().submit(
+            investigation_id=investigation_id,
+            subject_id=subject_id,
+            turn_index=turn_index,
+            context_sha256=context_sha256,
+            prompt=prompt,
+            external_llm_allowed=external_llm_allowed,
+            timeout_seconds=timeout_seconds,
+        )
+        await self._revoke_after_success(result, investigation_id)
+        return result
+
     async def submit_with_attempt(
         self,
         *,
@@ -165,6 +188,10 @@ class _RevokingScriptedTurnTransport(ScriptedTurnTransport):
             attempt=attempt,
             timeout_seconds=timeout_seconds,
         )
+        await self._revoke_after_success(result, investigation_id)
+        return result
+
+    async def _revoke_after_success(self, result: TurnSubmission, investigation_id: UUID) -> None:
         if result.status is TurnSubmissionStatus.SUCCEEDED and not self._revoked:
             await self._policy_service.revoke(
                 policy_id=self._policy.id,
@@ -174,7 +201,6 @@ class _RevokingScriptedTurnTransport(ScriptedTurnTransport):
                 correlation_id=f"vt-download-revocation:{investigation_id}",
             )
             self._revoked = True
-        return result
 
 
 async def _seed_unrelated_unassociated_sample(uow_factory, artifact_store) -> None:
@@ -1207,7 +1233,9 @@ async def test_vt_download_v2_fallback_requires_explicit_opt_in_and_is_claimed(
         assert len(proxy_requests) == 2
         assert len(direct_requests) == (1 if fallback_enabled else 0)
         assert [item.status for item in result["invocations"]] == [
-            ToolInvocationStatus.SUCCEEDED if fallback_enabled else ToolInvocationStatus.UNAVAILABLE
+            ToolInvocationStatus.SUCCEEDED
+            if fallback_enabled
+            else ToolInvocationStatus.NEEDS_REVIEW
         ]
         claims = result["claims"]
         assert len(claims) == (3 if fallback_enabled else 2)
@@ -1284,7 +1312,9 @@ async def test_vt_download_rejects_non_allowlisted_redirect_before_target_send(
         assert claim.family == "vt.download_sample"
         assert claim.state == "COMPLETED"
         assert claim.canonical_request["host"] != "unlisted.invalid"
-        assert [item.status for item in result["invocations"]] == [ToolInvocationStatus.UNAVAILABLE]
+        assert [item.status for item in result["invocations"]] == [
+            ToolInvocationStatus.NEEDS_REVIEW
+        ]
     finally:
         if result["direct_client"] is not None:
             await result["direct_client"].aclose()

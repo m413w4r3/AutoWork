@@ -451,7 +451,8 @@ async def test_ambiguous_download_failure_stops_without_persisting_adapter_outpu
         ),
     )
     fixture.envelope = replace(fixture.envelope, acquire_hits_allowed=True)
-    fixture.service._sample_associations = InMemorySampleAssociationRepository()
+    source_associations = InMemorySampleAssociationRepository()
+    fixture.service._sample_associations = source_associations
     fixture.service._samples = cast(Any, _NoExistingSamples())
     database.investigations[fixture.investigation_id] = make_investigation()
     port = _PartialDownloadTimeoutPort(sample)
@@ -460,6 +461,8 @@ async def test_ambiguous_download_failure_stops_without_persisting_adapter_outpu
         acquisition=make_sample_acquisition_service(database, port),
         recorder=make_evidence_recorder(database),
     )
+    association = await hits.register_hit(fixture.investigation_id, sha256, SampleOrigin.VT_PIVOT)
+    await source_associations.append_version(association, expected_version=0)
     actual_registry = _register(database, hits)
     definition, adapter = actual_registry.get("vt.download_sample", "1")
     fixture.registry.unregister("vt.download_sample", "1")
