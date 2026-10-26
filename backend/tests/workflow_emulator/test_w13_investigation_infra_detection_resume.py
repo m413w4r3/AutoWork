@@ -1372,6 +1372,14 @@ async def test_w13_d7_tool_replay_ambiguous_bridge_resume_and_local_denials(
             suffix=f"w13-d7-policy-{uuid4().hex[:8]}",
             material=policy_material,
         )
+        await persist_sample_association_fixture(
+            uow_factory,
+            driver.artifact_store,
+            investigation_id=policy_seed.investigation.id,
+            subject_id=policy_seed.subject.id,
+            sample_sha256=policy_material.seed_hash,
+            origin=SampleOrigin.SEED,
+        )
         policy_vt = HashCheckedVirusTotal(material=policy_material)
         policy_shodan = FakeShodanPort()
         policy_transport = ScriptedInvestigationTransport(
@@ -1484,6 +1492,14 @@ async def test_w13_d7_tool_replay_ambiguous_bridge_resume_and_local_denials(
             driver.artifact_store,
             suffix=f"w13-d7-quota-{uuid4().hex[:8]}",
             material=quota_material,
+        )
+        await persist_sample_association_fixture(
+            uow_factory,
+            driver.artifact_store,
+            investigation_id=quota_seed.investigation.id,
+            subject_id=quota_seed.subject.id,
+            sample_sha256=quota_material.seed_hash,
+            origin=SampleOrigin.SEED,
         )
         quota_vt = HashCheckedVirusTotal(material=quota_material)
         quota_vt.errors["file_report"] = VirusTotalQuotaExceededError("simulated quota")

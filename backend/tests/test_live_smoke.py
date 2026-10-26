@@ -82,6 +82,7 @@ def _vt_adapter(handler: Any, client_stack: list[httpx.AsyncClient]) -> VirusTot
         capabilities=VirusTotalCapabilities(
             file_report=True, file_relationships=True, intelligence_search=True
         ),
+        offline_probe_mode=True,
         routing_policy=VirusTotalRoutingPolicy(
             routes={
                 VirusTotalCapability.FILE_REPORT: _ROUTE,

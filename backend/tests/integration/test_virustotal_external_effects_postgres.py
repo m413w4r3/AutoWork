@@ -28,12 +28,14 @@ from cti_app.application.virustotal import (
 from cti_app.application.virustotal_persistence import VirusTotalObservationService
 from cti_app.config import Settings
 from cti_app.domain.classification import TLP
-from cti_app.domain.entities import Sample, SampleState
+from cti_app.domain.entities import Sample, SampleState, SourceDocument
 from cti_app.domain.entities import SampleOrigin as EntitySampleOrigin
 from cti_app.domain.investigation import (
     BudgetDimension,
     DisclosureBounds,
     EnvelopeAuthorityKind,
+    EvidenceKind,
+    EvidenceObservation,
     SampleAssociation,
     SampleOrigin,
     TLPLevel,
@@ -132,6 +134,7 @@ def _make_vt_adapter(
     direct_handler=None,
     allow_v2_fallback: bool = False,
     enable_behaviour_pcap: bool = False,
+    enable_intelligence_search: bool = False,
 ):
     proxy_client = httpx.AsyncClient(transport=httpx.MockTransport(proxy_handler))
     direct_client = (
@@ -169,6 +172,16 @@ def _make_vt_adapter(
             behaviour_reports=True,
             behaviour_pcap=True,
         )
+    if enable_intelligence_search:
+        routes[VirusTotalCapability.INTELLIGENCE_SEARCH] = VirusTotalOperationRoute(
+            primary=steps[0]
+        )
+        capabilities = VirusTotalCapabilities(
+            file_report=True,
+            intelligence_search=True,
+            behaviour_reports=capabilities.behaviour_reports,
+            behaviour_pcap=capabilities.behaviour_pcap,
+        )
     adapter = VirusTotalHttpAdapter(
         client=proxy_client,
         direct_client=direct_client,
@@ -197,6 +210,13 @@ async def _run_inherited_case(
     sample_do_not_submit: bool = False,
     sample_external_llm_allowed: bool = True,
     bypass_legacy_guard: bool = False,
+    enable_intelligence_search: bool = False,
+    tool_name: str = "vt.file_report",
+    tool_arguments: dict[str, object] | None = None,
+    source_observation_id: UUID | None = None,
+    source_tlp: TLP = TLP.CLEAR,
+    source_do_not_submit: bool = False,
+    source_license_restriction: str | None = None,
 ):
     engine = create_postgres_engine(database_url)
     session_factory = create_session_factory(engine)
@@ -242,6 +262,41 @@ async def _run_inherited_case(
                 )
             )
             await uow.commit()
+    if source_observation_id is not None:
+        source_bytes = f"synthetic restricted VT source document {uuid4()}".encode()
+        source_blob_id = await artifact_store.put_bytes(
+            source_bytes,
+            bucket="vt-read-source-documents",
+            mime_type="text/plain",
+        )
+        source_document = SourceDocument(
+            subject_id=seeded.subject.id,
+            blob_id=source_blob_id,
+            original_name="synthetic-vt-source.txt",
+            origin="synthetic VT source restriction fixture",
+            acquired_at=datetime.now(UTC),
+            license_restriction=source_license_restriction,
+            tlp=source_tlp,
+            do_not_submit=source_do_not_submit,
+            external_llm_allowed=True,
+        )
+        source_observation = EvidenceObservation(
+            investigation_id=seeded.investigation.id,
+            kind=EvidenceKind.OTHER,
+            blob_id=source_blob_id,
+            sha256=hashlib.sha256(source_bytes).hexdigest(),
+            source="synthetic-vt-source-document",
+            source_version="source-document.v1",
+            observed_at=datetime.now(UTC),
+            object_type="source_document",
+            object_id=str(source_document.id),
+            limitations=("Synthetic source-document evidence only.",),
+            id=source_observation_id,
+        )
+        async with uow_factory() as uow:
+            await uow.source_documents.add(source_document)
+            await uow.evidence_observations.append_if_absent(source_observation)
+            await uow.commit()
     async with uow_factory() as uow:
         for file_hash in sorted(set(hashes)):
             await uow.sample_associations.append_version(
@@ -264,6 +319,7 @@ async def _run_inherited_case(
         direct_handler=direct_handler,
         allow_v2_fallback=allow_v2_fallback,
         enable_behaviour_pcap=enable_behaviour_pcap,
+        enable_intelligence_search=enable_intelligence_search,
     )
     settings = investigation_settings(providers=True)
     if enable_behaviour_pcap:
@@ -285,7 +341,19 @@ async def _run_inherited_case(
         shodan_adapter=None,
         ghidra_adapter=None,
     )
-    if enable_behaviour_pcap:
+    if tool_arguments is not None:
+        responses = [
+            decision(
+                "Read the synthetic VT source evidence.",
+                tool_call={
+                    "tool_name": tool_name,
+                    "schema_version": "1",
+                    "arguments": tool_arguments,
+                    "purpose": "Check source restrictions before a synthetic VT query.",
+                },
+            )
+        ]
+    elif enable_behaviour_pcap:
         file_hash = hashes[0]
         responses = [
             decision(
@@ -690,6 +758,68 @@ async def test_restricted_sample_vt_read_is_refused_before_transport(
         sample_tlp=sample_tlp,
         sample_do_not_submit=sample_do_not_submit,
         sample_external_llm_allowed=sample_external_llm_allowed,
+        bypass_legacy_guard=bypass_legacy_guard,
+    )
+    try:
+        assert physical_requests == []
+        assert result["human_decisions"] == []
+        assert result["invocations"]
+        assert result["invocations"][0].status in {
+            ToolInvocationStatus.POLICY_DENIED,
+            ToolInvocationStatus.NEEDS_REVIEW,
+        }
+        if not bypass_legacy_guard:
+            assert result["claims"] == []
+    finally:
+        if result["direct_client"] is not None:
+            await result["direct_client"].aclose()
+        await result["proxy_client"].aclose()
+        await result["engine"].dispose()
+
+
+@pytest.mark.parametrize(
+    ("source_tlp", "source_do_not_submit", "source_license_restriction"),
+    [
+        (TLP.RED, False, None),
+        (TLP.CLEAR, True, None),
+        (TLP.CLEAR, False, "no external submission"),
+    ],
+    ids=("tlp-red", "do-not-submit", "license-veto"),
+)
+@pytest.mark.parametrize("bypass_legacy_guard", [False, True], ids=("legacy", "coordinator"))
+@pytest.mark.asyncio
+async def test_restricted_source_document_vt_read_is_refused_before_transport(
+    migrated_postgres_url: str,
+    tmp_path: Path,
+    source_tlp: TLP,
+    source_do_not_submit: bool,
+    source_license_restriction: str | None,
+    bypass_legacy_guard: bool,
+) -> None:
+    physical_requests: list[httpx.Request] = []
+    observation_id = uuid4()
+
+    def proxy_handler(request: httpx.Request) -> httpx.Response:
+        physical_requests.append(request)
+        return httpx.Response(200, json={"data": []}, request=request)
+
+    result = await _run_inherited_case(
+        database_url=migrated_postgres_url,
+        tmp_path=tmp_path,
+        max_claims=10,
+        hashes=(),
+        proxy_handler=proxy_handler,
+        enable_intelligence_search=True,
+        tool_name="vt.intelligence_search",
+        tool_arguments={
+            "query": "tag:synthetic-source",
+            "justification": "Investigate a synthetic source observation.",
+            "evidence_refs": [str(observation_id)],
+        },
+        source_observation_id=observation_id,
+        source_tlp=source_tlp,
+        source_do_not_submit=source_do_not_submit,
+        source_license_restriction=source_license_restriction,
         bypass_legacy_guard=bypass_legacy_guard,
     )
     try:

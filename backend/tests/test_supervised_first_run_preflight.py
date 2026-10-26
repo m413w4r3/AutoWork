@@ -459,8 +459,8 @@ def test_runtime_inventory_uses_worker_factory_without_provider_requests(
         "OPERATOR_API_TOKEN",
     ):
         monkeypatch.delenv(name, raising=False)
-    # A disabled proxy route must make VT unavailable; this test supplies a
-    # non-contacted route so it can assert that the worker factory wires it.
+    # The route is non-contacted. Without a SQL session factory, the runtime
+    # cannot wire the external-effect coordinator and must withhold VT reads.
     monkeypatch.setenv("VIRUSTOTAL_PROXY_URL", "http://proxy.test:8080")
     monkeypatch.setenv("VIRUSTOTAL_FILE_REPORT_ENABLED", "true")
     monkeypatch.setenv("VIRUSTOTAL_FILE_REPORT_LEGACY_FALLBACK_ENABLED", "false")
@@ -472,7 +472,9 @@ def test_runtime_inventory_uses_worker_factory_without_provider_requests(
     assert inventory["provider_calls"] == 0
     assert inventory["constructed_inventory_matches"] is True
     assert inventory["live_process_inventory_observed"] is False
-    assert inventory["worker"]["families"]["virustotal"]["status"] == "available"
+    vt_reads = inventory["worker"]["families"]["virustotal_reads"]
+    assert vt_reads["status"] == "unavailable"
+    assert vt_reads["reason"] == "external_effect_coordinator_unavailable"
 
 
 def test_non_empty_database_without_alembic_identity_is_refused(

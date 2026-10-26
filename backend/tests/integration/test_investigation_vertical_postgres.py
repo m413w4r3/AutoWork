@@ -26,6 +26,8 @@ from cti_app.domain.investigation import (
     FindingKind,
     FrameworkPreSubmissionProof,
     NoveltyClass,
+    SampleAssociation,
+    SampleOrigin,
     SampleQualification,
     ToolInvocationStatus,
 )
@@ -111,6 +113,22 @@ def _unique_sample_material() -> _SyntheticSampleMaterial:
     )
 
 
+async def _associate_vt_file_source(uow_factory, investigation_id: UUID, sample_hash: str) -> UUID:
+    association_id = uuid4()
+    async with uow_factory() as uow:
+        await uow.sample_associations.append_version(
+            SampleAssociation(
+                investigation_id=investigation_id,
+                sample_sha256=sample_hash,
+                origin=SampleOrigin.MANUAL,
+                id=association_id,
+            ),
+            expected_version=0,
+        )
+        await uow.commit()
+    return association_id
+
+
 @pytest.mark.asyncio
 async def test_real_postgres_http_bridge_vertical_investigation_and_v6_publication(
     uow_factory, tmp_path: Path
@@ -122,6 +140,9 @@ async def test_real_postgres_http_bridge_vertical_investigation_and_v6_publicati
     seeded = await _seed_verified_article(uow_factory, artifact_store, suffix=uuid4().hex[:10])
     assert seeded.seed_observation is not None
     material = _unique_sample_material()
+    source_association_id = await _associate_vt_file_source(
+        uow_factory, seeded.investigation.id, seeded.seed_observation.object_id
+    )
     candidate_hash = material.sample_hash
     vt = _HashCheckedVirusTotal(material=material, include_candidate=True)
     shodan = FakeShodanPort()
@@ -285,8 +306,12 @@ async def test_real_postgres_http_bridge_vertical_investigation_and_v6_publicati
         assert state_payload["opinion_draft"] is not None
         sample_list = await client.get(f"/api/investigations/{investigation_id}/samples")
         assert sample_list.status_code == 200, sample_list.text
-        assert len(sample_list.json()) == 1
-        sample_view = sample_list.json()[0]
+        sample_views = sample_list.json()
+        assert {item["sample_sha256"] for item in sample_views} == {
+            seeded.seed_observation.object_id,
+            candidate_hash,
+        }
+        sample_view = next(item for item in sample_views if item["sample_sha256"] == candidate_hash)
         assert sample_view["sample_sha256"] == candidate_hash
         assert sample_view["qualification"] == "candidate"
 
@@ -329,13 +354,25 @@ async def test_real_postgres_http_bridge_vertical_investigation_and_v6_publicati
                 "sample.analyze",
                 "shodan.host",
             }
-            # Local analysis is PARTIAL when optional extractors (code features, goodware
-            # corpus) are not provisioned in the harness; every other tool must succeed.
+            # The article seed is linked for VT source-policy checks but has no quarantined
+            # bytes. If it is selected for eager local analysis, that request must fail closed;
+            # acquired candidates may be partial when optional extractors are not provisioned.
+            failed_analysis = tuple(
+                item
+                for item in invocations
+                if item.tool_name == "sample.analyze" and item.status is ToolInvocationStatus.FAILED
+            )
+            assert len(failed_analysis) <= 1
             assert all(
                 item.status is ToolInvocationStatus.SUCCEEDED
                 or (
                     item.tool_name == "sample.analyze"
                     and item.status is ToolInvocationStatus.PARTIAL
+                )
+                or (
+                    item.tool_name == "sample.analyze"
+                    and item.status is ToolInvocationStatus.FAILED
+                    and item.normalized_parameters["association_id"] == str(source_association_id)
                 )
                 for item in invocations
             )
@@ -348,13 +385,14 @@ async def test_real_postgres_http_bridge_vertical_investigation_and_v6_publicati
         assert vt.calls["intelligence_search"] == 1
         assert vt.download_calls == 1
         assert shodan.calls == [("host", (_IOC,))]
-        assert transport.submission_count == 7
+        submissions_before_replay = transport.submission_count
+        assert submissions_before_replay == 7
 
         # Re-dispatching the succeeded durable job does not download again or submit
         # another Bridge turn.
         await _run_http_job(app, uow_factory, registry, dispatcher, UUID(started["job_id"]))
         assert vt.download_calls == 1
-        assert transport.submission_count == 7
+        assert transport.submission_count == submissions_before_replay
 
         qualification = await client.post(
             f"/api/investigations/{investigation_id}/samples/{association.id}/qualify",
@@ -1125,6 +1163,9 @@ async def test_operator_request_racing_investigation_turn_is_rebased_without_rep
     artifact_store = ProductionArtifactStore(blob_catalog)
     seeded = await _seed_verified_article(uow_factory, artifact_store, suffix=uuid4().hex[:10])
     assert seeded.seed_observation is not None
+    await _associate_vt_file_source(
+        uow_factory, seeded.investigation.id, seeded.seed_observation.object_id
+    )
     vt = _HashCheckedVirusTotal(include_candidate=False)
     transport = _VerticalScriptedTransport(
         [

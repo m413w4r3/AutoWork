@@ -40,7 +40,10 @@ from cti_app.application.investigation_persistence import (
     ToolInvocationRepository,
     VersionConflictError,
 )
-from cti_app.application.investigation_service import InvestigationService
+from cti_app.application.investigation_service import (
+    _VT_SOURCE_REFS_PARAMETER,
+    InvestigationService,
+)
 from cti_app.application.investigation_state import (
     InvestigationStateRepository,
     InvestigationStateVersionConflict,
@@ -1430,6 +1433,11 @@ def _semantic_parameters_fingerprint(
     explicit reconciliation; under-blocking would allow a second external call.
     """
     normalized = dict(parameters)
+    # Trusted source refs are persisted beside VT parameters for the S3 consume
+    # guard, but they are server-derived metadata rather than caller input. Keep
+    # them out of semantic replay matching so retries still find the original
+    # unresolved operation.
+    normalized.pop(_VT_SOURCE_REFS_PARAMETER, None)
     if tool_name == "advisor.consult":
         question = normalized.get("question", "")
         if isinstance(question, str):
