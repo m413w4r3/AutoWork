@@ -96,7 +96,10 @@ from cti_app.infrastructure.database.repositories.virustotal_external_effects im
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
 from cti_app.infrastructure.investigation_runtime_ports import create_external_effect_coordinator
-from cti_app.integrations.models import create_coordinated_http_responses_transport
+from cti_app.integrations.models import (
+    BridgeTransportError,
+    create_coordinated_http_responses_transport,
+)
 from tests.integration.conftest import _alembic_config
 from tests.workflow_emulator.investigation_support import seed_verified_article
 
@@ -739,6 +742,109 @@ async def test_coordinated_bridge_http_post_completes_one_persisted_model_claim(
         assert api_key not in repr(persisted_columns)
         assert run is not None and run.submission_state == "result_obtained"
         assert api_key not in caplog.text
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_bridge_submission_cannot_omit_restricted_prompt_source_reference(
+    migrated_postgres_url: str,
+    tmp_path: Path,
+) -> None:
+    (
+        session_factory,
+        engine,
+        _investigation_id,
+        initial_authority,
+        _prepared,
+        _store_for_other_family,
+        run_id,
+    ) = await _prepare_model_submission_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    assert initial_authority.bridge_turn_id is not None
+    authority = replace(
+        initial_authority,
+        invocation_id=None,
+        invocation_arguments_sha256=None,
+    )
+    passage = "Synthetic passage restricted from external submission."
+    document_id = uuid4()
+    prompt = f"Summarize source_document {document_id}: {passage}"
+    prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    request_id = "bridge-request-1"
+    sent: list[httpx.Request] = []
+    now = datetime.now(UTC)
+
+    async with session_factory() as session:
+        async with session.begin():
+            turn = await session.get(ModelConversationTurnRow, authority.bridge_turn_id)
+            run = await session.get(ModelRunRow, run_id)
+            blob = await session.scalar(select(BlobRow).order_by(BlobRow.id).limit(1))
+            assert turn is not None and run is not None and blob is not None
+            conversation = await session.get(ModelConversationRow, turn.conversation_id)
+            assert conversation is not None
+            run.authorized_input_hash = prompt_sha256
+            turn.input_blob_reference = f"sha256:{prompt_sha256}"
+            turn.input_sha256 = prompt_sha256
+            session.add(
+                SourceDocumentRow(
+                    id=document_id,
+                    subject_id=conversation.subject_id,
+                    blob_id=blob.id,
+                    original_name="restricted-synthetic-source.txt",
+                    origin="test",
+                    acquired_at=now,
+                    license_restriction=None,
+                    tlp="RED",
+                    do_not_submit=False,
+                    external_llm_allowed=True,
+                    created_at=now,
+                )
+            )
+
+    # This caller-supplied binding has valid authority and model lineage, but
+    # omits the source_document ref for the restricted passage in the prompt.
+    binding = BridgeExternalEffectBinding(
+        authority=authority,
+        family="bridge.investigation_turn.v1",
+        provider_scope="bridge.responses",
+        normalizer_version="bridge.turn.v1",
+        evidence_refs=(),
+        bridge_turn_id=authority.bridge_turn_id,
+        model_run_id=run_id,
+        model_input_sha256=prompt_sha256,
+        authorized_input_hash=prompt_sha256,
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert json.loads(request.content)["input"] == prompt
+        sent.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            content=b'{"id":"resp-synthetic","status":"completed","output_text":"ok"}',
+        )
+
+    transport = create_coordinated_http_responses_transport(
+        "https://bridge.synthetic/v1",
+        coordinator=create_external_effect_coordinator(session_factory),
+        http_transport=httpx.MockTransport(handler),
+    )
+    refusal: BridgeTransportError | None = None
+    try:
+        try:
+            await transport.create(
+                {"model": "chatgpt-web", "input": prompt},
+                idempotency_key=request_id,
+                bridge_external_effect_binding=binding,
+            )
+        except BridgeTransportError as exc:
+            refusal = exc
+
+        assert refusal is not None, "restricted passage without a source ref was dispatched"
+        assert refusal.code == "external_effect_authority_required"
+        assert sent == []
     finally:
         await engine.dispose()
 
