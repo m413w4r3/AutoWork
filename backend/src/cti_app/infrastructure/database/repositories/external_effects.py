@@ -36,6 +36,7 @@ from cti_app.domain.external_effects import (
     ExternalEffectUseKind,
     PreparedExternalRequest,
     canonical_json_bytes,
+    normalize_credential_parameter_name,
     occurrence_sha256,
     validate_persistable_reference,
     validate_prepared_request,
@@ -105,11 +106,13 @@ class ExternalEffectFamilyBinding:
     def __post_init__(self) -> None:
         if any(not isinstance(name, str) for name in self.credential_parameter_names):
             raise ValueError("family credential parameter declarations must be strings")
-        credential_parameter_names = frozenset(
-            re.sub(r"[-_]", "", name.casefold()) for name in self.credential_parameter_names
-        )
-        if credential_parameter_names - {"key"}:
-            raise ValueError("unsupported family credential parameter")
+        try:
+            credential_parameter_names = frozenset(
+                normalize_credential_parameter_name(name)
+                for name in self.credential_parameter_names
+            )
+        except ValueError as exc:
+            raise ValueError("invalid family credential parameter declaration") from exc
         object.__setattr__(self, "credential_parameter_names", credential_parameter_names)
         if self.requires_source_refs and self.source_reference_resolver is None:
             raise ValueError("source-dependent families require a trusted source resolver")

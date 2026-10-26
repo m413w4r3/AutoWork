@@ -373,8 +373,10 @@ def test_digest_determinism_and_mutation_sensitivity() -> None:
         _wire(target=b"/v1/report?hash=changed")
     ) != application_request_sha256(_wire())
     assert application_request_sha256(
-        _wire(headers=((b"x-repeat", b"one"), (b"x-repeat", b"two")))
-    ) != application_request_sha256(_wire(headers=((b"x-repeat", b"two"), (b"x-repeat", b"one"))))
+        _wire(headers=((b"Content-Type", b"application/json"), (b"Accept", b"application/json")))
+    ) != application_request_sha256(
+        _wire(headers=((b"Accept", b"application/json"), (b"Content-Type", b"application/json")))
+    )
 
 
 def test_credential_redacted_digest_hides_credentials_but_exact_digest_does_not() -> None:
@@ -395,6 +397,46 @@ def test_credential_redacted_digest_hides_credentials_but_exact_digest_does_not(
         headers=first.headers,
     )
     assert application_request_sha256(changed_target) != application_request_sha256(first)
+
+
+def test_persisted_header_digest_allowlists_only_documented_safe_values() -> None:
+    safe_first = _wire(
+        headers=((b"Content-Type", b"application/json"), (b"Accept", b"application/json"))
+    )
+    safe_second = _wire(
+        headers=((b"Content-Type", b"text/plain"), (b"Accept", b"application/json"))
+    )
+    assert application_request_sha256(safe_first) != application_request_sha256(safe_second)
+
+    aliases_first = _wire(
+        headers=(
+            (b"Api-Key", b"first-api-key"),
+            (b"X-Auth-Token", b"first-auth-token"),
+            (b"X-Whatever-Secret", b"first-arbitrary-secret"),
+        )
+    )
+    aliases_second = _wire(
+        headers=(
+            (b"Api-Key", b"second-api-key"),
+            (b"X-Auth-Token", b"second-auth-token"),
+            (b"X-Whatever-Secret", b"second-arbitrary-secret"),
+        )
+    )
+    assert application_request_sha256(aliases_first) == application_request_sha256(aliases_second)
+    assert _wire_request_sha256(aliases_first) != _wire_request_sha256(aliases_second)
+    reordered = _wire(
+        headers=(
+            (b"X-Whatever-Secret", b"value"),
+            (b"Accept", b"text/plain"),
+        )
+    )
+    original_order = _wire(
+        headers=(
+            (b"Accept", b"text/plain"),
+            (b"X-Whatever-Secret", b"value"),
+        )
+    )
+    assert application_request_sha256(reordered) != application_request_sha256(original_order)
 
 
 @pytest.mark.asyncio
@@ -430,7 +472,9 @@ async def test_connect_error_after_handoff_is_ambiguous_and_never_retried() -> N
     assert replay.claim_id == first.claim_id
 
 
-@pytest.mark.parametrize("parameter", ["tokenizer", "keyword", "signature_version"])
+@pytest.mark.parametrize(
+    "parameter", ["tokenizer", "keyword", "signature_version", "access_keyword"]
+)
 def test_lookalike_query_names_keep_distinct_digests_and_effect_keys(parameter: str) -> None:
     fast_wire = _wire(target=f"/responses?{parameter}=fast".encode())
     slow_wire = _wire(target=f"/responses?{parameter}=slow".encode())
@@ -478,6 +522,34 @@ def test_credential_query_values_collapse_but_family_declared_key_is_optional() 
     assert _family_credentials_match(key_prepared, declared)
     assert not _family_credentials_match(key_prepared, undeclared)
 
+    apikey_declared = ExternalEffectFamilyBinding(
+        provider="virustotal",
+        provider_scopes=frozenset({"tenant-prod"}),
+        normalizer_versions=frozenset({"vt.file-report.v1"}),
+        invocation_tool_binding=None,
+        credential_parameter_names=frozenset({"apikey"}),
+    )
+    apikey_wire = _wire(target=b"/responses?apikey=first")
+    apikey_second_wire = _wire(target=b"/responses?apikey=second")
+    assert application_request_sha256(
+        apikey_wire, credential_parameter_names=("apikey",)
+    ) == application_request_sha256(apikey_second_wire, credential_parameter_names=("apikey",))
+    apikey_prepared = _prepared(wire=apikey_wire, credential_parameter_names=("apikey",))
+    assert apikey_declared.credential_parameter_names == frozenset({"apikey"})
+    assert _family_credentials_match(apikey_prepared, apikey_declared)
+
+
+@pytest.mark.parametrize("invalid_name", ["api key", "apikey&token", "api%2Dkey"])
+def test_family_credential_declarations_must_be_plain_parameter_tokens(invalid_name: str) -> None:
+    with pytest.raises(ValueError, match="invalid family credential parameter declaration"):
+        ExternalEffectFamilyBinding(
+            provider="virustotal",
+            provider_scopes=frozenset({"tenant-prod"}),
+            normalizer_versions=frozenset({"vt.file-report.v1"}),
+            invocation_tool_binding=None,
+            credential_parameter_names=frozenset({invalid_name}),
+        )
+
 
 @pytest.mark.parametrize(
     "parameter",
@@ -495,6 +567,13 @@ def test_credential_query_values_collapse_but_family_declared_key_is_optional() 
         "sig",
         "x-amz-signature",
         "x-goog-signature",
+        "access_key",
+        "x_api_key",
+        "api-key",
+        "auth_token",
+        "x_auth_token",
+        "session_token",
+        "private_token",
     ],
 )
 def test_exact_credential_query_and_fragment_aliases_are_redacted(parameter: str) -> None:
@@ -516,14 +595,18 @@ def test_exact_credential_headers_are_redacted(header: bytes) -> None:
     assert application_request_sha256(first) == application_request_sha256(second)
 
 
-def test_credential_lookalike_header_is_not_redacted() -> None:
+def test_non_allowlisted_header_values_are_redacted_but_names_are_not() -> None:
     first = _wire(headers=((b"authorization-version", b"first"),))
     second = _wire(headers=((b"authorization-version", b"second"),))
-    assert application_request_sha256(first) != application_request_sha256(second)
+    assert application_request_sha256(first) == application_request_sha256(second)
+    assert _wire_request_sha256(first) != _wire_request_sha256(second)
+    assert application_request_sha256(first) != application_request_sha256(
+        _wire(headers=((b"authorization-version-2", b"first"),))
+    )
 
     encoded_alias_first = _wire(headers=((b"x%2Dapikey", b"first"),))
     encoded_alias_second = _wire(headers=((b"x%2Dapikey", b"second"),))
-    assert application_request_sha256(encoded_alias_first) != application_request_sha256(
+    assert application_request_sha256(encoded_alias_first) == application_request_sha256(
         encoded_alias_second
     )
 
@@ -1045,6 +1128,59 @@ async def test_mutated_noncredential_bytes_fail_exact_send_time_digest() -> None
     outcome = await _coordinator(store).send_one(_authority(), prepared, transport)
     assert isinstance(outcome, Ambiguous)
     assert transport.physical_calls == 0
+    assert store.claim_state is EffectClaimState.NEEDS_REVIEW
+
+
+@pytest.mark.asyncio
+async def test_changed_unallowlisted_header_value_is_refused_at_send() -> None:
+    class MutatingHeaderTransport:
+        def __init__(self) -> None:
+            self.physical_calls = 0
+
+        async def submit_once(
+            self, request: FrozenWireRequest, capability: PhysicalSendCapability
+        ) -> TransportResponse:
+            object.__setattr__(request, "headers", ((b"Api-Key", b"substituted"),))
+            capability(request)
+            self.physical_calls += 1
+            return TransportResponse()
+
+    original = _wire(headers=((b"Api-Key", b"original"),))
+    prepared = _prepared(wire=original)
+    store = FakeStore()
+    transport = MutatingHeaderTransport()
+    outcome = await _coordinator(store).send_one(_authority(), prepared, transport)
+    assert isinstance(outcome, Ambiguous)
+    assert transport.physical_calls == 0
+    assert store.claim_state is EffectClaimState.NEEDS_REVIEW
+
+
+@pytest.mark.asyncio
+async def test_legacy_no_submit_callback_cannot_authorize_retry() -> None:
+    class LegacyCallbackTransport:
+        def __init__(self) -> None:
+            self.physical_calls = 0
+            self.legacy_callback_unavailable = False
+
+        async def submit_once(
+            self, request: FrozenWireRequest, capability: PhysicalSendCapability
+        ) -> TransportResponse:
+            assert not hasattr(capability, "report_pre_submission_failure")
+            capability(request)
+            self.physical_calls += 1
+            try:
+                callback_name = "report_pre_submission_failure"
+                getattr(capability, callback_name)(httpx.ConnectError("fabricated no-submit proof"))
+            except AttributeError:
+                self.legacy_callback_unavailable = True
+            raise httpx.ConnectError("transport failed after the handoff marker")
+
+    store = FakeStore()
+    transport = LegacyCallbackTransport()
+    outcome = await _coordinator(store).send_one(_authority(), _prepared(), transport)
+    assert isinstance(outcome, Ambiguous)
+    assert transport.physical_calls == 1
+    assert transport.legacy_callback_unavailable
     assert store.claim_state is EffectClaimState.NEEDS_REVIEW
 
 

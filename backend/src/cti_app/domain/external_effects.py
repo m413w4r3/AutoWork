@@ -135,13 +135,11 @@ class PreparedExternalRequest:
         credential_parameter_names = tuple(
             sorted(
                 {
-                    _normalize_declared_credential_parameter_name(item)
+                    normalize_credential_parameter_name(item)
                     for item in self.credential_parameter_names
                 }
             )
         )
-        if set(credential_parameter_names) - _OPTIONAL_CREDENTIAL_PARAMETER_NAMES:
-            raise ExternalEffectValidationError("unsupported family credential parameter")
         object.__setattr__(self, "credential_parameter_names", credential_parameter_names)
         frozen = _freeze_json(self.canonical_request)
         if not isinstance(frozen, Mapping):
@@ -347,15 +345,13 @@ def application_request_sha256(
     """Hash a credential-redacted wire image for durable claim identity."""
 
     declared_names = frozenset(
-        _normalize_declared_credential_parameter_name(name) for name in credential_parameter_names
+        normalize_credential_parameter_name(name) for name in credential_parameter_names
     )
-    if declared_names - _OPTIONAL_CREDENTIAL_PARAMETER_NAMES:
-        raise ExternalEffectValidationError("unsupported family credential parameter")
 
     headers_value = [
         [
             _b64url(name),
-            _b64url(b"<redacted>" if _credential_header_name(name) else value),
+            _b64url(value if _safe_persisted_header_name(name) else b"<redacted>"),
         ]
         for name, value in request.headers
     ]
@@ -383,7 +379,17 @@ def _wire_request_sha256(request: FrozenWireRequest) -> str:
     return hashlib.sha256(canonical_json_bytes(image)).hexdigest()
 
 
-_CREDENTIAL_HEADER_NAMES = frozenset({"authorization", "proxyauthorization", "cookie", "xapikey"})
+_SAFE_PERSISTED_HEADER_NAMES = frozenset(
+    {
+        "contenttype",
+        "contentencoding",
+        "accept",
+        "acceptencoding",
+        "contentlength",
+        "useragent",
+        "idempotencykey",
+    }
+)
 _CREDENTIAL_PARAMETER_NAMES = frozenset(
     re.sub(r"[-_]", "", name)
     for name in (
@@ -400,9 +406,16 @@ _CREDENTIAL_PARAMETER_NAMES = frozenset(
         "sig",
         "x-amz-signature",
         "x-goog-signature",
+        "access_key",
+        "x_api_key",
+        "api-key",
+        "auth_token",
+        "x_auth_token",
+        "session_token",
+        "private_token",
     )
 )
-_OPTIONAL_CREDENTIAL_PARAMETER_NAMES = frozenset({"key"})
+_PARAMETER_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 def _normalized_credential_name(raw_name: bytes) -> str:
@@ -410,14 +423,20 @@ def _normalized_credential_name(raw_name: bytes) -> str:
     return re.sub(r"[-_]", "", decoded)
 
 
-def _normalize_declared_credential_parameter_name(name: str) -> str:
-    decoded = unquote_plus(name).casefold()
-    return re.sub(r"[-_]", "", decoded)
+def normalize_credential_parameter_name(name: str) -> str:
+    """Normalize an explicitly trusted family parameter declaration.
+
+    Declarations are names, not URL fragments: reject separators and escapes so
+    one family cannot accidentally declare multiple query parameters at once.
+    """
+    if not isinstance(name, str) or _PARAMETER_TOKEN_RE.fullmatch(name) is None:
+        raise ExternalEffectValidationError("credential parameter declaration must be a token")
+    return re.sub(r"[-_]", "", name.casefold())
 
 
-def _credential_header_name(name: bytes) -> bool:
+def _safe_persisted_header_name(name: bytes) -> bool:
     normalized = re.sub(r"[-_]", "", name.decode("ascii", errors="ignore").casefold())
-    return normalized in _CREDENTIAL_HEADER_NAMES
+    return normalized in _SAFE_PERSISTED_HEADER_NAMES
 
 
 def _is_credential_parameter_name(normalized: str, declared_names: frozenset[str]) -> bool:

@@ -660,12 +660,27 @@ async def test_credential_redacted_digest_is_the_only_wire_digest_persisted(
     api_key = "ephemeral-api-key-value-do-not-persist"
     wire = FrozenWireRequest(
         method=b"POST",
-        target=b"/responses?api_key=first&hash=abc#refresh_token=first",
+        target=(
+            b"/responses?api_key=first&access_key=first&x_api_key=first&hash=abc"
+            b"#refresh_token=first"
+        ),
         headers=(
             (b"Authorization", b"Bearer " + api_key.encode()),
             (b"x-api-key", api_key.encode()),
+            (b"Api-Key", api_key.encode()),
+            (b"X-Auth-Token", api_key.encode()),
+            (b"X-Whatever-Secret", api_key.encode()),
         ),
         body=b'{"input":"offline fake"}',
+    )
+    changed_credentials = FrozenWireRequest(
+        method=wire.method,
+        target=wire.target.replace(b"first", b"second"),
+        headers=tuple(
+            (name, value.replace(b"first", b"second").replace(api_key.encode(), b"another-key"))
+            for name, value in wire.headers
+        ),
+        body=wire.body,
     )
     prepared = PreparedExternalRequest.build(
         family=base.family,
@@ -695,6 +710,7 @@ async def test_credential_redacted_digest_is_the_only_wire_digest_persisted(
             }
         )
         assert row.application_request_sha256 == application_request_sha256(wire)
+        assert row.application_request_sha256 == application_request_sha256(changed_credentials)
         assert row.application_request_sha256 != _wire_request_sha256(wire)
         assert api_key not in persisted
         assert _wire_request_sha256(wire) not in persisted
@@ -758,8 +774,9 @@ def _store(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("credential_parameter", ["key", "apikey"])
 async def test_family_declared_key_parameter_is_required_before_submission(
-    migrated_postgres_url: str, tmp_path: Path
+    migrated_postgres_url: str, tmp_path: Path, credential_parameter: str
 ) -> None:
     session_factory, engine, _investigation_id, _subject_id, authorities = await _prepare_case(
         migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
@@ -767,7 +784,7 @@ async def test_family_declared_key_parameter_is_required_before_submission(
     authority, base = authorities[0]
     wire = FrozenWireRequest(
         method=b"GET",
-        target=b"/v1/report?hash=abc&key=credential-probe",
+        target=f"/v1/report?hash=abc&{credential_parameter}=credential-probe".encode(),
         headers=((b"accept", b"application/json"),),
         body=b"",
     )
@@ -778,7 +795,7 @@ async def test_family_declared_key_parameter_is_required_before_submission(
         normalizer_version=base.normalizer_version,
         canonical_request=base.canonical_request,
         application_request=wire,
-        credential_parameter_names=("key",),
+        credential_parameter_names=(credential_parameter,),
     )
     unconfigured_transport = _CountingTransport()
     try:
@@ -791,7 +808,10 @@ async def test_family_declared_key_parameter_is_required_before_submission(
 
         configured_transport = _CountingTransport()
         accepted = await ExternalEffectCoordinator(
-            _store(session_factory, credential_parameter_names=frozenset({"key"}))
+            _store(
+                session_factory,
+                credential_parameter_names=frozenset({credential_parameter}),
+            )
         ).send_one(authority, prepared, configured_transport)
         assert isinstance(accepted, Completed)
         assert configured_transport.calls == 1
