@@ -957,6 +957,7 @@ def build_investigation_app(
     app.state.job_registry = registry
     app.state.job_dispatcher = dispatcher
     app.state.identity_provider = LocalIdentityProvider("editor:workflow-emulator")
+    app.state.settings = Settings(_env_file=None)
     _install_job_service(app, uow_factory, registry)
     return app, registry, dispatcher
 

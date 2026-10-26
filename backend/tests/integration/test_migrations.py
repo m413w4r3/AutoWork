@@ -323,12 +323,12 @@ def _expected_foreign_keys(table: Table) -> set[ForeignKeyShape]:
     shapes: set[ForeignKeyShape] = set()
     for fkc in table.foreign_key_constraints:
         elements = list(fkc.elements)
-        referred_table = elements[0].column.table.name
+        referred_table = str(elements[0].target_fullname).split(".", 1)[0]
         shapes.add(
             (
                 tuple(fkc.column_keys),
                 referred_table,
-                tuple(elem.column.name for elem in elements),
+                tuple(str(elem.target_fullname).split(".", 1)[1] for elem in elements),
                 fkc.ondelete,
             )
         )
@@ -1134,7 +1134,15 @@ def test_stamped_0001_without_c2_upgrades_additively_and_preserves_data(
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0003_osint_open_policy"
     after = asyncio.run(_database_snapshot(temporary_postgres_url))
     for table_name, table_schema in before.items():
+        if table_name == "investigation_envelopes":
+            continue
         assert after[table_name] == table_schema
+    assert {
+        "authority_kind",
+        "inherited_policy_id",
+        "inherited_policy_version",
+        "inherited_policy_event_id",
+    } <= set(after["investigation_envelopes"]["columns"])
     assert {"investigation_experiment_heads", "investigation_experiments"} <= set(after)
     assert asyncio.run(_insert_edition_marker_read(temporary_postgres_url, edition_id)) == (
         "Migration fixture"
@@ -1159,7 +1167,15 @@ def test_stamped_0001_with_exact_manual_c2_schema_advances_without_ddl(
     assert asyncio.run(_c2_catalog_snapshot(temporary_postgres_url)) == before_c2
     after_tables = asyncio.run(_database_snapshot(temporary_postgres_url))
     for table_name, table_schema in before_tables.items():
+        if table_name == "investigation_envelopes":
+            continue
         assert after_tables[table_name] == table_schema
+    assert {
+        "authority_kind",
+        "inherited_policy_id",
+        "inherited_policy_version",
+        "inherited_policy_event_id",
+    } <= set(after_tables["investigation_envelopes"]["columns"])
     assert asyncio.run(_insert_edition_marker_read(temporary_postgres_url, edition_id)) == (
         "Migration fixture"
     )
@@ -1367,7 +1383,7 @@ def test_0002_envelope_null_authority_is_read_as_human_without_backfill(
                         "approved_at, updated_at, version) "
                         "VALUES (:investigation_id, CAST('[]' AS jsonb), "
                         'CAST(\'{"limits": {}, "reservations": []}\' AS jsonb), '
-                        "false, 'GREEN', false, false, :decision_id, 'legacy-actor', "
+                        "false, 'green', false, false, :decision_id, 'legacy-actor', "
                         "now(), now(), 1)"
                     ),
                     {"investigation_id": investigation_case.id, "decision_id": uuid4()},

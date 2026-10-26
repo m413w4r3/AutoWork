@@ -132,14 +132,20 @@ _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
 class _Actor:
-    def __init__(self) -> None:
+    mode = "local"
+    verified = False
+
+    def __init__(
+        self,
+        scopes: frozenset[IdentityScope] = frozenset(
+            {IdentityScope.HUMAN_OPERATOR, IdentityScope.OPERATOR_CLIENT}
+        ),
+    ) -> None:
         self.actor_id = "operator:m05b-driver"
+        self._scopes = scopes
 
     async def current(self) -> Identity:
-        return Identity(
-            actor_id=self.actor_id,
-            scopes=frozenset({IdentityScope.HUMAN_OPERATOR, IdentityScope.OPERATOR_CLIENT}),
-        )
+        return Identity(actor_id=self.actor_id, scopes=self._scopes)
 
 
 class _ReservationTransport:
@@ -539,6 +545,8 @@ async def test_investigation_no_sample_postgres_continuous_journey(
         assert await p10_turn_snapshot() == p10_turns_before
         assert p09_absence.calls == []
 
+        previous_provider = app.state.identity_provider
+        app.state.identity_provider = _Actor(scopes=frozenset({IdentityScope.HUMAN_OPERATOR}))
         approved = await approve_envelope_http(
             client,
             investigation_id,
@@ -553,6 +561,7 @@ async def test_investigation_no_sample_postgres_continuous_journey(
             allow_acquisition=False,
             max_acquire_volume=0,
         )
+        app.state.identity_provider = previous_provider
         assert approved.status_code == 200, approved.text
         async with uow_factory() as uow:
             envelope = await uow.investigation_envelopes.get(investigation_id)

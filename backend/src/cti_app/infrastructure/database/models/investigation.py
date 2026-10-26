@@ -20,6 +20,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
+from . import osint_open_policy as _osint_open_policy  # noqa: F401
 from .base import Base
 
 TOOL_INVOCATION_STATUS_VALUES_SQL = (
@@ -570,6 +571,26 @@ class InvestigationEnvelopeRow(Base):
             "AND inherited_policy_version IS NOT NULL AND inherited_policy_event_id IS NOT NULL "
             "AND approval_decision_id = inherited_policy_event_id)",
             name="ck_investigation_envelopes_authority_lineage",
+        ),
+        ForeignKeyConstraint(
+            ["inherited_policy_id", "inherited_policy_version"],
+            ["osint_open_policies.policy_id", "osint_open_policies.version"],
+            name="fk_investigation_envelopes_inherited_policy",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            [
+                "inherited_policy_id",
+                "inherited_policy_version",
+                "inherited_policy_event_id",
+            ],
+            [
+                "osint_open_policy_events.policy_id",
+                "osint_open_policy_events.policy_version",
+                "osint_open_policy_events.id",
+            ],
+            name="fk_investigation_envelopes_inherited_event",
+            ondelete="RESTRICT",
         ),
         Index("ix_investigation_envelopes_updated", "updated_at"),
     )

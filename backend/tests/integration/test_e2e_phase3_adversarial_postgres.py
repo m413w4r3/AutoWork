@@ -231,6 +231,9 @@ def block_non_loopback_sockets(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 class _OperatorClientIdentityProvider:
+    mode = "local"
+    verified = False
+
     def __init__(self) -> None:
         self.actor_id = "human:m05d-adversarial"
 
@@ -238,6 +241,20 @@ class _OperatorClientIdentityProvider:
         return Identity(
             actor_id=self.actor_id,
             scopes=frozenset({IdentityScope.HUMAN_OPERATOR, IdentityScope.OPERATOR_CLIENT}),
+        )
+
+
+class _HumanIdentityProvider:
+    mode = "local"
+    verified = False
+
+    def __init__(self) -> None:
+        self.actor_id = "human:m05d-adversarial"
+
+    async def current(self) -> Identity:
+        return Identity(
+            actor_id=self.actor_id,
+            scopes=frozenset({IdentityScope.HUMAN_OPERATOR}),
         )
 
 
@@ -554,6 +571,8 @@ async def test_operator_context_cas_and_advisor_egress_guard_postgres(
         assert started.status_code == 200, started.text
         async with uow_factory() as uow:
             assert await uow.sample_associations.list_for_investigation(investigation_id) == ()
+        previous_provider = app.state.identity_provider
+        app.state.identity_provider = _HumanIdentityProvider()
         approved = await approve_envelope_http(
             client,
             investigation_id,
@@ -567,6 +586,7 @@ async def test_operator_context_cas_and_advisor_egress_guard_postgres(
             },
             allow_acquisition=False,
         )
+        app.state.identity_provider = previous_provider
         assert approved.status_code == 200, approved.text
 
         timestamp = datetime(2026, 10, 2, tzinfo=UTC)
@@ -1056,6 +1076,8 @@ async def test_sample_disclosure_veto_matrix_refuses_before_fake_send_postgres(
             },
         )
         assert started.status_code == 200, started.text
+        previous_provider = app.state.identity_provider
+        app.state.identity_provider = _HumanIdentityProvider()
         approved = await approve_envelope_http(
             client,
             investigation_id,
@@ -1063,6 +1085,7 @@ async def test_sample_disclosure_veto_matrix_refuses_before_fake_send_postgres(
             budget_limits={"bridge_turns": 20, "tool_seconds": 72_000},
             allow_acquisition=False,
         )
+        app.state.identity_provider = previous_provider
         assert approved.status_code == 200, approved.text
         veto_cases = (
             ("tlp-red", {"tlp": TLP.RED}, "tlp_red"),

@@ -1094,17 +1094,20 @@ async def test_unapproved_envelope_denies_external_tool_and_loop_continues_postg
         await _run_http_job(app, uow_factory, registry, dispatcher, UUID(started["job_id"]))
         state = await client.get(f"/api/investigations/{seeded.investigation.id}")
         assert state.status_code == 200
-        assert state.json()["status"] == "completed"
+        # Without an approved envelope the Bridge-led loop cannot continue:
+        # external tools and Bridge submissions are denied before transport.
+        assert state.json()["status"] == "exhausted"
     async with uow_factory() as uow:
         invocations = await uow.tool_invocations.list_for_investigation(seeded.investigation.id)
         persisted_envelope = await uow.investigation_envelopes.get(seeded.investigation.id)
-    denied = next(item for item in invocations if item.tool_name == "vt.file_report")
-    assert denied.status is ToolInvocationStatus.POLICY_DENIED
+    external = [item for item in invocations if item.tool_name == "vt.file_report"]
+    # The disclosure refusal may happen before a durable invocation is created;
+    # any persisted attempt must still be a policy denial.
+    assert all(item.status is ToolInvocationStatus.POLICY_DENIED for item in external)
     assert persisted_envelope is None
     assert vt.calls["file_report"] == 0
-    assert transport.submission_count == 2
-    assert "request_permission" in transport.prompts[1]
-    assert "article.get_claims" in transport.prompts[1]
+    assert transport.submission_count == 0
+    assert transport.prompts == []
 
 
 @pytest.mark.parametrize(
@@ -1273,6 +1276,14 @@ async def test_unresolved_investigation_state_conflict_schedules_retryable_job(
     ) as client:
         started = await _start_http(client, seeded)
         investigation_id = seeded.investigation.id
+        approved = await _approve_envelope_http(
+            client,
+            investigation_id,
+            providers=("bridge",),
+            budget_limits={"bridge_turns": 1, "tool_seconds": 20_000},
+            allow_acquisition=False,
+        )
+        assert approved.status_code == 200, approved.text
         async with uow_factory() as uow:
             repository_type = type(uow.investigation_states)
         original_save_if_version = repository_type.save_if_version

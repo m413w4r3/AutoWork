@@ -68,8 +68,20 @@ def _metadata_for_frozen_baseline() -> MetaData:
             continue
 
         for constraint in tuple(table.constraints):
-            if constraint.name == "ck_investigation_envelopes_authority_lineage":
-                table.constraints.remove(constraint)
+            if constraint.name in {
+                "ck_investigation_envelopes_authority_lineage",
+                "fk_investigation_envelopes_inherited_policy",
+                "fk_investigation_envelopes_inherited_event",
+            }:
+                table.constraints.discard(constraint)
+        for foreign_key in tuple(table.foreign_keys):
+            if (
+                foreign_key.parent is not None
+                and foreign_key.parent.name in _OSINT_ENVELOPE_COLUMNS
+            ):
+                table.foreign_keys.discard(foreign_key)
+                if foreign_key.constraint is not None:
+                    table.constraints.discard(foreign_key.constraint)
         for column_name in _OSINT_ENVELOPE_COLUMNS:
             if column_name in table.c:
                 table._columns.remove(table.c[column_name])
