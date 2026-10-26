@@ -151,7 +151,7 @@ async def test_w15_download_finish_refusal_analysis_then_finish(
             composition_factory=factory,
         )
         async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://w15-g1"
+            transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
         ) as client:
             started = await start_investigation_http(client, seeded)
             approved = await approve_envelope_http(

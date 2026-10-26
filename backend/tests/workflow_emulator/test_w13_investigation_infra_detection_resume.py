@@ -292,7 +292,7 @@ async def test_w13_d4_ip_only_network_review_and_local_capability_fallback(
             composition_factory=factory,
         )
         async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://w13-d4"
+            transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
         ) as client:
             started = await _start_and_approve(
                 driver,
@@ -477,7 +477,7 @@ async def test_w13_d4_ip_only_network_review_and_local_capability_fallback(
                 composition_factory=fallback_factory,
             )
             async with httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=fallback_app), base_url="http://w13-d4-fallback"
+                transport=httpx.ASGITransport(app=fallback_app), base_url="http://127.0.0.1"
             ) as fallback_client:
                 fallback_started = await _start_and_approve(
                     driver,
@@ -877,7 +877,7 @@ async def test_w13_d5_rule_v1_v2_review_and_manifest_bound_archive(
                 "yara": str(worker.family_statuses.get("yara")) if worker is not None else None,
             }
         async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://w13-d5"
+            transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
         ) as client:
             started = await _start_and_approve(
                 driver,
@@ -1273,7 +1273,7 @@ async def test_w13_d7_tool_replay_ambiguous_bridge_resume_and_local_denials(
             composition_factory=factory,
         )
         async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://w13-d7"
+            transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
         ) as client:
             started = await _start_and_approve(
                 driver,
@@ -1425,7 +1425,7 @@ async def test_w13_d7_tool_replay_ambiguous_bridge_resume_and_local_denials(
             composition_factory=policy_factory,
         )
         async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=policy_app), base_url="http://w13-d7-policy"
+            transport=httpx.ASGITransport(app=policy_app), base_url="http://127.0.0.1"
         ) as policy_client:
             policy_started = await _start_and_approve(
                 driver,
@@ -1523,7 +1523,7 @@ async def test_w13_d7_tool_replay_ambiguous_bridge_resume_and_local_denials(
             composition_factory=quota_factory,
         )
         async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=quota_app), base_url="http://w13-d7-quota"
+            transport=httpx.ASGITransport(app=quota_app), base_url="http://127.0.0.1"
         ) as quota_client:
             quota_started = await _start_and_approve(
                 driver,

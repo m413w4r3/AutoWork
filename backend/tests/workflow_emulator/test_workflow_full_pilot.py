@@ -1328,7 +1328,7 @@ async def test_workflow_full_supervised_first_run_dynamic_pilot(
             settings=settings,
         )
         async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://workflow-full-pilot"
+            transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
         ) as client:
             started = await start_investigation_http(client, seeded)
             qualification = await qualify_sample_http(

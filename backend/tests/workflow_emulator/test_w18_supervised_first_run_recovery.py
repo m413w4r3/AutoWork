@@ -178,9 +178,7 @@ async def _new_combined_app(
     old_client = driver.client
     driver.app = app
     driver.artifact_store = artifact_store
-    driver.client = httpx.AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://workflow-emulator"
-    )
+    driver.client = httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1")
     await old_client.aclose()
     return app, registry, dispatcher
 

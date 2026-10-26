@@ -14,6 +14,7 @@ from cti_app.application.identity import (
     LocalIdentityProvider,
     StaticTokenIdentityProvider,
 )
+from cti_app.config import Settings
 
 
 async def test_authenticated_human_can_read_only_article_claims(
@@ -155,3 +156,26 @@ async def test_authenticated_human_can_read_only_article_claims(
         cursor=None,
     )
     assert client_result is page
+
+
+@pytest.mark.asyncio
+async def test_local_human_with_settings_rejects_non_loopback_server() -> None:
+    from cti_app.api.investigation import _require_verified_human_operator
+
+    provider = LocalIdentityProvider()
+    request = SimpleNamespace(
+        state=SimpleNamespace(identity=await provider.current()),
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                identity_provider=provider,
+                settings=Settings(_env_file=None),
+            )
+        ),
+        scope={"server": ("workflow-emulator", 80)},
+    )
+
+    with pytest.raises(HTTPException) as error:
+        await _require_verified_human_operator(request)
+
+    assert error.value.status_code == 403
+    assert error.value.detail["code"] == "verified_human_operator_required"

@@ -784,7 +784,7 @@ async def test_w14_a_similarity_rule_revision_and_new_article_sample(
             include_detection=True,
         )
         async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://w14-a"
+            transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
         ) as client:
             started = await _start_and_approve(
                 driver,
@@ -1072,7 +1072,7 @@ async def test_w14_c_contradictory_report_keeps_one_hypothesis_open(
             composition_factory=factory,
         )
         async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://w14-c"
+            transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
         ) as client:
             started = await _start_and_approve(
                 driver,
@@ -1317,7 +1317,7 @@ async def test_w14_d_evidence_bounded_opinion_without_yara(
             composition_factory=factory,
         )
         async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://w14-d"
+            transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
         ) as client:
             started = await _start_and_approve(
                 driver,
@@ -1971,7 +1971,7 @@ async def test_w14_e_retrohunt_subject_slots_replay_and_concurrent_investigation
             }
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app),
-                base_url=f"http://w14-e-prepare-{len(stacks)}",
+                base_url="http://127.0.0.1",
             ) as client:
                 started = await _start_and_approve(
                     driver,
@@ -2119,7 +2119,7 @@ async def test_w14_e_retrohunt_subject_slots_replay_and_concurrent_investigation
         async def resume_and_run(item: Mapping[str, Any]) -> None:
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=item["app"]),
-                base_url=f"http://w14-e-submit-{item['seeded'].investigation.id}",
+                base_url="http://127.0.0.1",
             ) as client:
                 current = await client.get(f"/api/investigations/{item['seeded'].investigation.id}")
                 assert current.status_code == 200, current.text
@@ -2224,7 +2224,7 @@ async def test_w14_e_retrohunt_subject_slots_replay_and_concurrent_investigation
             )
         )
         async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=replay_app), base_url="http://w14-e-replay"
+            transport=httpx.ASGITransport(app=replay_app), base_url="http://127.0.0.1"
         ) as client:
             current = await client.get(f"/api/investigations/{first.investigation.id}")
             assert current.status_code == 200, current.text
@@ -2319,7 +2319,7 @@ async def test_w14_e_retrohunt_subject_slots_replay_and_concurrent_investigation
             },
         )
         async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=replay_app), base_url="http://w14-e-opinion"
+            transport=httpx.ASGITransport(app=replay_app), base_url="http://127.0.0.1"
         ) as client:
             opinion = await _approve_opinion(
                 client,

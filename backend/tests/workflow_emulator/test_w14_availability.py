@@ -286,7 +286,7 @@ async def test_w14_f_optional_outages_preserve_proof_and_resume_without_replay(
             assert "sandbox.report.import" in declared.available_tools
 
         async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://w14-f"
+            transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
         ) as client:
             started = await start_investigation_http(client, seeded)
             approved = await approve_envelope_http(
