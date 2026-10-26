@@ -64,6 +64,7 @@ from cti_app.infrastructure.database.models import (  # noqa: F401
     edition_publication,
     editions,
     editorial,
+    external_effects,
     invariants,
     investigation,
     jobs,
@@ -1130,16 +1131,21 @@ def test_stamped_0001_without_c2_upgrades_additively_and_preserves_data(
     assert marker == "Migration fixture"
     before = asyncio.run(_database_snapshot(temporary_postgres_url))
 
+    command.upgrade(config, "0004_external_effect_claims")
+
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0004_external_effect_claims"
+    at_0004 = asyncio.run(_database_snapshot(temporary_postgres_url))
+    for table_name, table_schema in before.items():
+        if table_name == "investigation_envelopes":
+            continue
+        assert at_0004[table_name] == table_schema
+
     command.upgrade(config, "head")
 
     assert (
         asyncio.run(_alembic_version(temporary_postgres_url)) == "0005_sample_acquisition_dispatch"
     )
     after = asyncio.run(_database_snapshot(temporary_postgres_url))
-    for table_name, table_schema in before.items():
-        if table_name == "investigation_envelopes":
-            continue
-        assert after[table_name] == table_schema
     assert {
         "authority_kind",
         "inherited_policy_id",
@@ -1147,6 +1153,11 @@ def test_stamped_0001_without_c2_upgrades_additively_and_preserves_data(
         "inherited_policy_event_id",
     } <= set(after["investigation_envelopes"]["columns"])
     assert {"investigation_experiment_heads", "investigation_experiments"} <= set(after)
+    assert "dispatch_attempt_id" in after["sample_acquisition_attempts"]["columns"]
+    assert any(
+        index[0] == "uq_sample_acquisition_attempt_dispatch"
+        for index in after["sample_acquisition_attempts"]["indexes"]
+    )
     assert asyncio.run(_insert_edition_marker_read(temporary_postgres_url, edition_id)) == (
         "Migration fixture"
     )
@@ -1164,6 +1175,15 @@ def test_stamped_0001_with_exact_manual_c2_schema_advances_without_ddl(
     before_c2 = asyncio.run(_c2_catalog_snapshot(temporary_postgres_url))
     before_tables = asyncio.run(_database_snapshot(temporary_postgres_url))
 
+    command.upgrade(config, "0004_external_effect_claims")
+
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0004_external_effect_claims"
+    at_0004 = asyncio.run(_database_snapshot(temporary_postgres_url))
+    for table_name, table_schema in before_tables.items():
+        if table_name == "investigation_envelopes":
+            continue
+        assert at_0004[table_name] == table_schema
+
     command.upgrade(config, "head")
 
     assert (
@@ -1171,16 +1191,17 @@ def test_stamped_0001_with_exact_manual_c2_schema_advances_without_ddl(
     )
     assert asyncio.run(_c2_catalog_snapshot(temporary_postgres_url)) == before_c2
     after_tables = asyncio.run(_database_snapshot(temporary_postgres_url))
-    for table_name, table_schema in before_tables.items():
-        if table_name == "investigation_envelopes":
-            continue
-        assert after_tables[table_name] == table_schema
     assert {
         "authority_kind",
         "inherited_policy_id",
         "inherited_policy_version",
         "inherited_policy_event_id",
     } <= set(after_tables["investigation_envelopes"]["columns"])
+    assert "dispatch_attempt_id" in after_tables["sample_acquisition_attempts"]["columns"]
+    assert any(
+        index[0] == "uq_sample_acquisition_attempt_dispatch"
+        for index in after_tables["sample_acquisition_attempts"]["indexes"]
+    )
     assert asyncio.run(_insert_edition_marker_read(temporary_postgres_url, edition_id)) == (
         "Migration fixture"
     )
@@ -1245,6 +1266,25 @@ def test_migration_up_and_down_on_temporary_postgres(temporary_postgres_url: str
     assert set(asyncio.run(_trigger_function_pairs(temporary_postgres_url))) == set(
         EXPECTED_TRIGGERS
     )
+
+    command.downgrade(config, "0004_external_effect_claims")
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0004_external_effect_claims"
+    assert asyncio.run(_table_names(temporary_postgres_url)) == (
+        EXPECTED_TABLES
+        - {"sample_acquisition_dispatch_attempts", "effect_acquisition_dispatch_links"}
+    )
+    at_0004 = asyncio.run(_database_snapshot(temporary_postgres_url))
+    assert "dispatch_attempt_id" not in at_0004["sample_acquisition_attempts"]["columns"]
+    assert not any(
+        index[0] == "uq_sample_acquisition_attempt_dispatch"
+        for index in at_0004["sample_acquisition_attempts"]["indexes"]
+    )
+
+    command.upgrade(config, "head")
+    assert (
+        asyncio.run(_alembic_version(temporary_postgres_url)) == "0005_sample_acquisition_dispatch"
+    )
+    assert asyncio.run(_table_names(temporary_postgres_url)) == EXPECTED_TABLES
 
     command.downgrade(config, "base")
     assert asyncio.run(_table_names(temporary_postgres_url)) == {ALEMBIC_TABLE}

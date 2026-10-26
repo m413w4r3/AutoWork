@@ -14,7 +14,11 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 
 from cti_app.application.blobs import BlobCatalogService
-from cti_app.application.bridge_investigator import ScriptedTurnTransport
+from cti_app.application.bridge_investigator import (
+    ScriptedTurnTransport,
+    TurnSubmission,
+    TurnSubmissionStatus,
+)
 from cti_app.application.investigation_tools import RegistryToolDispatcher
 from cti_app.application.osint_open_policy import OsintOpenPolicyService
 from cti_app.application.production_artifact_store import ProductionArtifactStore
@@ -128,6 +132,49 @@ async def _activate_policy(
         correlation_id=f"vt-read-policy:{subject_id}:{uuid4()}",
     )
     return service, policy
+
+
+class _RevokingScriptedTurnTransport(ScriptedTurnTransport):
+    """Revoke inherited OSINT authority after a decision, before tool consume."""
+
+    def __init__(self, responses, *, policy_service, policy) -> None:
+        super().__init__(responses)
+        self._policy_service = policy_service
+        self._policy = policy
+        self._revoked = False
+
+    async def submit_with_attempt(
+        self,
+        *,
+        investigation_id: UUID,
+        subject_id: UUID,
+        turn_index: int,
+        context_sha256: str,
+        prompt: str,
+        external_llm_allowed: bool,
+        attempt: int,
+        timeout_seconds: float | None = None,
+    ) -> TurnSubmission:
+        result = await super().submit_with_attempt(
+            investigation_id=investigation_id,
+            subject_id=subject_id,
+            turn_index=turn_index,
+            context_sha256=context_sha256,
+            prompt=prompt,
+            external_llm_allowed=external_llm_allowed,
+            attempt=attempt,
+            timeout_seconds=timeout_seconds,
+        )
+        if result.status is TurnSubmissionStatus.SUCCEEDED and not self._revoked:
+            await self._policy_service.revoke(
+                policy_id=self._policy.id,
+                expected_version=self._policy.version,
+                actor_id="human:vt-download-revocation-test",
+                reason="Revoke the synthetic download before transport handoff.",
+                correlation_id=f"vt-download-revocation:{investigation_id}",
+            )
+            self._revoked = True
+        return result
 
 
 async def _seed_unrelated_unassociated_sample(uow_factory, artifact_store) -> None:
@@ -263,7 +310,7 @@ async def _run_inherited_case(
     proxy_transport: httpx.AsyncBaseTransport | None = None,
     acquire_hits_allowed: bool = False,
     policy_external_llm_allowed: bool = True,
-    revoke_policy_before_dispatch: bool = False,
+    revoke_policy_after_bridge_response: bool = False,
     repeat_tool_call_in_same_turn: bool = False,
 ):
     engine = create_postgres_engine(database_url)
@@ -475,7 +522,11 @@ async def _run_inherited_case(
     responses.append(
         decision("Finish from the persisted synthetic VT evidence.", next_action="finish")
     )
-    turn_transport = ScriptedTurnTransport(responses)
+    turn_transport = (
+        _RevokingScriptedTurnTransport(responses, policy_service=policy_service, policy=policy)
+        if revoke_policy_after_bridge_response
+        else ScriptedTurnTransport(responses)
+    )
     factory = composition_factory(
         uow_factory=uow_factory,
         artifact_store=artifact_store,
@@ -503,14 +554,6 @@ async def _run_inherited_case(
             )
             assert started_response.status_code == 200, started_response.text
             started = started_response.json()
-            if revoke_policy_before_dispatch:
-                await policy_service.revoke(
-                    policy_id=policy.id,
-                    expected_version=policy.version,
-                    actor_id="human:vt-download-revocation-test",
-                    reason="Revoke the synthetic download before transport handoff.",
-                    correlation_id=f"vt-download-revocation:{seeded.investigation.id}",
-                )
             if bypass_legacy_guard:
                 original_dispatch_once = RegistryToolDispatcher._dispatch_once
 
@@ -818,7 +861,7 @@ async def test_osint_open_candidate_download_claims_every_hop_before_send(
             enable_file_download=True,
             download_allowed_hosts=frozenset({"vtsamples.commondatastorage.googleapis.com"}),
             acquire_hits_allowed=True,
-            policy_external_llm_allowed=False,
+            policy_external_llm_allowed=True,
             tool_name="vt.download_sample",
             tool_arguments={
                 "sha256": requested_hash,
@@ -948,7 +991,7 @@ async def test_verified_local_candidate_reuse_skips_provider_and_s3_claims(
         enable_file_download=True,
         download_allowed_hosts=frozenset({"vtsamples.commondatastorage.googleapis.com"}),
         acquire_hits_allowed=True,
-        policy_external_llm_allowed=False,
+        policy_external_llm_allowed=True,
         tool_name="vt.download_sample",
         tool_arguments={
             "sha256": requested_hash,
@@ -994,7 +1037,7 @@ async def test_download_sha256_mismatch_never_creates_quarantine_sample(
         proxy_transport=_WrongBytesTransport(),
         enable_file_download=True,
         acquire_hits_allowed=True,
-        policy_external_llm_allowed=False,
+        policy_external_llm_allowed=True,
         tool_name="vt.download_sample",
         tool_arguments={
             "sha256": requested_hash,
@@ -1065,7 +1108,7 @@ async def test_ambiguous_download_is_needs_review_and_replay_does_not_send_again
         proxy_transport=_InterruptedTransport(),
         enable_file_download=True,
         acquire_hits_allowed=True,
-        policy_external_llm_allowed=False,
+        policy_external_llm_allowed=True,
         repeat_tool_call_in_same_turn=True,
         tool_name="vt.download_sample",
         tool_arguments={
@@ -1152,7 +1195,7 @@ async def test_vt_download_v2_fallback_requires_explicit_opt_in_and_is_claimed(
         enable_file_download=True,
         file_download_legacy_fallback_enabled=fallback_enabled,
         acquire_hits_allowed=True,
-        policy_external_llm_allowed=False,
+        policy_external_llm_allowed=True,
         tool_name="vt.download_sample",
         tool_arguments={
             "sha256": requested_hash,
@@ -1226,7 +1269,7 @@ async def test_vt_download_rejects_non_allowlisted_redirect_before_target_send(
         enable_file_download=True,
         download_allowed_hosts=frozenset({"vtsamples.commondatastorage.googleapis.com"}),
         acquire_hits_allowed=True,
-        policy_external_llm_allowed=False,
+        policy_external_llm_allowed=True,
         tool_name="vt.download_sample",
         tool_arguments={
             "sha256": requested_hash,
@@ -1269,8 +1312,8 @@ async def test_revoked_osint_download_authority_has_zero_send_and_no_claim(
         enable_file_download=True,
         download_allowed_hosts=frozenset({"vtsamples.commondatastorage.googleapis.com"}),
         acquire_hits_allowed=True,
-        policy_external_llm_allowed=False,
-        revoke_policy_before_dispatch=True,
+        policy_external_llm_allowed=True,
+        revoke_policy_after_bridge_response=True,
         tool_name="vt.download_sample",
         tool_arguments={
             "sha256": requested_hash,

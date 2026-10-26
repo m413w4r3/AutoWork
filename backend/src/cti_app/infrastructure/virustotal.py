@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from enum import StrEnum
-from typing import Any, BinaryIO, Literal
+from typing import Any, BinaryIO, Literal, cast
 from urllib.parse import quote, urljoin, urlsplit
 from uuid import uuid4
 
@@ -390,7 +390,7 @@ class _VirusTotalDownloadPermitAwareTransport(PermitAwareTransport):
             follow_redirects=False,
             stream=True,
         )
-        spool: BinaryIO = tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b")
+        spool = tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b")
         try:
             status = response.status_code
             limit = (
@@ -426,7 +426,7 @@ class _VirusTotalDownloadPermitAwareTransport(PermitAwareTransport):
                 if name in response.headers
             }
             token = uuid4().hex
-            self.__pending[token] = (spool, status, safe_headers)
+            self.__pending[token] = (cast(BinaryIO, spool), status, safe_headers)
             return TransportResponse(payload=token.encode("ascii"))
         except BaseException:
             spool.close()

@@ -1017,6 +1017,11 @@ async def test_downgrade_refuses_committed_external_effect_rows(
             occurrence_digest=occurrence_sha256(prepared.occurrence_id),
         )
         assert isinstance(consumed, ConsumeCommitted)
+        await asyncio.to_thread(
+            command.downgrade,
+            _alembic_config(migrated_postgres_url),
+            "0004_external_effect_claims",
+        )
         with pytest.raises(RuntimeError, match="refusing to drop external effect"):
             await asyncio.to_thread(
                 command.downgrade,

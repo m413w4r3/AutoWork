@@ -2048,7 +2048,7 @@ class InvestigationService:
                 for item in await self._invocations.list_for_investigation(investigation.id)
                 if item.tool_name == proposed.tool_name
                 and item.schema_version == proposed.schema_version
-                and thaw_json(item.normalized_parameters) == thaw_json(proposed.arguments)
+                and _tool_call_arguments_match(item.normalized_parameters, proposed.arguments)
             )
             matching_invocations = tuple(
                 item
@@ -4044,6 +4044,19 @@ def _vt_source_refs_from_parameters(
         except (KeyError, TypeError, ValueError):
             return ()
     return tuple(references)
+
+
+def _tool_call_arguments_match(
+    normalized_parameters: Mapping[str, Any], arguments: Mapping[str, Any]
+) -> bool:
+    stored_arguments = thaw_json(normalized_parameters)
+    if not isinstance(stored_arguments, dict):
+        return False
+    call_arguments = thaw_json(arguments)
+    if not isinstance(call_arguments, dict):
+        return False
+    stored_arguments.pop(_VT_SOURCE_REFS_PARAMETER, None)
+    return stored_arguments == call_arguments
 
 
 def _copy_investigation_budget(budget: InvestigationBudget) -> InvestigationBudget:
