@@ -1094,11 +1094,6 @@ async def test_sample_disclosure_veto_matrix_refuses_before_fake_send_postgres(
             ("tlp-red", {"tlp": TLP.RED}, "tlp_red"),
             ("do-not-submit", {"do_not_submit": True}, "do_not_submit"),
             (
-                "external-disabled",
-                {"external_llm_allowed": False},
-                "external_llm_allowed_false",
-            ),
-            (
                 "owner-restriction",
                 {"license_restriction": "Synthetic owner/source restriction fixture."},
                 "license_restriction",

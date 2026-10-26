@@ -14,7 +14,6 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from cti_app.application.context_pagination import ContextOmissionManifestEntryV1
 from cti_app.application.investigation_contracts import (
-    MAX_CONTEXT_BYTES,
     InvestigationContextV1,
     InvestigationSourceV1,
 )
@@ -152,7 +151,6 @@ class OperatorContextPolicyV1(_OperatorContextContract):
     external_llm_allowed: bool
     blocked_capabilities: tuple[str, ...] = Field(max_length=128)
     budget_remaining: dict[str, int | None]
-    max_context_bytes: Literal[262144] = MAX_CONTEXT_BYTES
 
 
 class OperatorOpinionPointerV1(_OperatorContextContract):
@@ -171,10 +169,9 @@ class InvestigationOperatorContextSummaryV1(_OperatorContextContract):
     working_state_version: int = Field(ge=1)
     working_state_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     context_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    context_bytes: int = Field(ge=0, le=MAX_CONTEXT_BYTES)
+    context_bytes: int = Field(ge=0)
     summary_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     fingerprint: str = Field(min_length=1, max_length=8_192)
-    max_context_bytes: Literal[262144] = MAX_CONTEXT_BYTES
     source: InvestigationSourceV1
     status: OperatorContextStatusV1
     brief: OperatorContextBriefV1
@@ -318,7 +315,6 @@ def build_operator_context_summary(
         context_bytes=len(context_bytes),
         summary_sha256="0" * 64,
         fingerprint=fingerprint,
-        max_context_bytes=MAX_CONTEXT_BYTES,
         source=context.source,
         status=OperatorContextStatusV1(
             execution_mode="operator_led",
@@ -357,7 +353,6 @@ def build_operator_context_summary(
             ),
             blocked_capabilities=tuple(blocked),
             budget_remaining=dict(context.investigation.budget_remaining),
-            max_context_bytes=MAX_CONTEXT_BYTES,
         ),
     )
     summary_hash = hashlib.sha256(summary.canonical_bytes(include_summary_hash=False)).hexdigest()

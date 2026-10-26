@@ -785,13 +785,12 @@ async def test_osint_open_claim_ceiling_refuses_a_distinct_vt_effect_before_send
 
 
 @pytest.mark.parametrize(
-    ("sample_tlp", "sample_do_not_submit", "sample_external_llm_allowed"),
+    ("sample_tlp", "sample_do_not_submit"),
     [
-        (TLP.RED, False, True),
-        (TLP.CLEAR, True, True),
-        (TLP.CLEAR, False, False),
+        (TLP.RED, False),
+        (TLP.CLEAR, True),
     ],
-    ids=("tlp-red", "do-not-submit", "external-disclosure-veto"),
+    ids=("tlp-red", "do-not-submit"),
 )
 @pytest.mark.parametrize("bypass_legacy_guard", [False, True], ids=("legacy", "coordinator"))
 @pytest.mark.asyncio
@@ -800,7 +799,6 @@ async def test_restricted_sample_vt_read_is_refused_before_transport(
     tmp_path: Path,
     sample_tlp: TLP,
     sample_do_not_submit: bool,
-    sample_external_llm_allowed: bool,
     bypass_legacy_guard: bool,
 ) -> None:
     sample_bytes = f"synthetic restricted VT source {uuid4()}".encode()
@@ -830,7 +828,7 @@ async def test_restricted_sample_vt_read_is_refused_before_transport(
         sample_bytes=sample_bytes,
         sample_tlp=sample_tlp,
         sample_do_not_submit=sample_do_not_submit,
-        sample_external_llm_allowed=sample_external_llm_allowed,
+        sample_external_llm_allowed=True,
         bypass_legacy_guard=bypass_legacy_guard,
     )
     try:

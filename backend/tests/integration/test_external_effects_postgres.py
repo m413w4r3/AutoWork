@@ -36,7 +36,17 @@ from cti_app.application.external_effects import (
 )
 from cti_app.application.investigation_advisor_tools import ADVISOR_SCHEMA_VERSION
 from cti_app.application.investigation_service import InvestigationService
-from cti_app.application.model_gateway import BridgeExternalEffectBinding
+from cti_app.application.model_conversations import ModelConversationService
+from cti_app.application.model_gateway import (
+    AdapterResult,
+    AdapterResultStatus,
+    BlobModelOutputStore,
+    BridgeExternalEffectBinding,
+    ModelCapabilities,
+    ModelGateway,
+    ModelRouter,
+    ModelUsage,
+)
 from cti_app.application.osint_open_policy import OsintOpenPolicyService
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.config import Settings
@@ -63,6 +73,12 @@ from cti_app.domain.investigation import (
     TLPLevel,
 )
 from cti_app.domain.investigation_state import InvestigationWorkingState
+from cti_app.domain.model_conversations import (
+    ConversationMode,
+    ConversationPurpose,
+    ConversationTransport,
+)
+from cti_app.domain.model_runs import ModelBackend, ModelProvider, ModelRole, ModelTransport
 from cti_app.domain.osint_open import OsintCapabilities, OsintScopeKind
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 from cti_app.infrastructure.database.models.core import BlobRow, SampleRow, SourceDocumentRow
@@ -98,6 +114,7 @@ from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
 from cti_app.infrastructure.investigation_runtime_ports import create_external_effect_coordinator
 from cti_app.integrations.models import (
     BridgeTransportError,
+    FakeModelAdapter,
     create_coordinated_http_responses_transport,
 )
 from tests.integration.conftest import _alembic_config
@@ -156,6 +173,45 @@ class _CountingRawClient:
         if isinstance(self.response, Exception):
             raise self.response
         return self.response
+
+
+class _SyntheticOpenAIBridgeAdapter:
+    """A deterministic local adapter for persisted Bridge conversation fixtures."""
+
+    provider = ModelProvider.OPENAI
+    backend = ModelBackend.CHATGPT_BRIDGE
+    transport = ModelTransport.OPENAI_RESPONSES
+    requested_model = "test-model"
+    is_external = True
+    is_configured = True
+    capabilities = ModelCapabilities()
+
+    async def invoke(
+        self,
+        _request: Any,
+        *,
+        role: ModelRole,
+        output_schema: type[Any] | None = None,
+    ) -> AdapterResult:
+        del role, output_schema
+        return AdapterResult(
+            status=AdapterResultStatus.COMPLETED,
+            provider=self.provider,
+            requested_model=self.requested_model,
+            actual_model_version=self.requested_model,
+            usage=ModelUsage(),
+            output_text="Synthetic local advisor response.",
+        )
+
+    async def resume(
+        self,
+        response_id: str,
+        *,
+        role: ModelRole,
+        output_schema: type[Any] | None = None,
+    ) -> AdapterResult:
+        del response_id, role, output_schema
+        raise AssertionError("The deterministic synthetic adapter is never resumed.")
 
 
 class _BarrierPolicyGuard:
@@ -1099,16 +1155,13 @@ async def test_osint_open_inherited_advisor_bridge_claim_and_revocation_gate(
     def uow_factory() -> SqlAlchemyUnitOfWork:
         return SqlAlchemyUnitOfWork(session_factory)
 
-    artifact_store = ProductionArtifactStore(
-        BlobCatalogService(
-            FilesystemBlobStore(tmp_path / f"osint-advisor-{uuid4().hex}"), uow_factory
-        )
-    )
+    blob_store = FilesystemBlobStore(tmp_path / f"osint-advisor-{uuid4().hex}")
+    artifact_store = ProductionArtifactStore(BlobCatalogService(blob_store, uow_factory))
     seeded = await seed_verified_article(
         uow_factory,
         artifact_store,
         suffix=f"osint-advisor-{uuid4().hex[:12]}",
-        include_seed=False,
+        include_seed=True,
     )
     policy_service = OsintOpenPolicyService(uow_factory, Settings(_env_file=None))
     policy = await policy_service.activate(
@@ -1156,21 +1209,25 @@ async def test_osint_open_inherited_advisor_bridge_claim_and_revocation_gate(
         await uow.commit()
 
     now = datetime.now(UTC)
-    conversation_id = uuid4()
-    first_turn_id = uuid4()
-    first_run_id = uuid4()
+    conversation_id: UUID | None = None
     first_invocation_id = uuid4()
     first_operation_key = f"advisor-osint-first:{uuid4()}"
-    second_turn_id = uuid4()
-    second_run_id = uuid4()
     second_invocation_id = uuid4()
     second_operation_key = f"advisor-osint-second:{uuid4()}"
-    request_ids = (f"advisor-request:{uuid4()}", f"advisor-request:{uuid4()}")
-    input_hashes = (
-        hashlib.sha256(b"advisor first prompt").hexdigest(),
-        hashlib.sha256(b"advisor second prompt").hexdigest(),
+    assert seeded.seed_observation is not None
+    evidence_refs = (
+        EvidenceReference(
+            kind="evidence_observation",
+            id=str(seeded.seed_observation.id),
+            version=seeded.seed_observation.source_version,
+            sha256=seeded.seed_observation.sha256,
+        ),
     )
-    arguments = {"consultation_type": "draft_text", "question": "Synthetic advisor request."}
+    arguments = {
+        "consultation_type": "draft_text",
+        "question": "Synthetic advisor request.",
+        "evidence_refs": [str(seeded.seed_observation.id)],
+    }
     reservation_dimensions = {
         BudgetDimension.BRIDGE_TURNS: 1,
         BudgetDimension.TOOL_SECONDS: 10,
@@ -1178,18 +1235,26 @@ async def test_osint_open_inherited_advisor_bridge_claim_and_revocation_gate(
         BudgetDimension.CONTEXT_TOKENS: 32,
     }
     reservation_json = {key.value: value for key, value in reservation_dimensions.items()}
+    fake_bridge_adapter = _SyntheticOpenAIBridgeAdapter()
+    model_gateway = ModelGateway(
+        ModelRouter(
+            openai_research=fake_bridge_adapter,
+            openai_structured=fake_bridge_adapter,
+            qwen=FakeModelAdapter(),
+            fake=FakeModelAdapter(),
+        ),
+        uow_factory,
+        BlobModelOutputStore(BlobCatalogService(blob_store, uow_factory)),
+    )
+    model_conversations = ModelConversationService(uow_factory, model_gateway, blob_store)
 
     async def persist_attempt(
         *,
         index: int,
         operation_key: str,
         invocation_id: UUID,
-        turn_id: UUID,
-        run_id: UUID,
-        request_id: str,
-        input_sha256: str,
-        parent_turn_id: UUID | None,
     ) -> tuple[ExternalEffectAuthority, PreparedExternalRequest]:
+        nonlocal conversation_id
         async with uow_factory() as uow:
             envelope = await uow.investigation_envelopes.get(seeded.investigation.id)
             assert envelope is not None
@@ -1199,6 +1264,7 @@ async def test_osint_open_inherited_advisor_bridge_claim_and_revocation_gate(
                 reserved_envelope, expected_version=envelope.version
             )
             await uow.commit()
+        assert reserved_envelope.approval_decision_id is not None
 
         async with session_factory() as session:
             async with session.begin():
@@ -1214,45 +1280,6 @@ async def test_osint_open_inherited_advisor_bridge_claim_and_revocation_gate(
                     )
                 )
                 await session.execute(update_investigation_status(seeded.investigation.id))
-                if index == 1:
-                    session.add(
-                        ModelConversationRow(
-                            id=conversation_id,
-                            provider="openai",
-                            transport="chatgpt_bridge",
-                            purpose="analyst_assistance",
-                            edition_id=None,
-                            subject_id=seeded.subject.id,
-                            title="Synthetic inherited advisor conversation",
-                            status="busy",
-                            external_id=None,
-                            external_locator=None,
-                            expected_profile=None,
-                            requested_model="test-model",
-                            head_turn_id=None,
-                            turn_count=1,
-                            created_at=now,
-                            updated_at=now,
-                            last_used_at=None,
-                            version=1,
-                        )
-                    )
-                else:
-                    conversation = await session.get(ModelConversationRow, conversation_id)
-                    previous_turn = await session.get(ModelConversationTurnRow, first_turn_id)
-                    previous_run = await session.get(ModelRunRow, first_run_id)
-                    assert conversation is not None
-                    assert previous_turn is not None and previous_run is not None
-                    previous_turn.status = "succeeded"
-                    previous_turn.finished_at = now
-                    previous_run.status = "succeeded"
-                    previous_run.finished_at = now
-                    conversation.status = "busy"
-                    conversation.head_turn_id = first_turn_id
-                    conversation.turn_count += 1
-                    conversation.version += 1
-                    conversation.updated_at = now
-
                 session.add(
                     ToolInvocationRow(
                         id=invocation_id,
@@ -1292,79 +1319,83 @@ async def test_osint_open_inherited_advisor_bridge_claim_and_revocation_gate(
                         for dimension, amount in reservation_dimensions.items()
                     ]
                 )
-                session.add(
-                    ModelRunRow(
-                        id=run_id,
-                        provider="openai",
-                        backend="chatgpt_bridge",
-                        transport="openai_responses",
-                        model_role="research",
-                        requested_model="test-model",
-                        actual_model_version=None,
-                        prompt_template_id="advisor.synthetic",
-                        prompt_template_version="1",
-                        authorized_input_hash=input_sha256,
-                        evidence_pack_hash="e" * 64,
-                        parameters={},
-                        duration_ms=None,
-                        usage=None,
-                        status="running",
-                        submission_state="external_state_unknown",
-                        submission_attempt=1,
-                        bridge_request_id=request_id,
-                        response_id=None,
-                        output_references=[],
-                        error_code=None,
-                        error_message=None,
-                        error_details=None,
-                        raw_output_reference=None,
-                        raw_output_sha256=None,
-                        raw_output_chars=None,
-                        normalized_output_reference=None,
-                        normalized_output_sha256=None,
-                        parser_stage=None,
-                        serializer_version=None,
-                        normalization_version=None,
-                        json_error_line=None,
-                        json_error_column=None,
-                        validation_errors=[],
-                        transformations=[],
-                        citation_count=0,
-                        extracted_url_count=0,
-                        visible_citations=[],
-                        started_at=now,
-                        finished_at=None,
-                        updated_at=now,
-                    )
-                )
-                await session.flush()
-                session.add(
-                    ModelConversationTurnRow(
-                        id=turn_id,
-                        conversation_id=conversation_id,
-                        sequence=index,
-                        parent_turn_id=parent_turn_id,
-                        model_run_id=run_id,
-                        input_blob_reference="sha256:" + input_sha256,
-                        input_sha256=input_sha256,
-                        output_blob_reference=None,
-                        output_sha256=None,
-                        status="running",
-                        external_turn_id=None,
-                        idempotency_key=request_id,
-                        correlation_id=request_id,
-                        error_code=None,
-                        error_message=None,
-                        error_details=None,
-                        created_at=now,
-                        started_at=now,
-                        finished_at=None,
-                    )
-                )
+
+        if conversation_id is None:
+            conversation = await model_conversations.create(
+                provider=ModelProvider.OPENAI,
+                transport=ConversationTransport.CHATGPT_BRIDGE,
+                purpose=ConversationPurpose.PIVOT_RESEARCH,
+                title="Synthetic inherited advisor conversation",
+                edition_id=None,
+                subject_id=seeded.subject.id,
+                expected_profile=None,
+                requested_model="test-model",
+            )
+            conversation_id = conversation.id
+        turn = await model_conversations.add_turn(
+            conversation_id,
+            message=(
+                f"Synthetic advisor request. Evidence observation {seeded.seed_observation.id}."
+            ),
+            mode=ConversationMode.FRESH if index == 1 else ConversationMode.CONTINUE,
+            external_llm_allowed=True,
+            stateless_external=True,
+            idempotency_key=f"advisor-turn:{uuid4()}",
+            correlation_id=f"advisor-correlation:{uuid4()}",
+            bridge_external_effect_binding=BridgeExternalEffectBinding(
+                authority=ExternalEffectAuthority(
+                    investigation_id=seeded.investigation.id,
+                    invocation_id=invocation_id,
+                    operation_key=operation_key,
+                    reservation_amounts=reservation_json,
+                    expected_envelope_version=reserved_envelope.version,
+                    approval_decision_id=reserved_envelope.approval_decision_id,
+                    invocation_arguments_sha256=hashlib.sha256(
+                        canonical_json_bytes(arguments)
+                    ).hexdigest(),
+                    authority_kind=ExternalEffectAuthorityKind.OSINT_POLICY,
+                    policy_event_id=policy.event_id,
+                    policy_version=str(policy.version),
+                    pinned_subject_id=seeded.subject.id,
+                ),
+                family="advisor.consultation.v1",
+                provider_scope="bridge.responses",
+                normalizer_version="advisor.consultation.v1",
+                evidence_refs=evidence_refs,
+            ),
+        )
 
         async with uow_factory() as uow:
             envelope = await uow.investigation_envelopes.get(seeded.investigation.id)
-            assert envelope is not None
+            run = await uow.model_runs.get(turn.model_run_id)
+            assert envelope is not None and run is not None
+            assert run.bridge_request_id is not None
+            assert conversation_id is not None
+            input_sha256 = turn.input_sha256
+            request_id = run.bridge_request_id
+            run_sha256 = run.authorized_input_hash
+            await uow.commit()
+        async with session_factory() as session:
+            async with session.begin():
+                run_row = await session.get(ModelRunRow, run.id)
+                turn_row = await session.get(ModelConversationTurnRow, turn.id)
+                conversation_row = await session.get(ModelConversationRow, conversation_id)
+                assert run_row is not None and turn_row is not None and conversation_row is not None
+                run_row.status = "running"
+                run_row.submission_state = "external_state_unknown"
+                run_row.submission_attempt = 1
+                run_row.finished_at = None
+                run_row.error_code = None
+                run_row.error_message = None
+                run_row.error_details = None
+                turn_row.status = "running"
+                turn_row.finished_at = None
+                turn_row.error_code = None
+                turn_row.error_message = None
+                turn_row.error_details = None
+                conversation_row.status = "busy"
+                conversation_row.updated_at = now
+
         authority = ExternalEffectAuthority(
             investigation_id=seeded.investigation.id,
             invocation_id=invocation_id,
@@ -1373,8 +1404,8 @@ async def test_osint_open_inherited_advisor_bridge_claim_and_revocation_gate(
             expected_envelope_version=envelope.version,
             approval_decision_id=envelope.approval_decision_id,
             invocation_arguments_sha256=hashlib.sha256(canonical_json_bytes(arguments)).hexdigest(),
-            bridge_turn_id=turn_id,
-            model_run_id=run_id,
+            bridge_turn_id=turn.id,
+            model_run_id=run.id,
             authority_kind=ExternalEffectAuthorityKind.OSINT_POLICY,
             policy_event_id=policy.event_id,
             policy_version=str(policy.version),
@@ -1386,15 +1417,23 @@ async def test_osint_open_inherited_advisor_bridge_claim_and_revocation_gate(
             provider_scope="bridge.responses",
             normalizer_version="advisor.consultation.v1",
             canonical_request={
-                "authorized_input_hash": input_sha256,
+                "authorized_input_hash": run_sha256,
                 "bridge_request_id": request_id,
                 "model_input_sha256": input_sha256,
             },
+            evidence_refs=evidence_refs,
             application_request=FrozenWireRequest(
                 method=b"POST",
                 target=b"/responses",
                 headers=((b"content-type", b"application/json"),),
-                body=b'{"input":"synthetic advisor request"}',
+                body=canonical_json_bytes(
+                    {
+                        "input": (
+                            "Synthetic advisor request. Evidence observation "
+                            f"{seeded.seed_observation.id}."
+                        )
+                    }
+                ),
             ),
         )
         return authority, prepared
@@ -1404,11 +1443,6 @@ async def test_osint_open_inherited_advisor_bridge_claim_and_revocation_gate(
             index=1,
             operation_key=first_operation_key,
             invocation_id=first_invocation_id,
-            turn_id=first_turn_id,
-            run_id=first_run_id,
-            request_id=request_ids[0],
-            input_sha256=input_hashes[0],
-            parent_turn_id=None,
         )
         coordinator = create_external_effect_coordinator(session_factory)
         transport = _CountingTransport()
@@ -1416,15 +1450,30 @@ async def test_osint_open_inherited_advisor_bridge_claim_and_revocation_gate(
         assert isinstance(sent, Completed)
         assert transport.calls == 1
 
+        assert active_authority.bridge_turn_id is not None
+        assert active_authority.model_run_id is not None
+        async with session_factory() as session:
+            async with session.begin():
+                active_turn = await session.get(
+                    ModelConversationTurnRow, active_authority.bridge_turn_id
+                )
+                active_run = await session.get(ModelRunRow, active_authority.model_run_id)
+                assert active_turn is not None and active_run is not None
+                active_conversation = await session.get(
+                    ModelConversationRow, active_turn.conversation_id
+                )
+                assert active_conversation is not None
+                active_turn.status = "succeeded"
+                active_turn.finished_at = now
+                active_run.status = "succeeded"
+                active_run.finished_at = now
+                active_conversation.status = "ready"
+                active_conversation.updated_at = now
+
         revoked_authority, revoked_prepared = await persist_attempt(
             index=2,
             operation_key=second_operation_key,
             invocation_id=second_invocation_id,
-            turn_id=second_turn_id,
-            run_id=second_run_id,
-            request_id=request_ids[1],
-            input_sha256=input_hashes[1],
-            parent_turn_id=first_turn_id,
         )
         revoked = await policy_service.revoke(
             policy_id=policy.policy_id,

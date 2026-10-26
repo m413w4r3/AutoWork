@@ -79,9 +79,7 @@ from cti_app.application.research_context_builder import (
     PROVIDER_DOWNLOAD_ROUTE_REFUSAL_OBJECT_TYPE,
     USER_REQUEST_ACTION_PREFIX,
     ArticleSnapshot,
-    InvestigationContextTooLarge,
     ResearchContextBuilder,
-    ensure_investigation_context_size,
     provider_authorization_blocked_capabilities,
     provider_download_blocked_capabilities,
 )
@@ -775,42 +773,27 @@ class InvestigationService:
                 idempotency_key=f"context:{state.turn_index}",
                 available_capabilities=self._available_capabilities,
             )
-            try:
-                if state.pending_context_snapshot_id is not None:
-                    pending_json = await self._context_snapshots.load(
-                        state.pending_context_snapshot_id
-                    )
-                    if (
-                        pending_json is None
-                        or hashlib.sha256(pending_json.encode("utf-8")).hexdigest()
-                        != state.pending_context_sha256
-                    ):
-                        return await self.conclude(
-                            investigation_id, StopReason.SUBMISSION_NEEDS_REVIEW
-                        )
-                    ensure_investigation_context_size(pending_json.encode("utf-8"))
-                    context = parse_investigation_context(pending_json)
-                else:
-                    context = await self._context_builder.build(
-                        investigation_id=investigation_id,
-                        synthesis_artifact_id=investigation.synthesis_artifact_id,
-                        state=state,
-                        tool_context=tool_context,
-                        budget_remaining={
-                            dimension.value: amount
-                            for dimension, amount in budget.remaining.items()
-                        },
-                        registry=self._registry,
-                    )
-                context_bytes = context.canonical_bytes()
-                ensure_investigation_context_size(context_bytes)
-            except InvestigationContextTooLarge as exc:
-                over_limit = state.with_context_limit_failure(
-                    actual_bytes=exc.actual_bytes,
-                    max_bytes=exc.max_bytes,
+            if state.pending_context_snapshot_id is not None:
+                pending_json = await self._context_snapshots.load(state.pending_context_snapshot_id)
+                if (
+                    pending_json is None
+                    or hashlib.sha256(pending_json.encode("utf-8")).hexdigest()
+                    != state.pending_context_sha256
+                ):
+                    return await self.conclude(investigation_id, StopReason.SUBMISSION_NEEDS_REVIEW)
+                context = parse_investigation_context(pending_json)
+            else:
+                context = await self._context_builder.build(
+                    investigation_id=investigation_id,
+                    synthesis_artifact_id=investigation.synthesis_artifact_id,
+                    state=state,
+                    tool_context=tool_context,
+                    budget_remaining={
+                        dimension.value: amount for dimension, amount in budget.remaining.items()
+                    },
+                    registry=self._registry,
                 )
-                await self._save_state(state, over_limit)
-                return await self.conclude(investigation_id, StopReason.BUDGET_EXHAUSTED)
+            context_bytes = context.canonical_bytes()
             stopped = await self._requested_stop(investigation_id)
             if stopped is not None:
                 return stopped

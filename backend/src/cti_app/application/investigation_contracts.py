@@ -33,11 +33,9 @@ from cti_app.domain.investigation import (
 from cti_app.domain.investigation_state import DecisionValidationCode
 from cti_app.domain.protocol_model import ProtocolDiagramKind
 
-MAX_CONTEXT_BYTES: Literal[262144] = 262_144
 MAX_DECISION_BYTES = 131_072
 MAX_SUMMARY_CHARS = 12_000
 MAX_CONTEXT_CONFIRMED_IOCS = 64
-MAX_CONTEXT_CONFIRMED_IOC_BYTES = 32_768
 MAX_CONTEXT_PUBLICATION_ANCHORS = 128
 _SECRET_FIELD = re.compile(
     r"(?:api[_-]?key|private[_-]?key|client[_-]?secret|access[_-]?token|bearer|"
@@ -326,8 +324,6 @@ class InvestigationContextV1(_StrictContract):
         if self.view == "delta" and (self.article is not None or self.delta is None):
             raise ValueError("A delta context cannot re-embed article content and requires changes")
         _reject_disallowed_payload(self.model_dump(mode="python"))
-        if len(self.canonical_bytes()) > MAX_CONTEXT_BYTES:
-            raise ValueError(f"Investigation context exceeds {MAX_CONTEXT_BYTES} bytes")
         return self
 
     def canonical_bytes(self) -> bytes:
@@ -348,8 +344,7 @@ class InvestigationOperatorContextV1(_StrictContract):
     working_state_version: int = Field(ge=1)
     working_state_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     context_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    context_bytes: int = Field(ge=0, le=MAX_CONTEXT_BYTES)
-    max_context_bytes: Literal[262144] = MAX_CONTEXT_BYTES
+    context_bytes: int = Field(ge=0)
     truncation: dict[str, bool]
     truncation_counts: dict[str, int] = Field(default_factory=dict)
     truncation_pointers: dict[str, tuple[str, ...]] = Field(default_factory=dict)
@@ -1497,7 +1492,6 @@ def _opinion_unresolved_from_wire(
 
 
 __all__ = [
-    "MAX_CONTEXT_BYTES",
     "MAX_DECISION_BYTES",
     "AgentTurnDecisionV1",
     "ArticleClaimV1",

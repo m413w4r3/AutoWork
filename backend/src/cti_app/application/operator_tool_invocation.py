@@ -29,7 +29,6 @@ from cti_app.application.context_pagination import (
 )
 from cti_app.application.evidence_recorder import _sanitize_json, sanitize_evidence_text
 from cti_app.application.investigation_contracts import (
-    MAX_CONTEXT_BYTES,
     InvestigationContextV1,
     InvestigationOperatorContextV1,
     OperatorContextSectionPageV1,
@@ -60,7 +59,6 @@ from cti_app.application.operator_context_summary import (
 from cti_app.application.persistence import AnalystInvestigationRepository
 from cti_app.application.research_context_builder import (
     CanonicalEvidenceSummaryPort,
-    InvestigationContextTooLarge,
     ResearchContextBuilder,
 )
 from cti_app.domain.analyst_opinion import investigation_opinion_id
@@ -483,42 +481,24 @@ class OperatorToolInvocationService:
                 else ()
             ),
         )
-        try:
-            context = await self._context_builder.build(
-                investigation_id=self._investigation_id,
-                synthesis_artifact_id=investigation.synthesis_artifact_id,
-                state=state,
-                tool_context=tool_context,
-                budget_remaining={
-                    dimension.value: amount for dimension, amount in budget.remaining.items()
-                },
-                registry=self._registry,
-            )
-        except InvestigationContextTooLarge as exc:
-            raise OperatorToolInvocationError(
-                "operator_context_too_large",
-                413,
-                details={"dominant_sections": list(exc.dominant_sections)},
-            ) from None
+        context = await self._context_builder.build(
+            investigation_id=self._investigation_id,
+            synthesis_artifact_id=investigation.synthesis_artifact_id,
+            state=state,
+            tool_context=tool_context,
+            budget_remaining={
+                dimension.value: amount for dimension, amount in budget.remaining.items()
+            },
+            registry=self._registry,
+        )
         context_bytes = context.canonical_bytes()
         content_bytes = _canonical_context_content_bytes(context)
-        if len(context_bytes) > MAX_CONTEXT_BYTES:
-            raise OperatorToolInvocationError(
-                "operator_context_too_large",
-                413,
-                details={
-                    "dominant_sections": list(
-                        self._context_builder._dominant_context_sections(context)
-                    )
-                },
-            )
         return InvestigationOperatorContextV1(
             investigation_id=self._investigation_id,
             working_state_version=state.version,
             working_state_sha256=state.sha256,
             context_sha256=hashlib.sha256(content_bytes).hexdigest(),
             context_bytes=len(context_bytes),
-            max_context_bytes=MAX_CONTEXT_BYTES,
             truncation=_truncation_flags(context),
             truncation_counts=dict(context.investigation.truncation_counts),
             truncation_pointers=_truncation_pointers(

@@ -29,7 +29,6 @@ from cti_app.application.context_pagination import (
     source_reference,
 )
 from cti_app.application.investigation_contracts import (
-    MAX_CONTEXT_CONFIRMED_IOC_BYTES,
     MAX_CONTEXT_CONFIRMED_IOCS,
     AdvisorGuidanceV1,
     ArticleClaimV1,
@@ -70,7 +69,6 @@ from cti_app.application.investigation_tools import (
 )
 from cti_app.application.operator_advisor_guidance import (
     ADVISOR_CONSULTATION_TYPES,
-    bound_advisor_guidance,
     build_advisor_guidance,
 )
 from cti_app.config import get_settings
@@ -85,7 +83,6 @@ from cti_app.domain.investigation import (
     InvestigationFinding,
     ToolInvocation,
     ToolInvocationStatus,
-    canonical_json_bytes,
     thaw_json,
 )
 from cti_app.domain.investigation_state import (
@@ -100,28 +97,22 @@ MAX_CONTEXT_EVIDENCE = 16
 MAX_CONTEXT_SOURCE_PAGE = 256
 MAX_CONTEXT_EVIDENCE_CHARS = 600
 MAX_CONTEXT_EVIDENCE_INDEX = 200
-MAX_CONTEXT_EVIDENCE_INDEX_BYTES = 24 * 1024
 MAX_CONTEXT_TOOL_COVERAGE = 200
-MAX_CONTEXT_TOOL_COVERAGE_BYTES = 48 * 1024
 MAX_CONTEXT_ACQUIRED_SAMPLES = 64
 MAX_CONTEXT_LATEST_TOOL_RESULTS = 16
 MAX_CONTEXT_OPINION_NOTES = 24
-MAX_CONTEXT_OPINION_NOTE_BYTES = 12 * 1024
 PROVIDER_AUTHORIZATION_REFUSAL_OBJECT_TYPE = "provider_authorization_refusal"
 PROVIDER_AUTHORIZATION_REFUSAL_THRESHOLD = 2
 PROVIDER_DOWNLOAD_ROUTE_REFUSAL_OBJECT_TYPE = "provider_download_route_refused"
 PROVIDER_DOWNLOAD_AUTH_REFUSAL_OBJECT_TYPE = "provider_download_authorization_refused"
 PROVIDER_DOWNLOAD_REFUSAL_THRESHOLD = 2
 MAX_CONTEXT_FINDINGS = 200
-MAX_CONTEXT_FINDING_BYTES = 48 * 1024
 MAX_CONTEXT_FINDING_STATEMENT_CHARS = 420
 MAX_CONTEXT_PUBLICATION_ANCHORS = 128
-MAX_CONTEXT_PUBLICATION_ANCHOR_BYTES = 20 * 1024
 MAX_CONTEXT_TOOLS = 64
 MAX_PIVOT_SOURCE_OBSERVATIONS = 512
 MAX_CONTEXT_RULE_CORPUS_IMPORTS = 64
 MAX_CONTEXT_RULE_CANDIDATES = 16
-INVESTIGATION_MAX_CONTEXT_BYTES = 256 * 1024
 USER_REQUEST_ACTION_PREFIX = "user-request:"
 MAX_OPERATOR_REQUESTS = 8
 MAX_OPERATOR_REQUEST_BYTES = 32_768
@@ -870,27 +861,6 @@ def _binary_evidence_summary(
     return summary
 
 
-class InvestigationContextTooLarge(ValueError):
-    code = "investigation_context_too_large"
-
-    def __init__(
-        self,
-        actual_bytes: int,
-        max_bytes: int = INVESTIGATION_MAX_CONTEXT_BYTES,
-        *,
-        dominant_sections: tuple[str, ...] = (),
-    ) -> None:
-        self.actual_bytes = actual_bytes
-        self.max_bytes = max_bytes
-        self.dominant_sections = dominant_sections
-        super().__init__(f"{self.code}: {actual_bytes} bytes exceeds {max_bytes} bytes")
-
-
-def ensure_investigation_context_size(context_bytes: bytes) -> None:
-    if len(context_bytes) > INVESTIGATION_MAX_CONTEXT_BYTES:
-        raise InvestigationContextTooLarge(len(context_bytes), INVESTIGATION_MAX_CONTEXT_BYTES)
-
-
 class InvestigationReadPort(Protocol):
     async def get_evidence(self, observation_id: UUID) -> Mapping[str, Any] | None: ...
 
@@ -1261,6 +1231,8 @@ class ResearchContextBuilder:
             )
         if finding_source_page.total > len(finding_summary):
             truncation_counts["findings"] = finding_source_page.total - len(finding_summary)
+        if superseded_finding_count:
+            truncation_counts["findings_superseded"] = superseded_finding_count
         opinion_note_count = len(current_opinion.observations) if current_opinion else 0
         if opinion_note_count > len(opinion_notes):
             truncation_counts["opinion_notes"] = opinion_note_count - len(opinion_notes)
@@ -1422,13 +1394,6 @@ class ResearchContextBuilder:
                 )
             ),
             current_opinion=self._current_opinion_context(current_opinion),
-        )
-        context = self._reduce_context_to_fit(
-            context,
-            observations=observations,
-            findings=findings,
-            superseded_findings=superseded_finding_count,
-            opinion=current_opinion,
         )
         context = self._attach_materialized_omission_manifest(
             context,
@@ -2117,7 +2082,6 @@ class ResearchContextBuilder:
                 selected_findings,
                 observation_ids={observation.id for observation in observations},
                 max_items=limit,
-                max_bytes=INVESTIGATION_MAX_CONTEXT_BYTES,
             )
             return len(ordered_findings), tuple(
                 finding.model_dump(mode="json") for finding in finding_rows
@@ -2138,7 +2102,6 @@ class ResearchContextBuilder:
                 selected_findings,
                 observation_ids={observation.id for observation in observations},
                 max_items=limit,
-                max_bytes=INVESTIGATION_MAX_CONTEXT_BYTES,
             )
             finding_by_id = {finding.finding_id: finding for finding in finding_rows}
             ordered_finding_rows = tuple(
@@ -2166,7 +2129,6 @@ class ResearchContextBuilder:
                 observation_ids={observation.id for observation in observations},
                 ordered_notes=selected_notes,
                 max_items=limit,
-                max_bytes=INVESTIGATION_MAX_CONTEXT_BYTES,
             )
             return len(opinion_notes), tuple(note.model_dump(mode="json") for note in note_rows)
         if section == "tool_coverage":
@@ -2367,7 +2329,6 @@ class ResearchContextBuilder:
                 source_page.items,
                 observation_ids=observation_ids,
                 max_items=limit,
-                max_bytes=INVESTIGATION_MAX_CONTEXT_BYTES,
             )
             items = tuple(item.model_dump(mode="json") for item in finding_rows)
             return self._project_source_page(
@@ -2544,70 +2505,6 @@ class ResearchContextBuilder:
             unbounded_reason=source_page.unbounded_reason,
         )
 
-    def _reduce_context_to_fit(
-        self,
-        context: InvestigationContextV1,
-        *,
-        observations: tuple[EvidenceObservation, ...],
-        findings: tuple[InvestigationFinding, ...],
-        superseded_findings: int,
-        opinion: AnalystOpinionV1 | None,
-    ) -> InvestigationContextV1:
-        if len(context.canonical_bytes()) <= INVESTIGATION_MAX_CONTEXT_BYTES:
-            return context
-
-        latest_findings = self._latest_finding_versions(findings)
-        all_notes = opinion.observations if opinion is not None else ()
-        stages = (
-            (150, 12, 150, 20, 150, 12, 96, 600, 128, 1024),
-            (100, 8, 100, 12, 100, 8, 64, 400, 96, 800),
-            (50, 4, 64, 8, 50, 4, 32, 240, 64, 600),
-            (20, 2, 32, 4, 16, 2, 16, 128, 32, 400),
-            (0, 1, 16, 1, 8, 1, 8, 64, 16, 256),
-        )
-        current = context
-        original_counts = dict(context.investigation.truncation_counts)
-        for (
-            evidence_index_limit,
-            new_evidence_limit,
-            finding_limit,
-            note_limit,
-            coverage_limit,
-            hypothesis_limit,
-            rule_limit,
-            text_limit,
-            pivot_limit,
-            advisor_guidance_bytes,
-        ) in stages:
-            current = self._apply_context_budget_stage(
-                current,
-                observations=observations,
-                findings=latest_findings,
-                superseded_findings=superseded_findings + len(findings) - len(latest_findings),
-                opinion=opinion,
-                notes=all_notes,
-                evidence_index_limit=evidence_index_limit,
-                new_evidence_limit=new_evidence_limit,
-                finding_limit=finding_limit,
-                note_limit=note_limit,
-                coverage_limit=coverage_limit,
-                hypothesis_limit=hypothesis_limit,
-                rule_limit=rule_limit,
-                text_limit=text_limit,
-                pivot_limit=pivot_limit,
-                advisor_guidance_bytes=advisor_guidance_bytes,
-                prior_counts=original_counts,
-            )
-            if len(current.canonical_bytes()) <= INVESTIGATION_MAX_CONTEXT_BYTES:
-                return current
-
-        size = len(current.canonical_bytes())
-        raise InvestigationContextTooLarge(
-            size,
-            INVESTIGATION_MAX_CONTEXT_BYTES,
-            dominant_sections=self._dominant_context_sections(current),
-        )
-
     @staticmethod
     def _current_opinion_context(
         opinion: AnalystOpinionV1 | None,
@@ -2632,296 +2529,12 @@ class ResearchContextBuilder:
             content_sha256=content_sha256,
         )
 
-    def _apply_context_budget_stage(
-        self,
-        context: InvestigationContextV1,
-        *,
-        observations: tuple[EvidenceObservation, ...],
-        findings: tuple[InvestigationFinding, ...],
-        superseded_findings: int,
-        opinion: AnalystOpinionV1 | None,
-        notes: Sequence[Any],
-        evidence_index_limit: int,
-        new_evidence_limit: int,
-        finding_limit: int,
-        note_limit: int,
-        coverage_limit: int,
-        hypothesis_limit: int,
-        rule_limit: int,
-        text_limit: int,
-        pivot_limit: int,
-        advisor_guidance_bytes: int,
-        prior_counts: Mapping[str, int],
-    ) -> InvestigationContextV1:
-        investigation = context.investigation
-        ordered_observations = tuple(
-            sorted(observations, key=lambda item: (item.observed_at, str(item.id)), reverse=True)
-        )
-        retained_observations = ordered_observations[:evidence_index_limit]
-        evidence_rows = tuple(self._evidence_index((item,))[0][0] for item in retained_observations)
-        new_evidence = investigation.new_evidence[:new_evidence_limit]
-
-        selected_findings = tuple(
-            sorted(
-                findings,
-                key=lambda item: (item.created_at, str(item.id)),
-                reverse=True,
-            )[:finding_limit]
-        )
-        finding_rows, _ = self._finding_context(
-            selected_findings,
-            observation_ids={item.id for item in observations},
-        )
-
-        note_order = tuple(notes[-note_limit:]) if note_limit else ()
-        note_rows, _ = self._opinion_note_index(
-            opinion,
-            finding_ids={item.id for item in findings},
-            observation_ids={item.id for item in observations},
-            ordered_notes=note_order,
-            max_items=note_limit,
-            max_bytes=MAX_CONTEXT_OPINION_NOTE_BYTES,
-        )
-        coverage_rows = investigation.tool_coverage[-coverage_limit:] if coverage_limit else ()
-        hypothesis_rows = investigation.hypotheses[:hypothesis_limit]
-        rule_rows = investigation.rule_deltas[-rule_limit:] if rule_limit else ()
-        action_rows = investigation.previous_actions[-8:]
-        article, text_count = self._truncate_article(context.article, text_limit)
-        investigation, extra_text_count = self._truncate_investigation_text(
-            investigation,
-            text_limit,
-        )
-        text_count += extra_text_count
-
-        counts = dict(prior_counts)
-        counts["evidence_index"] = max(
-            counts.get("evidence_index", 0), len(observations) - len(evidence_rows)
-        )
-        counts["new_evidence"] = max(
-            counts.get("new_evidence", 0), len(observations) - len(new_evidence)
-        )
-        counts["findings"] = max(counts.get("findings", 0), len(findings) - len(finding_rows))
-        if superseded_findings:
-            counts["findings_superseded"] = superseded_findings
-        counts["opinion_notes"] = max(counts.get("opinion_notes", 0), len(notes) - len(note_rows))
-        counts["tool_coverage"] = max(
-            counts.get("tool_coverage", 0),
-            len(investigation.tool_coverage) - len(coverage_rows),
-        )
-        counts["hypotheses"] = max(
-            counts.get("hypotheses", 0), len(investigation.hypotheses) - len(hypothesis_rows)
-        )
-        counts["rule_deltas"] = max(
-            counts.get("rule_deltas", 0), len(investigation.rule_deltas) - len(rule_rows)
-        )
-        if text_count:
-            counts["long_texts"] = max(counts.get("long_texts", 0), text_count)
-
-        updated_investigation = investigation.model_copy(
-            update={
-                "new_evidence": new_evidence,
-                "new_evidence_truncated": len(observations) > len(new_evidence),
-                "evidence_index": evidence_rows,
-                "evidence_index_truncated": (
-                    investigation.evidence_index_truncated or len(observations) > len(evidence_rows)
-                ),
-                "findings": finding_rows,
-                "findings_truncated": (
-                    investigation.findings_truncated
-                    or superseded_findings > 0
-                    or len(findings) > len(finding_rows)
-                ),
-                "opinion_notes": note_rows,
-                "opinion_notes_truncated": (
-                    investigation.opinion_notes_truncated or len(notes) > len(note_rows)
-                ),
-                "tool_coverage": coverage_rows,
-                "tool_coverage_truncated": (
-                    investigation.tool_coverage_truncated
-                    or len(context.investigation.tool_coverage) > len(coverage_rows)
-                ),
-                "hypotheses": hypothesis_rows,
-                "hypotheses_truncated": (
-                    investigation.hypotheses_truncated is True
-                    or len(investigation.hypotheses) > len(hypothesis_rows)
-                ),
-                "rule_deltas": rule_rows,
-                "rule_deltas_truncated": (
-                    investigation.rule_deltas_truncated is True
-                    or len(investigation.rule_deltas) > len(rule_rows)
-                ),
-                "previous_actions": action_rows,
-                "previous_actions_truncated": (
-                    investigation.previous_actions_truncated is True
-                    or len(investigation.previous_actions) > len(action_rows)
-                ),
-                "long_texts_truncated": (
-                    investigation.long_texts_truncated is True or text_count > 0
-                ),
-                "truncation_counts": counts,
-            }
-        )
-        advisor_guidance, _advisor_truncated = bound_advisor_guidance(
-            context.advisor_guidance,
-            max_bytes=advisor_guidance_bytes,
-        )
-        return context.model_copy(
-            update={
-                "article": article,
-                "investigation": updated_investigation,
-                "advisor_guidance": advisor_guidance,
-                "available_pivots": context.available_pivots[:pivot_limit],
-                "available_pivots_truncated": (
-                    context.available_pivots_truncated
-                    or len(context.available_pivots) > pivot_limit
-                ),
-            }
-        )
-
     @staticmethod
     def _latest_finding_versions(
         findings: Sequence[InvestigationFinding],
     ) -> tuple[InvestigationFinding, ...]:
         superseded_ids = {item.supersedes for item in findings if item.supersedes is not None}
         return tuple(item for item in findings if item.id not in superseded_ids)
-
-    @staticmethod
-    def _truncate_article(
-        article: ArticleContextV1 | None,
-        maximum: int,
-    ) -> tuple[ArticleContextV1 | None, int]:
-        if article is None:
-            return None, 0
-        changed = 0
-        short_summary = _truncate(article.short_summary, maximum)
-        changed += short_summary != article.short_summary
-        claim_rows = []
-        for claim in article.claims:
-            statement = _truncate(claim.statement, maximum)
-            changed += statement != claim.statement
-            claim_rows.append(claim.model_copy(update={"statement": statement}))
-        known_chain_rows: list[dict[str, Any]] = []
-        for chain_item in article.known_chain:
-            value = dict(chain_item)
-            summary = value.get("summary")
-            if isinstance(summary, str):
-                truncated = _truncate(summary, maximum)
-                changed += truncated != summary
-                value["summary"] = truncated
-            known_chain_rows.append(value)
-        questions = tuple(_truncate(item, maximum) for item in article.open_questions)
-        changed += sum(
-            before != after for before, after in zip(article.open_questions, questions, strict=True)
-        )
-        return (
-            article.model_copy(
-                update={
-                    "short_summary": short_summary,
-                    "claims": tuple(claim_rows),
-                    "known_chain": tuple(known_chain_rows),
-                    "open_questions": questions,
-                    "long_texts_truncated": (article.long_texts_truncated is True or changed > 0),
-                }
-            ),
-            changed,
-        )
-
-    @staticmethod
-    def _truncate_investigation_text(
-        investigation: ContextInvestigationV1,
-        maximum: int,
-    ) -> tuple[ContextInvestigationV1, int]:
-        changed = 0
-        agenda = tuple(_truncate(item, maximum) for item in investigation.agenda)
-        changed += sum(
-            before != after for before, after in zip(investigation.agenda, agenda, strict=True)
-        )
-        hypothesis_rows: list[dict[str, Any]] = []
-        for hypothesis in investigation.hypotheses:
-            value = dict(hypothesis)
-            statement = value.get("statement")
-            if isinstance(statement, str):
-                truncated = _truncate(statement, maximum)
-                changed += truncated != statement
-                value["statement"] = truncated
-            hypothesis_rows.append(value)
-        evidence_rows: list[EvidenceSummaryV1] = []
-        for evidence_item in investigation.new_evidence:
-            summary = _truncate(evidence_item.summary, maximum)
-            changed += summary != evidence_item.summary
-            evidence_rows.append(evidence_item.model_copy(update={"summary": summary}))
-        finding_rows: list[FindingSummaryV1] = []
-        for finding in investigation.findings:
-            statement = _truncate(finding.statement, maximum)
-            changed += statement != finding.statement
-            finding_rows.append(finding.model_copy(update={"statement": statement}))
-        note_rows: list[OpinionNoteSummaryV1] = []
-        for note in investigation.opinion_notes:
-            note_text = _truncate(note.text, maximum)
-            changed += note_text != note.text
-            note_rows.append(note.model_copy(update={"text": note_text}))
-        coverage_rows: list[ToolCoverageEntryV1] = []
-        for coverage_item in investigation.tool_coverage:
-            summary = _truncate(coverage_item.summary, maximum)
-            changed += summary != coverage_item.summary
-            coverage_rows.append(coverage_item.model_copy(update={"summary": summary}))
-        rule_rows: list[dict[str, Any]] = []
-        for rule_item in investigation.rule_deltas:
-            value = dict(rule_item)
-            for key in ("summary", "detail", "source_description"):
-                rule_text = value.get(key)
-                if isinstance(rule_text, str):
-                    truncated = _truncate(rule_text, maximum)
-                    changed += truncated != rule_text
-                    value[key] = truncated
-            rule_rows.append(value)
-        action_rows: list[dict[str, Any]] = []
-        for action in investigation.previous_actions:
-            value = dict(action)
-            action_summary = value.get("summary")
-            if isinstance(action_summary, str):
-                truncated = _truncate(action_summary, maximum)
-                changed += truncated != action_summary
-                value["summary"] = truncated
-            action_rows.append(value)
-        return (
-            investigation.model_copy(
-                update={
-                    "agenda": agenda,
-                    "hypotheses": tuple(hypothesis_rows),
-                    "new_evidence": tuple(evidence_rows),
-                    "findings": tuple(finding_rows),
-                    "opinion_notes": tuple(note_rows),
-                    "tool_coverage": tuple(coverage_rows),
-                    "rule_deltas": tuple(rule_rows),
-                    "previous_actions": tuple(action_rows),
-                }
-            ),
-            changed,
-        )
-
-    @staticmethod
-    def _dominant_context_sections(context: InvestigationContextV1) -> tuple[str, ...]:
-        payload = context.model_dump(mode="json", by_alias=True)
-        investigation = payload.get("investigation", {})
-        sections = {
-            "identity": {key: payload.get(key) for key in ("investigation_id", "source", "view")},
-            "article": payload.get("article"),
-            "new_evidence": investigation.get("new_evidence"),
-            "evidence_index": investigation.get("evidence_index"),
-            "findings": investigation.get("findings"),
-            "opinion_notes": investigation.get("opinion_notes"),
-            "tool_coverage": investigation.get("tool_coverage"),
-            "sample_deltas": investigation.get("sample_deltas"),
-            "available_tools": payload.get("available_tools"),
-            "available_pivots": payload.get("available_pivots"),
-            "advisor_guidance": payload.get("advisor_guidance"),
-        }
-        ranked = sorted(
-            ((name, len(canonical_json_bytes(value))) for name, value in sections.items() if value),
-            key=lambda item: (-item[1], item[0]),
-        )
-        return tuple(f"{name}:{size}" for name, size in ranked[:8])
 
     async def _rule_corpus_inventory_context(
         self,
@@ -3151,19 +2764,12 @@ class ResearchContextBuilder:
     @staticmethod
     def _indicator_inventory(snapshot: ArticleSnapshot) -> IndicatorInventoryV1:
         items: list[ConfirmedIOCContextV1] = []
-        encoded_bytes = 0
-        truncated = snapshot.confirmed_iocs_truncated
-        for raw_item in snapshot.confirmed_iocs:
+        truncated = snapshot.confirmed_iocs_truncated or (
+            len(snapshot.confirmed_iocs) > MAX_CONTEXT_CONFIRMED_IOCS
+        )
+        for raw_item in snapshot.confirmed_iocs[:MAX_CONTEXT_CONFIRMED_IOCS]:
             item = ConfirmedIOCContextV1.model_validate(raw_item, strict=True)
-            item_bytes = len(canonical_json_bytes(item.model_dump(mode="json")))
-            if (
-                len(items) >= MAX_CONTEXT_CONFIRMED_IOCS
-                or encoded_bytes + item_bytes > MAX_CONTEXT_CONFIRMED_IOC_BYTES
-            ):
-                truncated = True
-                continue
             items.append(item)
-            encoded_bytes += item_bytes
         return IndicatorInventoryV1(items=tuple(items), truncated=truncated)
 
     async def _evidence_context(
@@ -3207,17 +2813,16 @@ class ResearchContextBuilder:
     def _evidence_index(
         observations: tuple[EvidenceObservation, ...],
     ) -> tuple[tuple[EvidenceSummaryV1, ...], bool]:
-        result: list[EvidenceSummaryV1] = []
-        encoded_bytes = 2
-        truncated = len(observations) > MAX_CONTEXT_EVIDENCE_INDEX
-        for observation in sorted(
+        ordered = sorted(
             observations,
             key=lambda item: (
                 item.observed_at is None,
                 item.observed_at or datetime.min.replace(tzinfo=UTC),
                 item.id.int,
             ),
-        ):
+        )
+        result: list[EvidenceSummaryV1] = []
+        for observation in ordered[:MAX_CONTEXT_EVIDENCE_INDEX]:
             summary = _safe_untrusted(
                 _truncate(
                     f"{observation.source} recorded {observation.kind.value} for "
@@ -3230,16 +2835,8 @@ class ResearchContextBuilder:
                 kind=observation.kind,
                 summary=summary,
             )
-            item_bytes = len(canonical_json_bytes(item.model_dump(mode="json"))) + 1
-            if (
-                len(result) >= MAX_CONTEXT_EVIDENCE_INDEX
-                or encoded_bytes + item_bytes > MAX_CONTEXT_EVIDENCE_INDEX_BYTES
-            ):
-                truncated = True
-                continue
             result.append(item)
-            encoded_bytes += item_bytes
-        return tuple(result), truncated
+        return tuple(result), len(ordered) > MAX_CONTEXT_EVIDENCE_INDEX
 
     @staticmethod
     def _opinion_note_index(
@@ -3249,12 +2846,10 @@ class ResearchContextBuilder:
         observation_ids: set[UUID],
         ordered_notes: Sequence[Any] | None = None,
         max_items: int = MAX_CONTEXT_OPINION_NOTES,
-        max_bytes: int = MAX_CONTEXT_OPINION_NOTE_BYTES,
     ) -> tuple[tuple[OpinionNoteSummaryV1, ...], bool]:
         if opinion is None:
             return (), False
         result: list[OpinionNoteSummaryV1] = []
-        encoded_bytes = 2
         notes = (
             tuple(ordered_notes)
             if ordered_notes is not None
@@ -3275,12 +2870,10 @@ class ResearchContextBuilder:
                     sorted(set(note.evidence_refs).intersection(observation_ids), key=str)[:16]
                 ),
             )
-            item_bytes = len(canonical_json_bytes(item.model_dump(mode="json"))) + 1
-            if len(result) >= max_items or encoded_bytes + item_bytes > max_bytes:
+            if len(result) >= max_items:
                 truncated = True
                 continue
             result.append(item)
-            encoded_bytes += item_bytes
         return tuple(result), truncated
 
     async def _invocation_facts(
@@ -3617,7 +3210,6 @@ class ResearchContextBuilder:
         candidates = invocations[-MAX_CONTEXT_TOOL_COVERAGE:]
         truncated = len(invocations) > len(candidates)
         entries: list[ToolCoverageEntryV1] = []
-        encoded_bytes = 2
         for invocation in reversed(candidates):
             linked_observations = tuple(
                 observation_by_id[ref]
@@ -3645,12 +3237,7 @@ class ResearchContextBuilder:
                 observation_id=observation.id if observation is not None else None,
                 summary=summary,
             )
-            item_bytes = len(canonical_json_bytes(entry.model_dump(mode="json"))) + 1
-            if encoded_bytes + item_bytes > MAX_CONTEXT_TOOL_COVERAGE_BYTES:
-                truncated = True
-                continue
             entries.append(entry)
-            encoded_bytes += item_bytes
         return tuple(reversed(entries)), truncated
 
     def _finding_context(
@@ -3659,11 +3246,9 @@ class ResearchContextBuilder:
         *,
         observation_ids: set[UUID],
         max_items: int = MAX_CONTEXT_FINDINGS,
-        max_bytes: int = MAX_CONTEXT_FINDING_BYTES,
     ) -> tuple[tuple[FindingSummaryV1, ...], bool]:
         result: list[FindingSummaryV1] = []
-        encoded_bytes = 2
-        truncated = len(findings) > MAX_CONTEXT_FINDINGS
+        truncated = len(findings) > max_items
         for finding in self._order_findings(findings):
             valid_refs = tuple(ref for ref in finding.observation_refs if ref in observation_ids)
             item = FindingSummaryV1(
@@ -3681,12 +3266,10 @@ class ResearchContextBuilder:
                 observation_refs=tuple(sorted(set(valid_refs), key=str)[:128]),
                 claim_refs=tuple(sorted(set(finding.claim_refs))[:128]),
             )
-            item_bytes = len(canonical_json_bytes(item.model_dump(mode="json"))) + 1
-            if len(result) >= max_items or encoded_bytes + item_bytes > max_bytes:
+            if len(result) >= max_items:
                 truncated = True
                 continue
             result.append(item)
-            encoded_bytes += item_bytes
         return tuple(result), truncated
 
     @staticmethod
@@ -3723,20 +3306,14 @@ class ResearchContextBuilder:
     def _full_article(snapshot: ArticleSnapshot) -> ArticleContextV1:
         article = snapshot.article
         publication_anchors: list[PublicationAnchorV1] = []
-        anchor_bytes = 2
-        anchors_truncated = article.publication_anchors_truncated
-        for anchor in sorted(article.publication_anchors, key=lambda item: item.anchor):
+        ordered_anchors = sorted(article.publication_anchors, key=lambda item: item.anchor)
+        anchors_truncated = article.publication_anchors_truncated or (
+            len(ordered_anchors) > MAX_CONTEXT_PUBLICATION_ANCHORS
+        )
+        for anchor in ordered_anchors[:MAX_CONTEXT_PUBLICATION_ANCHORS]:
             excerpt = _safe_untrusted(_truncate(anchor.excerpt, 96))
             item = PublicationAnchorV1(anchor=anchor.anchor, excerpt=excerpt)
-            item_bytes = len(canonical_json_bytes(item.model_dump(mode="json"))) + 1
-            if (
-                len(publication_anchors) >= MAX_CONTEXT_PUBLICATION_ANCHORS
-                or anchor_bytes + item_bytes > MAX_CONTEXT_PUBLICATION_ANCHOR_BYTES
-            ):
-                anchors_truncated = True
-                continue
             publication_anchors.append(item)
-            anchor_bytes += item_bytes
         return ArticleContextV1(
             short_summary=_truncate(
                 _safe_untrusted(article.short_summary), MAX_ARTICLE_NARRATIVE_CHARS
