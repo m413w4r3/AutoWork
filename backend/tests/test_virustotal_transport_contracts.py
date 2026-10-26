@@ -7,7 +7,7 @@ import re
 import traceback
 from collections.abc import Callable
 from io import BytesIO
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -35,12 +35,22 @@ from cti_app.domain.virustotal import (
     VirusTotalTransportKind,
 )
 from cti_app.infrastructure.virustotal import VirusTotalHttpAdapter
+from tests.virustotal_external_effect_fakes import (
+    authorized_vt_read,
+    configure_test_vt_adapter,
+)
 
 BASE = "https://www.virustotal.com/api/v3"
 LEGACY_BASE = "https://www.virustotal.com/vtapi/v2"
 SHA256 = hashlib.sha256(b"sample-bytes").hexdigest()
 API_KEY = "fake-vt-api-key-must-never-leak"
 SIGNED_URL = "https://cdn.example.test/object.bin?signature=do-not-log-this"
+
+
+@pytest.fixture(autouse=True)
+def _external_effect_authority():
+    with authorized_vt_read():
+        yield
 
 
 def _route(capability: VirusTotalCapability) -> VirusTotalRoutingPolicy:
@@ -126,6 +136,7 @@ def _make_adapter(
         download_client_factory=download_factory,
         **kwargs,
     )
+    configure_test_vt_adapter(adapter)
     return adapter, clients
 
 
@@ -779,6 +790,9 @@ async def test_object_report_url_id_retry_and_schema_validation() -> None:
     assert report.kind == "urls"
     assert len(calls) == 2
     assert calls[-1].url.params.multi_items() == []
+    claims = tuple(cast(Any, adapter)._test_external_effect_store.claims.values())
+    assert len(claims) == 2
+    assert {claim.family for claim in claims} == {"vt.object_report"}
 
     adapter, clients = _make_adapter(
         lambda request: (

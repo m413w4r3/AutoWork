@@ -7,6 +7,7 @@ deduplicated blob; retrying the same response reuses it and never issues a
 VirusTotal request.
 """
 
+import base64
 import hashlib
 import json
 import logging
@@ -29,6 +30,7 @@ from cti_app.application.virustotal import (
 )
 from cti_app.domain.entities import ProvenanceEvent, Sample, SampleState
 from cti_app.domain.entities import SampleOrigin as EntitySampleOrigin
+from cti_app.domain.external_effects import EvidenceReference
 from cti_app.domain.investigation import EvidenceKind, SampleAssociation
 from cti_app.domain.investigation import SampleOrigin as AssociationSampleOrigin
 from cti_app.domain.network_protocol import (
@@ -67,10 +69,152 @@ class StoredBehaviourPcap:
     evidence_id: UUID
 
 
+@dataclass(frozen=True, slots=True)
+class ArchivedVirusTotalResponse:
+    body: bytes
+    status_code: int
+    content_type_class: str
+    reference: EvidenceReference
+    location_host: str | None = None
+    retry_after: float | None = None
+    issuer: str = "unknown"
+    oversized: bool = False
+
+
 class VirusTotalObservationService:
     def __init__(self, catalog: BlobCatalogService, uow_factory: UnitOfWorkFactory) -> None:
         self._catalog = catalog
         self._uow_factory = uow_factory
+
+    async def archive_external_response(
+        self,
+        content: bytes,
+        *,
+        status_code: int,
+        content_type_class: str,
+        location_host: str | None,
+        retry_after: float | None,
+        issuer: str,
+        oversized: bool,
+    ) -> EvidenceReference:
+        """Persist a bounded gated VT response before its claim is completed."""
+        if not isinstance(content, bytes) or not 100 <= status_code <= 599:
+            raise ValueError("Only complete HTTP VT responses can be archived")
+        if content_type_class not in {"json", "html", "binary", "text", "other", "missing"}:
+            raise ValueError("Invalid VT content type classification")
+        if issuer not in {"unknown", "proxy-likely", "upstream-vt-likely"}:
+            raise ValueError("Invalid VT response issuer")
+        if location_host is not None and not re.fullmatch(r"[a-zA-Z0-9.:-]{1,255}", location_host):
+            raise ValueError("Invalid VT response location host")
+        if retry_after is not None and (
+            isinstance(retry_after, bool) or not isinstance(retry_after, int | float)
+        ):
+            raise ValueError("Invalid VT response retry delay")
+        metadata = {
+            "content_type_class": content_type_class,
+            "issuer": issuer,
+            "location_host": location_host,
+            "oversized": oversized,
+            "retry_after": retry_after,
+            "status_code": status_code,
+        }
+        encoded_metadata = (
+            base64.urlsafe_b64encode(
+                json.dumps(
+                    metadata,
+                    ensure_ascii=True,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("ascii")
+            )
+            .rstrip(b"=")
+            .decode("ascii")
+        )
+        content_mime_types = {
+            "binary": "application/octet-stream",
+            "html": "text/html",
+            "json": "application/json",
+            "missing": "application/octet-stream",
+            "other": "application/octet-stream",
+            "text": "text/plain",
+        }
+        blob = await self._catalog.ingest(
+            BytesIO(content),
+            logical_bucket=VIRUSTOTAL_RAW_BUCKET,
+            mime_type=content_mime_types[content_type_class],
+        )
+        return EvidenceReference(
+            kind="vt.raw_response",
+            id=str(blob.id),
+            version=f"vt-http.v1.{encoded_metadata}",
+            sha256=blob.descriptor.sha256,
+        )
+
+    async def read_external_response(
+        self, reference: EvidenceReference, *, max_bytes: int
+    ) -> ArchivedVirusTotalResponse:
+        """Resolve a claim's raw response reference and verify its canonical blob."""
+        if reference.kind != "vt.raw_response":
+            raise ValueError("VT raw response reference has the wrong kind")
+        prefix = "vt-http.v1."
+        if not reference.version.startswith(prefix):
+            raise ValueError("VT raw response reference version is invalid")
+        token = reference.version[len(prefix) :]
+        if not token or not re.fullmatch(r"[A-Za-z0-9_-]+", token):
+            raise ValueError("VT raw response reference version is invalid")
+        try:
+            metadata = json.loads(
+                base64.b64decode(
+                    token + "=" * (-len(token) % 4), altchars=b"-_", validate=True
+                ).decode("ascii")
+            )
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            raise ValueError("VT raw response reference version is invalid") from None
+        if not isinstance(metadata, dict):
+            raise ValueError("VT raw response reference version is invalid")
+        status_code = metadata.get("status_code")
+        content_type_class = metadata.get("content_type_class")
+        location_host = metadata.get("location_host")
+        retry_after = metadata.get("retry_after")
+        issuer = metadata.get("issuer")
+        oversized = metadata.get("oversized")
+        if (
+            isinstance(status_code, bool)
+            or not isinstance(status_code, int)
+            or not 100 <= status_code <= 599
+            or content_type_class not in {"json", "html", "binary", "text", "other", "missing"}
+            or (location_host is not None and not isinstance(location_host, str))
+            or (
+                retry_after is not None
+                and (isinstance(retry_after, bool) or not isinstance(retry_after, int | float))
+            )
+            or issuer not in {"unknown", "proxy-likely", "upstream-vt-likely"}
+            or not isinstance(oversized, bool)
+        ):
+            raise ValueError("VT raw response reference metadata is invalid")
+        blob_id = UUID(reference.id)
+        async with self._uow_factory() as uow:
+            blob = await uow.blobs.get(blob_id)
+        if (
+            blob is None
+            or blob.descriptor.logical_bucket != VIRUSTOTAL_RAW_BUCKET
+            or blob.descriptor.sha256 != reference.sha256
+        ):
+            raise ValueError("VT raw response archive reference is missing or changed")
+        content = await self._catalog.read(blob_id, max_bytes=max_bytes)
+        if hashlib.sha256(content).hexdigest() != reference.sha256:
+            raise ValueError("VT raw response archive checksum failed")
+        return ArchivedVirusTotalResponse(
+            body=content,
+            status_code=status_code,
+            content_type_class=content_type_class,
+            reference=reference,
+            location_host=location_host,
+            retry_after=float(retry_after) if retry_after is not None else None,
+            issuer=issuer,
+            oversized=oversized,
+        )
 
     async def store_behaviour_pcap(
         self,

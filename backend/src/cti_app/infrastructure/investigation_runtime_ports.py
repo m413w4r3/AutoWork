@@ -15,6 +15,7 @@ from typing import cast
 from uuid import UUID
 
 import httpx
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cti_app.application.behavior_report_import import BehaviorReportImporter
 from cti_app.application.blob_storage import BlobStore
@@ -26,6 +27,7 @@ from cti_app.application.confined_analysis import (
     ConfinedAnalysisExecutionPort,
     ConfinedAnalysisFamilyStatus,
 )
+from cti_app.application.external_effects import ExternalEffectCoordinator
 from cti_app.application.goodware import GoodwareMeasurementService
 from cti_app.application.identity import LocalIdentityProvider
 from cti_app.application.investigation_composition import (
@@ -70,6 +72,15 @@ from cti_app.infrastructure.confined_analysis_dispatch import (
 )
 from cti_app.infrastructure.confined_local_commands import ConfinedLocalCommands
 from cti_app.infrastructure.confined_tshark import ConfinedTsharkAdapter
+from cti_app.infrastructure.database.repositories.external_effects import (
+    SqlAlchemyExternalEffectClaimStore,
+)
+from cti_app.infrastructure.database.repositories.virustotal_external_effects import (
+    VT_EXTERNAL_EFFECT_FAMILIES,
+    SqlAlchemyVirusTotalPolicyGuard,
+    VirusTotalReadReusePolicy,
+    virustotal_external_effect_family_bindings,
+)
 from cti_app.infrastructure.floss_adapter import FlossAdapter
 from cti_app.infrastructure.ghidra_mcp import GhidraMcpHttpAdapter
 from cti_app.infrastructure.local_command_runner import LocalCommandRunner
@@ -166,6 +177,7 @@ def build_investigation_runtime_ports(
     settings: Settings,
     *,
     uow_factory: UnitOfWorkFactory,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
     blob_store: BlobStore,
     blob_catalog: BlobCatalogService,
     vt_adapter: VirusTotalPort | None,
@@ -183,6 +195,20 @@ def build_investigation_runtime_ports(
     confined_analysis_execution: ConfinedAnalysisExecutionPort | None = None,
 ) -> InvestigationRuntimePorts:
     statuses: list[RuntimePortStatus] = []
+
+    configure_vt_effects = getattr(vt_adapter, "configure_external_effects", None)
+    if session_factory is not None and vt_adapter is not None and vt_observations is not None:
+        reuse_policy = VirusTotalReadReusePolicy()
+        coordinator = ExternalEffectCoordinator(
+            SqlAlchemyExternalEffectClaimStore(
+                session_factory,
+                policy_guard=SqlAlchemyVirusTotalPolicyGuard(),
+                family_bindings=virustotal_external_effect_family_bindings(),
+            ),
+            reuse_policies={family: reuse_policy for family in VT_EXTERNAL_EFFECT_FAMILIES},
+        )
+        if callable(configure_vt_effects):
+            configure_vt_effects(coordinator, vt_observations)
 
     vt_route_status = {
         capability: _vt_proxy_route_status(settings, vt_adapter, capability)
@@ -790,6 +816,7 @@ def build_investigation_runtime_composition_factory(
     settings: Settings,
     *,
     uow_factory: UnitOfWorkFactory,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
     blob_store: BlobStore,
     blob_catalog: BlobCatalogService,
     artifact_store: ProductionArtifactStore,
@@ -812,6 +839,7 @@ def build_investigation_runtime_composition_factory(
     ports = build_investigation_runtime_ports(
         settings,
         uow_factory=uow_factory,
+        session_factory=session_factory,
         blob_store=blob_store,
         blob_catalog=blob_catalog,
         vt_adapter=vt_adapter,

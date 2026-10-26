@@ -45,6 +45,8 @@ from cti_app.application.investigation_persistence import (
     AnalystOpinionRepository,
     EvidenceObservationRepository,
     FindingRepository,
+    InvestigationBudgetRepository,
+    InvestigationBudgetSnapshot,
     InvestigationEnvelopeRepository,
     ToolInvocationRepository,
     VersionConflictError,
@@ -92,6 +94,10 @@ from cti_app.domain.editorial import (
     AnalystDecision,
     AnalystDecisionTargetType,
     AnalystDecisionType,
+)
+from cti_app.domain.external_effects import (
+    ExternalEffectAuthority,
+    ExternalEffectAuthorityKind,
 )
 from cti_app.domain.investigation import (
     AgendaItem,
@@ -146,12 +152,25 @@ MAX_IDENTICAL_DEFINITE_TOOL_FAILURES = 2
 MAX_STATE_VERSION_CONFLICT_RETRIES = 4
 _RECENT_ACTIONS_LIMIT = 32
 _OPERATOR_REQUEST_MARKER_PREFIX = "api:user-request:"
+_VT_COORDINATED_READ_TOOLS = frozenset(
+    {
+        "vt.file_report",
+        "vt.object_report",
+        "vt.relationships",
+        "vt.intelligence_search",
+        "vt.behaviour",
+    }
+)
 
 
 class InvocationReconciliationOutcome(StrEnum):
     EXECUTED_WITH_RESULT = "executed_with_result"
     NOT_EXECUTED = "not_executed"
     ABANDON = "abandon"
+
+
+class _BudgetSnapshotPersistenceError(RuntimeError):
+    """Envelope and normalized budget could not be persisted atomically."""
 
 
 class ToolObservationWriter(Protocol):
@@ -306,6 +325,7 @@ class InvestigationService:
         observations: EvidenceObservationRepository,
         findings: FindingRepository,
         opinions: AnalystOpinionRepository,
+        budget_snapshots: InvestigationBudgetRepository | None = None,
         observation_writer: ToolObservationWriter | None = None,
         artifact_store: ProductionArtifactStore | None = None,
         evidence_summaries: FrameworkProofDescriptorReader | None = None,
@@ -314,6 +334,7 @@ class InvestigationService:
         no_progress_limit: int = 2,
         max_turns_per_run: int = 64,
         commit_uow: Callable[[], Awaitable[None]] | None = None,
+        rollback_uow: Callable[[], Awaitable[None]] | None = None,
         audit_decisions: AnalystDecisionRepository | None = None,
         effective_policy_for: Callable[[UUID], Awaitable[Any | None]] | None = None,
     ) -> None:
@@ -332,6 +353,7 @@ class InvestigationService:
         self._observations = observations
         self._findings = findings
         self._opinions = opinions
+        self._budget_snapshots = budget_snapshots
         self._observation_writer = observation_writer
         self._artifact_store = artifact_store
         self._evidence_summaries = evidence_summaries
@@ -340,6 +362,7 @@ class InvestigationService:
         self._no_progress_limit = no_progress_limit
         self._max_turns_per_run = max_turns_per_run
         self._commit_uow = commit_uow
+        self._rollback_uow = rollback_uow
         self._effective_policy_for = effective_policy_for
         owner = getattr(commit_uow, "__self__", None)
         self._audit_decisions = audit_decisions or getattr(owner, "analyst_decisions", None)
@@ -398,7 +421,8 @@ class InvestigationService:
             raise ValueError("Investigation envelope belongs to another investigation")
         existing_envelope = await self._envelopes.get(investigation.id)
         if existing_envelope is None and envelope is not None:
-            await self._envelopes.save_if_version(envelope, expected_version=None)
+            envelope = await self._envelopes.save_if_version(envelope, expected_version=None)
+            await self._save_budget_snapshot(envelope)
         elif (
             existing_envelope is not None
             and envelope is not None
@@ -1392,12 +1416,55 @@ class InvestigationService:
 
         tool_budget = _copy_investigation_budget(budget)
         tool_envelope = replace(envelope, budget=tool_budget) if envelope is not None else None
+        external_effect_authority: ExternalEffectAuthority | None = None
+        if (
+            tool_name in _VT_COORDINATED_READ_TOOLS
+            and envelope is not None
+            and reservation_persisted
+            and persisted_reservation is not None
+            and self._budget_snapshots is not None
+        ):
+            authority_kind = (
+                ExternalEffectAuthorityKind.OSINT_POLICY
+                if envelope.authority_kind is EnvelopeAuthorityKind.OSINT_POLICY
+                else ExternalEffectAuthorityKind.HUMAN_G2
+            )
+            reservation_amounts = {
+                (
+                    dimension.value if isinstance(dimension, BudgetDimension) else str(dimension)
+                ): int(amount)
+                for dimension, amount in persisted_reservation.amounts.items()
+            }
+            external_effect_authority = ExternalEffectAuthority(
+                investigation_id=investigation.id,
+                invocation_id=invocation.id,
+                operation_key=operation_key,
+                reservation_amounts=reservation_amounts,
+                expected_envelope_version=envelope.version,
+                approval_decision_id=envelope.approval_decision_id,
+                invocation_arguments_sha256=hashlib.sha256(
+                    canonical_json_bytes(invocation.normalized_parameters)
+                ).hexdigest(),
+                authority_kind=authority_kind,
+                policy_event_id=envelope.inherited_policy_event_id,
+                policy_version=(
+                    str(envelope.inherited_policy_version)
+                    if envelope.inherited_policy_version is not None
+                    else None
+                ),
+                pinned_subject_id=(
+                    investigation.subject_id
+                    if authority_kind is ExternalEffectAuthorityKind.OSINT_POLICY
+                    else None
+                ),
+            )
         tool_context = ToolExecutionContext(
             investigation_id=investigation.id,
             envelope=tool_envelope,
             budget=tool_budget,
             idempotency_key=operation_key,
             available_capabilities=self._available_capabilities,
+            external_effect_authority=external_effect_authority,
         )
 
         async def check_current_admission(
@@ -1446,7 +1513,12 @@ class InvestigationService:
             purpose=purpose,
             operation_key=operation_key,
             reservation_amounts=cost,
-            pre_dispatch_check=check_current_admission,
+            # Migrated VT reads get their final policy/revocation check inside
+            # the coordinator's locked consume transaction. The legacy callback
+            # remains for external families that have not moved to S3 yet.
+            pre_dispatch_check=(
+                None if tool_name in _VT_COORDINATED_READ_TOOLS else check_current_admission
+            ),
         )
         framework_proves_non_execution = _confirmed_external_non_execution(result)
         unproven_external_failure = (
@@ -2882,7 +2954,49 @@ class InvestigationService:
         self, envelope: InvestigationEnvelope
     ) -> InvestigationEnvelope:
         updated = replace(envelope, version=envelope.version + 1)
-        return await self._envelopes.save_if_version(updated, expected_version=envelope.version)
+        saved = await self._envelopes.save_if_version(updated, expected_version=envelope.version)
+        await self._save_budget_snapshot(saved)
+        return saved
+
+    async def _save_budget_snapshot(self, envelope: InvestigationEnvelope) -> None:
+        """Mirror the envelope's canonical budget into normalized reservation rows."""
+        repository = self._budget_snapshots
+        if repository is None:
+            return
+        try:
+            current = await repository.get(envelope.investigation_id)
+            if current is None:
+                await repository.save_if_version(
+                    InvestigationBudgetSnapshot(
+                        investigation_id=envelope.investigation_id,
+                        version=1,
+                        budget=envelope.budget,
+                    ),
+                    expected_version=None,
+                )
+                return
+            if current.budget == envelope.budget:
+                return
+            await repository.save_if_version(
+                InvestigationBudgetSnapshot(
+                    investigation_id=envelope.investigation_id,
+                    version=current.version + 1,
+                    budget=envelope.budget,
+                ),
+                expected_version=current.version,
+            )
+        except asyncio.CancelledError:
+            await self._rollback_budget_snapshot_pair()
+            raise
+        except Exception as exc:
+            await self._rollback_budget_snapshot_pair()
+            raise _BudgetSnapshotPersistenceError(
+                "Envelope budget mirror failed before external dispatch."
+            ) from exc
+
+    async def _rollback_budget_snapshot_pair(self) -> None:
+        if self._rollback_uow is not None:
+            await asyncio.shield(self._rollback_uow())
 
     async def _commit_current_uow(self) -> None:
         if self._commit_uow is not None:

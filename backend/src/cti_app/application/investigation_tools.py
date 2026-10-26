@@ -22,6 +22,7 @@ from pydantic import (
 )
 
 from cti_app.application.evidence_recorder import sanitize_evidence_text
+from cti_app.domain.external_effects import ExternalEffectAuthority
 from cti_app.domain.investigation import (
     BudgetDimension,
     BudgetExceeded,
@@ -230,6 +231,7 @@ class ToolExecutionContext:
     available_capabilities: frozenset[str] = frozenset()
     blocked_capabilities: tuple[str, ...] = ()
     unavailable_tool_reasons: Mapping[str, str] = field(default_factory=dict)
+    external_effect_authority: ExternalEffectAuthority | None = None
     pre_transport_check: (
         Callable[[ToolExecutionContext], Awaitable[FrameworkPreSubmissionProof | None]] | None
     ) = None

@@ -383,6 +383,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     investigation_runtime_composition = build_investigation_runtime_composition_factory(
         settings,
         uow_factory=uow_factory,
+        session_factory=session_factory,
         blob_store=blob_store,
         blob_catalog=blob_catalog,
         artifact_store=production_artifact_store,
