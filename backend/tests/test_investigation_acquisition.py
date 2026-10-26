@@ -62,7 +62,7 @@ class _ResponseOriginHttpError(VirusTotalHttpError):
 
 def _approved_service(database: FakeDatabase, investigation, content: bytes):
     envelope_service = InvestigationEnvelopeService(lambda: FakeUow(database))
-    proposal = make_approved_proposal(investigation)
+    proposal = make_approved_proposal(investigation, external_llm_allowed=True)
     port = FakeVirusTotalPort(content)
     return (
         envelope_service,
@@ -458,7 +458,7 @@ async def test_known_article_hash_without_bytes_is_acquired_without_becoming_con
     database.investigations[investigation.id] = investigation
     envelope_service = InvestigationEnvelopeService(lambda: FakeUow(database))
     await envelope_service.approve(
-        make_approved_proposal(investigation),
+        make_approved_proposal(investigation, external_llm_allowed=True),
         actor_id="analyst:alice",
         reason="Allow this bounded VT pivot.",
         correlation_id="g2:known-sample",
@@ -596,7 +596,7 @@ async def test_same_subject_investigations_keep_associations_and_attempts_scoped
         (second_service, second_investigation, "g2:second"),
     ):
         await service.approve(
-            make_approved_proposal(investigation),
+            make_approved_proposal(investigation, external_llm_allowed=True),
             actor_id="analyst:alice",
             reason="Approve this investigation's own hit budget.",
             correlation_id=correlation,
@@ -721,7 +721,7 @@ async def test_corrupt_subject_sample_bytes_are_not_reused() -> None:
         (second_envelopes, second_investigation, "g2:corrupt-target"),
     ):
         await svc.approve(
-            make_approved_proposal(investigation),
+            make_approved_proposal(investigation, external_llm_allowed=True),
             actor_id="analyst:alice",
             reason="Approve bounded sample review.",
             correlation_id=correlation,
@@ -782,9 +782,9 @@ async def test_incompatible_subject_sample_disclosure_requires_review() -> None:
     first = await service.register_hit(first_investigation.id, sha256, SampleOrigin.VT_PIVOT)
     acquired = await service.acquire_hit(first.id, purpose="Acquire permissive source sample")
     assert acquired.sample_id is not None
-    # Model a pre-existing permissive source Sample; new VT downloads are
-    # intentionally local-only regardless of their acquisition envelope.
-    database.samples[acquired.sample_id].external_llm_allowed = True
+    # The new VT acquisition contract records True; the target investigation's
+    # stricter disclosure policy still prevents cross-investigation reuse.
+    assert database.samples[acquired.sample_id].external_llm_allowed is True
     second = await service.register_hit(second_investigation.id, sha256, SampleOrigin.VT_PIVOT)
 
     result = await service.acquire_hit(second.id, purpose="Check policy compatibility")

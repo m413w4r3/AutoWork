@@ -554,6 +554,7 @@ async def test_operator_context_summarizes_pcap_and_keeps_revised_finding() -> N
                 sha256=capture_sha256,
                 size=len(capture),
                 mime_type="application/vnd.tcpdump.pcap",
+                logical_bucket="investigation-evidence",
             )
         )
 

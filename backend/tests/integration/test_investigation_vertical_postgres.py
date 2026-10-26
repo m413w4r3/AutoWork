@@ -17,7 +17,10 @@ from cti_app.application.bridge_investigator import (
     TurnSubmissionStatus,
 )
 from cti_app.application.production_artifact_store import ProductionArtifactStore
-from cti_app.application.virustotal import VirusTotalCapabilities
+from cti_app.application.virustotal import (
+    VirusTotalCapabilities,
+)
+from cti_app.application.virustotal_persistence import VirusTotalObservationService
 from cti_app.domain.analyst_opinion import OpinionBlockType, OpinionClaimQualification
 from cti_app.domain.editorial import AnalystDecisionType
 from cti_app.domain.investigation import (
@@ -37,6 +40,8 @@ from cti_app.domain.publication_document import (
     publication_document_from_json,
 )
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
+from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
+from cti_app.infrastructure.investigation_runtime_ports import build_investigation_runtime_ports
 from cti_app.infrastructure.virustotal import VirusTotalHttpAdapter
 from tests.workflow_emulator.investigation_support import (
     DEFAULT_IOC as _IOC,
@@ -127,6 +132,32 @@ async def _associate_vt_file_source(uow_factory, investigation_id: UUID, sample_
         )
         await uow.commit()
     return association_id
+
+
+def _real_vt_runtime_ports(
+    *,
+    database_url: str,
+    uow_factory,
+    blob_store: FilesystemBlobStore,
+    blob_catalog: BlobCatalogService,
+    settings,
+    virustotal: VirusTotalHttpAdapter,
+    capabilities: VirusTotalCapabilities,
+):
+    engine = create_postgres_engine(database_url)
+    runtime = build_investigation_runtime_ports(
+        settings,
+        uow_factory=uow_factory,
+        session_factory=create_session_factory(engine),
+        blob_store=blob_store,
+        blob_catalog=blob_catalog,
+        vt_adapter=virustotal,
+        vt_capabilities=capabilities,
+        vt_observations=VirusTotalObservationService(blob_catalog, uow_factory),
+        shodan_adapter=None,
+        ghidra_adapter=None,
+    )
+    return engine, runtime.optional_tool_ports
 
 
 @pytest.mark.asyncio
@@ -593,11 +624,10 @@ async def test_postgres_bridge_pre_submission_exhaustion_resumes_with_new_attemp
 
 @pytest.mark.asyncio
 async def test_real_postgres_tool_path_classifies_vt_download_route_404_as_needs_review(
-    uow_factory, tmp_path: Path
+    uow_factory, migrated_postgres_url: str, tmp_path: Path
 ) -> None:
-    blob_catalog = BlobCatalogService(
-        FilesystemBlobStore(tmp_path / "download-refusal-blobs"), uow_factory
-    )
+    blob_store = FilesystemBlobStore(tmp_path / "download-refusal-blobs")
+    blob_catalog = BlobCatalogService(blob_store, uow_factory)
     artifact_store = ProductionArtifactStore(blob_catalog)
     seeded = await _seed_verified_article(uow_factory, artifact_store, suffix=uuid4().hex[:10])
     assert seeded.seed_observation is not None
@@ -617,6 +647,16 @@ async def test_real_postgres_tool_path_classifies_vt_download_route_404_as_needs
         file_download_enabled=True,
         download_allowed_hosts=frozenset({"vtsamples.commondatastorage.googleapis.com"}),
         download_allowed_ports=frozenset({443}),
+    )
+    settings = _settings(providers=True)
+    runtime_engine, runtime_ports = _real_vt_runtime_ports(
+        database_url=migrated_postgres_url,
+        uow_factory=uow_factory,
+        blob_store=blob_store,
+        blob_catalog=blob_catalog,
+        settings=settings,
+        virustotal=vt,
+        capabilities=VirusTotalCapabilities(file_download=True),
     )
     transport = _VerticalScriptedTransport(
         [
@@ -642,9 +682,10 @@ async def test_real_postgres_tool_path_classifies_vt_download_route_404_as_needs
     factory = _composition_factory(
         uow_factory=uow_factory,
         artifact_store=artifact_store,
-        settings=_settings(providers=True),
+        settings=settings,
         transport=transport,
         virustotal=cast(Any, vt),
+        additional_ports=runtime_ports,
     )
     app, registry, dispatcher = _build_app(
         uow_factory=uow_factory,
@@ -698,7 +739,10 @@ async def test_real_postgres_tool_path_classifies_vt_download_route_404_as_needs
         assert request_paths == [
             f"/api/v3/files/{material.sample_hash}/download",
             f"/api/v3/files/{material.sample_hash}/download_url",
-        ]
+        ], (
+            "unexpected VT transport path; persisted acquisition "
+            f"code={getattr(failed_attempt, 'error_code', None)!r}"
+        )
         # The 404 body cannot be attributed to VT or its proxy, so the external
         # outcome is ambiguous and must be reconciled before any retry. Only a
         # framework diagnostic is persisted; the adapter output is not.
@@ -721,6 +765,7 @@ async def test_real_postgres_tool_path_classifies_vt_download_route_404_as_needs
         assert any(item.status.value == "reserved" for item in envelope.budget.reservations)
     finally:
         await vt_client.aclose()
+        await runtime_engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -894,11 +939,14 @@ async def test_real_postgres_exhausted_loop_acquisition_budget_is_not_ambiguous(
 
 @pytest.mark.asyncio
 async def test_real_postgres_ambiguous_download_logs_safe_terminal_diagnostics(
-    uow_factory, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    uow_factory,
+    migrated_postgres_url: str,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    artifact_store = ProductionArtifactStore(
-        BlobCatalogService(FilesystemBlobStore(tmp_path / "partial-download-blobs"), uow_factory)
-    )
+    blob_store = FilesystemBlobStore(tmp_path / "partial-download-blobs")
+    blob_catalog = BlobCatalogService(blob_store, uow_factory)
+    artifact_store = ProductionArtifactStore(blob_catalog)
     seeded = await _seed_verified_article(uow_factory, artifact_store, suffix=uuid4().hex[:10])
     assert seeded.seed_observation is not None
     material = _unique_sample_material()
@@ -915,6 +963,16 @@ async def test_real_postgres_ambiguous_download_logs_safe_terminal_diagnostics(
         file_download_enabled=True,
         download_allowed_hosts=frozenset({"vtsamples.commondatastorage.googleapis.com"}),
         download_allowed_ports=frozenset({443}),
+    )
+    settings = _settings(providers=True)
+    runtime_engine, runtime_ports = _real_vt_runtime_ports(
+        database_url=migrated_postgres_url,
+        uow_factory=uow_factory,
+        blob_store=blob_store,
+        blob_catalog=blob_catalog,
+        settings=settings,
+        virustotal=vt,
+        capabilities=VirusTotalCapabilities(file_download=True),
     )
     transport = _VerticalScriptedTransport(
         [
@@ -939,9 +997,10 @@ async def test_real_postgres_ambiguous_download_logs_safe_terminal_diagnostics(
     factory = _composition_factory(
         uow_factory=uow_factory,
         artifact_store=artifact_store,
-        settings=_settings(providers=True),
+        settings=settings,
         transport=transport,
         virustotal=cast(Any, vt),
+        additional_ports=runtime_ports,
     )
     app, registry, dispatcher = _build_app(
         uow_factory=uow_factory,
@@ -1000,12 +1059,13 @@ async def test_real_postgres_ambiguous_download_logs_safe_terminal_diagnostics(
         assert warning.levelname == "WARNING"
         assert warning.tool_name == "vt.download_sample"
         assert warning.exception_class == "SampleAcquisitionDownloadError"
-        assert warning.error_code == "virustotal_download_interrupted_after_bytes"
+        assert warning.error_code == "virustotal_external_effect_needs_review"
         assert warning.investigation_id == str(seeded.investigation.id)
         assert warning.invocation_id == str(invocation.id)
         assert material.sample_hash not in warning.getMessage()
     finally:
         await vt_client.aclose()
+        await runtime_engine.dispose()
 
 
 @pytest.mark.asyncio

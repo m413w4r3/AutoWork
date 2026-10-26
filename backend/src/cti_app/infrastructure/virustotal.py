@@ -2087,9 +2087,20 @@ class VirusTotalHttpAdapter(VirusTotalPort):
                 headers=headers,
             )
             return await client.send(request, follow_redirects=False, stream=True)
-        if authority is None or coordinator is None or acquisition_hash is None:
+        if authority is None:
             raise VirusTotalExternalEffectRefusedError(
-                "The VirusTotal download has no committed investigation authority."
+                "The VirusTotal download has no committed investigation authority.",
+                code="vt_download_authority_missing",
+            )
+        if coordinator is None:
+            raise VirusTotalExternalEffectRefusedError(
+                "The VirusTotal download coordinator is not configured.",
+                code="vt_download_coordinator_missing",
+            )
+        if acquisition_hash is None:
+            raise VirusTotalExternalEffectRefusedError(
+                "The VirusTotal download has no canonical source hash.",
+                code="vt_download_hash_missing",
             )
 
         request = client.build_request("GET", url, params=params, headers=headers)
@@ -2159,9 +2170,9 @@ class VirusTotalHttpAdapter(VirusTotalPort):
                 return response
             if isinstance(outcome, (Refused, DefinitelyNotSubmitted)):
                 code = (
-                    f"virustotal_external_effect_refused_{outcome.reason}"
+                    _vt_coordinator_refusal_code(outcome.reason)
                     if isinstance(outcome, Refused)
-                    else "virustotal_external_effect_not_submitted"
+                    else "vt_effect_not_submitted"
                 )
                 raise VirusTotalExternalEffectRefusedError(
                     "The coordinator refused the VirusTotal download before a new send.",
@@ -2410,6 +2421,12 @@ def _proxy_query_params(
     if transport == "proxy-v3" and sentinel_enabled and not params:
         return {VIRUSTOTAL_PROXY_QUERY_SENTINEL_NAME: VIRUSTOTAL_PROXY_QUERY_SENTINEL_VALUE}
     return params
+
+
+def _vt_coordinator_refusal_code(reason: str) -> str:
+    """Persist a bounded coordinator reason without request data or credentials."""
+    token = re.sub(r"[^a-z0-9_]+", "_", reason.casefold()).strip("_")
+    return f"vt_refused_{(token or 'unspecified')[:53]}"
 
 
 def _normalize_route(value: str) -> str:

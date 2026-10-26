@@ -349,6 +349,7 @@ class SqlAlchemyVirusTotalPolicyGuard:
         session = context.database_session
         if not isinstance(session, AsyncSession):
             return False
+        require_external_llm_allowed = context.prepared.family != "vt.download_sample"
         sample_hashes = {
             reference.id
             for reference in context.prepared.evidence_refs
@@ -450,7 +451,7 @@ class SqlAlchemyVirusTotalPolicyGuard:
                 item.tlp.casefold() == "red"
                 or item.do_not_submit
                 or bool((item.license_restriction or "").strip())
-                or not item.external_llm_allowed
+                or (require_external_llm_allowed and not item.external_llm_allowed)
                 for item in samples
             ):
                 return False
@@ -478,7 +479,7 @@ class SqlAlchemyVirusTotalPolicyGuard:
                 item.tlp.casefold() == "red"
                 or item.do_not_submit
                 or bool((item.license_restriction or "").strip())
-                or not item.external_llm_allowed
+                or (require_external_llm_allowed and not item.external_llm_allowed)
                 for item in hash_samples
             ):
                 return False
@@ -494,7 +495,11 @@ class SqlAlchemyVirusTotalPolicyGuard:
                 )
             )
             if {item.id for item in documents} != document_ids or any(
-                not item.external_llm_allowed for item in documents
+                item.tlp.casefold() == "red"
+                or item.do_not_submit
+                or bool((item.license_restriction or "").strip())
+                or (require_external_llm_allowed and not item.external_llm_allowed)
+                for item in documents
             ):
                 return False
         return True

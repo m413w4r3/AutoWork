@@ -28,6 +28,7 @@ from cti_app.infrastructure.virustotal_retrohunt_client import (
     VirusTotalRetrohuntHttpClient,
 )
 from tests.virustotal_external_effect_fakes import (
+    authorized_vt_download,
     authorized_vt_read,
     configure_test_vt_adapter,
 )
@@ -206,9 +207,11 @@ async def test_file_download_302_uses_exact_cdn_without_proxy_credentials() -> N
             trust_env=False,
         ),
     )
+    configure_test_vt_adapter(adapter)
     sink = io.BytesIO()
     try:
-        result = await adapter.file_download(sample_hash, sink=sink)
+        with authorized_vt_download():
+            result = await adapter.file_download(sample_hash, sink=sink)
     finally:
         await proxy_client.aclose()
 
@@ -263,8 +266,10 @@ async def test_download_ticket_has_sentinel_and_signed_cdn_has_no_authentication
             transport=httpx.MockTransport(cdn_handler), trust_env=False
         ),
     )
+    configure_test_vt_adapter(adapter)
     try:
-        result = await adapter.file_download(sample_hash, sink=io.BytesIO())
+        with authorized_vt_download():
+            result = await adapter.file_download(sample_hash, sink=io.BytesIO())
     finally:
         await client.aclose()
 
@@ -324,8 +329,10 @@ async def test_direct_v2_download_keeps_only_documented_params_without_sentinel(
         proxy_query_sentinel_enabled=True,
         download_allowed_hosts=frozenset({CDN_HOST}),
     )
+    configure_test_vt_adapter(adapter)
     try:
-        result = await adapter.file_download(sample_hash, sink=io.BytesIO())
+        with authorized_vt_download():
+            result = await adapter.file_download(sample_hash, sink=io.BytesIO())
     finally:
         await direct.aclose()
         await proxy.aclose()

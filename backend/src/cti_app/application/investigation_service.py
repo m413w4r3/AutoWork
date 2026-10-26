@@ -1583,7 +1583,9 @@ class InvestigationService:
                 ) or await self._vt_source_disclosure_restricted(
                     current_investigation,
                     external_effect_evidence_refs,
-                    require_external_llm_allowed=not local_download_reuse,
+                    require_external_llm_allowed=(
+                        tool_name != "vt.download_sample" and not local_download_reuse
+                    ),
                 ):
                     return FrameworkPreSubmissionProof.DISCLOSURE_REVOKED
             elif tool_name == "advisor.consult":
@@ -1676,6 +1678,16 @@ class InvestigationService:
         valid_refs = await self._valid_observation_refs(
             investigation.id, tuple(dict.fromkeys(result_refs))
         )
+        if uncertain_external:
+            coordinator_transition = await self._invocations.get(invocation.id)
+            if (
+                coordinator_transition is not None
+                and coordinator_transition.status is ToolInvocationStatus.NEEDS_REVIEW
+            ):
+                # The coordinator durably marks the invocation when it records
+                # an ambiguous post-handoff result. Continue from that version
+                # so the framework diagnostic can attach without a stale CAS.
+                invocation = coordinator_transition
         terminal = invocation.transition(
             result.status,
             response_refs=valid_refs,

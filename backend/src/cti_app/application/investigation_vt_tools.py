@@ -513,7 +513,7 @@ class _VirusTotalAdapter:
                         consumed[BudgetDimension.TOOL_SECONDS] = 0
                     return replace(result, budget_consumed=consumed)
                 return result
-            except VirusTotalExternalEffectNeedsReviewError:
+            except VirusTotalExternalEffectNeedsReviewError as exc:
                 return self._result(
                     state,
                     ToolInvocationStatus.NEEDS_REVIEW,
@@ -521,13 +521,15 @@ class _VirusTotalAdapter:
                     message=(
                         "The VirusTotal request outcome needs reconciliation; it was not resent."
                     ),
+                    error_code=_safe_external_effect_error_code(exc),
                 )
-            except VirusTotalExternalEffectRefusedError:
+            except VirusTotalExternalEffectRefusedError as exc:
                 return self._result(
                     state,
                     ToolInvocationStatus.NEEDS_REVIEW,
                     reason="external_effect_refused",
                     message="The VirusTotal request was refused before a new send.",
+                    error_code=_safe_external_effect_error_code(exc),
                 )
             except VirusTotalInvalidInputError:
                 return self._result(
@@ -702,6 +704,7 @@ class _VirusTotalAdapter:
         *,
         reason: str | None = None,
         message: str = "",
+        error_code: str | None = None,
         extra: Mapping[str, Any] | None = None,
         zero_cost: bool = False,
     ) -> ToolResult:
@@ -748,6 +751,7 @@ class _VirusTotalAdapter:
             suggested_alternatives=alternatives,
             output=output,
             message=message,
+            error_code=error_code,
         )
 
     def _alternatives(self, state: _ExecutionState) -> tuple[str, ...]:
@@ -1808,6 +1812,13 @@ def _explicit_not_found(error: VirusTotalHttpError) -> bool:
 
 def _safe_error_code(error: VirusTotalHttpError) -> str:
     return sanitize_evidence_text(error.error_code or error.code, max_chars=128)
+
+
+def _safe_external_effect_error_code(error: Exception) -> str:
+    code = getattr(error, "code", None)
+    if isinstance(code, str) and re.fullmatch(r"[a-z0-9_]{1,80}", code):
+        return code
+    return "virustotal_external_effect_refused"
 
 
 def _normalize_dork(value: str) -> str:

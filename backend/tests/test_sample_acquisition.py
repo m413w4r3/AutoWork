@@ -335,7 +335,7 @@ async def test_successful_seed_acquisition_creates_a_quarantined_sample(tmp_path
     assert sample.state is SampleState.QUARANTINED
     assert sample.tlp is TLP.GREEN
     assert sample.do_not_submit is True  # always locked down, regardless of policy
-    assert sample.external_llm_allowed is False  # acquired bytes remain local-only
+    assert sample.external_llm_allowed is True
     assert sample.source_service == "virustotal"
     assert sample.source_object_id == sha256
     assert sample.expected_hash == sha256

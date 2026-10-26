@@ -103,11 +103,17 @@ async def _model_run_ids(scenario: ProductionScenario) -> set[UUID]:
         return set(rows.all())
 
 
-async def _publication_render_ids(scenario: ProductionScenario) -> set[UUID]:
+async def _publication_render_ids(
+    scenario: ProductionScenario, publication_artifact_ids: tuple[UUID, ...]
+) -> set[UUID]:
     async with scenario.uow_factory() as uow:
         sql_uow = cast(SqlAlchemyUnitOfWork, uow)
         assert sql_uow._session is not None
-        rows = await sql_uow._session.scalars(select(PublicationRenderRow.id))
+        rows = await sql_uow._session.scalars(
+            select(PublicationRenderRow.id).where(
+                PublicationRenderRow.publication_artifact_id.in_(publication_artifact_ids)
+            )
+        )
         return set(rows.all())
 
 
@@ -226,7 +232,7 @@ async def test_postgres_localized_diagram_correction_and_rerender_loop(
             cache,
         )
         before_inspection = await inspection.metadata(initial_render.output_sha256)
-        initial_render_ids = await _publication_render_ids(scenario)
+        initial_render_ids = await _publication_render_ids(scenario, (publication_before.id,))
         assert len(initial_render_ids) == 1
         initial_render_id = str(next(iter(initial_render_ids)))
         inspected_inputs = await input_inspection.metadata(initial_render_id)
@@ -285,7 +291,8 @@ async def test_postgres_localized_diagram_correction_and_rerender_loop(
         assert small_finding["class"].value == "deterministic"
         old_page = diagram_mapping["locations"][0]["page"]
         old_png = await inspection.page_png(old_hash, old_page, PdfInspectionProfile.PREVIEW)
-        assert await _publication_render_ids(scenario) == initial_render_ids
+        current_render_ids = await _publication_render_ids(scenario, (publication_before.id,))
+        assert current_render_ids == initial_render_ids
         assert await _model_run_ids(scenario) == pipeline_model_run_ids
         old_png_path = tmp_path / "before.png"
         old_png_path.write_bytes(old_png.content)
@@ -395,7 +402,9 @@ async def test_postgres_localized_diagram_correction_and_rerender_loop(
         assert await _model_run_ids(scenario) == model_runs_before_apply
         assert new_render.output_sha256 is not None
         assert new_render.output_sha256 != old_hash
-        render_ids_after = await _publication_render_ids(scenario)
+        render_ids_after = await _publication_render_ids(
+            scenario, (publication_before.id, publication_after.id)
+        )
         new_render_id = str(next(iter(render_ids_after - initial_render_ids)))
         inspected_after_render_data = await input_inspection.render_data(new_render_id)
         assert inspected_after_render_data["availability"] == "ready"

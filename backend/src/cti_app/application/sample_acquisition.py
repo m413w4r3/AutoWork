@@ -179,11 +179,10 @@ class SampleAcquisitionBudgetExceededError(SampleAcquisitionError):
 class SampleAcquisitionPolicy:
     """The investigation's persisted disclosure policy, exactly as handed off.
 
-    Distinct from the resulting Sample's own fields: a successfully
-    acquired live sample is always locked down (``do_not_submit=True`` and
-    ``external_llm_allowed=False``) regardless of this policy, which only
-    governs whether VirusTotal may be asked for the bytes at all. The policy
-    never authorizes disclosure of the acquired bytes to an external LLM.
+    A successfully acquired sample is recorded with ``external_llm_allowed=True``
+    and remains independently locked down by ``do_not_submit=True``. This policy
+    governs whether VirusTotal may be asked for the bytes; it does not override
+    the sample's submission veto or the investigation's current authorization.
     """
 
     tlp: TLP
@@ -688,7 +687,7 @@ class VirusTotalSampleAcquisitionService:
                 license_restriction=None,
                 tlp=policy.tlp,
                 do_not_submit=True,
-                external_llm_allowed=False,
+                external_llm_allowed=True,
                 origin_kind=origin_kind,
                 state=state,
                 source_service="virustotal",

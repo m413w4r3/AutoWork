@@ -57,6 +57,17 @@ def authorized_vt_read(*, invocation_id: UUID | None = None) -> Iterator[Externa
         yield authority
 
 
+@contextmanager
+def authorized_vt_download() -> Iterator[ExternalEffectAuthority]:
+    authority = replace(
+        make_test_authority(),
+        operation_key="test-vt-download-operation",
+        reservation_amounts={"downloads": 1, "vt_units": 1},
+    )
+    with virustotal_external_effect_scope(authority):
+        yield authority
+
+
 class InMemoryExternalEffectClaimStore:
     """Minimal durable-store double that still exercises the real coordinator gate."""
 

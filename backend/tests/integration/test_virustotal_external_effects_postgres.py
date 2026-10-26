@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import struct
+from contextlib import ExitStack
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -16,8 +17,6 @@ from sqlalchemy import select
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.bridge_investigator import (
     ScriptedTurnTransport,
-    TurnSubmission,
-    TurnSubmissionStatus,
 )
 from cti_app.application.investigation_tools import RegistryToolDispatcher
 from cti_app.application.osint_open_policy import OsintOpenPolicyService
@@ -132,75 +131,6 @@ async def _activate_policy(
         correlation_id=f"vt-read-policy:{subject_id}:{uuid4()}",
     )
     return service, policy
-
-
-class _RevokingScriptedTurnTransport(ScriptedTurnTransport):
-    """Revoke inherited OSINT authority after a decision, before tool consume."""
-
-    def __init__(self, responses, *, policy_service, policy) -> None:
-        super().__init__(responses)
-        self._policy_service = policy_service
-        self._policy = policy
-        self._revoked = False
-
-    async def submit(
-        self,
-        *,
-        investigation_id: UUID,
-        subject_id: UUID,
-        turn_index: int,
-        context_sha256: str,
-        prompt: str,
-        external_llm_allowed: bool,
-        timeout_seconds: float | None = None,
-    ) -> TurnSubmission:
-        result = await super().submit(
-            investigation_id=investigation_id,
-            subject_id=subject_id,
-            turn_index=turn_index,
-            context_sha256=context_sha256,
-            prompt=prompt,
-            external_llm_allowed=external_llm_allowed,
-            timeout_seconds=timeout_seconds,
-        )
-        await self._revoke_after_success(result, investigation_id)
-        return result
-
-    async def submit_with_attempt(
-        self,
-        *,
-        investigation_id: UUID,
-        subject_id: UUID,
-        turn_index: int,
-        context_sha256: str,
-        prompt: str,
-        external_llm_allowed: bool,
-        attempt: int,
-        timeout_seconds: float | None = None,
-    ) -> TurnSubmission:
-        result = await super().submit_with_attempt(
-            investigation_id=investigation_id,
-            subject_id=subject_id,
-            turn_index=turn_index,
-            context_sha256=context_sha256,
-            prompt=prompt,
-            external_llm_allowed=external_llm_allowed,
-            attempt=attempt,
-            timeout_seconds=timeout_seconds,
-        )
-        await self._revoke_after_success(result, investigation_id)
-        return result
-
-    async def _revoke_after_success(self, result: TurnSubmission, investigation_id: UUID) -> None:
-        if result.status is TurnSubmissionStatus.SUCCEEDED and not self._revoked:
-            await self._policy_service.revoke(
-                policy_id=self._policy.policy_id,
-                expected_version=self._policy.version,
-                actor_id="human:vt-download-revocation-test",
-                reason="Revoke the synthetic download before transport handoff.",
-                correlation_id=f"vt-download-revocation:{investigation_id}",
-            )
-            self._revoked = True
 
 
 async def _seed_unrelated_unassociated_sample(uow_factory, artifact_store) -> None:
@@ -336,7 +266,7 @@ async def _run_inherited_case(
     proxy_transport: httpx.AsyncBaseTransport | None = None,
     acquire_hits_allowed: bool = False,
     policy_external_llm_allowed: bool = True,
-    revoke_policy_after_bridge_response: bool = False,
+    revoke_policy_before_download_consume: bool = False,
     repeat_tool_call_in_same_turn: bool = False,
 ):
     engine = create_postgres_engine(database_url)
@@ -548,11 +478,33 @@ async def _run_inherited_case(
     responses.append(
         decision("Finish from the persisted synthetic VT evidence.", next_action="finish")
     )
-    turn_transport = (
-        _RevokingScriptedTurnTransport(responses, policy_service=policy_service, policy=policy)
-        if revoke_policy_after_bridge_response
-        else ScriptedTurnTransport(responses)
-    )
+    turn_transport = ScriptedTurnTransport(responses)
+    consume_patcher = None
+    if revoke_policy_before_download_consume:
+        coordinator = getattr(adapter, "_external_effect_coordinator", None)
+        assert coordinator is not None
+        claim_store = coordinator._claim_store
+        original_consume = claim_store.consume
+        revocation_done = False
+
+        async def revoke_before_consume(authority, prepared, **kwargs):
+            nonlocal revocation_done
+            if (
+                not revocation_done
+                and authority.investigation_id == seeded.investigation.id
+                and prepared.family == "vt.download_sample"
+            ):
+                await policy_service.revoke(
+                    policy_id=policy.policy_id,
+                    expected_version=policy.version,
+                    actor_id="human:vt-download-revocation-test",
+                    reason="Revoke the synthetic download before coordinator consume.",
+                    correlation_id=f"vt-download-revocation:{seeded.investigation.id}",
+                )
+                revocation_done = True
+            return await original_consume(authority, prepared, **kwargs)
+
+        consume_patcher = patch.object(claim_store, "consume", new=revoke_before_consume)
     factory = composition_factory(
         uow_factory=uow_factory,
         artifact_store=artifact_store,
@@ -580,26 +532,23 @@ async def _run_inherited_case(
             )
             assert started_response.status_code == 200, started_response.text
             started = started_response.json()
-            if bypass_legacy_guard:
-                original_dispatch_once = RegistryToolDispatcher._dispatch_once
+            with ExitStack() as stack:
+                if consume_patcher is not None:
+                    stack.enter_context(consume_patcher)
+                if bypass_legacy_guard:
+                    original_dispatch_once = RegistryToolDispatcher._dispatch_once
 
-                async def dispatch_once_without_legacy_guard(self, context, **kwargs):
-                    kwargs["pre_dispatch_check"] = None
-                    return await original_dispatch_once(self, context, **kwargs)
+                    async def dispatch_once_without_legacy_guard(self, context, **kwargs):
+                        kwargs["pre_dispatch_check"] = None
+                        return await original_dispatch_once(self, context, **kwargs)
 
-                with patch.object(
-                    RegistryToolDispatcher,
-                    "_dispatch_once",
-                    dispatch_once_without_legacy_guard,
-                ):
-                    await run_http_job(
-                        app,
-                        uow_factory,
-                        registry,
-                        dispatcher,
-                        UUID(started["job_id"]),
+                    stack.enter_context(
+                        patch.object(
+                            RegistryToolDispatcher,
+                            "_dispatch_once",
+                            dispatch_once_without_legacy_guard,
+                        )
                     )
-            else:
                 await run_http_job(
                     app,
                     uow_factory,
@@ -617,6 +566,13 @@ async def _run_inherited_case(
             )
             envelope = await uow.investigation_envelopes.get(seeded.investigation.id)
             inheritance = await uow.osint_open_policies.get_inheritance(seeded.investigation.id)
+            acquisition_errors = []
+            for requested_hash in hashes:
+                latest_error = await uow.sample_acquisition_attempts.find_latest_error(
+                    seeded.investigation.id, requested_hash
+                )
+                if latest_error is not None:
+                    acquisition_errors.append(latest_error)
             await uow.commit()
         async with session_factory() as session:
             claims = list(
@@ -630,6 +586,7 @@ async def _run_inherited_case(
             )
         return {
             "adapter": adapter,
+            "acquisition_errors": acquisition_errors,
             "claims": claims,
             "direct_client": direct_client,
             "envelope": envelope,
@@ -984,7 +941,7 @@ async def test_osint_open_candidate_download_claims_every_hop_before_send(
         assert association_version.version == 1
         assert sample is not None
         assert sample.state == "review_candidate"
-        assert sample.external_llm_allowed is False
+        assert sample.external_llm_allowed is True
     finally:
         if result is not None and result["direct_client"] is not None:
             await result["direct_client"].aclose()
@@ -1328,7 +1285,7 @@ async def test_vt_download_rejects_non_allowlisted_redirect_before_target_send(
 
 @pytest.mark.asyncio
 async def test_revoked_osint_download_authority_has_zero_send_and_no_claim(
-    migrated_postgres_url: str, tmp_path: Path
+    migrated_postgres_url: str, tmp_path: Path, caplog
 ) -> None:
     requested_hash = _synthetic_hash()
     physical_requests: list[httpx.Request] = []
@@ -1347,7 +1304,7 @@ async def test_revoked_osint_download_authority_has_zero_send_and_no_claim(
         download_allowed_hosts=frozenset({"vtsamples.commondatastorage.googleapis.com"}),
         acquire_hits_allowed=True,
         policy_external_llm_allowed=True,
-        revoke_policy_after_bridge_response=True,
+        revoke_policy_before_download_consume=True,
         tool_name="vt.download_sample",
         tool_arguments={
             "sha256": requested_hash,
@@ -1359,10 +1316,17 @@ async def test_revoked_osint_download_authority_has_zero_send_and_no_claim(
         assert physical_requests == []
         assert result["claims"] == []
         assert result["invocations"]
-        assert result["invocations"][0].status in {
-            ToolInvocationStatus.POLICY_DENIED,
-            ToolInvocationStatus.NEEDS_REVIEW,
-        }
+        assert result["invocations"][0].status is ToolInvocationStatus.NEEDS_REVIEW
+        assert [attempt.error_code for attempt in result["acquisition_errors"]] == [
+            "vt_refused_osint_policy_denied"
+        ]
+        warning = next(
+            record
+            for record in caplog.records
+            if getattr(record, "event", None) == "investigation_tool_invocation_terminal_failure"
+        )
+        assert warning.error_code == "vt_refused_osint_policy_denied"
+        assert requested_hash not in warning.getMessage()
     finally:
         if result["direct_client"] is not None:
             await result["direct_client"].aclose()
