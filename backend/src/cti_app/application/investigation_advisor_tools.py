@@ -99,7 +99,6 @@ _TYPED_CONSULTATION_TYPES = frozenset(
     {"draft_text", "review_text", "yara_draft", "suricata_draft", "figure_plan"}
 )
 MAX_ADVISOR_TOOL_SECONDS = 3_600
-DEFAULT_ADVISOR_SAMPLE_BLOB_MAX_BYTES = 64 * 1024 * 1024
 # Keep and strengthen the prior admission floor by deriving it from the Bridge
 # phase envelope: maximum paced wait + connect + capabilities + the larger of
 # the archive timeout and the 35s advisor preparation/scheduling margin. This
@@ -2909,33 +2908,18 @@ class InvestigationAdvisorTool:
             sample_origin = getattr(sample_origin, "value", sample_origin)
             blob_content: bytes | None = None
             content_status = "verified"
-            configured_blob_limit = getattr(
-                self._settings,
-                "advisor_sample_blob_max_bytes",
-                DEFAULT_ADVISOR_SAMPLE_BLOB_MAX_BYTES,
-            )
-            max_content_bytes = (
-                configured_blob_limit
-                if type(configured_blob_limit) is int and configured_blob_limit > 0
-                else DEFAULT_ADVISOR_SAMPLE_BLOB_MAX_BYTES
-            )
-            content_omission_reason: str | None = None
-            if descriptor.size > max_content_bytes:
-                content_status = "omitted_technical_size_limit"
-                content_omission_reason = "sample_blob_exceeds_configured_technical_limit"
-            else:
-                try:
-                    blob_content = await self._artifact_store.read_bytes(
-                        blob_id, max_bytes=descriptor.size
-                    )
-                    if (
-                        len(blob_content) != descriptor.size
-                        or hashlib.sha256(blob_content).hexdigest() != association.sample_sha256
-                    ):
-                        blob_content = None
-                        content_status = "blob_content_verification_failed"
-                except Exception:
-                    content_status = "blob_content_unavailable"
+            try:
+                blob_content = await self._artifact_store.read_bytes(
+                    blob_id, max_bytes=descriptor.size
+                )
+                if (
+                    len(blob_content) != descriptor.size
+                    or hashlib.sha256(blob_content).hexdigest() != association.sample_sha256
+                ):
+                    blob_content = None
+                    content_status = "blob_content_verification_failed"
+            except Exception:
+                content_status = "blob_content_unavailable"
             raw_mime_type = getattr(descriptor, "mime_type", "application/octet-stream")
             mime_type = (
                 raw_mime_type.strip()
@@ -2955,8 +2939,7 @@ class InvestigationAdvisorTool:
                     "evidence_ids": [str(item.id) for item in associated_observations],
                     "evidence_blob_ids": [str(item.blob_id) for item in associated_observations],
                     "evidence_sha256s": [item.sha256 for item in associated_observations],
-                    "mime_type": mime_type[:512],
-                    "mime_type_truncated": len(mime_type) > 512,
+                    "mime_type": mime_type,
                     "byte_length": descriptor.size,
                     "encoding": "base64",
                     "content_base64": (
@@ -2965,8 +2948,6 @@ class InvestigationAdvisorTool:
                         else ""
                     ),
                     "content_status": content_status,
-                    "content_omission_reason": content_omission_reason,
-                    "maximum_content_bytes": max_content_bytes,
                     "association_status": _safe_text(
                         getattr(
                             getattr(association, "qualification", "unknown"),
@@ -3598,7 +3579,7 @@ class InvestigationAdvisorTool:
                 sample.blob_id,
                 measured_hash,
                 str(association_id) if association_id is not None else "",
-                mime_type[:512],
+                mime_type,
             )
         return None
 
@@ -6719,7 +6700,6 @@ def _sample_policy_allows_external(sample: object) -> bool:
     )
     return not (
         bool(getattr(sample, "do_not_submit", False))
-        or not bool(getattr(sample, "external_llm_allowed", True))
         or (isinstance(tlp_value, str) and tlp_value.casefold() == TLP.RED.value.casefold())
         or has_license_restriction
     )
@@ -6732,8 +6712,6 @@ def _sample_restriction_sources(sample: object | None) -> list[str]:
     sources: list[str] = []
     if bool(getattr(sample, "do_not_submit", False)):
         sources.append("do_not_submit")
-    if not bool(getattr(sample, "external_llm_allowed", True)):
-        sources.append("external_llm_allowed_false")
     tlp = getattr(sample, "tlp", None)
     tlp_value = getattr(tlp, "value", tlp)
     if isinstance(tlp_value, str) and tlp_value.casefold() == TLP.RED.value.casefold():

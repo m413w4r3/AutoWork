@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from enum import StrEnum
-from typing import cast
+from typing import Any, cast
 from uuid import UUID
 
 import httpx
@@ -43,7 +43,10 @@ from cti_app.application.local_analysis import (
     default_local_command_specs,
 )
 from cti_app.application.model_conversations import ModelConversationService
-from cti_app.application.model_gateway import BridgeExternalEffectBinding
+from cti_app.application.model_gateway import (
+    BRIDGE_SOURCE_PROVENANCE_KEY,
+    BridgeExternalEffectBinding,
+)
 from cti_app.application.native_analysis import UnavailableNativeAnalysisPort
 from cti_app.application.network_workbench import QuarantinedCaptureSource
 from cti_app.application.persistence import UnitOfWorkFactory
@@ -76,6 +79,9 @@ from cti_app.infrastructure.confined_analysis_dispatch import (
 from cti_app.infrastructure.confined_local_commands import ConfinedLocalCommands
 from cti_app.infrastructure.confined_tshark import ConfinedTsharkAdapter
 from cti_app.infrastructure.database.repositories.external_effects import (
+    BRIDGE_RESOLVER_FAMILY_KEY,
+    BRIDGE_RESOLVER_RUN_HASH_KEY,
+    BRIDGE_RESOLVER_TURN_HASH_KEY,
     ExternalEffectFamilyBinding,
     SqlAlchemyExternalEffectClaimStore,
 )
@@ -139,6 +145,48 @@ _BRIDGE_TURN_FAMILY = "bridge.investigation_turn.v1"
 _ADVISOR_CONSULTATION_FAMILY = "advisor.consultation.v1"
 
 
+def _bridge_source_reference_resolver(
+    family: str,
+) -> Callable[[Mapping[str, Any]], tuple[EvidenceReference, ...]]:
+    def resolve(parameters: Mapping[str, Any]) -> tuple[EvidenceReference, ...]:
+        provenance = parameters.get(BRIDGE_SOURCE_PROVENANCE_KEY)
+        raw_refs = provenance.get("evidence_refs") if isinstance(provenance, Mapping) else None
+        if (
+            not isinstance(provenance, Mapping)
+            or provenance.get("family") != family
+            or provenance.get("authorized_input_hash")
+            != parameters.get(BRIDGE_RESOLVER_RUN_HASH_KEY)
+            or provenance.get("turn_input_sha256") != parameters.get(BRIDGE_RESOLVER_TURN_HASH_KEY)
+            or parameters.get(BRIDGE_RESOLVER_FAMILY_KEY) != family
+            or not isinstance(raw_refs, (list, tuple))
+            or not raw_refs
+        ):
+            return ()
+        references: list[EvidenceReference] = []
+        for item in raw_refs:
+            if not isinstance(item, Mapping) or set(item) != {
+                "kind",
+                "id",
+                "version",
+                "sha256",
+            }:
+                return ()
+            try:
+                references.append(
+                    EvidenceReference(
+                        kind=item["kind"],
+                        id=item["id"],
+                        version=item["version"],
+                        sha256=item["sha256"],
+                    )
+                )
+            except (TypeError, ValueError):
+                return ()
+        return tuple(references)
+
+    return resolve
+
+
 def create_external_effect_coordinator(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> ExternalEffectCoordinator:
@@ -154,6 +202,8 @@ def create_external_effect_coordinator(
                 model_submission=True,
                 requires_model_lineage=True,
                 model_run_provider="openai",
+                requires_source_refs=True,
+                source_reference_resolver=_bridge_source_reference_resolver(_BRIDGE_TURN_FAMILY),
             ),
             _ADVISOR_CONSULTATION_FAMILY: ExternalEffectFamilyBinding(
                 provider="bridge",
@@ -163,6 +213,10 @@ def create_external_effect_coordinator(
                 model_submission=True,
                 requires_model_lineage=True,
                 model_run_provider="openai",
+                requires_source_refs=True,
+                source_reference_resolver=_bridge_source_reference_resolver(
+                    _ADVISOR_CONSULTATION_FAMILY
+                ),
             ),
         }
     )

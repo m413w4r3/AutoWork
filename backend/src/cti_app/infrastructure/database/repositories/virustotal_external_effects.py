@@ -440,7 +440,6 @@ class SqlAlchemyVirusTotalPolicyGuard:
                 item.tlp.casefold() == "red"
                 or item.do_not_submit
                 or bool((item.license_restriction or "").strip())
-                or not item.external_llm_allowed
                 for item in samples
             ):
                 return False
@@ -468,7 +467,6 @@ class SqlAlchemyVirusTotalPolicyGuard:
                 item.tlp.casefold() == "red"
                 or item.do_not_submit
                 or bool((item.license_restriction or "").strip())
-                or not item.external_llm_allowed
                 for item in hash_samples
             ):
                 return False

@@ -2386,7 +2386,7 @@ async def test_evidence_observation_resolves_restricted_sample_hash_at_consume(
 
 
 @pytest.mark.asyncio
-async def test_human_g2_vt_read_checks_external_llm_source_restriction_at_consume(
+async def test_human_g2_vt_read_permits_acquired_sample_external_llm_flag(
     migrated_postgres_url: str, tmp_path: Path
 ) -> None:
     session_factory, engine, investigation_id, subject_id, authorities = await _prepare_case(
@@ -2502,9 +2502,8 @@ async def test_human_g2_vt_read_checks_external_llm_source_restriction_at_consum
     transport = _CountingTransport()
     try:
         outcome = await ExternalEffectCoordinator(store).send_one(authority, prepared, transport)
-        assert isinstance(outcome, Refused)
-        assert outcome.reason == "vt_source_disclosure_denied"
-        assert transport.calls == 0
+        assert not isinstance(outcome, Refused)
+        assert transport.calls == 1
     finally:
         await engine.dispose()
 

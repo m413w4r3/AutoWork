@@ -2261,13 +2261,17 @@ async def test_sample_level_restriction_blocks_explicit_observation(restriction)
         make_context(investigation_id, key="operator:advisor:restricted-sample"),
     )
 
-    assert transport.calls == []
-    assert result.output["advisor_status"] == "disclosure_restricted"
-    assert result.output["preflight_status"] == "POLICY_BLOCKED"
-    assert tuple(result.output["disclosure_restricted_refs"]) == (str(observation.id),)
-    assert result.output["confirmed_non_execution"] is True
-    if restriction.get("license_restriction"):
-        assert restriction["license_restriction"] not in repr(result.output)
+    if restriction.get("external_llm_allowed") is False:
+        assert len(transport.calls) == 1
+        assert result.output.get("advisor_status") != "disclosure_restricted"
+    else:
+        assert transport.calls == []
+        assert result.output["advisor_status"] == "disclosure_restricted"
+        assert result.output["preflight_status"] == "POLICY_BLOCKED"
+        assert tuple(result.output["disclosure_restricted_refs"]) == (str(observation.id),)
+        assert result.output["confirmed_non_execution"] is True
+        if restriction.get("license_restriction"):
+            assert restriction["license_restriction"] not in repr(result.output)
 
 
 @pytest.mark.asyncio
@@ -2765,7 +2769,7 @@ async def test_encoded_sample_material_with_operational_secret_or_signed_url_is_
 
 
 @pytest.mark.asyncio
-async def test_sample_blob_over_configured_technical_bound_is_omitted_with_provenance() -> None:
+async def test_sample_blob_bytes_are_included_without_a_size_ceiling() -> None:
     investigation_id = uuid4()
     sample_content = b"synthetic sample content above the configured test bound"
     sample_hash = hashlib.sha256(sample_content).hexdigest()
@@ -2791,7 +2795,6 @@ async def test_sample_blob_over_configured_technical_bound_is_omitted_with_prove
         observation=observation,
         raw=observation_raw,
     )
-    tool._settings.advisor_sample_blob_max_bytes = 8
     sample_id = uuid4()
     association_id = uuid4()
     tool._blobs.add(
@@ -2847,14 +2850,12 @@ async def test_sample_blob_over_configured_technical_bound_is_omitted_with_prove
 
     assert result.status is ToolInvocationStatus.SUCCEEDED, result.output
     assert len(transport.calls) == 1
-    assert sample_reads == []
+    assert sample_reads == [sample_blob_id]
     prompt = transport.calls[0]["prompt"]
     assert f"sample_id={sample_id}" in prompt
     assert f"association_id={association_id}" in prompt
-    assert "content_status=omitted_technical_size_limit" in prompt
-    assert "content_omission_reason=sample_blob_exceeds_configured_technical_limit" in prompt
-    assert "maximum_content_bytes=8" in prompt
-    assert base64.b64encode(sample_content).decode("ascii") not in prompt
+    assert "content_status=verified" in prompt
+    assert base64.b64encode(sample_content).decode("ascii") in prompt
 
 
 @pytest.mark.asyncio
@@ -4697,11 +4698,25 @@ async def test_dispatcher_reserves_measured_prompt_bytes_before_transport_and_co
 
 
 @pytest.mark.asyncio
-async def test_dispatcher_denies_over_budget_measured_prompt_before_transport() -> None:
+async def test_dispatcher_sends_prompt_above_context_accounting_limit() -> None:
     investigation_id = uuid4()
     context = make_dispatch_context(investigation_id, context_byte_limit=1)
-    transport = Transport(TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="unused"))
-    tool, _sample_blob = make_tool(investigation_id=investigation_id, transport=transport)
+    observation, raw = make_observation(
+        investigation_id,
+        {"schema": "context-accounting-fixture.v1", "content": "Verified prompt evidence."},
+    )
+    transport = Transport(
+        TurnSubmission(
+            TurnSubmissionStatus.SUCCEEDED,
+            output_text=advisor_response("The evidence is available.", [str(observation.id)]),
+        )
+    )
+    tool, _sample_blob = make_tool(
+        investigation_id=investigation_id,
+        transport=transport,
+        observation=observation,
+        raw=raw,
+    )
     registry = InMemoryToolRegistry()
     register_investigation_advisor_tool(registry, adapter=tool)
 
@@ -4709,15 +4724,17 @@ async def test_dispatcher_denies_over_budget_measured_prompt_before_transport() 
         context,
         tool_name="advisor.consult",
         schema_version="advisor-consult.v1",
-        arguments={"consultation_type": "plan_investigation", "evidence_refs": []},
+        arguments={
+            "consultation_type": "plan_investigation",
+            "evidence_refs": [str(observation.id)],
+        },
         purpose="Check G2 admission against the measured advisor prompt.",
         operation_key=context.idempotency_key,
     )
 
-    assert result.status is ToolInvocationStatus.NEEDS_REVIEW
-    assert result.framework_pre_submission_proof is FrameworkPreSubmissionProof.BUDGET_REJECTED
-    assert transport.calls == []
-    assert not context.budget.reservations
+    assert len(transport.calls) == 1
+    assert result.output.get("advisor_status") != "budget_refused"
+    assert context.budget.consumed[BudgetDimension.CONTEXT_BYTES] > 1
 
 
 @pytest.mark.asyncio
@@ -5630,7 +5647,6 @@ async def test_large_prompt_reservation_is_persisted_before_fake_transport() -> 
     tool._blobs.descriptors[
         blob_id
     ].descriptor.mime_type = "application/x-synthetic-sample; fixture=large"
-    tool._settings.advisor_sample_blob_max_bytes = 8_000_000
 
     class LargeSampleAssociations:
         async def list_for_investigation(self, _investigation_id):

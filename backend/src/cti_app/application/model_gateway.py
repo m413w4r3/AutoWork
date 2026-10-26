@@ -259,8 +259,8 @@ class BridgeExternalEffectBinding:
     """Per-attempt authorization seed for one Bridge Responses submission.
 
     The application turn service fills the exact persisted turn/run IDs and
-    input hash before model execution. This value stays in memory and is not
-    part of the model's authorized-input digest or persisted metadata.
+    input hash before model execution. The binding stays request-local; its
+    source references are persisted separately as hash-bound run provenance.
     """
 
     authority: ExternalEffectAuthority
@@ -298,6 +298,7 @@ class BridgeExternalEffectBinding:
 
 BridgeExternalEffectBindingFactory = Callable[..., Awaitable[BridgeExternalEffectBinding | None]]
 BridgeReusedResultResolver = Callable[[Reused], Awaitable[dict[str, Any] | None]]
+BRIDGE_SOURCE_PROVENANCE_KEY = "_bridge_external_effect_source_provenance"
 
 
 @dataclass(frozen=True, slots=True)

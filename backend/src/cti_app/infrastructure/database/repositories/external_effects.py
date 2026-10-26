@@ -84,6 +84,9 @@ class _ConsumeDenied(Exception):
 
 
 SourceReferenceResolver = Callable[[Mapping[str, Any]], tuple[EvidenceReference, ...]]
+BRIDGE_RESOLVER_FAMILY_KEY = "_bridge_external_effect_family"
+BRIDGE_RESOLVER_RUN_HASH_KEY = "_bridge_external_effect_run_input_hash"
+BRIDGE_RESOLVER_TURN_HASH_KEY = "_bridge_external_effect_turn_input_hash"
 
 
 def _vt_file_hash_from_request(prepared: PreparedExternalRequest) -> str | None:
@@ -145,8 +148,8 @@ class ExternalEffectFamilyBinding:
     """Server-owned provider, model, and source contract for one external family.
 
     A source resolver derives the expected evidence references from persisted,
-    normalized invocation inputs; callers cannot use empty references to bypass
-    a source restriction.
+    normalized invocation or model-run provenance; callers cannot use empty
+    references to bypass a source restriction.
     """
 
     provider: str
@@ -349,7 +352,9 @@ class SqlAlchemyExternalEffectClaimStore:
                         family_binding,
                         allow_nonrunning_invocation=existing is not None,
                     )
-                    self._validate_family_source_refs(family_binding, invocation, prepared)
+                    await self._validate_external_source_refs(
+                        session, authority, family_binding, invocation, prepared
+                    )
                     if existing is not None:
                         if (
                             reservation.status == "released"
@@ -741,7 +746,9 @@ class SqlAlchemyExternalEffectClaimStore:
                         invocation,
                         family_binding,
                     )
-                    self._validate_family_source_refs(family_binding, invocation, prepared)
+                    await self._validate_external_source_refs(
+                        session, authority, family_binding, invocation, prepared
+                    )
                     current = await session.scalar(
                         select(ExternalEffectClaimRow)
                         .where(ExternalEffectClaimRow.id == claim.id)
@@ -879,7 +886,9 @@ class SqlAlchemyExternalEffectClaimStore:
                         family_binding,
                         allow_nonrunning_invocation=True,
                     )
-                    self._validate_family_source_refs(family_binding, invocation, prepared)
+                    await self._validate_external_source_refs(
+                        session, authority, family_binding, invocation, prepared
+                    )
                     existing = await session.scalar(
                         select(ExternalEffectClaimRow)
                         .where(
@@ -1117,6 +1126,19 @@ class SqlAlchemyExternalEffectClaimStore:
             if (invocation.tool_name, invocation.schema_version) != binding:
                 raise _ConsumeDenied("invocation_operation_schema_mismatch")
 
+    async def _validate_external_source_refs(
+        self,
+        session: AsyncSession,
+        authority: ExternalEffectAuthority,
+        family_binding: ExternalEffectFamilyBinding,
+        invocation: ToolInvocationRow | None,
+        prepared: PreparedExternalRequest,
+    ) -> None:
+        if family_binding.requires_model_lineage:
+            await self._validate_model_source_refs(session, authority, family_binding, prepared)
+        else:
+            self._validate_family_source_refs(family_binding, invocation, prepared)
+
     def _validate_family_source_refs(
         self,
         family_binding: ExternalEffectFamilyBinding,
@@ -1125,12 +1147,82 @@ class SqlAlchemyExternalEffectClaimStore:
     ) -> None:
         if not family_binding.requires_source_refs:
             return
-        if invocation is None or family_binding.source_reference_resolver is None:
+        if (
+            family_binding.requires_model_lineage
+            or invocation is None
+            or family_binding.source_reference_resolver is None
+        ):
             raise _ConsumeDenied("trusted_source_inputs_required")
         try:
             expected = family_binding.source_reference_resolver(invocation.normalized_parameters)
         except Exception as exc:
             raise _ConsumeDenied("trusted_source_reference_resolution_failed") from exc
+        self._compare_family_source_refs(expected, prepared)
+        if prepared.family == "vt.behaviour_pcap":
+            hash_references = [
+                item for item in prepared.evidence_refs if item.kind == "sample_hash"
+            ]
+            parameters = invocation.normalized_parameters
+            expected_hash = parameters.get("file_hash")
+            expected_sandbox = parameters.get("sandbox_id")
+            if (
+                len(hash_references) != 1
+                or not isinstance(expected_hash, str)
+                or hash_references[0].id != expected_hash
+                or not isinstance(expected_sandbox, str)
+                or _vt_pcap_sandbox_from_request(prepared) != expected_sandbox
+            ):
+                raise _ConsumeDenied("vt_source_hash_request_mismatch")
+
+    async def _validate_model_source_refs(
+        self,
+        session: AsyncSession,
+        authority: ExternalEffectAuthority,
+        family_binding: ExternalEffectFamilyBinding,
+        prepared: PreparedExternalRequest,
+    ) -> None:
+        if not family_binding.requires_source_refs:
+            return
+        if (
+            authority.bridge_turn_id is None
+            or authority.model_run_id is None
+            or family_binding.source_reference_resolver is None
+        ):
+            raise _ConsumeDenied("trusted_source_inputs_required")
+        turn = await session.scalar(
+            select(ModelConversationTurnRow)
+            .where(ModelConversationTurnRow.id == authority.bridge_turn_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        run = await session.scalar(
+            select(ModelRunRow)
+            .where(ModelRunRow.id == authority.model_run_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if (
+            turn is None
+            or run is None
+            or turn.model_run_id != run.id
+            or not isinstance(run.parameters, Mapping)
+        ):
+            raise _ConsumeDenied("trusted_source_reference_resolution_failed")
+        resolver_inputs = dict(run.parameters)
+        resolver_inputs[BRIDGE_RESOLVER_FAMILY_KEY] = prepared.family
+        resolver_inputs[BRIDGE_RESOLVER_RUN_HASH_KEY] = run.authorized_input_hash
+        resolver_inputs[BRIDGE_RESOLVER_TURN_HASH_KEY] = turn.input_sha256
+        try:
+            expected = family_binding.source_reference_resolver(resolver_inputs)
+        except Exception as exc:
+            raise _ConsumeDenied("trusted_source_reference_resolution_failed") from exc
+        self._compare_family_source_refs(expected, prepared)
+
+    def _compare_family_source_refs(
+        self,
+        expected: tuple[EvidenceReference, ...],
+        prepared: PreparedExternalRequest,
+    ) -> None:
         if not expected:
             raise _ConsumeDenied("source_references_required")
         try:
@@ -1175,19 +1267,6 @@ class SqlAlchemyExternalEffectClaimStore:
             if hash_references and (
                 len(hash_references) != 1
                 or _vt_file_hash_from_request(prepared) != hash_references[0].id
-            ):
-                raise _ConsumeDenied("vt_source_hash_request_mismatch")
-        elif prepared.family == "vt.behaviour_pcap":
-            hash_references = [item for item in normalized_actual if item.kind == "sample_hash"]
-            parameters = invocation.normalized_parameters
-            expected_hash = parameters.get("file_hash")
-            expected_sandbox = parameters.get("sandbox_id")
-            if (
-                len(hash_references) != 1
-                or not isinstance(expected_hash, str)
-                or hash_references[0].id != expected_hash
-                or not isinstance(expected_sandbox, str)
-                or _vt_pcap_sandbox_from_request(prepared) != expected_sandbox
             ):
                 raise _ConsumeDenied("vt_source_hash_request_mismatch")
 
@@ -1470,8 +1549,6 @@ class SqlAlchemyExternalEffectClaimStore:
                 or bool((sample.license_restriction or "").strip())
             ):
                 raise _ConsumeDenied("sample_source_restricted")
-            if _is_model_submission(prepared, family_binding) and not sample.external_llm_allowed:
-                raise _ConsumeDenied("sample_external_llm_not_allowed")
         if sample_ids and {sample.id for sample in samples} != sample_ids:
             raise _ConsumeDenied("sample_source_missing")
 

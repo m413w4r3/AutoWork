@@ -12,6 +12,7 @@ from uuid import UUID, uuid4
 from cti_app.application.blob_storage import BlobStore
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.model_gateway import (
+    BRIDGE_SOURCE_PROVENANCE_KEY,
     BridgeExternalEffectBinding,
     ConversationContext,
     ModelExecution,
@@ -1336,6 +1337,18 @@ class ModelConversationService:
                     model_input_sha256=turn.input_sha256,
                     authorized_input_hash=run.authorized_input_hash,
                 )
+                run.parameters = {
+                    **run.parameters,
+                    BRIDGE_SOURCE_PROVENANCE_KEY: {
+                        "family": bridge_external_effect_binding.family,
+                        "turn_input_sha256": turn.input_sha256,
+                        "authorized_input_hash": run.authorized_input_hash,
+                        "evidence_refs": [
+                            reference.to_json()
+                            for reference in bridge_external_effect_binding.evidence_refs
+                        ],
+                    },
+                }
                 request = replace(
                     request,
                     bridge_external_effect_binding=bridge_external_effect_binding,
