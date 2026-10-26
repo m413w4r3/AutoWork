@@ -1006,6 +1006,8 @@ async def test_operator_context_cas_and_advisor_egress_guard_postgres(
             current_envelope = await uow.investigation_envelopes.get(investigation_id)
             latest_state = await uow.investigation_states.get(investigation_id)
         assert current_envelope is not None and latest_state is not None
+        previous_provider = app.state.identity_provider
+        app.state.identity_provider = _HumanIdentityProvider()
         revoked = await client.post(
             f"/api/investigations/{investigation_id}/envelope/revoke",
             json={
@@ -1015,6 +1017,7 @@ async def test_operator_context_cas_and_advisor_egress_guard_postgres(
             },
             headers={"Idempotency-Key": f"m05d-envelope-revoke-{investigation_id}"},
         )
+        app.state.identity_provider = previous_provider
         assert revoked.status_code == 200, revoked.text
         revoked_attempt = await _invoke_advisor(
             client,
