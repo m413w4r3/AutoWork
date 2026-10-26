@@ -78,6 +78,30 @@ def _approved_service(database: FakeDatabase, investigation, content: bytes):
 
 
 @pytest.mark.asyncio
+async def test_register_hit_persists_new_association_before_acquisition() -> None:
+    database = FakeDatabase()
+    investigation = make_investigation()
+    database.investigations[investigation.id] = investigation
+    sample_hash = hashlib.sha256(b"synthetic unacquired VT hit").hexdigest()
+    hits = HitAcquisitionService(
+        lambda: FakeUow(database),
+        acquisition=None,
+        recorder=make_evidence_recorder(database),
+    )
+
+    assert database.associations == {}
+    association = await hits.register_hit(investigation.id, sample_hash, SampleOrigin.VT_PIVOT)
+
+    async with FakeUow(database) as uow:
+        persisted = await uow.sample_associations.get(association.id)
+    assert persisted == association
+    assert persisted is not None
+    assert persisted.sample_sha256 == sample_hash
+    assert persisted.origin is SampleOrigin.VT_PIVOT
+    assert database.associations == {association.id: association}
+
+
+@pytest.mark.asyncio
 async def test_default_g2_envelope_refuses_acquisition_as_a_review_request() -> None:
     database = FakeDatabase()
     investigation = make_investigation()

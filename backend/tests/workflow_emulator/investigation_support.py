@@ -246,6 +246,7 @@ class ScriptedInvestigationTransport(ScriptedTurnTransport):
 
     async def _pending_analysis(self) -> Mapping[str, Any] | None:
         async with self._uow_factory() as uow:
+            investigation = await uow.analyst_investigations.get(self._investigation_id)
             associations = await uow.sample_associations.list_for_investigation(
                 self._investigation_id
             )
@@ -253,12 +254,31 @@ class ScriptedInvestigationTransport(ScriptedTurnTransport):
             observations = await uow.evidence_observations.list_for_investigation(
                 self._investigation_id
             )
+            analyzable_association_ids: set[UUID] = set()
+            if investigation is not None:
+                for association in associations:
+                    samples = await uow.samples.list_by_subject_and_sha256(
+                        investigation.subject_id, association.sample_sha256
+                    )
+                    if any(
+                        getattr(sample.state, "value", sample.state)
+                        in {"quarantined", "review_candidate"}
+                        for sample in samples
+                    ):
+                        analyzable_association_ids.add(association.id)
         analyzed = {
             str(item.normalized_parameters.get("association_id"))
             for item in invocations
             if item.tool_name == "sample.analyze"
         }
-        association = next((item for item in associations if str(item.id) not in analyzed), None)
+        association = next(
+            (
+                item
+                for item in associations
+                if item.id in analyzable_association_ids and str(item.id) not in analyzed
+            ),
+            None,
+        )
         if association is None:
             return None
         evidence_ref = next(
@@ -865,6 +885,8 @@ async def persist_sample_association_fixture(
     sample_sha256: str | None = None,
     origin: SampleOrigin = SampleOrigin.MANUAL,
     logical_name: str = "synthetic-fixture.bin",
+    do_not_submit: bool = True,
+    external_llm_allowed: bool = False,
 ) -> SampleAssociation:
     """Persist an exact sample association and optional quarantined fixture bytes."""
     if sample_bytes is not None:
@@ -890,8 +912,8 @@ async def persist_sample_association_fixture(
             acquired_at=datetime.now(UTC),
             license_restriction=None,
             tlp=TLP.CLEAR,
-            do_not_submit=True,
-            external_llm_allowed=False,
+            do_not_submit=do_not_submit,
+            external_llm_allowed=external_llm_allowed,
             origin_kind=EntitySampleOrigin.MANUAL,
             state=SampleState.QUARANTINED,
             source_service="workflow-emulator",

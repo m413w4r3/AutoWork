@@ -36,6 +36,7 @@ from cti_app.application.investigation_persistence import (
     InMemoryInvestigationEnvelopeRepository,
     InMemorySampleAssociationRepository,
     InMemoryToolInvocationRepository,
+    InvestigationBudgetSnapshot,
     VersionConflictError,
 )
 from cti_app.application.investigation_service import (
@@ -176,6 +177,36 @@ def test_envelope_reduction_uses_only_domain_fields() -> None:
     assert _envelope_reduced_since(baseline, reduced) is True
     assert _envelope_reduced_since(baseline, extended) is False
     assert _envelope_reduced_since(baseline, None) is True
+
+
+def test_budget_snapshot_preserves_historical_commit_under_revoked_limit() -> None:
+    budget = InvestigationBudget(limits={BudgetDimension.VT_UNITS: 3})
+    budget.reserve("first", {BudgetDimension.VT_UNITS: 2})
+    budget.commit("first", {BudgetDimension.VT_UNITS: 1})
+    budget.reserve("second", {BudgetDimension.VT_UNITS: 1})
+    budget.commit("second", {BudgetDimension.VT_UNITS: 0})
+
+    snapshot = InvestigationBudgetSnapshot(
+        investigation_id=uuid4(),
+        version=1,
+        budget=budget,
+    )
+
+    assert snapshot.budget.limits[BudgetDimension.VT_UNITS] == 3
+    assert snapshot.budget.consumed[BudgetDimension.VT_UNITS] == 1
+    assert [item.operation_key for item in snapshot.budget.reservations] == ["first", "second"]
+
+    revoked = InvestigationBudget(limits={BudgetDimension.VT_UNITS: 0})
+    for reservation in snapshot.budget.reservations:
+        revoked.restore_reservation(reservation)
+    revoked_snapshot = InvestigationBudgetSnapshot(
+        investigation_id=snapshot.investigation_id,
+        version=2,
+        budget=revoked,
+    )
+
+    assert revoked_snapshot.budget.limits[BudgetDimension.VT_UNITS] == 0
+    assert revoked_snapshot.budget.consumed[BudgetDimension.VT_UNITS] == 1
 
 
 def test_tool_operation_identity_ignores_explanatory_purpose() -> None:

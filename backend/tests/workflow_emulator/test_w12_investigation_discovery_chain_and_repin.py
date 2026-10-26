@@ -29,6 +29,7 @@ from cti_app.domain.investigation import (
     FindingAssessment,
     FindingKind,
     NoveltyClass,
+    SampleOrigin,
     SampleQualification,
     ToolInvocationStatus,
 )
@@ -62,6 +63,7 @@ from tests.workflow_emulator.investigation_support import (
     composition_factory,
     decision,
     investigation_settings,
+    persist_sample_association_fixture,
     publish_opinion_http,
     qualify_sample_http,
     read_composition,
@@ -197,6 +199,23 @@ async def test_w12_discovery_chain_claim_review_and_explicit_repin(
                 f"C1: {material.seed_hash} is a loader and its dropped file is the final payload."
             ),
         )
+        assert seed.seed_observation is not None
+        await persist_sample_association_fixture(
+            uow_factory,
+            artifact_store,
+            investigation_id=seed.investigation.id,
+            subject_id=seed.subject.id,
+            sample_sha256=material.seed_hash,
+            origin=SampleOrigin.SEED,
+        )
+        await persist_sample_association_fixture(
+            uow_factory,
+            artifact_store,
+            investigation_id=seed.investigation.id,
+            subject_id=seed.subject.id,
+            sample_sha256=material.sample_hash,
+            origin=SampleOrigin.VT_PIVOT,
+        )
 
         relationship_pages = [
             _page(
@@ -331,19 +350,6 @@ async def test_w12_discovery_chain_claim_review_and_explicit_repin(
                 },
             ),
             decision(
-                "Acquire the absent candidate under the approved envelope.",
-                tool_call={
-                    "tool_name": "vt.download_sample",
-                    "schema_version": "1",
-                    "arguments": {
-                        "sha256": material.sample_hash,
-                        "purpose": "Acquire the S2 candidate returned by the search.",
-                        "evidence_refs": [str(seed.seed_observation.id)],
-                    },
-                    "purpose": "Download S2 to quarantine for local inspection.",
-                },
-            ),
-            decision(
                 "Inspect dropped children of S1.",
                 tool_call={
                     "tool_name": "vt.relationships",
@@ -367,6 +373,19 @@ async def test_w12_discovery_chain_claim_review_and_explicit_repin(
                         "relation": "execution_parents",
                     },
                     "purpose": "Read the S2 parents relationship.",
+                },
+            ),
+            decision(
+                "Acquire the absent candidate under the approved envelope.",
+                tool_call={
+                    "tool_name": "vt.download_sample",
+                    "schema_version": "1",
+                    "arguments": {
+                        "sha256": material.sample_hash,
+                        "purpose": "Acquire the S2 candidate returned by the search.",
+                        "evidence_refs": [str(seed.seed_observation.id)],
+                    },
+                    "purpose": "Download S2 to quarantine for local inspection.",
                 },
             ),
         ]
@@ -453,7 +472,17 @@ async def test_w12_discovery_chain_claim_review_and_explicit_repin(
                     "read_candidate_http",
                     sample_response.text,
                 )
-                sample_view = sample_response.json()[0]
+                sample_views = sample_response.json()
+                invariants.require(
+                    {item["sample_sha256"] for item in sample_views}
+                    == {material.seed_hash, material.sample_hash},
+                    driver.scenario,
+                    "read_candidate_http",
+                    "the VT source seed and acquired S2 association must both be persisted",
+                )
+                sample_view = next(
+                    item for item in sample_views if item["sample_sha256"] == material.sample_hash
+                )
                 invariants.require(
                     sample_view["sample_sha256"] == material.sample_hash
                     and sample_view["qualification"] == SampleQualification.CANDIDATE.value,
@@ -474,6 +503,13 @@ async def test_w12_discovery_chain_claim_review_and_explicit_repin(
                     )
                 if association is None:
                     raise AssertionError("W12 candidate association was not persisted")
+                invariants.require(
+                    association.sample_sha256 == material.sample_hash
+                    and association.origin is SampleOrigin.VT_PIVOT,
+                    driver.scenario,
+                    "read_candidate_http",
+                    "S2 remains linked to its VT pivot association after acquisition",
+                )
                 new_sample = next(item for item in findings if item.kind is FindingKind.NEW_SAMPLE)
                 chain = next(item for item in findings if item.kind is FindingKind.INFECTION_CHAIN)
                 claim = next(
@@ -541,15 +577,17 @@ async def test_w12_discovery_chain_claim_review_and_explicit_repin(
                     "persisted_findings",
                     "supported Bridge output without observation refs must be downgraded",
                 )
+                required_tools = {
+                    "vt.file_report",
+                    "vt.intelligence_search",
+                    "vt.download_sample",
+                    "sample.analyze",
+                    "vt.relationships",
+                }
+                actual_tools = {item.tool_name for item in invocations}
+                invocation_statuses = [(item.tool_name, item.status.value) for item in invocations]
                 invariants.require(
-                    {item.tool_name for item in invocations}
-                    >= {
-                        "vt.file_report",
-                        "vt.intelligence_search",
-                        "vt.download_sample",
-                        "sample.analyze",
-                        "vt.relationships",
-                    }
+                    actual_tools >= required_tools
                     and all(
                         item.status is ToolInvocationStatus.SUCCEEDED
                         # PARTIAL: optional code-feature/goodware extractors are not provisioned
@@ -562,7 +600,9 @@ async def test_w12_discovery_chain_claim_review_and_explicit_repin(
                     ),
                     driver.scenario,
                     "persisted_findings",
-                    "the real dispatcher must persist each selected tool operation",
+                    "the real dispatcher must persist each selected tool operation; "
+                    f"missing={sorted(required_tools - actual_tools)}, "
+                    f"statuses={invocation_statuses}",
                 )
                 g3 = await driver._perform(
                     "confirm_candidate_g3_http",

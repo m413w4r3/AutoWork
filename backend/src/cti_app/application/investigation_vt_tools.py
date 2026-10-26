@@ -17,7 +17,7 @@ import re
 import time
 import unicodedata
 from collections.abc import Awaitable, Buffer, Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any, Literal, Protocol, cast
 from urllib.parse import urlsplit
@@ -43,6 +43,8 @@ from cti_app.application.virustotal import (
     VirusTotalCapabilityDisabledError,
     VirusTotalConfigurationError,
     VirusTotalError,
+    VirusTotalExternalEffectNeedsReviewError,
+    VirusTotalExternalEffectRefusedError,
     VirusTotalFileReport,
     VirusTotalHttpError,
     VirusTotalInvalidInputError,
@@ -56,6 +58,8 @@ from cti_app.application.virustotal import (
     VirusTotalSearchResult,
     normalize_file_hash,
     validate_search_query,
+    virustotal_external_effect_counts,
+    virustotal_external_effect_scope,
 )
 from cti_app.application.virustotal_persistence import VirusTotalObservationService
 from cti_app.domain.investigation import (
@@ -422,6 +426,7 @@ class _ExecutionState:
     available_capabilities: frozenset[str] = frozenset()
     object_type: str = "virustotal"
     object_id: str = "virustotal"
+    reserved_vt_units: int | None = None
 
 
 _ToolOperation = Callable[[_ExecutionState], Awaitable[ToolResult]]
@@ -451,6 +456,29 @@ class _VirusTotalAdapter:
         self.max_tool_seconds = max_tool_seconds
         self.reserved_vt_units = reserved_vt_units
 
+    async def reservation_cost(
+        self, _arguments: Mapping[str, Any], _context: ToolExecutionContext
+    ) -> Mapping[BudgetDimension, int]:
+        """Reserve enough VT units for every explicitly configured file route."""
+        units = self.reserved_vt_units
+        max_file_report_requests = getattr(self.virustotal, "maximum_file_report_requests", None)
+        if self.name == "vt.file_report" and callable(max_file_report_requests):
+            units = max(1, int(max_file_report_requests()))
+        return {BudgetDimension.VT_UNITS: units}
+
+    def _reserved_vt_units_for(self, context: ToolExecutionContext) -> int:
+        reservation = next(
+            (
+                item
+                for item in context.budget.reservations
+                if item.operation_key == context.idempotency_key
+            ),
+            None,
+        )
+        if reservation is None:
+            return self.reserved_vt_units
+        return int(reservation.amounts.get(BudgetDimension.VT_UNITS, self.reserved_vt_units))
+
     async def _run(
         self,
         arguments: Mapping[str, Any],
@@ -459,6 +487,7 @@ class _VirusTotalAdapter:
     ) -> ToolResult:
         state = _ExecutionState()
         state.available_capabilities = context.available_capabilities
+        state.reserved_vt_units = self._reserved_vt_units_for(context)
         if context.envelope is None or not _external_disclosure_allowed(context.envelope):
             return self._result(
                 state,
@@ -467,96 +496,131 @@ class _VirusTotalAdapter:
                 message="The investigation disclosure bounds do not allow a VirusTotal request.",
                 zero_cost=True,
             )
-        try:
-            return await operation(state)
-        except VirusTotalInvalidInputError:
-            return self._result(
-                state,
-                ToolInvocationStatus.FAILED,
-                reason="invalid_input",
-                message="VirusTotal tool arguments failed operation-specific validation.",
-            )
-        except VirusTotalRelationNotAllowedError:
-            return self._result(
-                state,
-                ToolInvocationStatus.FAILED,
-                reason="relation_not_allowed",
-                message="The requested relation is outside the VirusTotal allowlist.",
-            )
-        except VirusTotalQuotaExceededError as exc:
-            extra: dict[str, Any] = {"reason": "quota"}
-            if exc.retry_after is not None:
-                extra["retry_after"] = max(0.0, float(exc.retry_after))
-            return self._result(
-                state,
-                ToolInvocationStatus.UNAVAILABLE,
-                message="VirusTotal quota is unavailable for this request.",
-                extra=extra,
-            )
-        except VirusTotalNotAuthorizedError:
-            return self._result(
-                state,
-                ToolInvocationStatus.UNAVAILABLE,
-                reason="provider_authorization_refused",
-                message="VirusTotal does not authorize this operation for the configured account.",
-            )
-        except (VirusTotalCapabilityDisabledError, VirusTotalRouteUnavailableError):
-            return self._result(
-                state,
-                ToolInvocationStatus.UNAVAILABLE,
-                reason="capability_unavailable",
-                message="The VirusTotal capability or its configured route is unavailable.",
-            )
-        except VirusTotalConfigurationError:
-            return self._result(
-                state,
-                ToolInvocationStatus.UNAVAILABLE,
-                reason="capability_unavailable",
-                message="The VirusTotal route is not configured.",
-            )
-        except VirusTotalHttpError as exc:
-            if exc.status_code in {401, 403}:
+        with virustotal_external_effect_scope(
+            context.external_effect_authority,
+            context.external_effect_evidence_refs,
+        ):
+            try:
+                result = await operation(state)
+                counts = virustotal_external_effect_counts()
+                if counts is not None and sum(counts) > 0:
+                    sent, _reused = counts
+                    consumed = dict(result.budget_consumed)
+                    consumed[BudgetDimension.VT_UNITS] = min(
+                        sent, self._reserved_vt_units_for(context)
+                    )
+                    if sent == 0:
+                        consumed[BudgetDimension.TOOL_SECONDS] = 0
+                    return replace(result, budget_consumed=consumed)
+                return result
+            except VirusTotalExternalEffectNeedsReviewError:
+                return self._result(
+                    state,
+                    ToolInvocationStatus.NEEDS_REVIEW,
+                    reason="external_effect_needs_review",
+                    message=(
+                        "The VirusTotal request outcome needs reconciliation; it was not resent."
+                    ),
+                )
+            except VirusTotalExternalEffectRefusedError:
+                return self._result(
+                    state,
+                    ToolInvocationStatus.NEEDS_REVIEW,
+                    reason="external_effect_refused",
+                    message="The VirusTotal request was refused before a new send.",
+                )
+            except VirusTotalInvalidInputError:
+                return self._result(
+                    state,
+                    ToolInvocationStatus.FAILED,
+                    reason="invalid_input",
+                    message="VirusTotal tool arguments failed operation-specific validation.",
+                )
+            except VirusTotalRelationNotAllowedError:
+                return self._result(
+                    state,
+                    ToolInvocationStatus.FAILED,
+                    reason="relation_not_allowed",
+                    message="The requested relation is outside the VirusTotal allowlist.",
+                )
+            except VirusTotalQuotaExceededError as exc:
+                extra: dict[str, Any] = {"reason": "quota"}
+                if exc.retry_after is not None:
+                    extra["retry_after"] = max(0.0, float(exc.retry_after))
+                return self._result(
+                    state,
+                    ToolInvocationStatus.UNAVAILABLE,
+                    message="VirusTotal quota is unavailable for this request.",
+                    extra=extra,
+                )
+            except VirusTotalNotAuthorizedError:
                 return self._result(
                     state,
                     ToolInvocationStatus.UNAVAILABLE,
                     reason="provider_authorization_refused",
-                    message="VirusTotal refused authorization for this provider capability.",
+                    message=(
+                        "VirusTotal does not authorize this operation for the configured account."
+                    ),
                 )
-            if _explicit_not_found(exc):
-                observation = await self._record_negative(
-                    context,
-                    state,
-                    reason="The VirusTotal API explicitly reported that the object was not found.",
-                    details={"http_status": 404, "error_code": _safe_error_code(exc)},
-                )
+            except (VirusTotalCapabilityDisabledError, VirusTotalRouteUnavailableError):
                 return self._result(
                     state,
-                    ToolInvocationStatus.EMPTY,
-                    reason="not_found",
-                    message="VirusTotal explicitly reported that this object was not found.",
-                    extra={"negative_observation_ref": str(observation.id)},
+                    ToolInvocationStatus.UNAVAILABLE,
+                    reason="capability_unavailable",
+                    message="The VirusTotal capability or its configured route is unavailable.",
                 )
-            return self._result(
-                state,
-                ToolInvocationStatus.FAILED,
-                reason="provider_error",
-                message="VirusTotal returned an unsuccessful response.",
-                extra={"http_status": exc.status_code} if exc.status_code is not None else {},
-            )
-        except VirusTotalError:
-            return self._result(
-                state,
-                ToolInvocationStatus.FAILED,
-                reason="provider_error",
-                message="The VirusTotal operation failed.",
-            )
-        except (TypeError, ValueError):
-            return self._result(
-                state,
-                ToolInvocationStatus.FAILED,
-                reason="invalid_input",
-                message="VirusTotal tool arguments failed operation-specific validation.",
-            )
+            except VirusTotalConfigurationError:
+                return self._result(
+                    state,
+                    ToolInvocationStatus.UNAVAILABLE,
+                    reason="capability_unavailable",
+                    message="The VirusTotal route is not configured.",
+                )
+            except VirusTotalHttpError as exc:
+                if exc.status_code in {401, 403}:
+                    return self._result(
+                        state,
+                        ToolInvocationStatus.UNAVAILABLE,
+                        reason="provider_authorization_refused",
+                        message="VirusTotal refused authorization for this provider capability.",
+                    )
+                if _explicit_not_found(exc):
+                    observation = await self._record_negative(
+                        context,
+                        state,
+                        reason=(
+                            "The VirusTotal API explicitly reported that the object was not found."
+                        ),
+                        details={"http_status": 404, "error_code": _safe_error_code(exc)},
+                    )
+                    return self._result(
+                        state,
+                        ToolInvocationStatus.EMPTY,
+                        reason="not_found",
+                        message="VirusTotal explicitly reported that this object was not found.",
+                        extra={"negative_observation_ref": str(observation.id)},
+                    )
+                return self._result(
+                    state,
+                    ToolInvocationStatus.FAILED,
+                    reason="provider_error",
+                    message="VirusTotal returned an unsuccessful response.",
+                    extra={"http_status": exc.status_code} if exc.status_code is not None else {},
+                )
+            except VirusTotalError:
+                return self._result(
+                    state,
+                    ToolInvocationStatus.FAILED,
+                    reason="provider_error",
+                    message="The VirusTotal operation failed.",
+                )
+            except (TypeError, ValueError):
+                return self._result(
+                    state,
+                    ToolInvocationStatus.FAILED,
+                    reason="invalid_input",
+                    message="VirusTotal tool arguments failed operation-specific validation.",
+                )
 
     async def _record_negative(
         self,
@@ -657,6 +721,17 @@ class _VirusTotalAdapter:
                 math.ceil(max(0.0, time.monotonic() - state.started_at)), self.max_tool_seconds
             ),
         }
+        counts = virustotal_external_effect_counts()
+        if counts is not None and sum(counts) > 0:
+            sent, _reused = counts
+            consumed[BudgetDimension.VT_UNITS] = min(
+                sent,
+                state.reserved_vt_units
+                if state.reserved_vt_units is not None
+                else self.reserved_vt_units,
+            )
+            if sent == 0:
+                consumed[BudgetDimension.TOOL_SECONDS] = 0
         alternatives: tuple[str, ...] = ()
         if status in {
             ToolInvocationStatus.EMPTY,
@@ -1399,7 +1474,11 @@ class _BehaviourPcapAdapter(_VirusTotalAdapter):
             sink = _BoundedCaptureSink(self.max_capture_bytes)
             state.api_requests = 1
             try:
-                result = await self.virustotal.behaviour_pcap(sandbox_id, sink=sink)
+                result = await self.virustotal.behaviour_pcap(
+                    sandbox_id,
+                    sink=sink,
+                    max_bytes=self.max_capture_bytes,
+                )
                 content = sink.getvalue()
                 if (
                     not content
@@ -1417,6 +1496,8 @@ class _BehaviourPcapAdapter(_VirusTotalAdapter):
                     raise VirusTotalInvalidInputError(
                         "VirusTotal sandbox PCAP hashes do not match the received bytes."
                     )
+            except VirusTotalExternalEffectNeedsReviewError:
+                raise
             except (VirusTotalError, TypeError, ValueError) as exc:
                 extra: dict[str, Any] = {"confirmed_non_execution": True}
                 status_code = getattr(exc, "status_code", None)
@@ -1597,10 +1678,10 @@ def register_virustotal_tools(
                 page_size=1,
                 max_results=20,
                 max_tool_seconds=max_tool_seconds,
-                reserved_vt_units=1,
+                reserved_vt_units=2,
                 article_snapshot_resolver=article_snapshot_resolver,
             ),
-            1,
+            2,
         ),
         (
             "vt.relationships",

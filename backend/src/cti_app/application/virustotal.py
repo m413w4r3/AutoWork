@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, BinaryIO, Literal, Protocol
 
+from cti_app.domain.external_effects import EvidenceReference, ExternalEffectAuthority
 from cti_app.domain.retrohunt import (
     RetrohuntProviderJob,
     RetrohuntProviderResults,
@@ -25,6 +28,58 @@ from cti_app.domain.virustotal import (
 
 if TYPE_CHECKING:
     from cti_app.application.sample_acquisition import SampleAcquisitionResponseOrigin
+
+
+_external_effect_authority: ContextVar[ExternalEffectAuthority | None] = ContextVar(
+    "virustotal_external_effect_authority", default=None
+)
+_external_effect_evidence_refs: ContextVar[tuple[EvidenceReference, ...]] = ContextVar(
+    "virustotal_external_effect_evidence_refs", default=()
+)
+_external_effect_counts: ContextVar[tuple[int, int] | None] = ContextVar(
+    "virustotal_external_effect_counts", default=None
+)
+
+
+@contextmanager
+def virustotal_external_effect_scope(
+    authority: ExternalEffectAuthority | None,
+    evidence_refs: tuple[EvidenceReference, ...] = (),
+) -> Iterator[None]:
+    """Bind a dispatcher-provided authority to one async VT tool call."""
+    token = _external_effect_authority.set(authority)
+    evidence_token = _external_effect_evidence_refs.set(tuple(evidence_refs))
+    counts_token = _external_effect_counts.set((0, 0))
+    try:
+        yield
+    finally:
+        _external_effect_counts.reset(counts_token)
+        _external_effect_evidence_refs.reset(evidence_token)
+        _external_effect_authority.reset(token)
+
+
+def current_virustotal_external_effect_authority() -> ExternalEffectAuthority | None:
+    """Return the authority bound by the current investigation tool call."""
+    return _external_effect_authority.get()
+
+
+def current_virustotal_external_effect_evidence_refs() -> tuple[EvidenceReference, ...]:
+    """Return trusted source references bound by the investigation service."""
+    return _external_effect_evidence_refs.get()
+
+
+def record_virustotal_external_effect(*, reused: bool) -> None:
+    """Record one successful physical-send or completed-claim reuse in this tool call."""
+    counts = _external_effect_counts.get()
+    if counts is None:
+        return
+    sent, reused_count = counts
+    _external_effect_counts.set((sent, reused_count + 1) if reused else (sent + 1, reused_count))
+
+
+def virustotal_external_effect_counts() -> tuple[int, int] | None:
+    """Return successful VT send and reuse counts for the active tool call."""
+    return _external_effect_counts.get()
 
 
 class VirusTotalError(RuntimeError):
@@ -95,6 +150,14 @@ class VirusTotalError(RuntimeError):
         self.fallback_decision = fallback_decision
         if response_origin is not None:
             self.response_origin = response_origin
+
+
+class VirusTotalExternalEffectRefusedError(VirusTotalError):
+    code = "virustotal_external_effect_refused"
+
+
+class VirusTotalExternalEffectNeedsReviewError(VirusTotalExternalEffectRefusedError):
+    code = "virustotal_external_effect_needs_review"
 
 
 class VirusTotalConfigurationError(VirusTotalError):
@@ -278,13 +341,14 @@ class VirusTotalRawResponse:
     """The safe, httpx-independent shape of one successful upstream response.
 
     Carries only what the domain and persistence layers need to reproduce
-    the transport's outcome: the exact body bytes and the HTTP status the
-    server actually returned. Never carries headers, cookies, or anything
-    that could leak credentials.
+    the transport's outcome: the exact body bytes, HTTP status, and a
+    normalized content-type class. Never carries headers, cookies, or
+    anything that could leak credentials.
     """
 
     body: bytes
     status_code: int
+    content_type_class: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -386,7 +450,7 @@ class VirusTotalPort(Protocol):
     ) -> VirusTotalDownloadResult: ...
 
     async def behaviour_pcap(
-        self, sandbox_id: str, *, sink: BinaryIO
+        self, sandbox_id: str, *, sink: BinaryIO, max_bytes: int | None = None
     ) -> VirusTotalDownloadResult: ...
 
     async def file_relationship(

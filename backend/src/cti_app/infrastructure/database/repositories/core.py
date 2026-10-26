@@ -1222,6 +1222,15 @@ class SqlAlchemySampleRepository:
         )
         return _sample_from_row(row) if row else None
 
+    async def list_by_subject_and_sha256(self, subject_id: UUID, sha256: str) -> Sequence[Sample]:
+        rows = await self._session.scalars(
+            select(SampleRow)
+            .join(BlobRow, BlobRow.id == SampleRow.blob_id)
+            .where(SampleRow.subject_id == subject_id, BlobRow.sha256 == sha256)
+            .order_by(SampleRow.id)
+        )
+        return [_sample_from_row(row) for row in rows]
+
     async def save(self, sample: Sample) -> None:
         row = await self._session.get(SampleRow, sample.id)
         if row is None:

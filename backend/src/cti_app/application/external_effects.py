@@ -16,8 +16,9 @@ import asyncio
 import threading
 import time
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
-from typing import Any, Protocol, SupportsIndex
+from dataclasses import dataclass, field
+from enum import StrEnum
+from typing import Any, Protocol, SupportsIndex, cast
 from uuid import UUID, uuid4
 
 from cti_app.domain.external_effects import (
@@ -29,7 +30,7 @@ from cti_app.domain.external_effects import (
     ExternalEffectValidationError,
     FrozenWireRequest,
     PreparedExternalRequest,
-    application_request_sha256,
+    _wire_request_sha256,
     effect_key,
     occurrence_sha256,
     validate_persistable_reference,
@@ -61,6 +62,9 @@ class ExternalEffectClaim:
     state: EffectClaimState
     evidence_refs: tuple[EvidenceReference, ...] = ()
     result_ref: str | None = None
+    bridge_turn_id: UUID | None = None
+    model_run_id: UUID | None = None
+    outcome_code: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +145,7 @@ class ExternalEffectClaimStore(Protocol):
         *,
         result_ref: str | None,
         evidence_refs: tuple[EvidenceReference, ...],
+        outcome_code: str | None = None,
     ) -> bool: ...
 
     async def enter_handoff(
@@ -180,12 +185,24 @@ class ExternalEffectClaimStore(Protocol):
 class TransportResponse:
     result_ref: str | None = None
     evidence_refs: tuple[EvidenceReference, ...] = ()
+    outcome_code: str | None = None
+    payload: bytes | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.result_ref is not None:
             validate_persistable_reference(self.result_ref, "result_ref")
         if any(not isinstance(item, EvidenceReference) for item in self.evidence_refs):
             raise ExternalEffectValidationError("transport evidence refs must be typed references")
+        if self.outcome_code is not None and not _is_safe_outcome_code(self.outcome_code):
+            raise ExternalEffectValidationError("transport outcome code is invalid")
+        if self.payload is not None and not isinstance(self.payload, bytes):
+            raise ExternalEffectValidationError("transport payload must be bytes")
+
+
+class NoSubmissionProofKind(StrEnum):
+    """Coordinator-verified proof phase delivered only to the claim store."""
+
+    BEFORE_HANDOFF = "before_handoff"
 
 
 @dataclass(frozen=True, slots=True, init=False, repr=False)
@@ -194,6 +211,7 @@ class _CoordinatorNoHandoffProof:
 
     claim_id: UUID
     nonce: UUID
+    kind: NoSubmissionProofKind
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         raise TypeError("no-handoff proofs are issued by ExternalEffectCoordinator")
@@ -215,15 +233,15 @@ class _NoHandoffProofVerifier:
             return
         raise ValueError("no-handoff verifier is already bound to a store")
 
-    def consume(self, store: object, proof: object, claim_id: UUID) -> bool:
+    def consume(self, store: object, proof: object, claim_id: UUID) -> NoSubmissionProofKind | None:
         try:
             bound_store = object.__getattribute__(self, "_NoHandoffProofVerifier__store")
             consume = object.__getattribute__(self, "_NoHandoffProofVerifier__consume")
         except AttributeError:
-            return False
+            return None
         if bound_store is not store:
-            return False
-        return consume(proof, claim_id) is True
+            return None
+        return cast(NoSubmissionProofKind | None, consume(proof, claim_id))
 
 
 class PermitHandoffGate(Protocol):
@@ -286,14 +304,12 @@ def _install_physical_send_capability_dispatch() -> tuple[
 
     def dispatch(capability: PhysicalSendCapability, request: FrozenWireRequest) -> None:
         with registry_lock:
-            authorize = authorizers.get(capability)
-        if authorize is None:
+            registered = authorizers.get(capability)
+        if registered is None:
             raise HandoffGateRefused("physical send capability is not registered")
-        authorize(request)
+        registered(request)
 
-    def issue(
-        authorize: Callable[[FrozenWireRequest], None],
-    ) -> PhysicalSendCapability:
+    def issue(authorize: Callable[[FrozenWireRequest], None]) -> PhysicalSendCapability:
         capability = object.__new__(PhysicalSendCapability)
         with registry_lock:
             authorizers[capability] = authorize
@@ -352,6 +368,8 @@ class Completed:
     claim_id: UUID
     result_ref: str | None
     evidence_refs: tuple[EvidenceReference, ...]
+    outcome_code: str | None = None
+    payload: bytes | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -474,10 +492,10 @@ class _PermitRegistry:
             and permit.family == prepared.family
             and permit.provider == prepared.provider
             and permit.provider_scope == prepared.provider_scope
-            and permit.request_digest == prepared.application_request_sha256
+            and permit.request_digest == prepared.physical_request_sha256
             and permit.envelope_version == authority.expected_envelope_version
             and permit.approval_decision_id == authority.approval_decision_id
-            and application_request_sha256(prepared.application_request) == permit.request_digest
+            and _wire_request_sha256(prepared.application_request) == permit.request_digest
         )
 
 
@@ -489,28 +507,36 @@ class ExternalEffectCoordinator:
         *,
         reuse_policies: Mapping[str, ExternalEffectReusePolicy] | None = None,
         permit_ttl_seconds: float = 5.0,
-        capability_issuer: Callable[[Callable[[FrozenWireRequest], None]], PhysicalSendCapability],
+        capability_issuer: Callable[
+            [Callable[[FrozenWireRequest], None]],
+            PhysicalSendCapability,
+        ],
         capability_revoker: Callable[[PhysicalSendCapability], None],
     ) -> None:
         self._claim_store = claim_store
         self._reuse_policies = dict(reuse_policies or {})
         permit_registry = _PermitRegistry(ttl_seconds=permit_ttl_seconds)
 
-        issued_proofs: dict[UUID, tuple[UUID, _CoordinatorNoHandoffProof]] = {}
+        issued_proofs: dict[
+            UUID, tuple[UUID, _CoordinatorNoHandoffProof, NoSubmissionProofKind]
+        ] = {}
         proof_lock = threading.Lock()
 
-        def issue_no_handoff_proof(claim_id: UUID) -> _CoordinatorNoHandoffProof:
+        def issue_no_handoff_proof(
+            claim_id: UUID, kind: NoSubmissionProofKind
+        ) -> _CoordinatorNoHandoffProof:
             nonce = uuid4()
             proof = object.__new__(_CoordinatorNoHandoffProof)
             object.__setattr__(proof, "claim_id", claim_id)
             object.__setattr__(proof, "nonce", nonce)
+            object.__setattr__(proof, "kind", kind)
             with proof_lock:
-                issued_proofs[nonce] = (claim_id, proof)
+                issued_proofs[nonce] = (claim_id, proof, kind)
             return proof
 
-        def consume_no_handoff_proof(proof: object, claim_id: UUID) -> bool:
+        def consume_no_handoff_proof(proof: object, claim_id: UUID) -> NoSubmissionProofKind | None:
             if not isinstance(proof, _CoordinatorNoHandoffProof):
-                return False
+                return None
             nonce = getattr(proof, "nonce", None)
             bound_claim_id = getattr(proof, "claim_id", None)
             if (
@@ -518,13 +544,13 @@ class ExternalEffectCoordinator:
                 or not isinstance(bound_claim_id, UUID)
                 or bound_claim_id != claim_id
             ):
-                return False
+                return None
             with proof_lock:
                 registered = issued_proofs.get(nonce)
                 if registered is None or registered[0] != claim_id or registered[1] is not proof:
-                    return False
+                    return None
                 del issued_proofs[nonce]
-                return True
+                return registered[2]
 
         verifier = object.__new__(_NoHandoffProofVerifier)
         object.__setattr__(verifier, "_NoHandoffProofVerifier__consume", consume_no_handoff_proof)
@@ -536,7 +562,7 @@ class ExternalEffectCoordinator:
             prepared: PreparedExternalRequest,
             key: str,
             transport: PermitAwareTransport,
-            handoff_state: dict[str, bool],
+            handoff_state: dict[str, Any],
         ) -> TransportResponse:
             if not permit_registry.is_valid(permit, authority, prepared, key):
                 raise _PreHandoffGateRefused("permit expired, invalid, or already used")
@@ -545,7 +571,7 @@ class ExternalEffectCoordinator:
                 validate_prepared_request(prepared)
             except ExternalEffectValidationError as exc:
                 raise _PreHandoffGateRefused("prepared request changed before handoff") from exc
-            if application_request_sha256(request) != permit.request_digest:
+            if _wire_request_sha256(request) != permit.request_digest:
                 raise _PreHandoffGateRefused("physical request digest mismatch")
             try:
                 admitted = await claim_store.enter_handoff(
@@ -579,7 +605,7 @@ class ExternalEffectCoordinator:
                     capability_attempted = True
                     if sent_request is not request:
                         raise HandoffGateRefused("physical request substitution refused")
-                    actual_digest = application_request_sha256(sent_request)
+                    actual_digest = _wire_request_sha256(sent_request)
                     try:
                         validate_prepared_request(prepared)
                     except ExternalEffectValidationError as exc:
@@ -611,9 +637,9 @@ class ExternalEffectCoordinator:
             return response
 
         async def seal_zero_handoff(
-            claim_id: UUID, *, reason_code: str
+            claim_id: UUID, *, reason_code: str, kind: NoSubmissionProofKind
         ) -> DefinitelyNotSubmitted | Ambiguous:
-            proof = issue_no_handoff_proof(claim_id)
+            proof = issue_no_handoff_proof(claim_id, kind)
             try:
                 changed = await claim_store.definitely_not_submitted(
                     claim_id, proof=proof, reason_code=reason_code
@@ -688,10 +714,12 @@ class ExternalEffectCoordinator:
             permit = permit_registry.issue(consume.claim_id, authority, prepared, key)
             if not permit_registry.is_valid(permit, authority, prepared, key):
                 return await seal_zero_handoff(
-                    consume.claim_id, reason_code="permit_validation_failed"
+                    consume.claim_id,
+                    reason_code="permit_validation_failed",
+                    kind=NoSubmissionProofKind.BEFORE_HANDOFF,
                 )
 
-            handoff_state = {"entered": False}
+            handoff_state: dict[str, Any] = {"entered": False}
             try:
                 response = await submit_through_gate(
                     permit, authority, prepared, key, transport, handoff_state
@@ -704,7 +732,9 @@ class ExternalEffectCoordinator:
                     await self._seal_needs_review(consume.claim_id, "transport_outcome_unknown")
                     return Ambiguous(consume.claim_id)
                 return await seal_zero_handoff(
-                    consume.claim_id, reason_code="pre_handoff_gate_refused"
+                    consume.claim_id,
+                    reason_code="pre_handoff_gate_refused",
+                    kind=NoSubmissionProofKind.BEFORE_HANDOFF,
                 )
             except Exception:
                 await self._seal_needs_review(consume.claim_id, "transport_outcome_unknown")
@@ -718,13 +748,20 @@ class ExternalEffectCoordinator:
                     consume.claim_id,
                     result_ref=response.result_ref,
                     evidence_refs=response.evidence_refs,
+                    outcome_code=response.outcome_code,
                 )
             except Exception:
                 completed = False
             if not completed:
                 await self._seal_needs_review(consume.claim_id, "outcome_persist_failed")
                 return Ambiguous(consume.claim_id)
-            return Completed(consume.claim_id, response.result_ref, response.evidence_refs)
+            return Completed(
+                consume.claim_id,
+                response.result_ref,
+                response.evidence_refs,
+                response.outcome_code,
+                response.payload,
+            )
 
         # The issuer stays in this closure; no coordinator attribute exposes it.
         self.send_one: Callable[
@@ -752,6 +789,23 @@ class ExternalEffectCoordinator:
                 FrameworkNoSendProof("EXISTING_CLAIM", "effect_binding_conflict"),
             )
         if claim.state is EffectClaimState.COMPLETED:
+            if claim.outcome_code is not None:
+                if (
+                    claim.invocation_id == authority.invocation_id
+                    and claim.bridge_turn_id == authority.bridge_turn_id
+                    and claim.model_run_id == authority.model_run_id
+                ):
+                    return Completed(
+                        claim.id,
+                        claim.result_ref,
+                        claim.evidence_refs,
+                        claim.outcome_code,
+                    )
+                await self._release_refused_reuse_reservation(claim, authority, prepared)
+                return Refused(
+                    "effect_occurrence_required",
+                    FrameworkNoSendProof("EXISTING_CLAIM", "effect_occurrence_required"),
+                )
             policy = self._reuse_policies.get(prepared.family)
             if policy is None:
                 await self._release_refused_reuse_reservation(claim, authority, prepared)
@@ -787,6 +841,8 @@ class ExternalEffectCoordinator:
             )
         if claim.state is EffectClaimState.DEFINITIVELY_NOT_SUBMITTED:
             return DefinitelyNotSubmitted(claim.id)
+        if claim.state is EffectClaimState.CONSUMED:
+            await self._seal_needs_review(claim.id, "replayed_consumed_claim")
         return Ambiguous(claim.id)
 
     async def _release_refused_reuse_reservation(
@@ -816,6 +872,10 @@ class ExternalEffectCoordinator:
 del _bind_capability_init
 
 
+def _is_safe_outcome_code(value: str) -> bool:
+    return isinstance(value, str) and value in {"bridge_rate_limited", "bridge_rejected"}
+
+
 __all__ = [
     "Ambiguous",
     "Completed",
@@ -833,6 +893,7 @@ __all__ = [
     "ExternalEffectReusePolicy",
     "FrameworkNoSendProof",
     "HandoffGateRefused",
+    "NoSubmissionProofKind",
     "PermitAwareTransport",
     "PermitHandoffGate",
     "PhysicalSendCapability",

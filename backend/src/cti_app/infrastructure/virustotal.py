@@ -7,7 +7,9 @@ import json
 import logging
 import re
 import ssl
+import struct
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from enum import StrEnum
@@ -17,6 +19,18 @@ from uuid import uuid4
 
 import httpx
 
+from cti_app.application.external_effects import (
+    Ambiguous,
+    Completed,
+    DefinitelyNotSubmitted,
+    ExternalEffectCoordinator,
+    HandoffGateRefused,
+    PermitAwareTransport,
+    PhysicalSendCapability,
+    Refused,
+    Reused,
+    TransportResponse,
+)
 from cti_app.application.sample_acquisition import (
     SampleAcquisitionCacheScope,
     SampleAcquisitionResponseOrigin,
@@ -36,6 +50,8 @@ from cti_app.application.virustotal import (
     VirusTotalDownloadTooLargeError,
     VirusTotalDownloadTruncatedError,
     VirusTotalError,
+    VirusTotalExternalEffectNeedsReviewError,
+    VirusTotalExternalEffectRefusedError,
     VirusTotalFile,
     VirusTotalFileReport,
     VirusTotalHttpError,
@@ -59,11 +75,23 @@ from cti_app.application.virustotal import (
     VirusTotalSignedUrlExpiredError,
     VirusTotalTransportError,
     VirusTotalUnexpectedRedirectError,
+    current_virustotal_external_effect_authority,
+    current_virustotal_external_effect_evidence_refs,
     file_hash_family,
     normalize_file_hash,
+    record_virustotal_external_effect,
     validate_search_query,
 )
+from cti_app.application.virustotal_persistence import (
+    ArchivedVirusTotalResponse,
+    VirusTotalObservationService,
+)
 from cti_app.config import VIRUSTOTAL_DOWNLOAD_REQUIRED_CDN_HOST, Settings
+from cti_app.domain.external_effects import (
+    EvidenceReference,
+    FrozenWireRequest,
+    PreparedExternalRequest,
+)
 from cti_app.domain.retrohunt import (
     RetrohuntProviderJob,
     RetrohuntProviderResults,
@@ -84,6 +112,8 @@ logger = logging.getLogger(__name__)
 
 
 _MAX_ERROR_BODY_BYTES = 64 * 1024
+_VT_RESULT_MAGIC = b"VT-READ-RESULT\x01\0"
+_VT_READ_NORMALIZER_VERSION = "vt-read.v1"
 _DOWNLOAD_FINGERPRINT_CONFIG_VERSION = "vt-download-transport-v2"
 VIRUSTOTAL_PROXY_QUERY_SENTINEL_NAME = "x"
 VIRUSTOTAL_PROXY_QUERY_SENTINEL_VALUE = "1"
@@ -226,6 +256,268 @@ def create_virustotal_direct_http_client(settings: Settings) -> httpx.AsyncClien
     )
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class _TransientVirusTotalResponse:
+    status_code: int
+    content_type_class: str
+    location_host: str | None
+    retry_after: float | None
+    issuer: str
+    oversized: bool
+    body: bytes
+
+
+class _VirusTotalPermitAwareTransport(PermitAwareTransport):
+    """The only gated-read owner of a raw VT HTTPX request/client call."""
+
+    __slots__ = ("__archive", "__client", "__frozen_request", "__max_bytes", "__request")
+
+    def __init__(
+        self,
+        *,
+        client: httpx.AsyncClient,
+        request: httpx.Request,
+        frozen_request: FrozenWireRequest,
+        archive: VirusTotalObservationService,
+        max_response_bytes: int,
+    ) -> None:
+        self.__client = client
+        self.__request = request
+        self.__frozen_request = frozen_request
+        self.__archive = archive
+        self.__max_bytes = max_response_bytes
+
+    async def submit_once(
+        self, request: FrozenWireRequest, capability: PhysicalSendCapability
+    ) -> TransportResponse:
+        if request is not self.__frozen_request or _freeze_httpx_request(self.__request) != request:
+            raise HandoffGateRefused("prepared VT request changed before physical send")
+        capability(request)
+        response = await self.__client.send(
+            self.__request,
+            follow_redirects=False,
+            stream=True,
+        )
+        try:
+            status_code = response.status_code
+            content_type_class = _content_type_class(response.headers.get("Content-Type"))
+            location_host = _url_host(response.headers.get("Location"))
+            retry_after = _retry_after(response.headers.get("Retry-After"))
+            limit = self.__max_bytes + 1 if status_code < 300 else _MAX_ERROR_BODY_BYTES
+            body = await _read_response_prefix(response, limit)
+            oversized = status_code < 300 and len(body) > self.__max_bytes
+            issuer = _response_issuer(response.headers, body)
+            transient = _TransientVirusTotalResponse(
+                status_code=status_code,
+                content_type_class=content_type_class,
+                location_host=location_host,
+                retry_after=retry_after,
+                issuer=issuer,
+                oversized=oversized,
+                body=body,
+            )
+            reference = await self.__archive.archive_external_response(
+                body,
+                status_code=status_code,
+                content_type_class=content_type_class,
+                location_host=location_host,
+                retry_after=retry_after,
+                issuer=issuer,
+                oversized=oversized,
+            )
+            return TransportResponse(
+                result_ref=reference.id,
+                evidence_refs=(reference,),
+                payload=_encode_vt_transient_response(transient),
+            )
+        finally:
+            await response.aclose()
+
+
+def _freeze_httpx_request(request: httpx.Request) -> FrozenWireRequest:
+    return FrozenWireRequest(
+        method=request.method.encode("ascii"),
+        target=request.url.raw_path,
+        headers=tuple((bytes(name), bytes(value)) for name, value in request.headers.raw),
+        body=request.content,
+    )
+
+
+def _credential_free_query(request: httpx.Request) -> list[list[str]]:
+    safe: list[list[str]] = []
+    for name, value in request.url.params.multi_items():
+        # VT v2 names this credential parameter exactly `apikey`. Keep other
+        # query names and values in canonical identity rather than applying a
+        # heuristic that could make distinct application requests collide.
+        if name.casefold() == "apikey":
+            continue
+        safe.append([name, value])
+    return safe
+
+
+def _encode_vt_transient_response(response: _TransientVirusTotalResponse) -> bytes:
+    metadata = json.dumps(
+        {
+            "content_type_class": response.content_type_class,
+            "issuer": response.issuer,
+            "location_host": response.location_host,
+            "oversized": response.oversized,
+            "retry_after": response.retry_after,
+            "status_code": response.status_code,
+        },
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    return _VT_RESULT_MAGIC + struct.pack(">I", len(metadata)) + metadata + response.body
+
+
+def _decode_vt_transient_response(payload: bytes | None) -> _TransientVirusTotalResponse | None:
+    if not isinstance(payload, bytes) or not payload.startswith(_VT_RESULT_MAGIC):
+        return None
+    offset = len(_VT_RESULT_MAGIC)
+    if len(payload) < offset + 4:
+        return None
+    metadata_length = struct.unpack(">I", payload[offset : offset + 4])[0]
+    start = offset + 4
+    end = start + metadata_length
+    if end > len(payload):
+        return None
+    try:
+        metadata = json.loads(payload[start:end].decode("ascii"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(metadata, dict):
+        return None
+    status_code = metadata.get("status_code")
+    content_type_class = metadata.get("content_type_class")
+    issuer = metadata.get("issuer")
+    location_host = metadata.get("location_host")
+    retry_after = metadata.get("retry_after")
+    oversized = metadata.get("oversized")
+    if (
+        isinstance(status_code, bool)
+        or not isinstance(status_code, int)
+        or not 100 <= status_code <= 599
+        or content_type_class not in {"missing", "html", "json", "binary", "text", "other"}
+        or issuer not in {"unknown", "proxy-likely", "upstream-vt-likely"}
+        or (location_host is not None and not isinstance(location_host, str))
+        or (
+            retry_after is not None
+            and (isinstance(retry_after, bool) or not isinstance(retry_after, int | float))
+        )
+        or not isinstance(oversized, bool)
+    ):
+        return None
+    return _TransientVirusTotalResponse(
+        status_code=status_code,
+        content_type_class=content_type_class,
+        location_host=location_host,
+        retry_after=float(retry_after) if retry_after is not None else None,
+        issuer=issuer,
+        oversized=oversized,
+        body=payload[end:],
+    )
+
+
+def _one_raw_response_reference(
+    references: tuple[EvidenceReference, ...],
+) -> EvidenceReference | None:
+    matches = tuple(reference for reference in references if reference.kind == "vt.raw_response")
+    return matches[0] if len(matches) == 1 else None
+
+
+async def _read_vt_archive(
+    archive: VirusTotalObservationService,
+    reference: EvidenceReference,
+    maximum: int,
+) -> ArchivedVirusTotalResponse:
+    try:
+        return await archive.read_external_response(reference, max_bytes=maximum)
+    except Exception:
+        raise VirusTotalExternalEffectNeedsReviewError(
+            "The VirusTotal response archive is missing or unverifiable."
+        ) from None
+
+
+def _transient_from_archive(archived: ArchivedVirusTotalResponse) -> _TransientVirusTotalResponse:
+    return _TransientVirusTotalResponse(
+        status_code=archived.status_code,
+        content_type_class=archived.content_type_class,
+        location_host=archived.location_host,
+        retry_after=archived.retry_after,
+        issuer=archived.issuer,
+        oversized=archived.oversized,
+        body=archived.body,
+    )
+
+
+def _httpx_response_from_transient(
+    request: httpx.Request, transient: _TransientVirusTotalResponse
+) -> httpx.Response:
+    content_types = {
+        "html": "text/html",
+        "json": "application/json",
+        "binary": "application/octet-stream",
+        "text": "text/plain",
+        "other": "application/octet-stream",
+    }
+    headers: dict[str, str] = {}
+    content_type = content_types.get(transient.content_type_class)
+    if content_type is not None:
+        headers["Content-Type"] = content_type
+    if transient.location_host is not None:
+        headers["Location"] = f"https://{transient.location_host}/"
+    if transient.retry_after is not None:
+        headers["Retry-After"] = str(transient.retry_after)
+    if transient.issuer == "proxy-likely":
+        headers["Via"] = "gated-proxy"
+    elif transient.issuer == "upstream-vt-likely":
+        headers["Server"] = "VirusTotal"
+    return httpx.Response(
+        transient.status_code,
+        headers=headers,
+        content=transient.body,
+        request=request,
+    )
+
+
+async def _read_response_prefix(response: httpx.Response, maximum: int) -> bytes:
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in response.aiter_bytes():
+        remaining = maximum - size
+        if remaining <= 0:
+            break
+        chunks.append(chunk[:remaining])
+        size += min(len(chunk), remaining)
+        if len(chunk) > remaining:
+            break
+    return b"".join(chunks)
+
+
+def _virustotal_external_effect_family(
+    operation: VirusTotalOperation | None, capability: str | None
+) -> str | None:
+    if operation is VirusTotalOperation.FILE_DOWNLOAD:
+        return None
+    if capability == "object_report":
+        return "vt.object_report"
+    if capability == VirusTotalCapability.BEHAVIOUR_PCAP.value:
+        return "vt.behaviour_pcap"
+    if operation is None:
+        return None
+    families = {
+        VirusTotalOperation.FILE_REPORT: "vt.file_report",
+        VirusTotalOperation.FILE_RELATIONSHIP: "vt.relationships",
+        VirusTotalOperation.OBJECT_RELATIONSHIP: "vt.relationships",
+        VirusTotalOperation.INTELLIGENCE_SEARCH: "vt.intelligence_search",
+        VirusTotalOperation.BEHAVIOURS: "vt.behaviour",
+    }
+    return families.get(operation)
+
+
 class VirusTotalHttpAdapter(VirusTotalPort):
     def __init__(
         self,
@@ -255,8 +547,12 @@ class VirusTotalHttpAdapter(VirusTotalPort):
         download_max_bytes: int = 200 * 1024 * 1024,
         download_timeout_seconds: float = 120.0,
         download_client_factory: Callable[[], httpx.AsyncClient] | None = None,
+        offline_probe_mode: bool = False,
     ) -> None:
         self._client = client
+        self._external_effect_coordinator: ExternalEffectCoordinator | None = None
+        self._raw_response_archive: VirusTotalObservationService | None = None
+        self._offline_probe_mode = offline_probe_mode
         self._base_url = _validate_base_url(base_url)
         self._fallback_base_url = (
             _validate_base_url(fallback_base_url) if fallback_base_url else None
@@ -395,6 +691,20 @@ class VirusTotalHttpAdapter(VirusTotalPort):
             if download_route is not None
             else "unconfigured"
         )
+
+    def configure_external_effects(
+        self,
+        coordinator: ExternalEffectCoordinator,
+        raw_response_archive: VirusTotalObservationService,
+    ) -> None:
+        """Bind the investigation-only coordinator and canonical raw response archive."""
+        self._external_effect_coordinator = coordinator
+        self._raw_response_archive = raw_response_archive
+
+    def maximum_file_report_requests(self) -> int:
+        """Return the maximum physical sends allowed by the configured file route."""
+        route = self._routing_policy.route_for(VirusTotalCapability.FILE_REPORT)
+        return len(route.steps()) if route is not None else 1
 
     @property
     def sample_acquisition_cache_scope(self) -> SampleAcquisitionCacheScope:
@@ -747,7 +1057,9 @@ class VirusTotalHttpAdapter(VirusTotalPort):
             )
             raise
 
-    async def behaviour_pcap(self, sandbox_id: str, *, sink: BinaryIO) -> VirusTotalDownloadResult:
+    async def behaviour_pcap(
+        self, sandbox_id: str, *, sink: BinaryIO, max_bytes: int | None = None
+    ) -> VirusTotalDownloadResult:
         correlation_id = uuid4().hex
         fingerprint = self.acquisition_route_fingerprint
         if (
@@ -782,29 +1094,34 @@ class VirusTotalHttpAdapter(VirusTotalPort):
         step = route.primary
         client, base_url = self._resolve_transport(step)
         normalized_id = quote(sandbox_id.strip(), safe="")
+        capture_limit = (
+            self._download_max_bytes
+            if max_bytes is None
+            else min(self._download_max_bytes, _positive(max_bytes, "max_bytes"))
+        )
         try:
             async with asyncio.timeout(self._download_timeout_seconds):
-                return await _stream_route_download(
-                    client,
-                    f"{base_url}/file_behaviours/{normalized_id}/pcap",
-                    sink=sink,
-                    expected_hash=None,
-                    expected_family=None,
-                    expected_magic=_PCAP_MAGIC,
-                    max_bytes=self._download_max_bytes,
-                    allowed_hosts=self._download_allowed_hosts,
-                    allowed_ports=self._download_allowed_ports,
-                    max_redirects=self._download_max_redirects,
-                    download_client_factory=self._download_client,
-                    proxy_query_sentinel_enabled=self._proxy_query_sentinel_enabled,
-                    follow_redirects=True,
-                    operation=None,
+                response = await self._get(
+                    f"/file_behaviours/{normalized_id}/pcap",
+                    client=client,
+                    base_url=base_url,
                     route=_route_name(step),
                     capability=VirusTotalCapability.BEHAVIOUR_PCAP.value,
                     correlation_id=correlation_id,
                     fingerprint=fingerprint,
                     secret_values=(self._api_key,) if self._api_key else (),
+                    response_max_bytes=capture_limit,
                 )
+        except VirusTotalResponseTooLargeError as caught_error:
+            raise VirusTotalDownloadTooLargeError(
+                "Le PCAP VirusTotal dépasse la limite configurée.",
+                route=_route_name(step),
+                route_path="/file_behaviours/{sandbox_id}/pcap",
+                transport=_transport_name(step),
+                bytes_read=capture_limit + 1,
+                correlation_id=correlation_id,
+                fingerprint=fingerprint,
+            ) from caught_error
         except TimeoutError:
             raise VirusTotalTransportError(
                 "Le téléchargement PCAP VirusTotal a expiré.",
@@ -827,6 +1144,49 @@ class VirusTotalHttpAdapter(VirusTotalPort):
                 response_origin=SampleAcquisitionResponseOrigin.UNKNOWN,
             )
             raise
+
+        if response.status_code == 204 or not response.body:
+            raise VirusTotalDownloadEmptyError(
+                "La route de téléchargement VirusTotal a renvoyé un contenu vide.",
+                status_code=response.status_code,
+                route=_route_name(step),
+                transport=_transport_name(step),
+                content_type_class=response.content_type_class,
+                correlation_id=correlation_id,
+                fingerprint=fingerprint,
+            )
+        content_type_class = response.content_type_class or "missing"
+        if _sniff_binary_error(response.body[:16], content_type_class) is not None:
+            raise VirusTotalDownloadNotBinaryError(
+                "La route PCAP VirusTotal a renvoyé une page HTML ou JSON.",
+                status_code=response.status_code,
+                route=_route_name(step),
+                transport=_transport_name(step),
+                content_type_class=content_type_class,
+                bytes_read=len(response.body),
+                correlation_id=correlation_id,
+                fingerprint=fingerprint,
+            )
+        if not any(response.body.startswith(magic) for magic in _PCAP_MAGIC):
+            raise VirusTotalPayloadError(
+                "Le contenu reçu n'a pas une signature PCAP ou PCAPNG reconnue.",
+                code="virustotal_pcap_magic_invalid",
+                status_code=response.status_code,
+                route=_route_name(step),
+                transport=_transport_name(step),
+                content_type_class=content_type_class,
+                bytes_read=len(response.body),
+                correlation_id=correlation_id,
+                fingerprint=fingerprint,
+            )
+        content = response.body
+        sink.write(content)
+        return VirusTotalDownloadResult(
+            md5=hashlib.md5(content, usedforsecurity=False).hexdigest(),
+            sha1=hashlib.sha1(content, usedforsecurity=False).hexdigest(),
+            sha256=hashlib.sha256(content).hexdigest(),
+            size=len(content),
+        )
 
     async def object_report(
         self,
@@ -1235,11 +1595,17 @@ class VirusTotalHttpAdapter(VirusTotalPort):
         fingerprint: str | None = None,
         fallback_decision: str | None = None,
         secret_values: tuple[str | None, ...] = (),
+        response_max_bytes: int | None = None,
     ) -> VirusTotalRawResponse:
         correlation_id = correlation_id or uuid4().hex
         normalized_route = _normalize_route(path)
         route_label = route or "proxy:v3"
         transport = _transport_name_from_label(route_label)
+        max_response_bytes = (
+            self._max_response_bytes
+            if response_max_bytes is None
+            else _positive(response_max_bytes, "response_max_bytes")
+        )
         response: httpx.Response | None = None
         content_type_class: str | None = None
         location_host: str | None = None
@@ -1250,11 +1616,22 @@ class VirusTotalHttpAdapter(VirusTotalPort):
                 transport=transport,
                 sentinel_enabled=self._proxy_query_sentinel_enabled,
             )
-            response = await (client or self._client).get(
-                f"{base_url or self._base_url}{path}",
-                params=request_params,
-                follow_redirects=False,
-            )
+            family = _virustotal_external_effect_family(operation, capability)
+            if family is None:
+                response = await (client or self._client).get(
+                    f"{base_url or self._base_url}{path}",
+                    params=request_params,
+                    follow_redirects=False,
+                )
+            else:
+                response = await self._coordinated_read(
+                    client=client or self._client,
+                    url=f"{base_url or self._base_url}{path}",
+                    params=request_params,
+                    family=family,
+                    route=route_label,
+                    max_response_bytes=max_response_bytes,
+                )
             content_type_class = _content_type_class(response.headers.get("Content-Type"))
             location_host = _url_host(response.headers.get("Location"))
             if 300 <= response.status_code < 400:
@@ -1292,7 +1669,7 @@ class VirusTotalHttpAdapter(VirusTotalPort):
                     fallback_decision=fallback_decision,
                     secret_values=secret_values + ((self._api_key,) if self._api_key else ()),
                 )
-            body = await _read_bounded(response, self._max_response_bytes)
+            body = await _read_bounded(response, max_response_bytes)
             bytes_read = len(body)
             _log_vt_exchange(
                 correlation_id=correlation_id,
@@ -1307,7 +1684,11 @@ class VirusTotalHttpAdapter(VirusTotalPort):
                 fallback_decision=fallback_decision or "none",
                 fingerprint=fingerprint or self.acquisition_route_fingerprint,
             )
-            return VirusTotalRawResponse(body=body, status_code=response.status_code)
+            return VirusTotalRawResponse(
+                body=body,
+                status_code=response.status_code,
+                content_type_class=content_type_class,
+            )
         except VirusTotalError as caught_error:
             _set_error_route(caught_error, route_label, normalized_route)
             _annotate_error(
@@ -1412,6 +1793,135 @@ class VirusTotalHttpAdapter(VirusTotalPort):
         )
         raise error from None
 
+    async def _coordinated_read(
+        self,
+        *,
+        client: httpx.AsyncClient,
+        url: str,
+        params: Mapping[str, Any] | None,
+        family: str,
+        route: str,
+        max_response_bytes: int | None = None,
+    ) -> httpx.Response:
+        authority = current_virustotal_external_effect_authority()
+        coordinator = self._external_effect_coordinator
+        archive = self._raw_response_archive
+        if (
+            self._offline_probe_mode
+            and authority is None
+            and coordinator is None
+            and archive is None
+        ):
+            # This mode is used only by the local MockTransport preflight. Runtime
+            # adapter construction leaves it disabled, so investigation reads
+            # always require the coordinator and committed authority below.
+            return await client.get(url, params=params, follow_redirects=False)
+        if authority is None or coordinator is None or archive is None:
+            raise VirusTotalExternalEffectRefusedError(
+                "The VirusTotal read has no committed investigation authority."
+            )
+
+        request = client.build_request("GET", url, params=params)
+        frozen_request = _freeze_httpx_request(request)
+        canonical_request = {
+            "schema": "vt-read-request.v1",
+            "family": family,
+            "route": route,
+            "method": "GET",
+            "path": request.url.path,
+            "query": _credential_free_query(request),
+        }
+        prepared = PreparedExternalRequest.build(
+            family=family,
+            provider="vt",
+            provider_scope="default",
+            normalizer_version=_VT_READ_NORMALIZER_VERSION,
+            canonical_request=canonical_request,
+            application_request=frozen_request,
+            evidence_refs=current_virustotal_external_effect_evidence_refs(),
+            credential_parameter_names=("apikey",),
+        )
+        transport = _VirusTotalPermitAwareTransport(
+            client=client,
+            request=request,
+            frozen_request=frozen_request,
+            archive=archive,
+            max_response_bytes=(
+                self._max_response_bytes if max_response_bytes is None else max_response_bytes
+            ),
+        )
+        try:
+            outcome = await coordinator.send_one(authority, prepared, transport)
+        except Exception:
+            raise VirusTotalExternalEffectNeedsReviewError(
+                "The VirusTotal effect outcome could not be confirmed; it will not be resent."
+            ) from None
+
+        if isinstance(outcome, Completed):
+            envelope = outcome.payload
+            decoded = (
+                _decode_vt_transient_response(envelope) if isinstance(envelope, bytes) else None
+            )
+            reference = _one_raw_response_reference(outcome.evidence_refs)
+            if reference is None or outcome.result_ref != reference.id:
+                raise VirusTotalExternalEffectNeedsReviewError(
+                    "The completed VirusTotal response has no raw archive reference."
+                )
+            archived = await _read_vt_archive(
+                archive,
+                reference,
+                max(
+                    (self._max_response_bytes if max_response_bytes is None else max_response_bytes)
+                    + 1,
+                    _MAX_ERROR_BODY_BYTES,
+                ),
+            )
+            archived_transient = _transient_from_archive(archived)
+            if decoded is None:
+                decoded = archived_transient
+            elif decoded != archived_transient:
+                raise VirusTotalExternalEffectNeedsReviewError(
+                    "The completed VirusTotal response does not match its raw archive."
+                )
+            record_virustotal_external_effect(reused=outcome.payload is None)
+            return _httpx_response_from_transient(request, decoded)
+
+        if isinstance(outcome, Reused):
+            reference = _one_raw_response_reference(outcome.observation_refs)
+            if reference is None:
+                raise VirusTotalExternalEffectNeedsReviewError(
+                    "The reused VirusTotal effect has no raw response archive."
+                )
+            archived = await _read_vt_archive(
+                archive,
+                reference,
+                max(
+                    (self._max_response_bytes if max_response_bytes is None else max_response_bytes)
+                    + 1,
+                    _MAX_ERROR_BODY_BYTES,
+                ),
+            )
+            record_virustotal_external_effect(reused=True)
+            return _httpx_response_from_transient(request, _transient_from_archive(archived))
+
+        if isinstance(outcome, Ambiguous):
+            raise VirusTotalExternalEffectNeedsReviewError(
+                "The VirusTotal request outcome is ambiguous; it will not be resent."
+            )
+        if isinstance(outcome, (Refused, DefinitelyNotSubmitted)):
+            refusal_code = (
+                f"virustotal_external_effect_refused_{outcome.reason}"
+                if isinstance(outcome, Refused)
+                else "virustotal_external_effect_not_submitted"
+            )
+            raise VirusTotalExternalEffectRefusedError(
+                "The coordinator refused the VirusTotal request before a new send.",
+                code=refusal_code,
+            )
+        raise VirusTotalExternalEffectNeedsReviewError(
+            "The coordinator returned an unknown VirusTotal outcome."
+        )
+
     def _page_limit(self, value: int | None) -> int:
         if value is None:
             return self._default_page_size
@@ -1432,6 +1942,7 @@ def create_virustotal_http_adapter(
     direct_client: httpx.AsyncClient | None = None,
     api_key: str | None = None,
     routing_policy: VirusTotalRoutingPolicy | None = None,
+    offline_probe_mode: bool = False,
 ) -> VirusTotalHttpAdapter:
     """Bind adapter policy and limits to the validated runtime settings."""
     arguments = {
@@ -1550,6 +2061,7 @@ def create_virustotal_http_adapter(
         direct_client=direct_client,
         api_key=resolved_api_key,
         routing_policy=effective_routing_policy,
+        offline_probe_mode=offline_probe_mode,
         **arguments,
     )
 

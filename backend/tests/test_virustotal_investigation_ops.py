@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -30,9 +30,19 @@ from cti_app.domain.virustotal import (
 )
 from cti_app.infrastructure.virustotal import VirusTotalHttpAdapter
 from cti_app.workers.tasks import virustotal_capabilities_from_settings
+from tests.virustotal_external_effect_fakes import (
+    authorized_vt_read,
+    configure_test_vt_adapter,
+)
 
 BASE = "https://www.virustotal.com/api/v3"
 SHA256 = "a" * 64
+
+
+@pytest.fixture(autouse=True)
+def _external_effect_authority():
+    with authorized_vt_read():
+        yield
 
 
 def _adapter(
@@ -55,6 +65,7 @@ def _adapter(
         ),
         **kwargs,
     )
+    configure_test_vt_adapter(value)
     return value, client
 
 
@@ -108,6 +119,8 @@ async def test_object_relationship_routes_are_allowlisted_and_encoded(
     assert seen == [expected_path]
     assert page.empty is True
     assert page.exhaustive is True
+    claim = next(iter(cast(Any, value)._test_external_effect_store.claims.values()))
+    assert claim.family == "vt.relationships"
 
 
 @pytest.mark.asyncio
@@ -173,6 +186,9 @@ async def test_behaviours_page_with_cursor_and_typed_summary() -> None:
     assert page.behaviour_summaries[0].has_html_report is False
     assert page.behaviour_summaries[0].available_sections == ("dns_lookups",)
     assert "raw_json" not in repr(page.behaviour_summaries)
+    claims = tuple(cast(Any, value)._test_external_effect_store.claims.values())
+    assert len(claims) == 2
+    assert {claim.family for claim in claims} == {"vt.behaviour"}
 
 
 @pytest.mark.asyncio
@@ -191,6 +207,8 @@ async def test_search_exposes_descriptors_only_and_order() -> None:
         await client.aclose()
     assert result.descriptors_only is False
     assert result.order == "last_submission_date-"
+    claim = next(iter(cast(Any, value)._test_external_effect_store.claims.values()))
+    assert claim.family == "vt.intelligence_search"
 
 
 @pytest.mark.asyncio
@@ -279,6 +297,7 @@ async def test_quota_and_authorization_errors_keep_journal_metadata(
         capabilities=VirusTotalCapabilities(file_report=True),
         routing_policy=VirusTotalRoutingPolicy(routes={VirusTotalCapability.FILE_REPORT: route}),
     )
+    configure_test_vt_adapter(value)
     try:
         with pytest.raises(error_type) as caught:
             await value.file_report(SHA256)

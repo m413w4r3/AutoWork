@@ -1643,12 +1643,15 @@ class SqlAlchemyInvestigationBudgetRepository:
                     amounts[dimension] = amount_row.reserved_amount
                 if amount_row.committed_amount is not None:
                     committed[dimension] = amount_row.committed_amount
-            budget.reserve(reservation.operation_key, amounts)
             status = BudgetReservationStatus(reservation.status)
-            if status is BudgetReservationStatus.COMMITTED:
-                budget.commit(reservation.operation_key, committed)
-            elif status is BudgetReservationStatus.RELEASED:
-                budget.release(reservation.operation_key)
+            budget.restore_reservation(
+                BudgetReservation(
+                    operation_key=reservation.operation_key,
+                    amounts=amounts,
+                    status=status,
+                    committed_amounts=committed,
+                )
+            )
         return InvestigationBudgetSnapshot(
             investigation_id=row.investigation_id,
             version=row.version,

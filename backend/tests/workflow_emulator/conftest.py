@@ -9,11 +9,13 @@ from pathlib import Path
 
 import pytest
 from sqlalchemy.engine import make_url
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
+from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from tests.integration.conftest import (
     migrated_postgres_url,  # noqa: F401
     temporary_postgres_url,  # noqa: F401
@@ -22,6 +24,16 @@ from tests.integration.conftest import (
 from tests.integration.production.support import ProductionScenario
 
 from .driver import WorkflowDriver
+
+
+@pytest.fixture
+def external_effect_session_factory(
+    migrated_postgres_url: str,  # noqa: F811
+) -> Iterator[async_sessionmaker[AsyncSession]]:
+    """SQLAlchemy sessions for runtime tests that bind the external-effect coordinator."""
+    engine = create_postgres_engine(migrated_postgres_url)
+    yield create_session_factory(engine)
+    asyncio.run(engine.dispose())
 
 
 def _allow_local_host(host: object, *, allow_socket_path: bool = False) -> bool:

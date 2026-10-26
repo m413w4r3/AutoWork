@@ -45,7 +45,10 @@ from cti_app.application.investigation_persistence import (
     AnalystOpinionRepository,
     EvidenceObservationRepository,
     FindingRepository,
+    InvestigationBudgetRepository,
+    InvestigationBudgetSnapshot,
     InvestigationEnvelopeRepository,
+    SampleAssociationRepository,
     ToolInvocationRepository,
     VersionConflictError,
 )
@@ -62,9 +65,12 @@ from cti_app.application.investigation_tools import (
     ToolResult,
     tool_operation_cache_identity,
 )
+from cti_app.application.investigation_vt_tools import _normalize_object_id
 from cti_app.application.persistence import (
     AnalystDecisionRepository,
     AnalystInvestigationRepository,
+    SampleRepository,
+    SourceDocumentRepository,
 )
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.research_context_builder import (
@@ -79,6 +85,7 @@ from cti_app.application.research_context_builder import (
     provider_authorization_blocked_capabilities,
     provider_download_blocked_capabilities,
 )
+from cti_app.application.virustotal import normalize_file_hash
 from cti_app.domain.analyst_opinion import (
     AnalystObservationV1,
     AnalystOpinionStatus,
@@ -88,10 +95,16 @@ from cti_app.domain.analyst_opinion import (
     opinion_blocks_with_observations,
     verify_opinion_citations,
 )
+from cti_app.domain.classification import TLP
 from cti_app.domain.editorial import (
     AnalystDecision,
     AnalystDecisionTargetType,
     AnalystDecisionType,
+)
+from cti_app.domain.external_effects import (
+    EvidenceReference,
+    ExternalEffectAuthority,
+    ExternalEffectAuthorityKind,
 )
 from cti_app.domain.investigation import (
     AgendaItem,
@@ -132,6 +145,7 @@ from cti_app.domain.production import (
     ProductionArtifact,
     ProductionRun,
 )
+from cti_app.domain.virustotal import VirusTotalObjectType
 
 _logger = logging.getLogger(__name__)
 _SAFE_LOG_TOKEN = re.compile(r"[^A-Za-z0-9_.-]+")
@@ -146,12 +160,27 @@ MAX_IDENTICAL_DEFINITE_TOOL_FAILURES = 2
 MAX_STATE_VERSION_CONFLICT_RETRIES = 4
 _RECENT_ACTIONS_LIMIT = 32
 _OPERATOR_REQUEST_MARKER_PREFIX = "api:user-request:"
+_VT_COORDINATED_READ_TOOLS = frozenset(
+    {
+        "vt.file_report",
+        "vt.object_report",
+        "vt.relationships",
+        "vt.intelligence_search",
+        "vt.behaviour",
+        "vt.behaviour_pcap",
+    }
+)
+_VT_SOURCE_REFS_PARAMETER = "_vt_external_effect_source_refs"
 
 
 class InvocationReconciliationOutcome(StrEnum):
     EXECUTED_WITH_RESULT = "executed_with_result"
     NOT_EXECUTED = "not_executed"
     ABANDON = "abandon"
+
+
+class _BudgetSnapshotPersistenceError(RuntimeError):
+    """Envelope and normalized budget could not be persisted atomically."""
 
 
 class ToolObservationWriter(Protocol):
@@ -306,6 +335,10 @@ class InvestigationService:
         observations: EvidenceObservationRepository,
         findings: FindingRepository,
         opinions: AnalystOpinionRepository,
+        sample_associations: SampleAssociationRepository | None = None,
+        samples: SampleRepository | None = None,
+        source_documents: SourceDocumentRepository | None = None,
+        budget_snapshots: InvestigationBudgetRepository | None = None,
         observation_writer: ToolObservationWriter | None = None,
         artifact_store: ProductionArtifactStore | None = None,
         evidence_summaries: FrameworkProofDescriptorReader | None = None,
@@ -314,6 +347,7 @@ class InvestigationService:
         no_progress_limit: int = 2,
         max_turns_per_run: int = 64,
         commit_uow: Callable[[], Awaitable[None]] | None = None,
+        rollback_uow: Callable[[], Awaitable[None]] | None = None,
         audit_decisions: AnalystDecisionRepository | None = None,
         effective_policy_for: Callable[[UUID], Awaitable[Any | None]] | None = None,
     ) -> None:
@@ -332,6 +366,10 @@ class InvestigationService:
         self._observations = observations
         self._findings = findings
         self._opinions = opinions
+        self._sample_associations = sample_associations
+        self._samples = samples
+        self._source_documents = source_documents
+        self._budget_snapshots = budget_snapshots
         self._observation_writer = observation_writer
         self._artifact_store = artifact_store
         self._evidence_summaries = evidence_summaries
@@ -340,6 +378,7 @@ class InvestigationService:
         self._no_progress_limit = no_progress_limit
         self._max_turns_per_run = max_turns_per_run
         self._commit_uow = commit_uow
+        self._rollback_uow = rollback_uow
         self._effective_policy_for = effective_policy_for
         owner = getattr(commit_uow, "__self__", None)
         self._audit_decisions = audit_decisions or getattr(owner, "analyst_decisions", None)
@@ -398,7 +437,8 @@ class InvestigationService:
             raise ValueError("Investigation envelope belongs to another investigation")
         existing_envelope = await self._envelopes.get(investigation.id)
         if existing_envelope is None and envelope is not None:
-            await self._envelopes.save_if_version(envelope, expected_version=None)
+            envelope = await self._envelopes.save_if_version(envelope, expected_version=None)
+            await self._save_budget_snapshot(envelope)
         elif (
             existing_envelope is not None
             and envelope is not None
@@ -1203,6 +1243,7 @@ class InvestigationService:
         registered = self._registry.get(tool_name, schema_version)
         definition = registered[0] if registered else None
         requested_cost = thaw_json(definition.cost_model) if definition is not None else {}
+        existing: ToolInvocation | None = None
         if registered is not None:
             adapter = registered[1]
             existing_lookup = getattr(self._invocations, "get_by_operation_key", None)
@@ -1241,12 +1282,32 @@ class InvestigationService:
             ToolEffect.EXTERNAL_ACTIVE,
             ToolEffect.EXTERNAL_SUBMIT,
         }
+        invocation_parameters: Mapping[str, Any] = arguments
+        external_effect_evidence_refs: tuple[EvidenceReference, ...] = ()
+        if tool_name in _VT_COORDINATED_READ_TOOLS:
+            if existing is not None:
+                invocation_parameters = existing.normalized_parameters
+                external_effect_evidence_refs = _vt_source_refs_from_parameters(
+                    invocation_parameters
+                )
+            else:
+                external_effect_evidence_refs = await self._trusted_vt_source_references(
+                    investigation=investigation,
+                    tool_name=tool_name,
+                    arguments=arguments,
+                )
+                invocation_parameters = {
+                    **arguments,
+                    _VT_SOURCE_REFS_PARAMETER: [
+                        reference.to_json() for reference in external_effect_evidence_refs
+                    ],
+                }
         invocation = ToolInvocation(
             investigation_id=investigation.id,
             operation_key=operation_key,
             tool_name=tool_name,
             schema_version=schema_version,
-            normalized_parameters=arguments,
+            normalized_parameters=invocation_parameters,
             purpose=purpose,
             reserved_budget=requested_cost,
         )
@@ -1392,12 +1453,56 @@ class InvestigationService:
 
         tool_budget = _copy_investigation_budget(budget)
         tool_envelope = replace(envelope, budget=tool_budget) if envelope is not None else None
+        external_effect_authority: ExternalEffectAuthority | None = None
+        if (
+            tool_name in _VT_COORDINATED_READ_TOOLS
+            and envelope is not None
+            and reservation_persisted
+            and persisted_reservation is not None
+            and self._budget_snapshots is not None
+        ):
+            authority_kind = (
+                ExternalEffectAuthorityKind.OSINT_POLICY
+                if envelope.authority_kind is EnvelopeAuthorityKind.OSINT_POLICY
+                else ExternalEffectAuthorityKind.HUMAN_G2
+            )
+            reservation_amounts = {
+                (
+                    dimension.value if isinstance(dimension, BudgetDimension) else str(dimension)
+                ): int(amount)
+                for dimension, amount in persisted_reservation.amounts.items()
+            }
+            external_effect_authority = ExternalEffectAuthority(
+                investigation_id=investigation.id,
+                invocation_id=invocation.id,
+                operation_key=operation_key,
+                reservation_amounts=reservation_amounts,
+                expected_envelope_version=envelope.version,
+                approval_decision_id=envelope.approval_decision_id,
+                invocation_arguments_sha256=hashlib.sha256(
+                    canonical_json_bytes(invocation.normalized_parameters)
+                ).hexdigest(),
+                authority_kind=authority_kind,
+                policy_event_id=envelope.inherited_policy_event_id,
+                policy_version=(
+                    str(envelope.inherited_policy_version)
+                    if envelope.inherited_policy_version is not None
+                    else None
+                ),
+                pinned_subject_id=(
+                    investigation.subject_id
+                    if authority_kind is ExternalEffectAuthorityKind.OSINT_POLICY
+                    else None
+                ),
+            )
         tool_context = ToolExecutionContext(
             investigation_id=investigation.id,
             envelope=tool_envelope,
             budget=tool_budget,
             idempotency_key=operation_key,
             available_capabilities=self._available_capabilities,
+            external_effect_authority=external_effect_authority,
+            external_effect_evidence_refs=external_effect_evidence_refs,
         )
 
         async def check_current_admission(
@@ -1427,7 +1532,21 @@ class InvestigationService:
                     or dict(current_reservation.amounts) != dict(cost)
                 ):
                     return FrameworkPreSubmissionProof.RESERVATION_CHANGED
-            if tool_name == "advisor.consult":
+            if tool_name in _VT_COORDINATED_READ_TOOLS:
+                current_investigation = await self._investigations.get(investigation.id)
+                if current_investigation is None:
+                    return FrameworkPreSubmissionProof.INVESTIGATION_MISSING
+                snapshot = await self._context_builder.article_snapshots.resolve(
+                    current_investigation.synthesis_artifact_id
+                )
+                if not self.external_llm_allowed(
+                    snapshot, current_envelope
+                ) or await self._vt_source_disclosure_restricted(
+                    current_investigation,
+                    external_effect_evidence_refs,
+                ):
+                    return FrameworkPreSubmissionProof.DISCLOSURE_REVOKED
+            elif tool_name == "advisor.consult":
                 current_investigation = await self._investigations.get(investigation.id)
                 if current_investigation is None:
                     return FrameworkPreSubmissionProof.INVESTIGATION_MISSING
@@ -1446,6 +1565,8 @@ class InvestigationService:
             purpose=purpose,
             operation_key=operation_key,
             reservation_amounts=cost,
+            # Keep the pre-dispatch envelope, reservation and source checks.
+            # The coordinator repeats the authoritative checks under its consume lock.
             pre_dispatch_check=check_current_admission,
         )
         framework_proves_non_execution = _confirmed_external_non_execution(result)
@@ -1538,6 +1659,186 @@ class InvestigationService:
         await self._commit_current_uow()
         _log_terminal_tool_failure(invocation, result)
         return invocation, result, valid_refs, uncertain_external
+
+    async def _vt_source_disclosure_restricted(
+        self,
+        investigation: AnalystInvestigation,
+        references: tuple[EvidenceReference, ...],
+    ) -> bool:
+        hashes = {reference.id for reference in references if reference.kind == "sample_hash"}
+        document_ids = {
+            reference.id for reference in references if reference.kind == "source_document"
+        }
+        for reference in references:
+            if reference.kind != "evidence_observation":
+                continue
+            try:
+                observation_id = UUID(reference.id)
+            except ValueError:
+                return True
+            observation = await self._observations.get(observation_id)
+            if (
+                observation is None
+                or observation.investigation_id != investigation.id
+                or observation.source_version != reference.version
+                or observation.sha256 != reference.sha256
+            ):
+                return True
+            object_type = observation.object_type.casefold()
+            if object_type in {"sample", "file", "sample_observation"}:
+                hashes.add(observation.object_id)
+            elif object_type in {"source_document", "document"}:
+                document_ids.add(observation.object_id)
+        sample_associations = self._sample_associations
+        sample_repository = self._samples
+        if hashes:
+            if sample_associations is None or sample_repository is None:
+                return True
+            associations = await sample_associations.list_for_investigation(investigation.id)
+            if not hashes.issubset({association.sample_sha256 for association in associations}):
+                return True
+        for sample_hash in hashes:
+            if sample_repository is None:
+                return True
+            samples = await sample_repository.list_by_subject_and_sha256(
+                investigation.subject_id, sample_hash
+            )
+            if any(
+                sample.tlp is TLP.RED
+                or sample.do_not_submit
+                or bool((sample.license_restriction or "").strip())
+                or not sample.external_llm_allowed
+                for sample in samples
+            ):
+                return True
+        if document_ids:
+            source_documents = self._source_documents
+            if source_documents is None:
+                return True
+            for raw_document_id in document_ids:
+                try:
+                    document_id = UUID(raw_document_id)
+                except ValueError:
+                    return True
+                document = await source_documents.get(document_id)
+                if (
+                    document is None
+                    or document.subject_id != investigation.subject_id
+                    or document.tlp is TLP.RED
+                    or document.do_not_submit
+                    or bool((document.license_restriction or "").strip())
+                    or not document.external_llm_allowed
+                ):
+                    return True
+        return False
+
+    async def _trusted_vt_source_references(
+        self,
+        *,
+        investigation: AnalystInvestigation,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+    ) -> tuple[EvidenceReference, ...]:
+        """Resolve source refs from canonical investigation evidence, never tool claims."""
+        hash_value: Any = None
+        if tool_name in {"vt.file_report", "vt.behaviour", "vt.behaviour_pcap"}:
+            hash_value = arguments.get("file_hash")
+        elif tool_name == "vt.relationships" and arguments.get("object_type") == "file":
+            hash_value = arguments.get("object_id")
+        if hash_value is not None:
+            try:
+                normalized_hash = normalize_file_hash(str(hash_value))
+            except (TypeError, ValueError):
+                return ()
+            if len(normalized_hash) != 64:
+                return ()
+            return (
+                EvidenceReference(
+                    kind="sample_hash",
+                    id=normalized_hash,
+                    version="sample-hash.v1",
+                    sha256=normalized_hash,
+                ),
+            )
+
+        if tool_name == "vt.intelligence_search":
+            raw_refs = arguments.get("evidence_refs")
+            if not isinstance(raw_refs, (list, tuple)) or not raw_refs:
+                return ()
+            resolved_observations: dict[UUID, EvidenceObservation] = {}
+            for raw_ref in raw_refs:
+                try:
+                    reference_id = UUID(str(raw_ref))
+                except (TypeError, ValueError, AttributeError):
+                    return ()
+                observation = await self._observations.get(reference_id)
+                if observation is not None and observation.investigation_id == investigation.id:
+                    resolved_observations[observation.id] = observation
+                    continue
+                finding = await self._findings.get(reference_id)
+                if finding is None or finding.investigation_id != investigation.id:
+                    return ()
+                for observation_id in finding.observation_refs:
+                    cited = await self._observations.get(observation_id)
+                    if cited is None or cited.investigation_id != investigation.id:
+                        return ()
+                    resolved_observations[cited.id] = cited
+            return tuple(
+                EvidenceReference(
+                    kind="evidence_observation",
+                    id=str(item.id),
+                    version=item.source_version,
+                    sha256=item.sha256,
+                )
+                for item in sorted(resolved_observations.values(), key=lambda value: str(value.id))
+            )
+
+        if tool_name not in {"vt.object_report", "vt.relationships"}:
+            return ()
+        raw_kind = str(arguments.get("object_type", ""))
+        raw_object_id = arguments.get("object_id")
+        object_type = {
+            "ip_addresses": VirusTotalObjectType.IP_ADDRESS,
+            "ip_address": VirusTotalObjectType.IP_ADDRESS,
+            "domains": VirusTotalObjectType.DOMAIN,
+            "domain": VirusTotalObjectType.DOMAIN,
+            "urls": VirusTotalObjectType.URL,
+            "url": VirusTotalObjectType.URL,
+        }.get(raw_kind)
+        if object_type is None or not isinstance(raw_object_id, str):
+            return ()
+        try:
+            normalized_object_id = _normalize_object_id(object_type, raw_object_id)
+            snapshot = await self._context_builder.article_snapshots.resolve(
+                investigation.synthesis_artifact_id
+            )
+        except Exception:
+            return ()
+        expected_indicator = {
+            VirusTotalObjectType.IP_ADDRESS: "ipv4",
+            VirusTotalObjectType.DOMAIN: "domain",
+            VirusTotalObjectType.URL: "url",
+        }[object_type]
+        document_refs: dict[str, EvidenceReference] = {}
+        for indicator in snapshot.confirmed_iocs:
+            if indicator.indicator_type != expected_indicator:
+                continue
+            try:
+                candidate = _normalize_object_id(object_type, indicator.value)
+            except (TypeError, ValueError):
+                continue
+            if candidate != normalized_object_id:
+                continue
+            version = f"{snapshot.synthesis_artifact_id}@{snapshot.synthesis_version or 1}"
+            for document_id in indicator.source_document_ids:
+                reference = EvidenceReference(
+                    kind="source_document",
+                    id=str(document_id),
+                    version=version,
+                    sha256=snapshot.synthesis_sha256,
+                )
+                document_refs[reference.id] = reference
+        return tuple(document_refs[key] for key in sorted(document_refs))
 
     def _tool_operation_key(
         self,
@@ -2882,7 +3183,49 @@ class InvestigationService:
         self, envelope: InvestigationEnvelope
     ) -> InvestigationEnvelope:
         updated = replace(envelope, version=envelope.version + 1)
-        return await self._envelopes.save_if_version(updated, expected_version=envelope.version)
+        saved = await self._envelopes.save_if_version(updated, expected_version=envelope.version)
+        await self._save_budget_snapshot(saved)
+        return saved
+
+    async def _save_budget_snapshot(self, envelope: InvestigationEnvelope) -> None:
+        """Mirror the envelope's canonical budget into normalized reservation rows."""
+        repository = self._budget_snapshots
+        if repository is None:
+            return
+        try:
+            current = await repository.get(envelope.investigation_id)
+            if current is None:
+                await repository.save_if_version(
+                    InvestigationBudgetSnapshot(
+                        investigation_id=envelope.investigation_id,
+                        version=1,
+                        budget=envelope.budget,
+                    ),
+                    expected_version=None,
+                )
+                return
+            if current.budget == envelope.budget:
+                return
+            await repository.save_if_version(
+                InvestigationBudgetSnapshot(
+                    investigation_id=envelope.investigation_id,
+                    version=current.version + 1,
+                    budget=envelope.budget,
+                ),
+                expected_version=current.version,
+            )
+        except asyncio.CancelledError:
+            await self._rollback_budget_snapshot_pair()
+            raise
+        except Exception as exc:
+            await self._rollback_budget_snapshot_pair()
+            raise _BudgetSnapshotPersistenceError(
+                "Envelope budget mirror failed before external dispatch."
+            ) from exc
+
+    async def _rollback_budget_snapshot_pair(self) -> None:
+        if self._rollback_uow is not None:
+            await asyncio.shield(self._rollback_uow())
 
     async def _commit_current_uow(self) -> None:
         if self._commit_uow is not None:
@@ -3604,6 +3947,30 @@ def bridge_budget_operation_key(
 ) -> str:
     key = f"bridge:{investigation_id}:{turn_index}:{context_sha256}"
     return f"{key}:attempt={attempt}" if attempt else key
+
+
+def _vt_source_refs_from_parameters(
+    parameters: Mapping[str, Any],
+) -> tuple[EvidenceReference, ...]:
+    raw = parameters.get(_VT_SOURCE_REFS_PARAMETER)
+    if not isinstance(raw, (list, tuple)) or len(raw) > 16:
+        return ()
+    references: list[EvidenceReference] = []
+    for item in raw:
+        if not isinstance(item, Mapping):
+            return ()
+        try:
+            references.append(
+                EvidenceReference(
+                    kind=str(item["kind"]),
+                    id=str(item["id"]),
+                    version=str(item["version"]),
+                    sha256=str(item["sha256"]),
+                )
+            )
+        except (KeyError, TypeError, ValueError):
+            return ()
+    return tuple(references)
 
 
 def _copy_investigation_budget(budget: InvestigationBudget) -> InvestigationBudget:

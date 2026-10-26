@@ -23,7 +23,6 @@ from cti_app.application.context_pagination import (
 )
 from cti_app.domain.analyst_opinion import AnalystOpinionV1
 from cti_app.domain.investigation import (
-    BudgetReservationStatus,
     DetectionCandidateVersion,
     EvidenceObservation,
     InvestigationBudget,
@@ -196,11 +195,11 @@ class InvestigationBudgetRepository(Protocol):
 def _copy_budget(budget: InvestigationBudget) -> InvestigationBudget:
     copied = InvestigationBudget(limits=dict(budget.limits))
     for reservation in budget.reservations:
-        copied.reserve(reservation.operation_key, reservation.amounts)
-        if reservation.status is BudgetReservationStatus.COMMITTED:
-            copied.commit(reservation.operation_key, reservation.committed_amounts)
-        elif reservation.status is BudgetReservationStatus.RELEASED:
-            copied.release(reservation.operation_key)
+        # Snapshot hydration must preserve reservations admitted under an
+        # earlier policy, including in-flight work retained during revocation.
+        # ``reserve`` is an admission operation and would recheck current limits
+        # against historical reservation amounts.
+        copied.restore_reservation(reservation)
     return copied
 
 

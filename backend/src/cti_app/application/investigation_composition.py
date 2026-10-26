@@ -1610,6 +1610,7 @@ def build_investigation_composition(
         turn_transport or ModelConversationTurnTransport(model_conversations)
     )
     commit_uow = getattr(uow, "commit", None)
+    rollback_uow = getattr(uow, "rollback", None)
     osint_open_policy_service = OsintOpenPolicyService(uow_factory, settings)
     service = InvestigationService(
         post_synthesis=AnalystPostSynthesisService(
@@ -1629,6 +1630,10 @@ def build_investigation_composition(
         observations=uow.evidence_observations,
         findings=uow.investigation_findings,
         opinions=uow.analyst_opinions,
+        sample_associations=uow.sample_associations,
+        samples=getattr(uow, "samples", None),
+        source_documents=getattr(uow, "source_documents", None),
+        budget_snapshots=getattr(uow, "investigation_budgets", None),
         observation_writer=ProductionArtifactObservationWriter(
             artifact_store, uow.evidence_observations
         ),
@@ -1637,6 +1642,7 @@ def build_investigation_composition(
         available_capabilities=available_capabilities,
         no_progress_limit=settings.investigation_no_progress_limit,
         commit_uow=commit_uow if callable(commit_uow) else None,
+        rollback_uow=rollback_uow if callable(rollback_uow) else None,
         effective_policy_for=osint_open_policy_service.effective_for_investigation,
     )
     return InvestigationComposition(

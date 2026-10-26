@@ -14,6 +14,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.sql.elements import ColumnElement
 
 from cti_app.application.external_effects import (
     ConsumeCommitted,
@@ -23,6 +24,7 @@ from cti_app.application.external_effects import (
     ExistingClaim,
     ExternalEffectClaim,
     ExternalEffectPolicyGuard,
+    NoSubmissionProofKind,
     ReuseDecision,
     _CoordinatorNoHandoffProof,
     _NoHandoffProofVerifier,
@@ -35,6 +37,7 @@ from cti_app.domain.external_effects import (
     ExternalEffectUseKind,
     PreparedExternalRequest,
     canonical_json_bytes,
+    normalize_credential_parameter_name,
     occurrence_sha256,
     validate_persistable_reference,
     validate_prepared_request,
@@ -49,6 +52,7 @@ from cti_app.infrastructure.database.models.external_effects import (
     ExternalEffectUseRow,
 )
 from cti_app.infrastructure.database.models.investigation import (
+    EvidenceObservationRow,
     InvestigationBudgetReservationAmountRow,
     InvestigationBudgetReservationRow,
     InvestigationEnvelopeRow,
@@ -99,8 +103,19 @@ class ExternalEffectFamilyBinding:
     model_run_provider: str | None = None
     requires_source_refs: bool = False
     source_reference_resolver: SourceReferenceResolver | None = None
+    credential_parameter_names: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
+        if any(not isinstance(name, str) for name in self.credential_parameter_names):
+            raise ValueError("family credential parameter declarations must be strings")
+        try:
+            credential_parameter_names = frozenset(
+                normalize_credential_parameter_name(name)
+                for name in self.credential_parameter_names
+            )
+        except ValueError as exc:
+            raise ValueError("invalid family credential parameter declaration") from exc
+        object.__setattr__(self, "credential_parameter_names", credential_parameter_names)
         if self.requires_source_refs and self.source_reference_resolver is None:
             raise ValueError("source-dependent families require a trusted source resolver")
         if self.requires_model_lineage and self.model_run_provider is None:
@@ -119,6 +134,14 @@ def _is_model_submission(
 
 def _requires_model_lineage(family: str, family_binding: ExternalEffectFamilyBinding) -> bool:
     return family_binding.requires_model_lineage or family.startswith(_MODEL_LINEAGE_PREFIXES)
+
+
+def _family_credentials_match(
+    prepared: PreparedExternalRequest, family_binding: ExternalEffectFamilyBinding
+) -> bool:
+    return (
+        frozenset(prepared.credential_parameter_names) == family_binding.credential_parameter_names
+    )
 
 
 def _retrohunt_request_matches(
@@ -189,9 +212,11 @@ class SqlAlchemyExternalEffectClaimStore:
         verifier.bind_store(self)
         self._no_handoff_proof_verifier = verifier
 
-    def _consume_no_handoff_proof(self, proof: _CoordinatorNoHandoffProof, claim_id: UUID) -> bool:
+    def _consume_no_handoff_proof(
+        self, proof: _CoordinatorNoHandoffProof, claim_id: UUID
+    ) -> NoSubmissionProofKind | None:
         verifier = self._no_handoff_proof_verifier
-        return verifier is not None and verifier.consume(self, proof, claim_id)
+        return verifier.consume(self, proof, claim_id) if verifier is not None else None
 
     async def consume(
         self,
@@ -224,6 +249,8 @@ class SqlAlchemyExternalEffectClaimStore:
             or prepared.provider_scope not in family_binding.provider_scopes
         ):
             return ConsumeRefused("provider_scope_not_registered")
+        if not _family_credentials_match(prepared, family_binding):
+            return ConsumeRefused("family_credential_declaration_mismatch")
         if prepared.normalizer_version not in family_binding.normalizer_versions:
             return ConsumeRefused("unsupported_normalizer_version")
         try:
@@ -402,7 +429,13 @@ class SqlAlchemyExternalEffectClaimStore:
         *,
         result_ref: str | None,
         evidence_refs: tuple[EvidenceReference, ...],
+        outcome_code: str | None = None,
     ) -> bool:
+        if outcome_code is not None and (
+            not isinstance(outcome_code, str)
+            or outcome_code not in {"bridge_rate_limited", "bridge_rejected"}
+        ):
+            return False
         async with self._session_factory() as session:
             async with session.begin():
                 row = await self._claim_for_transition(session, claim_id)
@@ -429,7 +462,7 @@ class SqlAlchemyExternalEffectClaimStore:
                         evidence_refs=persisted_refs,
                         updated_at=now,
                         completed_at=now,
-                        last_error_code=None,
+                        last_error_code=outcome_code,
                     )
                     .returning(ExternalEffectClaimRow.id)
                 )
@@ -475,7 +508,8 @@ class SqlAlchemyExternalEffectClaimStore:
         proof: _CoordinatorNoHandoffProof,
         reason_code: str,
     ) -> bool:
-        if not self._consume_no_handoff_proof(proof, claim_id):
+        proof_kind = self._consume_no_handoff_proof(proof, claim_id)
+        if proof_kind is not NoSubmissionProofKind.BEFORE_HANDOFF:
             return False
         reason = _safe_code(reason_code)
         async with self._session_factory() as session:
@@ -609,6 +643,7 @@ class SqlAlchemyExternalEffectClaimStore:
             or family_binding.provider != prepared.provider
             or prepared.provider_scope not in family_binding.provider_scopes
             or prepared.normalizer_version not in family_binding.normalizer_versions
+            or not _family_credentials_match(prepared, family_binding)
             or _requires_model_lineage(prepared.family, family_binding)
         ):
             return None
@@ -749,6 +784,7 @@ class SqlAlchemyExternalEffectClaimStore:
             or family_binding.provider != prepared.provider
             or prepared.provider_scope not in family_binding.provider_scopes
             or prepared.normalizer_version not in family_binding.normalizer_versions
+            or not _family_credentials_match(prepared, family_binding)
         ):
             return False
         try:
@@ -1051,6 +1087,7 @@ class SqlAlchemyExternalEffectClaimStore:
                 "sample_association",
                 "source_document",
                 "document",
+                "evidence_observation",
             }:
                 try:
                     UUID(reference.id)
@@ -1151,6 +1188,8 @@ class SqlAlchemyExternalEffectClaimStore:
         association_ids: set[UUID] = set()
         document_ids: set[UUID] = set()
         sample_hashes: set[str] = set()
+        observation_ids: dict[UUID, EvidenceReference] = {}
+        is_model_submission = _is_model_submission(prepared, family_binding)
         recognized_kinds = {
             "sample",
             "sample_association_sample",
@@ -1158,14 +1197,27 @@ class SqlAlchemyExternalEffectClaimStore:
             "sample_hash",
             "source_document",
             "document",
+            "evidence_observation",
         }
         for reference in prepared.evidence_refs:
             if reference.kind not in recognized_kinds:
+                if is_model_submission:
+                    raise _ConsumeDenied("unrecognized_source_reference_kind")
                 continue
             if reference.kind == "sample_hash":
                 if not re.fullmatch(r"[0-9a-f]{64}", reference.id):
                     raise _ConsumeDenied("malformed_sample_hash_reference")
                 sample_hashes.add(reference.id)
+                continue
+            if reference.kind == "evidence_observation":
+                try:
+                    observation_id = UUID(reference.id)
+                except ValueError as exc:
+                    raise _ConsumeDenied("malformed_source_reference") from exc
+                existing_reference = observation_ids.get(observation_id)
+                if existing_reference is not None and existing_reference != reference:
+                    raise _ConsumeDenied("conflicting_evidence_observation_reference")
+                observation_ids[observation_id] = reference
                 continue
             try:
                 ref_id = UUID(reference.id)
@@ -1179,35 +1231,74 @@ class SqlAlchemyExternalEffectClaimStore:
             elif reference.kind in {"source_document", "document"}:
                 document_ids.add(ref_id)
 
-        associations = list(
-            await session.scalars(
-                select(SampleAssociationRow)
-                .where(
-                    or_(
-                        SampleAssociationRow.id.in_(sorted(association_ids, key=str))
-                        if association_ids
-                        else SampleAssociationRow.id.is_(None),
-                        (
-                            (SampleAssociationRow.investigation_id == authority.investigation_id)
-                            & SampleAssociationRow.sample_id.in_(sorted(sample_ids, key=str))
-                        )
-                        if sample_ids
-                        else SampleAssociationRow.sample_id.is_(None),
-                        SampleAssociationRow.sample_sha256.in_(sorted(sample_hashes))
-                        if sample_hashes
-                        else SampleAssociationRow.sample_sha256.is_(None),
+        if observation_ids:
+            observations = list(
+                await session.scalars(
+                    select(EvidenceObservationRow)
+                    .where(
+                        EvidenceObservationRow.investigation_id == authority.investigation_id,
+                        EvidenceObservationRow.id.in_(sorted(observation_ids, key=str)),
                     )
+                    .order_by(EvidenceObservationRow.id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
                 )
-                .order_by(SampleAssociationRow.id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
             )
+            if {item.id for item in observations} != set(observation_ids):
+                raise _ConsumeDenied("evidence_observation_missing")
+            for observation in observations:
+                reference = observation_ids[observation.id]
+                if (
+                    reference.sha256 != observation.sha256
+                    or reference.version != observation.source_version
+                ):
+                    raise _ConsumeDenied("evidence_observation_version_mismatch")
+                object_type = observation.object_type.casefold()
+                if object_type in {"sample", "file", "sample_observation"}:
+                    if not re.fullmatch(r"[0-9a-f]{64}", observation.object_id):
+                        raise _ConsumeDenied("unresolvable_evidence_observation_source")
+                    sample_hashes.add(observation.object_id)
+                elif object_type in {"source_document", "document"}:
+                    try:
+                        document_ids.add(UUID(observation.object_id))
+                    except ValueError as exc:
+                        raise _ConsumeDenied("unresolvable_evidence_observation_source") from exc
+                elif is_model_submission:
+                    raise _ConsumeDenied("unresolvable_evidence_observation_source")
+
+        association_terms: list[ColumnElement[bool]] = []
+        if association_ids:
+            association_terms.append(SampleAssociationRow.id.in_(sorted(association_ids, key=str)))
+        if sample_ids:
+            association_terms.append(
+                (SampleAssociationRow.investigation_id == authority.investigation_id)
+                & SampleAssociationRow.sample_id.in_(sorted(sample_ids, key=str))
+            )
+        if sample_hashes:
+            association_terms.append(
+                (SampleAssociationRow.investigation_id == authority.investigation_id)
+                & SampleAssociationRow.sample_sha256.in_(sorted(sample_hashes))
+            )
+        associations = (
+            list(
+                await session.scalars(
+                    select(SampleAssociationRow)
+                    .where(or_(*association_terms))
+                    .order_by(SampleAssociationRow.id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            )
+            if association_terms
+            else []
         )
         for association in associations:
             if association.investigation_id != authority.investigation_id:
                 raise _ConsumeDenied("sample_association_investigation_mismatch")
             if association.sample_id is not None:
                 sample_ids.add(association.sample_id)
+            elif is_model_submission and association.id in association_ids:
+                raise _ConsumeDenied("sample_association_unresolvable")
         if (
             association_ids
             and {item.id for item in associations}.intersection(association_ids) != association_ids
@@ -1216,6 +1307,12 @@ class SqlAlchemyExternalEffectClaimStore:
         found_hashes = {item.sample_sha256 for item in associations}
         if sample_hashes and not sample_hashes.issubset(found_hashes):
             raise _ConsumeDenied("sample_hash_not_associated_with_investigation")
+        if is_model_submission and sample_hashes:
+            resolved_hashes = {
+                item.sample_sha256 for item in associations if item.sample_id is not None
+            }
+            if not sample_hashes.issubset(resolved_hashes):
+                raise _ConsumeDenied("sample_hash_unresolvable")
         if referenced_sample_ids and not referenced_sample_ids.issubset(
             {item.sample_id for item in associations if item.sample_id is not None}
         ):
@@ -1235,7 +1332,12 @@ class SqlAlchemyExternalEffectClaimStore:
             )
         )
         for sample in samples:
-            if sample.subject_id != subject_id or sample.tlp == "red" or sample.do_not_submit:
+            if (
+                sample.subject_id != subject_id
+                or sample.tlp.casefold() == "red"
+                or sample.do_not_submit
+                or bool((sample.license_restriction or "").strip())
+            ):
                 raise _ConsumeDenied("sample_source_restricted")
             if _is_model_submission(prepared, family_binding) and not sample.external_llm_allowed:
                 raise _ConsumeDenied("sample_external_llm_not_allowed")
@@ -1258,7 +1360,7 @@ class SqlAlchemyExternalEffectClaimStore:
         for document in documents:
             if (
                 document.subject_id != subject_id
-                or document.tlp == "red"
+                or document.tlp.casefold() == "red"
                 or document.do_not_submit
                 or bool(document.license_restriction)
             ):
@@ -1317,10 +1419,15 @@ class SqlAlchemyExternalEffectClaimStore:
         expected_provider = family_binding.model_run_provider or prepared.provider
         model_input_sha256 = prepared.canonical_request.get("model_input_sha256")
         authorized_input_sha256 = prepared.canonical_request.get("authorized_input_hash")
+        bridge_request_id = prepared.canonical_request.get("bridge_request_id")
         if (
             run is None
             or run.status != "running"
-            or run.submission_state != "not_submitted"
+            or run.submission_state != "external_state_unknown"
+            or run.submission_attempt < 1
+            or not isinstance(bridge_request_id, str)
+            or not bridge_request_id
+            or run.bridge_request_id != bridge_request_id
             or run.provider != expected_provider
             or not isinstance(model_input_sha256, str)
             or not isinstance(authorized_input_sha256, str)
@@ -1329,7 +1436,6 @@ class SqlAlchemyExternalEffectClaimStore:
         ):
             raise _ConsumeDenied("model_run_not_eligible")
         run.submission_state = "submission_in_progress"
-        run.submission_attempt += 1
         run.updated_at = datetime.now(UTC)
 
     async def _claim_for_transition(
@@ -1455,6 +1561,14 @@ def _claim_to_domain(row: ExternalEffectClaimRow) -> ExternalEffectClaim:
         state=EffectClaimState(row.state),
         evidence_refs=tuple(refs),
         result_ref=result_ref,
+        bridge_turn_id=row.bridge_turn_id,
+        model_run_id=row.model_run_id,
+        outcome_code=(
+            row.last_error_code
+            if row.state == EffectClaimState.COMPLETED.value
+            and row.last_error_code in {"bridge_rate_limited", "bridge_rejected"}
+            else None
+        ),
     )
 
 

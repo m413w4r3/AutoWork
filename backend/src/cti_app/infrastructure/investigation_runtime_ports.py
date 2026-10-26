@@ -15,6 +15,7 @@ from typing import cast
 from uuid import UUID
 
 import httpx
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cti_app.application.behavior_report_import import BehaviorReportImporter
 from cti_app.application.blob_storage import BlobStore
@@ -26,6 +27,7 @@ from cti_app.application.confined_analysis import (
     ConfinedAnalysisExecutionPort,
     ConfinedAnalysisFamilyStatus,
 )
+from cti_app.application.external_effects import ExternalEffectCoordinator
 from cti_app.application.goodware import GoodwareMeasurementService
 from cti_app.application.identity import LocalIdentityProvider
 from cti_app.application.investigation_composition import (
@@ -70,6 +72,15 @@ from cti_app.infrastructure.confined_analysis_dispatch import (
 )
 from cti_app.infrastructure.confined_local_commands import ConfinedLocalCommands
 from cti_app.infrastructure.confined_tshark import ConfinedTsharkAdapter
+from cti_app.infrastructure.database.repositories.external_effects import (
+    SqlAlchemyExternalEffectClaimStore,
+)
+from cti_app.infrastructure.database.repositories.virustotal_external_effects import (
+    VT_EXTERNAL_EFFECT_FAMILIES,
+    SqlAlchemyVirusTotalPolicyGuard,
+    VirusTotalReadReusePolicy,
+    virustotal_external_effect_family_bindings,
+)
 from cti_app.infrastructure.floss_adapter import FlossAdapter
 from cti_app.infrastructure.ghidra_mcp import GhidraMcpHttpAdapter
 from cti_app.infrastructure.local_command_runner import LocalCommandRunner
@@ -166,6 +177,7 @@ def build_investigation_runtime_ports(
     settings: Settings,
     *,
     uow_factory: UnitOfWorkFactory,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
     blob_store: BlobStore,
     blob_catalog: BlobCatalogService,
     vt_adapter: VirusTotalPort | None,
@@ -183,6 +195,30 @@ def build_investigation_runtime_ports(
     confined_analysis_execution: ConfinedAnalysisExecutionPort | None = None,
 ) -> InvestigationRuntimePorts:
     statuses: list[RuntimePortStatus] = []
+
+    configure_vt_effects = getattr(vt_adapter, "configure_external_effects", None)
+    vt_effects_ready = bool(
+        session_factory is not None
+        and vt_adapter is not None
+        and vt_observations is not None
+        and callable(configure_vt_effects)
+    )
+    if (
+        session_factory is not None
+        and vt_adapter is not None
+        and vt_observations is not None
+        and callable(configure_vt_effects)
+    ):
+        reuse_policy = VirusTotalReadReusePolicy()
+        coordinator = ExternalEffectCoordinator(
+            SqlAlchemyExternalEffectClaimStore(
+                session_factory,
+                policy_guard=SqlAlchemyVirusTotalPolicyGuard(),
+                family_bindings=virustotal_external_effect_family_bindings(),
+            ),
+            reuse_policies={family: reuse_policy for family in VT_EXTERNAL_EFFECT_FAMILIES},
+        )
+        configure_vt_effects(coordinator, vt_observations)
 
     vt_route_status = {
         capability: _vt_proxy_route_status(settings, vt_adapter, capability)
@@ -222,29 +258,36 @@ def build_investigation_runtime_ports(
         and acquisition_budget_ready
     )
     effective_pcap = bool(
-        settings.virustotal_behaviour_pcap_enabled and vt_adapter is not None and pcap_route_ready
+        settings.virustotal_behaviour_pcap_enabled
+        and vt_adapter is not None
+        and vt_effects_ready
+        and pcap_route_ready
     )
     vt_capabilities = replace(
         vt_capabilities,
         file_report=(
             vt_capabilities.file_report
             and settings.virustotal_file_report_enabled
+            and vt_effects_ready
             and vt_route_status[VirusTotalCapability.FILE_REPORT][0]
         ),
         file_relationships=(
             vt_capabilities.file_relationships
             and settings.virustotal_object_relationships_enabled
+            and vt_effects_ready
             and vt_route_status[VirusTotalCapability.FILE_RELATIONSHIPS][0]
         ),
         intelligence_search=(
             vt_capabilities.intelligence_search
             and settings.virustotal_intelligence_search_enabled
+            and vt_effects_ready
             and vt_route_status[VirusTotalCapability.INTELLIGENCE_SEARCH][0]
         ),
         file_download=effective_download,
         behaviour_reports=(
             vt_capabilities.behaviour_reports
             and settings.virustotal_behaviour_reports_enabled
+            and vt_effects_ready
             and vt_route_status[VirusTotalCapability.BEHAVIOUR_REPORTS][0]
         ),
         behaviour_pcap=effective_pcap,
@@ -510,6 +553,16 @@ def build_investigation_runtime_ports(
     )
     if vt_adapter is None:
         vt_reason = "virustotal_adapter_not_configured"
+    elif not vt_effects_ready and any(
+        (
+            settings.virustotal_file_report_enabled,
+            settings.virustotal_object_relationships_enabled,
+            settings.virustotal_intelligence_search_enabled,
+            settings.virustotal_behaviour_reports_enabled,
+            settings.virustotal_behaviour_pcap_enabled,
+        )
+    ):
+        vt_reason = "external_effect_coordinator_unavailable"
     elif vt_enabled:
         vt_reason = None
     else:
@@ -539,6 +592,20 @@ def build_investigation_runtime_ports(
         "virustotal",
         vt_adapter is not None and vt_enabled,
         vt_reason,
+    )
+    vt_reads_available = any(
+        (
+            vt_capabilities.file_report,
+            vt_capabilities.file_relationships,
+            vt_capabilities.intelligence_search,
+            vt_capabilities.behaviour_reports,
+            vt_capabilities.behaviour_pcap,
+        )
+    )
+    record(
+        "virustotal_reads",
+        vt_reads_available,
+        None if vt_reads_available else vt_reason,
     )
     if not settings.virustotal_file_download_enabled:
         download_reason = "virustotal_file_download_disabled"
@@ -790,6 +857,7 @@ def build_investigation_runtime_composition_factory(
     settings: Settings,
     *,
     uow_factory: UnitOfWorkFactory,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
     blob_store: BlobStore,
     blob_catalog: BlobCatalogService,
     artifact_store: ProductionArtifactStore,
@@ -812,6 +880,7 @@ def build_investigation_runtime_composition_factory(
     ports = build_investigation_runtime_ports(
         settings,
         uow_factory=uow_factory,
+        session_factory=session_factory,
         blob_store=blob_store,
         blob_catalog=blob_catalog,
         vt_adapter=vt_adapter,

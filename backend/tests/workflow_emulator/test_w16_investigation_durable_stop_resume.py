@@ -31,6 +31,7 @@ from cti_app.application.production_artifact_store import ProductionArtifactStor
 from cti_app.domain.investigation import (
     BudgetDimension,
     InvestigationBudget,
+    SampleOrigin,
 )
 from cti_app.domain.investigation_state import StopReason
 from cti_app.domain.jobs import INVESTIGATION_RUN_JOB_KIND, Job, JobStatus
@@ -54,6 +55,7 @@ from tests.workflow_emulator.investigation_support import (
     composition_factory,
     decision,
     investigation_settings,
+    persist_sample_association_fixture,
     run_http_job,
     seed_verified_article,
     start_investigation_http,
@@ -467,6 +469,14 @@ async def test_w16_g2_revocation_during_vt_archives_reply_and_blocks_followup(
         suffix=f"w16-revoke-{uuid4().hex[:8]}",
         material=material,
     )
+    await persist_sample_association_fixture(
+        uow_factory,
+        artifact_store,
+        investigation_id=seeded.investigation.id,
+        subject_id=seeded.subject.id,
+        sample_sha256=material.seed_hash,
+        origin=SampleOrigin.SEED,
+    )
     first_call = {
         "tool_name": "vt.file_report",
         "schema_version": "1",
@@ -604,6 +614,14 @@ async def test_w16_revoked_g2_requires_human_extend_then_resumes_without_repeati
         artifact_store,
         suffix=f"w16-reextend-{uuid4().hex[:8]}",
         material=material,
+    )
+    await persist_sample_association_fixture(
+        uow_factory,
+        artifact_store,
+        investigation_id=seeded.investigation.id,
+        subject_id=seeded.subject.id,
+        sample_sha256=material.seed_hash,
+        origin=SampleOrigin.SEED,
     )
     first_call = {
         "tool_name": "vt.file_report",

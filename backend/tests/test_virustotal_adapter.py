@@ -4,7 +4,8 @@ import io
 import json
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
-from typing import Any
+from typing import Any, cast
+from uuid import UUID
 
 import httpx
 import pytest
@@ -16,12 +17,15 @@ from cti_app.application.virustotal import (
     VirusTotalCapabilityDisabledError,
     VirusTotalDownloadHostNotAllowedError,
     VirusTotalError,
+    VirusTotalExternalEffectNeedsReviewError,
+    VirusTotalExternalEffectRefusedError,
     VirusTotalInvalidInputError,
     VirusTotalOperationRoute,
     VirusTotalResponseTooLargeError,
     VirusTotalRouteStep,
     VirusTotalRouteUnavailableError,
     VirusTotalRoutingPolicy,
+    virustotal_external_effect_scope,
 )
 from cti_app.config import Settings
 from cti_app.domain.virustotal import (
@@ -34,9 +38,19 @@ from cti_app.infrastructure.virustotal import (
     create_virustotal_direct_http_client,
     create_virustotal_http_client,
 )
+from tests.virustotal_external_effect_fakes import (
+    authorized_vt_read,
+    configure_test_vt_adapter,
+)
 
 BASE = "https://www.virustotal.com/api/v3"
 SHA256 = "A" * 64
+
+
+@pytest.fixture(autouse=True)
+def _external_effect_authority():
+    with authorized_vt_read():
+        yield
 
 
 def adapter(handler: Any, **kwargs: Any) -> tuple[VirusTotalHttpAdapter, httpx.AsyncClient]:
@@ -49,6 +63,7 @@ def adapter(handler: Any, **kwargs: Any) -> tuple[VirusTotalHttpAdapter, httpx.A
         ),
         **kwargs,
     )
+    configure_test_vt_adapter(value)
     return value, client
 
 
@@ -85,6 +100,9 @@ async def test_file_report_normalizes_hash_and_returns_exact_body() -> None:
     assert result.file.lookup_value == SHA256.lower()
     assert str(seen[0].url) == f"{BASE}/files/{SHA256.lower()}?x=1"
     assert "x-apikey" not in seen[0].headers
+    claims = tuple(cast(Any, value)._test_external_effect_store.claims.values())
+    assert len(claims) == 1
+    assert claims[0].family == "vt.file_report"
 
 
 @pytest.mark.asyncio
@@ -125,6 +143,7 @@ async def test_file_report_falls_back_to_v2_only_with_direct_key_client() -> Non
         capabilities=VirusTotalCapabilities(file_report=True),
         file_report_legacy_fallback_enabled=True,
     )
+    configure_test_vt_adapter(value)
     try:
         result = await value.file_report(SHA256)
     finally:
@@ -136,6 +155,9 @@ async def test_file_report_falls_back_to_v2_only_with_direct_key_client() -> Non
     assert direct_calls[0].url.params["resource"] == SHA256.lower()
     assert direct_calls[0].url.params["apikey"] == "direct-test-key"
     assert direct_calls[0].headers["x-apikey"] == "direct-test-key"
+    claims = tuple(cast(Any, value)._test_external_effect_store.claims.values())
+    assert len(claims) == 2
+    assert {claim.family for claim in claims} == {"vt.file_report"}
 
 
 @pytest.mark.asyncio
@@ -249,6 +271,8 @@ async def test_submissions_is_an_allowed_file_relationship() -> None:
         await client.aclose()
     assert result.empty is True
     assert seen == [f"/api/v3/files/{SHA256.lower()}/submissions"]
+    claim = next(iter(cast(Any, value)._test_external_effect_store.claims.values()))
+    assert claim.family == "vt.relationships"
 
 
 @pytest.mark.asyncio
@@ -268,6 +292,8 @@ async def test_intelligence_uses_params_and_forces_descriptors_only() -> None:
         await client.aclose()
     assert result.items == ({"id": "x"},)
     assert result.exhaustive is True
+    claim = next(iter(cast(Any, value)._test_external_effect_store.claims.values()))
+    assert claim.family == "vt.intelligence_search"
 
 
 @pytest.mark.asyncio
@@ -296,6 +322,9 @@ async def test_pagination_cursor_and_max_pages() -> None:
     assert result.stopped_due_to_limit is True
     assert result.exhaustive is False
     assert result.next_cursor == "page-3"
+    claims = tuple(cast(Any, value)._test_external_effect_store.claims.values())
+    assert len(claims) == 2
+    assert {claim.family for claim in claims} == {"vt.relationships"}
 
 
 @pytest.mark.asyncio
@@ -411,28 +440,108 @@ async def test_retry_after_http_date_and_invalid_json_and_size_limit() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("transport_error", "code", "retryable"),
+    "transport_error",
     [
-        (httpx.ConnectTimeout("connect"), "virustotal_connect_timeout", True),
-        (httpx.ReadTimeout("read"), "virustotal_read_timeout", True),
-        (httpx.ConnectError("connect"), "virustotal_connection_error", True),
-        (httpx.ProxyError("proxy"), "virustotal_proxy_error", True),
+        httpx.ConnectTimeout("connect"),
+        httpx.ReadTimeout("read"),
+        httpx.ConnectError("connect"),
+        httpx.ProxyError("proxy"),
     ],
 )
-async def test_transport_errors_are_normalized(
-    transport_error: Exception, code: str, retryable: bool
+async def test_post_handoff_transport_errors_need_review_and_are_not_resent(
+    transport_error: Exception,
 ) -> None:
+    calls = 0
+
     def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
         raise transport_error
 
     value, client = adapter(handler)
     try:
-        with pytest.raises(VirusTotalError) as caught:
+        with pytest.raises(VirusTotalExternalEffectNeedsReviewError) as caught:
+            await value.file_report(SHA256)
+        with pytest.raises(VirusTotalExternalEffectNeedsReviewError):
             await value.file_report(SHA256)
     finally:
         await client.aclose()
-    assert caught.value.code == code
-    assert caught.value.retryable is retryable
+    assert caught.value.code == "virustotal_external_effect_needs_review"
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_read_without_committed_authority_is_refused_before_http() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"data": {}}, request=request)
+
+    value, client = adapter(handler)
+    try:
+        with virustotal_external_effect_scope(None):
+            with pytest.raises(VirusTotalExternalEffectRefusedError):
+                await value.file_report(SHA256)
+    finally:
+        await client.aclose()
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+async def test_completed_read_replay_resolves_verified_archive_without_a_second_send() -> None:
+    calls = 0
+    body = json.dumps({"data": {"id": SHA256.lower(), "type": "file", "attributes": {}}}).encode()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, content=body, request=request)
+
+    value, client = adapter(handler)
+    first_id = UUID("7e5a111b-5a87-491b-9310-a122a0a22ad0")
+    second_id = UUID("6829a5e1-cff4-44d1-a98e-1dc9775dcade")
+    try:
+        with authorized_vt_read(invocation_id=first_id):
+            first = await value.file_report(SHA256)
+        with authorized_vt_read(invocation_id=second_id):
+            replay = await value.file_report(SHA256)
+    finally:
+        await client.aclose()
+    assert first.raw_json == replay.raw_json == body
+    assert calls == 1
+    assert cast(Any, value)._test_external_effect_store.reuse_count == 1
+
+
+@pytest.mark.asyncio
+async def test_missing_replay_archive_needs_review_without_a_second_send() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            json={"data": {"id": SHA256.lower(), "type": "file", "attributes": {}}},
+            request=request,
+        )
+
+    value, client = adapter(handler)
+    first_id = UUID("e15678c3-4f27-4a55-9ca5-bf8b41d68c8e")
+    second_id = UUID("b9b397c3-bf3b-4255-a512-7487d73dc8c0")
+    try:
+        with authorized_vt_read(invocation_id=first_id):
+            await value.file_report(SHA256)
+        claim = next(iter(cast(Any, value)._test_external_effect_store.claims.values()))
+        archive = cast(Any, value)._test_vt_response_archive
+        del archive.items[claim.result_ref]
+        with authorized_vt_read(invocation_id=second_id):
+            with pytest.raises(VirusTotalExternalEffectNeedsReviewError):
+                await value.file_report(SHA256)
+    finally:
+        await client.aclose()
+    assert calls == 1
 
 
 @pytest.mark.asyncio
@@ -516,6 +625,7 @@ async def test_proxy_fallback_requires_explicit_flag_and_then_follows_policy() -
         fallback_base_url=fallback_base,
         capabilities=VirusTotalCapabilities(file_report=True),
     )
+    configure_test_vt_adapter(value)
     with pytest.raises(VirusTotalError) as caught:
         await value.file_report(SHA256)
     assert caught.value.status_code == 404
@@ -529,12 +639,14 @@ async def test_proxy_fallback_requires_explicit_flag_and_then_follows_policy() -
         capabilities=VirusTotalCapabilities(file_report=True),
         file_report_proxy_fallback_enabled=True,
     )
+    configure_test_vt_adapter(value)
     try:
         result = await value.file_report(SHA256)
     finally:
         await client.aclose()
     assert calls == ["primary", "fallback"]
     assert result.file.lookup_value == SHA256.lower()
+    assert len(cast(Any, value)._test_external_effect_store.claims) == 2
 
 
 @pytest.mark.asyncio
@@ -565,6 +677,7 @@ async def test_non_404_never_falls_back_to_direct(status: int) -> None:
         capabilities=VirusTotalCapabilities(file_report=True),
         file_report_legacy_fallback_enabled=True,
     )
+    configure_test_vt_adapter(value)
     try:
         with pytest.raises(VirusTotalError) as caught:
             await value.file_report(SHA256)
@@ -599,6 +712,7 @@ async def test_api_key_never_appears_in_raised_errors() -> None:
         capabilities=VirusTotalCapabilities(file_report=True),
         file_report_legacy_fallback_enabled=True,
     )
+    configure_test_vt_adapter(value)
     try:
         with pytest.raises(VirusTotalError) as caught:
             await value.file_report(SHA256)

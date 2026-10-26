@@ -27,6 +27,10 @@ from cti_app.infrastructure.virustotal import VirusTotalHttpAdapter
 from cti_app.infrastructure.virustotal_retrohunt_client import (
     VirusTotalRetrohuntHttpClient,
 )
+from tests.virustotal_external_effect_fakes import (
+    authorized_vt_read,
+    configure_test_vt_adapter,
+)
 
 BASE = "https://www.virustotal.com/api/v3"
 CDN_HOST = "vtsamples.commondatastorage.googleapis.com"
@@ -100,8 +104,10 @@ async def test_file_report_uses_sentinel_for_proxy_without_query_parameters() ->
         capabilities=VirusTotalCapabilities(file_report=True),
         proxy_query_sentinel_enabled=True,
     )
+    configure_test_vt_adapter(adapter)
     try:
-        result = await adapter.file_report(SHA256)
+        with authorized_vt_read():
+            result = await adapter.file_report(SHA256)
     finally:
         await client.aclose()
 
@@ -144,8 +150,10 @@ async def test_object_report_retry_without_projection_still_has_proxy_query() ->
         capabilities=VirusTotalCapabilities(file_report=True),
         proxy_query_sentinel_enabled=True,
     )
+    configure_test_vt_adapter(adapter)
     try:
-        result = await adapter.object_report("domains", "drivegoogel.cam")
+        with authorized_vt_read():
+            result = await adapter.object_report("domains", "drivegoogel.cam")
     finally:
         await client.aclose()
 
@@ -326,7 +334,7 @@ async def test_direct_v2_download_keeps_only_documented_params_without_sentinel(
 
 
 @pytest.mark.asyncio
-async def test_behaviour_pcap_queryless_proxy_stream_uses_sentinel() -> None:
+async def test_behaviour_pcap_queryless_proxy_uses_sentinel() -> None:
     def pcap_route(request: httpx.Request, rewritten_query: str) -> httpx.Response:
         assert rewritten_query == "x=1&apikey=" + PROXY_SECRET
         return httpx.Response(200, content=PCAP_BYTES, request=request)
@@ -340,8 +348,10 @@ async def test_behaviour_pcap_queryless_proxy_stream_uses_sentinel() -> None:
         behaviour_pcap_enabled=True,
         proxy_query_sentinel_enabled=True,
     )
+    configure_test_vt_adapter(adapter)
     try:
-        result = await adapter.behaviour_pcap("sandbox-1", sink=io.BytesIO())
+        with authorized_vt_read():
+            result = await adapter.behaviour_pcap("sandbox-1", sink=io.BytesIO())
     finally:
         await client.aclose()
 
@@ -369,9 +379,11 @@ async def test_relationship_and_behaviour_existing_queries_survive_proxy_rewrite
         capabilities=VirusTotalCapabilities(file_relationships=True, behaviour_reports=True),
         proxy_query_sentinel_enabled=True,
     )
+    configure_test_vt_adapter(adapter)
     try:
-        await adapter.file_relationship(SHA256, "contacted_domains")
-        await adapter.behaviours(SHA256)
+        with authorized_vt_read():
+            await adapter.file_relationship(SHA256, "contacted_domains")
+            await adapter.behaviours(SHA256)
     finally:
         await client.aclose()
 
@@ -498,9 +510,11 @@ async def test_proxy_error_body_echo_is_redacted_from_exception_and_logs(caplog)
         capabilities=VirusTotalCapabilities(file_report=True),
         proxy_query_sentinel_enabled=True,
     )
+    configure_test_vt_adapter(adapter)
     try:
-        with pytest.raises(VirusTotalHttpError) as caught:
-            await adapter.file_report(SHA256)
+        with authorized_vt_read():
+            with pytest.raises(VirusTotalHttpError) as caught:
+                await adapter.file_report(SHA256)
     finally:
         await client.aclose()
 

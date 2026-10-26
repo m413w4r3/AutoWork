@@ -218,6 +218,7 @@ async def offline_preflight() -> ProviderPreflightReport:
                 behaviour_reports=True,
             ),
             routing_policy=VirusTotalRoutingPolicy(routes=vt_routes),
+            offline_probe_mode=True,
         )
         shodan = ShodanHttpAdapter(
             client=shodan_client,

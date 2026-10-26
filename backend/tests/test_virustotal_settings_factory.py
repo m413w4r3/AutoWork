@@ -78,6 +78,7 @@ def test_adapter_factory_tracks_all_settings_driven_constructor_parameters() -> 
         "api_key",
         "routing_policy",
         "download_client_factory",
+        "offline_probe_mode",
     }
     constructor_parameters = set(inspect.signature(VirusTotalHttpAdapter.__init__).parameters)
     constructor_parameters.discard("self")

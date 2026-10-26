@@ -301,6 +301,20 @@ def _observed_frame_hypothesis() -> dict[str, object]:
     return proposal.to_dict()
 
 
+class _RuntimeBoundHashCheckedVirusTotal(HashCheckedVirusTotal):
+    """Offline VT fake that accepts the production runtime's coordinator binding."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.external_effect_coordinator: Any | None = None
+        self.raw_response_archive: Any | None = None
+
+    def configure_external_effects(self, coordinator: Any, raw_response_archive: Any) -> None:
+        # The fake returns fixture values directly and performs no physical provider request.
+        self.external_effect_coordinator = coordinator
+        self.raw_response_archive = raw_response_archive
+
+
 class _PilotBridge(ScriptedInvestigationTransport):
     """Choose each next tool batch from DB observations archived by prior work."""
 
@@ -929,6 +943,7 @@ class _PilotBridge(ScriptedInvestigationTransport):
 async def test_workflow_full_supervised_first_run_dynamic_pilot(
     workflow_driver: WorkflowDriver,
     uow_factory,
+    external_effect_session_factory,
     tmp_path: Path,
 ) -> None:
     driver = workflow_driver
@@ -1176,6 +1191,8 @@ async def test_workflow_full_supervised_first_run_dynamic_pilot(
             sample_bytes=bytes_a,
             origin=SampleOrigin.SEED,
             logical_name="pilot-a-inert.bin",
+            do_not_submit=False,
+            external_llm_allowed=True,
         )
         await persist_sample_association_fixture(
             uow_factory,
@@ -1222,7 +1239,7 @@ async def test_workflow_full_supervised_first_run_dynamic_pilot(
         settings = worker.settings
         network_limits = NetworkExtractionLimitsV1()
         tshark = ConfinedTsharkAdapter(worker.port, limits=network_limits)
-        vt = HashCheckedVirusTotal(material=material, include_candidate=False)
+        vt = _RuntimeBoundHashCheckedVirusTotal(material=material, include_candidate=False)
         vt._routing_policy = VirusTotalRoutingPolicy(
             routes={
                 VirusTotalCapability.FILE_REPORT: VirusTotalOperationRoute(
@@ -1237,6 +1254,7 @@ async def test_workflow_full_supervised_first_run_dynamic_pilot(
         runtime = build_investigation_runtime_composition_factory(
             settings,
             uow_factory=uow_factory,
+            session_factory=external_effect_session_factory,
             blob_store=filesystem_store,
             blob_catalog=blob_catalog,
             artifact_store=artifact_store,
@@ -1259,6 +1277,8 @@ async def test_workflow_full_supervised_first_run_dynamic_pilot(
             ),
             confined_analysis_execution=worker.port,
         )
+        assert vt.external_effect_coordinator is not None
+        assert vt.raw_response_archive is not None
         inventory = describe_tool_inventory(runtime)
         inventory_path = output_root / "runtime-port-inventory.json"
         inventory_path.write_text(
