@@ -603,6 +603,7 @@ async def test_real_postgres_tool_path_classifies_vt_download_route_404_as_needs
     assert seeded.seed_observation is not None
     request_paths: list[str] = []
     material = _unique_sample_material()
+    await _associate_vt_file_source(uow_factory, seeded.investigation.id, material.sample_hash)
 
     def not_found(request: httpx.Request) -> httpx.Response:
         request_paths.append(request.url.path)
@@ -761,6 +762,7 @@ async def test_real_postgres_exhausted_loop_acquisition_budget_is_not_ambiguous(
 
     request_paths: list[str] = []
     material = _unique_sample_material()
+    await _associate_vt_file_source(uow_factory, seeded.investigation.id, material.sample_hash)
 
     def not_found(request: httpx.Request) -> httpx.Response:
         request_paths.append(request.url.path)
@@ -900,6 +902,7 @@ async def test_real_postgres_ambiguous_download_logs_safe_terminal_diagnostics(
     seeded = await _seed_verified_article(uow_factory, artifact_store, suffix=uuid4().hex[:10])
     assert seeded.seed_observation is not None
     material = _unique_sample_material()
+    await _associate_vt_file_source(uow_factory, seeded.investigation.id, material.sample_hash)
 
     def partial_response(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, stream=_PartialDownloadFailureStream(), request=request)

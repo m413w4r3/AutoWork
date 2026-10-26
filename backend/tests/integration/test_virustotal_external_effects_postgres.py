@@ -194,7 +194,7 @@ class _RevokingScriptedTurnTransport(ScriptedTurnTransport):
     async def _revoke_after_success(self, result: TurnSubmission, investigation_id: UUID) -> None:
         if result.status is TurnSubmissionStatus.SUCCEEDED and not self._revoked:
             await self._policy_service.revoke(
-                policy_id=self._policy.id,
+                policy_id=self._policy.policy_id,
                 expected_version=self._policy.version,
                 actor_id="human:vt-download-revocation-test",
                 reason="Revoke the synthetic download before transport handoff.",
@@ -1243,7 +1243,11 @@ async def test_vt_download_v2_fallback_requires_explicit_opt_in_and_is_claimed(
         if fallback_enabled:
             assert direct_requests[0].url.params["apikey"] == _VT_KEY
             assert direct_requests[0].url.params["hash"] == requested_hash
-            assert claims[-1].canonical_request["route"] == "direct:legacy_v2"
+            direct_claims = [
+                claim for claim in claims if claim.canonical_request["route"] == "direct:legacy_v2"
+            ]
+            assert len(direct_claims) == 1
+            assert direct_claims[0].canonical_request["hop"] == 0
         durable = json.dumps(
             [
                 {

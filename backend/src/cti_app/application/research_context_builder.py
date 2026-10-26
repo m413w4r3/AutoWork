@@ -237,6 +237,7 @@ class CanonicalEvidenceSummaryPort:
             "sha256": descriptor.sha256,
             "byte_size": descriptor.size,
             "mime_type": descriptor.mime_type,
+            "logical_bucket": descriptor.logical_bucket,
         }
 
     async def sample_inventory(self, investigation_id: UUID) -> tuple[Mapping[str, Any], ...]:

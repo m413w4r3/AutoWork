@@ -85,6 +85,7 @@ from cti_app.application.research_context_builder import (
     provider_authorization_blocked_capabilities,
     provider_download_blocked_capabilities,
 )
+from cti_app.application.sample_acquisition import SAMPLES_QUARANTINE_BUCKET
 from cti_app.application.virustotal import VirusTotalInvalidInputError, normalize_file_hash
 from cti_app.domain.analyst_opinion import (
     AnalystObservationV1,
@@ -101,6 +102,7 @@ from cti_app.domain.editorial import (
     AnalystDecisionTargetType,
     AnalystDecisionType,
 )
+from cti_app.domain.entities import SampleState
 from cti_app.domain.external_effects import (
     EvidenceReference,
     ExternalEffectAuthority,
@@ -1293,23 +1295,14 @@ class InvestigationService:
                 )
             else:
                 if tool_name == "vt.download_sample":
-                    try:
-                        download_hash = normalize_file_hash(str(arguments.get("sha256", "")))
-                    except (TypeError, ValueError, VirusTotalInvalidInputError):
-                        external_effect_evidence_refs = ()
-                    else:
-                        external_effect_evidence_refs = (
-                            (
-                                EvidenceReference(
-                                    kind="sample_hash",
-                                    id=download_hash,
-                                    version="sample-hash.v1",
-                                    sha256=download_hash,
-                                ),
-                            )
-                            if len(download_hash) == 64
-                            else ()
-                        )
+                    # Resolve the target hash from canonical investigation
+                    # evidence or an existing association. Caller supplied
+                    # evidence_refs cannot authorize the target hash.
+                    external_effect_evidence_refs = await self._trusted_vt_source_references(
+                        investigation=investigation,
+                        tool_name="vt.file_report",
+                        arguments={"file_hash": arguments.get("sha256")},
+                    )
                 else:
                     external_effect_evidence_refs = await self._trusted_vt_source_references(
                         investigation=investigation,
@@ -1559,14 +1552,38 @@ class InvestigationService:
                 current_investigation = await self._investigations.get(investigation.id)
                 if current_investigation is None:
                     return FrameworkPreSubmissionProof.INVESTIGATION_MISSING
+                if tool_name == "vt.download_sample":
+                    raw_hash = arguments.get("sha256")
+                    try:
+                        target_hash = (
+                            normalize_file_hash(raw_hash) if isinstance(raw_hash, str) else ""
+                        )
+                    except (TypeError, ValueError, VirusTotalInvalidInputError):
+                        target_hash = ""
+                    if (
+                        len(target_hash) == 64
+                        and sum(
+                            reference.kind == "sample_hash"
+                            for reference in external_effect_evidence_refs
+                        )
+                        != 1
+                    ):
+                        return FrameworkPreSubmissionProof.DISCLOSURE_REVOKED
                 snapshot = await self._context_builder.article_snapshots.resolve(
                     current_investigation.synthesis_artifact_id
+                )
+                local_download_reuse = (
+                    tool_name == "vt.download_sample"
+                    and await self._verified_local_download_reuse(
+                        current_investigation, external_effect_evidence_refs
+                    )
                 )
                 if not self.external_llm_allowed(
                     snapshot, current_envelope
                 ) or await self._vt_source_disclosure_restricted(
                     current_investigation,
                     external_effect_evidence_refs,
+                    require_external_llm_allowed=not local_download_reuse,
                 ):
                     return FrameworkPreSubmissionProof.DISCLOSURE_REVOKED
             elif tool_name == "advisor.consult":
@@ -1682,6 +1699,60 @@ class InvestigationService:
         await self._commit_current_uow()
         _log_terminal_tool_failure(invocation, result)
         return invocation, result, valid_refs, uncertain_external
+
+    async def _verified_local_download_reuse(
+        self,
+        investigation: AnalystInvestigation,
+        references: tuple[EvidenceReference, ...],
+    ) -> bool:
+        """Prove a local quarantine hit before exempting it from egress disclosure."""
+        hash_references = tuple(
+            reference for reference in references if reference.kind == "sample_hash"
+        )
+        if (
+            len(hash_references) != 1
+            or self._samples is None
+            or self._artifact_store is None
+            or self._evidence_summaries is None
+        ):
+            return False
+        requested_hash = hash_references[0].id
+        if len(requested_hash) != 64:
+            return False
+        try:
+            if normalize_file_hash(requested_hash) != requested_hash:
+                return False
+        except (TypeError, ValueError, VirusTotalInvalidInputError):
+            return False
+        samples = await self._samples.list_by_subject_and_sha256(
+            investigation.subject_id, requested_hash
+        )
+        if len(samples) != 1:
+            return False
+        sample = samples[0]
+        if (
+            sample.external_llm_allowed
+            or sample.expected_hash not in {None, requested_hash}
+            or sample.state not in {SampleState.QUARANTINED, SampleState.REVIEW_CANDIDATE}
+        ):
+            return False
+        descriptor = await self._evidence_summaries.blob_metadata(sample.blob_id)
+        if descriptor is None:
+            return False
+        size = descriptor.get("byte_size")
+        if (
+            descriptor.get("sha256") != requested_hash
+            or descriptor.get("logical_bucket") != SAMPLES_QUARANTINE_BUCKET
+            or isinstance(size, bool)
+            or not isinstance(size, int)
+            or size < 0
+        ):
+            return False
+        try:
+            content = await self._artifact_store.read_bytes(sample.blob_id, max_bytes=size)
+        except Exception:
+            return False
+        return len(content) == size and hashlib.sha256(content).hexdigest() == requested_hash
 
     async def _vt_source_disclosure_restricted(
         self,

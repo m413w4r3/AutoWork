@@ -780,7 +780,11 @@ async def test_incompatible_subject_sample_disclosure_requires_review() -> None:
     )
     sha256 = hashlib.sha256(content).hexdigest()
     first = await service.register_hit(first_investigation.id, sha256, SampleOrigin.VT_PIVOT)
-    await service.acquire_hit(first.id, purpose="Acquire permissive source sample")
+    acquired = await service.acquire_hit(first.id, purpose="Acquire permissive source sample")
+    assert acquired.sample_id is not None
+    # Model a pre-existing permissive source Sample; new VT downloads are
+    # intentionally local-only regardless of their acquisition envelope.
+    database.samples[acquired.sample_id].external_llm_allowed = True
     second = await service.register_hit(second_investigation.id, sha256, SampleOrigin.VT_PIVOT)
 
     result = await service.acquire_hit(second.id, purpose="Check policy compatibility")
