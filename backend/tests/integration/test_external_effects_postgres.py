@@ -535,7 +535,11 @@ async def test_downgrade_refuses_committed_external_effect_rows(
         )
         assert isinstance(consumed, ConsumeCommitted)
         with pytest.raises(RuntimeError, match="refusing to drop external effect"):
-            command.downgrade(_alembic_config(migrated_postgres_url), "0003_osint_open_policy")
+            await asyncio.to_thread(
+                command.downgrade,
+                _alembic_config(migrated_postgres_url),
+                "0003_osint_open_policy",
+            )
         async with session_factory() as session:
             claim = await session.get(ExternalEffectClaimRow, consumed.claim_id)
             version = await session.scalar(text("SELECT version_num FROM alembic_version"))
@@ -672,7 +676,7 @@ async def test_explicit_new_occurrence_creates_claim_after_recorded_reuse(
 
         reuse_authority, reuse_prepared = authorities[1]
         reused = await coordinator.send_one(
-            replace(reuse_authority, expected_envelope_version=5),
+            replace(reuse_authority, expected_envelope_version=4),
             reuse_prepared,
             transport,
         )
@@ -683,7 +687,7 @@ async def test_explicit_new_occurrence_creates_claim_after_recorded_reuse(
         occurrence_authority, _ = authorities[2]
         new_prepared = replace(original_prepared, occurrence_id=uuid4())
         new_effect = await coordinator.send_one(
-            replace(occurrence_authority, expected_envelope_version=5),
+            replace(occurrence_authority, expected_envelope_version=4),
             new_prepared,
             transport,
         )

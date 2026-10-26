@@ -297,6 +297,10 @@ class HandoffGateRefused(RuntimeError):
     """The one-use gate could not authorize physical handoff."""
 
 
+class _PreHandoffGateRefused(HandoffGateRefused):
+    """A gate refusal proven to occur before its durable handoff marker."""
+
+
 @dataclass(frozen=True, slots=True)
 class Ambiguous:
     claim_id: UUID | None
@@ -451,16 +455,17 @@ class ExternalEffectCoordinator:
             prepared: PreparedExternalRequest,
             key: str,
             transport: PermitAwareTransport,
+            handoff_state: dict[str, bool],
         ) -> TransportResponse:
             if not permit_registry.is_valid(permit, authority, prepared, key):
-                raise HandoffGateRefused("permit expired, invalid, or already used")
+                raise _PreHandoffGateRefused("permit expired, invalid, or already used")
             request = prepared.application_request
             try:
                 validate_prepared_request(prepared)
             except ExternalEffectValidationError as exc:
-                raise HandoffGateRefused("prepared request changed before handoff") from exc
+                raise _PreHandoffGateRefused("prepared request changed before handoff") from exc
             if application_request_sha256(request) != permit.request_digest:
-                raise HandoffGateRefused("physical request digest mismatch")
+                raise _PreHandoffGateRefused("physical request digest mismatch")
             try:
                 admitted = await claim_store.enter_handoff(
                     permit.claim_id,
@@ -471,7 +476,8 @@ class ExternalEffectCoordinator:
             except Exception as exc:
                 raise HandoffGateRefused("durable handoff gate unavailable") from exc
             if not admitted:
-                raise HandoffGateRefused("claim is sealed or handoff already entered")
+                raise _PreHandoffGateRefused("claim is sealed or handoff already entered")
+            handoff_state["entered"] = True
             if time.monotonic() >= permit.expires_at_monotonic:
                 raise HandoffGateRefused("permit expired before physical operation invocation")
 
@@ -595,11 +601,21 @@ class ExternalEffectCoordinator:
                     consume.claim_id, reason_code="permit_validation_failed"
                 )
 
+            handoff_state = {"entered": False}
             try:
-                response = await submit_through_gate(permit, authority, prepared, key, transport)
+                response = await submit_through_gate(
+                    permit, authority, prepared, key, transport, handoff_state
+                )
             except asyncio.CancelledError:
                 await self._seal_needs_review(consume.claim_id, "cancelled_during_transport")
                 return Ambiguous(consume.claim_id)
+            except _PreHandoffGateRefused:
+                if handoff_state["entered"]:
+                    await self._seal_needs_review(consume.claim_id, "transport_outcome_unknown")
+                    return Ambiguous(consume.claim_id)
+                return await seal_zero_handoff(
+                    consume.claim_id, reason_code="pre_handoff_gate_refused"
+                )
             except Exception:
                 await self._seal_needs_review(consume.claim_id, "transport_outcome_unknown")
                 return Ambiguous(consume.claim_id)
