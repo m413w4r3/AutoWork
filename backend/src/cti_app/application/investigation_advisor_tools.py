@@ -1097,6 +1097,12 @@ class InvestigationAdvisorTool:
             deadline_monotonic=execution_deadline_monotonic,
             minimum_timeout_seconds=minimum_execution_seconds,
             clock=execution_clock,
+            external_effect_binding_context={
+                "authority_context": getattr(context, "external_effect_authority", None),
+                "invocation_arguments": dict(arguments),
+                "transmitted_refs": transmitted_refs,
+                "reservation_operation_key": reservation_key,
+            },
         )
         evidence_preflight = evaluate_advisor_evidence_preflight(
             prompt_data, dossier, prompt, submitted=_advisor_payload_was_submitted(submission)

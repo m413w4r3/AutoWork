@@ -4,6 +4,7 @@ import asyncio
 import copy
 import hashlib
 import importlib
+import json
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -34,6 +35,7 @@ from cti_app.application.external_effects import (
     TransportResponse,
 )
 from cti_app.application.investigation_service import InvestigationService
+from cti_app.application.model_gateway import BridgeExternalEffectBinding
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.domain.external_effects import (
     EvidenceReference,
@@ -87,6 +89,7 @@ from cti_app.infrastructure.database.repositories.virustotal_external_effects im
 )
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
+from cti_app.integrations.models import create_coordinated_http_responses_transport
 from tests.integration.conftest import _alembic_config
 from tests.workflow_emulator.investigation_support import seed_verified_article
 
@@ -612,6 +615,103 @@ async def test_prestarted_bridge_attempt_matches_request_and_does_not_increment_
         assert run.submission_attempt == 1
         assert run.bridge_request_id == prepared.canonical_request["bridge_request_id"]
         assert claim is not None and claim.model_run_id == run_id
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_coordinated_bridge_http_post_completes_one_persisted_model_claim(
+    migrated_postgres_url: str,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    (
+        session_factory,
+        engine,
+        investigation_id,
+        authority,
+        prepared,
+        store,
+        run_id,
+    ) = await _prepare_model_submission_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    api_key = "pg-bridge-api-key-canary-do-not-persist"
+    captured: list[httpx.Request] = []
+    prompt = "Exact synthetic prompt bytes for the PostgreSQL transport test."
+    payload = {"model": "chatgpt-web", "input": prompt}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            content=b'{"id":"resp-synthetic","status":"completed","output_text":"ok"}',
+        )
+
+    assert authority.bridge_turn_id is not None
+    assert authority.model_run_id == run_id
+    assert isinstance(prepared.canonical_request["model_input_sha256"], str)
+    assert isinstance(prepared.canonical_request["authorized_input_hash"], str)
+    binding = BridgeExternalEffectBinding(
+        authority=authority,
+        family=prepared.family,
+        provider_scope=prepared.provider_scope,
+        normalizer_version=prepared.normalizer_version,
+        bridge_turn_id=authority.bridge_turn_id,
+        model_run_id=run_id,
+        model_input_sha256=prepared.canonical_request["model_input_sha256"],
+        authorized_input_hash=prepared.canonical_request["authorized_input_hash"],
+    )
+    transport = create_coordinated_http_responses_transport(
+        "https://bridge.synthetic/v1",
+        api_key=api_key,
+        coordinator=ExternalEffectCoordinator(store),
+        http_transport=httpx.MockTransport(handler),
+    )
+    try:
+        result = await transport.create(
+            payload,
+            idempotency_key="bridge-request-1",
+            bridge_external_effect_binding=binding,
+        )
+        assert result["output_text"] == "ok"
+        assert len(captured) == 1
+        request = captured[0]
+        assert request.method == "POST"
+        assert request.url.path == "/v1/responses"
+        assert json.loads(request.content)["input"] == prompt
+        assert request.headers["Authorization"] == f"Bearer {api_key}"
+        async with session_factory() as session:
+            claims = list(
+                await session.scalars(
+                    select(ExternalEffectClaimRow).where(
+                        ExternalEffectClaimRow.investigation_id == investigation_id,
+                        ExternalEffectClaimRow.family == "bridge.investigation_turn.v1",
+                    )
+                )
+            )
+            run = await session.get(ModelRunRow, run_id)
+        assert len(claims) == 1
+        claim = claims[0]
+        assert claim.state == "COMPLETED"
+        assert claim.bridge_turn_id == authority.bridge_turn_id
+        assert claim.model_run_id == run_id
+        assert claim.application_request_sha256 == application_request_sha256(
+            FrozenWireRequest(
+                method=request.method.encode("ascii"),
+                target=request.url.raw_path,
+                headers=tuple(request.headers.raw),
+                body=request.content,
+            )
+        )
+        persisted_columns = {
+            column.name: getattr(claim, column.name)
+            for column in ExternalEffectClaimRow.__table__.columns
+        }
+        assert api_key not in repr(persisted_columns)
+        assert run is not None and run.submission_state == "result_obtained"
+        assert api_key not in caplog.text
     finally:
         await engine.dispose()
 

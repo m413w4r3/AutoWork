@@ -84,6 +84,39 @@ async def test_advisor_refuses_pacing_wait_beyond_deadline_before_transport(monk
     assert transport.submission_count == 0
 
 
+@pytest.mark.asyncio
+async def test_main_bridge_fails_closed_when_external_effect_authority_is_missing() -> None:
+    investigation_id = uuid4()
+    context = _context(investigation_id)
+    transport = ScriptedTurnTransport(
+        [
+            {
+                "reasoning_summary": "This response must not be submitted.",
+                "goal": "Finish the synthetic investigation.",
+                "hypothesis_refs": [],
+                "proposed_tool_calls": [],
+                "finding_proposals": [],
+                "opinion_delta": None,
+                "next_action": AgentNextAction.FINISH.value,
+            }
+        ]
+    )
+    transport.requires_external_effect_authority = True
+
+    result = await BridgeInvestigator(transport).turn(
+        investigation_id=investigation_id,
+        subject_id=context.source.subject_id,
+        turn_index=0,
+        context=context,
+        external_llm_allowed=True,
+    )
+
+    assert result.status is TurnSubmissionStatus.UNAVAILABLE
+    assert result.submission_state == "pre_submission"
+    assert result.submissions_made == 0
+    assert transport.submission_count == 0
+
+
 def _context(investigation_id, *, claims=()):
     return InvestigationContextV1(
         view="full",
@@ -434,6 +467,56 @@ async def test_rate_limit_retry_honors_retry_after_and_stops_after_one_retry() -
     assert result.status is TurnSubmissionStatus.PRE_SUBMISSION_RETRY_EXHAUSTED
     assert transport.submission_count == 2
     assert clock.delays == [7]
+
+
+@pytest.mark.asyncio
+async def test_complete_rate_limit_retry_uses_new_occurrence_and_counts_submissions() -> None:
+    investigation_id = uuid4()
+    context = _context(investigation_id)
+    rejected = TurnSubmission(
+        TurnSubmissionStatus.UNAVAILABLE,
+        error_code="bridge_rate_limited",
+        submission_state="post_submission",
+        retryable=True,
+        retry_after_seconds=4,
+        completed_response=True,
+    )
+    success = {
+        "reasoning_summary": "The synthetic retry completed after the server delay.",
+        "goal": "Finish the synthetic investigation.",
+        "hypothesis_refs": [],
+        "proposed_tool_calls": [],
+        "finding_proposals": [],
+        "opinion_delta": None,
+        "next_action": AgentNextAction.FINISH.value,
+    }
+    transport = ScriptedTurnTransport([rejected, success])
+    clock = _ManualClock()
+    bridge = BridgeInvestigator(
+        transport,
+        minimum_submission_interval_seconds=0,
+        submission_jitter_fraction=0,
+        clock=clock,
+        sleeper=clock.sleep,
+        rng=lambda: 0.5,
+    )
+
+    result = await bridge.turn(
+        investigation_id=investigation_id,
+        subject_id=context.source.subject_id,
+        turn_index=2,
+        context=context,
+        external_llm_allowed=True,
+    )
+
+    assert result.status is TurnSubmissionStatus.SUCCEEDED
+    assert result.submissions_made == 2
+    assert transport.submission_count == 2
+    assert len(transport._by_key) == 2
+    assert result.idempotency_key in transport._by_key
+    assert any(not key.endswith(":attempt=1") for key in transport._by_key)
+    assert any(key.endswith(":attempt=1") for key in transport._by_key)
+    assert clock.delays == [4]
 
 
 @pytest.mark.asyncio
@@ -1049,6 +1132,152 @@ async def test_consultation_has_no_short_application_timeout(monkeypatch) -> Non
 
     assert result.status is TurnSubmissionStatus.SUCCEEDED
     assert result.output_text == "response arrived after the former 240 second cutoff"
+
+
+@pytest.mark.asyncio
+async def test_advisor_forwards_inherited_open_policy_authority_without_new_approval(
+    monkeypatch,
+) -> None:
+    class NoWaitPacer:
+        async def wait_for_next_submission(self):
+            return None
+
+    monkeypatch.setattr(bridge_module, "_shared_bridge_pacer", lambda **_kwargs: NoWaitPacer())
+    invocation_id = uuid4()
+    authority_context = SimpleNamespace(
+        policy_name="OSINT_OPEN",
+        inherited=True,
+        invocation_id=invocation_id,
+    )
+    binding = object()
+
+    class AuthorityAwareTransport:
+        requires_external_effect_authority = True
+
+        def __init__(self) -> None:
+            self.binding_context = None
+            self.submission_kwargs = None
+
+        async def build_external_effect_binding(self, **kwargs):
+            self.binding_context = kwargs
+            return binding
+
+        async def submit(self, **kwargs):
+            self.submission_kwargs = kwargs
+            return TurnSubmission(
+                TurnSubmissionStatus.SUCCEEDED,
+                output_text="synthetic consultation response",
+            )
+
+    transport = AuthorityAwareTransport()
+    investigation_id = uuid4()
+    transmitted_refs = ({"kind": "observation", "id": str(uuid4()), "sha256": "a" * 64},)
+    invocation_arguments = {"consultation_type": "review_text", "question": "Synthetic question."}
+    reservation_key = "operator:advisor:open-policy-invocation"
+    result = await submit_bridge_consultation_once(
+        transport,
+        investigation_id=investigation_id,
+        subject_id=uuid4(),
+        turn_index=3,
+        context_sha256="b" * 64,
+        prompt="Synthetic advisor prompt.",
+        external_llm_allowed=True,
+        settings=SimpleNamespace(
+            openai_bridge_min_submission_interval_seconds=0,
+            openai_bridge_submission_jitter_fraction=0,
+        ),
+        external_effect_binding_context={
+            "authority_context": authority_context,
+            "invocation_arguments": invocation_arguments,
+            "transmitted_refs": transmitted_refs,
+            "reservation_operation_key": reservation_key,
+        },
+    )
+
+    assert result.status is TurnSubmissionStatus.SUCCEEDED
+    assert transport.binding_context is not None
+    assert transport.binding_context["family"] == "advisor.consultation.v1"
+    assert transport.binding_context["authority_context"] is authority_context
+    assert transport.binding_context["invocation_arguments"] == invocation_arguments
+    assert transport.binding_context["transmitted_refs"] == transmitted_refs
+    assert transport.binding_context["reservation_operation_key"] == reservation_key
+    assert transport.submission_kwargs is not None
+    assert transport.submission_kwargs["bridge_external_effect_binding"] is binding
+
+
+@pytest.mark.asyncio
+async def test_advisor_complete_rate_limit_retry_builds_a_new_bound_attempt(monkeypatch) -> None:
+    class NoWaitPacer:
+        def __init__(self) -> None:
+            self.delays: list[float] = []
+
+        async def wait_for_next_submission(self):
+            return True
+
+        async def defer_submissions(self, seconds, *, deadline_monotonic=None):
+            del deadline_monotonic
+            self.delays.append(seconds)
+            return True
+
+    pacer = NoWaitPacer()
+    monkeypatch.setattr(bridge_module, "_shared_bridge_pacer", lambda **_kwargs: pacer)
+    bindings = [object(), object()]
+
+    class RateLimitThenSuccessTransport:
+        requires_external_effect_authority = True
+
+        def __init__(self) -> None:
+            self.binding_attempts: list[int] = []
+            self.submit_attempts: list[int] = []
+
+        async def build_external_effect_binding(self, *, attempt, **_kwargs):
+            self.binding_attempts.append(attempt)
+            return bindings[attempt]
+
+        async def submit(self, **kwargs):
+            self.submit_attempts.append(0)
+            assert kwargs["bridge_external_effect_binding"] is bindings[0]
+            return TurnSubmission(
+                TurnSubmissionStatus.UNAVAILABLE,
+                error_code="bridge_rate_limited",
+                submission_state="post_submission",
+                retryable=True,
+                retry_after_seconds=2,
+                completed_response=True,
+                idempotency_key="advisor-attempt-0",
+            )
+
+        async def submit_with_attempt(self, *, attempt, **kwargs):
+            self.submit_attempts.append(attempt)
+            assert attempt == 1
+            assert kwargs["bridge_external_effect_binding"] is bindings[1]
+            return TurnSubmission(
+                TurnSubmissionStatus.SUCCEEDED,
+                output_text="synthetic advisor response",
+                idempotency_key="advisor-attempt-1",
+            )
+
+    transport = RateLimitThenSuccessTransport()
+    result = await submit_bridge_consultation_once(
+        transport,
+        investigation_id=uuid4(),
+        subject_id=uuid4(),
+        turn_index=4,
+        context_sha256="c" * 64,
+        prompt="Synthetic advisor prompt.",
+        external_llm_allowed=True,
+        settings=SimpleNamespace(
+            openai_bridge_min_submission_interval_seconds=0,
+            openai_bridge_submission_jitter_fraction=0,
+            openai_bridge_pre_submission_retry_max_seconds=8,
+        ),
+    )
+
+    assert result.status is TurnSubmissionStatus.SUCCEEDED
+    assert result.idempotency_key == "advisor-attempt-1"
+    assert transport.binding_attempts == [0, 1]
+    assert transport.submit_attempts == [0, 1]
+    assert pacer.delays == [2]
 
 
 @pytest.mark.asyncio

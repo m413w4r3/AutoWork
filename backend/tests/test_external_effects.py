@@ -6,6 +6,7 @@ import importlib
 import pickle
 import time
 from collections.abc import Mapping
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
@@ -34,6 +35,7 @@ from cti_app.application.external_effects import (
     _NoHandoffProofVerifier,
     _PermitRegistry,
 )
+from cti_app.application.model_gateway import BridgeExternalEffectBinding
 from cti_app.domain.external_effects import (
     ConsumedEffectPermit,
     EffectClaimState,
@@ -55,6 +57,11 @@ from cti_app.infrastructure.database.repositories.external_effects import (
     SqlAlchemyExternalEffectClaimStore,
     _ConsumeDenied,
     _family_credentials_match,
+)
+from cti_app.integrations.models import (
+    BridgeTransportError,
+    HttpResponsesTransport,
+    create_coordinated_http_responses_transport,
 )
 
 _INVESTIGATION_ID = UUID("b4079022-263e-48cb-86f7-460be4457fcb")
@@ -124,6 +131,7 @@ class FakeStore:
         self.events: list[str] = []
         self.complete_result = True
         self.completed_outcomes: list[str | None] = []
+        self.completed_result_refs: list[str | None] = []
         self.sealed: list[tuple[str, str]] = []
         self.reuse_id: UUID | None = uuid4()
         self.reuse_calls: list[ReuseDecision] = []
@@ -168,6 +176,12 @@ class FakeStore:
                     envelope_version=authority.expected_envelope_version,
                     approval_decision_id=authority.approval_decision_id,
                     state=self.claim_state,
+                    result_ref=(
+                        self.completed_result_refs[-1] if self.completed_result_refs else None
+                    ),
+                    bridge_turn_id=authority.bridge_turn_id,
+                    model_run_id=authority.model_run_id,
+                    outcome_code=(self.completed_outcomes[-1] if self.completed_outcomes else None),
                 )
             )
         self._first_consume = False
@@ -176,6 +190,7 @@ class FakeStore:
     async def complete(self, *args: object, **kwargs: object) -> bool:
         self.events.append("complete")
         self.completed_outcomes.append(kwargs.get("outcome_code"))  # type: ignore[arg-type]
+        self.completed_result_refs.append(kwargs.get("result_ref"))  # type: ignore[arg-type]
         if self.complete_result:
             self.claim_state = EffectClaimState.COMPLETED
         return self.complete_result
@@ -345,6 +360,178 @@ def _coordinator(
         reuse_policies=reuse_policies,
         permit_ttl_seconds=permit_ttl_seconds,
     )
+
+
+def _bridge_external_effect_binding() -> BridgeExternalEffectBinding:
+    bridge_turn_id = uuid4()
+    model_run_id = uuid4()
+    authority = replace(
+        _authority(),
+        bridge_turn_id=bridge_turn_id,
+        model_run_id=model_run_id,
+    )
+    return BridgeExternalEffectBinding(
+        authority=authority,
+        family="bridge.investigation_turn.v1",
+        provider_scope="bridge-test",
+        normalizer_version="bridge.turn.v1",
+        bridge_turn_id=bridge_turn_id,
+        model_run_id=model_run_id,
+        model_input_sha256="a" * 64,
+        authorized_input_hash="b" * 64,
+    )
+
+
+@pytest.mark.asyncio
+async def test_coordinated_bridge_posts_the_same_json_bytes_and_hides_authorization() -> None:
+    payload = {"model": "chatgpt-web", "input": "Exact authorized prompt bytes."}
+    captured: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            content=b'{"id":"resp-test","status":"completed","output_text":"ok"}',
+        )
+
+    key = "authorization-probe-do-not-persist"
+    legacy = HttpResponsesTransport(
+        "https://bridge.test/v1",
+        api_key=key,
+        http_transport=httpx.MockTransport(handler),
+    )
+    await legacy.create(payload, idempotency_key="bridge-request-1")
+    legacy_body = captured[-1].content
+
+    store = FakeStore()
+    gated = create_coordinated_http_responses_transport(
+        "https://bridge.test/v1",
+        api_key=key,
+        coordinator=_coordinator(store),
+        http_transport=httpx.MockTransport(handler),
+    )
+    result = await gated.create(
+        payload,
+        idempotency_key="bridge-request-1",
+        bridge_external_effect_binding=_bridge_external_effect_binding(),
+    )
+
+    assert result["output_text"] == "ok"
+    assert len(captured) == 2
+    assert captured[1].content == legacy_body
+    assert store._prepared_request is not None
+    wire = store._prepared_request.application_request
+    assert wire.method == b"POST"
+    assert wire.target == b"/v1/responses"
+    assert wire.body == legacy_body
+    assert any(
+        name.lower() == b"authorization" and value.endswith(key.encode())
+        for name, value in wire.headers
+    )
+    assert key not in repr(
+        {
+            "application_request_sha256": store._prepared_request.application_request_sha256,
+            "canonical_request": store._prepared_request.canonical_request,
+            "result_ref": store.completed_result_refs,
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_coordinated_bridge_refuses_unbound_and_legacy_post_paths() -> None:
+    calls = 0
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"status": "completed", "output_text": "ok"})
+
+    store = FakeStore()
+    gated = create_coordinated_http_responses_transport(
+        "https://bridge.test/v1",
+        api_key=None,
+        coordinator=_coordinator(store),
+        http_transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(BridgeTransportError) as missing_binding:
+        await gated.create({"input": "must not send"}, idempotency_key="bridge-request-1")
+    assert missing_binding.value.code == "external_effect_authority_required"
+    for path in ("/responses", "/responses/", "/responses?mode=retry", "/responses/../responses"):
+        with pytest.raises(BridgeTransportError) as legacy_path:
+            await gated._request("POST", path, json_body={"input": "must not send"})
+        assert legacy_path.value.code == "external_effect_authority_required"
+    assert calls == 0
+    assert store.events == []
+
+
+@pytest.mark.asyncio
+async def test_complete_bridge_429_is_replayed_without_a_second_post() -> None:
+    calls: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(
+            429,
+            headers={"Retry-After": "2"},
+            json={"detail": {"code": "bridge_rate_limited", "message": "response body"}},
+        )
+
+    store = FakeStore()
+    coordinator = _coordinator(store)
+    transport = create_coordinated_http_responses_transport(
+        "https://bridge.test/v1",
+        api_key="authorization-probe-do-not-persist",
+        coordinator=coordinator,
+        http_transport=httpx.MockTransport(handler),
+    )
+    kwargs = {
+        "payload": {"input": "safe test prompt"},
+        "idempotency_key": "bridge-request-429",
+        "bridge_external_effect_binding": _bridge_external_effect_binding(),
+    }
+    for _ in range(2):
+        with pytest.raises(BridgeTransportError) as caught:
+            await transport.create(**kwargs)
+        assert caught.value.code == "bridge_rate_limited"
+        assert caught.value.retry_after == 2
+        assert caught.value.retryable is True
+        assert caught.value.submission_state == "post_submission"
+        assert caught.value.completed_response is True
+        assert "authorization-probe-do-not-persist" not in str(caught.value)
+    assert len(calls) == 1
+    assert store.completed_outcomes == ["bridge_rate_limited"]
+    assert store.claim_state is EffectClaimState.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_timeout_after_bridge_handoff_is_needs_review_and_never_resends() -> None:
+    calls: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        raise httpx.ReadTimeout("authorization-probe-do-not-persist", request=request)
+
+    store = FakeStore()
+    transport = create_coordinated_http_responses_transport(
+        "https://bridge.test/v1",
+        api_key="authorization-probe-do-not-persist",
+        coordinator=_coordinator(store),
+        http_transport=httpx.MockTransport(handler),
+    )
+    kwargs = {
+        "payload": {"input": "safe test prompt"},
+        "idempotency_key": "bridge-request-timeout",
+        "bridge_external_effect_binding": _bridge_external_effect_binding(),
+    }
+    for _ in range(2):
+        with pytest.raises(BridgeTransportError) as caught:
+            await transport.create(**kwargs)
+        assert caught.value.code == "model_submission_reconciliation_required"
+        assert caught.value.submission_state == "external_state_unknown"
+        assert "authorization-probe-do-not-persist" not in str(caught.value)
+    assert len(calls) == 1
+    assert store.sealed == [("needs_review", "transport_outcome_unknown")]
 
 
 class AllowReuse:

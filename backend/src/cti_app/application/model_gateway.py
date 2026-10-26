@@ -6,7 +6,7 @@ import json
 import math
 import re
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -17,6 +17,8 @@ from uuid import UUID, uuid4
 from pydantic import BaseModel, ValidationError
 
 from cti_app.application.diagnostics import DiagnosticsLog
+from cti_app.application.external_effects import Reused
+from cti_app.domain.external_effects import EvidenceReference, ExternalEffectAuthority
 from cti_app.domain.model_conversations import ConversationTurnStatus
 from cti_app.domain.model_runs import (
     ModelBackend,
@@ -209,6 +211,9 @@ class ModelRequest:
     # for a caller that has proved no provider submission took place.
     allow_failed_resubmit: bool = False
     timeout_seconds: float | None = None
+    bridge_external_effect_binding: BridgeExternalEffectBinding | None = field(
+        default=None, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         if not self.text.strip():
@@ -244,6 +249,55 @@ class SafeModelRequest:
     request_id: str | None = None
     conversation: ConversationContext | None = None
     timeout_seconds: float | None = None
+    bridge_external_effect_binding: BridgeExternalEffectBinding | None = field(
+        default=None, repr=False, compare=False
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class BridgeExternalEffectBinding:
+    """Per-attempt authorization seed for one Bridge Responses submission.
+
+    The application turn service fills the exact persisted turn/run IDs and
+    input hash before model execution. This value stays in memory and is not
+    part of the model's authorized-input digest or persisted metadata.
+    """
+
+    authority: ExternalEffectAuthority
+    family: str
+    provider_scope: str
+    normalizer_version: str
+    evidence_refs: tuple[EvidenceReference, ...] = ()
+    credential_parameter_names: tuple[str, ...] = ()
+    reused_result_resolver: BridgeReusedResultResolver | None = field(
+        default=None, repr=False, compare=False
+    )
+    bridge_turn_id: UUID | None = None
+    model_run_id: UUID | None = None
+    model_input_sha256: str | None = None
+    authorized_input_hash: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.family.startswith(("bridge.", "advisor.")):
+            raise ValueError("Bridge effect family must use a bridge/advisor namespace")
+        if not self.provider_scope.strip() or not self.normalizer_version.strip():
+            raise ValueError("Bridge provider scope and normalizer version are required")
+        if any(not isinstance(item, EvidenceReference) for item in self.evidence_refs):
+            raise TypeError("Bridge evidence refs must be typed references")
+        if (self.bridge_turn_id is None) != (self.model_run_id is None):
+            raise ValueError("Bridge turn and ModelRun IDs must be bound together")
+        for name, value in (
+            ("model input", self.model_input_sha256),
+            ("authorized input", self.authorized_input_hash),
+        ):
+            if value is not None and (
+                len(value) != 64 or any(char not in "0123456789abcdef" for char in value)
+            ):
+                raise ValueError(f"Bridge {name} hash must be a lowercase SHA-256")
+
+
+BridgeExternalEffectBindingFactory = Callable[..., Awaitable[BridgeExternalEffectBinding | None]]
+BridgeReusedResultResolver = Callable[[Reused], Awaitable[dict[str, Any] | None]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1503,6 +1557,7 @@ def sanitize_model_request(request: ModelRequest) -> SafeModelRequest:
         authorized_input_hash=digest,
         conversation=request.conversation,
         timeout_seconds=request.timeout_seconds,
+        bridge_external_effect_binding=request.bridge_external_effect_binding,
     )
 
 
@@ -1631,6 +1686,8 @@ def _record_background_wait_state(
 
 
 def _submission_may_have_started(exc: Exception) -> bool:
+    if getattr(exc, "completed_response", False) is True:
+        return False
     submission_state = getattr(exc, "submission_state", None)
     if submission_state in {
         "submission_attempted",
@@ -1708,6 +1765,8 @@ def _error_details(
             details[key] = value[:128]
     if getattr(exc, "verified_no_answer", False) is True:
         details["verified_no_answer"] = True
+    if getattr(exc, "completed_response", False) is True:
+        details["completed_response"] = True
     source_submission_state = submission_state or getattr(exc, "submission_state", None)
     if isinstance(source_submission_state, str) and source_submission_state:
         details["submission_state"] = source_submission_state[:32]

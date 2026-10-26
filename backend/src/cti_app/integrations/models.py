@@ -10,21 +10,37 @@ from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from io import BytesIO
 from typing import Any, Protocol
-from uuid import UUID
+from uuid import UUID, uuid5
 
 import httpx
 from pydantic import BaseModel
 
 from cti_app.application.blobs import BlobCatalogService
+from cti_app.application.external_effects import (
+    Ambiguous,
+    Completed,
+    DefinitelyNotSubmitted,
+    ExternalEffectCoordinator,
+    PhysicalSendCapability,
+    Refused,
+    Reused,
+    TransportResponse,
+)
 from cti_app.application.model_gateway import (
     AdapterResult,
     AdapterResultStatus,
+    BridgeExternalEffectBinding,
     ConversationResult,
     ModelCapabilities,
     ModelCapabilityError,
     ModelGatewayError,
     SafeModelRequest,
     validate_structured_output,
+)
+from cti_app.domain.external_effects import (
+    ExternalEffectValidationError,
+    FrozenWireRequest,
+    PreparedExternalRequest,
 )
 from cti_app.domain.model_runs import (
     ModelBackend,
@@ -54,6 +70,7 @@ class ResponsesTransport(Protocol):
         *,
         idempotency_key: str | None = None,
         timeout_seconds: float | None = None,
+        bridge_external_effect_binding: BridgeExternalEffectBinding | None = None,
     ) -> dict[str, Any]: ...
 
     async def retrieve(self, response_id: str) -> dict[str, Any]: ...
@@ -76,7 +93,11 @@ class HttpResponsesTransport:
         capabilities_timeout_seconds: float = 2,
         archive_timeout_seconds: float = 60,
         client: httpx.AsyncClient | None = None,
+        external_effect_coordinator: ExternalEffectCoordinator | None = None,
+        http_transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
+        if external_effect_coordinator is not None and client is not None:
+            raise ValueError("Coordinated Bridge transport owns its HTTP client")
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
         self._timeout = timeout_seconds
@@ -84,6 +105,8 @@ class HttpResponsesTransport:
         self._capabilities_timeout = min(capabilities_timeout_seconds, 2)
         self._archive_timeout = archive_timeout_seconds
         self._client = client
+        self._external_effect_coordinator = external_effect_coordinator
+        self._http_transport = http_transport
         self._last_capabilities_check = 0.0
 
     @property
@@ -96,7 +119,19 @@ class HttpResponsesTransport:
         *,
         idempotency_key: str | None = None,
         timeout_seconds: float | None = None,
+        bridge_external_effect_binding: BridgeExternalEffectBinding | None = None,
     ) -> dict[str, Any]:
+        if self._external_effect_coordinator is not None:
+            if bridge_external_effect_binding is None:
+                raise _bridge_external_effect_refusal()
+            return await self._coordinated_create(
+                payload,
+                idempotency_key=idempotency_key,
+                timeout_seconds=timeout_seconds,
+                binding=bridge_external_effect_binding,
+            )
+        if bridge_external_effect_binding is not None:
+            raise _bridge_external_effect_refusal()
         return await self._request(
             "POST",
             "/responses",
@@ -118,6 +153,12 @@ class HttpResponsesTransport:
         timeout_seconds: float | None = None,
         phase: str = "generation",
     ) -> dict[str, Any]:
+        if (
+            self._external_effect_coordinator is not None
+            and method.upper() == "POST"
+            and _is_responses_submission_path(self._base_url, path)
+        ):
+            raise _bridge_external_effect_refusal()
         # Exactly one HTTP attempt: whether a failed POST may be replayed is a
         # gateway decision taken from the typed error, never an implicit loop.
         headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else {}
@@ -138,7 +179,11 @@ class HttpResponsesTransport:
                     timeout=timeout,
                 )
             else:
-                async with httpx.AsyncClient(timeout=timeout) as client:
+                async with httpx.AsyncClient(
+                    timeout=timeout,
+                    follow_redirects=False,
+                    transport=self._http_transport,
+                ) as client:
                     response = await client.request(
                         method, f"{self._base_url}{path}", json=json_body, headers=headers
                     )
@@ -195,6 +240,126 @@ class HttpResponsesTransport:
             )
         return value
 
+    async def _coordinated_create(
+        self,
+        payload: dict[str, Any],
+        *,
+        idempotency_key: str | None,
+        timeout_seconds: float | None,
+        binding: BridgeExternalEffectBinding,
+    ) -> dict[str, Any]:
+        coordinator = self._external_effect_coordinator
+        if coordinator is None:
+            raise _bridge_external_effect_refusal()
+        if (
+            not idempotency_key
+            or binding.bridge_turn_id is None
+            or binding.model_run_id is None
+            or binding.model_input_sha256 is None
+            or binding.authorized_input_hash is None
+            or binding.authority.bridge_turn_id != binding.bridge_turn_id
+            or binding.authority.model_run_id != binding.model_run_id
+        ):
+            raise _bridge_external_effect_refusal()
+
+        headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else {}
+        headers["X-Idempotency-Key"] = idempotency_key
+        correlation_id = get_correlation_id()
+        if correlation_id != "-":
+            headers["X-Correlation-ID"] = correlation_id
+        read_timeout = timeout_seconds if timeout_seconds is not None else self._timeout
+        timeout = httpx.Timeout(read_timeout, connect=self._connect_timeout)
+        try:
+            async with httpx.AsyncClient(
+                timeout=timeout,
+                follow_redirects=False,
+                transport=self._http_transport,
+            ) as client:
+                request = client.build_request(
+                    "POST",
+                    f"{self._base_url}/responses",
+                    json=payload,
+                    headers=headers,
+                    timeout=timeout,
+                )
+                frozen_request = FrozenWireRequest(
+                    method=request.method.encode("ascii"),
+                    target=request.url.raw_path,
+                    headers=tuple(request.headers.raw),
+                    body=request.content,
+                )
+                prepared = PreparedExternalRequest.build(
+                    family=binding.family,
+                    provider=ModelProvider.OPENAI.value,
+                    provider_scope=binding.provider_scope,
+                    normalizer_version=binding.normalizer_version,
+                    canonical_request={
+                        "authorized_input_hash": binding.authorized_input_hash,
+                        "bridge_request_id": idempotency_key,
+                        "model_input_sha256": binding.model_input_sha256,
+                    },
+                    application_request=frozen_request,
+                    occurrence_id=uuid5(
+                        UUID("d34c1df1-a1c5-4ff1-90fc-7d2063f7cb0f"), idempotency_key
+                    ),
+                    evidence_refs=binding.evidence_refs,
+                    credential_parameter_names=binding.credential_parameter_names,
+                )
+                physical_transport = _CoordinatedResponsesPoster(client, request)
+                outcome = await coordinator.send_one(
+                    binding.authority,
+                    prepared,
+                    physical_transport,
+                )
+        except (ExternalEffectValidationError, TypeError, ValueError):
+            raise _bridge_external_effect_refusal() from None
+        except Exception:
+            raise _bridge_submission_reconciliation_error() from None
+
+        if isinstance(outcome, Completed):
+            if outcome.outcome_code in {"bridge_rate_limited", "bridge_rejected"}:
+                status, code, retryable, retry_after = _decode_rejection_result_ref(
+                    outcome.result_ref
+                )
+                raise _completed_bridge_rejection(
+                    status,
+                    code,
+                    retryable,
+                    retry_after,
+                )
+            if outcome.payload is None:
+                raise _bridge_submission_reconciliation_error()
+            try:
+                value = json.loads(outcome.payload)
+            except (ValueError, json.JSONDecodeError):
+                raise _bridge_submission_reconciliation_error() from None
+            if not isinstance(value, dict):
+                raise _bridge_submission_reconciliation_error()
+            return value
+        if isinstance(outcome, DefinitelyNotSubmitted):
+            raise BridgeTransportError(
+                "bridge_submission_not_started",
+                "La soumission Bridge n'a pas commencé; une nouvelle tentative est possible.",
+                retryable=True,
+                phase="generation",
+                submission_state="pre_submission",
+            )
+        if isinstance(outcome, Refused):
+            raise _bridge_external_effect_refusal()
+        if isinstance(outcome, Reused):
+            resolver = binding.reused_result_resolver
+            if resolver is not None:
+                try:
+                    archived_response = await resolver(outcome)
+                except Exception:
+                    raise _bridge_submission_reconciliation_error() from None
+                if isinstance(archived_response, dict):
+                    return archived_response
+            raise _bridge_submission_reconciliation_error()
+        if isinstance(outcome, Ambiguous):
+            raise _bridge_submission_reconciliation_error()
+        raise _bridge_submission_reconciliation_error()
+
 
 class BridgeTransportError(ModelGatewayError):
     provider = "openai_chatgpt_bridge"
@@ -216,6 +381,7 @@ class BridgeTransportError(ModelGatewayError):
         conversation_id: str | None = None,
         reason: str | None = None,
         verified_no_answer: bool = False,
+        completed_response: bool = False,
     ) -> None:
         super().__init__(safe_description)
         self.code = code
@@ -231,6 +397,157 @@ class BridgeTransportError(ModelGatewayError):
         self.conversation_id = conversation_id
         self.reason = reason
         self.verified_no_answer = verified_no_answer
+        self.completed_response = completed_response
+
+
+class _CoordinatedResponsesPoster:
+    """Private single-call transport for one coordinator-held Bridge request."""
+
+    def __init__(
+        self,
+        client: httpx.AsyncClient,
+        request: httpx.Request,
+    ) -> None:
+        self.__client = client
+        self.__request = request
+
+    async def submit_once(
+        self,
+        request: FrozenWireRequest,
+        capability: PhysicalSendCapability,
+    ) -> TransportResponse:
+        capability(request)
+        response = await self.__client.send(self.__request, follow_redirects=False)
+        if response.is_error:
+            if response.status_code == 429:
+                error = BridgeTransportError(
+                    "bridge_rate_limited",
+                    "Le bridge limite temporairement les requêtes.",
+                    retryable=True,
+                    retry_after=_retry_after_seconds(response.headers.get("Retry-After")),
+                    phase="generation",
+                    status_code=429,
+                    submission_state="post_submission",
+                    completed_response=True,
+                )
+            else:
+                parsed = _bridge_http_error(response, 1, default_phase="generation")
+                rejection_code = (
+                    "bridge_protocol_error" if parsed.code == "bridge_rate_limited" else parsed.code
+                )
+                error = BridgeTransportError(
+                    rejection_code,
+                    _safe_bridge_rejection_message(rejection_code),
+                    retryable=parsed.retryable,
+                    retry_after=parsed.retry_after,
+                    phase="generation",
+                    status_code=response.status_code,
+                    submission_state="post_submission",
+                    completed_response=True,
+                )
+            return TransportResponse(
+                result_ref=_encode_rejection_result_ref(error),
+                outcome_code=(
+                    "bridge_rate_limited" if response.status_code == 429 else "bridge_rejected"
+                ),
+            )
+        if not 200 <= response.status_code < 300:
+            raise RuntimeError("Bridge returned a non-final HTTP status")
+        try:
+            decoded = response.json()
+        except (ValueError, json.JSONDecodeError):
+            raise RuntimeError("Bridge returned an unreadable response") from None
+        if not isinstance(decoded, dict):
+            raise RuntimeError("Bridge returned a non-object response")
+        return TransportResponse(payload=response.content)
+
+
+def _bridge_external_effect_refusal() -> BridgeTransportError:
+    return BridgeTransportError(
+        "external_effect_authority_required",
+        "Bridge submission was refused because external-effect authorization is unavailable.",
+        retryable=False,
+        phase="preflight",
+        submission_state="pre_submission",
+    )
+
+
+def _is_responses_submission_path(base_url: str, path: str) -> bool:
+    try:
+        actual_path = httpx.URL(f"{base_url}{path}").path.rstrip("/")
+        responses_path = httpx.URL(f"{base_url}/responses").path.rstrip("/")
+    except (TypeError, ValueError, httpx.InvalidURL):
+        return True
+    return actual_path == responses_path
+
+
+def _bridge_submission_reconciliation_error() -> BridgeTransportError:
+    return BridgeTransportError(
+        "model_submission_reconciliation_required",
+        "Bridge submission may have reached the provider and requires reconciliation.",
+        retryable=False,
+        phase="reconciliation",
+        submission_state="external_state_unknown",
+    )
+
+
+def _safe_bridge_rejection_message(code: str) -> str:
+    return {
+        "bridge_auth_failed": "L'authentification auprès du bridge a échoué.",
+        "bridge_rate_limited": "Le bridge limite temporairement les requêtes.",
+        "bridge_payload_conflict": "La clé d'idempotence est liée à une autre requête.",
+        "bridge_timeout": "Le bridge ChatGPT n'a pas répondu à temps.",
+        "bridge_server_error": "Le bridge ChatGPT a rencontré une erreur.",
+    }.get(code, "Le bridge ChatGPT a renvoyé un rejet complet.")
+
+
+def _encode_rejection_result_ref(error: BridgeTransportError) -> str:
+    status = error.status_code if error.status_code is not None else 400
+    retry_after_ms = (
+        min(86_400_000, max(0, round(error.retry_after * 1000)))
+        if error.retry_after is not None
+        else 0
+    )
+    retryable = 1 if error.retryable else 0
+    return f"bridge-http-rejection:v1:{status}:{error.code}:{retryable}:{retry_after_ms}"
+
+
+def _decode_rejection_result_ref(
+    result_ref: str | None,
+) -> tuple[int, str, bool, float | None]:
+    if result_ref is None:
+        return 400, "bridge_protocol_error", False, None
+    match = re.fullmatch(
+        r"bridge-http-rejection:v1:(\d{3}):((?:bridge|conversation)_[a-z0-9_]{1,56}):([01]):(\d{1,8})",
+        result_ref,
+    )
+    if match is None:
+        return 400, "bridge_protocol_error", False, None
+    status = int(match.group(1))
+    code = match.group(2)
+    retryable = match.group(3) == "1"
+    retry_after_ms = int(match.group(4))
+    if retry_after_ms > 86_400_000 or (status == 429) != (code == "bridge_rate_limited"):
+        return 400, "bridge_protocol_error", False, None
+    return status, code, retryable, retry_after_ms / 1000 if retry_after_ms else None
+
+
+def _completed_bridge_rejection(
+    status: int,
+    code: str,
+    retryable: bool,
+    retry_after: float | None,
+) -> BridgeTransportError:
+    return BridgeTransportError(
+        code,
+        _safe_bridge_rejection_message(code),
+        retryable=retryable,
+        retry_after=retry_after,
+        phase="generation",
+        status_code=status,
+        submission_state="post_submission",
+        completed_response=True,
+    )
 
 
 def _retry_after_seconds(value: str | None) -> float | None:
@@ -582,6 +899,30 @@ class ChatGPTBridgeClient(HttpResponsesTransport):
             raise _archive_response_error(response, conversation_id)
 
 
+def create_coordinated_http_responses_transport(
+    base_url: str,
+    *,
+    api_key: str | None,
+    coordinator: ExternalEffectCoordinator,
+    http_transport: httpx.AsyncBaseTransport | None = None,
+    timeout_seconds: float | None = 900,
+    connect_timeout_seconds: float = 3,
+    capabilities_timeout_seconds: float = 2,
+    archive_timeout_seconds: float = 60,
+) -> ChatGPTBridgeClient:
+    """Build the private, one-POST-at-a-time gated Bridge Responses client."""
+    return ChatGPTBridgeClient(
+        base_url,
+        api_key=api_key,
+        timeout_seconds=timeout_seconds,
+        connect_timeout_seconds=connect_timeout_seconds,
+        capabilities_timeout_seconds=capabilities_timeout_seconds,
+        archive_timeout_seconds=archive_timeout_seconds,
+        external_effect_coordinator=coordinator,
+        http_transport=http_transport,
+    )
+
+
 class ChatCompletionsTransportError(ModelGatewayError):
     """Typed Chat Completions failure carrying only bounded, prompt-free facts.
 
@@ -877,6 +1218,8 @@ class OpenAIResearchAdapter:
         create_kwargs: dict[str, Any] = {"idempotency_key": request.request_id}
         if request.timeout_seconds is not None:
             create_kwargs["timeout_seconds"] = request.timeout_seconds
+        if request.bridge_external_effect_binding is not None:
+            create_kwargs["bridge_external_effect_binding"] = request.bridge_external_effect_binding
         return _responses_result(
             await self._transport.create(payload, **create_kwargs),
             self.provider,
@@ -950,6 +1293,8 @@ class OpenAIStructuredAdapter:
         create_kwargs: dict[str, Any] = {"idempotency_key": request.request_id}
         if request.timeout_seconds is not None:
             create_kwargs["timeout_seconds"] = request.timeout_seconds
+        if request.bridge_external_effect_binding is not None:
+            create_kwargs["bridge_external_effect_binding"] = request.bridge_external_effect_binding
         return _responses_result(
             await self._transport.create(payload, **create_kwargs),
             self.provider,
