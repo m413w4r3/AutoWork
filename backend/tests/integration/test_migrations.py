@@ -84,7 +84,7 @@ def _head_revision() -> str:
 
     The rest of this module compares the full migrated schema against
     ``Base.metadata``. The current head includes additive migrations through
-    ``0003_osint_open_policy``.
+    ``0004_external_effect_claims``.
     """
     from alembic.script import ScriptDirectory
 
@@ -1042,7 +1042,7 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
     command.upgrade(config, "head")
     command.current(config)
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
-    assert _head_revision() == "0003_osint_open_policy"
+    assert _head_revision() == "0004_external_effect_claims"
 
     tables = asyncio.run(_table_names(temporary_postgres_url))
     assert _REPAIR_TABLE in tables
@@ -1131,7 +1131,7 @@ def test_stamped_0001_without_c2_upgrades_additively_and_preserves_data(
 
     command.upgrade(config, "head")
 
-    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0003_osint_open_policy"
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0004_external_effect_claims"
     after = asyncio.run(_database_snapshot(temporary_postgres_url))
     for table_name, table_schema in before.items():
         if table_name == "investigation_envelopes":
@@ -1163,7 +1163,7 @@ def test_stamped_0001_with_exact_manual_c2_schema_advances_without_ddl(
 
     command.upgrade(config, "head")
 
-    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0003_osint_open_policy"
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0004_external_effect_claims"
     assert asyncio.run(_c2_catalog_snapshot(temporary_postgres_url)) == before_c2
     after_tables = asyncio.run(_database_snapshot(temporary_postgres_url))
     for table_name, table_schema in before_tables.items():
@@ -1262,7 +1262,7 @@ def test_c2_downgrade_refuses_to_discard_experiment_rows(
     with pytest.raises(RuntimeError, match="refusing to downgrade C2 experiment storage"):
         command.downgrade(config, "0001_baseline")
 
-    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0003_osint_open_policy"
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0004_external_effect_claims"
 
     async def _experiment_count() -> int:
         engine = create_async_engine(temporary_postgres_url)
@@ -1350,7 +1350,7 @@ def test_osint_policy_downgrade_refuses_policy_and_inherited_lineage_rows(
     with pytest.raises(RuntimeError, match="Cannot downgrade populated OSINT_OPEN policy storage"):
         command.downgrade(config, "0002_c2_experiments")
 
-    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0003_osint_open_policy"
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0004_external_effect_claims"
     assert asyncio.run(_state_counts()) == (1, 1, 1, 1, 1, 1)
 
 
@@ -1418,4 +1418,4 @@ def test_0002_envelope_null_authority_is_read_as_human_without_backfill(
     raw_authority, interpreted_authority = asyncio.run(_read_legacy_envelope())
     assert raw_authority is None
     assert interpreted_authority is EnvelopeAuthorityKind.HUMAN_G2
-    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0003_osint_open_policy"
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0004_external_effect_claims"

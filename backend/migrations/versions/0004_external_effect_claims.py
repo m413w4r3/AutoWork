@@ -222,6 +222,9 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     bind = op.get_bind()
+    bind.execute(
+        text("LOCK TABLE external_effect_use, external_effect_claim IN ACCESS EXCLUSIVE MODE")
+    )
     rows_exist = bind.execute(
         text(
             "SELECT EXISTS (SELECT 1 FROM external_effect_claim) "

@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
+import importlib
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+from alembic import command
 from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
@@ -20,9 +25,12 @@ from cti_app.application.external_effects import (
     ConsumePolicyContext,
     DefinitelyNotSubmitted,
     ExternalEffectCoordinator,
+    HandoffGateRefused,
+    PhysicalSendCapability,
     Refused,
+    Reused,
+    ReuseDecision,
     TransportResponse,
-    _NoHandoffProofAuthority,
 )
 from cti_app.application.investigation_service import InvestigationService
 from cti_app.application.production_artifact_store import ProductionArtifactStore
@@ -63,6 +71,7 @@ from cti_app.infrastructure.database.repositories.external_effects import (
 from cti_app.infrastructure.database.repositories.investigation import _budget_to_payload
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
+from tests.integration.conftest import _alembic_config
 from tests.workflow_emulator.investigation_support import seed_verified_article
 
 pytestmark = pytest.mark.integration
@@ -76,14 +85,40 @@ _REQUEST = {"hash": "abc", "include": ["relations", "history"]}
 
 class _CountingTransport:
     def __init__(self) -> None:
-        self.calls = 0
+        self.__raw_client = _CountingRawClient()
         self.submit_entries = 0
-        self._lock = asyncio.Lock()
 
-    async def submit_once(self, _request: FrozenWireRequest) -> TransportResponse:
+    @property
+    def calls(self) -> int:
+        return self.__raw_client.calls
+
+    async def submit_once(
+        self,
+        request: FrozenWireRequest,
+        capability: PhysicalSendCapability | None = None,
+    ) -> TransportResponse:
         self.submit_entries += 1
-        async with self._lock:
-            self.calls += 1
+        if (
+            not isinstance(capability, PhysicalSendCapability)
+            or type(capability) is not PhysicalSendCapability
+        ):
+            raise HandoffGateRefused("physical send capability is required")
+        if self.__raw_client.retries_enabled:
+            raise HandoffGateRefused("raw client retries must be disabled")
+        capability(request)
+        return await self.__raw_client.send(request, follow_redirects=False)
+
+
+class _CountingRawClient:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.retries_enabled = False
+
+    async def send(
+        self, _request: FrozenWireRequest, *, follow_redirects: bool
+    ) -> TransportResponse:
+        assert follow_redirects is False
+        self.calls += 1
         return TransportResponse(result_ref="artifact:pg-fake-result")
 
 
@@ -375,44 +410,34 @@ def update_investigation_status(investigation_id: UUID):
 
 
 @pytest.mark.asyncio
-async def test_only_coordinator_pre_transport_seal_changes_durable_claim(
-    migrated_postgres_url: str, tmp_path: Path
+async def test_sql_store_seals_real_pretransport_failure_and_rejects_forged_proofs(
+    migrated_postgres_url: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     session_factory, engine, investigation_id, _subject_id, authorities = await _prepare_case(
         migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
     )
     authority, prepared = authorities[0]
-    proof_authority = _NoHandoffProofAuthority()
-    store = _store(session_factory, proof_authority=proof_authority)
-
-    class _ForeignProofProbeStore:
-        def __init__(self, delegate: SqlAlchemyExternalEffectClaimStore) -> None:
-            self._delegate = delegate
-
-        def __getattr__(self, name: str) -> Any:
-            return getattr(self._delegate, name)
-
-        async def consume(self, *args: Any, **kwargs: Any) -> Any:
-            result = await self._delegate.consume(*args, **kwargs)
-            if isinstance(result, ConsumeCommitted):
-                foreign_authority = _NoHandoffProofAuthority()
-                foreign_authority.arm_claim(result.claim_id)
-                foreign_proof = foreign_authority.issue(result.claim_id)
-                assert not await self._delegate.definitely_not_submitted(
-                    result.claim_id,
-                    proof=foreign_proof,
-                    reason_code="foreign_proof_probe",
-                )
-                async with session_factory() as session:
-                    row = await session.get(ExternalEffectClaimRow, result.claim_id)
-                assert row is not None and row.state == "CONSUMED"
-            return result
-
+    store = _store(session_factory)
     transport = _CountingTransport()
-    coordinator = ExternalEffectCoordinator(
-        _ForeignProofProbeStore(store), no_handoff_proof_authority=proof_authority
+    external_effects = importlib.import_module("cti_app.application.external_effects")
+    ticks = iter((10.0, 12.0))
+    monkeypatch.setattr(
+        external_effects, "time", SimpleNamespace(monotonic=lambda: next(ticks, 12.0))
     )
-    coordinator._permits._ttl_seconds = -1
+    original_seal = store.definitely_not_submitted
+    captured_proofs: list[object] = []
+
+    async def check_untrusted_proofs_before_seal(
+        claim_id: UUID, *, proof: object, reason_code: str
+    ) -> bool:
+        captured_proofs.append(proof)
+        assert not await original_seal(uuid4(), proof=proof, reason_code="wrong_claim")
+        assert not await original_seal(claim_id, proof=copy.copy(proof), reason_code="copied_proof")
+        assert not await original_seal(claim_id, proof=object(), reason_code="forged_proof")
+        return await original_seal(claim_id, proof=proof, reason_code=reason_code)
+
+    monkeypatch.setattr(store, "definitely_not_submitted", check_untrusted_proofs_before_seal)
+    coordinator = ExternalEffectCoordinator(store)
     try:
         outcome = await coordinator.send_one(authority, prepared, transport)
         assert isinstance(outcome, DefinitelyNotSubmitted)
@@ -423,20 +448,24 @@ async def test_only_coordinator_pre_transport_seal_changes_durable_claim(
         assert row.state == "DEFINITIVELY_NOT_SUBMITTED"
         assert row.handoff_permit_nonce is None
         assert row.investigation_id == investigation_id
+        assert len(captured_proofs) == 1
+        assert not await original_seal(
+            outcome.claim_id, proof=captured_proofs[0], reason_code="replayed_proof"
+        )
     finally:
         await engine.dispose()
 
 
 @pytest.mark.asyncio
 async def test_second_coordinator_cannot_seal_claim_with_foreign_proof(
-    migrated_postgres_url: str, tmp_path: Path
+    migrated_postgres_url: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     session_factory, engine, _investigation_id, _subject_id, authorities = await _prepare_case(
         migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
     )
     authority, prepared = authorities[0]
-    proof_authority = _NoHandoffProofAuthority()
-    store = _store(session_factory, proof_authority=proof_authority)
+    store = _store(session_factory)
+    _coordinator = ExternalEffectCoordinator(store)
     consumed = await store.consume(
         authority,
         prepared,
@@ -445,9 +474,16 @@ async def test_second_coordinator_cannot_seal_claim_with_foreign_proof(
     )
     assert isinstance(consumed, ConsumeCommitted), "fixture must create a committed claim"
 
+    foreign_store = _store(session_factory)
+    external_effects = importlib.import_module("cti_app.application.external_effects")
+    ticks = iter((20.0, 22.0))
+    monkeypatch.setattr(
+        external_effects, "time", SimpleNamespace(monotonic=lambda: next(ticks, 22.0))
+    )
+
     class _ClaimReplayProbe:
         def __getattr__(self, name: str) -> Any:
-            return getattr(store, name)
+            return getattr(foreign_store, name)
 
         async def consume(self, *args: Any, **kwargs: Any) -> ConsumeCommitted:
             assert isinstance(consumed, ConsumeCommitted), (
@@ -460,11 +496,14 @@ async def test_second_coordinator_cannot_seal_claim_with_foreign_proof(
             # before the definitive-not-submitted CAS.
             return True
 
-    foreign_authority = _NoHandoffProofAuthority()
-    foreign_coordinator = ExternalEffectCoordinator(
-        _ClaimReplayProbe(), no_handoff_proof_authority=foreign_authority
-    )
-    foreign_coordinator._permits._ttl_seconds = -1
+        async def definitely_not_submitted(
+            self, claim_id: UUID, *, proof: object, reason_code: str
+        ) -> bool:
+            return await store.definitely_not_submitted(
+                claim_id, proof=proof, reason_code=reason_code
+            )
+
+    foreign_coordinator = ExternalEffectCoordinator(_ClaimReplayProbe())  # type: ignore[arg-type]
     transport = _CountingTransport()
     try:
         outcome = await foreign_coordinator.send_one(authority, prepared, transport)
@@ -478,16 +517,40 @@ async def test_second_coordinator_cannot_seal_claim_with_foreign_proof(
         await engine.dispose()
 
 
+@pytest.mark.asyncio
+async def test_downgrade_refuses_committed_external_effect_rows(
+    migrated_postgres_url: str, tmp_path: Path
+) -> None:
+    session_factory, engine, investigation_id, _subject_id, authorities = await _prepare_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    authority, prepared = authorities[0]
+    store = _store(session_factory)
+    try:
+        consumed = await store.consume(
+            authority,
+            prepared,
+            effect_key=effect_key(investigation_id, prepared),
+            occurrence_digest=occurrence_sha256(prepared.occurrence_id),
+        )
+        assert isinstance(consumed, ConsumeCommitted)
+        with pytest.raises(RuntimeError, match="refusing to drop external effect"):
+            command.downgrade(_alembic_config(migrated_postgres_url), "0003_osint_open_policy")
+        async with session_factory() as session:
+            claim = await session.get(ExternalEffectClaimRow, consumed.claim_id)
+            version = await session.scalar(text("SELECT version_num FROM alembic_version"))
+        assert claim is not None and claim.state == "CONSUMED"
+        assert version == "0004_external_effect_claims"
+    finally:
+        await engine.dispose()
+
+
 def _store(
-    session_factory: async_sessionmaker[AsyncSession],
-    *,
-    proof_authority: _NoHandoffProofAuthority,
-    policy_guard: Any = None,
+    session_factory: async_sessionmaker[AsyncSession], *, policy_guard: Any = None
 ) -> SqlAlchemyExternalEffectClaimStore:
     return SqlAlchemyExternalEffectClaimStore(
         session_factory,
         policy_guard=policy_guard,
-        no_handoff_proof_verifier=proof_authority.verifier,
         family_bindings={
             _FAMILY: ExternalEffectFamilyBinding(
                 provider=_PROVIDER,
@@ -509,11 +572,9 @@ async def test_concurrent_same_effect_and_replay_make_one_send(
         suffix=uuid4().hex[:12],
         invocations=2,
     )
-    proof_authority = _NoHandoffProofAuthority()
-    store = _store(session_factory, proof_authority=proof_authority)
+    store = _store(session_factory)
     coordinator = ExternalEffectCoordinator(
-        _ClaimBarrierStore(store, asyncio.Barrier(len(authorities))),
-        no_handoff_proof_authority=proof_authority,
+        _ClaimBarrierStore(store, asyncio.Barrier(len(authorities)))
     )
     transport = _CountingTransport()
     try:
@@ -579,6 +640,92 @@ async def test_concurrent_same_effect_and_replay_make_one_send(
         await engine.dispose()
 
 
+@pytest.mark.asyncio
+async def test_explicit_new_occurrence_creates_claim_after_recorded_reuse(
+    migrated_postgres_url: str, tmp_path: Path
+) -> None:
+    session_factory, engine, investigation_id, _subject_id, authorities = await _prepare_case(
+        migrated_postgres_url,
+        tmp_path,
+        suffix=uuid4().hex[:12],
+        invocations=3,
+    )
+
+    class _AllowReuse:
+        async def authorize_reuse(
+            self,
+            claim: Any,
+            _authority: ExternalEffectAuthority,
+            _prepared: PreparedExternalRequest,
+        ) -> ReuseDecision:
+            return ReuseDecision(source_invocation_id=claim.invocation_id, observation_refs=())
+
+    coordinator = ExternalEffectCoordinator(
+        _store(session_factory), reuse_policies={_FAMILY: _AllowReuse()}
+    )
+    transport = _CountingTransport()
+    original_authority, original_prepared = authorities[0]
+    try:
+        original = await coordinator.send_one(original_authority, original_prepared, transport)
+        assert isinstance(original, Completed)
+        assert transport.calls == 1
+
+        reuse_authority, reuse_prepared = authorities[1]
+        reused = await coordinator.send_one(
+            replace(reuse_authority, expected_envelope_version=5),
+            reuse_prepared,
+            transport,
+        )
+        assert isinstance(reused, Reused)
+        assert reused.claim_id == original.claim_id
+        assert transport.calls == 1
+
+        occurrence_authority, _ = authorities[2]
+        new_prepared = replace(original_prepared, occurrence_id=uuid4())
+        new_effect = await coordinator.send_one(
+            replace(occurrence_authority, expected_envelope_version=5),
+            new_prepared,
+            transport,
+        )
+        assert isinstance(new_effect, Completed)
+        assert new_effect.claim_id != original.claim_id
+        assert transport.calls == 2
+
+        async with session_factory() as session:
+            original_claim = await session.get(ExternalEffectClaimRow, original.claim_id)
+            new_claim = await session.get(ExternalEffectClaimRow, new_effect.claim_id)
+            claims = await session.scalar(
+                select(func.count())
+                .select_from(ExternalEffectClaimRow)
+                .where(ExternalEffectClaimRow.investigation_id == investigation_id)
+            )
+            original_uses = list(
+                (
+                    await session.scalars(
+                        select(ExternalEffectUseRow).where(
+                            ExternalEffectUseRow.claim_id == original.claim_id
+                        )
+                    )
+                ).all()
+            )
+            new_uses = list(
+                (
+                    await session.scalars(
+                        select(ExternalEffectUseRow).where(
+                            ExternalEffectUseRow.claim_id == new_effect.claim_id
+                        )
+                    )
+                ).all()
+            )
+        assert original_claim is not None and original_claim.state == "COMPLETED"
+        assert new_claim is not None and new_claim.state == "COMPLETED"
+        assert claims == 2
+        assert sorted(use.use_kind for use in original_uses) == ["REUSED", "SENT"]
+        assert [use.use_kind for use in new_uses] == ["SENT"]
+    finally:
+        await engine.dispose()
+
+
 def _policy_authority(
     base: ExternalEffectAuthority, *, subject_id: UUID, policy_event_id: UUID
 ) -> ExternalEffectAuthority:
@@ -609,14 +756,11 @@ async def test_revocation_first_guard_denies_with_zero_send(
     authority = _policy_authority(
         base, subject_id=subject_id, policy_event_id=guard.policy_event_id
     )
-    proof_authority = _NoHandoffProofAuthority()
-    store = _store(session_factory, proof_authority=proof_authority, policy_guard=guard)
+    store = _store(session_factory, policy_guard=guard)
     transport = _CountingTransport()
     try:
         await guard.revoke(session_factory, investigation_id)
-        outcome = await ExternalEffectCoordinator(
-            store, no_handoff_proof_authority=proof_authority
-        ).send_one(authority, prepared, transport)
+        outcome = await ExternalEffectCoordinator(store).send_one(authority, prepared, transport)
         assert isinstance(outcome, Refused)
         assert outcome.reason == "osint_policy_denied"
         assert guard.events == ["policy_lock"]
@@ -644,14 +788,11 @@ async def test_consume_first_policy_lock_wins_before_revocation(
     authority = _policy_authority(
         base, subject_id=subject_id, policy_event_id=guard.policy_event_id
     )
-    proof_authority = _NoHandoffProofAuthority()
-    store = _store(session_factory, proof_authority=proof_authority, policy_guard=guard)
+    store = _store(session_factory, policy_guard=guard)
     transport = _CountingTransport()
     try:
         send_task = asyncio.create_task(
-            ExternalEffectCoordinator(store, no_handoff_proof_authority=proof_authority).send_one(
-                authority, prepared, transport
-            )
+            ExternalEffectCoordinator(store).send_one(authority, prepared, transport)
         )
         await asyncio.wait_for(guard.consume_locked.wait(), timeout=10)
         revoke_task = asyncio.create_task(guard.revoke(session_factory, investigation_id))
@@ -678,13 +819,10 @@ async def test_crash_before_consume_leaves_no_claim(
         migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
     )
     authority, prepared = authorities[0]
-    proof_authority = _NoHandoffProofAuthority()
-    store = _store(session_factory, proof_authority=proof_authority)
+    store = _store(session_factory)
     failing_store = _PreConsumeFailureStore(store)
     transport = _CountingTransport()
-    coordinator = ExternalEffectCoordinator(
-        failing_store, no_handoff_proof_authority=proof_authority
-    )
+    coordinator = ExternalEffectCoordinator(failing_store)  # type: ignore[arg-type]
     try:
         outcome = await coordinator.send_one(authority, prepared, transport)
         assert isinstance(outcome, Refused)
@@ -692,7 +830,7 @@ async def test_crash_before_consume_leaves_no_claim(
         assert failing_store.consume_calls == 1
         assert transport.calls == 0
         assert transport.submit_entries == 0
-        assert coordinator._permits._issued == {}
+        assert "_permits" not in dir(coordinator)
         async with session_factory() as session:
             count = await session.scalar(
                 select(func.count())
@@ -747,8 +885,7 @@ async def test_crash_after_consume_seals_review_and_replay_never_sends(
         migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
     )
     authority, prepared = authorities[0]
-    proof_authority = _NoHandoffProofAuthority()
-    store = _store(session_factory, proof_authority=proof_authority)
+    store = _store(session_factory)
     transport = _CountingTransport()
     try:
         consumed = await store.consume(
@@ -760,9 +897,7 @@ async def test_crash_after_consume_seals_review_and_replay_never_sends(
         assert isinstance(consumed, ConsumeCommitted)
         # Simulate restart recovery after the consume commit and before handoff.
         assert await store.needs_review(consumed.claim_id, reason_code="worker_crash_after_consume")
-        replay = await ExternalEffectCoordinator(
-            store, no_handoff_proof_authority=proof_authority
-        ).send_one(authority, prepared, transport)
+        replay = await ExternalEffectCoordinator(store).send_one(authority, prepared, transport)
         assert isinstance(replay, Ambiguous)
         assert transport.calls == 0
         async with session_factory() as session:

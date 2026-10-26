@@ -175,16 +175,23 @@ class SqlAlchemyExternalEffectClaimStore:
         *,
         policy_guard: ExternalEffectPolicyGuard | None = None,
         family_bindings: Mapping[str, ExternalEffectFamilyBinding] | None = None,
-        no_handoff_proof_verifier: _NoHandoffProofVerifier | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._policy_guard = policy_guard
         self._family_bindings = dict(family_bindings or {})
-        self._no_handoff_proof_verifier = no_handoff_proof_verifier
+        self._no_handoff_proof_verifier: _NoHandoffProofVerifier | None = None
+
+    def _bind_no_handoff_proof_verifier(self, verifier: _NoHandoffProofVerifier) -> None:
+        if type(verifier) is not _NoHandoffProofVerifier:
+            raise TypeError("claim store requires a coordinator-bound no-handoff verifier")
+        if self._no_handoff_proof_verifier is not None:
+            raise ValueError("claim store already has a no-handoff proof verifier")
+        verifier.bind_store(self)
+        self._no_handoff_proof_verifier = verifier
 
     def _consume_no_handoff_proof(self, proof: _CoordinatorNoHandoffProof, claim_id: UUID) -> bool:
         verifier = self._no_handoff_proof_verifier
-        return verifier is not None and verifier.consume(proof, claim_id)
+        return verifier is not None and verifier.consume(self, proof, claim_id)
 
     async def consume(
         self,

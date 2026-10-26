@@ -5,6 +5,7 @@ import copy
 import importlib
 import time
 from collections.abc import Mapping
+from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -22,11 +23,11 @@ from cti_app.application.external_effects import (
     ExternalEffectCoordinator,
     ExternalEffectReusePolicy,
     HandoffGateRefused,
+    PhysicalSendCapability,
     Refused,
     ReuseDecision,
     TransportResponse,
-    _HandoffGate,
-    _NoHandoffProofAuthority,
+    _NoHandoffProofVerifier,
     _PermitRegistry,
 )
 from cti_app.domain.external_effects import (
@@ -124,8 +125,16 @@ class FakeStore:
         self.gate_entries = 0
         self.handoff_delay = 0.0
         self._prepared_request: PreparedExternalRequest | None = None
-        self.proof_authority = _NoHandoffProofAuthority()
-        self._proof_verifier = self.proof_authority.verifier
+        self._proof_verifier: _NoHandoffProofVerifier | None = None
+        self.no_handoff_proofs: list[object] = []
+
+    def _bind_no_handoff_proof_verifier(self, verifier: _NoHandoffProofVerifier) -> None:
+        if type(verifier) is not _NoHandoffProofVerifier:
+            raise TypeError("fake store requires a coordinator-bound verifier")
+        if self._proof_verifier is not None:
+            raise ValueError("fake store already has a no-handoff proof verifier")
+        verifier.bind_store(self)
+        self._proof_verifier = verifier
 
     async def consume(
         self,
@@ -149,7 +158,7 @@ class FakeStore:
                     application_request_sha256=prepared.application_request_sha256,
                     envelope_version=authority.expected_envelope_version,
                     approval_decision_id=authority.approval_decision_id,
-                    state=EffectClaimState.NEEDS_REVIEW,
+                    state=self.claim_state,
                 )
             )
         self._first_consume = False
@@ -188,7 +197,8 @@ class FakeStore:
     async def definitely_not_submitted(
         self, claim_id: UUID, *, proof: object, reason_code: str
     ) -> bool:
-        if not self._proof_verifier.consume(proof, claim_id):  # type: ignore[arg-type]
+        self.no_handoff_proofs.append(proof)
+        if self._proof_verifier is None or not self._proof_verifier.consume(self, proof, claim_id):
             return False
         if (
             self.claim_state is not EffectClaimState.CONSUMED
@@ -235,21 +245,74 @@ class FakeTransport:
         response: object | Exception | None = None,
         *,
         fail_during_submission: bool = False,
+        send_delay_seconds: float = 0.0,
+        substitute_request: bool = False,
+        retry_inside_transport: bool = False,
+        client_retries_enabled: bool = False,
     ) -> None:
-        self.calls: list[FrozenWireRequest] = []
+        self.__raw_client = _FakeRawClient(events, response, retries_enabled=client_retries_enabled)
         self.submit_entries = 0
         self.events = events
-        self.response = response or TransportResponse(result_ref="artifact:result-1")
         self.fail_during_submission = fail_during_submission
+        self.send_delay_seconds = send_delay_seconds
+        self.substitute_request = substitute_request
+        self.retry_inside_transport = retry_inside_transport
 
-    async def submit_once(self, request: FrozenWireRequest) -> TransportResponse:
+    @property
+    def calls(self) -> list[FrozenWireRequest]:
+        return self.__raw_client.calls
+
+    @property
+    def physical_calls(self) -> int:
+        return len(self.__raw_client.calls)
+
+    async def submit_once(
+        self,
+        request: FrozenWireRequest,
+        capability: PhysicalSendCapability | None = None,
+    ) -> TransportResponse:
         self.submit_entries += 1
+        if (
+            not isinstance(capability, PhysicalSendCapability)
+            or type(capability) is not PhysicalSendCapability
+        ):
+            raise HandoffGateRefused("physical send capability is required")
+        if self.fail_during_submission:
+            raise RuntimeError("local transport setup failed")
+        if self.send_delay_seconds:
+            await asyncio.sleep(self.send_delay_seconds)
+        if self.__raw_client.retries_enabled:
+            raise HandoffGateRefused("raw client retries must be disabled")
+        sent_request = _wire(target=b"/substituted") if self.substitute_request else request
+        capability(sent_request)
+        response = await self.__raw_client.send(sent_request, follow_redirects=False)
+        if self.retry_inside_transport:
+            capability(request)
+        return response
+
+
+class _FakeRawClient:
+    def __init__(
+        self,
+        events: list[str] | None,
+        response: object | Exception | None,
+        *,
+        retries_enabled: bool = False,
+    ) -> None:
+        self.calls: list[FrozenWireRequest] = []
+        self.events = events
+        self.response = response or TransportResponse(result_ref="artifact:result-1")
+        self.retries_enabled = retries_enabled
+
+    async def send(
+        self, request: FrozenWireRequest, *, follow_redirects: bool
+    ) -> TransportResponse:
+        if follow_redirects or self.retries_enabled:
+            raise AssertionError("fake raw client must disable redirects and retries")
+        self.calls.append(request)
         if self.events is not None:
             assert self.events[-1] == "gate"
             self.events.append("send")
-        if self.fail_during_submission:
-            raise RuntimeError("local transport setup failed")
-        self.calls.append(request)
         if isinstance(self.response, Exception):
             raise self.response
         return self.response  # type: ignore[return-value]
@@ -263,7 +326,6 @@ def _coordinator(
 ) -> ExternalEffectCoordinator:
     return ExternalEffectCoordinator(
         store,
-        no_handoff_proof_authority=store.proof_authority,
         reuse_policies=reuse_policies,
         permit_ttl_seconds=permit_ttl_seconds,
     )
@@ -438,11 +500,15 @@ async def test_transport_callback_exception_is_ambiguous_and_never_retried() -> 
 
 
 @pytest.mark.asyncio
-async def test_expired_permit_is_refused_before_transport_entry() -> None:
+async def test_expired_permit_is_refused_before_transport_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     store = FakeStore()
     transport = FakeTransport()
-    coordinator = _coordinator(store)
-    coordinator._permits._ttl_seconds = -1
+    module = importlib.import_module("cti_app.application.external_effects")
+    ticks = iter((10.0, 12.0))
+    monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=lambda: next(ticks, 12.0)))
+    coordinator = _coordinator(store, permit_ttl_seconds=1.0)
     outcome = await coordinator.send_one(_authority(), _prepared(), transport)
     assert isinstance(outcome, DefinitelyNotSubmitted)
     assert transport.submit_entries == 0
@@ -476,27 +542,22 @@ async def test_permit_expiring_while_handoff_is_paused_never_reaches_physical_se
 
 
 @pytest.mark.asyncio
-async def test_stale_gate_after_definitive_seal_cannot_submit() -> None:
+async def test_pretransport_seal_prevents_stale_replay_from_sending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     store = FakeStore()
-    coordinator = _coordinator(store)
     authority, prepared = _authority(), _prepared()
-    key = effect_key(authority.investigation_id, prepared)
-    claim_id = store.result.claim_id  # type: ignore[union-attr]
-    store._prepared_request = prepared
-    permit = coordinator._permits.issue(claim_id, authority, prepared, key)
-    coordinator._proof_authority.arm_claim(claim_id)
-    gate = _HandoffGate(
-        claim_store=store,
-        permit_registry=coordinator._permits,
-        permit=permit,
-        authority=authority,
-        prepared=prepared,
-        key=key,
-    )
-    sealed = await coordinator._seal_zero_handoff(claim_id, reason_code="pre_handoff_timeout")
+    transport = FakeTransport()
+    module = importlib.import_module("cti_app.application.external_effects")
+    ticks = iter((10.0, 12.0))
+    monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=lambda: next(ticks, 12.0)))
+    coordinator = _coordinator(store, permit_ttl_seconds=1.0)
+    sealed = await coordinator.send_one(authority, prepared, transport)
     assert isinstance(sealed, DefinitelyNotSubmitted)
-    with pytest.raises(HandoffGateRefused):
-        await gate.submit(permit, prepared, FakeTransport())
+    assert transport.physical_calls == 0
+    replay = await coordinator.send_one(authority, prepared, transport)
+    assert isinstance(replay, DefinitelyNotSubmitted)
+    assert transport.physical_calls == 0
     assert store.claim_state is EffectClaimState.DEFINITIVELY_NOT_SUBMITTED
 
 
@@ -504,44 +565,18 @@ async def test_stale_gate_after_definitive_seal_cannot_submit() -> None:
 async def test_gate_refuses_request_substitution_and_second_submission() -> None:
     store = FakeStore()
     coordinator = _coordinator(store)
-    authority, prepared = _authority(), _prepared()
-    store._prepared_request = prepared
-    key = effect_key(authority.investigation_id, prepared)
-    claim_id = store.result.claim_id  # type: ignore[union-attr]
-    permit = coordinator._permits.issue(claim_id, authority, prepared, key)
-    wrong_gate = _HandoffGate(
-        claim_store=store,
-        permit_registry=coordinator._permits,
-        permit=permit,
-        authority=authority,
-        prepared=prepared,
-        key=key,
-    )
-    with pytest.raises(HandoffGateRefused, match="prepared request binding mismatch"):
-        await wrong_gate.submit(
-            permit,
-            _prepared(wire=_wire(target=b"/substituted")),
-            FakeTransport(),
-        )
-    assert store.gate_entries == 0
+    substituted_transport = FakeTransport(substitute_request=True)
+    substituted = await coordinator.send_one(_authority(), _prepared(), substituted_transport)
+    assert isinstance(substituted, Ambiguous)
+    assert substituted_transport.physical_calls == 0
+    assert substituted_transport.submit_entries == 1
 
-    gate = _HandoffGate(
-        claim_store=store,
-        permit_registry=coordinator._permits,
-        permit=permit,
-        authority=authority,
-        prepared=prepared,
-        key=key,
-    )
-    transport = FakeTransport(response=TransportResponse(result_ref="artifact:one-shot"))
-    response = await gate.submit(permit, prepared, transport)
-    assert response.result_ref == "artifact:one-shot"
-    assert transport.submit_entries == 1
-    assert len(transport.calls) == 1
-    assert transport.calls[0] is prepared.application_request
-    with pytest.raises(HandoffGateRefused, match="already used"):
-        await gate.submit(permit, prepared, transport)
-    assert transport.submit_entries == 1
+    retry_store = FakeStore()
+    retry_transport = FakeTransport(retry_inside_transport=True)
+    retry = await _coordinator(retry_store).send_one(_authority(), _prepared(), retry_transport)
+    assert isinstance(retry, Ambiguous)
+    assert retry_transport.physical_calls == 1
+    assert retry_transport.submit_entries == 1
 
 
 @pytest.mark.asyncio
@@ -555,41 +590,123 @@ async def test_physical_submit_failure_is_never_classified_not_submitted() -> No
     assert store.claim_state is EffectClaimState.NEEDS_REVIEW
 
 
-def test_no_handoff_proofs_are_opaque_bound_and_one_use() -> None:
+@pytest.mark.asyncio
+async def test_permit_aware_transport_refuses_direct_call_without_capability() -> None:
+    transport = FakeTransport()
+    with pytest.raises(HandoffGateRefused, match="capability is required"):
+        await transport.submit_once(_wire())
+    with pytest.raises(HandoffGateRefused, match="capability is required"):
+        await transport.submit_once(
+            _wire(),
+            lambda *_args, **_kwargs: None,  # type: ignore[arg-type]
+        )
+    assert transport.physical_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_capability_rechecks_expiry_at_physical_send() -> None:
+    store = FakeStore()
+    transport = FakeTransport(send_delay_seconds=0.05)
+    outcome = await _coordinator(store, permit_ttl_seconds=0.02).send_one(
+        _authority(), _prepared(), transport
+    )
+    assert isinstance(outcome, Ambiguous)
+    assert transport.submit_entries == 1
+    assert transport.physical_calls == 0
+    assert store.claim_state is EffectClaimState.NEEDS_REVIEW
+
+
+@pytest.mark.asyncio
+async def test_transport_byte_substitution_is_refused_at_physical_send() -> None:
+    store = FakeStore()
+    transport = FakeTransport(substitute_request=True)
+    outcome = await _coordinator(store).send_one(_authority(), _prepared(), transport)
+    assert isinstance(outcome, Ambiguous)
+    assert transport.physical_calls == 0
+    assert store.claim_state is EffectClaimState.NEEDS_REVIEW
+
+
+@pytest.mark.asyncio
+async def test_transport_retry_cannot_obtain_second_physical_send() -> None:
+    store = FakeStore()
+    transport = FakeTransport(retry_inside_transport=True)
+    outcome = await _coordinator(store).send_one(_authority(), _prepared(), transport)
+    assert isinstance(outcome, Ambiguous)
+    assert transport.physical_calls == 1
+    assert len(transport.calls) == 1
+    assert store.claim_state is EffectClaimState.NEEDS_REVIEW
+
+
+@pytest.mark.asyncio
+async def test_transport_refuses_client_with_retries_enabled() -> None:
+    store = FakeStore()
+    transport = FakeTransport(client_retries_enabled=True)
+    outcome = await _coordinator(store).send_one(_authority(), _prepared(), transport)
+    assert isinstance(outcome, Ambiguous)
+    assert transport.physical_calls == 0
+    assert store.claim_state is EffectClaimState.NEEDS_REVIEW
+
+
+def test_no_handoff_proofs_are_opaque_bound_and_one_use(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     claim_id = uuid4()
     other_claim_id = uuid4()
-    store = FakeStore(ConsumeCommitted(claim_id))
-    coordinator = _coordinator(store)
-    with pytest.raises(ValueError, match="already bound to a coordinator"):
-        ExternalEffectCoordinator(store, no_handoff_proof_authority=coordinator._proof_authority)
-    coordinator._proof_authority.arm_claim(claim_id)
-    proof = coordinator._proof_authority.issue(claim_id)
-    foreign_authority = _NoHandoffProofAuthority()
-    with pytest.raises(PermissionError):
-        foreign_authority.issue(claim_id)
-    foreign_authority.arm_claim(claim_id)
-    foreign_proof = foreign_authority.issue(claim_id)
-    coordinator._proof_authority.arm_claim(other_claim_id)
-    wrong_claim_proof = coordinator._proof_authority.issue(other_claim_id)
+    module = importlib.import_module("cti_app.application.external_effects")
+    ticks = iter((10.0, 12.0, 20.0, 22.0))
+    monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=lambda: next(ticks, 22.0)))
+
+    def capture_from_pretransport_failure(
+        target_claim: UUID,
+    ) -> tuple[FakeStore, object, ExternalEffectCoordinator]:
+        base_store = FakeStore(ConsumeCommitted(target_claim))
+        captured: list[object] = []
+
+        class _ProofCaptureStore:
+            def __getattr__(self, name: str) -> Any:
+                return getattr(base_store, name)
+
+            async def definitely_not_submitted(
+                self, claim: UUID, *, proof: object, reason_code: str
+            ) -> bool:
+                captured.append(proof)
+                return False
+
+            async def needs_review(self, claim: UUID, *, reason_code: str) -> bool:
+                return True
+
+        coordinator = ExternalEffectCoordinator(  # type: ignore[arg-type]
+            _ProofCaptureStore(), permit_ttl_seconds=1.0
+        )
+        outcome = asyncio.run(coordinator.send_one(_authority(), _prepared(), FakeTransport()))
+        assert isinstance(outcome, Ambiguous)
+        assert len(captured) == 1
+        return base_store, captured[0], coordinator
+
+    store, proof, coordinator = capture_from_pretransport_failure(claim_id)
+    _foreign_store, foreign_proof, _foreign_coordinator = capture_from_pretransport_failure(
+        other_claim_id
+    )
+    assert "_proof_authority" not in dir(coordinator)
+    assert "_seal_zero_handoff" not in dir(coordinator)
+    assert "_permits" not in dir(coordinator)
+    assert not any("issue_no_handoff_proof" in name or "arm_claim" in name for name in dir(module))
+    assert not any(
+        "proof_authority" in name or "issue_no_handoff_proof" in name for name in vars(coordinator)
+    )
+    assert not any("issue_no_handoff_proof" in name or "arm_claim" in name for name in vars(module))
+
     copied = copy.copy(proof)
-    forged = object.__new__(type(proof))
-    unregistered = object.__new__(type(proof))
-    for name, value in {
-        "claim_id": claim_id,
-        "nonce": proof.nonce,
-    }.items():
-        object.__setattr__(unregistered, name, value)
+    forged = object()
 
     async def attempt(target: UUID, token: object) -> bool:
         return await store.definitely_not_submitted(target, proof=token, reason_code="test_no_send")
 
     assert not asyncio.run(attempt(claim_id, forged))
     assert not asyncio.run(attempt(claim_id, copied))
-    assert not asyncio.run(attempt(claim_id, unregistered))
     assert not asyncio.run(attempt(claim_id, foreign_proof))
-    assert not asyncio.run(attempt(claim_id, wrong_claim_proof))
     assert not asyncio.run(attempt(other_claim_id, proof))
-    assert store.sealed == []
+    assert store.claim_state is EffectClaimState.CONSUMED
     assert asyncio.run(attempt(claim_id, proof))
     assert not asyncio.run(attempt(claim_id, proof))
     assert store.sealed == [("not_submitted", "test_no_send")]
@@ -941,7 +1058,6 @@ async def test_source_dependent_family_rejects_untrusted_source_refs(case: str) 
 
     class _SourceCheckStore(SqlAlchemyExternalEffectClaimStore):
         def __init__(self, *args: object, **kwargs: object) -> None:
-            self.proof_authority = _NoHandoffProofAuthority()
             super().__init__(*args, **kwargs)  # type: ignore[arg-type]
 
         async def _lock_authority(self, *args, **kwargs):

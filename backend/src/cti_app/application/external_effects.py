@@ -3,6 +3,11 @@
 The coordinator owns the authorization cut. An injected claim store must
 commit ``consume`` before it returns ``ConsumeCommitted``; no database lock is
 held while the injected transport runs.
+
+Security boundary: family, adapter, and tool code may use public or conventional
+single-underscore APIs, and may forge, copy, or replay values. This module does
+not claim to contain arbitrary in-process introspection through frames, closure
+inspection, ``gc``, or ``ctypes``.
 """
 
 from __future__ import annotations
@@ -10,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 from uuid import UUID, uuid4
@@ -151,6 +156,8 @@ class ExternalEffectClaimStore(Protocol):
         self, claim_id: UUID, *, proof: _CoordinatorNoHandoffProof, reason_code: str
     ) -> bool: ...
 
+    def _bind_no_handoff_proof_verifier(self, verifier: _NoHandoffProofVerifier) -> None: ...
+
     async def needs_review(self, claim_id: UUID, *, reason_code: str) -> bool: ...
 
     async def record_reuse(
@@ -191,80 +198,32 @@ class _CoordinatorNoHandoffProof:
     def __init__(self, *args: object, **kwargs: object) -> None:
         raise TypeError("no-handoff proofs are issued by ExternalEffectCoordinator")
 
-    @classmethod
-    def _issue(cls, *, claim_id: UUID, nonce: UUID) -> _CoordinatorNoHandoffProof:
-        proof = object.__new__(cls)
-        for name, value in {
-            "claim_id": claim_id,
-            "nonce": nonce,
-        }.items():
-            object.__setattr__(proof, name, value)
-        return proof
-
-
-class _NoHandoffProofState:
-    def __init__(self) -> None:
-        self.pending_claims: set[UUID] = set()
-        self.issued: dict[UUID, tuple[UUID, _CoordinatorNoHandoffProof]] = {}
-        self.lock = threading.Lock()
-
 
 class _NoHandoffProofVerifier:
-    """Store-side verifier that can consume proofs but cannot mint them."""
+    """Store-side proof consumer; it has no proof-minting operation."""
 
-    def __init__(self, state: _NoHandoffProofState) -> None:
-        self._state = state
-
-    def consume(self, proof: _CoordinatorNoHandoffProof, claim_id: UUID) -> bool:
-        if not isinstance(proof, _CoordinatorNoHandoffProof):
-            return False
-        nonce = getattr(proof, "nonce", None)
-        bound_claim_id = getattr(proof, "claim_id", None)
-        if (
-            not isinstance(nonce, UUID)
-            or not isinstance(bound_claim_id, UUID)
-            or bound_claim_id != claim_id
-        ):
-            return False
-        with self._state.lock:
-            registered = self._state.issued.get(nonce)
-            if registered is None or registered[0] != claim_id or registered[1] is not proof:
-                return False
-            del self._state.issued[nonce]
-            return True
-
-
-class _NoHandoffProofAuthority:
-    """Per-coordinator issuer; the paired store verifier has no mint operation."""
+    __slots__ = ("__consume", "__store")
 
     def __init__(self) -> None:
-        self._state = _NoHandoffProofState()
-        self.verifier = _NoHandoffProofVerifier(self._state)
-        self._coordinator_bound = False
+        raise TypeError("no-handoff verifiers are coordinator-bound")
 
-    def _bind_to_coordinator(self) -> None:
-        with self._state.lock:
-            if self._coordinator_bound:
-                raise ValueError("no-handoff proof authority is already bound to a coordinator")
-            self._coordinator_bound = True
+    def bind_store(self, store: object) -> None:
+        try:
+            object.__getattribute__(self, "_NoHandoffProofVerifier__store")
+        except AttributeError:
+            object.__setattr__(self, "_NoHandoffProofVerifier__store", store)
+            return
+        raise ValueError("no-handoff verifier is already bound to a store")
 
-    def arm_claim(self, claim_id: UUID) -> None:
-        with self._state.lock:
-            self._state.pending_claims.add(claim_id)
-
-    def disarm_claim(self, claim_id: UUID) -> None:
-        with self._state.lock:
-            self._state.pending_claims.discard(claim_id)
-
-    def issue(self, claim_id: UUID) -> _CoordinatorNoHandoffProof:
-        with self._state.lock:
-            if claim_id not in self._state.pending_claims:
-                raise PermissionError("no-handoff proof is unavailable for this claim")
-            self._state.pending_claims.remove(claim_id)
-            nonce = uuid4()
-            proof = _CoordinatorNoHandoffProof._issue(claim_id=claim_id, nonce=nonce)
-            self._state.issued[nonce] = (claim_id, proof)
-            return proof
+    def consume(self, store: object, proof: object, claim_id: UUID) -> bool:
+        try:
+            bound_store = object.__getattribute__(self, "_NoHandoffProofVerifier__store")
+            consume = object.__getattribute__(self, "_NoHandoffProofVerifier__consume")
+        except AttributeError:
+            return False
+        if bound_store is not store:
+            return False
+        return consume(proof, claim_id) is True
 
 
 class PermitHandoffGate(Protocol):
@@ -279,13 +238,31 @@ class PermitHandoffGate(Protocol):
 
 
 class PermitAwareTransport(Protocol):
-    async def submit_once(self, request: FrozenWireRequest) -> TransportResponse:
-        """Perform one physical attempt for this request, with retries disabled.
+    async def submit_once(
+        self, request: FrozenWireRequest, capability: PhysicalSendCapability
+    ) -> TransportResponse:
+        """Send once through the capability immediately before the raw client.
 
-        The handoff gate is the only application path that invokes this method.
-        It invokes it through a one-use operation after validating the exact
-        request and permit at the operation boundary.
+        Implementations keep their raw client private, configure retries off,
+        and invoke the capability immediately before their single raw-client
+        call. This is the transport's only physical-send API.
         """
+
+
+class PhysicalSendCapability:
+    """One-use authorization for one exact physical request."""
+
+    __slots__ = ("__execute",)
+
+    def __init__(self) -> None:
+        raise TypeError("physical send capabilities are coordinator-issued")
+
+    def __call__(self, request: FrozenWireRequest) -> None:
+        try:
+            execute = object.__getattribute__(self, "_PhysicalSendCapability__execute")
+        except AttributeError as exc:
+            raise HandoffGateRefused("physical send capability is invalid") from exc
+        execute(self, request)
 
 
 @dataclass(frozen=True, slots=True)
@@ -368,7 +345,7 @@ class _PermitRegistry:
         prepared: PreparedExternalRequest,
         key: str,
     ) -> bool:
-        """Atomically validate and burn immediately before durable gate entry."""
+        """Atomically validate and burn immediately before the physical send."""
 
         nonce = getattr(permit, "nonce", None)
         if not isinstance(nonce, UUID):
@@ -422,223 +399,232 @@ class _PermitRegistry:
         )
 
 
-class _HandoffGate:
-    """Own one exact physical submission after a one-use durable handoff."""
-
-    def __init__(
-        self,
-        *,
-        claim_store: ExternalEffectClaimStore,
-        permit_registry: _PermitRegistry,
-        permit: ConsumedEffectPermit,
-        authority: ExternalEffectAuthority,
-        prepared: PreparedExternalRequest,
-        key: str,
-    ) -> None:
-        self._claim_store = claim_store
-        self._permit_registry = permit_registry
-        self._permit = permit
-        self._authority = authority
-        self._prepared = prepared
-        self._key = key
-        self._lock = asyncio.Lock()
-        self._state = "OPEN"
-
-    async def submit(
-        self,
-        permit: ConsumedEffectPermit,
-        prepared: PreparedExternalRequest,
-        transport: PermitAwareTransport,
-    ) -> TransportResponse:
-        async with self._lock:
-            if self._state != "OPEN":
-                raise HandoffGateRefused("handoff gate is closed or already used")
-            self._state = "SUBMITTING"
-
-        if permit is not self._permit:
-            self._state = "CLOSED"
-            raise HandoffGateRefused("handoff token binding mismatch")
-        if not self._permit_registry.is_valid(permit, self._authority, self._prepared, self._key):
-            self._state = "CLOSED"
-            raise HandoffGateRefused("permit expired, invalid, or already used")
-        if prepared is not self._prepared:
-            self._state = "CLOSED"
-            raise HandoffGateRefused("prepared request binding mismatch")
-        request = self._prepared.application_request
-        try:
-            validate_prepared_request(self._prepared)
-        except ExternalEffectValidationError as exc:
-            self._state = "CLOSED"
-            raise HandoffGateRefused("prepared request changed before handoff") from exc
-        if application_request_sha256(request) != permit.request_digest:
-            self._state = "CLOSED"
-            raise HandoffGateRefused("physical request digest mismatch")
-        try:
-            admitted = await self._claim_store.enter_handoff(
-                permit.claim_id,
-                permit_nonce=permit.nonce,
-                request_digest=prepared.application_request_sha256,
-                expires_at_monotonic=permit.expires_at_monotonic,
-            )
-        except Exception as exc:
-            self._state = "CLOSED"
-            raise HandoffGateRefused("durable handoff gate unavailable") from exc
-        if not admitted:
-            self._state = "CLOSED"
-            raise HandoffGateRefused("claim is sealed or handoff already entered")
-        if time.monotonic() >= permit.expires_at_monotonic:
-            self._state = "CLOSED"
-            raise HandoffGateRefused("permit expired before physical operation invocation")
-
-        operation_used = False
-
-        async def submit_exact_once() -> TransportResponse:
-            nonlocal operation_used
-            if operation_used:
-                raise HandoffGateRefused("physical submit operation was already invoked")
-            operation_used = True
-            if not self._authorize_physical_operation(permit, request):
-                raise HandoffGateRefused("permit expired, invalid, or already used")
-            return await transport.submit_once(request)
-
-        try:
-            response = await submit_exact_once()
-        except BaseException:
-            self._state = "CLOSED"
-            raise
-        self._state = "SUBMITTED"
-        return response
-
-    def _authorize_physical_operation(
-        self, permit: ConsumedEffectPermit, request: FrozenWireRequest
-    ) -> bool:
-        if request is not self._prepared.application_request:
-            return False
-        try:
-            validate_prepared_request(self._prepared)
-        except ExternalEffectValidationError:
-            return False
-        return application_request_sha256(
-            request
-        ) == permit.request_digest and self._permit_registry.burn_and_validate(
-            permit, self._authority, self._prepared, self._key
-        )
-
-
 class ExternalEffectCoordinator:
     def __init__(
         self,
         claim_store: ExternalEffectClaimStore,
         *,
-        no_handoff_proof_authority: _NoHandoffProofAuthority,
         reuse_policies: Mapping[str, ExternalEffectReusePolicy] | None = None,
         permit_ttl_seconds: float = 5.0,
     ) -> None:
         self._claim_store = claim_store
         self._reuse_policies = dict(reuse_policies or {})
-        self._permits = _PermitRegistry(ttl_seconds=permit_ttl_seconds)
-        no_handoff_proof_authority._bind_to_coordinator()
-        self._proof_authority = no_handoff_proof_authority
+        permit_registry = _PermitRegistry(ttl_seconds=permit_ttl_seconds)
 
-    async def send_one(
-        self,
-        authority: ExternalEffectAuthority,
-        prepared: PreparedExternalRequest,
-        transport: PermitAwareTransport,
-    ) -> ExternalEffectOutcome:
-        try:
-            validate_prepared_request(prepared)
-            if authority.bridge_turn_id is None and authority.model_run_id is not None:
-                raise ExternalEffectValidationError("model_run_id requires bridge_turn_id")
-            if authority.bridge_turn_id is not None and authority.model_run_id is None:
-                raise ExternalEffectValidationError("bridge_turn_id requires model_run_id")
+        issued_proofs: dict[UUID, tuple[UUID, _CoordinatorNoHandoffProof]] = {}
+        proof_lock = threading.Lock()
+
+        def issue_no_handoff_proof(claim_id: UUID) -> _CoordinatorNoHandoffProof:
+            nonce = uuid4()
+            proof = object.__new__(_CoordinatorNoHandoffProof)
+            object.__setattr__(proof, "claim_id", claim_id)
+            object.__setattr__(proof, "nonce", nonce)
+            with proof_lock:
+                issued_proofs[nonce] = (claim_id, proof)
+            return proof
+
+        def consume_no_handoff_proof(proof: object, claim_id: UUID) -> bool:
+            if not isinstance(proof, _CoordinatorNoHandoffProof):
+                return False
+            nonce = getattr(proof, "nonce", None)
+            bound_claim_id = getattr(proof, "claim_id", None)
             if (
-                authority.authority_kind is ExternalEffectAuthorityKind.OSINT_POLICY
-                and authority.policy_event_id is None
+                not isinstance(nonce, UUID)
+                or not isinstance(bound_claim_id, UUID)
+                or bound_claim_id != claim_id
             ):
-                raise ExternalEffectValidationError("OSINT_POLICY authority lacks its policy event")
-            key = effect_key(authority.investigation_id, prepared)
-            occurrence_digest = occurrence_sha256(prepared.occurrence_id)
-        except (ExternalEffectValidationError, TypeError, ValueError):
-            return Refused(
-                reason="invalid_prepared_effect",
-                framework_no_send_proof=FrameworkNoSendProof(
-                    "PREPARATION", "invalid_prepared_effect"
-                ),
-            )
+                return False
+            with proof_lock:
+                registered = issued_proofs.get(nonce)
+                if registered is None or registered[0] != claim_id or registered[1] is not proof:
+                    return False
+                del issued_proofs[nonce]
+                return True
 
-        try:
-            consume = await self._claim_store.consume(
-                authority,
-                prepared,
-                effect_key=key,
-                occurrence_digest=occurrence_digest,
-            )
-        except Exception:
-            # No permit exists and transport has not been entered. A commit
-            # acknowledgement failure is safe from egress and a replay will
-            # observe the durable claim if the database committed it.
-            return Refused(
-                reason="consume_unavailable",
-                framework_no_send_proof=FrameworkNoSendProof("PRE_CONSUME", "consume_unavailable"),
-            )
+        verifier = object.__new__(_NoHandoffProofVerifier)
+        object.__setattr__(verifier, "_NoHandoffProofVerifier__consume", consume_no_handoff_proof)
+        claim_store._bind_no_handoff_proof_verifier(verifier)
 
-        if isinstance(consume, ConsumeRefused):
-            return Refused(
-                reason=consume.reason,
-                framework_no_send_proof=FrameworkNoSendProof("PRE_CONSUME", consume.reason),
-            )
-        if isinstance(consume, ExistingClaim):
-            return await self._handle_existing(consume.claim, authority, prepared)
-        if not isinstance(consume, ConsumeCommitted):
-            return Refused(
-                reason="invalid_consume_result",
-                framework_no_send_proof=FrameworkNoSendProof(
-                    "PRE_CONSUME", "invalid_consume_result"
-                ),
-            )
+        async def submit_through_gate(
+            permit: ConsumedEffectPermit,
+            authority: ExternalEffectAuthority,
+            prepared: PreparedExternalRequest,
+            key: str,
+            transport: PermitAwareTransport,
+        ) -> TransportResponse:
+            if not permit_registry.is_valid(permit, authority, prepared, key):
+                raise HandoffGateRefused("permit expired, invalid, or already used")
+            request = prepared.application_request
+            try:
+                validate_prepared_request(prepared)
+            except ExternalEffectValidationError as exc:
+                raise HandoffGateRefused("prepared request changed before handoff") from exc
+            if application_request_sha256(request) != permit.request_digest:
+                raise HandoffGateRefused("physical request digest mismatch")
+            try:
+                admitted = await claim_store.enter_handoff(
+                    permit.claim_id,
+                    permit_nonce=permit.nonce,
+                    request_digest=prepared.application_request_sha256,
+                    expires_at_monotonic=permit.expires_at_monotonic,
+                )
+            except Exception as exc:
+                raise HandoffGateRefused("durable handoff gate unavailable") from exc
+            if not admitted:
+                raise HandoffGateRefused("claim is sealed or handoff already entered")
+            if time.monotonic() >= permit.expires_at_monotonic:
+                raise HandoffGateRefused("permit expired before physical operation invocation")
 
-        # Permit creation occurs only after the store reports a committed claim.
-        permit = self._permits.issue(consume.claim_id, authority, prepared, key)
-        self._proof_authority.arm_claim(consume.claim_id)
-        if not self._permits.is_valid(permit, authority, prepared, key):
-            return await self._seal_zero_handoff(
-                consume.claim_id, reason_code="permit_validation_failed"
-            )
+            capability_used = False
+            capability_lock = threading.Lock()
+            capability_holder: dict[str, PhysicalSendCapability] = {}
 
-        gate = _HandoffGate(
-            claim_store=self._claim_store,
-            permit_registry=self._permits,
-            permit=permit,
-            authority=authority,
-            prepared=prepared,
-            key=key,
-        )
-        self._proof_authority.disarm_claim(consume.claim_id)
-        try:
-            response = await gate.submit(permit, prepared, transport)
-        except asyncio.CancelledError:
-            await self._seal_needs_review(consume.claim_id, "cancelled_during_transport")
-            return Ambiguous(consume.claim_id)
-        except Exception:
-            await self._seal_needs_review(consume.claim_id, "transport_outcome_unknown")
-            return Ambiguous(consume.claim_id)
+            def physical_send_capability(
+                caller: PhysicalSendCapability,
+                sent_request: FrozenWireRequest,
+            ) -> None:
+                nonlocal capability_used
+                with capability_lock:
+                    if capability_holder.get("capability") is not caller:
+                        raise HandoffGateRefused("physical send capability is invalid")
+                    if capability_used:
+                        raise HandoffGateRefused("physical send capability was already used")
+                    capability_used = True
+                    if sent_request is not request:
+                        raise HandoffGateRefused("physical request substitution refused")
+                    actual_digest = application_request_sha256(sent_request)
+                    try:
+                        validate_prepared_request(prepared)
+                    except ExternalEffectValidationError as exc:
+                        raise HandoffGateRefused(
+                            "prepared request changed before physical send"
+                        ) from exc
+                    permit_valid = permit_registry.burn_and_validate(
+                        permit, authority, prepared, key
+                    )
+                    if actual_digest != permit.request_digest or not permit_valid:
+                        raise HandoffGateRefused("physical send capability expired or invalid")
+                    if time.monotonic() >= permit.expires_at_monotonic:
+                        raise HandoffGateRefused("physical send capability expired or invalid")
 
-        if not isinstance(response, TransportResponse):
-            await self._seal_needs_review(consume.claim_id, "invalid_transport_response")
-            return Ambiguous(consume.claim_id)
-        try:
-            completed = await self._claim_store.complete(
-                consume.claim_id,
-                result_ref=response.result_ref,
-                evidence_refs=response.evidence_refs,
+            capability = object.__new__(PhysicalSendCapability)
+            capability_holder["capability"] = capability
+            object.__setattr__(
+                capability, "_PhysicalSendCapability__execute", physical_send_capability
             )
-        except Exception:
-            completed = False
-        if not completed:
-            await self._seal_needs_review(consume.claim_id, "outcome_persist_failed")
-            return Ambiguous(consume.claim_id)
-        return Completed(consume.claim_id, response.result_ref, response.evidence_refs)
+            return await transport.submit_once(request, capability)
+
+        async def seal_zero_handoff(
+            claim_id: UUID, *, reason_code: str
+        ) -> DefinitelyNotSubmitted | Ambiguous:
+            proof = issue_no_handoff_proof(claim_id)
+            try:
+                changed = await claim_store.definitely_not_submitted(
+                    claim_id, proof=proof, reason_code=reason_code
+                )
+            except Exception:
+                changed = False
+            if changed:
+                return DefinitelyNotSubmitted(claim_id)
+            await self._seal_needs_review(claim_id, "zero_handoff_seal_failed")
+            return Ambiguous(claim_id)
+
+        async def send_one(
+            authority: ExternalEffectAuthority,
+            prepared: PreparedExternalRequest,
+            transport: PermitAwareTransport,
+        ) -> ExternalEffectOutcome:
+            try:
+                validate_prepared_request(prepared)
+                if authority.bridge_turn_id is None and authority.model_run_id is not None:
+                    raise ExternalEffectValidationError("model_run_id requires bridge_turn_id")
+                if authority.bridge_turn_id is not None and authority.model_run_id is None:
+                    raise ExternalEffectValidationError("bridge_turn_id requires model_run_id")
+                if (
+                    authority.authority_kind is ExternalEffectAuthorityKind.OSINT_POLICY
+                    and authority.policy_event_id is None
+                ):
+                    raise ExternalEffectValidationError(
+                        "OSINT_POLICY authority lacks its policy event"
+                    )
+                key = effect_key(authority.investigation_id, prepared)
+                occurrence_digest = occurrence_sha256(prepared.occurrence_id)
+            except (ExternalEffectValidationError, TypeError, ValueError):
+                return Refused(
+                    reason="invalid_prepared_effect",
+                    framework_no_send_proof=FrameworkNoSendProof(
+                        "PREPARATION", "invalid_prepared_effect"
+                    ),
+                )
+
+            try:
+                consume = await claim_store.consume(
+                    authority,
+                    prepared,
+                    effect_key=key,
+                    occurrence_digest=occurrence_digest,
+                )
+            except Exception:
+                # A commit acknowledgement failure is safe from egress; replay
+                # observes any claim that committed despite the error.
+                return Refused(
+                    reason="consume_unavailable",
+                    framework_no_send_proof=FrameworkNoSendProof(
+                        "PRE_CONSUME", "consume_unavailable"
+                    ),
+                )
+
+            if isinstance(consume, ConsumeRefused):
+                return Refused(
+                    reason=consume.reason,
+                    framework_no_send_proof=FrameworkNoSendProof("PRE_CONSUME", consume.reason),
+                )
+            if isinstance(consume, ExistingClaim):
+                return await self._handle_existing(consume.claim, authority, prepared)
+            if not isinstance(consume, ConsumeCommitted):
+                return Refused(
+                    reason="invalid_consume_result",
+                    framework_no_send_proof=FrameworkNoSendProof(
+                        "PRE_CONSUME", "invalid_consume_result"
+                    ),
+                )
+
+            permit = permit_registry.issue(consume.claim_id, authority, prepared, key)
+            if not permit_registry.is_valid(permit, authority, prepared, key):
+                return await seal_zero_handoff(
+                    consume.claim_id, reason_code="permit_validation_failed"
+                )
+
+            try:
+                response = await submit_through_gate(permit, authority, prepared, key, transport)
+            except asyncio.CancelledError:
+                await self._seal_needs_review(consume.claim_id, "cancelled_during_transport")
+                return Ambiguous(consume.claim_id)
+            except Exception:
+                await self._seal_needs_review(consume.claim_id, "transport_outcome_unknown")
+                return Ambiguous(consume.claim_id)
+
+            if not isinstance(response, TransportResponse):
+                await self._seal_needs_review(consume.claim_id, "invalid_transport_response")
+                return Ambiguous(consume.claim_id)
+            try:
+                completed = await claim_store.complete(
+                    consume.claim_id,
+                    result_ref=response.result_ref,
+                    evidence_refs=response.evidence_refs,
+                )
+            except Exception:
+                completed = False
+            if not completed:
+                await self._seal_needs_review(consume.claim_id, "outcome_persist_failed")
+                return Ambiguous(consume.claim_id)
+            return Completed(consume.claim_id, response.result_ref, response.evidence_refs)
+
+        # The issuer stays in this closure; no coordinator attribute exposes it.
+        self.send_one: Callable[
+            [ExternalEffectAuthority, PreparedExternalRequest, PermitAwareTransport],
+            Awaitable[ExternalEffectOutcome],
+        ] = send_one
 
     async def _handle_existing(
         self,
@@ -718,21 +704,6 @@ class ExternalEffectCoordinator:
             # itself is unavailable.
             return
 
-    async def _seal_zero_handoff(
-        self, claim_id: UUID, *, reason_code: str
-    ) -> DefinitelyNotSubmitted | Ambiguous:
-        proof = self._proof_authority.issue(claim_id)
-        try:
-            changed = await self._claim_store.definitely_not_submitted(
-                claim_id, proof=proof, reason_code=reason_code
-            )
-        except Exception:
-            changed = False
-        if changed:
-            return DefinitelyNotSubmitted(claim_id)
-        await self._seal_needs_review(claim_id, "zero_handoff_seal_failed")
-        return Ambiguous(claim_id)
-
 
 __all__ = [
     "Ambiguous",
@@ -753,6 +724,7 @@ __all__ = [
     "HandoffGateRefused",
     "PermitAwareTransport",
     "PermitHandoffGate",
+    "PhysicalSendCapability",
     "Refused",
     "ReuseDecision",
     "TransportResponse",
