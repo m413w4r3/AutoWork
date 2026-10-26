@@ -128,3 +128,16 @@ arbitraire en processus (gc, inspection de fermetures/frames, ctypes,
 monkey-patch de classe) est hors périmètre. Conséquence : chaque revue de
 famille doit vérifier client brut privé, un seul appel juste après usage de la
 capacité, ni retry, ni redirection suivie, ni chemin d'envoi alternatif.
+
+### Mise à jour de clôture M06-P/R (familles)
+
+| Lot | Agent | Effort | SHA | Statut | Reviewer | Verdict |
+|---|---|---|---|---|---|---|
+| Extensions core (portées par S3-BRIDGE) | `f070c5a6` | xhigh | `c36bb116`→`1df683cb` (+`1186c960` test) | **INTEGRATED** via VT-READ | `27e3f730` | `c36bb116` REVISE (preuve no-submit forgeable, redaction trop large) → `911f8738` REVISE (alias) → `90f73648` REVISE (credential dans `canonical_request`) → `0d067f91` REVISE (échantillons non résolus, `license_restriction`, portée hash) → **`1df683cb` APPROVED** |
+| S3-VT-READ | `f2bdce99` → relais `30509bed` (contexte 95 %) | xhigh | `15ee7e7b` → `5e08413e` (wip relais) → `b89a9191` | **INTEGRATED** (`main@1c28892c`, merge no-ff) | `45de4bd5` (frais) | `15ee7e7b` REVISE (BLOCKER sources ignorées, MAJOR budget object-report, MINOR disponibilité) + 14 régressions suites complètes → `bbe4c342` REVISE (MINOR W12) → **`b89a9191` APPROVED** |
+| S3-BRIDGE | `f070c5a6` (arrêté, compactions multiples) | xhigh | `783c0ebb` (wip) | **PAUSED — non revu** | — | à reprendre en nouvelle session |
+| S3-VT-DOWNLOAD | — | — | — | **NOT STARTED** | — | — |
+
+Leçon : les rapports d'enfants sur lots ciblés ont manqué 14 régressions ;
+le parent a exécuté les suites complètes sur chaque SHA candidat. Handoff :
+[`M06PR_HANDOFF.md`](M06PR_HANDOFF.md).

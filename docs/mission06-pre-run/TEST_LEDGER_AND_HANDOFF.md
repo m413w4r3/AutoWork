@@ -282,3 +282,40 @@ hors checkout principal et passent dans le checkout principal ; non liés à S3.
 
 État `main` local : `af819b2e` (= `origin/main`) → `a832902b`
 (workflow-gate-fix) → `796292a7` (S3-CORE) → `044178b2` (docs). **Aucun push.**
+
+### 6.1 Suite des gates M06-P/R
+
+| SHA | Commande | Résultat |
+|---|---|---|
+| `c36bb116` | backend ; intégration | 5037 + 2 env ; 377 passed |
+| `911f8738` | ruff, mypy ; backend ; intégration | PASS ; 5060 + 2 env ; 378 passed |
+| `90f73648` | idem + workflow | PASS ; 5074 + 2 env ; 379 ; 31 |
+| `0d067f91` | idem | PASS ; 5075 + 2 env ; 389 + 1 instable (`test_publication_render_repository[source_blob_id]`, 3/3 isolément) ; 31 |
+| `1df683cb` | idem | PASS ; 5075 + 2 env ; **394** ; **31** |
+| `15ee7e7b` | idem | PASS ; **12 ❌** backend (10 réels) ; 396 / 1 ❌ ; 28 / 3 ❌ → REVISE |
+| `bbe4c342` | idem | PASS ; **5084 + 2 env** ; **409** ; **31** |
+| `b89a9191` | ruff, mypy ; `test_investigation_acquisition.py` ; workflow | PASS ; 20 ; **31** |
+
+## 7. Verdicts M06-P/R (2026-10-26)
+
+```text
+OSINT_OPEN_POLICY_IMPLEMENTED : PASS conservé
+NO_REPEATED_OPERATOR_APPROVALS : PARTIAL   (VT lectures démontrées ; Bridge/download non migrés)
+G3_NONBLOCKING_FOR_ANALYSIS : PARTIAL      (non démontré via routes migrées)
+
+S3_CORE : APPROVED                          (796292a7 ; extensions 1df683cb)
+S3_VT_READ : READY                          (b89a9191 APPROVED, intégré main@1c28892c, suites complètes vertes)
+S3_VT_DOWNLOAD : BLOCKED                    (non commencé ; migration 0005 requise)
+S3_BRIDGE : BLOCKED                         (783c0ebb non revu, câblage absent)
+
+CREDENTIAL_NON_DISCLOSURE : PARTIAL         (core + VT lectures prouvés ; Bridge/download non migrés)
+POSTGRES_RACE_AND_RECOVERY : PARTIAL        (core + VT : concurrence, révocation, crash, rejeu ; pas Bridge/download)
+FULL_TEST_GATES : PARTIAL                   (local vert hors 2 tests env ; CI GitHub non rejouée sans push ; frontend non exécuté, non touché)
+LUNA_XHIGH_MULTI_AGENT_VERIFIED : FAILED    (parent claude-opus-5-5 ; enfants Luna vérifiés)
+REAL_RUN_PREFLIGHT : PARTIAL                (code/docs seulement ; lectures live non autorisées)
+REAL_INVESTIGATION_NOT_STARTED : CONFIRMED
+```
+
+READY pour VT-READ signifie : tranche, tests fakes + PostgreSQL, frontière
+d'émission et revue indépendante vérifiés **hors ligne**. Aucun appel VT réel
+n'a été fait ; la réception côté fournisseur n'est pas prouvée.

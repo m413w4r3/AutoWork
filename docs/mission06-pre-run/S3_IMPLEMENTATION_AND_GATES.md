@@ -1,5 +1,8 @@
 # S3 — implémentation et gates des effets externes
 
+> **Clôture M06-P/R :** `S3_VT_READ` READY (`b89a9191`, intégré `main@1c28892c`) ;
+> `S3_BRIDGE` et `S3_VT_DOWNLOAD` BLOCKED. Voir [`M06PR_HANDOFF.md`](M06PR_HANDOFF.md).
+>
 > **Mise à jour M06-P/R (2026-10-26) :** `S3-CORE` **APPROVED** sur `796292a7`
 > (5ᵉ revue indépendante xhigh) et **intégré** sur `main` local ; chaîne
 > `0001→0004` validée sur base jetable ; 5 tests PG S3 d'origine + nouveaux
