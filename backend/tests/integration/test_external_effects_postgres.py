@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
 
+import httpx
 import pytest
 from alembic import command
 from sqlalchemy import func, select, text
@@ -39,6 +40,8 @@ from cti_app.domain.external_effects import (
     ExternalEffectAuthorityKind,
     FrozenWireRequest,
     PreparedExternalRequest,
+    _wire_request_sha256,
+    application_request_sha256,
     canonical_json_bytes,
     effect_key,
     occurrence_sha256,
@@ -84,8 +87,16 @@ _REQUEST = {"hash": "abc", "include": ["relations", "history"]}
 
 
 class _CountingTransport:
-    def __init__(self) -> None:
-        self.__raw_client = _CountingRawClient()
+    def __init__(
+        self,
+        *,
+        response: TransportResponse | Exception | None = None,
+        pre_submission_failure: (
+            httpx.ConnectError | httpx.ConnectTimeout | httpx.PoolTimeout | None
+        ) = None,
+    ) -> None:
+        self.__raw_client = _CountingRawClient(response)
+        self.pre_submission_failure = pre_submission_failure
         self.submit_entries = 0
 
     @property
@@ -106,20 +117,26 @@ class _CountingTransport:
         if self.__raw_client.retries_enabled:
             raise HandoffGateRefused("raw client retries must be disabled")
         capability(request)
+        if self.pre_submission_failure is not None:
+            capability.report_pre_submission_failure(self.pre_submission_failure)
+            raise self.pre_submission_failure
         return await self.__raw_client.send(request, follow_redirects=False)
 
 
 class _CountingRawClient:
-    def __init__(self) -> None:
+    def __init__(self, response: TransportResponse | Exception | None = None) -> None:
         self.calls = 0
         self.retries_enabled = False
+        self.response = response or TransportResponse(result_ref="artifact:pg-fake-result")
 
     async def send(
         self, _request: FrozenWireRequest, *, follow_redirects: bool
     ) -> TransportResponse:
         assert follow_redirects is False
         self.calls += 1
-        return TransportResponse(result_ref="artifact:pg-fake-result")
+        if isinstance(self.response, Exception):
+            raise self.response
+        return self.response
 
 
 class _BarrierPolicyGuard:
@@ -518,6 +535,171 @@ async def test_second_coordinator_cannot_seal_claim_with_foreign_proof(
 
 
 @pytest.mark.asyncio
+async def test_postgate_connect_failure_is_definitively_not_submitted(
+    migrated_postgres_url: str, tmp_path: Path
+) -> None:
+    session_factory, engine, _investigation_id, _subject_id, authorities = await _prepare_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    authority, prepared = authorities[0]
+    store = _store(session_factory)
+    failure = httpx.ConnectError("connection could not be established")
+    transport = _CountingTransport(pre_submission_failure=failure)
+    coordinator = ExternalEffectCoordinator(store)
+    try:
+        first = await coordinator.send_one(authority, prepared, transport)
+        assert isinstance(first, DefinitelyNotSubmitted)
+        assert transport.submit_entries == 1
+        assert transport.calls == 0
+        async with session_factory() as session:
+            row = await session.get(ExternalEffectClaimRow, first.claim_id)
+        assert row is not None
+        assert row.state == "DEFINITIVELY_NOT_SUBMITTED"
+        assert row.handoff_permit_nonce is not None
+        assert row.last_error_code == "transport_no_request_bytes"
+
+        replay = await coordinator.send_one(authority, prepared, transport)
+        assert isinstance(replay, DefinitelyNotSubmitted)
+        assert transport.submit_entries == 1
+        assert transport.calls == 0
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_complete_429_retry_uses_new_claim_and_replay_does_not_send(
+    migrated_postgres_url: str, tmp_path: Path
+) -> None:
+    session_factory, engine, investigation_id, _subject_id, authorities = await _prepare_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12], invocations=2
+    )
+    first_authority, first_base = authorities[0]
+    retry_authority, retry_base = authorities[1]
+    first_prepared = replace(first_base, occurrence_id=uuid4())
+    retry_prepared = replace(retry_base, occurrence_id=uuid4())
+    store = _store(session_factory)
+    coordinator = ExternalEffectCoordinator(store)
+    first_transport = _CountingTransport(
+        response=TransportResponse(outcome_code="bridge_rate_limited")
+    )
+    retry_transport = _CountingTransport()
+    try:
+        first = await coordinator.send_one(first_authority, first_prepared, first_transport)
+        retry = await coordinator.send_one(retry_authority, retry_prepared, retry_transport)
+        assert isinstance(first, Completed) and first.outcome_code == "bridge_rate_limited"
+        assert isinstance(retry, Completed) and retry.outcome_code is None
+        assert first.claim_id != retry.claim_id
+        assert first_transport.calls == 1
+        assert retry_transport.calls == 1
+        async with session_factory() as session:
+            rate_claim = await session.get(ExternalEffectClaimRow, first.claim_id)
+            claim_count = await session.scalar(
+                select(func.count())
+                .select_from(ExternalEffectClaimRow)
+                .where(
+                    ExternalEffectClaimRow.investigation_id == investigation_id,
+                    ExternalEffectClaimRow.effect_key.in_(
+                        [
+                            effect_key(investigation_id, first_prepared),
+                            effect_key(investigation_id, retry_prepared),
+                        ]
+                    ),
+                )
+            )
+        assert rate_claim is not None
+        assert rate_claim.state == "COMPLETED"
+        assert rate_claim.last_error_code == "bridge_rate_limited"
+        assert claim_count == 2
+
+        replay = await coordinator.send_one(first_authority, first_prepared, first_transport)
+        assert isinstance(replay, Completed)
+        assert replay.outcome_code == "bridge_rate_limited"
+        assert first_transport.calls == 1
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_postwrite_timeout_seals_needs_review_and_never_resends(
+    migrated_postgres_url: str, tmp_path: Path
+) -> None:
+    session_factory, engine, _investigation_id, _subject_id, authorities = await _prepare_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    authority, prepared = authorities[0]
+    store = _store(session_factory)
+    transport = _CountingTransport(response=httpx.ReadTimeout("response timed out"))
+    coordinator = ExternalEffectCoordinator(store)
+    try:
+        first = await coordinator.send_one(authority, prepared, transport)
+        assert isinstance(first, Ambiguous)
+        assert transport.calls == 1
+        async with session_factory() as session:
+            row = await session.get(ExternalEffectClaimRow, first.claim_id)
+        assert row is not None and row.state == "NEEDS_REVIEW"
+        replay = await coordinator.send_one(authority, prepared, transport)
+        assert isinstance(replay, Ambiguous)
+        assert transport.calls == 1
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_credential_redacted_digest_is_the_only_wire_digest_persisted(
+    migrated_postgres_url: str, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    session_factory, engine, _investigation_id, _subject_id, authorities = await _prepare_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    authority, base = authorities[0]
+    api_key = "ephemeral-api-key-value-do-not-persist"
+    wire = FrozenWireRequest(
+        method=b"POST",
+        target=b"/responses?api_key=first&hash=abc#refresh_token=first",
+        headers=(
+            (b"Authorization", b"Bearer " + api_key.encode()),
+            (b"x-api-key", api_key.encode()),
+        ),
+        body=b'{"input":"offline fake"}',
+    )
+    prepared = PreparedExternalRequest.build(
+        family=base.family,
+        provider=base.provider,
+        provider_scope=base.provider_scope,
+        normalizer_version=base.normalizer_version,
+        canonical_request=base.canonical_request,
+        application_request=wire,
+        occurrence_id=uuid4(),
+    )
+    store = _store(session_factory)
+    transport = _CountingTransport()
+    try:
+        outcome = await ExternalEffectCoordinator(store).send_one(authority, prepared, transport)
+        assert isinstance(outcome, Completed)
+        assert transport.calls == 1
+        async with session_factory() as session:
+            row = await session.get(ExternalEffectClaimRow, outcome.claim_id)
+        assert row is not None
+        persisted = repr(
+            {
+                "digest": row.application_request_sha256,
+                "canonical_request": row.canonical_request,
+                "request_ref": row.request_ref,
+                "evidence_refs": row.evidence_refs,
+                "last_error_code": row.last_error_code,
+            }
+        )
+        assert row.application_request_sha256 == application_request_sha256(wire)
+        assert row.application_request_sha256 != _wire_request_sha256(wire)
+        assert api_key not in persisted
+        assert _wire_request_sha256(wire) not in persisted
+        assert api_key not in caplog.text
+        assert _wire_request_sha256(wire) not in caplog.text
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_downgrade_refuses_committed_external_effect_rows(
     migrated_postgres_url: str, tmp_path: Path
 ) -> None:
@@ -900,7 +1082,7 @@ async def test_crash_after_consume_seals_review_and_replay_never_sends(
         )
         assert isinstance(consumed, ConsumeCommitted)
         # Simulate restart recovery after the consume commit and before handoff.
-        assert await store.needs_review(consumed.claim_id, reason_code="worker_crash_after_consume")
+        # Replaying this consumed occurrence must seal it to NEEDS_REVIEW itself.
         replay = await ExternalEffectCoordinator(store).send_one(authority, prepared, transport)
         assert isinstance(replay, Ambiguous)
         assert transport.calls == 0

@@ -105,6 +105,7 @@ class PreparedExternalRequest:
     request_ref: str | None
     canonical_request_sha256: str
     application_request_sha256: str
+    physical_request_sha256: str = field(repr=False, compare=False)
     occurrence_id: UUID | None
     evidence_refs: tuple[EvidenceReference, ...]
     application_request: FrozenWireRequest = field(repr=False, compare=False)
@@ -137,8 +138,11 @@ class PreparedExternalRequest:
             raise ExternalEffectValidationError("canonical_request_sha256 does not match request")
         if application_request_sha256(self.application_request) != self.application_request_sha256:
             raise ExternalEffectValidationError(
-                "application_request_sha256 does not match wire bytes"
+                "application_request_sha256 does not match redacted wire image"
             )
+        _require_sha256(self.physical_request_sha256, "physical_request_sha256")
+        if _wire_request_sha256(self.application_request) != self.physical_request_sha256:
+            raise ExternalEffectValidationError("physical request digest does not match wire bytes")
 
     @classmethod
     def build(
@@ -164,6 +168,7 @@ class PreparedExternalRequest:
             request_ref=request_ref,
             canonical_request_sha256=canonical_request_sha256(canonical_request),
             application_request_sha256=application_request_sha256(application_request),
+            physical_request_sha256=_wire_request_sha256(application_request),
             occurrence_id=occurrence_id,
             evidence_refs=evidence_refs,
             application_request=application_request,
@@ -285,7 +290,7 @@ class ConsumedEffectPermit:
             "family": prepared.family,
             "provider": prepared.provider,
             "provider_scope": prepared.provider_scope,
-            "request_digest": prepared.application_request_sha256,
+            "request_digest": prepared.physical_request_sha256,
             "envelope_version": authority.expected_envelope_version,
             "approval_decision_id": authority.approval_decision_id,
             "nonce": nonce,
@@ -308,7 +313,27 @@ def canonical_request_sha256(canonical_request: Mapping[str, Any]) -> str:
 
 
 def application_request_sha256(request: FrozenWireRequest) -> str:
-    """Hash the JCS/base64url wire image specified by the S3 contract."""
+    """Hash a credential-redacted wire image for durable claim identity."""
+
+    headers_value = [
+        [
+            _b64url(name),
+            _b64url(b"<redacted>" if _credential_header_name(name) else value),
+        ]
+        for name, value in request.headers
+    ]
+    image = {
+        "body_b64": _b64url(request.body),
+        "format": "autowork.application-request.v1",
+        "headers_b64": _b64url(canonical_json_bytes(headers_value)),
+        "method_b64": _b64url(request.method),
+        "target_b64": _b64url(_redact_target_credentials(request.target)),
+    }
+    return hashlib.sha256(canonical_json_bytes(image)).hexdigest()
+
+
+def _wire_request_sha256(request: FrozenWireRequest) -> str:
+    """Hash the exact in-memory wire bytes for the final send-time capability."""
 
     headers_value = [[_b64url(name), _b64url(value)] for name, value in request.headers]
     image = {
@@ -319,6 +344,95 @@ def application_request_sha256(request: FrozenWireRequest) -> str:
         "target_b64": _b64url(request.target),
     }
     return hashlib.sha256(canonical_json_bytes(image)).hexdigest()
+
+
+_CREDENTIAL_PARAMETER_NAMES = frozenset(
+    re.sub(r"[^a-z0-9]", "", name)
+    for name in (
+        "access_token",
+        "access_key",
+        "access_key_id",
+        "apikey",
+        "api_key",
+        "auth",
+        "authorization",
+        "bearer",
+        "bearer_token",
+        "client_secret",
+        "client_assertion",
+        "credential",
+        "credentials",
+        "id_token",
+        "jwt",
+        "jwt_token",
+        "key",
+        "password",
+        "passwd",
+        "refresh_token",
+        "secret",
+        "session",
+        "session_id",
+        "session_token",
+        "sig",
+        "signature",
+        "token",
+        "oauth_token",
+        "oauth_signature",
+        "private_key",
+        "private_key_id",
+        "client_key",
+        "client_secret_key",
+        "secret_key",
+        "api_secret",
+        "consumer_key",
+        "consumer_secret",
+        "code_verifier",
+        "passphrase",
+        "x_amz_credential",
+        "x_amz_security_token",
+        "x_api_key",
+        "cookie",
+        "proxy_authorization",
+    )
+)
+
+
+def _normalized_credential_name(raw_name: bytes) -> str:
+    decoded = unquote_plus(raw_name.decode("ascii", errors="ignore")).casefold()
+    return re.sub(r"[^a-z0-9]", "", decoded)
+
+
+def _is_credential_name(normalized: str) -> bool:
+    return (
+        normalized in _CREDENTIAL_PARAMETER_NAMES
+        or "token" in normalized
+        or "secret" in normalized
+        or normalized.startswith("xamz")
+    )
+
+
+def _credential_header_name(name: bytes) -> bool:
+    return _is_credential_name(_normalized_credential_name(name))
+
+
+def _redact_parameter_component(component: bytes) -> bytes:
+    pieces = re.split(rb"([&;])", component)
+    for index in range(0, len(pieces), 2):
+        name, separator, _value = pieces[index].partition(b"=")
+        if _is_credential_name(_normalized_credential_name(name)):
+            pieces[index] = name + separator + b"<redacted>"
+    return b"".join(pieces)
+
+
+def _redact_target_credentials(target: bytes) -> bytes:
+    before_fragment, fragment_separator, fragment = target.partition(b"#")
+    path, query_separator, query = before_fragment.partition(b"?")
+    redacted = path
+    if query_separator:
+        redacted += query_separator + _redact_parameter_component(query)
+    if fragment_separator:
+        redacted += fragment_separator + _redact_parameter_component(fragment)
+    return redacted
 
 
 def occurrence_sha256(occurrence_id: UUID | None) -> str:
@@ -359,6 +473,7 @@ def validate_prepared_request(prepared: PreparedExternalRequest) -> None:
     if (
         application_request_sha256(prepared.application_request)
         != prepared.application_request_sha256
+        or _wire_request_sha256(prepared.application_request) != prepared.physical_request_sha256
     ):
         raise ExternalEffectValidationError("application request changed after preparation")
     _assert_safe_persisted_json(prepared.canonical_request)

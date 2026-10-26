@@ -23,6 +23,7 @@ from cti_app.application.external_effects import (
     ExistingClaim,
     ExternalEffectClaim,
     ExternalEffectPolicyGuard,
+    NoSubmissionProofKind,
     ReuseDecision,
     _CoordinatorNoHandoffProof,
     _NoHandoffProofVerifier,
@@ -189,9 +190,11 @@ class SqlAlchemyExternalEffectClaimStore:
         verifier.bind_store(self)
         self._no_handoff_proof_verifier = verifier
 
-    def _consume_no_handoff_proof(self, proof: _CoordinatorNoHandoffProof, claim_id: UUID) -> bool:
+    def _consume_no_handoff_proof(
+        self, proof: _CoordinatorNoHandoffProof, claim_id: UUID
+    ) -> NoSubmissionProofKind | None:
         verifier = self._no_handoff_proof_verifier
-        return verifier is not None and verifier.consume(self, proof, claim_id)
+        return verifier.consume(self, proof, claim_id) if verifier is not None else None
 
     async def consume(
         self,
@@ -402,7 +405,13 @@ class SqlAlchemyExternalEffectClaimStore:
         *,
         result_ref: str | None,
         evidence_refs: tuple[EvidenceReference, ...],
+        outcome_code: str | None = None,
     ) -> bool:
+        if outcome_code is not None and (
+            not isinstance(outcome_code, str)
+            or outcome_code not in {"bridge_rate_limited", "bridge_rejected"}
+        ):
+            return False
         async with self._session_factory() as session:
             async with session.begin():
                 row = await self._claim_for_transition(session, claim_id)
@@ -429,7 +438,7 @@ class SqlAlchemyExternalEffectClaimStore:
                         evidence_refs=persisted_refs,
                         updated_at=now,
                         completed_at=now,
-                        last_error_code=None,
+                        last_error_code=outcome_code,
                     )
                     .returning(ExternalEffectClaimRow.id)
                 )
@@ -475,8 +484,10 @@ class SqlAlchemyExternalEffectClaimStore:
         proof: _CoordinatorNoHandoffProof,
         reason_code: str,
     ) -> bool:
-        if not self._consume_no_handoff_proof(proof, claim_id):
+        proof_kind = self._consume_no_handoff_proof(proof, claim_id)
+        if proof_kind is None:
             return False
+        expected_handoff_nonce_is_null = proof_kind is NoSubmissionProofKind.BEFORE_HANDOFF
         reason = _safe_code(reason_code)
         async with self._session_factory() as session:
             async with session.begin():
@@ -490,7 +501,11 @@ class SqlAlchemyExternalEffectClaimStore:
                     .where(
                         ExternalEffectClaimRow.id == claim_id,
                         ExternalEffectClaimRow.state == EffectClaimState.CONSUMED.value,
-                        ExternalEffectClaimRow.handoff_permit_nonce.is_(None),
+                        (
+                            ExternalEffectClaimRow.handoff_permit_nonce.is_(None)
+                            if expected_handoff_nonce_is_null
+                            else ExternalEffectClaimRow.handoff_permit_nonce.is_not(None)
+                        ),
                         ExternalEffectClaimRow.version == row.version,
                     )
                     .values(
@@ -513,6 +528,18 @@ class SqlAlchemyExternalEffectClaimStore:
                         .values(
                             status="failed", version=ToolInvocationRow.version + 1, updated_at=now
                         )
+                    )
+                if (
+                    row.model_run_id is not None
+                    and proof_kind is NoSubmissionProofKind.TRANSPORT_NO_BYTES_LEFT
+                ):
+                    await session.execute(
+                        update(ModelRunRow)
+                        .where(
+                            ModelRunRow.id == row.model_run_id,
+                            ModelRunRow.submission_state == "submission_in_progress",
+                        )
+                        .values(submission_state="not_submitted", updated_at=now)
                     )
                 return True
 
@@ -1455,6 +1482,14 @@ def _claim_to_domain(row: ExternalEffectClaimRow) -> ExternalEffectClaim:
         state=EffectClaimState(row.state),
         evidence_refs=tuple(refs),
         result_ref=result_ref,
+        bridge_turn_id=row.bridge_turn_id,
+        model_run_id=row.model_run_id,
+        outcome_code=(
+            row.last_error_code
+            if row.state == EffectClaimState.COMPLETED.value
+            and row.last_error_code in {"bridge_rate_limited", "bridge_rejected"}
+            else None
+        ),
     )
 
 

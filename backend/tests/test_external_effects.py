@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
 
+import httpx
 import pytest
 from sqlalchemy.dialects import postgresql
 
@@ -25,6 +26,7 @@ from cti_app.application.external_effects import (
     ExternalEffectCoordinator,
     ExternalEffectReusePolicy,
     HandoffGateRefused,
+    NoSubmissionProofKind,
     PhysicalSendCapability,
     Refused,
     ReuseDecision,
@@ -41,6 +43,7 @@ from cti_app.domain.external_effects import (
     ExternalEffectValidationError,
     FrozenWireRequest,
     PreparedExternalRequest,
+    _wire_request_sha256,
     application_request_sha256,
     canonical_json_bytes,
     canonical_request_sha256,
@@ -117,6 +120,7 @@ class FakeStore:
         self.result = result or ConsumeCommitted(uuid4())
         self.events: list[str] = []
         self.complete_result = True
+        self.completed_outcomes: list[str | None] = []
         self.sealed: list[tuple[str, str]] = []
         self.reuse_id: UUID | None = uuid4()
         self.reuse_calls: list[ReuseDecision] = []
@@ -168,6 +172,7 @@ class FakeStore:
 
     async def complete(self, *args: object, **kwargs: object) -> bool:
         self.events.append("complete")
+        self.completed_outcomes.append(kwargs.get("outcome_code"))  # type: ignore[arg-type]
         if self.complete_result:
             self.claim_state = EffectClaimState.COMPLETED
         return self.complete_result
@@ -200,11 +205,23 @@ class FakeStore:
         self, claim_id: UUID, *, proof: object, reason_code: str
     ) -> bool:
         self.no_handoff_proofs.append(proof)
-        if self._proof_verifier is None or not self._proof_verifier.consume(self, proof, claim_id):
+        proof_kind = (
+            self._proof_verifier.consume(self, proof, claim_id)
+            if self._proof_verifier is not None
+            else None
+        )
+        if proof_kind is None:
             return False
         if (
             self.claim_state is not EffectClaimState.CONSUMED
-            or self.handoff_nonce is not None
+            or (
+                proof_kind is NoSubmissionProofKind.BEFORE_HANDOFF
+                and self.handoff_nonce is not None
+            )
+            or (
+                proof_kind is NoSubmissionProofKind.TRANSPORT_NO_BYTES_LEFT
+                and self.handoff_nonce is None
+            )
             or self.result.claim_id != claim_id  # type: ignore[union-attr]
         ):
             return False
@@ -361,6 +378,153 @@ def test_digest_determinism_and_mutation_sensitivity() -> None:
     assert application_request_sha256(
         _wire(headers=((b"x-repeat", b"one"), (b"x-repeat", b"two")))
     ) != application_request_sha256(_wire(headers=((b"x-repeat", b"two"), (b"x-repeat", b"one"))))
+
+
+def test_credential_redacted_digest_hides_credentials_but_exact_digest_does_not() -> None:
+    first = _wire(
+        target=b"/responses?api_key=first&hash=abc#refresh_token=first",
+        headers=((b"Authorization", b"Bearer first"), (b"x_api-key", b"first")),
+    )
+    second = _wire(
+        target=b"/responses?api_key=second&hash=abc#refresh_token=second",
+        headers=((b"Authorization", b"Bearer second"), (b"x_api-key", b"second")),
+    )
+    assert application_request_sha256(first) == application_request_sha256(second)
+    assert _wire_request_sha256(first) != _wire_request_sha256(second)
+    prepared = _prepared(wire=first)
+    assert _wire_request_sha256(first) not in repr(prepared)
+    changed_target = _wire(
+        target=b"/responses?api_key=first&hash=changed#refresh_token=first",
+        headers=first.headers,
+    )
+    assert application_request_sha256(changed_target) != application_request_sha256(first)
+
+
+@pytest.mark.asyncio
+async def test_confirmed_connect_failure_is_sealed_and_retry_uses_new_occurrence() -> None:
+    class ConfirmedConnectFailure:
+        def __init__(self, failure: httpx.ConnectError) -> None:
+            self.failure = failure
+            self.submit_entries = 0
+            self.physical_calls = 0
+
+        async def submit_once(
+            self, request: FrozenWireRequest, capability: PhysicalSendCapability
+        ) -> TransportResponse:
+            self.submit_entries += 1
+            capability(request)
+            capability.report_pre_submission_failure(self.failure)
+            raise self.failure
+
+    store = FakeStore()
+    failure = httpx.ConnectError("connection could not be established")
+    failed_transport = ConfirmedConnectFailure(failure)
+    coordinator = _coordinator(store)
+    first = await coordinator.send_one(_authority(), _prepared(), failed_transport)
+    assert isinstance(first, DefinitelyNotSubmitted)
+    assert store.claim_state is EffectClaimState.DEFINITIVELY_NOT_SUBMITTED
+    assert store.handoff_nonce is not None
+    assert failed_transport.physical_calls == 0
+
+    replay = await coordinator.send_one(_authority(), _prepared(), failed_transport)
+    assert isinstance(replay, DefinitelyNotSubmitted)
+    assert failed_transport.submit_entries == 1
+
+    retry_prepared = _prepared(occurrence_id=uuid4())
+    retry_store = FakeStore()
+    retry_transport = FakeTransport()
+    retried = await _coordinator(retry_store).send_one(
+        _authority(), retry_prepared, retry_transport
+    )
+    assert isinstance(retried, Completed)
+    assert retried.claim_id != first.claim_id
+    assert effect_key(_INVESTIGATION_ID, retry_prepared) != effect_key(
+        _INVESTIGATION_ID, _prepared()
+    )
+    assert retry_transport.physical_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_is_completed_and_new_occurrence_retry_is_a_new_claim() -> None:
+    first_prepared = _prepared()
+    first_store = FakeStore()
+    first_transport = FakeTransport(response=TransportResponse(outcome_code="bridge_rate_limited"))
+    first = await _coordinator(first_store).send_one(_authority(), first_prepared, first_transport)
+    assert isinstance(first, Completed)
+    assert first.outcome_code == "bridge_rate_limited"
+    assert first_store.completed_outcomes == ["bridge_rate_limited"]
+    assert first_transport.physical_calls == 1
+
+    retry_prepared = _prepared(occurrence_id=uuid4())
+    retry_store = FakeStore()
+    retry_transport = FakeTransport()
+    retry = await _coordinator(retry_store).send_one(_authority(), retry_prepared, retry_transport)
+    assert isinstance(retry, Completed)
+    assert retry.claim_id != first.claim_id
+    assert retry_transport.physical_calls == 1
+
+    first_claim = ExternalEffectClaim(
+        id=first.claim_id,
+        investigation_id=_INVESTIGATION_ID,
+        invocation_id=_INVOCATION_ID,
+        effect_key=effect_key(_INVESTIGATION_ID, first_prepared),
+        family=first_prepared.family,
+        provider=first_prepared.provider,
+        provider_scope=first_prepared.provider_scope,
+        canonical_request_sha256=first_prepared.canonical_request_sha256,
+        application_request_sha256=first_prepared.application_request_sha256,
+        envelope_version=4,
+        approval_decision_id=_APPROVAL_ID,
+        state=EffectClaimState.COMPLETED,
+        outcome_code="bridge_rate_limited",
+    )
+    replay_store = FakeStore(ExistingClaim(first_claim))
+    replay_transport = FakeTransport()
+    replay = await _coordinator(replay_store).send_one(
+        _authority(), first_prepared, replay_transport
+    )
+    assert isinstance(replay, Completed)
+    assert replay.outcome_code == "bridge_rate_limited"
+    assert replay_transport.physical_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_consumed_claim_replay_is_sealed_needs_review_without_send() -> None:
+    prepared = _prepared()
+    claim = ExternalEffectClaim(
+        id=uuid4(),
+        investigation_id=_INVESTIGATION_ID,
+        invocation_id=_INVOCATION_ID,
+        effect_key=effect_key(_INVESTIGATION_ID, prepared),
+        family=prepared.family,
+        provider=prepared.provider,
+        provider_scope=prepared.provider_scope,
+        canonical_request_sha256=prepared.canonical_request_sha256,
+        application_request_sha256=prepared.application_request_sha256,
+        envelope_version=4,
+        approval_decision_id=_APPROVAL_ID,
+        state=EffectClaimState.CONSUMED,
+    )
+    store = FakeStore(ExistingClaim(claim))
+    transport = FakeTransport()
+    outcome = await _coordinator(store).send_one(_authority(), prepared, transport)
+    assert isinstance(outcome, Ambiguous)
+    assert store.claim_state is EffectClaimState.NEEDS_REVIEW
+    assert store.sealed == [("needs_review", "replayed_consumed_claim")]
+    assert transport.physical_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_transport_payload_is_carried_in_memory_and_hidden_from_repr() -> None:
+    payload = b"model response bytes that stay in memory"
+    store = FakeStore()
+    outcome = await _coordinator(store).send_one(
+        _authority(), _prepared(), FakeTransport(response=TransportResponse(payload=payload))
+    )
+    assert isinstance(outcome, Completed)
+    assert outcome.payload == payload
+    assert payload.decode() not in repr(outcome)
+    assert payload.decode() not in repr(TransportResponse(payload=payload))
 
 
 def test_occurrence_default_and_explicit_are_stable_and_distinct() -> None:
@@ -772,6 +936,29 @@ async def test_transport_byte_substitution_is_refused_at_physical_send() -> None
     store = FakeStore()
     transport = FakeTransport(substitute_request=True)
     outcome = await _coordinator(store).send_one(_authority(), _prepared(), transport)
+    assert isinstance(outcome, Ambiguous)
+    assert transport.physical_calls == 0
+    assert store.claim_state is EffectClaimState.NEEDS_REVIEW
+
+
+@pytest.mark.asyncio
+async def test_mutated_noncredential_bytes_fail_exact_send_time_digest() -> None:
+    class MutatingTransport:
+        def __init__(self) -> None:
+            self.physical_calls = 0
+
+        async def submit_once(
+            self, request: FrozenWireRequest, capability: PhysicalSendCapability
+        ) -> TransportResponse:
+            object.__setattr__(request, "body", b"substituted body")
+            capability(request)
+            self.physical_calls += 1
+            return TransportResponse()
+
+    store = FakeStore()
+    transport = MutatingTransport()
+    prepared = _prepared(wire=_wire(headers=((b"Authorization", b"Bearer ephemeral"),)))
+    outcome = await _coordinator(store).send_one(_authority(), prepared, transport)
     assert isinstance(outcome, Ambiguous)
     assert transport.physical_calls == 0
     assert store.claim_state is EffectClaimState.NEEDS_REVIEW
