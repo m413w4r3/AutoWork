@@ -383,7 +383,9 @@ def _bridge_external_effect_binding() -> BridgeExternalEffectBinding:
 
 
 @pytest.mark.asyncio
-async def test_coordinated_bridge_posts_the_same_json_bytes_and_hides_authorization() -> None:
+async def test_coordinated_bridge_posts_the_same_json_bytes_and_hides_authorization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     payload = {"model": "chatgpt-web", "input": "Exact authorized prompt bytes."}
     captured: list[httpx.Request] = []
 
@@ -404,6 +406,21 @@ async def test_coordinated_bridge_posts_the_same_json_bytes_and_hides_authorizat
     await legacy.create(payload, idempotency_key="bridge-request-1")
     legacy_body = captured[-1].content
 
+    request_calls: list[tuple[str, str]] = []
+    original_request = httpx.AsyncClient.request
+
+    async def counted_request(
+        client: httpx.AsyncClient,
+        method: str,
+        url: str,
+        *args: Any,
+        **kwargs: Any,
+    ) -> httpx.Response:
+        request_calls.append((method, url))
+        return await original_request(client, method, url, *args, **kwargs)
+
+    monkeypatch.setattr(httpx.AsyncClient, "request", counted_request)
+
     store = FakeStore()
     gated = create_coordinated_http_responses_transport(
         "https://bridge.test/v1",
@@ -419,6 +436,7 @@ async def test_coordinated_bridge_posts_the_same_json_bytes_and_hides_authorizat
 
     assert result["output_text"] == "ok"
     assert len(captured) == 2
+    assert request_calls == [("POST", "https://bridge.test/v1/responses")]
     assert captured[1].content == legacy_body
     assert store._prepared_request is not None
     wire = store._prepared_request.application_request

@@ -152,11 +152,23 @@ class HttpResponsesTransport:
         idempotency_key: str | None = None,
         timeout_seconds: float | None = None,
         phase: str = "generation",
-    ) -> dict[str, Any]:
+        _physical_send_capability: PhysicalSendCapability | None = None,
+        _return_response: bool = False,
+    ) -> dict[str, Any] | httpx.Response:
+        is_responses_submission = method.upper() == "POST" and _is_responses_submission_path(
+            self._base_url, path
+        )
         if (
             self._external_effect_coordinator is not None
-            and method.upper() == "POST"
-            and _is_responses_submission_path(self._base_url, path)
+            and is_responses_submission
+            and _physical_send_capability is None
+        ):
+            raise _bridge_external_effect_refusal()
+        if _physical_send_capability is not None and (
+            self._external_effect_coordinator is None
+            or not is_responses_submission
+            or not _return_response
+            or self._client is not None
         ):
             raise _bridge_external_effect_refusal()
         # Exactly one HTTP attempt: whether a failed POST may be replayed is a
@@ -169,6 +181,12 @@ class HttpResponsesTransport:
             headers["X-Correlation-ID"] = correlation_id
         read_timeout = timeout_seconds if timeout_seconds is not None else self._timeout
         timeout = httpx.Timeout(read_timeout, connect=self._connect_timeout)
+
+        async def check_physical_send(request: httpx.Request) -> None:
+            if _physical_send_capability is not None:
+                _physical_send_capability(_freeze_httpx_request(request))
+
+        event_hooks = {"request": [check_physical_send]} if _physical_send_capability else None
         try:
             if self._client is not None:
                 response = await self._client.request(
@@ -183,11 +201,14 @@ class HttpResponsesTransport:
                     timeout=timeout,
                     follow_redirects=False,
                     transport=self._http_transport,
+                    event_hooks=event_hooks,
                 ) as client:
                     response = await client.request(
                         method, f"{self._base_url}{path}", json=json_body, headers=headers
                     )
         except httpx.ConnectError as exc:
+            if _physical_send_capability is not None:
+                raise
             raise BridgeTransportError(
                 "bridge_unreachable",
                 "Le bridge ChatGPT est inaccessible.",
@@ -196,6 +217,8 @@ class HttpResponsesTransport:
                 submission_state=("pre_submission" if phase == "preflight" else None),
             ) from exc
         except httpx.ReadTimeout as exc:
+            if _physical_send_capability is not None:
+                raise
             timed_out_generation = phase == "generation"
             raise BridgeTransportError(
                 ("bridge_wait_budget_exceeded" if timed_out_generation else "bridge_timeout"),
@@ -211,6 +234,8 @@ class HttpResponsesTransport:
                 ),
             ) from exc
         except httpx.ConnectTimeout as exc:
+            if _physical_send_capability is not None:
+                raise
             raise BridgeTransportError(
                 "bridge_timeout",
                 "Le bridge ChatGPT n'a pas répondu à temps.",
@@ -218,6 +243,8 @@ class HttpResponsesTransport:
                 phase=phase,
                 submission_state=("pre_submission" if phase == "preflight" else None),
             ) from exc
+        if _return_response:
+            return response
         if response.is_error:
             raise _bridge_http_error(response, 1, default_phase=phase)
         try:
@@ -270,47 +297,41 @@ class HttpResponsesTransport:
         read_timeout = timeout_seconds if timeout_seconds is not None else self._timeout
         timeout = httpx.Timeout(read_timeout, connect=self._connect_timeout)
         try:
-            async with httpx.AsyncClient(
-                timeout=timeout,
-                follow_redirects=False,
-                transport=self._http_transport,
-            ) as client:
-                request = client.build_request(
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as builder:
+                request = builder.build_request(
                     "POST",
                     f"{self._base_url}/responses",
                     json=payload,
                     headers=headers,
                     timeout=timeout,
                 )
-                frozen_request = FrozenWireRequest(
-                    method=request.method.encode("ascii"),
-                    target=request.url.raw_path,
-                    headers=tuple(request.headers.raw),
-                    body=request.content,
-                )
-                prepared = PreparedExternalRequest.build(
-                    family=binding.family,
-                    provider=ModelProvider.OPENAI.value,
-                    provider_scope=binding.provider_scope,
-                    normalizer_version=binding.normalizer_version,
-                    canonical_request={
-                        "authorized_input_hash": binding.authorized_input_hash,
-                        "bridge_request_id": idempotency_key,
-                        "model_input_sha256": binding.model_input_sha256,
-                    },
-                    application_request=frozen_request,
-                    occurrence_id=uuid5(
-                        UUID("d34c1df1-a1c5-4ff1-90fc-7d2063f7cb0f"), idempotency_key
-                    ),
-                    evidence_refs=binding.evidence_refs,
-                    credential_parameter_names=binding.credential_parameter_names,
-                )
-                physical_transport = _CoordinatedResponsesPoster(client, request)
-                outcome = await coordinator.send_one(
-                    binding.authority,
-                    prepared,
-                    physical_transport,
-                )
+            frozen_request = _freeze_httpx_request(request)
+            prepared = PreparedExternalRequest.build(
+                family=binding.family,
+                provider=ModelProvider.OPENAI.value,
+                provider_scope=binding.provider_scope,
+                normalizer_version=binding.normalizer_version,
+                canonical_request={
+                    "authorized_input_hash": binding.authorized_input_hash,
+                    "bridge_request_id": idempotency_key,
+                    "model_input_sha256": binding.model_input_sha256,
+                },
+                application_request=frozen_request,
+                occurrence_id=uuid5(UUID("d34c1df1-a1c5-4ff1-90fc-7d2063f7cb0f"), idempotency_key),
+                evidence_refs=binding.evidence_refs,
+                credential_parameter_names=binding.credential_parameter_names,
+            )
+            physical_transport = _CoordinatedResponsesPoster(
+                self,
+                payload,
+                idempotency_key,
+                timeout_seconds,
+            )
+            outcome = await coordinator.send_one(
+                binding.authority,
+                prepared,
+                physical_transport,
+            )
         except (ExternalEffectValidationError, TypeError, ValueError):
             raise _bridge_external_effect_refusal() from None
         except Exception:
@@ -405,19 +426,32 @@ class _CoordinatedResponsesPoster:
 
     def __init__(
         self,
-        client: httpx.AsyncClient,
-        request: httpx.Request,
+        transport: HttpResponsesTransport,
+        payload: dict[str, Any],
+        idempotency_key: str,
+        timeout_seconds: float | None,
     ) -> None:
-        self.__client = client
-        self.__request = request
+        self.__transport = transport
+        self.__payload = payload
+        self.__idempotency_key = idempotency_key
+        self.__timeout_seconds = timeout_seconds
 
     async def submit_once(
         self,
         request: FrozenWireRequest,
         capability: PhysicalSendCapability,
     ) -> TransportResponse:
-        capability(request)
-        response = await self.__client.send(self.__request, follow_redirects=False)
+        response = await self.__transport._request(
+            "POST",
+            "/responses",
+            json_body=self.__payload,
+            idempotency_key=self.__idempotency_key,
+            timeout_seconds=self.__timeout_seconds,
+            _physical_send_capability=capability,
+            _return_response=True,
+        )
+        if not isinstance(response, httpx.Response):
+            raise RuntimeError("Bridge gated request did not return an HTTP response")
         if response.is_error:
             if response.status_code == 429:
                 error = BridgeTransportError(
@@ -460,6 +494,15 @@ class _CoordinatedResponsesPoster:
         if not isinstance(decoded, dict):
             raise RuntimeError("Bridge returned a non-object response")
         return TransportResponse(payload=response.content)
+
+
+def _freeze_httpx_request(request: httpx.Request) -> FrozenWireRequest:
+    return FrozenWireRequest(
+        method=request.method.encode("ascii"),
+        target=request.url.raw_path,
+        headers=tuple(request.headers.raw),
+        body=request.content,
+    )
 
 
 def _bridge_external_effect_refusal() -> BridgeTransportError:
