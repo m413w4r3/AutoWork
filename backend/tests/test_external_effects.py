@@ -427,6 +427,54 @@ async def test_committed_consume_mints_one_permit_and_calls_transport_once() -> 
     assert not hasattr(transport, "prepare_submission")
 
 
+@pytest.mark.parametrize("submit_behavior", ("return_unused", "return_after_refusal", "raise"))
+@pytest.mark.asyncio
+async def test_saved_capability_is_revoked_when_submit_once_exits(
+    submit_behavior: str,
+) -> None:
+    class _CaptureCapabilityTransport:
+        def __init__(self) -> None:
+            self.submit_entries = 0
+            self.capability: PhysicalSendCapability | None = None
+            self.request: FrozenWireRequest | None = None
+            self.physical_calls = 0
+
+        async def submit_once(
+            self,
+            request: FrozenWireRequest,
+            capability: PhysicalSendCapability | None = None,
+        ) -> TransportResponse:
+            self.submit_entries += 1
+            assert isinstance(capability, PhysicalSendCapability)
+            self.capability = capability
+            self.request = request
+            if submit_behavior == "raise":
+                raise RuntimeError("transport setup failed")
+            if submit_behavior == "return_after_refusal":
+                try:
+                    capability(_wire(target=b"/substituted"))
+                except HandoffGateRefused:
+                    pass
+            return TransportResponse(result_ref="artifact:unused-capability")
+
+        def send_with_saved_capability(self) -> None:
+            assert self.capability is not None
+            assert self.request is not None
+            self.capability(self.request)
+            self.physical_calls += 1
+
+    store = FakeStore()
+    transport = _CaptureCapabilityTransport()
+    outcome = await _coordinator(store).send_one(_authority(), _prepared(), transport)
+
+    assert isinstance(outcome, Ambiguous)
+    assert store.claim_state is EffectClaimState.NEEDS_REVIEW
+    assert transport.submit_entries == 1
+    with pytest.raises(HandoffGateRefused, match="no longer active"):
+        transport.send_with_saved_capability()
+    assert transport.physical_calls == 0
+
+
 def test_forged_copied_reused_stale_and_misbound_permits_are_refused() -> None:
     registry = _PermitRegistry()
     authority = _authority()
@@ -559,6 +607,23 @@ async def test_pretransport_seal_prevents_stale_replay_from_sending(
     assert isinstance(replay, DefinitelyNotSubmitted)
     assert transport.physical_calls == 0
     assert store.claim_state is EffectClaimState.DEFINITIVELY_NOT_SUBMITTED
+
+
+@pytest.mark.asyncio
+async def test_handoff_refusal_with_existing_marker_stays_ambiguous() -> None:
+    store = FakeStore()
+    store.handoff_nonce = uuid4()
+    transport = FakeTransport()
+
+    outcome = await _coordinator(store).send_one(_authority(), _prepared(), transport)
+
+    assert isinstance(outcome, Ambiguous)
+    assert store.claim_state is EffectClaimState.NEEDS_REVIEW
+    assert store.events == ["commit", "gate"]
+    assert len(store.no_handoff_proofs) == 1
+    assert not any(kind == "not_submitted" for kind, _reason in store.sealed)
+    assert transport.submit_entries == 0
+    assert transport.physical_calls == 0
 
 
 @pytest.mark.asyncio

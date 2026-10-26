@@ -481,7 +481,9 @@ class ExternalEffectCoordinator:
             if time.monotonic() >= permit.expires_at_monotonic:
                 raise HandoffGateRefused("permit expired before physical operation invocation")
 
+            capability_attempted = False
             capability_used = False
+            capability_active = True
             capability_lock = threading.Lock()
             capability_holder: dict[str, PhysicalSendCapability] = {}
 
@@ -489,13 +491,15 @@ class ExternalEffectCoordinator:
                 caller: PhysicalSendCapability,
                 sent_request: FrozenWireRequest,
             ) -> None:
-                nonlocal capability_used
+                nonlocal capability_attempted, capability_used
                 with capability_lock:
                     if capability_holder.get("capability") is not caller:
                         raise HandoffGateRefused("physical send capability is invalid")
-                    if capability_used:
+                    if not capability_active:
+                        raise HandoffGateRefused("physical send capability is no longer active")
+                    if capability_attempted:
                         raise HandoffGateRefused("physical send capability was already used")
-                    capability_used = True
+                    capability_attempted = True
                     if sent_request is not request:
                         raise HandoffGateRefused("physical request substitution refused")
                     actual_digest = application_request_sha256(sent_request)
@@ -512,13 +516,25 @@ class ExternalEffectCoordinator:
                         raise HandoffGateRefused("physical send capability expired or invalid")
                     if time.monotonic() >= permit.expires_at_monotonic:
                         raise HandoffGateRefused("physical send capability expired or invalid")
+                    capability_used = True
 
             capability = object.__new__(PhysicalSendCapability)
             capability_holder["capability"] = capability
             object.__setattr__(
                 capability, "_PhysicalSendCapability__execute", physical_send_capability
             )
-            return await transport.submit_once(request, capability)
+            capability_was_used = False
+            try:
+                response = await transport.submit_once(request, capability)
+            finally:
+                with capability_lock:
+                    capability_active = False
+                    capability_was_used = capability_used
+            if not capability_was_used:
+                # The durable handoff marker is already present and the transport
+                # ran, so reject its response without claiming zero egress.
+                raise HandoffGateRefused("transport returned without using its send capability")
+            return response
 
         async def seal_zero_handoff(
             claim_id: UUID, *, reason_code: str
