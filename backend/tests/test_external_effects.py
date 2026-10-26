@@ -406,20 +406,18 @@ async def test_coordinated_bridge_posts_the_same_json_bytes_and_hides_authorizat
     await legacy.create(payload, idempotency_key="bridge-request-1")
     legacy_body = captured[-1].content
 
-    request_calls: list[tuple[str, str]] = []
-    original_request = httpx.AsyncClient.request
+    send_calls: list[httpx.Request] = []
+    original_send = httpx.AsyncClient.send
 
-    async def counted_request(
+    async def counted_send(
         client: httpx.AsyncClient,
-        method: str,
-        url: str,
-        *args: Any,
+        request: httpx.Request,
         **kwargs: Any,
     ) -> httpx.Response:
-        request_calls.append((method, url))
-        return await original_request(client, method, url, *args, **kwargs)
+        send_calls.append(request)
+        return await original_send(client, request, **kwargs)
 
-    monkeypatch.setattr(httpx.AsyncClient, "request", counted_request)
+    monkeypatch.setattr(httpx.AsyncClient, "send", counted_send)
 
     store = FakeStore()
     gated = create_coordinated_http_responses_transport(
@@ -436,13 +434,20 @@ async def test_coordinated_bridge_posts_the_same_json_bytes_and_hides_authorizat
 
     assert result["output_text"] == "ok"
     assert len(captured) == 2
-    assert request_calls == [("POST", "https://bridge.test/v1/responses")]
+    assert len(send_calls) == 1
+    assert send_calls[0] is captured[1]
     assert captured[1].content == legacy_body
     assert store._prepared_request is not None
     wire = store._prepared_request.application_request
+    assert store._prepared_request.provider == "bridge"
     assert wire.method == b"POST"
     assert wire.target == b"/v1/responses"
     assert wire.body == legacy_body
+    transmitted = send_calls[0]
+    assert wire.method == transmitted.method.encode("ascii")
+    assert wire.target == transmitted.url.raw_path
+    assert wire.headers == tuple(transmitted.headers.raw)
+    assert wire.body == transmitted.content
     assert any(
         name.lower() == b"authorization" and value.endswith(key.encode())
         for name, value in wire.headers

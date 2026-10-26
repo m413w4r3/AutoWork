@@ -1247,6 +1247,10 @@ class BridgeInvestigator:
                 rng=rng,
             )
 
+    @property
+    def requires_external_effect_authority(self) -> bool:
+        return bool(getattr(self._transport, "requires_external_effect_authority", False))
+
     async def _sleep(self, seconds: float) -> None:
         if self._sleeper is None:
             await asyncio.sleep(seconds)
@@ -1285,6 +1289,7 @@ class BridgeInvestigator:
         external_llm_allowed: bool,
         on_invalid_output: Callable[[str, str], Awaitable[None]] | None = None,
         before_submission: Callable[[], Awaitable[bool]] | None = None,
+        external_effect_binding_context: Mapping[str, Any] | None = None,
     ) -> BridgeTurnResult:
         if not external_llm_allowed:
             context_sha256 = hashlib.sha256(context.canonical_bytes()).hexdigest()
@@ -1354,7 +1359,8 @@ class BridgeInvestigator:
                 binding: BridgeExternalEffectBinding | None = None
                 if callable(binding_builder):
                     try:
-                        binding = await binding_builder(
+                        binding_context = dict(external_effect_binding_context or {})
+                        binding_context.update(
                             family="bridge.investigation_turn.v1",
                             investigation_id=investigation_id,
                             subject_id=subject_id,
@@ -1363,6 +1369,9 @@ class BridgeInvestigator:
                             context=active_context,
                             context_sha256=context_sha256,
                             prompt=submission_kwargs["prompt"],
+                        )
+                        binding = await binding_builder(
+                            **binding_context,
                         )
                     except Exception:
                         return BridgeTurnResult(

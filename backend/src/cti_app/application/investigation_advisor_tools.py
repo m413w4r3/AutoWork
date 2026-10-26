@@ -75,6 +75,7 @@ from cti_app.application.research_context_builder import ArticleSnapshotPort
 from cti_app.config import Settings
 from cti_app.domain.analyst_opinion import OpinionBlockType, investigation_opinion_id
 from cti_app.domain.classification import TLP
+from cti_app.domain.external_effects import EvidenceReference
 from cti_app.domain.investigation import (
     BudgetDimension,
     BudgetReservation,
@@ -850,6 +851,12 @@ class InvestigationAdvisorTool:
                     ),
                 )
             transmitted_refs = _prompt_transmitted_refs(prompt_data)
+            external_effect_evidence_refs = await _advisor_external_effect_evidence_refs(
+                transmitted_refs,
+                evidence,
+                observation_repository=self._observations,
+                investigation_id=context.investigation_id,
+            )
             advisor_observation_refs = tuple(
                 UUID(item["id"]) for item in transmitted_refs if item["kind"] == "observation"
             )
@@ -1101,6 +1108,7 @@ class InvestigationAdvisorTool:
                 "authority_context": getattr(context, "external_effect_authority", None),
                 "invocation_arguments": dict(arguments),
                 "transmitted_refs": transmitted_refs,
+                "evidence_refs": external_effect_evidence_refs,
                 "reservation_operation_key": reservation_key,
             },
         )
@@ -5300,6 +5308,42 @@ def _prompt_transmitted_refs(prompt_data: Mapping[str, Any]) -> tuple[dict[str, 
         ):
             refs.append({"kind": item["kind"], "id": item["id"], "sha256": item["sha256"]})
     return tuple(refs)
+
+
+async def _advisor_external_effect_evidence_refs(
+    transmitted_refs: tuple[dict[str, str], ...],
+    evidence: Sequence[EvidenceObservation],
+    *,
+    observation_repository: Any,
+    investigation_id: UUID,
+) -> tuple[EvidenceReference, ...]:
+    """Resolve transmitted observations to their canonical persisted versions."""
+    observations = {str(item.id): item for item in evidence}
+    references: dict[str, EvidenceReference] = {}
+    for reference in transmitted_refs:
+        if reference["kind"] != "observation":
+            continue
+        observation = observations.get(reference["id"])
+        if observation is None:
+            try:
+                observation_id = UUID(reference["id"])
+            except ValueError as exc:
+                raise _AdvisorInputValidationError("advisor_evidence_reference_mismatch") from exc
+            observation = await observation_repository.get(observation_id)
+        if (
+            observation is None
+            or observation.investigation_id != investigation_id
+            or observation.sha256 != reference["sha256"]
+        ):
+            raise _AdvisorInputValidationError("advisor_evidence_reference_mismatch")
+        resolved = EvidenceReference(
+            kind="evidence_observation",
+            id=str(observation.id),
+            version=observation.source_version,
+            sha256=observation.sha256,
+        )
+        references[resolved.id] = resolved
+    return tuple(references[key] for key in sorted(references))
 
 
 def _attach_advisor_provenance(result: ToolResult, provenance: Mapping[str, Any]) -> ToolResult:

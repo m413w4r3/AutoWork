@@ -455,7 +455,7 @@ async def _prepare_model_submission_case(
         async with session.begin():
             envelope = await session.get(InvestigationEnvelopeRow, investigation_id)
             assert envelope is not None
-            envelope.allowed_providers = ["openai"]
+            envelope.allowed_providers = ["bridge"]
             session.add(
                 ModelConversationRow(
                     id=conversation_id,
@@ -550,7 +550,7 @@ async def _prepare_model_submission_case(
     authority = replace(authority, bridge_turn_id=turn_id, model_run_id=run_id)
     prepared = PreparedExternalRequest.build(
         family="bridge.investigation_turn.v1",
-        provider="openai",
+        provider="bridge",
         provider_scope="bridge-test",
         normalizer_version="bridge.turn.v1",
         canonical_request={
@@ -569,7 +569,7 @@ async def _prepare_model_submission_case(
         session_factory,
         family_bindings={
             prepared.family: ExternalEffectFamilyBinding(
-                provider="openai",
+                provider="bridge",
                 provider_scopes=frozenset({"bridge-test"}),
                 normalizer_versions=frozenset({"bridge.turn.v1"}),
                 invocation_tool_binding=(_FAMILY, "v1"),
@@ -580,6 +580,25 @@ async def _prepare_model_submission_case(
         },
     )
     return session_factory, engine, investigation_id, authority, prepared, store, run_id
+
+
+def _bridge_model_lineage_store(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> SqlAlchemyExternalEffectClaimStore:
+    return SqlAlchemyExternalEffectClaimStore(
+        session_factory,
+        family_bindings={
+            "bridge.investigation_turn.v1": ExternalEffectFamilyBinding(
+                provider="bridge",
+                provider_scopes=frozenset({"bridge-test"}),
+                normalizer_versions=frozenset({"bridge.turn.v1"}),
+                invocation_tool_binding=None,
+                model_submission=True,
+                requires_model_lineage=True,
+                model_run_provider="openai",
+            )
+        },
+    )
 
 
 @pytest.mark.asyncio
@@ -705,6 +724,7 @@ async def test_coordinated_bridge_http_post_completes_one_persisted_model_claim(
                 body=request.content,
             )
         )
+        assert api_key not in claim.application_request_sha256
         persisted_columns = {
             column.name: getattr(claim, column.name)
             for column in ExternalEffectClaimRow.__table__.columns
@@ -712,6 +732,259 @@ async def test_coordinated_bridge_http_post_completes_one_persisted_model_claim(
         assert api_key not in repr(persisted_columns)
         assert run is not None and run.submission_state == "result_obtained"
         assert api_key not in caplog.text
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_bridge_rate_limit_retry_and_correction_consume_one_claim_per_persisted_attempt(
+    migrated_postgres_url: str,
+    tmp_path: Path,
+) -> None:
+    (
+        session_factory,
+        engine,
+        investigation_id,
+        initial_authority,
+        initial_prepared,
+        _unused_store,
+        first_run_id,
+    ) = await _prepare_model_submission_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    first_turn_id = initial_authority.bridge_turn_id
+    assert first_turn_id is not None
+    authority = replace(
+        initial_authority,
+        invocation_id=None,
+        invocation_arguments_sha256=None,
+    )
+    coordinator = ExternalEffectCoordinator(_bridge_model_lineage_store(session_factory))
+    first_transport = _CountingTransport(
+        response=TransportResponse(outcome_code="bridge_rate_limited")
+    )
+    second_transport = _CountingTransport()
+    third_transport = _CountingTransport()
+    second_turn_id = uuid4()
+    second_run_id = uuid4()
+    second_request_id = "bridge-request-retry-2"
+    second_input_sha256 = "c" * 64
+    third_turn_id = uuid4()
+    third_run_id = uuid4()
+    third_request_id = "bridge-request-correction-3"
+    third_input_sha256 = "d" * 64
+    now = datetime.now(UTC)
+    try:
+        async with session_factory() as session:
+            async with session.begin():
+                first_turn = await session.get(ModelConversationTurnRow, first_turn_id)
+                first_run = await session.get(ModelRunRow, first_run_id)
+                assert first_turn is not None and first_run is not None
+                conversation = await session.get(ModelConversationRow, first_turn.conversation_id)
+                assert conversation is not None
+                run_values = {
+                    column.name: getattr(first_run, column.name)
+                    for column in ModelRunRow.__table__.columns
+                }
+                run_values.update(
+                    {
+                        "id": second_run_id,
+                        "authorized_input_hash": second_input_sha256,
+                        "status": "running",
+                        "submission_state": "external_state_unknown",
+                        "submission_attempt": 1,
+                        "bridge_request_id": second_request_id,
+                        "response_id": None,
+                        "output_references": [],
+                        "error_code": None,
+                        "error_message": None,
+                        "error_details": None,
+                        "raw_output_reference": None,
+                        "raw_output_sha256": None,
+                        "raw_output_chars": None,
+                        "normalized_output_reference": None,
+                        "normalized_output_sha256": None,
+                        "duration_ms": None,
+                        "usage": None,
+                        "finished_at": None,
+                        "updated_at": now,
+                        "started_at": now,
+                    }
+                )
+                session.add(ModelRunRow(**run_values))
+                turn_values = {
+                    column.name: getattr(first_turn, column.name)
+                    for column in ModelConversationTurnRow.__table__.columns
+                }
+                turn_values.update(
+                    {
+                        "id": second_turn_id,
+                        "sequence": first_turn.sequence + 1,
+                        "parent_turn_id": first_turn.id,
+                        "model_run_id": second_run_id,
+                        "input_blob_reference": "sha256:" + second_input_sha256,
+                        "input_sha256": second_input_sha256,
+                        "output_blob_reference": None,
+                        "output_sha256": None,
+                        "status": "running",
+                        "external_turn_id": None,
+                        "idempotency_key": second_request_id,
+                        "correlation_id": second_request_id,
+                        "error_code": None,
+                        "error_message": None,
+                        "error_details": None,
+                        "created_at": now,
+                        "started_at": now,
+                        "finished_at": None,
+                    }
+                )
+                session.add(ModelConversationTurnRow(**turn_values))
+                correction_run_values = dict(run_values)
+                correction_run_values.update(
+                    {
+                        "id": third_run_id,
+                        "authorized_input_hash": third_input_sha256,
+                        "bridge_request_id": third_request_id,
+                    }
+                )
+                session.add(ModelRunRow(**correction_run_values))
+                correction_turn_values = dict(turn_values)
+                correction_turn_values.update(
+                    {
+                        "id": third_turn_id,
+                        "sequence": first_turn.sequence + 2,
+                        "parent_turn_id": second_turn_id,
+                        "model_run_id": third_run_id,
+                        "input_blob_reference": "sha256:" + third_input_sha256,
+                        "input_sha256": third_input_sha256,
+                        "idempotency_key": third_request_id,
+                        "correlation_id": third_request_id,
+                    }
+                )
+                session.add(ModelConversationTurnRow(**correction_turn_values))
+                conversation.turn_count += 1
+                conversation.turn_count += 1
+                conversation.version += 2
+                conversation.updated_at = now
+
+        first = await coordinator.send_one(authority, initial_prepared, first_transport)
+        assert isinstance(first, Completed)
+        assert first.outcome_code == "bridge_rate_limited"
+        second_authority = replace(
+            authority,
+            bridge_turn_id=second_turn_id,
+            model_run_id=second_run_id,
+        )
+        second_prepared = PreparedExternalRequest.build(
+            family="bridge.investigation_turn.v1",
+            provider="bridge",
+            provider_scope="bridge-test",
+            normalizer_version="bridge.turn.v1",
+            canonical_request={
+                "model_input_sha256": second_input_sha256,
+                "authorized_input_hash": second_input_sha256,
+                "bridge_request_id": second_request_id,
+            },
+            application_request=FrozenWireRequest(
+                method=b"POST",
+                target=b"/responses",
+                headers=((b"content-type", b"application/json"),),
+                body=b'{"input":"corrected synthetic request"}',
+            ),
+        )
+        retry = await coordinator.send_one(second_authority, second_prepared, second_transport)
+        assert isinstance(retry, Completed)
+        assert first.claim_id != retry.claim_id
+        correction_authority = replace(
+            authority,
+            bridge_turn_id=third_turn_id,
+            model_run_id=third_run_id,
+        )
+        correction_prepared = PreparedExternalRequest.build(
+            family="bridge.investigation_turn.v1",
+            provider="bridge",
+            provider_scope="bridge-test",
+            normalizer_version="bridge.turn.v1",
+            canonical_request={
+                "model_input_sha256": third_input_sha256,
+                "authorized_input_hash": third_input_sha256,
+                "bridge_request_id": third_request_id,
+            },
+            application_request=FrozenWireRequest(
+                method=b"POST",
+                target=b"/responses",
+                headers=((b"content-type", b"application/json"),),
+                body=b'{"input":"corrective synthetic request"}',
+            ),
+        )
+        correction = await coordinator.send_one(
+            correction_authority, correction_prepared, third_transport
+        )
+        assert isinstance(correction, Completed)
+        assert len({first.claim_id, retry.claim_id, correction.claim_id}) == 3
+        assert first_transport.calls == second_transport.calls == third_transport.calls == 1
+        async with session_factory() as session:
+            claims = list(
+                await session.scalars(
+                    select(ExternalEffectClaimRow)
+                    .where(
+                        ExternalEffectClaimRow.investigation_id == investigation_id,
+                        ExternalEffectClaimRow.family == "bridge.investigation_turn.v1",
+                    )
+                    .order_by(ExternalEffectClaimRow.created_at, ExternalEffectClaimRow.id)
+                )
+            )
+        assert len(claims) == 3
+        assert {claim.model_run_id for claim in claims} == {
+            first_run_id,
+            second_run_id,
+            third_run_id,
+        }
+        assert {claim.bridge_turn_id for claim in claims} == {
+            first_turn_id,
+            second_turn_id,
+            third_turn_id,
+        }
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_bridge_ambiguous_response_needs_review_and_replay_sends_nothing(
+    migrated_postgres_url: str,
+    tmp_path: Path,
+) -> None:
+    (
+        session_factory,
+        engine,
+        _investigation_id,
+        initial_authority,
+        prepared,
+        _unused_store,
+        run_id,
+    ) = await _prepare_model_submission_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    authority = replace(
+        initial_authority,
+        invocation_id=None,
+        invocation_arguments_sha256=None,
+    )
+    coordinator = ExternalEffectCoordinator(_bridge_model_lineage_store(session_factory))
+    transport = _CountingTransport(response=httpx.ReadTimeout("synthetic response timeout"))
+    try:
+        first = await coordinator.send_one(authority, prepared, transport)
+        assert isinstance(first, Ambiguous)
+        replay = await coordinator.send_one(authority, prepared, transport)
+        assert isinstance(replay, Ambiguous)
+        assert transport.calls == 1
+        async with session_factory() as session:
+            claim = await session.get(ExternalEffectClaimRow, first.claim_id)
+            run = await session.get(ModelRunRow, run_id)
+        assert claim is not None and claim.state == "NEEDS_REVIEW"
+        assert claim.bridge_turn_id == authority.bridge_turn_id
+        assert claim.model_run_id == run_id
+        assert run is not None and run.submission_state == "needs_review"
     finally:
         await engine.dispose()
 

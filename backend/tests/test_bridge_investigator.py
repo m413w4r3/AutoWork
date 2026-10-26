@@ -520,6 +520,76 @@ async def test_complete_rate_limit_retry_uses_new_occurrence_and_counts_submissi
 
 
 @pytest.mark.asyncio
+async def test_bridge_rate_limit_retry_and_correction_each_get_a_fresh_binding() -> None:
+    investigation_id = uuid4()
+    context = _context(investigation_id)
+    rejected = TurnSubmission(
+        TurnSubmissionStatus.UNAVAILABLE,
+        error_code="bridge_rate_limited",
+        submission_state="post_submission",
+        retryable=True,
+        retry_after_seconds=1,
+        completed_response=True,
+    )
+    valid = {
+        "reasoning_summary": "The corrected synthetic request is complete.",
+        "goal": "Finish the investigation.",
+        "hypothesis_refs": [],
+        "proposed_tool_calls": [],
+        "finding_proposals": [],
+        "opinion_delta": None,
+        "next_action": AgentNextAction.FINISH.value,
+    }
+
+    class BoundScriptedTransport(ScriptedTurnTransport):
+        requires_external_effect_authority = True
+
+        def __init__(self) -> None:
+            super().__init__([rejected, "invalid corrective response", valid])
+            self.bindings: list[object] = []
+            self.submitted_bindings: list[object] = []
+
+        async def build_external_effect_binding(self, **_kwargs):
+            binding = object()
+            self.bindings.append(binding)
+            return binding
+
+        async def submit(self, **kwargs):
+            binding = kwargs.pop("bridge_external_effect_binding")
+            self.submitted_bindings.append(binding)
+            return await super().submit(**kwargs)
+
+        async def submit_with_attempt(self, **kwargs):
+            binding = kwargs.pop("bridge_external_effect_binding")
+            self.submitted_bindings.append(binding)
+            return await super().submit_with_attempt(**kwargs)
+
+    transport = BoundScriptedTransport()
+    clock = _ManualClock()
+    result = await BridgeInvestigator(
+        transport,
+        minimum_submission_interval_seconds=0,
+        submission_jitter_fraction=0,
+        clock=clock,
+        sleeper=clock.sleep,
+        rng=lambda: 0.5,
+    ).turn(
+        investigation_id=investigation_id,
+        subject_id=context.source.subject_id,
+        turn_index=3,
+        context=context,
+        external_llm_allowed=True,
+    )
+
+    assert result.status is TurnSubmissionStatus.SUCCEEDED
+    assert result.submissions_made == 3
+    assert transport.submission_count == 3
+    assert len(transport.bindings) == len(transport.submitted_bindings) == 3
+    assert len({id(binding) for binding in transport.bindings}) == 3
+    assert transport.submitted_bindings == transport.bindings
+
+
+@pytest.mark.asyncio
 async def test_abandoned_attempt_uses_a_distinct_deterministic_submission_key() -> None:
     investigation_id = uuid4()
     context = _context(investigation_id)

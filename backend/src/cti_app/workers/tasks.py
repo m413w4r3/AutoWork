@@ -81,6 +81,7 @@ from cti_app.infrastructure.ghidra_mcp import create_ghidra_mcp_http_adapter
 from cti_app.infrastructure.http import AsyncioPinnedHttpTransport
 from cti_app.infrastructure.investigation_runtime_ports import (
     build_investigation_runtime_composition_factory,
+    create_external_effect_coordinator,
 )
 from cti_app.infrastructure.jobs import DramatiqJobDispatcher
 from cti_app.infrastructure.pdf_inspection import PdfInspectionCache
@@ -260,7 +261,12 @@ async def _execute_job(job_id: UUID) -> int | None:
             vt_capabilities,
         )
         production_diagnostics = DiagnosticsLog.from_env(settings.diagnostics_log_root)
-        model_gateway = create_model_gateway(settings, uow_factory)
+        external_effect_coordinator = create_external_effect_coordinator(session_factory)
+        model_gateway = create_model_gateway(
+            settings,
+            uow_factory,
+            external_effect_coordinator=external_effect_coordinator,
+        )
         # Exactly one bridge capabilities provider for this worker execution
         # context; it also doubles as the ConversationSessionCloser that
         # closes the exact live Temporary Chat browser session.
@@ -337,6 +343,7 @@ async def _execute_job(job_id: UUID) -> int | None:
             settings,
             uow_factory=uow_factory,
             session_factory=session_factory,
+            external_effect_coordinator=external_effect_coordinator,
             blob_store=blob_store,
             blob_catalog=blob_catalog,
             artifact_store=production_artifact_store,

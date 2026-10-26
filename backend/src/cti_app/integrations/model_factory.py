@@ -4,6 +4,7 @@ from minio import Minio
 
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.diagnostics import DiagnosticsLog
+from cti_app.application.external_effects import ExternalEffectCoordinator
 from cti_app.application.model_gateway import (
     ModelGateway,
     ModelRouter,
@@ -23,22 +24,38 @@ from cti_app.integrations.models import (
     OpenAIResearchAdapter,
     OpenAIStructuredAdapter,
     QwenAdapter,
+    create_coordinated_http_responses_transport,
 )
 
 
-def create_model_gateway(settings: Settings, uow_factory: UnitOfWorkFactory) -> ModelGateway:
+def create_model_gateway(
+    settings: Settings,
+    uow_factory: UnitOfWorkFactory,
+    *,
+    external_effect_coordinator: ExternalEffectCoordinator | None = None,
+) -> ModelGateway:
     if settings.model_force_adapter != "auto" and settings.app_env != "development":
         raise ValueError("A forced model adapter is allowed only in development")
-    bridge_transport = ChatGPTBridgeClient(
-        settings.openai_bridge_base_url,
-        api_key=_secret_value(settings.openai_bridge_api_key),
-        timeout_seconds=max(
+    bridge_transport_options = {
+        "api_key": _secret_value(settings.openai_bridge_api_key),
+        "timeout_seconds": max(
             settings.openai_bridge_wait_timeout_seconds,
             settings.openai_bridge_wait_timeout_research_seconds,
         ),
-        connect_timeout_seconds=settings.openai_bridge_connect_timeout_seconds,
-        capabilities_timeout_seconds=settings.openai_bridge_capabilities_timeout_seconds,
-    )
+        "connect_timeout_seconds": settings.openai_bridge_connect_timeout_seconds,
+        "capabilities_timeout_seconds": settings.openai_bridge_capabilities_timeout_seconds,
+    }
+    if external_effect_coordinator is None:
+        bridge_transport = ChatGPTBridgeClient(
+            settings.openai_bridge_base_url,
+            **bridge_transport_options,
+        )
+    else:
+        bridge_transport = create_coordinated_http_responses_transport(
+            settings.openai_bridge_base_url,
+            coordinator=external_effect_coordinator,
+            **bridge_transport_options,
+        )
     qwen_transport = HttpChatCompletionsTransport(
         settings.qwen_base_url,
         api_key=_secret_value(settings.qwen_api_key),
