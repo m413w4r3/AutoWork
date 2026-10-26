@@ -181,11 +181,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         return SqlAlchemyUnitOfWork(session_factory)
 
     external_effect_coordinator = create_external_effect_coordinator(session_factory)
-    model_gateway = create_model_gateway(
-        settings,
-        uow_factory,
-        external_effect_coordinator=external_effect_coordinator,
-    )
+    model_gateway = create_model_gateway(settings, uow_factory)
     vt_proxy_client: httpx.AsyncClient | None = None
     vt_direct_client: httpx.AsyncClient | None = None
     retrohunt_http_client: httpx.AsyncClient | None = None
@@ -361,9 +357,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         uow_factory,
         blob_store,
     )
+    investigation_model_gateway = create_model_gateway(
+        settings,
+        uow_factory,
+        external_effect_coordinator=external_effect_coordinator,
+    )
     model_conversation_service = ModelConversationService(
         uow_factory,
-        model_gateway,
+        investigation_model_gateway,
         blob_store,
         retention_days=settings.model_conversation_retention_days,
         conversation_session_closer=bridge_provider,

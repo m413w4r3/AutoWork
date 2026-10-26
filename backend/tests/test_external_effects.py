@@ -462,13 +462,21 @@ async def test_coordinated_bridge_posts_the_same_json_bytes_and_hides_authorizat
 
 
 @pytest.mark.asyncio
-async def test_coordinated_bridge_refuses_unbound_and_legacy_post_paths() -> None:
-    calls = 0
+async def test_production_bridge_allows_unbound_request_but_investigation_gate_refuses_it() -> None:
+    calls: list[httpx.Request] = []
 
-    async def handler(_request: httpx.Request) -> httpx.Response:
-        nonlocal calls
-        calls += 1
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
         return httpx.Response(200, json={"status": "completed", "output_text": "ok"})
+
+    production = HttpResponsesTransport(
+        "https://bridge.test/v1",
+        api_key=None,
+        http_transport=httpx.MockTransport(handler),
+    )
+    result = await production.create({"input": "production-style request"})
+    assert result["output_text"] == "ok"
+    assert len(calls) == 1
 
     store = FakeStore()
     gated = create_coordinated_http_responses_transport(
@@ -484,7 +492,7 @@ async def test_coordinated_bridge_refuses_unbound_and_legacy_post_paths() -> Non
         with pytest.raises(BridgeTransportError) as legacy_path:
             await gated._request("POST", path, json_body={"input": "must not send"})
         assert legacy_path.value.code == "external_effect_authority_required"
-    assert calls == 0
+    assert len(calls) == 1
     assert store.events == []
 
 

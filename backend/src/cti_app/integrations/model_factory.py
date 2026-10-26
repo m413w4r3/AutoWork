@@ -36,25 +36,29 @@ def create_model_gateway(
 ) -> ModelGateway:
     if settings.model_force_adapter != "auto" and settings.app_env != "development":
         raise ValueError("A forced model adapter is allowed only in development")
-    bridge_transport_options = {
-        "api_key": _secret_value(settings.openai_bridge_api_key),
-        "timeout_seconds": max(
-            settings.openai_bridge_wait_timeout_seconds,
-            settings.openai_bridge_wait_timeout_research_seconds,
-        ),
-        "connect_timeout_seconds": settings.openai_bridge_connect_timeout_seconds,
-        "capabilities_timeout_seconds": settings.openai_bridge_capabilities_timeout_seconds,
-    }
+    bridge_api_key = _secret_value(settings.openai_bridge_api_key)
+    bridge_timeout_seconds = max(
+        settings.openai_bridge_wait_timeout_seconds,
+        settings.openai_bridge_wait_timeout_research_seconds,
+    )
+    bridge_connect_timeout_seconds = settings.openai_bridge_connect_timeout_seconds
+    bridge_capabilities_timeout_seconds = settings.openai_bridge_capabilities_timeout_seconds
     if external_effect_coordinator is None:
         bridge_transport = ChatGPTBridgeClient(
             settings.openai_bridge_base_url,
-            **bridge_transport_options,
+            api_key=bridge_api_key,
+            timeout_seconds=bridge_timeout_seconds,
+            connect_timeout_seconds=bridge_connect_timeout_seconds,
+            capabilities_timeout_seconds=bridge_capabilities_timeout_seconds,
         )
     else:
         bridge_transport = create_coordinated_http_responses_transport(
             settings.openai_bridge_base_url,
             coordinator=external_effect_coordinator,
-            **bridge_transport_options,
+            api_key=bridge_api_key,
+            timeout_seconds=bridge_timeout_seconds,
+            connect_timeout_seconds=bridge_connect_timeout_seconds,
+            capabilities_timeout_seconds=bridge_capabilities_timeout_seconds,
         )
     qwen_transport = HttpChatCompletionsTransport(
         settings.qwen_base_url,

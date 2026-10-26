@@ -1258,6 +1258,67 @@ async def test_production_factory_builds_gemini_fail_closed_for_structured_outpu
         )
 
 
+async def test_production_factory_bridge_gateway_sends_without_investigation_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cti_app.application.persistence import UnitOfWorkFactory
+    from cti_app.config import Settings
+    from cti_app.integrations import model_factory
+
+    posts: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            posts.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            json={"id": "production-response", "status": "completed", "output_text": "ok"},
+        )
+
+    original_client = model_factory.ChatGPTBridgeClient
+    clients: list[ChatGPTBridgeClient] = []
+
+    def fake_transport_client(base_url: str, **options: Any) -> ChatGPTBridgeClient:
+        client = original_client(
+            base_url,
+            **options,
+            http_transport=httpx.MockTransport(handler),
+        )
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(model_factory, "ChatGPTBridgeClient", fake_transport_client)
+    monkeypatch.setattr(
+        model_factory,
+        "BlobModelOutputStore",
+        lambda _catalog: InMemoryModelOutputStore(),
+    )
+
+    model_uow = InMemoryModelRunUnitOfWorkFactory()
+    gateway = model_factory.create_model_gateway(
+        Settings(_env_file=None, openai_bridge_base_url="https://bridge.test/v1"),
+        cast(UnitOfWorkFactory, model_uow),
+    )
+    assert len(clients) == 1
+    clients[0]._last_capabilities_check = asyncio.get_running_loop().time()
+    execution = await gateway.execute(
+        ModelRequest(
+            text="Synthetic production pipeline prompt.",
+            prompt_template_id="test.production",
+            prompt_template_version="1",
+            evidence_pack_hash="f" * 64,
+            external_llm_allowed=True,
+            routing_hint=ModelRoutingHint.WEB_RESEARCH,
+            backend=ModelBackend.CHATGPT_BRIDGE,
+        ),
+        ModelRole.RESEARCH,
+    )
+
+    assert execution.run.status is ModelRunStatus.SUCCEEDED
+    assert len(posts) == 1
+
+
 async def test_bridge_wait_budgets_are_configured_per_model_role() -> None:
     from typing import cast
 

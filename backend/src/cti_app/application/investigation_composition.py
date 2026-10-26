@@ -738,7 +738,10 @@ class _PermissionAwareInvestigationTransport:
         build = getattr(self._transport, "build_external_effect_binding", None)
         if not callable(build):
             return None
-        return await build(family=family, **attempt)
+        binding = await build(family=family, **attempt)
+        if binding is None or isinstance(binding, BridgeExternalEffectBinding):
+            return binding
+        return None
 
     async def reconcile_orphaned_investigation_turn(
         self,
