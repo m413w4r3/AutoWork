@@ -94,7 +94,9 @@ def _capabilities(**overrides: object) -> OsintCapabilities:
         "context_bytes": BudgetDimension.CONTEXT_BYTES,
         "context_tokens": BudgetDimension.CONTEXT_TOKENS,
     }
-    budget_limits = dict(values["budget_limits"])
+    base_limits = values["budget_limits"]
+    assert isinstance(base_limits, dict)
+    budget_limits = dict(base_limits)
     for name, dimension in budget_dimension_aliases.items():
         if name in overrides:
             budget_limits[dimension] = overrides.pop(name)
