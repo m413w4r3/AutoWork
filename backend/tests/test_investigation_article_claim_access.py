@@ -168,7 +168,7 @@ async def test_local_human_with_settings_rejects_non_loopback_server() -> None:
         app=SimpleNamespace(
             state=SimpleNamespace(
                 identity_provider=provider,
-                settings=Settings(_env_file=None),
+                settings=Settings(_env_file=None, app_env="development"),
             )
         ),
         scope={"server": ("workflow-emulator", 80)},
