@@ -64,7 +64,10 @@ def _metadata_for_frozen_baseline() -> MetaData:
     """
     metadata = MetaData()
     for source_table in target_metadata.tables.values():
-        if source_table.name in _OSINT_POLICY_TABLES or source_table.name in _EXTERNAL_EFFECT_TABLES:
+        if (
+            source_table.name in _OSINT_POLICY_TABLES
+            or source_table.name in _EXTERNAL_EFFECT_TABLES
+        ):
             continue
         table = source_table.to_metadata(metadata)
         if table.name != "investigation_envelopes":

@@ -443,13 +443,16 @@ async def test_second_coordinator_cannot_seal_claim_with_foreign_proof(
         effect_key=effect_key(authority.investigation_id, prepared),
         occurrence_digest=occurrence_sha256(prepared.occurrence_id),
     )
-    assert isinstance(consumed, ConsumeCommitted)
+    assert isinstance(consumed, ConsumeCommitted), "fixture must create a committed claim"
 
     class _ClaimReplayProbe:
         def __getattr__(self, name: str) -> Any:
             return getattr(store, name)
 
         async def consume(self, *args: Any, **kwargs: Any) -> ConsumeCommitted:
+            assert isinstance(consumed, ConsumeCommitted), (
+                "claim replay probe requires a committed consume result"
+            )
             return consumed
 
         async def needs_review(self, claim_id: UUID, *, reason_code: str) -> bool:
