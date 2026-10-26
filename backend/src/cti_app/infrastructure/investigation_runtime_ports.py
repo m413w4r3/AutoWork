@@ -197,7 +197,18 @@ def build_investigation_runtime_ports(
     statuses: list[RuntimePortStatus] = []
 
     configure_vt_effects = getattr(vt_adapter, "configure_external_effects", None)
-    if session_factory is not None and vt_adapter is not None and vt_observations is not None:
+    vt_effects_ready = bool(
+        session_factory is not None
+        and vt_adapter is not None
+        and vt_observations is not None
+        and callable(configure_vt_effects)
+    )
+    if (
+        session_factory is not None
+        and vt_adapter is not None
+        and vt_observations is not None
+        and callable(configure_vt_effects)
+    ):
         reuse_policy = VirusTotalReadReusePolicy()
         coordinator = ExternalEffectCoordinator(
             SqlAlchemyExternalEffectClaimStore(
@@ -207,8 +218,7 @@ def build_investigation_runtime_ports(
             ),
             reuse_policies={family: reuse_policy for family in VT_EXTERNAL_EFFECT_FAMILIES},
         )
-        if callable(configure_vt_effects):
-            configure_vt_effects(coordinator, vt_observations)
+        configure_vt_effects(coordinator, vt_observations)
 
     vt_route_status = {
         capability: _vt_proxy_route_status(settings, vt_adapter, capability)
@@ -248,29 +258,36 @@ def build_investigation_runtime_ports(
         and acquisition_budget_ready
     )
     effective_pcap = bool(
-        settings.virustotal_behaviour_pcap_enabled and vt_adapter is not None and pcap_route_ready
+        settings.virustotal_behaviour_pcap_enabled
+        and vt_adapter is not None
+        and vt_effects_ready
+        and pcap_route_ready
     )
     vt_capabilities = replace(
         vt_capabilities,
         file_report=(
             vt_capabilities.file_report
             and settings.virustotal_file_report_enabled
+            and vt_effects_ready
             and vt_route_status[VirusTotalCapability.FILE_REPORT][0]
         ),
         file_relationships=(
             vt_capabilities.file_relationships
             and settings.virustotal_object_relationships_enabled
+            and vt_effects_ready
             and vt_route_status[VirusTotalCapability.FILE_RELATIONSHIPS][0]
         ),
         intelligence_search=(
             vt_capabilities.intelligence_search
             and settings.virustotal_intelligence_search_enabled
+            and vt_effects_ready
             and vt_route_status[VirusTotalCapability.INTELLIGENCE_SEARCH][0]
         ),
         file_download=effective_download,
         behaviour_reports=(
             vt_capabilities.behaviour_reports
             and settings.virustotal_behaviour_reports_enabled
+            and vt_effects_ready
             and vt_route_status[VirusTotalCapability.BEHAVIOUR_REPORTS][0]
         ),
         behaviour_pcap=effective_pcap,
@@ -536,6 +553,16 @@ def build_investigation_runtime_ports(
     )
     if vt_adapter is None:
         vt_reason = "virustotal_adapter_not_configured"
+    elif not vt_effects_ready and any(
+        (
+            settings.virustotal_file_report_enabled,
+            settings.virustotal_object_relationships_enabled,
+            settings.virustotal_intelligence_search_enabled,
+            settings.virustotal_behaviour_reports_enabled,
+            settings.virustotal_behaviour_pcap_enabled,
+        )
+    ):
+        vt_reason = "external_effect_coordinator_unavailable"
     elif vt_enabled:
         vt_reason = None
     else:
@@ -565,6 +592,20 @@ def build_investigation_runtime_ports(
         "virustotal",
         vt_adapter is not None and vt_enabled,
         vt_reason,
+    )
+    vt_reads_available = any(
+        (
+            vt_capabilities.file_report,
+            vt_capabilities.file_relationships,
+            vt_capabilities.intelligence_search,
+            vt_capabilities.behaviour_reports,
+            vt_capabilities.behaviour_pcap,
+        )
+    )
+    record(
+        "virustotal_reads",
+        vt_reads_available,
+        None if vt_reads_available else vt_reason,
     )
     if not settings.virustotal_file_download_enabled:
         download_reason = "virustotal_file_download_disabled"

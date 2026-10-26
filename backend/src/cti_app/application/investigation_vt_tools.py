@@ -496,7 +496,10 @@ class _VirusTotalAdapter:
                 message="The investigation disclosure bounds do not allow a VirusTotal request.",
                 zero_cost=True,
             )
-        with virustotal_external_effect_scope(context.external_effect_authority):
+        with virustotal_external_effect_scope(
+            context.external_effect_authority,
+            context.external_effect_evidence_refs,
+        ):
             try:
                 result = await operation(state)
                 counts = virustotal_external_effect_counts()
@@ -1675,10 +1678,10 @@ def register_virustotal_tools(
                 page_size=1,
                 max_results=20,
                 max_tool_seconds=max_tool_seconds,
-                reserved_vt_units=1,
+                reserved_vt_units=2,
                 article_snapshot_resolver=article_snapshot_resolver,
             ),
-            1,
+            2,
         ),
         (
             "vt.relationships",

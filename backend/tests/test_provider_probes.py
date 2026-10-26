@@ -62,6 +62,7 @@ def _vt_adapter(client: httpx.AsyncClient) -> VirusTotalHttpAdapter:
         base_url=VT_BASE,
         capabilities=VirusTotalCapabilities(file_report=True),
         routing_policy=VirusTotalRoutingPolicy(routes={VirusTotalCapability.FILE_REPORT: route}),
+        offline_probe_mode=True,
     )
 
 

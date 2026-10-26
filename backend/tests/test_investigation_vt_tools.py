@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4, uuid5
 
+import httpx
 import pytest
 
 from cti_app.application.analyst_handoff import AnalystHandoffPolicy
@@ -60,8 +61,11 @@ from cti_app.application.virustotal import (
     VirusTotalInvalidInputError,
     VirusTotalNotAuthorizedError,
     VirusTotalObjectReport,
+    VirusTotalOperationRoute,
     VirusTotalPage,
     VirusTotalQuotaExceededError,
+    VirusTotalRouteStep,
+    VirusTotalRoutingPolicy,
     VirusTotalSearchResult,
     VirusTotalTransportError,
     validate_search_query,
@@ -70,14 +74,18 @@ from cti_app.domain.analyst_opinion import (
     OpinionBlockType,
     OpinionClaimQualification,
 )
+from cti_app.domain.entities import Sample
 from cti_app.domain.investigation import (
     BudgetDimension,
+    BudgetReservationStatus,
     DisclosureBounds,
     EvidenceKind,
     FindingAssessment,
     FindingKind,
     InvestigationBudget,
     InvestigationEnvelope,
+    SampleAssociation,
+    SampleOrigin,
     TLPLevel,
     ToolInvocationStatus,
     canonical_json_bytes,
@@ -99,6 +107,11 @@ from cti_app.domain.virustotal import (
     VirusTotalObservation,
     VirusTotalOperation,
     VirusTotalTransportKind,
+)
+from cti_app.infrastructure.virustotal import VirusTotalHttpAdapter
+from tests.virustotal_external_effect_fakes import (
+    configure_test_vt_adapter,
+    make_test_authority,
 )
 
 _SEED_HASH = "a" * 64
@@ -885,6 +898,97 @@ async def test_object_report_is_available_for_verified_investigation_iocs() -> N
 
 
 @pytest.mark.asyncio
+async def test_object_report_projection_retry_reserves_and_consumes_each_physical_send() -> None:
+    requests: list[httpx.Request] = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if "relationships" in request.url.params:
+            return httpx.Response(403, json={"error": {"code": "Forbidden"}}, request=request)
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "id": "8.8.8.8",
+                    "type": "ip_address",
+                    "attributes": {"reputation": 1, "last_analysis_stats": {}},
+                }
+            },
+            request=request,
+        )
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream),
+        headers={"x-apikey": "synthetic-test-key"},
+        trust_env=False,
+    )
+    adapter = VirusTotalHttpAdapter(
+        client=client,
+        base_url="https://www.virustotal.com/api/v3",
+        capabilities=VirusTotalCapabilities(file_report=True),
+        routing_policy=VirusTotalRoutingPolicy(
+            routes={
+                VirusTotalCapability.FILE_REPORT: VirusTotalOperationRoute(
+                    primary=VirusTotalRouteStep(
+                        transport=VirusTotalTransportKind.PROXY,
+                        variant=VirusTotalEndpointVariant.V3,
+                    )
+                )
+            }
+        ),
+    )
+    claim_store, _archive = configure_test_vt_adapter(adapter)
+    tools = _tool_set(capabilities=VirusTotalCapabilities(file_report=True))
+    registry = InMemoryToolRegistry()
+    register_virustotal_tools(
+        registry,
+        virustotal=adapter,
+        observations=tools.vt_observations,
+        recorder=ProductionEvidenceRecorder(tools.blob_store, tools.evidence),
+        evidence_observations=tools.evidence,
+        findings=tools.findings,
+        article_snapshot_resolver=_article_snapshot_for_test,
+        capabilities=VirusTotalCapabilities(file_report=True),
+        evidence_payloads=tools.blob_store,
+    )
+    budget = InvestigationBudget(
+        limits={
+            dimension: 2 if dimension is BudgetDimension.VT_UNITS else 1_000
+            for dimension in BudgetDimension
+        }
+    )
+    assert tools.context.envelope is not None
+    context = replace(
+        tools.context,
+        envelope=replace(tools.context.envelope, budget=budget),
+        budget=budget,
+        external_effect_authority=make_test_authority(),
+    )
+    try:
+        result = await RegistryToolDispatcher(registry).dispatch(
+            context,
+            tool_name="vt.object_report",
+            schema_version="1",
+            arguments={"object_type": "ip_addresses", "object_id": "8.8.8.8"},
+            purpose="Count object projection fallback sends.",
+            operation_key="vt-object-report-projection-retry",
+        )
+    finally:
+        await client.aclose()
+
+    assert result.status is ToolInvocationStatus.SUCCEEDED
+    assert len(requests) == 2
+    assert requests[0].url.params
+    assert "relationships" not in requests[1].url.params
+    assert len(claim_store.claims) == 2
+    assert result.budget_consumed[BudgetDimension.VT_UNITS] == 2
+    reservation = budget.reservations[0]
+    assert reservation.amounts[BudgetDimension.VT_UNITS] == 2
+    assert reservation.committed_amounts[BudgetDimension.VT_UNITS] == 2
+    assert reservation.status is BudgetReservationStatus.COMMITTED
+
+
+@pytest.mark.asyncio
 async def test_object_report_rejects_an_ioc_not_in_the_investigation() -> None:
     tools = _tool_set()
 
@@ -1421,6 +1525,25 @@ class _VerticalHarness:
     vt: FakeVirusTotalPort
 
 
+class _VerticalSampleAssociationRepository:
+    async def list_for_investigation(self, investigation_id: UUID) -> tuple[SampleAssociation, ...]:
+        return tuple(
+            SampleAssociation(
+                investigation_id=investigation_id,
+                sample_sha256=sample_hash,
+                origin=SampleOrigin.MANUAL,
+            )
+            for sample_hash in (_SEED_HASH, _CANDIDATE_HASH)
+        )
+
+
+class _VerticalSampleRepository:
+    async def list_by_subject_and_sha256(
+        self, _subject_id: UUID, _sha256: str
+    ) -> tuple[Sample, ...]:
+        return ()
+
+
 def _vertical_harness(*, search_enabled: bool) -> _VerticalHarness:
     run_id = uuid4()
     subject_id = uuid4()
@@ -1523,6 +1646,8 @@ def _vertical_harness(*, search_enabled: bool) -> _VerticalHarness:
         observations=evidence,
         findings=findings,
         opinions=opinions,
+        sample_associations=_VerticalSampleAssociationRepository(),
+        samples=_VerticalSampleRepository(),
         available_capabilities=virustotal_tool_capabilities(caps),
         no_progress_limit=3,
     )

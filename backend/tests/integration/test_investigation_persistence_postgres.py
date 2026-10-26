@@ -537,6 +537,25 @@ async def _assert_repository_contract(
             replace(budget_v2, budget=InvestigationBudget()), expected_version=1
         )
 
+    revoked_budget = InvestigationBudget(limits={BudgetDimension.VT_UNITS: 0})
+    revoked_budget.restore_reservation(budget_v2.budget.reservations[0])
+    revoked_snapshot = InvestigationBudgetSnapshot(
+        investigation_id=investigation_id,
+        version=3,
+        budget=revoked_budget,
+    )
+    assert (
+        await persistence.investigation_budgets.save_if_version(
+            revoked_snapshot, expected_version=2
+        )
+        == revoked_snapshot
+    )
+    reread_revoked = await persistence.investigation_budgets.get(investigation_id)
+    assert reread_revoked == revoked_snapshot
+    assert reread_revoked is not None
+    assert reread_revoked.budget.limits[BudgetDimension.VT_UNITS] == 0
+    assert reread_revoked.budget.consumed[BudgetDimension.VT_UNITS] == 2
+
 
 @pytest.mark.asyncio
 async def test_concurrent_operation_key_replay_creates_one_invocation(

@@ -1630,6 +1630,9 @@ def build_investigation_composition(
         observations=uow.evidence_observations,
         findings=uow.investigation_findings,
         opinions=uow.analyst_opinions,
+        sample_associations=uow.sample_associations,
+        samples=getattr(uow, "samples", None),
+        source_documents=getattr(uow, "source_documents", None),
         budget_snapshots=getattr(uow, "investigation_budgets", None),
         observation_writer=ProductionArtifactObservationWriter(
             artifact_store, uow.evidence_observations

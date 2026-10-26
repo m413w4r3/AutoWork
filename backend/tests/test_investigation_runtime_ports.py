@@ -135,7 +135,16 @@ def test_virustotal_capabilities_and_status_require_a_verified_v3_route() -> Non
     ) == (True, None)
 
     inputs = _runtime_inputs(settings)
-    inputs["vt_adapter"] = SimpleNamespace(_routing_policy=no_routes)
+    inputs.update(
+        {
+            "vt_adapter": SimpleNamespace(
+                _routing_policy=no_routes,
+                configure_external_effects=lambda *_args: None,
+            ),
+            "vt_observations": object(),
+            "session_factory": object(),
+        }
+    )
     inputs["vt_capabilities"] = VirusTotalCapabilities(file_download=True, behaviour_pcap=True)
     runtime = build_investigation_runtime_composition_factory(**inputs)
     statuses = _status_map(runtime)
@@ -153,7 +162,16 @@ def test_virustotal_capabilities_and_status_require_a_verified_v3_route() -> Non
     }
 
     configured_inputs = _runtime_inputs(settings)
-    configured_inputs["vt_adapter"] = SimpleNamespace(_routing_policy=configured)
+    configured_inputs.update(
+        {
+            "vt_adapter": SimpleNamespace(
+                _routing_policy=configured,
+                configure_external_effects=lambda *_args: None,
+            ),
+            "vt_observations": object(),
+            "session_factory": object(),
+        }
+    )
     configured_inputs["vt_capabilities"] = VirusTotalCapabilities()
     configured_runtime = build_investigation_runtime_composition_factory(**configured_inputs)
     configured_statuses = _status_map(configured_runtime)
@@ -163,12 +181,52 @@ def test_virustotal_capabilities_and_status_require_a_verified_v3_route() -> Non
         "reason": None,
     }
 
+
+def test_virustotal_reads_are_unavailable_without_a_coordinator_session_factory() -> None:
+    settings = Settings(
+        _env_file=None,
+        virustotal_proxy_url="http://proxy.test:8080",
+        virustotal_file_report_enabled=True,
+    )
+    route = VirusTotalOperationRoute(
+        primary=VirusTotalRouteStep(
+            transport=VirusTotalTransportKind.PROXY,
+            variant=VirusTotalEndpointVariant.V3,
+        )
+    )
+    adapter = SimpleNamespace(
+        _routing_policy=VirusTotalRoutingPolicy(routes={VirusTotalCapability.FILE_REPORT: route}),
+        configure_external_effects=lambda *_args: None,
+    )
+    inputs = _runtime_inputs(settings)
+    inputs.update(
+        {
+            "vt_adapter": adapter,
+            "vt_capabilities": VirusTotalCapabilities(file_report=True),
+            "vt_observations": object(),
+        }
+    )
+
+    runtime = build_investigation_runtime_composition_factory(**inputs)
+
+    statuses = _status_map(runtime)
+    assert statuses["virustotal_reads"] == {
+        "status": "unavailable",
+        "reason": "external_effect_coordinator_unavailable",
+    }
+    assert runtime.composition_factory.optional_tool_ports is not None
+    assert runtime.composition_factory.optional_tool_ports.vt_capabilities is not None
+    assert runtime.composition_factory.optional_tool_ports.vt_capabilities.file_report is False
+
+
+def test_download_requires_cdn_allowlist_even_when_read_coordinator_is_absent() -> None:
     wrong_host_settings = Settings(
         _env_file=None,
         virustotal_proxy_url="http://proxy.test:8080",
         virustotal_file_download_enabled=True,
         virustotal_download_allowed_hosts="cdn.example.test",
     )
+    no_routes = VirusTotalRoutingPolicy()
     wrong_host_inputs = _runtime_inputs(wrong_host_settings)
     wrong_host_inputs["vt_adapter"] = SimpleNamespace(_routing_policy=no_routes)
     wrong_host_inputs["vt_capabilities"] = VirusTotalCapabilities(file_download=True)

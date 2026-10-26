@@ -76,6 +76,7 @@ from cti_app.application.virustotal import (
     VirusTotalTransportError,
     VirusTotalUnexpectedRedirectError,
     current_virustotal_external_effect_authority,
+    current_virustotal_external_effect_evidence_refs,
     file_hash_family,
     normalize_file_hash,
     record_virustotal_external_effect,
@@ -546,10 +547,12 @@ class VirusTotalHttpAdapter(VirusTotalPort):
         download_max_bytes: int = 200 * 1024 * 1024,
         download_timeout_seconds: float = 120.0,
         download_client_factory: Callable[[], httpx.AsyncClient] | None = None,
+        offline_probe_mode: bool = False,
     ) -> None:
         self._client = client
         self._external_effect_coordinator: ExternalEffectCoordinator | None = None
         self._raw_response_archive: VirusTotalObservationService | None = None
+        self._offline_probe_mode = offline_probe_mode
         self._base_url = _validate_base_url(base_url)
         self._fallback_base_url = (
             _validate_base_url(fallback_base_url) if fallback_base_url else None
@@ -1803,6 +1806,16 @@ class VirusTotalHttpAdapter(VirusTotalPort):
         authority = current_virustotal_external_effect_authority()
         coordinator = self._external_effect_coordinator
         archive = self._raw_response_archive
+        if (
+            self._offline_probe_mode
+            and authority is None
+            and coordinator is None
+            and archive is None
+        ):
+            # This mode is used only by the local MockTransport preflight. Runtime
+            # adapter construction leaves it disabled, so investigation reads
+            # always require the coordinator and committed authority below.
+            return await client.get(url, params=params, follow_redirects=False)
         if authority is None or coordinator is None or archive is None:
             raise VirusTotalExternalEffectRefusedError(
                 "The VirusTotal read has no committed investigation authority."
@@ -1825,6 +1838,7 @@ class VirusTotalHttpAdapter(VirusTotalPort):
             normalizer_version=_VT_READ_NORMALIZER_VERSION,
             canonical_request=canonical_request,
             application_request=frozen_request,
+            evidence_refs=current_virustotal_external_effect_evidence_refs(),
             credential_parameter_names=("apikey",),
         )
         transport = _VirusTotalPermitAwareTransport(
@@ -1928,6 +1942,7 @@ def create_virustotal_http_adapter(
     direct_client: httpx.AsyncClient | None = None,
     api_key: str | None = None,
     routing_policy: VirusTotalRoutingPolicy | None = None,
+    offline_probe_mode: bool = False,
 ) -> VirusTotalHttpAdapter:
     """Bind adapter policy and limits to the validated runtime settings."""
     arguments = {
@@ -2046,6 +2061,7 @@ def create_virustotal_http_adapter(
         direct_client=direct_client,
         api_key=resolved_api_key,
         routing_policy=effective_routing_policy,
+        offline_probe_mode=offline_probe_mode,
         **arguments,
     )
 

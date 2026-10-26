@@ -22,7 +22,7 @@ from pydantic import (
 )
 
 from cti_app.application.evidence_recorder import sanitize_evidence_text
-from cti_app.domain.external_effects import ExternalEffectAuthority
+from cti_app.domain.external_effects import EvidenceReference, ExternalEffectAuthority
 from cti_app.domain.investigation import (
     BudgetDimension,
     BudgetExceeded,
@@ -232,6 +232,7 @@ class ToolExecutionContext:
     blocked_capabilities: tuple[str, ...] = ()
     unavailable_tool_reasons: Mapping[str, str] = field(default_factory=dict)
     external_effect_authority: ExternalEffectAuthority | None = None
+    external_effect_evidence_refs: tuple[EvidenceReference, ...] = ()
     pre_transport_check: (
         Callable[[ToolExecutionContext], Awaitable[FrameworkPreSubmissionProof | None]] | None
     ) = None
@@ -248,6 +249,9 @@ class ToolExecutionContext:
                 )
         object.__setattr__(self, "available_capabilities", frozenset(self.available_capabilities))
         object.__setattr__(self, "blocked_capabilities", tuple(self.blocked_capabilities))
+        object.__setattr__(
+            self, "external_effect_evidence_refs", tuple(self.external_effect_evidence_refs)
+        )
         reasons = dict(self.unavailable_tool_reasons)
         if any(
             not isinstance(name, str)

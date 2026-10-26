@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import re
+from collections.abc import Callable, Mapping
+from uuid import UUID
+
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -12,6 +16,7 @@ from cti_app.application.external_effects import (
 )
 from cti_app.domain.external_effects import (
     EffectClaimState,
+    EvidenceReference,
     ExternalEffectAuthority,
     PreparedExternalRequest,
 )
@@ -22,7 +27,12 @@ from cti_app.domain.osint_open import (
     OsintPolicyVersion,
     OsintScopeKind,
 )
+from cti_app.infrastructure.database.models.core import BlobRow, SampleRow, SourceDocumentRow
 from cti_app.infrastructure.database.models.external_effects import ExternalEffectClaimRow
+from cti_app.infrastructure.database.models.investigation import (
+    EvidenceObservationRow,
+    SampleAssociationRow,
+)
 from cti_app.infrastructure.database.models.osint_open_policy import (
     OsintOpenInheritanceRow,
     OsintOpenPolicyEventRow,
@@ -41,6 +51,62 @@ VT_EXTERNAL_EFFECT_FAMILIES = {
     "vt.behaviour_pcap": ("vt.behaviour_pcap", "1"),
 }
 _VT_RAW_RESPONSE_KIND = "vt.raw_response"
+_VT_SOURCE_REFS_KEY = "_vt_external_effect_source_refs"
+
+
+def _metadata_source_refs(parameters: Mapping[str, object]) -> tuple[EvidenceReference, ...]:
+    raw = parameters.get(_VT_SOURCE_REFS_KEY)
+    if not isinstance(raw, (tuple, list)):
+        return ()
+    references: list[EvidenceReference] = []
+    for item in raw:
+        if not isinstance(item, Mapping):
+            return ()
+        try:
+            references.append(
+                EvidenceReference(
+                    kind=str(item["kind"]),
+                    id=str(item["id"]),
+                    version=str(item["version"]),
+                    sha256=str(item["sha256"]),
+                )
+            )
+        except (KeyError, TypeError, ValueError):
+            return ()
+    return tuple(references)
+
+
+def _source_refs_for_family(
+    family: str, parameters: Mapping[str, object]
+) -> tuple[EvidenceReference, ...]:
+    metadata = _metadata_source_refs(parameters)
+    hash_value: object = None
+    if family in {"vt.file_report", "vt.behaviour", "vt.behaviour_pcap"}:
+        hash_value = parameters.get("file_hash")
+    elif family == "vt.relationships" and parameters.get("object_type") == "file":
+        hash_value = parameters.get("object_id")
+    if hash_value is not None:
+        if not isinstance(hash_value, str) or not re.fullmatch(r"[0-9a-f]{64}", hash_value):
+            return ()
+        expected = (
+            EvidenceReference(
+                kind="sample_hash",
+                id=hash_value,
+                version="sample-hash.v1",
+                sha256=hash_value,
+            ),
+        )
+        return expected if not metadata or metadata == expected else ()
+    return metadata
+
+
+def _source_resolver_for_family(
+    family: str,
+) -> Callable[[Mapping[str, object]], tuple[EvidenceReference, ...]]:
+    def resolve(parameters: Mapping[str, object]) -> tuple[EvidenceReference, ...]:
+        return _source_refs_for_family(family, parameters)
+
+    return resolve
 
 
 def virustotal_external_effect_family_bindings() -> dict[str, ExternalEffectFamilyBinding]:
@@ -51,6 +117,8 @@ def virustotal_external_effect_family_bindings() -> dict[str, ExternalEffectFami
             normalizer_versions=frozenset({"vt-read.v1"}),
             invocation_tool_binding=tool_binding,
             credential_parameter_names=frozenset({"apikey"}),
+            source_reference_resolver=_source_resolver_for_family(family),
+            requires_source_refs=True,
         )
         for family, tool_binding in VT_EXTERNAL_EFFECT_FAMILIES.items()
     }
@@ -209,6 +277,13 @@ class SqlAlchemyVirusTotalPolicyGuard:
             or inheritance.subject_id != authority.pinned_subject_id
         ):
             return False
+        if (
+            pinned.disclosure_tlp.casefold() == "red"
+            or pinned.disclosure_do_not_submit
+            or not pinned.disclosure_external_llm_allowed
+            or not await self._source_external_disclosure_allowed(context)
+        ):
+            return False
         try:
             scope_kind = OsintScopeKind(pinned.scope_kind)
             subject_matches = (
@@ -239,6 +314,136 @@ class SqlAlchemyVirusTotalPolicyGuard:
         vt_budget = int(pinned.budget_limits.get("vt_units", 0))
         reserved_vt = int(context.authority.reservation_amounts.get("vt_units", 0))
         return reserved_vt <= vt_budget
+
+    async def _source_external_disclosure_allowed(self, context: ConsumePolicyContext) -> bool:
+        session = context.database_session
+        if not isinstance(session, AsyncSession):
+            return False
+        sample_hashes = {
+            reference.id
+            for reference in context.prepared.evidence_refs
+            if reference.kind == "sample_hash"
+        }
+        sample_ids: set[UUID] = set()
+        document_ids: set[UUID] = set()
+        observation_refs = {
+            reference.id: reference
+            for reference in context.prepared.evidence_refs
+            if reference.kind == "evidence_observation"
+        }
+        for reference in context.prepared.evidence_refs:
+            if reference.kind in {"sample", "sample_association_sample"}:
+                try:
+                    sample_ids.add(UUID(reference.id))
+                except ValueError:
+                    return False
+            elif reference.kind in {"source_document", "document"}:
+                try:
+                    document_ids.add(UUID(reference.id))
+                except ValueError:
+                    return False
+        if observation_refs:
+            try:
+                requested_observation_ids = {UUID(item) for item in observation_refs}
+            except ValueError:
+                return False
+            observations = list(
+                await session.scalars(
+                    select(EvidenceObservationRow)
+                    .where(
+                        EvidenceObservationRow.investigation_id
+                        == context.authority.investigation_id,
+                        EvidenceObservationRow.id.in_(sorted(requested_observation_ids, key=str)),
+                    )
+                    .with_for_update()
+                )
+            )
+            if {item.id for item in observations} != requested_observation_ids:
+                return False
+            for observation in observations:
+                reference = observation_refs[str(observation.id)]
+                if (
+                    reference.version != observation.source_version
+                    or reference.sha256 != observation.sha256
+                ):
+                    return False
+                if observation.object_type.casefold() in {"sample", "file", "sample_observation"}:
+                    sample_hashes.add(observation.object_id)
+                elif observation.object_type.casefold() in {"source_document", "document"}:
+                    try:
+                        document_ids.add(UUID(observation.object_id))
+                    except ValueError:
+                        return False
+
+        if sample_hashes:
+            associations = list(
+                await session.scalars(
+                    select(SampleAssociationRow)
+                    .where(
+                        SampleAssociationRow.investigation_id == context.authority.investigation_id,
+                        SampleAssociationRow.sample_sha256.in_(sorted(sample_hashes)),
+                    )
+                    .with_for_update()
+                )
+            )
+            if not sample_hashes.issubset({item.sample_sha256 for item in associations}):
+                return False
+            sample_ids.update(item.sample_id for item in associations if item.sample_id is not None)
+        if sample_ids:
+            samples = list(
+                await session.scalars(
+                    select(SampleRow)
+                    .where(
+                        SampleRow.id.in_(sorted(sample_ids, key=str)),
+                        SampleRow.subject_id == context.investigation_subject_id,
+                    )
+                    .with_for_update()
+                )
+            )
+            if {item.id for item in samples} != sample_ids or any(
+                item.tlp.casefold() == "red"
+                or item.do_not_submit
+                or bool((item.license_restriction or "").strip())
+                or not item.external_llm_allowed
+                for item in samples
+            ):
+                return False
+        if sample_hashes:
+            hash_samples = list(
+                await session.scalars(
+                    select(SampleRow)
+                    .join(BlobRow, BlobRow.id == SampleRow.blob_id)
+                    .where(
+                        SampleRow.subject_id == context.investigation_subject_id,
+                        BlobRow.sha256.in_(sorted(sample_hashes)),
+                    )
+                    .with_for_update()
+                )
+            )
+            if any(
+                item.tlp.casefold() == "red"
+                or item.do_not_submit
+                or bool((item.license_restriction or "").strip())
+                or not item.external_llm_allowed
+                for item in hash_samples
+            ):
+                return False
+        if document_ids:
+            documents = list(
+                await session.scalars(
+                    select(SourceDocumentRow)
+                    .where(
+                        SourceDocumentRow.id.in_(sorted(document_ids, key=str)),
+                        SourceDocumentRow.subject_id == context.investigation_subject_id,
+                    )
+                    .with_for_update()
+                )
+            )
+            if {item.id for item in documents} != document_ids or any(
+                not item.external_llm_allowed for item in documents
+            ):
+                return False
+        return True
 
 
 __all__ = [

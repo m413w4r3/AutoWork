@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import struct
+from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import patch
 from uuid import UUID, uuid4
 
 import httpx
@@ -13,8 +15,10 @@ from sqlalchemy import select
 
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.bridge_investigator import ScriptedTurnTransport
+from cti_app.application.investigation_tools import RegistryToolDispatcher
 from cti_app.application.osint_open_policy import OsintOpenPolicyService
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.sample_acquisition import SAMPLES_QUARANTINE_BUCKET
 from cti_app.application.virustotal import (
     VirusTotalCapabilities,
     VirusTotalOperationRoute,
@@ -23,6 +27,9 @@ from cti_app.application.virustotal import (
 )
 from cti_app.application.virustotal_persistence import VirusTotalObservationService
 from cti_app.config import Settings
+from cti_app.domain.classification import TLP
+from cti_app.domain.entities import Sample, SampleState
+from cti_app.domain.entities import SampleOrigin as EntitySampleOrigin
 from cti_app.domain.investigation import (
     BudgetDimension,
     DisclosureBounds,
@@ -185,6 +192,11 @@ async def _run_inherited_case(
     direct_handler=None,
     allow_v2_fallback: bool = False,
     enable_behaviour_pcap: bool = False,
+    sample_bytes: bytes | None = None,
+    sample_tlp: TLP = TLP.CLEAR,
+    sample_do_not_submit: bool = False,
+    sample_external_llm_allowed: bool = True,
+    bypass_legacy_guard: bool = False,
 ):
     engine = create_postgres_engine(database_url)
     session_factory = create_session_factory(engine)
@@ -201,6 +213,46 @@ async def _run_inherited_case(
         suffix=f"vt-read-{uuid4().hex[:12]}",
         include_seed=False,
     )
+    if sample_bytes is not None:
+        sample_hash = hashlib.sha256(sample_bytes).hexdigest()
+        if sample_hash not in hashes:
+            raise ValueError("restricted sample bytes must match a requested VT hash")
+        blob_id = await artifact_store.put_bytes(
+            sample_bytes,
+            bucket=SAMPLES_QUARANTINE_BUCKET,
+            mime_type="application/octet-stream",
+        )
+        async with uow_factory() as uow:
+            await uow.samples.add(
+                Sample(
+                    subject_id=seeded.subject.id,
+                    blob_id=blob_id,
+                    original_name="synthetic-vt-source.bin",
+                    origin="synthetic VT source restriction fixture",
+                    acquired_at=datetime.now(UTC),
+                    license_restriction=None,
+                    tlp=sample_tlp,
+                    do_not_submit=sample_do_not_submit,
+                    external_llm_allowed=sample_external_llm_allowed,
+                    origin_kind=EntitySampleOrigin.MANUAL,
+                    state=SampleState.QUARANTINED,
+                    source_service="synthetic-vt-source-fixture",
+                    source_object_id=sample_hash,
+                    expected_hash=sample_hash,
+                )
+            )
+            await uow.commit()
+    async with uow_factory() as uow:
+        for file_hash in sorted(set(hashes)):
+            await uow.sample_associations.append_version(
+                SampleAssociation(
+                    investigation_id=seeded.investigation.id,
+                    sample_sha256=file_hash,
+                    origin=SampleOrigin.MANUAL,
+                ),
+                expected_version=0,
+            )
+        await uow.commit()
     await _seed_unrelated_unassociated_sample(uow_factory, artifact_store)
     policy_service, policy = await _activate_policy(
         uow_factory, seeded.subject.id, max_claims=max_claims
@@ -299,13 +351,33 @@ async def _run_inherited_case(
             )
             assert started_response.status_code == 200, started_response.text
             started = started_response.json()
-            await run_http_job(
-                app,
-                uow_factory,
-                registry,
-                dispatcher,
-                UUID(started["job_id"]),
-            )
+            if bypass_legacy_guard:
+                original_dispatch_once = RegistryToolDispatcher._dispatch_once
+
+                async def dispatch_once_without_legacy_guard(self, context, **kwargs):
+                    kwargs["pre_dispatch_check"] = None
+                    return await original_dispatch_once(self, context, **kwargs)
+
+                with patch.object(
+                    RegistryToolDispatcher,
+                    "_dispatch_once",
+                    dispatch_once_without_legacy_guard,
+                ):
+                    await run_http_job(
+                        app,
+                        uow_factory,
+                        registry,
+                        dispatcher,
+                        UUID(started["job_id"]),
+                    )
+            else:
+                await run_http_job(
+                    app,
+                    uow_factory,
+                    registry,
+                    dispatcher,
+                    UUID(started["job_id"]),
+                )
 
         async with uow_factory() as uow:
             invocation_rows = await uow.tool_invocations.list_for_investigation(
@@ -564,6 +636,72 @@ async def test_osint_open_claim_ceiling_refuses_a_distinct_vt_effect_before_send
             ToolInvocationStatus.NEEDS_REVIEW,
         ]
         assert result["human_decisions"] == []
+    finally:
+        if result["direct_client"] is not None:
+            await result["direct_client"].aclose()
+        await result["proxy_client"].aclose()
+        await result["engine"].dispose()
+
+
+@pytest.mark.parametrize(
+    ("sample_tlp", "sample_do_not_submit", "sample_external_llm_allowed"),
+    [
+        (TLP.RED, False, True),
+        (TLP.CLEAR, True, True),
+        (TLP.CLEAR, False, False),
+    ],
+    ids=("tlp-red", "do-not-submit", "external-disclosure-veto"),
+)
+@pytest.mark.parametrize("bypass_legacy_guard", [False, True], ids=("legacy", "coordinator"))
+@pytest.mark.asyncio
+async def test_restricted_sample_vt_read_is_refused_before_transport(
+    migrated_postgres_url: str,
+    tmp_path: Path,
+    sample_tlp: TLP,
+    sample_do_not_submit: bool,
+    sample_external_llm_allowed: bool,
+    bypass_legacy_guard: bool,
+) -> None:
+    sample_bytes = f"synthetic restricted VT source {uuid4()}".encode()
+    file_hash = hashlib.sha256(sample_bytes).hexdigest()
+    physical_requests: list[httpx.Request] = []
+
+    def proxy_handler(request: httpx.Request) -> httpx.Response:
+        physical_requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "id": file_hash,
+                    "type": "file",
+                    "attributes": {"reputation": 0, "last_analysis_stats": {}},
+                }
+            },
+            request=request,
+        )
+
+    result = await _run_inherited_case(
+        database_url=migrated_postgres_url,
+        tmp_path=tmp_path,
+        max_claims=10,
+        hashes=(file_hash,),
+        proxy_handler=proxy_handler,
+        sample_bytes=sample_bytes,
+        sample_tlp=sample_tlp,
+        sample_do_not_submit=sample_do_not_submit,
+        sample_external_llm_allowed=sample_external_llm_allowed,
+        bypass_legacy_guard=bypass_legacy_guard,
+    )
+    try:
+        assert physical_requests == []
+        assert result["human_decisions"] == []
+        assert result["invocations"]
+        assert result["invocations"][0].status in {
+            ToolInvocationStatus.POLICY_DENIED,
+            ToolInvocationStatus.NEEDS_REVIEW,
+        }
+        if not bypass_legacy_guard:
+            assert result["claims"] == []
     finally:
         if result["direct_client"] is not None:
             await result["direct_client"].aclose()

@@ -8,7 +8,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, BinaryIO, Literal, Protocol
 
-from cti_app.domain.external_effects import ExternalEffectAuthority
+from cti_app.domain.external_effects import EvidenceReference, ExternalEffectAuthority
 from cti_app.domain.retrohunt import (
     RetrohuntProviderJob,
     RetrohuntProviderResults,
@@ -33,6 +33,9 @@ if TYPE_CHECKING:
 _external_effect_authority: ContextVar[ExternalEffectAuthority | None] = ContextVar(
     "virustotal_external_effect_authority", default=None
 )
+_external_effect_evidence_refs: ContextVar[tuple[EvidenceReference, ...]] = ContextVar(
+    "virustotal_external_effect_evidence_refs", default=()
+)
 _external_effect_counts: ContextVar[tuple[int, int] | None] = ContextVar(
     "virustotal_external_effect_counts", default=None
 )
@@ -41,20 +44,28 @@ _external_effect_counts: ContextVar[tuple[int, int] | None] = ContextVar(
 @contextmanager
 def virustotal_external_effect_scope(
     authority: ExternalEffectAuthority | None,
+    evidence_refs: tuple[EvidenceReference, ...] = (),
 ) -> Iterator[None]:
     """Bind a dispatcher-provided authority to one async VT tool call."""
     token = _external_effect_authority.set(authority)
+    evidence_token = _external_effect_evidence_refs.set(tuple(evidence_refs))
     counts_token = _external_effect_counts.set((0, 0))
     try:
         yield
     finally:
         _external_effect_counts.reset(counts_token)
+        _external_effect_evidence_refs.reset(evidence_token)
         _external_effect_authority.reset(token)
 
 
 def current_virustotal_external_effect_authority() -> ExternalEffectAuthority | None:
     """Return the authority bound by the current investigation tool call."""
     return _external_effect_authority.get()
+
+
+def current_virustotal_external_effect_evidence_refs() -> tuple[EvidenceReference, ...]:
+    """Return trusted source references bound by the investigation service."""
+    return _external_effect_evidence_refs.get()
 
 
 def record_virustotal_external_effect(*, reused: bool) -> None:
