@@ -1482,8 +1482,11 @@ class BridgeInvestigator:
                 may_retry_other_pre_submission = (
                     not is_rate_limited and pre_submission_attempt < MAX_PRE_SUBMISSION_ATTEMPTS - 1
                 )
+                retryable_submission = confirmed_not_submitted or (
+                    completed_rejection and is_rate_limited
+                )
                 if (
-                    (confirmed_not_submitted or completed_rejection)
+                    retryable_submission
                     and submission.retryable
                     and (may_retry_rate_limit or may_retry_other_pre_submission)
                 ):

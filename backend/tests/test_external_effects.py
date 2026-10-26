@@ -536,6 +536,35 @@ async def test_complete_bridge_429_is_replayed_without_a_second_post() -> None:
 
 
 @pytest.mark.asyncio
+async def test_bridge_500_after_handoff_needs_review_and_never_resends() -> None:
+    calls: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(500, json={"error": "synthetic server failure"})
+
+    store = FakeStore()
+    transport = create_coordinated_http_responses_transport(
+        "https://bridge.test/v1",
+        api_key="authorization-probe-do-not-persist",
+        coordinator=_coordinator(store),
+        http_transport=httpx.MockTransport(handler),
+    )
+    kwargs = {
+        "payload": {"input": "safe test prompt"},
+        "idempotency_key": "bridge-request-server-error",
+        "bridge_external_effect_binding": _bridge_external_effect_binding(),
+    }
+    for _ in range(2):
+        with pytest.raises(BridgeTransportError) as caught:
+            await transport.create(**kwargs)
+        assert caught.value.code == "model_submission_reconciliation_required"
+        assert caught.value.submission_state == "external_state_unknown"
+    assert len(calls) == 1
+    assert store.sealed == [("needs_review", "transport_outcome_unknown")]
+
+
+@pytest.mark.asyncio
 async def test_timeout_after_bridge_handoff_is_needs_review_and_never_resends() -> None:
     calls: list[httpx.Request] = []
 

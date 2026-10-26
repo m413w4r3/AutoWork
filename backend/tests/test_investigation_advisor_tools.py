@@ -45,6 +45,7 @@ from cti_app.application.investigation_tools import (
 )
 from cti_app.domain.analyst_opinion import OpinionBlockType
 from cti_app.domain.classification import TLP
+from cti_app.domain.external_effects import EvidenceReference
 from cti_app.domain.investigation import (
     BudgetDimension,
     DisclosureBounds,
@@ -151,6 +152,14 @@ class BlobRepository:
         return self.descriptors.get(blob_id)
 
 
+class SourceDocumentRepository:
+    def __init__(self, documents=()) -> None:
+        self.documents = {item.id: item for item in documents}
+
+    async def get(self, document_id):
+        return self.documents.get(document_id)
+
+
 class Registry:
     def __init__(self, definitions=()):
         self.definitions = tuple(definitions)
@@ -212,6 +221,7 @@ def make_tool(
     subject_id = uuid4()
     sample_blob_id = uuid4()
     snapshot = SimpleNamespace(
+        subject_id=subject_id,
         external_llm_allowed=allowed,
         do_not_submit=not allowed,
         tlp="clear",
@@ -4555,6 +4565,70 @@ async def test_external_disclosure_denial_never_calls_bridge(policy) -> None:
     assert result.output["preflight_status"] == "POLICY_BLOCKED"
     assert observation.id in result.observation_refs
     assert transport.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("document_resolves", [True, False])
+async def test_transmitted_article_passage_resolves_canonical_source_document(
+    document_resolves: bool,
+) -> None:
+    investigation_id = uuid4()
+
+    class BindingContextTransport(Transport):
+        async def build_external_effect_binding(self, **context):
+            self.binding_context = context
+            return None
+
+    transport = BindingContextTransport(
+        TurnSubmission(TurnSubmissionStatus.SUCCEEDED, output_text="Synthetic response.")
+    )
+    tool, _sample_blob = make_tool(investigation_id=investigation_id, transport=transport)
+    investigation = await tool._investigations.get(investigation_id)
+    snapshot = await tool._article_snapshots.resolve(investigation.synthesis_artifact_id)
+    document_id = uuid4()
+    blob_id = uuid4()
+    blob_sha256 = "b" * 64
+    snapshot.article_passages = (
+        SimpleNamespace(
+            claim_id="S1P1",
+            heading="Résumé",
+            text="S1P1. The Blackwood loader behavior was observed.",
+            source_document_ids=(document_id,),
+        ),
+    )
+    document = SimpleNamespace(
+        id=document_id,
+        subject_id=investigation.subject_id,
+        blob_id=blob_id,
+    )
+    tool._source_documents = SourceDocumentRepository((document,) if document_resolves else ())
+    tool._blobs.add(blob_id, sha256=blob_sha256, size=128, logical_bucket="source-documents")
+
+    result = await tool.execute(
+        {
+            "consultation_type": "plan_investigation",
+            "question": "Review the Blackwood loader behavior.",
+        },
+        make_context(investigation_id, key="operator:advisor:source-document-passage"),
+    )
+
+    if document_resolves:
+        assert len(transport.calls) == 1
+        external_effect_context = transport.binding_context
+        assert external_effect_context["transmitted_refs"] == (
+            {"kind": "source_document", "id": str(document_id), "sha256": "a" * 64},
+        )
+        assert external_effect_context["evidence_refs"] == (
+            EvidenceReference(
+                kind="source_document",
+                id=str(document_id),
+                version=f"blob:{blob_id}",
+                sha256=blob_sha256,
+            ),
+        )
+    else:
+        assert result.output["input_error_code"] == "advisor_evidence_reference_mismatch"
+        assert transport.calls == []
 
 
 @pytest.mark.asyncio

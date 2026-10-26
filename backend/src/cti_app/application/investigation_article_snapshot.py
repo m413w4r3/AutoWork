@@ -396,20 +396,48 @@ def _synthesis_passages(payload: dict[str, Any]) -> tuple[ArticlePassageSnapshot
     """Retain verbatim lead, section paragraphs, and timeline claims for task selection."""
     result: list[ArticlePassageSnapshot] = []
 
-    def add(text: object, claim_id: str, *, section_index: int | None, heading: str) -> None:
+    def add(
+        text: object,
+        claim_id: str,
+        *,
+        section_index: int | None,
+        heading: str,
+        evidence_refs: object = (),
+    ) -> None:
         if isinstance(text, str) and text.strip():
+            source_document_ids: set[UUID] = set()
+            if evidence_refs is not None:
+                if not isinstance(evidence_refs, list | tuple):
+                    raise ValueError("Synthesis passage evidence refs are invalid")
+                for reference in evidence_refs:
+                    if not isinstance(reference, dict):
+                        raise ValueError("Synthesis passage evidence ref is invalid")
+                    raw_document_id = reference.get("source_document_id")
+                    if not isinstance(raw_document_id, str):
+                        raise ValueError("Synthesis passage source document is unresolved")
+                    try:
+                        source_document_ids.add(UUID(raw_document_id))
+                    except ValueError as exc:
+                        raise ValueError("Synthesis passage source document is unresolved") from exc
             result.append(
                 ArticlePassageSnapshot(
                     claim_id=claim_id,
                     section_index=section_index,
                     heading=heading.strip(),
                     text=text,
+                    source_document_ids=tuple(sorted(source_document_ids, key=str)),
                 )
             )
 
     for index, paragraph in enumerate(payload.get("lead", []), 1):
         if isinstance(paragraph, dict):
-            add(paragraph.get("text"), f"L{index}.1", section_index=None, heading="Introduction")
+            add(
+                paragraph.get("text"),
+                f"L{index}.1",
+                section_index=None,
+                heading="Introduction",
+                evidence_refs=paragraph.get("evidence_refs", ()),
+            )
     for section_index, section in enumerate(payload.get("sections", []), 1):
         if not isinstance(section, dict):
             continue
@@ -421,6 +449,7 @@ def _synthesis_passages(payload: dict[str, Any]) -> tuple[ArticlePassageSnapshot
                     f"S{section_index}P{paragraph_index}.1",
                     section_index=section_index,
                     heading=heading,
+                    evidence_refs=paragraph.get("evidence_refs", ()),
                 )
     for index, item in enumerate(payload.get("timeline", []), 1):
         if isinstance(item, dict):
@@ -429,6 +458,7 @@ def _synthesis_passages(payload: dict[str, Any]) -> tuple[ArticlePassageSnapshot
                 f"T{index}",
                 section_index=None,
                 heading="Chronologie",
+                evidence_refs=item.get("evidence_refs", ()),
             )
     return tuple(result)
 

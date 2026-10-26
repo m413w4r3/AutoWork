@@ -520,6 +520,45 @@ async def test_complete_rate_limit_retry_uses_new_occurrence_and_counts_submissi
 
 
 @pytest.mark.asyncio
+async def test_retryable_non_rate_limit_completed_response_does_not_resend() -> None:
+    investigation_id = uuid4()
+    context = _context(investigation_id)
+    failure = TurnSubmission(
+        TurnSubmissionStatus.UNAVAILABLE,
+        error_code="bridge_server_error",
+        submission_state="post_submission",
+        retryable=True,
+        completed_response=True,
+    )
+    response = {
+        "reasoning_summary": "The synthetic investigation is complete.",
+        "goal": "Finish the investigation.",
+        "hypothesis_refs": [],
+        "proposed_tool_calls": [],
+        "finding_proposals": [],
+        "opinion_delta": None,
+        "next_action": AgentNextAction.FINISH.value,
+    }
+    transport = ScriptedTurnTransport([failure, response])
+
+    result = await BridgeInvestigator(
+        transport,
+        minimum_submission_interval_seconds=0,
+        submission_jitter_fraction=0,
+    ).turn(
+        investigation_id=investigation_id,
+        subject_id=context.source.subject_id,
+        turn_index=9,
+        context=context,
+        external_llm_allowed=True,
+    )
+
+    assert result.status is TurnSubmissionStatus.UNAVAILABLE
+    assert result.submissions_made == 1
+    assert transport.submission_count == 1
+
+
+@pytest.mark.asyncio
 async def test_bridge_rate_limit_retry_and_correction_each_get_a_fresh_binding() -> None:
     investigation_id = uuid4()
     context = _context(investigation_id)

@@ -147,6 +147,7 @@ class ArticlePassageSnapshot:
     section_index: int | None
     heading: str
     text: str
+    source_document_ids: tuple[UUID, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

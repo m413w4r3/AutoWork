@@ -147,6 +147,7 @@ class InvestigationAdvisorTool:
         findings: Any,
         investigation_states: Any | None = None,
         experiments: Any | None = None,
+        source_documents: Any | None = None,
         opinions: Any,
         sample_associations: Any,
         samples: Any,
@@ -162,6 +163,7 @@ class InvestigationAdvisorTool:
         self._findings = findings
         self._investigation_states = investigation_states
         self._experiments = experiments
+        self._source_documents = source_documents
         self._opinions = opinions
         self._sample_associations = sample_associations
         self._samples = samples
@@ -856,6 +858,9 @@ class InvestigationAdvisorTool:
                 evidence,
                 observation_repository=self._observations,
                 investigation_id=context.investigation_id,
+                snapshot=snapshot,
+                source_document_repository=self._source_documents,
+                blob_repository=self._blobs,
             )
             advisor_observation_refs = tuple(
                 UUID(item["id"]) for item in transmitted_refs if item["kind"] == "observation"
@@ -1971,6 +1976,9 @@ class InvestigationAdvisorTool:
                         if type(getattr(item, "section_index", None)) is int
                         else {}
                     ),
+                    "source_document_ids": [
+                        str(document_id) for document_id in getattr(item, "source_document_ids", ())
+                    ],
                 }
                 for item in getattr(snapshot, "article_passages", ())
             ],
@@ -5237,6 +5245,12 @@ def _typed_transmitted_refs(data: Mapping[str, Any], snapshot: Any) -> list[dict
         getattr(snapshot, "synthesis_sha256", None),
         getattr(snapshot, "synthesis_sha256", None),
     )
+    synthesis_sha256 = getattr(snapshot, "synthesis_sha256", None)
+    for passage in data.get("article_passages", ()):
+        if not isinstance(passage, Mapping):
+            continue
+        for document_id in passage.get("source_document_ids", ()):
+            add("source_document", document_id, synthesis_sha256)
     evidence_sha: dict[str, str] = {}
     for item in data.get("evidence", ()):
         if isinstance(item, Mapping):
@@ -5285,6 +5299,18 @@ def _transmitted_refs_for_dossier(
                 identifier = f"article:{identifier}"
             if kind in {"article", "observation", "finding", "measurement"}:
                 selected.add((kind, identifier))
+                if kind == "article":
+                    passage_claim_id = item.get("claim_id")
+                    for passage in data.get("article_passages", ()):
+                        if (
+                            isinstance(passage, Mapping)
+                            and passage.get("claim_id") == passage_claim_id
+                        ):
+                            selected.update(
+                                ("source_document", str(document_id))
+                                for document_id in passage.get("source_document_ids", ())
+                                if isinstance(document_id, str)
+                            )
             if kind in {"measurement", "fact"}:
                 evidence_id = item.get("evidence_id")
                 if isinstance(evidence_id, str):
@@ -5316,11 +5342,44 @@ async def _advisor_external_effect_evidence_refs(
     *,
     observation_repository: Any,
     investigation_id: UUID,
+    snapshot: Any,
+    source_document_repository: Any | None,
+    blob_repository: Any,
 ) -> tuple[EvidenceReference, ...]:
-    """Resolve transmitted observations to their canonical persisted versions."""
+    """Resolve transmitted observations and source documents canonically."""
     observations = {str(item.id): item for item in evidence}
-    references: dict[str, EvidenceReference] = {}
+    references: dict[tuple[str, str], EvidenceReference] = {}
     for reference in transmitted_refs:
+        if reference["kind"] == "source_document":
+            if (
+                source_document_repository is None
+                or blob_repository is None
+                or reference["sha256"] != getattr(snapshot, "synthesis_sha256", None)
+            ):
+                raise _AdvisorInputValidationError("advisor_evidence_reference_mismatch")
+            try:
+                document_id = UUID(reference["id"])
+            except ValueError as exc:
+                raise _AdvisorInputValidationError("advisor_evidence_reference_mismatch") from exc
+            document = await source_document_repository.get(document_id)
+            if document is None or document.subject_id != getattr(snapshot, "subject_id", None):
+                raise _AdvisorInputValidationError("advisor_evidence_reference_mismatch")
+            blob = await blob_repository.get(document.blob_id)
+            blob_descriptor = getattr(blob, "descriptor", None)
+            blob_sha256 = getattr(blob_descriptor, "sha256", None)
+            if (
+                not isinstance(blob_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", blob_sha256) is None
+            ):
+                raise _AdvisorInputValidationError("advisor_evidence_reference_mismatch")
+            resolved = EvidenceReference(
+                kind="source_document",
+                id=str(document.id),
+                version=f"blob:{document.blob_id}",
+                sha256=blob_sha256,
+            )
+            references[(resolved.kind, resolved.id)] = resolved
+            continue
         if reference["kind"] != "observation":
             continue
         observation = observations.get(reference["id"])
@@ -5342,7 +5401,7 @@ async def _advisor_external_effect_evidence_refs(
             version=observation.source_version,
             sha256=observation.sha256,
         )
-        references[resolved.id] = resolved
+        references[(resolved.kind, resolved.id)] = resolved
     return tuple(references[key] for key in sorted(references))
 
 

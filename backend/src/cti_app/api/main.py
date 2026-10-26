@@ -357,12 +357,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         uow_factory,
         blob_store,
     )
+    model_conversation_service = ModelConversationService(
+        uow_factory,
+        model_gateway,
+        blob_store,
+        retention_days=settings.model_conversation_retention_days,
+        conversation_session_closer=bridge_provider,
+        visible_recovery_transport=bridge_provider,
+    )
     investigation_model_gateway = create_model_gateway(
         settings,
         uow_factory,
         external_effect_coordinator=external_effect_coordinator,
     )
-    model_conversation_service = ModelConversationService(
+    investigation_model_conversation_service = ModelConversationService(
         uow_factory,
         investigation_model_gateway,
         blob_store,
@@ -395,7 +403,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         blob_store=blob_store,
         blob_catalog=blob_catalog,
         artifact_store=production_artifact_store,
-        model_conversations=model_conversation_service,
+        model_conversations=investigation_model_conversation_service,
         vt_adapter=vt_adapter,
         vt_capabilities=vt_capabilities,
         vt_observations=vt_observations,

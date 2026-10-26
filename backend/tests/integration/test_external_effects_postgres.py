@@ -1356,9 +1356,11 @@ async def test_osint_open_inherited_advisor_bridge_claim_and_revocation_gate(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure_kind", ["timeout", "http_500"])
 async def test_bridge_ambiguous_response_needs_review_and_replay_sends_nothing(
     migrated_postgres_url: str,
     tmp_path: Path,
+    failure_kind: str,
 ) -> None:
     (
         session_factory,
@@ -1377,7 +1379,15 @@ async def test_bridge_ambiguous_response_needs_review_and_replay_sends_nothing(
         invocation_arguments_sha256=None,
     )
     coordinator = ExternalEffectCoordinator(_bridge_model_lineage_store(session_factory))
-    transport = _CountingTransport(response=httpx.ReadTimeout("synthetic response timeout"))
+    if failure_kind == "http_500":
+        request = httpx.Request("POST", "https://bridge.test/v1/responses")
+        response = httpx.Response(500, request=request)
+        failure = httpx.HTTPStatusError(
+            "synthetic post-handoff HTTP 500", request=request, response=response
+        )
+    else:
+        failure = httpx.ReadTimeout("synthetic response timeout")
+    transport = _CountingTransport(response=failure)
     try:
         first = await coordinator.send_one(authority, prepared, transport)
         assert isinstance(first, Ambiguous)
@@ -1926,11 +1936,13 @@ async def test_declared_query_credential_in_canonical_request_is_rejected_before
         ("clear", None),
     ],
 )
-async def test_evidence_observation_source_document_restrictions_are_checked_at_consume(
+@pytest.mark.parametrize("reference_kind", ["evidence_observation", "source_document"])
+async def test_source_document_restrictions_are_checked_at_consume(
     migrated_postgres_url: str,
     tmp_path: Path,
     restriction: str,
     expected_reason: str | None,
+    reference_kind: str,
 ) -> None:
     session_factory, engine, investigation_id, subject_id, authorities = await _prepare_case(
         migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
@@ -1978,6 +1990,9 @@ async def test_evidence_observation_source_document_restrictions_are_checked_at_
                 document.external_llm_allowed = False
             elif restriction == "do_not_submit":
                 document.do_not_submit = True
+            document_id = document.id
+            document_blob_id = document.blob_id
+            document_blob_sha256 = blob.sha256
             session.add(
                 EvidenceObservationRow(
                     id=observation_id,
@@ -1994,11 +2009,20 @@ async def test_evidence_observation_source_document_restrictions_are_checked_at_
                     invocation_ref=None,
                 )
             )
-    reference = EvidenceReference(
-        kind="evidence_observation",
-        id=str(observation_id),
-        version=observation_version,
-        sha256=observation_sha256,
+    reference = (
+        EvidenceReference(
+            kind="evidence_observation",
+            id=str(observation_id),
+            version=observation_version,
+            sha256=observation_sha256,
+        )
+        if reference_kind == "evidence_observation"
+        else EvidenceReference(
+            kind="source_document",
+            id=str(document_id),
+            version=f"blob:{document_blob_id}",
+            sha256=document_blob_sha256,
+        )
     )
     prepared = PreparedExternalRequest.build(
         family=base.family,

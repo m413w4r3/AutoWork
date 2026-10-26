@@ -430,25 +430,14 @@ class _CoordinatedResponsesPoster:
                     completed_response=True,
                 )
             else:
-                parsed = _bridge_http_error(response, 1, default_phase="generation")
-                rejection_code = (
-                    "bridge_protocol_error" if parsed.code == "bridge_rate_limited" else parsed.code
-                )
-                error = BridgeTransportError(
-                    rejection_code,
-                    _safe_bridge_rejection_message(rejection_code),
-                    retryable=parsed.retryable,
-                    retry_after=parsed.retry_after,
-                    phase="generation",
-                    status_code=response.status_code,
-                    submission_state="post_submission",
-                    completed_response=True,
-                )
+                # After handoff, only a complete 429 proves the Bridge declined
+                # generation and permits the bounded rate-limit retry. Other
+                # HTTP errors can arrive after generation started, so let the
+                # coordinator seal the claim as NEEDS_REVIEW.
+                raise RuntimeError("Bridge returned an ambiguous post-handoff HTTP error")
             return TransportResponse(
                 result_ref=_encode_rejection_result_ref(error),
-                outcome_code=(
-                    "bridge_rate_limited" if response.status_code == 429 else "bridge_rejected"
-                ),
+                outcome_code="bridge_rate_limited",
             )
         if not 200 <= response.status_code < 300:
             raise RuntimeError("Bridge returned a non-final HTTP status")
