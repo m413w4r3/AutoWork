@@ -239,14 +239,16 @@ async def test_file_download_rejects_redirect_outside_allowlist_without_followin
         base_url=BASE,
         capabilities=VirusTotalCapabilities(file_download=True),
         file_download_enabled=True,
+        offline_probe_mode=True,
         download_allowed_hosts=frozenset({"cdn.example.test"}),
         download_client_factory=lambda: httpx.AsyncClient(
             transport=httpx.MockTransport(unexpected_download), trust_env=False
         ),
     )
     try:
-        with pytest.raises(VirusTotalDownloadHostNotAllowedError) as caught:
-            await value.file_download(SHA256, sink=io.BytesIO())
+        with virustotal_external_effect_scope(None):
+            with pytest.raises(VirusTotalDownloadHostNotAllowedError) as caught:
+                await value.file_download(SHA256, sink=io.BytesIO())
     finally:
         await client.aclose()
 
@@ -254,6 +256,30 @@ async def test_file_download_rejects_redirect_outside_allowlist_without_followin
     assert caught.value.location_host == "not-allowed.example.test"
     assert signed_url not in str(caught.value)
     assert "signature=secret" not in repr(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_file_download_without_s3_authority_refuses_before_transport() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, content=b"synthetic bytes", request=request)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    value = VirusTotalHttpAdapter(
+        client=client,
+        base_url=BASE,
+        capabilities=VirusTotalCapabilities(file_download=True),
+        file_download_enabled=True,
+    )
+    try:
+        with pytest.raises(VirusTotalExternalEffectRefusedError):
+            await value.file_download(SHA256, sink=io.BytesIO())
+    finally:
+        await client.aclose()
+    assert calls == 0
 
 
 @pytest.mark.asyncio

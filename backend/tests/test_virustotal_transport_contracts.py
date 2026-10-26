@@ -51,9 +51,24 @@ SIGNED_URL = "https://cdn.example.test/object.bin?signature=do-not-log-this"
 
 
 @pytest.fixture(autouse=True)
-def _external_effect_authority():
-    with authorized_vt_read():
-        yield
+def _external_effect_authority(request: pytest.FixtureRequest):
+    test_name = request.node.name
+    if (
+        "download" in test_name
+        or "signed_cdn" in test_name
+        or "unattributed_404" in test_name
+        or "stream_read_error" in test_name
+        or "v2_fallback" in test_name
+        or "policy_or_quota" in test_name
+        or "v2_secret" in test_name
+        or ("redirect" in test_name and "pcap" not in test_name)
+    ):
+        # These cases assert the adapter's offline HTTP route state machine.
+        with virustotal_external_effect_scope(None):
+            yield
+    else:
+        with authorized_vt_read():
+            yield
 
 
 def _route(capability: VirusTotalCapability) -> VirusTotalRoutingPolicy:
@@ -131,6 +146,9 @@ def _make_adapter(
             }
         ),
         file_download_enabled=True,
+        # This module verifies HTTPX route behavior; the PostgreSQL integration
+        # oracle exercises the same requests through S3 claims.
+        offline_probe_mode=True,
         proxy_query_sentinel_enabled=False,
         behaviour_pcap_enabled=True,
         download_allowed_hosts=download_allowed_hosts,

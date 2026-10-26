@@ -14,6 +14,7 @@ from cti_app.application.external_effects import (
     ExternalEffectClaim,
     ReuseDecision,
 )
+from cti_app.application.virustotal import VT_DOWNLOAD_CREDENTIAL_PARAMETER_NAMES
 from cti_app.domain.external_effects import (
     EffectClaimState,
     EvidenceReference,
@@ -49,6 +50,7 @@ VT_EXTERNAL_EFFECT_FAMILIES = {
     "vt.intelligence_search": ("vt.intelligence_search", "1"),
     "vt.behaviour": ("vt.behaviour", "1"),
     "vt.behaviour_pcap": ("vt.behaviour_pcap", "1"),
+    "vt.download_sample": ("vt.download_sample", "1"),
 }
 _VT_RAW_RESPONSE_KIND = "vt.raw_response"
 _VT_SOURCE_REFS_KEY = "_vt_external_effect_source_refs"
@@ -92,6 +94,8 @@ def _source_refs_for_family(
         hash_value = parameters.get("file_hash")
     elif family == "vt.relationships" and parameters.get("object_type") == "file":
         hash_value = parameters.get("object_id")
+    elif family == "vt.download_sample":
+        hash_value = parameters.get("sha256")
     if hash_value is not None:
         if not isinstance(hash_value, str) or not re.fullmatch(r"[0-9a-f]{64}", hash_value):
             return ()
@@ -131,9 +135,15 @@ def virustotal_external_effect_family_bindings() -> dict[str, ExternalEffectFami
         family: ExternalEffectFamilyBinding(
             provider="vt",
             provider_scopes=frozenset({"default"}),
-            normalizer_versions=frozenset({"vt-read.v1"}),
+            normalizer_versions=frozenset(
+                {"vt-download.v1" if family == "vt.download_sample" else "vt-read.v1"}
+            ),
             invocation_tool_binding=tool_binding,
-            credential_parameter_names=frozenset({"apikey"}),
+            credential_parameter_names=(
+                VT_DOWNLOAD_CREDENTIAL_PARAMETER_NAMES
+                if family == "vt.download_sample"
+                else frozenset({"apikey"})
+            ),
             source_reference_resolver=_source_resolver_for_family(family),
             requires_source_refs=True,
         )

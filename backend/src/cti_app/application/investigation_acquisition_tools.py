@@ -514,6 +514,8 @@ class _DownloadSampleAdapter:
                 evidence_refs=evidence_refs,
                 operation_key=context.idempotency_key,
                 envelope=context.envelope,
+                external_effect_authority=context.external_effect_authority,
+                external_effect_evidence_refs=context.external_effect_evidence_refs,
             )
         except (ValueError, HitAcquisitionError) as exc:
             return ToolResult(

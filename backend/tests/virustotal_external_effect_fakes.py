@@ -16,7 +16,10 @@ from cti_app.application.external_effects import (
     ReuseDecision,
     _NoHandoffProofVerifier,
 )
-from cti_app.application.virustotal import virustotal_external_effect_scope
+from cti_app.application.virustotal import (
+    current_virustotal_external_effect_authority,
+    virustotal_external_effect_scope,
+)
 from cti_app.application.virustotal_persistence import (
     ArchivedVirusTotalResponse,
     VirusTotalObservationService,
@@ -235,6 +238,11 @@ def configure_test_vt_adapter(
 ) -> tuple[InMemoryExternalEffectClaimStore, InMemoryVirusTotalArchive]:
     store = InMemoryExternalEffectClaimStore()
     archive = InMemoryVirusTotalArchive()
+    if (
+        getattr(adapter, "_offline_probe_mode", False)
+        and current_virustotal_external_effect_authority() is None
+    ):
+        return store, archive
     coordinator = ExternalEffectCoordinator(
         store,
         reuse_policies={

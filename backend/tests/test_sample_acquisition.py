@@ -621,6 +621,9 @@ def _adapter(
         base_url=BASE,
         capabilities=VirusTotalCapabilities(file_download=True),
         file_download_enabled=True,
+        # These adapter tests exercise the offline HTTP route state machine;
+        # the PostgreSQL S3 oracle covers coordinated investigation downloads.
+        offline_probe_mode=True,
         download_allowed_hosts=allowed_hosts,
         download_client_factory=lambda: httpx.AsyncClient(
             transport=httpx.MockTransport(download_handler), follow_redirects=False
@@ -747,6 +750,7 @@ async def test_adapter_enforces_the_download_size_limit_while_streaming() -> Non
         base_url=BASE,
         capabilities=VirusTotalCapabilities(file_download=True),
         file_download_enabled=True,
+        offline_probe_mode=True,
         download_allowed_hosts=frozenset({"signed.example.test"}),
         download_max_bytes=4,
         download_client_factory=lambda: httpx.AsyncClient(

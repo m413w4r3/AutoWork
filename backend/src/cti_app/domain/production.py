@@ -1586,6 +1586,44 @@ class SampleAcquisitionOutcome(StrEnum):
     ERROR = "error"
 
 
+class SampleAcquisitionDispatchState(StrEnum):
+    PREPARED = "PREPARED"
+    SUBMISSION_IN_PROGRESS = "SUBMISSION_IN_PROGRESS"
+    COMPLETED = "COMPLETED"
+    DEFINITIVELY_NOT_SUBMITTED = "DEFINITIVELY_NOT_SUBMITTED"
+    NEEDS_REVIEW = "NEEDS_REVIEW"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SampleAcquisitionDispatchAttempt:
+    """Durable pre-send identity for one hash-acquisition workflow."""
+
+    investigation_id: UUID
+    association_id: UUID
+    operation_key: str
+    requested_hash: str
+    hash_family: str
+    reason: SampleAcquisitionReason
+    invocation_id: UUID | None = None
+    state: SampleAcquisitionDispatchState = SampleAcquisitionDispatchState.PREPARED
+    version: int = 1
+    id: UUID = field(default_factory=uuid4)
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+    def __post_init__(self) -> None:
+        if not _ACQUISITION_HASH_RE.fullmatch(self.requested_hash):
+            raise ValueError("requested_hash must be a lowercase MD5, SHA-1, or SHA-256")
+        if self.hash_family not in ("md5", "sha1", "sha256"):
+            raise ValueError("hash_family must be md5, sha1, or sha256")
+        if not self.operation_key.strip() or len(self.operation_key) > 255:
+            raise ValueError("operation_key must be non-empty and bounded")
+        if self.version < 1:
+            raise ValueError("version must be positive")
+        if self.created_at.tzinfo is None or self.updated_at.tzinfo is None:
+            raise ValueError("dispatch timestamps must be timezone-aware")
+
+
 _ACQUISITION_HASH_RE = re.compile(r"^(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})$")
 
 
@@ -1607,6 +1645,7 @@ class SampleAcquisitionAttempt:
     outcome: SampleAcquisitionOutcome
     sample_id: UUID | None = None
     error_code: str | None = None
+    dispatch_attempt_id: UUID | None = None
     id: UUID = field(default_factory=uuid4)
     occurred_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 

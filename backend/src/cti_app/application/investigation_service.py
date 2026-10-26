@@ -168,6 +168,7 @@ _VT_COORDINATED_READ_TOOLS = frozenset(
         "vt.intelligence_search",
         "vt.behaviour",
         "vt.behaviour_pcap",
+        "vt.download_sample",
     }
 )
 _VT_SOURCE_REFS_PARAMETER = "_vt_external_effect_source_refs"
@@ -1291,11 +1292,30 @@ class InvestigationService:
                     invocation_parameters
                 )
             else:
-                external_effect_evidence_refs = await self._trusted_vt_source_references(
-                    investigation=investigation,
-                    tool_name=tool_name,
-                    arguments=arguments,
-                )
+                if tool_name == "vt.download_sample":
+                    try:
+                        download_hash = normalize_file_hash(str(arguments.get("sha256", "")))
+                    except (TypeError, ValueError):
+                        external_effect_evidence_refs = ()
+                    else:
+                        external_effect_evidence_refs = (
+                            (
+                                EvidenceReference(
+                                    kind="sample_hash",
+                                    id=download_hash,
+                                    version="sample-hash.v1",
+                                    sha256=download_hash,
+                                ),
+                            )
+                            if len(download_hash) == 64
+                            else ()
+                        )
+                else:
+                    external_effect_evidence_refs = await self._trusted_vt_source_references(
+                        investigation=investigation,
+                        tool_name=tool_name,
+                        arguments=arguments,
+                    )
                 invocation_parameters = {
                     **arguments,
                     _VT_SOURCE_REFS_PARAMETER: [
@@ -1542,11 +1562,13 @@ class InvestigationService:
                 snapshot = await self._context_builder.article_snapshots.resolve(
                     current_investigation.synthesis_artifact_id
                 )
-                if not self.external_llm_allowed(
-                    snapshot, current_envelope
+                if (
+                    tool_name != "vt.download_sample"
+                    and not self.external_llm_allowed(snapshot, current_envelope)
                 ) or await self._vt_source_disclosure_restricted(
                     current_investigation,
                     external_effect_evidence_refs,
+                    require_external_llm_allowed=tool_name != "vt.download_sample",
                 ):
                     return FrameworkPreSubmissionProof.DISCLOSURE_REVOKED
             elif tool_name == "advisor.consult":
@@ -1667,6 +1689,8 @@ class InvestigationService:
         self,
         investigation: AnalystInvestigation,
         references: tuple[EvidenceReference, ...],
+        *,
+        require_external_llm_allowed: bool = True,
     ) -> bool:
         sample_hashes = {
             reference.id for reference in references if reference.kind == "sample_hash"
@@ -1730,7 +1754,7 @@ class InvestigationService:
                 sample.tlp is TLP.RED
                 or sample.do_not_submit
                 or bool((sample.license_restriction or "").strip())
-                or not sample.external_llm_allowed
+                or (require_external_llm_allowed and not sample.external_llm_allowed)
                 for sample in samples
             ):
                 return True
@@ -1750,7 +1774,7 @@ class InvestigationService:
                     or document.tlp is TLP.RED
                     or document.do_not_submit
                     or bool((document.license_restriction or "").strip())
-                    or not document.external_llm_allowed
+                    or (require_external_llm_allowed and not document.external_llm_allowed)
                 ):
                     return True
         return False

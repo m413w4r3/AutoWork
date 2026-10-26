@@ -19,10 +19,10 @@ from __future__ import annotations
 import hashlib
 import json
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import BinaryIO, Protocol, cast
+from typing import Any, BinaryIO, Protocol, cast
 from uuid import UUID
 
 from cti_app.application.blob_storage import BlobReadLimitExceededError, BlobStorageUnavailableError
@@ -33,17 +33,23 @@ from cti_app.application.virustotal import (
     VirusTotalCapabilities,
     VirusTotalDownloadHashMismatchError,
     VirusTotalError,
+    VirusTotalExternalEffectNeedsReviewError,
+    VirusTotalExternalEffectRefusedError,
     VirusTotalHttpError,
     VirusTotalPort,
     file_hash_family,
     normalize_file_hash,
+    virustotal_external_effect_scope,
 )
 from cti_app.domain.classification import TLP
 from cti_app.domain.entities import ProvenanceEvent, Sample, SampleOrigin, SampleState
 from cti_app.domain.errors import EntityNotFoundError
+from cti_app.domain.external_effects import EvidenceReference, ExternalEffectAuthority
 from cti_app.domain.production import (
     LoopBudgetCategory,
     SampleAcquisitionAttempt,
+    SampleAcquisitionDispatchAttempt,
+    SampleAcquisitionDispatchState,
     SampleAcquisitionOutcome,
     SampleAcquisitionReason,
 )
@@ -287,11 +293,18 @@ class VirusTotalSampleAcquisitionService:
         requested_hash: str,
         reason: SampleAcquisitionReason,
         policy: SampleAcquisitionPolicy,
+        association_id: UUID | None = None,
+        operation_key: str | None = None,
+        invocation_id: UUID | None = None,
+        external_effect_authority: ExternalEffectAuthority | None = None,
+        external_effect_evidence_refs: tuple[EvidenceReference, ...] = (),
     ) -> SampleAcquisitionResult:
         normalized: str | None = None
         hash_family: str | None = None
         budget_committed = False
         actor_id: str | None = None
+        dispatch_attempt_id: UUID | None = None
+        dispatch_authority: ExternalEffectAuthority | None = None
         try:
             # 1. capability
             if not self._capabilities.is_enabled(VirusTotalCapability.FILE_DOWNLOAD):
@@ -346,35 +359,103 @@ class VirusTotalSampleAcquisitionService:
                         reused_existing_sample=True,
                     )
 
-            # 7. budget — consumed and committed before any network call starts.
+            # 7. Persist the pre-send identity with the investigation-local budget.
+            # Replays of a PREPARED identity do not consume that budget twice.
             async with self._uow_factory() as uow:
                 investigation = await uow.analyst_investigations.get(investigation_id)
                 if investigation is None:
                     raise SampleAcquisitionInvestigationNotFoundError(
                         "L'investigation demandée est introuvable."
                     )
-                try:
-                    investigation.consume_budget(LoopBudgetCategory.VT_READ_UNITS)
-                    await uow.analyst_investigations.save(investigation)
-                    if reason is SampleAcquisitionReason.HIT_REVIEW:
-                        investigation.consume_budget(LoopBudgetCategory.HITS_ACQUIRED)
+                created_dispatch = True
+                if external_effect_authority is not None:
+                    if (
+                        association_id is None
+                        or operation_key is None
+                        or invocation_id is None
+                        or external_effect_authority.investigation_id != investigation_id
+                        or external_effect_authority.invocation_id != invocation_id
+                        or external_effect_authority.operation_key != operation_key
+                        or external_effect_authority.acquisition_attempt_id is not None
+                        or external_effect_authority.acquisition_dispatch_attempt_id is not None
+                    ):
+                        raise SampleAcquisitionError(
+                            "External download authority is missing its dispatch binding."
+                        )
+                    (
+                        dispatch,
+                        created_dispatch,
+                    ) = await uow.sample_acquisition_attempts.prepare_dispatch(
+                        SampleAcquisitionDispatchAttempt(
+                            investigation_id=investigation_id,
+                            association_id=association_id,
+                            invocation_id=invocation_id,
+                            operation_key=operation_key,
+                            requested_hash=normalized,
+                            hash_family=hash_family,
+                            reason=reason,
+                        )
+                    )
+                    dispatch_attempt_id = dispatch.id
+                    if dispatch.state is not SampleAcquisitionDispatchState.PREPARED:
+                        target_code = (
+                            "virustotal_download_replay_needs_review"
+                            if dispatch.state
+                            in {
+                                SampleAcquisitionDispatchState.SUBMISSION_IN_PROGRESS,
+                                SampleAcquisitionDispatchState.NEEDS_REVIEW,
+                            }
+                            else "virustotal_download_already_completed"
+                        )
+                        raise SampleAcquisitionDownloadError(
+                            code=target_code,
+                            ambiguous=dispatch.state
+                            in {
+                                SampleAcquisitionDispatchState.SUBMISSION_IN_PROGRESS,
+                                SampleAcquisitionDispatchState.NEEDS_REVIEW,
+                            },
+                            provider_called=False,
+                        )
+                    dispatch_authority = replace(
+                        external_effect_authority,
+                        acquisition_dispatch_attempt_id=dispatch.id,
+                    )
+                if created_dispatch:
+                    try:
+                        investigation.consume_budget(LoopBudgetCategory.VT_READ_UNITS)
                         await uow.analyst_investigations.save(investigation)
-                except ValueError as exc:
-                    raise SampleAcquisitionBudgetExceededError(
-                        "Investigation-local sample acquisition budget is exhausted."
-                    ) from exc
+                        if reason is SampleAcquisitionReason.HIT_REVIEW:
+                            investigation.consume_budget(LoopBudgetCategory.HITS_ACQUIRED)
+                            await uow.analyst_investigations.save(investigation)
+                    except ValueError as exc:
+                        raise SampleAcquisitionBudgetExceededError(
+                            "Investigation-local sample acquisition budget is exhausted."
+                        ) from exc
                 await uow.commit()
             budget_committed = True
-
-            return await self._download_and_store(
-                investigation_id=investigation_id,
-                subject_id=subject_id,
-                normalized_hash=normalized,
-                hash_family=hash_family,
-                reason=reason,
-                policy=policy,
-                actor_id=actor_id,
-            )
+            if dispatch_authority is None:
+                return await self._download_and_store(
+                    investigation_id=investigation_id,
+                    subject_id=subject_id,
+                    normalized_hash=normalized,
+                    hash_family=hash_family,
+                    reason=reason,
+                    policy=policy,
+                    actor_id=actor_id,
+                )
+            with virustotal_external_effect_scope(
+                dispatch_authority, external_effect_evidence_refs
+            ):
+                return await self._download_and_store(
+                    investigation_id=investigation_id,
+                    subject_id=subject_id,
+                    normalized_hash=normalized,
+                    hash_family=hash_family,
+                    reason=reason,
+                    policy=policy,
+                    actor_id=actor_id,
+                    dispatch_attempt_id=dispatch_attempt_id,
+                )
         except SampleAcquisitionBudgetExceededError:
             # No provider call was made; do not record this as a provider failure.
             raise
@@ -401,6 +482,18 @@ class VirusTotalSampleAcquisitionService:
                 cache_error_code=cache_error_code,
                 actor_id=actor_id,
                 record_ledger=budget_committed,
+                dispatch_attempt_id=dispatch_attempt_id,
+                operation_key=operation_key,
+                dispatch_target=(
+                    SampleAcquisitionDispatchState.NEEDS_REVIEW
+                    if isinstance(exc, SampleAcquisitionDownloadError) and exc.ambiguous
+                    else (
+                        SampleAcquisitionDispatchState.DEFINITIVELY_NOT_SUBMITTED
+                        if isinstance(exc, SampleAcquisitionDownloadError)
+                        and not exc.provider_called
+                        else SampleAcquisitionDispatchState.COMPLETED
+                    )
+                ),
             )
             raise
 
@@ -414,6 +507,7 @@ class VirusTotalSampleAcquisitionService:
         reason: SampleAcquisitionReason,
         policy: SampleAcquisitionPolicy,
         actor_id: str,
+        dispatch_attempt_id: UUID | None = None,
     ) -> SampleAcquisitionResult:
         spool = cast(
             BinaryIO,
@@ -435,8 +529,19 @@ class VirusTotalSampleAcquisitionService:
                     "virustotal_capability_disabled",
                     "virustotal_route_unavailable",
                     "virustotal_transport_not_configured",
+                    "virustotal_download_query_not_allowlisted",
                 }
-                if isinstance(exc, VirusTotalDownloadHashMismatchError):
+                if isinstance(exc, VirusTotalExternalEffectNeedsReviewError):
+                    code = exc.code
+                    ambiguous = True
+                    refusal_reason = None
+                    failure_kind = SampleAcquisitionFailureKind.FAILED_BEFORE_BYTES
+                elif isinstance(exc, VirusTotalExternalEffectRefusedError):
+                    code = exc.code
+                    ambiguous = False
+                    refusal_reason = None
+                    failure_kind = SampleAcquisitionFailureKind.FAILED_BEFORE_BYTES
+                elif isinstance(exc, VirusTotalDownloadHashMismatchError):
                     code = exc.code
                     ambiguous = True
                     refusal_reason = None
@@ -501,7 +606,10 @@ class VirusTotalSampleAcquisitionService:
                 provider_called = not (
                     isinstance(exc, VirusTotalError)
                     and exc.status_code is None
-                    and exc.code in preflight_codes
+                    and (
+                        exc.code in preflight_codes
+                        or isinstance(exc, VirusTotalExternalEffectRefusedError)
+                    )
                 )
                 raise SampleAcquisitionDownloadError(
                     code=code,
@@ -560,8 +668,10 @@ class VirusTotalSampleAcquisitionService:
                         reason=reason,
                         outcome=SampleAcquisitionOutcome.SUCCESS,
                         sample_id=existing_sample.id,
+                        dispatch_attempt_id=dispatch_attempt_id,
                     )
                 )
+                await _complete_dispatch(uow, dispatch_attempt_id)
                 await uow.commit()
                 return SampleAcquisitionResult(
                     outcome=SampleAcquisitionOutcome.SUCCESS,
@@ -610,8 +720,10 @@ class VirusTotalSampleAcquisitionService:
                     reason=reason,
                     outcome=SampleAcquisitionOutcome.SUCCESS,
                     sample_id=sample.id,
+                    dispatch_attempt_id=dispatch_attempt_id,
                 )
             )
+            await _complete_dispatch(uow, dispatch_attempt_id)
             await uow.commit()
             return SampleAcquisitionResult(
                 outcome=SampleAcquisitionOutcome.SUCCESS,
@@ -632,6 +744,9 @@ class VirusTotalSampleAcquisitionService:
         cache_error_code: str | None,
         actor_id: str | None,
         record_ledger: bool,
+        dispatch_attempt_id: UUID | None = None,
+        operation_key: str | None = None,
+        dispatch_target: SampleAcquisitionDispatchState | None = None,
     ) -> None:
         """Audit any failure on the investigation — never on a Sample that never existed.
 
@@ -665,9 +780,54 @@ class VirusTotalSampleAcquisitionService:
                         reason=reason,
                         outcome=SampleAcquisitionOutcome.ERROR,
                         error_code=(cache_error_code or error_code)[:64],
+                        dispatch_attempt_id=dispatch_attempt_id,
                     )
                 )
+            if dispatch_attempt_id is not None and dispatch_target is not None:
+                current_dispatch = (
+                    await uow.sample_acquisition_attempts.get_dispatch(
+                        investigation_id, operation_key
+                    )
+                    if operation_key is not None
+                    else None
+                )
+                if (
+                    dispatch_target is SampleAcquisitionDispatchState.DEFINITIVELY_NOT_SUBMITTED
+                    and current_dispatch is not None
+                    and current_dispatch.state
+                    is SampleAcquisitionDispatchState.SUBMISSION_IN_PROGRESS
+                ):
+                    dispatch_target = SampleAcquisitionDispatchState.COMPLETED
+                await _finish_dispatch(uow, dispatch_attempt_id, dispatch_target)
             await uow.commit()
+
+
+async def _complete_dispatch(uow: Any, dispatch_attempt_id: UUID | None) -> None:
+    if dispatch_attempt_id is None:
+        return
+    changed = await uow.sample_acquisition_attempts.transition_dispatch(
+        dispatch_attempt_id,
+        expected=SampleAcquisitionDispatchState.SUBMISSION_IN_PROGRESS,
+        target=SampleAcquisitionDispatchState.COMPLETED,
+    )
+    if not changed:
+        raise SampleAcquisitionError("Acquisition dispatch was not in a sendable state.")
+
+
+async def _finish_dispatch(
+    uow: Any,
+    dispatch_attempt_id: UUID,
+    target: SampleAcquisitionDispatchState,
+) -> None:
+    for expected in (
+        SampleAcquisitionDispatchState.SUBMISSION_IN_PROGRESS,
+        SampleAcquisitionDispatchState.PREPARED,
+        target,
+    ):
+        if await uow.sample_acquisition_attempts.transition_dispatch(
+            dispatch_attempt_id, expected=expected, target=target
+        ):
+            return
 
 
 _CACHEABLE_FAILURE_KINDS = frozenset(

@@ -1,5 +1,5 @@
 from collections.abc import Collection, Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID
 
@@ -43,6 +43,8 @@ from cti_app.domain.production import (
     ProductionStage,
     ProductionSubmissionReconciliation,
     SampleAcquisitionAttempt,
+    SampleAcquisitionDispatchAttempt,
+    SampleAcquisitionDispatchState,
     SampleAcquisitionOutcome,
     SampleAcquisitionReason,
     SourceExtraction,
@@ -73,6 +75,7 @@ from cti_app.infrastructure.database.models.production import (
     ProductionReuseInvalidationRow,
     ProductionRunRow,
     SampleAcquisitionAttemptRow,
+    SampleAcquisitionDispatchAttemptRow,
     SourceExtractionRow,
 )
 
@@ -222,10 +225,97 @@ class SqlAlchemySampleAcquisitionAttemptRepository:
                 outcome=attempt.outcome.value,
                 sample_id=attempt.sample_id,
                 error_code=attempt.error_code,
+                dispatch_attempt_id=attempt.dispatch_attempt_id,
                 occurred_at=attempt.occurred_at,
             )
         )
         await self._session.flush()
+
+    async def get_dispatch(
+        self, investigation_id: UUID, operation_key: str
+    ) -> SampleAcquisitionDispatchAttempt | None:
+        row = await self._session.scalar(
+            select(SampleAcquisitionDispatchAttemptRow).where(
+                SampleAcquisitionDispatchAttemptRow.investigation_id == investigation_id,
+                SampleAcquisitionDispatchAttemptRow.operation_key == operation_key,
+            )
+        )
+        return _sample_acquisition_dispatch_from_row(row) if row is not None else None
+
+    async def prepare_dispatch(
+        self, attempt: SampleAcquisitionDispatchAttempt
+    ) -> tuple[SampleAcquisitionDispatchAttempt, bool]:
+        statement = (
+            insert(SampleAcquisitionDispatchAttemptRow)
+            .values(
+                id=attempt.id,
+                investigation_id=attempt.investigation_id,
+                association_id=attempt.association_id,
+                invocation_id=attempt.invocation_id,
+                operation_key=attempt.operation_key,
+                requested_hash=attempt.requested_hash,
+                hash_family=attempt.hash_family,
+                reason=attempt.reason.value,
+                state=attempt.state.value,
+                version=attempt.version,
+                created_at=attempt.created_at,
+                updated_at=attempt.updated_at,
+            )
+            .on_conflict_do_nothing(
+                index_elements=[
+                    SampleAcquisitionDispatchAttemptRow.investigation_id,
+                    SampleAcquisitionDispatchAttemptRow.operation_key,
+                ]
+            )
+            .returning(SampleAcquisitionDispatchAttemptRow.id)
+        )
+        inserted_id = (await self._session.execute(statement)).scalar_one_or_none()
+        if inserted_id is not None:
+            return attempt, True
+        row = await self._session.scalar(
+            select(SampleAcquisitionDispatchAttemptRow)
+            .where(
+                SampleAcquisitionDispatchAttemptRow.investigation_id == attempt.investigation_id,
+                SampleAcquisitionDispatchAttemptRow.operation_key == attempt.operation_key,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if row is None:
+            raise RuntimeError("dispatch identity conflict row was not visible")
+        existing = _sample_acquisition_dispatch_from_row(row)
+        if (
+            existing.association_id != attempt.association_id
+            or existing.invocation_id != attempt.invocation_id
+            or existing.requested_hash != attempt.requested_hash
+            or existing.hash_family != attempt.hash_family
+            or existing.reason != attempt.reason
+        ):
+            raise ValueError("operation key is already bound to another acquisition")
+        return existing, False
+
+    async def transition_dispatch(
+        self,
+        dispatch_attempt_id: UUID,
+        *,
+        expected: SampleAcquisitionDispatchState,
+        target: SampleAcquisitionDispatchState,
+    ) -> bool:
+        row = await self._session.scalar(
+            select(SampleAcquisitionDispatchAttemptRow)
+            .where(SampleAcquisitionDispatchAttemptRow.id == dispatch_attempt_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if row is None or row.state != expected.value:
+            if row is not None and row.state == target.value:
+                return True
+            return False
+        row.state = target.value
+        row.version += 1
+        row.updated_at = datetime.now(UTC)
+        await self._session.flush()
+        return True
 
 
 def _sample_acquisition_attempt_from_row(
@@ -240,7 +330,27 @@ def _sample_acquisition_attempt_from_row(
         outcome=SampleAcquisitionOutcome(row.outcome),
         sample_id=row.sample_id,
         error_code=row.error_code,
+        dispatch_attempt_id=row.dispatch_attempt_id,
         occurred_at=row.occurred_at,
+    )
+
+
+def _sample_acquisition_dispatch_from_row(
+    row: SampleAcquisitionDispatchAttemptRow,
+) -> SampleAcquisitionDispatchAttempt:
+    return SampleAcquisitionDispatchAttempt(
+        id=row.id,
+        investigation_id=row.investigation_id,
+        association_id=row.association_id,
+        invocation_id=row.invocation_id,
+        operation_key=row.operation_key,
+        requested_hash=row.requested_hash,
+        hash_family=row.hash_family,
+        reason=SampleAcquisitionReason(row.reason),
+        state=SampleAcquisitionDispatchState(row.state),
+        version=row.version,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
     )
 
 

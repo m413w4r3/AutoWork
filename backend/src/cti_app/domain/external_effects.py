@@ -221,6 +221,7 @@ class ExternalEffectAuthority:
     bridge_turn_id: UUID | None = None
     model_run_id: UUID | None = None
     acquisition_attempt_id: UUID | None = None
+    acquisition_dispatch_attempt_id: UUID | None = None
     retrohunt_reservation_id: UUID | None = None
     authority_kind: ExternalEffectAuthorityKind = ExternalEffectAuthorityKind.HUMAN_G2
     policy_event_id: UUID | None = None
@@ -235,6 +236,7 @@ class ExternalEffectAuthority:
             "bridge_turn_id",
             "model_run_id",
             "acquisition_attempt_id",
+            "acquisition_dispatch_attempt_id",
             "retrohunt_reservation_id",
             "policy_event_id",
             "pinned_subject_id",
@@ -265,6 +267,13 @@ class ExternalEffectAuthority:
                 )
         elif any(value is not None for value in (self.policy_event_id, self.policy_version)):
             raise ExternalEffectValidationError("policy bindings require OSINT_POLICY authority")
+        if (
+            self.acquisition_attempt_id is not None
+            and self.acquisition_dispatch_attempt_id is not None
+        ):
+            raise ExternalEffectValidationError(
+                "terminal and pre-send acquisition identities are mutually exclusive"
+            )
         copied: dict[str, int] = {}
         if not isinstance(self.reservation_amounts, Mapping):
             raise ExternalEffectValidationError("reservation_amounts must be a mapping")

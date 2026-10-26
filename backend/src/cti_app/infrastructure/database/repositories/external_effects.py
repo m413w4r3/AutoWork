@@ -47,8 +47,10 @@ from cti_app.domain.external_effects import (
     effect_key as compute_effect_key,
 )
 from cti_app.domain.investigation import BudgetReservationStatus
+from cti_app.domain.production import SampleAcquisitionDispatchState
 from cti_app.infrastructure.database.models.core import BlobRow, SampleRow, SourceDocumentRow
 from cti_app.infrastructure.database.models.external_effects import (
+    ExternalEffectAcquisitionDispatchRow,
     ExternalEffectClaimRow,
     ExternalEffectUseRow,
 )
@@ -69,6 +71,7 @@ from cti_app.infrastructure.database.models.model_execution import (
 from cti_app.infrastructure.database.models.production import (
     AnalystInvestigationRow,
     SampleAcquisitionAttemptRow,
+    SampleAcquisitionDispatchAttemptRow,
 )
 from cti_app.infrastructure.database.models.retrohunt import RetrohuntReservationRow
 from cti_app.infrastructure.database.repositories.investigation import (
@@ -424,6 +427,16 @@ class SqlAlchemyExternalEffectClaimStore:
                             await self._lock_and_consume_family_attempt(
                                 session, authority, prepared, investigation, family_binding
                             )
+                            if authority.acquisition_dispatch_attempt_id is not None:
+                                session.add(
+                                    ExternalEffectAcquisitionDispatchRow(
+                                        claim_id=row_id,
+                                        dispatch_attempt_id=(
+                                            authority.acquisition_dispatch_attempt_id
+                                        ),
+                                    )
+                                )
+                                await session.flush()
                             await self._check_source_restrictions(
                                 session,
                                 authority,
@@ -631,6 +644,7 @@ class SqlAlchemyExternalEffectClaimStore:
                 )
                 if changed_id is None:
                     return False
+                await self._set_dispatch_needs_review(session, claim_id, now)
                 if row.invocation_id is not None:
                     await session.execute(
                         update(ToolInvocationRow)
@@ -704,6 +718,7 @@ class SqlAlchemyExternalEffectClaimStore:
             return None
         if (
             authority.acquisition_attempt_id is not None
+            or authority.acquisition_dispatch_attempt_id is not None
             or authority.retrohunt_reservation_id is not None
         ):
             return None
@@ -1092,6 +1107,7 @@ class SqlAlchemyExternalEffectClaimStore:
                 (
                     authority.bridge_turn_id,
                     authority.acquisition_attempt_id,
+                    authority.acquisition_dispatch_attempt_id,
                     authority.retrohunt_reservation_id,
                 )
             ):
@@ -1204,10 +1220,13 @@ class SqlAlchemyExternalEffectClaimStore:
         requires_model_lineage = _requires_model_lineage(prepared.family, family_binding)
         if (
             authority.acquisition_attempt_id is not None
-            and authority.retrohunt_reservation_id is not None
-        ):
+            or authority.acquisition_dispatch_attempt_id is not None
+        ) and authority.retrohunt_reservation_id is not None:
             raise _ConsumeDenied("multiple_family_attempts")
-        if authority.acquisition_attempt_id is not None and not is_acquisition:
+        if (
+            authority.acquisition_attempt_id is not None
+            or authority.acquisition_dispatch_attempt_id is not None
+        ) and not is_acquisition:
             raise _ConsumeDenied("acquisition_attempt_on_unrelated_family")
         if authority.retrohunt_reservation_id is not None and not is_retrohunt:
             raise _ConsumeDenied("retrohunt_attempt_on_unrelated_family")
@@ -1231,9 +1250,51 @@ class SqlAlchemyExternalEffectClaimStore:
             # Existing ledger rows are terminal outcomes written after a pull;
             # they cannot authorize a new pre-send request.
             raise _ConsumeDenied("acquisition_dispatch_attempt_required")
-        if is_acquisition:
-            raise _ConsumeDenied("acquisition_dispatch_attempt_required")
-        if authority.acquisition_attempt_id is not None:
+        if authority.acquisition_dispatch_attempt_id is not None:
+            dispatch = await session.scalar(
+                select(SampleAcquisitionDispatchAttemptRow)
+                .where(
+                    SampleAcquisitionDispatchAttemptRow.id
+                    == authority.acquisition_dispatch_attempt_id
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            expected_hashes = {
+                reference.id
+                for reference in prepared.evidence_refs
+                if reference.kind == "sample_hash"
+            }
+            association = (
+                await session.scalar(
+                    select(SampleAssociationRow)
+                    .where(SampleAssociationRow.id == dispatch.association_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+                if dispatch is not None
+                else None
+            )
+            if (
+                dispatch is None
+                or association is None
+                or association.investigation_id != dispatch.investigation_id
+                or association.sample_sha256 != dispatch.requested_hash
+                or dispatch.investigation_id != authority.investigation_id
+                or dispatch.invocation_id != authority.invocation_id
+                or dispatch.operation_key != authority.operation_key
+                or dispatch.requested_hash not in expected_hashes
+            ):
+                raise _ConsumeDenied("acquisition_dispatch_mismatch")
+            if dispatch.state not in {
+                SampleAcquisitionDispatchState.PREPARED.value,
+                SampleAcquisitionDispatchState.SUBMISSION_IN_PROGRESS.value,
+            }:
+                raise _ConsumeDenied("acquisition_dispatch_not_sendable")
+            dispatch.state = SampleAcquisitionDispatchState.SUBMISSION_IN_PROGRESS.value
+            dispatch.version += 1
+            dispatch.updated_at = datetime.now(UTC)
+        elif is_acquisition:
             raise _ConsumeDenied("acquisition_dispatch_attempt_required")
 
         if is_retrohunt and authority.retrohunt_reservation_id is None:
@@ -1628,6 +1689,19 @@ class SqlAlchemyExternalEffectClaimStore:
             .with_for_update()
             .execution_options(populate_existing=True)
         )
+        dispatch_link = await session.scalar(
+            select(ExternalEffectAcquisitionDispatchRow)
+            .where(ExternalEffectAcquisitionDispatchRow.claim_id == row.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if dispatch_link is not None:
+            await session.scalar(
+                select(SampleAcquisitionDispatchAttemptRow)
+                .where(SampleAcquisitionDispatchAttemptRow.id == dispatch_link.dispatch_attempt_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
         if row.retrohunt_reservation_id is not None:
             await session.scalar(
                 select(RetrohuntReservationRow)
@@ -1656,6 +1730,26 @@ class SqlAlchemyExternalEffectClaimStore:
                 .with_for_update()
                 .execution_options(populate_existing=True)
             )
+
+    async def _set_dispatch_needs_review(
+        self, session: AsyncSession, claim_id: UUID, now: datetime
+    ) -> None:
+        link = await session.get(ExternalEffectAcquisitionDispatchRow, claim_id)
+        if link is None:
+            return
+        await session.execute(
+            update(SampleAcquisitionDispatchAttemptRow)
+            .where(
+                SampleAcquisitionDispatchAttemptRow.id == link.dispatch_attempt_id,
+                SampleAcquisitionDispatchAttemptRow.state
+                == SampleAcquisitionDispatchState.SUBMISSION_IN_PROGRESS.value,
+            )
+            .values(
+                state=SampleAcquisitionDispatchState.NEEDS_REVIEW.value,
+                version=SampleAcquisitionDispatchAttemptRow.version + 1,
+                updated_at=now,
+            )
+        )
 
 
 def _claim_to_domain(row: ExternalEffectClaimRow) -> ExternalEffectClaim:

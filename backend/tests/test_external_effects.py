@@ -1829,3 +1829,150 @@ def test_migration_preflight_rejects_default_and_complete_index_drift(
     with pytest.raises(RuntimeError, match="drift"):
         migration._preflight(bind)
     assert bind.ddl_calls == 0
+
+
+@pytest.mark.parametrize("drift", [None, "missing_dispatch_check", "partial_schema"])
+def test_acquisition_dispatch_migration_preflight_checks_complete_shape(
+    monkeypatch: pytest.MonkeyPatch, drift: str | None
+) -> None:
+    migration = importlib.import_module("migrations.versions.0005_sample_acquisition_dispatch")
+    tables = (
+        migration.SampleAcquisitionDispatchAttemptRow.__table__,
+        migration.ExternalEffectAcquisitionDispatchRow.__table__,
+    )
+    terminal = importlib.import_module(
+        "cti_app.infrastructure.database.models.production"
+    ).SampleAcquisitionAttemptRow.__table__
+
+    class _Inspector:
+        def get_table_names(self):
+            if drift == "partial_schema":
+                return [tables[0].name, terminal.name]
+            return [table.name for table in (*tables, terminal)]
+
+        def _table(self, name: str):
+            return next(table for table in (*tables, terminal) if table.name == name)
+
+        def get_columns(self, name: str):
+            return [
+                {
+                    "name": column.name,
+                    "type": column.type.compile(dialect=postgresql.dialect()),
+                    "nullable": column.nullable,
+                    "default": (
+                        str(column.server_default.arg)
+                        if column.server_default is not None
+                        else None
+                    ),
+                }
+                for column in self._table(name).columns
+            ]
+
+        def get_pk_constraint(self, name: str):
+            constraint = next(
+                item
+                for item in self._table(name).constraints
+                if item.__class__.__name__ == "PrimaryKeyConstraint"
+            )
+            return {
+                "name": constraint.name,
+                "constrained_columns": [column.name for column in constraint.columns],
+            }
+
+        def get_unique_constraints(self, name: str):
+            return [
+                {"name": item.name, "column_names": [column.name for column in item.columns]}
+                for item in self._table(name).constraints
+                if item.__class__.__name__ == "UniqueConstraint"
+            ]
+
+        def get_check_constraints(self, name: str):
+            checks = [
+                {"name": item.name, "sqltext": str(item.sqltext)}
+                for item in self._table(name).constraints
+                if item.__class__.__name__ == "CheckConstraint"
+            ]
+            if drift == "missing_dispatch_check" and name == tables[0].name:
+                return checks[:-1]
+            return checks
+
+        def get_foreign_keys(self, name: str):
+            result = []
+            for item in self._table(name).constraints:
+                if item.__class__.__name__ != "ForeignKeyConstraint":
+                    continue
+                elements = tuple(item.elements)
+                result.append(
+                    {
+                        "name": item.name,
+                        "constrained_columns": [column.name for column in item.columns],
+                        "referred_table": elements[0].column.table.name,
+                        "referred_columns": [element.column.name for element in elements],
+                        "options": {"ondelete": item.ondelete},
+                    }
+                )
+            return result
+
+        def get_indexes(self, name: str):
+            rows = []
+            for item in self._table(name).indexes:
+                row = {
+                    "name": item.name,
+                    "column_names": [column.name for column in item.columns],
+                    "unique": item.unique,
+                    "duplicates_constraint": None,
+                }
+                if item.name == migration._INDEX:
+                    row["dialect_options"] = {
+                        "postgresql_where": str(item.dialect_options["postgresql"]["where"])
+                    }
+                rows.append(row)
+            return rows
+
+    inspector = _Inspector()
+    monkeypatch.setattr(migration, "inspect", lambda _bind: inspector)
+    if drift is None:
+        assert migration._preflight(object()) is True
+    elif drift == "partial_schema":
+        with pytest.raises(RuntimeError, match="partial schema"):
+            migration._preflight(object())
+    else:
+        with pytest.raises(RuntimeError, match="constraints"):
+            migration._preflight(object())
+
+
+def test_acquisition_dispatch_migration_refuses_to_drop_persisted_lineage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    migration = importlib.import_module("migrations.versions.0005_sample_acquisition_dispatch")
+
+    class _Result:
+        def scalar_one(self) -> bool:
+            return True
+
+    class _Bind:
+        statements: list[str]
+
+        def __init__(self) -> None:
+            self.statements = []
+
+        def execute(self, statement: Any) -> _Result:
+            self.statements.append(str(statement))
+            return _Result()
+
+    class _Operations:
+        def __init__(self) -> None:
+            self.bind = _Bind()
+
+        def get_bind(self) -> _Bind:
+            return self.bind
+
+    operations = _Operations()
+    monkeypatch.setattr(migration, "op", operations)
+
+    with pytest.raises(RuntimeError, match="refusing to drop sample acquisition dispatch lineage"):
+        migration.downgrade()
+
+    assert operations.bind.statements[0].startswith("LOCK TABLE")
+    assert "effect_acquisition_dispatch_links" in operations.bind.statements[0]
+    assert "SELECT EXISTS" in operations.bind.statements[1]

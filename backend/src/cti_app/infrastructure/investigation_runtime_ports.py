@@ -216,7 +216,11 @@ def build_investigation_runtime_ports(
                 policy_guard=SqlAlchemyVirusTotalPolicyGuard(),
                 family_bindings=virustotal_external_effect_family_bindings(),
             ),
-            reuse_policies={family: reuse_policy for family in VT_EXTERNAL_EFFECT_FAMILIES},
+            reuse_policies={
+                family: reuse_policy
+                for family in VT_EXTERNAL_EFFECT_FAMILIES
+                if family != "vt.download_sample"
+            },
         )
         configure_vt_effects(coordinator, vt_observations)
 
