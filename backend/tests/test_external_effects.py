@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import importlib
+import pickle
 import time
 from collections.abc import Mapping
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy.dialects import postgresql
 
+from cti_app.application import external_effects as external_effects_module
 from cti_app.application.external_effects import (
     Ambiguous,
     Completed,
@@ -427,6 +429,90 @@ async def test_committed_consume_mints_one_permit_and_calls_transport_once() -> 
     assert not hasattr(transport, "prepare_submission")
 
 
+@pytest.mark.asyncio
+async def test_forged_exact_type_capability_is_refused_without_sending() -> None:
+    transport = FakeTransport()
+    forged = object.__new__(PhysicalSendCapability)
+
+    with pytest.raises(AttributeError):
+        object.__setattr__(forged, "_PhysicalSendCapability__execute", lambda _request: None)
+    with pytest.raises(AttributeError):
+        object.__setattr__(forged, "unexpected", object())
+    with pytest.raises(HandoffGateRefused, match="not registered"):
+        await transport.submit_once(_wire(), forged)
+
+    assert transport.submit_entries == 1
+    assert transport.physical_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_capability_copies_are_unregistered_and_surfaces_hide_registry() -> None:
+    class _CopyProbeTransport(FakeTransport):
+        capability: PhysicalSendCapability | None = None
+        copies: tuple[PhysicalSendCapability, ...] = ()
+
+        async def submit_once(
+            self,
+            request: FrozenWireRequest,
+            capability: PhysicalSendCapability | None = None,
+        ) -> TransportResponse:
+            assert isinstance(capability, PhysicalSendCapability)
+            self.capability = capability
+            self.copies = (copy.copy(capability), copy.deepcopy(capability))
+            for copied_capability in self.copies:
+                with pytest.raises(HandoffGateRefused, match="not registered"):
+                    copied_capability(request)
+            with pytest.raises(TypeError):
+                pickle.dumps(capability)
+            return await super().submit_once(request, capability)
+
+    store = FakeStore()
+    coordinator = _coordinator(store)
+    transport = _CopyProbeTransport()
+    outcome = await coordinator.send_one(_authority(), _prepared(), transport)
+
+    assert isinstance(outcome, Completed)
+    assert transport.capability is not None
+    assert transport.physical_calls == 1
+    with pytest.raises(HandoffGateRefused, match="not registered"):
+        transport.capability(_wire())
+    for copied_capability in transport.copies:
+        with pytest.raises(HandoffGateRefused, match="not registered"):
+            copied_capability(_wire())
+
+    shallow_surfaces = (
+        transport.capability,
+        transport,
+        coordinator,
+        external_effects_module,
+    )
+    hidden_names = {
+        "authorizers",
+        "authorizer",
+        "validator",
+        "validators",
+        "capability_issuer",
+        "capability_revoker",
+        "capability_validator",
+        "capability_registry",
+        "_issue_physical_send_capability",
+        "_revoke_physical_send_capability",
+        "_install_physical_send_capability_dispatch",
+        "_bind_capability_init",
+        "physical_send_capability",
+    }
+    for surface in shallow_surfaces:
+        names = set(dir(surface))
+        try:
+            names.update(vars(surface))
+        except TypeError:
+            # Slotted capabilities have no instance dictionary.
+            assert surface is transport.capability
+        assert not names.intersection(hidden_names)
+        assert not any("capability_registry" in name.lower() for name in names)
+        assert not any("validator" in name.lower() for name in names)
+
+
 @pytest.mark.parametrize("submit_behavior", ("return_unused", "return_after_refusal", "raise"))
 @pytest.mark.asyncio
 async def test_saved_capability_is_revoked_when_submit_once_exits(
@@ -470,7 +556,7 @@ async def test_saved_capability_is_revoked_when_submit_once_exits(
     assert isinstance(outcome, Ambiguous)
     assert store.claim_state is EffectClaimState.NEEDS_REVIEW
     assert transport.submit_entries == 1
-    with pytest.raises(HandoffGateRefused, match="no longer active"):
+    with pytest.raises(HandoffGateRefused, match="not registered"):
         transport.send_with_saved_capability()
     assert transport.physical_calls == 0
 

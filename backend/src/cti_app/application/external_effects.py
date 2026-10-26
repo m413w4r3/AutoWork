@@ -17,7 +17,7 @@ import threading
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Protocol, SupportsIndex
 from uuid import UUID, uuid4
 
 from cti_app.domain.external_effects import (
@@ -249,20 +249,102 @@ class PermitAwareTransport(Protocol):
         """
 
 
-class PhysicalSendCapability:
-    """One-use authorization for one exact physical request."""
+class HandoffGateRefused(RuntimeError):
+    """The one-use gate could not authorize physical handoff."""
 
-    __slots__ = ("__execute",)
+
+class PhysicalSendCapability:
+    """Opaque token for one coordinator-registered physical send authorization."""
+
+    __slots__ = ()
 
     def __init__(self) -> None:
         raise TypeError("physical send capabilities are coordinator-issued")
 
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        raise TypeError("physical send capabilities cannot be subclassed")
+
     def __call__(self, request: FrozenWireRequest) -> None:
-        try:
-            execute = object.__getattribute__(self, "_PhysicalSendCapability__execute")
-        except AttributeError as exc:
-            raise HandoffGateRefused("physical send capability is invalid") from exc
-        execute(self, request)
+        raise HandoffGateRefused("physical send capability is not registered")
+
+    def __copy__(self) -> PhysicalSendCapability:
+        return object.__new__(type(self))
+
+    def __deepcopy__(self, _memo: dict[int, Any]) -> PhysicalSendCapability:
+        return object.__new__(type(self))
+
+    def __reduce_ex__(self, _protocol: SupportsIndex) -> str | tuple[Any, ...]:
+        raise TypeError("physical send capabilities cannot be serialized")
+
+
+def _install_physical_send_capability_dispatch() -> tuple[
+    Callable[[Callable[[FrozenWireRequest], None]], PhysicalSendCapability],
+    Callable[[PhysicalSendCapability], None],
+]:
+    registry_lock = threading.Lock()
+    authorizers: dict[PhysicalSendCapability, Callable[[FrozenWireRequest], None]] = {}
+
+    def dispatch(capability: PhysicalSendCapability, request: FrozenWireRequest) -> None:
+        with registry_lock:
+            authorize = authorizers.get(capability)
+        if authorize is None:
+            raise HandoffGateRefused("physical send capability is not registered")
+        authorize(request)
+
+    def issue(
+        authorize: Callable[[FrozenWireRequest], None],
+    ) -> PhysicalSendCapability:
+        capability = object.__new__(PhysicalSendCapability)
+        with registry_lock:
+            authorizers[capability] = authorize
+        return capability
+
+    def revoke(capability: PhysicalSendCapability) -> None:
+        with registry_lock:
+            authorizers.pop(capability, None)
+
+    type.__setattr__(PhysicalSendCapability, "__call__", dispatch)
+    return issue, revoke
+
+
+_issue_physical_send_capability, _revoke_physical_send_capability = (
+    _install_physical_send_capability_dispatch()
+)
+del _install_physical_send_capability_dispatch
+
+
+def _make_capability_init_binder(
+    issue: Callable[[Callable[[FrozenWireRequest], None]], PhysicalSendCapability],
+    revoke: Callable[[PhysicalSendCapability], None],
+) -> Callable[[Callable[..., None]], Callable[..., None]]:
+    def bind(initializer: Callable[..., None]) -> Callable[..., None]:
+        def wrapped(
+            self: Any,
+            claim_store: ExternalEffectClaimStore,
+            *,
+            reuse_policies: Mapping[str, ExternalEffectReusePolicy] | None = None,
+            permit_ttl_seconds: float = 5.0,
+        ) -> None:
+            initializer(
+                self,
+                claim_store,
+                reuse_policies=reuse_policies,
+                permit_ttl_seconds=permit_ttl_seconds,
+                capability_issuer=issue,
+                capability_revoker=revoke,
+            )
+
+        return wrapped
+
+    return bind
+
+
+_bind_capability_init = _make_capability_init_binder(
+    _issue_physical_send_capability, _revoke_physical_send_capability
+)
+del _make_capability_init_binder
+del _issue_physical_send_capability
+del _revoke_physical_send_capability
 
 
 @dataclass(frozen=True, slots=True)
@@ -291,10 +373,6 @@ class Refused:
 class DefinitelyNotSubmitted:
     claim_id: UUID
     state: EffectClaimState = EffectClaimState.DEFINITIVELY_NOT_SUBMITTED
-
-
-class HandoffGateRefused(RuntimeError):
-    """The one-use gate could not authorize physical handoff."""
 
 
 class _PreHandoffGateRefused(HandoffGateRefused):
@@ -404,12 +482,15 @@ class _PermitRegistry:
 
 
 class ExternalEffectCoordinator:
+    @_bind_capability_init
     def __init__(
         self,
         claim_store: ExternalEffectClaimStore,
         *,
         reuse_policies: Mapping[str, ExternalEffectReusePolicy] | None = None,
         permit_ttl_seconds: float = 5.0,
+        capability_issuer: Callable[[Callable[[FrozenWireRequest], None]], PhysicalSendCapability],
+        capability_revoker: Callable[[PhysicalSendCapability], None],
     ) -> None:
         self._claim_store = claim_store
         self._reuse_policies = dict(reuse_policies or {})
@@ -485,16 +566,12 @@ class ExternalEffectCoordinator:
             capability_used = False
             capability_active = True
             capability_lock = threading.Lock()
-            capability_holder: dict[str, PhysicalSendCapability] = {}
 
             def physical_send_capability(
-                caller: PhysicalSendCapability,
                 sent_request: FrozenWireRequest,
             ) -> None:
                 nonlocal capability_attempted, capability_used
                 with capability_lock:
-                    if capability_holder.get("capability") is not caller:
-                        raise HandoffGateRefused("physical send capability is invalid")
                     if not capability_active:
                         raise HandoffGateRefused("physical send capability is no longer active")
                     if capability_attempted:
@@ -518,11 +595,7 @@ class ExternalEffectCoordinator:
                         raise HandoffGateRefused("physical send capability expired or invalid")
                     capability_used = True
 
-            capability = object.__new__(PhysicalSendCapability)
-            capability_holder["capability"] = capability
-            object.__setattr__(
-                capability, "_PhysicalSendCapability__execute", physical_send_capability
-            )
+            capability = capability_issuer(physical_send_capability)
             capability_was_used = False
             try:
                 response = await transport.submit_once(request, capability)
@@ -530,6 +603,7 @@ class ExternalEffectCoordinator:
                 with capability_lock:
                     capability_active = False
                     capability_was_used = capability_used
+                capability_revoker(capability)
             if not capability_was_used:
                 # The durable handoff marker is already present and the transport
                 # ran, so reject its response without claiming zero egress.
@@ -735,6 +809,11 @@ class ExternalEffectCoordinator:
             # The durable CONSUMED row remains a no-resend barrier if sealing
             # itself is unavailable.
             return
+
+
+# Drop the temporary binder after the coordinator constructor closes over the
+# private registry functions.
+del _bind_capability_init
 
 
 __all__ = [
