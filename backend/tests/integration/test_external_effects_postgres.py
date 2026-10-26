@@ -1215,6 +1215,30 @@ async def test_osint_open_inherited_advisor_bridge_claim_and_revocation_gate(
     second_invocation_id = uuid4()
     second_operation_key = f"advisor-osint-second:{uuid4()}"
     assert seeded.seed_observation is not None
+    source_document_id = uuid4()
+    async with session_factory() as session:
+        async with session.begin():
+            session.add(
+                SourceDocumentRow(
+                    id=source_document_id,
+                    subject_id=seeded.subject.id,
+                    blob_id=seeded.seed_observation.blob_id,
+                    original_name="synthetic-advisor-source.txt",
+                    origin="test",
+                    acquired_at=now,
+                    license_restriction=None,
+                    tlp="CLEAR",
+                    do_not_submit=False,
+                    external_llm_allowed=True,
+                    created_at=now,
+                )
+            )
+            observation = await session.get(
+                EvidenceObservationRow, seeded.seed_observation.id
+            )
+            assert observation is not None
+            observation.object_type = "source_document"
+            observation.object_id = str(source_document_id)
     evidence_refs = (
         EvidenceReference(
             kind="evidence_observation",
