@@ -24,8 +24,8 @@ from cti_app.application.external_effects import (
     ExternalEffectClaim,
     ExternalEffectPolicyGuard,
     ReuseDecision,
-    _consume_no_handoff_proof,
     _CoordinatorNoHandoffProof,
+    _NoHandoffProofVerifier,
 )
 from cti_app.domain.external_effects import (
     EffectClaimState,
@@ -175,10 +175,16 @@ class SqlAlchemyExternalEffectClaimStore:
         *,
         policy_guard: ExternalEffectPolicyGuard | None = None,
         family_bindings: Mapping[str, ExternalEffectFamilyBinding] | None = None,
+        no_handoff_proof_verifier: _NoHandoffProofVerifier | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._policy_guard = policy_guard
         self._family_bindings = dict(family_bindings or {})
+        self._no_handoff_proof_verifier = no_handoff_proof_verifier
+
+    def _consume_no_handoff_proof(self, proof: _CoordinatorNoHandoffProof, claim_id: UUID) -> bool:
+        verifier = self._no_handoff_proof_verifier
+        return verifier is not None and verifier.consume(proof, claim_id)
 
     async def consume(
         self,
@@ -462,7 +468,7 @@ class SqlAlchemyExternalEffectClaimStore:
         proof: _CoordinatorNoHandoffProof,
         reason_code: str,
     ) -> bool:
-        if not _consume_no_handoff_proof(proof, claim_id):
+        if not self._consume_no_handoff_proof(proof, claim_id):
             return False
         reason = _safe_code(reason_code)
         async with self._session_factory() as session:

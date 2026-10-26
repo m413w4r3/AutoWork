@@ -6,7 +6,12 @@ from alembic.config import Config
 from alembic.script import ScriptDirectory
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_CHAIN = ("0001_baseline", "0002_c2_experiments", "0003_osint_open_policy")
+EXPECTED_CHAIN = (
+    "0001_baseline",
+    "0002_c2_experiments",
+    "0003_osint_open_policy",
+    "0004_external_effect_claims",
+)
 
 
 def test_alembic_chain_has_one_short_head_and_exact_revisions() -> None:
@@ -15,7 +20,7 @@ def test_alembic_chain_has_one_short_head_and_exact_revisions() -> None:
     revisions = list(scripts.walk_revisions())
     revision_ids = [script.revision for script in revisions]
 
-    assert scripts.get_heads() == ["0003_osint_open_policy"]
+    assert scripts.get_heads() == ["0004_external_effect_claims"]
     assert all(revision_id for revision_id in revision_ids)
     assert all(len(revision_id) <= 32 for revision_id in revision_ids)
     assert len(revision_ids) == len(set(revision_ids)), "duplicate Alembic revision IDs"
@@ -24,4 +29,5 @@ def test_alembic_chain_has_one_short_head_and_exact_revisions() -> None:
         "0001_baseline": None,
         "0002_c2_experiments": "0001_baseline",
         "0003_osint_open_policy": "0002_c2_experiments",
+        "0004_external_effect_claims": "0003_osint_open_policy",
     }

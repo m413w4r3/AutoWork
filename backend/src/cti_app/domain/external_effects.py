@@ -486,18 +486,42 @@ def _validate_safe_reference(value: str, label: str, *, allow_non_reference: boo
         sensitive_parameter_names = {
             "access_token",
             "access_key",
+            "access_key_id",
             "apikey",
             "auth",
             "authorization",
+            "bearer",
+            "bearer_token",
             "client_secret",
+            "client_assertion",
             "credential",
+            "credentials",
+            "id_token",
+            "jwt",
+            "jwt_token",
             "key",
             "password",
             "passwd",
+            "refresh_token",
             "secret",
+            "session",
+            "session_id",
+            "session_token",
             "sig",
             "signature",
             "token",
+            "oauth_token",
+            "oauth_signature",
+            "private_key",
+            "private_key_id",
+            "client_key",
+            "client_secret_key",
+            "secret_key",
+            "api_secret",
+            "consumer_key",
+            "consumer_secret",
+            "code_verifier",
+            "passphrase",
             "x_amz_credential",
             "x_amz_security_token",
             "x_api_key",
@@ -508,7 +532,12 @@ def _validate_safe_reference(value: str, label: str, *, allow_non_reference: boo
         for component in (parsed.query, parsed.fragment):
             for name, _ in parse_qsl(component, keep_blank_values=True):
                 normalized_name = re.sub(r"[^a-z0-9]", "", unquote_plus(name).casefold())
-                if normalized_name in normalized_sensitive or normalized_name.startswith("xamz"):
+                if (
+                    normalized_name in normalized_sensitive
+                    or "token" in normalized_name
+                    or "secret" in normalized_name
+                    or normalized_name.startswith("xamz")
+                ):
                     raise ExternalEffectValidationError(
                         f"credential-bearing URL is not persistable: {label}"
                     )

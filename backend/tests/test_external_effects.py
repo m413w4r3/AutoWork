@@ -5,13 +5,13 @@ import copy
 import importlib
 import time
 from collections.abc import Mapping
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy.dialects import postgresql
 
 from cti_app.application.external_effects import (
-    _NO_HANDOFF_PROOFS,
     Ambiguous,
     Completed,
     ConsumeCommitted,
@@ -20,13 +20,13 @@ from cti_app.application.external_effects import (
     ExistingClaim,
     ExternalEffectClaim,
     ExternalEffectCoordinator,
+    ExternalEffectReusePolicy,
     HandoffGateRefused,
-    PermitHandoffGate,
     Refused,
     ReuseDecision,
     TransportResponse,
-    _consume_no_handoff_proof,
     _HandoffGate,
+    _NoHandoffProofAuthority,
     _PermitRegistry,
 )
 from cti_app.domain.external_effects import (
@@ -122,7 +122,10 @@ class FakeStore:
         self.claim_state = EffectClaimState.CONSUMED
         self.handoff_nonce: UUID | None = None
         self.gate_entries = 0
+        self.handoff_delay = 0.0
         self._prepared_request: PreparedExternalRequest | None = None
+        self.proof_authority = _NoHandoffProofAuthority()
+        self._proof_verifier = self.proof_authority.verifier
 
     async def consume(
         self,
@@ -178,12 +181,14 @@ class FakeStore:
             return False
         self.handoff_nonce = permit_nonce
         self.gate_entries += 1
+        if self.handoff_delay:
+            await asyncio.sleep(self.handoff_delay)
         return True
 
     async def definitely_not_submitted(
         self, claim_id: UUID, *, proof: object, reason_code: str
     ) -> bool:
-        if not _consume_no_handoff_proof(proof, claim_id):  # type: ignore[arg-type]
+        if not self._proof_verifier.consume(proof, claim_id):  # type: ignore[arg-type]
             return False
         if (
             self.claim_state is not EffectClaimState.CONSUMED
@@ -229,48 +234,39 @@ class FakeTransport:
         events: list[str] | None = None,
         response: object | Exception | None = None,
         *,
-        fail_before_handoff: bool = False,
-        bypass_gate: bool = False,
-        handoff_delay: float = 0,
-        detach_gate: bool = False,
+        fail_during_submission: bool = False,
     ) -> None:
-        self.calls: list[tuple[FrozenWireRequest, ConsumedEffectPermit]] = []
-        self.send_entries = 0
+        self.calls: list[FrozenWireRequest] = []
+        self.submit_entries = 0
         self.events = events
         self.response = response or TransportResponse(result_ref="artifact:result-1")
-        self.fail_before_handoff = fail_before_handoff
-        self.bypass_gate = bypass_gate
-        self.handoff_delay = handoff_delay
-        self.detach_gate = detach_gate
-        self.detached: (
-            tuple[ConsumedEffectPermit, PreparedExternalRequest, PermitHandoffGate] | None
-        ) = None
+        self.fail_during_submission = fail_during_submission
 
-    async def send(
-        self,
-        request: FrozenWireRequest,
-        *,
-        permit: ConsumedEffectPermit,
-        prepared: PreparedExternalRequest,
-        gate: PermitHandoffGate,
-    ) -> TransportResponse:
-        self.send_entries += 1
+    async def submit_once(self, request: FrozenWireRequest) -> TransportResponse:
+        self.submit_entries += 1
         if self.events is not None:
-            assert self.events[-1] == "commit"
+            assert self.events[-1] == "gate"
             self.events.append("send")
-        if self.fail_before_handoff:
+        if self.fail_during_submission:
             raise RuntimeError("local transport setup failed")
-        if self.detach_gate:
-            self.detached = (permit, prepared, gate)
-            return self.response  # type: ignore[return-value]
-        if self.handoff_delay:
-            await asyncio.sleep(self.handoff_delay)
-        if not self.bypass_gate:
-            await gate.enter(permit, prepared)
-        self.calls.append((request, permit))
+        self.calls.append(request)
         if isinstance(self.response, Exception):
             raise self.response
         return self.response  # type: ignore[return-value]
+
+
+def _coordinator(
+    store: Any,
+    *,
+    reuse_policies: Mapping[str, ExternalEffectReusePolicy] | None = None,
+    permit_ttl_seconds: float = 5.0,
+) -> ExternalEffectCoordinator:
+    return ExternalEffectCoordinator(
+        store,
+        no_handoff_proof_authority=store.proof_authority,
+        reuse_policies=reuse_policies,
+        permit_ttl_seconds=permit_ttl_seconds,
+    )
 
 
 class AllowReuse:
@@ -348,7 +344,7 @@ def test_effect_key_binds_investigation_and_provider_scope() -> None:
 async def test_refusal_mints_no_permit_and_never_sends() -> None:
     store = FakeStore(ConsumeRefused("provider_not_allowed"))
     transport = FakeTransport()
-    outcome = await ExternalEffectCoordinator(store).send_one(_authority(), _prepared(), transport)
+    outcome = await _coordinator(store).send_one(_authority(), _prepared(), transport)
     assert isinstance(outcome, Refused)
     assert outcome.reason == "provider_not_allowed"
     assert transport.calls == []
@@ -358,14 +354,15 @@ async def test_refusal_mints_no_permit_and_never_sends() -> None:
 async def test_committed_consume_mints_one_permit_and_calls_transport_once() -> None:
     store = FakeStore()
     transport = FakeTransport(store.events)
-    outcome = await ExternalEffectCoordinator(store).send_one(_authority(), _prepared(), transport)
-    assert isinstance(outcome, Completed)
-    assert store.events == ["commit", "send", "gate", "complete"]
+    outcome = await _coordinator(store).send_one(_authority(), _prepared(), transport)
+    assert isinstance(outcome, Completed), (store.events, store.sealed)
+    assert store.events == ["commit", "gate", "send", "complete"]
     assert len(transport.calls) == 1
     assert store.gate_entries == 1
-    request, permit = transport.calls[0]
+    request = transport.calls[0]
     assert request == _prepared().application_request
-    assert permit.claim_id == store.result.claim_id  # type: ignore[union-attr]
+    assert transport.submit_entries == 1
+    assert not hasattr(transport, "prepare_submission")
 
 
 def test_forged_copied_reused_stale_and_misbound_permits_are_refused() -> None:
@@ -403,7 +400,7 @@ async def test_prepared_byte_mutation_is_refused_before_consume_or_send() -> Non
     transport = FakeTransport()
     prepared = _prepared()
     object.__setattr__(prepared, "application_request", _wire(target=b"/changed"))
-    outcome = await ExternalEffectCoordinator(store).send_one(_authority(), prepared, transport)
+    outcome = await _coordinator(store).send_one(_authority(), prepared, transport)
     assert isinstance(outcome, Refused)
     assert outcome.reason == "invalid_prepared_effect"
     assert store.events == []
@@ -414,7 +411,7 @@ async def test_prepared_byte_mutation_is_refused_before_consume_or_send() -> Non
 async def test_handoff_then_transport_exception_is_ambiguous_and_never_retried() -> None:
     store = FakeStore()
     transport = FakeTransport(response=RuntimeError("remote accepted then client failed"))
-    coordinator = ExternalEffectCoordinator(store)
+    coordinator = _coordinator(store)
     outcome = await coordinator.send_one(_authority(), _prepared(), transport)
     assert isinstance(outcome, Ambiguous)
     assert store.sealed == [("needs_review", "transport_outcome_unknown")]
@@ -422,57 +419,72 @@ async def test_handoff_then_transport_exception_is_ambiguous_and_never_retried()
     replay = await coordinator.send_one(_authority(), _prepared(), transport)
     assert isinstance(replay, Ambiguous)
     assert len(transport.calls) == 1
+    assert store.claim_state is EffectClaimState.NEEDS_REVIEW
 
 
 @pytest.mark.asyncio
-async def test_transport_failure_before_gate_is_ambiguous_and_never_retried() -> None:
+async def test_transport_callback_exception_is_ambiguous_and_never_retried() -> None:
     store = FakeStore()
-    transport = FakeTransport(fail_before_handoff=True)
-    outcome = await ExternalEffectCoordinator(store).send_one(_authority(), _prepared(), transport)
+    transport = FakeTransport(fail_during_submission=True)
+    coordinator = _coordinator(store)
+    outcome = await coordinator.send_one(_authority(), _prepared(), transport)
     assert isinstance(outcome, Ambiguous)
     assert store.sealed == [("needs_review", "transport_outcome_unknown")]
-    assert transport.send_entries == 1
+    assert transport.submit_entries == 1
     assert transport.calls == []
-    replay = await ExternalEffectCoordinator(store).send_one(_authority(), _prepared(), transport)
+    replay = await coordinator.send_one(_authority(), _prepared(), transport)
     assert isinstance(replay, Ambiguous)
-    assert transport.send_entries == 1
+    assert transport.submit_entries == 1
 
 
 @pytest.mark.asyncio
 async def test_expired_permit_is_refused_before_transport_entry() -> None:
     store = FakeStore()
     transport = FakeTransport()
-    coordinator = ExternalEffectCoordinator(store)
+    coordinator = _coordinator(store)
     coordinator._permits._ttl_seconds = -1
     outcome = await coordinator.send_one(_authority(), _prepared(), transport)
     assert isinstance(outcome, DefinitelyNotSubmitted)
-    assert transport.send_entries == 0
+    assert transport.submit_entries == 0
     assert transport.calls == []
 
 
 @pytest.mark.asyncio
 async def test_permit_expiring_while_handoff_is_paused_never_reaches_physical_send() -> None:
+    class SideEffectingPreparationTransport(FakeTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.preparation_calls = 0
+
+        def prepare_submission(self, request: FrozenWireRequest) -> None:
+            self.preparation_calls += 1
+            self.calls.append(request)
+
     store = FakeStore()
-    transport = FakeTransport(handoff_delay=0.15)
-    outcome = await ExternalEffectCoordinator(store, permit_ttl_seconds=0.1).send_one(
+    store.handoff_delay = 0.15
+    transport = SideEffectingPreparationTransport()
+    outcome = await _coordinator(store, permit_ttl_seconds=0.1).send_one(
         _authority(), _prepared(), transport
     )
     assert isinstance(outcome, Ambiguous)
-    assert transport.send_entries == 1
+    assert transport.submit_entries == 0
+    assert transport.preparation_calls == 0
     assert transport.calls == []
-    assert store.gate_entries == 0
-    assert store.handoff_nonce is None
+    assert store.gate_entries == 1
+    assert store.handoff_nonce is not None
     assert store.sealed == [("needs_review", "transport_outcome_unknown")]
 
 
 @pytest.mark.asyncio
-async def test_detached_gate_released_after_definitive_seal_cannot_send() -> None:
+async def test_stale_gate_after_definitive_seal_cannot_submit() -> None:
     store = FakeStore()
-    coordinator = ExternalEffectCoordinator(store)
+    coordinator = _coordinator(store)
     authority, prepared = _authority(), _prepared()
     key = effect_key(authority.investigation_id, prepared)
     claim_id = store.result.claim_id  # type: ignore[union-attr]
+    store._prepared_request = prepared
     permit = coordinator._permits.issue(claim_id, authority, prepared, key)
+    coordinator._proof_authority.arm_claim(claim_id)
     gate = _HandoffGate(
         claim_store=store,
         permit_registry=coordinator._permits,
@@ -483,52 +495,99 @@ async def test_detached_gate_released_after_definitive_seal_cannot_send() -> Non
     )
     sealed = await coordinator._seal_zero_handoff(claim_id, reason_code="pre_handoff_timeout")
     assert isinstance(sealed, DefinitelyNotSubmitted)
-    physical_calls = 0
-
-    async def detached_callback() -> None:
-        nonlocal physical_calls
-        await gate.enter(permit, prepared)
-        physical_calls += 1
-
     with pytest.raises(HandoffGateRefused):
-        await detached_callback()
-    assert physical_calls == 0
+        await gate.submit(permit, prepared, FakeTransport())
     assert store.claim_state is EffectClaimState.DEFINITIVELY_NOT_SUBMITTED
 
 
 @pytest.mark.asyncio
-async def test_physical_send_outside_gate_is_never_classified_not_submitted() -> None:
+async def test_gate_refuses_request_substitution_and_second_submission() -> None:
     store = FakeStore()
-    transport = FakeTransport(bypass_gate=True)
-    outcome = await ExternalEffectCoordinator(store).send_one(_authority(), _prepared(), transport)
+    coordinator = _coordinator(store)
+    authority, prepared = _authority(), _prepared()
+    store._prepared_request = prepared
+    key = effect_key(authority.investigation_id, prepared)
+    claim_id = store.result.claim_id  # type: ignore[union-attr]
+    permit = coordinator._permits.issue(claim_id, authority, prepared, key)
+    wrong_gate = _HandoffGate(
+        claim_store=store,
+        permit_registry=coordinator._permits,
+        permit=permit,
+        authority=authority,
+        prepared=prepared,
+        key=key,
+    )
+    with pytest.raises(HandoffGateRefused, match="prepared request binding mismatch"):
+        await wrong_gate.submit(
+            permit,
+            _prepared(wire=_wire(target=b"/substituted")),
+            FakeTransport(),
+        )
+    assert store.gate_entries == 0
+
+    gate = _HandoffGate(
+        claim_store=store,
+        permit_registry=coordinator._permits,
+        permit=permit,
+        authority=authority,
+        prepared=prepared,
+        key=key,
+    )
+    transport = FakeTransport(response=TransportResponse(result_ref="artifact:one-shot"))
+    response = await gate.submit(permit, prepared, transport)
+    assert response.result_ref == "artifact:one-shot"
+    assert transport.submit_entries == 1
+    assert len(transport.calls) == 1
+    assert transport.calls[0] is prepared.application_request
+    with pytest.raises(HandoffGateRefused, match="already used"):
+        await gate.submit(permit, prepared, transport)
+    assert transport.submit_entries == 1
+
+
+@pytest.mark.asyncio
+async def test_physical_submit_failure_is_never_classified_not_submitted() -> None:
+    store = FakeStore()
+    transport = FakeTransport(response=TimeoutError("response outcome unknown"))
+    outcome = await _coordinator(store).send_one(_authority(), _prepared(), transport)
     assert isinstance(outcome, Ambiguous)
     assert len(transport.calls) == 1
-    assert store.sealed == [("needs_review", "transport_returned_without_handoff")]
+    assert store.sealed == [("needs_review", "transport_outcome_unknown")]
     assert store.claim_state is EffectClaimState.NEEDS_REVIEW
 
 
 def test_no_handoff_proofs_are_opaque_bound_and_one_use() -> None:
     claim_id = uuid4()
     other_claim_id = uuid4()
-    issuer = object()
-    proof = _NO_HANDOFF_PROOFS.issue(claim_id, issuer)
     store = FakeStore(ConsumeCommitted(claim_id))
+    coordinator = _coordinator(store)
+    with pytest.raises(ValueError, match="already bound to a coordinator"):
+        ExternalEffectCoordinator(store, no_handoff_proof_authority=coordinator._proof_authority)
+    coordinator._proof_authority.arm_claim(claim_id)
+    proof = coordinator._proof_authority.issue(claim_id)
+    foreign_authority = _NoHandoffProofAuthority()
+    with pytest.raises(PermissionError):
+        foreign_authority.issue(claim_id)
+    foreign_authority.arm_claim(claim_id)
+    foreign_proof = foreign_authority.issue(claim_id)
+    coordinator._proof_authority.arm_claim(other_claim_id)
+    wrong_claim_proof = coordinator._proof_authority.issue(other_claim_id)
     copied = copy.copy(proof)
     forged = object.__new__(type(proof))
-    wrong_issuer = object.__new__(type(proof))
+    unregistered = object.__new__(type(proof))
     for name, value in {
         "claim_id": claim_id,
         "nonce": proof.nonce,
-        "_issuer": object(),
     }.items():
-        object.__setattr__(wrong_issuer, name, value)
+        object.__setattr__(unregistered, name, value)
 
     async def attempt(target: UUID, token: object) -> bool:
         return await store.definitely_not_submitted(target, proof=token, reason_code="test_no_send")
 
     assert not asyncio.run(attempt(claim_id, forged))
     assert not asyncio.run(attempt(claim_id, copied))
-    assert not asyncio.run(attempt(claim_id, wrong_issuer))
+    assert not asyncio.run(attempt(claim_id, unregistered))
+    assert not asyncio.run(attempt(claim_id, foreign_proof))
+    assert not asyncio.run(attempt(claim_id, wrong_claim_proof))
     assert not asyncio.run(attempt(other_claim_id, proof))
     assert store.sealed == []
     assert asyncio.run(attempt(claim_id, proof))
@@ -540,7 +599,7 @@ def test_no_handoff_proofs_are_opaque_bound_and_one_use() -> None:
 async def test_post_handoff_timeout_is_ambiguous_and_never_retried() -> None:
     store = FakeStore()
     transport = FakeTransport(response=TimeoutError("response lost"))
-    coordinator = ExternalEffectCoordinator(store)
+    coordinator = _coordinator(store)
     first = await coordinator.send_one(_authority(), _prepared(), transport)
     assert isinstance(first, Ambiguous)
     assert store.sealed == [("needs_review", "transport_outcome_unknown")]
@@ -554,7 +613,7 @@ async def test_completion_cas_failure_becomes_ambiguous() -> None:
     store = FakeStore()
     store.complete_result = False
     transport = FakeTransport()
-    outcome = await ExternalEffectCoordinator(store).send_one(_authority(), _prepared(), transport)
+    outcome = await _coordinator(store).send_one(_authority(), _prepared(), transport)
     assert isinstance(outcome, Ambiguous)
     assert store.sealed == [("needs_review", "outcome_persist_failed")]
     assert len(transport.calls) == 1
@@ -581,25 +640,26 @@ async def test_completed_effect_requires_family_reuse_policy_and_records_zero_bu
         evidence_refs=refs,
         result_ref="artifact:result-1",
     )
-    store = FakeStore(ExistingClaim(claim))
+    no_policy_store = FakeStore(ExistingClaim(claim))
     no_policy_transport = FakeTransport()
-    denied = await ExternalEffectCoordinator(store).send_one(
+    denied = await _coordinator(no_policy_store).send_one(
         _authority(), _prepared(), no_policy_transport
     )
     assert isinstance(denied, Refused)
     assert denied.reason == "effect_occurrence_required"
     assert no_policy_transport.calls == []
-    assert store.refused_reuse_reservations == ["op-1"]
+    assert no_policy_store.refused_reuse_reservations == ["op-1"]
 
+    policy_store = FakeStore(ExistingClaim(claim))
     transport = FakeTransport()
     policy = AllowReuse(claim.invocation_id, refs)
-    reused = await ExternalEffectCoordinator(
-        store, reuse_policies={"vt.file_report": policy}
-    ).send_one(_authority(amounts={"vt_units": 2, "tool_seconds": 5}), _prepared(), transport)
+    reused = await _coordinator(policy_store, reuse_policies={"vt.file_report": policy}).send_one(
+        _authority(amounts={"vt_units": 2, "tool_seconds": 5}), _prepared(), transport
+    )
     assert reused.__class__.__name__ == "Reused"
     assert reused.observation_refs == refs  # type: ignore[union-attr]
     assert dict(reused.budget_delta) == {"tool_seconds": 0, "vt_units": 0}  # type: ignore[union-attr]
-    assert store.reuse_calls == [policy.decision]
+    assert policy_store.reuse_calls == [policy.decision]
     assert transport.calls == []
 
 
@@ -623,7 +683,7 @@ async def test_existing_claim_with_changed_request_digest_is_refused() -> None:
     store = FakeStore(ExistingClaim(claim))
     changed_wire = _prepared(wire=_wire(target=b"/different"))
     transport = FakeTransport()
-    outcome = await ExternalEffectCoordinator(store).send_one(_authority(), changed_wire, transport)
+    outcome = await _coordinator(store).send_one(_authority(), changed_wire, transport)
     assert isinstance(outcome, Refused)
     assert outcome.reason == "effect_binding_conflict"
     assert transport.calls == []
@@ -708,6 +768,50 @@ def test_credential_fragment_aliases_are_rejected_before_persistence(url: str) -
     with pytest.raises(ExternalEffectValidationError) as evidence_error:
         EvidenceReference("observation", url, "v1", "a" * 64)
     assert "secret" not in str(evidence_error.value)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://host/path?id_token=credential-probe",
+        "https://host/path?ID-TOKEN=credential-probe",
+        "https://host/path?refresh_token=credential-probe",
+        "https://host/path?Refresh-Token=credential-probe",
+        "https://host/path#id_token=credential-probe",
+        "https://host/path#ID-TOKEN=credential-probe",
+        "https://host/path#refresh_token=credential-probe",
+        "https://host/path#Refresh-Token=credential-probe",
+        "https://host/path?private_key=credential-probe",
+        "https://host/path?PRIVATE-KEY=credential-probe",
+        "https://host/path#private_key=credential-probe",
+        "https://host/path#PRIVATE-KEY=credential-probe",
+    ],
+)
+def test_oauth_token_aliases_never_reach_persisted_refs_or_errors(url: str) -> None:
+    failures = []
+    with pytest.raises(ExternalEffectValidationError) as canonical_error:
+        _prepared(request={"url": url})
+    failures.append(canonical_error.value)
+    with pytest.raises(ExternalEffectValidationError) as request_ref_error:
+        PreparedExternalRequest.build(
+            family="vt.file_report",
+            provider="virustotal",
+            provider_scope="tenant-prod",
+            normalizer_version="vt.file-report.v1",
+            canonical_request={"hash": "abc"},
+            request_ref=url,
+            application_request=_wire(),
+        )
+    failures.append(request_ref_error.value)
+    with pytest.raises(ExternalEffectValidationError) as evidence_error:
+        EvidenceReference("observation", url, "v1", "a" * 64)
+    failures.append(evidence_error.value)
+
+    for error in failures:
+        assert "credential-probe" not in str(error)
+        assert url not in str(error)
+        assert "credential-probe" not in repr(error)
+        assert url not in repr(error)
 
 
 @pytest.mark.asyncio
@@ -836,6 +940,10 @@ async def test_source_dependent_family_rejects_untrusted_source_refs(case: str) 
             return None
 
     class _SourceCheckStore(SqlAlchemyExternalEffectClaimStore):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self.proof_authority = _NoHandoffProofAuthority()
+            super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+
         async def _lock_authority(self, *args, **kwargs):
             invocation = type(
                 "Invocation",
@@ -870,10 +978,10 @@ async def test_source_dependent_family_rejects_untrusted_source_refs(case: str) 
         occurrence_digest=occurrence_sha256(prepared.occurrence_id),
     )
     assert isinstance(direct_result, ConsumeRefused)
-    result = await ExternalEffectCoordinator(store).send_one(authority, prepared, transport)
+    result = await _coordinator(store).send_one(authority, prepared, transport)
     assert isinstance(result, Refused)
     assert result.reason in {"malformed_source_reference", "source_references_mismatch"}
-    assert transport.send_entries == 0
+    assert transport.submit_entries == 0
     assert transport.calls == []
 
 

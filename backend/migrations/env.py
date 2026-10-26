@@ -55,12 +55,12 @@ _OSINT_ENVELOPE_COLUMNS = frozenset(
 
 
 def _metadata_for_frozen_baseline() -> MetaData:
-    """Keep additive OSINT_OPEN objects out of the metadata-driven 0001 baseline.
+    """Keep post-baseline OSINT and external-effect objects out of 0001.
 
-    The baseline intentionally predates OSINT_OPEN, but its frozen migration
-    derives its table list from ``Base.metadata``. Present that migration with
-    its pre-policy shape while retaining the complete metadata as Alembic's
-    target for current schema inspection and later additive revisions.
+    The baseline intentionally predates these additive features, but its
+    frozen migration derives its table list from ``Base.metadata``. Present
+    that migration with its pre-feature shape while retaining complete
+    metadata for current schema inspection and later additive revisions.
     """
     metadata = MetaData()
     for source_table in target_metadata.tables.values():
