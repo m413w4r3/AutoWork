@@ -503,6 +503,13 @@ async def test_w12_discovery_chain_claim_review_and_explicit_repin(
                     )
                 if association is None:
                     raise AssertionError("W12 candidate association was not persisted")
+                invariants.require(
+                    association.sample_sha256 == material.sample_hash
+                    and association.origin is SampleOrigin.VT_PIVOT,
+                    driver.scenario,
+                    "read_candidate_http",
+                    "S2 remains linked to its VT pivot association after acquisition",
+                )
                 new_sample = next(item for item in findings if item.kind is FindingKind.NEW_SAMPLE)
                 chain = next(item for item in findings if item.kind is FindingKind.INFECTION_CHAIN)
                 claim = next(
