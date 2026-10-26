@@ -1389,7 +1389,14 @@ async def test_evidence_observation_resolves_restricted_sample_hash_at_consume(
                     )
                 )
             )
-        assert restriction_text not in repr(claims)
+        persisted_claims = [
+            {
+                column.name: getattr(claim, column.name)
+                for column in ExternalEffectClaimRow.__table__.columns
+            }
+            for claim in claims
+        ]
+        assert restriction_text not in repr(persisted_claims)
     finally:
         await engine.dispose()
 
