@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import struct
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -123,6 +124,7 @@ def _make_vt_adapter(
     proxy_handler,
     direct_handler=None,
     allow_v2_fallback: bool = False,
+    enable_behaviour_pcap: bool = False,
 ):
     proxy_client = httpx.AsyncClient(transport=httpx.MockTransport(proxy_handler))
     direct_client = (
@@ -146,21 +148,29 @@ def _make_vt_adapter(
                 variant=VirusTotalEndpointVariant.LEGACY_V2,
             )
         )
-    routing = VirusTotalRoutingPolicy(
-        routes={
-            VirusTotalCapability.FILE_REPORT: VirusTotalOperationRoute(
-                primary=steps[0], fallbacks=tuple(steps[1:])
-            )
-        }
-    )
+    routes = {
+        VirusTotalCapability.FILE_REPORT: VirusTotalOperationRoute(
+            primary=steps[0], fallbacks=tuple(steps[1:])
+        )
+    }
+    capabilities = VirusTotalCapabilities(file_report=True)
+    if enable_behaviour_pcap:
+        routes[VirusTotalCapability.BEHAVIOUR_REPORTS] = VirusTotalOperationRoute(primary=steps[0])
+        routes[VirusTotalCapability.BEHAVIOUR_PCAP] = VirusTotalOperationRoute(primary=steps[0])
+        capabilities = VirusTotalCapabilities(
+            file_report=True,
+            behaviour_reports=True,
+            behaviour_pcap=True,
+        )
     adapter = VirusTotalHttpAdapter(
         client=proxy_client,
         direct_client=direct_client,
         api_key=_VT_KEY if direct_client is not None else None,
         base_url=_VT_BASE,
         legacy_base_url=_LEGACY_BASE if direct_client is not None else None,
-        capabilities=VirusTotalCapabilities(file_report=True),
-        routing_policy=routing,
+        capabilities=capabilities,
+        routing_policy=VirusTotalRoutingPolicy(routes=routes),
+        behaviour_pcap_enabled=enable_behaviour_pcap,
     )
     return adapter, proxy_client, direct_client
 
@@ -174,6 +184,7 @@ async def _run_inherited_case(
     proxy_handler,
     direct_handler=None,
     allow_v2_fallback: bool = False,
+    enable_behaviour_pcap: bool = False,
 ):
     engine = create_postgres_engine(database_url)
     session_factory = create_session_factory(engine)
@@ -200,8 +211,16 @@ async def _run_inherited_case(
         proxy_handler=proxy_handler,
         direct_handler=direct_handler,
         allow_v2_fallback=allow_v2_fallback,
+        enable_behaviour_pcap=enable_behaviour_pcap,
     )
     settings = investigation_settings(providers=True)
+    if enable_behaviour_pcap:
+        settings = settings.model_copy(
+            update={
+                "virustotal_behaviour_reports_enabled": True,
+                "virustotal_behaviour_pcap_enabled": True,
+            }
+        )
     runtime_ports = build_investigation_runtime_ports(
         settings,
         uow_factory=uow_factory,
@@ -209,23 +228,46 @@ async def _run_inherited_case(
         blob_store=blob_store,
         blob_catalog=blob_catalog,
         vt_adapter=adapter,
-        vt_capabilities=VirusTotalCapabilities(file_report=True),
+        vt_capabilities=adapter._capabilities,
         vt_observations=VirusTotalObservationService(blob_catalog, uow_factory),
         shodan_adapter=None,
         ghidra_adapter=None,
     )
-    responses = [
-        decision(
-            f"Read synthetic VT report {index}.",
-            tool_call={
-                "tool_name": "vt.file_report",
-                "schema_version": "1",
-                "arguments": {"file_hash": file_hash},
-                "purpose": f"Read synthetic report {index}.",
-            },
-        )
-        for index, file_hash in enumerate(hashes, start=1)
-    ]
+    if enable_behaviour_pcap:
+        file_hash = hashes[0]
+        responses = [
+            decision(
+                "Read the synthetic behaviour report.",
+                tool_call={
+                    "tool_name": "vt.behaviour",
+                    "schema_version": "1",
+                    "arguments": {"file_hash": file_hash},
+                    "purpose": "Verify the persisted sandbox descriptor.",
+                },
+            ),
+            decision(
+                "Read the synthetic sandbox capture.",
+                tool_call={
+                    "tool_name": "vt.behaviour_pcap",
+                    "schema_version": "1",
+                    "arguments": {"file_hash": file_hash, "sandbox_id": "sandbox-1"},
+                    "purpose": "Quarantine the bounded synthetic sandbox capture.",
+                },
+            ),
+        ]
+    else:
+        responses = [
+            decision(
+                f"Read synthetic VT report {index}.",
+                tool_call={
+                    "tool_name": "vt.file_report",
+                    "schema_version": "1",
+                    "arguments": {"file_hash": file_hash},
+                    "purpose": f"Read synthetic report {index}.",
+                },
+            )
+            for index, file_hash in enumerate(hashes, start=1)
+        ]
     responses.append(
         decision("Finish from the persisted synthetic VT evidence.", next_action="finish")
     )
@@ -293,7 +335,7 @@ async def _run_inherited_case(
             "hashes": hashes,
             "human_decisions": human_decisions,
             "inheritance": inheritance,
-            "invocations": [row for row in invocation_rows if row.tool_name == "vt.file_report"],
+            "invocations": [row for row in invocation_rows if row.tool_name.startswith("vt.")],
             "policy": policy,
             "proxy_client": proxy_client,
             "session_factory": session_factory,
@@ -374,6 +416,95 @@ async def test_osint_open_inherited_investigation_uses_vt_coordinator_and_hides_
         assert {claim.canonical_request["route"] for claim in result["claims"]} == {
             "proxy:v3",
             "direct:legacy_v2",
+        }
+        durable_rows = json.dumps(
+            [
+                {
+                    "canonical_request": claim.canonical_request,
+                    "request_ref": claim.request_ref,
+                    "canonical_request_sha256": claim.canonical_request_sha256,
+                    "application_request_sha256": claim.application_request_sha256,
+                    "evidence_refs": claim.evidence_refs,
+                }
+                for claim in result["claims"]
+            ],
+            sort_keys=True,
+        )
+        assert _VT_KEY not in durable_rows
+        assert _VT_KEY not in caplog.text
+    finally:
+        if result["direct_client"] is not None:
+            await result["direct_client"].aclose()
+        await result["proxy_client"].aclose()
+        await result["engine"].dispose()
+
+
+@pytest.mark.asyncio
+async def test_osint_open_inherited_investigation_gates_behaviour_pcap(
+    migrated_postgres_url: str, tmp_path: Path, caplog
+) -> None:
+    file_hash = _synthetic_hash()
+    proxy_requests: list[httpx.Request] = []
+    frame = b"\x00" * 14
+    pcap = (
+        struct.pack("<IHHIIII", 0xA1B2C3D4, 2, 4, 0, 0, 65_535, 1)
+        + struct.pack("<IIII", 1, 0, len(frame), len(frame))
+        + frame
+    )
+
+    def proxy_handler(request: httpx.Request) -> httpx.Response:
+        proxy_requests.append(request)
+        if request.url.path == f"/api/v3/files/{file_hash}/behaviours":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": "sandbox-1",
+                            "type": "file_behaviour",
+                            "attributes": {
+                                "has_pcap": True,
+                                "sandbox_name": "synthetic-sandbox",
+                            },
+                        }
+                    ]
+                },
+                request=request,
+            )
+        if request.url.path == "/api/v3/file_behaviours/sandbox-1/pcap":
+            return httpx.Response(
+                200,
+                content=pcap,
+                headers={"content-type": "application/vnd.tcpdump.pcap"},
+                request=request,
+            )
+        pytest.fail(f"unexpected fake VT request: {request.url!s}")
+
+    result = await _run_inherited_case(
+        database_url=migrated_postgres_url,
+        tmp_path=tmp_path,
+        max_claims=10,
+        hashes=(file_hash,),
+        proxy_handler=proxy_handler,
+        enable_behaviour_pcap=True,
+    )
+    try:
+        assert result["envelope"].authority_kind is EnvelopeAuthorityKind.OSINT_POLICY
+        assert result["inheritance"].policy_event_id == result["policy"].event_id
+        assert result["human_decisions"] == []
+        assert [item.tool_name for item in result["invocations"]] == [
+            "vt.behaviour",
+            "vt.behaviour_pcap",
+        ]
+        assert [item.status for item in result["invocations"]] == [
+            ToolInvocationStatus.SUCCEEDED,
+            ToolInvocationStatus.SUCCEEDED,
+        ]
+        assert len(proxy_requests) == 2
+        assert len(result["claims"]) == 2
+        assert {claim.family for claim in result["claims"]} == {
+            "vt.behaviour",
+            "vt.behaviour_pcap",
         }
         durable_rows = json.dumps(
             [
