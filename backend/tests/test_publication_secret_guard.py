@@ -12,7 +12,9 @@ from cti_app.application.publication_secret_guard import (
     PublicationSecretDetectedError,
     configured_operational_secret_values,
     contains_explicit_operational_secrets,
+    contains_operational_secrets,
     guard_publication_render_data,
+    redact_operational_secrets_with_findings,
 )
 
 
@@ -66,6 +68,98 @@ def test_guard_still_refuses_service_dsns_and_signed_urls() -> None:
             guard_publication_render_data({"content_sections": [{"text": value}]})
         assert exc_info.value.code == "publication_secret_detected"
         assert value not in str(exc_info.value)
+
+
+def test_advisor_filter_allows_host_paths_and_generic_url_query_names() -> None:
+    settings = SimpleNamespace(
+        workspace_path=Path("/app"),
+        data_root=Path("/root"),
+        diagnostics_directory=Path("/var/diagnostics"),
+        windows_root=Path("C:\\Program Files\\AutoWork"),
+    )
+    text = (
+        "/application /rootkit /var/diagnosticsX "
+        "C:\\Program Files\\AutoWork\\samples\\implant.exe "
+        "https://evil.example/x?key=abc&token=def&policy=p&expires=123&auth=ghi"
+    )
+
+    cleaned, findings = redact_operational_secrets_with_findings(
+        {"hypotheses": [{"statement": text}]},
+        settings=settings,
+        include_host_paths=False,
+    )
+
+    assert cleaned["hypotheses"][0]["statement"] == text
+    assert findings == ()
+    assert not contains_operational_secrets(
+        {"hypotheses": [{"statement": text}]},
+        settings=settings,
+        include_host_paths=False,
+    )
+
+
+def test_secret_findings_include_nested_locations_and_types_without_values() -> None:
+    operator_token = "synthetic-operator-token-" + "Q" * 32
+    settings = SimpleNamespace(operator_api_token=SecretStr(operator_token))
+    signed_url = "https://storage.invalid/object?X-Amz-Signature=synthetic-signature"
+    dsn = "postgresql://fixture-user:fixture-password@db.invalid:5432/cti"
+    configured_host_url = f"https://{operator_token}.evil.invalid/object?key=arbitrary"
+    payload = {
+        "hypotheses": [
+            {"statement": f"Configured operator token: {operator_token}"},
+            {"statement": f"Signed reference: {signed_url}"},
+            {"statement": f"Connection reference: {dsn}"},
+            {"statement": f"Configured host reference: {configured_host_url}"},
+        ]
+    }
+
+    _cleaned, findings = redact_operational_secrets_with_findings(
+        payload, settings=settings, include_host_paths=False
+    )
+
+    assert [(item.location, item.secret_type) for item in findings] == [
+        ("$.hypotheses[0].statement", "configured_credential"),
+        ("$.hypotheses[1].statement", "signed_url"),
+        ("$.hypotheses[2].statement", "dsn"),
+        ("$.hypotheses[3].statement", "configured_credential"),
+    ]
+    safe_findings = repr(findings)
+    assert operator_token not in safe_findings
+    assert "synthetic-signature" not in safe_findings
+    assert "fixture-password" not in safe_findings
+
+
+@pytest.mark.parametrize(
+    "query_name",
+    ["sig", "signature", "access_token", "X-Amz-Credential", "X-Amz-Anything", "X-Goog-Whatever"],
+)
+def test_strong_signature_query_names_are_redacted(query_name: str) -> None:
+    url = f"https://storage.invalid/object?{query_name}=synthetic-value"
+
+    cleaned, findings = redact_operational_secrets_with_findings(
+        {"links": [{"url": url}]}, settings=SimpleNamespace(), include_host_paths=False
+    )
+
+    assert cleaned["links"][0]["url"] == "[clé masquée]"
+    assert [(item.location, item.secret_type) for item in findings] == [
+        ("$.links[0].url", "signed_url")
+    ]
+
+
+def test_user_password_url_is_redacted_but_username_only_url_is_not() -> None:
+    user_password = "https://fixture-user:fixture-password@storage.invalid/object"
+    username_only = "https://fixture-user@storage.invalid/object"
+
+    cleaned, findings = redact_operational_secrets_with_findings(
+        {"links": [user_password, username_only]},
+        settings=SimpleNamespace(),
+        include_host_paths=False,
+    )
+
+    assert cleaned["links"] == ["[clé masquée]", username_only]
+    assert [(item.location, item.secret_type) for item in findings] == [
+        ("$.links[0]", "signed_url")
+    ]
 
 
 def test_pure_secret_guard_uses_only_explicit_values_and_deterministic_patterns(

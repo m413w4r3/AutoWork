@@ -67,9 +67,10 @@ from cti_app.application.investigation_tools import (
 )
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.publication_secret_guard import (
+    PublicationSecretFinding,
     configured_operational_secret_values,
     contains_operational_secrets,
-    redact_operational_secrets,
+    redact_operational_secrets_with_findings,
 )
 from cti_app.application.research_context_builder import ArticleSnapshotPort
 from cti_app.config import Settings
@@ -277,10 +278,10 @@ class InvestigationAdvisorTool:
                     if isinstance(reference, str)
                 )
             prompt_data["evidence_refs"] = list(dict.fromkeys(observation_refs))
-            prompt_data, redacted_count = _redact_advisor_payload(
+            prompt_data, redaction_findings = _redact_advisor_payload(
                 prompt_data, settings=self._settings
             )
-            if redacted_count or _marked_secret_field_survives(
+            if redaction_findings or _marked_secret_field_survives(
                 prompt_data, settings=self._settings
             ):
                 return no_context_cost
@@ -693,26 +694,29 @@ class InvestigationAdvisorTool:
                     if isinstance(reference, str)
                 )
             prompt_data["evidence_refs"] = list(dict.fromkeys(explicit_observation_refs))
-            if _contains_encoded_operational_secrets(prompt_data, settings=self._settings):
-                return await self._persist_preflight_refusal(
-                    context,
-                    consultation_type=consultation_type,
-                    evidence_refs=tuple(item.id for item in evidence),
-                    reason="autowork_credential_or_signed_url_detected",
-                    redacted_secret_count=1,
-                )
-            prompt_data, redacted_secret_count = _redact_advisor_payload(
+            encoded_findings = _contains_encoded_operational_secrets(
                 prompt_data, settings=self._settings
             )
-            if redacted_secret_count or _marked_secret_field_survives(
+            prompt_data, direct_findings = _redact_advisor_payload(
+                prompt_data, settings=self._settings
+            )
+            secret_findings = (*encoded_findings, *direct_findings)
+            redacted_secret_count = len(secret_findings)
+            if secret_findings or _marked_secret_field_survives(
                 prompt_data, settings=self._settings
             ):
+                if not secret_findings:
+                    _, secret_findings = redact_operational_secrets_with_findings(
+                        prompt_data, settings=self._settings, include_host_paths=False
+                    )
+                    redacted_secret_count = len(secret_findings)
                 return await self._persist_preflight_refusal(
                     context,
                     consultation_type=consultation_type,
                     evidence_refs=tuple(item.id for item in evidence),
                     reason="autowork_credential_or_signed_url_detected",
                     redacted_secret_count=redacted_secret_count,
+                    secret_findings=secret_findings,
                 )
             dossier = build_advisor_dossier(prompt_data)
             prompt_data["dossier_manifest"] = [dict(item) for item in dossier.manifest]
@@ -1475,7 +1479,12 @@ class InvestigationAdvisorTool:
         evidence_refs: tuple[UUID, ...],
         reason: str,
         redacted_secret_count: int,
+        secret_findings: Sequence[PublicationSecretFinding] = (),
     ) -> ToolResult:
+        safe_findings = [
+            {"location": finding.location, "type": finding.secret_type}
+            for finding in secret_findings
+        ]
         result = ToolResult(
             ToolInvocationStatus.FAILED,
             observation_refs=evidence_refs,
@@ -1487,6 +1496,7 @@ class InvestigationAdvisorTool:
                 "failure_stage": "secret_preflight",
                 "failure_reason": reason,
                 "redacted_secret_count": redacted_secret_count,
+                "secret_findings": safe_findings,
                 "confirmed_non_execution": True,
                 "bridge_turns_consumed": 0,
                 "usable": False,
@@ -1514,6 +1524,7 @@ class InvestigationAdvisorTool:
                     "failure_stage": "secret_preflight",
                     "failure_reason": reason,
                     "bridge_turns_consumed": 0,
+                    "secret_findings": safe_findings,
                     "output": dict(result.output),
                 },
                 source=ADVISOR_TOOL_NAME,
@@ -4572,15 +4583,21 @@ def _validate_editorial_unit_targets(units: list[Any] | tuple[Any, ...]) -> None
         seen_targets.add(target)
 
 
-def _redact_advisor_payload(value: Any, *, settings: Settings | None = None) -> tuple[Any, int]:
-    return redact_operational_secrets(value, settings=settings)
+def _redact_advisor_payload(
+    value: Any, *, settings: Settings | None = None
+) -> tuple[Any, tuple[PublicationSecretFinding, ...]]:
+    return redact_operational_secrets_with_findings(
+        value, settings=settings, include_host_paths=False
+    )
 
 
 def _marked_secret_field_survives(value: Any, *, settings: Settings | None = None) -> bool:
-    return contains_operational_secrets(value, settings=settings)
+    return contains_operational_secrets(value, settings=settings, include_host_paths=False)
 
 
-def _contains_encoded_operational_secrets(value: Any, *, settings: Settings | None = None) -> bool:
+def _contains_encoded_operational_secrets(
+    value: Any, *, settings: Settings | None = None
+) -> tuple[PublicationSecretFinding, ...]:
     """Detect actual AutoWork credentials and signed URLs inside byte encodings.
 
     Only byte values explicitly represented as bytes, hex, or Base64 are
@@ -4612,11 +4629,11 @@ def _contains_encoded_operational_secrets(value: Any, *, settings: Settings | No
     def decoded_fragments(
         item: Any,
         *,
-        path: tuple[str, ...] = (),
+        path: tuple[str | int, ...] = (),
         inherited_encoding: str | None = None,
-    ) -> Sequence[bytes]:
+    ) -> Sequence[tuple[bytes, tuple[str | int, ...]]]:
         if isinstance(item, bytes | bytearray | memoryview):
-            return (bytes(item),)
+            return ((bytes(item), path),)
         if isinstance(item, Mapping):
             encoding_value = item.get("encoding", item.get("kind"))
             if encoding_value is None:
@@ -4624,50 +4641,71 @@ def _contains_encoded_operational_secrets(value: Any, *, settings: Settings | No
             encoding = (
                 encoding_value.casefold() if isinstance(encoding_value, str) else inherited_encoding
             )
-            found: list[bytes] = []
+            found: list[tuple[bytes, tuple[str | int, ...]]] = []
             for raw_key, child in item.items():
-                key = str(raw_key).casefold().replace("-", "_")
                 found.extend(
-                    decoded_fragments(child, path=(*path, key), inherited_encoding=encoding)
+                    decoded_fragments(
+                        child, path=(*path, str(raw_key)), inherited_encoding=encoding
+                    )
                 )
             return tuple(found)
         if isinstance(item, (list, tuple)):
             if (
                 path
-                and any("byte" in part or "raw" in part for part in path)
+                and any("byte" in str(part) or "raw" in str(part) for part in path)
                 and all(type(element) is int and 0 <= element <= 255 for element in item)
             ):
-                return (bytes(item),)
+                return ((bytes(item), path),)
             return tuple(
                 candidate
-                for child in item
+                for index, child in enumerate(item)
                 for candidate in decoded_fragments(
-                    child, path=path, inherited_encoding=inherited_encoding
+                    child, path=(*path, index), inherited_encoding=inherited_encoding
                 )
             )
         if not isinstance(item, str):
             return ()
-        names = (*path, inherited_encoding or "")
+        names = (*map(str, path), inherited_encoding or "")
         normalized = " ".join(names).casefold()
         compact = re.sub(r"\s+", "", item)
         if "hex" in normalized or "hexdump" in normalized or "byte" in normalized:
             decoded_hex = decode_hex_fragment(item)
             if decoded_hex is not None:
-                return (decoded_hex,)
+                return ((decoded_hex, path),)
         if "base64" in normalized or "byte" in normalized:
             try:
-                return (base64.b64decode(compact, validate=True),)
+                return ((base64.b64decode(compact, validate=True), path),)
             except (ValueError, binascii.Error):
                 return ()
         return ()
 
     text_encodings = ("utf-8", "utf-16le", "utf-16be", "latin-1")
-    for fragment in decoded_fragments(value):
+    findings: list[PublicationSecretFinding] = []
+    for fragment, path in decoded_fragments(value):
         for encoding in text_encodings:
             decoded_text = fragment.decode(encoding, errors="ignore")
-            if contains_operational_secrets(decoded_text, settings=settings):
-                return True
-    return False
+            _cleaned, matches = redact_operational_secrets_with_findings(
+                decoded_text, settings=settings, include_host_paths=False
+            )
+            if matches:
+                location = _encoded_json_path(path)
+                findings.extend(
+                    PublicationSecretFinding(location, "encoded_credential") for _ in matches
+                )
+                break
+    return tuple(findings)
+
+
+def _encoded_json_path(parts: Sequence[str | int]) -> str:
+    path = "$"
+    for part in parts:
+        if isinstance(part, int):
+            path += f"[{part}]"
+        elif re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", part):
+            path += f".{part}"
+        else:
+            path += f"[{json.dumps(part, ensure_ascii=False)}]"
+    return path
 
 
 def _advisor_unit_provenance(

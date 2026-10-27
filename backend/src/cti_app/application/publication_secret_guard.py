@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import json
 import os
 import re
 from collections.abc import Iterator, Mapping, Sequence
@@ -67,22 +68,7 @@ _SENSITIVE_QUERY_NAMES = frozenset(
     {
         "sig",
         "signature",
-        "token",
         "access_token",
-        "api_token",
-        "api_key",
-        "key",
-        "auth",
-        "authorization",
-        "credential",
-        "expires",
-        "policy",
-        "x-amz-signature",
-        "x-amz-credential",
-        "x-amz-security-token",
-        "x-goog-signature",
-        "x-goog-credential",
-        "googleaccessid",
     }
 )
 _IOC_VALUE_FIELDS = frozenset(
@@ -126,16 +112,21 @@ def guard_publication_render_data(
             )
 
 
-def redact_operational_secrets(value: Any, *, settings: Any | None = None) -> tuple[Any, int]:
-    """Redact AutoWork operational secrets before an advisor payload reaches Bridge."""
-    operational_values = _operational_values(settings)
-    count = 0
+def redact_operational_secrets_with_findings(
+    value: Any,
+    *,
+    settings: Any | None = None,
+    include_host_paths: bool = True,
+) -> tuple[Any, tuple[PublicationSecretFinding, ...]]:
+    """Redact operational values and return value-free locations for each match."""
+    operational_values = _operational_values(settings, include_host_paths=include_host_paths)
+    findings: list[PublicationSecretFinding] = []
 
-    def walk(item: Any, *, field_name: str = "") -> Any:
-        nonlocal count
+    def walk(item: Any, *, path: str = "$", field_name: str = "") -> Any:
         if isinstance(item, Mapping):
             cleaned: dict[Any, Any] = {}
             for key, child in item.items():
+                child_path = _json_path_child(path, key)
                 if _is_operational_field_name(str(key)) and child not in (
                     None,
                     False,
@@ -143,29 +134,76 @@ def redact_operational_secrets(value: Any, *, settings: Any | None = None) -> tu
                     _SECRET_REDACTION,
                 ):
                     cleaned[key] = _SECRET_REDACTION
-                    count += 1
+                    findings.append(
+                        PublicationSecretFinding(
+                            location=_safe_finding_location(child_path, operational_values),
+                            secret_type=_finding_type(_operational_field_type(str(key))),
+                        )
+                    )
                 else:
-                    cleaned[key] = walk(child, field_name=str(key))
+                    cleaned[key] = walk(child, path=child_path, field_name=str(key))
             return cleaned
         if isinstance(item, list):
-            return [walk(child, field_name=field_name) for child in item]
+            return [
+                walk(child, path=f"{path}[{index}]", field_name=field_name)
+                for index, child in enumerate(item)
+            ]
         if isinstance(item, tuple):
-            return tuple(walk(child, field_name=field_name) for child in item)
+            return tuple(
+                walk(child, path=f"{path}[{index}]", field_name=field_name)
+                for index, child in enumerate(item)
+            )
         if isinstance(item, Path):
             item = str(item)
         if not isinstance(item, str):
             return item
-        redacted_text, replacements = _redact_operational_text(item, operational_values)
-        count += replacements
-        if not replacements and _is_operational_field_name(field_name) and item.strip():
+        redacted_text, secret_types = _redact_operational_text_with_types(item, operational_values)
+        findings.extend(
+            PublicationSecretFinding(
+                location=_safe_finding_location(path, operational_values),
+                secret_type=_finding_type(secret_type),
+            )
+            for secret_type in secret_types
+        )
+        if (
+            not secret_types
+            and _is_operational_field_name(field_name)
+            and item.strip() not in {"", _SECRET_REDACTION}
+        ):
+            findings.append(
+                PublicationSecretFinding(
+                    location=_safe_finding_location(path, operational_values),
+                    secret_type=_finding_type(_operational_field_type(field_name)),
+                )
+            )
             return _SECRET_REDACTION
         return redacted_text
 
-    return walk(value), count
+    return walk(value), tuple(findings)
 
 
-def contains_operational_secrets(value: Any, *, settings: Any | None = None) -> bool:
-    cleaned, count = redact_operational_secrets(value, settings=settings)
+def redact_operational_secrets(
+    value: Any,
+    *,
+    settings: Any | None = None,
+    include_host_paths: bool = True,
+) -> tuple[Any, int]:
+    """Redact AutoWork operational secrets and return the number of matches."""
+    cleaned, findings = redact_operational_secrets_with_findings(
+        value, settings=settings, include_host_paths=include_host_paths
+    )
+    return cleaned, len(findings)
+
+
+def contains_operational_secrets(
+    value: Any,
+    *,
+    settings: Any | None = None,
+    include_host_paths: bool = True,
+) -> bool:
+    cleaned, count = redact_operational_secrets(
+        value, settings=settings, include_host_paths=include_host_paths
+    )
     return count > 0 or cleaned != value
 
 
@@ -237,7 +275,9 @@ def contains_explicit_operational_secrets(
     return contains(value)
 
 
-def _operational_values(settings: Any | None) -> tuple[tuple[str, str, bool], ...]:
+def _operational_values(
+    settings: Any | None, *, include_host_paths: bool = True
+) -> tuple[tuple[str, str, bool], ...]:
     configured = settings if settings is not None else get_settings()
     values: dict[tuple[str, str, bool], None] = {}
     model_fields = getattr(type(configured), "model_fields", {})
@@ -253,7 +293,7 @@ def _operational_values(settings: Any | None) -> tuple[tuple[str, str, bool], ..
         secret_value = getattr(value, "get_secret_value", None)
         if callable(secret_value):
             _add_operational_value(values, secret_value(), "service_credential")
-        elif isinstance(value, Path):
+        elif isinstance(value, Path) and include_host_paths:
             _add_operational_value(values, str(value), "host_path", case_insensitive=True)
             try:
                 _add_operational_value(
@@ -267,7 +307,7 @@ def _operational_values(settings: Any | None) -> tuple[tuple[str, str, bool], ..
                 normalized_name
             ):
                 _add_operational_value(values, value, _operational_field_type(normalized_name))
-            elif normalized_name.endswith(_HOST_PATH_SETTING_SUFFIXES):
+            elif include_host_paths and normalized_name.endswith(_HOST_PATH_SETTING_SUFFIXES):
                 _add_operational_value(values, value, "host_path", case_insensitive=True)
             elif _is_sensitive_url(value):
                 _add_operational_value(values, value, "signed_url")
@@ -275,11 +315,16 @@ def _operational_values(settings: Any | None) -> tuple[tuple[str, str, bool], ..
     for name, value in os.environ.items():
         if _OPERATIONAL_ENV_NAME.fullmatch(name) and value:
             _add_operational_value(values, value, _operational_field_type(name))
-        elif name.casefold() in {"home", "pwd", "tmpdir", "temp", "tmp"} and value:
+        elif (
+            include_host_paths
+            and name.casefold() in {"home", "pwd", "tmpdir", "temp", "tmp"}
+            and value
+        ):
             _add_operational_value(values, value, "host_path", case_insensitive=True)
 
-    for host_path in (Path.cwd(), Path.home()):
-        _add_operational_value(values, str(host_path), "host_path", case_insensitive=True)
+    if include_host_paths:
+        for host_path in (Path.cwd(), Path.home()):
+            _add_operational_value(values, str(host_path), "host_path", case_insensitive=True)
     return tuple(
         (value, secret_type, case_insensitive)
         for value, secret_type, case_insensitive in sorted(
@@ -332,11 +377,14 @@ def _is_sensitive_url(value: str) -> bool:
         query_names = {
             name.casefold() for name, _ in parse_qsl(parsed.query, keep_blank_values=True)
         }
-        return (
-            parsed.username is not None
-            or parsed.password is not None
-            or bool(query_names & _SENSITIVE_QUERY_NAMES)
+        signed_query = any(
+            name in _SENSITIVE_QUERY_NAMES
+            or name.startswith("x-amz-")
+            or name.startswith("x-goog-")
+            for name in query_names
         )
+        has_user_password = bool(parsed.username and parsed.password)
+        return has_user_password or signed_query
     except ValueError:
         return False
 
@@ -367,35 +415,73 @@ def _operational_secret_type(
 def _redact_operational_text(
     text: str, operational_values: tuple[tuple[str, str, bool], ...]
 ) -> tuple[str, int]:
-    count = 0
+    cleaned, secret_types = _redact_operational_text_with_types(text, operational_values)
+    return cleaned, len(secret_types)
+
+
+def _redact_operational_text_with_types(
+    text: str, operational_values: tuple[tuple[str, str, bool], ...]
+) -> tuple[str, tuple[str, ...]]:
+    secret_types: list[str] = []
 
     def replace_assignment(match: re.Match[str]) -> str:
-        nonlocal count
         if match.group("value").strip("\"'`") == _SECRET_REDACTION:
             return match.group()
-        count += 1
+        secret_types.append(_finding_type(_operational_field_type(match.group("label"))))
         return f"{match.group('label')}{_SECRET_REDACTION}"
 
     cleaned = _OPERATIONAL_ASSIGNMENT.sub(replace_assignment, text)
-    cleaned, dsn_count = _SERVICE_DSN.subn(_SECRET_REDACTION, cleaned)
-    count += dsn_count
+
+    def replace_dsn(_match: re.Match[str]) -> str:
+        secret_types.append("dsn")
+        return _SECRET_REDACTION
+
+    cleaned = _SERVICE_DSN.sub(replace_dsn, cleaned)
 
     def replace_sensitive_url(match: re.Match[str]) -> str:
-        nonlocal count
         url = match.group()
         if not _is_sensitive_url(url):
             return url
-        count += 1
+        parsed = urlsplit(url)
+        secret_types.append(
+            "dsn"
+            if parsed.scheme.casefold() in {"postgres", "postgresql", "redis", "rediss"}
+            else "signed_url"
+        )
         return _SECRET_REDACTION
 
     cleaned = _URL.sub(replace_sensitive_url, cleaned)
-    for value, _secret_type, case_insensitive in operational_values:
+    for value, secret_type, case_insensitive in operational_values:
         if value == _SECRET_REDACTION:
             continue
         flags = re.IGNORECASE if case_insensitive else 0
         cleaned, replacements = re.subn(re.escape(value), _SECRET_REDACTION, cleaned, flags=flags)
-        count += replacements
-    return cleaned, count
+        secret_types.extend(_finding_type(secret_type) for _ in range(replacements))
+    return cleaned, tuple(secret_types)
+
+
+def _finding_type(secret_type: str) -> str:
+    if secret_type in {"service_credential", "operational_secret"}:
+        return "configured_credential"
+    if secret_type == "service_password":
+        return "configured_password"
+    if secret_type == "service_connection_string":
+        return "dsn"
+    return secret_type
+
+
+def _json_path_child(path: str, key: Any) -> str:
+    if isinstance(key, int):
+        return f"{path}[{key}]"
+    name = str(key)
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", name):
+        return f"{path}.{name}"
+    return f"{path}[{json.dumps(name, ensure_ascii=False)}]"
+
+
+def _safe_finding_location(path: str, operational_values: tuple[tuple[str, str, bool], ...]) -> str:
+    cleaned, _ = _redact_operational_text(path, operational_values)
+    return cleaned
 
 
 def _redact_known_values(text: str, operational_values: tuple[tuple[str, str, bool], ...]) -> str:
@@ -576,4 +662,5 @@ __all__ = [
     "contains_operational_secrets",
     "guard_publication_render_data",
     "redact_operational_secrets",
+    "redact_operational_secrets_with_findings",
 ]
