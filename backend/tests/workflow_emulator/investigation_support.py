@@ -27,7 +27,6 @@ from cti_app.application.jobs import JobExecutor, SynchronousJobDispatcher, crea
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.sample_acquisition import (
     SAMPLES_QUARANTINE_BUCKET,
-    SampleAcquisitionCacheScope,
     VirusTotalSampleAcquisitionService,
 )
 from cti_app.application.virustotal import (
@@ -94,6 +93,10 @@ from cti_app.domain.semantic_annotation import (
     SemanticTextSpanV1,
     SemanticTextV1,
 )
+from cti_app.infrastructure.investigation_runtime_ports import (
+    create_external_effect_coordinator,
+)
+from cti_app.infrastructure.virustotal import VirusTotalHttpAdapter
 from tests.confined_worker_harness import (
     ConfinedRuleCorpusBytes,
     build_confined_worker_harness,
@@ -138,7 +141,7 @@ class SyntheticSampleMaterial:
 
 
 class HashCheckedVirusTotal(FakeVirusTotalPort):
-    """No-network VT fake whose acquired bytes match the returned SHA-256."""
+    """Fake VT read operations plus a MockTransport-backed download adapter."""
 
     def __init__(
         self,
@@ -184,30 +187,76 @@ class HashCheckedVirusTotal(FakeVirusTotalPort):
             else []
         )
 
-    @property
-    def sample_acquisition_cache_scope(self) -> SampleAcquisitionCacheScope:
-        """Stable, credential-free cache scope for the synthetic proxy route."""
-        return SampleAcquisitionCacheScope(
-            provider="virustotal",
-            account_capability_fingerprint="workflow-fixture-account-unattributed-v1",
-            route_fingerprint="workflow-fixture-vt-proxy-v3-download-v1",
-            transport="proxy-v3",
-            configuration_fingerprint="workflow-fixture-vt-config-v1",
-        )
-
     async def object_relationship(
         self, object_type: Any, object_id: str, relation: str, **kwargs: Any
     ):
         self.relationship_call_args.append((str(object_type), object_id, relation))
         return await super().object_relationship(object_type, object_id, relation, **kwargs)
 
-    async def file_download(self, file_hash: str, *, sink: Any) -> None:
-        sample_bytes = self._samples.get(file_hash)
-        assert sample_bytes is not None
-        assert hashlib.sha256(sample_bytes).hexdigest() == file_hash
-        self.download_calls += 1
-        self.downloaded_hashes.append(file_hash)
-        sink.write(sample_bytes)
+    def download_adapter(self) -> VirusTotalHttpAdapter:
+        """Build the production HTTP adapter with both hops confined to MockTransport."""
+
+        def mock_request(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if path.endswith("/download") and "/files/" in path:
+                file_hash = path.rsplit("/files/", 1)[1].removesuffix("/download")
+                self.download_calls += 1
+                self.downloaded_hashes.append(file_hash)
+                return httpx.Response(
+                    404,
+                    json={"error": "NotFoundError"},
+                    request=request,
+                )
+            if path.endswith("/download_url") and "/files/" in path:
+                file_hash = path.rsplit("/files/", 1)[1].removesuffix("/download_url")
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": (
+                            "https://vtsamples.commondatastorage.googleapis.com/"
+                            f"{file_hash}?signature=synthetic"
+                        )
+                    },
+                    request=request,
+                )
+            if request.url.host == "vtsamples.commondatastorage.googleapis.com":
+                file_hash = path.rsplit("/", 1)[-1]
+                sample_bytes = self._samples.get(file_hash)
+                if sample_bytes is not None:
+                    assert hashlib.sha256(sample_bytes).hexdigest() == file_hash
+                    return self.sample_download_response(request, file_hash, sample_bytes)
+            return httpx.Response(404, json={"error": "NotFoundError"}, request=request)
+
+        return VirusTotalHttpAdapter(
+            client=httpx.AsyncClient(
+                transport=httpx.MockTransport(mock_request),
+                trust_env=False,
+            ),
+            base_url="https://www.virustotal.com/api/v3",
+            capabilities=VirusTotalCapabilities(file_download=True),
+            file_download_enabled=True,
+            download_allowed_hosts=frozenset({"vtsamples.commondatastorage.googleapis.com"}),
+            download_allowed_ports=frozenset({443}),
+            download_client_factory=lambda: httpx.AsyncClient(
+                transport=httpx.MockTransport(mock_request),
+                trust_env=False,
+            ),
+        )
+
+    def sample_download_response(
+        self,
+        request: httpx.Request,
+        file_hash: str,
+        sample_bytes: bytes,
+    ) -> httpx.Response:
+        """Return the synthetic signed-CDN response; subclasses may model stream failures."""
+        del file_hash
+        return httpx.Response(
+            200,
+            content=sample_bytes,
+            headers={"content-type": "application/octet-stream"},
+            request=request,
+        )
 
 
 FinalResponseBuilder = Callable[
@@ -770,13 +819,28 @@ def composition_factory(
     artifact_store: ProductionArtifactStore,
     settings: Settings,
     transport: ScriptedTurnTransport,
-    virustotal: HashCheckedVirusTotal | None = None,
+    virustotal: HashCheckedVirusTotal | VirusTotalHttpAdapter | None = None,
+    acquisition_adapter: VirusTotalHttpAdapter | None = None,
+    external_effect_session_factory: Any | None = None,
     shodan: FakeShodanPort | None = None,
     include_local_analysis: bool = False,
     rule_corpus_bytes: Any | None = None,
     yara_engine: Any | None = None,
     additional_ports: OptionalInvestigationToolPorts | None = None,
 ) -> InvestigationCompositionFactory:
+    injected_acquisition = additional_ports.acquisition if additional_ports is not None else None
+    if injected_acquisition is not None:
+        # Only a production-built service over a coordinator-bound HTTP adapter
+        # may be injected; anything else could download without S3 consume.
+        injected_port = getattr(injected_acquisition, "_port", None)
+        if not (
+            isinstance(injected_acquisition, VirusTotalSampleAcquisitionService)
+            and isinstance(injected_port, VirusTotalHttpAdapter)
+            and getattr(injected_port, "_external_effect_coordinator", None) is not None
+        ):
+            raise ValueError(
+                "Injected VT acquisition must wrap a coordinator-bound VirusTotalHttpAdapter."
+            )
     ports = OptionalInvestigationToolPorts()
     needs_confined_worker = (
         include_local_analysis
@@ -813,17 +877,37 @@ def composition_factory(
             intelligence_search=True,
             file_download=True,
         )
-        ports = replace(
-            ports,
-            virustotal=virustotal,
-            acquisition=VirusTotalSampleAcquisitionService(
-                virustotal,
+        observations = VirusTotalObservationService(blob_catalog, uow_factory)
+        session_factory = external_effect_session_factory or getattr(
+            uow_factory, "session_factory", None
+        )
+        if session_factory is None:
+            raise ValueError(
+                "Workflow VT downloads require a database-backed external-effect coordinator."
+            )
+        acquisition = injected_acquisition
+        if acquisition is None:
+            download_adapter = acquisition_adapter or (
+                virustotal.download_adapter()
+                if isinstance(virustotal, HashCheckedVirusTotal)
+                else virustotal
+            )
+            download_adapter.configure_external_effects(
+                create_external_effect_coordinator(session_factory),
+                observations,
+            )
+            acquisition = VirusTotalSampleAcquisitionService(
+                download_adapter,
                 vt_capabilities,
                 blob_catalog,
                 uow_factory,
                 LocalIdentityProvider("service:synthetic-acquisition"),
-            ),
-            virustotal_observations=VirusTotalObservationService(blob_catalog, uow_factory),
+            )
+        ports = replace(
+            ports,
+            virustotal=virustotal,
+            acquisition=acquisition,
+            virustotal_observations=observations,
             vt_capabilities=vt_capabilities,
             vt_routing_policy=VirusTotalRoutingPolicy(
                 routes={

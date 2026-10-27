@@ -514,6 +514,20 @@ async def test_w14_a_similarity_rule_revision_and_new_article_sample(
             origin=SampleOrigin.MANUAL,
             logical_name="sample-d-controlled-positive.bin",
         )
+        pivot_observation_c = await _persist_observation(
+            uow_factory,
+            driver.artifact_store,
+            investigation_id=seeded.investigation.id,
+            kind=EvidenceKind.VT_RELATIONSHIP,
+            payload={
+                "schema": "w14-synthetic-vt-relationship.v1",
+                "source_sample_sha256": sha_a,
+                "related_sample_sha256": sha_c,
+            },
+            source="vt.relationships",
+            object_type="sample",
+            object_id=sha_c,
+        )
         vt = HashCheckedVirusTotal(material=material)
         rule_candidate_id = uuid4()
         baseline_id = uuid4()
@@ -649,7 +663,7 @@ async def test_w14_a_similarity_rule_revision_and_new_article_sample(
                         {
                             "sha256": sha_c,
                             "purpose": "Acquire one inert synthetic stage C for the rule holdout.",
-                            "evidence_refs": [str(seeded.seed_observation.id)],
+                            "evidence_refs": [str(pivot_observation_c.id)],
                         },
                     ),
                 )
@@ -870,7 +884,21 @@ async def test_w14_a_similarity_rule_revision_and_new_article_sample(
                 " | ".join(f"{item.tool_name}:{item.status.value}" for item in invocations)
             )
             association_c = next(item for item in associations if item.sample_sha256 == sha_c)
+            download_c = next(
+                item for item in invocations if item.tool_name == "vt.download_sample"
+            )
             assert association_c.qualification is SampleQualification.CANDIDATE
+            source_refs = download_c.normalized_parameters["_vt_external_effect_source_refs"]
+            assert any(
+                item["kind"] == "sample_hash" and item["id"] == sha_c for item in source_refs
+            )
+            assert any(
+                item["kind"] == "evidence_observation"
+                and item["id"] == str(pivot_observation_c.id)
+                and item["version"] == pivot_observation_c.source_version
+                and item["sha256"] == pivot_observation_c.sha256
+                for item in source_refs
+            )
             # The first explicit v1 report is tested on A/B while D remains a
             # candidate. Human G3 then confirms D, and the retest measures v1's
             # false negative before v2 is proposed. Candidate version records stay

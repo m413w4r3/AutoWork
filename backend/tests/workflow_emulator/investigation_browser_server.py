@@ -639,6 +639,7 @@ async def _serve() -> None:
                 settings=_settings(providers=True, local_analysis=True),
                 transport=transport,
                 virustotal=vt,
+                external_effect_session_factory=session_factory,
                 shodan=shodan,
                 include_local_analysis=True,
             )

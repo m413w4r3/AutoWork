@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 from uuid import UUID, uuid4
@@ -16,7 +17,6 @@ from cti_app.application.bridge_investigator import (
     TurnSubmission,
     TurnSubmissionStatus,
 )
-from cti_app.application.investigation_composition import OptionalInvestigationToolPorts
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.virustotal import (
     VirusTotalCapabilities,
@@ -302,7 +302,7 @@ async def test_real_postgres_http_bridge_vertical_investigation_and_v6_publicati
         final_response_builder=final_response_builder,
     )
     settings = _settings(providers=True, local_analysis=True)
-    runtime_engine, runtime_ports = _real_vt_runtime_ports(
+    runtime_engine, _runtime_ports = _real_vt_runtime_ports(
         database_url=migrated_postgres_url,
         uow_factory=uow_factory,
         blob_store=blob_store,
@@ -311,7 +311,6 @@ async def test_real_postgres_http_bridge_vertical_investigation_and_v6_publicati
         virustotal=vt_adapter,
         capabilities=VirusTotalCapabilities(file_download=True),
     )
-    assert runtime_ports.acquisition is not None
     composition_factory = _composition_factory(
         uow_factory=uow_factory,
         artifact_store=artifact_store,
@@ -320,7 +319,8 @@ async def test_real_postgres_http_bridge_vertical_investigation_and_v6_publicati
         virustotal=vt,
         shodan=shodan,
         include_local_analysis=True,
-        additional_ports=OptionalInvestigationToolPorts(acquisition=runtime_ports.acquisition),
+        acquisition_adapter=vt_adapter,
+        external_effect_session_factory=create_session_factory(runtime_engine),
     )
     app, registry, dispatcher = _build_app(
         uow_factory=uow_factory,
@@ -732,7 +732,8 @@ async def test_real_postgres_tool_path_classifies_vt_download_route_404_as_needs
         settings=settings,
         transport=transport,
         virustotal=cast(Any, vt),
-        additional_ports=runtime_ports,
+        external_effect_session_factory=create_session_factory(runtime_engine),
+        additional_ports=replace(runtime_ports, acquisition=None),
     )
     app, registry, dispatcher = _build_app(
         uow_factory=uow_factory,
@@ -1047,7 +1048,8 @@ async def test_real_postgres_ambiguous_download_logs_safe_terminal_diagnostics(
         settings=settings,
         transport=transport,
         virustotal=cast(Any, vt),
-        additional_ports=runtime_ports,
+        external_effect_session_factory=create_session_factory(runtime_engine),
+        additional_ports=replace(runtime_ports, acquisition=None),
     )
     app, registry, dispatcher = _build_app(
         uow_factory=uow_factory,

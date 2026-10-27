@@ -120,7 +120,12 @@ async def test_w15_download_finish_refusal_analysis_then_finish(
         material = SyntheticSampleMaterial.unique()
         sample_bytes = b"MZ\x00W15-inert-sample:" + uuid4().bytes
         sample_hash = hashlib.sha256(sample_bytes).hexdigest()
-        material = replace(material, sample_bytes=sample_bytes, sample_hash=sample_hash)
+        material = replace(
+            material,
+            seed_hash=sample_hash,
+            sample_bytes=sample_bytes,
+            sample_hash=sample_hash,
+        )
         seeded = await seed_verified_article(
             uow_factory,
             driver.artifact_store,
@@ -191,6 +196,18 @@ async def test_w15_download_finish_refusal_analysis_then_finish(
         download = next(item for item in invocations if item.tool_name == "vt.download_sample")
         analysis = next(item for item in invocations if item.tool_name == "sample.analyze")
         assert download.status is ToolInvocationStatus.SUCCEEDED
+        assert seeded.seed_observation is not None
+        source_refs = download.normalized_parameters["_vt_external_effect_source_refs"]
+        assert any(
+            item["kind"] == "sample_hash" and item["id"] == sample_hash for item in source_refs
+        )
+        assert any(
+            item["kind"] == "evidence_observation"
+            and item["id"] == str(seeded.seed_observation.id)
+            and item["version"] == seeded.seed_observation.source_version
+            and item["sha256"] == seeded.seed_observation.sha256
+            for item in source_refs
+        )
         assert analysis.status in {ToolInvocationStatus.SUCCEEDED, ToolInvocationStatus.PARTIAL}
         assert analysis.normalized_parameters["association_id"] == str(association.id)
         assert analysis.response_refs
