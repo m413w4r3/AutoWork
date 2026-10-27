@@ -5141,8 +5141,8 @@ async def test_dsn_with_password_refuses_with_nested_location_and_type(monkeypat
 
 
 def test_encoded_credential_diagnostics_mask_sensitive_mapping_keys() -> None:
-    safe_key_secret = "fixture-key"
-    encoded_key_secret = "fixture/key"
+    safe_key_secret = "fixture-key-" + "S" * 8
+    encoded_key_secret = "fixture/key-" + "T" * 8
     settings = SimpleNamespace(
         operator_api_token=SecretStr(safe_key_secret),
         operator_client_api_token=SecretStr(encoded_key_secret),
@@ -5316,6 +5316,7 @@ async def test_autowork_credentials_in_payload_refuse_before_bridge_without_leak
                             ),
                         }
                     ],
+                    "raw_base64": base64.b64encode(operator_secret.encode()).decode("ascii"),
                 }
             ],
             "operator_api_token": operator_secret,
@@ -5330,11 +5331,15 @@ async def test_autowork_credentials_in_payload_refuse_before_bridge_without_leak
     assert result.status is ToolInvocationStatus.FAILED
     assert result.output["advisor_status"] == "refused"
     assert result.output["confirmed_non_execution"] is True
-    assert result.output["redacted_secret_count"] == 2, (
+    assert result.output["redacted_secret_count"] == 3, (
         result.output["redacted_secret_count"],
         [dict(item) for item in result.output["secret_findings"]],
     )
     assert [dict(item) for item in result.output["secret_findings"]] == [
+        {
+            "location": "$.evidence[0].raw_base64",
+            "type": "encoded_credential",
+        },
         {
             "location": "$.evidence[0].content_excerpts[0].text",
             "type": "configured_credential",

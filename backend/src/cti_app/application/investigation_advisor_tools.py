@@ -702,7 +702,12 @@ class InvestigationAdvisorTool:
             prompt_data, direct_findings = _redact_advisor_payload(
                 prompt_data, settings=self._settings
             )
-            secret_findings = (*encoded_findings, *direct_findings)
+            secret_findings = tuple(
+                {
+                    (finding.location, finding.secret_type): finding
+                    for finding in (*encoded_findings, *direct_findings)
+                }.values()
+            )
             redacted_secret_count = len(secret_findings)
             if secret_findings or _marked_secret_field_survives(
                 prompt_data, settings=self._settings

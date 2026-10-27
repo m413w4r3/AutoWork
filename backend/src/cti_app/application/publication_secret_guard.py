@@ -28,6 +28,8 @@ _DOCUMENTED_DOMAIN_CONTEXT = re.compile(
     r"\b(?:domain|domain name|hostname|domaine|nom de domaine)\b", re.I
 )
 _SECRET_REDACTION = "[clé masquée]"
+# Encoded substring matching requires 16 configured characters to limit IOC collisions.
+_MIN_ENCODED_SECRET_LENGTH = 16
 _OPERATIONAL_SETTING_FIELDS = frozenset(
     {
         "operator_api_token",
@@ -62,7 +64,7 @@ _OPERATIONAL_ASSIGNMENT = re.compile(
     r"(?P<value>\[clé masquée\]|\"[^\"]*\"|'[^']*'|[^\s,;]+)"
 )
 _SERVICE_DSN = re.compile(
-    r"(?i)\b(?:postgres(?:ql)?|redis|rediss|mysql|mariadb|mongodb(?:\+srv)?)://"
+    r"(?i)\b(?:postgres(?:ql)?|redis|rediss|mysql|mariadb|mongodb)(?:\+[a-z0-9_]+)?://"
     r"[^\s,;<>\"']+"
 )
 _URL = re.compile(r"(?i)\bhttps?://[^\s,;<>\"']+")
@@ -141,10 +143,10 @@ def _diagnostic_secret_fragments(
     for value, _secret_type, _case_insensitive in operational_values:
         if not value:
             continue
-        representations = (
-            *_percent_decoded_candidates(value),
-            *_encoded_secret_representations(value),
-        )
+        representations = {value}
+        if len(value) >= _MIN_ENCODED_SECRET_LENGTH:
+            representations.update(_percent_decoded_candidates(value))
+            representations.update(_encoded_secret_representations(value))
         for representation in representations:
             candidate = representation.casefold()
             width = min(4, len(candidate))
@@ -156,6 +158,8 @@ def _diagnostic_secret_fragments(
 
 
 def _encoded_secret_representations(value: str) -> frozenset[str]:
+    if len(value) < _MIN_ENCODED_SECRET_LENGTH:
+        return frozenset()
     once_encoded = quote(value, safe="")
     representations = {once_encoded, quote(once_encoded, safe="")}
     try:
@@ -562,13 +566,20 @@ def _service_dsn_has_credentials(dsn: str) -> bool:
 
 
 def _operational_secret_type(
-    text: str, field_name: str, operational_values: tuple[tuple[str, str, bool], ...]
+    text: str,
+    field_name: str,
+    operational_values: tuple[tuple[str, str, bool], ...],
+    *,
+    percent_decoded_text: bool = False,
 ) -> str | None:
     if _is_operational_field_name(field_name) and text.strip() not in {"", _SECRET_REDACTION}:
         return _operational_field_type(field_name)
-    for candidate in _percent_decoded_candidates(text):
+    for candidate_index, candidate in enumerate(_percent_decoded_candidates(text)):
         for value, secret_type, case_insensitive in operational_values:
-            found = (
+            raw_match_allowed = len(value) >= _MIN_ENCODED_SECRET_LENGTH or (
+                candidate_index == 0 and not percent_decoded_text
+            )
+            found = raw_match_allowed and (
                 value.casefold() in candidate.casefold() if case_insensitive else value in candidate
             )
             encoded_match = False
@@ -632,7 +643,9 @@ def _redact_operational_text_with_types(
     text: str, operational_values: tuple[tuple[str, str, bool], ...]
 ) -> tuple[str, tuple[str, ...]]:
     for decoded_text in _percent_decoded_candidates(text)[1:]:
-        secret_type = _operational_secret_type(decoded_text, "", operational_values)
+        secret_type = _operational_secret_type(
+            decoded_text, "", operational_values, percent_decoded_text=True
+        )
         if secret_type is not None:
             return _SECRET_REDACTION, (_finding_type(secret_type),)
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 from pathlib import Path
 from types import SimpleNamespace
@@ -198,8 +199,6 @@ def test_configured_secret_is_blocked_when_percent_encoded_in_generic_query(pass
 
 @pytest.mark.parametrize("encoding", ["hex", "base64"])
 def test_configured_secret_is_redacted_when_hex_or_base64_encoded(encoding: str) -> None:
-    import base64
-
     secret = "fixture-secret/value"
     encoded_secret = (
         secret.encode().hex()
@@ -218,6 +217,40 @@ def test_configured_secret_is_redacted_when_hex_or_base64_encoded(encoding: str)
     assert [(item.location, item.secret_type) for item in findings] == [
         ("$.evidence[0]", "encoded_credential")
     ]
+
+
+def test_short_configured_secret_does_not_match_encoded_ioc_material() -> None:
+    secret = "abc"
+    settings = SimpleNamespace(
+        operator_api_token=SecretStr(secret),
+        operator_client_api_token=SecretStr("a/b"),
+    )
+    digest = hashlib.sha256(b"documented SHA-256 fixture 835874").hexdigest()
+    implant_blob = b"MZ" + bytes(range(256)) + b"abc" + bytes(range(128))
+    implant_base64 = base64.b64encode(implant_blob).decode("ascii")
+    assert "616263" in digest and secret not in digest
+    assert "YWJj" in implant_base64 and secret not in implant_base64
+    payload = {
+        "hash": f"SHA-256: {digest}",
+        "content_base64": implant_base64,
+        "reference": "https://evidence.invalid/object?token=a%2Fb",
+    }
+
+    cleaned, findings = redact_operational_secrets_with_findings(
+        payload, settings=settings, include_host_paths=False
+    )
+
+    if cleaned != payload or findings:
+        pytest.fail("short configured values matched ordinary encoded CTI material")
+
+    raw_cleaned, raw_findings = redact_operational_secrets_with_findings(
+        {"statement": f"A raw configured value appears here: {secret}"},
+        settings=settings,
+        include_host_paths=False,
+    )
+    if raw_cleaned["statement"] != "A raw configured value appears here: [clé masquée]":
+        pytest.fail("short configured values stopped matching their raw form")
+    assert len(raw_findings) == 1, "raw configured value did not produce one finding"
 
 
 @pytest.mark.parametrize("passes", [1, 2])
@@ -255,6 +288,30 @@ def test_user_password_url_is_redacted_but_username_only_url_is_not() -> None:
 
 def test_service_dsn_without_userinfo_is_allowed() -> None:
     dsn = "postgresql://db.invalid:5432/cti"
+
+    cleaned, findings = redact_operational_secrets_with_findings(
+        {"references": [dsn]}, settings=SimpleNamespace(), include_host_paths=False
+    )
+
+    assert cleaned["references"][0] == dsn
+    assert findings == ()
+
+
+def test_driver_qualified_service_dsn_with_userinfo_is_redacted() -> None:
+    dsn = "postgresql+asyncpg://fixture-user:fixture-password@db.invalid:5432/cti"
+
+    cleaned, findings = redact_operational_secrets_with_findings(
+        {"references": [dsn]}, settings=SimpleNamespace(), include_host_paths=False
+    )
+
+    if cleaned["references"][0] != "[clé masquée]" or [
+        (item.location, item.secret_type) for item in findings
+    ] != [("$.references[0]", "dsn")]:
+        pytest.fail("driver-qualified service DSN with userinfo was not redacted")
+
+
+def test_driver_qualified_service_dsn_without_userinfo_is_allowed() -> None:
+    dsn = "postgresql+asyncpg://db.invalid:5432/cti"
 
     cleaned, findings = redact_operational_secrets_with_findings(
         {"references": [dsn]}, settings=SimpleNamespace(), include_host_paths=False
@@ -319,10 +376,8 @@ def test_percent_encoded_service_dsn_with_userinfo_is_redacted(passes: int) -> N
 
 
 def test_finding_paths_mask_configured_and_encoded_dictionary_keys() -> None:
-    import base64
-
-    secret = "fixture-key"
-    encoded_secret = "fixture/key"
+    secret = "fixture-key-" + "Q" * 8
+    encoded_secret = "fixture/key-" + "R" * 8
     settings = SimpleNamespace(
         operator_api_token=SecretStr(secret),
         operator_client_api_token=SecretStr(encoded_secret),
