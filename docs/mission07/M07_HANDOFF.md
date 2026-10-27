@@ -119,3 +119,10 @@ Budgets OSINT_OPEN validés : tool_seconds 86400 ; vt_units 10000 ; downloads 10
 
 ### Rapport final attendu
 SHA déployé (`22d03e22`, empreinte `239f62da6a38b8ea`), Alembic, contrôles de santé, état de la nouvelle investigation, appels réellement effectués, budgets consommés/réservés, blocages.
+
+### BLOCAGE JETONS (2026-10-27, cause établie par l'orchestrateur principal)
+- Avant B2, le backend live avait `OPERATOR_API_TOKEN` et `OPERATOR_CLIENT_API_TOKEN` définis (len 54, vérifié). Le `make up` de B2 a été lancé depuis un shell qui ne les exportait pas ; `compose.yaml:97-98` (et ~582) les lit dans l'environnement du shell (`${VAR:-}`) ⇒ conteneurs recréés avec jetons vides ⇒ API en identité locale `dev-analyst` (loopback seulement : ports 127.0.0.1:8000/5173). **Erreur d'exécution de B2, non détectée par les contrôles post-B2** (on n'avait pas vérifié les jetons).
+- Conséquence : outils opérateur 403 `operator_client_scope_required` ; B3/B4/B6 faits sous `dev-analyst`.
+- Non fait volontairement : générer des jetons éphémères (changerait les identifiants de l'utilisateur), lire `.env`.
+- Reprise : l'utilisateur relance `make up` (même image, schéma 0005) depuis un shell exportant ses deux jetons ; puis vérifier `len>0` dans backend/worker/job-recovery, puis ratification ou ré-activation de la politique sous identité vérifiée (voir rapport).
+- Lacune de contrôle à ajouter à toute redéploiement : vérifier la présence des jetons AVANT et APRÈS.
