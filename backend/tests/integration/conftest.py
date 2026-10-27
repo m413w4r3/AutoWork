@@ -1,6 +1,7 @@
 import asyncio
 import os
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
@@ -9,7 +10,7 @@ from alembic import command
 from alembic.config import Config
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.infrastructure.database.session import (
@@ -19,6 +20,14 @@ from cti_app.infrastructure.database.session import (
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
 
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
+
+
+@dataclass(frozen=True)
+class _SessionBoundUnitOfWorkFactory:
+    session_factory: async_sessionmaker[AsyncSession]
+
+    def __call__(self) -> SqlAlchemyUnitOfWork:
+        return SqlAlchemyUnitOfWork(self.session_factory)
 
 
 def _alembic_config(database_url: str) -> Config:
@@ -96,8 +105,6 @@ def uow_factory(migrated_postgres_url: str) -> UnitOfWorkFactory:
     """Postgres-backed UnitOfWork factory for production workflow tests."""
     engine = create_postgres_engine(migrated_postgres_url)
     session_factory = create_session_factory(engine)
-
-    def factory() -> SqlAlchemyUnitOfWork:
-        return SqlAlchemyUnitOfWork(session_factory)
-
-    return factory
+    # Workflow harnesses need the matching session factory to bind production
+    # external-effect coordinators to their mock HTTP adapters.
+    return _SessionBoundUnitOfWorkFactory(session_factory)

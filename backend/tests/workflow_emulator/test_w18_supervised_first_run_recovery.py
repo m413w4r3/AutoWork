@@ -9,7 +9,7 @@ import os
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -40,7 +40,6 @@ from cti_app.application.publication_rendering import PublicationRenderService
 from cti_app.application.subject_production import SubjectProductionService
 from cti_app.application.typst_paths import typst_bundle_paths
 from cti_app.application.typst_rendering import TypstRenderer
-from cti_app.application.virustotal import VirusTotalTransportError
 from cti_app.domain.analyst_opinion import (
     AnalystOpinionStatus,
     OpinionBlockType,
@@ -92,7 +91,7 @@ pytestmark = [pytest.mark.integration, pytest.mark.workflow_full]
 
 
 class _AmbiguousDownloadVirusTotal(HashCheckedVirusTotal):
-    """Fake VT proxy that blocks one inert download, then returns an ambiguous timeout."""
+    """Mock a signed CDN stream ending after partial bytes to model ambiguity."""
 
     def __init__(self, *, material: SyntheticSampleMaterial) -> None:
         super().__init__(material=material)
@@ -100,13 +99,33 @@ class _AmbiguousDownloadVirusTotal(HashCheckedVirusTotal):
         self.release_download = asyncio.Event()
         self.partial_bytes_written = 0
 
-    async def file_download(self, file_hash: str, *, sink: Any) -> None:
-        self.download_calls += 1
-        self.downloaded_hashes.append(file_hash)
-        self.download_entered.set()
-        await self.release_download.wait()
-        self.partial_bytes_written = sink.write(b"synthetic partial sample bytes")
-        raise VirusTotalTransportError("simulated local proxy timeout")
+    def sample_download_response(
+        self,
+        request: httpx.Request,
+        file_hash: str,
+        sample_bytes: bytes,
+    ) -> httpx.Response:
+        del file_hash, sample_bytes
+        payload = b"synthetic partial sample bytes"
+        owner = self
+
+        class PartialFailureStream(httpx.AsyncByteStream):
+            async def __aiter__(self) -> AsyncIterator[bytes]:
+                owner.download_entered.set()
+                await owner.release_download.wait()
+                yield payload
+                owner.partial_bytes_written = len(payload)
+                raise httpx.ReadError("synthetic connection ended after partial bytes")
+
+            async def aclose(self) -> None:
+                return None
+
+        return httpx.Response(
+            200,
+            stream=PartialFailureStream(),
+            headers={"content-type": "application/octet-stream"},
+            request=request,
+        )
 
 
 def _renderer(
