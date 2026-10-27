@@ -15,7 +15,6 @@ from sqlalchemy import select
 
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.bridge_investigator import (
-    ModelConversationTurnTransport,
     ScriptedTurnTransport,
     TurnSubmission,
     TurnSubmissionStatus,
@@ -77,7 +76,7 @@ from cti_app.infrastructure.database.models.production import (
 )
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.investigation_runtime_ports import (
-    _build_bridge_external_effect_binding,
+    build_investigation_runtime_composition_factory,
     build_investigation_runtime_ports,
     create_external_effect_coordinator,
 )
@@ -88,6 +87,7 @@ from cti_app.integrations.models import (
     OpenAIResearchAdapter,
     create_coordinated_http_responses_transport,
 )
+from tests.confined_worker_harness import build_confined_worker_harness
 from tests.workflow_emulator.investigation_support import (
     DEFAULT_IOC as _IOC,
 )
@@ -756,7 +756,7 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
                 BudgetDimension.SHODAN_CREDITS: 0,
                 BudgetDimension.DOWNLOADS: 1,
                 BudgetDimension.BRIDGE_TURNS: 12,
-                BudgetDimension.TOOL_SECONDS: 3600,
+                BudgetDimension.TOOL_SECONDS: 86_400,
                 BudgetDimension.CONTEXT_BYTES: 1_000_000,
                 BudgetDimension.CONTEXT_TOKENS: 100_000,
             },
@@ -908,40 +908,39 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
         BlobModelOutputStore(blob_catalog),
     )
     model_conversations = ModelConversationService(uow_factory, model_gateway, blob_store)
-    coordinated_advisor_transport = ModelConversationTurnTransport(
-        model_conversations,
-        bridge_external_effect_binding_factory=_build_bridge_external_effect_binding,
-        require_external_effect_authority=True,
+    # Satisfy the production Bridge routing gate; model requests still use the
+    # MockTransport-backed gateway configured above.
+    settings = _settings(providers=True, local_analysis=True).model_copy(
+        update={"openai_bridge_base_url": "https://bridge.fixture.invalid/v1"}
     )
-
-    settings = _settings(providers=True, local_analysis=True)
-    runtime_engine, runtime_ports = _real_vt_runtime_ports(
-        database_url=migrated_postgres_url,
+    confined_worker = build_confined_worker_harness(
+        settings=settings,
         uow_factory=uow_factory,
+        artifact_store=artifact_store,
+        required_families=("sample_analysis",),
+    )
+    runtime = build_investigation_runtime_composition_factory(
+        settings,
+        uow_factory=uow_factory,
+        session_factory=effect_sessions,
+        external_effect_coordinator=effect_coordinator,
         blob_store=blob_store,
         blob_catalog=blob_catalog,
-        settings=settings,
-        virustotal=vt_adapter,
-        capabilities=VirusTotalCapabilities(
+        artifact_store=artifact_store,
+        model_conversations=model_conversations,
+        vt_adapter=vt_adapter,
+        vt_capabilities=VirusTotalCapabilities(
             file_report=True,
             intelligence_search=True,
             file_download=True,
         ),
-        session_factory=effect_sessions,
-        external_effect_coordinator=effect_coordinator,
+        vt_observations=VirusTotalObservationService(blob_catalog, uow_factory),
+        shodan_adapter=None,
+        ghidra_adapter=None,
+        confined_analysis_execution=confined_worker.port,
     )
-    assert runtime_ports.acquisition is not None
-    composition_factory = _composition_factory(
-        uow_factory=uow_factory,
-        artifact_store=artifact_store,
-        settings=settings,
-        transport=coordinated_advisor_transport,
-        virustotal=vt_adapter,
-        include_local_analysis=True,
-        # Preserve W15's in-process confined worker. The production runtime's
-        # default execution port is not allowed to override that test harness.
-        additional_ports=replace(runtime_ports, confined_analysis_execution=None),
-    )
+    assert runtime.ports.optional_tool_ports.acquisition is not None
+    composition_factory = runtime.composition_factory
     app, _, _ = _build_app(
         uow_factory=uow_factory,
         artifact_store=artifact_store,
@@ -1773,7 +1772,6 @@ async def test_real_postgres_osint_open_continuous_vt_analysis_advisor(
             )
     finally:
         await vt_adapter._client.aclose()
-        await runtime_engine.dispose()
         await effect_engine.dispose()
 
 
