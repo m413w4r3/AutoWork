@@ -758,7 +758,7 @@ async def test_trusted_vt_source_refs_accept_arbitrary_hash_under_active_osint_p
     assert references == (
         EvidenceReference("sample_hash", arbitrary_hash, "sample-hash.v1", arbitrary_hash),
     )
-    assert fixture.observations.items == {}
+    assert await fixture.observations.list_for_investigation(investigation.id) == ()
     caller_claims = await fixture.service._trusted_vt_source_references(
         investigation=investigation,
         tool_name="vt.file_report",

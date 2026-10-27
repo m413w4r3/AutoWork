@@ -64,6 +64,7 @@ from cti_app.infrastructure.database.repositories.virustotal_external_effects im
 )
 from cti_app.infrastructure.database.repositories.virustotal_external_effects import (
     _source_refs_for_family,
+    virustotal_external_effect_family_bindings,
 )
 from cti_app.integrations.models import (
     BridgeTransportError,
@@ -2007,6 +2008,100 @@ async def test_source_dependent_family_rejects_untrusted_source_refs(case: str) 
     assert result.reason in {"malformed_source_reference", "source_references_mismatch"}
     assert transport.submit_entries == 0
     assert transport.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy", [True, False])
+async def test_consume_allows_unassociated_vt_hash_only_under_osint_policy(policy: bool) -> None:
+    arbitrary_hash = "d" * 64
+    source_reference = EvidenceReference(
+        "sample_hash", arbitrary_hash, "sample-hash.v1", arbitrary_hash
+    )
+    invocation_parameters = {
+        "file_hash": arbitrary_hash,
+        "_vt_external_effect_source_refs": [source_reference.to_json()],
+    }
+    prepared = PreparedExternalRequest.build(
+        family="vt.file_report",
+        provider="vt",
+        provider_scope="default",
+        normalizer_version="vt-read.v1",
+        canonical_request={"path": f"/api/v3/files/{arbitrary_hash}"},
+        application_request=_wire(target=f"/api/v3/files/{arbitrary_hash}".encode()),
+        evidence_refs=(source_reference,),
+        credential_parameter_names=("apikey",),
+    )
+    authority = _authority(policy=policy)
+
+    class _NoopContext:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args: object):
+            return None
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args: object):
+            return None
+
+        def begin(self):
+            return _NoopContext()
+
+        async def scalar(self, *args: object, **kwargs: object):
+            return None
+
+        async def scalars(self, *args: object, **kwargs: object):
+            return []
+
+        async def execute(self, *args: object, **kwargs: object):
+            return SimpleNamespace(scalar_one_or_none=lambda: uuid4())
+
+    class _Guard:
+        async def lock_for_consume(self, session, authority):
+            return True
+
+    class _ConsumeStore(SqlAlchemyExternalEffectClaimStore):
+        async def _lock_authority(self, session, authority, *args, **kwargs):
+            invocation = SimpleNamespace(
+                normalized_parameters=invocation_parameters,
+                investigation_id=authority.investigation_id,
+                operation_key=authority.operation_key,
+                status="running",
+                tool_name="vt.file_report",
+                schema_version="1",
+            )
+            investigation = SimpleNamespace(subject_id=authority.pinned_subject_id)
+            reservation = SimpleNamespace(status="reserved")
+            return investigation, object(), invocation, reservation, []
+
+        async def _check_authority(self, *args: object, **kwargs: object):
+            return None
+
+        async def _lock_and_consume_family_attempt(self, *args: object, **kwargs: object):
+            return None
+
+        async def _lock_and_start_model_attempt(self, *args: object, **kwargs: object):
+            return None
+
+    store = _ConsumeStore(
+        lambda: _Session(),  # type: ignore[arg-type]
+        policy_guard=_Guard(),
+        family_bindings=virustotal_external_effect_family_bindings(),
+    )
+    result = await store.consume(
+        authority,
+        prepared,
+        effect_key=effect_key(authority.investigation_id, prepared),
+        occurrence_digest=occurrence_sha256(prepared.occurrence_id),
+    )
+
+    if policy:
+        assert isinstance(result, ConsumeCommitted)
+    else:
+        assert result == ConsumeRefused("sample_hash_not_associated_with_investigation")
 
 
 @pytest.mark.parametrize(

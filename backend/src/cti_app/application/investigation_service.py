@@ -1989,7 +1989,7 @@ class InvestigationService:
         if hash_value is not None:
             try:
                 normalized_hash = normalize_file_hash(str(hash_value))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, VirusTotalInvalidInputError):
                 return ()
             if len(normalized_hash) != 64:
                 return ()

@@ -1427,6 +1427,15 @@ class SqlAlchemyExternalEffectClaimStore:
             "vt.behaviour_pcap",
             "vt.relationships",
         }
+        # The policy and persisted invocation reference were already checked by
+        # _check_authority and _validate_external_source_refs above.
+        allows_unassociated_osint_vt_hash = (
+            authority.authority_kind is ExternalEffectAuthorityKind.OSINT_POLICY
+            and prepared.provider == "vt"
+            and family_binding.provider == "vt"
+            and family_binding.requires_source_refs
+            and (vt_file_hash_read or prepared.family == "vt.download_sample")
+        )
         recognized_kinds = {
             "sample",
             "sample_association_sample",
@@ -1564,7 +1573,10 @@ class SqlAlchemyExternalEffectClaimStore:
             raise _ConsumeDenied("sample_association_missing")
         found_hashes = {item.sample_sha256 for item in associations}
         observation_grounding_hashes = observation_hashes if vt_file_hash_read else set()
-        if sample_hashes - (found_hashes | observation_grounding_hashes):
+        if (
+            sample_hashes - (found_hashes | observation_grounding_hashes)
+            and not allows_unassociated_osint_vt_hash
+        ):
             raise _ConsumeDenied("sample_hash_not_associated_with_investigation")
         sample_hash_grounding = sample_hashes if vt_file_hash_read else set()
         if observation_hashes - (found_hashes | sample_hash_grounding):
