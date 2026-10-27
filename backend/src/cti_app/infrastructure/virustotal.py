@@ -363,6 +363,7 @@ class _VirusTotalDownloadPermitAwareTransport(PermitAwareTransport):
         "__max_bytes",
         "__pending",
         "__request",
+        "__stream_read_failure",
     )
 
     def __init__(
@@ -378,6 +379,7 @@ class _VirusTotalDownloadPermitAwareTransport(PermitAwareTransport):
         self.__frozen_request = frozen_request
         self.__max_bytes = max_response_bytes
         self.__pending: dict[str, tuple[BinaryIO, int, dict[str, str]]] = {}
+        self.__stream_read_failure: tuple[int, int] | None = None
 
     async def submit_once(
         self, request: FrozenWireRequest, capability: PhysicalSendCapability
@@ -402,15 +404,19 @@ class _VirusTotalDownloadPermitAwareTransport(PermitAwareTransport):
             )
             size = 0
             if limit:
-                async for chunk in response.aiter_bytes():
-                    remaining = limit - size
-                    if remaining <= 0:
-                        break
-                    piece = chunk[:remaining]
-                    spool.write(piece)
-                    size += len(piece)
-                    if len(piece) < len(chunk):
-                        break
+                try:
+                    async for chunk in response.aiter_bytes():
+                        remaining = limit - size
+                        if remaining <= 0:
+                            break
+                        piece = chunk[:remaining]
+                        spool.write(piece)
+                        size += len(piece)
+                        if len(piece) < len(chunk):
+                            break
+                except httpx.ReadError:
+                    self.__stream_read_failure = (status, size)
+                    raise
             spool.seek(0)
             safe_headers = {
                 name: response.headers[name]
@@ -444,6 +450,18 @@ class _VirusTotalDownloadPermitAwareTransport(PermitAwareTransport):
             return None
         spool, status, headers = item
         return httpx.Response(status, headers=headers, stream=_SpooledResponseStream(spool))
+
+    def take_stream_read_failure(self) -> VirusTotalExternalEffectNeedsReviewError | None:
+        failure, self.__stream_read_failure = self.__stream_read_failure, None
+        if failure is None:
+            return None
+        status, bytes_read = failure
+        return VirusTotalExternalEffectNeedsReviewError(
+            "The VirusTotal download stream was truncated after handoff; it will not be resent.",
+            code="virustotal_download_truncated",
+            status_code=status,
+            bytes_read=bytes_read,
+        )
 
     def close_pending(self) -> None:
         for spool, _status, _headers in self.__pending.values():
@@ -2175,6 +2193,9 @@ class VirusTotalHttpAdapter(VirusTotalPort):
             try:
                 outcome = await coordinator.send_one(authority, prepared, transport_adapter)
             except Exception:
+                stream_failure = transport_adapter.take_stream_read_failure()
+                if stream_failure is not None:
+                    raise stream_failure from None
                 raise VirusTotalExternalEffectNeedsReviewError(
                     "The VirusTotal download outcome could not be confirmed; it will not be resent."
                 ) from None
@@ -2196,7 +2217,14 @@ class VirusTotalHttpAdapter(VirusTotalPort):
                     "The coordinator refused the VirusTotal download before a new send.",
                     code=code,
                 )
-            if isinstance(outcome, (Ambiguous, Reused, Completed)):
+            if isinstance(outcome, Ambiguous):
+                stream_failure = transport_adapter.take_stream_read_failure()
+                if stream_failure is not None:
+                    raise stream_failure
+                raise VirusTotalExternalEffectNeedsReviewError(
+                    "The VirusTotal download claim cannot authorize another physical send."
+                )
+            if isinstance(outcome, (Reused, Completed)):
                 raise VirusTotalExternalEffectNeedsReviewError(
                     "The VirusTotal download claim cannot authorize another physical send."
                 )
