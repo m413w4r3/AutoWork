@@ -85,7 +85,10 @@ from cti_app.application.research_context_builder import (
     provider_download_blocked_capabilities,
 )
 from cti_app.application.sample_acquisition import SAMPLES_QUARANTINE_BUCKET
-from cti_app.application.virustotal import VirusTotalInvalidInputError, normalize_file_hash
+from cti_app.application.virustotal import (
+    VirusTotalInvalidInputError,
+    normalize_file_hash,
+)
 from cti_app.domain.analyst_opinion import (
     AnalystObservationV1,
     AnalystOpinionStatus,
@@ -1395,19 +1398,20 @@ class InvestigationService:
                 )
             else:
                 if tool_name == "vt.download_sample":
-                    # Resolve the target hash from canonical investigation
-                    # evidence or an existing association. Caller supplied
-                    # evidence_refs cannot authorize the target hash.
+                    # Resolve the target with the same policy gate as file_report.
+                    # Caller supplied evidence_refs cannot authorize the hash.
                     external_effect_evidence_refs = await self._trusted_vt_source_references(
                         investigation=investigation,
                         tool_name="vt.file_report",
                         arguments={"file_hash": arguments.get("sha256")},
+                        envelope=envelope,
                     )
                 else:
                     external_effect_evidence_refs = await self._trusted_vt_source_references(
                         investigation=investigation,
                         tool_name=tool_name,
                         arguments=arguments,
+                        envelope=envelope,
                     )
                 invocation_parameters = {
                     **arguments,
@@ -1678,6 +1682,7 @@ class InvestigationService:
                     current_investigation,
                     external_effect_evidence_refs,
                     tool_name,
+                    envelope=current_envelope,
                 ):
                     return FrameworkPreSubmissionProof.DISCLOSURE_REVOKED
             elif tool_name == "advisor.consult":
@@ -1863,6 +1868,8 @@ class InvestigationService:
         investigation: AnalystInvestigation,
         references: tuple[EvidenceReference, ...],
         family: str,
+        *,
+        envelope: InvestigationEnvelope | None = None,
     ) -> bool:
         sample_hashes = {
             reference.id for reference in references if reference.kind == "sample_hash"
@@ -1904,21 +1911,37 @@ class InvestigationService:
         sample_associations = self._sample_associations
         sample_repository = self._samples
         if hashes:
-            if sample_associations is None or sample_repository is None:
+            allow_unobserved_hash = await self._osint_open_vt_hash_reads_allowed(
+                investigation, envelope
+            )
+            if not allow_unobserved_hash and (
+                sample_associations is None or sample_repository is None
+            ):
                 return True
-            associations = await sample_associations.list_for_investigation(investigation.id)
+            associations = (
+                await sample_associations.list_for_investigation(investigation.id)
+                if sample_associations is not None
+                else ()
+            )
             associated_hashes = {association.sample_sha256 for association in associations}
             if any(
                 reference.kind == "sample_hash" for reference in references
             ) and not observation_hashes.issubset(sample_hashes):
                 return True
-            if sample_hashes - (associated_hashes | observation_hashes):
+            ungrounded_hashes = sample_hashes - (associated_hashes | observation_hashes)
+            if ungrounded_hashes and not allow_unobserved_hash:
                 return True
             if observation_hashes - (associated_hashes | sample_hashes):
                 return True
         for sample_hash in hashes:
             if sample_repository is None:
-                return True
+                if (
+                    not allow_unobserved_hash
+                    or sample_hash in observation_hashes
+                    or sample_hash in associated_hashes
+                ):
+                    return True
+                continue
             samples = await sample_repository.list_by_subject_and_sha256(
                 investigation.subject_id, sample_hash
             )
@@ -1955,8 +1978,9 @@ class InvestigationService:
         investigation: AnalystInvestigation,
         tool_name: str,
         arguments: Mapping[str, Any],
+        envelope: InvestigationEnvelope | None = None,
     ) -> tuple[EvidenceReference, ...]:
-        """Resolve source refs from canonical investigation evidence, never tool claims."""
+        """Resolve hash refs from active OSINT authority or local evidence, never caller claims."""
         hash_value: Any = None
         if tool_name in {"vt.file_report", "vt.behaviour", "vt.behaviour_pcap"}:
             hash_value = arguments.get("file_hash")
@@ -1975,6 +1999,8 @@ class InvestigationService:
                 version="sample-hash.v1",
                 sha256=normalized_hash,
             )
+            if await self._osint_open_vt_hash_reads_allowed(investigation, envelope):
+                return (hash_reference,)
             associations = (
                 await self._sample_associations.list_for_investigation(investigation.id)
                 if self._sample_associations is not None
@@ -1989,20 +2015,20 @@ class InvestigationService:
                 if item.object_type.casefold() in {"sample", "file", "sample_observation", "sha256"}
                 and item.object_id == normalized_hash
             )
-            if not matching_observations:
-                return ()
-            return (
-                hash_reference,
-                *(
-                    EvidenceReference(
-                        kind="evidence_observation",
-                        id=str(item.id),
-                        version=item.source_version,
-                        sha256=item.sha256,
-                    )
-                    for item in sorted(matching_observations, key=lambda value: str(value.id))
-                ),
-            )
+            if matching_observations:
+                return (
+                    hash_reference,
+                    *(
+                        EvidenceReference(
+                            kind="evidence_observation",
+                            id=str(item.id),
+                            version=item.source_version,
+                            sha256=item.sha256,
+                        )
+                        for item in sorted(matching_observations, key=lambda value: str(value.id))
+                    ),
+                )
+            return ()
 
         if tool_name == "vt.intelligence_search":
             raw_refs = arguments.get("evidence_refs")
@@ -2082,6 +2108,43 @@ class InvestigationService:
                 )
                 document_refs[reference.id] = reference
         return tuple(document_refs[key] for key in sorted(document_refs))
+
+    async def _osint_open_vt_hash_reads_allowed(
+        self,
+        investigation: AnalystInvestigation,
+        envelope: InvestigationEnvelope | None,
+    ) -> bool:
+        if (
+            envelope is None
+            or envelope.investigation_id != investigation.id
+            or envelope.authority_kind is not EnvelopeAuthorityKind.OSINT_POLICY
+            or envelope.inherited_policy_id is None
+            or envelope.inherited_policy_version is None
+            or envelope.inherited_policy_event_id is None
+            or "vt" not in envelope.allowed_providers
+            or self._effective_policy_for is None
+        ):
+            return False
+        try:
+            effective = await self._effective_policy_for(investigation.id)
+        except Exception:
+            return False
+        if effective is None or not effective.authorized:
+            return False
+        inheritance = effective.inheritance
+        policy = effective.policy
+        return bool(
+            inheritance.investigation_id == investigation.id
+            and inheritance.subject_id == investigation.subject_id
+            and inheritance.policy_id == envelope.inherited_policy_id
+            and inheritance.policy_version == envelope.inherited_policy_version
+            and inheritance.policy_event_id == envelope.inherited_policy_event_id
+            and policy.policy_id == envelope.inherited_policy_id
+            and policy.version == envelope.inherited_policy_version
+            and policy.event_id == envelope.inherited_policy_event_id
+            and policy.contains_subject(investigation.subject_id)
+            and "vt" in policy.capabilities.allowed_providers
+        )
 
     async def _bridge_context_evidence_references(
         self,
@@ -4291,6 +4354,7 @@ def _vt_source_refs_from_parameters(
     raw = parameters.get(_VT_SOURCE_REFS_PARAMETER)
     if not isinstance(raw, (list, tuple)) or len(raw) > 16:
         return ()
+
     references: list[EvidenceReference] = []
     for item in raw:
         if not isinstance(item, Mapping):

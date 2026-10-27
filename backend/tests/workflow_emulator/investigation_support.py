@@ -450,6 +450,7 @@ async def seed_verified_article(
     suffix: str,
     material: SyntheticSampleMaterial | None = None,
     include_seed: bool = True,
+    include_seed_observation: bool = True,
     article_claim: str | None = None,
 ) -> SeededInvestigation:
     """Persist a verified article, its independent run, and optional seed evidence."""
@@ -551,7 +552,7 @@ async def seed_verified_article(
         schema_version="analyst-input-pack-v1",
     )
     seed_observation: EvidenceObservation | None = None
-    if include_seed:
+    if include_seed and include_seed_observation:
         seed_bytes = b"Synthetic seed evidence; no real provider request is made." + uuid4().bytes
         seed_blob_id = await artifact_store.put_bytes(
             seed_bytes,

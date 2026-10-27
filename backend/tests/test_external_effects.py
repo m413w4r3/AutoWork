@@ -62,6 +62,9 @@ from cti_app.infrastructure.database.repositories.external_effects import (
 from cti_app.infrastructure.database.repositories.virustotal_external_effects import (
     _source_flags_block as osint_guard_source_flags_block,
 )
+from cti_app.infrastructure.database.repositories.virustotal_external_effects import (
+    _source_refs_for_family,
+)
 from cti_app.integrations.models import (
     BridgeTransportError,
     HttpResponsesTransport,
@@ -88,6 +91,35 @@ _APPROVAL_ID = UUID("b5e03b5a-9619-461f-9a39-10ec2856373d")
 def test_source_do_not_submit_does_not_block_vt_reads_or_downloads(family: str) -> None:
     assert not external_effect_source_do_not_submit_blocks(family, True)
     assert not external_effect_source_do_not_submit_blocks(family, False)
+
+
+@pytest.mark.parametrize(
+    ("family", "parameter_name"),
+    [
+        ("vt.file_report", "file_hash"),
+        ("vt.behaviour", "file_hash"),
+        ("vt.relationships", "object_id"),
+        ("vt.download_sample", "sha256"),
+    ],
+)
+def test_vt_consume_source_refs_reconstruct_normalized_hash(
+    family: str, parameter_name: str
+) -> None:
+    arbitrary_hash = "d" * 64
+    parameters = {parameter_name: f" {arbitrary_hash.upper()} "}
+    if family == "vt.relationships":
+        parameters["object_type"] = "file"
+
+    assert _source_refs_for_family(family, parameters) == (
+        EvidenceReference("sample_hash", arbitrary_hash, "sample-hash.v1", arbitrary_hash),
+    )
+
+
+@pytest.mark.parametrize("hash_length", [32, 40])
+def test_vt_consume_source_refs_keep_md5_and_sha1_outside_sample_hash_policy(
+    hash_length: int,
+) -> None:
+    assert _source_refs_for_family("vt.file_report", {"file_hash": "a" * hash_length}) == ()
 
 
 @pytest.mark.parametrize(
