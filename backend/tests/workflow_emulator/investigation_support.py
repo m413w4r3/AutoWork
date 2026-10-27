@@ -820,6 +820,7 @@ def composition_factory(
     settings: Settings,
     transport: ScriptedTurnTransport,
     virustotal: HashCheckedVirusTotal | VirusTotalHttpAdapter | None = None,
+    acquisition_adapter: VirusTotalHttpAdapter | None = None,
     external_effect_session_factory: Any | None = None,
     shodan: FakeShodanPort | None = None,
     include_local_analysis: bool = False,
@@ -827,6 +828,11 @@ def composition_factory(
     yara_engine: Any | None = None,
     additional_ports: OptionalInvestigationToolPorts | None = None,
 ) -> InvestigationCompositionFactory:
+    if additional_ports is not None and additional_ports.acquisition is not None:
+        raise ValueError(
+            "Workflow VT acquisition must be built by composition_factory so it is bound "
+            "to the external-effect coordinator."
+        )
     ports = OptionalInvestigationToolPorts()
     needs_confined_worker = (
         include_local_analysis
@@ -864,35 +870,29 @@ def composition_factory(
             file_download=True,
         )
         observations = VirusTotalObservationService(blob_catalog, uow_factory)
-        acquisition = (
-            additional_ports.acquisition
-            if additional_ports is not None and additional_ports.acquisition is not None
-            else None
+        session_factory = external_effect_session_factory or getattr(
+            uow_factory, "session_factory", None
         )
-        if acquisition is None:
-            session_factory = external_effect_session_factory or getattr(
-                uow_factory, "session_factory", None
+        if session_factory is None:
+            raise ValueError(
+                "Workflow VT downloads require a database-backed external-effect coordinator."
             )
-            if session_factory is None:
-                raise ValueError(
-                    "Workflow VT downloads require a database-backed external-effect coordinator."
-                )
-            download_adapter = (
-                virustotal.download_adapter()
-                if isinstance(virustotal, HashCheckedVirusTotal)
-                else virustotal
-            )
-            download_adapter.configure_external_effects(
-                create_external_effect_coordinator(session_factory),
-                observations,
-            )
-            acquisition = VirusTotalSampleAcquisitionService(
-                download_adapter,
-                vt_capabilities,
-                blob_catalog,
-                uow_factory,
-                LocalIdentityProvider("service:synthetic-acquisition"),
-            )
+        download_adapter = acquisition_adapter or (
+            virustotal.download_adapter()
+            if isinstance(virustotal, HashCheckedVirusTotal)
+            else virustotal
+        )
+        download_adapter.configure_external_effects(
+            create_external_effect_coordinator(session_factory),
+            observations,
+        )
+        acquisition = VirusTotalSampleAcquisitionService(
+            download_adapter,
+            vt_capabilities,
+            blob_catalog,
+            uow_factory,
+            LocalIdentityProvider("service:synthetic-acquisition"),
+        )
         ports = replace(
             ports,
             virustotal=virustotal,
@@ -936,7 +936,7 @@ def composition_factory(
         overrides = {
             item.name: getattr(additional_ports, item.name)
             for item in fields(OptionalInvestigationToolPorts)
-            if getattr(additional_ports, item.name) is not None
+            if item.name != "acquisition" and getattr(additional_ports, item.name) is not None
         }
         ports = replace(ports, **overrides)
     return InvestigationCompositionFactory(
