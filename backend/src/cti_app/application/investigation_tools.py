@@ -887,7 +887,15 @@ class RegistryToolDispatcher:
             },
             pre_submission_proof=proof,
         )
-        return replace(result, output={**result.output, "reason": reasons[proof]})
+        return replace(
+            result,
+            output={
+                **result.output,
+                "reason": reasons[proof],
+                "error_code": reasons[proof],
+            },
+            error_code=reasons[proof],
+        )
 
     @staticmethod
     def _policy_status(

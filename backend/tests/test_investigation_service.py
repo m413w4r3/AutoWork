@@ -1364,6 +1364,37 @@ async def test_download_route_refusal_archives_scoped_untrusted_observation() ->
 
 
 @pytest.mark.asyncio
+async def test_framework_policy_refusal_archives_stable_error_code() -> None:
+    investigation_id = uuid4()
+    observations = InMemoryEvidenceObservationRepository()
+    store = _ContextBlobStore()
+    writer = ProductionArtifactObservationWriter(store, observations)
+    invocation = ToolInvocation(
+        investigation_id=investigation_id,
+        operation_key="synthetic-source-reference-refusal",
+        tool_name="vt.download_sample",
+        schema_version="1",
+        normalized_parameters={"sha256": "e" * 64},
+        purpose="synthetic sample acquisition",
+    )
+    error_code = "external_disclosure_revoked_before_dispatch"
+    result = ToolResult(
+        status=ToolInvocationStatus.POLICY_DENIED,
+        output={"reason": error_code, "error_code": error_code},
+        error_code=error_code,
+        framework_pre_submission_proof=FrameworkPreSubmissionProof.DISCLOSURE_REVOKED,
+    )
+
+    archived = await writer.archive(invocation, result)
+    payload = await store.read_json(archived[0].blob_id)
+
+    assert payload["result"]["error_code"] == error_code
+    assert payload["result"]["framework_pre_submission_proof"]["object_type"] == (
+        FrameworkPreSubmissionProof.DISCLOSURE_REVOKED.value
+    )
+
+
+@pytest.mark.asyncio
 async def test_untyped_download_refusal_requires_reconciliation_before_retry() -> None:
     first_call = _tool_call(
         "vt.download_sample", "synthetic-hash-one", "review first synthetic hit"

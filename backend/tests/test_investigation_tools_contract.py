@@ -18,6 +18,7 @@ from cti_app.application.investigation_tools import (
 from cti_app.domain.investigation import (
     BudgetDimension,
     DisclosureBounds,
+    FrameworkPreSubmissionProof,
     InvestigationBudget,
     InvestigationEnvelope,
     ToolInvocationStatus,
@@ -363,6 +364,32 @@ async def test_acquisition_and_active_effects_have_distinct_policy_outcomes() ->
     )
     assert acquire_result.status is ToolInvocationStatus.POLICY_DENIED
     assert active_result.status is ToolInvocationStatus.NEEDS_REVIEW
+
+
+@pytest.mark.asyncio
+async def test_pre_dispatch_refusal_has_a_stable_error_code() -> None:
+    registry = InMemoryToolRegistry()
+    adapter = FakeAdapter()
+    registry.register(_definition(), adapter)
+    dispatcher = RegistryToolDispatcher(registry)
+
+    async def refuse(_context):
+        return FrameworkPreSubmissionProof.DISCLOSURE_REVOKED
+
+    result = await dispatcher.dispatch(
+        _context(),
+        tool_name="vt.file_report",
+        schema_version="1",
+        arguments={"sha256": "a" * 64},
+        purpose="Check a synthetic source reference.",
+        operation_key="source-reference-refusal",
+        pre_dispatch_check=refuse,
+    )
+
+    assert result.status is ToolInvocationStatus.POLICY_DENIED
+    assert result.error_code == "external_disclosure_revoked_before_dispatch"
+    assert result.output["error_code"] == result.error_code
+    assert adapter.calls == 0
 
 
 @pytest.mark.asyncio
