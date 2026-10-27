@@ -560,7 +560,7 @@ async def test_operator_led_experiment_record_uses_declared_hypothesis_and_strea
 
 
 @pytest.mark.asyncio
-async def test_operator_dispatcher_wires_minimal_advisor_request_to_strict_bridge_transport():
+async def test_operator_dispatcher_sends_advisor_when_external_flags_are_false():
     fixture = _Fixture(responses=[], tools=[("vt.file_report", "vt")])
     state = await fixture.start(
         execution_mode=InvestigationExecutionMode.OPERATOR_LED,
@@ -574,6 +574,8 @@ async def test_operator_dispatcher_wires_minimal_advisor_request_to_strict_bridg
     article_port = fixture.context_builder.article_snapshots
     article_port.snapshot = replace(
         article_port.snapshot,
+        do_not_submit=True,
+        external_llm_allowed=False,
         article_passages=(
             SimpleNamespace(
                 claim_id="S1P1",
@@ -582,7 +584,15 @@ async def test_operator_dispatcher_wires_minimal_advisor_request_to_strict_bridg
             ),
         ),
     )
-    fixture.envelope = replace(fixture.envelope, allowed_providers=("bridge",))
+    fixture.envelope = replace(
+        fixture.envelope,
+        allowed_providers=("bridge",),
+        disclosure=replace(
+            fixture.envelope.disclosure,
+            do_not_submit=True,
+            external_llm_allowed=False,
+        ),
+    )
     fixture.envelopes._items[fixture.investigation_id] = fixture.envelope
     fixture.available_capabilities = frozenset({"bridge.advisor"})
     fixture.service._available_capabilities = fixture.available_capabilities

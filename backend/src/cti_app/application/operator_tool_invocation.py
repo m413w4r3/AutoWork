@@ -477,7 +477,7 @@ class OperatorToolInvocationService:
             unavailable_tool_reasons=self._unavailable_tool_reasons,
             blocked_capabilities=(
                 ("bridge.advisor:external_llm_disclosure_denied",)
-                if not InvestigationService.external_llm_allowed(snapshot, envelope)
+                if not InvestigationService.bridge_disclosure_allowed(snapshot, envelope)
                 else ()
             ),
         )
@@ -899,7 +899,9 @@ class OperatorToolInvocationService:
         snapshot = await self._context_builder.article_snapshots.resolve(
             investigation.synthesis_artifact_id
         )
-        advisor_external_allowed = InvestigationService.external_llm_allowed(snapshot, envelope)
+        advisor_external_allowed = InvestigationService.bridge_disclosure_allowed(
+            snapshot, envelope
+        )
         advisor_disclosure_denied = tool_name == "advisor.consult" and not advisor_external_allowed
         registered = self._registry.get(tool_name, schema_version)
         definition = registered[0] if registered is not None else None
@@ -918,6 +920,7 @@ class OperatorToolInvocationService:
         if (
             not advisor_disclosure_denied
             and requires_external_disclosure
+            and tool_name != "advisor.consult"
             and not InvestigationService.external_llm_allowed(snapshot, envelope)
         ):
             self._require_external_disclosure(snapshot, envelope)

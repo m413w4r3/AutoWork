@@ -1050,10 +1050,15 @@ class SqlAlchemyExternalEffectClaimStore:
             raise _ConsumeDenied("provider_not_allowed")
         if envelope.disclosure_tlp == "red":
             raise _ConsumeDenied("tlp_red")
-        if envelope.disclosure_do_not_submit:
+        is_bridge_submission = prepared.family.startswith(_MODEL_LINEAGE_PREFIXES)
+        if envelope.disclosure_do_not_submit and not is_bridge_submission:
             raise _ConsumeDenied("do_not_submit")
         is_model_submission = _is_model_submission(prepared, family_binding)
-        if is_model_submission and not envelope.disclosure_external_llm_allowed:
+        if (
+            is_model_submission
+            and not is_bridge_submission
+            and not envelope.disclosure_external_llm_allowed
+        ):
             raise _ConsumeDenied("external_llm_not_allowed")
         if (
             prepared.family.startswith(("acquisition.", "vt.download"))
@@ -1352,11 +1357,13 @@ class SqlAlchemyExternalEffectClaimStore:
         sample_ids: set[UUID] = set()
         referenced_sample_ids: set[UUID] = set()
         association_ids: set[UUID] = set()
+        association_sample_refs: dict[UUID, EvidenceReference] = {}
         document_ids: set[UUID] = set()
         sample_hashes: set[str] = set()
         observation_hashes: set[str] = set()
         observation_ids: dict[UUID, EvidenceReference] = {}
         is_model_submission = _is_model_submission(prepared, family_binding)
+        is_bridge_submission = prepared.family.startswith(_MODEL_LINEAGE_PREFIXES)
         vt_file_hash_read = prepared.family in {
             "vt.file_report",
             "vt.behaviour",
@@ -1396,7 +1403,13 @@ class SqlAlchemyExternalEffectClaimStore:
                 ref_id = UUID(reference.id)
             except ValueError as exc:
                 raise _ConsumeDenied("malformed_source_reference") from exc
-            if reference.kind in {"sample", "sample_association_sample"}:
+            if reference.kind == "sample_association_sample" and is_bridge_submission:
+                existing_reference = association_sample_refs.get(ref_id)
+                if existing_reference is not None and existing_reference != reference:
+                    raise _ConsumeDenied("conflicting_sample_association_reference")
+                association_sample_refs[ref_id] = reference
+                association_ids.add(ref_id)
+            elif reference.kind in {"sample", "sample_association_sample"}:
                 sample_ids.add(ref_id)
                 referenced_sample_ids.add(ref_id)
             elif reference.kind == "sample_association":
@@ -1428,7 +1441,7 @@ class SqlAlchemyExternalEffectClaimStore:
                     raise _ConsumeDenied("evidence_observation_version_mismatch")
                 object_type = observation.object_type.casefold()
                 file_object_types = {"sample", "file", "sample_observation"}
-                if vt_file_hash_read:
+                if vt_file_hash_read or is_bridge_submission:
                     file_object_types.add("sha256")
                 if object_type in file_object_types:
                     if not re.fullmatch(r"[0-9a-f]{64}", observation.object_id):
@@ -1439,7 +1452,7 @@ class SqlAlchemyExternalEffectClaimStore:
                         document_ids.add(UUID(observation.object_id))
                     except ValueError as exc:
                         raise _ConsumeDenied("unresolvable_evidence_observation_source") from exc
-                elif is_model_submission:
+                elif is_model_submission and not is_bridge_submission:
                     raise _ConsumeDenied("unresolvable_evidence_observation_source")
 
         if vt_file_hash_read and sample_hashes and not observation_hashes.issubset(sample_hashes):
@@ -1475,6 +1488,14 @@ class SqlAlchemyExternalEffectClaimStore:
         for association in associations:
             if association.investigation_id != authority.investigation_id:
                 raise _ConsumeDenied("sample_association_investigation_mismatch")
+            sample_reference = association_sample_refs.get(association.id)
+            if sample_reference is not None:
+                if association.sample_sha256 != sample_reference.sha256:
+                    raise _ConsumeDenied("sample_association_hash_mismatch")
+                if association.sample_id is None:
+                    raise _ConsumeDenied("sample_association_unresolvable")
+                sample_ids.add(association.sample_id)
+                referenced_sample_ids.add(association.sample_id)
             if association.sample_id is not None:
                 sample_ids.add(association.sample_id)
             elif is_model_submission and association.id in association_ids:
@@ -1545,7 +1566,7 @@ class SqlAlchemyExternalEffectClaimStore:
             if (
                 sample.subject_id != subject_id
                 or sample.tlp.casefold() == "red"
-                or sample.do_not_submit
+                or (sample.do_not_submit and not is_bridge_submission)
                 or bool((sample.license_restriction or "").strip())
             ):
                 raise _ConsumeDenied("sample_source_restricted")
@@ -1569,11 +1590,15 @@ class SqlAlchemyExternalEffectClaimStore:
             if (
                 document.subject_id != subject_id
                 or document.tlp.casefold() == "red"
-                or document.do_not_submit
+                or (document.do_not_submit and not is_bridge_submission)
                 or bool(document.license_restriction)
             ):
                 raise _ConsumeDenied("source_document_restricted")
-            if _is_model_submission(prepared, family_binding) and not document.external_llm_allowed:
+            if (
+                _is_model_submission(prepared, family_binding)
+                and not is_bridge_submission
+                and not document.external_llm_allowed
+            ):
                 raise _ConsumeDenied("source_document_external_llm_not_allowed")
         if document_ids and {document.id for document in documents} != document_ids:
             raise _ConsumeDenied("source_document_missing")

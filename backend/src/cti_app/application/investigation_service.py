@@ -393,6 +393,12 @@ class InvestigationService:
         return InvestigationService._external_allowed(snapshot, envelope)
 
     @staticmethod
+    def bridge_disclosure_allowed(
+        snapshot: ArticleSnapshot, envelope: InvestigationEnvelope | None
+    ) -> bool:
+        return InvestigationService._external_tlp_allowed(snapshot, envelope)
+
+    @staticmethod
     def unapproved_budget_for(investigation: AnalystInvestigation) -> InvestigationBudget:
         return InvestigationService._unapproved_budget(investigation)
 
@@ -797,7 +803,7 @@ class InvestigationService:
             stopped = await self._requested_stop(investigation_id)
             if stopped is not None:
                 return stopped
-            allowed = self.external_llm_allowed(snapshot, envelope)
+            allowed = self.bridge_disclosure_allowed(snapshot, envelope)
             if not allowed:
                 # Context construction is the local read path; no model transport runs.
                 action = self._external_policy_block_action(snapshot, envelope, state.turn_index)
@@ -1628,7 +1634,7 @@ class InvestigationService:
                 snapshot = await self._context_builder.article_snapshots.resolve(
                     current_investigation.synthesis_artifact_id
                 )
-                if not self.external_llm_allowed(snapshot, current_envelope):
+                if not self.bridge_disclosure_allowed(snapshot, current_envelope):
                     return FrameworkPreSubmissionProof.DISCLOSURE_REVOKED
             return None
 
@@ -3316,8 +3322,22 @@ class InvestigationService:
     def _external_allowed(
         snapshot: ArticleSnapshot, envelope: InvestigationEnvelope | None
     ) -> bool:
-        # External submission always needs a materialized G2 envelope. Policy
-        # inheritance is performed at investigation start, never at invocation.
+        if not InvestigationService._external_tlp_allowed(snapshot, envelope):
+            return False
+        assert envelope is not None
+        return bool(
+            snapshot.external_llm_allowed
+            and envelope.disclosure.external_llm_allowed
+            and not snapshot.do_not_submit
+            and not envelope.disclosure.do_not_submit
+        )
+
+    @staticmethod
+    def _external_tlp_allowed(
+        snapshot: ArticleSnapshot, envelope: InvestigationEnvelope | None
+    ) -> bool:
+        # Both Bridge and external provider operations need a materialized G2
+        # envelope with a source TLP no higher than its approved TLP bound.
         if envelope is None or not isinstance(snapshot.tlp, str):
             return False
         raw_tlp = snapshot.tlp.strip().casefold()
@@ -3339,14 +3359,7 @@ class InvestigationService:
         }
         if envelope_tlp is not None and tlp_rank[envelope_tlp] < tlp_rank[source_tlp]:
             return False
-        return bool(
-            snapshot.external_llm_allowed
-            and envelope.disclosure.external_llm_allowed
-            and not snapshot.do_not_submit
-            and not envelope.disclosure.do_not_submit
-            and source_tlp is not TLPLevel.RED
-            and envelope_tlp is not TLPLevel.RED
-        )
+        return source_tlp is not TLPLevel.RED and envelope_tlp is not TLPLevel.RED
 
     @staticmethod
     def _external_policy_block_action(
@@ -3863,7 +3876,7 @@ def _tool_allowed_by_envelope(definition: Any, envelope: InvestigationEnvelope |
         if (
             provider not in envelope.allowed_providers
             or (envelope.disclosure.tlp is not None and envelope.disclosure.tlp.value == "red")
-            or envelope.disclosure.do_not_submit
+            or (envelope.disclosure.do_not_submit and definition.name != "advisor.consult")
         ):
             return False
         if definition.effect is ToolEffect.ACQUIRE and not envelope.acquire_hits_allowed:

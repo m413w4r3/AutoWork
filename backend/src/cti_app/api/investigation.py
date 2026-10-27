@@ -1742,7 +1742,7 @@ async def get_investigation_operator_status(
             envelope=envelope,
             invocations=invocations,
             observations=observations,
-            external_llm_allowed=InvestigationService.external_llm_allowed(snapshot, envelope),
+            external_llm_allowed=InvestigationService.bridge_disclosure_allowed(snapshot, envelope),
         )
         if tool_inventory is not None:
             available_tool_names, unavailable_tool_diagnostics = tool_inventory
@@ -2889,7 +2889,8 @@ async def _investigation_view(
         invocations=invocations,
         observations=observations,
         external_llm_allowed=(
-            currently_authorized and InvestigationService.external_llm_allowed(snapshot, envelope)
+            currently_authorized
+            and InvestigationService.bridge_disclosure_allowed(snapshot, envelope)
         ),
     )
     if tool_inventory is None:

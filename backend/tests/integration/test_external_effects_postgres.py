@@ -38,6 +38,7 @@ from cti_app.application.investigation_advisor_tools import ADVISOR_SCHEMA_VERSI
 from cti_app.application.investigation_service import InvestigationService
 from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.model_gateway import (
+    BRIDGE_SOURCE_PROVENANCE_KEY,
     AdapterResult,
     AdapterResultStatus,
     BridgeExternalEffectBinding,
@@ -907,6 +908,262 @@ async def test_bridge_submission_cannot_omit_restricted_prompt_source_reference(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reference_kind", "observation_object_type", "restriction"),
+    [
+        ("sample", None, None),
+        ("sample_association_sample", None, None),
+        ("sample_association", None, None),
+        ("sample_hash", None, None),
+        ("source_document", None, None),
+        ("evidence_observation", "tool_result", None),
+        ("evidence_observation", "source_document", None),
+        ("sample", None, "sample_red"),
+        ("sample", None, "sample_license"),
+        ("source_document", None, "document_red"),
+        ("source_document", None, "document_license"),
+    ],
+)
+async def test_bridge_source_rules_ignore_submission_flags_but_keep_red_and_license_vetoes(
+    migrated_postgres_url: str,
+    tmp_path: Path,
+    reference_kind: str,
+    observation_object_type: str | None,
+    restriction: str | None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    (
+        session_factory,
+        engine,
+        investigation_id,
+        initial_authority,
+        initial_prepared,
+        _unused_store,
+        run_id,
+    ) = await _prepare_model_submission_case(
+        migrated_postgres_url, tmp_path, suffix=uuid4().hex[:12]
+    )
+    authority = replace(
+        initial_authority,
+        invocation_id=None,
+        invocation_arguments_sha256=None,
+        expected_envelope_version=5,
+    )
+    sample_id = uuid4()
+    association_id = uuid4()
+    document_id = uuid4()
+    observation_id = uuid4()
+    sample_sha256 = "9" * 64
+    observation_version = "source-v1"
+    sample_license_text = "sample license restriction canary"
+    document_license_text = "document license restriction canary"
+    now = datetime.now(UTC)
+    try:
+        async with session_factory() as session:
+            async with session.begin():
+                envelope = await session.get(InvestigationEnvelopeRow, investigation_id)
+                assert envelope is not None
+                envelope.disclosure_do_not_submit = True
+                envelope.disclosure_external_llm_allowed = False
+                envelope.version = 5
+                turn = await session.get(ModelConversationTurnRow, authority.bridge_turn_id)
+                run = await session.get(ModelRunRow, run_id)
+                blob = await session.scalar(select(BlobRow).order_by(BlobRow.id).limit(1))
+                assert turn is not None and run is not None and blob is not None
+                sample_sha256 = blob.sha256
+                conversation = await session.get(ModelConversationRow, turn.conversation_id)
+                assert conversation is not None
+                session.add(
+                    SampleRow(
+                        id=sample_id,
+                        subject_id=conversation.subject_id,
+                        blob_id=blob.id,
+                        original_name="bridge-permission-flag-sample.bin",
+                        origin="test",
+                        acquired_at=now,
+                        license_restriction=(
+                            sample_license_text if restriction == "sample_license" else None
+                        ),
+                        tlp="RED" if restriction == "sample_red" else "CLEAR",
+                        do_not_submit=True,
+                        external_llm_allowed=False,
+                        origin_kind="manual",
+                        state="validated",
+                        source_service=None,
+                        source_object_id=sample_sha256,
+                        expected_hash=sample_sha256,
+                        validation_actor=None,
+                        validation_date=None,
+                        validation_reason=None,
+                        imphash=None,
+                        ssdeep=None,
+                        tlsh=None,
+                        rich_header_hash=None,
+                        vhash=None,
+                        main_icon_dhash=None,
+                        imphash_source=None,
+                        ssdeep_source=None,
+                        tlsh_source=None,
+                        rich_header_hash_source=None,
+                        vhash_source=None,
+                        main_icon_dhash_source=None,
+                        created_at=now,
+                    )
+                )
+                session.add(
+                    SampleAssociationRow(
+                        id=association_id,
+                        investigation_id=investigation_id,
+                        sample_id=sample_id,
+                        sample_sha256=sample_sha256,
+                        origin="manual",
+                    )
+                )
+                session.add(
+                    SourceDocumentRow(
+                        id=document_id,
+                        subject_id=conversation.subject_id,
+                        blob_id=blob.id,
+                        original_name="bridge-permission-flag-source.txt",
+                        origin="test",
+                        acquired_at=now,
+                        license_restriction=(
+                            document_license_text if restriction == "document_license" else None
+                        ),
+                        tlp="RED" if restriction == "document_red" else "CLEAR",
+                        do_not_submit=True,
+                        external_llm_allowed=False,
+                        created_at=now,
+                    )
+                )
+                if reference_kind == "evidence_observation":
+                    session.add(
+                        EvidenceObservationRow(
+                            id=observation_id,
+                            investigation_id=investigation_id,
+                            kind="other",
+                            blob_id=blob.id,
+                            sha256=blob.sha256,
+                            source="test.source",
+                            source_version=observation_version,
+                            observed_at=now,
+                            object_type=observation_object_type or "tool_result",
+                            object_id=(
+                                str(document_id)
+                                if observation_object_type == "source_document"
+                                else "synthetic-tool-result"
+                            ),
+                            limitations=[],
+                            invocation_ref=None,
+                        )
+                    )
+                if reference_kind in {"sample", "sample_association_sample"}:
+                    source_ref = EvidenceReference(
+                        kind=reference_kind,
+                        id=(
+                            str(association_id)
+                            if reference_kind == "sample_association_sample"
+                            else str(sample_id)
+                        ),
+                        version=(
+                            "1" if reference_kind == "sample_association_sample" else "sample.v1"
+                        ),
+                        sha256=sample_sha256,
+                    )
+                elif reference_kind == "sample_association":
+                    source_ref = EvidenceReference(
+                        kind=reference_kind,
+                        id=str(association_id),
+                        version="association.v1",
+                        sha256=sample_sha256,
+                    )
+                elif reference_kind == "sample_hash":
+                    source_ref = EvidenceReference(
+                        kind=reference_kind,
+                        id=sample_sha256,
+                        version="sample-hash.v1",
+                        sha256=sample_sha256,
+                    )
+                elif reference_kind == "source_document":
+                    source_ref = EvidenceReference(
+                        kind=reference_kind,
+                        id=str(document_id),
+                        version=f"blob:{blob.id}",
+                        sha256=blob.sha256,
+                    )
+                else:
+                    source_ref = EvidenceReference(
+                        kind=reference_kind,
+                        id=str(observation_id),
+                        version=observation_version,
+                        sha256=blob.sha256,
+                    )
+                run.parameters = {
+                    BRIDGE_SOURCE_PROVENANCE_KEY: {
+                        "family": initial_prepared.family,
+                        "authorized_input_hash": run.authorized_input_hash,
+                        "turn_input_sha256": turn.input_sha256,
+                        "evidence_refs": [source_ref.to_json()],
+                    }
+                }
+
+        prepared = PreparedExternalRequest.build(
+            family=initial_prepared.family,
+            provider=initial_prepared.provider,
+            provider_scope="bridge.responses",
+            normalizer_version=initial_prepared.normalizer_version,
+            canonical_request=initial_prepared.canonical_request,
+            application_request=initial_prepared.application_request,
+            evidence_refs=(source_ref,),
+        )
+        transport = _CountingTransport()
+        outcome = await create_external_effect_coordinator(session_factory).send_one(
+            authority, prepared, transport
+        )
+        if restriction is not None:
+            assert isinstance(outcome, Refused)
+            assert outcome.reason == (
+                "sample_source_restricted"
+                if restriction.startswith("sample_")
+                else "source_document_restricted"
+            )
+            assert transport.calls == 0
+            restriction_text = (
+                sample_license_text
+                if restriction == "sample_license"
+                else document_license_text
+                if restriction == "document_license"
+                else None
+            )
+            if restriction_text is not None:
+                assert restriction_text not in repr(outcome)
+                assert restriction_text not in caplog.text
+            async with session_factory() as session:
+                claim_count = await session.scalar(
+                    select(func.count())
+                    .select_from(ExternalEffectClaimRow)
+                    .where(ExternalEffectClaimRow.investigation_id == investigation_id)
+                )
+            assert claim_count == 0
+            return
+        assert isinstance(outcome, Completed)
+        assert transport.calls == 1
+        async with session_factory() as session:
+            claims = list(
+                await session.scalars(
+                    select(ExternalEffectClaimRow).where(
+                        ExternalEffectClaimRow.investigation_id == investigation_id,
+                        ExternalEffectClaimRow.family == prepared.family,
+                    )
+                )
+            )
+        assert len(claims) == 1
+        assert claims[0].state == "COMPLETED"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_bridge_rate_limit_retry_and_correction_consume_one_claim_per_persisted_attempt(
     migrated_postgres_url: str,
     tmp_path: Path,
@@ -1233,9 +1490,7 @@ async def test_osint_open_inherited_advisor_bridge_claim_and_revocation_gate(
                     created_at=now,
                 )
             )
-            observation = await session.get(
-                EvidenceObservationRow, seeded.seed_observation.id
-            )
+            observation = await session.get(EvidenceObservationRow, seeded.seed_observation.id)
             assert observation is not None
             observation.object_type = "source_document"
             observation.object_id = str(source_document_id)

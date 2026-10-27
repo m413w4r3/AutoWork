@@ -209,7 +209,7 @@ class InvestigationAdvisorTool:
             if investigation is None:
                 return no_context_cost
             snapshot = await self._article_snapshots.resolve(investigation.synthesis_artifact_id)
-            if not InvestigationService.external_llm_allowed(snapshot, context.envelope):
+            if not InvestigationService.bridge_disclosure_allowed(snapshot, context.envelope):
                 return no_context_cost
             evidence = await self._load_evidence(context.investigation_id, evidence_refs)
             if not evidence_refs and consultation_type not in {
@@ -518,7 +518,7 @@ class InvestigationAdvisorTool:
                     },
                     error_code="advisor_disclosure_restricted",
                 )
-            if not InvestigationService.external_llm_allowed(snapshot, context.envelope):
+            if not InvestigationService.bridge_disclosure_allowed(snapshot, context.envelope):
                 return self._finish(
                     context,
                     ToolResult(
@@ -6686,7 +6686,7 @@ def _drop_findings_linked_to_restricted_evidence(
 
 
 def _sample_policy_allows_external(sample: object) -> bool:
-    """Apply explicit sample rules before disclosing associated sample data.
+    """Apply TLP and license restrictions before disclosing associated sample data.
 
     D7 maps every non-empty license_restriction to an explicit owner/source
     veto when sample metadata or content would be sent externally. This
@@ -6699,8 +6699,7 @@ def _sample_policy_allows_external(sample: object) -> bool:
         str(license_restriction).strip()
     )
     return not (
-        bool(getattr(sample, "do_not_submit", False))
-        or (isinstance(tlp_value, str) and tlp_value.casefold() == TLP.RED.value.casefold())
+        (isinstance(tlp_value, str) and tlp_value.casefold() == TLP.RED.value.casefold())
         or has_license_restriction
     )
 
@@ -6710,8 +6709,6 @@ def _sample_restriction_sources(sample: object | None) -> list[str]:
     if sample is None:
         return []
     sources: list[str] = []
-    if bool(getattr(sample, "do_not_submit", False)):
-        sources.append("do_not_submit")
     tlp = getattr(sample, "tlp", None)
     tlp_value = getattr(tlp, "value", tlp)
     if isinstance(tlp_value, str) and tlp_value.casefold() == TLP.RED.value.casefold():

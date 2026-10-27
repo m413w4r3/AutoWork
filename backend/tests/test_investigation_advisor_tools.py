@@ -2232,7 +2232,7 @@ async def test_generic_api_key_in_cti_evidence_is_not_an_autowork_secret() -> No
         {"license_restriction": "Owner prohibits external disclosure"},
     ],
 )
-async def test_sample_level_restriction_blocks_explicit_observation(restriction) -> None:
+async def test_sample_flags_do_not_veto_bridge_but_red_and_license_do(restriction) -> None:
     investigation_id = uuid4()
     sample_hash = "c" * 64
     observation, raw = make_observation(
@@ -2261,7 +2261,7 @@ async def test_sample_level_restriction_blocks_explicit_observation(restriction)
         make_context(investigation_id, key="operator:advisor:restricted-sample"),
     )
 
-    if restriction.get("external_llm_allowed") is False:
+    if restriction.get("do_not_submit") or restriction.get("external_llm_allowed") is False:
         assert len(transport.calls) == 1
         assert result.output.get("advisor_status") != "disclosure_restricted"
     else:
@@ -2386,8 +2386,8 @@ async def test_restriction_trace_aggregates_conflicting_sample_records() -> None
         do_not_submit=True,
         external_llm_allowed=True,
     )
-    # Records sharing a hash may disagree; the trace must reflect every
-    # restriction that contributed to the veto, not the first matching record.
+    # Records sharing a hash may disagree; only a license restriction vetoes
+    # Bridge disclosure and appears in this refusal trace.
     tool._samples = _Samples([allowed_sample, restricted_sample, submit_blocked_sample])
 
     result = await tool.execute(
@@ -2404,10 +2404,7 @@ async def test_restriction_trace_aggregates_conflicting_sample_records() -> None
     assert result.output["disclosure_restricted_sample_count"] == 1
     rows = result.output["disclosure_restricted_sample_associations"]
     assert len(rows) == 1
-    assert tuple(rows[0]["restriction_sources"]) == (
-        "do_not_submit",
-        "license_restriction",
-    )
+    assert tuple(rows[0]["restriction_sources"]) == ("license_restriction",)
     assert restriction_text not in repr(result.output)
 
 
@@ -2904,7 +2901,7 @@ async def test_unreferenced_restricted_sample_does_not_block_unrelated_consultat
 
 
 @pytest.mark.asyncio
-async def test_dotnet_analysis_of_restricted_sample_is_blocked() -> None:
+async def test_dotnet_analysis_of_do_not_submit_sample_reaches_bridge() -> None:
     investigation_id = uuid4()
     sample_hash = "c" * 64
     observation, raw = make_observation(
@@ -2956,14 +2953,12 @@ async def test_dotnet_analysis_of_restricted_sample_is_blocked() -> None:
         make_context(investigation_id, key="operator:advisor:restricted-dotnet"),
     )
 
-    assert transport.calls == []
-    assert result.output["advisor_status"] == "disclosure_restricted"
-    assert tuple(result.output["disclosure_restricted_refs"]) == (str(observation.id),)
-    assert result.output["confirmed_non_execution"] is True
+    assert len(transport.calls) == 1
+    assert result.output.get("advisor_status") != "disclosure_restricted"
 
 
 @pytest.mark.asyncio
-async def test_restricted_sample_inventory_refuses_before_sending_linked_finding() -> None:
+async def test_do_not_submit_sample_inventory_sends_linked_finding_to_bridge() -> None:
     investigation_id = uuid4()
     sample_hash = "c" * 64
     restricted, restricted_raw = make_observation(
@@ -3032,10 +3027,9 @@ async def test_restricted_sample_inventory_refuses_before_sending_linked_finding
         make_context(investigation_id, key="operator:advisor:restricted-finding"),
     )
 
-    assert transport.calls == []
-    assert result.output["advisor_status"] == "disclosure_restricted"
-    assert result.output["confirmed_non_execution"] is True
-    assert "RESTRICTED_FINDING_MARKER" not in repr(result.output)
+    assert len(transport.calls) == 1
+    assert result.output.get("advisor_status") != "disclosure_restricted"
+    assert "RESTRICTED_FINDING_MARKER" in transport.calls[0]["prompt"]
 
 
 @pytest.mark.asyncio
@@ -4529,7 +4523,7 @@ def test_context_truncation_stops_at_sentence_or_word_and_marks_ellipsis() -> No
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("policy", ["external_llm_allowed", "do_not_submit", "tlp_red"])
-async def test_external_disclosure_denial_never_calls_bridge(policy) -> None:
+async def test_bridge_egress_ignores_submission_flags_but_enforces_red(policy) -> None:
     investigation_id = uuid4()
     observation, raw = make_observation(
         investigation_id,
@@ -4546,10 +4540,35 @@ async def test_external_disclosure_denial_never_calls_bridge(policy) -> None:
         allowed=True,
     )
     snapshot = await tool._article_snapshots.resolve(uuid4())
+    context = make_context(investigation_id)
+    envelope = context.envelope
+    assert envelope is not None
     if policy == "external_llm_allowed":
         snapshot.external_llm_allowed = False
+        context = replace(
+            context,
+            envelope=replace(
+                envelope,
+                disclosure=DisclosureBounds(
+                    tlp=TLPLevel.GREEN,
+                    do_not_submit=False,
+                    external_llm_allowed=False,
+                ),
+            ),
+        )
     elif policy == "do_not_submit":
         snapshot.do_not_submit = True
+        context = replace(
+            context,
+            envelope=replace(
+                envelope,
+                disclosure=DisclosureBounds(
+                    tlp=TLPLevel.GREEN,
+                    do_not_submit=True,
+                    external_llm_allowed=True,
+                ),
+            ),
+        )
     else:
         snapshot.tlp = "RED"
     result = await tool.execute(
@@ -4557,15 +4576,19 @@ async def test_external_disclosure_denial_never_calls_bridge(policy) -> None:
             "consultation_type": "plan_investigation",
             "evidence_refs": [str(observation.id)],
         },
-        make_context(investigation_id),
+        context,
     )
 
-    assert result.status is ToolInvocationStatus.POLICY_DENIED
-    assert result.error_code == "POLICY_DENIED"
-    assert result.output["advisor_status"] == "policy_denied"
-    assert result.output["preflight_status"] == "POLICY_BLOCKED"
-    assert observation.id in result.observation_refs
-    assert transport.calls == []
+    if policy == "tlp_red":
+        assert result.status is ToolInvocationStatus.POLICY_DENIED
+        assert result.error_code == "POLICY_DENIED"
+        assert result.output["advisor_status"] == "policy_denied"
+        assert result.output["preflight_status"] == "POLICY_BLOCKED"
+        assert observation.id in result.observation_refs
+        assert transport.calls == []
+    else:
+        assert len(transport.calls) == 1
+        assert result.status is not ToolInvocationStatus.POLICY_DENIED
 
 
 @pytest.mark.asyncio
