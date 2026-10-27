@@ -108,6 +108,11 @@ Budgets OSINT_OPEN validés : tool_seconds 86400 ; vt_units 10000 ; downloads 10
 - Relais prévu pour la suite (sans jeton côté enfants) : l'orchestrateur exécute un relais mécanique fichier→`docker exec` ; CTI-ANALYST (Luna) ne fait que décider.
 - Défauts non corrigés : D7, D8 (voir B6).
 
+### RÉSOLU — jetons opérateur chargés (utilisateur, 2026-10-27 ~20:55 UTC) ; phase C lancée
+- L'utilisateur a ajouté les jetons au `.env` et relancé `make up`. Vérifié sans afficher de valeur : deux jetons de 64 car. distincts ; `/api/identity/status` humain = authenticated/human_identity true ; client = authenticated/human_identity false ; `operator-status` + `operator/context?view=summary` OK avec le client ; Alembic 0005 ; inv `a8845772` running, 0 invocation ; politique `dc034634` active. B3/B4/B6 restent attribués à `dev-analyst` (identité locale d'origine) dans l'audit.
+- Relais opérateur : `.autowork-runs/m07/relay.py` (processus de l'orchestrateur, sans jeton ; whitelist GET /api/investigations/<inv>/… et POST …/operator/tools/<tool> ; jamais de retry) ; `inbox/`→`outbox/`, journal append-only `.autowork-runs/m07/journal.jsonl`. Si le relais est arrêté : `cd .autowork-runs/m07 && nohup python3 relay.py &`.
+- CTI-ANALYST : Paseo `83a9aeb8-bd9f-4aee-b0b5-57dde569027e`, codex/gpt-6-luna xhigh auto-review, workspace wks_9c25e352c5ccd0a5 ; journal analytique `analyst_log.md`, `checkpoint.md` dans le même dossier. Isolation analytique : ne lit pas l'investigation historique.
+
 ### À FAIRE : B3 → B6 (voir plan présenté ; résumé)
 - **B3** Réconcilier l'inv `5f66ebfb` (`running`, màj 2026-10-20, aucun job) : avant = aucun job/effet externe en cours ou ambigu pour elle (sinon STOP + diagnostic) ; action = passage terminal par action applicative motivée via API/service (CAS), historique + réservations conservés ; les 19 `needs_review` intacts. Trouver l'endpoint/méthode exacts (`conclude`/stop) dans `api/investigation.py` ; vérifier par lecture que ce n'est pas un UPDATE SQL direct.
 - **B4** Activer OSINT_OPEN sur le sujet `d22822d4-27ce-47d2-9cc5-f84cf312986a` avec les budgets validés (service `OsintOpenPolicyService`, `api/osint_policy.py`) ; relire les valeurs et l'événement ACTIVATED/version épinglée.
