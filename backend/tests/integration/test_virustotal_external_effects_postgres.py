@@ -1530,6 +1530,72 @@ async def test_restricted_sample_vt_read_is_refused_before_transport(
         await result["engine"].dispose()
 
 
+@pytest.mark.parametrize(
+    ("sample_tlp", "sample_do_not_submit", "expected_transport_calls"),
+    [
+        pytest.param(TLP.CLEAR, False, 1, id="clear-external-llm-disallowed"),
+        pytest.param(TLP.CLEAR, True, 0, id="do-not-submit"),
+        pytest.param(TLP.RED, False, 0, id="tlp-red"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_vt_file_report_respects_sample_submission_restrictions_not_external_llm_flag(
+    migrated_postgres_url: str,
+    tmp_path: Path,
+    sample_tlp: TLP,
+    sample_do_not_submit: bool,
+    expected_transport_calls: int,
+) -> None:
+    sample_bytes = f"synthetic VT disclosure source {uuid4()}".encode()
+    file_hash = hashlib.sha256(sample_bytes).hexdigest()
+    physical_requests: list[httpx.Request] = []
+
+    def proxy_handler(request: httpx.Request) -> httpx.Response:
+        physical_requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "id": file_hash,
+                    "type": "file",
+                    "attributes": {"reputation": 0, "last_analysis_stats": {}},
+                }
+            },
+            request=request,
+        )
+
+    result = await _run_inherited_case(
+        database_url=migrated_postgres_url,
+        tmp_path=tmp_path,
+        max_claims=10,
+        hashes=(file_hash,),
+        proxy_handler=proxy_handler,
+        sample_bytes=sample_bytes,
+        sample_tlp=sample_tlp,
+        sample_do_not_submit=sample_do_not_submit,
+        sample_external_llm_allowed=False,
+        policy_external_llm_allowed=True,
+    )
+    try:
+        assert len(physical_requests) == expected_transport_calls
+        if expected_transport_calls:
+            assert len(result["claims"]) == 1
+            assert len(result["invocations"]) == 1
+            assert result["invocations"][0].status is ToolInvocationStatus.SUCCEEDED
+        else:
+            assert result["claims"] == []
+            assert result["invocations"]
+            assert result["invocations"][0].status in {
+                ToolInvocationStatus.POLICY_DENIED,
+                ToolInvocationStatus.NEEDS_REVIEW,
+            }
+    finally:
+        if result["direct_client"] is not None:
+            await result["direct_client"].aclose()
+        await result["proxy_client"].aclose()
+        await result["engine"].dispose()
+
+
 @pytest.mark.asyncio
 async def test_restricted_observation_grounded_vt_read_is_refused_before_transport(
     migrated_postgres_url: str, tmp_path: Path
