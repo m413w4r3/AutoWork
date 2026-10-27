@@ -60,7 +60,7 @@ from cti_app.infrastructure.database.repositories.external_effects import (
     _family_credentials_match,
 )
 from cti_app.infrastructure.database.repositories.virustotal_external_effects import (
-    _source_do_not_submit_blocks as osint_guard_source_do_not_submit_blocks,
+    _source_flags_block as osint_guard_source_flags_block,
 )
 from cti_app.integrations.models import (
     BridgeTransportError,
@@ -100,21 +100,28 @@ def test_source_do_not_submit_blocks_external_upload_families(family: str) -> No
 
 
 @pytest.mark.parametrize(
-    ("family", "blocks"),
+    ("family", "do_not_submit", "external_llm_allowed", "blocks"),
     [
-        ("vt.download_sample", False),
-        ("bridge.investigation_turn.v1", False),
-        ("advisor.consultation.v1", False),
-        ("other.upload", True),
+        ("vt.download_sample", True, False, False),
+        ("advisor.consultation.v1", True, True, False),
+        ("bridge.investigation_turn.v1", True, True, False),
+        ("advisor.consultation.v1", False, False, True),
+        ("bridge.investigation_turn.v1", True, False, True),
+        ("other.upload", True, True, True),
+        ("other.upload", False, True, False),
     ],
 )
-def test_osint_policy_guard_source_veto_exempts_bridge_like_consume(
-    family: str, blocks: bool
+def test_osint_policy_guard_source_flags_exempt_bridge_from_do_not_submit_only(
+    family: str, do_not_submit: bool, external_llm_allowed: bool, blocks: bool
 ) -> None:
-    # An acquired sample is stored with do_not_submit; OSINT_OPEN must still
-    # let Bridge cite it while keeping the veto for upload families.
-    assert osint_guard_source_do_not_submit_blocks(family, True) is blocks
-    assert osint_guard_source_do_not_submit_blocks(family, False) is False
+    # Acquired samples are stored do_not_submit/external_llm_allowed: Bridge may
+    # cite them, but never a source that forbids external LLMs (e.g. VT PCAP).
+    assert (
+        osint_guard_source_flags_block(
+            family, do_not_submit=do_not_submit, external_llm_allowed=external_llm_allowed
+        )
+        is blocks
+    )
 
 
 def _wire(
