@@ -37,7 +37,6 @@ from cti_app.config import Settings
 from cti_app.domain.analyst_opinion import OpinionBlockType, OpinionClaimQualification
 from cti_app.domain.editorial import AnalystDecisionType
 from cti_app.domain.investigation import (
-    canonical_json_bytes,
     BudgetDimension,
     DisclosureBounds,
     EnvelopeAuthorityKind,
@@ -50,6 +49,7 @@ from cti_app.domain.investigation import (
     SampleQualification,
     TLPLevel,
     ToolInvocationStatus,
+    canonical_json_bytes,
 )
 from cti_app.domain.osint_open import OsintCapabilities, OsintScopeKind
 from cti_app.domain.production import ProductionArtifactStage, ProductionArtifactStatus
